@@ -217,7 +217,7 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
         }
     }
 
-    // ── Anthropic Messages API (typed events) ──────────────────────
+    // ── Anthropic Messages API (typed events) ───────────────────
     if (parsed.object.get("type")) |tv| {
         if (tv == .string) {
             const ty = tv.string;
@@ -408,7 +408,7 @@ pub const StreamCtx = struct {
 
     /// Frees the buffers AND destroys the struct: it is called `destroy` and not
     /// `deinit` on purpose, because it takes `self` down with it and a
-    /// `defer ctx.deinit()` on a stack-allocated StreamCtx blows up with
+    /// `defer ctx.destroy()` on a stack-allocated StreamCtx blows up with
     /// "Invalid free". Only used with the ones coming out of `gpa.create`.
     pub fn destroy(self: *StreamCtx) void {
         for (self.parts.items) |*p| {
@@ -593,9 +593,10 @@ pub fn streamChatCtx(
 ) !StreamResult {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = user_cb, .kind = kind };
-    // CAREFUL: on error you must use `deinit`, not `destroy`: the ctx may
+    // CAREFUL: the error path must call `destroy` (NOT `deinit`): the ctx may
     // already have `parts` (accumulated tool calls) and `line_buf` allocated.
-    // With `errdefer gpa.destroy(ctx)` both of those leaked on every 429/5xx.
+    // `destroy` is the one that frees them; a plain `gpa.destroy(ctx)` without
+    // it leaked both on every 429/5xx.
     errdefer ctx.destroy();
     try streamRaw(gpa, http, url, bearer, body, ctx);
     return .{ .ctx = ctx, .partial = ctx.partial };
@@ -1532,10 +1533,11 @@ test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
     try std.testing.expectEqual(@as(u8, 'x'), col.text.items[payload_len - 1]);
 }
 
-test "StreamCtx.deinit no fuga con parts y line_buf poblados" {
-    // The error path of `streamChatCtx` must call `deinit` (not
-    // `destroy`), because by the time a request fails the ctx already has
-    // accumulated tool calls and a line buffer. With `destroy` they leaked.
+test "StreamCtx.destroy no fuga con parts y line_buf poblados" {
+    // The error path of `streamChatCtx` must call `destroy` (NOT `deinit`),
+    // because by the time a request fails the ctx already has accumulated tool
+    // calls and a line buffer. `destroy` is what frees them; without it they
+    // leaked.
     const ctx = try std.testing.allocator.create(StreamCtx);
     ctx.* = .{
         .gpa = std.testing.allocator,
