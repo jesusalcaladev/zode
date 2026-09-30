@@ -121,6 +121,27 @@ fn setServerMessage(body: []const u8) void {
 pub var last_error_buf: [512]u8 = undefined;
 pub var last_error_len: usize = 0;
 
+// ── ZODE_DBG_ERR: volcar la respuesta del server ──────────────
+//
+// `ZODE_DBG_ERR=1` imprime a stderr el status y los primeros bytes de CADA
+// respuesta (buena o mala). Existe por una razón concreta: el mensaje de error
+// que se ve en la TUI sale de `"message":"..."` del body, y cuando el body no
+// tiene ese campo (o viene troceado) lo que se muestra es "HTTP 403" y no hay
+// por dónde tirar. Con esto se lee lo que contestó de verdad.
+//
+// Se lee UNA vez al arrancar (`dbgInitEnv`): el `Io` no expone el entorno, y
+// leerlo por cada respuesta sería una lookup por request.
+pub var dbg_err_flag: bool = false;
+
+pub fn dbgInitEnv(env: ?*const std.process.Environ.Map) void {
+    const v = if (env) |e| e.get("ZODE_DBG_ERR") else null;
+    dbg_err_flag = if (v) |x| x.len > 0 and x[0] != '0' else false;
+}
+
+fn dbg_err() bool {
+    return dbg_err_flag;
+}
+
 pub fn lastErrorBody() []const u8 {
     return last_error_buf[0..last_error_len];
 }
@@ -645,9 +666,13 @@ fn streamRaw(
     };
 
     if (res.status != 200) {
+        if (dbg_err()) {
+            std.debug.print("[DBG] status={d} raw={s}\n", .{ res.status, ctx.raw[0..@min(ctx.raw_len, 240)] });
+        }
         if (res.retry_after) |ra| retry_after_secs = ra;
         // Cada status tiene su propio error porque la ACCION que hay que hacer
         // es distinta, y "HTTP 403" no dice nada:
+        //   400  peticion mala   -> no reintentar (repetirla no la arregla)
         //   401  key invalida    -> no reintentar, revisar la key
         //   402  sin creditos    -> no reintentar (antes reintentaba 3 veces!)
         //   403  acceso denegado -> casi siempre es el MODELO, no la key
@@ -661,6 +686,11 @@ fn streamRaw(
             // 404 casi siempre es "este modelo no existe (o tu cuenta no lo
             // tiene)". Reintentarlo 3 veces es esperar en balde.
             404 => error.ModelNotFound,
+            // 400: la PETICIÓN está mal. Reintentar la misma cosa 3 veces son
+            // 3,5 s de reloj y un turno que parece colgado. Y con el free-auto
+            // encendido lo trata `noteTurnFailure`: este par se aparta y el
+            // siguiente turno empieza en otro.
+            400 => error.BadRequest,
             else => error.ServerError,
         };
         // El mensaje del server es lo que de verdad explica el fallo; se saca
@@ -673,6 +703,7 @@ fn streamRaw(
         }
         return err;
     }
+    if (dbg_err()) std.debug.print("[DBG] 200 raw={s}\n", .{ctx.raw[0..@min(ctx.raw_len, 240)]});
     retry_after_secs = null;
     if (res.retry_after) |ra| retry_after_secs = ra;
     ctx.finish() catch |err| switch (err) {
@@ -1498,7 +1529,7 @@ test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
     };
     defer ctx.destroy();
 
-    // Payload de ~200 KB repartido en trozos de 8 KB:现实中 es lo que pasa
+    // Payload de ~200 KB repartido en trozos de 8 KB: es lo que pasa de
     // cuando el modelo devuelve un tool call enorme o un fragmento largo.
     const payload_len: usize = 200_000;
     const prefix = "data: {\"choices\":[{\"delta\":{\"content\":\"";

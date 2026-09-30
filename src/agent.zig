@@ -1401,6 +1401,10 @@ fn chatWorker(job: *ChatJob) void {
     while (iterations < max_iterations) : (iterations += 1) {
         const again = runOneTurn(m, last_user) catch |err| {
             reportErr(m, err);
+            // Con el free-auto encendido, el estado del pool ES la siguiente
+            // pregunta del usuario ("¿y ahora qué?"), y la respuesta cabe en una
+            // línea. Sin esto se ve un error y nada más.
+            notePoolState(m);
             m.streamEnd();
             return;
         };
@@ -1619,6 +1623,48 @@ fn pushSwitchNotice(m: *tui.Model, sw: free_auto.Switch, to: Target) void {
     setStatusWithZo(m, .thinking, short);
 }
 
+/// [roster] Una línea con el estado del pool, para cuando el turno se muere.
+///
+/// Dice lo único que sirve: cuántos candidatos quedan vivos y que `/free-auto
+/// status` da el detalle. Sin el pool construido no dice nada (sería ruido).
+fn notePoolState(m: *tui.Model) void {
+    if (!free_auto.freeAutoOn()) return;
+    const lbl = free_auto.freeAutoLabel(m.allocator);
+    if (lbl.len == 0) return;
+    // `statusLabel` ya empieza por "free-auto n/m", así que aquí NO se repite el
+    // prefijo (salía "free-auto: free-auto 3/16 · ...", que es de las cosas que
+    // hacen que una línea de información deje de leerse).
+    const msg = std.fmt.allocPrint(m.allocator, "{s} · /free-auto status for the detail", .{lbl}) catch
+        "free-auto: pool changed";
+    pushInfoOwned(m, msg);
+}
+
+/// [roster] Marca el par que acaba de tumbar el turno y lo deja para el
+/// siguiente.
+///
+/// NO rota el turno (eso es lo de `quotaVerdict`): aquí el error no es de cuota,
+/// es "este par no está dando". Lo que hace esicidearlo un minuto y mover el
+/// índice, para que el siguiente prompt empiece en otro sitio.
+///
+/// Las dos excepciones son obvias y estan en el test:
+///   - `AuthFailed`: es la KEY. Rotar daría 401 en los 16, y además el mensaje
+///     de `reportErr` ya dice qué variable mirar.
+///   - `Cancelled`: el usuario.paró. Marcar el par de muerto sería castigar al
+///     modelo por una tecla de ESC.
+fn noteTurnFailure(m: *tui.Model, err: anyerror, pick: Target) void {
+    if (!free_auto.freeAutoOn()) return;
+    if (pick.from_roster == null) return;
+    if (err == error.AuthFailed or err == error.Cancelled) return;
+    const sw = free_auto.switchTo(m.allocator, .failed, chat.lastErrorBody()) orelse return;
+    const c = sw.cand;
+    const msg = std.fmt.allocPrint(
+        m.allocator,
+        "{s}/{s} failed: {s} → next turn starts with {s}/{s}",
+        .{ sw.prev_provider, sw.prev_model, errPhrase(err), c.provider_id, c.model_id },
+    ) catch "free-auto: the pair failed";
+    pushInfoOwned(m, msg);
+}
+
 fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
@@ -1673,16 +1719,6 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     // bloquea.
     var pick = pickTarget(m);
 
-    var body_buf: [1 << 20]u8 = undefined;
-    const body = try chat.buildBodyMessages(
-        &body_buf,
-        pick.model,
-        comp.msgs,
-        current_effort,
-        tools_mod.toolsJson(),
-        pick.kind,
-    );
-
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
 
@@ -1704,6 +1740,30 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     // cuando el problema es de configuración y no de cuota.
     var rotations: u8 = 0;
     while (true) : (attempt += 1) {
+        // El body se compone DENTRO del bucle, y no antes.
+        //
+        // Es el bug más caro de la rotación: el body lleva el NOMBRE del modelo
+        // dentro, así que al rotar había que rehacerlo. Con el body compuesto
+        // fuera, la petición iba al provider/modelo nuevo con el nombre del
+        // viejo dentro, y la respuesta del server era un 400 con un mensaje sin
+        // sentido ("JSON parsing failed") que no cuadraba con nada. Se vio en la
+        // E2E: un 403 claro (el gate) seguido de tres 400 que no tenían
+        // explicación. Con openrouter, un body que pide un modelo gateado y una
+        // url de otro es exactamente el tipo de cosa que su capa de routing no
+        // sabe parsear.
+        //
+        // El coste de recomponerlo en cada reintento son microsegundos de
+        // serialización al lado de una ida a la red: no compensa ahorrarlos.
+        var body_buf: [1 << 20]u8 = undefined;
+        const body = try chat.buildBodyMessages(
+            &body_buf,
+            pick.model,
+            comp.msgs,
+            current_effort,
+            tools_mod.toolsJson(),
+            pick.kind,
+        );
+
         var url_buf: [1024]u8 = undefined;
         // OJO: `streamChat` espera la URL COMPLETA, no solo la base del provider.
         // Pasarle la base a secas daba 404 en TODAS las peticiones de la TUI (el
@@ -1758,6 +1818,13 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
                 Retry.wait(attempt) catch return null; // ESC corta
                 continue;
             }
+            // [roster] Se acabaron los reintentos con ESTE par. En el turno no se
+            // rota (un 5xx puede ser un blip y el backoff ya se ha mostrado), pero
+            // el par se marca como muerto para que el SIGUIENTE turno no empiece
+            // por el mismo. Sin esto, con un modelo que falla siempre (un free que
+            // el provider no sirve) el usuario se queda atascado en el mismo
+            // error por siempre y `/free-auto` no sirve para nada.
+            noteTurnFailure(m, err, pick);
             return err;
         };
         break;
@@ -2084,7 +2151,9 @@ pub fn isGateMessage(detail: []const u8) bool {
     return containsNoCase(detail, "within opencode") or
         containsNoCase(detail, "access is disabled") or
         containsNoCase(detail, "not available for your") or
-        containsNoCase(detail, "only be used from within");
+        containsNoCase(detail, "only be used from within") or
+        containsNoCase(detail, "agentic harness") or
+        containsNoCase(detail, "not available on this account");
 }
 
 /// `containsNoCase` sin allocar: lowera los dos caracteres a la vez en vez de
@@ -2261,17 +2330,31 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             ) catch "acceso denegado";
             pushInfoOwned(m, msg);
         },
+        error.BadRequest => {
+            // 400: el server no aceptó la petición. Con el free-auto encendido
+            // este par ya se aparta para el siguiente turno (`noteTurnFailure`),
+            // así que aquí solo hay que decir qué pidió y qué contestó.
+            const msg = std.fmt.allocPrint(
+                gpa,
+                "{s} rejected the request for `{s}`: {s}",
+                .{ cur_provider_id, cur_model, reason },
+            ) catch "petición rechazada";
+            pushInfoOwned(m, msg);
+        },
         error.RateLimited, error.Overloaded => {
-            const msg = std.fmt.allocPrint(gpa, "{s} tras varios intentos: {s}", .{ @errorName(err), reason }) catch
+            // `errPhrase`, no `@errorName`: esta línea la lee una persona y
+            // "RateLimited" no le dice nada a nadie. Es la misma regla que los
+            // avisos de reintento, que ya lo hacían bien.
+            const msg = std.fmt.allocPrint(gpa, "{s} tras varios intentos: {s}", .{ errPhrase(err), reason }) catch
                 "servicio saturado";
             pushInfoOwned(m, msg);
         },
         else => {
-            const msg = std.fmt.allocPrint(gpa, "error: {t} ({s})", .{ err, reason }) catch "error";
+            const msg = std.fmt.allocPrint(gpa, "{s}: {s}", .{ errPhrase(err), reason }) catch "error";
             pushInfoOwned(m, msg);
         },
     }
-    setStatusWithZo(m, .warn, @errorName(err));
+    setStatusWithZo(m, .warn, errPhrase(err));
 }
 
 /// Nombre de la variable de entorno con la key del provider activo, para poder
@@ -3038,6 +3121,57 @@ test "targetForCandidate: provider desconocido devuelve null (no un target a med
     try std.testing.expect(targetForCandidate(&m, cand) == null);
 }
 
+test "noteTurnFailure: el 401 y el ESC NO tiran el par" {
+    // Las dos excepciones, y son las que importan:
+    //  - 401 es la KEY: rotar daria 401 en los 16 del pool, y encima el
+    //    mensaje de reportErr ya dice que variable mirar.
+    //  - ESC paro el turno a proposito: castigar al modelo por una tecla seria
+    //    la manera mas rapida de que el usuario desactive el free-auto.
+    const saved = free_auto_state_save();
+    defer free_auto_state_restore(saved);
+
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var pool = roster_mod.Roster.init(arena);
+    pool.built = true;
+    pool.len = 2;
+    pool.items[0] = .{ .provider_id = "groq", .model_id = "m0" };
+    pool.items[1] = .{ .provider_id = "groq", .model_id = "m1" };
+    free_auto_state_set(true, true, pool);
+    const pick = pickTarget(&m);
+
+    // Con el free-auto APAGADO no se toca nada aunque el turno se muera.
+    free_auto_state_set(false, true, pool);
+    noteTurnFailure(&m, error.ServerError, pick);
+    try std.testing.expectEqual(@as(u8, 0), roster_mod.Roster.init(arena).dead_len);
+    try std.testing.expectEqualStrings("m0", pick.from_roster.?.model_id);
+
+    // Encendido: un 5xx tras los reintentos SÍ aparta el par (y con el).
+    free_auto_state_set(true, true, pool);
+    noteTurnFailure(&m, error.ServerError, pick);
+    try std.testing.expectEqualStrings("m1", free_auto.rosterGet(arena).currentCandidate().?.model_id);
+
+    // Encendido pero 401: ni se aparta ni se rota.
+    var pool2 = roster_mod.Roster.init(arena);
+    pool2.built = true;
+    pool2.len = 2;
+    pool2.items[0] = .{ .provider_id = "groq", .model_id = "m0" };
+    pool2.items[1] = .{ .provider_id = "groq", .model_id = "m1" };
+    free_auto_state_set(true, true, pool2);
+    noteTurnFailure(&m, error.AuthFailed, pick);
+    try std.testing.expectEqualStrings("m0", free_auto.rosterGet(arena).currentCandidate().?.model_id);
+    try std.testing.expectEqual(@as(u8, 0), free_auto.rosterGet(arena).dead_len);
+
+    // Y ESC tampoco.
+    free_auto_state_set(true, true, pool2);
+    noteTurnFailure(&m, error.Cancelled, pick);
+    try std.testing.expectEqualStrings("m0", free_auto.rosterGet(arena).currentCandidate().?.model_id);
+}
+
 test "quotaVerdict: la tabla de las siete senales" {
     // La accion que corresponde a cada fila es OPUESTA, y equivocarse aqui
     // significa dos cosas malas: rotar cuando no toca (el usuario ve el modelo
@@ -3071,6 +3205,18 @@ test "quotaVerdict: la tabla de las siete senales" {
     try std.testing.expect(quotaVerdict(error.ServerError, gate) == null);
     try std.testing.expect(quotaVerdict(error.Overloaded, gate) == null);
     try std.testing.expect(quotaVerdict(error.Cancelled, gate) == null);
+    // El 400 tampoco rota en el momento: si la peticion esta mal, esta mal para
+    // los 16. Lo que hace el free-auto con un 400 es apartar el par para el
+    // SIGUIENTE turno (`noteTurnFailure`), que es otra cosa.
+    try std.testing.expect(quotaVerdict(error.BadRequest, gate) == null);
+    // Y no es reintentable: repetir la misma peticion 3 veces son 3,5 s de reloj.
+    try std.testing.expect(!isRetryable(error.BadRequest));
+    try std.testing.expect(!isRetryable(error.AuthFailed));
+    try std.testing.expect(!isRetryable(error.NoCredits));
+    try std.testing.expect(!isRetryable(error.Forbidden));
+    try std.testing.expect(isRetryable(error.RateLimited));
+    try std.testing.expect(isRetryable(error.Overloaded));
+    try std.testing.expect(isRetryable(error.ServerError));
 }
 
 test "isGateMessage: las frases reales del gate, y case-insensitive" {
@@ -3079,6 +3225,12 @@ test "isGateMessage: las frases reales del gate, y case-insensitive" {
     try std.testing.expect(isGateMessage("Can Only Be Used From Within OpenCode"));
     try std.testing.expect(isGateMessage("Model access is disabled"));
     try std.testing.expect(isGateMessage("this model is not available for your account"));
+    // La de openrouter, copiada de un 403 real (2026-09-30):
+    //   "thinkingmachines/inkling-small:free is only available on agentic
+    //    harnesses. Try plugging it into a coding agent or productivity app
+    //    listed at ..."
+    try std.testing.expect(isGateMessage("x:free is only available on agentic harnesses. Try plugging it into a coding agent"));
+    try std.testing.expect(isGateMessage("The model is not available on this account"));
     // Y lo que NO es el gate, para no gastar un par de providers de más.
     try std.testing.expect(!isGateMessage(""));
     try std.testing.expect(!isGateMessage("insufficient credits"));
@@ -3086,6 +3238,8 @@ test "isGateMessage: las frases reales del gate, y case-insensitive" {
     try std.testing.expect(!isGateMessage("opencode is down"));
     // El "within" suelto no basta: hace falta la frase entera.
     try std.testing.expect(!isGateMessage("error within the quota system"));
+    // Y un 5xx con un body raro NO es un gate (eso se reintenta con backoff).
+    try std.testing.expect(!isGateMessage("upstream request failed: model is unavailable"));
 }
 
 test "el backoff respeta el retry-after del server" {

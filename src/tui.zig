@@ -652,6 +652,10 @@ pub const Model = struct {
         const n = @min(text.len, self.status_buf.len);
         @memcpy(self.status_buf[0..n], text[0..n]);
         self.status_len = n;
+        // La fila de status es parte de la pantalla: cambiarla SIN pedir frame
+        // deja el texto viejo ahí hasta que llegue una tecla. Todos los
+        // mutadores de estado que escribe un worker tienen que ponerlo.
+        self.dirty = true;
     }
 
     /// Texto + mood. El mood se guarda aparte para que la fila de status
@@ -667,6 +671,9 @@ pub const Model = struct {
         self.status_len = n;
         self.status_mood = new_mood;
         self.status_mood_set = true;
+        // El mood también se pinta (la carita va en su color), así que esto
+        // también es un cambio de pantalla.
+        self.dirty = true;
     }
 
     /// Mood del estado actual. Si nadie lo ha puesto, se deduce del trabajo.
@@ -1238,15 +1245,27 @@ pub const Model = struct {
         // (streaming)` lo descartaba en silencio y la respuesta final del turno
         // con tools no aparecía nunca: el modelo contestaba, los tokens llegaban
         // y el historial se quedaba en la tool.
-        if (self.streaming or self.stream_buf.items.len > 0) {
+        // Y solo si HAY texto. Un turno que muere con un error (403, 5xx tras 3
+        // reintentos) abria el parrafo en vivo y lo cerraba vacio, dejando un
+        // "◆" solo en el historial: ruido que parece contenido. Con texto
+        // vacio no hay nada que guardar, y el `busy = false` de abajo sigue
+        // haciendo su trabajo.
+        const has_text = !std.mem.eql(u8, std.mem.trim(u8, self.stream_buf.items, " \t\n\r"), "");
+        if (has_text and (self.streaming or self.stream_buf.items.len > 0)) {
             const text = self.allocator.dupe(u8, self.stream_buf.items) catch "";
             self.paras.append(self.allocator, .{ .kind = .assistant, .text = text }) catch {
                 self.allocator.free(text);
             };
-            self.streaming = false;
-            self.stream_buf.clearRetainingCapacity();
         }
+        self.streaming = false;
+        self.stream_buf.clearRetainingCapacity();
         self.busy = false;
+        // Un cambio de estado pide un frame, aunque no haya texto nuevo: `busy`
+        // pasa a false y con eso desaparece el spinner, y sin repintar se
+        // quedaba ahí congelado ("streaming 3.9s" para siempre, con la app
+        //_STOP_ de verdad). Es el mismo motivo por el que el drain ya no baja
+        // `dirty`.
+        self.dirty = true;
     }
 
     /// Línea de tool ejecutada (thread-safe; el worker llama).
@@ -1294,6 +1313,9 @@ pub const Model = struct {
         if (self.tool_run) |tr| {
             tr.deinit(self.allocator);
             self.tool_run = null;
+            // Desaparece la línea "running · 21.4s": sin repintar se queda
+            // congelada en la última lectura del reloj.
+            self.dirty = true;
         }
     }
 
@@ -1421,10 +1443,14 @@ pub const Model = struct {
         return true;
     }
 
+    /// El drain del DRAW: mueve `pending` a `paras` y BAJA `dirty`, porque a
+    /// partir de aquí el frame ya está pintado y lo que venga después es lo
+    /// que tiene que pedir el siguiente.
     fn drainPending(self: *Model) void {
         self.lock();
         defer self.unlock();
         self.drainPendingLocked();
+        self.dirty = false;
     }
 
     /// Mueve `pending` a `paras`. El llamante tiene el lock cogido.
@@ -1443,7 +1469,15 @@ pub const Model = struct {
             };
         }
         self.pending.clearRetainingCapacity();
-        self.dirty = false;
+        // OJO: aquí NO se baja `dirty`. Antes se bajaba, y como `streamEnd`
+        // llama a esta función (no solo el draw), el `dirty = true` que había
+        // puesto el worker se lo comía el propio worker: las líneas de error
+        // quedaban en `paras` y en la pantalla se veía el frame viejo, sin
+        // repintar, hasta que el usuario pulsaba una tecla. Se vio en la E2E
+        // del free-auto: 3 avisos de reintento, luego nada, y la franja de
+        // actividad congelada en "streaming 3.9s" para siempre.
+        //
+        // El que lo baja es el DRAW, después de pintar (ver `drainPending`).
         // Sticky bottom: si ya estabas scrolleando arriba, el texto nuevo NO
         // te tira de vuelta. Solo se re-ancla si estabas abajo (scroll == 0).
         if (hubo_nuevo and self.scroll == 0) self.scroll = 0;
@@ -1478,13 +1512,31 @@ pub const Model = struct {
         };
     }
 
+    /// Ritmo del tick en reposo, en ms.
+    ///
+    /// Existe porque el tick NO puede desarmarse del todo en reposo, aunque no
+    /// haya nada que repintar. Ver `wakeLatencyMs`: sin este latido, lo que
+    /// empuja un worker en segundo plano (el pool del free-auto, la conexión ACP,
+    /// la lista de modelos) queda invisible hasta que el usuario pulse algo.
+    pub const idle_tick_ms: u32 = 250;
+
+    /// Cada cuánto pedir el siguiente tick, según el estado.
+    ///
+    /// La idea: el tick se arma SIEMPRE, pero en reposo va a 250 ms y sin
+    /// repintar. Cuatro despertares por segundo que solo toman un spinlock y
+    /// leen cinco bools es gratis; lo caro (el redraw) sigue sin pasar en reposo,
+    /// que es lo que la nota de "0 CPU en idle" quiere decir de verdad.
+    pub fn tickIntervalMs(a: Activity, pal_active: bool) u32 {
+        if (a.busy or a.dirty) return 40;
+        if (a.perm or a.picker or pal_active) return 120;
+        return idle_tick_ms;
+    }
+
     /// Pide un frame dentro de `ms` ms. Idempotente: no apila timers.
     fn armTick(self: *Model, ctx: *vxfw.EventContext) !void {
         if (self.tick_armed) return;
         self.tick_armed = true;
-        const a = self.activity();
-        const ms: u32 = if (a.busy or a.dirty) 40 else 120;
-        try ctx.tick(ms, self.widget());
+        try ctx.tick(tickIntervalMs(self.activity(), self.pal.active), self.widget());
     }
 
     /// Sube (`n` > 0) o baja el historial.
@@ -2111,8 +2163,15 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             const a = self.activity();
             if (a.busy or a.dirty or a.perm or a.picker or self.pal.active) {
                 ctx.redraw = true;
-                try self.armTick(ctx); // sigue solo mientras haya trabajo
             }
+            // Y se rearma SIEMPRE, también en reposo. Antes solo se rearmaba con
+            // trabajo, y eso dejaba al worker del free-auto (o al de ACP) sin
+            // forma de que su línea se vieran: se empujaban igual, pero nadie
+            // miraba. El síntoma era "el comando no hace nada" y había que
+            // pulsar una tecla para descubrir que sí. `tickIntervalMs` pone el
+            // intervalo en 250 ms en reposo, así que el coste es un spinlock cada
+            // cuarto de segundo y NO un redraw.
+            try self.armTick(ctx);
         },
         .init => {
             ctx.redraw = true; // primer frame sin esperar a una tecla
@@ -4209,6 +4268,70 @@ test "un diff de 300 lineas no cuelga y sigue siendo UN parrafo" {
         if (p.kind == .diff) diffs += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), diffs);
+}
+
+test "streamEnd sin texto no deja un parrafo vacio en el historial" {
+    // Un turno que muere con un error abre el parrafo en vivo y lo cierra vacio.
+    // Con el `◆` solo dejas ruido que parece contenido. Se vio en la E2E del
+    // free-auto: 403 -> 5xx x3 -> historial con un "◆" sin nada detrás.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamEnd();
+    var assistants: usize = 0;
+    for (m.paras.items) |p| {
+        if (p.kind == .assistant) assistants += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), assistants);
+
+    // Pero si HAY texto (aunque sean espacios alrededor), se guarda.
+    m.streamStart();
+    m.streamDelta("OK");
+    m.streamEnd();
+    assistants = 0;
+    for (m.paras.items) |p| {
+        if (p.kind == .assistant) assistants += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), assistants);
+
+    // Y solo espacios cuenta como vacio: es lo que devuelve un modelo que
+    // responde con un "\n" y nada mas.
+    m.streamStart();
+    m.streamDelta("  \n ");
+    m.streamEnd();
+    assistants = 0;
+    for (m.paras.items) |p| {
+        if (p.kind == .assistant) assistants += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), assistants);
+    try std.testing.expect(!m.busy);
+}
+
+test "el tick sigue armado en reposo: si no, un worker no puede despertar la UI" {
+    // El latido de reposo. Antes el tick se desarmaba al no quedar trabajo, y
+    // entonces lo que empujaba un worker en segundo plano (pool del free-auto,
+    // conexion ACP, lista de modelos) se quedaba en `pending` hasta que el
+    // usuario pulsara una tecla. Se vio en la pty de pruebas: "/free-auto on"
+    // tardaba 40 s y no aparecia nada hasta teclear.
+    const reposo = Model.Activity{ .busy = false, .dirty = false, .perm = false, .picker = false, .streaming = false };
+    const con_palette = Model.Activity{ .busy = false, .dirty = false, .perm = false, .picker = false, .streaming = false };
+    const trabajando = Model.Activity{ .busy = true, .dirty = false, .perm = false, .picker = false, .streaming = false };
+    const sucio = Model.Activity{ .busy = false, .dirty = true, .perm = false, .picker = false, .streaming = false };
+    const dialogo = Model.Activity{ .busy = false, .dirty = false, .perm = true, .picker = false, .streaming = false };
+
+    // El reposo tiene que tener latido Y no ser tan corto que sea un redraw
+    // disfrazado: 250 ms es WakeLatency, no trabajo.
+    try std.testing.expectEqual(@as(u32, 250), Model.tickIntervalMs(reposo, false));
+    try std.testing.expect(Model.idle_tick_ms >= 200);
+    // Con trabajo, sigue el ritmo rapido de antes.
+    try std.testing.expectEqual(@as(u32, 40), Model.tickIntervalMs(trabajando, false));
+    try std.testing.expectEqual(@as(u32, 40), Model.tickIntervalMs(sucio, false));
+    // La paleta abierta (p.ej. descargando modelos) no es reposo: 120 ms.
+    try std.testing.expectEqual(@as(u32, 120), Model.tickIntervalMs(con_palette, true));
+    try std.testing.expectEqual(@as(u32, 120), Model.tickIntervalMs(dialogo, false));
+    // Y nunca cero: un timer de 0 seria un bucle.
+    try std.testing.expect(Model.tickIntervalMs(reposo, false) > 0);
 }
 
 test "streamEnd marca dirty: un cambio de estado pide un frame" {

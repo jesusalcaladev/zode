@@ -62,6 +62,25 @@ pub fn build(b: *std.Build) void {
     const probe_step = b.step("acp-probe", "Habla con el agente ACP real y enseña el tráfico");
     probe_step.dependOn(&probe_run.step);
 
+    // Sonda del free-auto: providers con key, modelos free y el pool ya ordenado
+    // (`zig build roster-probe`). No es un test: habla con la red.
+    //
+    // Solo se declara `vaxis`: el resto de módulos los coge la sonda POR RUTA
+    // (y por eso la sonda vive en `src/`, no en `src/bin/`). Declararlos aquí
+    // también choca: un fichero no puede ser la raíz de dos módulos en la misma
+    // compilación, y `providers.zig` ya lo es de `agent`.
+    const roster_mod = b.createModule(.{
+        .root_source_file = b.path("src/roster_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    roster_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const roster_probe = b.addExecutable(.{ .name = "roster_probe", .root_module = roster_mod });
+    const roster_probe_run = b.addRunArtifact(roster_probe);
+    if (b.args) |args| roster_probe_run.addArgs(args);
+    const roster_probe_step = b.step("roster-probe", "Enseña el pool de modelos free de cada provider");
+    roster_probe_step.dependOn(&roster_probe_run.step);
+
     // Tests con acceso a vaxis (markdown/highlight testean estilos)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_all.zig"),
