@@ -260,6 +260,13 @@ pub const Roster = struct {
         return std.mem.lessThan(u8, a.model_id, b.model_id);
     }
 
+    /// El candidato activo (sin mirar cooldowns: el que se está usando ahora
+    /// mismo, aunque esté a punto de morir). Null si el pool está vacío.
+    pub fn currentCandidate(self: *const Roster) ?Candidate {
+        if (self.len == 0 or self.cur_raw >= self.len) return null;
+        return self.items[self.cur_raw];
+    }
+
     /// El candidato activo, o null si no queda ninguno vivo.
     ///
     /// Avanza solo sobre los que NO están en cooldown: `active()` no muta el
@@ -403,6 +410,23 @@ fn fakeRoster(gpa: std.mem.Allocator, n: u8) Roster {
         };
     }
     return r;
+}
+
+test "currentCandidate es el que se está usando, aunque esté muerto" {
+    // Es lo que necesita la línea de "cambié de modelo": el par que se cae, no el
+    // siguiente. Y tiene que seguir dando el muerto (es justo cuando se consulta).
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    var r = fakeRoster(astate.allocator(), 3);
+
+    const before = r.currentCandidate().?;
+    try std.testing.expectEqualStrings("m0", before.model_id);
+
+    _ = r.rotate(0, .no_credits, "402");
+    // El activo ya es otro, y el muerto se puede consultar por su motivo.
+    const now = r.currentCandidate().?;
+    try std.testing.expectEqualStrings("m1", now.model_id);
+    try std.testing.expect(std.mem.indexOf(u8, r.deadReason(0), "402") != null);
 }
 
 test "active devuelve el primero y respeta la longitud" {

@@ -11,6 +11,7 @@ const tools_mod = @import("tools.zig");
 const cache_stats = @import("cache_stats.zig");
 const chat = @import("chat.zig");
 const agent = @import("agent.zig");
+const free_auto = @import("free_auto.zig");
 const compaction_mod = @import("compaction.zig");
 const mascot = @import("mascot.zig");
 
@@ -57,6 +58,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     agent.environ_global = env;
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
     chat.io_global = io;
+    free_auto.attachIo(io); // el reloj de los cooldowns del free-auto
     models.dbg_io = io;
     defer agent.shutdownUserConfig();
     agent.loadUserConfig();
@@ -212,16 +214,22 @@ fn runTui(init: std.process.Init) !u8 {
     agent.api_key_global = envGet(init.environ_map, "ZODE_API_KEY");
     agent.environ_global = init.environ_map;
     agent.gpa_global = init.gpa;
+    free_auto.attachIo(io);
     chat.io_global = io;
     agent.resume_on_start = std.mem.eql(u8, envGet(init.environ_map, "ZODE_RESUME") orelse "", "1");
     defer agent.shutdownUserConfig();
     agent.loadUserConfig();
     agent.bootstrapSession(&model);
 
-    // Cabecera de bienvenida: arte del búho, línea de Zo y pistas. Va en el
-    // Kind `.banner` (azul de marca) en vez de `.info` (gris), y la carita de
-    // Zo con el color de su mood.
+    // Cabecera de bienvenida: solo el wordmark. Va en el Kind `.banner` (azul de
+    // marca) en vez de `.info` (gris).
     model.pushHeader(.idle);
+
+    // [roster] Free-auto: si el entorno lo pide, el pool de modelos free se
+    // construye en un worker (no bloquea el arranque) y el status bar lo enseña
+    // en cuanto esté. Va DESPUÉS de `loadUserConfig`, porque sin la config del
+    // usuario el pool no vería sus providers.
+    agent.initFreeAutoFromEnv(&model);
 
     try app.run(model.widget(), .{});
 

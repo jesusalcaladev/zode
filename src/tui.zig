@@ -2813,6 +2813,18 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     const ct = std.fmt.allocPrint(arena, "ctx {d}%", .{agent.ctx_pct}) catch return null;
     out.append(arena, .{ .text = ct, .style = theme.ctxColor(agent.ctx_pct) }) catch return null;
 
+    // [roster] El free-auto, si está encendido. Va con el PROPIO color (no el
+    // apagado) porque es estado de verdad, no adorno: mientras esté aquí, el
+    // modelo que contesta puede no ser el que pusiste en `/model`, y eso tiene
+    // que verse sin tener que pedirlo.
+    {
+        const fa = agent.freeAutoLabel(arena);
+        if (fa.len > 0) {
+            if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
+            out.append(arena, .{ .text = fa, .style = theme.warn }) catch return null;
+        }
+    }
+
     if (streaming and agent.tps_live > 1) {
         out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
         const tt = std.fmt.allocPrint(arena, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch return null;
