@@ -232,6 +232,22 @@ fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
+/// [roster] La etiqueta del free-auto para el status bar, o "" si está apagado.
+///
+/// Es un `pub` en vez de dejar que la TUI importe `free_auto.zig`: el status bar
+/// solo debe saber leer, no escribir, del estado del modo.
+pub fn freeAutoLabel(gpa: std.mem.Allocator) []const u8 {
+    return free_auto.freeAutoLabel(gpa);
+}
+
+/// [roster] Enciende el free-auto si el entorno lo pide (`ZODE_FREE_AUTO=1`).
+///
+/// Lo llama el arranque de la TUI, DESPUÉS de `loadUserConfig` y de `loadAuthKeys`
+/// (sin keys cargadas el pool saldría vacío y el modo parecería roto).
+pub fn initFreeAutoFromEnv(m: *tui.Model) void {
+    free_auto.initFromEnv(m, m.environ);
+}
+
 /// [roster] `pub` para que lo use `free_auto.zig` desde su worker.
 pub fn pushInfo(m: *tui.Model, text: []const u8) void {
     m.pushInfo(text);
@@ -1512,6 +1528,97 @@ fn toolCallsJsonFromCalls(gpa: std.mem.Allocator, calls: []const TurnCtx.Call) ?
 /// `free` sobre `.rodata` -> panic "reached unreachable code" en ReleaseSafe,
 /// es decir, un turno con tools tumbaba la app SIEMPRE. Los literales Zig son
 /// `[]const`, asi que ahora el compilador IMPIDE devolverlos por aqui.
+/// [roster] A quién se le pregunta en un turno.
+///
+/// Existe para que `runOneTurn` no tenga que decidir entre "el provider/modelo
+/// activo" y "el candidato del free-auto" en tres sitios distintos (body, url y
+/// key). Con la rotación el `pick` se REEMPLAZA dentro del bucle de reintentos, y
+/// si cada sitio consultara el global por su cuenta, media petición iría al
+/// provider viejo: un 401 con la key de otro, o un body con el nombre del modelo
+/// que ya no está.
+const Target = struct {
+    def: *const providers.ProviderDef,
+    model: []const u8,
+    kind: chat.ProviderKind,
+    base_url: []const u8,
+    key: ?[]const u8,
+    /// El candidato del pool, o null si este turno va al provider/modelo activo.
+    from_roster: ?roster_mod.Candidate = null,
+};
+
+/// El objetivo de este turno: el pool si el free-auto está encendido y ya tiene
+/// lista, el provider/modelo activo si no.
+///
+/// Con el pool sin construir (o vacío) cae al activo SIN avisar: la lista son N
+/// peticiones y el primer prompt no puede esperar por ellas. La rotación espera
+/// al siguiente turno.
+fn pickTarget(m: *tui.Model) Target {
+    const active = activeTarget(m);
+    if (!free_auto.freeAutoOn()) return active;
+    if (free_auto.poolSize() == 0) return active;
+    const cand = free_auto.rosterGet(m.allocator).active(free_auto.nowMs()) orelse return active;
+    return targetForCandidate(m, cand) orelse active;
+}
+
+/// El `Target` del provider/modelo activos.
+fn activeTarget(m: *tui.Model) Target {
+    const def = activeProviderDef(m.environ);
+    const kind = chat.kindForProvider(def.id);
+    return .{
+        .def = def,
+        .model = cur_model,
+        .kind = kind,
+        .base_url = def.base_url,
+        // Anthropic lleva la key en cabeceras, no en Bearer: aquí null.
+        .key = if (kind == .anthropic) null else providers.keyFor(def, m.environ) orelse curKey(m),
+    };
+}
+
+/// El `Target` de un par provider/modelo concreto. Null si ese provider ya no
+/// está (el usuario lo quitó de `config.json` después de construir el pool).
+fn targetForCandidate(m: *tui.Model, cand: roster_mod.Candidate) ?Target {
+    const def = config_mod.find(user_config, cand.provider_id) orelse
+        providers.byId(cand.provider_id) orelse return null;
+    const kind = chat.kindForProvider(def.id);
+    return .{
+        .def = def,
+        .model = cand.model_id,
+        .kind = kind,
+        .base_url = def.base_url,
+        .key = if (kind == .anthropic) null else providers.keyFor(def, m.environ),
+        .from_roster = cand,
+    };
+}
+
+/// [roster] La línea de historial que explica el cambio de modelo.
+///
+/// Va al historial y no solo al status porque es el momento en que el usuario
+/// pierde de vista por qué va tan lento: sin esta línea, un provider cayendo a
+/// mitad del turno parece un fallo. Y dice las DOS cosas (qué murió y por qué, a
+/// qué se pasa), porque "cambió de modelo" sin motivo no es información.
+fn pushSwitchNotice(m: *tui.Model, sw: free_auto.Switch, to: Target) void {
+    const to_c = to.from_roster orelse return;
+    const reason = if (sw.prev_reason.len > 0) sw.prev_reason else "quota gone";
+    const msg = std.fmt.allocPrint(
+        m.allocator,
+        "quota gone on {s}/{s} ({s}) → {s}/{s} (free-auto {d}/{d})",
+        .{
+            sw.prev_provider,
+            sw.prev_model,
+            reason,
+            to_c.provider_id,
+            to_c.model_id,
+            free_auto.rosterGet(m.allocator).idx + 1,
+            free_auto.poolSize(),
+        },
+    ) catch "free-auto: switched model";
+    pushInfoOwned(m, msg);
+    // El status va corto: es una línea segmentada y ya lleva modelo y provider.
+    // El detalle (el por qué) está en la línea de arriba, que no se recorta.
+    const short = std.fmt.allocPrint(m.allocator, "switched to {s}", .{to_c.model_id}) catch "switching model";
+    setStatusWithZo(m, .thinking, short);
+}
+
 fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
@@ -1558,16 +1665,22 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
         pushInfoOwned(m, msg);
     }
 
-    const def = activeProviderDef(m.environ);
-    const kind = chat.kindForProvider(def.id);
+    // [roster] A quién se le pregunta en ESTE turno.
+    //
+    // Sin free-auto es el provider/modelo activo de siempre. Con free-auto, el
+    // candidato vivo del pool (que puede ser otro provider), y si el pool aún no
+    // está construido, el activo: la rotación espera al siguiente turno, nunca
+    // bloquea.
+    var pick = pickTarget(m);
+
     var body_buf: [1 << 20]u8 = undefined;
     const body = try chat.buildBodyMessages(
         &body_buf,
-        cur_model,
+        pick.model,
         comp.msgs,
         current_effort,
         tools_mod.toolsJson(),
-        kind,
+        pick.kind,
     );
 
     var http = http_client.Http.init(gpa, io_global);
@@ -1578,30 +1691,35 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     // que la elipsis solo ocupa dos celdas.
     setStatusWithZo(m, .thinking, "thinking");
 
-    // OJO: `streamChat` espera la URL COMPLETA, no solo la base del provider.
-    // Pasarle la base a secas daba 404 en TODAS las peticiones de la TUI (el
-    // runner headless de main.zig sí añade el path, por eso allí funcionaba).
-    var url_buf: [1024]u8 = undefined;
-    const url = if (kind == .anthropic)
-        std.fmt.bufPrint(&url_buf, "{s}/messages", .{def.base_url}) catch def.base_url
-    else
-        std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{def.base_url}) catch def.base_url;
-
-    // Para Anthropic la auth va en cabeceras (x-api-key), no en Bearer: se pasa
-    // null y lo pone `streamRaw`. Para el resto, Bearer con la key del provider.
-    const bearer: ?[]const u8 = if (kind == .anthropic)
-        null
-    else
-        providers.keyFor(def, m.environ) orelse curKey(m);
-
-    var attempt: usize = 0;
     // Cada ITERACIÓN del agent loop abre su párrafo en vivo. Sin esto, la
     // respuesta que viene después de una tool se acumulaba en `stream_buf` sin
     // dueño y `streamEnd` la tiraba: el turno acababa con la tool como último
     // punto del historial y sin respuesta. `streamStartIteration` (y no
     // `streamStart`) para no resetear el reloj de la franja en cada iteración.
     m.streamStartIteration();
+
+    var attempt: usize = 0;
+    // Rotaciones de este turno. Vive aquí y no en un global porque se reinicia
+    // con el turno: 3 rotaciones por turno es el techo que evita dar vueltas
+    // cuando el problema es de configuración y no de cuota.
+    var rotations: u8 = 0;
     while (true) : (attempt += 1) {
+        var url_buf: [1024]u8 = undefined;
+        // OJO: `streamChat` espera la URL COMPLETA, no solo la base del provider.
+        // Pasarle la base a secas daba 404 en TODAS las peticiones de la TUI (el
+        // runner headless de main.zig sí añade el path, por eso allí funcionaba).
+        const url = if (pick.kind == .anthropic)
+            std.fmt.bufPrint(&url_buf, "{s}/messages", .{pick.base_url}) catch pick.base_url
+        else
+            std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{pick.base_url}) catch pick.base_url;
+
+        // Para Anthropic la auth va en cabeceras (x-api-key), no en Bearer: se pasa
+        // null y lo pone `streamRaw`. Para el resto, Bearer con la key.
+        const bearer: ?[]const u8 = if (pick.kind == .anthropic)
+            null
+        else
+            pick.key;
+
         chat.streamChat(
             gpa,
             &http,
@@ -1614,8 +1732,27 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
                 .onToolCall = onToolCall,
                 .onFinish = onFinish,
             },
-            kind,
+            pick.kind,
         ) catch |err| {
+            // [roster] ¿Se acabó la cuota de ESE par? Entonces otro par sigue
+            // con la MISMA petición y el turno no se muere. Va ANTES del reintento
+            // con backoff porque un 429 con `retry-after: 30` esperando 30s al
+            // mismo provider es exactamente lo que el usuario no quiere.
+            if (quotaVerdict(err, chat.lastErrorBody())) |why| {
+                if (rotations < roster_mod.max_rotations_per_turn) {
+                    if (free_auto.switchTo(gpa, why, chat.lastErrorBody())) |sw| {
+                        if (targetForCandidate(m, sw.cand)) |next| {
+                            rotations += 1;
+                            pick = next;
+                            pushSwitchNotice(m, sw, pick);
+                            continue; // <- el turno sigue solo
+                        }
+                    }
+                    // No queda ningún par vivo (o su provider ya no está en la
+                    // config): cae al reintento normal, y si tampoco, el error de
+                    // abajo explica qué se probó.
+                }
+            }
             if (isRetryable(err) and attempt < 3) {
                 pushRetryNotice(m, err, attempt);
                 Retry.wait(attempt) catch return null; // ESC corta
@@ -2801,6 +2938,104 @@ test "el backoff que se anuncia es el que se espera" {
     try std.testing.expect(a2 >= 2000 and a2 < 2010);
     // El jitter no rompe la monotonía del backoff (2x es más que el jitter).
     try std.testing.expect(a1 > a0 and a2 > a1);
+}
+
+/// Guardar/restaurar el estado del free-auto en los tests (ver
+/// `free_auto.stateSave`).
+fn free_auto_state_save() free_auto.StateSnapshot {
+    return free_auto.stateSave();
+}
+fn free_auto_state_restore(s: free_auto.StateSnapshot) void {
+    free_auto.stateRestore(s);
+}
+fn free_auto_state_set(on: bool, inited: bool, st: roster_mod.Roster) void {
+    free_auto.stateSet(on, inited, st);
+}
+
+test "pickTarget: sin free-auto va al provider/modelo activos" {
+    // El caso por defecto, y el que importa mas de lo que parece: si el
+    // `pickTarget` tocara el pool con el modo apagado, un usuario normal
+    // acabaria con el modelo cambiado por debajo.
+    const saved = free_auto_state_save();
+    defer free_auto_state_restore(saved);
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    setModel("space-bunny-free");
+
+    const t = pickTarget(&m);
+    try std.testing.expect(t.from_roster == null);
+    try std.testing.expectEqualStrings(cur_model, t.model);
+    try std.testing.expectEqualStrings(activeProviderDef(m.environ).base_url, t.base_url);
+}
+
+test "pickTarget: con el free-auto encendido y pool vacío, al activo" {
+    // El pool tarda en construirse (son N peticiones). El primer prompt no puede
+    // esperar por el, asi que cae al activo sin decir nada.
+    const saved = free_auto_state_save();
+    defer free_auto_state_restore(saved);
+
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    setModel("space-bunny-free");
+
+    var empty = roster_mod.Roster.init(astate.allocator());
+    empty.built = true; // construido y vacío
+    free_auto_state_set(true, true, empty);
+
+    const t = pickTarget(&m);
+    try std.testing.expect(t.from_roster == null);
+    try std.testing.expectEqualStrings(cur_model, t.model);
+}
+
+test "pickTarget: con pool poblado, al candidato del pool" {
+    const saved = free_auto_state_save();
+    defer free_auto_state_restore(saved);
+
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // Un pool con un provider COMPILADO (groq), para que `targetForCandidate`
+    // lo encuentre de verdad y no por un config.json de mentira.
+    var pool = roster_mod.Roster.init(arena);
+    pool.built = true;
+    pool.len = 1;
+    pool.items[0] = .{ .provider_id = "groq", .model_id = "llama-3.3-70b-versatile", .ctx = 131072 };
+    free_auto_state_set(true, true, pool);
+
+    const t = pickTarget(&m);
+    const c = t.from_roster orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("groq", c.provider_id);
+    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", t.model);
+    // La URL y la key tienen que ser DEL PROVIDER NUEVO, no las del activo: si se
+    // colara la base antigua, la peticion iria al sitio equivocado con el modelo
+    // equivocado.
+    try std.testing.expectEqualStrings(providers.byId("groq").?.base_url, t.base_url);
+    // La key es la DEL CANDIDATO, no la del provider activo (aquí null porque en
+    // el entorno de test no hay GROQ_API_KEY). Mandarle la key de otro provider es
+    // exactamente el bug de `ZODE_PROVIDER` que ya se corrigió una vez.
+    // (Aqui daria null: en el entorno de test no hay GROQ_API_KEY.)
+    const want_key = providers.keyFor(providers.byId("groq").?, m.environ);
+    if (want_key) |k| {
+        try std.testing.expectEqualStrings(k, t.key.?);
+    } else {
+        try std.testing.expect(t.key == null);
+    }
+}
+
+test "targetForCandidate: provider desconocido devuelve null (no un target a medias)" {
+    // El pool se construye con los providers de este momento. Si el usuario
+    // borra uno de config.json despues, rotar a el daria un target sin base_url, y
+    // la peticion sairia con una URL vacia.
+    const cand = roster_mod.Candidate{ .provider_id = "provider-que-no-existe", .model_id = "x" };
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expect(targetForCandidate(&m, cand) == null);
 }
 
 test "quotaVerdict: la tabla de las siete senales" {

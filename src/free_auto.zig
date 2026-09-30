@@ -39,9 +39,26 @@ fn rosterUnlock() void {
     roster_lock.unlock();
 }
 
+/// El `Io` para el reloj, si lo hay.
+///
+/// Es `?std.Io` y no `agent.io_global` a pelo porque ese es `undefined` hasta
+/// que el arranque lo asigna, y leer el reloj de un `Io` sin inicializar es
+/// saltar por una vtable de basura: un GPF imediato (y NO un 0). Es la misma
+/// trampa que `Model.attachIo` con su flag `io_ready`, y el mismo remedio.
+var roster_io: ?std.Io = null;
+
+pub fn attachIo(io: std.Io) void {
+    roster_io = io;
+}
+
 /// Milisegundos desde epoch, para los cooldowns del roster.
+///
+/// Sin reloj devuelve 0. No es perfecto (los cooldowns no caducan solos) pero es
+/// el fallo que NO puede tumbar la app, y solo pasa en tests: en producción
+/// siempre hay `Io`.
 pub fn nowMs() i128 {
-    return std.Io.Timestamp.now(agent.io_global, .real).nanoseconds / std.time.ns_per_ms;
+    const io = roster_io orelse return 0;
+    return @divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms);
 }
 
 /// El roster global, creándolo si hace falta.
@@ -80,6 +97,72 @@ pub fn poolSize() u8 {
     defer rosterUnlock();
     if (!roster_inited) return 0;
     return roster_state.len;
+}
+
+/// El resultado de cambiar de par a mitad de un turno.
+pub const Switch = struct {
+    /// El par al que se pasa.
+    cand: roster_mod.Candidate,
+    /// El par que se queda sin cuota (para el mensaje).
+    prev_provider: []const u8,
+    prev_model: []const u8,
+    /// Por qué murió el anterior, ya con la etiqueta ("rate limited: 429 …").
+    prev_reason: []const u8,
+};
+
+/// Mata el par actual y devuelve el siguiente vivo, o null si no queda ninguno.
+///
+/// Devuelve EL ANTERIOR también, y no solo el nuevo, porque el mensaje al
+/// usuario tiene que poder decir los dos ("quota gone on groq/x → openrouter/y").
+/// Con el roster solo (`rotate`) hay que acordarse del índice de antes, que es
+/// justo el dato que se pierde en cuanto se mueve.
+pub fn switchTo(gpa: std.mem.Allocator, why: roster_mod.Why, detail: []const u8) ?Switch {
+    const r = rosterGet(gpa);
+    const prev_idx = r.cur_raw;
+    const prev = r.currentCandidate() orelse return null;
+    const next = r.rotate(nowMs(), why, detail) orelse return null;
+    return .{
+        .cand = r.items[next],
+        .prev_provider = prev.provider_id,
+        .prev_model = prev.model_id,
+        .prev_reason = r.deadReason(prev_idx),
+    };
+}
+
+// ── puente para los tests de `agent.zig` ──────────────────────
+//
+// `pickTarget` vive en agent.zig (porque necesita el provider activo) y el
+// estado del modo vive aquí. Los tests de uno necesitan tocar el del otro, y
+// hacerlo con `free_auto_on` a pelo desde el otro fichero no compila (es privado).
+// Estos tres son el puente, y son la razón de que existan en vez de un
+// `pub var` a lo bruto: obligan a restaurar el estado.
+
+pub const StateSnapshot = struct {
+    on: bool,
+    inited: bool,
+    state: roster_mod.Roster,
+};
+
+pub fn stateSave() StateSnapshot {
+    rosterLock();
+    defer rosterUnlock();
+    return .{ .on = free_auto_on, .inited = roster_inited, .state = roster_state };
+}
+
+pub fn stateRestore(s: StateSnapshot) void {
+    rosterLock();
+    free_auto_on = s.on;
+    roster_inited = s.inited;
+    roster_state = s.state;
+    rosterUnlock();
+}
+
+pub fn stateSet(on: bool, inited: bool, state: roster_mod.Roster) void {
+    rosterLock();
+    free_auto_on = on;
+    roster_inited = inited;
+    roster_state = state;
+    rosterUnlock();
 }
 
 /// Job del worker que construye el pool.
