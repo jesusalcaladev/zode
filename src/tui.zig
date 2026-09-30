@@ -222,18 +222,6 @@ fn buildLines(
     return buildLinesBase(pa, ctx, kind, text, width, null, null, "");
 }
 
-/// `buildLines` with the LANGUAGE of the content (only the diff uses it, to
-/// tokenize the body of each line).
-fn buildLinesLang(
-    pa: std.mem.Allocator,
-    ctx: vxfw.DrawContext,
-    kind: md.Kind,
-    text: []const u8,
-    width: u16,
-    lang: []const u8,
-) ![]const PLine {
-    return buildLinesBase(pa, ctx, kind, text, width, null, null, lang);
-}
 
 /// `buildLines` with an imposed base style (see `md.parseBase`).
 fn buildLinesBase(

@@ -172,9 +172,6 @@ fn tagEnd(html: []const u8, i: usize) ?usize {
     return null;
 }
 
-fn isClosingTag(rest: []const u8) bool {
-    return rest.len > 1 and rest[1] == '/';
-}
 
 /// ABSOLUTE position (just after the `>`) of the closing tag `name` that
 /// follows the opening tag at `open_at`.

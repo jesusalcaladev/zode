@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
         "Modo de optimización (default: ReleaseSafe)",
     ) orelse .ReleaseSafe;
     const strip = b.option(bool, "strip", "Quita las secciones de debug (default: true)") orelse true;
+    // Los tests van en Debug a propósito (el DebugAllocator y las
+    // comprobaciones de overflow son los que cazan los bugs), pero su binario
+    // no necesita símbolos: sin esto, cada reconstrucción deja otro de 49 MB en
+    // `.zig-cache/o`.
+    const strip_tests = b.option(bool, "strip-tests", "Strip del binario de tests (default: true)") orelse true;
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -88,6 +93,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/test_all.zig"),
         .target = target,
         .optimize = .Debug,
+        // El binario de tests en Debug pesa ~49 MB (casi todo secciones de
+        // debug de vaxis) y .zig-cache/o guarda UNO POR CADA RECONSTRUCCION: se
+        // llegaron a acumular 44, o sea 1.4 GB. Los tests no se depuran con gdb,
+        // así que los símbolos no sirven de nada: `strip` los deja en ~10 MB.
+        .strip = strip_tests,
     });
     test_mod.addImport("vaxis", vaxis.module("vaxis"));
     // `zig build test -- <filtro>` corre solo los tests cuyo nombre contiene el
