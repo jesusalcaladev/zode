@@ -12,7 +12,6 @@ const chat = @import("chat.zig");
 ///
 /// IMPORTANT: this is a VIEW for the wire only. The session JSONL keeps the
 /// full history, so resume/replay never loses data.
-
 pub const default_context_limit: i64 = 128_000;
 pub const target_pct: i64 = 80;
 /// Recent turns kept verbatim (never elided/summarized).

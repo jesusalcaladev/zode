@@ -7,7 +7,6 @@ const std = @import("std");
 /// NOTE this is deliberately PURE (no network): the part that always breaks is
 /// parsing the HTML the server returns, and that is tested with a fixture, not
 /// with the internet. `tools.zig` puts the network on top.
-
 /// Browser User-Agent.
 ///
 /// Without this half the internet returns 403: Cloudflare, GitHub and Wikipedia
@@ -20,12 +19,12 @@ pub const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTM
 /// Block tags: closing them (or opening them when they stand alone, like `<br>`)
 /// puts a line break in the text.
 const block_tags = [_][]const u8{
-    "p",        "div",   "br",     "li",   "tr",   "td",     "th",
-    "h1",       "h2",    "h3",     "h4",   "h5",   "h6",     "section",
-    "article",  "header", "footer", "nav",  "aside", "ul",     "ol",
-    "pre",      "blockquote", "form", "hr", "main", "figure", "figcaption",
-    "dl",       "dt",    "dd",     "table", "tbody", "thead", "body",
-    "html",     "head",  "title",  "meta", "link", "script", "style",
+    "p",       "div",        "br",     "li",    "tr",    "td",     "th",
+    "h1",      "h2",         "h3",     "h4",    "h5",    "h6",     "section",
+    "article", "header",     "footer", "nav",   "aside", "ul",     "ol",
+    "pre",     "blockquote", "form",   "hr",    "main",  "figure", "figcaption",
+    "dl",      "dt",         "dd",     "table", "tbody", "thead",  "body",
+    "html",    "head",       "title",  "meta",  "link",  "script", "style",
 };
 
 /// Tags whose whole content is thrown away (it is not page text).
@@ -172,7 +171,6 @@ fn tagEnd(html: []const u8, i: usize) ?usize {
     return null;
 }
 
-
 /// ABSOLUTE position (just after the `>`) of the closing tag `name` that
 /// follows the opening tag at `open_at`.
 ///
@@ -233,23 +231,51 @@ fn appendEntity(arena: std.mem.Allocator, out: *std.ArrayList(u8), html: []const
 /// as is (`&foo;`), which is what you see in the source.
 fn namedEntity(name: []const u8) ?[]const u8 {
     const pairs = [_][2][]const u8{
-        .{ "amp", "&" },      .{ "lt", "<" },        .{ "gt", ">" },
-        .{ "quot", "\"" },     .{ "apos", "'" },       .{ "nbsp", " " },
-        .{ "hellip", "…" },   .{ "mdash", "—" },     .{ "ndash", "–" },
-        .{ "laquo", "«" },    .{ "raquo", "»" },     .{ "ldquo", "“" },
-        .{ "rdquo", "”" },    .{ "lsquo", "‘" },     .{ "rsquo", "’" },
-        .{ "copy", "©" },     .{ "reg", "®" },       .{ "trade", "™" },
-        .{ "deg", "°" },      .{ "middot", "·" },    .{ "bull", "•" },
-        .{ "times", "×" },    .{ "euro", "€" },      .{ "pound", "£" },
-        .{ "frac12", "½" },   .{ "larr", "←" },      .{ "rarr", "→" },
-        .{ "harr", "↔" },     .{ "darr", "↓" },      .{ "uarr", "↑" },
-        .{ "infin", "∞" },    .{ "ne", "≠" },        .{ "le", "≤" },
-        .{ "ge", "≥" },       .{ "auml", "ä" },      .{ "ouml", "ö" },
-        .{ "uuml", "ü" },     .{ "szlig", "ß" },     .{ "ntilde", "ñ" },
-        .{ "aacute", "á" },   .{ "eacute", "é" },    .{ "iacute", "í" },
-        .{ "oacute", "ó" },   .{ "uacute", "ú" },    .{ "agrave", "à" },
-        .{ "egrave", "è" },   .{ "ccedil", "ç" },    .{ "shy", "" },
-        .{ "ensp", " " },     .{ "emsp", " " },      .{ "thinsp", " " },
+        .{ "amp", "&" },    .{ "lt", "<" },   .{ "gt", ">" },
+        .{ "quot", "\"" },  .{ "apos", "'" }, .{ "nbsp", " " },
+        .{ "hellip", "…" },
+        .{ "mdash", "—" },
+        .{ "ndash", "–" },
+        .{ "laquo", "«" },
+        .{ "raquo", "»" },
+        .{ "ldquo", "“" },
+        .{ "rdquo", "”" },
+        .{ "lsquo", "‘" },
+        .{ "rsquo", "’" },
+        .{ "copy", "©" },
+        .{ "reg", "®" },
+        .{ "trade", "™" },
+        .{ "deg", "°" },
+        .{ "middot", "·" },
+        .{ "bull", "•" },
+        .{ "times", "×" },
+        .{ "euro", "€" },
+        .{ "pound", "£" },
+        .{ "frac12", "½" },
+        .{ "larr", "←" },
+        .{ "rarr", "→" },
+        .{ "harr", "↔" },
+        .{ "darr", "↓" },
+        .{ "uarr", "↑" },
+        .{ "infin", "∞" },
+        .{ "ne", "≠" },
+        .{ "le", "≤" },
+        .{ "ge", "≥" },
+        .{ "auml", "ä" },
+        .{ "ouml", "ö" },
+        .{ "uuml", "ü" },
+        .{ "szlig", "ß" },
+        .{ "ntilde", "ñ" },
+        .{ "aacute", "á" },
+        .{ "eacute", "é" },
+        .{ "iacute", "í" },
+        .{ "oacute", "ó" },
+        .{ "uacute", "ú" },
+        .{ "agrave", "à" },
+        .{ "egrave", "è" },
+        .{ "ccedil", "ç" },
+        .{ "shy", "" },     .{ "ensp", " " }, .{ "emsp", " " },
+        .{ "thinsp", " " },
     };
     for (pairs) |p| {
         if (std.ascii.eqlIgnoreCase(p[0], name)) return p[1];

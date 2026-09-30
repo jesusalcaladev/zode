@@ -23,7 +23,6 @@ const chat = @import("chat.zig");
 ///     }
 ///   ]
 /// }
-
 pub const Config = struct {
     /// Default provider (id, must exist in the effective list).
     provider: []const u8 = "",

@@ -271,7 +271,6 @@ fn allProviders(arena: std.mem.Allocator) []const providers.ProviderDef {
     return config_mod.allDefs(arena, user_config);
 }
 
-
 pub fn activeProviderDef(env: ?*const std.process.Environ.Map) *const providers.ProviderDef {
     if (config_mod.find(user_config, cur_provider_id)) |d| return d;
     return providers.byId(cur_provider_id) orelse providers.activeDef(env);
@@ -853,9 +852,7 @@ fn cmdSession(m: *tui.Model) void {
 fn cmdProviders(m: *tui.Model) void {
     for (allProviders(m.allocator)) |*d| {
         const key_state: []const u8 =
-            if (d.key_env.len == 0) "sin key"
-            else if (providers.keyFor(d, m.environ) != null) "key ok"
-            else "SIN KEY";
+            if (d.key_env.len == 0) "sin key" else if (providers.keyFor(d, m.environ) != null) "key ok" else "SIN KEY";
         const active: []const u8 = if (std.mem.eql(u8, d.id, cur_provider_id)) " ←" else "";
         const line = std.fmt.allocPrint(
             m.allocator,
@@ -1552,7 +1549,8 @@ fn reportAcpErr(m: *tui.Model, err: anyerror) void {
 }
 
 /// `/resume`: reopens the most recent session by mtime.
-fn resumeLatest(m: *tui.Model) void {    var astate = std.heap.ArenaAllocator.init(m.allocator);
+fn resumeLatest(m: *tui.Model) void {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();
     const a = astate.allocator();
 
@@ -2646,7 +2644,6 @@ fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
     if (fa != fb) return fa;
     return std.mem.lessThan(u8, a.id, b.id);
 }
-
 
 /// Opens the model palette in TWO COLUMNS: providers | the active one's models.
 ///
