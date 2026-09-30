@@ -329,7 +329,7 @@ fichero entero) · `/help` que liste también los atajos · preview del fichero 
 | 4 | Completa. 4.1 bloques con gutter/fondo/chip, 4.2 diff por tokens, 4.3 sangría de continuación, 4.4 paleta en `theme.zig` truecolor, 4.5 `T.def` atenuado y `fn_call` con color, 4.6 verde de strings != verde de diff, 4.7 `generic` poblado + `normalizeLang`, 4.8 strings multilínea, 4.9 margen izquierdo. |
 | 5 | 5.1/5.2/5.4/5.5 hechas. **5.3** hecha de facto (el default ya es release+strip). |
 | 6 | Hecha, **con un diseño distinto al propuesto** (ver abajo). |
-| 7 | Diff con hunks reales. Queda header, columna de usage, `/help` con atajos y preview del `write`. |
+| 7 | Completa: diff con hunks reales, `/help` con atajos, columna de usage en el status y preview del `write`. **El header no se toca** (ver abajo). |
 
 **Medido, no estimado (esto cambió dos decisiones)**
 
@@ -359,7 +359,15 @@ siga funcionando sobre base64 sin descomprimir nada.
 | Fase | Qué |
 |---|---|
 | 5 | 5.6 (descartada por medición), 5.7/5.9/5.10 (requieren parche de vaxis, documentado en AGENTS.md), 5.8 (no verificable sin TTY). |
-| 7 | Header de 5 filas que se lea al instante, segunda columna de usage, `/help` con atajos, preview del fichero en `write`. |
+| 7 | Nada. |
+
+**El header NO se toca, y es deliberado.** El item pedía un "header de 5 filas
+que se lea al instante", pero ese item es anterior a la v3 del banner, que es la
+que **superó** la revisión del usuario (ASCII puro con `#`). AGENTS.md documenta
+las dos versiones que se probaron y se rechazaron (filas desalineadas; cajetín
+ilegible en su terminal). Volver a tocarlo es arriesgar un rechazo ya emitido
+a cambio de nada. El smoke test en pty fija que las dos filas del wordmark se
+leen, así que si algún día se rompe, se ve.
 
 **Correcciones de AGENTS.md**: las tres del ROADMAP están escritas (el bucle del layout, la cadena de ticks, y el diagnóstico **erróneo** del `Io.sleep` en ACP: en Linux es `clock_nanosleep` por hilo y no toca `t.mutex`, así que el reloj se congelaba por los puntos 1 y 2, no por el sleep). Añadida además una sección de trampas de Zig 0.16 que costaron una tarde.
 
