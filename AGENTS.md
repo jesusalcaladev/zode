@@ -1247,6 +1247,31 @@ estabiliza (las alturas empiezan estimadas y se corrigen al parsear).
   `─` 3 bytes para 1. Comparar bytes contra columnas da un test rojo con el
   layout correcto.
 
+## `tools/pty_smoke.py`: la unica verificacion que de verdad vale
+
+Los tests de `drawTest` leen el surface y comprueban el texto y los estilos, pero
+**no** comprueban lo que mas se rompe: el render de vaxis es DIFERENCIAL y hace
+consultas al terminal (color, capacidades, tamaño). Un emulador casero se pierde
+la mitad del redraw, que es justo lo que hace que un turno que funciona parezca
+congelado.
+
+Asi que hay un smoke test en pty de verdad (`pty.fork` + `TIOCSWINSZ` a 200x50):
+arranque, banner, caja del input, status, eco del prompt, **Ctrl+P abriendo y
+cerrando la paleta**, Ctrl+L, scroll, y que no haya panic ni `Invalid free`.
+
+```
+zig build && python3 tools/pty_smoke.py
+```
+
+Dos cosas que hace bien y que hay que mantener:
+
+- **`HOME` propio** (`/tmp/opencode/zode-smoke-home`). La app escribe
+  `~/.config/zode/auth.json` y `sessions/`, y un script automatico no debe tocar
+  la config real de quien lo ejecuta. El fuzzer de junio guardo una key pegada
+  por error y dejo el provider con 401 sin explicacion apparent.
+- **`TIOCSWINSZ` antes de nada**: sin tamano de ventana vaxis hace
+  `width_pix / width` y sale con division por cero. `script` NO fija el tamano.
+
 ## vaxis NO se parchea en el arbol (5.7 y 5.9)
 
 El ROADMAP propone dos parches sobre `zig-pkg/vaxis-…/src/vxfw/App.zig`:
