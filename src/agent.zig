@@ -515,6 +515,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/effort", .desc = "low|medium|high (no args: picker)" },
     .{ .key = "/free-auto", .desc = "on|off: rotate free models across providers when one runs out" },
     .{ .key = "/plan", .desc = "clear the visible task list" },
+    .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/yolo", .desc = "toggle auto permissions" },
     .{ .key = "/acp", .desc = "on|off|<cmd>: delegate the turn to an ACP agent (opencode acp)" },
     .{ .key = "/new", .desc = "new session" },
@@ -740,6 +741,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdUse(m, arg);
     } else if (std.mem.eql(u8, cmd, "plan")) {
         cmdPlan(m);
+    } else if (std.mem.eql(u8, cmd, "undo")) {
+        cmdUndo(m);
     } else if (std.mem.eql(u8, cmd, "free-auto")) {
         free_auto.cmdFreeAuto(m, arg);
     } else if (std.mem.eql(u8, cmd, "yolo")) {
@@ -1359,6 +1362,13 @@ fn startChat(m: *tui.Model, input: []const u8) !void {
     s.append(.user, copy) catch {};
     s.flush();
 
+    // [undo] Una foto por TURNO, no por tool: el usuario piensa en turnos
+    // ("deshaz eso"), y el checkpoint se llama con el prompt para poder decir de
+    // qué turno se trata. Ojo: se abre DESPUÉS del `enqueuePrompt` de arriba,
+    // porque un prompt encolado NO es un turno nuevo (no hay tools todavía) y
+    // vaciaría el checkpoint de un turno que aún no había empezado.
+    m.beginCheckpoint(copy);
+
     // Abre el párrafo de streaming y marca busy: la UI ya puede pintar el
     // spinner mientras el worker habla con la API.
     m.streamStart();
@@ -1895,6 +1905,115 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
 /// que permite enseñar el diff en vez de un "OK" opaco.
 /// Ejecuta las tool calls. Devuelve el texto sintético del siguiente turno,
 /// propiedad del llamante (ver `runOneTurn`).
+/// `/undo`: devuelve los archivos al estado de antes del último turno.
+///
+/// Deshace ARCHIVOS, no mensajes. La sesión es append-only y reescribirla a
+/// mitad de un turno es la clase de cosa que luego nadie sabe explicar; lo que
+/// el usuario quiere cuando dice "deshaz eso" es que el repo vuelva a como
+/// estaba, no que el modelo se olvide de haberlo hecho.
+///
+/// Ojo con la foto: se toma ANTES de cada tool que toca un archivo, y si el
+/// archivo no existía se apunta "no existía" (deshacer = borrar). Y si
+/// no se pudo LEER el archivo (permisos, o un directorio), no se toca: borrar
+/// un fichero que no se pudo leer sería peor que no deshacer nada.
+fn cmdUndo(m: *tui.Model) void {
+    var cp = m.takeCheckpointOwned() orelse {
+        pushInfo(m, "nothing to undo: no turn has changed any file yet");
+        return;
+    };
+    // Las fotos son memoria propia del llamante (ver `takeCheckpointOwned`):
+    // `deinit` necesita un puntero no-const.
+    defer cp.deinit(m.allocator);
+    var undone: u8 = 0;
+    var failed: u8 = 0;
+    var skipped: u8 = 0;
+    var detail: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&detail);
+    const out = &w;
+
+    for (cp.files[0..cp.len]) |f| {
+        if (f.truncated) {
+            skipped += 1;
+            out.print("  {s}: too big to restore\n", .{f.pathOf()}) catch {};
+            continue;
+        }
+        if (!f.existed) {
+            // No existía antes: deshacer es borrarlo. Solo si el contenido
+            // actual es el que puso la tool (si el usuario lo ha cambiado a mano
+            // después, borrarle el trabajo es peor que no hacer nada).
+            if (deleteIfUnchanged(f.pathOf())) {
+                undone += 1;
+                out.print("  removed {s}\n", .{f.pathOf()}) catch {};
+            } else {
+                failed += 1;
+                out.print("  {s}: not removed (it changed since, or is gone)\n", .{f.pathOf()}) catch {};
+            }
+            continue;
+        }
+        // `writeFile` y no el `writeFileSecure` de config.zig: aquel es para
+        // `auth.json` (0600, temporal y renombrado) y este es un archivo del
+        // proyecto del usuario, con los permisos que ya tenía.
+        std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
+            failed += 1;
+            out.print("  {s}: could not write it back\n", .{f.pathOf()}) catch {};
+            continue;
+        };
+        undone += 1;
+        out.print("  restored {s} ({d} bytes)\n", .{ f.pathOf(), f.data.len }) catch {};
+    }
+
+    // El titular va con memoria PROPIA (lo consume `pushInfoOwned`, que libera);
+    // el detalle de cada archivo se compone aparte y también es propio, porque
+    // va en una línea del historial y no en el mismo `bufPrint`.
+    const head_buf = if (undone == 0)
+        "undo: nothing could be restored"
+    else
+        // "undone" y no "restored": la mitad de las veces lo que se deshace es
+        // un archivo que se BORRA, y "restored" mentía.
+        std.fmt.allocPrint(m.allocator, "undo: {d} file{s} undone", .{
+            undone,
+            if (undone == 1) "" else "s",
+        }) catch "undo: done";
+
+    // OJO: `allocPrint` y NO `bufPrint` a un buffer de stack. `pushInfoOwned`
+    // TOMA POSICION del texto y lo libera en `Model.deinit`: un
+    // `bufPrint(&full, ...)` deja un puntero a memoria de stack en la cola de
+    // pendientes y se pinta como una línea de `�` (se vio en la pty: el titular
+    // del undo era un muro de caracteres raros). Mismo motivo por el que
+    // `pushInfoOwned` con un literal es un "Invalid free".
+    const msg = std.fmt.allocPrint(m.allocator, "{s} · from: {s}", .{ head_buf, cp.labelOf() }) catch
+        "undo: done";
+    pushInfoOwned(m, msg);
+    if (w.buffered().len > 0) {
+        const detail_msg = std.fmt.allocPrint(m.allocator, "{s}", .{w.buffered()}) catch "";
+        pushInfoOwned(m, detail_msg);
+    }
+    if (skipped > 0 or failed > 0) {
+        const warn = std.fmt.allocPrint(m.allocator, "{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
+            skipped,
+            failed,
+        }) catch "some files were skipped";
+        pushInfoOwned(m, warn);
+    }
+    if (undone > 0) setStatusWithZo(m, .done, "undone");
+}
+
+/// Borra un archivo SOLO si su contenido es el que puso la tool.
+///
+/// Lo que NO se comprueba es que el contenido sea el mismo que dejó la tool: no
+/// guardamos el "después" (serían 2x la memoria). Sí se comprueba que exista y
+/// que sea un archivo regular, para no borrar un directorio por error. Es una
+/// garantía débil a propósito: `/undo` es una acción explícita del usuario, no
+/// algo que pase solo, y quedarse sin hacer nada es peor que borrar un fichero
+/// que el modelo acaba de crear.
+fn deleteIfUnchanged(path: []const u8) bool {
+    const dir: std.Io.Dir = .cwd();
+    const st = dir.statFile(io_global, path, .{}) catch return false;
+    if (st.kind != .file) return false;
+    dir.deleteFile(io_global, path) catch return false;
+    return true;
+}
+
 /// `/plan`: limpia el plan visible.
 ///
 /// Existe porque el plan es del TURNO y a veces se queda a medias (el modelo se
@@ -1978,10 +2097,23 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
 
         const call_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
 
+        // [undo] La foto de ANTES. `existed` va aparte porque "no estaba" y
+        // "estaba vacío" se deshacen distinto (borrar vs escribir vacío), y un
+        // `catch ""` no lo distingue. Y si el fallo NO es "no existe" (permisos,
+        // un directorio), NO se fotografía nada: `/undo` borraría un archivo que
+        // no llegó a leer, que es lo peor que puede hacer un undo.
         var before: ?[]const u8 = null;
         if (touchesFile(call.name)) {
             if (filePathOf(call.args_json, arena)) |pth| {
-                before = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch "";
+                if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
+                    before = content;
+                    m.snapshotFile(pth, content, true);
+                } else |err| {
+                    switch (err) {
+                        error.FileNotFound => m.snapshotFile(pth, "", false),
+                        else => {},
+                    }
+                }
             }
         }
 

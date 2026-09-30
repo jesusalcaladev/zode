@@ -9,6 +9,7 @@ const ed_mod = @import("editor.zig");
 const mascot = @import("mascot.zig");
 const palette = @import("palette.zig");
 const plan_mod = @import("plan.zig");
+const checkpoint = @import("checkpoint.zig");
 const models_mod = @import("models.zig");
 
 /// Ítem del picker modal (estilo opencode). Labels/descs son gpa-owned
@@ -261,6 +262,11 @@ pub const Model = struct {
     /// el draw la pinta sin asignar nada.
     plan: plan_mod.Plan = .{},
 
+    /// Las fotos de los archivos por turno, para `/undo`. Es lo único que
+    /// sobrevive de un turno al siguiente (la arena del worker no), y por eso
+    /// lleva su propio allocator en la pila.
+    checkpoints: checkpoint.Stack = undefined,
+
     /// Momento en que empezó el turno en curso, en nanosegundos, para el reloj
     /// de la franja de actividad. 0 = sin turno. Lo escribe `streamStart`.
     busy_started_ns: i128 = 0,
@@ -470,12 +476,21 @@ pub const Model = struct {
             .paras = .empty,
             .pending = .empty,
             .seg_cache = .empty,
+            // La pila de checkpoints necesita el allocator en el momento de
+            // crearse (es quien guarda la memoria de las fotos). Se podría
+            // dejar `undefined` y hacerlo en `deinit`, pero entonces cualquier
+            // test que llame a `snapshotFile` sin `init` lee basura.
+            .checkpoints = .init(allocator),
         };
         m.setStatusText("zode v0.3 \u{b7} esc interrupts \u{b7} ctrl+c exits");
         return m;
     }
 
     pub fn deinit(self: *Model) void {
+        // Las fotos de los checkpoints son memoria del allocator del modelo y
+        // nadie más las suelta: sin esto, cada turno con tools deja el repo entero
+        // en memoria hasta que se sale.
+        self.checkpoints.deinit();
         // `clearQueue` conserva la capacidad (bien para no reasignar en cada
         // prompt), así que el buffer de la lista hay que liberarlo aparte o
         // fuga al salir.
@@ -1074,6 +1089,11 @@ pub const Model = struct {
     /// abrir el streaming porque `Timestamp.now` a través del `Io` desde el
     /// draw es justo lo que no se quiere en el camino caliente.
     /// Pasa el `Io` de la app. Lo llama `runTui` al arrancar.
+    /// `Stack.init` necesita el allocator, y `Model.init` ya lo tiene.
+    pub fn initCheckpoints(self: *Model) void {
+        self.checkpoints = .init(self.allocator);
+    }
+
     pub fn attachIo(self: *Model, io: std.Io) void {
         self.io = io;
         self.io_ready = true;
@@ -1339,6 +1359,67 @@ pub const Model = struct {
         const r = self.plan.apply(items, n);
         if (r == .changed or r == .empty) self.dirty = true;
         return r;
+    }
+
+    /// Empieza el checkpoint de un turno (lo llama `startChat`, una vez por
+    /// prompt, antes de lanzar el worker).
+    pub fn beginCheckpoint(self: *Model, label: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        self.checkpoints.begin(label);
+    }
+
+    /// Añade la foto de un archivo al checkpoint del turno en curso.
+    ///
+    /// `existed` va explícito y no se deduce del contenido: "el fichero no
+    /// estaba" y "el fichero estaba vacío" se deshacen distinto (borrar vs
+    /// escribir vacío), y un `catch ""` no distingue los dos casos.
+    pub fn snapshotFile(
+        self: *Model,
+        path: []const u8,
+        content: []const u8,
+        existed: bool,
+    ) void {
+        self.lock();
+        defer self.unlock();
+        if (self.checkpoints.isEmpty()) return;
+        _ = self.checkpoints.last().?.addFile(self.allocator, path, content, existed);
+    }
+
+    /// Saca el checkpoint del último turno para deshacerlo, y lo CONSUME (queda
+    /// fuera de la pila): si no, dos `/undo` seguidos restaurarían lo mismo dos
+    /// veces, y un segundo `/undo` tendría que deshacer el turno ANTERIOR.
+    ///
+    /// La memoria de las fotos pasa al LLAMANTE, que tiene que hacer
+    /// `defer cp.deinit(...)`. Por eso se llama `_Owned`: la primera versión
+    /// hacía `deinit` aquí y devolvía una copia con los `data` ya liberados, y
+    /// `/undo` escribía memoria liberada (segfault al escribir el fichero, no
+    /// al leer: por eso el test lo cazó en `expectEqualStrings` y no en el undo).
+    pub fn takeCheckpointOwned(self: *Model) ?checkpoint.Checkpoint {
+        self.lock();
+        defer self.unlock();
+        const cp = self.checkpoints.last() orelse return null;
+        const taken = cp.*;
+        // `len = 0` ANTES de desplazar: la ranura de origen deja de tener fotos
+        // que liberar (si no, el `deinit` del teardown las liberaría OTRA vez).
+        cp.len = 0;
+        cp.bytes = 0;
+        // El resto baja una posición. Con un solo elemento, la pila queda vacía.
+        var i: usize = 0;
+        while (i + 1 < self.checkpoints.len) : (i += 1) {
+            self.checkpoints.items[i] = self.checkpoints.items[i + 1];
+        }
+        self.checkpoints.items[self.checkpoints.len - 1].len = 0;
+        self.checkpoints.len -= 1;
+        return taken;
+    }
+
+    /// ¿Hay algo que deshacer? (para que `/undo` no diga "nada" cuando sí hay)
+    pub fn canUndo(self: *Model) bool {
+        self.lock();
+        defer self.unlock();
+        const cp = self.checkpoints.last() orelse return false;
+        return cp.len > 0;
     }
 
     /// Copia del plan para el draw (con el lock, porque lo escribe el worker).
@@ -4429,6 +4510,49 @@ test "streamEnd sin texto no deja un parrafo vacio en el historial" {
     }
     try std.testing.expectEqual(@as(usize, 1), assistants);
     try std.testing.expect(!m.busy);
+}
+
+test "el checkpoint se abre por TURNO y consume el último al deshacer" {
+    // Lo que importa del contrato: un prompt = un checkpoint (aunque el turno
+    // haga 5 tools), y `takeCheckpoint` lo QUITA, para que un segundo `/undo`
+    // deshaga el turno anterior y no repita el mismo.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try std.testing.expect(!m.canUndo());
+    m.beginCheckpoint("turno 1");
+    m.snapshotFile("a.txt", "v1", true);
+    m.snapshotFile("a.txt", "v2", true); // la segunda se ignora
+    try std.testing.expect(m.canUndo());
+
+    m.beginCheckpoint("turno 2");
+    m.snapshotFile("b.txt", "x", true);
+    var c2 = m.takeCheckpointOwned() orelse return error.TestUnexpectedResult;
+    defer c2.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("turno 2", c2.labelOf());
+    try std.testing.expectEqual(@as(u8, 1), c2.len);
+    // La foto de "a.txt" era del turno 1 y sigue ahí: `b.txt` no la pisó.
+    try std.testing.expect(m.canUndo());
+    var c1 = m.takeCheckpointOwned() orelse return error.TestUnexpectedResult;
+    defer c1.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("turno 1", c1.labelOf());
+    try std.testing.expectEqual(@as(u8, 1), c1.len);
+    try std.testing.expectEqualStrings("a.txt", c1.files[0].pathOf());
+    try std.testing.expectEqualStrings("v1", c1.files[0].data);
+
+    // Y ya no queda nada: `canUndo` en vez de un crash.
+    try std.testing.expect(!m.canUndo());
+    try std.testing.expect(m.takeCheckpointOwned() == null);
+}
+
+test "un snapshot sin checkpoint abierto no se guarda (ni rompe)" {
+    // `execToolCalls` puede correr antes de que `startChat` abra el checkpoint
+    // (turnos encadenados). Sin este guardia sería un acceso a un array vacío.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.snapshotFile("a.txt", "contenido", true);
+    try std.testing.expect(!m.canUndo());
+    try std.testing.expect(m.takeCheckpointOwned() == null);
 }
 
 test "el bloque del plan: un checkbox por paso, y el paso en marcha resaltado" {
