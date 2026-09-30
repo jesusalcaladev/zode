@@ -1414,7 +1414,7 @@ fn chatWorker(job: *ChatJob) void {
     var owned: ?[]u8 = null; // texto sintético de una iteración (propio)
 
     while (iterations < max_iterations) : (iterations += 1) {
-        const again = runOneTurn(m, last_user) catch |err| {
+        const again = runOneTurn(m, last_user, iterations == 0) catch |err| {
             reportErr(m, err);
             // Con el free-auto encendido, el estado del pool ES la siguiente
             // pregunta del usuario ("¿y ahora qué?"), y la respuesta cabe en una
@@ -1734,7 +1734,16 @@ fn withMentions(
     return copy;
 }
 
-fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
+/// `first_call` es `true` solo en la primera iteración del agent loop.
+///
+/// Existe por el aviso de las menciones: `runOneTurn` se llama una vez por
+/// iteración (prompt -> tool -> prompt -> tool...) y en todas se reamplía el
+/// último mensaje de usuario, que sigue siendo el mismo prompt con su `@ruta`.
+///
+/// El CONTENIDO tiene que estar en todas (el modelo lo necesita en cada
+/// petición), pero el AVISO del historial solo en la primera: si no, un turno de
+/// tres tools mete tres líneas idénticas diciendo "@fichero: 1 inlined".
+fn runOneTurn(m: *tui.Model, user_text: []const u8, first_call: bool) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
     const s = ensureSession(m, gpa);
@@ -1794,7 +1803,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     // pendientes. El siguiente frame lo pinta, vaxis lee los BYTES del grapheme
     // liberados, y la app muere con un segfault en el renderer. Quinta vez que
     // sale esta familia de bug en este repo.
-    if (mentions_in.files > 0) {
+    if (mentions_in.files > 0 and first_call) {
         var note_buf: [160]u8 = undefined;
         const note = if (mentions_in.missing > 0)
             std.fmt.bufPrint(&note_buf, "@fichero: {d} inlined with the prompt, {d} not found", .{
