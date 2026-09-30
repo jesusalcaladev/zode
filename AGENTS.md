@@ -800,9 +800,14 @@ cambio de layout. Ahora usan `findRow` / `hasBlankRowBetween`, que buscan por
 
 ## UI en ingles
 
-Toda la UI visible esta en ingles. El system prompt del agente tambien lo esta
-(los modelos responden mejor). Los comentarios y los nombres de test siguen en
-espanol, que es el idioma de quien los lee.
+La UI visible esta en ingles, el system prompt del agente tambien (los modelos
+responden mejor) y **los comentarios del codigo tambien**. Se cambio en
+septiembre de 2026: el codigo lo lee gente que no es quien lo escribe, y dos
+idiomas en el mismo fichero hacen que las_cauciones se lean a medias.
+
+Los NOMBRES DE TEST siguen en espanol a proposito: son el indice de lo que
+cubre la suite, y el nombre entero es lo que diria "esto se rompio" si se
+quitara el test.
 
 ## La paleta EJECUTA, no rellena
 
@@ -1167,3 +1172,77 @@ draws the `⏺ tool(...)` header and its result. That is why `AcpTurn` has no
 (`opencode service status` → `127.0.0.1:<port>`, which asks for Basic auth) —
 is what would let zode see and drive the sessions of the TUI that is already
 running. ACP is the clean one; HTTP is the one that shares state.
+
+## La congelacion de septiembre 2026: NO era rendimiento
+
+Diagnostico completo en `ROADMAP.md`. Lo que hay que retenue, porque las tres
+cosas que lo causaban son invisibles en un perfil de CPU:
+
+1. **El bucle del layout no terminaba.** Era
+   `while (seg_cache.len < paras.len)` + `orderedRemove(0)` al pasar del tope de
+   128: append (129) -> evict (128) -> volver a entrar, para siempre. Con
+   `pushDiff` metiendo un PARRAFO POR LINEA de diff, un solo `write` de un
+   fichero de 129 lineas colgaba la app al instante. Ahora la cache es una
+   VENTANA (`layoutWindow`) con `para_idx` por entrada y `para_heights` por
+   parrafo, y hay un presupuesto de iteraciones (`layout_iters` /
+   `layout_overflow`) para que una regresion FUTURA falle un test en 1 s en vez
+   de colgar el proceso. Ese presupuesto no es decorativo: sin el, el test
+   cuelga el runner entero y no hay CI posible.
+
+2. **La cadena de ticks se podia morir para siempre.** El `.tick` solo se
+   rearmaba "si hay trabajo", y `busy`/`dirty` tienen ventanas en las que los
+   dos son falsos (entre `streamEnd` y `pushToolStart` hay un `write(2)` de
+   sesion y un DEFLATE-9 en medio). Un tick ahi dejaba `App.timers` VACIO, y el
+   worker no tiene ni puntero al `EventContext` ni a la cola de eventos: no
+   habia forma de pedir un frame. El tick se rearma SIEMPRE ahora.
+
+3. **`requestPermission` hacia spin-yield sobre el lock del HISTORIAL** durante
+   los 30 s que tardas en decidir: quemaba un core y hacia que cada adquisicion
+   de lock de la UI fuera un `yield` fallado. Ahora tiene lock PROPIO y espera
+   dormida con `nanosleep` y backoff 1->20 ms.
+
+## Correccion: el diagnostico delACP sobre `Io.sleep` era erroneo
+
+`acp.zig` decia (y este documento lo repetia) que "`Io.sleep` secuestra el bucle
+de eventos de vaxis". **En Linux es falso**, y conviene corregirlo para que
+nadie vuelva a investigarlo:
+
+- `Io.sleep` es una llamada a la vtable. `Threaded.sleep` va a `sleepPosix`
+  porque `use_parking_sleep` solo es true en Windows/NetBSD/illumos.
+- `sleepPosix` es un `clock_nanosleep` en el hilo que llama, con un `Syscall`
+  por hilo que **no toca `t.mutex`**.
+- El tick de vaxis es una entrada normal en `App.timers` que evalua
+  `App.checkTimers` en el hilo de la UI.
+
+El reloj se congelaba por los puntos 1 y 2 de arriba, no por el sleep. Por eso
+`acp.nap` (un `nanosleep` pelado) es igualmente lo correcto: es lo que se usa en
+`Retry.wait` y en la espera del dialogo de permisos, pero por robustez, no
+porque `Io.sleep` fuera un problema.
+
+## Correccion: la capacidad de la cache de segmentos
+
+El comentario de `max_cached_paras` decia "el scroll profundo re-parsea on
+demand". **No lo hacia**, y esa suposicion es justo lo que hacia que el bucle
+de `tui.zig` no terminara. Ahora si lo hace: `layoutWindow` elige la ventana
+que contiene las lineas visibles y `layoutFor` itera hasta que el rango se
+estabiliza (las alturas empiezan estimadas y se corrigen al parsear).
+
+## Trampas de Zig 0.16 que costaron una tarde
+
+- **`gpa.free(list.items)` es `Invalid free`.** En 0.16 `items` es el slice de
+  LONGITUD y la capacidad va aparte. Para liberar hay que usar
+  `allocatedSlice()`. Peta en `pushDiff` con "Invalid free".
+- **`clearRetainingCapacity` hace `@memset(items, undefined)`.** Si se llama en
+  `deinit` DESPUES de `deinit` de esa misma lista, es un memset de `undefined`
+  sobre memoria liberada -> GPF.
+- **`std.Thread.Mutex` ya no existe.** `std.Io.Mutex` / `std.Io.Condition` lo
+  tienen, pero necesitan un `Io` (y los tests construyen el `Model` sin app).
+  Para el dialogo de permisos: `std.atomic.Mutex` propio + espera dormida.
+- **`ArrayList` unmanaged pide capacidad exacta**: un `FixedBufferAllocator` de
+  128 B falla al pedir 128 B para 8 punteros. Los tests de `TurnStats` usan 512.
+- **Devolver un slice a un temporal de pila** (`normalizeLang` lo hacia) se lee
+  DESPUES de que la funcion retorne: tres tests rojos seguidos hasta que se
+  cayera.
+- **`rowText` devuelve BYTES, no columnas**: `◆` son 3 bytes para 2 columnas y
+  `─` 3 bytes para 1. Comparar bytes contra columnas da un test rojo con el
+  layout correcto.

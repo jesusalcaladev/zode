@@ -9,7 +9,7 @@ pub const Config = struct {
     models_url: []const u8,
     model: []const u8,
 
-    /// Lee config de variables de entorno (fase 1); luego: ~/.config/zode/config.json
+    /// Reads config from environment variables (phase 1); then: ~/.config/zode/config.json
     pub fn load(env: ?*const std.process.Environ.Map) Config {
         const get = struct {
             fn f(e: ?*const std.process.Environ.Map, key: []const u8, fallback: []const u8) []const u8 {
@@ -24,14 +24,14 @@ pub const Config = struct {
         };
     }
 
-    /// URL del endpoint de modelos.
+    /// URL of the models endpoint.
     pub fn urlModels(self: Config, buf: []u8) []const u8 {
         if (buf.len < self.models_url.len) return self.models_url;
         @memcpy(buf[0..self.models_url.len], self.models_url);
         return buf[0..self.models_url.len];
     }
 
-    /// URL del endpoint de chat completions, formateada en `buf`.
+    /// URL of the chat completions endpoint, formatted into `buf`.
     pub fn urlChat(self: Config, buf: []u8) []const u8 {
         return std.fmt.bufPrint(buf, "{s}/chat/completions", .{self.base_url}) catch self.base_url;
     }

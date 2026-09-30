@@ -117,7 +117,7 @@ test "summaryPrompt incluye roles y trunca mensajes largos" {
     const p = try summaryPrompt(arena, &msgs);
     try std.testing.expect(std.mem.indexOf(u8, p, "[user] hola") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "[tool] ") != null);
-    // Cada mensaje se trunca a 2000 chars.
+    // Every message is truncated to 2000 chars.
     try std.testing.expect(p.len < 6000);
 }
 
@@ -147,15 +147,15 @@ test "elide reduce tool dumps pero protege recientes" {
     }
 
     const before = estimateTokens(msgs);
-    const res = try elideTier(arena, msgs, @divTrunc(before, 4)); // budget muy bajo
+    const res = try elideTier(arena, msgs, @divTrunc(before, 4)); // very low budget
     try std.testing.expect(res.elided > 0);
     try std.testing.expect(estimateTokens(res.msgs) < before);
 
-    // Los últimos (recent_window) NO fueron elididos. Con alternancia
-    // assistant(odd)/tool(even), el último índice par (len-2) es un tool.
+    // The last ones (recent_window) were NOT elided. With an assistant(odd)/tool(even)
+    // alternation, the last even index (len-2) is a tool.
     const last_tool = res.msgs[res.msgs.len - 2];
     try std.testing.expectEqualStrings(big_tool, last_tool.content);
-    // y el índice len-1 (assistant) nunca se toca.
+    // and index len-1 (assistant) is never touched.
     try std.testing.expectEqualStrings("thinking", res.msgs[res.msgs.len - 1].content);
 }
 

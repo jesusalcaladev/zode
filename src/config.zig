@@ -2,13 +2,13 @@ const std = @import("std");
 const providers = @import("providers.zig");
 const chat = @import("chat.zig");
 
-/// Config por usuario: `~/.config/zode/config.json`.
+/// User config: `~/.config/zode/config.json`.
 ///
-/// Antes la lista de providers estaba compilada en el binario, así que apuntar
-/// a vLLM, LM Studio, Together o cualquier endpoint OpenAI-compat exigía
-/// recompilar. Ahora se añaden sin tocar código.
+/// The provider list used to be compiled into the binary, so pointing at vLLM,
+/// LM Studio, Together or any OpenAI-compat endpoint required recompiling.
+/// Now they are added without touching code.
 ///
-/// Formato:
+/// Format:
 /// {
 ///   "provider": "mi-vllm",
 ///   "providers": [
@@ -25,21 +25,21 @@ const chat = @import("chat.zig");
 /// }
 
 pub const Config = struct {
-    /// Provider por defecto (id, debe existir en la lista efectiva).
+    /// Default provider (id, must exist in the effective list).
     provider: []const u8 = "",
-    /// Modelo por defecto global (vacío = el del provider).
+    /// Global default model (empty = the provider's).
     model: []const u8 = "",
-    /// Providers definidos por el usuario (se anexan a los compilados).
+    /// User-defined providers (appended to the compiled ones).
     extra: []const providers.ProviderDef = &.{},
-    /// Wire format de cada provider extra: "openai" (default) o "anthropic".
+    /// Wire format of each extra provider: "openai" (default) or "anthropic".
     anthropic_extra: []const bool = &.{},
-    /// Ruta de config que se cargó (para diagnostics), o null.
+    /// Config path that was loaded (for diagnostics), or null.
     path: ?[]const u8 = null,
     pub const empty: Config = .{};
 };
 
-/// provider_id → ¿usar el wire format nativo de Anthropic?
-/// Los providers compilados se resuelven por id; los extra, por su flag.
+/// provider_id → use Anthropic's native wire format?
+/// Compiled providers are resolved by id; extra ones by their flag.
 pub fn isAnthropic(cfg: Config, id: []const u8) bool {
     if (providers.byId(id) != null) return chat.kindForProvider(id) == .anthropic;
     for (cfg.extra, 0..) |d, i| {
@@ -48,7 +48,7 @@ pub fn isAnthropic(cfg: Config, id: []const u8) bool {
     return false;
 }
 
-/// Ruta de `~/.config/zode/auth.json` (donde se guardan las keys de la paleta).
+/// Path of `~/.config/zode/auth.json` (where the palette stores keys).
 pub fn authPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     const dir = configDir(env, buf) orelse return null;
     return std.fmt.bufPrint(buf[dir.len..], "{s}/auth.json", .{dir}) catch null;
@@ -61,9 +61,9 @@ fn configPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.config/zode/config.json", .{home}) catch null;
 }
 
-/// Carga `~/.config/zode/config.json`. Best-effort: si no existe o está
-/// corrupto devuelve `Config.empty` y la app sigue con los providers
-/// compilados. Toda la memoria sale de `arena`.
+/// Loads `~/.config/zode/config.json`. Best-effort: if it is missing or corrupt
+/// it returns `Config.empty` and the app keeps running with the compiled
+/// providers. All memory comes from `arena`.
 pub fn load(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -102,9 +102,9 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
         const id_v = o.get("id") orelse continue;
         if (id_v != .string or id_v.string.len == 0) continue;
         const id = try arena.dupe(u8, id_v.string);
-        if (providers.byId(id) != null) continue; // no shadowear compilados
+        if (providers.byId(id) != null) continue; // do not shadow compiled ones
 
-        // base_url es obligatorio: sin él no hay a dónde enviar el request.
+        // base_url is mandatory: without it there is nowhere to send the request.
         const base_v = o.get("base_url") orelse continue;
         if (base_v != .string) continue;
         const base = try arena.dupe(u8, base_v.string);
@@ -124,7 +124,7 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
         else
             "";
 
-        // key_env acepta string o array de strings.
+        // key_env accepts a string or an array of strings.
         var keys: std.ArrayList([]const u8) = .empty;
         if (o.get("key_env")) |kv| {
             switch (kv) {
@@ -165,7 +165,7 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
     return cfg;
 }
 
-/// Todos los providers: compilados + los de config.json.
+/// All providers: compiled + the ones from config.json.
 pub fn allDefs(arena: std.mem.Allocator, cfg: Config) []const providers.ProviderDef {
     const n = providers.defs.len + cfg.extra.len;
     const out = arena.alloc(providers.ProviderDef, n) catch return &providers.defs;
@@ -203,7 +203,7 @@ test "parse: provider extra completo" {
     try std.testing.expectEqualStrings("vllm", cfg.extra[0].id);
     try std.testing.expectEqualStrings("http://localhost:8000/v1", cfg.extra[0].base_url);
     try std.testing.expectEqualStrings("qwen3-coder", cfg.extra[0].default_model);
-    // key_env como string suelto → slice de 1
+    // key_env as a lone string → slice of 1
     try std.testing.expectEqual(@as(usize, 1), cfg.extra[0].key_env.len);
     try std.testing.expect(!isAnthropic(cfg, "vllm"));
 }
@@ -232,7 +232,7 @@ test "parse: kind anthropic marca el wire format" {
     ;
     const cfg = try parse(arena, json, "/tmp/c.json");
     try std.testing.expect(isAnthropic(cfg, "proxy"));
-    // Los compilados mandan por id.
+    // Compiled providers win by id.
     try std.testing.expect(isAnthropic(cfg, "anthropic"));
     try std.testing.expect(!isAnthropic(cfg, "openrouter"));
 }
@@ -260,7 +260,7 @@ test "parse: no se puede shadowear un provider compilado" {
     ;
     const cfg = try parse(arena, json, "/tmp/c.json");
     try std.testing.expectEqual(@as(usize, 0), cfg.extra.len);
-    // Y el lookup sigue resolviendo al compilado.
+    // And the lookup still resolves to the compiled one.
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", find(cfg, "openrouter").?.base_url);
 }
 
@@ -290,13 +290,13 @@ test "allDefs: compila los de config detrás de los built-in" {
     try std.testing.expectEqualStrings("vllm", all[all.len - 1].id);
 }
 
-// ── escritura (auth.json) ─────────────────────────────────────
+// ── writing (auth.json) ───────────────────────────────────────
 
-/// Ruta de `~/.config/zode`, o null si no hay HOME.
+/// Path of `~/.config/zode`, or null when there is no HOME.
 ///
-/// Se exporta porque guardar la key de un provider (el "Connect an
-/// integration" de la paleta) necesita el mismo directorio que leer el
-/// config, y duplicar la lógica de `configPath` sería pedir que se separen.
+/// Exported because storing a provider's key (the palette's "Connect an
+/// integration") needs the same directory as reading the config, and
+/// duplicating `configPath`'s logic would just invite them to drift apart.
 pub fn configDir(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     const m = env orelse return null;
     const home = m.get("HOME") orelse return null;
@@ -304,11 +304,11 @@ pub fn configDir(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.config/zode", .{home}) catch null;
 }
 
-/// Escribe un archivo con permisos 0600.
+/// Writes a file with 0600 permissions.
 ///
-/// 0600 y no 0644 a propósito: el archivo contiene API keys en claro y
-/// `config.json` sí es versionable, este no. `writeFile` no permite fijar
-/// permisos, así que se escribe en temporal y se renombra.
+/// 0600 and not 0644 on purpose: the file holds API keys in cleartext and
+/// `config.json` is meant to be versioned while this one is not. `writeFile`
+/// cannot set permissions, so it is written to a temp file and renamed.
 pub fn writeFileSecure(
     io: std.Io,
     env: ?*const std.process.Environ.Map,
@@ -317,7 +317,7 @@ pub fn writeFileSecure(
 ) !void {
     var dir_buf: [1024]u8 = undefined;
     const dir_path = configDir(env, &dir_buf) orelse return error.NoHome;
-    // `Dir.createDirPath` es mkdir -p: el usuario puede no tener ~/.config/zode.
+    // `Dir.createDirPath` is mkdir -p: the user may not have ~/.config/zode yet.
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
 
     var tmp_buf: [1200]u8 = undefined;
@@ -328,24 +328,24 @@ pub fn writeFileSecure(
         .permissions = @enumFromInt(0o600),
     });
     defer file.close(io);
-    // `File` no tiene writeAll en 0.16: se hace un writer con su buffer.
+    // `File` has no writeAll in 0.16: build a writer with its own buffer.
     var wbuf: [4096]u8 = undefined;
     var fw = file.writer(io, &wbuf);
     try fw.interface.writeAll(data);
     try fw.interface.flush();
-    // El temporal se renombra a su nombre final: si se escribiera en sitio, un
-    // fallo a mitad dejaría la mitad de la key en un fichero de 0644.
+    // The temp file is renamed to its final name: writing in place would leave
+    // half of the key in a 0644 file if it failed midway.
     try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
 }
 
-// ── JSON mínimo a mano ────────────────────────────────────────
+// ── minimal hand-written JSON ─────────────────────────────────
 
-/// Escribe un objeto plano `{ "k": "v", ... }` en `out`.
+/// Writes a flat object `{ "k": "v", ... }` to `out`.
 ///
-/// A mano y no con `{f}` porque el writer de 0.16 no formatea
-/// `json.ObjectMap` ni `json.Array`, y el archivo que escribimos (auth.json) es
-/// un puñado de pares string→string: serializarlo aquí son 20 líneas y deja el
-/// formato de las keys bajo control (y sin comillas raras).
+/// By hand and not with `{f}` because the 0.16 writer does not format
+/// `json.ObjectMap` or `json.Array`, and the file we write (auth.json) is a
+/// handful of string→string pairs: serializing it here is 20 lines and keeps
+/// the key format under control (and free of odd quoting).
 pub fn writeStringMap(out: *std.Io.Writer, gpa: std.mem.Allocator, pairs: []const [2][]const u8) !void {
     try out.writeAll("{");
     for (pairs, 0..) |kv, i| {
@@ -357,7 +357,7 @@ pub fn writeStringMap(out: *std.Io.Writer, gpa: std.mem.Allocator, pairs: []cons
     try out.writeAll("}");
 }
 
-/// Escribe un array de strings `["a","b"]`.
+/// Writes a string array `["a","b"]`.
 pub fn writeStringArray(out: *std.Io.Writer, gpa: std.mem.Allocator, items: []const []const u8) !void {
     try out.writeAll("[");
     for (items, 0..) |it, i| {
@@ -367,7 +367,7 @@ pub fn writeStringArray(out: *std.Io.Writer, gpa: std.mem.Allocator, items: []co
     try out.writeAll("]");
 }
 
-/// String JSON con escapes mínimos (comilla, barra, control, UTF-8 tal cual).
+/// JSON string with minimal escaping (quote, backslash, control, UTF-8 as-is).
 pub fn writeJsonString(out: *std.Io.Writer, gpa: std.mem.Allocator, s: []const u8) !void {
     try out.writeAll("\"");
     var start: usize = 0;
@@ -391,10 +391,10 @@ pub fn writeJsonString(out: *std.Io.Writer, gpa: std.mem.Allocator, s: []const u
 }
 
 test "writeFileSecure: crea el directorio y escribe con 0600" {
-    // El flujo completo: mkdir -p del directorio, temporal, y renombrado. Es
-    // lo que usa "Connect an integration" y si falla se queda sin key.
-    // Un entorno con HOME propio: `writeFileSecure` lo necesita para saber
-    // dónde está ~/.config/zode, así que el test NO puede pasar null.
+    // The full flow: mkdir -p of the directory, temp file, and rename. This is
+    // what "Connect an integration" uses, and if it fails you end up with no key.
+    // An environment with its own HOME: `writeFileSecure` needs it to know
+    // where ~/.config/zode is, so the test CANNOT pass null.
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     const home: [:0]const u8 = "HOME=/tmp/zode-test-home\x00";

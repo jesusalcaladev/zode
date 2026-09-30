@@ -13,10 +13,10 @@ pub const Mood = enum {
 
     /// Color of the face. ANSI indexes: a small status line reads better with
     /// terminal colors than with truecolor.
-    /// El color del mood como lo espera `vaxis.Style` (no como índice suelto).
-    /// El status lo usa para pintar la carita, y el color ES la señal de "está
-    /// pensando / esperando permiso /.colgado", así que tiene que salir bien
-    /// sin que quien pinta tenga que acordarse del índice.
+    /// The mood's color the way `vaxis.Style` wants it (not as a bare index).
+    /// The status line uses it to paint the face, and the color IS the signal for
+    /// "thinking / waiting for permission / hung", so it has to come out right
+    /// without whoever paints having to remember the index.
     pub fn vaxisColor(self: Mood) vaxis.Cell.Color {
         return .{ .index = self.color() };
     }
@@ -33,15 +33,16 @@ pub const Mood = enum {
     }
 };
 
-/// Zo's face for a mood: la carita del status bar y de la franja de actividad.
+/// Zo's face for a mood: the little face in the status bar and in the activity
+/// strip.
 ///
-/// Los paréntesis son el marco y dentro van los dos ojos (o la boca, en
-/// `tooling`). Solo vive en el status bar, que es donde tiene que ser legible
-/// sin ocupar filas de la cabecera.
+/// The parentheses are the frame, and inside them go the two eyes (or the mouth,
+/// in `tooling`). It only lives in the status bar, which is where it has to be
+/// legible without eating rows of the header.
 ///
-/// SIN ESPACIOS dentro: el test del status recorre los graphemes de la carita
-/// buscándolos en la fila, y un espacio casa con cualquier hueco de la pantalla
-/// (y sale del color equivocado, que es el estilo que el test comprueba).
+/// NO SPACES inside: the status test walks the face's graphemes looking for
+/// them in the row, and a space matches any gap on screen (and comes out in the
+/// wrong color, which is the style the test checks).
 pub fn face(mood: Mood) []const u8 {
     return switch (mood) {
         .idle => "(◕◕)",
@@ -53,33 +54,31 @@ pub fn face(mood: Mood) []const u8 {
     };
 }
 
-/// ## Por qué ASCII PURO y no letras de cajetín
+/// ## Why PURE ASCII instead of box-drawing letters
 ///
-/// Se intentó dos veces con `█ ╗ ╝ ═ ║` (estilo figlet "big") y las dos
-/// salieron mal. La última se veía en la pty de pruebas como un ZODE
-/// perfecto y en la terminal del usuario como una mancha con relieve que no
-/// se leia como nada.
+/// It was tried twice with `█ ╗ ╝ ═ ║` (figlet "big" style) and both came out
+/// wrong. The last one looked like a perfect ZODE in the test pty and like a
+/// blurry relief in the user's terminal, reading as nothing at all.
 ///
-/// El motivo: un art de cajetin depende de CÓMO dibuja la fuente el bloque
-/// completo. Con un doble ancho, con un sustituto de la terminal o con una
-/// fuente de relleno raro, los trazos se ensanchan y se solapan, y lo que
-/// era una letra se convierte en un borron. `#` es un caracter ASCII normal
-/// y se ve igual en todas partes.
+/// The reason: a box-drawing art piece depends on HOW the font draws the full
+/// block. With a double-width cell, with a terminal substitute, or with a weird
+/// fallback font, the strokes widen and overlap, and what was a letter turns
+/// into a smudge. `#` is a normal ASCII character and looks the same
+/// everywhere.
 ///
-/// ## Por qué se COMPONE en comptime y no escrito a mano
+/// ## Why it is COMPOSED in comptime instead of written by hand
 ///
-/// Las cuatro letras son cajas de 6 columnas separadas por un espacio, y el
-/// relleno de cada fila se calcula con `glyphCols` (columnas, no bytes: cada
-/// `█` eran 3 bytes y el relleno salia con underflow). Escrito a mano el
-/// relleno se pierde, porque los editores recortan los espacios al final de
-/// la linea, y las filas dejan de caer en las mismas columnas: los trazos no
-/// alinean y el nombre se lee como ruido. Editar el banner es editar la
-/// tabla de glifos, no medir filas a ojo. `banner_art_width` es la
-/// asercion y la comprueba el test del TUI.
+/// The four letters are 6-column boxes separated by a space, and the padding of
+/// each row is computed with `glyphCols` (columns, not bytes: each `█` is 3
+/// bytes and the padding came out with an underflow). Written by hand the
+/// padding gets lost, because editors strip trailing spaces, and the rows stop
+/// landing on the same columns: the strokes don't line up and the name reads as
+/// noise. Editing the banner means editing the glyph table, not measuring rows
+/// by eye. `banner_art_width` is the assertion, and the TUI test checks it.
 ///
-/// Los espacios van DENTRO del literal de la glifo, nunca al final del
-/// archivo: dentro de `"..."` sobreviven al editor aunque la linea termine
-/// en `",`.
+/// The spaces go INSIDE the glyph literal, never at the end of the file:
+/// inside `"..."` they survive the editor even if the line ends
+/// with `",`.
 const glyph_z = [_][]const u8{
     "######",
     "##  ##",
@@ -109,14 +108,14 @@ const glyph_e = [_][]const u8{
     "######",
 };
 
-/// Columnas de un fragmento de art, no bytes.
+/// Columns of an art fragment, not bytes.
 ///
-/// En el art del banner todo es de ancho 1 (`#` y espacio), asi que contar
-/// codepoints ES contar columnas. Con `str.len` el relleno a la derecha
-/// salia mal.
+/// In the banner art everything is width 1 (`#` and space), so counting
+/// codepoints IS counting columns. With `str.len` the right padding
+/// came out wrong.
 pub fn glyphCols(s: []const u8) usize {
-    // El iterador de UTF-8 da un salto por byte y se pasa del presupuesto de
-    // 1000 branches. Se sube solo aqui.
+    // The UTF-8 iterator branches once per byte and blows past the
+    // 1000 branch quota. Raise it here only.
     @setEvalBranchQuota(10_000);
     const view = std.unicode.Utf8View.initUnchecked(s);
     var it = view.iterator();
@@ -125,7 +124,7 @@ pub fn glyphCols(s: []const u8) usize {
     return n;
 }
 
-/// El wordmark, en orden, con su anchura en columnas.
+/// The wordmark, in order, with its width in columns.
 const wordmark = [_]struct { rows: []const []const u8, w: usize }{
     .{ .rows = &glyph_z, .w = 6 },
     .{ .rows = &glyph_o, .w = 6 },
@@ -133,23 +132,23 @@ const wordmark = [_]struct { rows: []const []const u8, w: usize }{
     .{ .rows = &glyph_e, .w = 6 },
 };
 
-/// Cuantas filas tiene el wordmark (una por letra de alto).
+/// How many rows the wordmark has (one per letter height).
 pub const banner_art_height = 5;
 
-/// Columnas del wordmark: 4 cajas de 6 con UN espacio de separacion.
+/// Columns of the wordmark: 4 boxes of 6 with ONE separating space.
 pub const banner_art_width = 4 * 6 + 3;
 
-/// Ensambla la fila `r` del wordmark: los huecos fijos de las letras.
+/// Assemble row `r` of the wordmark: the fixed gaps between the letters.
 fn bannerRow(comptime r: usize) []const u8 {
     comptime var out: []const u8 = "";
     inline for (wordmark, 0..) |letter, i| {
         if (i > 0) out = out ++ " ";
-        // Relleno por la DERECHA hasta la anchura de la caja. La última letra
-        // no lo necesita: el trailing space no se vería, y la fila se mide
-        // contra `banner_art_width` con un `@min`.
+        // Pad on the RIGHT up to the box width. The last letter
+        // doesn't need it: the trailing space wouldn't be visible, and the row
+        // is measured against `banner_art_width` with a `@min`.
         if (i + 1 < wordmark.len) {
-            // OJO: `.len` son BYTES y cada `█` son 3, así que el relleno se
-            // calcula en COLUMNAS. Con bytes salía un `underflow` en comptime.
+            // CAREFUL: `.len` is BYTES and each `█` is 3, so the padding is
+            // computed in COLUMNS. With bytes it raised an `underflow` at comptime.
             const missing = letter.w - glyphCols(letter.rows[r]);
             const filler = " " ** missing;
             out = out ++ letter.rows[r] ++ filler;
@@ -162,28 +161,28 @@ fn bannerRow(comptime r: usize) []const u8 {
 
 /// Welcome banner for the TUI startup.
 ///
-/// SOLO el wordmark. La cabecera se queja de "basura en la vista", y el usuario
-/// tiene razón: una mascota de 18 filas, una línea de saludo y otra de atajos
-/// son 20 filas de cabecera antes de la primera palabra del chat. Esto es lo
-/// que se pidió literalmente ("solo coloca arriba ZODE y listo"), y es el
-///-banner que había antes de meter a Houston (ver AGENTS.md, v4).
+/// ONLY the wordmark. The header was complained about as "junk in the view",
+/// and the user was right: an 18-row mascot, a greeting line and a shortcuts
+/// line are 20 header rows before the first word of the chat. This is what was
+/// literally asked for ("just put ZODE up there and that's it"), and it is the
+///-banner that was there before Houston showed up (see AGENTS.md, v4).
 ///
-/// El art va en un solo bloque a propósito: partido en párrafos, la línea más
-/// ancha manda en el ajuste de todos ellos.
+/// The art goes in a single block on purpose: split into paragraphs, the
+/// widest line dictates the wrapping of all of them.
 pub const banner = bannerRow(0) ++ "\n" ++
     bannerRow(1) ++ "\n" ++
     bannerRow(2) ++ "\n" ++
     bannerRow(3) ++ "\n" ++
     bannerRow(4);
 
-/// Dos fotogramas de la cara para la franja de actividad.
+/// Two frames of the face for the activity strip.
 ///
-/// La mascotita tiene que MOVERSE mientras el modelo trabaja: es la unica
-/// señal de que la app esta viva cuando el stream va lento. Un icono estatico
-/// no dice si esta pensando o colgado.
+/// The little mascot has to MOVE while the model works: it is the only
+/// signal that the app is alive when the stream is slow. A static icon
+/// doesn't say whether it's thinking or hung.
 ///
-/// El segundo fotograma es el mismo visor con un ojo entornado (`◔`), que con
-/// los dos abiertos (`◕`) alternando se lee como un parpadeo.
+/// The second frame is the same face with one eye squinted (`◔`), and alternating
+/// it with both eyes open (`◕`) reads as a blink.
 pub fn faceFrames(mood: Mood, frame: u64) []const u8 {
     const odd = frame % 2 == 1;
     return switch (mood) {

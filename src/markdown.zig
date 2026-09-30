@@ -5,7 +5,7 @@ const theme = @import("theme.zig");
 
 pub const Style = vaxis.Style;
 
-/// Segmento de texto con estilo: la unidad de render del historial.
+/// Text segment with style: the render unit of the history.
 pub const Segment = struct {
     text: []const u8,
     style: Style,
@@ -16,22 +16,22 @@ pub const Kind = enum {
     assistant,
     info,
     tool,
-    /// Línea de cabecera de una tool en curso: "⏺ Read(src/tui.zig)"
+    /// Header line of a running tool: "⏺ Read(src/tui.zig)"
     tool_run,
-    /// Línea de resultado de una tool: "⎿  Read 1006 lines · 3ms"
+    /// Result line of a tool: "⎿  Read 1006 lines · 3ms"
     tool_res,
-    /// Diff unificado: líneas con `+`/`-`/` ` (coloreadas por el prefijo).
+    /// Unified diff: lines with `+`/`-`/` ` (colored by prefix).
     diff,
-    /// Bloque de cabecera (banner del búho + línea de Zo). Azul de marca en vez
-    /// del gris de `.info`, y con `*texto*` pinta en el brillo del wordmark.
+    /// Header block (owl banner + Zo's line). Brand blue instead of
+    /// `.info`'s gray, and with `*text*` it paints in the wordmark's brightness.
     banner,
     error_msg,
     code,
     separator,
 };
 
-/// Bloque visual del historial: ya parseado y con estilos.
-/// `lines` son segmentos por línea SIN wrap (el wrap es en el draw).
+/// Visual block of the history: already parsed and styled.
+/// `lines` are segments per line WITHOUT wrap (wrapping happens in the draw).
 pub const Block = struct {
     kind: Kind,
     lines: []const []const Segment,
@@ -42,41 +42,42 @@ const styles = struct {
     fn fg(idx: u8) Style {
         return .{ .fg = .{ .index = idx } };
     }
-    const user_prefix = fg(4); // azul
+    const user_prefix = fg(4); // blue
     const user_text = Style{};
     const asst_prefix = fg(5); // magenta
     const asst_text = Style{};
-    const info = fg(8); // gris
+    const info = fg(8); // gray
     const tool = fg(6); // cyan
     const tool_bold: Style = .{ .bold = true, .fg = .{ .index = 6 } };
-    const tool_res = fg(8); // el resultado va atenuado
-    // El resumen de la tool va en NEGRITA de verdad. Antes era idéntico a
-    // `tool_res` (mismo índice, sin `.bold`), así que el "dos tonos" que se
-    // describe en AGENTS.md era un no-op: `*write*(hola.js) · *3ms*` salía
-    // entero del mismo gris.
+    const tool_res = fg(8); // the result goes dimmed
+    // The tool summary goes in REAL BOLD. Before it was identical to
+    // `tool_res` (same index, no `.bold`), so the "two tones" described in
+    // AGENTS.md was a no-op: `*write*(hola.js) · *3ms*` came out entirely in
+    // the same gray.
     const tool_res_bold: Style = .{ .bold = true, .fg = .{ .index = 8 } };
-    const diff_add = fg(2); // verde
-    const diff_del = fg(1); // rojo
-    const diff_ctx = fg(8); // gris
-    const err = fg(1); // rojo
-    // Cabecera: el búho va en el color de marca y el wordmark un tono por
-    // encima, para que el logo se lea encendido contra el arte.
-    // Son los tres azules de `theme.zig`; se repiten aquí porque este módulo
-    // no depende de la TUI (lo usan los tests de markdown solos).
+    const diff_add = fg(2); // green
+    const diff_del = fg(1); // red
+    const diff_ctx = fg(8); // gray
+    const err = fg(1); // red
+    // Header: the owl goes in the brand color and the wordmark one tone
+    // above, so the logo reads lit against the art.
+    // These are the three blues from `theme.zig`; they are repeated here
+    // because this module does not depend on the TUI (markdown's tests use it
+    // on its own).
     const banner: Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // brand
     const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } }; // brand_hi
     const heading = Style{ .bold = true, .fg = .{ .index = 4 } };
     const bold = Style{ .bold = true };
-    const inline_code = Style{ .fg = .{ .index = 3 } }; // amarillo
+    const inline_code = Style{ .fg = .{ .index = 3 } }; // yellow
     const sep = fg(8);
 };
 
-/// Parsea texto (posible markdown) a bloques. Memoria: arena.
+/// Parses text (possibly markdown) into blocks. Memory: arena.
 pub fn parse(arena: std.mem.Allocator, kind: Kind, text: []const u8) ![]Block {
     return parseBase(arena, kind, text, null, null);
 }
 
-/// `parse` con estilo base impuesto (ver `inlineSegmentsBase`).
+/// `parse` with an imposed base style (see `inlineSegmentsBase`).
 pub fn parseBase(
     arena: std.mem.Allocator,
     kind: Kind,
@@ -87,11 +88,11 @@ pub fn parseBase(
     return parseLang(arena, kind, text, base_override, mood_style, "");
 }
 
-/// Como `parseBase` pero sabiendo en qué LENGUAJE está el contenido.
+/// Like `parseBase` but knowing which LANGUAGE the content is in.
 ///
-/// Ahora mismo solo lo usa el diff: sin la extensión del fichero no se puede
-/// tokenizar el cuerpo de una línea (`+const x: u32 = 4`) y sale entero del
-/// color del prefijo, que es el muro verde que había.
+/// Right now only the diff uses it: without the file extension the body of a
+/// line (`+const x: u32 = 4`) cannot be tokenized and comes out entirely in the
+/// prefix color, which is the green wall that used to be there.
 pub fn parseLang(
     arena: std.mem.Allocator,
     kind: Kind,
@@ -107,8 +108,8 @@ pub fn parseLang(
     var in_code = false;
     var code_lang: []const u8 = "";
     var code_lines: std.ArrayList([]const Segment) = .empty;
-    // Estado del highlighter entre líneas (strings y comentarios de bloque
-    // sin cerrar). Se reinicia al abrir cada fence.
+    // Highlighter state carried across lines (unclosed strings and block
+    // comments). Reset every time a fence opens.
     var code_state = hl.State{};
 
     var it = std.mem.splitScalar(u8, text, '\n');
@@ -126,7 +127,7 @@ pub fn parseLang(
                 code_lines = .empty;
                 in_code = false;
             } else {
-                // cerrar bloque inline pendiente
+                // close the pending inline block
                 if (inline_lines.items.len > 0) {
                     try blocks.append(arena, .{
                         .kind = kind,
@@ -137,17 +138,17 @@ pub fn parseLang(
                 in_code = true;
                 const trimmed = std.mem.trimStart(u8, line, " ");
                 code_lang = if (trimmed.len > 3) trimmed[3..] else "";
-                // Cada fence arranca sin estado: lo que quedó abierto en el
-                // bloque anterior no se arrastra.
+                // Every fence starts with no state: whatever stayed open in
+                // the previous block is not carried over.
                 code_state = .{};
             }
             continue;
         }
 
         if (in_code) {
-            // El estado se lleva ENTRE LÍNEAS del bloque: sin esto un `\` de
-            // Zig o una comilla sin cerrar hacían que la línea siguiente
-            // saliera de verde entera, y a veces el resto del fichero.
+            // The state is carried ACROSS LINES of the block: without this a
+            // Zig `\` or an unclosed quote made the next line come out entirely
+            // green, and sometimes the rest of the file with it.
             const segs = hl.highlightLineState(arena, line, code_lang, &code_state) catch
                 try arena.alloc(Segment, 0);
             try code_lines.append(arena, segs);
@@ -156,10 +157,10 @@ pub fn parseLang(
 
         // headings
         //
-        // OJO: el banner de inicio se salta esto. Su arte empieza por `##`
-        // (relleno de `#` de un ASCII art) y TODAS sus filas se comían como
-        // encabezados: el logo salía como "####  ####  *zode*". El banner no
-        // es prosa, es un dibujo: no se le busca estructura de markdown.
+        // CAREFUL: the startup banner skips this. Its art starts with `##`
+        // (`#` fill of ASCII art) and ALL of its rows were eaten as headings:
+        // the logo came out as "####  ####  *zode*". The banner is not prose,
+        // it is a drawing: do not look for markdown structure in it.
         if (kind != .banner) {
             const trimmed = std.mem.trimStart(u8, line, " ");
             if (trimmed.len >= 2 and trimmed[0] == '#' and (trimmed[1] == ' ' or trimmed[1] == '#')) {
@@ -175,12 +176,12 @@ pub fn parseLang(
             }
         }
 
-        // El diff necesita el LENGUAJE del fichero para tokenizar el cuerpo; el
-        // resto de kinds lo ignoran (se les pasa "").
+        // The diff needs the file's LANGUAGE to tokenize the body; the other
+        // kinds ignore it (they are passed "").
         const line_lang: []const u8 = if (kind == .diff) diff_lang else "";
         try inline_lines.append(arena, try inlineSegmentsLang(arena, line, kind, base_override, mood_style, line_lang));
     }
-    // código pendiente sin cierre
+    // pending code without a closing fence
     if (in_code and code_lines.items.len > 0) {
         try blocks.append(arena, .{
             .kind = .code,
@@ -188,7 +189,7 @@ pub fn parseLang(
             .lang = code_lang,
         });
     }
-    // texto pendiente
+    // pending text
     if (inline_lines.items.len > 0) {
         try blocks.append(arena, .{
             .kind = kind,
@@ -198,7 +199,7 @@ pub fn parseLang(
     return blocks.toOwnedSlice(arena);
 }
 
-/// Estilo base según kind para texto sin formato especial.
+/// Base style per kind for text with no special formatting.
 fn baseStyle(kind: Kind) Style {
     return switch (kind) {
         .user => styles.user_text,
@@ -212,17 +213,17 @@ fn baseStyle(kind: Kind) Style {
     };
 }
 
-/// Una línea de diff unificada: prefijo por su color + el resto POR TOKENS.
+/// One unified diff line: prefix in its own color + the rest BY TOKENS.
 ///
-/// Antes era UN solo segmento de toda la línea con `diff_add`, que es un verde
-/// sólido (#00cd00). Escribir un fichero de 200 líneas daba 200 filas verde
-/// plano: no se distinguía una string de un número de un tipo, y además ese
-/// verde era el MISMO que el de las strings del código (`highlight.zig`), así
-/// que "verde" no significaba nada.
+/// Before it was a SINGLE segment for the whole line with `diff_add`, which is a
+/// solid green (#00cd00). Writing a 200-line file gave 200 flat green rows: you
+/// could not tell a string from a number from a type, and on top of that that
+/// green was the SAME one used for code strings (`highlight.zig`), so "green"
+/// did not mean anything.
 ///
-/// Ahora el prefijo `+`/`-`/` ` va con su color y el cuerpo pasa por el
-/// highlighter con `lang`, que es lo que hace legible un diff: los números se
-/// ven números y los identificadores en Pascal se ven tipos.
+/// Now the `+`/`-`/` ` prefix goes with its own color and the body goes through
+/// the highlighter with `lang`, which is what makes a diff readable: numbers
+/// look like numbers and Pascal identifiers look like types.
 fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![]Segment {
     if (line.len == 0) {
         const segs = try arena.alloc(Segment, 1);
@@ -232,20 +233,20 @@ fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![
     const pre_style: Style = switch (line[0]) {
         '+' => theme.diff_add,
         '-' => theme.diff_del,
-        '@' => styles.heading, // cabecera @@ hunk @@
+        '@' => styles.heading, // @@ hunk @@ header
         else => theme.diff_ctx,
     };
-    // `@@ … @@` es una cabecera de hunk, no código: entero del color del heading.
+    // `@@ … @@` is a hunk header, not code: entirely in the heading color.
     if (line[0] == '@') {
         const segs = try arena.alloc(Segment, 1);
         segs[0] = .{ .text = line, .style = pre_style };
         return segs;
     }
 
-    // El prefijo (`+`, `-` o el espacio de contexto) es un segmento propio, y
-    // el resto se tokeniza. El espacio de contexto NO se incluye en el cuerpo
-    // que va al highlighter: si no, el lenguaje no reconocería nada hasta el
-    // primer carácter real.
+    // The prefix (`+`, `-` or the context space) is a segment of its own, and
+    // the rest is tokenized. The context space is NOT included in the body that
+    // goes to the highlighter: otherwise the language would recognize nothing
+    // until the first real character.
     const lead: usize = if (line[0] == '+' or line[0] == '-')
         1
     else if (line[0] == ' ')
@@ -260,10 +261,10 @@ fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![
     if (body.len > 0) {
         const toks = try hl.highlightLine(arena, body, lang);
         for (toks) |t| {
-            // Los tokens del highlight traen sus propios colores; el prefijo
-            // del diff ya va aparte. Para el contexto (líneas ` `) sí se
-            // atenúa el cuerpo, que si no el diff de un fichero entero sale
-            // con el mismo contraste que las líneas cambiadas.
+            // The highlight tokens bring their own colors; the diff prefix
+            // already goes separately. For the context (` ` lines) the body IS
+            // dimmed, because otherwise the diff of a whole file comes out with
+            // the same contrast as the changed lines.
             var st = t.style;
             if (lead == 0 or (lead == 1 and line[0] == ' ')) {
                 st = theme.diff_ctx;
@@ -274,25 +275,25 @@ fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![
     return out.toOwnedSlice(arena);
 }
 
-/// Tope de líneas por fichero para el diff.
+/// Line cap per file for the diff.
 ///
-/// `unifiedDiff` es LCS O(n·m) por líneas y la tabla son (n+1)·(m+1) `usize`: un
-/// par de ficheros de 10 000 líneas son 800 MB de tabla. Por encima de este
-/// tope no se calcula el diff: se enseña un aviso. Es degradación, no error.
+/// `unifiedDiff` is line-wise LCS O(n·m) and the table is (n+1)·(m+1) `usize`: a
+/// pair of 10 000-line files is 800 MB of table. Above this cap the diff is not
+/// computed: a notice is shown instead. That is degradation, not an error.
 pub const max_diff_lines = 2000;
 
-/// Construye un diff unificado (simplificado) entre dos textos.
-/// Algoritmo LCS por líneas: O(n*m), suficiente para ediciones de código
-/// donde los bloques son cientos de líneas (y con `max_diff_lines` hay tope).
+/// Builds a (simplified) unified diff between two texts.
+/// Line-wise LCS algorithm: O(n*m), enough for code edits where the blocks are
+/// hundreds of lines (and `max_diff_lines` puts a cap on it).
 ///
-/// Devuelve un slice de arena con líneas ya prefijadas con ' ', '+' o '-'.
+/// Returns an arena slice whose lines are already prefixed with ' ', '+' or '-'.
 pub fn unifiedDiff(arena: std.mem.Allocator, before: []const u8, after: []const u8) ![]const []const u8 {
     var old_lines: std.ArrayList([]const u8) = .empty;
     var new_lines: std.ArrayList([]const u8) = .empty;
     try splitLines(arena, before, &old_lines);
     try splitLines(arena, after, &new_lines);
 
-    // Tabla LCS (n+1) x (m+1) de usize.
+    // LCS table (n+1) x (m+1) of usize.
     const n = old_lines.items.len;
     const m = new_lines.items.len;
     if (n > max_diff_lines or m > max_diff_lines) {
@@ -344,23 +345,23 @@ fn prefixed(arena: std.mem.Allocator, p: u8, line: []const u8) ![]const u8 {
     return buf;
 }
 
-/// Parte en líneas ignorando el salto final: "a\nb\n" son 2 líneas, no 3.
-/// (Si no, un fichero terminado en \n genera una línea vacía espuria en el diff.)
+/// Splits into lines ignoring the final newline: "a\nb\n" is 2 lines, not 3.
+/// (Otherwise a file ending in \n produces a spurious empty line in the diff.)
 fn splitLines(arena: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
     const body = if (std.mem.endsWith(u8, text, "\n")) text[0 .. text.len - 1] else text;
     var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |l| try out.append(arena, l);
 }
 
-/// Segmentos inline: **bold**, `code`, y texto normal.
-/// Segmentos inline de una línea. `pub` para que los tests de la TUI
-/// puedan comprobar el reparto de estilos del banner.
+/// Inline segments: **bold**, `code`, and plain text.
+/// Inline segments of one line. `pub` so the TUI tests can check the
+/// style layout of the banner.
 pub fn inlineSegments(arena: std.mem.Allocator, line: []const u8, kind: Kind) ![]Segment {
     return inlineSegmentsBase(arena, line, kind, null, null);
 }
 
-/// Igual que `inlineSegments` pero con un estilo base imposed por el llamante
-/// (la TUI lo usa para pintar la carita de Zo con el color de su mood).
+/// Same as `inlineSegments` but with a base style imposed by the caller
+/// (the TUI uses it to paint Zo's face in the color of its mood).
 pub fn inlineSegmentsBase(
     arena: std.mem.Allocator,
     line: []const u8,
@@ -371,11 +372,11 @@ pub fn inlineSegmentsBase(
     return inlineSegmentsLang(arena, line, kind, base_override, mood_style, "");
 }
 
-/// Como `inlineSegmentsBase` pero con el LENGUAJE de la línea.
+/// Like `inlineSegmentsBase` but with the line's LANGUAGE.
 ///
-/// Hace falta para el diff: el prefijo va con su color y el cuerpo se tokeniza
-/// como código, así que hay que saber en qué lenguaje está el fichero que se
-/// edita. Para el resto de kinds el idioma da igual.
+/// Needed for the diff: the prefix goes with its own color and the body is
+/// tokenized as code, so you have to know which language the file being edited
+/// is in. For the other kinds the language does not matter.
 pub fn inlineSegmentsLang(
     arena: std.mem.Allocator,
     line: []const u8,
@@ -386,19 +387,20 @@ pub fn inlineSegmentsLang(
 ) ![]Segment {
     if (kind == .diff) return diffSegments(arena, line, lang);
 
-    // Cabecera: `*zode*` y `*─────*` brillan dentro del arte del búho. Con
-    // esto el brillo cae DENTRO del dibujo en vez de pintar una línea entera,
-    // que es lo que hace que el ASCII art parezca un logo y no un bloque.
+    // Header: `*zode*` and `*─────*` glow inside the owl's art. With this the
+    // glow lands INSIDE the drawing instead of painting a whole line, which is
+    // what makes the ASCII art look like a logo and not a block.
     if (kind == .banner and
         (std.mem.indexOfScalar(u8, line, '*') != null or std.mem.indexOfScalar(u8, line, '~') != null))
     {
         return markedSegments(arena, line, styles.banner, styles.banner_bold, mood_style orelse styles.banner);
     }
 
-    // Las tools usan la MISMA marca `*…*` para partir el nombre del resto:
-    // `write(hola.js)` sale entero del mismo color y no se distingue la tool de
-    // su argumento. Con `*write* (hola.js)` el nombre va en el color fuerte y
-    // el argumento en el apagado, que es como lo lee el ojo de un vistazo.
+    // Tools use the SAME `*…*` marker to split the name off the rest:
+    // `write(hola.js)` comes out entirely in one color and you cannot tell the
+    // tool from its argument. With `*write* (hola.js)` the name goes in the
+    // strong color and the argument in the dimmed one, which is how the eye
+    // reads it at a glance.
     if (kind == .tool_run and std.mem.indexOfScalar(u8, line, '*') != null) {
         return markedSegments(arena, line, styles.tool, styles.tool_bold, styles.tool);
     }
@@ -445,15 +447,17 @@ pub fn inlineSegmentsLang(
     return segs.toOwnedSlice(arena);
 }
 
-/// Parte la línea por marcas y pinta cada tramo con su estilo.
+/// Splits the line on markers and paints each span with its style.
 ///
-/// Hay DOS tipos de marca porque el logo es fijo y el color de Zo no:
-///   `*…*`  → `hi` (el wordmark, siempre el mismo azul claro)
-///   `~…~`  → `mood` (lo que pase el llamante: el color del estado de Zo)
+/// There are TWO kinds of marker because the logo is fixed and Zo's color is
+/// not:
+///   `*…*`  → `hi` (the wordmark, always the same light blue)
+///   `~…~`  → `mood` (whatever the caller passes: the color of Zo's mood)
 ///
-/// Las marcas se QUITAN del texto de salida (son marcas, no contenido), así que
-/// quien llama ve el texto limpio mientras el dibujo sale con varios colores.
-/// Una marca sin pareja se trata como texto normal, para no perder caracteres.
+/// The markers are STRIPPED from the output text (they are markers, not
+/// content), so the caller sees clean text while the drawing comes out in
+/// several colors. An unpaired marker is treated as normal text, so no
+/// character is ever lost.
 fn markedSegments(
     arena: std.mem.Allocator,
     line: []const u8,
@@ -487,20 +491,21 @@ fn markedSegments(
     return segs.toOwnedSlice(arena);
 }
 
-/// Busca `needle` en `line` desde `from`; devuelve el índice de inicio si está.
+/// Searches for `needle` in `line` starting at `from`; returns its start index
+/// if found.
 fn constClose(line: []const u8, from: usize, needle: []const u8) ?usize {
     const rel = std.mem.indexOfPos(u8, line, from, needle) orelse return null;
     return rel;
 }
 
-/// Prefijos de prompt por kind (se dibujan en la primera línea del bloque).
+/// Prompt prefixes per kind (they are drawn on the first line of the block).
 pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
     return switch (kind) {
         .user => .{ .text = "› ", .style = styles.user_prefix },
         .assistant => .{ .text = "◆ ", .style = styles.asst_prefix },
         .info => .{ .text = "· ", .style = styles.info },
         .tool => .{ .text = "⚙ ", .style = styles.tool },
-        // Tool calls estilo Claude Code: cabecera y resultado con guiones.
+        // Claude Code style tool calls: header and result with dashes.
         .tool_run => .{ .text = "⏺ ", .style = styles.tool_bold },
         .tool_res => .{ .text = "⎿  ", .style = styles.tool_res },
         .diff => .{ .text = "", .style = styles.diff_ctx },
@@ -517,14 +522,14 @@ pub fn infoStyle() Style {
     return styles.info;
 }
 
-// test básico
+// basic test
 test "parse markdown básico" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const blocks = try parse(arena, .assistant, "# Titulo\nHola **mundo** con `code`\n```zig\nconst x = 1;\n```\nfin");
-    // bloque 1: heading + línea inline (2 líneas)
+    // block 1: heading + inline line (2 lines)
     try std.testing.expect(blocks.len >= 3);
     try std.testing.expectEqual(Kind.code, blocks[1].kind);
 }
@@ -579,7 +584,7 @@ test "diffSegments: el prefijo va con su color y el cuerpo POR TOKENS" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // El prefijo es su propio segmento...
+    // The prefix is a segment of its own...
     const add = try inlineSegments(arena, "+nuevo", .diff);
     try std.testing.expectEqualStrings("+", add[0].text);
     try std.testing.expectEqual(theme.diff_add.fg, add[0].style.fg);
@@ -592,7 +597,7 @@ test "diffSegments: el prefijo va con su color y el cuerpo POR TOKENS" {
     try std.testing.expectEqualStrings(" ", ctx[0].text);
     try std.testing.expectEqual(theme.diff_ctx.fg, ctx[0].style.fg);
 
-    // ...y el texto NO se pierde nunca: invariante del módulo.
+    // ...and the text is NEVER lost: module invariant.
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(std.testing.allocator);
     for (add) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
@@ -600,10 +605,10 @@ test "diffSegments: el prefijo va con su color y el cuerpo POR TOKENS" {
 }
 
 test "una línea + del diff lleva tokens, no un segmento verde" {
-    // El muro verde: `+const n: u32 = 42` era UN segmento con `diff_add`. Ahora
-    // el prefijo va con su color y el cuerpo se tokeniza, así que `const` es
-    // keyword, `u32` un tipo y `42` un número. Es lo que hace legible un diff
-    // sin abrir el fichero.
+    // The green wall: `+const n: u32 = 42` was ONE segment with `diff_add`. Now
+    // the prefix goes with its own color and the body is tokenized, so `const`
+    // is a keyword, `u32` a type and `42` a number. That is what makes a diff
+    // readable without opening the file.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -618,11 +623,11 @@ test "una línea + del diff lleva tokens, no un segmento verde" {
     const num = findDiffSeg(segs, "42") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(theme.code_num.fg, num.style.fg);
 
-    // Y el prefijo conserva su verde de diff, que es DISTINTO del verde de las
-    // strings del código (antes ambos eran `index 2`).
+    // And the prefix keeps its diff green, which is DISTINCT from the green of
+    // the code strings (before, both were `index 2`).
     try std.testing.expect(!std.meta.eql(theme.diff_add.fg, theme.code_str.fg));
 
-    // Invariante: se conserva cada byte.
+    // Invariant: every byte is preserved.
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(std.testing.allocator);
     for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
@@ -637,8 +642,8 @@ fn findDiffSeg(segs: []const Segment, needle: []const u8) ?Segment {
 }
 
 test "el diff sin saber el lenguaje sale plano pero conserva el prefijo" {
-    // Con `lang = ""` cae en el `generic`, que ahora tiene tabla: no es un
-    // muro verde, pero tampoco inventa colores.
+    // With `lang = ""` it falls back to `generic`, which now has a table: it is
+    // not a green wall, but it does not invent colors either.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -653,10 +658,10 @@ test "el diff sin saber el lenguaje sale plano pero conserva el prefijo" {
 }
 
 test "un banner que empieza por ## NO se come como encabezado" {
-    // El art del banner usa `#` como relleno y TODAS sus filas empiezan por
-    // `##`, así que el parser las interpretaba como encabezados markdown y
-    // devolvía "####  ####  *zode*" en vez del dibujo entero. El banner es un
-    // dibujo, no prosa: no se le busca estructura.
+    // The banner art uses `#` as fill and ALL of its rows start with `##`, so
+    // the parser interpreted them as markdown headings and returned
+    // "####  ####  *zode*" instead of the whole drawing. The banner is a
+    // drawing, not prose: do not look for structure in it.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -669,8 +674,8 @@ test "un banner que empieza por ## NO se come como encabezado" {
     for (segs) |seg| try text.appendSlice(std.testing.allocator, seg.text);
     try std.testing.expectEqualStrings("######  ####   ######", text.items);
 
-    // Y el resto de tipos SIGUE interpretando los encabezados: el arreglo es
-    // para `.banner`, no una desactivar general.
+    // And the other kinds STILL interpret headings: the fix is for `.banner`,
+    // not a general deactivation.
     const h = try parseBase(arena, .info, "## un titulo", null, null);
     var ht: std.ArrayList(u8) = .empty;
     defer ht.deinit(std.testing.allocator);
@@ -683,12 +688,13 @@ test "unifiedDiff: por encima del tope no se calcula el LCS (sería O(n*m))" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Con el tope normal el diff se calcula.
+    // With the normal cap the diff is computed.
     const small = try unifiedDiff(arena, "a\nb\n", "a\nc\n");
     try std.testing.expectEqual(@as(usize, 3), small.len);
     try std.testing.expectEqualStrings("-b", small[1]);
 
-    // Por encima del tope sale el aviso, y sale RÁPIDO: sin la tabla de 4000x4000.
+    // Above the cap the notice comes out, and it comes out FAST: without the
+    // 4000x4000 table.
     var big_a: std.ArrayList(u8) = .empty;
     var big_b: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -706,16 +712,17 @@ test "tool_res_bold es bold DE VERDAD (el 'dos tonos' no era un no-op)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // El resumen de la tool (`*3ms*`) tiene que salir en negrita; antes
-    // `tool_res_bold` era idéntico a `tool_res` (mismo índice, sin `.bold`) y
-    // el "dos tonos" de las tools no pintaba nada.
+    // The tool summary (`*3ms*`) has to come out in bold; before,
+    // `tool_res_bold` was identical to `tool_res` (same index, no `.bold`) and
+    // the tools' "two tones" painted nothing.
     const segs = try inlineSegments(arena, "*3ms*", .tool_res);
     try std.testing.expectEqual(@as(usize, 1), segs.len);
     try std.testing.expect(segs[0].style.bold);
     try std.testing.expectEqual(styles.tool_res_bold.fg, segs[0].style.fg);
     try std.testing.expectEqualStrings("3ms", segs[0].text);
 
-    // Y el texto SIN marcar sale apagado y SIN bold: los dos tonos existen.
+    // And the UNMARKED text comes out dimmed and WITHOUT bold: the two tones
+    // exist.
     const plain = try inlineSegments(arena, "salida", .tool_res);
     try std.testing.expect(!plain[0].style.bold);
     try std.testing.expectEqual(styles.tool_res.fg, plain[0].style.fg);

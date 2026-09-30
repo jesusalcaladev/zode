@@ -2,10 +2,10 @@ const std = @import("std");
 const chat = @import("chat.zig");
 const zjsonl = @import("zjsonl.zig");
 
-/// Un mensaje de la conversación. Diseño eficiente:
-/// - `content` es el texto plano (lo que entra y sale del LLM).
-/// - Para assistant con tool_calls guardamos el JSON crudo del server
-///   (`tool_calls_json`): el replay es byte-idéntico sin re-serializar.
+/// A conversation message. Efficient design:
+/// - `content` is the plain text (what goes in and out of the LLM).
+/// - For an assistant with tool_calls we store the raw JSON from the server
+///   (`tool_calls_json`): the replay is byte-identical without re-serializing.
 pub const Message = struct {
     role: Role,
     content: []const u8,
@@ -20,13 +20,13 @@ pub const Session = struct {
     allocator: std.mem.Allocator,
     io: std.Io = undefined,
     id: [8]u8,
-    /// Mensajes en memoria (propietario).
+    /// Messages in memory (owned).
     messages: std.ArrayList(Message),
-    /// File handle abierto en append; null = sesión pura en memoria (tests).
+    /// File handle opened in append mode; null = session purely in memory (tests).
     file: ?std.Io.File = null,
     write_buf: [4096]u8 = undefined,
     compress_buf: [1 << 16]u8 = undefined,
-    /// Ruta de la sesión (propietario, para mostrar en TUI).
+    /// Session path (owned, to show in the TUI).
     path: ?[]const u8 = null,
     fw: ?std.Io.File.Writer = null,
 
@@ -38,14 +38,14 @@ pub const Session = struct {
         };
     }
 
-    /// Crea una sesión nueva en disco. Devuelve puntero heap porque el
-    /// File.Writer interno referencia el write_buf del propio struct
-    /// (moverlo por valor lo rompería).
+    /// Creates a new session on disk. Returns a heap pointer because the internal
+    /// File.Writer references the write_buf of the struct itself (moving it by
+    /// value would break it).
     pub fn create(allocator: std.mem.Allocator, io: std.Io) !*Session {
         const s = try allocator.create(Session);
         errdefer allocator.destroy(s);
         s.* = Session.init(allocator);
-        // id: microsegundos en base32 (sin colisiones entre sesiones)
+        // id: microseconds in base32 (no collisions between sessions)
         const now = std.Io.Timestamp.now(io, .real);
         const ts: u64 = @intCast(@divTrunc(now.nanoseconds, 1000));
         const names = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -64,7 +64,7 @@ pub const Session = struct {
         const file = try dir.createFile(io, s.path.?, .{ .truncate = false });
         s.file = file;
         s.io = io;
-        // Streaming writer: appends al final del fd (sin hole de 0xFF).
+        // Streaming writer: appends at the end of the fd (no 0xFF hole).
         s.fw = std.Io.File.Writer.initStreaming(file, io, &s.write_buf);
         return s;
     }
@@ -82,7 +82,7 @@ pub const Session = struct {
         if (self.path) |p| self.allocator.free(p);
     }
 
-    /// Añade un mensaje a memoria y lo persiste (1 write lineal).
+    /// Adds a message to memory and persists it (1 linear write).
     pub fn append(self: *Session, role: Message.Role, content: []const u8) !void {
         const copy = try self.allocator.dupe(u8, content);
         errdefer self.allocator.free(copy);
@@ -90,7 +90,7 @@ pub const Session = struct {
         if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
     }
 
-    /// Añade un mensaje con metadatos de tool_calls (asistente).
+    /// Adds a message with tool_calls metadata (assistant).
     pub fn appendAssistant(
         self: *Session,
         content: []const u8,
@@ -111,7 +111,7 @@ pub const Session = struct {
         if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
     }
 
-    /// Añade un tool_result.
+    /// Adds a tool_result.
     pub fn appendToolResult(
         self: *Session,
         tool_call_id: []const u8,
@@ -133,8 +133,8 @@ pub const Session = struct {
         if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
     }
 
-    /// Serializa y escribe una línea JSONL. Sin pretty-print: 1 línea = 1 mensaje.
-    /// El content se comprime con DEFLATE si ahorra >=25% (marker "z").
+    /// Serializes and writes one JSONL line. No pretty-print: 1 line = 1 message.
+    /// The content is DEFLATE-compressed if it saves >=25% (marker "z").
     fn persist(self: *Session, m: *const Message) !void {
         if (self.fw == null) return;
         const w = &self.fw.?.interface;
@@ -149,7 +149,7 @@ pub const Session = struct {
         w.writeAll("\"") catch {};
         if (m.tool_calls_json) |tj| {
             w.writeAll(",\"tool_calls\":") catch {};
-            w.writeAll(tj) catch {}; // JSON crudo del server
+            w.writeAll(tj) catch {}; // raw JSON from the server
         }
         if (m.tool_call_id) |id| {
             w.writeAll(",\"tool_call_id\":\"") catch {};
@@ -159,12 +159,12 @@ pub const Session = struct {
             w.writeAll("\"") catch {};
         }
         w.writeAll("}\n") catch {};
-        w.flush() catch {}; // durable por línea
+        w.flush() catch {}; // durable per line
     }
 
-    /// Reabre una sesión existente: carga el historial y sigue persistiendo.
-    /// Estrategia sin APIs de seek: reescribe el historial completo una vez
-    /// (truncate) y a partir de ahí append normal. O(session) una sola vez.
+    /// Reopens an existing session: loads the history and keeps persisting.
+    /// Strategy without seek APIs: rewrite the whole history once (truncate)
+    /// and from there on a normal append. O(session) exactly once.
     pub fn resumePath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Session {
         const s = try allocator.create(Session);
         errdefer allocator.destroy(s);
@@ -182,7 +182,7 @@ pub const Session = struct {
         return s;
     }
 
-    /// Ruta de la sesión más reciente (por mtime); null si no hay.
+    /// Path of the most recent session (by mtime); null if there is none.
     pub fn latestSessionPath(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
         var dir = std.Io.Dir.cwd().openDir(io, "sessions", .{}) catch return null;
         defer dir.close(io);
@@ -219,7 +219,7 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
             '\t' => try w.writeAll("\\t"),
             else => {
                 if (c < 0x20) {
-                    try w.print("\\u{x:0>4}", .{c}); // JSON-safe para binario comprimido
+                    try w.print("\\u{x:0>4}", .{c}); // JSON-safe for compressed binary
                 } else {
                     try w.writeByte(c);
                 }
@@ -232,7 +232,7 @@ fn sessionPath(allocator: std.mem.Allocator, id: *const [8]u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "sessions/zode-{s}.jsonl", .{id});
 }
 
-/// Reconstruye una sesión desde un archivo JSONL (para `zode --resume`).
+/// Rebuilds a session from a JSONL file (for `zode --resume`).
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session {
     var s = Session.init(allocator);
     s.io = io;
@@ -253,7 +253,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
 }
 
 fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Message {
-    // Arena SOLO para el árbol JSON; los datos devueltos se copian al gpa.
+    // Arena ONLY for the JSON tree; the returned data is copied into the gpa.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -277,7 +277,7 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Message {
     }
     var tcj: ?[]const u8 = null;
     if (obj.get("tool_calls")) |tc| {
-        // Re-serializa compacto (solo al cargar).
+        // Re-serialize compactly (only on load).
         tcj = try std.json.Stringify.valueAlloc(gpa, tc, .{});
     }
     var tcid: ?[]const u8 = null;
@@ -305,11 +305,11 @@ test "round trip: sesion comprimida en disco" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 
-    // Crea sesión real y agrega un mensaje grande (tool output típico).
+    // Create a real session and add a big message (typical tool output).
     var used_path: []const u8 = "";
     {
         const s = try Session.create(alloc, io);
-        defer alloc.destroy(s); // LIFO: corre DESPUÉS de deinit
+        defer alloc.destroy(s); // LIFO: runs AFTER deinit
         defer s.deinit();
         used_path = try alloc.dupe(u8, s.path.?);
         const big = "const std = @import(\"std\");\n" ** 100; // ~2.8KB
@@ -319,18 +319,18 @@ test "round trip: sesion comprimida en disco" {
     }
     defer alloc.free(used_path);
 
-    // Verifica que la línea quedó comprimida: content empieza con marker "z".
+    // Verify the line came out compressed: content starts with the "z" marker.
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, used_path, alloc, .limited(1 << 20));
     defer alloc.free(raw);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     const first = lines.next().?;
     try std.testing.expect(std.mem.indexOf(u8, first, "\"tool_call_id\":\"call_1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "\"content\":\"z") != null);
-    try std.testing.expect(first.len < 1400); // 2.8KB -> comprimido
+    try std.testing.expect(first.len < 1400); // 2.8KB -> compressed
 
-    // Resume: carga y verifica contenido byte-idéntico.
+    // Resume: load and verify byte-identical content.
     const s2 = try Session.resumePath(alloc, io, used_path);
-    defer alloc.destroy(s2); // LIFO: corre DESPUÉS de deinit
+    defer alloc.destroy(s2); // LIFO: runs AFTER deinit
     defer s2.deinit();
     try std.testing.expectEqual(@as(usize, 2), s2.messages.items.len);
     const expected = "const std = @import(\"std\");\n" ** 100;

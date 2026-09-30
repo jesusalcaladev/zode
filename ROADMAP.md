@@ -316,6 +316,32 @@ diff con **hunks reales** (`@@` + elipsis de contexto; hoy `unifiedDiff` escupe 
 fichero entero) · `/help` que liste también los atajos · preview del fichero en
 `write` en vez de un "OK" opaco.
 
+### Estado tras la primera tanda (2026-09-30)
+
+**Hecho y verificado** (`zig build test`: 211/211 verde, binario 1.89 MB)
+
+| Fase | Qué |
+|---|---|
+| 0 | Tests de seguridad. `zig build test -- <filtro>` (el runner de 0.16 no trae `--test-filter`). El test de 130 párrafos CUELGABA el runner entero; ahora hay presupuesto de iteraciones y falla en 1 s. |
+| 1 | **Las nueve**. 1.1 `layoutWindow` con ventana + `para_idx` + `para_heights`; 1.2 `pushDiff` = un párrafo (+ `DiffCounts`); 1.3 párrafo en vivo e `iteration N/8` por iteración; 1.4 `dirty` en todo cambio de estado; 1.5 tick autosuficiente + `redraw_requested`; 1.6 snapshot con lock, parseo fuera; 1.7 permiso con lock propio y espera dormida; 1.8 tope de 2000 líneas al LCS; 1.9 sesión perezosa. |
+| 2 | Completa. Placeholder `thinking · Ns`, tool con argumento en la franja, spinner con `workingLocked`, TTFT, errores en rojo (`.error_msg` llevaba meses sin callers), `tool_res_bold` de verdad, `/allowlist`, aviso de compactación, ctx% en turnos sin tools, `drawHints` borrado. |
+| 3 | Completa. `TurnStats` + `pushTurnSummary`. |
+| 4 | Completa. 4.1 bloques con gutter/fondo/chip, 4.2 diff por tokens, 4.3 sangría de continuación, 4.4 paleta en `theme.zig` truecolor, 4.5 `T.def` atenuado y `fn_call` con color, 4.6 verde de strings != verde de diff, 4.7 `generic` poblado + `normalizeLang`, 4.8 strings multilínea, 4.9 margen izquierdo. |
+| 5 | 5.1/5.2/5.4/5.5 hechas. **5.3** hecha de facto (el default ya es release+strip). |
+| 6 | Pendiente. |
+
+**Pendiente**
+
+| Fase | Qué |
+|---|---|
+| 5 | 5.6 `CellRun` 40 B -> 12 B, 5.7 `arena.reset(.retain_capacity)` en vaxis, 5.8 pintar solo filas visibles, 5.9/5.10 arranque. |
+| 6 | Poda por bytes con rehidratación desde el JSONL. `para_heights` ya está, que es la pieza que lo hace posible. |
+| 7 | Pulido. |
+
+**Correcciones de AGENTS.md**: las tres del ROADMAP están escritas (el bucle del layout, la cadena de ticks, y el diagnóstico **erróneo** del `Io.sleep` en ACP: en Linux es `clock_nanosleep` por hilo y no toca `t.mutex`, así que el reloj se congelaba por los puntos 1 y 2, no por el sleep). Añadida además una sección de trampas de Zig 0.16 que costaron una tarde.
+
+**Convención**: los comentarios del código pasaron a inglés. Los **nombres de test siguen en español** a propósito: son el índice de la suite.
+
 ---
 
 ## Orden y por qué

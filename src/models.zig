@@ -14,21 +14,21 @@ pub fn dbg(comptime fmt: []const u8, args: anytype) void {
 pub const Model = struct {
     id: []const u8,
     owned_by: []const u8,
-    /// Ventana de contexto en tokens (0 = el provider no lo publica).
-    /// OpenRouter sí lo manda, y es lo que permite dejar de usar el 128k fijo.
+    /// Context window in tokens (0 = the provider does not publish it).
+    /// OpenRouter does send it, and that is what lets us stop using the fixed 128k.
     context_length: u32 = 0,
-    /// Precio por prompt token en USD (0 = desconocido). Viene como string
-    /// decimal en OpenRouter ("0.00000015").
+    /// Price per prompt token in USD (0 = unknown). It arrives as a decimal
+    /// string in OpenRouter ("0.00000015").
     price_prompt: f64 = 0,
-    /// Precio por completion token en USD.
+    /// Price per completion token in USD.
     price_completion: f64 = 0,
 };
 
 pub const ModelList = struct {
     items: []Model,
-    /// Nombres de modelos free detectados (sufijo -free).
+    /// Names of the free models detected (-free suffix).
     free_count: usize,
-    /// El provider publicó contexto/precio para al menos un modelo.
+    /// The provider published context/price for at least one model.
     has_metadata: bool = false,
 
     pub fn deinit(self: *ModelList, gpa: std.mem.Allocator) void {
@@ -40,7 +40,7 @@ pub const ModelList = struct {
     }
 };
 
-/// GET /models (formato OpenAI: {"object":"list","data":[{"id":...}]}).
+/// GET /models (OpenAI format: {"object":"list","data":[{"id":...}]}).
 pub fn listModels(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
@@ -59,8 +59,8 @@ pub fn listModels(
 
     const root = parsed.value;
     if (root != .object) return error.BadPayload;
-    // OpenAI y Anthropic usan {"data":[...]}; algunos proxies anidan
-    // (data.data) o devuelven el array directamente.
+    // OpenAI and Anthropic use {"data":[...]}; some proxies nest it
+    // (data.data) or return the array directly.
     var data = root.object.get("data") orelse return error.BadPayload;
     if (data == .object) {
         data = data.object.get("data") orelse return error.BadPayload;
@@ -85,8 +85,8 @@ pub fn listModels(
         const owner_copy = try gpa.dupe(u8, if (owner == .string) owner.string else "?");
         errdefer gpa.free(owner_copy);
 
-        // Metadatos opcionales: solo OpenRouter los publica, el resto de
-        // providersOpenAI-compat los omiten. Si faltan, quedan en 0.
+        // Optional metadata: only OpenRouter publishes it, the rest of the
+        // OpenAI-compat providers omit it. If missing, they stay at 0.
         var ctx: u32 = 0;
         if (entry.object.get("context_length")) |cv| {
             switch (cv) {
@@ -120,9 +120,9 @@ pub fn listModels(
     return .{ .items = items, .free_count = free_count, .has_metadata = has_metadata };
 }
 
-/// Lee un número que el provider puede mandar como float, entero, o como
-/// string decimal (OpenRouter manda los precios así para no perder precisión
-/// en float). Nunca devuelve NaN: eso rompería las comparaciones de /cost.
+/// Reads a number the provider may send as a float, an integer, or as a
+/// decimal string (OpenRouter sends prices that way to avoid losing precision
+/// in a float). It never returns NaN: that would break the /cost comparisons.
 fn jsonNumber(v: std.json.Value) f64 {
     return switch (v) {
         .float => |f| if (std.math.isFinite(f)) f else 0,
@@ -137,7 +137,7 @@ test "listModels parsea context_length y pricing de OpenRouter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
-    // Payload real de OpenRouter (los precios vienen como strings decimales).
+    // Real OpenRouter payload (prices come as decimal strings).
     const json =
         \\{"object":"list","data":[
         \\ {"id":"anthropic/claude-sonnet-4-5","owned_by":"anthropic",
@@ -146,7 +146,7 @@ test "listModels parsea context_length y pricing de OpenRouter" {
         \\ {"id":"some/free-model","owned_by":"x","context_length":8192}
         \\]}
     ;
-    // Reusa el parser sin red: extraemos la parte de parseo a un helper.
+    // Reuse the parser without the network: the parsing part was extracted into a helper.
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, gpa, json, .{});
     const data = parsed.object.get("data").?;
 
@@ -162,7 +162,7 @@ test "listModels parsea context_length y pricing de OpenRouter" {
     const c = jsonNumber(pricing.object.get("completion").?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.000015), c, 1e-12);
 
-    // Modelo sin pricing: 0, no NaN.
+    // Model with no pricing: 0, not NaN.
     const no_price = data.array.items[1].object.get("pricing");
     try std.testing.expect(no_price == null);
 }
@@ -171,7 +171,7 @@ test "jsonNumber acepta float, integer y string decimal" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), jsonNumber(.{ .float = 1.5 }), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 7.0), jsonNumber(.{ .integer = 7 }), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), jsonNumber(.{ .number_string = "0.25" }), 1e-12);
-    // Basura → 0, nunca NaN (que rompería las comparaciones).
+    // Garbage → 0, never NaN (which would break the comparisons).
     try std.testing.expectApproxEqAbs(@as(f64, 0), jsonNumber(.{ .string = "abc" }), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0), jsonNumber(.null), 1e-9);
 }
