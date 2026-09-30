@@ -81,8 +81,12 @@ pub const Http = struct {
         const status: u16 = @intFromEnum(response.head.status);
         const retry_after = parseRetryAfter(response.head);
 
-        var transfer_buf: [256 * 1024]u8 = undefined;
-        var reader = response.reader(&transfer_buf);
+        // El buffer de transferencia va al HEAP (5.5 del ROADMAP), no a la pila: son
+        // 256 KiB residentes durante toda la descarga y, con el stack por defecto
+        // de `std.Thread`, dejarían una trampa para el día que alguien lo baje.
+        const transfer_buf = try self.gpa.alloc(u8, 256 * 1024);
+        defer self.gpa.free(transfer_buf);
+        var reader = response.reader(transfer_buf);
         // `takeDelimiter` exige que el delimitador quepa en el buffer: una
         // línea SSE más larga (un tool call enorme, un delta gigante) lo hace
         // fallar con StreamTooLong y MATABA el stream a mitad de respuesta.

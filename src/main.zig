@@ -192,7 +192,10 @@ fn runTui(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
 
-    const tty_buffer = try gpa.alloc(u8, 1024 * 1024);
+    // 64 KiB en vez de 1 MB (5.4 del ROADMAP): el buffer de la TTY es memoria
+    // PERMANENTE (vive todo el proceso) y 1 MB se paga el 99% del tiempo sin
+    // escribirse. Con un stream de tokens por chunk llega de sobra.
+    const tty_buffer = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(tty_buffer);
 
     var app = try vxfw.App.init(io, gpa, init.environ_map, tty_buffer);

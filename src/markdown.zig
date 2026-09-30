@@ -193,9 +193,16 @@ fn diffSegments(arena: std.mem.Allocator, line: []const u8) ![]Segment {
     return segs;
 }
 
+/// Tope de líneas por fichero para el diff.
+///
+/// `unifiedDiff` es LCS O(n·m) por líneas y la tabla son (n+1)·(m+1) `usize`: un
+/// par de ficheros de 10 000 líneas son 800 MB de tabla. Por encima de este
+/// tope no se calcula el diff: se enseña un aviso. Es degradación, no error.
+pub const max_diff_lines = 2000;
+
 /// Construye un diff unificado (simplificado) entre dos textos.
 /// Algoritmo LCS por líneas: O(n*m), suficiente para ediciones de código
-/// donde los bloques son cientos de líneas, no millones.
+/// donde los bloques son cientos de líneas (y con `max_diff_lines` hay tope).
 ///
 /// Devuelve un slice de arena con líneas ya prefijadas con ' ', '+' o '-'.
 pub fn unifiedDiff(arena: std.mem.Allocator, before: []const u8, after: []const u8) ![]const []const u8 {
@@ -207,6 +214,12 @@ pub fn unifiedDiff(arena: std.mem.Allocator, before: []const u8, after: []const 
     // Tabla LCS (n+1) x (m+1) de usize.
     const n = old_lines.items.len;
     const m = new_lines.items.len;
+    if (n > max_diff_lines or m > max_diff_lines) {
+        const note = try arena.dupe(u8, "diff omitted (file too large)");
+        const one = try arena.alloc([]const u8, 1);
+        one[0] = note;
+        return one;
+    }
     const table = try arena.alloc(usize, (n + 1) * (m + 1));
     @memset(table, 0);
     var i = n;
@@ -506,4 +519,27 @@ test "un banner que empieza por ## NO se come como encabezado" {
     defer ht.deinit(std.testing.allocator);
     for (h[0].lines[0]) |seg| try ht.appendSlice(std.testing.allocator, seg.text);
     try std.testing.expectEqualStrings("un titulo", ht.items);
+}
+
+test "unifiedDiff: por encima del tope no se calcula el LCS (sería O(n*m))" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Con el tope normal el diff se calcula.
+    const small = try unifiedDiff(arena, "a\nb\n", "a\nc\n");
+    try std.testing.expectEqual(@as(usize, 3), small.len);
+    try std.testing.expectEqualStrings("-b", small[1]);
+
+    // Por encima del tope sale el aviso, y sale RÁPIDO: sin la tabla de 4000x4000.
+    var big_a: std.ArrayList(u8) = .empty;
+    var big_b: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < max_diff_lines + 10) : (i += 1) {
+        try big_a.appendSlice(arena, "x\n");
+        try big_b.appendSlice(arena, "y\n");
+    }
+    const out = try unifiedDiff(arena, big_a.items, big_b.items);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expect(std.mem.indexOf(u8, out[0], "too large") != null);
 }

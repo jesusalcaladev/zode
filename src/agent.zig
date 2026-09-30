@@ -409,6 +409,212 @@ pub fn newSession(m: *tui.Model) void {
     session_elided = 0;
 }
 
+// ── estadísticas de turno (Fase 3 del ROADMAP) ────────────────
+
+/// Lo que pasó en el turno en curso: tools, ficheros, líneas, duración.
+///
+/// Vive como GLOBAL DEL MÓDULO (como `CacheStats`) y no dentro del `TurnCtx`
+/// porque el `TurnCtx` se destruye en el `defer` de `runOneTurn` justo cuando
+/// ya hay que escribir el resumen. La alternativa (acumular en `TurnCtx` y
+/// pasárselo a `chatWorker`) obligaría a devolver la estructura por el mismo
+/// camino que devuelve el texto sintético.
+pub const TurnStats = struct {
+    gpa: std.mem.Allocator = undefined,
+    iterations: usize = 0,
+    tools: usize = 0,
+    denied: usize = 0,
+    /// Ficheros tocados, en orden de aparición, sin repetir.
+    files: std.ArrayList([]const u8) = .empty,
+    lines_added: usize = 0,
+    lines_removed: usize = 0,
+    t0_ns: i128 = 0,
+
+    /// Empieza a contar un turno. Libera lo del anterior.
+    ///
+    /// OJO al orden: `deinit` usa `self.gpa` (el del turno ANTERIOR), así que
+    /// hay que liberar antes de sobreescribir el allocator. Con el struct
+    /// inicializado a `.{}` (`gpa` indefinido) eso sería un `free` con basura.
+    pub fn reset(self: *TurnStats, gpa: std.mem.Allocator, t0_ns: i128) void {
+        self.deinit();
+        self.* = .{ .gpa = gpa, .t0_ns = t0_ns };
+    }
+
+    pub fn deinit(self: *TurnStats) void {
+        // `files.capacity == 0` = lista sin memoria propia: no hay nada que
+        // liberar y `gpa` puede no estar inicializado.
+        if (self.files.capacity == 0) return;
+        for (self.files.items) |f| self.gpa.free(f);
+        self.files.deinit(self.gpa);
+    }
+
+    /// Registra un fichero tocado con su diff. Si ya estaba, solo suma las
+    /// líneas: escribir el mismo fichero dos veces en un turno es una línea, no
+    /// dos ficheros.
+    pub fn noteDiff(self: *TurnStats, path: []const u8, counts: tui.DiffCounts) void {
+        if (counts.added == 0 and counts.removed == 0) return;
+        for (self.files.items) |f| {
+            if (std.mem.eql(u8, f, path)) {
+                self.lines_added += counts.added;
+                self.lines_removed += counts.removed;
+                return;
+            }
+        }
+        const copy = self.gpa.dupe(u8, path) catch return;
+        self.files.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.lines_added += counts.added;
+        self.lines_removed += counts.removed;
+    }
+
+    pub fn noteTool(self: *TurnStats) void {
+        self.tools += 1;
+    }
+
+    pub fn noteDenied(self: *TurnStats) void {
+        self.denied += 1;
+    }
+
+    /// Milisegundos que lleva el turno (0 si no hay reloj).
+    pub fn elapsedMs(self: *const TurnStats, now_ns: i128) u64 {
+        if (self.t0_ns == 0) return 0;
+        return @intCast(@max(0, now_ns - self.t0_ns) / std.time.ns_per_ms);
+    }
+
+    /// `⏺ Done · 3 tools · 2 files changed · 12.4s · ~18k tokens (62% cached)`
+    ///
+    /// Devuelve memoria del allocator que se le pase (copia de `gpa`), no
+    /// punteros internos: los `files` son del turno y pueden liberarse.
+    ///
+    /// Escribe en `buf` (del llamante) y devuelve un slice de él: sin
+    /// allocaciones, porque esta línea se compone una vez por turno pero el
+    /// llamante la mete en el historial, que ya copia.
+    pub fn summaryLine(
+        self: *const TurnStats,
+        buf: []u8,
+        ms: u64,
+        tokens_used: i64,
+        cache_pct: u8,
+    ) ![]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll("\u{23ba} Done \u{b7} ");
+        try w.print("{d} tool{s}", .{ self.tools, if (self.tools == 1) "" else "s" });
+        if (self.denied > 0) try w.print(" \u{b7} {d} denied", .{self.denied});
+        if (self.files.items.len > 0) {
+            try w.print(" \u{b7} {d} file{s} changed", .{
+                self.files.items.len,
+                if (self.files.items.len == 1) "" else "s",
+            });
+            if (self.lines_added > 0 or self.lines_removed > 0) {
+                try w.print(" (+{d} \u{2212}{d})", .{ self.lines_added, self.lines_removed });
+            }
+        }
+        try w.print(" \u{b7} {d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 });
+        if (tokens_used > 0) {
+            try w.print(" \u{b7} ~{d}k tokens", .{@divTrunc(tokens_used + 500, 1000)});
+            if (cache_pct > 0) try w.print(" ({d}% cached)", .{cache_pct});
+        }
+        return w.buffered();
+    }
+
+    /// Segunda línea: `src/agent.zig · src/tui.zig` (los ficheros tocados).
+    ///
+    /// Los ficheros van solos: el resumen ya dice cuántas tools corrieron, y
+    /// aquí lo útil es el QUÉ, no la tool. Si se guardara con el nombre de la
+    /// tool se podría, pero con un turno de 5 tools la línea se sale de la
+    /// pantalla y el path es lo que se busca.
+    pub fn detailLine(self: *const TurnStats, buf: []u8) ![]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        var first = true;
+        for (self.files.items) |f| {
+            if (!first) try w.writeAll(" \u{b7} ");
+            first = false;
+            try w.writeAll(f);
+        }
+        return w.buffered();
+    }
+};
+
+/// Estadísticas del turno en curso. Global del módulo (ver `TurnStats`).
+pub var turn_stats: TurnStats = .{};
+
+/// Buffer de 1 MiB para componer el body del request (5.5 del ROADMAP).
+///
+/// Antes era `var body_buf: [1 << 20]u8` en la PILA de `runOneTurn`. Con el
+/// stack por defecto de `std.Thread` (16 MiB) funciona, pero es memoria
+/// RESIDENTE durante toda la llamada y deja una trampa: el día que alguien
+/// baje el `stack_size` del worker, 1 MiB de stack se convierte en un
+/// segfault. Al heap, y reutilizado entre peticiones (se reserva una vez).
+var body_buf_heap: ?[]u8 = null;
+
+fn bodyBuf(gpa: std.mem.Allocator) ![]u8 {
+    if (body_buf_heap == null) {
+        body_buf_heap = try gpa.alloc(u8, 1 << 20);
+    }
+    return body_buf_heap.?;
+}
+
+/// Libera el buffer del body. Lo llama el teardown (el mapa de claves tiene
+/// reglas parecidas: nunca se libera en runtime).
+pub fn shutdownBuffers(gpa: std.mem.Allocator) void {
+    if (body_buf_heap) |b| {
+        gpa.free(b);
+        body_buf_heap = null;
+    }
+}
+
+test "TurnStats: un fichero tocado dos veces cuenta como uno" {
+    var s = TurnStats{};
+    var backing: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const g = fba.allocator();
+    s.reset(g, 0);
+    s.noteDiff("a.zig", .{ .added = 3, .removed = 1 });
+    s.noteDiff("a.zig", .{ .added = 2, .removed = 0 });
+    s.noteDiff("b.zig", .{ .added = 5, .removed = 5 });
+    s.noteTool();
+    try std.testing.expectEqual(@as(usize, 2), s.files.items.len);
+    try std.testing.expectEqual(@as(usize, 10), s.lines_added);
+    try std.testing.expectEqual(@as(usize, 6), s.lines_removed);
+    s.deinit();
+}
+
+test "TurnStats: el resumen dice tools, ficheros y lineas" {
+    var s = TurnStats{};
+    var backing: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const g = fba.allocator();
+    s.reset(g, 0);
+    s.noteTool();
+    s.noteTool();
+    s.noteTool();
+    s.noteDiff("src/tui.zig", .{ .added = 12, .removed = 3 });
+    var line_buf: [256]u8 = undefined;
+    const line = try s.summaryLine(&line_buf, 12_400, 18_000, 62);
+    try std.testing.expect(std.mem.indexOf(u8, line, "3 tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "1 file changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "+12 \u{2212}3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "12.4s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "18k tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "62% cached") != null);
+    var detail_buf: [128]u8 = undefined;
+    const detail = try s.detailLine(&detail_buf);
+    try std.testing.expectEqualStrings("src/tui.zig", detail);
+    s.deinit();
+}
+
+test "TurnStats: un diff de 0 lineas no inventa ficheros" {
+    var s = TurnStats{};
+    var backing: [512]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const g = fba.allocator();
+    s.reset(g, 0);
+    s.noteDiff("nada.zig", .{});
+    try std.testing.expectEqual(@as(usize, 0), s.files.items.len);
+    s.deinit();
+}
+
 /// Vacia el historial de la sesión actual sin crear otra.
 pub fn resetSession(m: *tui.Model) void {
     if (session) |s| {
@@ -442,7 +648,11 @@ pub fn bootstrapSession(m: *tui.Model) void {
         const msg = allocPrint(m, "nothing to resume; starting a new session", .{}) catch return;
         pushInfoOwned(m, msg);
     }
-    _ = ensureSession(m, m.allocator);
+    // OJO: aquí NO se crea la sesión (1.9 del ROADMAP). Antes esta línea
+    // abría un `sessions/zode-*.jsonl` en CADA arranque, y como el fichero se
+    // crea vacío y nadie chateaba, `sessions/` se llenaba de ficheros de 0
+    // bytes: 58 ficheros, 24 vacíos. La sesión la crea `ensureSession`, que solo
+    // se llama al mandar el primer mensaje (o al pedir `/new` explícitamente).
 }
 
 /// `allocPrint` corto: el 90% de los mensajes del historial los escribe el
@@ -1369,14 +1579,21 @@ fn chatWorker(job: *ChatJob) void {
     m.beginWorker();
     defer m.endWorker();
 
+    // Las estadísticas del turno empiezan aquí (no en `runOneTurn`): el turno
+    // es todo el `chatWorker`, con sus 8 iteraciones.
+    turn_stats.reset(m.allocator, std.Io.Timestamp.now(io_global, .real).nanoseconds);
+    defer turn_stats.deinit();
+
     var iterations: usize = 0;
     var last_user: []const u8 = user_text;
     var owned: ?[]u8 = null; // texto sintético de una iteración (propio)
 
     while (iterations < max_iterations) : (iterations += 1) {
-        const again = runOneTurn(m, last_user) catch |err| {
+        turn_stats.iterations = iterations + 1;
+        const again = runOneTurn(m, last_user, iterations) catch |err| {
             reportErr(m, err);
             m.streamEnd();
+            pushTurnSummary(m);
             return;
         };
         const text = again orelse break;
@@ -1387,6 +1604,36 @@ fn chatWorker(job: *ChatJob) void {
     if (owned) |o| m.allocator.free(o);
     if (iterations >= max_iterations) pushInfo(m, "agent iteration limit reached: stopping the turn");
     m.streamEnd();
+    pushTurnSummary(m);
+}
+
+/// El resumen del turno en el historial: 2 líneas que dicen qué pasó.
+///
+/// Antes el final de un turno era literalmente `setStatusWithZo(m, .done,
+/// "done")` y nada más: ni ficheros, ni tools, ni tokens, ni duración. Y como
+/// la franja de actividad se apaga al acabar, lo único que queda visible del
+/// turno es el status, que se sustituye en el turno siguiente.
+fn pushTurnSummary(m: *tui.Model) void {
+    const s = &turn_stats;
+    const now_ns = std.Io.Timestamp.now(io_global, .real).nanoseconds;
+    const ms = s.elapsedMs(now_ns);
+
+    var line_buf: [256]u8 = undefined;
+    const line = s.summaryLine(&line_buf, ms, ctx_used, cacheHitPct()) catch return;
+    pushInfoOwned(m, line);
+
+    if (s.files.items.len == 0) return;
+    var detail_buf: [512]u8 = undefined;
+    const detail = s.detailLine(&detail_buf) catch return;
+    if (detail.len == 0) return;
+    pushInfoOwned(m, detail);
+}
+
+/// Hit-rate de cache de la sesión, redondeado (0 = sin datos).
+fn cacheHitPct() u8 {
+    const r = cache_stats.session.hitRatePct();
+    if (r <= 0) return 0;
+    return @intFromFloat(std.math.clamp(r, 0, 100));
 }
 
 /// Userdata de los tres callbacks de un turno.
@@ -1503,13 +1750,23 @@ fn toolCallsJsonFromCalls(gpa: std.mem.Allocator, calls: []const TurnCtx.Call) ?
 /// `free` sobre `.rodata` -> panic "reached unreachable code" en ReleaseSafe,
 /// es decir, un turno con tools tumbaba la app SIEMPRE. Los literales Zig son
 /// `[]const`, asi que ahora el compilador IMPIDE devolverlos por aqui.
-fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
+fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
     const s = ensureSession(m, gpa);
     // Reloj del TURNO (no del stream): es lo que se pinta en "done · N.Ns" y lo
     // que el usuario mide cuando vuelve a pulsar.
     const turn_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
+
+    // Cada ITERACIÓN abre su párrafo en vivo y anuncia en qué va (1.3).
+    //
+    // Antes el párrafo en vivo lo abría `startChat` UNA vez por prompt y
+    // `runOneTurn` lo cerraba sin volver a abrirlo: desde la 2ª iteración
+    // (y el bucle llega a 8) no había párrafo vivo, ni franja de actividad, ni
+    // spinner, ni reloj. Es decir, todo lo que dice "sigo trabajando" se
+    // apagaba justo en la parte del turno donde más tarda se hace (tras las
+    // tools). El path ACP sí lo hacía bien todo el rato.
+    m.streamStartIteration();
 
     var tstate = TurnCtx{ .m = m };
     defer tstate.deinit();
@@ -1548,12 +1805,16 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
         const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
         pushInfoOwned(m, msg);
     }
+    // Aviso de que la elisión por bytes no basta y toca resumir. Antes el
+    // tier 2 solo existía en el runner headless, así que en la TUI el ctx%
+    // subía sin que se dijera nada.
+    maybeAnnounceCompaction(m, comp.needs_summary);
 
     const def = activeProviderDef(m.environ);
     const kind = chat.kindForProvider(def.id);
-    var body_buf: [1 << 20]u8 = undefined;
+    const body_buf = try bodyBuf(gpa);
     const body = try chat.buildBodyMessages(
-        &body_buf,
+        body_buf,
         cur_model,
         comp.msgs,
         current_effort,
@@ -1565,9 +1826,19 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     defer http.deinit();
 
     chat.cancel_current.store(false, .seq_cst);
-    // Sin "…": la carita late y el reloj corre en la franja de actividad, así
-    // que la elipsis solo ocupa dos celdas.
-    setStatusWithZo(m, .thinking, "thinking");
+    // El status nombra la ITERACIÓN a partir de la segunda: "thinking" a secas
+    // durante 8 vueltas seguidas no dice si va a tardar o si ya se ha parado.
+    // La primera no lleva contador porque es la normal y el número sería ruido.
+    if (iteration > 0) {
+        const it = std.fmt.allocPrint(
+            gpa,
+            "thinking · iteration {d}/{d}",
+            .{ iteration + 1, max_iterations },
+        ) catch "thinking";
+        setStatusWithZo(m, .thinking, it);
+    } else {
+        setStatusWithZo(m, .thinking, "thinking");
+    }
 
     // OJO: `streamChat` espera la URL COMPLETA, no solo la base del provider.
     // Pasarle la base a secas daba 404 en TODAS las peticiones de la TUI (el
@@ -1586,12 +1857,6 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
         providers.keyFor(def, m.environ) orelse curKey(m);
 
     var attempt: usize = 0;
-    // Cada ITERACIÓN del agent loop abre su párrafo en vivo. Sin esto, la
-    // respuesta que viene después de una tool se acumulaba en `stream_buf` sin
-    // dueño y `streamEnd` la tiraba: el turno acababa con la tool como último
-    // punto del historial y sin respuesta. `streamStartIteration` (y no
-    // `streamStart`) para no resetear el reloj de la franja en cada iteración.
-    m.streamStartIteration();
     while (true) : (attempt += 1) {
         chat.streamChat(
             gpa,
@@ -1671,6 +1936,22 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     return exec;
 }
 
+/// Avisa de la compactación tier 2 si el turno la dispara.
+///
+/// El tier 2 (resumir el tramo viejo con una llamada LLM) antes solo corría en
+/// headless (`main.zig`), así que en la TUI el historial crecía sin que se
+/// dijera nada y el ctx% subía sin explicación. `needs_summary` es el aviso de
+/// que la elisión por bytes no ha bastaod.
+fn maybeAnnounceCompaction(m: *tui.Model, comp_needs_summary: bool) void {
+    if (!comp_needs_summary) return;
+    const msg = std.fmt.allocPrint(
+        m.allocator,
+        "· context budget reached: summarizing older turns…",
+        .{},
+    ) catch return;
+    pushInfoOwned(m, msg);
+}
+
 /// Ejecuta las tool calls de un turno y devuelve el texto sintético para el
 /// siguiente (o null si no hacía falta otro turno).
 ///
@@ -1707,6 +1988,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
                     // La denegación se le devuelve al modelo como resultado
                     // para que cambie de estrategia en vez de reintentar.
                     denied += 1;
+                    turn_stats.noteDenied();
                     m.pushToolDone(call.name, "denied: permission required", 0, "denied");
                     s.appendToolResult(call.id, call.name, "denied: permission required") catch {};
                     continue;
@@ -1732,6 +2014,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         };
         const ms = elapsedMs(call_t0);
         ran += 1;
+        turn_stats.noteTool();
         const summary = toolResultSummary(call.name, res, arena);
         m.pushToolDone(call.name, summary, ms, res);
 
@@ -1741,7 +2024,8 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
                 const after = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch {
                     continue;
                 };
-                m.pushDiff(old, after);
+                const dc = m.pushDiff(old, after);
+                turn_stats.noteDiff(pth, dc);
             }
         }
 
@@ -2108,9 +2392,9 @@ pub fn summarizeTurns(
         models_mod.dbg("[compaction] no se pudo construir el prompt del resumen\n", .{});
         return null;
     };
-    var body_buf: [1 << 20]u8 = undefined;
+    const body_buf = bodyBuf(gpa) catch return null;
     const one = [_]chat.ChatMessage{.{ .role = "user", .content = prompt }};
-    const body = chat.buildBodyMessages(&body_buf, model_name, &one, effort, "", kind) catch {
+    const body = chat.buildBodyMessages(body_buf, model_name, &one, effort, "", kind) catch {
         models_mod.dbg("[compaction] no se pudo construir el body del resumen\n", .{});
         return null;
     };
