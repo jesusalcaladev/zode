@@ -8,6 +8,7 @@ const theme = @import("theme.zig");
 const ed_mod = @import("editor.zig");
 const mascot = @import("mascot.zig");
 const palette = @import("palette.zig");
+const plan_mod = @import("plan.zig");
 const models_mod = @import("models.zig");
 
 /// Ítem del picker modal (estilo opencode). Labels/descs son gpa-owned
@@ -252,6 +253,13 @@ pub const Model = struct {
     /// tenia idea de si estaba trabajando. Ahora se encolan y el worker los
     /// va sacando al terminar su turno.
     queue: std.ArrayList([]u8) = .empty,
+
+    /// El plan visible (la tool `todo`). Lo escribe el worker desde otro hilo y
+    /// lo lee el draw en cada frame, así que va con el MISMO lock que el resto.
+    ///
+    /// No es un `ArrayList`: la lista es de tamaño fijo (ver `plan.zig`), y así
+    /// el draw la pinta sin asignar nada.
+    plan: plan_mod.Plan = .{},
 
     /// Momento en que empezó el turno en curso, en nanosegundos, para el reloj
     /// de la franja de actividad. 0 = sin turno. Lo escribe `streamStart`.
@@ -1319,6 +1327,34 @@ pub const Model = struct {
         }
     }
 
+    /// Aplica el plan que manda la tool `todo` y devuelve el resumen para el
+    /// historial (o "" si la lista no ha cambiado, que es el caso normal: el
+    /// modelo reenvía la misma lista).
+    ///
+    /// El texto lo decide el llamante porque es memoria de SU arena: aquí solo
+    /// se copia el plan a buffers fijos, que es lo que puede vivir entre frames.
+    pub fn applyPlan(self: *Model, items: []const plan_mod.Item, n: u8) plan_mod.Plan.Applied {
+        self.lock();
+        defer self.unlock();
+        const r = self.plan.apply(items, n);
+        if (r == .changed or r == .empty) self.dirty = true;
+        return r;
+    }
+
+    /// Copia del plan para el draw (con el lock, porque lo escribe el worker).
+    pub fn planCopy(self: *Model) plan_mod.Plan {
+        self.lock();
+        defer self.unlock();
+        return self.plan;
+    }
+
+    pub fn clearPlan(self: *Model) void {
+        self.lock();
+        defer self.unlock();
+        self.plan.clear();
+        self.dirty = true;
+    }
+
     /// Milisegundos que lleva la tool en curso (0 si no hay ninguna).
     pub fn toolRunMillis(self: *const Model) u64 {
         return self.toolRunMillisLocked();
@@ -2244,6 +2280,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     const queued = self.queuedCount();
     const act_rows: u16 = if (act.busy or queued > 0) 1 else 0;
 
+    // El plan (tool `todo`): un checkbox por paso, encima de la franja de
+    // actividad. Solo ocupa filas si hay plan, y como mucho `plan_max_rows`: un
+    // plan de 20 pasos no puede comerse el historial.
+    const pl_now = self.planCopy();
+    const plan_rows: u16 = if (pl_now.isEmpty()) 0 else @min(@as(u16, pl_now.len), plan_max_rows);
+
     // Popup de autocompletado: solo si hay coincidencias.
     const ac_rows: u16 = if (self.ac.active and matchCount(self) > 0)
         @as(u16, @intCast(@min(matchCount(self), self.ac.max_visible) + 1))
@@ -2252,10 +2294,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     // El input crece con el texto, pero nunca se come el historial: si no
     // caben las dos cosas, se recorta el input (y su vista se ancla abajo).
-    const chrome: u16 = 4 + ac_rows + act_rows; // status + bordes + popup + franja
+    const chrome: u16 = 4 + ac_rows + act_rows + plan_rows; // status + bordes + popup + franja + plan
     const avail: u16 = if (height > chrome + 2) height - chrome - 2 else 1;
     const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(text_w), max_input_lines))), avail), 1);
-    const input_top: u16 = height - 4 - act_rows - input_h;
+    // OJO: el orden de arriba abajo es status · franja · PLAN · caja del input.
+    // El plan va entre la franja y el input (y no encima del status) porque es
+    // lo que se mira mientras el modelo trabaja, al lado del reloj.
+    const input_top: u16 = height - 4 - act_rows - plan_rows - input_h;
     const history_h: u16 = if (input_top > 1) input_top - 1 else 1;
     // El handler de teclas necesita el alto para saltar una pagina entera.
     self.hist_rows = history_h;
@@ -2454,8 +2499,11 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // un modelo lento no dice nada: no se sabía si estaba pensando, esperando o
     // colgado. Aquí va la carita + el estado + los segundos Transcurridos, que
     // es lo que de verdad responde a "¿está trabajando o se ha pegado?".
-    if (act_rows == 1 and input_top > 0) {
-        drawActivityStrip(&p, input_top - 1, width, self, act, queued);
+    if (plan_rows > 0) {
+        drawPlanBlock(&p, input_top - plan_rows, width, plan_rows, pl_now);
+    }
+    if (act_rows == 1 and input_top > act_rows + plan_rows) {
+        drawActivityStrip(&p, input_top - act_rows - plan_rows - 1, width, self, act, queued);
     }
 
     drawInput(&p, &surface, self, input_top, width, input_h);
@@ -2716,6 +2764,81 @@ fn drawPermissionModal(
 ///
 /// Cuando hay cola se ven también los prompts encolados, para que se sepa qué
 /// va a salir después en vez de tener que acordarse.
+/// Cuántos pasos del plan se pintan como mucho.
+///
+/// Con 20 filas el plan se come el historial entero, que es justo lo que un plan
+/// NO debe hacer (el historial es la conversación). Seis es un número pensado
+/// para una terminal normal: se ve el principio y el estado, y el resto se
+/// deduce del "2/8" del status.
+pub const plan_max_rows: u16 = 6;
+
+/// El bloque del plan: un checkbox por paso, con el paso en marcha resaltado.
+///
+/// Por qué está EN PANTALLA y no solo en el historial: la pregunta "¿cuánto
+/// falta?" tiene que poder contestarse sin Ask Mode, y el historial obliga a
+/// scrollear. Y el paso en marcha va en el color de marca porque es la única
+/// información que cambia de un frame a otro.
+///
+/// Cuando todo está hecho se dibuja UNA línea ("all N steps done") en vez de N
+/// checkboxes: un plan terminado no necesita estar en pantalla, y dejarlo ahí
+/// empuja el input hacia arriba sin motivo.
+fn drawPlanBlock(
+    p: *Painter,
+    top: u16,
+    width: u16,
+    rows: u16,
+    pl: plan_mod.Plan,
+) void {
+    if (pl.allDone()) {
+        p.fillRow(top, " ", .{});
+        var buf: [64]u8 = undefined;
+        const txt = std.fmt.bufPrint(&buf, "☑ all {d} steps done", .{pl.len}) catch "☑ done";
+        _ = p.putText(1, top, txt, theme.ok);
+        return;
+    }
+
+    const cur = pl.currentIndex();
+    for (0..rows) |i| {
+        const row: u16 = top + @as(u16, @intCast(i));
+        p.fillRow(row, " ", .{});
+        const it = pl.items[i];
+        const is_cur = cur != null and @as(u8, @intCast(i)) == cur.?;
+        // El paso en marcha: el color de marca en NEGROITA. El resto de estilos
+        // ya son Style completos del theme, y mezclar un literal con un tema es
+        // justo el error de tipos que suena a "expected Color, found Style".
+        const style: vaxis.Style = if (is_cur) theme.brand_bold else if (it.status == .done) theme.brand_faint else theme.brand_soft;
+
+        var col: u16 = 1;
+        col = p.putText(col, row, it.status.glyph(), style);
+        // El número es lo que hace falta para poder decir "el 3" en voz alta, y
+        // occupies 3 columnas: `☐ 12. ` frente a `☐ 1. `.
+        col = p.putText(col + 1, row, tryNum(p.arena, @as(u8, @intCast(i)) + 1), theme.brand_faint);
+        col = p.putText(col + 1, row, it.textOf(), style);
+        if (col >= width) return;
+    }
+
+    // Si el plan es más largo que las filas, la última fila lo dice. Sin esto
+    // el usuario ve 6 de 20 y no sabe si se ha acabado de pintar o se ha
+    // cortado.
+    if (pl.len > rows) {
+        const row: u16 = top + rows - 1;
+        var buf: [64]u8 = undefined;
+        const txt = std.fmt.bufPrint(
+            &buf,
+            "  +{d} more · {d}/{d} done",
+            .{ pl.len - rows, pl.doneCount(), pl.len },
+        ) catch "";
+        _ = p.putText(1, row, txt, theme.brand_faint);
+    }
+}
+
+/// "3" como texto propio del frame.
+fn tryNum(arena: std.mem.Allocator, n: u8) []const u8 {
+    var buf: [4]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}.", .{n}) catch return "";
+    return arena.dupe(u8, s) catch "";
+}
+
 fn drawActivityStrip(
     p: *Painter,
     row: u16,
@@ -4306,6 +4429,160 @@ test "streamEnd sin texto no deja un parrafo vacio en el historial" {
     }
     try std.testing.expectEqual(@as(usize, 1), assistants);
     try std.testing.expect(!m.busy);
+}
+
+test "el bloque del plan: un checkbox por paso, y el paso en marcha resaltado" {
+    // Lo que se comprueba es lo que el usuario VE (la lógica del plan ya esta
+    // testeada en plan.zig): que hay un checkbox por paso y que el paso en
+    // marcha es el único con color de marca. Esa diferencia entre "por dónde va"
+    // y "una lista" es justo lo que hace útil el bloque.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const args =
+        \\{"items":[
+        \\{"content":"leer el roadmap","status":"done"},
+        \\{"content":"implementar la tool","status":"in_progress"},
+        \\{"content":"escribir los tests","status":"pending"}
+        \\]}
+    ;
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    const parsed = try plan_mod.parseItems(arena, args, &items);
+    _ = m.applyPlan(&parsed.items, parsed.len);
+    // Aplicar el plan es un cambio de estado: tiene que pedir frame.
+    try std.testing.expect(m.activity().dirty);
+
+    const s = try drawTest(&m, arena, 100, 30);
+    const r_done = findRow(s, "leer el roadmap") orelse return error.TestUnexpectedResult;
+    const r_cur = findRow(s, "implementar la tool") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(findRow(s, "escribir los tests") != null);
+    // En el orden de la lista, de arriba abajo.
+    try std.testing.expect(r_done < r_cur);
+
+    var buf: [256]u8 = undefined;
+    // El hecho hecho lleva su check (no una flecha) y el apagado.
+    const done_row = rowText(s, r_done, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, done_row, "☑") != null);
+    const done_cell = s.readCell(1, r_done);
+    try std.testing.expectEqual(theme.brand_faint.fg, done_cell.style.fg);
+    try std.testing.expect(!done_cell.style.bold);
+
+    // El paso en marcha: MISMO texto, color de marca y en negrita.
+    const cur_cell = s.readCell(1, r_cur);
+    try std.testing.expectEqual(theme.brand_bold.fg, cur_cell.style.fg);
+    try std.testing.expect(cur_cell.style.bold);
+    const cur_row = rowText(s, r_cur, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, cur_row, "◐") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cur_row, "2.") != null);
+
+    // Y el pendiente va en el soft, sin negrita: se distinguen los tres estados
+    // de un vistazo.
+    const r_next = findRow(s, "escribir los tests") orelse return error.TestUnexpectedResult;
+    const next_cell = s.readCell(1, r_next);
+    try std.testing.expectEqual(theme.brand_soft.fg, next_cell.style.fg);
+    try std.testing.expect(!next_cell.style.bold);
+}
+
+test "el plan se dibuja ENCIMA del input y lo empuja, sin comerse el historial" {
+    // El orden de las filas de abajo arriba es status · franja · PLAN · input.
+    // Si el plan se dibujara en otro sitio taparía el historial, que es justo lo
+    // que un plan no debe hacer.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushKind(.user, "hola");
+
+    const s_sin = try drawTest(&m, arena, 100, 30);
+    const input_sin = findRow(s_sin, "Ask anything") orelse return error.TestUnexpectedResult;
+
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    const texts = [_][]const u8{ "primero", "segundo", "tercero" };
+    for (0..3) |i| {
+        var it = plan_mod.Item{ .status = .pending };
+        const t = texts[i];
+        @memcpy(it.text[0..t.len], t);
+        it.len = @intCast(t.len);
+        items[i] = it;
+    }
+    _ = m.applyPlan(&items, 3);
+    const s_con = try drawTest(&m, arena, 100, 30);
+    const input_con = findRow(s_con, "Ask anything") orelse return error.TestUnexpectedResult;
+    // El primer paso del plan: suficiente para saber DÓNDE está el bloque.
+    const r_plan = findRow(s_con, "primero") orelse return error.TestUnexpectedResult;
+
+    // El plan queda por ENCIMA del input (el input está siempre abajo del todo),
+    // y el input SUBE 3 filas: las filas del plan se le quitan de encima, no se
+    // las come el historial.
+    try std.testing.expect(r_plan < input_con);
+    try std.testing.expectEqual(input_sin - 3, input_con);
+    // Y el historial sigue ahí arriba (con 30 filas hay sitio de sobra).
+    try std.testing.expect(findRow(s_con, "hola") != null);
+    try std.testing.expect(findRow(s_con, "hola").? < r_plan);
+
+    // Sin plan, no hay filas de checkboxes.
+    m.clearPlan();
+    const s_limpio = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(s_limpio, "☐") == null);
+    try std.testing.expectEqual(input_sin, findRow(s_limpio, "Ask anything").?);
+}
+
+test "el plan terminado se dibuja en UNA línea" {
+    // Un plan terminado con 20 checkboxes solo empuja el input hacia arriba sin
+    // motivo: una línea dice lo mismo.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    for (0..8) |i| {
+        var it = plan_mod.Item{ .status = .done };
+        it.text[0] = 'a' + @as(u8, @intCast(i));
+        it.len = 1;
+        items[i] = it;
+    }
+    _ = m.applyPlan(&items, 8);
+
+    const s = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(s, "all 8 steps done") != null);
+    // Ojo: el check del resumen es "☑ all...", así que buscar "☑ a" casaría
+    // con el propio resumen. Lo que se busca es el NÚMERO de cada paso, que
+    // solo aparece cuando la lista se pinta entera.
+    try std.testing.expect(findRow(s, "1. a") == null);
+    try std.testing.expect(findRow(s, "4. d") == null);
+}
+
+test "un plan largo dice cuantos pasos se han quedado sin pintar" {
+    // Sin el "+N more", ver 6 de 20 parece un plan entero. Y el recorte tiene un
+    // tope (`plan_max_rows`) porque un plan de 20 no puede comerse el historial.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    for (0..20) |i| {
+        var it = plan_mod.Item{ .status = .pending };
+        it.text[0] = 'a' + @as(u8, @intCast(i % 26));
+        it.len = 1;
+        items[i] = it;
+    }
+    items[0].status = .done;
+    _ = m.applyPlan(&items, 20);
+
+    const s = try drawTest(&m, arena, 120, 44);
+    const r = findRow(s, "+14 more") orelse return error.TestUnexpectedResult;
+    var buf: [128]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, r, &buf), "1/20 done") != null);
+    // Y solo se pintan `plan_max_rows` pasos: ni uno más.
+    try std.testing.expectEqual(plan_max_rows, r - findRow(s, "a").? + 1);
 }
 
 test "el tick sigue armado en reposo: si no, un worker no puede despertar la UI" {

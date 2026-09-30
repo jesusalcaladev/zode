@@ -6,6 +6,7 @@ const http_client = @import("http_client.zig");
 const tools_mod = @import("tools.zig");
 const roster_mod = @import("roster.zig");
 const free_auto = @import("free_auto.zig");
+const plan_mod = @import("plan.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("models.zig");
 const cache_stats = @import("cache_stats.zig");
@@ -513,6 +514,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "low|medium|high (no args: picker)" },
     .{ .key = "/free-auto", .desc = "on|off: rotate free models across providers when one runs out" },
+    .{ .key = "/plan", .desc = "clear the visible task list" },
     .{ .key = "/yolo", .desc = "toggle auto permissions" },
     .{ .key = "/acp", .desc = "on|off|<cmd>: delegate the turn to an ACP agent (opencode acp)" },
     .{ .key = "/new", .desc = "new session" },
@@ -736,6 +738,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdEffort(m, arg);
     } else if (std.mem.eql(u8, cmd, "use")) {
         cmdUse(m, arg);
+    } else if (std.mem.eql(u8, cmd, "plan")) {
+        cmdPlan(m);
     } else if (std.mem.eql(u8, cmd, "free-auto")) {
         free_auto.cmdFreeAuto(m, arg);
     } else if (std.mem.eql(u8, cmd, "yolo")) {
@@ -1891,6 +1895,51 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
 /// que permite enseñar el diff en vez de un "OK" opaco.
 /// Ejecuta las tool calls. Devuelve el texto sintético del siguiente turno,
 /// propiedad del llamante (ver `runOneTurn`).
+/// `/plan`: limpia el plan visible.
+///
+/// Existe porque el plan es del TURNO y a veces se queda a medias (el modelo se
+/// quedó sin pasos, o el usuario quiere empezar de cero sin abrir sesión nueva).
+/// Sin esto, la única forma de vaciarlo es que el modelo mande una lista vacía,
+/// y eso no va a pasar nunca por iniciativa propia.
+fn cmdPlan(m: *tui.Model) void {
+    if (m.planCopy().isEmpty()) {
+        pushInfo(m, "the plan is already empty");
+        return;
+    }
+    m.clearPlan();
+    pushInfo(m, "plan cleared");
+}
+
+/// Aplica la lista de la tool `todo` y dice en el historial cuánto ha cambiado.
+///
+/// El motivo de que esté aquí y no en `tools.execute` es la propiedad de la
+/// memoria: `execute` devuelve memoria de la arena del turno (que se libera al
+/// acabar), y el plan tiene que VIVIR entre frames. El sitio con estado
+/// compartido es el `Model`.
+///
+/// Y el caso "no ha cambiado" importa: el modelo reenvía la lista entera en
+/// cada llamada, así que sin esto el historial repetiría "plan: 1/3" cinco
+/// veces en un turno y la línea dejaría de informar.
+fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    const parsed = plan_mod.parseItems(arena, args_json, &items) catch |err| {
+        const msg = switch (err) {
+            error.TooManyItems => "the plan has more than 20 steps: shorten it",
+            error.BadPlan => "the plan did not parse: send {items:[{content, status}]}",
+        };
+        pushInfoOwned(m, msg);
+        return;
+    };
+    const r = m.applyPlan(&parsed.items, parsed.len);
+    if (r == .same) return;
+    // Con memoria PROPIA (no de la arena del turno): el texto vive en la cola
+    // de pending y lo dibuja un frame posterior.
+    const pl = m.planCopy();
+    const msg = std.fmt.allocPrint(m.allocator, "{s}", .{pl.summary(m.allocator)}) catch "plan updated";
+    pushInfoOwned(m, msg);
+    if (pl.allDone()) setStatusWithZo(m, .done, "all plan steps done");
+}
+
 fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     const gpa = m.allocator;
     var astate = std.heap.ArenaAllocator.init(gpa);
@@ -1934,6 +1983,13 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
             if (filePathOf(call.args_json, arena)) |pth| {
                 before = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch "";
             }
+        }
+
+        // La tool `todo` no tiene resultado que mirar: su efecto es el PLAN que
+        // ve el usuario, y se aplica aquí (no dentro de `execute`) porque el plan
+        // vive en el `Model`, que es de la TUI.
+        if (std.mem.eql(u8, call.name, "todo")) {
+            applyPlanCall(m, call.args_json, arena);
         }
 
         const res = tools_mod.execute(io_global, call.name, call.args_json, arena) catch |err| {
