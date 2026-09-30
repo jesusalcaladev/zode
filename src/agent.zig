@@ -234,10 +234,24 @@ fn pushInfo(m: *tui.Model, text: []const u8) void {
     m.pushInfo(text);
 }
 
+fn pushError(m: *tui.Model, text: []const u8) void {
+    m.pushError(text);
+}
+
 /// Variante que ya trae la memoria del llamante: no hay que duplicar (ni
 /// liberar) el texto. Se usa en el worker, que no puede dejar basura por frame.
 fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
     m.pushInfoOwned(text);
+}
+
+/// Error al historial, en ROJO (`md.Kind.error_msg`, prefijo `✗`).
+///
+/// Existía el Kind y el prefijo desde el principio, y NINGÚN caller lo usaba:
+/// todos los errores salían por `pushInfoOwned`, que es gris de `.info`. O sea
+/// que un 403 y un "session resumed" se leían igual de apagados, y en un
+/// historial largo el error era una línea más entre cien.
+fn pushErrorOwned(m: *tui.Model, text: []const u8) void {
+    m.pushErrorOwned(text);
 }
 
 /// Pone el estado del turno. El texto NO lleva la carita: la dibuja la TUI en
@@ -701,6 +715,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "low|medium|high (no args: picker)" },
     .{ .key = "/yolo", .desc = "toggle auto permissions" },
+    .{ .key = "/allowlist", .desc = "tools always allowed (persisted)" },
     .{ .key = "/acp", .desc = "on|off|<cmd>: delegate the turn to an ACP agent (opencode acp)" },
     .{ .key = "/new", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
@@ -709,6 +724,33 @@ pub const commands = [_]Cmd{
     .{ .key = "/cache", .desc = "cache hit-rate for this session" },
     .{ .key = "/quit", .desc = "quit" },
 };
+
+/// `/allowlist`: qué tools están en "siempre permitir".
+///
+/// La allowlist vive en `~/.config/zode/permissions.json` y no había forma de
+/// verla: si una tool dejaba de preguntar y no sabías por qué, la única forma
+/// era abrir el fichero a mano. Además dice si `/yolo` está puesto, que es el
+/// otro modo de "no me pregunta".
+fn cmdAllowlist(m: *tui.Model) void {
+    var line_buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line_buf);
+    w.writeAll("always allowed: ") catch {};
+    var n: usize = 0;
+    for (always_lens, 0..) |l, i| {
+        if (l == 0) continue;
+        if (n > 0) w.writeAll(" \u{b7} ") catch {};
+        w.writeAll(always_names[i][0..l]) catch {};
+        n += 1;
+    }
+    if (n == 0) w.writeAll("(none)") catch {};
+    if (yolo) w.writeAll("  \u{b7} yolo ON: everything is auto-allowed") catch {};
+    const msg = std.fmt.allocPrint(
+        m.allocator,
+        "{s}",
+        .{w.buffered()},
+    ) catch return;
+    pushInfoOwned(m, msg);
+}
 
 /// `/cache`: hit-rate de prompt cache de la sesión.
 fn cmdCache(m: *tui.Model) void {
@@ -908,7 +950,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // lo maneja la TUI
     } else if (std.mem.eql(u8, cmd, "models")) {
-        listModelsAsync(m) catch pushInfo(m, "error starting /models");
+        listModelsAsync(m) catch pushError(m, "error starting /models");
     } else if (std.mem.eql(u8, cmd, "providers")) {
         cmdProviders(m);
     } else if (std.mem.eql(u8, cmd, "provider")) {
@@ -925,6 +967,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdUse(m, arg);
     } else if (std.mem.eql(u8, cmd, "yolo")) {
         cmdYolo(m);
+    } else if (std.mem.eql(u8, cmd, "allowlist")) {
+        cmdAllowlist(m);
     } else if (std.mem.eql(u8, cmd, "acp")) {
         cmdAcp(m, arg orelse "");
     } else if (std.mem.eql(u8, cmd, "context")) {
@@ -1286,7 +1330,7 @@ fn acpWorker(job: *ChatJob) void {
         }
 
         if (std.mem.eql(u8, reason, "cancelled")) {
-            pushInfo(m, "ACP turn cancelled");
+            pushError(m, "ACP turn cancelled");
         }
 
         // Siguiente prompt en cola, si lo hay.
@@ -1488,7 +1532,7 @@ fn resumeLatest(m: *tui.Model) void {    var astate = std.heap.ArenaAllocator.in
 
     const latest = session_mod.Session.latestSessionPath(a, io_global) catch null;
     const path = latest orelse {
-        pushInfo(m, "no saved sessions");
+        pushError(m, "no saved sessions");
         return;
     };
     if (session) |old| {
@@ -1496,7 +1540,7 @@ fn resumeLatest(m: *tui.Model) void {    var astate = std.heap.ArenaAllocator.in
         session = null;
     }
     const s = session_mod.Session.resumePath(m.allocator, io_global, path) catch {
-        pushInfo(m, "could not read the session");
+        pushError(m, "could not read the session");
         return;
     };
     session = s;
@@ -1602,7 +1646,7 @@ fn chatWorker(job: *ChatJob) void {
         last_user = text;
     }
     if (owned) |o| m.allocator.free(o);
-    if (iterations >= max_iterations) pushInfo(m, "agent iteration limit reached: stopping the turn");
+    if (iterations >= max_iterations) pushError(m, "agent iteration limit reached: stopping the turn");
     m.streamEnd();
     pushTurnSummary(m);
 }
@@ -1918,6 +1962,11 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
 
     // Sin tool calls: el turno se acabó.
     if (tstate.calls.items.len == 0) {
+        // El ctx% se refresca AQUÍ también, no solo en el path de tools (que es
+        // el que llama a `refreshContextUsage`): un turno sin tools es el caso
+        // NORMAL y el contador se quedaba en lo del turno anterior hasta que
+        // apareciera una tool.
+        refreshContextUsage(m);
         // "done" a secas no dice cuánto costó. Con el reloj del turno, el status
         // pasa a ser el resumen de lo que acaba de pasar (que es lo único que
         // queda visible cuando la franja se apaga).
@@ -2304,7 +2353,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
                 "key rejected by {s}. check ZODE_{s}_KEY (/provider shows the state)",
                 .{ cur_provider_id, providerEnvName() },
             ) catch "key rechazada";
-            pushInfoOwned(m, msg);
+            pushErrorOwned(m, msg);
         },
         // 402: la cuenta no tiene saldo. No es un bug de zode ni la key.
         error.NoCredits => {
@@ -2313,7 +2362,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
                 "out of credits on {s}: {s}\n  pick a `-free` model or switch with /provider",
                 .{ cur_provider_id, reason },
             ) catch "sin creditos";
-            pushInfoOwned(m, msg);
+            pushErrorOwned(m, msg);
         },
         // 404: el modelo no existe en ese provider. Casi siempre es que se
         // quedo un id viejo HARDCODEADO (por eso el default se cambia cuando
@@ -2324,7 +2373,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
                 "model `{s}` does not exist on {s}: {s}\n  /model for the ones you have",
                 .{ cur_model, cur_provider_id, reason },
             ) catch "modelo inexistente";
-            pushInfoOwned(m, msg);
+            pushErrorOwned(m, msg);
         },
         // 403: en la practica casi siempre es el MODELO que no esta disponible
         // para esta cuenta, no la key. Decirlo claro evita horas de debugger.
@@ -2334,16 +2383,16 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
                 "`{s}` is not available on your {s} account: {s}\n  /model for your models, /provider to switch",
                 .{ cur_model, cur_provider_id, reason },
             ) catch "acceso denegado";
-            pushInfoOwned(m, msg);
+            pushErrorOwned(m, msg);
         },
         error.RateLimited, error.Overloaded => {
             const msg = std.fmt.allocPrint(gpa, "{s} tras varios intentos: {s}", .{ @errorName(err), reason }) catch
                 "servicio saturado";
-            pushInfoOwned(m, msg);
+            pushErrorOwned(m, msg);
         },
         else => {
             const msg = std.fmt.allocPrint(gpa, "error: {t} ({s})", .{ err, reason }) catch "error";
-            pushInfoOwned(m, msg);
+            pushErrorOwned(m, msg);
         },
     }
     setStatusWithZo(m, .warn, @errorName(err));
@@ -3088,4 +3137,31 @@ test "toolArgSummary y toolResultSummary conocen las tools de web" {
     try std.testing.expect(std.mem.indexOf(u8, res, "3 lines") != null);
     const hits = toolResultSummary("web_search", "1. One\n   https://a.example\n   snip\n\n2. Two\n   https://b.example\n   snip\n", arena);
     try std.testing.expectEqualStrings("2 results", hits);
+}
+
+test "cmdAllowlist lista lo que hay y avisa si esta vacia" {
+    var backing: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var m = tui.Model.init(fba.allocator());
+    defer m.deinit();
+
+    // Vacia: lo dice, para que "no me pregunta" se pueda distinguir de "no hay
+    // nada que mirar".
+    cmdAllowlist(&m);
+    m.drainPending();
+    try std.testing.expect(std.mem.indexOf(u8, m.paras.items[0].text, "(none)") != null);
+
+    // Con una tool en la lista: sale su nombre.
+    _ = setAlwaysAllowedNoSave("bash");
+    cmdAllowlist(&m);
+    m.drainPending();
+    try std.testing.expect(std.mem.indexOf(u8, m.paras.items[1].text, "bash") != null);
+
+    // Y no se duplica: el count no crece por repreguntar.
+    const before = m.paras.items.len;
+    cmdAllowlist(&m);
+    m.drainPending();
+    try std.testing.expectEqual(before + 1, m.paras.items.len);
+
+    always_lens = @splat(0); // no dejar el estado global sucio
 }

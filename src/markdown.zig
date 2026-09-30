@@ -49,7 +49,11 @@ const styles = struct {
     const tool = fg(6); // cyan
     const tool_bold: Style = .{ .bold = true, .fg = .{ .index = 6 } };
     const tool_res = fg(8); // el resultado va atenuado
-    const tool_res_bold: Style = .{ .fg = .{ .index = 8 } }; // su resumen, un punto mas claro
+    // El resumen de la tool va en NEGRITA de verdad. Antes era idéntico a
+    // `tool_res` (mismo índice, sin `.bold`), así que el "dos tonos" que se
+    // describe en AGENTS.md era un no-op: `*write*(hola.js) · *3ms*` salía
+    // entero del mismo gris.
+    const tool_res_bold: Style = .{ .bold = true, .fg = .{ .index = 8 } };
     const diff_add = fg(2); // verde
     const diff_del = fg(1); // rojo
     const diff_ctx = fg(8); // gris
@@ -542,4 +546,24 @@ test "unifiedDiff: por encima del tope no se calcula el LCS (sería O(n*m))" {
     const out = try unifiedDiff(arena, big_a.items, big_b.items);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expect(std.mem.indexOf(u8, out[0], "too large") != null);
+}
+
+test "tool_res_bold es bold DE VERDAD (el 'dos tonos' no era un no-op)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // El resumen de la tool (`*3ms*`) tiene que salir en negrita; antes
+    // `tool_res_bold` era idéntico a `tool_res` (mismo índice, sin `.bold`) y
+    // el "dos tonos" de las tools no pintaba nada.
+    const segs = try inlineSegments(arena, "*3ms*", .tool_res);
+    try std.testing.expectEqual(@as(usize, 1), segs.len);
+    try std.testing.expect(segs[0].style.bold);
+    try std.testing.expectEqual(styles.tool_res_bold.fg, segs[0].style.fg);
+    try std.testing.expectEqualStrings("3ms", segs[0].text);
+
+    // Y el texto SIN marcar sale apagado y SIN bold: los dos tonos existen.
+    const plain = try inlineSegments(arena, "salida", .tool_res);
+    try std.testing.expect(!plain[0].style.bold);
+    try std.testing.expectEqual(styles.tool_res.fg, plain[0].style.fg);
 }
