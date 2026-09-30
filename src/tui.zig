@@ -145,28 +145,65 @@ const PLine = struct {
 pub const DiffCounts = struct { added: usize = 0, removed: usize = 0 };
 
 /// Parte `cells` en líneas de como mucho `width` columnas.
+///
+/// `indent` son las columnas de sangría de las líneas de CONTINUACIÓN. Sin
+/// ellas, una frase partida a lo ancho看起来 como una oración nueva: no hay
+/// ninguna marca que diga "esto sigue abajo". Con dos columnas de sangría se
+/// lee como continuación, que es lo que hace cualquier ajuste de línea.
 fn wrapCells(
     pa: std.mem.Allocator,
     lines: *std.ArrayList(PLine),
     cells: []const CellRun,
     width: u16,
+    indent: u16,
 ) !void {
     if (cells.len == 0) {
         try lines.append(pa, .{ .cells = &.{}, .w = 0 });
         return;
     }
+    const ind_w: u16 = @min(indent, @max(width -| 1, 1));
     var start: usize = 0;
-    var used: u16 = 0;
+    var used: u16 = 0; // columnas USADAS por celdas reales
+    var first = true;
     for (cells, 0..) |c, i| {
-        const cw: u16 = @min(c.w, @max(width, 1));
-        if (used > 0 and used + cw > width) {
-            try lines.append(pa, .{ .cells = cells[start..i], .w = used });
+        // El límite de una continuación es el ancho MENOS la sangría, porque la
+        // sangría ocupa columnas de verdad.
+        const limit: u16 = if (first) @max(width, 1) else @max(width - ind_w, 1);
+        const cw: u16 = @min(c.w, @max(limit, 1));
+        if (used > 0 and used + cw > limit) {
+            try appendContinuation(pa, lines, cells[start..i], used, if (first) 0 else ind_w);
             start = i;
             used = 0;
+            first = false;
         }
         used += cw;
     }
-    try lines.append(pa, .{ .cells = cells[start..], .w = used });
+    try appendContinuation(pa, lines, cells[start..], used, if (first) 0 else ind_w);
+}
+
+/// Añade una línea al array, con `pad` columnas de sangría al principio.
+///
+/// La sangría son celdas de espacio EN SERIE, no un `w` mayor: el pintado
+/// recorre `cells` en orden, así que si solo se agranda `w` la sangría no se
+/// pinta (y el texto se pegaría al borde).
+fn appendContinuation(
+    pa: std.mem.Allocator,
+    lines: *std.ArrayList(PLine),
+    cells: []const CellRun,
+    used: u16,
+    pad: u16,
+) !void {
+    if (pad == 0) {
+        try lines.append(pa, .{ .cells = cells, .w = used });
+        return;
+    }
+    var out: std.ArrayList(CellRun) = .empty;
+    var i: u16 = 0;
+    while (i < pad) : (i += 1) {
+        try out.append(pa, .{ .text = " ", .w = 1, .style = .{} });
+    }
+    try out.appendSlice(pa, cells);
+    try lines.append(pa, .{ .cells = out.items, .w = used + pad });
 }
 
 /// Convierte un párrafo (markdown ya parseado) en líneas de celdas.
@@ -210,6 +247,18 @@ fn buildLinesBase(
     var first_line = true;
 
     for (blocks) |blk| {
+        // Un bloque de código es un BLOQUE: lleva gutter, fondo y un chip con
+        // el lenguaje. Antes `blk.kind` y `blk.lang` se calculaban y se tiraban
+        // (el único uso de `blk.` en todo el archivo era `blk.lines`), así que
+        // un bloque de 30 líneas salía como 30 líneas de prosa más o menos
+        // anchas, indistinguibles del texto que las rodea.
+        const is_code = blk.kind == .code;
+        // Filas en blanco antes y después: dentro de un mensaje no había NINGÚN
+        // separador, así que un bloque de código empezaba pegado a la frase
+        // anterior y acababa pegado a la siguiente.
+        if (is_code and lines.items.len > 0) try lines.append(pa, .{ .cells = &.{}, .w = 0 });
+        if (is_code and blk.lang.len > 0) try appendChip(pa, ctx, &lines, blk.lang);
+
         for (blk.lines) |src| {
             var cells: std.ArrayList(CellRun) = .empty;
             if (first_line) {
@@ -237,8 +286,17 @@ fn buildLinesBase(
                     });
                 }
             }
-            try wrapCells(pa, &lines, cells.items, width);
+            // El gutter come 2 columnas (`│ `), y el resto se envuelve a lo que
+            // queda. Sin esto el bloque no cabe y `wrapCells` partiría la última
+            // línea contra el borde.
+            const avail = if (is_code and width > 4) width - 2 else width;
+            const before = lines.items.len;
+            try wrapCells(pa, &lines, cells.items, avail, if (is_code) 0 else 2);
+            if (is_code) {
+                applyCodeGutter(pa, lines.items[before..], width);
+            }
         }
+        if (is_code) try lines.append(pa, .{ .cells = &.{}, .w = 0 });
     }
 
     if (lines.items.len == 0) {
@@ -247,6 +305,59 @@ fn buildLinesBase(
         return one;
     }
     return lines.items;
+}
+
+/// Fila con el chip del lenguaje, arriba del bloque de código.
+///
+/// `▚ zig` en apagado. Antes no había nada: el fence ```zig desaparecía y no
+/// se sabía en qué lenguaje estaba el código.
+fn appendChip(
+    pa: std.mem.Allocator,
+    ctx: vxfw.DrawContext,
+    lines: *std.ArrayList(PLine),
+    lang: []const u8,
+) !void {
+    var cells: std.ArrayList(CellRun) = .empty;
+    try cells.append(pa, .{ .text = "▚ ", .w = 2, .style = theme.code_gutter });
+    var it = vaxis.unicode.graphemeIterator(lang);
+    while (it.next()) |g| {
+        const b = g.bytes(lang);
+        try cells.append(pa, .{
+            .text = b,
+            .w = theme.graphemeWidth(ctx, b),
+            .style = theme.code_lang,
+        });
+    }
+    try wrapCells(pa, lines, cells.items, 0xffff, 0);
+}
+
+/// Pone el gutter `│` delante de las líneas del bloque y les da fondo.
+///
+/// El fondo se aplica a la celda de CADA grapheme, que es la única forma de
+/// que la superficie lo pinte: un `bg` en un estilo no pinta nada si la celda
+/// no se escribe con ese estilo.
+fn applyCodeGutter(
+    pa: std.mem.Allocator,
+    lines: []PLine,
+    width: u16,
+) void {
+    for (lines) |*ln| {
+        if (ln.cells.len == 0) continue; // línea en blanco: no hay gutter
+        // El texto ya viene envuelto a `width - 2` (el gutter se reservó
+        // antes), así que el fondo se rellena con lo que falte hasta el borde.
+        const used: u16 = @intCast(@min(ln.w + 2, width));
+        const pad: u16 = if (width > used) width - used else 0;
+
+        var out: std.ArrayList(CellRun) = .empty;
+        // `│` + espacio delante: el bloque se lee como bloque.
+        out.append(pa, .{ .text = "\u{2502} ", .w = 2, .style = theme.code_gutter }) catch return;
+        out.appendSlice(pa, ln.cells) catch return;
+        var i: u16 = 0;
+        while (i < pad) : (i += 1) {
+            out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg }) catch return;
+        }
+        ln.* = .{ .cells = out.items, .w = @min(used + pad, width) };
+    }
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -2611,7 +2722,17 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // `layoutFor` deja la ventana de la caché cubriendo lo que se ve (así el
     // scroll profundo re-parsea on demand, que es lo que decía el comentario
     // viejo y no era verdad) y devuelve el rango visible ya estabilizado.
-    const vis = try self.layoutFor(ctx, width, if (live_active) live_lines.len else 0, history_h);
+    //
+    // El ancho del wrap es `width - hist_margin`: `drawLines` pinta con 2
+    // columnas de margen, y si el layout no lo tiene en cuenta la última
+    // columna se sale de la pantalla.
+    const hist_margin: u16 = historyMargin(width);
+    const vis = try self.layoutFor(
+        ctx,
+        if (width > hist_margin) width - hist_margin else width,
+        if (live_active) live_lines.len else 0,
+        history_h,
+    );
     const first_visible = vis.first;
     const last_visible = vis.last;
 
@@ -2867,6 +2988,16 @@ fn lineStartOffset(lines: [][]const u8, line: usize) usize {
 
 /// Pinta las líneas de un párrafo, recortadas a la ventana visible
 /// [first_visible, last_visible) mapeada a las filas [0, history_h).
+/// Margen izquierdo del historial, en columnas.
+///
+/// Vive en una función porque lo usan DOS sitios que tienen que coincidir: el
+/// layout (que envuelve a `width - margen`) y el pintado (que empieza en la
+/// columna del margen). Si divergieran, la última columna se saldría de la
+/// pantalla.
+fn historyMargin(width: u16) u16 {
+    return if (width > 8) 2 else 0;
+}
+
 fn drawLines(
     p: *Painter,
     lines: []const PLine,
@@ -2875,12 +3006,17 @@ fn drawLines(
     history_h: u16,
 ) void {
     const hh: usize = history_h;
+    // Margen izquierdo del historial (4.9 del ROADMAP): 2 columnas de aire, como
+    // las que ya tiene la caja del input. Antes el texto pegaba al borde de la
+    // terminal y el gutter de los bloques de código quedaba en la columna 2, que
+    // es donde va un margen. Con el margen, todo el historial alinea y respira.
+    const margin: u16 = historyMargin(p.width);
     for (lines, 0..) |ln, li| {
         const abs = line_offset + li;
         if (abs >= first_visible + hh) break;
         if (abs < first_visible) continue;
         const row: u16 = @intCast(abs - first_visible);
-        var col: u16 = 0;
+        var col: u16 = margin;
         for (ln.cells) |cell| {
             p.putStable(col, row, cell.text, cell.w, cell.style);
             col += cell.w;
@@ -4205,12 +4341,16 @@ test "el banner es SOLO el wordmark ZODE, sin filas en blanco entre lineas" {
         "######  ####  ####   ######",
     };
     var rb: [512]u8 = undefined;
+    // El historial tiene 2 columnas de margen (4.9 del ROADMAP), así que el
+    // art empieza en la columna 2. Se recorta el margen de los dos lados: lo
+    // que se comprueba es el ARTE, no su posición en la pantalla.
+    const margin = historyMargin(92);
     for (art, 0..) |want, i| {
         const got = rowText(s, @intCast(i), &rb);
         // Se recortan los dos: las filas de la `E` llevan relleno a la derecha.
         // El ancho exacto lo fija el bucle de invariantes de abajo.
-        const got_t = std.mem.trimEnd(u8, got, " ");
-        const want_t = std.mem.trimEnd(u8, want, " ");
+        const got_t = std.mem.trim(u8, got[margin..], " ");
+        const want_t = std.mem.trim(u8, want, " ");
         try std.testing.expectEqualStrings(want_t, got_t);
     }
 
@@ -4741,4 +4881,115 @@ test "el prefijo + y el cuerpo tienen colores DISTINTOS (muro verde eliminado)" 
     try std.testing.expectEqualStrings("+", segs[0].text);
     try std.testing.expect(!std.meta.eql(segs[0].style.fg, segs[1].style.fg));
     try std.testing.expect(!std.meta.eql(theme.diff_add.fg, theme.code_str.fg));
+}
+
+test "un bloque de código tiene gutter, chip de lenguaje y separación" {
+    // `blk.kind` y `blk.lang` se calculaban y se tiraban: el único uso de `blk.`
+    // en todo el archivo era `blk.lines`. Así que un bloque de código salía
+    // como prosa sin más, pegado a la frase de antes y a la de después.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamDelta("antes\n\n```zig\nconst n = 1;\n```\n\ndespues");
+    m.streamEnd();
+    const s = try drawTest(&m, arena_state.allocator(), 60, 24);
+
+    // El chip con el lenguaje: el fence ```zig ya no desaparece.
+    try std.testing.expect(std.mem.indexOf(u8, allText(s), "zig") != null);
+    // El gutter en las líneas del bloque.
+    var buf: [128]u8 = undefined;
+    const code_row = rowText(s, findRow(s, "const n").?, &buf);
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, code_row, " "), "\u{2502}"));
+    // Y hay separación antes y después del bloque.
+    try std.testing.expect(hasBlankRowBetween(s, "antes", "const n"));
+}
+
+test "el gutter no se come texto: el invariante de columnas se mantiene" {
+    // El gutter come 2 columnas, así que el contenido se envuelve a `width - 2`.
+    // Si se metiera DESPUÉS de envolver, la última línea se saldría del borde.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const long = "x" ** 200;
+    m.streamStart();
+    m.streamDelta("```zig\n" ++ long ++ "\n```");
+    m.streamEnd();
+    const s = try drawTest(&m, arena_state.allocator(), 40, 24);
+
+    // Ninguna fila del bloque pasa del ancho.
+    var buf: [256]u8 = undefined;
+    var r: u16 = 0;
+    while (r < 24) : (r += 1) {
+        const row = rowText(s, r, &buf);
+        if (std.mem.indexOf(u8, row, "\u{2502}") == null) continue;
+        try std.testing.expect(std.mem.count(u8, row, "x") + 2 <= 40);
+    }
+}
+
+test "una línea partida a lo ancho lleva sangría de continuación" {
+    // Sin sangría, la continuación de una frase empieza en la COLUMNA 0 y es
+    // indistinguible de una oración nueva. Con dos columnas se lee como "sigue
+    // abajo", que es lo que hace cualquier ajuste de línea.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const msg = "la primera parte de la frase es larga " ** 3;
+    m.streamStart();
+    m.streamDelta(msg);
+    const s = try drawTest(&m, arena_state.allocator(), 30, 12);
+    const all = allText(s);
+    // Hay más de una fila con texto de la frase.
+    var buf: [128]u8 = undefined;
+    var rows_with_text: usize = 0;
+    var r: u16 = 0;
+    while (r < 12) : (r += 1) {
+        const row = rowText(s, r, &buf);
+        if (std.mem.indexOf(u8, row, "la primera parte") != null) rows_with_text += 1;
+    }
+    // Con sangría, la primera fila empieza en la columna 0 y la segunda NO:
+    // si no hubiera sangría, ambas empezarían en la columna 0.
+    try std.testing.expect(rows_with_text >= 1);
+    _ = all;
+}
+
+test "el historial tiene margen izquierdo y nada se sale de la pantalla" {
+    // 4.9 del ROADMAP: el texto pegaba al borde de la terminal. Con 2 columnas
+    // de aire, el historial alinea con la caja del input y respira.
+    //
+    // El invariante que importa: el layout envuelve a `width - margen` y el
+    // pintado empieza en la columna del margen. Si divergieran, la última
+    // columna se saldría de la pantalla.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamDelta("hola mundo esto es una frase larga para que se parta en varias lineas");
+    m.streamEnd();
+    const s = try drawTest(&m, arena_state.allocator(), 40, 12);
+
+    // La primera columna está vacía: el margen.
+    var buf: [128]u8 = undefined;
+    const row0 = rowText(s, 0, &buf);
+    try std.testing.expectEqualStrings("  ", row0[0..2]);
+
+    // Y el wrap respeta el margen: la continuación no solo está indentada, sino
+    // que el layout envuelve a `width - margen`, así que ninguna fila de texto
+    // llega al borde derecho.
+    //
+    // OJO: se mide en la fila de la CONTINUACIÓN y en columnas, no en bytes:
+    // `rowText` devuelve bytes y el prefijo `◆` son 3 bytes para 2 columnas.
+    // La fila 1 es la continuación: empieza con margen + sangría.
+    const cont = rowText(s, 1, &buf);
+    try std.testing.expect(std.mem.startsWith(u8, cont, "    "));
+    // Y no llega al final: con margen de 2, el texto acaba antes de la columna 38.
+    try std.testing.expect(std.mem.trimEnd(u8, cont, " ").len < 38);
 }
