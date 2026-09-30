@@ -1,0 +1,13 @@
+test "TurnStats: un fichero tocado dos veces cuenta como uno" {
+test "TurnStats: el resumen dice tools, ficheros y lineas" {
+test "TurnStats: un diff de 0 lineas no inventa ficheros" {
+test "normalizeKey: recorta lo que la terminal suelta al pegar" {
+test "normalizeKey: rechaza basura pegada por error" {
+test "normalizeKey: una key real pasa" {
+test "el texto sintético de iteración es memoria propia, no un literal" {
+test "errPhrase: los errores se leen como frases, no como identificadores" {
+test "el backoff que se anuncia es el que se espera" {
+test "el backoff respeta el retry-after del server" {
+test "toolCallsJsonFromCalls: el mensaje del assistant lleva las tool_calls" {
+test "toolArgSummary y toolResultSummary conocen las tools de web" {
+test "cmdAllowlist lista lo que hay y avisa si esta vacia" {
