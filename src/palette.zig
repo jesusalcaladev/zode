@@ -7,28 +7,28 @@ const tui = @import("tui.zig");
 
 const Painter = tui.Painter;
 
-/// Paleta modal de comandos y modelos, al estilo de opencode / Claude Code.
+/// Modal palette of commands and models, in the style of opencode / Claude Code.
 ///
-/// Dos modos:
-///   - `.commands`: lista agrupada de comandos con el atajo a la derecha.
-///   - `.models`:   DOS COLUMNAS. La izquierda son los providers (con su
-///                  estado de key) y la derecha los modelos del provider
-///                  resaltado. Es lo que hace opencode: provider -> modelos.
+/// Two modes:
+///   - `.commands`: grouped list of commands with the shortcut on the right.
+///   - `.models`:   TWO COLUMNS. The left one holds the providers (with their
+///                  key state) and the right one the models of the highlighted
+///                  provider. That is what opencode does: provider -> models.
 ///
-/// El módulo no sabe nada de providers, de red ni de sesiones: quien lo abre
-/// le pasa la lista de `Item` y recibe la selección. Eso lo hace testeable sin
-/// red y deja el dibujo separado de los datos.
+/// The module knows nothing about providers, networking or sessions: whoever
+/// opens it passes in the list of `Item` and gets back the selection. That
+/// makes it testable without a network and keeps drawing separate from data.
 ///
-/// Invariante importante: `sel[c]` indexa `filtered[c]`, NUNCA `items`. Antes
-/// de tener esta nota el dibujo filtraba sobre la marcha mientras la selección
-/// contaba sobre la lista completa, y con cualquier filtro la Highlight iba a
-/// la fila equivocada.
+/// Important invariant: `sel[c]` indexes `filtered[c]`, NEVER `items`. Before
+/// this note existed, the drawing filtered on the fly while the selection
+/// counted on the full list, and with any filter the highlight went to the
+/// wrong row.
 pub const Mode = enum {
     commands,
     models,
-    /// Modal de conectar: columna de providers + "Connect an integration".
+    /// Connect modal: providers column + "Connect an integration".
     connect,
-    /// Escribir la API key de un provider.
+    /// Typing a provider's API key.
     key_prompt,
 };
 
@@ -36,17 +36,17 @@ pub const Kind = enum {
     command,
     provider,
     model,
-    /// "Connect an integration": pide la key del provider de la fila.
+    /// "Connect an integration": asks for the key of the provider in the row.
     connect,
 };
 
 pub const Item = struct {
     kind: Kind,
-    /// Índice del encabezado de grupo (0 = sin grupo). El valor es un índice
-    /// +1 sobre `groups`.
+    /// Group header index (0 = no group). The value is an index
+    /// +1 over `groups`.
     group: u8 = 0,
     label: []const u8 = "",
-    /// Columna derecha: atajo de teclado, "free", precio…
+    /// Right column: keyboard shortcut, "free", price…
     hint: []const u8 = "",
 };
 
@@ -62,25 +62,25 @@ pub const Palette = struct {
     active: bool = false,
     mode: Mode = .commands,
 
-    /// Filtro de búsqueda (la línea "search" del modal).
+    /// Search filter (the modal's "search" line).
     query: [max_query]u8 = undefined,
     query_len: usize = 0,
 
-    /// Columna activa en modo modelos: 0 = providers, 1 = modelos.
+    /// Active column in models mode: 0 = providers, 1 = models.
     col: u8 = 1,
     sel: [2]usize = .{ 0, 0 },
     scroll: [2]usize = .{ 0, 0 },
-    /// Índices (sobre `items`) que sobreviven al filtro, uno por columna.
+    /// Indices (into `items`) that survive the filter, one per column.
     filtered: [2]std.ArrayList(u32) = .{ .empty, .empty },
 
-    /// Datos que rellena quien abre la paleta.
+    /// Data filled in by whoever opens the palette.
     items: []const Item = &.{},
     groups: []const Group = &.{},
-    /// ¿La paleta es dueña de `items` (y de sus strings)? Si lo es, los libera
-    /// al reemplazarlos. Lo pone `setItemsOwned`.
+    /// Does the palette own `items` (and their strings)? If so, it frees them
+    /// when replacing them. `setItemsOwned` sets this.
     owns_items: bool = false,
 
-    /// Modo `.key_prompt`.
+    /// `.key_prompt` mode.
     key_item: u32 = 0,
     key_input: [max_key]u8 = undefined,
     key_len: usize = 0,
@@ -112,15 +112,15 @@ pub const Palette = struct {
         self.key_msg_len = n;
     }
 
-    /// Mensaje con formato (los callers vienen de `agent`, que no puede tocar
-    /// el buffer de la palette directamente).
+    /// Formatted message (the callers come from `agent`, which cannot touch the
+    /// palette's buffer directly).
     pub fn setKeyMessagef(self: *Palette, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.bufPrint(&self.key_msg, fmt, args) catch return;
         self.key_msg_len = s.len;
     }
 
-    /// Índice (sobre `items`) del provider resaltado en la columna izquierda,
-    /// o null si no hay ninguno. Lo usa Ctrl+A para saber a quién va la key.
+    /// Index (into `items`) of the highlighted provider in the left column, or
+    /// null if there is none. Ctrl+A uses it to know who the key is for.
     pub fn providerHighlighted(self: *const Palette) ?u32 {
         if (self.mode != .models) return null;
         const f = self.filtered[0].items;
@@ -130,17 +130,17 @@ pub const Palette = struct {
         return idx;
     }
 
-    /// ¿Item de la columna actual? En modo modelos la columna 0 son providers.
+    /// Item of the current column? In models mode column 0 is providers.
     pub fn column(self: *const Palette) usize {
         return if (self.mode == .models) self.col else 0;
     }
 
-    /// ¿Es un modal de una sola columna? (comandos, conectar, key)
+    /// Is it a single-column modal? (commands, connect, key)
     pub fn isSingleColumn(self: *const Palette) bool {
         return self.mode != .models;
     }
 
-    /// Item resaltado de la columna actual, o null.
+    /// Highlighted item of the current column, or null.
     pub fn selected(self: *const Palette) ?Item {
         const c = self.column();
         const f = self.filtered[c].items;
@@ -148,7 +148,7 @@ pub const Palette = struct {
         return self.items[f[self.sel[c]]];
     }
 
-    /// Ídem por columna explícita (para el test y para el dibujo).
+    /// Same, by explicit column (for the test and for the drawing).
     pub fn selectedIn(self: *const Palette, c: usize) ?Item {
         const f = self.filtered[c].items;
         if (self.sel[c] >= f.len) return null;
@@ -159,19 +159,19 @@ pub const Palette = struct {
         return self.filtered[c].items.len;
     }
 
-    /// Carga una lista nueva y vuelve a filtrar. Quien llama mantiene `items`
-    /// y `groups` vivos (son de su arena o del allocator del modelo).
+    /// Loads a new list and refilters. The caller keeps `items` and `groups`
+    /// alive (they are from its arena or the model's allocator).
     pub fn setItems(self: *Palette, items: []const Item, groups: []const Group) void {
         self.setItemsBorrowed(items, groups);
     }
 
-    /// Igual que `setItems` pero la paleta pasa a ser dueña de `items` (y de
-    /// sus strings) y libera los de la lista anterior al reemplazarlos.
+    /// Same as `setItems` but the palette becomes the owner of `items` (and of
+    /// their strings) and frees those of the previous list when replacing them.
     ///
-    /// Importante para el worker de modelos: si entregara un slice de
-    /// `models_mod.Model` y liberara la lista justo después, los `id` de los
-    /// items serían punteros colgantes y el dibujo reventaba con
-    /// `InvalidStartByte` al pintar la columna de modelos.
+    /// Important for the models worker: if it handed over a slice of
+    /// `models_mod.Model` and freed the list right after, the `id` of the items
+    /// would be dangling pointers and the drawing blew up with
+    /// `InvalidStartByte` when painting the models column.
     pub fn setItemsBorrowed(self: *Palette, items: []const Item, groups: []const Group) void {
         self.releaseItems();
         self.items = items;
@@ -191,24 +191,24 @@ pub const Palette = struct {
     fn resetSelection(self: *Palette) void {
         self.sel = .{ 0, 0 };
         self.scroll = .{ 0, 0 };
-        // En `.connect` la lista única es la columna 0; en `.models` se empieza
-        // en la de modelos, que es la que se viene a mirar.
+        // In `.connect` the single list is column 0; in `.models` we start on
+        // the models one, which is the one you come to look at.
         self.col = if (self.mode == .models) 1 else 0;
         self.refilter();
     }
 
-    /// Repuebla las dos listas filtradas. Una columna, dos: en modo modelos la
-    /// 0 son providers (`provider`/`connect`) y la 1 son `model`. En modo
-    /// comandos todo va a la columna 0.
+    /// Refills both filtered lists. One column, two: in models mode 0 is
+    /// providers (`provider`/`connect`) and 1 is `model`. In commands mode
+    /// everything goes to column 0.
     pub fn refilter(self: *Palette) void {
         const q = self.queryText();
-        // En modo `.connect` TODO va a la columna 0 (es una sola lista), así
-        // que se comporta como `.commands` pero con los items de provider.
+        // In `.connect` mode EVERYTHING goes to column 0 (it is a single list),
+        // so it behaves like `.commands` but with the provider items.
         const single = self.mode == .commands or self.mode == .connect or self.mode == .key_prompt;
-        // En el modo de dos columnas SOLO filtra la que tiene el foco. Filtrar
-        // las dos dejaba la otra en blanco al buscar, y daba la sensacion de
-        // que la lista de modelos no existia: se escribia "sonnet" y no veias
-        // ni un modelo, solo "no matches" en las dos columnas.
+        // In two-column mode filter ONLY the focused one. Filtering both left
+        // the other blank when searching, which gave the impression that the
+        // models list did not exist: you typed "sonnet" and did not see a single
+        // model, only "no matches" in both columns.
         const focus = self.column();
         for (0..2) |c| {
             self.filtered[c].clearRetainingCapacity();
@@ -246,7 +246,7 @@ pub const Palette = struct {
         self.sel[c] = @intCast(next);
     }
 
-    /// Mantiene el item resaltado dentro de la ventana de `rows`.
+    /// Keeps the highlighted item inside the `rows` window.
     pub fn clampScroll(self: *Palette, c: usize, rows: usize) void {
         if (rows == 0) return;
         if (self.sel[c] < self.scroll[c]) self.scroll[c] = self.sel[c];
@@ -255,16 +255,16 @@ pub const Palette = struct {
         if (n > rows and self.scroll[c] > n - rows) self.scroll[c] = n - rows;
     }
 
-    /// Libera los items propios (labels y hints) y vacía la lista.
+    /// Frees the owned items (labels and hints) and empties the list.
     pub fn releaseItems(self: *Palette) void {
         if (self.owns_items) freeItems(self.gpa, self.items);
         self.items = &.{};
         self.owns_items = false;
     }
 
-    /// Cierra la paleta para el redraw. NO libera los items: se puede reabrir en
-    /// sitio (paleta de modelos → conectar) y entonces `setItemsOwned` los
-    /// libera a los suyos. Para soltar la memoria, `destroy`.
+    /// Closes the palette for the redraw. Does NOT free the items: it can be
+    /// reopened in place (models palette → connect) and then `setItemsOwned`
+    /// frees them along with its own. To release the memory, `destroy`.
     pub fn close(self: *Palette) void {
         self.active = false;
         self.mode = .commands;
@@ -274,40 +274,41 @@ pub const Palette = struct {
         self.col = 1;
         self.sel = .{ 0, 0 };
         self.scroll = .{ 0, 0 };
-        // OJO: los items NO se sueltan aquí. Con `items = &.{}` a pelo se
-        // perdían las etiquetas propias (cada Ctrl+P que se cerraba era una
-        // fuga) y además `owns_items` se quedaba en `true` con una lista
-        // vacía, que es peor: parece que la paleta es dueña de algo.
+        // CAREFUL: the items are NOT released here. With a bare `items = &.{}`
+        // the owned labels were lost (every Ctrl+P that closed was a leak) and
+        // on top of that `owns_items` stayed `true` with an empty list, which
+        // is worse: it looks like the palette owns something.
         self.filtered[0].clearRetainingCapacity();
         self.filtered[1].clearRetainingCapacity();
     }
 
-    /// Cierra la paleta y libera lo que sea suyo. Al salir del proceso.
+    /// Closes the palette and frees whatever is its own. On process exit.
     pub fn destroy(self: *Palette) void {
         self.releaseItems();
         self.deinit();
     }
 };
 
-// ── filtrado ─────────────────────────────────────────────────
+// ── filtering ────────────────────────────────────────────────
 
-/// ¿El item sobrevive al filtro?
+/// Does the item survive the filter?
 ///
-/// Es una paleta de búsqueda, no el autocompletado de `/`: aquí la SUBCADENA
-/// es lo que se quiere. Con prefijo estricto, escribir "mod" no encontraba
-/// "/model" (que empieza por barra) y el buscador parecía roto. Orden: prefijo
-/// primero (caso habitual y barato), luego subcadena del label, luego el hint
-/// y por último el nombre del grupo, para que "model" saque el grupo entero.
+/// This is a search palette, not `/` autocomplete: here the SUBSTRING is what
+/// is wanted. With a strict prefix, typing "mod" did not find "/model" (which
+/// starts with a slash) and the search looked broken. Order: prefix first (the
+/// usual and cheap case), then the label's substring, then the hint and
+/// finally the group name, so that "model" brings out the whole group.
 pub fn matches(item: Item, groups: []const Group, q: []const u8) bool {
     if (q.len == 0) return true;
     if (startsWithIgnoreCase(item.label, q)) return true;
     if (containsIgnoreCase(item.label, q)) return true;
     if (item.hint.len > 0 and containsIgnoreCase(item.hint, q)) return true;
-    // El nombre del grupo es una via MAS para encontrar, nunca un veto: con un
-    // `return containsIgnoreCase(...)` el grupo vetaba la coincidencia y buscar
-    // "sonnet" no encontraba "claude-sonnet-4" (vive en el grupo "Models",
-    // que no tiene "sonnet"). Ademas al hacer Enter con la lista filtrada vacia
-    // se acababa aplicando un modelo que no era el resaltado.
+    // The group name is one MORE way to find, never a veto: with a
+    // `return containsIgnoreCase(...)` the group vetoed the match, and searching
+    // "sonnet" did not find "claude-sonnet-4" (it lives in the "Models" group,
+    // which does not contain "sonnet"). On top of that, pressing Enter with an
+    // empty filtered list ended up applying a model that was not the
+    // highlighted one.
     for (groups, 0..) |g, i| {
         if (i + 1 == item.group and containsIgnoreCase(g.name, q)) return true;
     }
@@ -339,20 +340,20 @@ const t = std.testing;
 test "matches: prefijo, subcadena, hint y nombre de grupo" {
     const groups = [_]Group{ .{ .name = "Modelo" }, .{ .name = "Sesión" } };
 
-    // Grupo "Modelo": buscar "model" saca el item entero.
+    // Group "Modelo": searching "model" brings out the whole item.
     const it = Item{ .kind = .command, .group = 1, .label = "/model" };
-    try t.expect(matches(it, &groups, "")); // filtro vacío deja todo
-    try t.expect(matches(it, &groups, "/mo")); // prefijo
+    try t.expect(matches(it, &groups, "")); // empty filter keeps everything
+    try t.expect(matches(it, &groups, "/mo")); // prefix
     try t.expect(matches(it, &groups, "/model"));
-    try t.expect(matches(it, &groups, "mod")); // subcadena: sin esto no aparece
-    try t.expect(matches(it, &groups, "model")); // y por el nombre del grupo
+    try t.expect(matches(it, &groups, "mod")); // substring: without this it does not show
+    try t.expect(matches(it, &groups, "model")); // and by the group name
 
-    // Grupo "Sesión": "mod" NO debe colarse (ni por label ni por grupo).
+    // Group "Sesión": "mod" must NOT sneak in (neither by label nor by group).
     const it2 = Item{ .kind = .command, .group = 2, .label = "/new" };
     try t.expect(!matches(it2, &groups, "mod"));
-    try t.expect(matches(it2, &groups, "ses")); // sí por el nombre del grupo
+    try t.expect(matches(it2, &groups, "ses")); // yes by the group name
 
-    // Un hint hace match aunque el label no (el precio "free").
+    // A hint matches even when the label does not (the "free" price).
     const it3 = Item{ .kind = .model, .label = "sonnet", .hint = "free" };
     try t.expect(matches(it3, &groups, "free"));
     try t.expect(matches(it3, &groups, "sonnet"));
@@ -360,16 +361,16 @@ test "matches: prefijo, subcadena, hint y nombre de grupo" {
 }
 
 test "matches: el grupo NO veta la coincidencia del label" {
-    // Regresión: el grupo se comprobaba con `return containsIgnoreCase(...)`,
-    // es decir como veto. Buscar "sonnet" no encontraba "claude-sonnet-4",
-    // porque vive en el grupo "Models" y ahí no aparece "sonnet". Con la lista
-    // filtrada vacia, Enter acababa aplicando un modelo que no era el
-    // resaltado.
+    // Regression: the group was checked with `return containsIgnoreCase(...)`,
+    // that is, as a veto. Searching "sonnet" did not find "claude-sonnet-4",
+    // because it lives in the "Models" group and "sonnet" does not appear
+    // there. With the filtered list empty, Enter ended up applying a model
+    // that was not the highlighted one.
     const groups = [_]Group{ .{ .name = "Providers" }, .{ .name = "" }, .{ .name = "Models" } };
     const m = Item{ .kind = .model, .group = 3, .label = "anthropic/claude-sonnet-4" };
     try t.expect(matches(m, &groups, "sonnet"));
     try t.expect(matches(m, &groups, "claude"));
-    // Y buscar por el nombre del grupo sigue funcionando.
+    // And searching by the group name still works.
     try t.expect(matches(m, &groups, "model"));
     try t.expect(!matches(m, &groups, "gpt"));
 }
@@ -386,16 +387,17 @@ test "refilter: en dos columnas solo filtra la que tiene el foco" {
         .{ .kind = .model, .group = 3, .label = "gpt-5" },
     };
     pal.setItems(&items, &groups);
-    try t.expectEqual(@as(u8, 1), pal.col); // foco en modelos
+    try t.expectEqual(@as(u8, 1), pal.col); // focus on models
 
     @memcpy(pal.query[0..6], "sonnet");
     pal.query_len = 6;
     pal.refilter();
-    // Solo se filtra la columna enfocada: 1 modelo y los 2 providers intactos.
+    // Only the focused column is filtered: 1 model and the 2 providers intact.
     try t.expectEqual(@as(usize, 1), pal.countIn(1));
     try t.expectEqual(@as(usize, 2), pal.countIn(0));
 
-    // Al pasar el foco a providers, ahora se filtra esa y no la otra.
+    // When the focus moves to providers, now that one is filtered and not the
+    // other.
     pal.col = 0;
     pal.refilter();
     try t.expectEqual(@as(usize, 0), pal.countIn(0));
@@ -416,11 +418,11 @@ test "refilter: dos columnas, providers y modelos no se mezclan" {
     pal.setItems(&items, &.{});
 
     try t.expectEqual(@as(usize, 3), pal.countIn(0)); // 2 providers + connect
-    try t.expectEqual(@as(usize, 2), pal.countIn(1)); // 2 modelos
+    try t.expectEqual(@as(usize, 2), pal.countIn(1)); // 2 models
 
-    // El filtro se aplica SOLO a la columna con el foco (aqui la de modelos,
-    // col=1): "gpt" deja 1 modelo y la columna de providers intacta, para que
-    // siga de contexto en vez de desaparecer.
+    // The filter is applied ONLY to the column with the focus (here the models
+    // one, col=1): "gpt" leaves 1 model and the providers column intact, so it
+    // stays as context instead of disappearing.
     @memcpy(pal.query[0..3], "gpt");
     pal.query_len = 3;
     pal.refilter();
@@ -443,7 +445,7 @@ test "refilter: la selección se recorta al tamaño de la lista filtrada" {
     @memcpy(pal.query[0..3], "mod");
     pal.query_len = 3;
     pal.refilter();
-    // Solo "/model" sobrevive: la selección no puede quedarse en el índice 2.
+    // Only "/model" survives: the selection cannot stay at index 2.
     try t.expectEqual(@as(usize, 1), pal.countIn(0));
     try t.expectEqual(@as(usize, 0), pal.sel[0]);
     try t.expectEqualStrings("/model", pal.selected().?.label);
@@ -487,11 +489,11 @@ test "clampScroll: la selección siempre visible" {
     try t.expectEqual(@as(usize, 0), pal.scroll[0]);
 }
 
-// ── dibujo ────────────────────────────────────────────────────
+// ── drawing ───────────────────────────────────────────────────
 
-/// Ancho en COLUMNAS de un texto (los ids de modelo llevan `/` y `·`, que son
-/// de 1, pero los emoji y los `▸` no). Contar bytes descuadra la columna
-/// derecha, que se alinea por ancho real.
+/// Width in COLUMNS of a text (model ids carry `/` and `·`, which are 1, but
+/// emoji and `▸` are not). Counting bytes misaligns the right column, which is
+/// aligned by real width.
 fn displayWidth(text: []const u8) usize {
     var n: usize = 0;
     var it = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
@@ -502,9 +504,9 @@ fn displayWidth(text: []const u8) usize {
     return n;
 }
 
-/// Libera una lista de items con sus strings. Cada `label`/`hint` es una copia
-/// propia (dup), no un slice del allocator del llamante: si lo fueran, el
-/// liberado dejaría punteros colgantes en la paleta.
+/// Frees a list of items along with their strings. Each `label`/`hint` is an
+/// owned copy (dup), not a slice from the caller's allocator: if they were, the
+/// free would leave dangling pointers in the palette.
 pub fn freeItems(gpa: std.mem.Allocator, items: []const Item) void {
     for (items) |it| {
         gpa.free(it.label);
@@ -513,30 +515,30 @@ pub fn freeItems(gpa: std.mem.Allocator, items: []const Item) void {
     gpa.free(@constCast(items));
 }
 
-/// Geometría del modal. Se calcula una vez y la usan tanto el dibujo como el
-/// `clampScroll`, para que no se puedan divergir.
+/// Modal geometry. Computed once and used by both the drawing and
+/// `clampScroll`, so that the two cannot diverge.
 pub const Box = struct {
     x: u16,
     y: u16,
     w: u16,
     h: u16,
-    /// Ancho de la columna izquierda (modo modelos).
+    /// Width of the left column (models mode).
     col_w: u16,
-    /// Filas útiles para items, sin título, búsqueda ni pie.
+    /// Rows usable for items, without title, search or footer.
     list_rows: usize,
-    /// Fila de la primera línea de item.
+    /// Row of the first item line.
     list_top: u16,
 };
 
-/// Calcula el tamaño del modal. Modo modelos: dos columnas; comandos: una.
+/// Computes the modal's size. Models mode: two columns; commands: one.
 pub fn boxFor(pal: *const Palette, width: u16, height: u16) Box {
     const w: u16 = @min(width -| 4, 76);
     const h: u16 = @min(height -| 4, 24);
-    // El prompt de key necesita más alto: tiene campo, mensaje y dos hints.
+    // The key prompt needs more height: it has a field, a message and two hints.
     const hh: u16 = if (pal.mode == .key_prompt) @min(height -| 4, 12) else h;
     const two_cols = pal.mode == .models and pal.countIn(0) > 0;
     const col_w: u16 = if (two_cols) @max(18, w / 3) else w;
-    // h = borde(1) + titulo(1) + busqueda(1) + items + pie(1) + borde(1)
+    // h = border(1) + title(1) + search(1) + items + footer(1) + border(1)
     const list_rows: usize = if (hh > 7) @as(usize, hh) - 5 else 1;
     return .{
         .x = (width -| w) / 2,
@@ -545,13 +547,13 @@ pub fn boxFor(pal: *const Palette, width: u16, height: u16) Box {
         .h = hh,
         .col_w = col_w,
         .list_rows = list_rows,
-        .list_top = 0, // lo fija `draw` (depende del modo key_prompt)
+        .list_top = 0, // `draw` sets it (depends on key_prompt mode)
     };
 }
 
-/// Pinta el modal completo. El historial de detrás se limpia con un espacio:
-/// el surface de vaxis ya trae el texto del historial y sin limpiar, los items
-/// del modal se transparentaría sobre él.
+/// Draws the whole modal. The history behind it is cleared with a space: the
+/// vaxis surface already carries the history text, and without clearing, the
+/// modal's items would show through on top of it.
 pub fn draw(
     p: *Painter,
     surface: *vxfw.Surface,
@@ -562,7 +564,7 @@ pub fn draw(
     const box = boxFor(pal, width, height);
     if (box.w < 24 or box.h < 8) return;
 
-    // ── fondo y bordes ──
+    // ── background and borders ──
     var y: u16 = 0;
     while (y < box.h) : (y += 1) {
         p.fillRange(box.x, box.x + box.w, box.y + y, " ", .{});
@@ -579,7 +581,7 @@ pub fn draw(
     p.putStable(box.x, box.y + box.h - 1, "╰", 1, theme.brand_faint);
     p.putStable(box.x + box.w - 1, box.y + box.h - 1, "╯", 1, theme.brand_faint);
 
-    // ── título (izquierda) y "esc" (derecha) ──
+    // ── title (left) and "esc" (right) ──
     const title = switch (pal.mode) {
         .commands => "Commands",
         .models => "Switch model",
@@ -601,7 +603,7 @@ pub fn draw(
         return;
     }
 
-    // ── línea de búsqueda, con el cursor al final de lo escrito ──
+    // ── search line, with the cursor at the end of what was typed ──
     const sy = box.y + 2;
     _ = p.putText(box.x + 2, sy, "▌", theme.brand_bold);
     const q = pal.queryText();
@@ -612,9 +614,9 @@ pub fn draw(
     }
     surface.cursor = .{ .row = sy, .col = box.x + 3 + @as(u16, @intCast(q.len)) };
 
-    // ── lista ──
+    // ── list ──
     if (pal.mode == .models and pal.countIn(0) > 0) {
-        // Columna de providers + separador + columna de modelos.
+        // Providers column + separator + models column.
         var ry: u16 = 3;
         while (ry < box.h - 2) : (ry += 1) {
             p.putStable(box.x + box.col_w, box.y + ry, "│", 1, theme.brand_faint);
@@ -625,11 +627,11 @@ pub fn draw(
         drawColumn(p, pal, box, 0, box.x + 1, box.w - 2);
     }
 
-    // ── pie ──
+    // ── footer ──
     drawFooter(p, pal, box);
 }
 
-/// Una columna de items, con encabezado de grupo, scroll y resaltado.
+/// A column of items, with group header, scroll and highlight.
 fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16) void {
     const filtered = pal.filtered[c].items;
     if (filtered.len == 0) {
@@ -645,11 +647,11 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16) v
     while (i < filtered.len and shown < box.list_rows) : (i += 1) {
         const it = pal.items[filtered[i]];
 
-        // Encabezado de grupo, con una línea en blanco antes (como opencode).
+        // Group header, with a blank line before it (like opencode).
         if (it.group != 0 and it.group != last_group) {
             last_group = it.group;
             if (shown > 0) {
-                shown += 1; // separador entre grupos
+                shown += 1; // separator between groups
                 if (shown >= box.list_rows) break;
             }
             const gname = groupName(pal, it.group);
@@ -660,19 +662,19 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16) v
             if (shown >= box.list_rows) break;
         }
 
-        // OJO: la fila se calcula DESPUÉS del bloque de grupo. Si se calculara
-        // antes, la etiqueta salía una fila por encima y el encabezado se
-        // comía su sitio (la lista parecía desordenada).
+        // CAREFUL: the row is computed AFTER the group block. If it were
+        // computed before, the label came out one row too high and the header
+        // ate its spot (the list looked out of order).
         const row = box.y + 3 + @as(u16, @intCast(shown));
-        // Solo la columna CON FOCO resalta de verdad. Antes las dos pintaban su
-        // seleccion igual y no habia forma de saber cual estaba activa: se
-        // pulsaban las flechas y la lista de modelos no se movia, que es
-        // exactamente lo que hace pensar que la lista no existe.
+        // Only the FOCUSED column really highlights. Before, both painted their
+        // selection alike and there was no way to know which one was active:
+        // you pressed the arrows and the models list did not move, which is
+        // exactly what makes you think the list does not exist.
         const is_sel = i == pal.sel[c];
         const focused = c == pal.column();
         if (is_sel and focused) p.fillRange(x0, x0 + w, row, " ", theme.selected);
-        // En la columna sin foco, la fila elegida se marca con un ▸ y en azul
-        // apagado: se ve cual es sin parecer que tiene el foco.
+        // In the unfocused column, the chosen row is marked with a ▸ in dim
+        // blue: you can see which one it is without it looking focused.
         if (is_sel and !focused) _ = p.putText(x0, row, "▸", theme.brand_soft);
         _ = p.putText(
             x0 + 1,
@@ -681,12 +683,12 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16) v
             if (is_sel) theme.item_sel else if (focused) theme.item else theme.dim,
         );
 
-        // Columna derecha alineada al borde: atajo, "free", precio…
+        // Right column aligned to the edge: shortcut, "free", price…
         //
-        // Solo si caben ETIQUETA y hint con un hueco de por medio. Antes solo
-        // se miraba que el hint himself cabía, y en la columna estrecha de
-        // providers el hint se pintaba ENCIMA de la etiqueta y se leia
-        // "anthrclaude-sonnet-4-5". La etiqueta manda: es lo que se selecciona.
+        // Only if both LABEL and hint fit with a gap in between. Before, only
+        // whether the hint itself fit was checked, and in the narrow providers
+        // column the hint was painted ON TOP of the label and you read
+        // "anthrclaude-sonnet-4-5". The label wins: that is what you select.
         const label_w = displayWidth(it.label);
         const hint_w = displayWidth(it.hint);
         if (hint_w > 0 and label_w + hint_w + 3 <= w) {
@@ -713,7 +715,7 @@ fn drawFooter(p: *Painter, pal: *const Palette, box: Box) void {
         _ = p.putText(box.x + box.w - 2 - @as(u16, @intCast(hint.len)), fy, hint, theme.brand_soft);
     }
     if (pal.mode == .models) {
-        // Atajo para conectar sin tener que llegar al item de abajo.
+        // Shortcut to connect without having to reach the item at the bottom.
         const left = "ctrl+a connect";
         if (left.len + 4 < box.w) {
             _ = p.putText(box.x + 2, fy, left, theme.brand);
@@ -725,8 +727,9 @@ fn drawKeyPrompt(p: *Painter, pal: *const Palette, box: Box) void {
     const top = box.y + 3;
     const label = if (pal.key_item < pal.items.len) pal.items[pal.key_item].label else "provider";
 
-    // Explicar a qué provider va la key ANTES del campo: si no, no se sabe si
-    // se está connectando el que está resaltado o el que está activo.
+    // Explain which provider the key is for BEFORE the field: otherwise there
+    // is no way to know whether you are connecting the highlighted one or the
+    // active one.
     _ = p.putText(box.x + 3, top, "Connecting", theme.brand_soft);
     _ = p.putText(box.x + 3 + 11, top, label, theme.brand_bold);
 
@@ -734,8 +737,8 @@ fn drawKeyPrompt(p: *Painter, pal: *const Palette, box: Box) void {
     const prompt = std.fmt.bufPrint(&pb, "API key for {s}", .{label}) catch "API key";
     _ = p.putText(box.x + 3, top + 1, prompt, theme.brand);
 
-    // Enmascarado, como un campo de password. Se ven los últimos 3 caracteres
-    // para poder comprobar que no has pegado algo truncado.
+    // Masked, like a password field. The last 3 characters stay visible so you
+    // can check that you did not paste something truncated.
     const typed = pal.keyText();
     const masked_len: usize = if (typed.len > 3) typed.len - 3 else 0;
     var w: u16 = 0;
@@ -749,7 +752,8 @@ fn drawKeyPrompt(p: *Painter, pal: *const Palette, box: Box) void {
         _ = p.putText(x, top + 3, tail, theme.brand);
         x += @as(u16, @intCast(tail.len));
     }
-    // Cursor al final del campo (subrayado, para que se vea dónde escribir).
+    // Cursor at the end of the field (underlined, so you can see where to
+    // type).
     _ = p.putStable(x, top + 3, "_", 1, theme.brand_bold);
 
     const msg = pal.keyMessage();
@@ -781,33 +785,33 @@ fn groupName(pal: *const Palette, group: u8) []const u8 {
     return pal.groups[i].name;
 }
 
-// ── entrada ───────────────────────────────────────────────────
+// ── input ─────────────────────────────────────────────────────
 
-/// Qué hacer con la paleta cerrada. Lo decide el modelo (que es quien conoce
-/// los providers y el agente), así que aquí solo se reporta la intención.
+/// What to do with the closed palette. The model decides (it is the one that
+/// knows the providers and the agent), so here we only report the intent.
 pub const Action = union(enum) {
     none,
-    /// Ejecutar este comando del agente (p. ej. "model", "new", "context").
+    /// Run this agent command (e.g. "model", "new", "context").
     run_command: []const u8,
-    /// Cambiar a este provider.
+    /// Switch to this provider.
     set_provider: []const u8,
-    /// Cambiar a este modelo.
+    /// Switch to this model.
     set_model: []const u8,
-    /// Conectar un provider con esta key. Los dos slices apuntan a buffers de
-    /// la propia palette: quien recibe la acción debe copiarlos ANTES de
-    /// cerrar la palette.
+    /// Connect a provider with this key. Both slices point at the palette's own
+    /// buffers: whoever receives the action must copy them BEFORE closing the
+    /// palette.
     connect: struct { provider: []const u8, key: []const u8 },
-    /// Cerrar.
+    /// Close.
     close,
 };
 
-/// Traduce una tecla a la acción correspondiente.
+/// Translates a key into the corresponding action.
 ///
-/// El llamante pasa la key ya filtrada por el modal (Ctrl+P no debe abrir la
-/// paleta mientras se escribe un "p" normal, así que el handler de la TUI
-/// decide qué teclas se le pasan).
+/// The caller passes the key already filtered by the modal (Ctrl+P must not
+/// open the palette while a plain "p" is being typed, so the TUI's handler
+/// decides which keys are passed in).
 pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
-    // ── prompt de key ──
+    // ── key prompt ──
     if (pal.mode == .key_prompt) {
         if (key.matches(vaxis.Key.escape, .{})) {
             pal.mode = .models;
@@ -817,8 +821,8 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
         }
         if (key.matches(vaxis.Key.enter, .{})) {
             const provider = if (pal.key_item < pal.items.len) pal.items[pal.key_item].label else "";
-            // Se devuelven los slices SIN limpiar: el llamante los copia
-            // (guardar la key es I/O) y luego llama a `close`.
+            // The slices are returned WITHOUT clearing: the caller copies them
+            // (saving the key is I/O) and then calls `close`.
             return .{ .connect = .{ .provider = provider, .key = pal.keyText() } };
         }
         if (key.matches(vaxis.Key.backspace, .{})) {
@@ -836,7 +840,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
 
     const c = pal.column();
 
-    // ── navegación ──
+    // ── navigation ──
     if (key.matches(vaxis.Key.up, .{})) {
         pal.move(c, -1);
         return .{ .none = {} };
@@ -858,11 +862,11 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
         return .{ .close = {} };
     }
 
-    // En modo modelos, Tab / ←→ cambian de columna (providers <-> modelos).
+    // In models mode, Tab / ←→ switch column (providers <-> models).
     if (pal.mode == .models) {
         if (key.matches(vaxis.Key.tab, .{})) {
             pal.col = if (pal.col == 0) 1 else 0;
-            pal.refilter(); // la columna que entra en foco pasa a filtrar
+            pal.refilter(); // the column gaining focus starts filtering
             return .{ .none = {} };
         }
         if (key.matches(vaxis.Key.left, .{}) and pal.col == 1) {
@@ -877,11 +881,11 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
         }
     }
 
-    // ── búsqueda ──
+    // ── search ──
     if (key.matches(vaxis.Key.backspace, .{})) {
         if (pal.query_len > 0) {
-            // Backspace borra un grapheme, no un byte: los acentos y los emoji
-            // son multi-byte y parteirlos deja bytes sueltos.
+            // Backspace deletes one grapheme, not one byte: accents and emoji
+            // are multi-byte and splitting them leaves stray bytes.
             pal.query_len = backOneGrapheme(pal.query[0..pal.query_len]);
         }
         pal.sel = .{ 0, 0 };
@@ -890,7 +894,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
         return .{ .none = {} };
     }
     if (key.text) |txt| {
-        // Solo texto imprimible: las teclas con modificador ya se han filtrado.
+        // Only printable text: keys with a modifier have already been filtered.
         if (txt.len > 0 and !key.mods.ctrl and !key.mods.alt) {
             const n = @min(txt.len, max_query - pal.query_len);
             @memcpy(pal.query[pal.query_len .. pal.query_len + n], txt[0..n]);
@@ -902,7 +906,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
         return .{ .none = {} };
     }
 
-    // ── confirmar ──
+    // ── confirm ──
     if (key.matches(vaxis.Key.enter, .{})) {
         const filtered_index = if (pal.sel[c] < pal.filtered[c].items.len)
             pal.filtered[c].items[pal.sel[c]]
@@ -910,10 +914,11 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
             return Action{ .none = {} };
         const it = pal.items[filtered_index];
         return switch (it.kind) {
-            // "Connect" sale como `run_command` y lo atiende el modelo, que es
-            // quien sabe abrir la lista de providers. Si se resolviera aquí
-            // (cambiando `mode` a `.connect` sin cambiar `items`) la lista
-            // seguiría siendo la de comandos con el titulo de Connect.
+            // "Connect" comes out as `run_command` and the model handles it, as
+            // it is the one that knows how to open the providers list. If it
+            // were resolved here (switching `mode` to `.connect` without
+            // changing `items`) the list would still be the commands one with
+            // the Connect title.
             .command => .{ .run_command = it.label },
             .provider => blk: {
                 if (pal.mode == .connect) {
@@ -939,12 +944,12 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
     return .{ .none = {} };
 }
 
-/// Índice del último carácter UTF-8 completo antes de `len`.
+/// Index of the last complete UTF-8 character before `len`.
 fn backOneGrapheme(s: []const u8) usize {
     if (s.len == 0) return 0;
     var i = s.len - 1;
     while (i > 0) {
-        // Un byte UTF-8 de continuación vale 10xxxxxx.
+        // A UTF-8 continuation byte is 10xxxxxx.
         if ((s[i] & 0xC0) != 0x80) break;
         i -= 1;
     }
@@ -954,8 +959,8 @@ fn backOneGrapheme(s: []const u8) usize {
 // ── tests ─────────────────────────────────────────────────────
 
 test "backOneGrapheme: borra un grapheme, no un byte" {
-    // "ñ" son 2 bytes y "🙂" son 4: con un `len - 1` a secas se dejaban bytes
-    // sueltos y el buscador acumulaba basura UTF-8 inválida.
+    // "ñ" is 2 bytes and "🙂" is 4: with a plain `len - 1` stray bytes were
+    // left behind and the search accumulated invalid UTF-8 garbage.
     try t.expectEqual(@as(usize, 0), backOneGrapheme(""));
     try t.expectEqual(@as(usize, 0), backOneGrapheme("a"));
     try t.expectEqual(@as(usize, 1), backOneGrapheme("ab"));
@@ -963,7 +968,7 @@ test "backOneGrapheme: borra un grapheme, no un byte" {
     try t.expectEqual(@as(usize, 1), backOneGrapheme("a\xc3\xb1"));
     // "🙂" (4 bytes)
     try t.expectEqual(@as(usize, 0), backOneGrapheme("\xf0\x9f\x99\x82"));
-    // "🙂ñ" -> deja "🙂"
+    // "🙂ñ" -> leaves "🙂"
     try t.expectEqual(@as(usize, 4), backOneGrapheme("\xf0\x9f\x99\x82\xc3\xb1"));
 }
 
@@ -978,9 +983,9 @@ test "handleKey: escribir filtra y enter devuelve la acción" {
     pal.setItems(&items, &.{});
     pal.active = true;
 
-    // Escribir "mod" deja solo /model.
-    // Una Key real de vaxis trae `.text`; el código de caracteres solo no
-    // suffitiría (y el test no lo notaría si `text` fuera null).
+    // Typing "mod" leaves only /model.
+    // A real vaxis Key carries `.text`; the code point alone would not be
+    // enough (and the test would not notice if `text` were null).
     for ([_]vaxis.Key{
         .{ .codepoint = 'm', .text = "m" },
         .{ .codepoint = 'o', .text = "o" },
@@ -991,7 +996,7 @@ test "handleKey: escribir filtra y enter devuelve la acción" {
     try t.expectEqual(@as(usize, 1), pal.countIn(0));
     try t.expectEqualStrings("mod", pal.queryText());
 
-    // Enter devuelve run_command con la etiqueta del item (no el prefijo).
+    // Enter returns run_command with the item's label (not the prefix).
     const act = handleKey(&pal, .{ .codepoint = 13 });
     try t.expectEqualStrings("/model", act.run_command);
 }
@@ -1006,14 +1011,14 @@ test "handleKey: esc cierra" {
 }
 
 test "close NO suelta los items propios: los libera el siguiente setItemsOwned" {
-    // `close` se llama en cada Esc y en cada comando ejecutado, y la paleta se
-    // puede reabrir EN SITE (modelos → conectar). Antes `close` hacía
-    // `items = &.{}` sin liberar: cada Ctrl+P cerrado era una fuga de las
-    // etiquetas, y además `owns_items` se quedaba en `true` sobre una lista
-    // vacía (la paleta parecía dueña de algo que ya no tenía).
+    // `close` is called on every Esc and on every executed command, and the
+    // palette can be reopened IN PLACE (models → connect). Before, `close` did
+    // `items = &.{}` without freeing: every closed Ctrl+P was a leak of the
+    // labels, and on top of that `owns_items` stayed `true` over an empty list
+    // (the palette looked like the owner of something it no longer had).
     var pal = Palette.init(t.allocator);
-    // `destroy` y no `deinit`: los items son del allocator de test y solo él
-    // los suelta (es lo que hace `Model.deinit` → `destroyPalette`).
+    // `destroy` and not `deinit`: the items belong to the test allocator and
+    // only it frees them (that is what `Model.deinit` → `destroyPalette` does).
     defer pal.destroy();
 
     const owned = t.allocator.alloc(Item, 2) catch unreachable;
@@ -1024,12 +1029,12 @@ test "close NO suelta los items propios: los libera el siguiente setItemsOwned" 
 
     pal.close();
     try t.expect(!pal.active);
-    // Los items siguen ahí: se pueden reutilizar o liberar después.
+    // The items are still there: they can be reused or freed afterwards.
     try t.expectEqual(@as(usize, 2), pal.items.len);
     try t.expectEqualStrings("/help", pal.items[0].label);
 
-    // Y al repoblar, los antiguos se sueltan de verdad (el allocator de test
-    // falla si no).
+    // And when repopulating, the old ones are really freed (the test allocator
+    // fails if not).
     const next = t.allocator.alloc(Item, 1) catch unreachable;
     next[0] = .{ .kind = .command, .label = t.allocator.dupe(u8, "/cache") catch unreachable };
     pal.setItemsOwned(next, &.{});
@@ -1071,7 +1076,7 @@ test "handleKey: el prompt de key acumula texto enmascarado" {
     try t.expectEqualStrings("a", pal.keyText());
 }
 
-// ── tests de dibujo ───────────────────────────────────────────
+// ── drawing tests ─────────────────────────────────────────────
 
 test "draw: el modal pinta título, búsqueda y el item resaltado" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -1079,8 +1084,8 @@ test "draw: el modal pinta título, búsqueda y el item resaltado" {
     var m = tui.Model.init(t.allocator);
     defer m.deinit();
 
-    // OJO: la palette que dibuja el frame es la del MODELO. Configurar una
-    // local no cambiaría nada en pantalla.
+    // CAREFUL: the palette that draws the frame is the MODEL's one. Setting up
+    // a local one would not change anything on screen.
     const items = [_]Item{
         .{ .kind = .command, .label = "/help" },
         .{ .kind = .command, .label = "/model" },
@@ -1097,9 +1102,9 @@ test "draw: el modal pinta título, búsqueda y el item resaltado" {
 }
 
 test "draw: los grupos salen con su encabezado y en orden" {
-    // Regresión: la fila de cada item se calculaba ANTES del bloque de grupo,
-    // así que la etiqueta salía una fila por encima y el encabezado se
-    // colocaba encima de la etiqueta siguiente. La lista parecía desordenada.
+    // Regression: each item's row was computed BEFORE the group block, so the
+    // label came out one row too high and the header landed on top of the next
+    // label. The list looked out of order.
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var m = tui.Model.init(t.allocator);
@@ -1128,7 +1133,7 @@ test "draw: los grupos salen con su encabezado y en orden" {
         if (std.mem.indexOf(u8, r, "dos") != null) i_dos = row;
     }
     try t.expect(i_a != null and i_uno != null and i_b != null and i_dos != null);
-    // El encabezado va justo ANTES de su primer item, y en orden.
+    // The header goes exactly BEFORE its first item, and in order.
     try t.expect(i_uno.? > i_a.?);
     try t.expect(i_dos.? > i_b.?);
     try t.expect(i_b.? > i_uno.?);
@@ -1156,13 +1161,13 @@ test "draw: modo modelos pinta las dos columnas y el pie" {
     try t.expect(std.mem.indexOf(u8, all, "openrouter") != null);
     try t.expect(std.mem.indexOf(u8, all, "deepseek-chat") != null);
     try t.expect(std.mem.indexOf(u8, all, "free") != null);
-    // El pie anuncia el atajo para conectar, que es la vía corta.
+    // The footer announces the connect shortcut, which is the short way.
     try t.expect(std.mem.indexOf(u8, all, "ctrl+a connect") != null);
 }
 
 test "draw: el hint no se pisa con la etiqueta" {
-    // Regresión: en la columna estrecha de providers, el hintDefault se
-    // pintaba encima de la etiqueta y se leia "anthrclaude-sonnet-4-5".
+    // Regression: in the narrow providers column, the default hint was painted
+    // on top of the label and you read "anthrclaude-sonnet-4-5".
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var m = tui.Model.init(t.allocator);
@@ -1180,17 +1185,17 @@ test "draw: el hint no se pisa con la etiqueta" {
 
     const s = try tui.drawTest(&m, arena_state.allocator(), 90, 26);
     const all = tui.allText(s);
-    // La etiqueta se lee ENTERA: sin el hint encima.
+    // The label reads WHOLE: with no hint on top of it.
     try t.expect(std.mem.indexOf(u8, all, "anthropic") != null);
-    // Y el hint largo, al no caber con la etiqueta, no sale en absoluto.
+    // And the long hint, not fitting alongside the label, does not show at all.
     try t.expect(std.mem.indexOf(u8, all, "claude-sonnet-4-5") == null);
-    // El hint corto sí cabe y se ve.
+    // The short hint does fit and is visible.
     try t.expect(std.mem.indexOf(u8, all, "+ connect") != null);
 }
 
 test "displayWidth: cuenta columnas, no bytes" {
-    // Los ids de modelo llevan "/" y "·" (1 columna, 1-2 bytes). Contar bytes
-    // descentraba la columna derecha del hint.
+    // Model ids carry "/" and "·" (1 column, 1-2 bytes). Counting bytes threw
+    // the hint's right column off center.
     try t.expectEqual(@as(usize, 9), displayWidth("anthropic"));
     try t.expectEqual(@as(usize, 3), displayWidth("a/b"));
     try t.expectEqual(@as(usize, 0), displayWidth(""));
@@ -1219,14 +1224,14 @@ test "draw: el modal Connect lista los providers" {
 }
 
 test "freeItems: todos los strings son copias propias" {
-    // Regresión: el item "+ connect" traía LITERALES ("+ connect", "ctrl+a") y
-    // `freeItems` los liberaba. `gpa.free` sobre texto en .rodata es un
-    // "Invalid free" que solo salía al salir de la app, con la paleta ya a
-    // medio destruir y el canary del allocator reventando: muy difícil de
-    // atribuir al item que lo causó.
+    // Regression: the "+ connect" item carried LITERALS ("+ connect", "ctrl+a")
+    // and `freeItems` freed them. `gpa.free` on .rodata text is an
+    // "Invalid free" that only showed on app exit, with the palette half
+    // destroyed and the allocator's canary blowing up: very hard to attribute
+    // to the item that caused it.
     //
-    // Este test construye los items igual que el worker y los destruye: si
-    // alguien vuelve a meter un literal, revienta aquí y no al salir.
+    // This test builds the items exactly like the worker and destroys them: if
+    // someone puts a literal back in, it blows up here and not on exit.
     const gpa = std.testing.allocator;
     const items = gpa.alloc(Item, 2) catch return error.OutOfMemory;
     items[0] = .{
@@ -1261,8 +1266,8 @@ test "setItemsOwned: reemplaza y libera lo anterior" {
 
     pal.setItemsOwned(mk.build(gpa, "uno"), &.{});
     try t.expectEqualStrings("uno", pal.items[0].label);
-    // Reemplazar debe liberar la anterior: si no, la memoria crece cada vez que
-    // se abre la paleta (y `testing.allocator` lo detectaría como fuga).
+    // Replacing must free the previous one: otherwise memory grows every time
+    // the palette is opened (and `testing.allocator` would detect it as a leak).
     pal.setItemsOwned(mk.build(gpa, "dos"), &.{});
     try t.expectEqualStrings("dos", pal.items[0].label);
     pal.releaseItems();
@@ -1271,10 +1276,10 @@ test "setItemsOwned: reemplaza y libera lo anterior" {
 }
 
 test "modo modelos: la columna de modelos es la que tiene el foco" {
-    // Regresión: `openModelPalette` fijaba el modo DESPUÉS de `setItemsOwned`,
-    // y `resetSelection` calcula la columna activa a partir del modo. Con el
-    // modo viejo se quedaba en la columna de providers: las flechas no movian
-    // la lista de modelos y parecia que no habia nada que elegir.
+    // Regression: `openModelPalette` set the mode AFTER `setItemsOwned`, and
+    // `resetSelection` computes the active column from the mode. With the old
+    // mode it stayed on the providers column: the arrows did not move the
+    // models list and it looked like there was nothing to choose.
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var m = tui.Model.init(t.allocator);
@@ -1302,8 +1307,8 @@ const model_groups_test = [_]Group{
 };
 
 test "draw: solo la columna enfocada resalta" {
-    // Las dos columnas resaltaban su fila y no habia forma de saber cual
-    // tenia el foco. La que no lo tiene marca con ▸ y en apagado.
+    // Both columns highlighted their row and there was no way to know which one
+    // had the focus. The one that does not marks with ▸ and dimmed.
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var m = tui.Model.init(t.allocator);
@@ -1319,7 +1324,8 @@ test "draw: solo la columna enfocada resalta" {
 
     const s = try tui.drawTest(&m, arena_state.allocator(), 90, 26);
     const all = tui.allText(s);
-    // El provider elegido se marca con ▸ (sin foco) y el modelo enfocado con
-    // la barra de resaltado, que en texto plano solo se ve como la fila entera.
+    // The chosen provider is marked with ▸ (unfocused) and the focused model
+    // with the highlight bar, which in plain text is only visible as the whole
+    // row.
     try t.expect(std.mem.indexOf(u8, all, "▸") != null);
 }

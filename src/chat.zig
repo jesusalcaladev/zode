@@ -2,10 +2,11 @@ const std = @import("std");
 const http_client = @import("http_client.zig");
 const acp = @import("acp.zig");
 
-/// Io configurado por la TUI/CLI al arrancar.
+/// Io set up by the TUI/CLI at startup.
 ///
-/// OJO: ya NO se usa para dormir (ver `sleepMs`): `Io.sleep` desde un worker se
-/// lleva el event loop de la TUI. Sigue aquí para el resto de la capa HTTP.
+/// CAREFUL: it is NO LONGER used for sleeping (see `sleepMs`): `Io.sleep` from
+/// a worker takes the TUI's event loop down with it. It stays here for the rest
+/// of the HTTP layer.
 pub var io_global: std.Io = undefined;
 
 pub const Effort = enum(u32) {
@@ -21,25 +22,25 @@ pub const Effort = enum(u32) {
     }
 };
 
-/// Wire format del provider para chat: OpenAI-compat (chat/completions) o
-/// Anthropic nativo (Messages API con cache_control para prompt caching).
+/// Provider wire format for chat: OpenAI-compat (chat/completions) or native
+/// Anthropic (Messages API with cache_control for prompt caching).
 pub const ProviderKind = enum { openai, anthropic };
 
-/// Mapea el id del provider a su wire format.
+/// Maps the provider id to its wire format.
 pub fn kindForProvider(provider_id: []const u8) ProviderKind {
     if (std.mem.eql(u8, provider_id, "anthropic")) return .anthropic;
     return .openai;
 }
 
-/// Familias de modelo que cambian la forma del request más allá del
-/// wire format: no basta con saber si es OpenAI o Anthropic.
+/// Model families that change the shape of the request beyond the wire format:
+/// knowing whether it is OpenAI or Anthropic is not enough.
 pub const Family = enum {
     generic_openai,
-    /// o-series / gpt-5: quieren `max_completion_tokens`, rechazan
-    /// `temperature`, yfram `reasoning_effort`.
+    /// o-series / gpt-5: they want `max_completion_tokens`, reject
+    /// `temperature`, and take `reasoning_effort`.
     openai_reasoning,
-    /// Anthropic con thinking extended: `max_tokens` debe superar el budget
-    /// de razonamiento.
+    /// Anthropic with extended thinking: `max_tokens` must be greater than the
+    /// reasoning budget.
     anthropic_thinking,
     anthropic,
 
@@ -52,8 +53,8 @@ pub const Family = enum {
     }
 };
 
-/// Detecta la familia a partir del nombre del modelo. Heurística, no tabla:
-/// cubre los prefijos habituales de OpenAI y los gates de OpenCode.
+/// Detects the family from the model name. A heuristic, not a table: it covers
+/// the usual OpenAI prefixes and OpenCode's gates.
 pub fn familyForModel(model: []const u8) Family {
     if (startsWithAny(model, &.{
         "o1", "o3", "o4", "gpt-5", "gpt5", "o1-", "o3-", "o4-", "gpt-5-",
@@ -68,7 +69,7 @@ fn startsWithAny(haystack: []const u8, prefixes: []const []const u8) bool {
     return false;
 }
 
-/// Referencia a un mensaje del historial para el wire format.
+/// Reference to a history message, for the wire format.
 pub const ChatMessage = struct {
     role: []const u8, // "system" | "user" | "assistant" | "tool"
     content: []const u8,
@@ -79,9 +80,9 @@ pub const ChatMessage = struct {
 
 pub const Callbacks = struct {
     userdata: ?*anyopaque = null,
-    /// Fragmento de texto del asistente.
+    /// Text fragment from the assistant.
     onDelta: *const fn (?*anyopaque, []const u8) void = defaultOnDelta,
-    /// Tool call completo (id + name + arguments ya ensamblados).
+    /// Complete tool call (id + name + arguments already assembled).
     onToolCall: ?*const fn (?*anyopaque, id: []const u8, name: []const u8, args_json: []const u8) void = null,
     /// finish_reason ("stop", "tool_calls", ...).
     onFinish: ?*const fn (?*anyopaque, reason: []const u8) void = null,
@@ -89,12 +90,13 @@ pub const Callbacks = struct {
     fn defaultOnDelta(_: ?*anyopaque, _: []const u8) void {}
 };
 
-/// Saca el texto de `"message":"..."` de un JSON de error del server y lo deja
-/// en `last_error_buf`.
+/// Pulls the text of `"message":"..."` out of a server error JSON and leaves it
+/// in `last_error_buf`.
 ///
-/// A mano y no con `std.json` porque este cuerpo se lee justo cuando ya se va a
-/// devolver un error: parsearlo aqui solo podria fallar otra vez. Si el JSON no
-/// trae `message` (o no es JSON), el caller cae al "HTTP nnn".
+/// Hand-written instead of `std.json` because this body is read exactly when we
+/// are about to return an error: parsing it here could only fail again. If the
+/// JSON carries no `message` (or is not JSON), the caller falls back to
+/// "HTTP nnn".
 fn setServerMessage(body: []const u8) void {
     last_error_len = 0;
     const key = "\"message\"";
@@ -106,8 +108,8 @@ fn setServerMessage(body: []const u8) void {
 
     var n: usize = 0;
     while (i < body.len and body[i] != '"') : (i += 1) {
-        // Solo se desescapan la barra invertida y la comilla: un \uXXXX
-        // indulgingido no merece la pena y es texto de error, no contenido.
+        // Only the backslash and the quote are unescaped: a nested \uXXXX is
+        // not worth it, and this is error text, not content.
         if (body[i] == '\\' and i + 1 < body.len) i += 1;
         if (n + 1 >= last_error_buf.len) break;
         last_error_buf[n] = body[i];
@@ -117,7 +119,7 @@ fn setServerMessage(body: []const u8) void {
     last_error_len = n;
 }
 
-/// Últimos bytes del body cuando el server rechaza (para diagnóstico).
+/// Last bytes of the body when the server rejects the request (for diagnostics).
 pub var last_error_buf: [512]u8 = undefined;
 pub var last_error_len: usize = 0;
 
@@ -125,16 +127,16 @@ pub fn lastErrorBody() []const u8 {
     return last_error_buf[0..last_error_len];
 }
 
-/// Puesto a true por la UI (ESC) para abortar el stream en vuelo. Atómico:
-/// lo escribe el hilo de la TUI y lo lee el worker del request.
+/// Set to true by the UI (ESC) to abort the stream in flight. Atomic: the TUI
+/// thread writes it and the request worker reads it.
 pub var cancel_current = std.atomic.Value(bool).init(false);
 
-/// ¿Se pidió cancelar? Lo consulta el loop de SSE.
+/// Was a cancellation requested? Polled by the SSE loop.
 pub fn cancelled() bool {
     return cancel_current.load(.seq_cst);
 }
 
-/// Limpia el flag al empezar un request nuevo.
+/// Clears the flag when a new request starts.
 pub fn clearCancel() void {
     cancel_current.store(false, .seq_cst);
 }
@@ -149,10 +151,10 @@ pub const Usage = struct {
 };
 pub var last_usage: Usage = .{};
 
-// ── capa 1: eventos internos del stream ──────────────────────
+// ── layer 1: internal stream events ──────────────────────────
 const Event = union(enum) {
     delta: []const u8,
-    /// Fragmento de tool call (indexado, llega incremental).
+    /// Tool call fragment (indexed, arrives incrementally).
     tool_frag: struct {
         index: usize,
         id: ?[]const u8,
@@ -164,7 +166,7 @@ const Event = union(enum) {
     usage: Usage,
 };
 
-/// Dispatch interno: traduce JSON del stream a Events y llama `dispatch`.
+/// Internal dispatch: turns stream JSON into Events and calls `dispatch`.
 fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyopaque, dispatch: *const fn (?*anyopaque, Event) void) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -187,7 +189,7 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
         return error.ServerError;
     }
 
-    // usage (llega en el chunk final, a veces sin choices)
+    // usage (arrives in the final chunk, sometimes without choices)
     if (parsed.object.get("usage")) |u| {
         if (u == .object) {
             var usage = Usage{};
@@ -215,7 +217,7 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
         }
     }
 
-    // ── Anthropic Messages API (eventos tipados) ────────────────
+    // ── Anthropic Messages API (typed events) ──────────────────────
     if (parsed.object.get("type")) |tv| {
         if (tv == .string) {
             const ty = tv.string;
@@ -314,7 +316,7 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
                 return;
             }
 
-            // message_stop, ping, content_block_stop: nada que hacer.
+            // message_stop, ping, content_block_stop: nothing to do.
             return;
         }
     }
@@ -368,23 +370,23 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
     dispatch(userdata, .{ .delta = content.string });
 }
 
-// ── capa 2: StreamCtx (acumula tool_calls, filtra repetidos) ──
+// ── layer 2: StreamCtx (tool_call accumulation, de-dup) ───────
 pub const StreamCtx = struct {
     gpa: std.mem.Allocator,
     user: Callbacks,
     kind: ProviderKind = .openai,
     parts: std.ArrayList(Part) = .empty,
     finish_count: usize = 0,
-    /// Buffer de la línea SSE en curso (gpa-owned).
+    /// Buffer for the SSE line in progress (gpa-owned).
     line_buf: std.ArrayList(u8) = .empty,
-    /// Un evento `data:` ya se vio completo.
+    /// A `data:` event has already been seen in full.
     saw_done: bool = false,
-    /// El request se cortó con ESC: hay texto parcial que sí se conserva.
+    /// The request was cut short with ESC: there is partial text, and it is kept.
     partial: bool = false,
-    /// Primeros bytes del body de la respuesta. En un 200 es el preámbulo SSE
-    /// (nunca se lee), pero en un 4xx/5xx es el JSON de error del server, que es
-    /// lo único que explica por qué falló ("Insufficient account funds",
-    /// "Model access is disabled"). Sin esto el usuario solo veía "HTTP 403".
+    /// First bytes of the response body. On a 200 that is the SSE preamble
+    /// (never read), but on a 4xx/5xx it is the server's error JSON, which is
+    /// the only thing that explains the failure ("Insufficient account funds",
+    /// "Model access is disabled"). Without this the user only saw "HTTP 403".
     raw: [512]u8 = undefined,
     raw_len: usize = 0,
 
@@ -396,7 +398,7 @@ pub const StreamCtx = struct {
         emitted: bool = false,
     };
 
-    /// Guarda los primeros bytes del body (ver el campo `raw`).
+    /// Stores the first bytes of the body (see the `raw` field).
     pub fn noteRaw(self: *StreamCtx, chunk: []const u8) void {
         if (self.raw_len >= self.raw.len) return;
         const n = @min(chunk.len, self.raw.len - self.raw_len);
@@ -404,10 +406,10 @@ pub const StreamCtx = struct {
         self.raw_len += n;
     }
 
-    /// Libera los buffers Y destruye el struct: se llama `destroy` y no
-    /// `deinit` a propósito, porque se lleva el `self` consigo y un
-    /// `defer ctx.deinit()` sobre un StreamCtx del stack revienta con
-    /// "Invalid free". Solo se usa con los que salen de `gpa.create`.
+    /// Frees the buffers AND destroys the struct: it is called `destroy` and not
+    /// `deinit` on purpose, because it takes `self` down with it and a
+    /// `defer ctx.deinit()` on a stack-allocated StreamCtx blows up with
+    /// "Invalid free". Only used with the ones coming out of `gpa.create`.
     pub fn destroy(self: *StreamCtx) void {
         for (self.parts.items) |*p| {
             p.id.deinit(self.gpa);
@@ -419,9 +421,9 @@ pub const StreamCtx = struct {
         self.gpa.destroy(self);
     }
 
-    /// Consume un chunk del socket. Acumula en `line_buf` y despacha cada
-    /// evento `data:` en cuanto su línea queda completa: así el texto llega a
-    /// la UI token a token en vez de al final.
+    /// Consumes a chunk from the socket. Accumulates into `line_buf` and
+    /// dispatches every `data:` event as soon as its line is complete: that is
+    /// how the text reaches the UI token by token instead of at the end.
     pub fn feed(self: *StreamCtx, chunk: []const u8) !void {
         self.noteRaw(chunk);
         for (chunk) |c| {
@@ -430,14 +432,14 @@ pub const StreamCtx = struct {
                 self.line_buf.append(self.gpa, c) catch continue;
                 continue;
             }
-            // OJO: `clearRetainingCapacity` hace `@memset(items, undefined)`,
-            // así que hay que consumir la línea ANTES de limpiar el buffer.
+            // CAREFUL: `clearRetainingCapacity` does `@memset(items, undefined)`,
+            // so the line must be consumed BEFORE clearing the buffer.
             try self.handleLine(self.line_buf.items);
             self.line_buf.clearRetainingCapacity();
         }
     }
 
-    /// Fin del stream: la última línea puede no venir con '\n'.
+    /// End of the stream: the last line may come without a '\n'.
     pub fn finish(self: *StreamCtx) !void {
         if (self.line_buf.items.len > 0) {
             try self.handleLine(self.line_buf.items);
@@ -457,7 +459,7 @@ pub const StreamCtx = struct {
         }
         dispatchEvents(self.gpa, payload, self, StreamCtx.dispatch) catch |err| switch (err) {
             error.ServerError => return error.ServerError,
-            else => {}, // chunk malformado: saltar y seguir
+            else => {}, // malformed chunk: skip it and keep going
         };
     }
 
@@ -469,7 +471,7 @@ pub const StreamCtx = struct {
         return &self.parts.items[self.parts.items.len - 1];
     }
 
-    /// Slices devueltos válidos hasta el próximo streamChatCtx.
+    /// Returned slices stay valid until the next streamChatCtx.
     pub fn toolCallsJson(self: *StreamCtx, arena: std.mem.Allocator) ![]const u8 {
         if (self.parts.items.len == 0) return "";
         var out: std.ArrayList(u8) = .empty;
@@ -481,7 +483,7 @@ pub const StreamCtx = struct {
             try out.appendSlice(arena, "\",\"type\":\"function\",\"function\":{\"name\":\"");
             try out.appendSlice(arena, p.name.items);
             try out.appendSlice(arena, "\",\"arguments\":\"");
-            // arguments ya es JSON válido → escapamos como string para anidar.
+            // `arguments` is already valid JSON → escape it as a string to nest it.
             for (p.args.items) |c| {
                 switch (c) {
                     '"' => try out.appendSlice(arena, "\\\""),
@@ -502,8 +504,8 @@ pub const StreamCtx = struct {
         const self: *StreamCtx = @ptrCast(@alignCast(ud.?));
         switch (ev) {
             .usage => |u| {
-                // Merge por campo: Anthropic reparte usage entre
-                // message_start (input) y message_delta (output).
+                // Per-field merge: Anthropic splits usage between
+                // message_start (input) and message_delta (output).
                 if (u.prompt > 0) last_usage.prompt = u.prompt;
                 if (u.cached > 0) last_usage.cached = u.cached;
                 if (u.completion > 0) last_usage.completion = u.completion;
@@ -511,8 +513,8 @@ pub const StreamCtx = struct {
             .delta => |d| self.user.onDelta(self.user.userdata, d),
             .finish => |r| {
                 self.finish_count += 1;
-                // Solo el primer finish interesa; los servers a veces
-                // mandan finish en cada chunk final.
+                // Only the first finish matters; servers sometimes
+                // send finish on every trailing chunk.
                 if (self.finish_count == 1) {
                     if (self.user.onFinish) |f| f(self.user.userdata, r);
                 }
@@ -531,17 +533,17 @@ pub const StreamCtx = struct {
                 self.tryEmitTool(p);
             },
             .err => |msg| {
-                // Un error embebido en un chunk 200 (algunos gateways lo hacen).
+                // An error embedded in a 200 chunk (some gateways do that).
                 if (self.user.onFinish) |f| f(self.user.userdata, msg);
             },
         }
     }
 
-    /// Emite el tool call en cuanto sus argumentos son JSON válido.
+    /// Emits the tool call as soon as its arguments are valid JSON.
     ///
-    /// El trigger histórico era "el último byte es `}`", que colgaba el agent
-    /// loop si el stream se cortaba antes del cierre o el modelo devolvía
-    /// argumentos vacíos. Ahora se fuerza además en `finish`.
+    /// The historical trigger was "the last byte is `}`", which hung the agent
+    /// loop if the stream was cut before the closing byte or the model returned
+    /// empty arguments. Now it is additionally forced in `finish`.
     fn tryEmitTool(self: *StreamCtx, p: *Part) void {
         if (p.emitted) return;
         if (p.id.items.len == 0 or p.name.items.len == 0) return;
@@ -558,14 +560,14 @@ pub const StreamCtx = struct {
         } else |_| {}
     }
 
-    /// Recupera tool calls que nunca llegaron a emitirse (stream cortado).
-    /// Los que sí tienen args ejecutables se emiten ahora; el resto se descarta.
+    /// Recovers tool calls that never made it to being emitted (cut stream).
+    /// The ones that do have executable args are emitted now; the rest are dropped.
     fn flushPendingTools(self: *StreamCtx) void {
         for (self.parts.items) |*p| {
             if (p.emitted) continue;
             if (p.id.items.len == 0 or p.name.items.len == 0) continue;
             if (p.args.items.len == 0) {
-                // Un tool sin argumentos es legal: se trata como objeto vacío.
+                // A tool without arguments is legal: treat it as an empty object.
                 p.args.appendSlice(self.gpa, "{}") catch continue;
             }
             self.tryEmitTool(p);
@@ -575,11 +577,11 @@ pub const StreamCtx = struct {
 
 pub const StreamResult = struct {
     ctx: *StreamCtx,
-    /// True si el request se cortó con ESC (hay texto parcial).
+    /// True if the request was cut short with ESC (there is partial text).
     partial: bool = false,
 };
 
-/// Stream con acumulación de tool_calls. El caller hace `result.ctx.destroy()`.
+/// Stream with tool_call accumulation. The caller does `result.ctx.destroy()`.
 pub fn streamChatCtx(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
@@ -591,9 +593,9 @@ pub fn streamChatCtx(
 ) !StreamResult {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = user_cb, .kind = kind };
-    // OJO: en error hay que usar `deinit`, no `destroy`: el ctx puede tener
-    // `parts` (tool calls acumuladas) y `line_buf` ya reservados.
-    // Con `errdefer gpa.destroy(ctx)` esos dos se fugaban en cada 429/5xx.
+    // CAREFUL: on error you must use `deinit`, not `destroy`: the ctx may
+    // already have `parts` (accumulated tool calls) and `line_buf` allocated.
+    // With `errdefer gpa.destroy(ctx)` both of those leaked on every 429/5xx.
     errdefer ctx.destroy();
     try streamRaw(gpa, http, url, bearer, body, ctx);
     return .{ .ctx = ctx, .partial = ctx.partial };
@@ -607,14 +609,14 @@ fn streamRaw(
     body: []u8,
     ctx: *StreamCtx,
 ) !void {
-    _ = gpa; // el parser vive en el ctx (line_buf)
-    last_usage = .{}; // fresh por request: no arrastrar campos del turno anterior
+    _ = gpa; // the parser lives in the ctx (line_buf)
+    last_usage = .{}; // fresh per request: do not carry over fields from the previous turn
     clearCancel();
 
     const Hdr = http_client.Http.ExtraHeader;
     var hdrs_buf: [2]Hdr = undefined;
     var n: usize = 0;
-    // Anthropic no usa Bearer: x-api-key + versión de la API.
+    // Anthropic does not use Bearer: x-api-key + API version.
     var auth: ?[]const u8 = bearer;
     if (ctx.kind == .anthropic) {
         if (bearer) |k| {
@@ -628,7 +630,7 @@ fn streamRaw(
 
     const Feed = struct {
         fn onChunk(ud: ?*anyopaque, chunk: []const u8) anyerror!void {
-            if (cancelled()) return error.Cancelled; // ESC corta la conexión
+            if (cancelled()) return error.Cancelled; // ESC cuts the connection
             const c = @as(*StreamCtx, @ptrCast(@alignCast(ud.?)));
             c.feed(chunk) catch |err| switch (err) {
                 error.ServerError => return error.ServerError,
@@ -638,7 +640,7 @@ fn streamRaw(
 
     const res = http.streamPost(url, auth, body, hdrs_buf[0..n], Feed.onChunk, ctx) catch |err| {
         if (err == error.Cancelled) {
-            ctx.partial = true; // el texto recibido hasta ESC se conserva
+            ctx.partial = true; // the text received up to the ESC is kept
             return;
         }
         return err;
@@ -646,25 +648,27 @@ fn streamRaw(
 
     if (res.status != 200) {
         if (res.retry_after) |ra| retry_after_secs = ra;
-        // Cada status tiene su propio error porque la ACCION que hay que hacer
-        // es distinta, y "HTTP 403" no dice nada:
-        //   401  key invalida    -> no reintentar, revisar la key
-        //   402  sin creditos    -> no reintentar (antes reintentaba 3 veces!)
-        //   403  acceso denegado -> casi siempre es el MODELO, no la key
-        //   429/503 transitorios  -> reintentar
+        // Each status gets its own error because the ACTION to take differs,
+        // and "HTTP 403" says nothing:
+        //   401  invalid key    -> do not retry, check the key
+        //   402  no credits     -> do not retry (it used to retry 3 times!)
+        //   403  access denied  -> almost always the MODEL, not the key
+        //   429/503 transient   -> retry
         const err: anyerror = switch (res.status) {
             429 => error.RateLimited,
             503 => error.Overloaded,
             401 => error.AuthFailed,
             402 => error.NoCredits,
             403 => error.Forbidden,
-            // 404 casi siempre es "este modelo no existe (o tu cuenta no lo
-            // tiene)". Reintentarlo 3 veces es esperar en balde.
+            // 404 almost always means "this model does not exist (or your
+            // account does not have it)". Retrying 3 times is waiting for
+            // nothing.
             404 => error.ModelNotFound,
             else => error.ServerError,
         };
-        // El mensaje del server es lo que de verdad explica el fallo; se saca
-        // de su JSON ("message":"...") y si no esta, se deja el status.
+        // The server's message is what actually explains the failure; it is
+        // pulled out of its JSON ("message":"...") and if there is none the
+        // status is left as-is.
         last_error_len = 0;
         setServerMessage(ctx.raw[0..ctx.raw_len]);
         if (last_error_len == 0) {
@@ -678,28 +682,28 @@ fn streamRaw(
     ctx.finish() catch |err| switch (err) {
         error.ServerError => return error.ServerError,
     };
-    // Un tool call a medio llegar al final del stream no se emitía nunca y
-    // colgaba el agent loop: se fuerza la emisión de los que sí sean válidos.
+    // A tool call that arrives half-formed at the end of the stream was never
+    // emitted and hung the agent loop: force the emission of the valid ones.
     ctx.flushPendingTools();
 }
 
-/// Último `retry-after` visto en una respuesta de error (segundos).
+/// Last `retry-after` seen on an error response (seconds).
 pub var retry_after_secs: ?u16 = null;
 
-/// Duerme `ms` milisegundos. Interrumpe pronto si se pulsa ESC.
+/// Sleeps `ms` milliseconds. Returns early if ESC is pressed.
 ///
-/// ## Por qué `nanosleep` y no `Io.sleep`
+/// ## Why `nanosleep` and not `Io.sleep`
 ///
-/// Esto corre en el WORKER, y `Io.sleep` se lleva por delante el event loop del
-/// `Io` que la TUI tiene en el mismo hilo de eventos: durante el backoff se
-/// paran los redraws, el reloj de la franja se congela y los avisos se quedan
-/// en `pending` sin pintar. Es el mismo problema que el ACP resolvió con `nap()`
-/// y la misma solución: una syscall de verdad, sin tocar el `Io`.
+/// This runs in the WORKER, and `Io.sleep` takes the event loop of the `Io`
+/// that the TUI shares in the same event thread away with it: during the backoff
+/// the redraws stop, the clock in the activity strip freezes and the notices stay
+/// in `pending` unpainted. It is the same problem ACP solved with `nap()` and
+/// the same solution: a real syscall, without touching the `Io`.
 ///
-/// Se duerme a trozos de 50ms para que ESC pueda cortar la espera.
+/// Sleeps in 50 ms slices so ESC can cut the wait short.
 pub fn sleepMs(ms_arg: u64) void {
     if (ms_arg == 0) return;
-    // Techo: no dormir medio minuto seguido.
+    // Ceiling: never sleep half a minute in one go.
     var left: u64 = @min(ms_arg, 30_000);
     while (left > 0) {
         if (cancel_current.load(.seq_cst)) return;
@@ -709,8 +713,8 @@ pub fn sleepMs(ms_arg: u64) void {
     }
 }
 
-/// xorshift para el jitter del backoff (no necesita estado global seguro:
-/// solo lo usa el worker que ya está serializando sus requests).
+/// xorshift for the backoff jitter (no thread-safe global state needed: only
+/// the worker that is already serializing its requests uses it).
 var rng_state: u64 = 0x9E3779B97F4A7C15;
 
 pub fn randBelow(n: u64) u64 {
@@ -723,13 +727,13 @@ pub fn randBelow(n: u64) u64 {
     return x % n;
 }
 
-/// Procesa un body SSE completo de una sola vez (tests y paths sin socket).
-/// Usa el mismo parser incremental que el stream real, alimentándolo entero.
+/// Processes a whole SSE body in one go (tests and socketless paths).
+/// Uses the same incremental parser as the real stream, feeding it whole.
 pub fn scanSse(gpa: std.mem.Allocator, sse_body: []const u8, ctx: *StreamCtx) !void {
     _ = gpa;
     ctx.line_buf.clearRetainingCapacity();
-    // Un SSE malformado no tumba el parseo; solo un error del server
-    // (payload con `{"error":...}`) es fatal.
+    // A malformed SSE does not bring the parse down; only a server error
+    // (a payload with `{"error":...}`) is fatal.
     ctx.feed(sse_body) catch |err| switch (err) {
         error.ServerError => return error.ServerError,
     };
@@ -739,7 +743,7 @@ pub fn scanSse(gpa: std.mem.Allocator, sse_body: []const u8, ctx: *StreamCtx) !v
     ctx.flushPendingTools();
 }
 
-/// Stream simple sin tool_calls (CLI, tests). El caller libera `ctx`.
+/// Simple stream without tool_calls (CLI, tests). The caller frees `ctx`.
 pub fn streamChat(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
@@ -751,13 +755,13 @@ pub fn streamChat(
 ) !void {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind };
-    defer ctx.destroy(); // libera parts y destruye el struct
+    defer ctx.destroy(); // frees parts and destroys the struct
     try streamRaw(gpa, http, url, bearer, body, ctx);
 }
 
 // ── body builders ────────────────────────────────────────────
 
-/// Body con historial completo (multi-turno + tools), según provider.
+/// Body with the full history (multi-turn + tools), depending on the provider.
 pub fn buildBodyMessages(
     buf: []u8,
     model: []const u8,
@@ -772,7 +776,7 @@ pub fn buildBodyMessages(
     };
 }
 
-/// Formato OpenAI (chat/completions). Sin deps de alloc.
+/// OpenAI format (chat/completions). No alloc deps.
 fn buildBodyOpenAI(
     buf: []u8,
     model: []const u8,
@@ -808,9 +812,9 @@ fn buildBodyOpenAI(
     }
     try w.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true}");
 
-    // Los o-series / gpt-5 de OpenAI rechazan `max_tokens` (piden
-    // `max_completion_tokens`) y no aceptan `temperature`. Mandar el campo
-    // equivocado es un 400 directo, así que se ramifica por familia.
+    // OpenAI's o-series / gpt-5 reject `max_tokens` (they want
+    // `max_completion_tokens`) and do not accept `temperature`. Sending the
+    // wrong field is an instant 400, so branch by family.
     const fam = familyForModel(model);
     switch (fam) {
         .openai_reasoning => {
@@ -823,7 +827,7 @@ fn buildBodyOpenAI(
         },
     }
     if (fam == .openai_reasoning) {
-        // low/medium/high mapeado al vocabulario de OpenAI.
+        // low/medium/high mapped onto OpenAI's vocabulary.
         const re: []const u8 = switch (effort) {
             .low => "low",
             .high => "high",
@@ -834,8 +838,8 @@ fn buildBodyOpenAI(
         try w.writeAll("\"");
     }
 
-    // tools FIRST after messages? No: tools va fuera de messages (nivel raíz),
-    // y su posición estable en el JSON ayuda al caching del prefijo del provider.
+    // tools FIRST after messages? No: tools goes outside messages (root level),
+    // and its stable position in the JSON helps the provider's prefix caching.
     if (tools_json.len > 0) {
         try w.writeAll(",\"tools\":");
         try w.writeAll(tools_json);
@@ -844,18 +848,18 @@ fn buildBodyOpenAI(
     return w.buffered();
 }
 
-/// Compat: mensaje único (CLI headless).
+/// Compat: single message (headless CLI).
 pub fn buildBody(buf: []u8, model: []const u8, user_text: []const u8, effort: Effort) ![]u8 {
     const msgs = [_]ChatMessage{.{ .role = "user", .content = user_text }};
     return buildBodyMessages(buf, model, &msgs, effort, "", .openai);
 }
 
-/// Formato Anthropic Messages API:
-///  - system y tools van a nivel raíz, con breakpoints `cache_control`
-///    (prompt caching estilo Claude Code: el prefijo estable —tools+system+
-///    historial— se sirve de cache del server entre turnos).
-///  - assistant.tool_calls (formato OpenAI) → bloques `tool_use`.
-///  - runs de mensajes role=tool → UN mensaje user con bloques `tool_result`.
+/// Anthropic Messages API format:
+///  - system and tools go at root level, with `cache_control` breakpoints
+///    (Claude Code style prompt caching: the stable prefix —tools+system+
+///    history— is served from the server's cache between turns).
+///  - assistant.tool_calls (OpenAI format) → `tool_use` blocks.
+///  - runs of role=tool messages → ONE user message with `tool_result` blocks.
 fn buildBodyAnthropic(
     buf: []u8,
     model: []const u8,
@@ -870,9 +874,9 @@ fn buildBodyAnthropic(
     var w: std.Io.Writer = .fixed(buf);
     try w.writeAll("{\"model\":\"");
     try jsonEscape(&w, model);
-    // Anthropic EXIGE max_tokens (no tiene default). Además, con thinking
-    // extended el presupuesto de razonamiento va aparte y tiene que ser
-    // MENOR que max_tokens, si no el server responde 400.
+    // Anthropic REQUIRES max_tokens (it has no default). On top of that, with
+    // extended thinking the reasoning budget is separate and has to be SMALLER
+    // than max_tokens, otherwise the server answers 400.
     const think_budget: u32 = switch (effort) {
         .low => 1024,
         .medium => 4096,
@@ -893,8 +897,8 @@ fn buildBodyAnthropic(
                 var emitted: usize = 0;
                 for (pv.array.items, 0..) |t, ti| {
                     if (t != .object) continue;
-                    // Formato OpenAI: {type:function, function:{name,...}}.
-                    // También acepta forma plana {name, description, parameters}.
+                    // OpenAI format: {type:function, function:{name,...}}.
+                    // Also accepts the flat shape {name, description, parameters}.
                     var name_v: ?std.json.Value = t.object.get("name");
                     var desc_v: ?std.json.Value = t.object.get("description");
                     var params_v: ?std.json.Value = t.object.get("parameters");
@@ -921,8 +925,8 @@ fn buildBodyAnthropic(
                     } else {
                         try w.writeAll("{\"type\":\"object\"}");
                     }
-                    // Breakpoint en la ÚLTIMA tool: tools+system son estables,
-                    // así todo ese prefijo queda cacheado entre turnos.
+                    // Breakpoint on the LAST tool: tools+system are stable, so
+                    // that whole prefix stays cached between turns.
                     if (ti == pv.array.items.len - 1) {
                         try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
                     }
@@ -949,11 +953,11 @@ fn buildBodyAnthropic(
         const has_tc = m.tool_calls_json != null and m.tool_calls_json.?.len > 0;
         if (m.content.len == 0 and !has_tc and !std.mem.eql(u8, m.role, "tool")) {
             i += 1;
-            continue; // Anthropic rechaza contenido vacío
+            continue; // Anthropic rejects empty content
         }
 
         if (std.mem.eql(u8, m.role, "tool")) {
-            // Run de resultados consecutivos → UN mensaje user con tool_result.
+            // Run of consecutive results → ONE user message with tool_result.
             if (!first) try w.writeAll(",");
             first = false;
             try w.writeAll("{\"role\":\"user\",\"content\":[");
@@ -966,8 +970,8 @@ fn buildBodyAnthropic(
                 try w.writeAll("\",\"content\":\"");
                 try jsonEscape(&w, messages[i].content);
                 try w.writeAll("\"");
-                // Breakpoint al final del historial: el próximo turno reutiliza
-                // de cache TODO el prefijo (tools+system+mensajes).
+                // Breakpoint at the end of the history: the next turn reuses
+                // the WHOLE prefix from cache (tools+system+messages).
                 if (i == messages.len - 1) try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
                 try w.writeAll("}");
             }
@@ -978,7 +982,7 @@ fn buildBodyAnthropic(
         if (!first) try w.writeAll(",");
         first = false;
         try w.writeAll("{\"role\":\"");
-        try w.writeAll(m.role); // "user" | "assistant" (system solo en 0)
+        try w.writeAll(m.role); // "user" | "assistant" (system only at index 0)
         try w.writeAll("\",\"content\":");
 
         if (has_tc) {
@@ -1033,7 +1037,7 @@ fn buildBodyAnthropic(
             }
             try w.writeAll("]");
         } else if (i == messages.len - 1) {
-            // Último mensaje: forma bloque para anclar el breakpoint de cache.
+            // Last message: block form, to anchor the cache breakpoint.
             try w.writeAll("[{\"type\":\"text\",\"text\":\"");
             try jsonEscape(&w, m.content);
             try w.writeAll("\",\"cache_control\":{\"type\":\"ephemeral\"}}]");
@@ -1049,8 +1053,8 @@ fn buildBodyAnthropic(
     return w.buffered();
 }
 
-/// Serializa std.json.Value a JSON compacto (subconjunto propio, sin
-/// depender de la API de stringify de std).
+/// Serializes std.json.Value to compact JSON (own subset, without depending on
+/// std's stringify API).
 fn writeJsonValue(w: *std.Io.Writer, v: std.json.Value) !void {
     switch (v) {
         .null => try w.writeAll("null"),
@@ -1106,7 +1110,7 @@ fn jsonEscape(w: *std.Io.Writer, s: []const u8) !void {
     }
 }
 
-// ── tests herméticos ─────────────────────────────────────────
+// ── hermetic tests ───────────────────────────────────────────
 test "scanSse junta deltas y termina en [DONE]" {
     const sse =
         "data: {\"choices\":[{\"delta\":{\"content\":\"Hola \"}}]}\n" ++
@@ -1160,8 +1164,8 @@ test "tool_call fragmentado se acumula y emite una vez" {
     };
     defer ctx.destroy();
 
-    // Fragmentos: id+name primero, args en 3 pedazos (con llave adentro de
-    // un string para verificar que no confunde el parseo).
+    // Fragments: id+name first, args in 3 pieces (with a brace inside a
+    // string, to check that the parse is not confused).
     const sse =
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"grep\",\"arguments\":\"\"}}]}}]}\n" ++
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"a{b\\\"\"}}]}}]}\n" ++
@@ -1169,7 +1173,7 @@ test "tool_call fragmentado se acumula y emite una vez" {
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"}\"}}]}}]}\n" ++
         "data: [DONE]\n\n";
 
-    // args completos: {"pattern":"a{b","x":"}"}
+    // complete args: {"pattern":"a{b","x":"}"}
     try scanSse(std.testing.allocator, sse, ctx);
 
     try std.testing.expectEqual(@as(usize, 1), col.calls);
@@ -1275,9 +1279,9 @@ test "buildBodyAnthropic convierte tool_calls/results y ancla cache_control" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":{\"pattern\":\"foo\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\",\"text\":\"be terse\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1024") != null);
-    // El role "tool" no existe en Anthropic: van como tool_result en user.
+    // The role "tool" does not exist in Anthropic: they go as tool_result in user.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") == null);
-    // 3 breakpoints: system, última tool y último mensaje.
+    // 3 breakpoints: system, last tool and last message.
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
 }
 
@@ -1299,8 +1303,8 @@ test "feed: un evento partido a mitad de línea se entrega entero" {
     };
     defer ctx.destroy();
 
-    // Un solo evento, partido en 5 trozos arbitrarios (en mitad de línea y
-    // entre el `\n` y el siguiente `data:`).
+    // A single event, split into 5 arbitrary pieces (in the middle of a line
+    // and between the `\n` and the next `data:`).
     const full = "data: {\"choices\":[{\"delta\":{\"content\":\"Hola mundo\"}}]}\n\ndata: [DONE]\n\n";
     const cuts = [_]usize{ 7, 23, 51, 52, full.len };
     var prev: usize = 0;
@@ -1330,18 +1334,18 @@ test "feed: un payload partido a mitad de UTF-8 no se corrompe" {
     };
     defer ctx.destroy();
 
-    // "ñ" son 2 bytes y "✓" son 3: los cortes caen dentro de esos bytes.
+    // "ñ" is 2 bytes and "✓" is 3: the cuts land inside those bytes.
     const full = "data: {\"choices\":[{\"delta\":{\"content\":\"a\u{00f1}\u{2713}b\"}}]}\n\n";
     for (full, 0..) |_, i| {
-        try ctx.feed(full[i .. i + 1]); // un byte por chunk, el peor caso
+        try ctx.feed(full[i .. i + 1]); // one byte per chunk, the worst case
     }
     try ctx.finish();
     try std.testing.expectEqualStrings("a\u{00f1}\u{2713}b", col.text.items);
 }
 
 test "feed: un tool call cortado a mitad de args se emite al finish" {
-    // Regresión: con el trigger antiguo ("último byte == '}'") un stream
-    // cortado antes del cierre colgaba el agent loop para siempre.
+    // Regression: with the old trigger ("last byte == '}'") a stream cut
+    // before the closing byte hung the agent loop forever.
     const Collector = struct {
         calls: usize = 0,
         last_name: []const u8 = "",
@@ -1363,7 +1367,7 @@ test "feed: un tool call cortado a mitad de args se emite al finish" {
     };
     defer ctx.destroy();
 
-    // Args que NO terminan en '}' (la conexión se corta justo después).
+    // Args that do NOT end in '}' (the connection cuts right after).
     const sse =
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n";
     try scanSse(std.testing.allocator, sse, ctx);
@@ -1393,7 +1397,7 @@ test "feed: un tool sin argumentos se trata como objeto vacío" {
     };
     defer ctx.destroy();
 
-    // `list_files` sin argumentos: el server manda "arguments":"".
+    // `list_files` without arguments: the server sends "arguments":"".
     const sse =
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"list_files\",\"arguments\":\"\"}}]}}]}\n\n";
     try scanSse(std.testing.allocator, sse, ctx);
@@ -1406,15 +1410,15 @@ test "buildBodyOpenAI: o-series usa max_completion_tokens + reasoning_effort" {
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
-    // gpt-5: `max_tokens` da 400 en la API de OpenAI.
+    // gpt-5: `max_tokens` gives a 400 in OpenAI's API.
     const body = try buildBodyMessages(&buf, "gpt-5", &msgs, .medium, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
-    // Los modelos de razonamiento no aceptan temperature.
+    // Reasoning models do not accept temperature.
     try std.testing.expect(std.mem.indexOf(u8, body, "temperature") == null);
 
-    // o3 también entra por la rama de razonamiento.
+    // o3 also enters through the reasoning branch.
     const o3 = try buildBodyMessages(&buf, "o3-mini", &msgs, .high, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, o3, "\"max_completion_tokens\":16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, o3, "\"reasoning_effort\":\"high\"") != null);
@@ -1434,22 +1438,22 @@ test "buildBodyAnthropic: thinking con budget menor que max_tokens" {
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
-    // effort=high → max_tokens 16384 > budget 16384? No: debe ser estrictamente
-    // menor, así que con high no se manda thinking.
+    // effort=high → max_tokens 16384 > budget 16384? No: it must be strictly
+    // smaller, so with high no thinking is sent.
     const high = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .high, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, high, "\"max_tokens\":16384") != null);
     try std.testing.expect(std.mem.indexOf(u8, high, "thinking") == null);
 
-    // effort=medium → max_tokens 4096 > budget 4096, tampoco.
+    // effort=medium → max_tokens 4096 > budget 4096, neither.
     const med = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .medium, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, med, "thinking") == null);
 
-    // effort=low → max_tokens 1024 == budget 1024: tampoco (debe ser <).
+    // effort=low → max_tokens 1024 == budget 1024: neither (it must be <).
     const low = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .low, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, low, "thinking") == null);
 
-    // El presupuesto de thinking nunca puede igualar max_tokens: Anthropic
-    // exige budget_tokens < max_tokens.
+    // The thinking budget can never equal max_tokens: Anthropic
+    // requires budget_tokens < max_tokens.
     try std.testing.expect(!hasBadThinkingBudget(high));
     try std.testing.expect(!hasBadThinkingBudget(med));
     try std.testing.expect(!hasBadThinkingBudget(low));
@@ -1465,8 +1469,8 @@ test "familyForModel detecta razonamiento solo en o-series/gpt-5" {
     try std.testing.expectEqual(Family.generic_openai, familyForModel("claude-sonnet-4-5"));
 }
 
-/// Test helper: ¿el body tiene un budget de thinking >= max_tokens?
-/// Anthropic rechaza esa combinación, así que sirve de red de seguridad.
+/// Test helper: does the body have a thinking budget >= max_tokens?
+/// Anthropic rejects that combination, so this is a safety net.
 fn hasBadThinkingBudget(body: []const u8) bool {
     const ti = std.mem.indexOf(u8, body, "\"thinking\"") orelse return false;
     const bt = std.mem.indexOfScalarPos(u8, body, ti, '{') orelse return false;
@@ -1478,9 +1482,9 @@ fn hasBadThinkingBudget(body: []const u8) bool {
 }
 
 test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
-    // Regresión: `takeDelimiter` fallaba con StreamTooLong si la línea no
-    // cabía en el buffer de transferencia y el stream moría a mitad. El
-    // parser tiene que poder recomponerla de many pieces.
+    // Regression: `takeDelimiter` failed with StreamTooLong if the line did not
+    // fit in the transfer buffer and the stream died halfway through. The
+    // parser has to be able to reassemble it from many pieces.
     const Collector = struct {
         text: std.ArrayList(u8) = .empty,
         fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
@@ -1498,8 +1502,8 @@ test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
     };
     defer ctx.destroy();
 
-    // Payload de ~200 KB repartido en trozos de 8 KB:现实中 es lo que pasa
-    // cuando el modelo devuelve un tool call enorme o un fragmento largo.
+    // ~200 KB payload spread over 8 KB chunks: in practice that is what happens
+    // when the model returns a huge tool call or a long fragment.
     const payload_len: usize = 200_000;
     const prefix = "data: {\"choices\":[{\"delta\":{\"content\":\"";
     const suffix = "\"}}]}\n\ndata: [DONE]\n\n";
@@ -1514,7 +1518,7 @@ test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
     @memset(line[prefix.len .. prefix.len + payload_len], 'x');
     @memcpy(line[prefix.len + payload_len ..], suffix);
 
-    // Troceado agresivo, sin respetar líneas.
+    // Aggressive chopping, not respecting line boundaries.
     var off: usize = 0;
     while (off < line.len) {
         const n = @min(8192, line.len - off);
@@ -1529,16 +1533,16 @@ test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
 }
 
 test "StreamCtx.deinit no fuga con parts y line_buf poblados" {
-    // El path de error de `streamChatCtx` debe llamar a `deinit` (no
-    // `destroy`), porque para cuando un request falla el ctx ya tiene
-    // tool calls acumuladas y buffer de línea. Con `destroy` se fugaban.
+    // The error path of `streamChatCtx` must call `deinit` (not
+    // `destroy`), because by the time a request fails the ctx already has
+    // accumulated tool calls and a line buffer. With `destroy` they leaked.
     const ctx = try std.testing.allocator.create(StreamCtx);
     ctx.* = .{
         .gpa = std.testing.allocator,
         .user = .{},
         .line_buf = .empty,
     };
-    // Simula trabajo real: una tool call a medias y una línea SSE a medias.
+    // Simulates real work: a half-finished tool call and a half-finished SSE line.
     try ctx.line_buf.appendSlice(std.testing.allocator, "data: {\"a\":1}");
     const p = try ctx.partFor(0);
     try p.id.appendSlice(std.testing.allocator, "call_1");
@@ -1546,13 +1550,13 @@ test "StreamCtx.deinit no fuga con parts y line_buf poblados" {
     try p.args.appendSlice(std.testing.allocator, "{\"path\":\"x\"}");
     try p.args.append(std.testing.allocator, '}');
 
-    // `streamChatCtx` llama a esto en su `errdefer`; el allocator de tests
-    // falla si algo queda sin liberar.
+    // `streamChatCtx` calls this in its `errdefer`; the test allocator
+    // fails if anything is left unfreed.
     ctx.destroy();
 }
 
 test "setServerMessage: saca el message del JSON de error" {
-    // Es lo que convierte un inútil "HTTP 403" en "Model access is disabled".
+    // It is what turns a useless "HTTP 403" into "Model access is disabled".
     setServerMessage(
         \\{"error":{"type":"server_error","message":"Upstream request failed: Model access is disabled"}}
     );
@@ -1565,8 +1569,8 @@ test "setServerMessage: saca el message del JSON de error" {
 }
 
 test "setServerMessage: aguanta basura sin desbordar" {
-    // Sin "message" (JSON raro), vacío, sin abrir comilla, y una cadena
-    // enorme: en ningún caso puede sobrepasar el buffer ni dejar basura.
+    // Without "message" (odd JSON), empty, unopened quote, and a huge
+    // string: under no circumstances may it overrun the buffer or leave junk.
     setServerMessage("");
     try std.testing.expectEqual(@as(usize, 0), last_error_len);
     setServerMessage("<html>502 Bad Gateway</html>");
@@ -1585,10 +1589,10 @@ test "setServerMessage: desescapa comilla y barra" {
 }
 
 test "noteRaw: guarda solo los primeros bytes, sin desbordar" {
-    // El buffer es 512: sirve para el JSON de error corto, y si el body es
-    // gigante (un HTML de error de un proxy) se corta sin reventar nada.
-    // OJO: `destroy` se lleva el struct, así que tiene que estar en el heap
-    // (por eso se pide con `gpa.create` y no como valor local).
+    // The buffer is 512: it serves the short error JSON, and if the body is
+    // huge (an error HTML from a proxy) it is cut without blowing anything up.
+    // CAREFUL: `destroy` takes the struct with it, so it has to live on the
+    // heap (that is why it is asked with `gpa.create` and not as a local).
     const ctx = try std.testing.allocator.create(StreamCtx);
     ctx.* = .{ .gpa = std.testing.allocator, .user = .{} };
     ctx.noteRaw("hola");
@@ -1599,8 +1603,8 @@ test "noteRaw: guarda solo los primeros bytes, sin desbordar" {
 }
 
 test "los 402 y 403 tienen error propio (no se reintentan)" {
-    // 402 sin creditos se reintentaba 3 veces como si fuera 5xx: tres esperas
-    // de backoff para un error que no se va a arreglar solo.
+    // 402 without credits used to be retried 3 times as if it were a 5xx: three
+    // backoff waits for an error that is not going to fix itself.
     try std.testing.expect(!isRetryableTest(error.NoCredits));
     try std.testing.expect(!isRetryableTest(error.Forbidden));
     try std.testing.expect(!isRetryableTest(error.AuthFailed));
@@ -1608,8 +1612,8 @@ test "los 402 y 403 tienen error propio (no se reintentan)" {
     try std.testing.expect(isRetryableTest(error.Overloaded));
 }
 
-/// Espejo de la decisión de `agent.isRetryable`, para poder testearla sin
-/// depender del módulo del agente (que importa la TUI entera).
+/// Mirror of `agent.isRetryable`'s decision, so it can be tested without
+/// depending on the agent module (which imports the whole TUI).
 fn isRetryableTest(err: anyerror) bool {
     return switch (err) {
         error.RateLimited, error.Overloaded, error.ServerError => true,

@@ -1,9 +1,9 @@
 const std = @import("std");
 
-/// Mini-motor regex de backtracking. Soporta lo que un LLM usa al buscar código:
-/// literales, `.`, `^`, `$`, clases `[a-z_]` `[^...]`, escapes `\w \d \s \.`, etc.,
-/// cuantificadores `* + ?`, y alternación top-level `a|b`.
-/// Sin grupos con cuantificador (raro en búsquedas de código).
+/// Mini backtracking regex engine. Supports what an LLM uses when searching
+/// code: literals, `.`, `^`, `$`, classes `[a-z_]` `[^...]`, escapes
+/// `\w \d \s \.`, etc., quantifiers `* + ?`, and top-level alternation `a|b`.
+/// No groups with quantifiers (rare in code searches).
 pub const Regex = struct {
     pattern: []const u8,
 
@@ -11,9 +11,9 @@ pub const Regex = struct {
         return .{ .pattern = pattern };
     }
 
-    /// ¿Matchea en alguna posición de `text`?
+    /// Does it match at any position of `text`?
     pub fn matches(self: *const Regex, text: []const u8) bool {
-        // Alternación top-level: probar cada rama.
+        // Top-level alternation: try each branch.
         var it = BranchIter{ .p = self.pattern };
         while (it.next()) |branch| {
             if (matchBranch(branch, text)) return true;
@@ -21,7 +21,7 @@ pub const Regex = struct {
         return false;
     }
 
-    /// Devuelve el fin del match que empieza en `start` (para futures).
+    /// Returns the end of the match that starts at `start` (for future use).
     fn matchBranch(branch: []const u8, text: []const u8) bool {
         var start: usize = 0;
         while (start <= text.len) : (start += 1) {
@@ -56,23 +56,23 @@ const BranchIter = struct {
         }
         if (start > self.p.len) return null;
         const branch = self.p[start..self.i];
-        self.i += 1; // marca fin para la próxima llamada
+        self.i += 1; // mark the end for the next call
         return branch;
     }
 };
 
-/// Matchea la secuencia `p[from..]` contra `text[from_text..]`.
-/// Devuelve la posición final del match o null.
+/// Matches the sequence `p[from..]` against `text[from_text..]`.
+/// Returns the end position of the match or null.
 fn matchSeq(p: []const u8, from: usize, text: []const u8, from_text: usize) ?usize {
     var ti = from_text;
     var pi = from;
 
-    // Ancla ^
+    // ^ anchor
     if (pi < p.len and p[pi] == '^') {
         if (ti != 0) return null;
         pi += 1;
     }
-    // $ final
+    // trailing $
     if (pi < p.len and p[pi] == '$' and pi + 1 == p.len) {
         return if (ti == text.len) ti else null;
     }
@@ -83,7 +83,7 @@ fn matchSeq(p: []const u8, from: usize, text: []const u8, from_text: usize) ?usi
             return if (ti == text.len) ti else null;
         }
 
-        // ¿Cuánto mide el átomo y su cuantificador?
+        // How wide is the atom and its quantifier?
         const atom = Atom.parse(p, pi) orelse return null;
         pi = atom.end;
         var quant = Quant.one;
@@ -109,18 +109,18 @@ fn matchSeq(p: []const u8, from: usize, text: []const u8, from_text: usize) ?usi
             },
             .opt => {
                 if (ti < text.len and atom.match(text[ti])) {
-                    // probar con y sin
+                    // try with and without
                     if (matchSeq(p, next_pi, text, ti + 1) != null) return ti + 1;
                 }
                 pi = next_pi;
             },
             .star, .plus => {
-                // Consumir máximo greedily
+                // Consume greedily as much as possible
                 var count: usize = 0;
                 var end = ti;
                 while (end < text.len and atom.match(text[end])) : (end += 1) count += 1;
                 if (quant == .plus and count == 0) return null;
-                // Backtrack: probar el máximo hacia abajo
+                // Backtrack: try the maximum count downwards
                 var take = count;
                 while (true) {
                     if (matchSeq(p, next_pi, text, ti + take) != null) return ti + take;
@@ -137,14 +137,14 @@ fn matchSeq(p: []const u8, from: usize, text: []const u8, from_text: usize) ?usi
 const Quant = enum { one, star, plus, opt };
 
 const Atom = struct {
-    end: usize, // índice en el pattern después del átomo
+    end: usize, // index in the pattern after the atom
     kind: Kind,
 
     const Kind = union(enum) {
         literal: u8,
         any, // .
         class: struct { negated: bool, chars: []const u8 },
-        escape: u8, // w d s W D S o literal escapado
+        escape: u8, // w d s W D S, or an escaped literal
     };
 
     fn parse(p: []const u8, at: usize) ?Atom {
@@ -163,12 +163,12 @@ const Atom = struct {
                     j += 1;
                 }
                 const chars_start = j;
-                // ']' inicial es literal
+                // a leading ']' is a literal
                 if (j < p.len and p[j] == ']') j += 1;
                 while (j < p.len and p[j] != ']') : (j += 1) {
                     if (p[j] == '\\' and j + 1 < p.len) j += 1;
                 }
-                if (j >= p.len) return null; // clase sin cerrar
+                if (j >= p.len) return null; // unterminated class
                 return .{ .end = j + 1, .kind = .{ .class = .{ .negated = negated, .chars = p[chars_start..j] } } };
             },
             else => return .{ .end = at + 1, .kind = .{ .literal = c } },
@@ -204,13 +204,13 @@ const Atom = struct {
     fn classMatch(chars: []const u8, c: u8) bool {
         var i: usize = 0;
         while (i < chars.len) : (i += 1) {
-            // rangos a-z
+            // ranges a-z
             if (i + 2 < chars.len and chars[i + 1] == '-' and chars[i + 2] != ']') {
                 if (c >= chars[i] and c <= chars[i + 2]) return true;
                 i += 2;
                 continue;
             }
-            // escapes \w \d \s dentro de clase
+            // escapes \w \d \s inside a class
             if (chars[i] == '\\' and i + 1 < chars.len) {
                 const e = chars[i + 1];
                 const in = switch (e) {
@@ -233,7 +233,7 @@ const Atom = struct {
 test "literales y anclas" {
     const re = Regex.compile("fn main");
     try std.testing.expect(re.matches("const x = 1; fn main() {}"));
-    try std.testing.expect(re.matches("fn mainn")); // substring: sin anclar sí matchea
+    try std.testing.expect(re.matches("fn mainn")); // substring: unanchored does match
     const anchored = Regex.compile("^fn ");
     try std.testing.expect(anchored.matches("fn a() {}"));
     try std.testing.expect(!anchored.matches("x fn a() {}"));

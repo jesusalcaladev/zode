@@ -19,9 +19,9 @@ fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
-/// Modo headless: zode --models
+/// Headless mode: zode --models
 fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !u8 {
-    models.dbg_io = io; // para diagnósticos
+    models.dbg_io = io; // for diagnostics
     var http = http_client.Http.init(gpa, io);
     defer http.deinit();
 
@@ -46,8 +46,8 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     return 0;
 }
 
-/// Modo headless: zode --chat "texto"
-/// Headless agent: como la TUI pero sin UI (yolo ON, imprime a stderr).
+/// Headless mode: zode --chat "text"
+/// Headless agent: like the TUI but without UI (yolo ON, prints to stderr).
 fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, text: []const u8) !u8 {
     var http = http_client.Http.init(gpa, io);
     defer http.deinit();
@@ -89,14 +89,14 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     var iteration: usize = 0;
     var elided_total: usize = 0;
     while (iteration < 6) : (iteration += 1) {
-        // Contexto bajo budget: elide tool dumps viejos (vista del wire).
+        // Context under budget: elide old tool dumps (a wire view).
         {
             const comp = compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetTokens(env)) catch
                 compaction_mod.Compacted{ .msgs = msgs.items };
             if (comp.elided > 0) elided_total += comp.elided;
             var cur: []chat.ChatMessage = try arena.dupe(chat.ChatMessage, comp.msgs);
 
-            // Tier 2: resumir el tramo viejo con LLM si la elision no alcanzó.
+            // Tier 2: summarize the old stretch with the LLM if eliding was not enough.
             if (comp.needs_summary and comp.summary_upto > 0) {
                 const upto = @min(comp.summary_upto, cur.len);
                 const starts_sys = cur.len > 0 and std.mem.eql(u8, cur[0].role, "system");
@@ -159,10 +159,10 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             models.dbg("\n[cache] {d:.1}% hit-rate · {d} prompt / {d} cached tokens", .{ s.hitRatePct(), s.prompt_tokens, s.cached_tokens });
             if (elided_total > 0) models.dbg(" · {d} tool results elided", .{elided_total});
             models.dbg("\n", .{});
-            return 0; // respuesta final
+            return 0; // final answer
         }
 
-        // Ejecuta tools (headless = yolo) y alimenta los resultados.
+        // Runs the tools (headless = yolo) and feeds the results back.
         const tc_json = try result.ctx.toolCallsJson(arena);
         try msgs.append(arena, .{ .role = "assistant", .content = "", .tool_calls_json = tc_json });
         for (result.ctx.parts.items) |*p| {
@@ -187,14 +187,14 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     return 0;
 }
 
-/// Modo TUI: zode (sin args)
+/// TUI mode: zode (no args)
 fn runTui(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
 
-    // 64 KiB en vez de 1 MB (5.4 del ROADMAP): el buffer de la TTY es memoria
-    // PERMANENTE (vive todo el proceso) y 1 MB se paga el 99% del tiempo sin
-    // escribirse. Con un stream de tokens por chunk llega de sobra.
+    // 64 KiB instead of 1 MB (5.4 of the ROADMAP): the TTY buffer is PERMANENT
+    // memory (it lives for the whole process) and 1 MB is paid for 99% of the
+    // time without being written. With a token stream chunk by chunk it is plenty.
     const tty_buffer = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(tty_buffer);
 
@@ -204,13 +204,13 @@ fn runTui(init: std.process.Init) !u8 {
     var model = tui.Model.init(gpa);
     defer model.deinit();
     model.environ = init.environ_map;
-    model.attachIo(io); // para el reloj de la franja de actividad
+    model.attachIo(io); // for the activity strip clock
     model.attach();
 
     agent.io_global = io;
-    // Sin esto los diagnósticos de `models.dbg` (status + body del servidor)
-    // no salen en la TUI: solo se ve un "models: HTTP error at <url>" sin más,
-    // que no dice si fue un 401, un 403 o un 404.
+    // Without this the `models.dbg` diagnostics (status + server body) do not
+    // show up in the TUI: you only see "models: HTTP error at <url>" and
+    // nothing else, which does not say whether it was a 401, a 403 or a 404.
     models_mod.dbg_io = io;
     agent.api_key_global = envGet(init.environ_map, "ZODE_API_KEY");
     agent.environ_global = init.environ_map;
@@ -221,17 +221,17 @@ fn runTui(init: std.process.Init) !u8 {
     agent.loadUserConfig();
     agent.bootstrapSession(&model);
 
-    // Cabecera de bienvenida: arte del búho, línea de Zo y pistas. Va en el
-    // Kind `.banner` (azul de marca) en vez de `.info` (gris), y la carita de
-    // Zo con el color de su mood.
+    // Welcome header: the owl art, Zo's line and the hints. It goes in the
+    // `.banner` Kind (brand blue) instead of `.info` (grey), with Zo's face
+    // in the color of its mood.
     model.pushHeader(.idle);
 
     try app.run(model.widget(), .{});
 
-    // Los workers se lanzan con `detach`: nadie los une. Antes de que corran los
-    // `defer` (que destruyen el modelo, la app y el `Io`) hay que esperarlos, o
-    // un worker que sigue dentro de `io.async` usa memoria liberada y la app
-    // peta con un segfault al salir.
+    // Workers are spawned with `detach`: nobody joins them. They must be waited for
+    // before the `defer`s run (they destroy the model, the app and the `Io`), or
+    // a worker still inside `io.async` uses freed memory and the app dies with a
+    // segfault on exit.
     model.waitWorkers(2000);
     return 0;
 }

@@ -2,7 +2,7 @@ const std = @import("std");
 const http = @import("http_client.zig");
 const web = @import("web.zig");
 
-pub const max_tool_output = 16 * 1024; // presupuesto de salida por tool
+pub const max_tool_output = 16 * 1024; // output budget per tool
 
 pub const ToolDef = struct {
     name: []const u8,
@@ -22,7 +22,7 @@ pub const defs = [_]ToolDef{
     .{ .name = "think", .desc = "Private scratchpad to reason before acting (no side effects)" },
 };
 
-/// Declara las tools al LLM (formato OpenAI). Estático: 0 allocs por request.
+/// Declares the tools to the LLM (OpenAI format). Static: 0 allocs per request.
 pub fn toolsJson() []const u8 {
     return
     \\[
@@ -40,11 +40,11 @@ pub fn toolsJson() []const u8 {
     ;
 }
 
-/// ¿Esta tool hay que preguntarle al usuario antes de correrla?
+/// Does this tool need to ask the user before running it?
 ///
-/// `web_fetch` y `web_search` NO preguntan: son lecturas, no escriben nada, y un
-/// diálogo por cada consulta a internet convierte el agent loop en un
-/// interrogatorio. Es el mismo criterio que `read` o `grep`.
+/// `web_fetch` and `web_search` do NOT ask: they are reads, they write nothing, and
+/// a dialog for every internet query turns the agent loop into an interrogation.
+/// Same criterion as `read` or `grep`.
 pub fn needsPermission(name: []const u8) bool {
     return !(std.mem.eql(u8, name, "read") or
         std.mem.eql(u8, name, "glob") or
@@ -55,8 +55,8 @@ pub fn needsPermission(name: []const u8) bool {
         std.mem.eql(u8, name, "think"));
 }
 
-/// Ejecuta una tool con args JSON. Devuelve el resultado (truncado) —
-/// memoria de `arena`, válida hasta que la arena se libere.
+/// Runs a tool with JSON args. Returns the (truncated) result —
+/// `arena` memory, valid until the arena is freed.
 pub fn execute(io: std.Io, name: []const u8, args_json: []const u8, arena: std.mem.Allocator) ![]const u8 {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
     if (parsed != .object) return error.BadArgs;
@@ -123,7 +123,7 @@ fn toolRead(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
             truncated = true;
             break;
         }
-        // Trunca líneas larguísimas (minified) a 2000 chars.
+        // Truncate huge (minified) lines to 2000 chars.
         const shown = line[0..@min(line.len, 2000)];
         out.print(arena, "{d: >6}│ {s}\n", .{ line_no, shown }) catch break;
         lines_shown += 1;
@@ -152,11 +152,11 @@ fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]c
     return std.fmt.allocPrint(arena, "wrote {s} ({d} bytes)", .{ path, content.len });
 }
 
-// ── edit: single hunk (compat) o multi-hunk via `edits: [...]` ──
+// ── edit: single hunk (compat) or multi-hunk via `edits: [...]` ─
 fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const path = getStr(obj, "path") orelse return error.MissingPath;
 
-    // Recolecta hunks: `edits: [{old_string,new_string},...]` o single par.
+    // Collect hunks: `edits: [{old_string,new_string},...]` or a single pair.
     var hunks: std.ArrayList(Hunk) = .empty;
     if (obj.get("edits")) |edits_v| {
         if (edits_v != .array or edits_v.array.items.len == 0) return error.BadArgs;
@@ -178,7 +178,7 @@ fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
     var dir = std.Io.Dir.cwd();
     const data = try dir.readFileAlloc(io, path, arena, .limited(32 * 1024 * 1024));
 
-    // Valida todos los hunks contra el texto ORIGINAL (transacción).
+    // Validate every hunk against the ORIGINAL text (transaction).
     for (hunks.items) |*h| {
         if (h.old.len == 0) return std.fmt.allocPrint(arena, "error: empty old_string (use write for new files)", .{});
         var count: usize = 0;
@@ -197,7 +197,7 @@ fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
         h.occurrences = count;
     }
 
-    // Aplica en orden (el output de un hunk es el input del siguiente).
+    // Apply in order (the output of one hunk is the input of the next).
     var out: []const u8 = data;
     var total: usize = 0;
     for (hunks.items) |h| {
@@ -302,24 +302,24 @@ fn toolGlob(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
     return out.items;
 }
 
-// ── grep: rg nativo > grep nativo > fallback interno ─────────
+// ── grep: native rg > native grep > internal fallback ────────
 fn toolGrep(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const pattern = getStr(obj, "pattern") orelse return error.MissingPattern;
     const subdir = getStr(obj, "subdir") orelse ".";
 
-    // 1) ripgrep (el mejor: rápido, respeta .gitignore)
+    // 1) ripgrep (the best: fast, respects .gitignore)
     const rg_argv = [_][]const u8{ "rg", "--no-heading", "-n", "--max-count", "5", "--max-columns", "300", pattern, subdir };
     if (nativeGrep(arena, io, &rg_argv)) |out| return out;
 
-    // 2) grep -rn del sistema
+    // 2) the system's grep -rn
     const grep_argv = [_][]const u8{ "grep", "-rn", "--include=*", "-m", "5", pattern, subdir };
     if (nativeGrep(arena, io, &grep_argv)) |out| return out;
 
-    // 3) fallback: motor regex interno
+    // 3) fallback: internal regex engine
     return fallbackGrep(io, pattern, subdir, arena);
 }
 
-/// Corre un binario nativo de grep; null si el binario no existe.
+/// Runs a native grep binary; null if the binary does not exist.
 fn nativeGrep(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]const u8 {
     const result = std.process.run(arena, io, .{
         .argv = argv,
@@ -328,13 +328,13 @@ fn nativeGrep(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[
         .reserve_amount = 4096,
         .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
     }) catch return null;
-    // rg exit 1 = sin matches; exit 127/2 = binario/uso inválido → probar siguiente
+    // rg exit 1 = no matches; exit 127/2 = bad binary/usage → try the next one
     const code: u8 = switch (result.term) {
         .exited => |c| c,
         else => return null,
     };
     if (code == 0 and result.stdout.len > 0) {
-        // Trunca a ~80 líneas para no quemar tokens
+        // Truncate to ~80 lines to not burn tokens
         return truncateLines(arena, result.stdout, 80);
     }
     if (code == 1) {
@@ -359,7 +359,7 @@ fn truncateLines(arena: std.mem.Allocator, data: []const u8, max_lines: usize) [
     return out.items;
 }
 
-/// Fallback puro-Zig para cuando no hay rg ni grep (raro en dev boxes).
+/// Pure-Zig fallback for when there is neither rg nor grep (rare on dev boxes).
 fn fallbackGrep(io: std.Io, pattern: []const u8, subdir: []const u8, arena: std.mem.Allocator) ![]const u8 {
     const regex = @import("regex.zig").Regex.compile(pattern);
 
@@ -395,7 +395,7 @@ fn fallbackGrep(io: std.Io, pattern: []const u8, subdir: []const u8, arena: std.
     return out.items;
 }
 
-// ── list_files: listing plano del directorio (barato) ────────
+// ── list_files: plain directory listing (cheap) ──────────────
 fn toolListFiles(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const path = getStr(obj, "path") orelse ".";
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
@@ -424,39 +424,39 @@ fn toolListFiles(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
     return out.items;
 }
 
-// ── web: leer internet (sin permisos: son lecturas) ──────────
+// ── web: read the internet (no permissions: reads only) ──────
 
-/// Tope duro de una respuesta web. 200 KB de texto es de sobra para leer una
-/// doc y evita que una página infinita (un listado de 50 000 enlaces) reviente
-/// el contexto del turno.
+/// Hard cap on a web response. 200 KB of text is plenty to read a doc and
+/// keeps an endless page (a listing of 50 000 links) from blowing up the turn's
+/// context.
 const web_hard_cap = 200 * 1024;
 
 fn browserHeaders() [3]http.Http.ExtraHeader {
     return .{
         .{ .name = "user-agent", .value = web.user_agent },
         .{ .name = "accept", .value = "text/html,application/json,text/plain;q=0.9,*/*;q=0.8" },
-        // OJO: `accept-encoding` NO se puede dejar fuera y confiar. `std.http`
-        // pone `accept_encoding = .omit` (que es "no mandar el header"), y sin
-        // él GitHub y compañía devuelven gzip: el modelo se come 16 KB de
-        // bytes ilegibles y no sabe qué dice la página. Se pide `identity`
-        // explícitamente, que es la única forma de decir "sin comprimir" con
-        // std, que no descomprime de forma transparente.
+        // CAREFUL: you cannot leave `accept-encoding` out and trust things. `std.http`
+        // sets `accept_encoding = .omit` (meaning "don't send the header"), and without
+        // it GitHub and friends reply gzip: the model eats 16 KB of unreadable bytes
+        // and has no idea what the page says. We ask for `identity`
+        // explicitly, which is the only way to say "uncompressed" with
+        // std, which does not decompress transparently.
         .{ .name = "accept-encoding", .value = "identity" },
     };
 }
 
-/// ¿El body viene comprimido? (zstd, gzip, brotli…)
+/// Did the body come compressed? (zstd, gzip, brotli…)
 ///
-/// Red de seguridad para cuando un servidor ignora `accept-encoding: identity`:
-/// mejor un mensaje que diga "vino comprimido" que 16 KB de binario que el
-/// modelo se lee como texto.
+/// Safety net for when a server ignores `accept-encoding: identity`:
+/// a message saying "it came compressed" is infinitely better than 16 KB of
+/// binary that the model reads as text.
 fn looksCompressed(body: []const u8) ?[]const u8 {
     if (body.len < 2) return null;
-    // gzip 1f 8b, zstd 28 b5 2f fd, brotli (sin magic fijo: muchos sitios lo
-    // sirven sin cabecera reconocible, y se detecta por UTF-8 inválido abajo).
+    // gzip 1f 8b, zstd 28 b5 2f fd, brotli (no fixed magic: many sites serve it
+    // without a recognizable header, and it is detected by invalid UTF-8 below).
     if (body[0] == 0x1f and body[1] == 0x8b) return "gzip";
     if (body[0] == 0x28 and body[1] == 0xb5 and body.len >= 4 and body[2] == 0x2f and body[3] == 0xfd) return "zstd";
-    // Binario genérico: muchos NUL o bytes de control sueltos.
+    // Generic binary: many NULs or stray control bytes.
     var ctrl: usize = 0;
     const probe = body[0..@min(body.len, 512)];
     for (probe) |b| {
@@ -466,11 +466,11 @@ fn looksCompressed(body: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `web_fetch`: GET a una URL y el contenido como texto legible.
+/// `web_fetch`: GET a URL and return the content as readable text.
 ///
-/// El cuerpo se pasa SIEMPRE por `web.htmlToText` cuando parece HTML, porque
-/// modelar 300 KB de etiquetas es tirar el contexto. Un JSON o un texto plano
-/// pasan intactos.
+/// The body ALWAYS goes through `web.htmlToText` when it looks like HTML, because
+/// spending context on 300 KB of tags is throwing it away. JSON or plain text
+/// pass through untouched.
 fn toolWebFetch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const url = getStr(obj, "url") orelse
         return "error: web_fetch needs a `url` (http:// or https://)";
@@ -493,13 +493,13 @@ fn toolWebFetch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     defer h.freeBody(res.body);
 
     const body = res.body;
-    // Un cuerpo comprimido no es texto: decirlo es infinitamente mejor que
-    // devolver binario y que el modelo se lo lea como si fueran palabras.
+    // A compressed body is not text: saying so is infinitely better than
+    // returning binary and letting the model read it as if it were words.
     if (looksCompressed(body)) |kind| {
         return std.fmt.allocPrint(arena, "{s} answered with {s}-encoded content that zode cannot decode. Try a different URL (a .json or .txt endpoint usually works).", .{ trimmed, kind });
     }
-    // Un 4xx/5xx también es información: se devuelve el status y lo que dijo el
-    // server, que es donde está el motivo real ("Model access is disabled").
+    // A 4xx/5xx is information too: return the status and whatever the
+    // server said, which is where the real reason is ("Model access is disabled").
     if (res.status < 200 or res.status >= 300) {
         return std.fmt.allocPrint(arena, "HTTP {d} {s}\n{s}", .{
             res.status,
@@ -513,34 +513,34 @@ fn toolWebFetch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
 
     if (text.len == 0) return "(empty body)";
 
-    // OJO: el resultado se COPIA a memoria propia de la arena. Devolver un slice
-    // del buffer del HTTP es una bomba de relojería: el `defer freeBody` de más
-    // arriba lo suelta al salir de esta función, y el ArenaAllocator REUTILIZA
-    // esa memoria en la siguiente allocación (la del pool de `client.deinit`, la
-    // del propio growth del buffer…). El llamante leía `0xAA` donde debería
-    // estar el JSON. Pasa por el truncado y por el camino corto, y solo con
-    // arena: por eso no salió en los tests de red.
+    // CAREFUL: the result is COPIED into memory owned by the arena. Returning a slice
+    // of the HTTP buffer is a time bomb: the `defer freeBody` above
+    // releases it when this function returns, and the ArenaAllocator REUSES
+    // that memory in the next allocation (the one from `client.deinit`'s pool, the
+    // buffer's own growth…). The caller read `0xAA` where the JSON
+    // should have been. It goes through the truncation and the short path, and only with
+    // an arena: that is why it never showed up in the network tests.
     var out: std.ArrayList(u8) = .empty;
     if (text.len <= max_bytes) {
         out.appendSlice(arena, text) catch return "out of memory building the answer";
     } else {
-        // Se corta en un límite de línea: cortar a mitad de una palabra deja
-        // una basura que el modelo se queda pensando que es el final del
-        // documento.
+        // Cut at a line boundary: cutting in the middle of a word leaves
+        // garbage that the model keeps thinking is the end of the
+        // document.
         var cut = max_bytes;
         while (cut > 0 and text[cut] != '\n') cut -= 1;
-        if (cut < max_bytes / 2) cut = max_bytes; // página sin saltos: corte seco
+        if (cut < max_bytes / 2) cut = max_bytes; // page with no line breaks: hard cut
         out.appendSlice(arena, text[0..cut]) catch return "out of memory building the answer";
         out.print(arena, "\n\n… (truncated at {d} of {d} bytes; ask for the rest with a deeper request)", .{ cut, text.len }) catch {};
     }
     return out.items;
 }
 
-/// `web_search`: resultados de DuckDuckGo (endpoint `html/`, sin API key).
+/// `web_search`: DuckDuckGo results (`html/` endpoint, no API key).
 ///
-/// Es un scrape, y se romperá el día que cambien una clase del HTML. Cuando
-/// pasa, el error lo dice (con la alternativa) en vez de devolver una lista
-/// vacía, que el modelo interpretaría como "no hay resultados".
+/// It is a scrape, and it will break the day they change one of the HTML classes.
+/// When that happens, the error says so (with the alternative) instead of returning an
+/// empty list, which the model would interpret as "there are no results".
 fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const query = getStr(obj, "query") orelse
         return "error: web_search needs a `query`";
@@ -552,15 +552,15 @@ fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
         if (mr > 0) max_results = @min(@as(usize, @intCast(mr)), 20);
     }
 
-    // El endpoint `html/` de DDG es el que no pide JS ni key. La query va
-    // percent-encoded con el encoder de `std.Uri` (a mano se olvidan los `&` y
-    // el `+`, y la búsqueda se va al servidor en pieces).
+    // DDG's `html/` endpoint is the one that asks for neither JS nor a key. The query goes
+    // percent-encoded with `std.Uri`'s encoder (by hand people forget the `&` and
+    // the `+`, and the search reaches the server in pieces).
     var url_buf: [1024]u8 = undefined;
     var uw: std.Io.Writer = .fixed(&url_buf);
     uw.writeAll("https://html.duckduckgo.com/html/?q=") catch return "error: query too long";
-    // OJO: `std.Uri.Writer` NO es `pub` en 0.16, así que el encoder del
-    // componente de query no se puede usar desde aquí. Se percent-encoded a
-    // mano, que para una query son cuatro caracteres.
+    // CAREFUL: `std.Uri.Writer` is NOT `pub` in 0.16, so the query component
+    // encoder cannot be used from here. We percent-encode by
+    // hand, which for a query is four characters.
     percentEncodeQuery(q, &uw) catch return "error: query too long";
     const url = uw.buffered();
 
@@ -583,12 +583,12 @@ fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
     return results;
 }
 
-/// Percent-encoding de una query string a mano.
+/// Percent-encoding of a query string, by hand.
 ///
-/// `std.Uri.Writer` (que sí lo sabe hacer) no es `pub` en 0.16, y `std.Uri`
-/// solo expone el encoder por dentro. Son cuatro caracteres reserved y es una
-/// línea; lo importante es que `&` y `+` accounted: sin ellos, "zod & mcp"
-/// llega al servidor como dos búsquedas distintas.
+/// `std.Uri.Writer` (which does know how) is not `pub` in 0.16, and `std.Uri`
+/// only exposes the encoder internally. There are four reserved characters and it is one
+/// line; what matters is that `&` and `+` are accounted for: without them, "zod & mcp"
+/// reaches the server as two different searches.
 fn percentEncodeQuery(raw: []const u8, w: *std.Io.Writer) !void {
     for (raw) |c| {
         const safe = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
@@ -608,16 +608,16 @@ fn isHttpUrl(url: []const u8) bool {
     return false;
 }
 
-/// ¿El body es HTML?
+/// Is the body HTML?
 ///
-/// Se deduce del body y NO del `content-type`: ese header vive en el buffer de
-/// redirects de `receiveHead`, que muere al salir del request (ver el aviso en
-/// `http_client.JsonResult`). Un servidor puede además mandar `text/plain` con
-/// HTML dentro, o al revés, así que la cabecera tampoco era de fiar.
+/// It is deduced from the body and NOT from `content-type`: that header lives in
+/// `receiveHead`'s redirect buffer, which dies when the request returns (see the note in
+/// `http_client.JsonResult`). A server can also send `text/plain` with
+/// HTML inside, or the other way round, so the header was not to be trusted either.
 ///
-/// Mira el principio del documento por `<!doctype html`, `<html`, `<head` o
-/// `<body`, que es donde los pone cualquier plantilla, y descarta lo que empieza
-/// por `{` o `[` (JSON) o por `#!` (shebang de un gist).
+/// It looks at the start of the document for `<!doctype html`, `<html`, `<head` or
+/// `<body`, which is where any template puts them, and rejects what starts
+/// with `{` or `[` (JSON) or with `#!` (a gist's shebang).
 fn looksLikeHtml(body: []const u8) bool {
     const head = body[0..@min(body.len, 1024)];
     if (head.len == 0) return false;
@@ -630,7 +630,7 @@ fn looksLikeHtml(body: []const u8) bool {
         std.ascii.indexOfIgnoreCase(trimmed, "<body") != null;
 }
 
-// ── think: scratchpad sin efectos (mejora planificación) ─────
+// ── think: scratchpad with no side effects (planning) ────────
 fn toolThink(obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const thought = getStr(obj, "thought") orelse return error.MissingPath;
     return std.fmt.allocPrint(arena, "noted ({d} chars). Continue with your plan.", .{thought.len});
@@ -644,7 +644,7 @@ fn looksLikeText(path: []const u8) bool {
     return true;
 }
 
-// ── walker recursivo con skip de dirs binarias/vendidas ──────
+// ── recursive walker skipping binary/vendored dirs ───────────
 const Walker = struct {
     io: std.Io,
     arena: std.mem.Allocator,
@@ -658,7 +658,7 @@ const Walker = struct {
         self.stack.deinit(self.arena);
     }
 
-    /// Devuelve ruta del siguiente archivo (caller libera con arena.free)
+    /// Returns the path of the next file (caller frees with arena.free)
     fn next(self: *Walker) ?[]const u8 {
         while (true) {
             if (self.current_dir == null) {
@@ -671,7 +671,7 @@ const Walker = struct {
                 self.current_iter = self.current_dir.?.iterate();
                 continue;
             }
-            // Siguiente entry del dir actual
+            // Next entry of the current dir
             const entry = self.current_iter.?.next(self.io) catch null;
             if (entry) |e| {
                 const full = if (std.mem.eql(u8, self.current_base, "."))
@@ -693,7 +693,7 @@ const Walker = struct {
                     },
                 }
             } else {
-                // Dir agotado
+                // Dir exhausted
                 if (self.current_base.len > 0) self.arena.free(self.current_base);
                 self.current_dir.?.close(self.io);
                 self.current_dir = null;
@@ -722,7 +722,7 @@ fn walkZig(io: std.Io, arena: std.mem.Allocator, root: []const u8) !Walker {
     return w;
 }
 
-// ── glob matcher ( *, **, ? ) recursivo ──────────────────────
+// ── recursive glob matcher ( *, **, ? ) ──────────────────────
 fn globMatch(pattern: []const u8, path: []const u8) bool {
     return globHere(pattern, path);
 }
@@ -730,18 +730,18 @@ fn globMatch(pattern: []const u8, path: []const u8) bool {
 fn globHere(p: []const u8, s: []const u8) bool {
     if (p.len == 0) return s.len == 0;
 
-    // '**' = cualquier cosa, incluyendo '/'
+    // '**' = anything, including '/'
     if (p.len >= 2 and p[0] == '*' and p[1] == '*') {
         var rest = p[2..];
         if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
-        // ** consume 0 chars:
+        // ** consumes 0 chars:
         if (globHere(rest, s)) return true;
-        // ** consume 1 char y sigue:
+        // ** consumes 1 char and keeps going:
         if (s.len > 0) return globHere(p, s[1..]);
         return false;
     }
 
-    // '*' = cualquier cosa excepto '/'
+    // '*' = anything except '/'
     if (p[0] == '*') {
         var i: usize = 0;
         while (i <= s.len) : (i += 1) {
@@ -751,7 +751,7 @@ fn globHere(p: []const u8, s: []const u8) bool {
         return false;
     }
 
-    // '?' = un char (no '/')
+    // '?' = one char (not '/')
     if (p[0] == '?') {
         if (s.len == 0 or s[0] == '/') return false;
         return globHere(p[1..], s[1..]);
@@ -800,9 +800,9 @@ test "toolsJson es JSON válido y tiene una entrada por tool" {
         return error.TestUnexpectedResult;
     };
     try std.testing.expect(v == .array);
-    // El número sale de `defs`, no de un número escrito a mano: añadir una tool
-    // sin declararla en el JSON (o al revés) falla aquí en vez de dejar al
-    // modelo con una tool que no existe.
+    // The count comes from `defs`, not from a hand-written number: adding a tool
+    // without declaring it in the JSON (or the other way round) fails here instead of leaving
+    // the model with a tool that does not exist.
     try std.testing.expectEqual(defs.len, v.array.items.len);
     for (v.array.items) |item| {
         const fname = item.object.get("function").?.object.get("name").?.string;
@@ -815,8 +815,8 @@ test "toolsJson es JSON válido y tiene una entrada por tool" {
 }
 
 test "las tools de web no piden permiso (son lecturas)" {
-    // Pedir confirmación por cada consulta a internet convierte el agent loop en
-    // un interrogatorio. Mismo criterio que read/grep.
+    // Asking for confirmation on every internet query turns the agent loop into
+    // an interrogation. Same criterion as read/grep.
     try std.testing.expect(!needsPermission("web_fetch"));
     try std.testing.expect(!needsPermission("web_search"));
     try std.testing.expect(needsPermission("write"));
@@ -825,7 +825,7 @@ test "las tools de web no piden permiso (son lecturas)" {
 test "web_fetch y web_search aparecen en el JSON con su descripción" {
     try std.testing.expect(std.mem.indexOf(u8, toolsJson(), "\"web_fetch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, toolsJson(), "\"web_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, toolsJson(), "html.duckduckgo.com") == null); // el endpoint va en el código, no en el prompt
+    try std.testing.expect(std.mem.indexOf(u8, toolsJson(), "html.duckduckgo.com") == null); // the endpoint lives in the code, not in the prompt
 }
 
 test "web_fetch rechaza lo que no es http(s) sin tocar la red" {
@@ -858,16 +858,16 @@ test "percentEncodeQuery escapa lo que rompe una URL" {
     try std.testing.expectEqualStrings("zod+%26+mcp%2Fnuevo%2B1", w.buffered());
 }
 
-// ── tests de red (se saltan si no hay internet) ──────────────
+// ── network tests (skipped without internet) ─────────────────
 //
-// Estos son los únicos que pueden cazar la clase de bug más cara de este
-// archivo: devolver una VISTA del buffer del HTTP en vez de una copia. Con
-// arena, `freeBody` (que está en un `defer`) suelta la memoria al salir de la
-// tool y el ArenaAllocator la reutiliza en la siguiente allocación; el
-// llamante leía `0xAA` donde debería estar el JSON. No hay forma de reproducirlo
-// sin red, y sin red el bug se cuela.
+// These are the only ones that can catch the most expensive class of bug in this
+// file: returning a VIEW of the HTTP buffer instead of a copy. With an
+// arena, `freeBody` (which sits in a `defer`) releases the memory when the tool
+// returns and the ArenaAllocator reuses it in the next allocation; the
+// caller read `0xAA` where the JSON should have been. There is no way to reproduce it
+// without the network, and without the network the bug sneaks in.
 
-/// `true` si el error es de red (y el test se salta) en vez de un fallo real.
+/// `true` if the error is a network error (and the test is skipped) instead of a real failure.
 fn isNetError(err: anyerror) bool {
     return switch (err) {
         error.ConnectionRefused,
@@ -891,12 +891,12 @@ test "web_fetch real: el HTML llega como texto, no como etiquetas" {
         if (isNetError(err)) return error.SkipZigTest;
         return err;
     };
-    // OJO: example.com cambia su texto cada tanto; el test comprueba la
-    // FORMA (sin etiquetas, con frases con espacios) y no la frase exacta. Un
-    // test que falla porque una web cambió de copy no vale para nada.
+    // CAREFUL: example.com changes its text every so often; the test checks the
+    // SHAPE (no tags, sentences with spaces) and not the exact sentence. A
+    // test that fails because a site changed its copy is worthless.
     try std.testing.expect(out.len > 40);
-    // El texto legible no lleva etiquetas: si el buffer del HTTP se hubiera
-    // soltado, aquí aparecerían bytes de relleno (`0xAA`) en vez de la frase.
+    // The readable text carries no tags: if the HTTP buffer had been
+    // released, fill bytes (`0xAA`) would show up here instead of the sentence.
     try std.testing.expect(std.mem.indexOf(u8, out, "<html") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<div") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "documentation examples") != null);
@@ -909,12 +909,12 @@ test "web_search real: devuelve resultados con URL" {
         if (isNetError(err)) return error.SkipZigTest;
         return err;
     };
-    // Si el scraper cambia, esto falla y avisa: es lo que se busca.
+    // If the scraper changes, this fails and warns: that is exactly what it is for.
     try std.testing.expect(std.mem.indexOf(u8, out, "1. ") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "http") != null);
 }
 
-// ── tests de integración con testing.io ──
+// ── integration tests with testing.io ──
 test "tool read lee este archivo" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -934,7 +934,7 @@ test "grep nativo encuentra patrón" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const out = execute(std.testing.io, "grep", "{\"pattern\":\"toolGrep\",\"subdir\":\"src\"}", arena_state.allocator()) catch |err| {
-        if (err == error.FileNotFound) return error.SkipZigTest; // sin rg/grep en PATH
+        if (err == error.FileNotFound) return error.SkipZigTest; // no rg/grep in PATH
         return err;
     };
     try std.testing.expect(std.mem.indexOf(u8, out, "toolGrep") != null);

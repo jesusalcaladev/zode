@@ -5,16 +5,16 @@ const theme = @import("theme.zig");
 
 const Style = vaxis.Style;
 
-// ── estilos de token ───────────────────────────────────────────
+// ── token styles ───────────────────────────────────────────────
 //
-// Vivían aquí como índices xterm-256 hardcodeados y NO importaban `theme.zig`:
-// la cabecera iba en el azul de marca y el bloque de código en 256, o sea dos
-// sistemas de color distintos en la misma pantalla. Ahora salen de `theme.zig`
-// en truecolor, con fallback de vaxis al índice ANSI más cercano.
+// They used to live here as hardcoded xterm-256 indexes and did NOT import `theme.zig`:
+// the header went in the brand blue and the code block in 256, i.e. two
+// different color systems on the same screen. Now they come from `theme.zig`
+// in truecolor, with vaxis falling back to the closest ANSI index.
 //
-// Lo que más se nota es `def`: era `Style{}`, es decir el color por defecto de
-// la terminal, que es lo MÁS BRILLANTE de la pantalla, y cae en ~90 % de las
-// líneas del código. El bloque entero era el punto más llamativo.
+// What shows up the most is `def`: it was `Style{}`, that is the terminal's
+// default color, which is the BRIGHTEST thing on the screen, and it covers
+// ~90% of the lines of code. The whole block was the loudest point.
 const T = struct {
     const kw = theme.code_kw;
     const kw2 = theme.code_kw2;
@@ -38,11 +38,11 @@ const Cfg = struct {
     line_comments: []const []const u8 = &.{},
     block_comment_start: ?[]const u8 = null,
     block_comment_end: ?[]const u8 = null,
-    /// @word se pinta como decorador (JS/TS).
+    /// @word is painted as a decorator (JS/TS).
     decorators: bool = false,
-    /// Python/rust: prefijos r"…" b'…' f"…" pegados a strings.
+    /// Python/rust: prefixes r"…" b'…' f"…" glued to strings.
     string_prefixes: bool = false,
-    /// JS/TS: backtick `…` es string.
+    /// JS/TS: a backtick `…` is a string.
     template_literal: bool = true,
 };
 
@@ -53,7 +53,7 @@ fn eqAny(word: []const u8, list: []const []const u8) bool {
     return false;
 }
 
-// ── tablas por lenguaje ──────────────────────────────────────
+// ── per-language tables ──────────────────────────────────────
 const langs = struct {
     const zig = Cfg{
         .keywords = &.{ "const", "var", "fn", "pub", "struct", "enum", "union", "error", "test", "import", "export", "opaque", "extern", "packed", "inline", "noinline", "threadlocal", "usingnamespace", "align", "linksection", "callconv", "addrspace", "allowzero" },
@@ -131,13 +131,13 @@ const langs = struct {
         .line_comments = &.{ "--", "#" },
         .template_literal = false,
     };
-    // Fallback para cualquier fence sin etiqueta, o con una rara (`json`, `tsx`,
+    // Fallback for any untagged fence, or a rare one (`json`, `tsx`,
     // `diff`, `text`).
     //
-    // `builtins` y `types` estaban VACÍOS, y eso no es solo que faltaran
-    // colores: la heurística PascalCase→tipo de `highlightLine` está guardsada
-    // por `cfg.types.len > 0`, así que con el fallback la mitad del código de
-    // un `json` o un `tsx` salía plano. Con estas dos tablas ya no.
+    // `builtins` and `types` were EMPTY, and that is not just about missing
+    // colors: the PascalCase→type heuristic in `highlightLine` is guarded by
+    // `cfg.types.len > 0`, so with the fallback half the code of
+    // a `json` or a `tsx` came out plain. With these two tables it does not.
     const generic = Cfg{
         .keywords = &.{ "if", "else", "for", "while", "return", "function", "def", "class", "import", "const", "let", "var", "fn", "struct", "enum", "pub", "use", "module", "interface", "type", "extends", "implements", "package", "func", "val", "mut", "static", "final", "public", "private", "protected", "virtual", "override", "async", "defp", "end", "nil", "true", "false", "null", "None", "True", "False" },
         .control = &.{ "switch", "case", "try", "catch", "finally", "throw", "break", "continue", "and", "or", "not", "in", "is", "await", "yield", "elif", "elseif", "unless", "match", "select", "defer", "goto", "do", "then", "fi", "done", "unless" },
@@ -149,16 +149,16 @@ const langs = struct {
     };
 };
 
-/// Normaliza la etiqueta de un fence y devuelve el resultado en `buf`.
+/// Normalizes a fence tag and returns the result in `buf`.
 ///
-/// Devolver `[]const u8` apuntando a un temporal de pila era un bug: el slice se
-/// usaba después de que la función hubiera retornado. Por eso el buffer lo
-/// pasa el llamante y la config (que solo apunta a literales estáticos) se
-/// decide dentro de `cfgFor`.
+/// Returning a `[]const u8` pointing at a stack temporary was a bug: the slice got
+/// used after the function had returned. That is why the caller passes the buffer
+/// and the config (which only points at static literals) is resolved
+/// inside `cfgFor`.
 ///
-/// El fence lo pone el MODELO, así que viene de lo que sepa del lenguaje:
-/// ```JSON, ```Json, ``` tsx, ``` c++, ``` objective-c. Sin normalizar, todo
-/// eso caía en el `generic` y salía plano.
+/// The fence tag comes from the MODEL, so it comes from whatever it knows about the
+/// language: ```JSON, ```Json, ``` tsx, ``` c++, ``` objective-c. Without
+/// normalizing, all of that fell into `generic` and came out plain.
 pub fn normalizeLang(lang: []const u8, buf: []u8) []const u8 {
     const l = std.mem.trim(u8, lang, " \t\r\n");
     if (l.len == 0) return "";
@@ -195,12 +195,12 @@ pub fn normalizeLang(lang: []const u8, buf: []u8) []const u8 {
     return low;
 }
 
-/// Config del lenguaje, con la etiqueta YA normalizada.
+/// Language config, with the tag ALREADY normalized.
 ///
-/// La normalización va AQUÍ y no antes: `normalizeLang` escribe en un buffer
-/// de pila, así que el slice solo es válido mientras esta función corre. Y
-/// `Cfg` solo guarda punteros a literales estáticos, así que devolver una
-/// `Cfg` es seguro.
+/// The normalization happens HERE and not before: `normalizeLang` writes into a stack
+/// buffer, so the slice is only valid while this function runs. And
+/// `Cfg` only holds pointers to static literals, so returning a
+/// `Cfg` is safe.
 fn cfgFor(lang: []const u8) Cfg {
     var lbuf: [32]u8 = undefined;
     const l = normalizeLang(lang, &lbuf);
@@ -243,36 +243,36 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
-/// Estado del escáner ENTRE líneas.
+/// Scanner state BETWEEN lines.
 ///
-/// Sin esto, un `\\` de Zig al final de la línea o una comilla sin cerrar
-/// hacían que la línea siguiente se pintara de verde ENTERA: el scanner no
-/// tenía forma de saber que seguía dentro de un string. Es el bug clásico de
-/// los highlighters línea a línea, y se nota muchísimo en un `edit` de un
-/// fichero con cadenas multilínea.
+/// Without this, a trailing `\\` in Zig or an unclosed quote made the
+/// next line get painted ENTIRELY green: the scanner had no way of knowing it
+/// was still inside a string. It is the classic bug of
+/// line-by-line highlighters, and it shows badly in an `edit` of
+/// a file with multiline strings.
 pub const State = struct {
-    /// Dentro de un string sin cerrar.
+    /// Inside an unclosed string.
     in_str: bool = false,
-    /// Cierre del string en curso: `"`, `'` o `` ` ``.
+    /// Closing quote of the string in progress: `"`, `'` or `` ` ``.
     str_quote: u8 = 0,
-    /// Dentro de un comentario de bloque `/* … */` sin cerrar.
+    /// Inside an unclosed `/* … */` block comment.
     in_block: bool = false,
 };
 
-/// Token scanner genérico de UNA línea. Soporta strings con escapes y
-/// prefijos (r"…", b'…'), números (hex/bin/floats), comentarios de línea y
-/// bloque, keywords/control/builtins/tipos, llamadas fn y decoradores.
-/// Lenguaje desconocido → config genérica segura.
+/// Generic token scanner for ONE line. Supports strings with escapes and
+/// prefixes (r"…", b'…'), numbers (hex/bin/floats), line and block comments,
+/// keywords/control/builtins/types, fn calls and decorators.
+/// Unknown language → safe generic config.
 ///
-/// `state` se lleva entre líneas de un MISMO bloque para que los strings y los
-/// comentarios de bloque multilínea se pinten bien (ver `State`). Quien llama
-/// línea a línea sin estado (el diff) pasa uno nuevo por línea.
+/// `state` is carried between lines of the SAME block so multiline strings and
+/// block comments get painted right (see `State`). Callers that go line by line
+/// with no state (the diff) pass a fresh one per line.
 pub fn highlightLine(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![]md.Segment {
     var st = State{};
     return highlightLineState(arena, line, lang, &st);
 }
 
-/// Como `highlightLine` pero con estado entre líneas.
+/// Like `highlightLine` but with state carried between lines.
 pub fn highlightLineState(
     arena: std.mem.Allocator,
     line: []const u8,
@@ -283,10 +283,10 @@ pub fn highlightLineState(
 
     var segs: std.ArrayList(md.Segment) = .empty;
     var i: usize = 0;
-    var run_start: usize = 0; // inicio del tramo sin estilo pendiente
+    var run_start: usize = 0; // start of the pending unstyled run
 
-    // Si veníamos dentro de un string o de un comentario de bloque, TODO lo
-    // que quede de la línea es de ese color (hasta donde cierre, si cierra).
+    // If we came from inside a string or a block comment, EVERYTHING left in the
+    // line is that color (up to where it closes, if it does).
     const resume_str = state.in_str;
     const resume_block = state.in_block;
     if (resume_block) {
@@ -322,14 +322,14 @@ pub fn highlightLineState(
     }.f;
 
     while (i < line.len) {
-        // ── comentarios de línea: el resto de la línea ──
+        // ── line comments: the rest of the line ──
         if (lineCommentAt(line, i, cfg.line_comments)) |_| {
             try flushDef(arena, &segs, run_start, i, line);
             try segs.append(arena, .{ .text = line[i..], .style = T.comment });
             return segs.toOwnedSlice(arena);
         }
 
-        // ── apertura de comentario de bloque ──
+        // ── opening of a block comment ──
         if (cfg.block_comment_start) |bs| {
             if (std.mem.startsWith(u8, line[i..], bs)) {
                 const close = cfg.block_comment_end orelse "*/";
@@ -340,7 +340,7 @@ pub fn highlightLineState(
                 } else {
                     try segs.append(arena, .{ .text = line[i..], .style = T.comment });
                     i = line.len;
-                    state.in_block = true; // sigue en la línea siguiente
+                    state.in_block = true; // continues on the next line
                 }
                 run_start = i;
                 continue;
@@ -352,9 +352,9 @@ pub fn highlightLineState(
             try flushDef(arena, &segs, run_start, i, line);
             try segs.append(arena, .{ .text = line[i..sres.end], .style = T.str });
             i = sres.end;
-            // String sin cerrar en esta línea: el resto de la línea y la
-            // siguiente son string. Sin esto, una comilla sin cerrar pintaba de
-            // verde el resto del fichero.
+            // String unclosed in this line: the rest of the line and the
+            // next one are string. Without this, an unclosed quote painted the
+            // rest of the file green.
             if (sres.open) {
                 state.in_str = true;
                 state.str_quote = sres.quote;
@@ -364,11 +364,11 @@ pub fn highlightLineState(
             continue;
         }
 
-        // ── números (hex/bin/floats; no dentro de identificadores) ──
+        // ── numbers (hex/bin/floats; not inside identifiers) ──
         if (isDigit(line[i]) and (i == 0 or !isIdentChar(line[i - 1]))) {
             var j = i;
             while (j < line.len and (isIdentChar(line[j]) or line[j] == '.')) : (j += 1) {
-                // corta el punto si no sigue un dígito (rango, llamada, fin)
+                // cut the dot if no digit follows (range, call, end)
                 if (line[j] == '.' and (j + 1 >= line.len or !isDigit(line[j + 1]))) break;
             }
             try flushDef(arena, &segs, run_start, i, line);
@@ -378,7 +378,7 @@ pub fn highlightLineState(
             continue;
         }
 
-        // ── @word: builtins de zig (@as) o decoradores de JS/TS ──
+        // ── @word: zig builtins (@as) or JS/TS decorators ──
         if (line[i] == '@' and i + 1 < line.len and isIdentStart(line[i + 1])) {
             var j = i + 1;
             while (j < line.len and isIdentChar(line[j])) : (j += 1) {}
@@ -398,11 +398,11 @@ pub fn highlightLineState(
             continue;
         }
 
-        // ── identificadores ──
+        // ── identifiers ──
         if (isIdentStart(line[i])) {
             var j = i;
             while (j < line.len and isIdentChar(line[j])) : (j += 1) {}
-            // macros rust: println! / vec! (el ! va pegado)
+            // rust macros: println! / vec! (the ! is glued to it)
             if (j < line.len and line[j] == '!' and eqAny(line[i .. j + 1], cfg.builtins)) j += 1;
             const word = line[i..j];
 
@@ -416,10 +416,10 @@ pub fn highlightLineState(
             } else if (eqAny(word, cfg.types)) {
                 kind = .typ;
             } else if (cfg.types.len > 0 and word.len > 0 and word[0] >= 'A' and word[0] <= 'Z') {
-                // Heurística: IdentificadorEnPascal → tipo (cubre lo no listado)
+                // Heuristic: PascalCase identifier → type (covers what is not listed)
                 kind = .typ;
             } else {
-                // ¿llamada a función? siguiente no-espacio == '('
+                // Function call? next non-space == '('
                 var k = j;
                 while (k < line.len and (line[k] == ' ' or line[k] == '\t')) k += 1;
                 if (k < line.len and line[k] == '(') kind = .fn_call;
@@ -434,9 +434,9 @@ pub fn highlightLineState(
             continue;
         }
 
-        // ── cualquier otro char: pertenece al tramo sin estilo ──
+        // ── any other char: it belongs to the unstyled run ──
         i += 1;
-    } // fin while
+    } // end while
 
     try flushDef(arena, &segs, run_start, line.len, line);
     if (segs.items.len == 0) {
@@ -454,22 +454,22 @@ fn lineCommentAt(line: []const u8, at: usize, prefixes: []const []const u8) ?usi
 
 const StrStart = struct { end: usize, open: bool = false, quote: u8 = '"' };
 
-/// Devuelve el índice final (exclusivo) del string que EMPIEZA en `at`,
-/// o null si ahí no empieza un string.
+/// Returns the end index (exclusive) of the string that STARTS at `at`,
+/// or null if no string starts there.
 fn stringStart(line: []const u8, at: usize, cfg: Cfg) ?StrStart {
     if (line[at] != '"' and line[at] != '\'' and line[at] != '`') return null;
     if (line[at] == '`' and !cfg.template_literal) return null;
-    // prefijos r"…" b'…' f"…": solo si el char anterior es parte de un
-    // identificador corto tipo prefijo (python/rust); en la práctica basta
-    // con aceptarlo si el char anterior no es otro delimitador.
+    // prefixes r"…" b'…' f"…": only if the previous char is part of a
+    // short identifier-like prefix (python/rust); in practice it is enough
+    // to accept it if the previous char is not another delimiter.
     if (cfg.string_prefixes and at > 0 and isIdentChar(line[at - 1])) {
-        // podría ser el fin de un identificador común ("foo"x no es válido),
-        // pero aceptar el string evita falsos negativos con r"/b'/f".
+        // could be the end of a regular identifier ("foo"x is not valid),
+        // but accepting the string avoids false negatives with r"/b'/f".
         return scanString(line, at);
     }
     if (at > 0 and isIdentChar(line[at - 1]) and !cfg.string_prefixes) {
-        // ej: 12"abc" o foo"bar": no tratamos como string (JS lo permite;
-        // falso negativo aceptable para mantener simple el scanner).
+        // e.g.: 12"abc" or foo"bar": not treated as a string (JS allows it;
+        // an acceptable false negative to keep the scanner simple).
         return null;
     }
     return scanString(line, at);
@@ -485,13 +485,13 @@ fn scanString(line: []const u8, open: usize) ?StrStart {
         }
         if (line[j] == quote) return .{ .end = j + 1 };
     }
-    // String sin cierre en la línea: se pinta hasta el final Y se recuerda
-    // (`open = true`) para que la línea siguiente siga siendo string.
+    // String not closed in the line: it is painted to the end AND remembered
+    // (`open = true`) so the next line keeps being string.
     return .{ .end = line.len, .open = true, .quote = quote };
 }
 
-/// Índice final (exclusivo) del string que sigue ABIERTO desde `from`, o null
-/// si en esta línea no se cierra. `quote` es el delimitador.
+/// End index (exclusive) of the string that is still OPEN since `from`, or null
+/// if it does not close in this line. `quote` is the delimiter.
 fn findStrEnd(line: []const u8, from: usize, quote: u8) ?usize {
     var j = from;
     while (j < line.len) : (j += 1) {
@@ -527,7 +527,7 @@ test "zig: keyword, número, comentario, builtin y texto íntegro" {
     const line = "const n = @as(u8, 42); // fin";
     const segs = try highlightLine(arena, line, "zig");
 
-    // El texto concatenado debe ser IDÉNTICO a la línea (no se pierde nada).
+    // The concatenated text must be IDENTICAL to the line (nothing is lost).
     try std.testing.expectEqualStrings(line, try joinedText(arena, segs));
 
     const kw = findSeg(segs, "const").?;
@@ -615,27 +615,27 @@ test "línea vacía y solo espacios" {
 }
 
 test "un string multilínea no pinta de verde el resto del bloque" {
-    // 4.8 del ROADMAP. El scanner era línea a línea sin estado, así que un `\`
-    // de Zig o una comilla sin cerrar hacían que la línea siguiente saliera
-    // verde ENTERA (y a veces el resto del fichero).
+    // 4.8 of the ROADMAP. The scanner went line by line with no state, so a `\`
+    // in Zig or an unclosed quote made the next line come out
+    // ENTIRELY green (and sometimes the rest of the file).
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var st = State{};
-    // Línea 1: abre un string multilínea y NO lo cierra. El caso real es un
-    // `\\` de Zig al final (continuación de línea) o una comilla desbalanceada
-    // en un fichero largo.
+    // Line 1: opens a multiline string and does NOT close it. The real case is a
+    // trailing `\\` in Zig (line continuation) or an unbalanced quote
+    // in a long file.
     const l1 = try highlightLineState(arena, "const s = \"hola", "zig", &st);
     try std.testing.expect(st.in_str);
     try std.testing.expectEqualStrings("const s = \"hola", try joinedText(arena, l1));
 
-    // Línea 2: sigue dentro del string hasta que lo cierra.
+    // Line 2: still inside the string until it closes.
     const l2 = try highlightLineState(arena, "  mundo\";", "zig", &st);
-    try std.testing.expect(!st.in_str); // el " de aquí lo cerró
+    try std.testing.expect(!st.in_str); // the " here closed it
     try std.testing.expectEqualStrings("  mundo\";", try joinedText(arena, l2));
 
-    // Línea 3: ya es código normal (el string se cerró en la 2).
+    // Line 3: it is normal code again (the string closed in line 2).
     const l3 = try highlightLineState(arena, "const n = 1;", "zig", &st);
     try std.testing.expectEqualStrings("const n = 1;", try joinedText(arena, l3));
     if (findSeg(l3, "const")) |kw| try std.testing.expectEqual(T.kw, kw.style);
@@ -661,8 +661,8 @@ test "un comentario de bloque multilínea tampoco se propaga mal" {
 }
 
 test "el estado se reinicia entre fences distintos" {
-    // Si un bloque acaba con un string abierto, el SIGUIENTE fence no puede
-    // seguir en verde por arrastrar el estado.
+    // If a block ends with an open string, the NEXT fence must not
+    // stay green by dragging the state along.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -670,9 +670,9 @@ test "el estado se reinicia entre fences distintos" {
     var st = State{};
     _ = try highlightLineState(arena, "const s = \"", "zig", &st);
     try std.testing.expect(st.in_str);
-    st = .{}; // nuevo fence
+    st = .{}; // new fence
     const l = try highlightLineState(arena, "const n = 1;", "zig", &st);
-    // Nada de esta línea es string: `const` es keyword y el resto texto.
+    // None of this line is string: `const` is a keyword and the rest is text.
     try std.testing.expect(findSeg(l, "const") != null);
     if (findSeg(l, "const")) |kw| try std.testing.expectEqual(T.kw, kw.style);
 }

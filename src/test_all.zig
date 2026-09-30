@@ -1,4 +1,4 @@
-// Agregador de tests: compila con el import de vaxis disponible.
+// Test aggregator: it compiles with the vaxis import available.
 pub const chat = @import("chat.zig");
 pub const session = @import("session.zig");
 pub const tools = @import("tools.zig");

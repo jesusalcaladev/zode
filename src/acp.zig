@@ -1,65 +1,66 @@
-//! Cliente de ACP (Agent Client Protocol v1) sobre stdio, para hablar con
-//! `opencode acp` sin pasar por su terminal.
+//! ACP (Agent Client Protocol v1) client over stdio, to talk to `opencode acp`
+//! without going through its terminal.
 //!
-//! ## Que es esto
+//! ## What this is
 //!
-//! `opencode acp` es un AGENTE ACP: el cliente lo lanza como proceso hijo y le
-//! habla JSON-RPC delimitado por saltos de linea por stdin/stdout. No es la TUI
-//! (esa no tiene API) sino el mismo motor de opencode, y trae lo que nos
-//! interesa: sesiones, streaming de texto y tool calls, peticiones de permiso y
-//! uso de tokens. Ver <https://opencode.ai/v2/docs/cli/acp/>.
+//! `opencode acp` is an ACP AGENT: the client launches it as a child process and
+//! speaks newline-delimited JSON-RPC to it over stdin/stdout. It is not the TUI
+//! (that has no API) but the very same opencode engine, and it brings what we
+//! care about: sessions, text and tool call streaming, permission requests and
+//! token usage. See <https://opencode.ai/v2/docs/cli/acp/>.
 //!
-//! Es la "trampa por detras" de verdad: zode no manda teclas a la terminal de
-//! opencode, zode le habla a opencode.
+//! This is the real "trick behind the scenes": zode does not send keystrokes to
+//! opencode's terminal, zode talks to opencode.
 //!
-//! ## Decisiones que no son obvias
+//! ## Decisions that are not obvious
 //!
-//! - **El proceso hijo es global y vive entre turnos.** La sesion (y su
-//!   contexto) esta en el proceso, no en zode: si se creara uno por turno cada
-//!   prompt seria una sesion nueva y no habria memoria. Se arranca perezoso la
-//!   primera vez y se reutiliza.
-//! - **`Client` se aloca en el heap y NUNCA se copia por valor.** El
-//!   `Io.File.Reader` guarda un puntero a su buffer, que vive DENTRO del
-//!   struct: moverlo deja el puntero colgando (el mismo bug que el `File.Writer`
-//!   de `session.zig`).
-//! - **Las lineas se leen a mano, sin `takeDelimiter`.** `takeDelimiter` da
-//!   `error.StreamTooLong` si la linea no cabe en el buffer del reader, y un
-//!   `tool_call_update` con un volcado de 300 KB lo revienta. Aqui se acumula en
-//!   un `ArrayList` que crece y no hay limite artificial.
-//! - **stderr del hijo = `.ignore`.** Es un hijo dentro de una TUI: si escribiera
-//!   en nuestro terminal el banner y el historial se llenarian de logs. Para
-//!   diagnosticar esta `opencode --print-logs acp`.
-//! - **Se anuncian capacidades de cliente MINIMAS** (sin `fs` ni `terminal`):
-//!   opencode ejecuta sus propias tools, no necesita que se las prestemos, y
-//!   asi no llega ninguna peticion que no sepamos responder. Aun asi, lo que no
-//!   sepamos hacer se responde con "method not found": si no, el turno no acaba.
+//! - **The child process is global and lives across turns.** The session (and
+//!   its context) lives in the process, not in zode: if one were created per
+//!   turn, every prompt would be a new session with no memory. It is started
+//!   lazily the first time and then reused.
+//! - **`Client` is heap allocated and NEVER copied by value.** The
+//!   `Io.File.Reader` keeps a pointer to its buffer, which lives INSIDE the
+//!   struct: moving it leaves the pointer dangling (same bug as the
+//!   `File.Writer` in `session.zig`).
+//! - **Lines are read by hand, without `takeDelimiter`.** `takeDelimiter`
+//!   returns `error.StreamTooLong` if the line does not fit in the reader's
+//!   buffer, and a `tool_call_update` carrying a 300 KB dump blows it up. Here
+//!   it accumulates in an `ArrayList` that grows, with no artificial limit.
+//! - **The child's stderr = `.ignore`.** It is a child inside a TUI: if it
+//!   wrote to our terminal the banner and the history would fill up with logs.
+//!   To debug it, this is `opencode --print-logs acp`.
+//! - **We announce MINIMAL client capabilities** (no `fs`, no `terminal`):
+//!   opencode runs its own tools, it does not need us to lend it ours, and
+//!   this way no request arrives that we cannot answer. Even so, anything we
+//!   cannot do is answered with "method not found": otherwise the turn never
+//!   ends.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const config = @import("config.zig");
 
-/// Version del protocolo que hablamos.
+/// Protocol version we speak.
 pub const protocol_version = 1;
 
-/// El agente se identifica con esto en el `initialize`.
+/// The agent identifies itself with this in the `initialize`.
 pub const client_name = "zode";
 pub const client_version = "0.3";
 
-/// Comando por defecto. Se puede cambiar con `ZODE_ACP_CMD` (palabras
-/// separadas por espacios) para probar otro agente ACP.
+/// Default command. Can be changed with `ZODE_ACP_CMD` (space separated words)
+/// to try another ACP agent.
 pub const default_argv = [_][]const u8{ "opencode", "acp" };
 
-/// JSON-RPC "method not found", para lo que no sabemos hacer.
+/// JSON-RPC "method not found", for what we do not know how to do.
 const code_method_not_found = -32601;
 
-/// Una siesta de `ms` milisegundos SIN tocar el `Io` compartido.
+/// A nap of `ms` milliseconds WITHOUT touching the shared `Io`.
 ///
-/// Ver el comentario de `waitTurn`: `Io.sleep` secuestra el bucle de eventos y
-/// congela la TUI. `nanosleep` es una syscall y no molesta a nadie.
+/// See the `waitTurn` comment: `Io.sleep` hijacks the event loop and freezes
+/// the TUI. `nanosleep` is a syscall and disturbs nobody.
 ///
-/// Es `pub` porque el agente también la usa mientras espera a que el hilo de
-/// conexión termine.
+/// It is `pub` because the agent also uses it while waiting for the connection
+/// thread to finish.
 pub fn nap(ms: u64) void {
     if (builtin.os.tag != .linux) return;
     const ts = std.os.linux.timespec{
@@ -69,38 +70,39 @@ pub fn nap(ms: u64) void {
     _ = std.os.linux.nanosleep(&ts, null);
 }
 
-/// ¿Es `path` un fichero ejecutable?
+/// Is `path` an executable file?
 ///
-/// `std.posix` no expone `faccessat` en 0.16 y `Io.Dir.access` necesita un
-/// `Io` (que aquí no tenemos: `resolveArgv` corre antes de tener el del
-/// llamante en la mano). Se llama al `access(2)` de libc, que es exactamente
-/// lo mismo y no añade dependencia: `std.c` es parte del std.
+/// `std.posix` does not expose `faccessat` in 0.16 and `Io.Dir.access` needs an
+/// `Io` (which we do not have here: `resolveArgv` runs before the caller's one
+/// is at hand). We call libc's `access(2)`, which is exactly the same thing and
+/// adds no dependency: `std.c` is part of the std.
 fn isExecutable(io: Io, path: []const u8) bool {
-    // NO se usa `std.c.access`: eso ata el binario a libc, y zode es libc-free
-    // a propósito (permite target musl). Se mira el bit de ejecutable del modo,
-    // que es lo mismo que `X_OK` comprueba, y además que sea un fichero: un
-    // DIRECTORIO con el nombre del binario tiene el bit de x puesto y no vale.
+    // NOTE: `std.c.access` is NOT used: that ties the binary to libc, and zode
+    // is libc-free on purpose (it allows a musl target). We look at the
+    // executable bit of the mode, which is what `X_OK` checks, and additionally
+    // that it is a regular file: a DIRECTORY named after the binary has the x
+    // bit set and is not usable.
     const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     if (st.kind == .directory) return false;
-    // `permissions` es un enum del `mode_t`: los tres bits de ejecutable
-    // (dueño, grupo, resto) son 0o111, igual que en `X_OK`.
+    // `permissions` is a `mode_t` enum: the three executable bits (owner, group,
+    // other) are 0o111, same as in `X_OK`.
     const mode: u32 = @intCast(@intFromEnum(st.permissions));
     return mode & 0o111 != 0;
 }
 
-/// Rellena `out` con el argv y `argv[0]` resuelto a una ruta ABSOLUTA, y
-/// devuelve el slice. Si no se puede resolver, devuelve `argv` tal cual (que
-/// alors sea `spawn` el que falle con su propio error).
+/// Fills `out` with the argv and `argv[0]` resolved to an ABSOLUTE path, and
+/// returns the slice. If it cannot be resolved, returns `argv` as is (so that
+/// it is `spawn` that fails with its own error).
 ///
-/// `std.process.spawn` busca en el PATH del `Io`, que no tiene por qué ser el
-/// entorno de zode: con un `Threaded` hecho a mano sale `FileNotFound` aunque
-/// el binario esté en el PATH de la shell (pasó con la sonda). Aquí se busca en
-/// el `PATH` del mapa que pasa el llamante y se ejecuta una ruta absoluta, que
-/// `spawn` no necesita buscar.
+/// `std.process.spawn` looks it up in the `Io`'s PATH, which need not be zode's
+/// environment: with a hand-made `Threaded` it fails with `FileNotFound` even
+/// though the binary is in the shell's PATH (that happened with the probe).
+/// Here we look it up in the `PATH` of the map the caller passes us and run an
+/// absolute path, which `spawn` does not need to look up.
 ///
-/// `out` y `path_buf` son buffers del llamante porque lo que se devuelve son
-/// slices a ellos: devolverlos desde aquí sería un puntero al stack de esta
-/// función.
+/// `out` and `path_buf` are caller buffers because what is returned are slices
+/// into them: returning them from here would be a pointer to this function's
+/// stack.
 fn resolveArgv(
     io: Io,
     env: ?*const std.process.Environ.Map,
@@ -109,7 +111,7 @@ fn resolveArgv(
     path_buf: []u8,
 ) []const []const u8 {
     if (argv.len == 0 or argv.len > out.len) return argv;
-    // Con '/' ya es una ruta: `spawn` la ejecuta tal cual.
+    // With a '/' it is already a path: `spawn` runs it as is.
     if (std.mem.indexOfScalar(u8, argv[0], '/') != null) return argv;
     const map = env orelse return argv;
     const path_s = map.get("PATH") orelse return argv;
@@ -118,9 +120,9 @@ fn resolveArgv(
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
         const full = std.fmt.bufPrint(path_buf, "{s}/{s}", .{ dir, argv[0] }) catch continue;
-        // Que sea EJECUTABLE, no solo que exista: un directorio con el nombre
-        // del binario no vale. `std.posix` no expone `faccessat`, así que se
-        // usa el `access(2)` de libc vía `std.c`, que en Linux es lo mismo.
+        // It has to be EXECUTABLE, not merely to exist: a directory named after
+        // the binary does not do. `std.posix` does not expose `faccessat`, so we
+        // use libc's `access(2)` via `std.c`, which on Linux is the same thing.
         if (!isExecutable(io, full)) continue;
 
         @memcpy(out[0..argv.len], argv);
@@ -131,17 +133,17 @@ fn resolveArgv(
 }
 
 pub const Error = error{
-    /// El comando no se pudo lanzar (no hay `opencode` en el PATH).
+    /// The command could not be launched (there is no `opencode` in the PATH).
     SpawnFailed,
-    /// El agente no respondió al `initialize` o al `session/new`.
+    /// The agent did not answer the `initialize` or the `session/new`.
     HandshakeFailed,
-    /// Se mandó un prompt sin sesión.
+    /// A prompt was sent with no session.
     NoSession,
-    /// El hijo se cerró en mitad de un turno.
+    /// The child closed halfway through a turn.
     AgentDied,
 } || std.mem.Allocator.Error || Io.Cancelable;
 
-/// Una opción de permiso que ofrece el agente.
+/// A permission option offered by the agent.
 pub const PermOption = struct {
     id: []const u8,
     name: []const u8,
@@ -149,21 +151,21 @@ pub const PermOption = struct {
     kind: []const u8,
 };
 
-/// Dónde caen los eventos del turno. Todo tiene no-op por defecto para que un
-/// test pueda declarar solo lo que le interesa.
+/// Where the turn's events go. Everything defaults to a no-op so that a test
+/// can declare only what it cares about.
 pub const Sink = struct {
     userdata: ?*anyopaque = null,
     onText: *const fn (?*anyopaque, []const u8) void = noopText,
     onThought: *const fn (?*anyopaque, []const u8) void = noopText,
-    /// Tool nueva: se pinta su cabecera.
+    /// New tool: draw its header.
     onTool: *const fn (?*anyopaque, id: []const u8, name: []const u8, title: []const u8) void = noopTool,
-    /// La tool cambia de estado (`in_progress`/`completed`/`failed`).
+    /// The tool changes state (`in_progress`/`completed`/`failed`).
     onToolUpdate: *const fn (?*anyopaque, id: []const u8, status: []const u8, text: []const u8) void = noopToolUpdate,
-    /// Una línea del plan del agente.
+    /// A line of the agent's plan.
     onPlan: *const fn (?*anyopaque, []const u8) void = noopText,
-    /// Petición de permiso: devuelve el `optionId` elegido o null para cancelar.
-    /// Se llama desde el hilo del worker, asi que puede bloquear (el diálogo de
-    /// permisos de zode ya bloquea al worker por diseño).
+    /// Permission request: returns the chosen `optionId` or null to cancel.
+    /// It is called from the worker thread, so it may block (zode's permission
+    /// dialog already blocks the worker by design).
     onPermission: ?*const fn (?*anyopaque, tool: []const u8, detail: []const u8, options: []const PermOption) ?[]const u8 = null,
 };
 
@@ -171,8 +173,9 @@ fn noopText(_: ?*anyopaque, _: []const u8) void {}
 fn noopTool(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
 fn noopToolUpdate(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
 
-/// Herramienta recordada por su id: ACP manda el id en las actualizaciones, no
-/// el nombre, y sin esto el `pushToolDone` saldría sin saber qué tool cerró.
+/// A tool remembered by its id: ACP sends the id in the updates, not the name,
+/// and without this the `pushToolDone` would go out not knowing which tool
+/// closed.
 const ToolMemo = struct {
     id: [64]u8 = undefined,
     id_len: usize = 0,
@@ -184,7 +187,7 @@ const ToolMemo = struct {
     }
 };
 
-/// Qué respuesta estamos esperando del hijo.
+/// Which response we are waiting for from the child.
 const Wait = enum { none, init, new_session, prompt };
 
 pub const Client = struct {
@@ -193,14 +196,14 @@ pub const Client = struct {
     child: std.process.Child,
     stdin: Io.File,
 
-    /// Buffer del reader. El `Reader` guarda un puntero a ESTE array, así que
-    /// el struct no se puede mover (ver la nota de más arriba).
+    /// Reader's buffer. The `Reader` keeps a pointer to THIS array, so the
+    /// struct cannot be moved (see the note further up).
     out_buf: [64 * 1024]u8 = undefined,
     reader: Io.File.Reader,
 
-    /// Línea en curso. Puede crecer sin límite (ver la nota de más arriba).
+    /// Line in progress. It can grow without limit (see the note further up).
     line: std.ArrayList(u8) = .empty,
-    /// Buffer para serializar un mensaje antes de mandarlo.
+    /// Buffer to serialize a message before sending it.
     send_buf: [128 * 1024]u8 = undefined,
 
     next_id: i64 = 1,
@@ -213,16 +216,16 @@ pub const Client = struct {
     agent_name_len: usize = 0,
     stop_reason: [32]u8 = undefined,
     stop_len: usize = 0,
-    /// Último `error.message` que mandó el agente, para poder enseñarlo.
+    /// Last `error.message` the agent sent, so we can show it.
     last_error: [256]u8 = undefined,
     last_error_len: usize = 0,
 
-    /// Escribir al stdin necesita lock (el `Mutex` de Zig no es reentrante y
-    /// aquí se coge una sola vez por escritura).
+    /// Writing to stdin needs a lock (Zig's `Mutex` is not reentrant and here it
+    /// is taken only once per write).
     wlock: std.atomic.Mutex = .unlocked,
 
-    /// La UI ha pedido cortar el turno. Lo pone `cancel()` desde el hilo del
-    /// dibujo; lo lee y atiende el worker, que es el único que escribe.
+    /// The UI asked to cut the turn short. `cancel()` sets it from the draw
+    /// thread; the worker reads and honours it, and it is the only one writing.
     cancel_requested: std.atomic.Value(bool) = .init(false),
     cancel_sent: bool = false,
     would_block_count: usize = 0,
@@ -243,28 +246,28 @@ pub const Client = struct {
         return self.stop_reason[0..self.stop_len];
     }
 
-    /// El último error que mandó el agente (vacío si no hubo).
+    /// The last error the agent sent (empty if there was none).
     pub fn lastError(self: *const Client) []const u8 {
         return self.last_error[0..self.last_error_len];
     }
 
     pub fn toolName(self: *const Client, id: []const u8) []const u8 {
-        // OJO: con `for (self.tools[0..len]) |memo|` el `memo` es una COPIA del
-        // struct, y `memo.name[0..n]` apunta a esa copia de stack: al salir del
-        // bucle el slice queda colgando y devuelve basura. Por eso el índice.
+        // CAREFUL: with `for (self.tools[0..len]) |memo|` the `memo` is a COPY of
+        // the struct, and `memo.name[0..n]` points at that stack copy: on leaving
+        // the loop the slice dangles and returns garbage. That is why the index.
         for (self.tools[0..self.tools_len], 0..) |*memo, i| {
             if (memo.eqlId(id)) return self.tools[i].name[0..memo.name_len];
         }
         return "";
     }
 
-    // ── arranque ──────────────────────────────────────────────
+    // ── startup ───────────────────────────────────────────────
 
-    /// Lanza el agente, hace `initialize` y abre una sesión en `cwd`.
+    /// Launches the agent, does `initialize` and opens a session in `cwd`.
     ///
-    /// `argv_override` es el resultado de partir `ZODE_ACP_CMD`; si es null se
-    /// usa `default_argv`. `env` se usa para resolver el ejecutable por el
-    /// PATH (ver `resolveArgv`).
+    /// `argv_override` is the result of splitting `ZODE_ACP_CMD`; if it is null
+    /// `default_argv` is used. `env` is used to resolve the executable through
+    /// the PATH (see `resolveArgv`).
     pub fn start(
         gpa: std.mem.Allocator,
         io: Io,
@@ -284,13 +287,13 @@ pub const Client = struct {
         };
         errdefer self.line.deinit(gpa);
 
-        // El `Io` resuelve el PATH con SU entorno, que no siempre es el de
-        // zode (un `Threaded` de pruebas, por ejemplo, no lo tiene). Con un
-        // argv[0] sin '/', `spawn` da FileNotFound aunque el binario esté
-        // ahí. Se resuelve aquí contra el mapa que nos pasa el llamante.
-        // Los dos buffers son del stack de `start` a PROPÓSITO: `resolveArgv`
-        // devuelve slices que apuntan a ellos, y `spawn` los consume antes de
-        // que `start` devuelva.
+        // The `Io` resolves the PATH with ITS environment, which is not always
+        // zode's (a test `Threaded`, for example, has none). With an argv[0]
+        // without a '/', `spawn` gives FileNotFound even though the binary is
+        // right there. We resolve it here against the map the caller gives us.
+        // The two buffers are `start`'s stack buffers ON PURPOSE: `resolveArgv`
+        // returns slices pointing at them, and `spawn` consumes them before
+        // `start` returns.
         var resolved_argv: [8][]const u8 = undefined;
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const argv_final = resolveArgv(io, env, argv, &resolved_argv, &path_buf);
@@ -301,28 +304,28 @@ pub const Client = struct {
             .stdout = .pipe,
             .stderr = .ignore,
         }) catch return error.SpawnFailed;
-        // Si algo falla después, el hijo no se puede quedar huérfano.
+        // If something fails later, the child must not be left orphaned.
         errdefer self.child.kill(io);
 
         self.stdin = self.child.stdin.?;
-        // El pipe de lectura va en NO-BLOQUEANTE a propósito: el bucle de `pump`
-        // duerma entre mensajes en vez de clavarse, y así puede mirar la
-        // bandera de cancelar y mandar `session/cancel` aunque el agente esté
-        // en silencio. Un read bloqueante dejaría al worker esperando hasta que
-        // el agente hablara, que es justo cuando hace falta poder cortar.
+        // The read pipe goes into NON-BLOCKING on purpose: the `pump` loop
+        // sleeps between messages instead of blocking, and thus it can look at
+        // the cancel flag and send `session/cancel` even while the agent is
+        // silent. A blocking read would leave the worker waiting until the
+        // agent spoke, which is exactly when being able to cut short matters.
         //
-        // OJO: poner `flags.nonblocking = true` en el `File` NO pone el
-        // descriptor en O_NONBLOCK. Ese campo solo lo mira la ruta de Windows;
-        // en POSIX `read()` se hace tal cual y con el fd bloqueante se queda
-        // clavado para siempre (que es lo que pasaba: el turno se colgaba en el
-        // segundo read). Hay que hacer el `fcntl` de verdad.
+        // CAREFUL: setting `flags.nonblocking = true` on the `File` does NOT
+        // put the descriptor in O_NONBLOCK. That field is only consulted on the
+        // Windows path; on POSIX `read()` goes out as-is, and with a blocking
+        // fd it blocks forever (which is what was happening: the turn hung on
+        // the second read). You have to do the `fcntl` for real.
         var out_file = self.child.stdout.?;
         out_file.flags.nonblocking = true;
         if (builtin.os.tag == .linux) {
-            // `fcntl` devuelve el resultado crudo: los errores vienen
-            // codificados como valores enormes, así que "ha ido bien" es que
-            // quepa en 32 bits. (Al revés que un error de return: un GETFL
-            // bueno es un número PEQUEÑO, 0x44000 y poco.)
+            // `fcntl` returns the raw result: errors come back encoded as huge
+            // values, so "it worked" means "it fits in 32 bits". (The other way
+            // round than a return error: a good GETFL is a SMALL number, 0x44000
+            // or so.)
             const fl = std.os.linux.fcntl(out_file.handle, std.posix.F.GETFL, 0);
             if (fl <= std.math.maxInt(u32)) {
                 const want = fl | (1 << @bitOffsetOf(std.os.linux.O, "NONBLOCK"));
@@ -346,12 +349,12 @@ pub const Client = struct {
         gpa.destroy(self);
     }
 
-    // ── envío ─────────────────────────────────────────────────
+    // ── sending ───────────────────────────────────────────────
 
     fn write(self: *Client, bytes: []const u8) !void {
-        // `std.atomic.Mutex` es un SPINLOCK (no tiene `lock`), y no puede
-        // reentrarse. Aquí solo se coge para una escritura corta, asi que
-        // esperar con `yield` es suficiente.
+        // `std.atomic.Mutex` is a SPINLOCK (it has no `lock`), and it cannot be
+        // reentered. Here it is only taken for a short write, so waiting with
+        // `yield` is enough.
         while (!self.wlock.tryLock()) std.Thread.yield() catch {};
         defer self.wlock.unlock();
         try self.stdin.writeStreamingAll(self.io, bytes);
@@ -389,15 +392,15 @@ pub const Client = struct {
         try self.write(w.buffered());
     }
 
-    /// Pide cortar el turno. Se puede llamar desde CUALQUIER hilo (la UI lo hace
-    /// con ESC) y NO toca el `Io`: solo pone una bandera.
+    /// Asks to cut the turn short. Can be called from ANY thread (the UI does it
+    /// with ESC) and does NOT touch the `Io`: it only sets a flag.
     ///
-    /// OJO: aquí NO se escribe el `session/cancel` directamente. Escribir en el
-    /// pipe desde otro hilo mientras el worker está bloqueado leyendo con el
-    /// MISMO `Io` lo rompe: el hijo se muere y el turno acaba con AgentDied sin
-    /// haber llegado a cancelar nada. El `Io` de Zig no está pensado para que
-    /// dos hilos lo usen a la vez. Lo escribe el worker, que es su dueño, al
-    /// ver la bandera (ver `pump`).
+    /// CAREFUL: the `session/cancel` is NOT written here directly. Writing to
+    /// the pipe from another thread while the worker is blocked reading with the
+    /// SAME `Io` breaks it: the child dies and the turn ends with AgentDied
+    /// without ever having cancelled anything. Zig's `Io` is not meant to be
+    /// used by two threads at once. The worker writes it, since it is the
+    /// owner, upon seeing the flag (see `pump`).
     pub fn cancel(self: *Client) void {
         self.cancel_requested.store(true, .seq_cst);
     }
@@ -415,8 +418,8 @@ pub const Client = struct {
 
     // ── prompt ────────────────────────────────────────────────
 
-    /// Manda un prompt de texto al agente. Los eventos van saliendo por el
-    /// `sink` de `waitTurn`.
+    /// Sends a text prompt to the agent. The events come out through the `sink`
+    /// of `waitTurn`.
     pub fn prompt(self: *Client, text: []const u8) !void {
         if (self.session_len == 0) return error.NoSession;
         self.wait_id = self.takeId();
@@ -432,57 +435,56 @@ pub const Client = struct {
         try self.write(w.buffered());
     }
 
-    /// Lee y reparte hasta que el turno acaba. Devuelve el `stopReason`.
+    /// Reads and dispatches until the turn ends. Returns the `stopReason`.
     ///
-    /// El pipe de la salida del hijo está en NO-BLOQUEANTE, así que el bucle
-    /// duerme un momento entre lecturas. Eso es lo que permite que la UI
-    /// cancele el turno sin escribir en el `Io` desde otro hilo (ver `cancel`).
+    /// The child's output pipe is in NON-BLOCKING, so the loop sleeps a moment
+    /// between reads. That is what lets the UI cancel the turn without writing
+    /// to the `Io` from another thread (see `cancel`).
     pub fn waitTurn(self: *Client, sink: *const Sink) ![]const u8 {
         while (self.waiting == .prompt) {
             if (self.cancel_requested.load(.seq_cst) and !self.cancel_sent) self.sendCancel();
             const got = try self.pump(sink);
             if (got == .line) continue;
             if (got == .would_block) {
-                // 30 ms es imperceptible y no quema CPU (es el mismo orden que el
-                // tick de 40 ms del spinner).
+                // 30 ms is imperceptible and does not burn CPU (it is the same
+                // order as the spinner's 40 ms tick).
                 //
-                // OJO: `io.sleep` y no un `std.Thread.sleep` cualquiera. Este
-                // proceso tiene UN SOLO `Io` compartido entre el worker y el
-                // hilo de la UI, y `Io.sleep` se queda con el bucle de eventos
-                // del `Io`: el worker dormido dejaba de disparar el `tick` del
-                // spinner y la TUI se congelaba con el reloj clavado (justo lo
-                // que se vera en pantalla). Con `nanosleep` es una syscall
-                // pelada que no toca el `Io`.
+                // CAREFUL: `io.sleep`, not just any `std.Thread.sleep`. This
+                // process has a SINGLE `Io` shared between the worker and the
+                // UI thread, and `Io.sleep` takes the `Io`'s event loop with
+                // it: the sleeping worker stopped firing the spinner's `tick`
+                // and the TUI froze with the clock stuck (exactly what you see
+                // on screen). With `nanosleep` it is a bare syscall that does
+                // not touch the `Io`.
                 nap(30);
                 continue;
             }
-            return error.AgentDied; // el hijo se cerró
+            return error.AgentDied; // the child closed
         }
         return self.stopReason();
     }
 
-    // ── lectura ───────────────────────────────────────────────
+    // ── reading ───────────────────────────────────────────────
 
-    /// Qué pasó al leer un mensaje del hijo.
+    /// What happened when reading a message from the child.
     pub const Pump = enum { line, would_block, eof };
 
-    /// Lee mensajes hasta que llega la respuesta que esperamos.
-    /// `sink` puede ser null durante el handshake (aun no hay nada que
-    /// mostrar).
+    /// Reads messages until the response we are waiting for arrives.
+    /// `sink` can be null during the handshake (there is nothing to show yet).
     pub fn pump(self: *Client, sink: ?*const Sink) !Pump {
         const got = switch (try self.readLine()) {
             .would_block => return .would_block,
             .eof => return .eof,
             .line => |l| l,
         };
-        // `defer`, y no un `clear` al final: hay VARIOS `return .line`
-        // intermedios (línea vacía, JSON inválido, notificación) y con el
-        // clear solo al final `self.line` se quedaba con el texto anterior. La
-        // línea siguiente salía con la anterior PEGADA, el parse fallaba, y el
-        // bucle se comía su propia cola: cuelgue total tras el primer mensaje.
+        // `defer`, and not a `clear` at the end: there are SEVERAL intermediate
+        // `return .line` (empty line, invalid JSON, notification), and with the
+        // clear only at the end `self.line` kept the previous text. The next
+        // line came out GLUED to the previous one, the parse failed, and the
+        // loop ate its own queue: a total hang after the very first message.
         //
-        // OJO: el `defer` corre al SALIR de pump, después de los callbacks, que
-        // es justo cuando el texto deja de hacer falta.
+        // CAREFUL: the `defer` runs when EXITING pump, after the callbacks,
+        // which is exactly when the text stops being needed.
         defer self.line.clearRetainingCapacity();
         var line = got;
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
@@ -500,7 +502,7 @@ pub const Client = struct {
 
         if (root.get("method")) |mv| {
             const method = strOf(mv);
-            // Petición del agente hacia nosotros (permisos, fs, terminal).
+            // A request from the agent towards us (permissions, fs, terminal).
             if (id) |req_id| {
                 try self.handleRequest(req_id, method, root, sink);
             } else {
@@ -509,18 +511,18 @@ pub const Client = struct {
             return .line;
         }
 
-        // Respuesta a algo nuestro.
+        // A response to something of ours.
         //
-        // OJO: aquí NO vale `root.get("method") orelse return true`. Las
-        // respuestas NO llevan `method`, así que ese `orelse` se comía el
-        // `initialize` entero y el handshake se quedaba para siempre esperando
-        // una respuesta que ya había llegado (y sin pintar nada, que es lo
-        // que hace que un deadlock así sea tan difícil de ver).
+        // CAREFUL: `root.get("method") orelse return true` does NOT work here.
+        // Responses carry NO `method`, so that `orelse` swallowed the whole
+        // `initialize` and the handshake stayed forever waiting for a response
+        // that had already arrived (and without painting anything, which is
+        // what makes a deadlock like that so hard to spot).
         if (id) |resp_id| {
             if (resp_id != self.wait_id) return .line;
             if (root.get("error")) |e| {
-                // El mensaje del server es lo único útil: "HTTP 500" no dice
-                // nada, "model not found" sí.
+                // The server's message is the only useful thing: "HTTP 500" says
+                // nothing, "model not found" does.
                 var buf: [512]u8 = undefined;
                 const msg = blk: {
                     const m = strField(e.object, "message");
@@ -545,9 +547,9 @@ pub const Client = struct {
         return .line;
     }
 
-    /// Espera la respuesta del handshake. El pipe es NO-bloqueante, así que
-    /// entre mensajes hay que dormir un poco. Con tope: si el agente no contesta
-    /// en ~2 min, mejor un error claro que un cuelgue.
+    /// Waits for the handshake response. The pipe is NON-blocking, so between
+    /// messages we have to sleep a little. With a cap: if the agent does not
+    /// answer in ~2 min, a clear error is better than a hang.
     fn awaitHandshake(self: *Client, kind: Wait) !void {
         var spins: usize = 0;
         while (self.waiting == kind) {
@@ -569,8 +571,8 @@ pub const Client = struct {
         }
         switch (self.waiting) {
             .init => {
-                // El `initialize` es la unica respuesta con `agentInfo`: nos dice
-                // como se llama el agente, que es lo que se enseña en el status.
+                // The `initialize` is the only response with `agentInfo`: it tells
+                // us the agent's name, which is what is shown in the status bar.
                 if (res.object.get("agentInfo")) |ai| {
                     if (ai == .object) {
                         const nm = strField(ai.object, "name");
@@ -638,8 +640,8 @@ pub const Client = struct {
             try self.handlePermission(id, root, sink);
             return;
         }
-        // `fs/*`, `terminal/*`, `elicitation/*`…: no las anunciamos, pero si
-        // llegan hay que responder algo o el turno no acaba nunca.
+        // `fs/*`, `terminal/*`, `elicitation/*`…: we do not announce them, but
+        // if they arrive we have to answer something or the turn never ends.
         var w = Io.Writer.fixed(&self.send_buf);
         try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":", .{
             id,
@@ -681,8 +683,8 @@ pub const Client = struct {
             }
             return self.respondCancelled(id);
         }
-        // Sin nadie que pregunte (tests, o un turno sin UI): la primera opción
-        // "allow" es lo razonable, y si no hay, se cancela.
+        // Nobody to ask (tests, or a turn with no UI): the first "allow" option
+        // is the reasonable thing, and if there is none, cancel.
         for (list) |o| {
             if (std.mem.startsWith(u8, o.kind, "allow")) return self.respondSelected(id, o.id);
         }
@@ -705,7 +707,7 @@ pub const Client = struct {
 
     fn rememberTool(self: *Client, id: []const u8, name: []const u8) void {
         for (self.tools[0..self.tools_len]) |memo| {
-            if (memo.eqlId(id)) return; // ya la conocemos
+            if (memo.eqlId(id)) return; // we already know it
         }
         if (self.tools_len >= self.tools.len) return;
         var memo = &self.tools[self.tools_len];
@@ -718,31 +720,32 @@ pub const Client = struct {
         self.tools_len += 1;
     }
 
-    /// Resultado de intentar leer una línea del hijo.
+    /// Result of trying to read a line from the child.
     pub const Line = union(enum) {
-        /// Línea completa, en `self.line.items` (válida hasta el próximo pump).
+        /// Complete line, in `self.line.items` (valid until the next pump).
         line: []const u8,
-        /// No hay datos AHORA MISMO. Es el caso normal entre heartbeats.
+        /// No data RIGHT NOW. This is the normal case between heartbeats.
         would_block,
-        /// El hijo cerró el pipe.
+        /// The child closed the pipe.
         eof,
     };
 
-    /// Una línea del hijo, acumulada a mano.
+    /// A line from the child, accumulated by hand.
     ///
-    /// El `readLine` del Reader no vale: da `error.StreamTooLong` si la línea no
-    /// cabe en su buffer, y aquí las líneas son updates de tools que pueden
-    /// traer un volcado entero. Se lee el buffer a mano y se crece.
+    /// The Reader's `readLine` does not do: it gives `error.StreamTooLong` if
+    /// the line does not fit in its buffer, and here the lines are tool updates
+    /// that can carry a whole dump. The buffer is read by hand and grown.
     ///
-    /// El pipe está en NO-BLOQUEANTE (ver `start`): si no hay datos se devuelve
-    /// `would_block` para que el llamante duerma y mire la bandera de cancelar.
-    /// Un read bloqueante dejaría al worker clavado y el ESC no podría hacer
-    /// nada hasta que el agente volviera a hablar.
+    /// The pipe is in NON-BLOCKING (see `start`): if there is no data we return
+    /// `would_block` so the caller can sleep and look at the cancel flag. A
+    /// blocking read would leave the worker stuck and ESC could not do anything
+    /// until the agent spoke again.
     ///
-    /// OJO: `self.line` NO se limpia al entrar. Una línea a medias se queda
-    /// acumulada entre llamadas, y el que la limpia (al terminar de leerla) es
-    /// `pump`. Si se limpiara aquí, un `would_block` a mitad de línea perdería
-    /// lo leído y la línea nunca se cerraría.
+    /// CAREFUL: `self.line` is NOT cleared on entry. A partial line stays
+    /// accumulated across calls, and the one that clears it (once reading it
+    /// finishes) is `pump`. If it were cleared here, a `would_block` in the
+    /// middle of a line would lose what was read and the line would never be
+    /// closed.
     fn readLine(self: *Client) !Line {
         while (true) {
             const r = &self.reader.interface;
@@ -756,11 +759,10 @@ pub const Client = struct {
             r.toss(rest.len);
             const before = r.end;
             r.fillMore() catch |err| switch (err) {
-                // El `Reader` de fichero se COME el `WouldBlock` y lo convierte
-                // en `ReadFailed`, dejando el error de verdad en
-                // `self.reader.err` (el `err` del `Io.Reader` de dentro es otra
-                // cosa). Por eso no se mira el error que devuelve, sino el que
-                // guardó.
+                // The file `Reader` SWALLOWS the `WouldBlock` and turns it into
+                // `ReadFailed`, leaving the real error in `self.reader.err` (the
+                // inner `Io.Reader`'s `err` is a different thing). That is why we
+                // do not look at the error it returns, but at the one it stored.
                 error.ReadFailed => {
                     if (self.reader.err != null and self.reader.err.? == error.WouldBlock) {
                         return .would_block;
@@ -770,7 +772,7 @@ pub const Client = struct {
                 else => return err,
             };
             if (r.end == before) {
-                // EOF: lo que quedara sin newline se devuelve igual.
+                // EOF: whatever is left without a newline is returned as is.
                 if (self.line.items.len == 0) return .eof;
                 return .{ .line = self.line.items };
             }
@@ -778,12 +780,12 @@ pub const Client = struct {
     }
 };
 
-// ── helpers de JSON ──────────────────────────────────────────
+// ── JSON helpers ─────────────────────────────────────────────
 
-/// Campo de texto de un objeto, o "" si no está / no es string.
+/// Text field of an object, or "" if it is absent / not a string.
 ///
-/// OJO: `obj.get(k) orelse ""` NO compila, porque el `orelse` devuelve un
-/// `json.Value` y "" es un `[]const u8`. De ahí este helper.
+/// CAREFUL: `obj.get(k) orelse ""` does NOT compile, because `orelse` returns a
+/// `json.Value` and "" is a `[]const u8`. Hence this helper.
 fn strField(obj: std.json.ObjectMap, key: []const u8) []const u8 {
     const v = obj.get(key) orelse return "";
     return strOf(v);
@@ -805,15 +807,15 @@ fn intOf(v: ?std.json.Value) ?i64 {
     };
 }
 
-/// Texto de un `ContentBlock`, o null si no es de texto.
+/// Text of a `ContentBlock`, or null if it is not text.
 fn textOf(v: std.json.Value) ?[]const u8 {
     if (v != .object) return null;
     if (!std.mem.eql(u8, strOf(v.object.get("type") orelse return null), "text")) return null;
     return strOf(v.object.get("text") orelse return null);
 }
 
-/// `rawInput` es `unknown`: si es un objeto con `command`/`file_path` se
-///Sacale eso, si es una cadena se usa tal cual, y si no, nada.
+/// `rawInput` is `unknown`: if it is an object with `command`/`file_path` pull
+/// that out, if it is a string use it as is, and otherwise nothing.
 fn rawInputText(v: std.json.Value) []const u8 {
     switch (v) {
         .string => |s| return s,
@@ -828,8 +830,8 @@ fn rawInputText(v: std.json.Value) []const u8 {
     }
 }
 
-/// El texto de una actualización de tool: primero el `content` normal y, si no
-/// hay, el `rawOutput`.
+/// The text of a tool update: first the normal `content` and, if there is
+/// none, the `rawOutput`.
 fn updateText(upd: std.json.ObjectMap, buf: []u8) []const u8 {
     if (upd.get("content")) |c| {
         if (c == .array) {
@@ -859,8 +861,9 @@ fn updateText(upd: std.json.ObjectMap, buf: []u8) []const u8 {
 
 const testing = std.testing;
 
-/// Reparte una línea por el MISMO camino que el cliente real, sin proceso
-/// hijo: es lo que permite testear el parseo con updates capturados.
+/// Feeds a line through the SAME path as the real client, with no child
+/// process: that is what makes it possible to test the parsing with captured
+/// updates.
 fn feedLine(c: *Client, sink: *const Sink, line: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -929,8 +932,8 @@ test "una tool nueva se recuerda por id para poder cerrar su linea" {
         \\{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","name":"bash","title":"sleep 30","kind":"execute","status":"pending"}}}
     );
     try testing.expectEqualStrings("c1|bash|sleep 30", seen);
-    // El id es lo unico que viene en la actualizacion: sin el memo, el
-    // `pushToolDone` no sabria que tool se cerro.
+    // The id is the only thing that comes in the update: without the memo, the
+    // `pushToolDone` would not know which tool closed.
     try testing.expectEqualStrings("bash", c.toolName("c1"));
 }
 
@@ -972,9 +975,9 @@ test "las entradas del plan salen una a una" {
     try testing.expectEqualStrings("mirar el test\narreglarlo\n", got.items);
 }
 
-/// Agente ACP de mentira para los tests: un `sh` que lee una request por
-/// linea y contesta con JSON-RPC. Es mas fiel que un mock porque ejercita los
-/// pipes, el buffer del reader y el framing de lineas de verdad.
+/// A fake ACP agent for the tests: a `sh` that reads one request per line and
+/// answers with JSON-RPC. It is more faithful than a mock because it exercises
+/// the pipes, the reader's buffer and the real line framing.
 const fake_agent_script =
     \\while IFS= read -r line; do
     \\  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -998,11 +1001,11 @@ const fake_agent_script =
 
 const fake_agent_argv = [_][]const u8{ "/bin/sh", "-c", fake_agent_script };
 
-/// Agente que heartbeatea un rato y ATIENDE `session/cancel`.
+/// An agent that heartbeats for a while and HONOURS `session/cancel`.
 ///
-/// El corazón se queda CORTO a propósito: un `sh` no puede leer de su stdin
-/// mientras duerme, así que si esperase mucho no vería el cancel hasta que ya
-/// no hiciese falta. Con 8 ticks vuelve al bucle de lectura y lo ve.
+/// The heartbeat is kept SHORT on purpose: a `sh` cannot read from its stdin
+/// while it sleeps, so if it waited long it would not see the cancel until it
+/// was no longer needed. With 8 ticks it goes back to the read loop and sees it.
 const fake_cancel_script =
     \\while IFS= read -r line; do
     \\  case "$line" in
@@ -1024,10 +1027,11 @@ const fake_cancel_script =
 const fake_cancel_argv = [_][]const u8{ "/bin/sh", "-c", fake_cancel_script };
 
 test "cancel() corta el turno: el agente recibe session/cancel y responde cancelled" {
-    // Lo que hace de verdad el ESC en la TUI, pero sin la UI: `cancel()` solo
-    // pone una bandera y es el worker (dueño del `Io`) el que escribe. Si
-    // `cancel()` escribiera desde este hilo, el `Io` se usaría desde dos a la
-    // vez y el turno moriría con AgentDied sin llegar a cancelar nada.
+    // What ESC really does in the TUI, but without the UI: `cancel()` only
+    // sets a flag, and it is the worker (owner of the `Io`) that writes. If
+    // `cancel()` wrote from this thread, the `Io` would be used by two threads
+    // at once and the turn would die with AgentDied without ever cancelling
+    // anything.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1050,7 +1054,7 @@ test "el turno entero pasa por un agente de mentira: handshake, updates y stop" 
 
     const c = try Client.start(testing.allocator, io, &fake_agent_argv, "/tmp", null);
     defer c.deinit();
-    // El `initialize` se queda con el nombre que dijo el agente.
+    // The `initialize` keeps the name the agent said.
     try testing.expectEqualStrings("fake-agent", c.agentTitle());
     try testing.expectEqualStrings("sess_fake", c.sessionId());
 
@@ -1083,8 +1087,8 @@ test "el turno entero pasa por un agente de mentira: handshake, updates y stop" 
     try testing.expectEqualStrings("end_turn", try c.waitTurn(&sink));
 
     try testing.expect(std.mem.startsWith(u8, ctx.text.items, "hola "));
-    // El chunk de 100 KB tiene que llegar ENTERO: el `readLine` del std daría
-    // StreamTooLong con una linea mas grande que su buffer de 64 KB.
+    // The 100 KB chunk has to arrive WHOLE: std's `readLine` would give
+    // StreamTooLong with a line bigger than its 64 KB buffer.
     try testing.expect(ctx.text.items.len > 100_000);
     try testing.expectEqualStrings("t1|bash|echo", ctx.tool);
     try testing.expectEqualStrings("t1|completed|exit=0", ctx.done);

@@ -3,18 +3,18 @@ const std = @import("std");
 pub const ProviderDef = struct {
     id: []const u8,
     name: []const u8,
-    /// Base para chat completions (…/v1 o equivalente).
+    /// Base for chat completions (…/v1 or equivalent).
     base_url: []const u8,
-    /// Endpoint GET de modelos.
+    /// GET endpoint for models.
     models_url: []const u8,
-    /// Variables de entorno con la API key, en orden de preferencia.
-    /// La primera no vacía gana; "" = no necesita key.
+    /// Environment variables holding the API key, in order of preference.
+    /// The first non-empty one wins; "" = needs no key.
     key_env: []const []const u8,
-    /// Modelo por defecto de este provider.
+    /// Default model for this provider.
     default_model: []const u8,
-    /// Descripción corta para el picker.
+    /// Short description for the picker.
     note: []const u8 = "",
-    /// Si el provider expone precios/contexto en /models.
+    /// Whether the provider exposes pricing/context in /models.
     has_pricing: bool = false,
 };
 
@@ -97,31 +97,31 @@ pub fn activeDef(env: ?*const std.process.Environ.Map) *const ProviderDef {
     return byId(id) orelse &defs[0];
 }
 
-/// Las keys guardadas con "Connect an integration", indexadas por provider id.
+/// Keys stored via "Connect an integration", indexed by provider id.
 ///
-/// Viven en memoria (se cargan de `~/.config/zode/auth.json` al arrancar y se
-/// actualizan al guardar) porque `keyFor` se llama en cada request y no puede
-/// permitirse leer un fichero del disco cada vez. `setup` la rellena una vez.
+/// They live in memory (loaded from `~/.config/zode/auth.json` at startup and
+/// updated on save) because `keyFor` runs on every request and cannot afford to
+/// read a file from disk each time. `setup` fills it once.
 var saved_keys: ?*std.StringHashMapUnmanaged([]const u8) = null;
 
-/// Guarda el mapa de keys de `auth.json` (o null si no hay).
+/// Stores the key map from `auth.json` (or null if there is none).
 pub fn setSavedKeys(map: ?*std.StringHashMapUnmanaged([]const u8)) void {
     saved_keys = map;
 }
 
-/// Key guardada por el usuario para este provider (sin mirar el entorno).
+/// Key stored by the user for this provider (without looking at the env).
 pub fn savedKeyFor(id: []const u8) ?[]const u8 {
     const m = saved_keys orelse return null;
     return m.get(id);
 }
 
 pub fn keyFor(def: *const ProviderDef, env: ?*const std.process.Environ.Map) ?[]const u8 {
-    // 1) La guardada con la paleta: es lo que el usuario acaba de teclear.
+    // 1) The one stored via the palette: what the user just typed.
     if (savedKeyFor(def.id)) |k| {
         if (k.len > 0) return k;
     }
-    // 2) Las variables de entorno: mandan sobre `ZODE_API_KEY` si hay alguna
-    //    específica, y permiten seguir funcionando con .env como hasta ahora.
+    // 2) The environment variables: they beat `ZODE_API_KEY` if there is a
+    //    specific one, and keep .env working as it does today.
     for (def.key_env) |var_name| {
         if (envGet(env, var_name)) |k| {
             if (k.len > 0) return k;
@@ -130,9 +130,9 @@ pub fn keyFor(def: *const ProviderDef, env: ?*const std.process.Environ.Map) ?[]
     return null;
 }
 
-/// ¿Tiene key este provider? (para el picker y /providers)
+/// Does this provider have a key? (for the picker and /providers)
 pub fn hasKey(def: *const ProviderDef, env: ?*const std.process.Environ.Map) bool {
-    if (def.key_env.len == 0) return true; // no necesita key
+    if (def.key_env.len == 0) return true; // needs no key
     return keyFor(def, env) != null;
 }
 
@@ -142,8 +142,8 @@ fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
 }
 
 test "keyFor: la key guardada en la paleta gana a la del entorno" {
-    // El orden importa: si el entorno ganara, conectar un provider desde la
-    // TUI no serviría de nada mientras haya un .env con una key vieja.
+    // The order matters: if the env won, connecting a provider from the TUI
+    // would be useless as long as there is an .env with an old key.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();

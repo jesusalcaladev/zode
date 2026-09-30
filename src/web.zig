@@ -1,24 +1,24 @@
 const std = @import("std");
 
-/// Lo que necesita la tool `web_fetch` / `web_search` para convertir una página
-/// en algo que un modelo pueda leer: HTML a texto, y resultados de búsqueda a
-/// una lista.
+/// What the `web_fetch` / `web_search` tool needs to turn a page
+/// into something a model can read: HTML to text, and search results into
+/// a list.
 ///
-/// TODO esto es PURO (sin red) a propósito: la parte que falla siempre es la de
-/// parsear el HTML que devuelve el server, y eso se testea con un fixture, no
-/// con internet. La red la pone `tools.zig` encima.
+/// NOTE this is deliberately PURE (no network): the part that always breaks is
+/// parsing the HTML the server returns, and that is tested with a fixture, not
+/// with the internet. `tools.zig` puts the network on top.
 
-/// User-Agent de navegador.
+/// Browser User-Agent.
 ///
-/// Sin esto medio internet devuelve 403: Cloudflare, GitHub y Wikipedia
-/// rechazan el `User-Agent` por defecto de std, que es `zig`, y la respuesta de
-/// un 403 no dice absolutamente nada de lo que había detrás. Un 403 con este
-/// header es un problema del sitio; sin él, no se puede distinguir de un bloqueo
-/// real.
+/// Without this half the internet returns 403: Cloudflare, GitHub and Wikipedia
+/// reject std's default `User-Agent`, which is `zig`, and the response to
+/// a 403 says absolutely nothing about what was behind it. A 403 with this
+/// header is a problem with the site; without it, it cannot be told apart from a real
+/// block.
 pub const user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-/// Etiquetas de bloque: al cerrarlas (o al abrirlas si van solas, como `<br>`)
-/// sale un salto de línea en el texto.
+/// Block tags: closing them (or opening them when they stand alone, like `<br>`)
+/// puts a line break in the text.
 const block_tags = [_][]const u8{
     "p",        "div",   "br",     "li",   "tr",   "td",     "th",
     "h1",       "h2",    "h3",     "h4",   "h5",   "h6",     "section",
@@ -28,7 +28,7 @@ const block_tags = [_][]const u8{
     "html",     "head",  "title",  "meta", "link", "script", "style",
 };
 
-/// Tags cuyo contenido entero se tira (no es texto de la página).
+/// Tags whose whole content is thrown away (it is not page text).
 const drop_tags = [_][]const u8{ "script", "style", "noscript", "svg", "head" };
 
 fn isBlockTag(name: []const u8) bool {
@@ -45,40 +45,40 @@ fn isDropTag(name: []const u8) bool {
     return false;
 }
 
-/// HTML a texto legible.
+/// HTML to readable text.
 ///
-/// No es un parser de HTML: es un "quitar lo que no es texto" que aguanta el
-/// HTML que devuelve la web real (minificado, con scripts en medio del texto y
-/// con entidades). Lo que sale es para que lo lea un modelo, no para
-/// reconstruir la página: si el sitio necesita un motor de verdad, aquí no cabe.
+/// It is not an HTML parser: it is a "strip what is not text" that survives
+/// the HTML the real web returns (minified, with scripts in the middle of the text and
+/// with entities). What comes out is for a model to read, not for
+/// reconstructing the page: if the site needs a real engine, it does not fit here.
 ///
-/// Reglas, en orden:
-/// 1. `<!--…-->`, `<script>…</script>`, `<style>…</style>` y `<head>…</head>`
-///    fuera.
-/// 2. Cada tag de bloque (o su cierre) es un salto de línea.
-/// 3. El resto de tags desaparece, dejando su contenido.
-/// 4. Las entidades (`&amp;`, `&#39;`, `&hellip;`…) se convierten.
-/// 5. Los espacios seguidos se funden en uno, y 3+ saltos de línea en 2.
+/// Rules, in order:
+/// 1. `<!--…-->`, `<script>…</script>`, `<style>…</style>` and `<head>…</head>`
+///    are dropped.
+/// 2. Every block tag (or its closing tag) is a line break.
+/// 3. Every other tag disappears, leaving its content.
+/// 4. Entities (`&amp;`, `&#39;`, `&hellip;`…) are converted.
+/// 5. Runs of spaces are merged into one, and 3+ line breaks into 2.
 pub fn htmlToText(arena: std.mem.Allocator, html: []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
-    // Espacio pendiente: se emite solo si detrás viene texto de verdad. Sin esto
-    // cada tag deja un hueco y el texto sale con un espacio entre cada palabra.
+    // Pending space: it is only emitted if real text comes after it. Without this
+    // every tag leaves a gap and the text comes out with a space between every word.
     var space_pending = false;
-    // Saltos pendientes, como máximo 2 (el texto legible no lleva más).
+    // Pending breaks, at most 2 (readable text does not carry more).
     var nl_pending: u8 = 0;
 
     while (i < html.len) {
         const c = html[i];
         if (c == '<') {
-            // Comentario.
+            // Comment.
             if (std.mem.startsWith(u8, html[i..], "<!--")) {
                 i = (std.mem.indexOfPos(u8, html, i + 4, "-->") orelse html.len) + 3;
                 space_pending = true;
                 continue;
             }
             const end = tagEnd(html, i) orelse {
-                // No es un tag: el `<` va como texto (`a < b`).
+                // Not a tag: the `<` goes as text (`a < b`).
                 space_pending = flushSpace(arena, &out, &nl_pending, space_pending);
                 out.append(arena, '<') catch return "";
                 i += 1;
@@ -86,16 +86,16 @@ pub fn htmlToText(arena: std.mem.Allocator, html: []const u8) []const u8 {
             };
             const name = tagName(html[i..]);
             if (name.len > 0 and isDropTag(name)) {
-                // Sin cierre (un `<meta …>` suelto): solo se salta el tag.
+                // No closing tag (a loose `<meta …>`): only skip the tag itself.
                 i = closingTag(html, i, name) orelse end;
                 space_pending = true;
                 continue;
             }
             if (isBlockTag(name)) {
-                // `<br>`/`<hr>` FUERZAN un salto (dos, para dejar una línea en
-                // blanco). Los contenedores solo lo fuerzan si no estamos ya
-                // en un límite: `</li><li>` es UN salto, no dos, y con la regla
-                // tonta salía una línea en blanco entre cada item de lista.
+                // `<br>`/`<hr>` FORCE a break (two, to leave a blank
+                // line). Containers only force it if we are not already
+                // at a boundary: `</li><li>` is ONE break, not two, and with the naive
+                // rule a blank line came out between every list item.
                 const forces = std.ascii.eqlIgnoreCase(name, "br") or std.ascii.eqlIgnoreCase(name, "hr");
                 nl_pending = if (forces) 2 else if (nl_pending == 0) 1 else nl_pending;
                 space_pending = false;
@@ -109,23 +109,23 @@ pub fn htmlToText(arena: std.mem.Allocator, html: []const u8) []const u8 {
             continue;
         }
 
-        // Texto de verdad: primero los saltos pendientes, luego el texto.
+        // Real text: first the pending breaks, then the text.
         space_pending = flushSpace(arena, &out, &nl_pending, space_pending);
         i += appendEntity(arena, &out, html, i);
     }
 
-    // Cierre: sin espacio colgando ni saltos de más.
+    // Closing: no dangling space and no extra breaks.
     while (out.items.len > 0 and out.items[out.items.len - 1] == '\n') {
         _ = out.pop();
     }
     return out.items;
 }
 
-/// Vuelca el espacio/saltos pendientes ANTES de escribir texto de verdad.
+/// Flushes the pending space/breaks BEFORE writing real text.
 ///
-/// Un salto pendiente se come el espacio que lo precedía, y el espacio solo se
-/// escribe si el buffer no está ya en principio de línea: por eso el texto no
-/// sale con un hueco detrás de cada tag.
+/// A pending break eats the space that preceded it, and the space is only
+/// written if the buffer is not already at the start of a line: that is why the text does
+/// not come out with a gap after every tag.
 fn flushSpace(
     arena: std.mem.Allocator,
     out: *std.ArrayList(u8),
@@ -146,22 +146,22 @@ fn flushSpace(
     return false;
 }
 
-/// Nombre del tag que empieza en `rest` (que empieza por `<`).
+/// Name of the tag that starts in `rest` (which starts with `<`).
 fn tagName(rest: []const u8) []const u8 {
-    var j: usize = 1; // el '<'
+    var j: usize = 1; // the '<'
     if (j < rest.len and rest[j] == '/') j += 1;
     const start = j;
     while (j < rest.len and (std.ascii.isAlphanumeric(rest[j]) or rest[j] == '-')) j += 1;
     return rest[start..j];
 }
 
-/// Fin del tag que empieza en `i`, o null si no hay `>` antes del siguiente
-/// `<` (o del fin del texto).
+/// End of the tag that starts at `i`, or null if there is no `>` before the next
+/// `<` (or before the end of the text).
 ///
-/// OJO al `null`: `Tom & Jerry <3` NO es un tag, y si se tratara como tal se
-/// comería el resto de la línea. Un `<` sin `>` antes de otro `<` es texto.
+/// CAREFUL with the `null`: `Tom & Jerry <3` is NOT a tag, and treating it as
+/// one would eat the rest of the line. A `<` with no `>` before another `<` is text.
 fn tagEnd(html: []const u8, i: usize) ?usize {
-    var j = i + 1; // el '<' no cuenta como "el siguiente '<'"
+    var j = i + 1; // the '<' does not count as "the next '<'"
     while (j < html.len) : (j += 1) {
         switch (html[j]) {
             '>' => return j + 1,
@@ -176,14 +176,14 @@ fn isClosingTag(rest: []const u8) bool {
     return rest.len > 1 and rest[1] == '/';
 }
 
-/// Posición ABSOLUTA (justo después del `>`) del tag de cierre `name` que
-/// sigue al tag abierto en `open_at`.
+/// ABSOLUTE position (just after the `>`) of the closing tag `name` that
+/// follows the opening tag at `open_at`.
 ///
-/// OJO: el índice es del HTML entero, no de un slice que empiece en el tag.
-/// Antes se buscaba sobre `html[open_at..]` y se devolvía ese offset, que se
-/// usaba como absoluto: con `<head></head>` el salto acababa en el `/` del
-/// cierre y el `</head>` entero se colaba en el texto. Un índice que no es del
-/// buffer que se indexa es el peor tipo de bug posible: no da error, da basura.
+/// CAREFUL: the index is into the WHOLE html, not into a slice starting at the tag.
+/// It used to search over `html[open_at..]` and return that offset, which was
+/// then used as absolute: with `<head></head>` the jump landed on the `/` of the
+/// closing tag and the whole `</head>` slipped into the text. An index that is not
+/// into the buffer being indexed is the worst possible kind of bug: it gives no error, it gives garbage.
 fn closingTag(html: []const u8, open_at: usize, name: []const u8) ?usize {
     var needle_buf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buf, "</{s}", .{name}) catch return null;
@@ -192,14 +192,14 @@ fn closingTag(html: []const u8, open_at: usize, name: []const u8) ?usize {
     return gt + 1;
 }
 
-/// Escribe el texto desde `i`, decodificando entidades. Devuelve cuántos bytes
-/// del HTML se consumieron.
+/// Writes the text from `i`, decoding entities. Returns how many bytes
+/// of HTML were consumed.
 fn appendEntity(arena: std.mem.Allocator, out: *std.ArrayList(u8), html: []const u8, i: usize) usize {
     if (html[i] != '&') {
         out.append(arena, html[i]) catch return html.len - i;
         return 1;
     }
-    // `&` suelta (no es entidad) se escribe tal cual.
+    // A loose `&` (not an entity) is written as is.
     const semi = std.mem.indexOfScalarPos(u8, html, i, ';') orelse {
         out.append(arena, '&') catch {};
         return 1;
@@ -209,7 +209,7 @@ fn appendEntity(arena: std.mem.Allocator, out: *std.ArrayList(u8), html: []const
         out.append(arena, '&') catch {};
         return 1;
     }
-    // Numérica: &#39; &#x27;
+    // Numeric: &#39; &#x27;
     if (name[0] == '#') {
         const parsed: ?u21 = if (name.len > 1 and (name[1] == 'x' or name[1] == 'X'))
             (std.fmt.parseInt(u21, name[2..], 16) catch null)
@@ -231,9 +231,9 @@ fn appendEntity(arena: std.mem.Allocator, out: *std.ArrayList(u8), html: []const
     return 1;
 }
 
-/// Entidades nombradas. Solo las que aparecen de verdad en el texto de una
-/// página; una tabla de 250 nombres no compensa: lo que no está aquí se queda
-/// tal cual (`&foo;`), que es lo que se ve en el fuente.
+/// Named entities. Only the ones that really show up in the text of a
+/// page; a table of 250 names does not pay off: whatever is not here stays
+/// as is (`&foo;`), which is what you see in the source.
 fn namedEntity(name: []const u8) ?[]const u8 {
     const pairs = [_][2][]const u8{
         .{ "amp", "&" },      .{ "lt", "<" },        .{ "gt", ">" },
@@ -260,11 +260,11 @@ fn namedEntity(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Extrae resultados de búsqueda del HTML de DuckDuckGo (endpoint `html/`).
+/// Extracts search results from DuckDuckGo's HTML (`html/` endpoint).
 ///
-/// Devuelve texto con los resultados numerados: título, URL y snippet. Si no
-/// encuentra ninguno devuelve un mensaje que dice qué hacer (y no un error
-/// opaco), porque este scraper se rompe el día que cambien una clase del HTML.
+/// Returns text with the results numbered: title, URL and snippet. If it finds
+/// none it returns a message saying what to do (and not an
+/// opaque error), because this scraper breaks the day they change one of the HTML classes.
 pub fn searchResults(arena: std.mem.Allocator, html: []const u8, max: usize) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     var n: usize = 0;
@@ -276,7 +276,7 @@ pub fn searchResults(arena: std.mem.Allocator, html: []const u8, max: usize) []c
         const href_end = std.mem.indexOfScalarPos(u8, html, href_start, '"') orelse break;
         const href = html[href_start..href_end];
 
-        // El título va entre el `>` que cierra el `<a …>` y su `</a>`.
+        // The title sits between the `>` that closes the `<a …>` and its `</a>`.
         const title_start = (std.mem.indexOfScalarPos(u8, html, href_end, '>') orelse break) + 1;
         const title_end = std.mem.indexOfPos(u8, html, title_start, "</a>") orelse break;
 
@@ -292,7 +292,7 @@ pub fn searchResults(arena: std.mem.Allocator, html: []const u8, max: usize) []c
             out.print(arena, "   {s}\n", .{url}) catch return "";
         }
 
-        // El snippet va después del título, en otro `<a>`.
+        // The snippet comes after the title, in another `<a>`.
         if (std.mem.indexOfPos(u8, html, pos, "class=\"result__snippet\"")) |sn| {
             const s_start = (std.mem.indexOfScalarPos(u8, html, sn, '>') orelse sn) + 1;
             const s_end = std.mem.indexOfPos(u8, html, s_start, "</a>") orelse html.len;
@@ -308,7 +308,7 @@ pub fn searchResults(arena: std.mem.Allocator, html: []const u8, max: usize) []c
     return out.items;
 }
 
-/// La URL real detrás del enlace de DuckDuckGo (`//duckduckgo.com/l/?uddg=…`).
+/// The real URL behind the DuckDuckGo link (`//duckduckgo.com/l/?uddg=…`).
 fn realUrl(arena: std.mem.Allocator, href: []const u8) []const u8 {
     if (std.mem.indexOf(u8, href, "uddg=")) |at| {
         var rest = href[at + 5 ..];
@@ -322,7 +322,7 @@ fn realUrl(arena: std.mem.Allocator, href: []const u8) []const u8 {
     return href;
 }
 
-/// Texto de un trozo de HTML: quita etiquetas y decodifica entidades.
+/// Text of a chunk of HTML: strips tags and decodes entities.
 fn cleanText(arena: std.mem.Allocator, raw: []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -358,7 +358,7 @@ test "htmlToText: los saltos de bloque no dejan huecos" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const text = htmlToText(arena_state.allocator(), "<li>one</li><li>two</li><br><p>three</p>");
-    // Ni espacios sueltos al lado de los tags ni 5 saltos seguidos.
+    // Neither loose spaces next to the tags nor 5 breaks in a row.
     try std.testing.expectEqualStrings("one\ntwo\n\nthree", text);
 }
 
@@ -377,11 +377,11 @@ test "htmlToText no inventa texto con un & suelto" {
 }
 
 test "htmlToText: <head></head> vacío no deja el cierre en el texto" {
-    // Regresión: el salto al tag de cierre se calculaba sobre `html[i..]` y se
-    // usaba como índice del HTML entero. Con un `<head></head>` vacío el salto
-    // acababa en el `/` del cierre y el `</head>` entero salía en el texto.
-    // Lo peor del bug es que no da error: da basura, y el bucle puede no
-    // avanzar (la suite se colgaba).
+    // Regression: the jump to the closing tag was computed over `html[i..]` and
+    // used as an index into the whole HTML. With an empty `<head></head>` the jump
+    // landed on the `/` of the closing tag and the whole `</head>` came out in the text.
+    // The worst part of the bug is that it gives no error: it gives garbage, and the loop may not
+    // advance (the suite would hang).
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const text = htmlToText(arena_state.allocator(), "<html><head></head><p>a</p></html>");

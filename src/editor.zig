@@ -1,37 +1,37 @@
 const std = @import("std");
 
-/// Editor de input multilínea para la TUI.
+/// Multiline input editor for the TUI.
 ///
-/// `vxfw.TextField` es de una sola línea, y el input es justo donde más se
-/// nota la diferencia con Claude Code: pegar un stack trace, escribir un prompt
-/// largo, o revisar antes de mandar. Este editor cubre lo esencial:
+/// `vxfw.TextField` is single-line, and the input is exactly where the
+/// difference with Claude Code shows most: pasting a stack trace, writing a long
+/// prompt, or reviewing before sending. This editor covers the essentials:
 ///
-///  - buffer con cursor (byte offset), inserción y borrado por grapheme
-///  - Shift+Enter / Alt+Enter insertan un salto de línea
-///  - historial con ↑/↓ (recorre el prompt anterior)
-///  - Ctrl+A/E, Ctrl+←/→ y Alt+B/F para movimiento por palabra
-///  - Autocompletado de comandos `/` gestionado por el owner (aquí solo
-///    exponemos el texto para que lo consulten)
+///  - buffer with a cursor (byte offset), insertion and deletion per grapheme
+///  - Shift+Enter / Alt+Enter insert a line break
+///  - history with ↑/↓ (walks back through previous prompts)
+///  - Ctrl+A/E, Ctrl+←/→ and Alt+B/F for word-wise movement
+///  - `/` command autocompletion handled by the owner (here we only
+///    expose the text for it to consult)
 ///
-/// Todo el texto es UTF-8 y los saltos por palabra respetan graphemes, no
-/// bytes: `wörd` no se parte por la mitad de la `ö`.
+/// All the text is UTF-8 and word-wise jumps respect graphemes, not
+/// bytes: `wörd` never gets split in the middle of the `ö`.
 
 pub const max_history: usize = 100;
-/// Tope del buffer para que un pegado gigante no tumbe la TUI.
+/// Buffer cap so that a huge paste doesn't bring down the TUI.
 pub const max_bytes: usize = 256 * 1024;
 
 pub const Editor = struct {
     gpa: std.mem.Allocator,
     buf: std.ArrayList(u8) = .empty,
-    /// Offset del cursor en bytes dentro de `buf`.
+    /// Cursor offset in bytes inside `buf`.
     cursor: usize = 0,
-    /// Cursor de la línea actual cuando el texto tiene varias líneas.
+    /// Cursor of the current line when the text has multiple lines.
     history: std.ArrayList([]u8) = .empty,
-    /// Índice en `history` del prompt being editado (-1 = no recovered).
+    /// Index in `history` of the prompt being edited (-1 = none recovered).
     hist_idx: isize = -1,
-    /// Borrador de lo que había antes de navegar el historial.
+    /// Draft of what was there before browsing the history.
     draft: std.ArrayList(u8) = .empty,
-    /// Número de líneas lógicas del texto actual.
+    /// Number of logical lines in the current text.
     visual_lines: usize = 1,
 
     pub fn init(gpa: std.mem.Allocator) Editor {
@@ -53,8 +53,8 @@ pub const Editor = struct {
         return self.buf.items.len == 0;
     }
 
-    /// Inserta texto UTF-8 en el cursor. Recorta si `s` no cabe entero (un
-    /// pegado gigante no debe tumbar la TUI ni perder lo ya escrito).
+    /// Inserts UTF-8 text at the cursor. Truncates if `s` doesn't fit whole (a
+    /// huge paste must neither bring down the TUI nor lose what was already typed).
     pub fn insert(self: *Editor, s: []const u8) !void {
         if (s.len == 0) return;
         if (self.cursor + s.len > max_bytes) {
@@ -84,11 +84,11 @@ pub const Editor = struct {
         self.visual_lines = 1;
     }
 
-    // ── movimiento ───────────────────────────────────────────
+    // ── movement ─────────────────────────────────────────────
 
-    /// Inicio del grapheme anterior. `from` es un offset de byte válido, así
-    /// que el byte justo antes es el ÚLTIMO byte del grapheme previo: hay que
-    /// avanzar hacia atrás saltando los bytes de continuación hasta el líder.
+    /// Start of the previous grapheme. `from` is a valid byte offset, so the
+    /// byte just before it is the LAST byte of the previous grapheme: walk
+    /// backwards skipping continuation bytes until the leader.
     fn prevGraphemeStart(self: *const Editor, from: usize) usize {
         if (from == 0) return 0;
         var i = from - 1;
@@ -96,7 +96,7 @@ pub const Editor = struct {
         return i;
     }
 
-    /// Fin del grapheme que empieza en `from` (líder UTF-8).
+    /// End of the grapheme that starts at `from` (UTF-8 leader).
     fn nextGraphemeEnd(self: *const Editor, from: usize) usize {
         if (from >= self.buf.items.len) return self.buf.items.len;
         var i = from + 1;
@@ -130,7 +130,7 @@ pub const Editor = struct {
 
     pub fn moveWordLeft(self: *Editor) void {
         var i = self.cursor;
-        // Salta espacios hacia atrás, luego la palabra.
+        // Skip spaces backwards, then the word.
         while (i > 0 and isSpace(self.buf.items[i - 1])) i -= 1;
         while (i > 0 and !isSpace(self.buf.items[i - 1])) {
             i = self.prevGraphemeStart(i);
@@ -139,20 +139,20 @@ pub const Editor = struct {
         self.cursor = i;
     }
 
-    /// Avanza al inicio de la palabra siguiente. Equivale a pulsar Ctrl+→
-    /// dos veces en un editor de una línea: desde dentro de una palabra salta
-    /// al principio de la siguiente, no se queda en el espacio intermedio.
+    /// Advances to the start of the next word. Equivalent to pressing Ctrl+→
+    /// twice in a single-line editor: from inside a word it jumps to the start
+    /// of the next one, it doesn't stop on the space in between.
     pub fn moveWordRight(self: *Editor) void {
         const len = self.buf.items.len;
         var i = @min(self.cursor, len);
-        // 1. salta separadores y la palabra actual
+        // 1. skip the current word and its separators
         while (i < len and !isSpace(self.buf.items[i])) i = self.nextGraphemeEnd(i);
-        // 2. luego los separadores hasta la siguiente palabra
+        // 2. then the separators up to the next word
         while (i < len and isSpace(self.buf.items[i])) i += 1;
         self.cursor = i;
     }
 
-    // ── borrado ──────────────────────────────────────────────
+    // ── deletion ─────────────────────────────────────────────
 
     pub fn deleteBefore(self: *Editor) void {
         if (self.cursor == 0) return;
@@ -203,9 +203,9 @@ pub const Editor = struct {
         return out;
     }
 
-    // ── historial ────────────────────────────────────────────
+    // ── history ──────────────────────────────────────────────
 
-    /// Guarda el prompt actual y limpia el buffer (se llama al enviar).
+    /// Saves the current prompt and clears the buffer (called on send).
     pub fn commit(self: *Editor) void {
         const t = std.mem.trim(u8, self.buf.items, " \t\r\n");
         if (t.len > 0) {
@@ -213,7 +213,7 @@ pub const Editor = struct {
                 self.clear();
                 return;
             };
-            // No guardar duplicados consecutivos.
+            // Don't store consecutive duplicates.
             if (self.history.items.len == 0 or
                 !std.mem.eql(u8, self.history.items[self.history.items.len - 1], copy))
             {
@@ -229,10 +229,10 @@ pub const Editor = struct {
         self.clear();
     }
 
-    /// ↑: prompt anterior. Devuelve false si no hay más.
+    /// ↑: previous prompt. Returns false if there is no more.
     pub fn historyPrev(self: *Editor) bool {
         if (self.history.items.len == 0) return false;
-        // La primera vez guarda lo que había en el buffer como borrador.
+        // The first time, save what was in the buffer as the draft.
         if (self.hist_idx == -1) {
             self.draft.clearRetainingCapacity();
             self.draft.appendSlice(self.gpa, self.buf.items) catch {};
@@ -244,13 +244,13 @@ pub const Editor = struct {
         return true;
     }
 
-    /// ↓: prompt siguiente (o vuelve al borrador).
+    /// ↓: next prompt (or back to the draft).
     pub fn historyNext(self: *Editor) bool {
         if (self.hist_idx < 0) return false;
         if (@as(usize, @intCast(self.hist_idx)) >= self.history.items.len) return false;
         self.hist_idx += 1;
         if (@as(usize, @intCast(self.hist_idx)) >= self.history.items.len) {
-            // Pasado el final: vuelve a lo que se estaba escribiendo.
+            // Past the end: go back to what was being typed.
             self.setText(self.draft.items);
             self.hist_idx = -1;
             return true;
@@ -276,9 +276,9 @@ pub const Editor = struct {
         self.visual_lines = n;
     }
 
-    /// Número de líneas visuales que ocupa el texto a `width` columnas.
-    /// Cuenta hard breaks + wrap por columnas (no por bytes: un grapheme
-    /// ancho ocupa 2 columnas).
+    /// Number of visual lines the text occupies at `width` columns.
+    /// Counts hard breaks + wrap by columns (not by bytes: a wide grapheme
+    /// takes 2 columns).
     pub fn displayLines(self: *const Editor, width: u16) usize {
         if (width == 0) return self.visual_lines;
         const w: usize = width;
@@ -302,8 +302,8 @@ pub const Editor = struct {
         return @max(total, 1);
     }
 
-    /// Línea visual (0-based) donde cae el cursor, para dibujar el input.
-    /// Asume que el texto no hace wrap (o que el caller solo usa multilínea).
+    /// Visual line (0-based) where the cursor lands, for drawing the input.
+    /// Assumes the text doesn't wrap (or that the caller only uses multiline).
     pub fn cursorLine(self: *const Editor) usize {
         var line: usize = 0;
         var i: usize = 0;
@@ -318,7 +318,7 @@ fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
 }
 
-/// ¿Es un byte de continuación UTF-8 (10xxxxxx)?
+/// Is it a UTF-8 continuation byte (10xxxxxx)?
 fn isContinuation(c: u8) bool {
     return (c & 0xC0) == 0x80;
 }
@@ -360,17 +360,17 @@ test "insert no parte graphemes multibyte al borrar" {
     try e.insert("a\u{00f1}b");
     try std.testing.expectEqual(@as(usize, 4), e.cursor);
 
-    // El cursor está tras la 'b' (1 byte), así que eso es lo que se borra.
+    // The cursor is after the 'b' (1 byte), so that is what gets deleted.
     e.deleteBefore();
     try std.testing.expectEqualStrings("a\u{00f1}", e.text());
     try std.testing.expectEqual(@as(usize, 3), e.cursor);
 
-    // Ahora sí la ñ: los 2 bytes de golpe, nunca un byte suelto.
+    // Now the ñ: both bytes at once, never a lone byte.
     e.deleteBefore();
     try std.testing.expectEqualStrings("a", e.text());
     try std.testing.expectEqual(@as(usize, 1), e.cursor);
 
-    // Y de vuelta, insertando en medio.
+    // And back again, by inserting in the middle.
     e.deleteAfter();
     try std.testing.expectEqualStrings("a", e.text());
 }
@@ -384,20 +384,20 @@ test "movimiento por palabra" {
     e.moveToEnd();
 
     e.moveWordLeft();
-    try std.testing.expectEqual(@as(usize, 11), e.cursor); // inicio de "gamma"
+    try std.testing.expectEqual(@as(usize, 11), e.cursor); // start of "gamma"
     e.moveWordLeft();
-    try std.testing.expectEqual(@as(usize, 6), e.cursor); // inicio de "beta"
+    try std.testing.expectEqual(@as(usize, 6), e.cursor); // start of "beta"
 
     e.moveWordRight();
     try std.testing.expectEqual(@as(usize, 11), e.cursor);
     e.moveWordRight();
-    try std.testing.expectEqual(@as(usize, 16), e.cursor); // fin
+    try std.testing.expectEqual(@as(usize, 16), e.cursor); // end
 
-    // Desde el inicio, un word-jump adelante llega al inicio de "beta".
+    // From the start, one word-jump forward lands on the start of "beta".
     e.moveToStart();
     e.moveWordRight();
     try std.testing.expectEqual(@as(usize, 6), e.cursor);
-    // Y desde ahí, al de "gamma".
+    // And from there, on "gamma".
     e.moveWordRight();
     try std.testing.expectEqual(@as(usize, 11), e.cursor);
 }
@@ -455,7 +455,7 @@ test "historial: ↑/↓ con borrador" {
     try e.insert("tercero");
     e.commit();
 
-    // El buffer está vacío tras commit.
+    // The buffer is empty after commit.
     try std.testing.expect(e.isEmpty());
 
     try std.testing.expect(e.historyPrev());
@@ -464,10 +464,10 @@ test "historial: ↑/↓ con borrador" {
     try std.testing.expectEqualStrings("segundo", e.text());
     try std.testing.expect(e.historyPrev());
     try std.testing.expectEqualStrings("primero", e.text());
-    // No hay más atrás.
+    // No more further back.
     try std.testing.expect(!e.historyPrev());
 
-    // Hacia abajo vuelve a avanzar y acaba en el borrador (vacío).
+    // Going down advances again and ends on the draft (empty).
     try std.testing.expect(e.historyNext());
     try std.testing.expectEqualStrings("segundo", e.text());
     try std.testing.expect(e.historyNext());
@@ -486,7 +486,7 @@ test "historial guarda el borrador si no se envía" {
     try e.insert("borrador a medias");
     try std.testing.expect(e.historyPrev());
     try std.testing.expectEqualStrings("guardado", e.text());
-    // Al bajar del todo vuelve al borrador, no a vacío.
+    // Going all the way down returns to the draft, not to empty.
     try std.testing.expect(e.historyNext());
     try std.testing.expectEqualStrings("borrador a medias", e.text());
 }

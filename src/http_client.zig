@@ -1,9 +1,9 @@
 const std = @import("std");
 
-/// Cliente HTTP JSON sobre std.http.Client (Zig 0.16).
+/// JSON HTTP client on top of std.http.Client (Zig 0.16).
 ///
-/// NOTA: `Request` se alina en heap porque `receiveHead` y `bodyReader`
-/// guardan punteros internos al request.
+/// NOTE: `Request` is heap-allocated because `receiveHead` and `bodyReader`
+/// keep internal pointers to the request.
 pub const Http = struct {
     client: std.http.Client,
     gpa: std.mem.Allocator,
@@ -26,18 +26,18 @@ pub const Http = struct {
 
     pub const JsonResult = struct {
         status: u16,
-        body: []u8, // el caller libera con `freeBody`
-        /// Valor del header `retry-after` en segundos, si vino.
+        body: []u8, // the caller frees with `freeBody`
+        /// Value of the `retry-after` header in seconds, if the server sent one.
         retry_after: ?u16 = null,
     };
 
-    // NO hay `content_type` aqui a proposito: `receiveHead` deja los headers en
-    // el buffer de redirects, que es de STACK y muere al salir de `request`. Un
-    // `?[]const u8` a ese buffer colgado no da error de compilacion: da basura
-    // (y un crash en ReleaseSafe) el primer dia que alguien lea el campo. Quien
-    // necesite el tipo lo deduce del body, que si vive en `body`.
+    // There is deliberately NO `content_type` here: `receiveHead` leaves the headers
+    // in the redirect buffer, which lives on the STACK and dies when `request`
+    // returns. A `?[]const u8` pointing at that dead buffer is not a compile
+    // error: it yields garbage (and a crash in ReleaseSafe) the first day
+    // someone reads the field. The type is deduced from the body instead.
 
-    /// Header adicional para APIs que no usan Bearer (ej: x-api-key de Anthropic).
+    /// Extra header for APIs that do not use Bearer (e.g: Anthropic's x-api-key).
     pub const ExtraHeader = struct {
         name: []const u8,
         value: []const u8,
@@ -47,22 +47,22 @@ pub const Http = struct {
         self.gpa.free(body);
     }
 
-    /// Resultado de un request sin cuerpo de respuesta (streaming).
+    /// Result of a request with no response body (streaming).
     pub const StreamResult = struct {
         status: u16,
         retry_after: ?u16 = null,
     };
 
-    /// Callback invocado con cada trozo de bytes tal cual llega. Devolver
-    /// `error.Cancelled` aborta la lectura (el caller ve ese error).
+    /// Callback invoked with each chunk of bytes as it arrives. Returning
+    /// `error.Cancelled` aborts the read (the caller sees that error).
     pub const ChunkFn = *const fn (userdata: ?*anyopaque, chunk: []const u8) anyerror!void;
 
-    /// POST que entrega el body POR TROZOS en vez de acumularlo entero.
+    /// POST that delivers the body IN CHUNKS instead of buffering it whole.
     ///
-    /// Esto es lo que hace que el streaming SSE sea real: con `request()` el
-    /// body se bufferea completo (hasta 10 MB) y solo se parsea al final, así
-    /// que la TUI se queda congelada durante toda la generación. Aquí cada
-    /// chunk se entrega en cuanto llega desde el socket.
+    /// This is what makes SSE streaming real: with `request()` the body is
+    /// buffered completely (up to 10 MB) and only parsed at the end, so the
+    /// TUI stays frozen for the whole generation. Here every chunk is handed
+    /// over as soon as it arrives from the socket.
     pub fn streamPost(
         self: *Http,
         url: []const u8,
@@ -81,17 +81,17 @@ pub const Http = struct {
         const status: u16 = @intFromEnum(response.head.status);
         const retry_after = parseRetryAfter(response.head);
 
-        // El buffer de transferencia va al HEAP (5.5 del ROADMAP), no a la pila: son
-        // 256 KiB residentes durante toda la descarga y, con el stack por defecto
-        // de `std.Thread`, dejarían una trampa para el día que alguien lo baje.
+        // The transfer buffer goes on the HEAP (5.5 of the ROADMAP), not the stack:
+        // it is 256 KiB resident for the whole download and, with the default
+        // `std.Thread` stack, it would be a trap for the day someone lowers it.
         const transfer_buf = try self.gpa.alloc(u8, 256 * 1024);
         defer self.gpa.free(transfer_buf);
         var reader = response.reader(transfer_buf);
-        // `takeDelimiter` exige que el delimitador quepa en el buffer: una
-        // línea SSE más larga (un tool call enorme, un delta gigante) lo hace
-        // fallar con StreamTooLong y MATABA el stream a mitad de respuesta.
-        // Cuando ocurre, el buffer está lleno de una línea sin cerrar: se
-        // entrega tal cual y se sigue, porque el parser reensambla parciales.
+        // `takeDelimiter` requires the delimiter to fit in the buffer: a longer SSE
+        // line (a huge tool call, a giant delta) makes it fail with
+        // StreamTooLong and it KILLED the stream mid-response. When that
+        // happens the buffer holds a full unterminated line: it is delivered
+        // as-is and we keep going, because the parser reassembles partials.
         while (true) {
             const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
@@ -113,27 +113,27 @@ pub const Http = struct {
         return .{ .status = status, .retry_after = retry_after };
     }
 
-    /// GET que devuelve el body completo (límite 10MB).
+    /// GET that returns the whole body (10MB limit).
     pub fn get(self: *Http, url: []const u8, bearer: ?[]const u8) !JsonResult {
         return self.request(.GET, url, bearer, null, &.{});
     }
 
-    /// GET con headers propios.
+    /// GET with its own headers.
     ///
-    /// Lo necesita la tool de web: medio internet (Cloudflare, GitHub, Wikipedia)
-    /// devuelve 403 al `User-Agent` por defecto de std, que es `zig`, y la
-    /// respuesta de un 403 no dice nada de lo que había detrás.
+    /// The web tool needs it: half the internet (Cloudflare, GitHub, Wikipedia)
+    /// returns 403 to std's default `User-Agent`, which is `zig`, and a 403
+    /// response says nothing about what was behind it.
     pub fn getWithHeaders(self: *Http, url: []const u8, headers: []const ExtraHeader) !JsonResult {
         return self.request(.GET, url, null, null, headers);
     }
 
-    /// POST con body JSON. Devuelve el body completo (para SSE: `sendSse`).
-    /// `body` debe ser mutable por la firma de std (`sendBodyComplete`).
+    /// POST with a JSON body. Returns the whole body (for SSE: `sendSse`).
+    /// `body` must be mutable because of std's signature (`sendBodyComplete`).
     pub fn postJson(self: *Http, url: []const u8, bearer: ?[]const u8, body: []u8) !JsonResult {
         return self.request(.POST, url, bearer, body, &.{});
     }
 
-    /// POST con headers adicionales (ej: x-api-key de Anthropic).
+    /// POST with extra headers (e.g: Anthropic's x-api-key).
     pub fn postJsonWithHeaders(
         self: *Http,
         url: []const u8,
@@ -143,8 +143,8 @@ pub const Http = struct {
         return self.request(.POST, url, null, body, headers);
     }
 
-    /// Abre un request y envía el body. El caller hace `deinit` + `destroy`.
-    /// `streaming` añade los headers de SSE.
+    /// Opens a request and sends the body. The caller does `deinit` + `destroy`.
+    /// `streaming` adds the SSE headers.
     fn openRequest(
         self: *Http,
         method: std.http.Method,
@@ -173,8 +173,8 @@ pub const Http = struct {
             extra_len += 1;
         }
         if (streaming) {
-            // Muchos gateways (vLLM, Ollama, proxies) renegocian el stream
-            // según estos headers; sin ellos pueden devolver JSON de error.
+            // Many gateways (vLLM, Ollama, proxies) renegotiate the stream
+            // depending on these headers; without them they may return error JSON.
             extra[extra_len] = .{ .name = "accept", .value = "text/event-stream" };
             extra_len += 1;
             extra[extra_len] = .{ .name = "cache-control", .value = "no-cache" };
@@ -191,7 +191,7 @@ pub const Http = struct {
         req.* = try self.client.request(method, uri, .{
             .extra_headers = extra[0..extra_len],
             .redirect_behavior = @enumFromInt(3),
-            // Sin compresión: evita depender del decompress transparente
+            // No compression: avoids depending on transparent decompression
             .headers = .{ .accept_encoding = .omit },
         });
         errdefer req.deinit();
@@ -231,7 +231,7 @@ pub const Http = struct {
     }
 };
 
-/// Lee `retry-after` (segundos) de la respuesta, si el server lo mandó.
+/// Reads `retry-after` (seconds) from the response, if the server sent it.
 fn parseRetryAfter(head: anytype) ?u16 {
     var it = head.iterateHeaders();
     while (it.next()) |h| {
