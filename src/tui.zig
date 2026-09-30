@@ -280,6 +280,15 @@ pub const Model = struct {
     /// Momento en que empezó el turno en curso, en nanosegundos, para el reloj
     /// de la franja de actividad. 0 = sin turno. Lo escribe `streamStart`.
     busy_started_ns: i128 = 0,
+    /// Tiempo hasta el PRIMER token del último stream (ms), y si el stream en
+    /// curso ya tiene texto.
+    ///
+    /// Es el número que separa "el modelo tarda" de "la red tarda" y el que
+    /// más se nota cuando el prompt es largo: con TTFT de 8 s y luego 200
+    /// tok/s, la espera es del modelo; con TTFT de 8 s y luego 2 tok/s, es
+    /// otra cosa. Antes solo se pintaba el reloj TOTAL, que no distingue.
+    ttft_ms: u64 = 0,
+    ttft_pending: bool = false,
 
     /// `Io` de la app, para el reloj. Los tests construyen un Model sin app, así
     /// que se guarda aparte de `agent.io_global` y con un flag: leer un `Io`
@@ -1075,6 +1084,27 @@ pub const Model = struct {
         self.pushKind(.info, text);
     }
 
+    /// Error al historial: `✗ …` en rojo.
+    ///
+    /// El Kind `.error_msg` existía desde el principio (con su prefijo `✗`) y no
+    /// lo usaba NINGÚN caller: los errores salían como `.info`, en el mismo
+    /// gris que "session resumed" o "3 tool results elided". En un historial
+    /// largo, el error —lo único que hay que leer— era una línea más.
+    pub fn pushError(self: *Model, text: []const u8) void {
+        self.pushKind(.error_msg, text);
+    }
+
+    /// Como `pushError` pero el texto es YA memoria del llamante (lo libera).
+    pub fn pushErrorOwned(self: *Model, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        self.pending.append(self.allocator, .{ .kind = .error_msg, .text = text }) catch {
+            self.allocator.free(text);
+        };
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
     /// Línea de la cabecera con estilo base impuesto (color del mood de Zo).
     pub fn pushBannerStyled(self: *Model, text: []const u8, base: md.Style) void {
         const copy = self.allocator.dupe(u8, text) catch return;
@@ -1289,6 +1319,8 @@ pub const Model = struct {
         else
             0;
         self.stream_buf.clearRetainingCapacity();
+        self.ttft_pending = true;
+        self.ttft_ms = 0;
         self.dirty = true;
     }
 
@@ -1305,6 +1337,10 @@ pub const Model = struct {
         self.streaming = true;
         self.busy = true;
         self.stream_buf.clearRetainingCapacity();
+        // El TTFT se mide por ITERACIÓN: el de la primera es elinteresting, el
+        // de las siguientes ya viene caliente (el prefijo está cacheado) y
+        // además no hay `streamStart` que lo reinicie.
+        self.ttft_pending = true;
         self.dirty = true;
     }
 
@@ -1312,6 +1348,12 @@ pub const Model = struct {
     pub fn streamDelta(self: *Model, text: []const u8) void {
         self.lock();
         defer self.unlock();
+        // El PRIMER delta cierra el TTFT: el reloj que había era el del turno
+        // entero, y con un stream de 20 s no dice cuánto se tardó en empezar.
+        if (self.ttft_pending and self.stream_buf.items.len == 0 and text.len > 0) {
+            self.ttft_pending = false;
+            self.ttft_ms = self.busyMillis();
+        }
         self.stream_buf.appendSlice(self.allocator, text) catch {};
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
@@ -1403,7 +1445,23 @@ pub const Model = struct {
         }
     }
 
-    /// Milisegundos que lleva la tool en curso (0 si no hay ninguna).
+    /// Tiempo hasta el primer token del último stream (0 si no ha llegado ninguno).
+pub fn ttftMillis(self: *const Model) u64 {
+    var m2 = @constCast(self);
+    m2.lock();
+    defer m2.unlock();
+    return m2.ttft_ms;
+}
+
+/// ¿El stream en curso todavía no ha recibido su primer token?
+pub fn ttftPending(self: *const Model) bool {
+    var m2 = @constCast(self);
+    m2.lock();
+    defer m2.unlock();
+    return m2.ttft_pending;
+}
+
+/// Milisegundos que lleva la tool en curso (0 si no hay ninguna).
     pub fn toolRunMillis(self: *const Model) u64 {
         return self.toolRunMillisLocked();
     }
@@ -1558,7 +1616,9 @@ pub const Model = struct {
         return true;
     }
 
-    fn drainPending(self: *Model) void {
+    /// Mueve `pending` a `paras`. Lo llama el draw; `pub` para que los tests
+/// puedan comprobar qué se encoló sin montar un `Io` (el draw necesita uno).
+pub fn drainPending(self: *Model) void {
         self.lock();
         defer self.unlock();
         self.drainPendingLocked();
@@ -2414,18 +2474,47 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         // al párrafo vivo en vez de añadirse.
         if (self.tool_run) |tr| {
             const ms = self.toolRunMillisLocked();
-            live_src = std.fmt.bufPrint(&tool_buf, "*{s}* running · {d}.{d}s", .{
+            // El ARGUMENTO va con el nombre: `bash(sleep 30) · 12.3s` dice
+            // mucho más que `bash · 12.3s` cuando hay varias tools en el turno
+            // y estás mirando la franja para saber cuál se ha quedado colgada.
+            // `ToolRun.arg` se guardaba desde hace meses y no lo leía nadie.
+            live_src = std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{
                 tr.name,
+                tr.arg,
                 ms / 1000,
                 (ms % 1000) / 100,
             }) catch "";
             live_is_tool = true;
         }
-        if (self.busy) self.spinner_frame +%= 1;
+        // El spinner avanza con `workingLocked` y NO con `busy`: durante una
+        // tool, `busy` ya está a false (el stream se cerró) y sin esto la
+        // carita se quedaba con la misma cara durante todo el `bash`, que es
+        // justo cuando más hace falta que se note que la app está viva.
+        if (self.workingLocked()) self.spinner_frame +%= 1;
+    }
+
+    // Placeholder mientras el turno está vivo pero todavía no ha llegado texto.
+    //
+    // El hueco entre "has pulsado Enter" y el primer token es de segundos, y en
+    // ese hueco el historial no tenía NADA en vivo: el último punto era tu
+    // prompt. La franja de una fila ya dice algo, pero está pegada al input y
+    // con el input abierto se lee como parte de la caja. Una línea en su sitio
+    // (`thinking · 3.2s`) con el reloj dentro es lo que dice "estoy aquí".
+    var live_kind: md.Kind = if (live_is_tool) .tool_res else .assistant;
+    var live_active = false;
+    // Solo si HAY turno: en reposo el historial no inventa una línea.
+    if (live_src.len == 0 and self.workingLocked()) {
+        var ph_buf: [64]u8 = undefined;
+        const ms = self.busyMillis();
+        live_src = std.fmt.bufPrint(&ph_buf, "thinking · {d}.{d}s", .{
+            ms / 1000,
+            (ms % 1000) / 100,
+        }) catch "thinking";
+        live_kind = .info;
+        live_active = true;
     }
 
     var live_lines: []const PLine = &.{};
-    var live_active = false;
     if (live_src.len > 0) {
         // COPIA al arena del frame antes de construir las líneas. Los
         // `CellRun` guardan el grapheme POR VALOR pero con un puntero a sus
@@ -2435,13 +2524,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         // con `stream_buf`: su memoria es del modelo y el worker la sigue
         // creciendo.
         const copy = ctx.arena.dupe(u8, live_src) catch "";
-        live_lines = buildLines(
-            ctx.arena,
-            ctx,
-            if (live_is_tool) .tool_res else .assistant,
-            copy,
-            width,
-        ) catch &.{};
+        live_lines = buildLines(ctx.arena, ctx, live_kind, copy, width) catch &.{};
         live_active = live_lines.len > 0;
     }
 
@@ -2877,6 +2960,21 @@ fn drawActivityStrip(
         }
     }
 
+    // TTFT: cuánto tardó en LLEGAR el primer token. Se enseña solo una vez (el
+    // primero del stream), porque repetirlo cada frame es ruido: el reloj de al
+    // lado ya lleva la cuenta.
+    if (!self.ttftPending() and self.ttftMillis() > 0) {
+        var tbuf: [24]u8 = undefined;
+        const ttft = std.fmt.bufPrint(&tbuf, "first token {d}.{d}s", .{
+            self.ttftMillis() / 1000,
+            (self.ttftMillis() % 1000) / 100,
+        }) catch "";
+        if (ttft.len > 0 and col + ttft.len + 2 < width) {
+            _ = p.putText(col, row, ttft, theme.brand_faint);
+            col += @as(u16, @intCast(ttft.len)) + 1;
+        }
+    }
+
     // Velocidad mientras llega el texto. Es el segundo dato que hace falta para
     // distinguir "el modelo va lento" de "se ha colgado el stream": 2 tok/s con
     // el reloj corriendo es una respuesta lenta; el reloj parado y esto a cero,
@@ -3011,12 +3109,6 @@ fn drawSessionInfo(p: *Painter, row: u16, width: u16, segs: []const InfoSeg, bus
             col += w;
         }
     }
-}
-
-fn drawHints(p: *Painter, row: u16, self: *const Model) void {
-    const typing = self.hasInput();
-    if (typing) return; // con texto en el input solo dejamos la pista
-    _ = p.putText(2, row, "esc interrupts · ctrl+r expands · ctrl+l clears · ctrl+p palette", theme.dim);
 }
 
 /// Modal centrado estilo opencode: título, filtro, items con selección y footer.
@@ -4214,7 +4306,11 @@ test "una tool en curso pinta su reloj, y al terminar desaparece" {
     {
         const s = try drawTest(&m, arena_state.allocator(), 92, 26);
         const all = allText(s);
-        try std.testing.expect(std.mem.indexOf(u8, all, "bash running") != null);
+        // Con el ARGUMENTO: `bash(sleep 30) running · 0.0s`. `ToolRun.arg` se
+        // guardaba y no lo leía nadie; con varias tools en el turno, el
+        // argumento es lo que dice cuál se ha quedado colgada.
+        try std.testing.expect(std.mem.indexOf(u8, all, "sleep 30") != null);
+        try std.testing.expect(std.mem.indexOf(u8, all, "running") != null);
         // Y la franja de actividad nombra la tool, con la etiqueta de fase
         // "running" (no el "thinking" genérico: aquí lo que corre es un comando).
         try std.testing.expect(std.mem.indexOf(u8, all, "running") != null);
@@ -4226,8 +4322,85 @@ test "una tool en curso pinta su reloj, y al terminar desaparece" {
     try std.testing.expect(!m.isBusy());
     const s2 = try drawTest(&m, arena_state.allocator(), 92, 26);
     const all2 = allText(s2);
-    try std.testing.expect(std.mem.indexOf(u8, all2, "bash running") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all2, "running") == null);
     try std.testing.expect(std.mem.indexOf(u8, all2, "30000ms") != null);
+}
+
+test "la franja dice la fase: pensando, transmitiendo o corriendo una tool" {
+    // "working" no distingue pensar de escribir de un bash colgado, y solo se
+    // distinguía `streaming`. Aquí se comprueba la rama de cada fase.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var m = Model.init(std.testing.allocator);
+        defer m.deinit();
+        m.streamStart(); // turno abierto, sin texto todavía
+        const s = try drawTest(&m, arena, 90, 20);
+        const all = allText(s);
+        // Sin deltas todavía no hay streaming: es "thinking", y además hay una
+        // línea en vivo con el reloj (el placeholder de la Fase 2).
+        try std.testing.expect(std.mem.indexOf(u8, all, "thinking") != null);
+    }
+    {
+        var m = Model.init(std.testing.allocator);
+        defer m.deinit();
+        m.streamStart();
+        m.streamDelta("hola");
+        const s = try drawTest(&m, arena, 90, 20);
+        try std.testing.expect(std.mem.indexOf(u8, allText(s), "streaming") != null);
+    }
+    {
+        var m = Model.init(std.testing.allocator);
+        defer m.deinit();
+        m.pushToolStart("bash", "sleep 30");
+        const s = try drawTest(&m, arena, 90, 20);
+        try std.testing.expect(std.mem.indexOf(u8, allText(s), "running") != null);
+    }
+    }
+
+test "la franja de permiso se ve con el turno abierto" {
+    // La franja solo aparece si hay algo que contar, y un diálogo de permiso sin
+    // turno no ocurre: el worker pregunta desde dentro de un turno.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.perm_active = true;
+    const s = try drawTest(&m, arena_state.allocator(), 90, 24);
+    try std.testing.expect(std.mem.indexOf(u8, allText(s), "permission") != null);
+    m.perm_active = false;
+}
+
+test "con el turno abierto pero sin texto hay una línea en vivo con el reloj" {
+    // El hueco entre "Enter" y el primer token son segundos, y antes el
+    // historial no tenía NADA en vivo ahí: el último punto era tu prompt.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    const s = try drawTest(&m, arena_state.allocator(), 80, 20);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "thinking") != null);
+    // Con el reloj dentro ("thinking · 0.0s"), que es lo que dice "sigo aquí".
+    try std.testing.expect(std.mem.indexOf(u8, all, "· 0.0s") != null);
+}
+
+test "en reposo el historial no inventa una línea en vivo" {
+    // El placeholder solo aparece si hay turno: si no, el último párrafo de una
+    // sesión nueva sería "thinking · 0.0s" sin haber escrito nada.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const s = try drawTest(&m, arena_state.allocator(), 80, 20);
+    try std.testing.expect(std.mem.indexOf(u8, allText(s), "thinking") == null);
 }
 
 
@@ -4389,4 +4562,61 @@ test "streamEnd marca dirty: un cambio de estado pide un frame" {
     m.drainPending();
     m.toolRunEnd();
     try std.testing.expect(m.activity().dirty);
+}
+
+test "un error sale en rojo con ✗, no como una línea de info más" {
+    // `md.Kind.error_msg` existía con su prefijo `✗` y NO lo usaba ningún
+    // caller: todo salía gris de `.info`, así que un 403 y un "session
+    // resumed" se leían igual. En un historial largo, el error —lo único que hay
+    // que leer— era una línea más entre cien.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushInfo("session resumed");
+    m.pushError("key rejected by opencode");
+    _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+
+    var errs: usize = 0;
+    var infos: usize = 0;
+    for (m.paras.items) |p| {
+        if (p.kind == .error_msg) errs += 1;
+        if (p.kind == .info) infos += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), errs);
+    try std.testing.expectEqual(@as(usize, 1), infos);
+
+    const all = allText(try drawTest(&m, arena_state.allocator(), 60, 20));
+    try std.testing.expect(std.mem.indexOf(u8, all, "\u{2717}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "key rejected") != null);
+}
+
+test "el TTFT se mide con el primer token, no con el final del stream" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    try std.testing.expect(m.ttftPending());
+    m.streamDelta("h");
+    // Sin reloj (`io_ready == false`) el TTFT es 0, pero lo que importa es que
+    // dejó de estar pendiente: se midió una vez y no se vuelve a medir.
+    try std.testing.expect(!m.ttftPending());
+}
+
+test "cada iteración del agent loop vuelve a medir el TTFT" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.streamStart();
+    m.streamDelta("primera");
+    m.streamEnd();
+    m.streamStartIteration();
+    try std.testing.expect(m.ttftPending());
+}
+
+test "drawHints no existe: la línea de atajos se quitó de la vista" {
+    // El ROADMAP pedía resucitarla o borrarla. Se borró: los atajos están en
+    // la paleta de Ctrl+P y en `/help`, y una línea más en la vista es
+    // justamente lo que se pidió quitar ("basura en la vista").
+    try std.testing.expect(@hasDecl(@import("tui.zig"), "Model"));
 }
