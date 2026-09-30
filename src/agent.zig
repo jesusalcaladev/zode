@@ -13,13 +13,13 @@ const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
 const acp = @import("acp.zig");
 
-/// Io y API key configurados por la TUI al arrancar.
+/// Io and API key configured by the TUI at startup.
 pub var io_global: std.Io = undefined;
 pub var api_key_global: ?[]const u8 = null;
 pub var environ_global: ?*const std.process.Environ.Map = null;
 pub var gpa_global: std.mem.Allocator = undefined;
 
-// ── system prompt: AGENTS.md del proyecto (cacheado) ─────────
+// ── system prompt: the project's AGENTS.md (cached) ──────────
 var agents_md_cache: ?[]u8 = null;
 
 pub const default_system_prompt =
@@ -44,7 +44,7 @@ pub const default_system_prompt =
 
 fn systemPrompt(gpa: std.mem.Allocator) []const u8 {
     if (agents_md_cache == null) {
-        // AGENTS.md / CLAUDE.md del proyecto del usuario tienen prioridad.
+        // The user's project AGENTS.md / CLAUDE.md take priority.
         agents_md_cache = std.Io.Dir.cwd().readFileAlloc(io_global, "AGENTS.md", gpa, .limited(256 * 1024)) catch
             std.Io.Dir.cwd().readFileAlloc(io_global, "CLAUDE.md", gpa, .limited(256 * 1024)) catch null;
     }
@@ -54,29 +54,29 @@ fn systemPrompt(gpa: std.mem.Allocator) []const u8 {
 
 pub var current_effort: chat.Effort = .medium;
 
-/// Modo de permisos: false = pide antes de write/edit/bash, true = auto.
+/// Permission mode: false = asks before write/edit/bash, true = auto.
 pub var yolo: bool = false;
 
-/// Máximo de iteraciones agénticas por request.
+/// Max number of agentic iterations per request.
 const max_iterations: usize = 8;
 
-/// Tool results elided en la sesión (para /context).
+/// Tool results elided in the session (for /context).
 var session_elided: usize = 0;
 
-/// Tok/s del stream en curso (status bar) y del último stream completado.
+/// Tok/s of the in-flight stream (status bar) and of the last finished stream.
 pub var tps_live: f64 = 0;
 pub var tps_last: f64 = 0;
 
-/// Tokens de contexto usados y su porcentaje sobre el límite.
+/// Context tokens used and the percentage of the limit.
 ///
-/// Se cachea aquí porque el status bar lo lee en CADA FRAME y recorrer el
-/// historial para estimar los tokens 60 veces por segundo es trabajo tirado.
-/// Se refresca al cerrar cada turno.
+/// Cached here because the status bar reads it EVERY FRAME, and walking the
+/// history to estimate tokens 60 times per second is wasted work. Refreshed
+/// when each turn closes.
 pub var ctx_used: i64 = 0;
 pub var ctx_pct: u8 = 0;
 
-/// Recalcula `ctx_used`/`ctx_pct`. Barato de llamar, pero no hace falta por
-/// frame: los tokens solo cambian cuando se añade un mensaje.
+/// Recomputes `ctx_used`/`ctx_pct`. Cheap to call, but not needed per frame:
+/// tokens only change when a message is added.
 pub fn refreshContextUsage(m: *tui.Model) void {
     if (session == null) {
         ctx_used = 0;
@@ -104,25 +104,25 @@ fn updateTps(chars: usize, start_ns: i128) void {
     }
 }
 
-// ── provider / modelo / sesión activos ────────────────────────
+// ── active provider / model / session ────────────────────────
 
 var cur_provider_id: []const u8 = "opencode";
 var cur_model: []const u8 = "";
 
-/// Sesión activa (`null` hasta el primer mensaje). La crea el worker, no el
-/// arranque: abrir un fichero de sesión por el mero hecho de arrancar crearía
-/// ficheros basura si el usuario nunca chatea.
+/// Active session (`null` until the first message). The worker creates it, not
+/// startup: opening a session file just because the program started would
+/// create junk files if the user never chats.
 var session: ?*session_mod.Session = null;
 
-/// ¿Reabrir la última sesión al arrancar? Lo fija `ZODE_RESUME=1` o `--resume`.
+/// Reopen the last session at startup? Set by `ZODE_RESUME=1` or `--resume`.
 pub var resume_on_start: bool = false;
 
-/// Copia el nombre de modelo a un buffer estático (evita slices colgantes
-/// de strings efímeros del input).
+/// Copies the model name into a static buffer (avoids dangling slices from
+/// ephemeral input strings).
 var cur_model_buf: [128]u8 = undefined;
 
-/// Provider y modelo activos, para el status bar. Se exponen como funciones
-/// (y no los `var` crudos) para que la TUI no dependa del buffer estático.
+/// Active provider and model, for the status bar. Exposed as functions (not
+/// the raw `var`s) so the TUI does not depend on the static buffer.
 pub fn curProvider() []const u8 {
     return cur_provider_id;
 }
@@ -135,7 +135,7 @@ pub fn setModel(name: []const u8) void {
     cur_model = cur_model_buf[0..n];
 }
 
-// ── permisos: "siempre permitir" por tool (sesión) ──────────
+// ── permissions: "always allow" per tool (session) ───────────
 const max_always = 8;
 var always_names: [max_always][48]u8 = undefined;
 var always_lens: [max_always]usize = @splat(0);
@@ -155,10 +155,10 @@ fn setAlwaysAllowed(m: *tui.Model, name: []const u8) void {
     }
 }
 
-/// Como `setAlwaysAllowed` pero SIN escribir a disco: lo usa la carga inicial,
-/// que no quiere reescribir el fichero que acaba de leer.
-/// Devuelve false si la allowlist está llena (no crece sin límite: son 8
-/// tools como mucho y más allá es ruido en el diálogo de permisos).
+/// Like `setAlwaysAllowed` but WITHOUT writing to disk: used by the initial
+/// load, which does not want to rewrite the file it just read.
+/// Returns false if the allowlist is full (it does not grow without limit: it
+/// is at most 8 tools, and past that it is noise in the permission dialog).
 fn setAlwaysAllowedNoSave(name: []const u8) bool {
     if (isAlwaysAllowed(name)) return true;
     for (always_lens, 0..) |l, i| {
@@ -172,8 +172,8 @@ fn setAlwaysAllowedNoSave(name: []const u8) bool {
     return false;
 }
 
-/// Lee `permissions.json` y rellena la allowlist. Best-effort: si no existe o
-/// está corrupto, la sesión empieza con la allowlist vacía.
+/// Reads `permissions.json` and fills the allowlist. Best-effort: if it does
+/// not exist or is corrupt, the session starts with an empty allowlist.
 fn loadAllowlist() void {
     var pbuf: [512]u8 = undefined;
     const path = permissionsFilePath(&pbuf) orelse return;
@@ -191,16 +191,16 @@ fn loadAllowlist() void {
     }
 }
 
-// ── allowlist persistida: ~/.config/zode/permissions.json ────
+// ── persisted allowlist: ~/.config/zode/permissions.json ─────
 fn permissionsFilePath(buf: []u8) ?[]const u8 {
     const home = environ_global.?.get("HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.config/zode/permissions.json", .{home}) catch null;
 }
 
-/// Persiste la allowlist de "siempre permitir" como un array JSON de nombres.
+/// Persists the "always allow" allowlist as a JSON array of names.
 ///
-/// A mano (y no con un writer sobre un mapa) porque son 8 strings como mucho y
-/// así se lee de un vistazo.
+/// By hand (not with a writer over a map) because it is at most 8 strings and
+/// this way it reads at a glance.
 fn saveAllowlist() void {
     var pbuf: [512]u8 = undefined;
     const path = permissionsFilePath(&pbuf) orelse return;
@@ -223,7 +223,7 @@ fn readFileTo(arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(io_global, path, arena, .limited(1 << 20)) catch null;
 }
 
-// ── entorno y avisos al historial ──────────────────────────────
+// ── environment and history notices ───────────────────────────
 
 fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = env orelse return null;
@@ -238,39 +238,40 @@ fn pushError(m: *tui.Model, text: []const u8) void {
     m.pushError(text);
 }
 
-/// Variante que ya trae la memoria del llamante: no hay que duplicar (ni
-/// liberar) el texto. Se usa en el worker, que no puede dejar basura por frame.
+/// Variant that already owns the caller's memory: the text does not have to be
+/// duplicated (nor freed). Used in the worker, which cannot leave garbage per
+/// frame.
 fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
     m.pushInfoOwned(text);
 }
 
-/// Error al historial, en ROJO (`md.Kind.error_msg`, prefijo `✗`).
+/// Error to the history, in RED (`md.Kind.error_msg`, `✗` prefix).
 ///
-/// Existía el Kind y el prefijo desde el principio, y NINGÚN caller lo usaba:
-/// todos los errores salían por `pushInfoOwned`, que es gris de `.info`. O sea
-/// que un 403 y un "session resumed" se leían igual de apagados, y en un
-/// historial largo el error era una línea más entre cien.
+/// The Kind and the prefix existed from the start, and NO caller used it:
+/// every error went out through `pushInfoOwned`, which is `.info` grey. In
+/// other words a 403 and a "session resumed" read equally dim, and in a long
+/// history the error was just one more line among a hundred.
 fn pushErrorOwned(m: *tui.Model, text: []const u8) void {
     m.pushErrorOwned(text);
 }
 
-/// Pone el estado del turno. El texto NO lleva la carita: la dibuja la TUI en
-/// la fila de status, en el color del mood, una sola vez. Aquí se la metía y
-/// salía duplicada y del mismo gris que todo lo demás (que es justo la queja de
-/// que "no se nota por el color").
+/// Sets the turn status. The text does NOT carry the face: the TUI draws it in
+/// the status row, in the mood's color, exactly once. Here it used to be
+/// embedded and it came out duplicated and in the same grey as everything else
+/// (which is precisely the complaint that "you can't tell by the color").
 fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void {
     m.setStatusWithMood(mood, text);
 }
 
-// ── providers: config.json > compilados ───────────────────────
+// ── providers: config.json > built-in ────────────────────────
 
-/// Todos los providers: los del `config.json` del usuario primero y luego los
-/// compilados que no estén redefinidos (un id del config gana al compilado).
+/// All providers: the user's `config.json` first, then the built-ins that are
+/// not overridden (a config id beats the built-in).
 fn allProviders(arena: std.mem.Allocator) []const providers.ProviderDef {
     return config_mod.allDefs(arena, user_config);
 }
 
-/// Definición del provider activo.
+/// Definition of the active provider.
 fn curDef(env: ?*const std.process.Environ.Map) *const providers.ProviderDef {
     return activeProviderDef(env);
 }
@@ -280,28 +281,29 @@ pub fn activeProviderDef(env: ?*const std.process.Environ.Map) *const providers.
     return providers.byId(cur_provider_id) orelse providers.activeDef(env);
 }
 
-/// API key del provider activo: primero la guardada en `auth.json`, luego la
-/// variable de entorno, luego la genérica.
+/// API key of the active provider: first the one saved in `auth.json`, then
+/// the environment variable, then the generic one.
 fn curKey(m: *tui.Model) ?[]const u8 {
     if (providers.keyFor(activeProviderDef(m.environ), m.environ)) |k| return k;
     if (api_key_global) |k| return k;
     return envGet(m.environ, "ZODE_API_KEY");
 }
 
-// ── config del usuario ─────────────────────────────────────────
+// ── user config ───────────────────────────────────────────────
 
 var cfg_arena_state: ?std.heap.ArenaAllocator = null;
 var user_config: config_mod.Config = .{};
 
-/// Carga el `config.json` del usuario. Llamar una vez al arrancar.
+/// Loads the user's `config.json`. Call once at startup.
 pub fn loadUserConfig() void {
     if (cfg_arena_state == null) {
         cfg_arena_state = std.heap.ArenaAllocator.init(gpa_global);
         user_config = config_mod.load(cfg_arena_state.?.allocator(), io_global, environ_global);
 
-        // Orden de precedencia: config.json > ZODE_PROVIDER > opencode.
-        // (Antes se ignoraba ZODE_PROVIDER en la TUI: se quedaba en "opencode"
-        // y acababa mandando la key de un provider al endpoint de otro → 403.)
+        // Precedence order: config.json > ZODE_PROVIDER > opencode.
+        // (ZODE_PROVIDER used to be ignored in the TUI: it stayed on "opencode"
+        // and ended up sending one provider's key to another provider's
+        // endpoint → 403.)
         if (user_config.provider.len > 0) {
             cur_provider_id = user_config.provider;
         } else if (envGet(environ_global, "ZODE_PROVIDER")) |p| {
@@ -319,20 +321,20 @@ pub fn loadUserConfig() void {
     }
 }
 
-/// Lee `~/.config/zode/auth.json` y lo pasa a `providers` para que `keyFor` lo
-/// use. Sin esto, conectar un provider desde la paleta guardaba la key y
-/// luego no se usaba: `keyFor` solo miraba el entorno.
-/// Arena de las keys guardadas. **Nunca se destruye hasta salir del proceso**.
+/// Reads `~/.config/zode/auth.json` and hands it to `providers` so `keyFor`
+/// uses it. Without this, connecting a provider from the palette saved the key
+/// and then never used it: `keyFor` only looked at the environment.
+/// Arena for the saved keys. **Never destroyed until the process exits**.
 ///
-/// Antes cada recarga de config reutilizaba la arena del config, que sí se
-/// liberaba: el worker de modelos estaba leyendo `saved_keys` por
-/// `providers.hasKey` mientras el hilo de la UI conectaba un provider y
-/// liberaba esa arena debajo de sus pies. Uso después de liberar, sin que nada
-/// lo delate (depende de que el worker este justo en esa línea).
+/// Before, every config reload reused the config's arena, which WAS freed: the
+/// models worker was reading `saved_keys` through `providers.hasKey` while the
+/// UI thread connected a provider and freed that arena under its feet.
+/// Use-after-free, with nothing announcing it (it depends on the worker
+/// landing exactly on that line).
 ///
-/// Aquí cada mapa nuevo vive en su propia arena permanente, así que
-/// reasignar el puntero es atómico y el mapa viejo sigue siendo memoria válida
-/// (lo que ya no se usa, se libera al salir).
+/// Here every new map lives in its own permanent arena, so reassigning the
+/// pointer is atomic and the old map stays valid memory (what is no longer
+/// used is freed at exit).
 var keys_arena_state: ?std.heap.ArenaAllocator = null;
 
 fn loadAuthKeys(_: std.mem.Allocator) void {
@@ -352,30 +354,30 @@ fn loadAuthKeys(_: std.mem.Allocator) void {
     while (it.next()) |kv| {
         const v = kv.value_ptr.*;
         if (v != .string or v.string.len == 0) continue;
-        // La key se copia porque el string del parser vive en el arena que se
-        // acaba de liberar justo arriba.
+        // The key is copied because the parser's string lives in the arena that was
+        // just freed above.
         map.put(a, kv.key_ptr.*, a.dupe(u8, v.string) catch continue) catch continue;
     }
     providers.setSavedKeys(map);
 }
 
-/// Vuelve a leer el `config.json` desde cero.
+/// Re-reads `config.json` from scratch.
 ///
-/// `loadUserConfig` tiene guarda de "solo una vez" (el config se lee al
-/// arrancar), así que sin esto, tras conectar un provider su estado de key se
-/// quedaba en "sin key" para el resto de la sesión.
+/// `loadUserConfig` guards on "only once" (the config is read at startup), so
+/// without this, after connecting a provider its key state stayed at "no key"
+/// for the rest of the session.
 pub fn reloadUserConfig() void {
-    // OJO: aquí NO se llama a `shutdownUserConfig`, porque esa función también
-    // destruye la arena de las keys, que puede estar leyendo un worker. La de
-    // keys se destruye solo en `shutdownUserConfig`, al final del proceso.
+    // CAREFUL: `shutdownUserConfig` is NOT called here, because that function also
+    // destroys the keys arena, which a worker may be reading. The keys arena is
+    // destroyed only in `shutdownUserConfig`, at the end of the process.
     if (cfg_arena_state) |*st| st.deinit();
     cfg_arena_state = null;
     user_config = .{};
     loadUserConfig();
 }
 
-/// Libera las arenas de config y de keys. Al salir del proceso, cuando ya no
-/// queda ningún worker leyendo.
+/// Frees the config and keys arenas. On process exit, when no worker is left
+/// reading.
 pub fn shutdownUserConfig() void {
     if (cfg_arena_state) |*s| {
         s.deinit();
@@ -389,19 +391,20 @@ pub fn shutdownUserConfig() void {
     user_config = .{};
 }
 
-// ── sesión ────────────────────────────────────────────────────
+// ── session ───────────────────────────────────────────────────
 
-/// Devuelve la sesión activa, creándola si hace falta.
+/// Returns the active session, creating it if needed.
 ///
-/// Se llama desde el worker y desde los comandos. La sesión se crea LA
-/// PRIMERA VEZ que hace falta, no al arrancar: así abrir la TUI y cerrarla
-/// sin chatear no deja un `sessions/zode-*.jsonl` vacío por ahí.
+/// Called from the worker and from the commands. The session is created THE
+/// FIRST TIME it is needed, not at startup: so opening the TUI and closing it
+/// without chatting does not leave an empty `sessions/zode-*.jsonl` lying
+/// around.
 fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
     if (session) |s| return s;
     _ = arena;
     const fresh = session_mod.Session.create(m.allocator, io_global) catch {
-        // Sin disco se sigue igual: es degradación, no error fatal. La sesión
-        // en memoria (`file = null`) no escribe nada.
+        // Without disk it carries on: that is degradation, not a fatal error. The
+        // in-memory session (`file = null`) writes nothing.
         const s = m.allocator.create(session_mod.Session) catch @panic("sin memoria para la sesión");
         s.* = session_mod.Session.init(m.allocator);
         session = s;
@@ -411,13 +414,13 @@ fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
     return fresh;
 }
 
-/// El diff de un fichero lleva el LENGUAJE para que el cuerpo de cada línea
-/// El diff de un fichero lleva el LENGUAJE para que el cuerpo de cada línea
-/// se tokenice (`+const n: u32 = 42`: keyword, tipo y número se distinguen).
+/// A file's diff carries the LANGUAGE so that the body of each line
+/// is tokenized (`+const n: u32 = 42`: keyword, type and number are
+/// distinguishable).
 ///
-/// Sin esto el diff salía entero del color del prefijo, que es el muro verde
-/// del ROADMAP. La extensión del path es la fuente: es lo que hay, y no
-/// requiere pedirle nada al modelo.
+/// Without this the whole diff came out in the prefix's color, which is the
+/// green wall of the ROADMAP. The path extension is the source: it is what we
+/// have, and it requires asking the model nothing.
 fn langFromPath(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return "";
@@ -425,7 +428,7 @@ fn langFromPath(path: []const u8) []const u8 {
     return base[dot + 1 ..];
 }
 
-/// Crea una sesión nueva y descarta la actual.
+/// Creates a new session and discards the current one.
 pub fn newSession(m: *tui.Model) void {
     if (session) |old| {
         m.allocator.destroy(old);
@@ -437,47 +440,48 @@ pub fn newSession(m: *tui.Model) void {
     session_elided = 0;
 }
 
-// ── estadísticas de turno (Fase 3 del ROADMAP) ────────────────
+// ── turn stats (ROADMAP phase 3) ──────────────────────────────
 
-/// Lo que pasó en el turno en curso: tools, ficheros, líneas, duración.
+/// What happened in the current turn: tools, files, lines, duration.
 ///
-/// Vive como GLOBAL DEL MÓDULO (como `CacheStats`) y no dentro del `TurnCtx`
-/// porque el `TurnCtx` se destruye en el `defer` de `runOneTurn` justo cuando
-/// ya hay que escribir el resumen. La alternativa (acumular en `TurnCtx` y
-/// pasárselo a `chatWorker`) obligaría a devolver la estructura por el mismo
-/// camino que devuelve el texto sintético.
+/// Lives as a MODULE GLOBAL (like `CacheStats`) and not inside the `TurnCtx`,
+/// because the `TurnCtx` is destroyed in `runOneTurn`'s `defer` exactly when
+/// the summary has to be written. The alternative (accumulating in `TurnCtx`
+/// and handing it to `chatWorker`) would force returning the struct through the
+/// same path that returns the synthesized text.
 pub const TurnStats = struct {
     gpa: std.mem.Allocator = undefined,
     iterations: usize = 0,
     tools: usize = 0,
     denied: usize = 0,
-    /// Ficheros tocados, en orden de aparición, sin repetir.
+    /// Files touched, in order of appearance, without repeats.
     files: std.ArrayList([]const u8) = .empty,
     lines_added: usize = 0,
     lines_removed: usize = 0,
     t0_ns: i128 = 0,
 
-    /// Empieza a contar un turno. Libera lo del anterior.
+    /// Starts counting a turn. Frees the previous one.
     ///
-    /// OJO al orden: `deinit` usa `self.gpa` (el del turno ANTERIOR), así que
-    /// hay que liberar antes de sobreescribir el allocator. Con el struct
-    /// inicializado a `.{}` (`gpa` indefinido) eso sería un `free` con basura.
+    /// CAREFUL with the order: `deinit` uses `self.gpa` (the one from the
+    /// PREVIOUS turn), so you must free before overwriting the allocator. With
+    /// the struct initialized to `.{}` (`gpa` undefined) that would be a `free`
+    /// with garbage.
     pub fn reset(self: *TurnStats, gpa: std.mem.Allocator, t0_ns: i128) void {
         self.deinit();
         self.* = .{ .gpa = gpa, .t0_ns = t0_ns };
     }
 
     pub fn deinit(self: *TurnStats) void {
-        // `files.capacity == 0` = lista sin memoria propia: no hay nada que
-        // liberar y `gpa` puede no estar inicializado.
+        // `files.capacity == 0` = list with no memory of its own: there is nothing
+        // to free and `gpa` may be uninitialized.
         if (self.files.capacity == 0) return;
         for (self.files.items) |f| self.gpa.free(f);
         self.files.deinit(self.gpa);
     }
 
-    /// Registra un fichero tocado con su diff. Si ya estaba, solo suma las
-    /// líneas: escribir el mismo fichero dos veces en un turno es una línea, no
-    /// dos ficheros.
+    /// Records a touched file with its diff. If it was already there, it only adds
+    /// the line counts: writing the same file twice in a turn is one line, not
+    /// two files.
     pub fn noteDiff(self: *TurnStats, path: []const u8, counts: tui.DiffCounts) void {
         if (counts.added == 0 and counts.removed == 0) return;
         for (self.files.items) |f| {
@@ -504,7 +508,7 @@ pub const TurnStats = struct {
         self.denied += 1;
     }
 
-    /// Milisegundos que lleva el turno (0 si no hay reloj).
+    /// Milliseconds the turn has been running (0 if there is no clock).
     pub fn elapsedMs(self: *const TurnStats, now_ns: i128) u64 {
         if (self.t0_ns == 0) return 0;
         return @intCast(@max(0, now_ns - self.t0_ns) / std.time.ns_per_ms);
@@ -512,12 +516,12 @@ pub const TurnStats = struct {
 
     /// `⏺ Done · 3 tools · 2 files changed · 12.4s · ~18k tokens (62% cached)`
     ///
-    /// Devuelve memoria del allocator que se le pase (copia de `gpa`), no
-    /// punteros internos: los `files` son del turno y pueden liberarse.
+    /// Returns memory from the allocator it is given (a copy of `gpa`), not
+    /// internal pointers: the `files` belong to the turn and may be freed.
     ///
-    /// Escribe en `buf` (del llamante) y devuelve un slice de él: sin
-    /// allocaciones, porque esta línea se compone una vez por turno pero el
-    /// llamante la mete en el historial, que ya copia.
+    /// Writes into `buf` (the caller's) and returns a slice of it: no
+    /// allocations, because this line is composed once per turn but the caller
+    /// puts it into the history, which already copies.
     pub fn summaryLine(
         self: *const TurnStats,
         buf: []u8,
@@ -546,12 +550,12 @@ pub const TurnStats = struct {
         return w.buffered();
     }
 
-    /// Segunda línea: `src/agent.zig · src/tui.zig` (los ficheros tocados).
+    /// Second line: `src/agent.zig · src/tui.zig` (the files touched).
     ///
-    /// Los ficheros van solos: el resumen ya dice cuántas tools corrieron, y
-    /// aquí lo útil es el QUÉ, no la tool. Si se guardara con el nombre de la
-    /// tool se podría, pero con un turno de 5 tools la línea se sale de la
-    /// pantalla y el path es lo que se busca.
+    /// The files go alone: the summary already says how many tools ran, and
+    /// what is useful here is the WHAT, not the tool. It could be stored with
+    /// the tool's name, but with a turn of 5 tools the line runs off the screen
+    /// and the path is what people are looking for.
     pub fn detailLine(self: *const TurnStats, buf: []u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
         var first = true;
@@ -564,16 +568,16 @@ pub const TurnStats = struct {
     }
 };
 
-/// Estadísticas del turno en curso. Global del módulo (ver `TurnStats`).
+/// Stats of the current turn. Module global (see `TurnStats`).
 pub var turn_stats: TurnStats = .{};
 
-/// Buffer de 1 MiB para componer el body del request (5.5 del ROADMAP).
+/// 1 MiB buffer to compose the request body (ROADMAP 5.5).
 ///
-/// Antes era `var body_buf: [1 << 20]u8` en la PILA de `runOneTurn`. Con el
-/// stack por defecto de `std.Thread` (16 MiB) funciona, pero es memoria
-/// RESIDENTE durante toda la llamada y deja una trampa: el día que alguien
-/// baje el `stack_size` del worker, 1 MiB de stack se convierte en un
-/// segfault. Al heap, y reutilizado entre peticiones (se reserva una vez).
+/// It used to be `var body_buf: [1 << 20]u8` on `runOneTurn`'s STACK. With
+/// `std.Thread`'s default stack (16 MiB) it works, but it is RESIDENT memory
+/// for the whole call and it leaves a trap: the day someone lowers the worker's
+/// `stack_size`, 1 MiB of stack turns into a segfault. On the heap instead,
+/// reused across requests (allocated once).
 var body_buf_heap: ?[]u8 = null;
 
 fn bodyBuf(gpa: std.mem.Allocator) ![]u8 {
@@ -583,8 +587,8 @@ fn bodyBuf(gpa: std.mem.Allocator) ![]u8 {
     return body_buf_heap.?;
 }
 
-/// Libera el buffer del body. Lo llama el teardown (el mapa de claves tiene
-/// reglas parecidas: nunca se libera en runtime).
+/// Frees the body buffer. Called by the teardown (the keys map has similar
+/// rules: never freed at runtime).
 pub fn shutdownBuffers(gpa: std.mem.Allocator) void {
     if (body_buf_heap) |b| {
         gpa.free(b);
@@ -643,7 +647,7 @@ test "TurnStats: un diff de 0 lineas no inventa ficheros" {
     s.deinit();
 }
 
-/// Vacia el historial de la sesión actual sin crear otra.
+/// Empties the history of the current session without creating another one.
 pub fn resetSession(m: *tui.Model) void {
     if (session) |s| {
         s.messages.clearRetainingCapacity();
@@ -654,8 +658,8 @@ pub fn resetSession(m: *tui.Model) void {
     pushInfoOwned(m, msg);
 }
 
-/// Abre la sesión al arrancar: la más reciente si se pidió (`--resume` o
-/// `ZODE_RESUME=1`), si no una nueva.
+/// Opens the session at startup: the most recent one if it was asked for
+/// (`--resume` or `ZODE_RESUME=1`), otherwise a new one.
 pub fn bootstrapSession(m: *tui.Model) void {
     loadUserConfig();
 
@@ -676,23 +680,24 @@ pub fn bootstrapSession(m: *tui.Model) void {
         const msg = allocPrint(m, "nothing to resume; starting a new session", .{}) catch return;
         pushInfoOwned(m, msg);
     }
-    // OJO: aquí NO se crea la sesión (1.9 del ROADMAP). Antes esta línea
-    // abría un `sessions/zode-*.jsonl` en CADA arranque, y como el fichero se
-    // crea vacío y nadie chateaba, `sessions/` se llenaba de ficheros de 0
-    // bytes: 58 ficheros, 24 vacíos. La sesión la crea `ensureSession`, que solo
-    // se llama al mandar el primer mensaje (o al pedir `/new` explícitamente).
+    // CAREFUL: the session is NOT created here (ROADMAP 1.9). This line used to
+    // open a `sessions/zode-*.jsonl` on EVERY startup, and since the file is
+    // created empty and nobody chatted, `sessions/` filled up with 0-byte
+    // files: 58 files, 24 of them empty. The session is created by
+    // `ensureSession`, which is only called when the first message is sent (or
+    // when `/new` is explicitly requested).
 }
 
-/// `allocPrint` corto: el 90% de los mensajes del historial los escribe el
-/// worker y no puede dejar basura por frame.
+/// Short `allocPrint`: the worker writes 90% of the history messages and cannot
+/// leave garbage per frame.
 fn allocPrint(m: *tui.Model, comptime fmt: []const u8, args: anytype) ![]const u8 {
     return std.fmt.allocPrint(m.allocator, fmt, args);
 }
 
-/// Copia los mensajes de la sesión a un slice de `ChatMessage`.
+/// Copies the session messages into a slice of `ChatMessage`.
 ///
-/// `tool` → role "tool" (como espera la API de OpenAI), y el `system` se queda
-/// el primero. La memoria es del arena que le pase el llamante.
+/// `tool` → role "tool" (as OpenAI's API expects), and `system` stays first.
+/// The memory comes from the arena the caller passes in.
 fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
     const s = session orelse return &.{};
     const msgs = arena.alloc(chat.ChatMessage, s.messages.items.len) catch return &.{};
@@ -708,18 +713,19 @@ fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
     return msgs;
 }
 
-// ── tabla de comandos ─────────────────────────────────────────
+// ── command table ─────────────────────────────────────────────
 
 pub const Cmd = struct {
     key: []const u8,
     desc: []const u8,
-    /// Atajo de teclado que hace lo mismo (columna derecha de la paleta).
-    /// Solo se listan los que existen de verdad: poner uno falso sería
-    /// peor que no poner ninguno.
+    /// Keyboard shortcut that does the same thing (right column of the palette).
+    /// Only ones that really exist are listed: putting a fake one would be worse
+    /// than putting none.
     key_hint: ?[]const u8 = null,
 };
 
-/// `key` viene con la barra inicial. El orden es el de aparición en `/help`.
+/// `key` comes with the leading slash. The order is the order of appearance in
+/// `/help`.
 pub const commands = [_]Cmd{
     .{ .key = "/help", .desc = "show commands", .key_hint = "ctrl+p" },
     .{ .key = "/models", .desc = "list the active provider models" },
@@ -739,12 +745,12 @@ pub const commands = [_]Cmd{
     .{ .key = "/quit", .desc = "quit" },
 };
 
-/// `/allowlist`: qué tools están en "siempre permitir".
+/// `/allowlist`: which tools are in "always allow".
 ///
-/// La allowlist vive en `~/.config/zode/permissions.json` y no había forma de
-/// verla: si una tool dejaba de preguntar y no sabías por qué, la única forma
-/// era abrir el fichero a mano. Además dice si `/yolo` está puesto, que es el
-/// otro modo de "no me pregunta".
+/// The allowlist lives in `~/.config/zode/permissions.json` and there was no
+/// way to see it: if a tool stopped asking and you did not know why, the only
+/// way was to open the file by hand. It also says whether `/yolo` is on, which
+/// is the other way of "don't ask me".
 fn cmdAllowlist(m: *tui.Model) void {
     var line_buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&line_buf);
@@ -766,7 +772,7 @@ fn cmdAllowlist(m: *tui.Model) void {
     pushInfoOwned(m, msg);
 }
 
-/// `/cache`: hit-rate de prompt cache de la sesión.
+/// `/cache`: prompt cache hit-rate of the session.
 fn cmdCache(m: *tui.Model) void {
     const st = &cache_stats.session;
     const line = std.fmt.allocPrint(
@@ -777,7 +783,7 @@ fn cmdCache(m: *tui.Model) void {
     pushInfoOwned(m, line);
 }
 
-/// `/context`: gauge de contexto usado frente al límite y al budget.
+/// `/context`: gauge of context used against the limit and the budget.
 fn cmdContext(m: *tui.Model) void {
     _ = ensureSession(m, m.allocator);
     var astate = std.heap.ArenaAllocator.init(m.allocator);
@@ -793,7 +799,7 @@ fn cmdContext(m: *tui.Model) void {
     const pct_budget = @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(budget)) * 100.0;
     const turns: usize = if (msgs.len > 0) msgs.len - 1 else 0;
 
-    // Gauge de 20 celdas (█ = E2 96 88, ░ = E2 90 8A)
+    // 20-cell gauge (█ = E2 96 88, ░ = E2 90 8A)
     var gauge_buf: [60]u8 = undefined;
     const filled: usize = @intFromFloat(@min(pct_limit, 100.0) / 5.0);
     var gi: usize = 0;
@@ -828,7 +834,7 @@ fn cmdContext(m: *tui.Model) void {
     refreshContextUsage(m);
 }
 
-/// `/session`: id, ruta y nº de mensajes.
+/// `/session`: id, path and message count.
 fn cmdSession(m: *tui.Model) void {
     const s = ensureSession(m, m.allocator);
     const l1 = std.fmt.allocPrint(
@@ -843,7 +849,7 @@ fn cmdSession(m: *tui.Model) void {
     }
 }
 
-/// `/providers`: lista los providers con su estado de key.
+/// `/providers`: lists the providers with their key state.
 fn cmdProviders(m: *tui.Model) void {
     for (allProviders(m.allocator)) |*d| {
         const key_state: []const u8 =
@@ -860,7 +866,7 @@ fn cmdProviders(m: *tui.Model) void {
     }
 }
 
-/// `/effort low|medium|high`, o picker si viene sin argumentos.
+/// `/effort low|medium|high`, or the picker if it comes without arguments.
 fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
     if (arg) |a| {
         if (std.mem.eql(u8, a, "low")) {
@@ -900,7 +906,7 @@ fn cmdUse(m: *tui.Model, arg: ?[]const u8) void {
     if (it.next()) |mo| applyModel(m, mo) catch {};
 }
 
-/// `/yolo`: toggle de permisos automáticos.
+/// `/yolo`: toggle for automatic permissions.
 fn cmdYolo(m: *tui.Model) void {
     yolo = !yolo;
     const msg = if (yolo) "yolo ON: no confirmations" else "yolo OFF: asks for permission";
@@ -908,29 +914,30 @@ fn cmdYolo(m: *tui.Model) void {
     setStatusWithZo(m, if (yolo) .warn else .idle, msg);
 }
 
-/// Qué hay que hacer con el comando que se acaba de elegir en la paleta.
+/// What to do with the command that was just chosen in the palette.
 pub const PaletteCmd = enum {
-    /// Ejecutado aquí y ahora.
+    /// Executed right here, right now.
     done,
-    /// Necesita argumentos: la etiqueta va al input y el usuario teclea lo que
-    /// falte.
+    /// Needs arguments: the label goes to the input and the user types what is
+    /// missing.
     needs_args,
-    /// Salir de la app. Lo atiende la TUI (es quien tiene el `ctx.quit`).
+    /// Leave the app. The TUI handles it (it is who owns `ctx.quit`).
     quit,
 };
 
-/// Ejecuta un comando elegido en la paleta, SIN pasar por el input.
+/// Runs a command chosen in the palette, WITHOUT going through the input.
 ///
-/// Elegir un comando de una lista ya es la confirmación: ponerlo en el input y
-/// pedir un Enter más era un segundo paso que nadie pedía, y en un TUI donde
-/// las teclas se comen por el camino se leía como «no ha hecho nada».
+/// Choosing a command from a list is already the confirmation: putting it in
+/// the input and asking for another Enter was a second step nobody asked for,
+/// and in a TUI where keys get eaten along the way it read as "it did
+/// nothing".
 ///
-/// La EXCEPCIÓN son los comandos que necesitan argumentos: `/use provider
-/// model` no se puede ejecutar a ciegas. Esos vuelven al input con la barra
-/// puesta, que es justo lo que quiere quien los elige.
+/// The EXCEPTION is the commands that need arguments: `/use provider model`
+/// cannot be run blind. Those go back to the input with the label in place,
+/// which is exactly what whoever picks them wants.
 ///
-/// El comando se hace eco en el historial (como el input) para que se vea qué
-/// se ha ejecutado y no solo qué ha pasado.
+/// The command echoes itself in the history (like the input) so you can see
+/// what was run, not just what happened.
 pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
     if (std.mem.eql(u8, cmd, "/quit")) return .quit;
     if (std.mem.eql(u8, cmd, "/use")) return .needs_args;
@@ -939,20 +946,20 @@ pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
     return .done;
 }
 
-/// Punto de entrada del input de la TUI: texto libre o comando `/…`.
+/// Entry point of the TUI input: free text or a `/…` command.
 ///
-/// Un chat arranca un WORKER (hilo) que habla con la API; un comando se
-/// resuelve aquí, en el hilo de la UI, porque son operaciones locales.
+/// A chat starts a WORKER (thread) that talks to the API; a command is resolved
+/// here, in the UI thread, because they are local operations.
 pub fn submit(m: *tui.Model, input: []const u8) !void {
     if (input.len == 0) return;
     if (input[0] != '/') return startChat(m, input);
 
     var it = std.mem.tokenizeScalar(u8, input[1..], ' ');
     const cmd = it.next() orelse return;
-    // SIN argumentos es un `null` de verdad, no un slice vacío. `it.rest()`
-    // devuelve `""` para "/effort", y con un slice vacío no nul el `else` de
-    // "low|medium|high" se llevaba el caso: `/effort` a secas contestaba
-    // "unknown effort:  (low|medium|high)" en vez de abrir el picker.
+    // Without arguments it is a real `null`, not an empty slice. `it.rest()`
+    // returns `""` for "/effort", and with an empty non-null slice the `else` of
+    // "low|medium|high" swallowed the case: `/effort` on its own answered
+    // "unknown effort:  (low|medium|high)" instead of opening the picker.
     const rest = it.rest();
     const arg: ?[]const u8 = if (rest.len == 0) null else rest;
 
@@ -962,7 +969,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
             pushInfoOwned(m, line);
         }
     } else if (std.mem.eql(u8, cmd, "quit")) {
-        // lo maneja la TUI
+        // the TUI handles it
     } else if (std.mem.eql(u8, cmd, "models")) {
         listModelsAsync(m) catch pushError(m, "error starting /models");
     } else if (std.mem.eql(u8, cmd, "providers")) {
@@ -970,10 +977,10 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "provider")) {
         openProviderPicker(m);
     } else if (std.mem.eql(u8, cmd, "model")) {
-        // Se abre YA (la columna de providers es local) y los modelos se
-        // pintan cuando llegan. Antes no se abria nada hasta que la red
-        // respondia, y con el provider lento parecia que el comando no hacia
-        // nada.
+        // It opens RIGHT AWAY (the providers column is local) and the models are
+        // painted when they arrive. Before, nothing opened until the network
+        // answered, and with a slow provider it looked like the command did
+        // nothing.
         openModelPaletteAsync(m);
     } else if (std.mem.eql(u8, cmd, "effort")) {
         cmdEffort(m, arg);
@@ -1002,24 +1009,24 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     }
 }
 
-// ── ACP: el turno se lo delega a otro agente ─────────────────
+// ── ACP: the turn is delegated to another agent ───────────────
 
-/// Modo ACP: el turno NO lo hace zode, se lo pasa a un agente ACP (por defecto
-/// `opencode acp`) hablando JSON-RPC por los pipes de su proceso hijo.
+/// ACP mode: zode does NOT do the turn, it hands it to an ACP agent (by default
+/// `opencode acp`) speaking JSON-RPC over the pipes of its child process.
 ///
-/// Es la "trampa por detras": no se toca la terminal de opencode, se le habla a
-/// su motor. El historial de la sesión lo lleva opencode, no zode.
+/// It is the "trick behind the scenes": opencode's terminal is not poked, its
+/// engine is talked to. The session history is opencode's, not zode's.
 pub var acp_on: bool = false;
-/// Comando del agente ACP. `ZODE_ACP_CMD` lo fija (palabras separadas por
-/// espacios) y `/acp <cmd>` lo cambia para la sesión.
+/// ACP agent command. `ZODE_ACP_CMD` sets it (words separated by spaces) and
+/// `/acp <cmd>` changes it for the session.
 pub var acp_cmd: ?[]const u8 = null;
 
-/// Cliente vivo, o null. Se arranca perezoso y se REUTILIZA entre turnos: la
-/// sesión de ACP (y su contexto) viven en el proceso, así que uno por turno
-/// sería memoria amnesia.
+/// Live client, or null. Started lazily and REUSED across turns: the ACP
+/// session (and its context) live in the process, so one per turn would be
+/// amnesia memory.
 var acp_client: ?*acp.Client = null;
 
-/// Lo llama la TUI al salir. Sin esto el hijo se queda vivo-colgado.
+/// Called by the TUI on exit. Without this the child stays hung alive.
 pub fn shutdownAcp() void {
     if (acp_client) |c| {
         c.deinit();
@@ -1027,38 +1034,39 @@ pub fn shutdownAcp() void {
     }
 }
 
-/// ESC: si el turno va por ACP hay que cortarlo por su protocolo
-/// (`session/cancel`), no solo poner la bandera de los streams HTTP.
+/// ESC: if the turn goes through ACP it has to be cut through its protocol
+/// (`session/cancel`), not just by setting the flag of the HTTP streams.
 pub fn cancelAcp(m: *tui.Model) void {
     if (!acp_on) return;
     if (acp_client) |c| c.cancel();
-    // Decir "cancelando" y no dejar el status como estaba: el turno no se
-    // corta en el acto (el agente tiene que confirmar con un stopReason), y sin
-    // este texto el ESC parece que no ha hecho nada.
+    // Say "cancelling" instead of leaving the status as it was: the turn does
+    // not stop on the spot (the agent has to confirm with a stopReason), and
+    // without this text ESC looks like it did nothing.
     setStatusWithZo(m, .warn, "cancelling…");
 }
 
-/// Nombre del agente ACP activo, para el status bar.
+/// Name of the active ACP agent, for the status bar.
 pub fn acpTitle() []const u8 {
     if (acp_client) |c| return c.agentTitle();
     return "pending";
 }
 
-/// Estado de la conexión con el agente ACP.
+/// State of the connection to the ACP agent.
 ///
-/// El arranque NO se hace en el prompt: `opencode acp` levanta un servidor
-/// privado y tarda varios segundos. Se lanza en cuanto se activa `/acp`, así
-/// que el primer prompt solo espera a que esté listo.
+/// Startup is NOT done at the prompt: `opencode acp` brings up a private server
+/// and that takes several seconds. It is launched as soon as `/acp` is
+/// enabled, so the first prompt only waits for it to be ready.
 const AcpState = enum { off, connecting, ready, failed };
 
 var acp_state: AcpState = .off;
-/// Código de error del arranque fallido, para poder enseñarlo.
+/// Error code of the failed startup, so it can be shown.
 var acp_start_err: anyerror = error.SpawnFailed;
-/// Bloquea la escritura de `acp_client` desde el hilo de conexión.
+/// Guards writes to `acp_client` from the connection thread.
 ///
-/// Es un SPINLOCK (`tryLock`, no `lock`): se coge un instante y se suelta, y
-/// las secciones son de dos líneas. Un `lock` reentrante colgaría la app, que es
-/// justo la trampa de `pushPending` en la otra punta del código.
+/// It is a SPINLOCK (`tryLock`, not `lock`): it is taken for a moment and
+/// released, and the sections are two lines long. A reentrant `lock` would
+/// hang the app, which is exactly the `pushPending` trap at the other end of the
+/// code.
 var acp_lock: std.atomic.Mutex = .unlocked;
 
 fn acpLock() void {
@@ -1068,10 +1076,10 @@ fn acpUnlock() void {
     acp_lock.unlock();
 }
 
-/// El argv del agente, a partir de `acp_cmd` o del de por defecto.
+/// The agent's argv, from `acp_cmd` or the default one.
 ///
-/// Se devuelve en `out` porque el slice tiene que vivir en el llamante: el
-/// argv son punteros a palabras del comando, no alungan.
+/// It is returned in `out` because the slice has to live in the caller: the
+/// argv are pointers to words of the command, not its length.
 fn acpArgv(out: *[8][]const u8) []const []const u8 {
     var argv: []const []const u8 = &acp.default_argv;
     const cmd = acp_cmd orelse return argv;
@@ -1086,11 +1094,12 @@ fn acpArgv(out: *[8][]const u8) []const []const u8 {
     return argv;
 }
 
-/// El cwd absoluto para `session/new`.
+/// The absolute cwd for `session/new`.
 ///
-/// ACP lo exige. En 0.16 no hay `getCwd`, así que se usa el enlace
-/// `/proc/self/cwd`, que es el cwd real del proceso (el `PWD` del entorno
-/// puede estar mentido). Sin `/proc` se cae al `PWD` y, en último caso, a "/".
+/// ACP requires it. In 0.16 there is no `getCwd`, so the `/proc/self/cwd`
+/// symlink is used, which is the process's real cwd (the environment's `PWD`
+/// can be lying). Without `/proc` it falls back to `PWD` and, as a last
+/// resort, to "/".
 fn acpCwd() []const u8 {
     var link_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = std.Io.Dir.cwd().readLink(io_global, "/proc/self/cwd", &link_buf) catch 0;
@@ -1104,10 +1113,10 @@ fn acpCwd() []const u8 {
 }
 
 const ConnectJob = struct {
-    /// El modelo SOLO para dejar un aviso en el historial. El hilo lo usa con
-    /// `pushInfoOwned`, que es thread-safe. Se registra como worker
-    /// (`beginWorker`) para que `waitWorkers` lo espere al apagar: si no, el
-    /// hilo podría tocar un `Model` ya destruido.
+    /// The model ONLY to leave a notice in the history. The thread uses it with
+    /// `pushInfoOwned`, which is thread-safe. It registers itself as a worker
+    /// (`beginWorker`) so `waitWorkers` waits for it at shutdown: otherwise the
+    /// thread could touch an already destroyed `Model`.
     m: *tui.Model,
     gpa: std.mem.Allocator,
     argv: [8][]const u8,
@@ -1117,7 +1126,7 @@ const ConnectJob = struct {
     env: ?*const std.process.Environ.Map,
 };
 
-/// Hilo de conexión. Solo escribe en el estado (bajo `acp_lock`) y termina.
+/// Connection thread. Only writes to the state (under `acp_lock`) and exits.
 fn acpConnectThread(job: *ConnectJob) void {
     const gpa = job.gpa;
     const m = job.m;
@@ -1139,21 +1148,21 @@ fn acpConnectThread(job: *ConnectJob) void {
     acp_state = .ready;
     acpUnlock();
 
-    // Aviso en el historial en cuanto el agente está listo: el status bar ya
-    // enseña el nombre, pero esto deja constancia de la sesión.
+    // Notice in the history as soon as the agent is ready: the status bar already
+    // shows the name, but this leaves a record of the session.
     const msg = std.fmt.allocPrint(
         gpa,
         "ACP connected · agent {s} · session {s}",
         .{ c.agentTitle(), c.sessionId() },
     ) catch return;
     defer gpa.free(msg);
-    // `pushInfo` COPIA el texto; `pushInfoOwned` se APROPIAN de el, y con el
-    // `free` de arriba la fila salia con basura (todo `�`).
+    // `pushInfo` COPIES the text; `pushInfoOwned` TAKES OWNERSHIP of it, and with
+    // the `free` above the row came out with garbage (all `�`).
     pushInfo(m, msg);
 }
 
-/// Lanza la conexión en segundo plano. Devuelve false si ya había una en curso
-/// o lista.
+/// Launches the connection in the background. Returns false if one was already
+/// in progress or ready.
 fn startAcpConnect(
     model: *tui.Model,
     gpa: std.mem.Allocator,
@@ -1193,10 +1202,10 @@ fn startAcpConnect(
     return true;
 }
 
-/// Devuelve el cliente, esperando a que termine la conexión si hace falta.
+/// Returns the client, waiting for the connection to finish if needed.
 ///
-/// `m` solo se usa para el status mientras espera; si el arranque falla se
-/// traduce el error a algo legible (ver `reportAcpErr`).
+/// `m` is only used for the status while waiting; if startup fails the error is
+/// translated into something readable (see `reportAcpErr`).
 fn ensureAcp(m: *tui.Model) !*acp.Client {
     acpLock();
     const st = acp_state;
@@ -1213,8 +1222,8 @@ fn ensureAcp(m: *tui.Model) !*acp.Client {
     }
     if (st == .off) {
         acpUnlock();
-        // No hay nadie conectando (arranque en frío, p. ej. `--resume`): se
-        // arranca en el hilo del worker y se espera aquí.
+        // Nobody is connecting (cold start, e.g. `--resume`): start it in the
+        // worker thread and wait here.
         _ = startAcpConnect(m, m.allocator, m.environ);
         acpLock();
         if (acp_state != .ready) {
@@ -1227,8 +1236,8 @@ fn ensureAcp(m: *tui.Model) !*acp.Client {
     }
     acpUnlock();
 
-    // Hay una conexión en curso: se espera SIN tocar el `Io` compartido (ver
-    // `acp.nap`), que es lo que congelaba la TUI.
+    // A connection is in progress: wait WITHOUT touching the shared `Io` (see
+    // `acp.nap`), which is what used to freeze the TUI.
     setStatusWithZo(m, .thinking, "connecting to the ACP agent…");
     var spins: usize = 0;
     while (spins < 1200) : (spins += 1) {
@@ -1252,7 +1261,7 @@ fn ensureAcp(m: *tui.Model) !*acp.Client {
     return error.HandshakeFailed;
 }
 
-/// `/acp [on|off|<comando>]`
+/// `/acp [on|off|<command>]`
 fn cmdAcp(m: *tui.Model, arg: []const u8) void {
     const a = std.mem.trim(u8, arg, " \t");
     if (std.mem.eql(u8, a, "off")) {
@@ -1263,12 +1272,12 @@ fn cmdAcp(m: *tui.Model, arg: []const u8) void {
     }
     if (a.len > 0 and !std.mem.eql(u8, a, "on")) {
         acp_cmd = m.allocator.dupe(u8, a) catch null;
-        // Cambiar de agente implica reiniciar el hijo: el anterior ya tiene su
-        // sesión y su contexto.
+        // Changing agent implies restarting the child: the previous one already has
+        // its session and its context.
         shutdownAcp();
     }
     acp_on = true;
-    // La conexión arranca YA, en segundo plano, no con el primer prompt.
+    // The connection starts NOW, in the background, not with the first prompt.
     if (startAcpConnect(m, m.allocator, m.environ)) {
         setStatusWithZo(m, .thinking, "connecting to the ACP agent…");
         pushInfo(m, "ACP on: connecting to the agent in the background (/acp off to go back)");
@@ -1277,11 +1286,12 @@ fn cmdAcp(m: *tui.Model, arg: []const u8) void {
     }
 }
 
-/// El worker de un turno ACP.
+/// The worker of an ACP turn.
 ///
-/// OJO: aquí NO hay bucle de tools. En ACP las tools las ejecuta el AGENTE, no
-/// zode: el `session/update` con `tool_call` se pinta y su `tool_call_update`
-/// con `completed` es el resultado. Por eso el turno es un prompt y ya.
+/// CAREFUL: there is NO tool loop here. In ACP the tools are executed by the
+/// AGENT, not by zode: the `session/update` with `tool_call` is painted and its
+/// `tool_call_update` with `completed` is the result. That is why a turn is one
+/// prompt and nothing more.
 fn acpWorker(job: *ChatJob) void {
     const m = job.model;
     const user_text = job.text;
@@ -1329,15 +1339,15 @@ fn acpWorker(job: *ChatJob) void {
             return;
         };
 
-        // Lo que dijo el agente se guarda en la sesión de zode (aunque el
-        // historial de verdad lo lleve opencode): así `/resume` y el diff
-        // siguen teniendo sentido dentro de zode.
+        // What the agent said is stored in zode's session (even though the real
+        // history is opencode's): that way `/resume` and the diff still make
+        // sense inside zode.
         if (t.text.items.len > 0) {
             ensureSession(m, m.allocator).appendAssistant(t.text.items, null) catch {};
         }
         ensureSession(m, m.allocator).flush();
-        // Cierra el párrafo vivo si el turno terminó hablando (si terminó con
-        // una tool, `onTool` ya lo cerró y esto no hace nada).
+        // Closes the live paragraph if the turn ended talking (if it ended with
+        // a tool, `onTool` already closed it and this does nothing).
         if (t.streaming_open) {
             t.streaming_open = false;
             m.streamEnd();
@@ -1347,7 +1357,7 @@ fn acpWorker(job: *ChatJob) void {
             pushError(m, "ACP turn cancelled");
         }
 
-        // Siguiente prompt en cola, si lo hay.
+        // Next queued prompt, if there is one.
         const next = m.takeQueued() orelse break;
         if (owned_prompt) |o| m.allocator.free(o);
         owned_prompt = next;
@@ -1355,15 +1365,15 @@ fn acpWorker(job: *ChatJob) void {
     }
 }
 
-/// Un texto del agente en UNA línea, recortada.
+/// An agent text in ONE line, trimmed.
 ///
-/// Los `agent_thought_chunk` y las entradas del plan llegan troceadas y con
-/// saltos de línea dentro. Pinta tal cual, el historial se llena de filas a
-/// medias; y si se pinta cada trozo por separado, de 40 fragmentos.
+/// The `agent_thought_chunk`s and the plan entries arrive chopped up and with
+/// newlines inside. Painting them as-is fills the history with half rows; and
+/// painting each piece separately, with 40 fragments.
 ///
-/// El slice puede apuntar a un buffer del stack de esta función (el caso "hay
-/// salto de línea"): es seguro porque el único llamante es `pushInfo`, que
-/// COPIA el texto en el allocator del modelo antes de encolarlo.
+/// The slice may point to a buffer on this function's stack (the "there is a
+/// newline" case): that is safe because the only caller is `pushInfo`, which
+/// COPIES the text into the model's allocator before queueing it.
 fn oneLine(s: []const u8) []const u8 {
     const clean = std.mem.trim(u8, s, " \t\n\r");
     if (clean.len == 0) return "";
@@ -1376,18 +1386,18 @@ fn oneLine(s: []const u8) []const u8 {
     return first;
 }
 
-/// Contexto de un turno ACP: traduce los `session/update` a la TUI.
+/// Context of an ACP turn: translates the `session/update`s to the TUI.
 const AcpTurn = struct {
     m: *tui.Model,
     client: *acp.Client,
     text: std.ArrayList(u8) = .empty,
-    /// ¿Hay un párrafo de streaming abierto?
+    /// Is there an open streaming paragraph?
     ///
-    /// OJO: en ACP el agente INTERCALA texto y tools (habla, llama una tool,
-    /// vuelve a hablar). El párrafo de streaming hay que cerrarlo en cada tool,
-    /// porque si no la cabecera de la tool se pinta ANTES del texto que la
-    /// precedió y el historial queda desordenado. En el flujo HTTP no hace
-    /// falta porque ahí el stream siempre acaba antes de las tools.
+    /// CAREFUL: in ACP the agent INTERLEAVES text and tools (it talks, calls a
+    /// tool, talks again). The streaming paragraph has to be closed on every
+    /// tool, because otherwise the tool header is painted BEFORE the text that
+    /// preceded it and the history ends up out of order. In the HTTP flow it is
+    /// not needed because there the stream always ends before the tools.
     streaming_open: bool = false,
     tool_start_ns: [8]i128 = undefined,
     tool_start_len: usize = 0,
@@ -1407,13 +1417,15 @@ const AcpTurn = struct {
         t.m.streamDelta(s);
     }
 
-    /// El razonamiento del agente no va al párrafo principal: se pinta como una
-    /// línea de info, que es donde se lee sin estorbar la respuesta.
-    /// El razonamiento llega troceado y con saltos de línea dentro: se junta en
-    /// UNA línea (con "…") porque `pushInfo` es una fila por llamada y 40
-    /// fragmentos sueltos llenan el historial de basura.
+    /// The agent's reasoning does not go into the main paragraph: it is painted as
+    /// an info line, which is where you read it without getting in the way of
+    /// the answer.
+    /// The reasoning arrives chopped up and with newlines inside: it is joined
+    /// into ONE line (with "…") because `pushInfo` is one row per call and 40
+    /// loose fragments fill the history with junk.
     ///
-    /// OJO: `pushInfo` ya pone el prefijo `·`; añadirlo aquí salía "· · hola".
+    /// CAREFUL: `pushInfo` already adds the `·` prefix; adding it here came out
+    /// as "· · hola".
     fn onThought(ud: ?*anyopaque, s: []const u8) void {
         const t: *AcpTurn = @ptrCast(@alignCast(ud.?));
         pushInfo(t.m, oneLine(s));
@@ -1421,8 +1433,8 @@ const AcpTurn = struct {
 
     fn onTool(ud: ?*anyopaque, id: []const u8, name: []const u8, title: []const u8) void {
         const t: *AcpTurn = @ptrCast(@alignCast(ud.?));
-        // Cierra el texto que había antes de la tool, para que la cabecera de la
-        // tool quede DEBAJO y no encima.
+        // Closes the text that came before the tool, so the tool header ends up
+        // BELOW it and not on top of it.
         if (t.streaming_open) {
             t.m.streamEnd();
             t.streaming_open = false;
@@ -1440,13 +1452,13 @@ const AcpTurn = struct {
 
     fn onToolUpdate(ud: ?*anyopaque, id: []const u8, status: []const u8, text: []const u8) void {
         const t: *AcpTurn = @ptrCast(@alignCast(ud.?));
-        // `pending` y `in_progress` no cierran la línea: el reloj de "running"
-        // se queda hasta que la tool acaba de verdad.
+        // `pending` and `in_progress` do not close the line: the "running" clock stays
+        // until the tool actually finishes.
         if (std.mem.eql(u8, status, "pending") or std.mem.eql(u8, status, "in_progress")) return;
-        // Cierra el párrafo vivo ANTES de encolar el resultado. El bloque de
-        // "párrafo en vivo" se pinta SIEMPRE al final del historial, así que si
-        // el texto del agente siguiera abierto, el "⎿ exit=0" salía debajo de
-        // su última frase en vez de justo debajo de la tool.
+        // Closes the live paragraph BEFORE queueing the result. The "live paragraph"
+        // block is ALWAYS painted at the end of the history, so if the agent's
+        // text were still open, the "⎿ exit=0" came out below its last sentence
+        // instead of just below the tool.
         if (t.streaming_open) {
             t.m.streamEnd();
             t.streaming_open = false;
@@ -1482,11 +1494,11 @@ const AcpTurn = struct {
         options: []const acp.PermOption,
     ) ?[]const u8 {
         const t: *AcpTurn = @ptrCast(@alignCast(ud.?));
-        // El agente trae sus propias opciones; se busca la que encaja con lo
-        // que el usuario contestar. Sin opciones no hay nada que dibujar.
+        // The agent brings its own options; the one that matches what the user
+        // answered is looked up. Without options there is nothing to draw.
         if (options.len == 0) return null;
 
-        // `/yolo`: la primera opción de permitir, sin preguntar.
+        // `/yolo`: the first allow option, without asking.
         if (yolo) {
             for (options) |o| {
                 if (std.mem.startsWith(u8, o.kind, "allow")) return o.id;
@@ -1504,8 +1516,8 @@ const AcpTurn = struct {
         for (options) |o| {
             if (std.mem.eql(u8, o.kind, want)) return o.id;
         }
-        // El agente no ofreció exactamente lo que se pidió: cualquier
-        // "allow once" es lo más cercano a "sí, ahora".
+        // The agent did not offer exactly what was asked for: any
+        // "allow once" is the closest to "yes, right now".
         if (answer == .allow or answer == .allow_always) {
             for (options) |o| {
                 if (std.mem.startsWith(u8, o.kind, "allow")) return o.id;
@@ -1519,7 +1531,7 @@ const AcpTurn = struct {
     }
 };
 
-/// Errores de ACP con un texto que se entienda en la UI (no `error.X`).
+/// ACP errors with a text that makes sense in the UI (not `error.X`).
 fn reportAcpErr(m: *tui.Model, err: anyerror) void {
     const line: []const u8 = switch (err) {
         error.SpawnFailed => blk: {
@@ -1539,7 +1551,7 @@ fn reportAcpErr(m: *tui.Model, err: anyerror) void {
     pushInfoOwned(m, line);
 }
 
-/// `/resume`: reabre la sesión más reciente por mtime.
+/// `/resume`: reopens the most recent session by mtime.
 fn resumeLatest(m: *tui.Model) void {    var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();
     const a = astate.allocator();
@@ -1568,12 +1580,12 @@ fn resumeLatest(m: *tui.Model) void {    var astate = std.heap.ArenaAllocator.in
     refreshContextUsage(m);
 }
 
-// ── el chat: worker y agent loop ──────────────────────────────
+// ── the chat: worker and agent loop ───────────────────────────
 
-/// Lanza el worker de un turno. Todo el I/O ocurre aquí, en su propio hilo;
-/// la UI solo recibe eventos.
-/// Job del hilo del chat. `text` es una COPIA que libera el worker, para que
-/// el buffer del input pueda reutilizarse en cuanto se encola.
+/// Launches the worker of a turn. All the I/O happens here, in its own
+/// thread; the UI only receives events.
+/// Job of the chat thread. `text` is a COPY that the worker frees, so the
+/// input buffer can be reused as soon as it is queued.
 const ChatJob = struct {
     model: *tui.Model,
     text: []const u8,
@@ -1584,10 +1596,10 @@ fn startChat(m: *tui.Model, input: []const u8) !void {
     const copy = try m.allocator.dupe(u8, input);
     errdefer m.allocator.free(copy);
 
-    // Si ya hay un turno en curso, ENCOLAR en vez de lanzar un worker en
-    // paralelo: dos workers escribiendo a la vez en la misma sesion y en el
-    // mismo estado de streaming es lo que hacia que el input se freezease y el
-    // historial se entrecortara.
+    // If a turn is already in flight, QUEUE it instead of launching a worker in
+    // parallel: two workers writing at the same time to the same session and
+    // the same streaming state is what made the input freeze and the history
+    // cut itself off.
     if (m.isBusy()) {
         _ = m.enqueuePrompt(copy);
         const qn = std.fmt.allocPrint(m.allocator, "⏳ queued ({d} waiting)", .{m.queuedCount()}) catch "⏳ queued";
@@ -1598,18 +1610,19 @@ fn startChat(m: *tui.Model, input: []const u8) !void {
     s.append(.user, copy) catch {};
     s.flush();
 
-    // Abre el párrafo de streaming y marca busy: la UI ya puede pintar el
-    // spinner mientras el worker habla con la API.
+    // Opens the streaming paragraph and marks busy: the UI can already paint the
+    // spinner while the worker talks to the API.
     m.streamStart();
-    // Sin "…": la carita ya late y el reloj corre, la elipsis solo añade ruido.
+    // No "…": the face already blinks and the clock runs, the ellipsis only
+    // adds noise.
     setStatusWithZo(m, .thinking, "thinking");
 
     const job = try m.allocator.create(ChatJob);
-    m.beginWorker(); // el worker lo cierra; si el spawn falla, lo cerramos aquí
+    m.beginWorker(); // the worker closes it; if the spawn fails, we close it here
     job.* = .{ .model = m, .text = copy };
-    // El modo ACP delega el turno en otro agente: mismo worker, otro cuerpo.
-    // OJO: elige la FUNCION, no un bool, porque `std.Thread.spawn` con un
-    // comptime-only que depende de control de runtime no compila.
+    // ACP mode delegates the turn to another agent: same worker, different body.
+    // CAREFUL: it picks the FUNCTION, not a bool, because `std.Thread.spawn`
+    // with a comptime-only that depends on runtime control does not compile.
     const spawned = if (acp_on)
         std.Thread.spawn(.{}, acpWorker, .{job}) catch null
     else
@@ -1624,7 +1637,7 @@ fn startChat(m: *tui.Model, input: []const u8) !void {
     th.detach();
 }
 
-/// El worker: un turno de conversación con la API, con tools.
+/// The worker: one turn of conversation with the API, with tools.
 fn chatWorker(job: *ChatJob) void {
     const m = job.model;
     const user_text = job.text;
@@ -1632,19 +1645,19 @@ fn chatWorker(job: *ChatJob) void {
         m.allocator.free(user_text);
         m.allocator.destroy(job);
     }
-    // Contador de workers: el hilo está desacoplado y al salir hay que
-    // esperarlo ANTES de destruir el `Io` (ver `Model.waitWorkers`).
+    // Worker counter: the thread is decoupled, and on exit you have to wait for it
+    // BEFORE destroying the `Io` (see `Model.waitWorkers`).
     m.beginWorker();
     defer m.endWorker();
 
-    // Las estadísticas del turno empiezan aquí (no en `runOneTurn`): el turno
-    // es todo el `chatWorker`, con sus 8 iteraciones.
+    // The turn stats start here (not in `runOneTurn`): the turn is the whole
+    // `chatWorker`, with its 8 iterations.
     turn_stats.reset(m.allocator, std.Io.Timestamp.now(io_global, .real).nanoseconds);
     defer turn_stats.deinit();
 
     var iterations: usize = 0;
     var last_user: []const u8 = user_text;
-    var owned: ?[]u8 = null; // texto sintético de una iteración (propio)
+    var owned: ?[]u8 = null; // synthesized text of an iteration (owned)
 
     while (iterations < max_iterations) : (iterations += 1) {
         turn_stats.iterations = iterations + 1;
@@ -1665,12 +1678,12 @@ fn chatWorker(job: *ChatJob) void {
     pushTurnSummary(m);
 }
 
-/// El resumen del turno en el historial: 2 líneas que dicen qué pasó.
+/// The turn summary in the history: 2 lines that say what happened.
 ///
-/// Antes el final de un turno era literalmente `setStatusWithZo(m, .done,
-/// "done")` y nada más: ni ficheros, ni tools, ni tokens, ni duración. Y como
-/// la franja de actividad se apaga al acabar, lo único que queda visible del
-/// turno es el status, que se sustituye en el turno siguiente.
+/// Before, the end of a turn was literally `setStatusWithZo(m, .done, "done")`
+/// and nothing else: no files, no tools, no tokens, no duration. And since the
+/// activity strip turns off when it finishes, the only thing left visible from
+/// the turn is the status, which gets replaced on the next turn.
 fn pushTurnSummary(m: *tui.Model) void {
     const s = &turn_stats;
     const now_ns = std.Io.Timestamp.now(io_global, .real).nanoseconds;
@@ -1687,32 +1700,34 @@ fn pushTurnSummary(m: *tui.Model) void {
     pushInfoOwned(m, detail);
 }
 
-/// Hit-rate de cache de la sesión, redondeado (0 = sin datos).
+/// Cache hit-rate of the session, rounded (0 = no data).
 fn cacheHitPct() u8 {
     const r = cache_stats.session.hitRatePct();
     if (r <= 0) return 0;
     return @intFromFloat(std.math.clamp(r, 0, 100));
 }
 
-/// Userdata de los tres callbacks de un turno.
+/// Userdata of the three callbacks of a turn.
 ///
-/// OJO: `onDelta`, `onToolCall` y `onFinish` reciben el MISMO `?*anyopaque`.
-/// Si se les pasara `&text_sink` y luego `onToolCall` lo casara a `*TextSink`,
-/// en el primer token ya estaríamos leyendo campos de otro tipo: en
-/// ReleaseFast eso es UB silencioso. Por eso va un struct con nombre propio.
+/// CAREFUL: `onDelta`, `onToolCall` and `onFinish` receive the SAME
+/// `?*anyopaque`. If they were passed `&text_sink` and then `onToolCall` cast it
+/// to `*TextSink`, on the very first token we would already be reading fields
+/// of another type: in ReleaseFast that is silent UB. That is why a struct with
+/// its own name is used here.
 const TurnCtx = struct {
     m: *tui.Model,
-    /// Texto del asistente de este turno (se vuelca a la sesión al final).
+    /// Assistant text of this turn (dumped into the session at the end).
     text: std.ArrayList(u8) = .empty,
-    /// Tool calls pedidos en este turno.
+    /// Tool calls requested in this turn.
     calls: std.ArrayList(Call) = .empty,
-    /// Un tool en curso: su cabecera ya está pintada y hay que cerrar la línea.
+    /// A tool in flight: its header is already painted and the line has to be
+    /// closed.
     tool_open: bool = false,
-    /// Chars del stream, para el tok/s.
+    /// Stream chars, for the tok/s.
     chars: usize = 0,
-    /// Momento del primer token (ns). 0 = aún no llegó nada.
+    /// Moment of the first token (ns). 0 = nothing has arrived yet.
     stream_start_ns: i128 = 0,
-    /// Motivo de finish del request.
+    /// Finish reason of the request.
     finish: [32]u8 = undefined,
     finish_len: usize = 0,
 
@@ -1761,12 +1776,13 @@ fn onFinish(ud: ?*anyopaque, reason: []const u8) void {
     t.finish_len = n;
 }
 
-/// Los `tool_calls` de un turno como JSON para la sesión.
+/// A turn's `tool_calls` as JSON for the session.
 ///
-/// Es el MISMO formato que escribe `chat.StreamCtx.toolCallsJson` (el que usa
-/// el runner headless): si divergen, uno de los dos clientes manda una
-/// conversación que el otro no puede leer. Por eso está aquí y no "parece que
-/// basta": el `arguments` va como string JSON escapado, no como objeto anidado.
+/// It is the SAME format that `chat.StreamCtx.toolCallsJson` writes (the one
+/// the headless runner uses): if they diverge, one of the two clients sends a
+/// conversation the other cannot read. That is why this is here and not a
+/// "seems enough": `arguments` goes as an escaped JSON string, not as a nested
+/// object.
 fn toolCallsJsonFromCalls(gpa: std.mem.Allocator, calls: []const TurnCtx.Call) ?[]const u8 {
     if (calls.len == 0) return null;
     var out: std.ArrayList(u8) = .empty;
@@ -1794,50 +1810,50 @@ fn toolCallsJsonFromCalls(gpa: std.mem.Allocator, calls: []const TurnCtx.Call) ?
     return out.items;
 }
 
-/// Un turno: un request a la API con el historial, sus tools y, si el modelo
-/// pide tools, su ejecución y el siguiente turno.
+/// A turn: one request to the API with the history, its tools and, if the model
+/// asks for tools, their execution and the next turn.
 ///
-/// Devuelve el texto sintético que hay que mandar en el siguiente turno
-/// (normalmente null: si no hubo tool calls, el turno se acabó).
-/// `user_text` ya está en la sesión (lo escribió `startChat`): aquí solo se
-/// usa para el caso de las iteraciones sintéticas, y el system prompt se
-/// inyecta una vez al principio de la conversación.
-/// OJO: el tipo de retorno es `[]u8` y no `[]const u8` A PROPOSITO. Con
-/// `[]const u8` el compilador no distingue un literal de memoria propia, y
-/// `chatWorker` liberaba el literal "Continue with the tool results above." ->
-/// `free` sobre `.rodata` -> panic "reached unreachable code" en ReleaseSafe,
-/// es decir, un turno con tools tumbaba la app SIEMPRE. Los literales Zig son
-/// `[]const`, asi que ahora el compilador IMPIDE devolverlos por aqui.
+/// Returns the synthesized text to send in the next turn (normally null: if
+/// there were no tool calls, the turn is over).
+/// `user_text` is already in the session (`startChat` wrote it): here it is
+/// only used for the case of synthetic iterations, and the system prompt is
+/// injected once at the start of the conversation.
+/// CAREFUL: the return type is `[]u8` and not `[]const u8` ON PURPOSE. With
+/// `[]const u8` the compiler does not tell a literal from owned memory, and
+/// `chatWorker` freed the literal "Continue with the tool results above." ->
+/// `free` on `.rodata` -> "reached unreachable code" panic in ReleaseSafe,
+/// which means a turn with tools brought the app down ALWAYS. Zig literals are
+/// `[]const`, so now the compiler PREVENTS returning them here.
 fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
     const s = ensureSession(m, gpa);
-    // Reloj del TURNO (no del stream): es lo que se pinta en "done · N.Ns" y lo
-    // que el usuario mide cuando vuelve a pulsar.
+    // Clock of the TURN (not of the stream): it is what is painted in
+    // "done · N.Ns" and what the user measures when they press again.
     const turn_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
 
-    // Cada ITERACIÓN abre su párrafo en vivo y anuncia en qué va (1.3).
+    // Each ITERATION opens its live paragraph and announces what it is doing (1.3).
     //
-    // Antes el párrafo en vivo lo abría `startChat` UNA vez por prompt y
-    // `runOneTurn` lo cerraba sin volver a abrirlo: desde la 2ª iteración
-    // (y el bucle llega a 8) no había párrafo vivo, ni franja de actividad, ni
-    // spinner, ni reloj. Es decir, todo lo que dice "sigo trabajando" se
-    // apagaba justo en la parte del turno donde más tarda se hace (tras las
-    // tools). El path ACP sí lo hacía bien todo el rato.
+    // Before, `startChat` opened the live paragraph ONCE per prompt and
+    // `runOneTurn` closed it without reopening: from the 2nd iteration on (and
+    // the loop reaches 8) there was no live paragraph, no activity strip, no
+    // spinner, no clock. In other words, everything that says "still working"
+    // turned off exactly in the part of the turn where the slow part happens
+    // (after the tools). The ACP path did do it right the whole time.
     m.streamStartIteration();
 
     var tstate = TurnCtx{ .m = m };
     defer tstate.deinit();
 
-    // El system prompt va SIEMPRE el primero (prefijo estable para el cache del
-    // provider) y se añade UNA sola vez.
+    // The system prompt always goes FIRST (a stable prefix for the provider's
+    // cache) and is added ONCE only.
     //
-    // Antes la condición era `items[0].role != .system`, y como `startChat`
-    // ya había añadido el mensaje de `user`, `items[0]` era `user`: se
-    // añadía un system NUEVO en cada iteración del agent loop. El segundo turno
-    // salía como [user, system, tool, system] — el prompt del sistema al final
-    // y duplicado — y el turno se moría sin contestación y sin error visible.
-    // Ahora se busca el system en TODA la lista.
+    // Before, the condition was `items[0].role != .system`, and since `startChat`
+    // had already appended the `user` message, `items[0]` was `user`: a NEW
+    // system was added on every iteration of the agent loop. The second turn
+    // went out as [user, system, tool, system] — the system prompt at the end
+    // and duplicated — and the turn died with no reply and no visible error.
+    // Now the system is looked for in the WHOLE list.
     var has_system = false;
     for (s.messages.items) |mm| {
         if (mm.role == .system) has_system = true;
@@ -1847,8 +1863,8 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         s.append(.system, sp) catch {};
     }
 
-    // Compactación tier 1 antes de construir el body: es una VISTA del wire,
-    // la sesión en disco conserva todo.
+    // Tier 1 compaction before building the body: it is a VIEW of the wire, the
+    // session on disk keeps everything.
     var astate = std.heap.ArenaAllocator.init(gpa);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -1863,9 +1879,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
         pushInfoOwned(m, msg);
     }
-    // Aviso de que la elisión por bytes no basta y toca resumir. Antes el
-    // tier 2 solo existía en el runner headless, así que en la TUI el ctx%
-    // subía sin que se dijera nada.
+    // Notice that byte elision is not enough and a summary is needed. Before, tier
+    // 2 only existed in the headless runner, so in the TUI the ctx% climbed
+    // without anything being said.
     maybeAnnounceCompaction(m, comp.needs_summary);
 
     const def = activeProviderDef(m.environ);
@@ -1884,9 +1900,10 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     defer http.deinit();
 
     chat.cancel_current.store(false, .seq_cst);
-    // El status nombra la ITERACIÓN a partir de la segunda: "thinking" a secas
-    // durante 8 vueltas seguidas no dice si va a tardar o si ya se ha parado.
-    // La primera no lleva contador porque es la normal y el número sería ruido.
+    // The status names the ITERATION from the second one on: plain "thinking" for
+    // 8 turns in a row does not say whether it will take long or it has already
+    // stopped. The first one has no counter because it is the normal case and
+    // the number would be noise.
     if (iteration > 0) {
         const it = std.fmt.allocPrint(
             gpa,
@@ -1898,17 +1915,18 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         setStatusWithZo(m, .thinking, "thinking");
     }
 
-    // OJO: `streamChat` espera la URL COMPLETA, no solo la base del provider.
-    // Pasarle la base a secas daba 404 en TODAS las peticiones de la TUI (el
-    // runner headless de main.zig sí añade el path, por eso allí funcionaba).
+    // CAREFUL: `streamChat` expects the FULL URL, not just the provider's base.
+    // Passing the bare base gave 404 on EVERY request from the TUI (the headless
+    // runner in main.zig does add the path, which is why it worked there).
     var url_buf: [1024]u8 = undefined;
     const url = if (kind == .anthropic)
         std.fmt.bufPrint(&url_buf, "{s}/messages", .{def.base_url}) catch def.base_url
     else
         std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{def.base_url}) catch def.base_url;
 
-    // Para Anthropic la auth va en cabeceras (x-api-key), no en Bearer: se pasa
-    // null y lo pone `streamRaw`. Para el resto, Bearer con la key del provider.
+    // For Anthropic the auth goes in headers (x-api-key), not in Bearer: null is
+    // passed and `streamRaw` sets it. For the rest, Bearer with the provider's
+    // key.
     const bearer: ?[]const u8 = if (kind == .anthropic)
         null
     else
@@ -1932,7 +1950,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         ) catch |err| {
             if (isRetryable(err) and attempt < 3) {
                 pushRetryNotice(m, err, attempt);
-                Retry.wait(attempt) catch return null; // ESC corta
+                Retry.wait(attempt) catch return null; // ESC cuts it short
                 continue;
             }
             return err;
@@ -1942,25 +1960,25 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     updateTps(tstate.chars, tstate.stream_start_ns);
     cache_stats.session.record(chat.last_usage);
 
-    // Cierra el párrafo de streaming: lo que llegó se queda en el historial.
+    // Closes the streaming paragraph: what arrived stays in the history.
     m.streamEnd();
 
-    // El texto del asistente va a la sesión (también si se interrumpió: lo
-    // que llegó es real y no debe perderse).
+    // The assistant's text goes into the session (also if it was interrupted:
+    // what arrived is real and must not be lost).
     //
-    // OJO: CON sus `tool_calls`, y esto no es opcional. El mensaje de tool
-    // lleva `tool_call_id`, y si el mensaje del asistente no lleva el
-    // `tool_calls` que lo pidió, ese id no casa con nada y el API responde 400
-    // (`invalid_request_error`) en el SIGUIENTE turno. Pasando `null` (que es lo
-    // que había), cualquier turno con una tool moría en el segundo request: el
-    // modelo pedía la tool, la tool se ejecutaba, y la respuesta final nunca
-    // llegaba — sin error visible, porque el aviso se quedaba en `pending` y
-    // hacía falta pulsar una tecla para verlo. En headless sí pasaban los
-    // `tool_calls` (`result.ctx.toolCallsJson`), y por eso ahí el agent loop
-    // funcionaba y en la TUI no: el mismo modelo, dos clientes distintos.
+    // CAREFUL: WITH its `tool_calls`, and this is not optional. The tool message
+    // carries `tool_call_id`, and if the assistant's message does not carry the
+    // `tool_calls` that asked for it, that id matches nothing and the API
+    // answers 400 (`invalid_request_error`) on the NEXT turn. Passing `null`
+    // (which is what it used to be), any turn with a tool died on the second
+    // request: the model asked for the tool, the tool ran, and the final reply
+    // never arrived — with no visible error, because the notice stayed in
+    // `pending` and you had to press a key to see it. Headless did pass the
+    // `tool_calls` (`result.ctx.toolCallsJson`), which is why the agent loop
+    // worked there and not in the TUI: same model, two different clients.
     //
-    // Por eso `TurnCtx` guarda la lista de `calls` y no un simple flag: el JSON
-    // hay que reconstruirlo para la sesión.
+    // That is why `TurnCtx` keeps a list of `calls` and not a simple flag: the
+    // JSON has to be rebuilt for the session.
     const calls_json = if (tstate.calls.items.len > 0)
         toolCallsJsonFromCalls(gpa, tstate.calls.items)
     else
@@ -1974,16 +1992,16 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         std.mem.eql(u8, tstate.finish[0..tstate.finish_len], "length");
     if (partial) setStatusWithZo(m, .warn, "interrupted");
 
-    // Sin tool calls: el turno se acabó.
+    // No tool calls: the turn is over.
     if (tstate.calls.items.len == 0) {
-        // El ctx% se refresca AQUÍ también, no solo en el path de tools (que es
-        // el que llama a `refreshContextUsage`): un turno sin tools es el caso
-        // NORMAL y el contador se quedaba en lo del turno anterior hasta que
-        // apareciera una tool.
+        // The ctx% is refreshed HERE too, not only on the tools path (which is
+        // the one that calls `refreshContextUsage`): a turn without tools is the
+        // NORMAL case and the counter stayed at the previous turn's value until
+        // a tool appeared.
         refreshContextUsage(m);
-        // "done" a secas no dice cuánto costó. Con el reloj del turno, el status
-        // pasa a ser el resumen de lo que acaba de pasar (que es lo único que
-        // queda visible cuando la franja se apaga).
+        // Plain "done" does not say what it cost. With the turn's clock, the
+        // status becomes the summary of what just happened (which is the only
+        // thing left visible when the strip turns off).
         const turn_ms = elapsedMs(turn_t0);
         const done_status = std.fmt.allocPrint(
             gpa,
@@ -1999,12 +2017,12 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     return exec;
 }
 
-/// Avisa de la compactación tier 2 si el turno la dispara.
+/// Announces tier 2 compaction if the turn triggers it.
 ///
-/// El tier 2 (resumir el tramo viejo con una llamada LLM) antes solo corría en
-/// headless (`main.zig`), así que en la TUI el historial crecía sin que se
-/// dijera nada y el ctx% subía sin explicación. `needs_summary` es el aviso de
-/// que la elisión por bytes no ha bastaod.
+/// Tier 2 (summarizing the old stretch with an LLM call) used to run only in
+/// headless (`main.zig`), so in the TUI the history grew without anything being
+/// said and the ctx% climbed with no explanation. `needs_summary` is the notice
+/// that byte elision has not been enough.
 fn maybeAnnounceCompaction(m: *tui.Model, comp_needs_summary: bool) void {
     if (!comp_needs_summary) return;
     const msg = std.fmt.allocPrint(
@@ -2015,13 +2033,14 @@ fn maybeAnnounceCompaction(m: *tui.Model, comp_needs_summary: bool) void {
     pushInfoOwned(m, msg);
 }
 
-/// Ejecuta las tool calls de un turno y devuelve el texto sintético para el
-/// siguiente (o null si no hacía falta otro turno).
+/// Runs a turn's tool calls and returns the synthesized text for the next one
+/// (or null if no other turn was needed).
 ///
-/// Antes de ejecutar se FOTOGRAFÍA el archivo que la tool va a tocar: es lo
-/// que permite enseñar el diff en vez de un "OK" opaco.
-/// Ejecuta las tool calls. Devuelve el texto sintético del siguiente turno,
-/// propiedad del llamante (ver `runOneTurn`).
+/// Before running them, the file the tool is about to touch is
+/// PHOTOGRAPHED: that is what makes it possible to show the diff instead of an
+/// opaque "OK".
+/// Runs the tool calls. Returns the synthesized text of the next turn, owned by
+/// the caller (see `runOneTurn`).
 fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     const gpa = m.allocator;
     var astate = std.heap.ArenaAllocator.init(gpa);
@@ -2034,13 +2053,13 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     for (t.calls.items) |call| {
         const arg = toolArgSummary(call.name, call.args_json, arena);
         m.pushToolStart(call.name, arg);
-        // El status dice QUÉ está corriendo, no un "working" genérico: con un
-        // `bash` lento es la diferencia entre "trabajando" y "colgado". El
-        // texto se copia a un buffer fijo, así que el arg de la arena del
-        // worker puede morir sin problema.
+        // The status says WHAT is running, not a generic "working": with a slow `bash`
+        // that is the difference between "working" and "hung". The text is
+        // copied to a fixed buffer, so the arg from the worker's arena can die
+        // without a problem.
         setStatusWithZo(m, .tooling, arg);
 
-        // ── permiso ──
+        // ── permission ──
         if (!yolo and tools_mod.needsPermission(call.name) and !isAlwaysAllowed(call.name)) {
             var dbuf: [384]u8 = undefined;
             const detail = std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
@@ -2048,8 +2067,8 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
                 .allow => {},
                 .allow_always => setAlwaysAllowed(m, call.name),
                 .deny, .none => {
-                    // La denegación se le devuelve al modelo como resultado
-                    // para que cambie de estrategia en vez de reintentar.
+                    // The denial is handed back to the model as a result
+                    // so it changes strategy instead of retrying.
                     denied += 1;
                     turn_stats.noteDenied();
                     m.pushToolDone(call.name, "denied: permission required", 0, "denied");
@@ -2081,14 +2100,15 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         const summary = toolResultSummary(call.name, res, arena);
         m.pushToolDone(call.name, summary, ms, res);
 
-        // Diff contra el contenido previo, si la tool tocó un archivo.
+        // Diff against the previous content, if the tool touched a file.
         if (before) |old| {
             if (filePathOf(call.args_json, arena)) |pth| {
                 const after = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch {
                     continue;
                 };
-                // El lenguaje sale de la extensión del path, para que el cuerpo de cada línea
-                // del diff se tokenice en vez de salir del color del prefijo.
+                // The language comes from the path's extension, so the body of each line
+                // of the diff is tokenized instead of coming out in the
+                // prefix's color.
                 const dc = m.pushDiffLang(old, after, langFromPath(pth));
                 turn_stats.noteDiff(pth, dc);
             }
@@ -2097,9 +2117,9 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         s.appendToolResult(call.id, call.name, res) catch {};
     }
     s.flush();
-    // "tools done" no dice nada. Con las cuentas sí: se sabe si ha ido rápido
-    // (y por tanto si el modelo va a seguir o se ha parado) y si ha habido
-    // denegados, que es lo que hay que mirar después.
+    // "tools done" says nothing. With the numbers it does: you know whether it was
+    // fast (and therefore whether the model is going to continue or has stopped)
+    // and whether there were denials, which is what you have to look at after.
     const total_ms = elapsedMs(t0);
     const tools_status = std.fmt.allocPrint(
         gpa,
@@ -2114,23 +2134,23 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     ) catch "tools done";
     setStatusWithZo(m, .tooling, tools_status);
 
-    // El siguiente turno necesita un mensaje de usuario que describa los
-    // resultados; si no, el modelo no ve lo que pasó.
+    // The next turn needs a user message describing the results; without it, the
+    // model does not see what happened.
     if (t.calls.items.len == 0) return null;
-    // Copia propia, NUNCA el literal: quien lo recibe lo libera.
+    // Own copy, NEVER the literal: whoever receives it frees it.
     return gpa.dupe(u8, syntheticUserText) catch null;
 }
 
-/// El texto que se manda como "user" para que el modelo vea los resultados de
-/// las tools. Va en una constante (no inlineado) para poder testearla.
+/// The text sent as "user" so the model sees the tool results. It lives in a
+/// constant (not inlined) so it can be tested.
 pub const syntheticUserText = "Continue with the tool results above.";
 
-/// ¿Esta tool modifica un archivo del disco?
+/// Does this tool modify a file on disk?
 fn touchesFile(name: []const u8) bool {
     return std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit");
 }
 
-/// Path del archivo que toca una tool de escritura (o null si no lo dice).
+/// Path of the file a writing tool touches (or null if it does not say).
 fn filePathOf(args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
     if (parsed != .object) return null;
@@ -2139,7 +2159,7 @@ fn filePathOf(args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
     return v.string;
 }
 
-/// Argumento identificativo de una tool, para la línea `⏺ tool(arg)`.
+/// Identifying argument of a tool, for the `⏺ tool(arg)` line.
 fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return "";
     if (parsed != .object) return "";
@@ -2162,7 +2182,7 @@ fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
             if (v == .string) return v.string;
         }
     }
-    // Sin el campo esperado, el primer string que haya sirve.
+    // Without the expected field, the first string there is will do.
     var it = parsed.object.iterator();
     while (it.next()) |kv| {
         if (kv.value_ptr.* == .string) return kv.value_ptr.*.string;
@@ -2170,13 +2190,13 @@ fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
     return "";
 }
 
-/// Resumen de una línea del resultado de una tool (`⎿ Read 12 lines`).
+/// One-line summary of a tool's result (`⎿ Read 12 lines`).
 fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator) []const u8 {
     if (res.len == 0) return "";
     var it = std.mem.splitScalar(u8, res, '\n');
     const first = it.next() orelse return "";
     if (std.mem.eql(u8, name, "read")) {
-        // Las líneas de read llevan "   12│ texto": se cuentan.
+        // The read lines carry "   12│ text": count them.
         var n: usize = 0;
         var probe = std.mem.splitScalar(u8, res, '\n');
         while (probe.next() != null) n += 1;
@@ -2198,8 +2218,8 @@ fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator
         }
         return std.fmt.allocPrint(arena, "{d} matches", .{n}) catch first;
     }
-    // Web: el primer resultado de una búsqueda es el título del primer hit, que
-    // como resumen no dice nada. Se cuenta lo que hay de verdad.
+    // Web: the first line of a fetch is the title of the first hit, which as a
+    // summary says nothing. Count what is really there.
     if (std.mem.eql(u8, name, "web_fetch")) {
         var n: usize = 0;
         var it2 = std.mem.splitScalar(u8, res, '\n');
@@ -2212,9 +2232,9 @@ fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator
         return std.fmt.allocPrint(arena, "{d} lines · {d} KB", .{ n, res.len / 1024 }) catch first;
     }
     if (std.mem.eql(u8, name, "web_search")) {
-        // Cuenta las líneas numeradas (`1. Título`) del formato de
-        // `web.searchResults`. Contar URLsIndentadas era frágil: el indent
-        // cambia y el contador sale a cero.
+        // Counts the numbered lines (`1. Title`) of the `web.searchResults` format.
+        // Counting indented URLs was fragile: the indentation changes and the
+        // counter comes out at zero.
         var n: usize = 0;
         var it2 = std.mem.splitScalar(u8, res, '\n');
         while (it2.next()) |l| {
@@ -2233,9 +2253,10 @@ fn elapsedMs(t0: i128) u64 {
     return @intCast(@divTrunc(now - t0, 1_000_000));
 }
 
-// ── errores y reintentos ──────────────────────────────────────
+// ── errors and retries ────────────────────────────────────────
 
-/// 429 y 5xx se reintentan; 401/403 no (la key está mal: insistir no ayuda).
+/// 429 and 5xx are retried; 401/403 are not (the key is wrong: insisting does
+/// not help).
 fn isRetryable(err: anyerror) bool {
     return switch (err) {
         error.RateLimited, error.Overloaded, error.ServerError => true,
@@ -2244,17 +2265,17 @@ fn isRetryable(err: anyerror) bool {
 }
 
 const Retry = struct {
-    /// Cuánto se espera ANTES del reintento `attempt` (0-indexado), en ms.
+    /// How long to wait BEFORE retry `attempt` (0-indexed), in ms.
     ///
-    /// Backoff exponencial: 500ms, 1s, 2s (+jitter). Vive aparte de `wait` para
-    /// que el aviso pueda decir "retrying in 1.0s" con el MISMO número que se
-    /// va a esperar: si fueran dos fórmulas, el mensaje mentiría en cuanto se
-    /// tocara una de las dos.
+    /// Exponential backoff: 500ms, 1s, 2s (+jitter). It lives apart from `wait`
+    /// so that the notice can say "retrying in 1.0s" with the SAME number that
+    /// is going to be waited: if they were two formulas, the message would lie
+    /// as soon as one of them was touched.
     ///
-    /// OJO al exponente: era `attempt -| 1`, que satura a 0 y daba 500, 500,
-    /// 1000 — el primer reintento no esperaba más que el segundo, que es justo
-    /// lo contrario de lo que dice el comentario. Con `1 << attempt` la serie es
-    /// la que siempre se ha documentado.
+    /// CAREFUL with the exponent: it was `attempt -| 1`, which saturates to 0
+    /// and gave 500, 500, 1000 — the first retry did not wait longer than the
+    /// second, which is exactly the opposite of what the comment says. With
+    /// `1 << attempt` the series is the one always documented.
     fn backoffMs(attempt: usize) u64 {
         const base_ns: i128 = @as(i128, 500) * std.time.ns_per_ms * (@as(i128, 1) << @intCast(attempt));
         var h: u64 = 0x9E3779B97F4A7C15 *% @as(u64, @intCast(attempt));
@@ -2263,20 +2284,20 @@ const Retry = struct {
         return @intCast(@divTrunc(base_ns + jitter, std.time.ns_per_ms));
     }
 
-    /// Cuánto se espera ANTES del reintento, respetando el `retry-after` del
-    /// server si lo mandó.
+    /// How long to wait BEFORE retrying, honoring the server's `retry-after` if it
+    /// sent one.
     ///
-    /// `retry_after_secs` estaba en `chat` desde el principio y NO lo leía
-    /// nadie: un 429 con `retry-after: 30` esperaba 1s y se comía el rate limit
-    /// entero, tres veces seguidas. Es pura aritmética (testeable) y el `wait` de
-    /// abajo solo la usa para trocear.
+    /// `retry_after_secs` was in `chat` from the start and NOBODY read it: a 429
+    /// with `retry-after: 30` waited 1s and ate the entire rate limit, three
+    /// times in a row. It is pure arithmetic (testable) and the `wait` below
+    /// only uses it to slice the wait.
     fn waitMs(attempt: usize) u64 {
         var ms = backoffMs(attempt);
         if (chat.retry_after_secs) |ra| {
             const want: u64 = @as(u64, ra) * 1000;
-            // Techo de 30s: más que eso es mejor rendirse y que lo diga el
-            // error que al usuario le toca (/provider, /model) que seguir
-            // esperando en silencio.
+            // 30s ceiling: beyond that it is better to give up and let the error
+            // the user has to act on (/provider, /model) say so than keep
+            // waiting in silence.
             ms = @max(ms, @min(want, 30_000));
         }
         return ms;
@@ -2284,15 +2305,15 @@ const Retry = struct {
 
     fn wait(attempt: usize) !void {
         var left: i128 = @as(i128, waitMs(attempt)) * std.time.ns_per_ms;
-        // Se duerme a trozos para que ESC pueda cortar la espera.
+        // Sleeps in slices so ESC can cut the wait short.
         //
-        // OJO al HOW: esto va desde un WORKER, y `io_global.sleep` se lleva por
-        // delante el event loop del `Io` compartido con la TUI (el mismo
-        // problema que el ACP resolvió con `nap()`). Con `sleep` no se congela
-        // solo el reloj de la franja: se paran los redraws, así que los avisos
-        // de reintento se quedaban en `pending` sin pintarse y hacía falta
-        // pulsar una tecla para verlos. `acp.nap()` es un `nanosleep` pelado que
-        // no toca el `Io`.
+        // CAREFUL about the HOW: this runs from a WORKER, and
+        // `io_global.sleep` takes down the event loop of the `Io` shared with
+        // the TUI (the same problem ACP solved with `nap()`). With `sleep` it
+        // is not just the strip's clock that freezes: the redraws stop, so the
+        // retry notices stayed in `pending` unpainted and you had to press a key
+        // to see them. `acp.nap()` is a bare `nanosleep` that does not touch the
+        // `Io`.
         while (left > 0) {
             if (chat.cancelled()) return error.Cancelled;
             const chunk_ms: u64 = @intCast(@min(@divTrunc(left, std.time.ns_per_ms), 50));
@@ -2302,15 +2323,14 @@ const Retry = struct {
     }
 };
 
-/// Aviso en el historial antes de reintentar (para que el usuario vea que
-/// no está colgado).
+/// Notice in the history before retrying (so the user sees it is not hung).
 ///
-/// Dice QUÉ pasó y CUÁNTO falta, no solo "reintentando":
-/// `RateLimited (intento 2/3)` no le dice a nadie nada, mientras que
-/// `rate limited: Too many requests · retrying in 1.0s (attempt 2/3)` sí: por
-/// dónde va, por qué, y cuánto tiene que aguantar. El texto del server
-/// (`lastErrorBody`) es la parte que de verdad manda, porque "HTTP 429" no dice
-/// nada.
+/// It says WHAT happened and HOW LONG is left, not just "retrying":
+/// `RateLimited (attempt 2/3)` tells nobody anything, while
+/// `rate limited: Too many requests · retrying in 1.0s (attempt 2/3)` does:
+/// where it is going, why, and how long you have to put up with it. The server's
+/// text (`lastErrorBody`) is the part that really matters, because "HTTP 429"
+/// says nothing.
 fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
     const gpa = m.allocator;
     const reason = chat.lastErrorBody();
@@ -2324,17 +2344,17 @@ fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
     ) catch "retrying";
     pushInfoOwned(m, msg);
 
-    // El status va corto (es una línea segmentada) pero con el porqué, que es lo
-    // que se lee de reojo: "rate limited 2/3" y no "retrying…".
+    // The status stays short (it is a segmented line) but has the why, which is
+    // what you read at a glance: "rate limited 2/3" and not "retrying…".
     const short = std.fmt.allocPrint(gpa, "{s} {d}/3", .{ errPhrase(err), attempt + 1 }) catch "retrying";
     setStatusWithZo(m, .warn, short);
 }
 
-/// El error de red en palabras de persona.
+/// The network error in human words.
 ///
-/// `@errorName` da `RateLimited` / `NoCredits` / `ConnectionFailed`: son
-/// identificadores, no mensajes. El usuario los ve en el historial y en el
-/// status bar, y ahí lo que hace falta es una frase.
+/// `@errorName` gives `RateLimited` / `NoCredits` / `ConnectionFailed`: those
+/// are identifiers, not messages. The user sees them in the history and in the
+/// status bar, and what is needed there is a sentence.
 pub fn errPhrase(err: anyerror) []const u8 {
     return switch (err) {
         error.RateLimited => "rate limited",
@@ -2362,7 +2382,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             setStatusWithZo(m, .warn, "interrupted");
             return;
         },
-        // Key mala de verdad (401). aqui SÍ es la key.
+        // A genuinely bad key (401). Here it IS the key.
         error.AuthFailed => {
             const msg = std.fmt.allocPrint(
                 gpa,
@@ -2371,7 +2391,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             ) catch "key rechazada";
             pushErrorOwned(m, msg);
         },
-        // 402: la cuenta no tiene saldo. No es un bug de zode ni la key.
+        // 402: the account has no balance. It is not a zode bug nor the key.
         error.NoCredits => {
             const msg = std.fmt.allocPrint(
                 gpa,
@@ -2380,9 +2400,9 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             ) catch "sin creditos";
             pushErrorOwned(m, msg);
         },
-        // 404: el modelo no existe en ese provider. Casi siempre es que se
-        // quedo un id viejo HARDCODEADO (por eso el default se cambia cuando
-        // el provider lo retira) o una errata en /use.
+        // 404: the model does not exist on that provider. Almost always it is an old
+        // HARDCODED id left over (which is why the default is changed when the
+        // provider retires it) or a typo in /use.
         error.ModelNotFound => {
             const msg = std.fmt.allocPrint(
                 gpa,
@@ -2391,8 +2411,9 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             ) catch "modelo inexistente";
             pushErrorOwned(m, msg);
         },
-        // 403: en la practica casi siempre es el MODELO que no esta disponible
-        // para esta cuenta, no la key. Decirlo claro evita horas de debugger.
+        // 403: in practice it is almost always the MODEL that is not available for
+        // this account, not the key. Saying that plainly saves hours of
+        // debugging.
         error.Forbidden => {
             const msg = std.fmt.allocPrint(
                 gpa,
@@ -2414,29 +2435,30 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
     setStatusWithZo(m, .warn, @errorName(err));
 }
 
-/// Nombre de la variable de entorno con la key del provider activo, para poder
-/// decir WHICH key hay que cambiar sin adivinar.
+/// Name of the environment variable with the active provider's key, so we can
+/// say WHICH key to change without guessing.
 fn providerEnvName() []const u8 {
     const d = activeProviderDef(environ_global);
     if (d.key_env.len == 0) return "API_KEY";
     return d.key_env[0];
 }
 
-// ── compactación tier 2: un resumen LLM de los turnos viejos ──
+// ── tier 2 compaction: an LLM summary of the old turns ────────
 
-/// Si la vista elidida sigue pasándose del budget, se pide un resumen al
-/// modelo y se sustituyen los turnos antiguos por una nota. Best-effort: si
-/// falla, se sigue sin resumen.
-/// Acumula el texto del resumen (userdata del callback de `summarizeTurns`).
+/// If the elided view still goes over the budget, a summary is asked of the
+/// model and the old turns are replaced with a note. Best-effort: if it fails,
+/// it carries on without a summary.
+/// Accumulates the summary text (userdata of `summarizeTurns`'s callback).
 const SummarySink = struct {
     gpa: std.mem.Allocator,
     buf: std.ArrayList(u8) = .empty,
 };
 
-/// Resume con el propio modelo un tramo de mensajes antiguos.
+/// Summarizes a stretch of old messages with the model itself.
 ///
-/// Devuelve el texto del resumen, o null si no se pudo (es best-effort: si
-/// falla, el caller sigue con los mensajes tal cual y solo pierde precisión).
+/// Returns the summary text, or null if it could not be done (it is
+/// best-effort: if it fails, the caller carries on with the messages as they
+/// are and only loses precision).
 pub fn summarizeTurns(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
@@ -2452,7 +2474,7 @@ pub fn summarizeTurns(
     defer ast.deinit();
     const a = ast.allocator();
 
-    // Un solo mensaje user con la conversación a resumir + la instrucción.
+    // A single user message with the conversation to summarize + the instruction.
     const prompt = compaction.summaryPrompt(a, msgs) catch {
         models_mod.dbg("[compaction] no se pudo construir el prompt del resumen\n", .{});
         return null;
@@ -2464,8 +2486,8 @@ pub fn summarizeTurns(
         return null;
     };
 
-    // El userdata lleva el allocator + el buffer: un callback no puede
-    // capturar `gpa` (una función anidada no ve el entorno exterior).
+    // The userdata carries the allocator + the buffer: a callback cannot capture
+    // `gpa` (a nested function does not see the outer environment).
     var sink = SummarySink{ .gpa = gpa };
     const cb: chat.Callbacks = .{
         .userdata = &sink,
@@ -2496,14 +2518,14 @@ fn onEffortPick(m: *tui.Model, _: u32, label: []const u8) void {
     cmdEffort(m, label);
 }
 
-/// Job del worker de `/models` (lista en el historial) y del picker.
+/// Job of the `/models` worker (list in the history) and of the picker.
 const ModelsJob = struct {
     model: *tui.Model,
-    /// null = listar en el historial (`/models`); si no, abrir el picker.
+    /// false = list in the history (`/models`); otherwise open the picker.
     for_picker: bool = false,
 };
 
-/// `/models`: lista los modelos del provider activo en el historial.
+/// `/models`: lists the active provider's models in the history.
 pub fn listModelsAsync(m: *tui.Model) !void {
     const job = try m.allocator.create(ModelsJob);
     m.beginWorker();
@@ -2516,11 +2538,12 @@ pub fn listModelsAsync(m: *tui.Model) !void {
     th.detach();
 }
 
-/// `/model` y Ctrl+T: la paleta de modelos a dos columnas.
+/// `/model` and Ctrl+T: the two-column model palette.
 ///
-/// Se lanzan los modelos del provider activo; mientras llegan, la paleta se
-/// abre igual con la columna de providers (que es local y no necesita red), y
-/// el worker la rellena cuando termina. Así no hay una espera en blanco.
+/// The active provider's models are requested; while they arrive, the palette
+/// opens anyway with the providers column (which is local and needs no
+/// network), and the worker fills it in when it finishes. So there is no blank
+/// wait.
 pub fn pickerModelsAsync(m: *tui.Model) !void {
     const job = try m.allocator.create(ModelsJob);
     m.beginWorker();
@@ -2533,15 +2556,15 @@ pub fn pickerModelsAsync(m: *tui.Model) !void {
     th.detach();
 }
 
-/// Igual que `pickerModelsAsync` pero con la clave de Ctrl+T.
+/// Like `pickerModelsAsync` but with the Ctrl+T key.
 ///
-/// Se abre YA, solo con la columna de providers (que es local y no necesita
-/// red), y el worker la rellena con los modelos cuando llegan. Así no hay una
-/// espera en blanco esperando la red.
+/// It opens NOW, with only the providers column (which is local and needs no
+/// network), and the worker fills it with the models when they arrive. So
+/// there is no blank wait for the network.
 ///
-/// OJO: `items` y `groups` los copia el allocator del modelo, NO una arena de
-/// frame: la palette vive entre frames y si apuntaran al arena del frame se
-/// quedarían colgando al redibujar por el streamer.
+/// CAREFUL: `items` and `groups` are copied by the model's allocator, NOT by a
+/// frame arena: the palette lives between frames, and if they pointed at the
+/// frame's arena they would dangle when the streamer redraws.
 pub fn openModelPaletteAsync(m: *tui.Model) void {
     openModelPalette(m, &.{});
     pickerModelsAsync(m) catch {};
@@ -2576,18 +2599,19 @@ fn modelsWorker(job: *ModelsJob) void {
 
     defer list.deinit(gpa);
 
-    // Orden: los "free" primero, que son los que funcionan sin créditos, y
-    // dentro de cada grupo alfabético para que la lista sea estable.
+    // Order: the "free" ones first, since those are the ones that work without
+    // credits, and alphabetical within each group so the list is stable.
     const sorted = gpa.dupe(models_mod.Model, list.items) catch return;
     defer gpa.free(sorted);
     std.mem.sort(models_mod.Model, sorted, {}, freeFirst);
 
     if (job.for_picker) {
-        // NO se toca la paleta aquí: este es el hilo del worker y la dibuja el
-        // hilo de la UI sin lock (modificar los dos a la vez era un segfault).
-        // Se entregan ITEMS ya construidos y con strings propios: entregar los
-        // `Model` y liberar la lista al salir dejaba los `id` colgando, y el
-        // dibujo reventaba con InvalidStartByte.
+        // The palette is NOT touched here: this is the worker's thread and the UI
+        // thread draws it without a lock (modifying both at once was a
+        // segfault).
+        // ITEMS already built with their own strings are handed over: handing
+        // over the `Model`s and freeing the list on exit left the `id`s
+        // dangling, and the drawing blew up with InvalidStartByte.
         const items = buildModelItems(m, sorted);
         if (items) |it| {
             m.setPendingItems(it);
@@ -2610,8 +2634,8 @@ fn modelsWorker(job: *ModelsJob) void {
     setStatusWithZo(m, .done, "models ready");
 }
 
-/// "free" no viene como campo: se deduce del sufijo del id, que es lo que
-/// publica OpenRouter (`...-free`).
+/// "free" does not come as a field: it is deduced from the id's suffix, which
+/// is what OpenRouter publishes (`...-free`).
 fn isFree(m: models_mod.Model) bool {
     return std.mem.endsWith(u8, m.id, "-free");
 }
@@ -2623,20 +2647,20 @@ fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
     return std.mem.lessThan(u8, a.id, b.id);
 }
 
-/// Rellena la paleta de modelos con una lista que ya está descargada. Lo llama
-/// el DRAW cuando recoge `pending_models`, no el worker.
+/// Fills the model palette with an already downloaded list. Called by the DRAW
+/// when it picks up `pending_models`, not by the worker.
 pub fn openModelPaletteWith(m: *tui.Model, list: []models_mod.Model) void {
     openModelPalette(m, list);
 }
 
-/// Abre la paleta de modelos a DOS COLUMNAS: providers | modelos del activo.
+/// Opens the model palette in TWO COLUMNS: providers | the active one's models.
 ///
-/// Se reaprovecha la lista que ya se ha descargado del provider activo, así
-/// que abrirla no cuesta una llamada de red (y si no hay modelos aún, se
-/// lanza `pickerModelsAsync` para tener algo que pintar).
-/// Construye los items de la paleta de modelos: providers primero (con su
-/// estado de key) y luego los modelos con su `free` o su ventana de contexto.
-/// Todos los strings son copias propias del allocator del modelo.
+/// It reuses the list already downloaded from the active provider, so opening it
+/// costs no network call (and if there are no models yet, `pickerModelsAsync` is
+/// launched to have something to paint).
+/// Builds the model palette's items: providers first (with their key state) and
+/// then the models with their `free` flag or their context window. All strings
+/// are own copies from the model's allocator.
 fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
     const gpa = m.allocator;
     const defs = allProviders(gpa);
@@ -2654,9 +2678,9 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
         };
         i += 1;
     }
-    // OJO: TODO label/hint tiene que ser una COPIA propia. Un literal
-    // ("+ connect") liberado con `gpa.free` es un "Invalid free" que solo
-    // aparece al salir de la app, cuando la paleta se destruye.
+    // CAREFUL: EVERY label/hint has to be an OWN copy. A literal
+    // ("+ connect") freed with `gpa.free` is an "Invalid free" that only shows
+    // up on app exit, when the palette is destroyed.
     items[i] = .{
         .kind = .connect,
         .group = 2,
@@ -2681,29 +2705,29 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
 }
 
 fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
-    // El modo va antes de `setItemsOwned` (ver nota en la misma funcion).
-    // Delega en `buildModelItems`: mantener DOS constructores de items
-    // causa que en cuanto uno se queda sin actualizar aparezcan literales
-    // sueltos (que `freeItems` no puede liberar) y la app peta al salir.
+    // The mode goes before `setItemsOwned` (see the note in the same function).
+    // It delegates to `buildModelItems`: keeping TWO item constructors means
+    // that as soon as one of them is not updated, loose literals show up (which
+    // `freeItems` cannot free) and the app crashes on exit.
     const items = buildModelItems(m, list) orelse return;
-    // El modo va ANTES que `setItemsOwned`: `resetSelection` calcula la columna
-    // activa a partir del modo. Con el modo viejo, abrir la paleta de modelos
-    // dejaba activa la columna de PROVIDERS, las flechas no movian la lista de
-    // modelos y parecia que no habia nada que elegir.
+    // The mode goes BEFORE `setItemsOwned`: `resetSelection` computes the active
+    // column from the mode. With the old mode, opening the model palette left
+    // the PROVIDERS column active, the arrows did not move the model list and
+    // it looked like there was nothing to pick.
     m.pal.mode = .models;
     m.pal.active = true;
     m.pal.query_len = 0;
     m.pal.setItemsOwned(items, &model_groups);
 }
 
-/// Grupos de la paleta de modelos.
+/// Groups of the model palette.
 pub const model_groups = [_]palette.Group{
     .{ .name = "Providers" },
-    .{ .name = "" }, // separador del item "Connect an integration"
+    .{ .name = "" }, // separator for the "Connect an integration" item
     .{ .name = "Modelos" },
 };
 
-/// `/provider`: picker con todos los providers y su estado de key.
+/// `/provider`: picker with all the providers and their key state.
 fn openProviderPicker(m: *tui.Model) void {
     const gpa = m.allocator;
     const defs = allProviders(gpa);
@@ -2723,7 +2747,7 @@ fn openProviderPicker(m: *tui.Model) void {
     m.openPicker(2, "provider", items, onProviderPick);
 }
 
-/// `/effort` sin args: picker de 3 opciones.
+/// `/effort` without args: a 3-option picker.
 fn openEffortPicker(m: *tui.Model) void {
     const gpa = m.allocator;
     const opts = [_][]const u8{ "low", "medium", "high" };
@@ -2738,9 +2762,9 @@ fn openEffortPicker(m: *tui.Model) void {
     m.openPicker(3, "effort", items, onEffortPick);
 }
 
-// ── paleta modal (Ctrl+P) ─────────────────────────────────────
+// ── modal palette (Ctrl+P) ────────────────────────────────────
 
-/// Grupos de la paleta de comandos, en el orden en que se pintan.
+/// Groups of the command palette, in the order they are painted.
 pub const cmd_groups = [_]palette.Group{
     .{ .name = "Connect" },
     .{ .name = "Suggested" },
@@ -2748,20 +2772,19 @@ pub const cmd_groups = [_]palette.Group{
     .{ .name = "Session" },
 };
 
-/// Wrapper de `cmdGroup` para los tests (ver la nota de `key[1..]`).
+/// Wrapper of `cmdGroup` for the tests (see the `key[1..]` note).
 pub fn cmdGroupPublic(key: []const u8) u8 {
     return cmdGroup(key);
 }
 
-/// Grupo (índice +1 sobre `cmd_groups`) de cada comando. Vive aparte de la
-/// lista para poder reordenar los comandos sin tocar el mapeo.
+/// Group (+1 index over `cmd_groups`) of each command. It lives apart from the
+/// list so the commands can be reordered without touching the mapping.
 fn cmdGroup(key: []const u8) u8 {
-    // "connect" (sin barra) es el item de la cabecera de la paleta, no un
-    // comando de slash.
+    // "connect" (no slash) is the palette header item, not a slash command.
     if (std.mem.eql(u8, key, "connect")) return 1;
-    // `key[1..]` reventaba con "integer overflow" si la key venía vacía: en
-    // Zig 0.16 un slice `0..1` sobre un []const u8 de len 0 es un panic, no un
-    // slice vacío. Se quita la barra solo si de verdad la hay.
+    // `key[1..]` blew up with "integer overflow" if the key came in empty: in
+    // Zig 0.16 a `0..1` slice over a len-0 []const u8 is a panic, not an empty
+    // slice. The slash is removed only if it is really there.
     const k = if (key.len > 0 and key[0] == '/') key[1..] else key;
     if (std.mem.eql(u8, k, "help") or std.mem.eql(u8, k, "new") or
         std.mem.eql(u8, k, "resume") or std.mem.eql(u8, k, "yolo")) return 2;
@@ -2771,11 +2794,11 @@ fn cmdGroup(key: []const u8) u8 {
     return 4;
 }
 
-/// Ctrl+P → Connect: el modal de conectar providers. Una sola lista con todos
-/// los providers y su estado de key; Enter abre el campo para pegar la key.
+/// Ctrl+P → Connect: the modal to connect providers. A single list with all the
+/// providers and their key state; Enter opens the field to paste the key.
 ///
-/// Es el camino que pedía el usuario: paleta → Connect → provider → key, sin
-/// tener que entering por la columna izquierda de la paleta de modelos.
+/// This is the path the user asked for: palette → Connect → provider → key,
+/// without having to go through the left column of the model palette.
 pub fn openConnectPalette(m: *tui.Model) void {
     const gpa = m.allocator;
     const defs = allProviders(gpa);
@@ -2796,15 +2819,15 @@ pub fn openConnectPalette(m: *tui.Model) void {
     m.pal.setItemsOwned(items, &.{});
 }
 
-/// Ctrl+P: paleta de comandos.
+/// Ctrl+P: the command palette.
 ///
-/// Los items se copian al allocator del modelo (no a una arena de frame) porque
-/// la palette vive entre frames: si apuntaran al arena del frame, al redibujar
-/// por el streamer se quedarían colgando.
+/// The items are copied into the model's allocator (not a frame arena) because
+/// the palette lives between frames: if they pointed at the frame's arena, they
+/// would dangle when the streamer redraws.
 pub fn openCommandPalette(m: *tui.Model) void {
     const gpa = m.allocator;
-    // +1 por el item "Connect" de la cabecera: es la vía corta para conectar
-    // un provider sin salir de la paleta de comandos.
+    // +1 for the header's "Connect" item: it is the shortcut to connect a
+    // provider without leaving the command palette.
     const items = gpa.alloc(palette.Item, commands.len + 1) catch return;
     items[0] = .{
         .kind = .command,
@@ -2820,8 +2843,8 @@ pub fn openCommandPalette(m: *tui.Model) void {
             .hint = if (c.key_hint) |h| gpa.dupe(u8, h) catch "" else "",
         };
     }
-    // Orden estable por grupo: si no, los encabezados se repiten y la lista
-    // salta de "Modelo" a "Sesión" y vuelve a "Sugerido".
+    // Stable order by group: otherwise the headers repeat and the list jumps from
+    // "Model" to "Session" and back to "Suggested".
     std.mem.sort(palette.Item, items, {}, byGroupThenName);
     m.pal.mode = .commands;
     m.pal.active = true;
@@ -2834,7 +2857,7 @@ fn byGroupThenName(_: void, a: palette.Item, b: palette.Item) bool {
     return std.mem.lessThan(u8, a.label, b.label);
 }
 
-/// Aplica un provider elegido en la paleta (o en `/use`).
+/// Applies a provider chosen in the palette (or in `/use`).
 pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
     const def = config_mod.find(user_config, id) orelse providers.byId(id) orelse {
         const msg = std.fmt.allocPrint(m.allocator, "unknown provider: {s}", .{id}) catch return;
@@ -2853,7 +2876,7 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
     refreshContextUsage(m);
 }
 
-/// Aplica un modelo elegido en la paleta (o en `/model`).
+/// Applies a model chosen in the palette (or in `/model`).
 pub fn applyModel(m: *tui.Model, name: []const u8) !void {
     setModel(name);
     const msg = std.fmt.allocPrint(m.allocator, "model → {s}", .{name}) catch "modelo";
@@ -2862,15 +2885,15 @@ pub fn applyModel(m: *tui.Model, name: []const u8) !void {
     refreshContextUsage(m);
 }
 
-/// Abre el prompt para escribir la key de un provider.
+/// Opens the prompt to type a provider's key.
 ///
-/// `provider_idx` es el índice del provider en la paleta, o null para el
-/// provider activo. Volver a pulsarlo cuando el prompt ya está abierto lo
-/// cancela (toggle), que es lo que espera quien lo usa a ciegas.
+/// `provider_idx` is the provider's index in the palette, or null for the active
+/// provider. Pressing it again while the prompt is already open cancels it
+/// (toggle), which is what someone using it blindly expects.
 pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
     const gpa = m.allocator;
     if (m.pal.mode == .key_prompt) {
-        // Segundo ctrl+a mientras se escribe la key: cancela.
+        // A second ctrl+a while typing the key: cancels.
         openConnectPalette(m);
         return;
     }
@@ -2879,7 +2902,7 @@ pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
         if (m.pal.items[idx].kind != .provider) return;
         m.pal.key_item = idx;
     } else {
-        // Sin provider elegido: el activo, o el primero de la lista.
+        // No provider chosen: the active one, or the first in the list.
         m.pal.key_item = 0;
         for (m.pal.items, 0..) |it, i| {
             if (it.kind == .provider and std.mem.eql(u8, it.label, cur_provider_id)) {
@@ -2895,14 +2918,14 @@ pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
     _ = gpa;
 }
 
-/// Guarda la key de un provider en `~/.config/zode/auth.json`.
+/// Saves a provider's key in `~/.config/zode/auth.json`.
 ///
-/// Las keys NO van en `config.json` (que es texto que la gente versiona): en un
-/// archivo aparte con permisos 0600, que es lo que hace opencode. `auth.json`
-/// es un objeto plano `{ "<provider>": "<key>" }`.
+/// The keys do NOT go in `config.json` (that is text people version): they go in
+/// a separate file with 0600 permissions, which is what opencode does.
+/// `auth.json` is a flat object `{ "<provider>": "<key>" }`.
 pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
-    // Recortar y validar: ver `normalizeKey` (el comentario de ahi explica por
-    // que una key pegada con espacios deja el provider en 401 para siempre).
+    // Trim and validate: see `normalizeKey` (the comment there explains why a key
+    // pasted with spaces leaves the provider at 401 forever).
     const norm = normalizeKey(key);
     if (norm.problem.len > 0) {
         m.pal.setKeyMessage(norm.problem);
@@ -2924,26 +2947,26 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     defer astate.deinit();
     const a = astate.allocator();
 
-    // Se lee lo que haya, se le añade/actualiza esta entrada y se reescribe:
-    // al guardar una key no se deben perder las de los otros providers.
-    var obj: std.json.ObjectMap = .{}; // unmanaged: el mapa vacío es `.{}`
+    // Read whatever is there, add/update this entry and rewrite:
+    // saving a key must not lose the other providers' keys.
+    var obj: std.json.ObjectMap = .{}; // unmanaged: the empty map is `.{}`
     if (readFileTo(a, auth_path)) |prev| {
         if (std.json.parseFromSliceLeaky(std.json.Value, a, prev, .{})) |v| {
             if (v == .object) {
                 obj = v.object;
             } else {
-                obj = .{}; // no es un objeto: se empieza de cero
+                obj = .{}; // not an object: start from scratch
             }
         } else |_| {
-            obj = .{}; // JSON roto: también de cero, mejor que callar
+            obj = .{}; // broken JSON: from scratch too, better than staying quiet
         }
     }
     obj.put(a, provider, .{ .string = trimmed }) catch return;
 
-    // `auth.json` son unas pocas keys: cabe de sobra en un buffer de stack y
-    // así no hay que pelearse con un writer sobre un mapa. Se serializa el
-    // mapa entero, ya con la key nueva puesta arriba: si además se añadiera a
-    // mano, salía duplicada (`{"a":"x","a":"x"}`).
+    // `auth.json` is a handful of keys: it fits easily in a stack buffer, so
+    // there is no need to wrestle with a writer over a map. The whole map is
+    // serialized, already with the new key put in above: if it were also added
+    // by hand, it came out duplicated (`{"a":"x","a":"x"}`).
     var pairs: [64][2][]const u8 = undefined;
     var np: usize = 0;
     var it = obj.iterator();
@@ -2971,26 +2994,27 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     };
     reloadUserConfig();
     loadAuthKeys(gpa);
-    // Se vuelve a la lista de providers con el estado ya actualizado ("key
-    // ok"), que es donde se ve que ha funcionado. Tirar al usuario a la paleta
-    // de modelos le deja con una columna vacía sin entender por qué.
-    // `provider` apunta a un item de la paleta anterior, que `openConnectPalette`
-    // no libera (los items se copian al allocator del modelo), así que sigue
-    // siendo válido para formatear el mensaje.
+    // Go back to the providers list with the state already updated ("key
+    // ok"), which is where you see that it worked. Dumping the user into the
+    // model palette leaves them with an empty column and no idea why.
+    // `provider` points at an item of the previous palette, which
+    // `openConnectPalette` does not free (the items are copied into the model's
+    // allocator), so it is still valid to format the message.
     openConnectPalette(m);
     m.pal.setKeyMessagef("saved: {s}", .{provider});
 }
 
-// ── validación de keys ────────────────────────────────────────
+// ── key validation ────────────────────────────────────────────
 
-/// Normaliza una key pegada: recorta espacios/saltos (la terminal los suelta al
-/// pegar) y dice si el resultado parece una key de verdad.
+/// Normalizes a pasted key: trims spaces/newlines (the terminal sends them on
+/// paste) and says whether the result looks like a real key.
 ///
-/// Existe por un caso real: al fuzzer le dio por teclear en el campo de "connect"
-/// y guardó `"pasted texthelpoommxllmm"` como key de opencode. Como la key
-/// guardada tiene prioridad sobre el entorno, tapaba la key buena del `.env` y
-/// el provider respondía 401 "Invalid credential" sin explicación. Una key con
-/// espacios por dentro o demasiado corta no es una key: es texto pegado.
+/// It exists because of a real case: the fuzzer happened to type in the
+/// "connect" field and saved `"pasted texthelpoommxllmm"` as opencode's key.
+/// Since the saved key takes precedence over the environment, it masked the
+/// good key from the `.env` and the provider answered 401 "Invalid credential"
+/// with no explanation. A key with spaces inside it, or too short, is not a key:
+/// it is pasted text.
 pub fn normalizeKey(raw: []const u8) struct { key: []const u8, problem: []const u8 } {
     const key = std.mem.trim(u8, raw, " \\t\\r\\n");
     if (key.len == 0) return .{ .key = key, .problem = "empty key: nothing saved" };
@@ -3008,7 +3032,7 @@ test "normalizeKey: recorta lo que la terminal suelta al pegar" {
 }
 
 test "normalizeKey: rechaza basura pegada por error" {
-    // El caso real que rompió el provider: texto pegado con espacios.
+    // The real case that broke the provider: text pasted with spaces.
     const b = normalizeKey("pasted text\nhere");
     try std.testing.expect(b.problem.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, b.problem, "spaces") != null);
@@ -3029,55 +3053,56 @@ test "normalizeKey: una key real pasa" {
 }
 
 test "el texto sintético de iteración es memoria propia, no un literal" {
-    // Regresión: `execToolCalls` devolvía el LITERAL "Continue with the tool
-    // results above." con el tipo `?[]const u8`, y `chatWorker` lo liberaba
-    // porque asumía que todo lo que devolvía `runOneTurn` era suyo. Liberar
-    // `.rodata` es un "reached unreachable code" en ReleaseSafe: cualquier
-    // turno que usara una tool tumbaba la app, siempre.
+    // Regression: `execToolCalls` returned the LITERAL "Continue with the tool
+    // results above." typed as `?[]const u8`, and `chatWorker` freed it because
+    // it assumed everything `runOneTurn` returned was its own. Freeing
+    // `.rodata` is a "reached unreachable code" in ReleaseSafe: any turn that
+    // used a tool brought the app down, always.
     //
-    // Este test hace exactamente lo que hacía el caller: liberar lo devuelto.
-    // Con `testing.allocator` un literal se detecta al instante.
+    // This test does exactly what the caller did: free what was returned. With
+    // `testing.allocator` a literal is detected on the spot.
     const gpa = std.testing.allocator;
     const owned = gpa.dupe(u8, syntheticUserText) catch return error.OutOfMemory;
     gpa.free(owned);
-    // Y comprueba que el literal NO se puede liberar (por si alguien lo
-    // "optimiza" y vuelve a devolverlo).
+    // And it checks that the literal CANNOT be freed (in case someone
+    // "optimizes" it and returns it again).
     const as_const: []const u8 = syntheticUserText;
     try std.testing.expect(@intFromPtr(as_const.ptr) < 0x1000_0000_0000 or true);
 }
 
 test "errPhrase: los errores se leen como frases, no como identificadores" {
-    // El status bar y el historial los ve una persona. `RateLimited` no le
-    // dice nada a nadie; "rate limited" sí.
+    // A person sees the status bar and the history. `RateLimited` tells nobody
+    // anything; "rate limited" does.
     try std.testing.expectEqualStrings("rate limited", errPhrase(error.RateLimited));
     try std.testing.expectEqualStrings("server overloaded", errPhrase(error.Overloaded));
     try std.testing.expectEqualStrings("no credits", errPhrase(error.NoCredits));
     try std.testing.expectEqualStrings("model not found", errPhrase(error.ModelNotFound));
     try std.testing.expectEqualStrings("auth failed", errPhrase(error.AuthFailed));
-    // Lo que no se conoce pasa: mejor el identificador que mentir.
+    // What is not known passes through: the identifier is better than lying.
     try std.testing.expectEqualStrings("SomeNewError", errPhrase(error.SomeNewError));
 }
 
 test "el backoff que se anuncia es el que se espera" {
-    // El aviso dice "retrying in N.Ns" y `Retry.wait` duerme lo mismo. Si las
-    // dos fórmulas se separan, el mensaje miente.
+    // The notice says "retrying in N.Ns" and `Retry.wait` sleeps the same. If the
+    // two formulas drift apart, the message lies.
     //
-    // El jitter va de 0 a 3.9ms (`h & 0xFF` de un golden ratio sobre
-    // ns_per_ms/256), así que la margen es de 4ms, no de 100.
+    // The jitter goes from 0 to 3.9ms (`h & 0xFF` of a golden ratio over
+    // ns_per_ms/256), so the margin is 4ms, not 100.
     const a0 = Retry.backoffMs(0);
     const a1 = Retry.backoffMs(1);
     const a2 = Retry.backoffMs(2);
     try std.testing.expect(a0 >= 500 and a0 < 510);
     try std.testing.expect(a1 >= 1000 and a1 < 1010);
     try std.testing.expect(a2 >= 2000 and a2 < 2010);
-    // El jitter no rompe la monotonía del backoff (2x es más que el jitter).
+    // The jitter does not break the backoff's monotonicity (2x is more than the
+    // jitter).
     try std.testing.expect(a1 > a0 and a2 > a1);
 }
 
 test "el backoff respeta el retry-after del server" {
-    // `chat.retry_after_secs` estaba puesto desde el principio y no lo leía
-    // nadie: un 429 con `retry-after: 30` esperaba 1s y se comía el rate limit
-    // entero. Ahora se respeta, con techo de 30s.
+    // `chat.retry_after_secs` was there from the start and nobody read it: a 429
+    // with `retry-after: 30` waited 1s and ate the entire rate limit. Now it is
+    // honored, with a 30s ceiling.
     chat.retry_after_secs = null;
     defer chat.retry_after_secs = null;
     const base = Retry.waitMs(0);
@@ -3086,29 +3111,29 @@ test "el backoff respeta el retry-after del server" {
     chat.retry_after_secs = 12;
     try std.testing.expectEqual(@as(u64, 12_000), Retry.waitMs(0));
 
-    // Por debajo del backoff no se baja nunca (el server puede pedir 0).
+    // It never goes below the backoff (the server may ask for 0).
     chat.retry_after_secs = 0;
     try std.testing.expectEqual(base, Retry.waitMs(0));
 
-    // Y el techo: nadie espera 10 minutos en silencio.
+    // And the ceiling: nobody waits 10 minutes in silence.
     chat.retry_after_secs = 600;
     try std.testing.expectEqual(@as(u64, 30_000), Retry.waitMs(0));
 }
 
 test "toolCallsJsonFromCalls: el mensaje del assistant lleva las tool_calls" {
-    // Regresión GRABE: la TUI guardaba el mensaje del asistente con
-    // `appendAssistant(text, null)`, es decir SIN `tool_calls`. El mensaje de
-    // tool que va detrás lleva `tool_call_id`, así que no casaba con nada y el
-    // API devolvía 400 `invalid_request_error` en el turno SIGUIENTE. Resultado
-    // en pantalla: la tool se ejecutaba y la respuesta final no llegaba nunca,
-    // sin error visible (el aviso se quedaba en `pending` y hacía falta pulsar
-    // una tecla para verlo). En headless sí pasaba los `tool_calls`, y por eso
-    // el agent loop funcionaba allí y no en la TUI.
+    // SERIOUS regression: the TUI stored the assistant message with
+    // `appendAssistant(text, null)`, that is, WITHOUT `tool_calls`. The tool
+    // message that goes after it carries `tool_call_id`, so it matched nothing
+    // and the API answered 400 `invalid_request_error` on the NEXT turn.
+    // On-screen result: the tool ran and the final reply never arrived, with no
+    // visible error (the notice stayed in `pending` and you had to press a key
+    // to see it). Headless did pass the `tool_calls`, which is why the agent
+    // loop worked there and not in the TUI.
     const gpa = std.testing.allocator;
-    // Arena: el slice devuelto es la última reallocación de un ArrayList, y su
-    // `len` no es el tamaño con el que se reservó. Liberarlo a pelo con el
-    // allocator es un "Invalid free" (el allocator exige la longitud exacta).
-    // En producción no importa: `appendAssistant` lo dupéa.
+    // Arena: the returned slice is the last reallocation of an ArrayList, and
+    // its `len` is not the size it was reserved with. Freeing it raw with the
+    // allocator is an "Invalid free" (the allocator demands the exact length).
+    // In production it does not matter: `appendAssistant` dupes it.
     var astate = std.heap.ArenaAllocator.init(gpa);
     defer astate.deinit();
     var calls = [_]TurnCtx.Call{
@@ -3117,13 +3142,13 @@ test "toolCallsJsonFromCalls: el mensaje del assistant lleva las tool_calls" {
     };
     const json = toolCallsJsonFromCalls(astate.allocator(), &calls) orelse return error.TestUnexpectedResult;
 
-    // Tiene que ser el MISMO formato que escribe `chat.StreamCtx.toolCallsJson`
-    // (el que usa el runner headless): si divergen, uno de los dos clientes
-    // manda una conversación que el otro no puede leer.
+    // It has to be the SAME format that `chat.StreamCtx.toolCallsJson` writes
+    // (the one the headless runner uses): if they diverge, one of the two
+    // clients sends a conversation the other cannot read.
     const expected = "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.zig\\\"}\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls -la\\\"}\"}}]";
     try std.testing.expectEqualStrings(expected, json);
 
-    // Y el `arguments` va como STRING JSON escapado, no como objeto anidado.
+    // And `arguments` goes as an escaped JSON STRING, not as a nested object.
     var vstate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer vstate.deinit();
     const v = try std.json.parseFromSliceLeaky(std.json.Value, vstate.allocator(), json, .{});
@@ -3133,13 +3158,14 @@ test "toolCallsJsonFromCalls: el mensaje del assistant lleva las tool_calls" {
     try std.testing.expectEqualStrings("read", fnobj.get("name").?.string);
     try std.testing.expectEqualStrings("{\"path\":\"a.zig\"}", fnobj.get("arguments").?.string);
 
-    // Sin calls no hay JSON (y no un "[]" que el API no sabe qué hacer).
+    // With no calls there is no JSON (and not a "[]" the API does not know what to
+    // do with).
     try std.testing.expect(toolCallsJsonFromCalls(astate.allocator(), &[_]TurnCtx.Call{}) == null);
 }
 
 test "toolArgSummary y toolResultSummary conocen las tools de web" {
-    // `⏺ web_fetch(ziglang.org/…)` y `⎿ 412 lines · 78 KB` son feedback útil;
-    // sin esto salía el primer string suelto y "web_fetch" a secas.
+    // `⏺ web_fetch(ziglang.org/…)` and `⎿ 412 lines · 78 KB` are useful feedback;
+    // without this the first loose string came out and just "web_fetch".
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3161,23 +3187,23 @@ test "cmdAllowlist lista lo que hay y avisa si esta vacia" {
     var m = tui.Model.init(fba.allocator());
     defer m.deinit();
 
-    // Vacia: lo dice, para que "no me pregunta" se pueda distinguir de "no hay
-    // nada que mirar".
+    // Empty: it says so, so that "it doesn't ask" can be told apart from "there is
+    // nothing to look at".
     cmdAllowlist(&m);
     m.drainPending();
     try std.testing.expect(std.mem.indexOf(u8, m.paras.items[0].text, "(none)") != null);
 
-    // Con una tool en la lista: sale su nombre.
+    // With a tool in the list: its name shows up.
     _ = setAlwaysAllowedNoSave("bash");
     cmdAllowlist(&m);
     m.drainPending();
     try std.testing.expect(std.mem.indexOf(u8, m.paras.items[1].text, "bash") != null);
 
-    // Y no se duplica: el count no crece por repreguntar.
+    // And it does not duplicate: the count does not grow from asking again.
     const before = m.paras.items.len;
     cmdAllowlist(&m);
     m.drainPending();
     try std.testing.expectEqual(before + 1, m.paras.items.len);
 
-    always_lens = @splat(0); // no dejar el estado global sucio
+    always_lens = @splat(0); // do not leave the global state dirty
 }
