@@ -195,7 +195,3 @@ pub fn faceFrames(mood: Mood, frame: u64) []const u8 {
     };
 }
 
-/// Does this art line carry a mark? (for the invariant test)
-pub fn isWordmarkLine(line: []const u8) bool {
-    return std.mem.indexOf(u8, line, "*") != null;
-}

@@ -604,12 +604,6 @@ pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
     };
 }
 
-pub fn sepStyle() Style {
-    return styles.sep;
-}
-pub fn infoStyle() Style {
-    return styles.info;
-}
 
 // basic test
 test "parse markdown básico" {

@@ -59,6 +59,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     chat.io_global = io;
     models.dbg_io = io;
     defer agent.shutdownUserConfig();
+    defer agent.shutdownBuffers(); // the 1 MiB body buffer (see `bodyBuf`)
     agent.loadUserConfig();
 
     const def = agent.activeProviderDef(env);
@@ -218,6 +219,7 @@ fn runTui(init: std.process.Init) !u8 {
     chat.io_global = io;
     agent.resume_on_start = std.mem.eql(u8, envGet(init.environ_map, "ZODE_RESUME") orelse "", "1");
     defer agent.shutdownUserConfig();
+    defer agent.shutdownBuffers(); // the 1 MiB body buffer (see `bodyBuf`)
     agent.loadUserConfig();
     agent.bootstrapSession(&model);
 

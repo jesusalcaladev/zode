@@ -271,10 +271,6 @@ fn allProviders(arena: std.mem.Allocator) []const providers.ProviderDef {
     return config_mod.allDefs(arena, user_config);
 }
 
-/// Definition of the active provider.
-fn curDef(env: ?*const std.process.Environ.Map) *const providers.ProviderDef {
-    return activeProviderDef(env);
-}
 
 pub fn activeProviderDef(env: ?*const std.process.Environ.Map) *const providers.ProviderDef {
     if (config_mod.find(user_config, cur_provider_id)) |d| return d;
@@ -587,11 +583,15 @@ fn bodyBuf(gpa: std.mem.Allocator) ![]u8 {
     return body_buf_heap.?;
 }
 
-/// Frees the body buffer. Called by the teardown (the keys map has similar
-/// rules: never freed at runtime).
-pub fn shutdownBuffers(gpa: std.mem.Allocator) void {
+/// Frees the body buffer. Called by the TEARDOWN, never at runtime (the keys
+/// map has similar rules).
+///
+/// No allocator parameter, like `shutdownUserConfig`: the buffer was reserved
+/// with `gpa_global`, so freeing it with a different allocator would be an
+/// `Invalid free`.
+pub fn shutdownBuffers() void {
     if (body_buf_heap) |b| {
-        gpa.free(b);
+        gpa_global.free(b);
         body_buf_heap = null;
     }
 }
@@ -647,7 +647,7 @@ test "TurnStats: un diff de 0 lineas no inventa ficheros" {
     s.deinit();
 }
 
-/// Empties the history of the current session without creating another one.
+/// Empties the current session's history without creating a new one.
 pub fn resetSession(m: *tui.Model) void {
     if (session) |s| {
         s.messages.clearRetainingCapacity();
@@ -2647,11 +2647,6 @@ fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
     return std.mem.lessThan(u8, a.id, b.id);
 }
 
-/// Fills the model palette with an already downloaded list. Called by the DRAW
-/// when it picks up `pending_models`, not by the worker.
-pub fn openModelPaletteWith(m: *tui.Model, list: []models_mod.Model) void {
-    openModelPalette(m, list);
-}
 
 /// Opens the model palette in TWO COLUMNS: providers | the active one's models.
 ///
@@ -2885,11 +2880,10 @@ pub fn applyModel(m: *tui.Model, name: []const u8) !void {
     refreshContextUsage(m);
 }
 
-/// Opens the prompt to type a provider's key.
+/// Opens the prompt for a provider's API key.
 ///
-/// `provider_idx` is the provider's index in the palette, or null for the active
-/// provider. Pressing it again while the prompt is already open cancels it
-/// (toggle), which is what someone using it blindly expects.
+/// `provider_idx` selects which one; `null` means the active provider, or the
+/// first in the list.
 pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
     const gpa = m.allocator;
     if (m.pal.mode == .key_prompt) {

@@ -718,15 +718,6 @@ pub fn sleepMs(ms_arg: u64) void {
 /// the worker that is already serializing its requests uses it).
 var rng_state: u64 = 0x9E3779B97F4A7C15;
 
-pub fn randBelow(n: u64) u64 {
-    if (n == 0) return 0;
-    var x = rng_state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    rng_state = x;
-    return x % n;
-}
 
 /// Processes a whole SSE body in one go (tests and socketless paths).
 /// Uses the same incremental parser as the real stream, feeding it whole.
