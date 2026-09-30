@@ -4,6 +4,8 @@ const providers = @import("providers.zig");
 const chat = @import("chat.zig");
 const http_client = @import("http_client.zig");
 const tools_mod = @import("tools.zig");
+const roster_mod = @import("roster.zig");
+const free_auto = @import("free_auto.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("models.zig");
 const cache_stats = @import("cache_stats.zig");
@@ -230,13 +232,15 @@ fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
-fn pushInfo(m: *tui.Model, text: []const u8) void {
+/// [roster] `pub` para que lo use `free_auto.zig` desde su worker.
+pub fn pushInfo(m: *tui.Model, text: []const u8) void {
     m.pushInfo(text);
 }
 
 /// Variante que ya trae la memoria del llamante: no hay que duplicar (ni
 /// liberar) el texto. Se usa en el worker, que no puede dejar basura por frame.
-fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
+/// [roster] `pub` para que lo use `free_auto.zig`.
+pub fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
     m.pushInfoOwned(text);
 }
 
@@ -244,7 +248,8 @@ fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
 /// la fila de status, en el color del mood, una sola vez. Aquí se la metía y
 /// salía duplicada y del mismo gris que todo lo demás (que es justo la queja de
 /// que "no se nota por el color").
-fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void {
+/// [roster] `pub` para que lo use `free_auto.zig`.
+pub fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void {
     m.setStatusWithMood(mood, text);
 }
 
@@ -252,7 +257,8 @@ fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void {
 
 /// Todos los providers: los del `config.json` del usuario primero y luego los
 /// compilados que no estén redefinidos (un id del config gana al compilado).
-fn allProviders(arena: std.mem.Allocator) []const providers.ProviderDef {
+/// [roster] `pub` para que `free_auto.zig` liste los providers del pool.
+pub fn allProviders(arena: std.mem.Allocator) []const providers.ProviderDef {
     return config_mod.allDefs(arena, user_config);
 }
 
@@ -490,6 +496,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "low|medium|high (no args: picker)" },
+    .{ .key = "/free-auto", .desc = "on|off: rotate free models across providers when one runs out" },
     .{ .key = "/yolo", .desc = "toggle auto permissions" },
     .{ .key = "/acp", .desc = "on|off|<cmd>: delegate the turn to an ACP agent (opencode acp)" },
     .{ .key = "/new", .desc = "new session" },
@@ -713,6 +720,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdEffort(m, arg);
     } else if (std.mem.eql(u8, cmd, "use")) {
         cmdUse(m, arg);
+    } else if (std.mem.eql(u8, cmd, "free-auto")) {
+        free_auto.cmdFreeAuto(m, arg);
     } else if (std.mem.eql(u8, cmd, "yolo")) {
         cmdYolo(m);
     } else if (std.mem.eql(u8, cmd, "acp")) {
@@ -1894,6 +1903,69 @@ fn isRetryable(err: anyerror) bool {
     };
 }
 
+/// [roster] ¿Este error significa "este provider/modelo ya no da para seguir"?
+///
+/// Es la pregunta que decide si el turno CONTINÚA con otro par de
+/// provider/modelo (que es lo que hace `/free-auto`) o si se rinde con un
+/// mensaje. Y por eso la tabla esta tan fina: la accion que corresponde es
+/// opuesta segun la fila.
+///
+/// | error                 | veredicto | por que                                               |
+/// |-----------------------|-----------|-------------------------------------------------------|
+/// | 402 NoCredits         | si        | sin creditos. Reintentar el mismo es tonto.           |
+/// | 429 RateLimited       | si        | cuota del modelo, no de la key. Otro par sigue.       |
+/// | 403 "...within OpenCode" | si     | es el GATE, no la configuracion. Otro par funciona.   |
+/// | 403 sin eso           | NO        | casi siempre es un modelo no disponible en la cuenta.  |
+/// | 401 AuthFailed        | NO        | es la key. Rotar daria el mismo 401 en los 7.         |
+/// | 404 ModelNotFound     | NO        | es un id malo, no una cuota.                           |
+///
+/// `detail` es el cuerpo del error del server (`chat.lastErrorBody`), que es
+/// donde esta la frase que decide la fila del 403: "can only be used from within
+/// OpenCode" y "your credit balance is too low" son dos 403 que significan
+/// cosas opuestas.
+///
+/// Sin asignar: se llama en el camino de error, y devolver memoria obligaria a
+/// cada llamante a un `defer` dentro de un `catch`.
+pub fn quotaVerdict(err: anyerror, detail: []const u8) ?roster_mod.Why {
+    return switch (err) {
+        error.NoCredits => .no_credits,
+        error.RateLimited => .rate_limited,
+        error.Forbidden => if (isGateMessage(detail)) .gated else .misconfigured,
+        else => null,
+    };
+}
+
+/// ¿El texto del 403 es el gate de opencode (o su equivalente)?
+///
+/// Frases reales que se han visto en el `reason` de un 403:
+///   "can only be used from within OpenCode"
+///   "Model access is disabled"
+///   "model is not available for your account"
+/// Es subcadena y sin distinguir mayusculas porque cada provider redacta el
+/// suyo, y no hay una constante que_valga para todos.
+pub fn isGateMessage(detail: []const u8) bool {
+    return containsNoCase(detail, "within opencode") or
+        containsNoCase(detail, "access is disabled") or
+        containsNoCase(detail, "not available for your") or
+        containsNoCase(detail, "only be used from within");
+}
+
+/// `containsNoCase` sin allocar: lowera los dos caracteres a la vez en vez de
+/// construir una copia en minusculas del texto entero.
+pub fn containsNoCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var k: usize = 0;
+        while (k < needle.len and
+            std.ascii.toLower(haystack[i + k]) == std.ascii.toLower(needle[k])) k += 1
+        ;
+        if (k == needle.len) return true;
+    }
+    return false;
+}
+
 const Retry = struct {
     /// Cuánto se espera ANTES del reintento `attempt` (0-indexado), en ms.
     ///
@@ -2705,7 +2777,7 @@ test "el texto sintético de iteración es memoria propia, no un literal" {
 
 test "errPhrase: los errores se leen como frases, no como identificadores" {
     // El status bar y el historial los ve una persona. `RateLimited` no le
-    // dice nada a nadie; "rate limited" sí.
+    // dice nada a nadie; "rate limited" si.
     try std.testing.expectEqualStrings("rate limited", errPhrase(error.RateLimited));
     try std.testing.expectEqualStrings("server overloaded", errPhrase(error.Overloaded));
     try std.testing.expectEqualStrings("no credits", errPhrase(error.NoCredits));
@@ -2729,6 +2801,56 @@ test "el backoff que se anuncia es el que se espera" {
     try std.testing.expect(a2 >= 2000 and a2 < 2010);
     // El jitter no rompe la monotonía del backoff (2x es más que el jitter).
     try std.testing.expect(a1 > a0 and a2 > a1);
+}
+
+test "quotaVerdict: la tabla de las siete senales" {
+    // La accion que corresponde a cada fila es OPUESTA, y equivocarse aqui
+    // significa dos cosas malas: rotar cuando no toca (el usuario ve el modelo
+    // cambiando sin motivo y pierde el prompt cache) o rendirse cuando si
+    // tocaba (el turno muere y hay que escribir "continua").
+    const gate = "can only be used from within OpenCode";
+
+    // 402: sin creditos, siempre.
+    try std.testing.expectEqual(roster_mod.Why.no_credits, quotaVerdict(error.NoCredits, gate).?);
+    try std.testing.expectEqual(roster_mod.Why.no_credits, quotaVerdict(error.NoCredits, "").?);
+
+    // 429: cuota del modelo, siempre.
+    try std.testing.expectEqual(roster_mod.Why.rate_limited, quotaVerdict(error.RateLimited, "").?);
+
+    // 403 con el texto del gate: rota. Sin el texto: no.
+    try std.testing.expectEqual(roster_mod.Why.gated, quotaVerdict(error.Forbidden, gate).?);
+    try std.testing.expectEqual(
+        roster_mod.Why.gated,
+        quotaVerdict(error.Forbidden, "{\"error\":{\"message\":\"Model access is disabled\"}}").?,
+    );
+    try std.testing.expectEqual(
+        roster_mod.Why.misconfigured,
+        quotaVerdict(error.Forbidden, "model not found in your plan").?,
+    );
+
+    // 401 y 404 NUNCA rotan: la key es la key y un id malo sigue siendo malo.
+    try std.testing.expect(quotaVerdict(error.AuthFailed, gate) == null);
+    try std.testing.expect(quotaVerdict(error.ModelNotFound, gate) == null);
+    // Ni los 5xx de servidor: eso se reintenta con backoff, no cambiando de
+    // modelo (el modelo no tiene la culpa de que el server esté saturado).
+    try std.testing.expect(quotaVerdict(error.ServerError, gate) == null);
+    try std.testing.expect(quotaVerdict(error.Overloaded, gate) == null);
+    try std.testing.expect(quotaVerdict(error.Cancelled, gate) == null);
+}
+
+test "isGateMessage: las frases reales del gate, y case-insensitive" {
+    // Cada provider redacta el suyo; no hay una constante que valga.
+    try std.testing.expect(isGateMessage("can only be used from within OpenCode"));
+    try std.testing.expect(isGateMessage("Can Only Be Used From Within OpenCode"));
+    try std.testing.expect(isGateMessage("Model access is disabled"));
+    try std.testing.expect(isGateMessage("this model is not available for your account"));
+    // Y lo que NO es el gate, para no gastar un par de providers de más.
+    try std.testing.expect(!isGateMessage(""));
+    try std.testing.expect(!isGateMessage("insufficient credits"));
+    try std.testing.expect(!isGateMessage("model not found"));
+    try std.testing.expect(!isGateMessage("opencode is down"));
+    // El "within" suelto no basta: hace falta la frase entera.
+    try std.testing.expect(!isGateMessage("error within the quota system"));
 }
 
 test "el backoff respeta el retry-after del server" {
