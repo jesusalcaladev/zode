@@ -7,6 +7,7 @@ const tools_mod = @import("tools.zig");
 const roster_mod = @import("roster.zig");
 const free_auto = @import("free_auto.zig");
 const plan_mod = @import("plan.zig");
+const mentions = @import("mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("models.zig");
 const cache_stats = @import("cache_stats.zig");
@@ -1679,6 +1680,60 @@ fn noteTurnFailure(m: *tui.Model, err: anyerror, pick: Target) void {
     pushInfoOwned(m, msg);
 }
 
+/// Cuántos ficheros se metieron con el prompt, y cuántos mencionados no se
+/// pudieron meter. Lo devuelve la ampliación para que el llamante componga la
+/// línea del historial.
+pub const MentionCount = struct { files: u8 = 0, missing: u8 = 0 };
+
+/// Devuelve los mensajes con el ÚLTIMO mensaje de usuario ampliado por las
+/// menciones `@fichero`.
+///
+/// Se toca solo el último: es el que el usuario acaba de escribir, y ampliar un
+/// mensaje viejo (un prompt de la iteración anterior) sería duplicar contexto
+/// sin motivo.
+///
+/// Si la ampliación falla (un fichero que no se puede leer, un error de disco),
+/// se devuelve la lista tal cual: mencionar un fichero es una comodidad, nunca
+/// un motivo para que el turno no arranque.
+///
+/// Lo que NO se puede probar aquí es el camino que toca el disco: `expand` hace
+/// `statFile` con `io_global`, y en un test unitario ese `Io` es `undefined`
+/// (leer su vtable es un GPF, no un 0). Es la misma trampa que `Model.attachIo`
+/// con su flag `io_ready`, y por eso la ampliación de verdad se verifica en la
+/// pty, no aquí. Lo que sí se fija aquí es el contrato puro: sin menciones no se
+/// copia nada y solo se toca el último mensaje.
+fn withMentions(
+    arena: std.mem.Allocator,
+    msgs: []chat.ChatMessage,
+    count: *MentionCount,
+) []chat.ChatMessage {
+    if (msgs.len == 0) return msgs;
+    // OJO: el ÚLTIMO mensaje NO es el del usuario. `runOneTurn` añade el system
+    // prompt al FINAL si la sesión no lo tenía (por eso va al principio del
+    // cuerpo, no de la lista), así que en el primer turno la lista termina en
+    // `system`. Buscar "el último" a secas hacía que la mención no se ampliara
+    // NUNCA, y se vio en la pty: el modelo decía "no tengo el contenido del
+    // fichero" con el fichero en el prompt.
+    var last: ?usize = null;
+    for (msgs, 0..) |mm, i| {
+        if (std.mem.eql(u8, mm.role, "user")) last = i;
+    }
+    const li = last orelse return msgs;
+
+    const exp = mentions.expand(arena, io_global, msgs[li].content) catch return msgs;
+    if (exp.files == 0) return msgs;
+    count.files = exp.files;
+    count.missing = exp.missing;
+
+    // Copia de la lista para no tocar la de la sesión: `snapshotMsgs` ya la
+    //Living en la arena de ESTE turno, pero `comp.msgs` se reutiliza entre
+    // reintentos y rotaciones, así que el contenido tiene que ser estable.
+    const copy = arena.alloc(chat.ChatMessage, msgs.len) catch return msgs;
+    @memcpy(copy, msgs);
+    copy[li].content = exp.text;
+    return copy;
+}
+
 fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
@@ -1714,11 +1769,45 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8) !?[]u8 {
     defer astate.deinit();
     const arena = astate.allocator();
 
+    // Las menciones `@fichero` se resuelven AQUÍ, sobre la copia de los mensajes
+    // que va al modelo, y NO en la sesión: el prompt del usuario se guarda tal
+    // cual lo escribió (con su `@ruta`), y lo único que se enriquece es lo que
+    // sale por el cable. Si se guardara el contenido inyectado, el fichero de
+    // sesión creería 32 KB por cada mención y el `/resume` traería los ficheros
+    // dentro de los prompts.
+    var mentions_in: MentionCount = .{};
+    const msgs0 = withMentions(arena, snapshotMsgs(arena), &mentions_in);
+
     const comp: compaction.Compacted = compaction.elideTier(
         arena,
-        snapshotMsgs(arena),
+        msgs0,
         compaction.budgetTokens(m.environ),
-    ) catch compaction.Compacted{ .msgs = snapshotMsgs(arena) };
+    ) catch compaction.Compacted{ .msgs = msgs0 };
+    // Qué ficheros se han metido con el prompt. Sin esta línea el usuario ve que
+    // el modelo "sabe" algo que no le ha enseñado, y con un fichero de 30 KB eso
+    // además cambia el gasto de contexto sin previo aviso.
+    //
+    // OJO: `pushInfo` (que COPIA) y no `pushInfoOwned`. El texto se compone en un
+    // buffer de stack a propósito: `pushInfoOwned` TOMA POSICION del texto y lo
+    // libera en `Model.deinit`, así que darle memoria de la arena del turno (que
+    // muere al final de `runOneTurn`) deja un puntero colgando en la cola de
+    // pendientes. El siguiente frame lo pinta, vaxis lee los BYTES del grapheme
+    // liberados, y la app muere con un segfault en el renderer. Quinta vez que
+    // sale esta familia de bug en este repo.
+    if (mentions_in.files > 0) {
+        var note_buf: [160]u8 = undefined;
+        const note = if (mentions_in.missing > 0)
+            std.fmt.bufPrint(&note_buf, "@fichero: {d} inlined with the prompt, {d} not found", .{
+                mentions_in.files,
+                mentions_in.missing,
+            }) catch "@fichero: inlined"
+        else
+            std.fmt.bufPrint(&note_buf, "@fichero: {d} inlined with the prompt", .{
+                mentions_in.files,
+            }) catch "@fichero: inlined";
+        pushInfo(m, note);
+    }
+
     if (comp.elided > session_elided) {
         session_elided = comp.elided;
         const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
@@ -3358,6 +3447,52 @@ test "noteTurnFailure: el 401 y el ESC NO tiran el par" {
     free_auto_state_set(true, true, pool2);
     noteTurnFailure(&m, error.Cancelled, pick);
     try std.testing.expectEqualStrings("m0", free_auto.rosterGet(arena).currentCandidate().?.model_id);
+}
+
+test "withMentions: amplía SOLO el último mensaje de usuario" {
+    // Lo que importa: (a) la sesión no se toca (la copia es del turno), (b) solo
+    // el último mensaje, y (c) sin menciones no se toca nada.
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+
+    // El system al FINAL a proposito: es como queda de verdad (el system prompt
+    // se añade despues que el mensaje del usuario) y fue justo lo que hacia que
+    // la mencion no se ampliara nunca.
+    var msgs = [_]chat.ChatMessage{
+        .{ .role = "user", .content = "esto estaba antes @no-debe-importar.txt" },
+        .{ .role = "assistant", .content = "hola" },
+        .{ .role = "user", .content = "sin menciones" },
+        .{ .role = "system", .content = "eres un agente" },
+    };
+    var count = MentionCount{};
+    const out = withMentions(arena, &msgs, &count);
+    try std.testing.expectEqual(@as(usize, 4), out.len);
+    // Sin menciones no hay aviso: la línea sería ruido.
+    try std.testing.expectEqual(@as(u8, 0), count.files);
+    // Sin menciones en el último: la lista original, sin copias.
+    try std.testing.expect(out.ptr == &msgs);
+    try std.testing.expectEqualStrings("sin menciones", out[2].content);
+    // Y el mensaje viejo sigue intacto: no se amplía al reenviar.
+    try std.testing.expectEqualStrings("esto estaba antes @no-debe-importar.txt", out[0].content);
+}
+
+test "withMentions: no toca un mensaje que no sea de usuario" {
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    var msgs = [_]chat.ChatMessage{
+        .{ .role = "assistant", .content = "esto es mio @src/agent.zig" },
+    };
+    var count = MentionCount{};
+    const out = withMentions(arena, &msgs, &count);
+    try std.testing.expect(out.ptr == &msgs);
+    try std.testing.expectEqual(@as(u8, 0), count.files);
+    // Y una lista vacía no peta (devuelve la MISMA slice, sin reservar nada).
+    var vacia_arr: [1]chat.ChatMessage = undefined;
+    const vacia: []chat.ChatMessage = vacia_arr[0..0];
+    try std.testing.expectEqual(@as(usize, 0), withMentions(arena, vacia, &count).len);
+    try std.testing.expect(withMentions(arena, vacia, &count).ptr == vacia.ptr);
 }
 
 test "quotaVerdict: la tabla de las siete senales" {

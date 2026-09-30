@@ -19,6 +19,7 @@ pub const roster = @import("roster.zig");
 pub const free_auto = @import("free_auto.zig");
 pub const plan = @import("plan.zig");
 pub const checkpoint = @import("checkpoint.zig");
+pub const mentions = @import("mentions.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
