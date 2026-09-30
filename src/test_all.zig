@@ -15,6 +15,7 @@ pub const providers = @import("providers.zig");
 pub const agent = @import("agent.zig");
 pub const palette = @import("palette.zig");
 pub const web = @import("web.zig");
+pub const roster = @import("roster.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
