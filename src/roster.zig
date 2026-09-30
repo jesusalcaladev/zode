@@ -186,7 +186,9 @@ pub const Roster = struct {
             found_any_key = true;
             if (self.len >= max_candidates) break;
 
-            const list = models.listModels(self.arena, &http, def.models_url, providers.keyFor(&def, env)) catch {
+            // `var` y no `const`: `deinit` necesita un puntero no-const para
+            // liberar la lista (Zig no deja pasar un `*const` a un `*`).
+            var list = models.listModels(self.arena, &http, def.models_url, providers.keyFor(&def, env)) catch {
                 // Un provider caído no tumba el pool: se sigue con el resto.
                 self.last_error = error.ProviderListFailed;
                 continue;
