@@ -1,21 +1,31 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const md = @import("markdown.zig");
+const theme = @import("theme.zig");
 
 const Style = vaxis.Style;
 
-// ── estilos de token (brillan en 256 y degradan bien a 16) ──
+// ── estilos de token ───────────────────────────────────────────
+//
+// Vivían aquí como índices xterm-256 hardcodeados y NO importaban `theme.zig`:
+// la cabecera iba en el azul de marca y el bloque de código en 256, o sea dos
+// sistemas de color distintos en la misma pantalla. Ahora salen de `theme.zig`
+// en truecolor, con fallback de vaxis al índice ANSI más cercano.
+//
+// Lo que más se nota es `def`: era `Style{}`, es decir el color por defecto de
+// la terminal, que es lo MÁS BRILLANTE de la pantalla, y cae en ~90 % de las
+// líneas del código. El bloque entero era el punto más llamativo.
 const T = struct {
-    const kw = Style{ .fg = .{ .index = 5 } }; // magenta: keywords
-    const kw2 = Style{ .fg = .{ .index = 5 }, .italic = true }; // control-flow
-    const builtin = Style{ .fg = .{ .index = 6 } }; // cyan: builtins
-    const typ = Style{ .fg = .{ .index = 4 } }; // azul: tipos
-    const str = Style{ .fg = .{ .index = 2 } }; // verde: strings
-    const comment = Style{ .fg = .{ .index = 8 }, .italic = true }; // gris
-    const num = Style{ .fg = .{ .index = 3 } }; // amarillo
-    const fn_call = Style{ .bold = true };
-    const deco = Style{ .fg = .{ .index = 3 }, .italic = true }; // @decorador
-    const def = Style{};
+    const kw = theme.code_kw;
+    const kw2 = theme.code_kw2;
+    const builtin = theme.code_builtin;
+    const typ = theme.code_type;
+    const str = theme.code_str;
+    const comment = theme.code_comment;
+    const num = theme.code_num;
+    const fn_call = theme.code_fn;
+    const deco = theme.code_deco;
+    const def = theme.code_text;
 };
 
 const Kinds = enum { none, kw, kw2, builtin, typ, str, comment, num, fn_call, deco };
@@ -121,24 +131,86 @@ const langs = struct {
         .line_comments = &.{ "--", "#" },
         .template_literal = false,
     };
+    // Fallback para cualquier fence sin etiqueta, o con una rara (`json`, `tsx`,
+    // `diff`, `text`).
+    //
+    // `builtins` y `types` estaban VACÍOS, y eso no es solo que faltaran
+    // colores: la heurística PascalCase→tipo de `highlightLine` está guardsada
+    // por `cfg.types.len > 0`, así que con el fallback la mitad del código de
+    // un `json` o un `tsx` salía plano. Con estas dos tablas ya no.
     const generic = Cfg{
-        .keywords = &.{ "if", "else", "for", "while", "return", "function", "def", "class", "import", "const", "let", "var", "fn", "struct", "enum", "pub", "use" },
-        .control = &.{ "switch", "case", "try", "catch", "finally", "throw", "break", "continue", "and", "or", "not", "in", "is", "await", "yield" },
+        .keywords = &.{ "if", "else", "for", "while", "return", "function", "def", "class", "import", "const", "let", "var", "fn", "struct", "enum", "pub", "use", "module", "interface", "type", "extends", "implements", "package", "func", "val", "mut", "static", "final", "public", "private", "protected", "virtual", "override", "async", "defp", "end", "nil", "true", "false", "null", "None", "True", "False" },
+        .control = &.{ "switch", "case", "try", "catch", "finally", "throw", "break", "continue", "and", "or", "not", "in", "is", "await", "yield", "elif", "elseif", "unless", "match", "select", "defer", "goto", "do", "then", "fi", "done", "unless" },
+        .builtins = &.{ "print", "println", "printf", "console", "require", "import", "export", "document", "window", "fetch", "len", "range", "open", "str", "int", "float", "list", "dict", "set", "map", "Array", "Object", "String", "Number", "Boolean", "Promise", "Math", "JSON", "Date", "Error" },
+        .types = &.{ "string", "number", "boolean", "object", "array", "symbol", "bigint", "undefined", "any", "unknown", "never", "byte", "short", "long", "float", "double", "char", "int32", "int64", "uint32", "uint64", "String", "Number", "Boolean", "Array", "Object", "Promise", "Error" },
         .line_comments = &.{ "//", "#", "--" },
         .block_comment_start = "/*",
         .block_comment_end = "*/",
     };
 };
 
+/// Normaliza la etiqueta de un fence y devuelve el resultado en `buf`.
+///
+/// Devolver `[]const u8` apuntando a un temporal de pila era un bug: el slice se
+/// usaba después de que la función hubiera retornado. Por eso el buffer lo
+/// pasa el llamante y la config (que solo apunta a literales estáticos) se
+/// decide dentro de `cfgFor`.
+///
+/// El fence lo pone el MODELO, así que viene de lo que sepa del lenguaje:
+/// ```JSON, ```Json, ``` tsx, ``` c++, ``` objective-c. Sin normalizar, todo
+/// eso caía en el `generic` y salía plano.
+pub fn normalizeLang(lang: []const u8, buf: []u8) []const u8 {
+    const l = std.mem.trim(u8, lang, " \t\r\n");
+    if (l.len == 0) return "";
+    const n = @min(l.len, buf.len);
+    for (l[0..n], 0..) |c, i| {
+        buf[i] = std.ascii.toLower(c);
+    }
+    const low = buf[0..n];
+    const table = .{
+        .{ "javascript", "js" },    .{ "typescript", "ts" },
+        .{ "tsx", "ts" },           .{ "jsx", "js" },
+        .{ "python", "py" },        .{ "shell", "sh" },
+        .{ "bash", "sh" },          .{ "zsh", "sh" },
+        .{ "console", "sh" },       .{ "golang", "go" },
+        .{ "rs", "rust" },          .{ "c++", "cpp" },
+        .{ "cxx", "cpp" },          .{ "h", "c" },
+        .{ "objective-c", "c" },    .{ "objc", "c" },
+        .{ "csharp", "c" },         .{ "cs", "c" },
+        .{ "haskell", "generic" },  .{ "elixir", "generic" },
+        .{ "ruby", "generic" },     .{ "rb", "generic" },
+        .{ "lua", "generic" },      .{ "toml", "generic" },
+        .{ "yaml", "generic" },     .{ "yml", "generic" },
+        .{ "html", "generic" },     .{ "xml", "generic" },
+        .{ "css", "generic" },      .{ "scss", "generic" },
+        .{ "markdown", "generic" }, .{ "md", "generic" },
+        .{ "text", "generic" },     .{ "plain", "generic" },
+        .{ "plaintext", "generic" }, .{ "txt", "generic" },
+        .{ "diff", "generic" },     .{ "patch", "generic" },
+        .{ "json", "generic" },     .{ "jsonc", "generic" },
+    };
+    inline for (table) |pair| {
+        if (std.mem.eql(u8, low, pair[0])) return pair[1];
+    }
+    return low;
+}
+
+/// Config del lenguaje, con la etiqueta YA normalizada.
+///
+/// La normalización va AQUÍ y no antes: `normalizeLang` escribe en un buffer
+/// de pila, así que el slice solo es válido mientras esta función corre. Y
+/// `Cfg` solo guarda punteros a literales estáticos, así que devolver una
+/// `Cfg` es seguro.
 fn cfgFor(lang: []const u8) Cfg {
-    const l = lang;
+    var lbuf: [32]u8 = undefined;
+    const l = normalizeLang(lang, &lbuf);
     if (std.mem.eql(u8, l, "zig")) return langs.zig;
-    if (std.mem.eql(u8, l, "js") or std.mem.eql(u8, l, "javascript")) return langs.js;
-    if (std.mem.eql(u8, l, "ts") or std.mem.eql(u8, l, "typescript")) return langs.ts;
-    if (std.mem.eql(u8, l, "py") or std.mem.eql(u8, l, "python")) return langs.py;
-    if (std.mem.eql(u8, l, "sh") or std.mem.eql(u8, l, "bash") or std.mem.eql(u8, l, "shell") or std.mem.eql(u8, l, "zsh")) return langs.sh;
-    if (std.mem.eql(u8, l, "c") or std.mem.eql(u8, l, "cpp") or std.mem.eql(u8, l, "h") or std.mem.eql(u8, l, "hpp")) return langs.c_like;
-    if (std.mem.eql(u8, l, "rust") or std.mem.eql(u8, l, "rs")) return langs.rust;
+    if (std.mem.eql(u8, l, "js")) return langs.js;
+    if (std.mem.eql(u8, l, "ts")) return langs.ts;
+    if (std.mem.eql(u8, l, "py")) return langs.py;
+    if (std.mem.eql(u8, l, "sh")) return langs.sh;
+    if (std.mem.eql(u8, l, "c") or std.mem.eql(u8, l, "cpp")) return langs.c_like;
+    if (std.mem.eql(u8, l, "rust")) return langs.rust;
     if (std.mem.eql(u8, l, "go")) return langs.go;
     if (std.mem.eql(u8, l, "sql")) return langs.sql;
     return langs.generic;
@@ -374,16 +446,16 @@ test "zig: keyword, número, comentario, builtin y texto íntegro" {
     try std.testing.expectEqualStrings(line, try joinedText(arena, segs));
 
     const kw = findSeg(segs, "const").?;
-    try std.testing.expectEqual(@as(u8, 5), kw.style.fg.index); // magenta
+    try std.testing.expectEqual(theme.code_kw, kw.style);
     const num = findSeg(segs, "42").?;
-    try std.testing.expectEqual(@as(u8, 3), num.style.fg.index); // amarillo
+    try std.testing.expectEqual(theme.code_num, num.style);
     var found_comment = false;
     for (segs) |s| {
         if (std.mem.startsWith(u8, s.text, "// fin")) found_comment = true;
     }
     try std.testing.expect(found_comment);
     const b = findSeg(segs, "@as").?;
-    try std.testing.expectEqual(@as(u8, 6), b.style.fg.index); // cyan builtin
+    try std.testing.expectEqual(theme.code_builtin, b.style);
 }
 
 test "python: def kw, print builtin, self tipo, # comentario" {
@@ -394,9 +466,9 @@ test "python: def kw, print builtin, self tipo, # comentario" {
     const line = "def foo(self): print('hi')  # nota";
     const segs = try highlightLine(arena, line, "py");
     try std.testing.expectEqualStrings(line, try joinedText(arena, segs));
-    try std.testing.expectEqual(@as(u8, 5), findSeg(segs, "def").?.style.fg.index);
-    try std.testing.expectEqual(@as(u8, 6), findSeg(segs, "print").?.style.fg.index);
-    try std.testing.expectEqual(@as(u8, 4), findSeg(segs, "self").?.style.fg.index);
+    try std.testing.expectEqual(theme.code_kw, findSeg(segs, "def").?.style);
+    try std.testing.expectEqual(theme.code_builtin, findSeg(segs, "print").?.style);
+    try std.testing.expectEqual(theme.code_type, findSeg(segs, "self").?.style);
 }
 
 test "shell: builtin cyan y comentario #" {
@@ -407,7 +479,7 @@ test "shell: builtin cyan y comentario #" {
     const line = "grep foo file.txt # buscar";
     const segs = try highlightLine(arena, line, "sh");
     try std.testing.expectEqualStrings(line, try joinedText(arena, segs));
-    try std.testing.expectEqual(@as(u8, 6), findSeg(segs, "grep").?.style.fg.index);
+    try std.testing.expectEqual(theme.code_builtin, findSeg(segs, "grep").?.style);
 }
 
 test "lang desconocida: fallback seguro sin crash y texto íntegro" {
