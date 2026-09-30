@@ -222,7 +222,6 @@ fn buildLines(
     return buildLinesBase(pa, ctx, kind, text, width, null, null, "");
 }
 
-
 /// `buildLines` with an imposed base style (see `md.parseBase`).
 fn buildLinesBase(
     pa: std.mem.Allocator,
@@ -1197,49 +1196,49 @@ pub const Model = struct {
         }
     }
 
-    /// Compresses the paragraphs outside `[lo, hi)` (Fase 6 del ROADMAP).
-///
-/// `Model.paras` is the only structure that grows without bound: the segment
-/// cache is a sliding window, but every paragraph keeps its TEXT forever.
-/// Measured with 128 paragraphs holding 16 KB tool results (the
-/// `max_tool_output` cap) that is 2 MB of raw text, and it never comes back
-/// down however far you scroll.
-///
-/// Freeing the text outright is not an option: nothing can bring it back
-/// (`/resume` reads the session, but the session has no message behind half of
-/// these paragraphs — tool headers, diffs, notices). Compressing keeps it
-/// byte-exact and needs no mapping, and the round trip is already covered by
-/// the `zjsonl` tests.
-///
-/// Only paragraphs that are actually worth compressing are touched: below
-/// `zjsonl.min_compress_len` the base64 overhead costs more than it saves, and
-/// `compressLine` returns null in that case anyway.
-fn pruneCold(self: *Model, lo: usize, hi: usize) void {
-    for (self.paras.items, 0..) |*p, i| {
-        if (i >= lo and i < hi) continue; // inside the window
-        if (p.is_cold) continue;
-        if (p.text.len < zjsonl.min_compress_len) continue;
-        // Only prune paragraphs whose height is ALREADY measured. That is what
-        // lets `ensureParaHeights` keep working on the base64 (which has no
-        // newlines) without ever having to rehydrate: pruning can only take
-        // away text whose height is already known.
-        if (i >= self.para_heights.items.len) continue;
+    /// Compresses the paragraphs outside `[lo, hi)` (Phase 6 of the ROADMAP).
+    ///
+    /// `Model.paras` is the only structure that grows without bound: the segment
+    /// cache is a sliding window, but every paragraph keeps its TEXT forever.
+    /// Measured with 128 paragraphs holding 16 KB tool results (the
+    /// `max_tool_output` cap) that is 2 MB of raw text, and it never comes back
+    /// down however far you scroll.
+    ///
+    /// Freeing the text outright is not an option: nothing can bring it back
+    /// (`/resume` reads the session, but the session has no message behind half of
+    /// these paragraphs — tool headers, diffs, notices). Compressing keeps it
+    /// byte-exact and needs no mapping, and the round trip is already covered by
+    /// the `zjsonl` tests.
+    ///
+    /// Only paragraphs that are actually worth compressing are touched: below
+    /// `zjsonl.min_compress_len` the base64 overhead costs more than it saves, and
+    /// `compressLine` returns null in that case anyway.
+    fn pruneCold(self: *Model, lo: usize, hi: usize) void {
+        for (self.paras.items, 0..) |*p, i| {
+            if (i >= lo and i < hi) continue; // inside the window
+            if (p.is_cold) continue;
+            if (p.text.len < zjsonl.min_compress_len) continue;
+            // Only prune paragraphs whose height is ALREADY measured. That is what
+            // lets `ensureParaHeights` keep working on the base64 (which has no
+            // newlines) without ever having to rehydrate: pruning can only take
+            // away text whose height is already known.
+            if (i >= self.para_heights.items.len) continue;
 
-        // `compressLine` needs a destination buffer; one allocation per
-        // paragraph, freed right after.
-        const gpa = self.allocator;
-        const buf = gpa.alloc(u8, p.text.len + 1) catch continue;
-        defer gpa.free(buf);
-        const packed_z = zjsonl.compressLine(buf, p.text) orelse continue;
-        if (packed_z.len == 0) continue;
-        const copy = gpa.dupe(u8, packed_z) catch continue;
-        gpa.free(p.text);
-        p.text = copy;
-        p.is_cold = true;
+            // `compressLine` needs a destination buffer; one allocation per
+            // paragraph, freed right after.
+            const gpa = self.allocator;
+            const buf = gpa.alloc(u8, p.text.len + 1) catch continue;
+            defer gpa.free(buf);
+            const packed_z = zjsonl.compressLine(buf, p.text) orelse continue;
+            if (packed_z.len == 0) continue;
+            const copy = gpa.dupe(u8, packed_z) catch continue;
+            gpa.free(p.text);
+            p.text = copy;
+            p.is_cold = true;
+        }
     }
-}
 
-fn hasCached(self: *const Model, idx: usize) bool {
+    fn hasCached(self: *const Model, idx: usize) bool {
         for (self.seg_cache.items) |c| {
             if (c.para_idx == idx) return true;
         }
@@ -1675,22 +1674,22 @@ fn hasCached(self: *const Model, idx: usize) bool {
     }
 
     /// Time until the first token of the last stream (0 if none arrived).
-pub fn ttftMillis(self: *const Model) u64 {
-    var m2 = @constCast(self);
-    m2.lock();
-    defer m2.unlock();
-    return m2.ttft_ms;
-}
+    pub fn ttftMillis(self: *const Model) u64 {
+        var m2 = @constCast(self);
+        m2.lock();
+        defer m2.unlock();
+        return m2.ttft_ms;
+    }
 
-/// Has the stream in progress still not received its first token?
-pub fn ttftPending(self: *const Model) bool {
-    var m2 = @constCast(self);
-    m2.lock();
-    defer m2.unlock();
-    return m2.ttft_pending;
-}
+    /// Has the stream in progress still not received its first token?
+    pub fn ttftPending(self: *const Model) bool {
+        var m2 = @constCast(self);
+        m2.lock();
+        defer m2.unlock();
+        return m2.ttft_pending;
+    }
 
-/// Milliseconds the tool in progress has been running (0 if there is none).
+    /// Milliseconds the tool in progress has been running (0 if there is none).
     pub fn toolRunMillis(self: *const Model) u64 {
         return self.toolRunMillisLocked();
     }
@@ -1892,7 +1891,7 @@ pub fn ttftPending(self: *const Model) bool {
 
     /// Moves `pending` to `paras`. Called by draw; `pub` so the tests can check
     /// what got enqueued without setting up an `Io` (draw needs one).
-pub fn drainPending(self: *Model) void {
+    pub fn drainPending(self: *Model) void {
         self.lock();
         defer self.unlock();
         self.drainPendingLocked();
@@ -2098,7 +2097,6 @@ pub fn drainPending(self: *Model) void {
             .drawFn = typeErasedDrawFn,
         };
     }
-
 };
 
 /// State of the `/` command autocompletion.
@@ -2530,12 +2528,12 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                         return;
                     }
                 } else {
-                // Escape closes the popup without deleting what was typed.
-                if (key.matches(vaxis.Key.escape, .{})) {
-                    self.ac.active = false;
-                    ctx.redraw = true;
-                    return;
-                }
+                    // Escape closes the popup without deleting what was typed.
+                    if (key.matches(vaxis.Key.escape, .{})) {
+                        self.ac.active = false;
+                        ctx.redraw = true;
+                        return;
+                    }
                 }
             }
             // ESC aborts the stream in progress and closes the permission dialog.
@@ -4688,7 +4686,7 @@ test "la franja dice la fase: pensando, transmitiendo o corriendo una tool" {
         const s = try drawTest(&m, arena, 90, 20);
         try std.testing.expect(std.mem.indexOf(u8, allText(s), "running") != null);
     }
-    }
+}
 
 test "la franja de permiso se ve con el turno abierto" {
     // The strip only shows if there is something to report, and a permission
@@ -4734,7 +4732,6 @@ test "en reposo el historial no inventa una línea en vivo" {
     const s = try drawTest(&m, arena_state.allocator(), 80, 20);
     try std.testing.expect(std.mem.indexOf(u8, allText(s), "thinking") == null);
 }
-
 
 // ── ROADMAP Phase 0: the safety net that was missing ──────────
 //
@@ -5111,20 +5108,20 @@ test "el historial tiene margen izquierdo y nada se sale de la pantalla" {
 }
 
 test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
-    // Fase 6 del ROADMAP. `Model.paras` era la única estructura que crecía
-    // sin límite: la caché de segmentos es una ventana deslizante, pero cada
-    // párrafo guardaba su texto para siempre. Con 128 párrafos de 16 KB (el
-    // tope de `max_tool_output`) son 2 MB que nunca bajan.
+    // Phase 6 of the ROADMAP. `Model.paras` was the only structure that grew
+    // without bound: the segment cache is a sliding window, but every paragraph
+    // kept its text forever. With 128 paragraphs of 16 KB (the `max_tool_output`
+    // cap) that is 2 MB that never goes back down.
     //
-    // No se puede simplemente soltar el texto: no todos los párrafos tienen un
-    // mensaje de sesión detrás (cabeceras de tool, diffs, avisos), así que no
-    // habría de dónde releerlo. Comprimir lo mantiene byte-exact y no necesita
-    // ningún mapeo.
+    // You cannot simply drop the text: not every paragraph has a session
+    // message behind it (tool headers, diffs, notices), so there would be
+    // nowhere to re-read it from. Compressing keeps it byte-exact and needs no
+    // mapping.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // 60 párrafos de 4 KB cada uno (pasa de `zjsonl.min_compress_len`).
+    // 60 paragraphs of 4 KB each (over `zjsonl.min_compress_len`).
     const big_len = 4096;
     const big = try a.alloc(u8, big_len);
     for (big, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
@@ -5134,7 +5131,7 @@ test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
     var i: usize = 0;
     while (i < 60) : (i += 1) m.pushKind(.tool_res, big);
 
-    // Primer frame: la ventana es de abajo (las últimas filas).
+    // First frame: the window is at the bottom (the last rows).
     _ = try drawTest(&m, arena_state.allocator(), 60, 20);
     var cold: usize = 0;
     var hot_bytes: usize = 0;
@@ -5142,11 +5139,11 @@ test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
         if (p.is_cold) cold += 1;
         hot_bytes += p.text.len;
     }
-    try std.testing.expect(cold > 0); // algo se podó
-    try std.testing.expect(hot_bytes < 60 * big_len / 2); // y ocupa la mitad
+    try std.testing.expect(cold > 0); // something was pruned
+    try std.testing.expect(hot_bytes < 60 * big_len / 2); // and it takes half the space
 
-    // Ahora se comprueba el invariante que de verdad importa: subir hasta un
-    // párrafo podado y que el texto salga IDÉNTICO.
+    // Now we check the invariant that actually matters: scroll up to a pruned
+    // paragraph and have the text come out IDENTICAL.
     var target: ?usize = null;
     for (m.paras.items, 0..) |p, idx| {
         if (p.is_cold) {
@@ -5156,25 +5153,25 @@ test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
     }
     try std.testing.expect(target != null);
 
-    m.scrollBy(1_000_000); // al principio del todo
+    m.scrollBy(1_000_000); // all the way to the top
     _ = try drawTest(&m, arena_state.allocator(), 60, 20);
 
-    // El párrafo que estaba podado se rehidrató al entrar en la ventana, y su
-    // texto es byte a byte el original.
+    // The paragraph that was pruned was rehydrated when it entered the window,
+    // and its text is byte for byte the original.
     const rehydrated = m.paras.items[target.?];
     try std.testing.expect(!rehydrated.is_cold);
     try std.testing.expectEqualStrings(big, rehydrated.text);
 
-    // Y los que siguen podados también devuelven el texto ORIGINAL por
-    // `textLive`, que es lo que usa el layout. Es el invariante de la fase: la
-    // poda no puede cambiar ni un byte de lo que se ve.
+    // And the ones still pruned also return the ORIGINAL text through
+    // `textLive`, which is what the layout uses. That is the invariant of the
+    // phase: pruning cannot change a single byte of what is on screen.
     var still_cold: usize = 0;
     for (m.paras.items) |*p| {
         if (!p.is_cold) continue;
         still_cold += 1;
         try std.testing.expectEqualStrings(big, p.textLive(std.testing.allocator));
     }
-    try std.testing.expect(still_cold > 0); // la poda sigue aplicando
+    try std.testing.expect(still_cold > 0); // pruning still applies
 }
 
 test "poda: un párrafo corto NO se comprime (la base64 costaría más)" {
@@ -5204,15 +5201,15 @@ test "poda: comprimir y rehidratar es byte-exact con contenido repetitivo y unic
     while (i < 80) : (i += 1) m.pushKind(.tool_res, payload);
     _ = try drawTest(&m, arena_state.allocator(), 60, 20);
 
-    // Alguien quedó podado.
+    // Some paragraph ended up pruned.
     var any_cold = false;
     for (m.paras.items) |p| {
         if (p.is_cold) any_cold = true;
     }
     try std.testing.expect(any_cold);
 
-    // Al subir del todo, TODO parrafo (rehidratado o no) devuelve el texto
-    // original byte a byte, con los multibyte intactos.
+    // Scrolling all the way up, EVERY paragraph (rehydrated or not) returns the
+    // original text byte for byte, with the multibyte sequences intact.
     m.scrollBy(1_000_000);
     _ = try drawTest(&m, arena_state.allocator(), 60, 20);
     for (m.paras.items) |*p| {
@@ -5221,10 +5218,10 @@ test "poda: comprimir y rehidratar es byte-exact con contenido repetitivo y unic
 }
 
 test "poda: el ahorro es real (no solo un boolean)" {
-    // El ROADMAP estimaba ~8 MB de presupuesto de bytes. Con la medicion, lo
-    // que de verdad crecia sin limite eran los ~2 MB de texto de 128
-    // tool results de 16 KB. Este test fija que la poda los reduce de verdad y
-    // no se limita a marcar un flag.
+    // The ROADMAP estimated a byte budget of ~8 MB. Measured, what actually
+    // grew without bound were the ~2 MB of text of 128 tool results of 16 KB.
+    // This test pins down that pruning really shrinks them and does not just
+    // set a flag.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -5243,11 +5240,11 @@ test "poda: el ahorro es real (no solo un boolean)" {
     var after: usize = 0;
     for (m.paras.items) |p| after += p.text.len;
 
-    // De 2 MB a menos de 700 KB: los 128 parrafos son periodicos e identicos, asi que
-    // lo que queda es el factor de compresion (~10x) menos los que estan
-    // calientes en la ventana.
+    // From 2 MB to under 700 KB: the 128 paragraphs are periodic and identical,
+    // so what is left is the compression factor (~10x) minus the ones hot in
+    // the window.
     try std.testing.expect(after < before / 3);
-    // Y el invariant: al pedirlo, vuelve a salir el texto entero.
+    // And the invariant: asked for it, the full text comes back out.
     for (m.paras.items) |*p| {
         const live = p.textLive(std.testing.allocator);
         try std.testing.expectEqual(big.len, live.len);

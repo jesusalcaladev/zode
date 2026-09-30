@@ -718,7 +718,6 @@ pub fn sleepMs(ms_arg: u64) void {
 /// the worker that is already serializing its requests uses it).
 var rng_state: u64 = 0x9E3779B97F4A7C15;
 
-
 /// Processes a whole SSE body in one go (tests and socketless paths).
 /// Uses the same incremental parser as the real stream, feeding it whole.
 pub fn scanSse(gpa: std.mem.Allocator, sse_body: []const u8, ctx: *StreamCtx) !void {

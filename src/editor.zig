@@ -15,7 +15,6 @@ const std = @import("std");
 ///
 /// All the text is UTF-8 and word-wise jumps respect graphemes, not
 /// bytes: `wörd` never gets split in the middle of the `ö`.
-
 pub const max_history: usize = 100;
 /// Buffer cap so that a huge paste doesn't bring down the TUI.
 pub const max_bytes: usize = 256 * 1024;

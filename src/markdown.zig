@@ -604,7 +604,6 @@ pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
     };
 }
 
-
 // basic test
 test "parse markdown básico" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -623,7 +622,7 @@ test "unifiedDiff: cambio simple, con cabecera de hunk" {
     const arena = arena_state.allocator();
 
     const d = try unifiedDiff(arena, "uno\ndos\ntres\n", "uno\nDOS\ntres\n");
-    // Cabecera + 3 lineas + contexto: todo cabe en un hunk.
+    // Header + 3 lines + context: it all fits in a single hunk.
     try std.testing.expectEqual(@as(usize, 5), d.len);
     try std.testing.expectEqualStrings("@@ -1,3 +1,3 @@", d[0]);
     try std.testing.expectEqualStrings(" uno", d[1]);
@@ -637,7 +636,7 @@ test "unifiedDiff: sin cambios no produce +/-" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Sin cambios no hay nada que ver: ni siquiera un hunk.
+    // With no changes there is nothing to show: not even a hunk.
     const d = try unifiedDiff(arena, "igual\n", "igual\n");
     try std.testing.expectEqual(@as(usize, 0), d.len);
 }
@@ -777,7 +776,7 @@ test "unifiedDiff: por encima del tope no se calcula el LCS (sería O(n*m))" {
 
     // With the normal cap the diff is computed.
     const small = try unifiedDiff(arena, "a\nb\n", "a\nc\n");
-    try std.testing.expectEqual(@as(usize, 4), small.len); // cabecera + 3
+    try std.testing.expectEqual(@as(usize, 4), small.len); // header + 3
     try std.testing.expectEqualStrings("-b", small[2]);
 
     // Above the cap the notice comes out, and it comes out FAST: without the
@@ -816,17 +815,17 @@ test "tool_res_bold es bold DE VERDAD (el 'dos tonos' no era un no-op)" {
 }
 
 test "unifiedDiff: un cambio pequeno en un fichero grande NO escupe el fichero entero" {
-    // Antes el diff crudo se emitia completo: editar 2 lineas de un fichero de
-    // 200 pintaba 200 lineas de diff, 198 de ellas contexto. Eso es lo que hacia
-    // que un `write` pareciera un muro.
+    // The raw diff used to be emitted in full: editing 2 lines of a 200-line
+    // file painted 200 diff lines, 198 of them context. That is what made a
+    // `write` look like a wall.
     //
-    // Ahora se emiten solo los tramos con contexto alrededor del cambio, con
-    // cabecera `@@` y una elipsis entre hunks, como `diff -u`.
+    // Now only the ranges with context around the change are emitted, with an
+    // `@@` header and an ellipsis between hunks, like `diff -u`.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // 60 lineas, se cambia la 30.
+    // 60 lines, line 30 is changed.
     var before: std.ArrayList(u8) = .empty;
     var after: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -836,12 +835,12 @@ test "unifiedDiff: un cambio pequeno en un fichero grande NO escupe el fichero e
     }
 
     const d = try unifiedDiff(arena, before.items, after.items);
-    // Un solo hunk: cabecera + 3 de contexto + 1 cambio - + 1 + 3 de contexto.
+    // A single hunk: header + 3 context lines + 1 '-' change + 1 '+' + 3 context lines.
     try std.testing.expectEqual(@as(usize, 9), d.len);
     try std.testing.expectEqualStrings("@@ -28,7 +28,7 @@", d[0]);
     try std.testing.expectEqualStrings("-linea 30", d[4]);
     try std.testing.expectEqualStrings("+linea 999", d[5]);
-    // Y NO sale el resto del fichero.
+    // And the rest of the file does NOT come out.
     for (d) |l| {
         try std.testing.expect(std.mem.indexOf(u8, l, "linea 0") == null or
             std.mem.startsWith(u8, l, " ") or std.mem.startsWith(u8, l, "-") and l.len < 12);
@@ -863,7 +862,7 @@ test "unifiedDiff: dos cambios alejados dan dos hunks con elipsis en medio" {
     }
 
     const d = try unifiedDiff(arena, before.items, after.items);
-    // Dos cabeceras y una elipsis entre ellas.
+    // Two headers and one ellipsis between them.
     var headers: usize = 0;
     var elisions: usize = 0;
     for (d) |l| {
@@ -872,7 +871,7 @@ test "unifiedDiff: dos cambios alejados dan dos hunks con elipsis en medio" {
     }
     try std.testing.expectEqual(@as(usize, 2), headers);
     try std.testing.expectEqual(@as(usize, 1), elisions);
-    // Y las dos lineas cambiadas estan.
+    // And both changed lines are present.
     var found_a = false;
     var found_b = false;
     for (d) |l| {
@@ -885,8 +884,9 @@ test "unifiedDiff: dos cambios alejados dan dos hunks con elipsis en medio" {
 }
 
 test "unifiedDiff: sin cambios devuelve vacío (no un hunk de contexte)" {
-    // `pushDiff` ya filtraba esto por su cuenta, pero es mejor que la funcion
-    // no invente nada: un hunk de solo contexto seria ruido en el historial.
+    // `pushDiff` already filtered this on its own, but it is better for the
+    // function to invent nothing: a context-only hunk would be noise in the
+    // history.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

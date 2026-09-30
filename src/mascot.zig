@@ -194,4 +194,3 @@ pub fn faceFrames(mood: Mood, frame: u64) []const u8 {
         .err => if (odd) "(◕×)" else "(××)",
     };
 }
-
