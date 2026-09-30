@@ -1,0 +1,509 @@
+const std = @import("std");
+const vaxis = @import("vaxis");
+const hl = @import("highlight.zig");
+
+pub const Style = vaxis.Style;
+
+/// Segmento de texto con estilo: la unidad de render del historial.
+pub const Segment = struct {
+    text: []const u8,
+    style: Style,
+};
+
+pub const Kind = enum {
+    user,
+    assistant,
+    info,
+    tool,
+    /// Línea de cabecera de una tool en curso: "⏺ Read(src/tui.zig)"
+    tool_run,
+    /// Línea de resultado de una tool: "⎿  Read 1006 lines · 3ms"
+    tool_res,
+    /// Diff unificado: líneas con `+`/`-`/` ` (coloreadas por el prefijo).
+    diff,
+    /// Bloque de cabecera (banner del búho + línea de Zo). Azul de marca en vez
+    /// del gris de `.info`, y con `*texto*` pinta en el brillo del wordmark.
+    banner,
+    error_msg,
+    code,
+    separator,
+};
+
+/// Bloque visual del historial: ya parseado y con estilos.
+/// `lines` son segmentos por línea SIN wrap (el wrap es en el draw).
+pub const Block = struct {
+    kind: Kind,
+    lines: []const []const Segment,
+    lang: []const u8 = "",
+};
+
+const styles = struct {
+    fn fg(idx: u8) Style {
+        return .{ .fg = .{ .index = idx } };
+    }
+    const user_prefix = fg(4); // azul
+    const user_text = Style{};
+    const asst_prefix = fg(5); // magenta
+    const asst_text = Style{};
+    const info = fg(8); // gris
+    const tool = fg(6); // cyan
+    const tool_bold: Style = .{ .bold = true, .fg = .{ .index = 6 } };
+    const tool_res = fg(8); // el resultado va atenuado
+    const tool_res_bold: Style = .{ .fg = .{ .index = 8 } }; // su resumen, un punto mas claro
+    const diff_add = fg(2); // verde
+    const diff_del = fg(1); // rojo
+    const diff_ctx = fg(8); // gris
+    const err = fg(1); // rojo
+    // Cabecera: el búho va en el color de marca y el wordmark un tono por
+    // encima, para que el logo se lea encendido contra el arte.
+    // Son los tres azules de `theme.zig`; se repiten aquí porque este módulo
+    // no depende de la TUI (lo usan los tests de markdown solos).
+    const banner: Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // brand
+    const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } }; // brand_hi
+    const heading = Style{ .bold = true, .fg = .{ .index = 4 } };
+    const bold = Style{ .bold = true };
+    const inline_code = Style{ .fg = .{ .index = 3 } }; // amarillo
+    const sep = fg(8);
+};
+
+/// Parsea texto (posible markdown) a bloques. Memoria: arena.
+pub fn parse(arena: std.mem.Allocator, kind: Kind, text: []const u8) ![]Block {
+    return parseBase(arena, kind, text, null, null);
+}
+
+/// `parse` con estilo base impuesto (ver `inlineSegmentsBase`).
+pub fn parseBase(
+    arena: std.mem.Allocator,
+    kind: Kind,
+    text: []const u8,
+    base_override: ?Style,
+    mood_style: ?Style,
+) ![]Block {
+    var blocks: std.ArrayList(Block) = .empty;
+    var inline_lines: std.ArrayList([]const Segment) = .empty;
+
+    var in_code = false;
+    var code_lang: []const u8 = "";
+    var code_lines: std.ArrayList([]const Segment) = .empty;
+
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        // fences ``` / ~~~
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "```") or
+            std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "~~~"))
+        {
+            if (in_code) {
+                try blocks.append(arena, .{
+                    .kind = .code,
+                    .lines = try code_lines.toOwnedSlice(arena),
+                    .lang = code_lang,
+                });
+                code_lines = .empty;
+                in_code = false;
+            } else {
+                // cerrar bloque inline pendiente
+                if (inline_lines.items.len > 0) {
+                    try blocks.append(arena, .{
+                        .kind = kind,
+                        .lines = try inline_lines.toOwnedSlice(arena),
+                    });
+                    inline_lines = .empty;
+                }
+                in_code = true;
+                const trimmed = std.mem.trimStart(u8, line, " ");
+                code_lang = if (trimmed.len > 3) trimmed[3..] else "";
+            }
+            continue;
+        }
+
+        if (in_code) {
+            const segs = hl.highlightLine(arena, line, code_lang) catch
+                try arena.alloc(Segment, 0);
+            try code_lines.append(arena, segs);
+            continue;
+        }
+
+        // headings
+        //
+        // OJO: el banner de inicio se salta esto. Su arte empieza por `##`
+        // (relleno de `#` de un ASCII art) y TODAS sus filas se comían como
+        // encabezados: el logo salía como "####  ####  *zode*". El banner no
+        // es prosa, es un dibujo: no se le busca estructura de markdown.
+        if (kind != .banner) {
+            const trimmed = std.mem.trimStart(u8, line, " ");
+            if (trimmed.len >= 2 and trimmed[0] == '#' and (trimmed[1] == ' ' or trimmed[1] == '#')) {
+                var nh: usize = 0;
+                while (nh < trimmed.len and trimmed[nh] == '#') nh += 1;
+                if (nh < trimmed.len and trimmed[nh] == ' ') {
+                    const heading_text = trimmed[nh + 1 ..];
+                    const segs = try arena.alloc(Segment, 1);
+                    segs[0] = .{ .text = heading_text, .style = styles.heading };
+                    try inline_lines.append(arena, segs);
+                    continue;
+                }
+            }
+        }
+
+        try inline_lines.append(arena, try inlineSegmentsBase(arena, line, kind, base_override, mood_style));
+    }
+    // código pendiente sin cierre
+    if (in_code and code_lines.items.len > 0) {
+        try blocks.append(arena, .{
+            .kind = .code,
+            .lines = try code_lines.toOwnedSlice(arena),
+            .lang = code_lang,
+        });
+    }
+    // texto pendiente
+    if (inline_lines.items.len > 0) {
+        try blocks.append(arena, .{
+            .kind = kind,
+            .lines = try inline_lines.toOwnedSlice(arena),
+        });
+    }
+    return blocks.toOwnedSlice(arena);
+}
+
+/// Estilo base según kind para texto sin formato especial.
+fn baseStyle(kind: Kind) Style {
+    return switch (kind) {
+        .user => styles.user_text,
+        .assistant => styles.asst_text,
+        .info => styles.info,
+        .tool, .tool_run => styles.tool,
+        .tool_res => styles.tool_res,
+        .error_msg => styles.err,
+        .banner => styles.banner,
+        else => styles.asst_text,
+    };
+}
+
+/// Una línea de diff unificado coloreada por su prefijo.
+fn diffSegments(arena: std.mem.Allocator, line: []const u8) ![]Segment {
+    const style: Style = if (line.len == 0)
+        styles.diff_ctx
+    else switch (line[0]) {
+        '+' => styles.diff_add,
+        '-' => styles.diff_del,
+        '@' => styles.heading, // cabecera @@ hunk @@
+        else => styles.diff_ctx,
+    };
+    const segs = try arena.alloc(Segment, 1);
+    segs[0] = .{ .text = line, .style = style };
+    return segs;
+}
+
+/// Construye un diff unificado (simplificado) entre dos textos.
+/// Algoritmo LCS por líneas: O(n*m), suficiente para ediciones de código
+/// donde los bloques son cientos de líneas, no millones.
+///
+/// Devuelve un slice de arena con líneas ya prefijadas con ' ', '+' o '-'.
+pub fn unifiedDiff(arena: std.mem.Allocator, before: []const u8, after: []const u8) ![]const []const u8 {
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    var new_lines: std.ArrayList([]const u8) = .empty;
+    try splitLines(arena, before, &old_lines);
+    try splitLines(arena, after, &new_lines);
+
+    // Tabla LCS (n+1) x (m+1) de usize.
+    const n = old_lines.items.len;
+    const m = new_lines.items.len;
+    const table = try arena.alloc(usize, (n + 1) * (m + 1));
+    @memset(table, 0);
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        var j = m;
+        while (j > 0) {
+            j -= 1;
+            table[i * (m + 1) + j] = if (std.mem.eql(u8, old_lines.items[i], new_lines.items[j]))
+                table[(i + 1) * (m + 1) + (j + 1)] + 1
+            else
+                @max(table[(i + 1) * (m + 1) + j], table[i * (m + 1) + (j + 1)]);
+        }
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var x: usize = 0;
+    var y: usize = 0;
+    while (x < n and y < m) {
+        if (std.mem.eql(u8, old_lines.items[x], new_lines.items[y])) {
+            try out.append(arena, try prefixed(arena, ' ', old_lines.items[x]));
+            x += 1;
+            y += 1;
+        } else if (table[(x + 1) * (m + 1) + y] >= table[x * (m + 1) + (y + 1)]) {
+            try out.append(arena, try prefixed(arena, '-', old_lines.items[x]));
+            x += 1;
+        } else {
+            try out.append(arena, try prefixed(arena, '+', new_lines.items[y]));
+            y += 1;
+        }
+    }
+    while (x < n) : (x += 1) try out.append(arena, try prefixed(arena, '-', old_lines.items[x]));
+    while (y < m) : (y += 1) try out.append(arena, try prefixed(arena, '+', new_lines.items[y]));
+    return out.items;
+}
+
+fn prefixed(arena: std.mem.Allocator, p: u8, line: []const u8) ![]const u8 {
+    const buf = try arena.alloc(u8, line.len + 1);
+    buf[0] = p;
+    @memcpy(buf[1..], line);
+    return buf;
+}
+
+/// Parte en líneas ignorando el salto final: "a\nb\n" son 2 líneas, no 3.
+/// (Si no, un fichero terminado en \n genera una línea vacía espuria en el diff.)
+fn splitLines(arena: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const body = if (std.mem.endsWith(u8, text, "\n")) text[0 .. text.len - 1] else text;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |l| try out.append(arena, l);
+}
+
+/// Segmentos inline: **bold**, `code`, y texto normal.
+/// Segmentos inline de una línea. `pub` para que los tests de la TUI
+/// puedan comprobar el reparto de estilos del banner.
+pub fn inlineSegments(arena: std.mem.Allocator, line: []const u8, kind: Kind) ![]Segment {
+    return inlineSegmentsBase(arena, line, kind, null, null);
+}
+
+/// Igual que `inlineSegments` pero con un estilo base imposed por el llamante
+/// (la TUI lo usa para pintar la carita de Zo con el color de su mood).
+pub fn inlineSegmentsBase(
+    arena: std.mem.Allocator,
+    line: []const u8,
+    kind: Kind,
+    base_override: ?Style,
+    mood_style: ?Style,
+) ![]Segment {
+    // Las líneas de diff se colorean por su prefijo: +verde, -rojo, espacio
+    // gris. Es lo que hace legible un edit sin abrir un file externo.
+    if (kind == .diff) return diffSegments(arena, line);
+
+    // Cabecera: `*zode*` y `*─────*` brillan dentro del arte del búho. Con
+    // esto el brillo cae DENTRO del dibujo en vez de pintar una línea entera,
+    // que es lo que hace que el ASCII art parezca un logo y no un bloque.
+    if (kind == .banner and
+        (std.mem.indexOfScalar(u8, line, '*') != null or std.mem.indexOfScalar(u8, line, '~') != null))
+    {
+        return markedSegments(arena, line, styles.banner, styles.banner_bold, mood_style orelse styles.banner);
+    }
+
+    // Las tools usan la MISMA marca `*…*` para partir el nombre del resto:
+    // `write(hola.js)` sale entero del mismo color y no se distingue la tool de
+    // su argumento. Con `*write* (hola.js)` el nombre va en el color fuerte y
+    // el argumento en el apagado, que es como lo lee el ojo de un vistazo.
+    if (kind == .tool_run and std.mem.indexOfScalar(u8, line, '*') != null) {
+        return markedSegments(arena, line, styles.tool, styles.tool_bold, styles.tool);
+    }
+    if (kind == .tool_res and std.mem.indexOfScalar(u8, line, '*') != null) {
+        return markedSegments(arena, line, styles.tool_res, styles.tool_res_bold, styles.tool_res);
+    }
+
+    var segs: std.ArrayList(Segment) = .empty;
+    const base = base_override orelse baseStyle(kind);
+    var i: usize = 0;
+    var start: usize = 0;
+
+    while (i < line.len) {
+        // **bold**
+        if (i + 1 < line.len and line[i] == '*' and line[i + 1] == '*') {
+            if (constClose(line, i + 2, "**")) |end| {
+                if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                try segs.append(arena, .{ .text = line[i + 2 .. end], .style = styles.bold });
+                i = end + 2;
+                start = i;
+                continue;
+            }
+        }
+        // `code`
+        if (line[i] == '`') {
+            if (std.mem.indexOfScalarPos(u8, line, i + 1, '`')) |end| {
+                if (end > i + 1) {
+                    if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                    try segs.append(arena, .{ .text = line[i + 1 .. end], .style = styles.inline_code });
+                    i = end + 1;
+                    start = i;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if (start < line.len) {
+        try segs.append(arena, .{ .text = line[start..], .style = base });
+    }
+    if (segs.items.len == 0) {
+        try segs.append(arena, .{ .text = "", .style = base });
+    }
+    return segs.toOwnedSlice(arena);
+}
+
+/// Parte la línea por marcas y pinta cada tramo con su estilo.
+///
+/// Hay DOS tipos de marca porque el logo es fijo y el color de Zo no:
+///   `*…*`  → `hi` (el wordmark, siempre el mismo azul claro)
+///   `~…~`  → `mood` (lo que pase el llamante: el color del estado de Zo)
+///
+/// Las marcas se QUITAN del texto de salida (son marcas, no contenido), así que
+/// quien llama ve el texto limpio mientras el dibujo sale con varios colores.
+/// Una marca sin pareja se trata como texto normal, para no perder caracteres.
+fn markedSegments(
+    arena: std.mem.Allocator,
+    line: []const u8,
+    base: Style,
+    hi: Style,
+    mood: Style,
+) ![]Segment {
+    var segs: std.ArrayList(Segment) = .empty;
+    var i: usize = 0;
+    var start: usize = 0;
+
+    while (i < line.len) {
+        const m: ?struct { ch: u8, style: Style } = switch (line[i]) {
+            '*' => .{ .ch = '*', .style = hi },
+            '~' => .{ .ch = '~', .style = mood },
+            else => null,
+        };
+        if (m) |mark| {
+            if (constClose(line, i + 1, &.{mark.ch})) |end| {
+                if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                if (end > i + 1) try segs.append(arena, .{ .text = line[i + 1 .. end], .style = mark.style });
+                i = end + 1;
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if (start < line.len) try segs.append(arena, .{ .text = line[start..], .style = base });
+    if (segs.items.len == 0) try segs.append(arena, .{ .text = "", .style = base });
+    return segs.toOwnedSlice(arena);
+}
+
+/// Busca `needle` en `line` desde `from`; devuelve el índice de inicio si está.
+fn constClose(line: []const u8, from: usize, needle: []const u8) ?usize {
+    const rel = std.mem.indexOfPos(u8, line, from, needle) orelse return null;
+    return rel;
+}
+
+/// Prefijos de prompt por kind (se dibujan en la primera línea del bloque).
+pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
+    return switch (kind) {
+        .user => .{ .text = "› ", .style = styles.user_prefix },
+        .assistant => .{ .text = "◆ ", .style = styles.asst_prefix },
+        .info => .{ .text = "· ", .style = styles.info },
+        .tool => .{ .text = "⚙ ", .style = styles.tool },
+        // Tool calls estilo Claude Code: cabecera y resultado con guiones.
+        .tool_run => .{ .text = "⏺ ", .style = styles.tool_bold },
+        .tool_res => .{ .text = "⎿  ", .style = styles.tool_res },
+        .diff => .{ .text = "", .style = styles.diff_ctx },
+        .error_msg => .{ .text = "✗ ", .style = styles.err },
+        .banner => .{ .text = "", .style = styles.banner },
+        else => .{ .text = "  ", .style = styles.info },
+    };
+}
+
+pub fn sepStyle() Style {
+    return styles.sep;
+}
+pub fn infoStyle() Style {
+    return styles.info;
+}
+
+// test básico
+test "parse markdown básico" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const blocks = try parse(arena, .assistant, "# Titulo\nHola **mundo** con `code`\n```zig\nconst x = 1;\n```\nfin");
+    // bloque 1: heading + línea inline (2 líneas)
+    try std.testing.expect(blocks.len >= 3);
+    try std.testing.expectEqual(Kind.code, blocks[1].kind);
+}
+
+test "unifiedDiff: cambio simple" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const d = try unifiedDiff(arena, "uno\ndos\ntres\n", "uno\nDOS\ntres\n");
+    try std.testing.expectEqual(@as(usize, 4), d.len);
+    try std.testing.expectEqualStrings(" uno", d[0]);
+    try std.testing.expectEqualStrings("-dos", d[1]);
+    try std.testing.expectEqualStrings("+DOS", d[2]);
+    try std.testing.expectEqualStrings(" tres", d[3]);
+}
+
+test "unifiedDiff: sin cambios no produce +/-" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const d = try unifiedDiff(arena, "igual\n", "igual\n");
+    try std.testing.expectEqual(@as(usize, 1), d.len);
+    try std.testing.expectEqualStrings(" igual", d[0]);
+}
+
+test "unifiedDiff: lineas nuevas al final" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const d = try unifiedDiff(arena, "a\n", "a\nb\nc\n");
+    try std.testing.expectEqualStrings(" a", d[0]);
+    try std.testing.expectEqualStrings("+b", d[1]);
+    try std.testing.expectEqualStrings("+c", d[2]);
+}
+
+test "unifiedDiff: borrado" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const d = try unifiedDiff(arena, "a\nb\nc\n", "a\nc\n");
+    try std.testing.expectEqualStrings(" a", d[0]);
+    try std.testing.expectEqualStrings("-b", d[1]);
+    try std.testing.expectEqualStrings(" c", d[2]);
+}
+
+test "diffSegments colorea por prefijo" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const add = try inlineSegments(arena, "+nuevo", .diff);
+    try std.testing.expectEqualStrings("+nuevo", add[0].text);
+    try std.testing.expectEqual(styles.diff_add.fg, add[0].style.fg);
+
+    const del = try inlineSegments(arena, "-viejo", .diff);
+    try std.testing.expectEqual(styles.diff_del.fg, del[0].style.fg);
+
+    const ctx = try inlineSegments(arena, " igual", .diff);
+    try std.testing.expectEqual(styles.diff_ctx.fg, ctx[0].style.fg);
+}
+
+test "un banner que empieza por ## NO se come como encabezado" {
+    // El art del banner usa `#` como relleno y TODAS sus filas empiezan por
+    // `##`, así que el parser las interpretaba como encabezados markdown y
+    // devolvía "####  ####  *zode*" en vez del dibujo entero. El banner es un
+    // dibujo, no prosa: no se le busca estructura.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const blocks = try parseBase(arena, .banner, "######  ####   ######\n##  ## ##  ## ##    ", null, null);
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    const segs = blocks[0].lines[0];
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    for (segs) |seg| try text.appendSlice(std.testing.allocator, seg.text);
+    try std.testing.expectEqualStrings("######  ####   ######", text.items);
+
+    // Y el resto de tipos SIGUE interpretando los encabezados: el arreglo es
+    // para `.banner`, no una desactivar general.
+    const h = try parseBase(arena, .info, "## un titulo", null, null);
+    var ht: std.ArrayList(u8) = .empty;
+    defer ht.deinit(std.testing.allocator);
+    for (h[0].lines[0]) |seg| try ht.appendSlice(std.testing.allocator, seg.text);
+    try std.testing.expectEqualStrings("un titulo", ht.items);
+}

@@ -1,0 +1,5 @@
+.env
+zig-out/
+.zig-cache/
+sessions/
+*.tmp
