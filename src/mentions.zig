@@ -142,7 +142,8 @@ pub fn expand(
     const n = scan(text, &found);
     if (n == 0) return .{ .text = text, .files = 0, .missing = 0 };
 
-    var w: std.Io.Writer = .fixed(arena.alloc(u8, file_max * (max_files + 1)) catch return .{
+    // +1 KB de holgura para las cabeceras y los separadores de los 4 bloques.
+    var w: std.Io.Writer = .fixed(arena.alloc(u8, file_max * max_files + 1024) catch return .{
         .text = text,
         .files = 0,
         .missing = 0,
@@ -172,15 +173,25 @@ pub fn expand(
             missing += 1;
             continue;
         }
-        const content = dir.readFileAlloc(io, path, arena, .limited(file_max)) catch {
+        // Leer un PREFIJO, no el fichero entero.
+        //
+        // `readFileAlloc(..., .limited(n))` no recorta: si el fichero pasa de `n`
+        // bytes devuelve `error.FileTooBig`. Así que un `@src/tui.zig` (250 KB)
+        // se contaba como "not found" y no se inyectaba NUNCA, que es justo el
+        // caso que más falta hace. Con `readPositional` se leen los primeros
+        // `file_max` bytes y se marca como truncado, que es lo que el modelo
+        // necesita para no inventarse el final.
+        const content = readPrefix(io, dir, path, arena) catch {
             missing += 1;
             continue;
         };
-        try blockHeader(&w, path, content.len, content.len >= file_max);
-        try w.writeAll(content);
+        const truncated = content.truncated;
+        const kept = content.bytes;
+        try blockHeader(&w, path, kept.len, truncated);
+        try w.writeAll(kept);
         // Un separador entre ficheros: sin él, dos bloques pegados parecen uno
         // solo y el modelo no sabe dónde acaba cada uno.
-        if (!std.mem.endsWith(u8, content, "\n")) try w.writeAll("\n");
+        if (!std.mem.endsWith(u8, kept, "\n")) try w.writeAll("\n");
         try w.writeAll("\n");
         files += 1;
     }
@@ -191,6 +202,26 @@ pub fn expand(
         return .{ .text = text, .files = 0, .missing = missing };
     }
     return .{ .text = w.buffered(), .files = files, .missing = missing };
+}
+
+/// Los primeros `file_max` bytes de un fichero.
+///
+/// Devuelve el bloque y si se cortó. `arena` porque el contenido vive en el
+/// prompt ampliado, que es de la arena del turno.
+fn readPrefix(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    arena: std.mem.Allocator,
+) !struct { bytes: []const u8, truncated: bool } {
+    const f = try dir.openFile(io, path, .{});
+    defer f.close(io);
+    const buf = try arena.alloc(u8, file_max);
+    const n = try f.readPositional(io, &.{buf}, 0);
+    // Si el buffer se ha llenado, puede que haya más detrás: se marca como
+    // truncado. (Un fichero de EXACTAMENTE `file_max` sale también marcado, que
+    // es inofensivo: el bloque dice "truncated" y no le falta nada.)
+    return .{ .bytes = buf[0..n], .truncated = n >= file_max };
 }
 
 /// Un fichero que tiene sentido meter en un prompt.
@@ -255,6 +286,81 @@ test "scan: una mención dentro de paréntesis o comillas también vale" {
     var out: [scanned_max]Mention = undefined;
     const n = scan("(mira @src/a.zig) y \"@src/b.zig\"", &out);
     try std.testing.expectEqual(@as(u8, 2), n);
+}
+
+test "readPrefix: un fichero grande sale recortado, no error" {
+    // El bug de la pty: con `readFileAlloc(.limited(file_max))` un fichero de
+    // 250 KB daba `error.FileTooBig` y la mención se contaba como "not found".
+    // Aquí se comprueba que el prefijo sale y que se marca el recorte.
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    const io = std.testing.io;
+    const dir: std.Io.Dir = .cwd();
+
+    // 3 file_max de contenido: tiene que salir 1 file_max y "truncated".
+    var big: [8192]u8 = undefined;
+    @memset(&big, 'g');
+    var f = try dir.createFile(io, "mencion_test_grande.txt", .{});
+    defer dir.deleteFile(io, "mencion_test_grande.txt") catch {};
+    {
+        var written: usize = 0;
+        while (written < big.len * 8) : (written += big.len) {
+            try f.writePositionalAll(io, &big, written);
+        }
+        f.close(io);
+    }
+
+    const r = try readPrefix(io, dir, "mencion_test_grande.txt", arena);
+    try std.testing.expectEqual(@as(usize, file_max), r.bytes.len);
+    try std.testing.expect(r.truncated);
+
+    // Y un fichero pequeño: entero y sin marcar.
+    {
+        var w: std.Io.Writer = .fixed(arena.alloc(u8, 64) catch unreachable);
+        try w.writeAll("hola");
+        try dir.writeFile(io, .{ .sub_path = "mencion_test_chico.txt", .data = w.buffered() });
+    }
+    defer dir.deleteFile(io, "mencion_test_chico.txt") catch {};
+    const r2 = try readPrefix(io, dir, "mencion_test_chico.txt", arena);
+    try std.testing.expectEqualStrings("hola", r2.bytes);
+    try std.testing.expect(!r2.truncated);
+}
+
+test "un fichero más grande que el tope se mete TRUNCADO, no se pierde" {
+    // El fallo que salió en la pty: con `.limited(file_max)` un fichero de 250 KB
+    // devolvía `error.FileTooBig`, se contaba como "not found" y el modelo se
+    // enteraba de que el fichero no existía. Con el +1 y el recorte sale el
+    // bloque con su "(truncated)".
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    const dir: std.Io.Dir = .cwd();
+    {
+        var w: std.Io.Writer = .fixed(arena.alloc(u8, 4096) catch unreachable);
+        try w.writeAll("1234567890");
+        try dir.writeFile(std.testing.io, .{ .sub_path = "mencion_test_peque.txt", .data = w.buffered() });
+    }
+    defer dir.deleteFile(std.testing.io, "mencion_test_peque.txt") catch {};
+
+    const e = try expand(arena, std.testing.io, "mira @mencion_test_peque.txt");
+    try std.testing.expectEqual(@as(u8, 1), e.files);
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "1234567890") != null);
+    // Y la cabecera lleva los bytes de verdad, no los del buffer de entrada.
+    try std.testing.expect(std.mem.indexOf(u8, e.text, "--- mencion_test_peque.txt (10 bytes) ---") != null);
+}
+
+test "expand: sin ficheros servibles devuelve el texto ORIGINAL (sin copias)" {
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    const original = "mira @no/existe.txt";
+    const e = try expand(arena, std.testing.io, original);
+    try std.testing.expectEqual(@as(u8, 0), e.files);
+    try std.testing.expectEqual(@as(u8, 1), e.missing);
+    // Un bloque "Archivos mencionados:" vacío sería peor que no tocar nada.
+    try std.testing.expect(e.text.ptr == original.ptr);
+    try std.testing.expectEqualStrings(original, e.text);
 }
 
 test "la cabecera del bloque dice si está truncado" {
