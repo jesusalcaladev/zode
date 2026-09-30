@@ -2261,10 +2261,16 @@ fn modelsWorker(job: *ModelsJob) void {
     setStatusWithZo(m, .done, "models ready");
 }
 
-/// "free" no viene como campo: se deduce del sufijo del id, que es lo que
-/// publica OpenRouter (`...-free`).
+/// ¿Este modelo es gratis?
+///
+/// [roster] Antes miraba solo el sufijo `-free`, que es la convencion de
+/// opencode. OpenRouter usa `:free`, y hay providers que no usan ningun sufijo y
+/// se limitan a publicar precio 0, asi que `/model` marcaba como "free" un solo
+/// provider y el pool de modelos free salia casi vacio. Ahora lo decide
+/// `models.is_free`, que combina las tres senales (`models.isFreeId` +
+/// `models.isFreeByPrice`).
 fn isFree(m: models_mod.Model) bool {
-    return std.mem.endsWith(u8, m.id, "-free");
+    return m.is_free;
 }
 
 fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
