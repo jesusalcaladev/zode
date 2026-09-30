@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const agent = @import("agent.zig");
@@ -38,6 +39,26 @@ const PickerSnapshot = struct {
 // blanco. Regla: el grapheme debe vivir al menos hasta el final del frame,
 // es decir ser literal estático, propiedad del Model, o del arena del frame
 // (`ctx.arena`, que se resetea al principio del frame SIGUIENTE).
+// (`ctx.arena`, que se resetea al principio del frame SIGUIENTE).
+
+/// Duerme `ms` milisegundos con `nanosleep` pelado, sin pasar por el `Io`.
+///
+/// OJO: `Io.sleep` NO vale aquí. El `Io` es el mismo que el del event loop de
+/// vaxis, así que dormir con él se lleva por delante los redraws (la pantalla se
+/// queda congelada justo mientras hay algo que enseñar). `nanosleep` es una
+/// llamada al sistema en el hilo que llama y no toca nada compartido.
+fn napMs(ms: u64) void {
+    if (builtin.os.tag != .linux) {
+        std.Thread.yield() catch {};
+        return;
+    }
+    const ts = std.os.linux.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.os.linux.nanosleep(&ts, null);
+}
+
 pub const Painter = struct {
     surface: *vxfw.Surface,
     arena: std.mem.Allocator,
@@ -119,6 +140,9 @@ const PLine = struct {
     cells: []const CellRun,
     w: u16, // columnas ocupadas
 };
+
+/// Líneas añadidas y quitadas de un diff (lo que se enseña como `+N −M`).
+pub const DiffCounts = struct { added: usize = 0, removed: usize = 0 };
 
 /// Parte `cells` en líneas de como mucho `width` columnas.
 fn wrapCells(
@@ -295,6 +319,10 @@ pub const Model = struct {
     /// la UI solo se repinta cuando el usuario pulsa una tecla.
     dirty: bool = false,
     tick_armed: bool = false,
+    /// El worker pide frame con esto. Vive fuera del lock a propósito: es la
+    /// única señal que el hilo de la TUI puede leer sin coger el lock del
+    /// modelo (que el worker puede tener cogido en `requestPermission`).
+    redraw_requested: std.atomic.Value(bool) = .init(false),
 
     /// Scroll: 0 = anclado abajo; N = N líneas hacia arriba.
     scroll: usize = 0,
@@ -337,6 +365,20 @@ pub const Model = struct {
     perm_detail_len: usize = 0,
     perm_active: bool = false,
     perm_answer: PermAnswer = .none,
+    /// Lock PROPIO del diálogo, separado del `spin` del historial (1.7).
+    ///
+    /// Antes el worker esperaba al usuario con
+    /// `while(true) { yield; lock; read; unlock }` sobre el lock del HISTORIAL.
+    /// Eso quema un core entero durante los 30 s que tardas en decidir, y hace
+    /// que CADA adquisición de lock de la UI sea un `yield` fallado: el
+    /// diálogo de permisos degradaba toda la app, no solo al worker.
+    ///
+    /// Aquí el lock solo protege el estado (se coge microsegundos) y la espera
+    /// es DORMIDA con `nanosleep` growing. No se usa `std.Io.Condition` porque
+    /// necesita un `Io` y los tests construyen el Model sin app.
+    perm_mutex: std.atomic.Mutex = .unlocked,
+    /// Epoch para despertar a los que esperan (ver `waitPermAnswer`).
+    perm_epoch: std.atomic.Value(u32) = .init(0),
 
     /// Spinner (contadores, sin alloc).
     spinner_frame: usize = 0,
@@ -652,6 +694,11 @@ pub const Model = struct {
         const n = @min(text.len, self.status_buf.len);
         @memcpy(self.status_buf[0..n], text[0..n]);
         self.status_len = n;
+        // El status se pinta en el draw: sin `dirty` el cambio se queda en el
+        // buffer hasta que llegue otra tecla. Con un worker en marcha eso es
+        // "el status no se mueve" durante toda la llamada.
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// Texto + mood. El mood se guarda aparte para que la fila de status
@@ -667,6 +714,8 @@ pub const Model = struct {
         self.status_len = n;
         self.status_mood = new_mood;
         self.status_mood_set = true;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// Mood del estado actual. Si nadie lo ha puesto, se deduce del trabajo.
@@ -689,7 +738,10 @@ pub const Model = struct {
     /// Lo llama el worker ANTES de ejecutar una tool con permiso.
     /// Bloquea hasta que el usuario responde en la UI.
     pub fn requestPermission(self: *Model, tool: []const u8, detail: []const u8) PermAnswer {
-        self.lock();
+        // Copia del prompt ANTES de coger el lock: `tool` y `detail` vienen de
+        // una arena del worker, pero el memcpy es corto y así el lock del
+        // diálogo solo se usa para el estado.
+        self.permLock();
         const n_tool = @min(tool.len, self.perm_tool.len);
         @memcpy(self.perm_tool[0..n_tool], tool[0..n_tool]);
         self.perm_tool_len = n_tool;
@@ -698,38 +750,41 @@ pub const Model = struct {
         self.perm_detail_len = n_det;
         self.perm_answer = .none;
         self.perm_active = true;
-        self.unlock();
+        // El tick tiene que seguir corriendo mientras el usuario decide: sin
+        // esto el diálogo aparece pero no se repinta (el reloj, la carita...).
+        self.redraw_requested.store(true, .seq_cst);
+        self.permUnlock();
 
-        while (true) {
-            std.Thread.yield() catch {};
-            self.lock();
-            const a = self.perm_answer;
-            self.unlock();
-            if (a != .none) {
-                self.lock();
-                self.perm_active = false;
-                self.unlock();
-                return a;
-            }
-        }
+        // Espera DORMIDA: el backoff sube hasta 20 ms, así que el worker no
+        // gasta CPU mientras el usuario decide (antes hacía spin-yield).
+        self.waitPermAnswer();
+
+        self.permLock();
+        const a = self.perm_answer;
+        self.perm_active = false;
+        self.permUnlock();
+        return a;
     }
 
     /// UI: responde el diálogo abierto.
     pub fn answerPermission(self: *Model, a: PermAnswer) void {
-        self.lock();
+        self.permLock();
         self.perm_answer = a;
-        self.unlock();
+        self.permUnlock();
+        // Despierta al worker (que puede estar en un `nanosleep` de hasta 20 ms).
+        _ = self.perm_epoch.fetchAdd(1, .seq_cst);
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     pub fn permActive(self: *Model) bool {
-        self.lock();
-        defer self.unlock();
+        self.permLock();
+        defer self.permUnlock();
         return self.perm_active;
     }
 
     pub fn permView(self: *Model, tool: *[]const u8, detail: *[]const u8) bool {
-        self.lock();
-        defer self.unlock();
+        self.permLock();
+        defer self.permUnlock();
         if (!self.perm_active) return false;
         tool.* = self.perm_tool[0..self.perm_tool_len];
         detail.* = self.perm_detail[0..self.perm_detail_len];
@@ -965,6 +1020,44 @@ pub const Model = struct {
         self.spin.unlock();
     }
 
+    // ── lock del diálogo de permisos (1.7) ──────────────
+    //
+    // El lock del HISTORIAL (`spin`) no vale para esperar al usuario: el worker
+    // pasa por `requestPermission` en cada `write`/`edit`/`bash` que no esté en
+    // la allowlist, y un spin con `yield` sobre ese lock mientras el usuario
+    // piensa (que pueden ser 30 s) quema un core entero y hace que CADA
+    // adquisición de lock de la UI sea un `yield` fallido. Es decir, el
+    // diálogo de permisos degradaba toda la app.
+    //
+    // Aquí hay un mutex PROPIO, con condición: el worker espera en la condición
+    // (dormido, sin CPU) y solo se despierta cuando el usuario contesta. Y al no
+    // ser el lock del historial, el draw sigue ipsoizando mientras el worker
+    // espera.
+    fn permLock(self: *Model) void {
+        while (!self.perm_mutex.tryLock()) std.Thread.yield() catch {};
+    }
+    fn permUnlock(self: *Model) void {
+        self.perm_mutex.unlock();
+    }
+
+    /// Espera a que el usuario conteste, DORMIDO.
+    ///
+    /// El backoff sube de 1 ms a 20 ms: la primera respuesta suele ser
+    /// inmediata (el usuario ya tenía el dedo en `y`), y si tarda no se wakea
+    /// 1000 veces por segundo. Con `std.Thread.yield` puro eran ~1M de
+    /// iteraciones en 30 s.
+    fn waitPermAnswer(self: *Model) void {
+        var wait_ms: u64 = 1;
+        while (true) {
+            self.permLock();
+            const done = self.perm_answer != .none;
+            self.permUnlock();
+            if (done) return;
+            napMs(wait_ms);
+            wait_ms = @min(wait_ms * 2, 20);
+        }
+    }
+
     // ── API thread-safe (encola; el draw drena) ──────────
     pub fn pushKind(self: *Model, kind: md.Kind, text: []const u8) void {
         const copy = self.allocator.dupe(u8, text) catch return;
@@ -974,6 +1067,8 @@ pub const Model = struct {
             self.allocator.free(copy);
         };
         self.dirty = true;
+        // Pide frame ya: el tick puede estar a hasta 120 ms.
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     pub fn pushInfo(self: *Model, text: []const u8) void {
@@ -1219,6 +1314,7 @@ pub const Model = struct {
         defer self.unlock();
         self.stream_buf.appendSlice(self.allocator, text) catch {};
         self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// Cierra el streaming y fija el párrafo en el historial.
@@ -1247,6 +1343,12 @@ pub const Model = struct {
             self.stream_buf.clearRetainingCapacity();
         }
         self.busy = false;
+        // `dirty` OBLIGATORIO aquí: este párrafo se acaba de meter en `paras`, y
+        // sin `dirty` el draw no se pide hasta que llegue una tecla. La ventana
+        // entre este `streamEnd` y el siguiente `pushToolStart` (con un write(2)
+        // de sesión y un DEFLATE-9 en medio) era justo donde la cadena de ticks
+        // se quedaba sin rearmar y la pantalla muera.
+        self.dirty = true;
     }
 
     /// Línea de tool ejecutada (thread-safe; el worker llama).
@@ -1285,6 +1387,7 @@ pub const Model = struct {
             .started_ns = if (self.io_ready) std.Io.Timestamp.now(self.io, .real).nanoseconds else 0,
         };
         self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// Cierra la línea de "running" (la pone `pushToolDone`).
@@ -1294,6 +1397,9 @@ pub const Model = struct {
         if (self.tool_run) |tr| {
             tr.deinit(self.allocator);
             self.tool_run = null;
+            // La línea de reloj desaparece: eso es un cambio que hay que pintar.
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
         }
     }
 
@@ -1358,6 +1464,9 @@ pub const Model = struct {
             self.allocator.free(sum);
             return;
         };
+        // `dirty` no es un adorno: es lo que hace que la cadena de ticks siga
+        // viva. Un cambio de estado SIN `dirty` deja una ventana en la que el
+        // redraw no se pide y la pantalla se queda muerta (ver `armTick`).
         self.dirty = true;
         // El índice del párrafo se fija al drenar; `pending` aún no está en `paras`.
         self.last_tool = .{
@@ -1368,27 +1477,55 @@ pub const Model = struct {
         };
     }
 
-    /// Inserta un diff como párrafos (queda bajo la línea de resultado).
+    /// Un diff: UN párrafo con las líneas unidas por `\n`.
     ///
-    /// LCS por líneas: O(n*m), de sobra para ediciones de código. Se hace en
-    /// una arena propia y se vuelca línea a línea al historial.
-    pub fn pushDiff(self: *Model, before: []const u8, after: []const u8) void {
+    /// Antes era un párrafo POR LÍNEA. Con ≥129 líneas eso reventaba el tope de
+    /// la caché de segmentos y colgaba la app al instante (el bug del bucle de
+    /// layout): un solo `write` de un fichero de 129 líneas, congelación total.
+    /// Y además cada línea era un párrafo, o sea que además de colgar salía
+    /// "muy separado" (una fila en blanco entre cada línea de diff).
+    ///
+    /// `md.parse` parte por `\n` igual que por párrafos, así que el render no
+    /// cambia: siguen siendo N filas, pero N-1 filas en blanco menos.
+    ///
+    /// Devuelve cuántas líneas se añadieron y cuántas se quitaron (ya se
+    /// contaban y se tiraban); el llamante puede enseñarlo en el resumen.
+    pub fn pushDiff(self: *Model, before: []const u8, after: []const u8) DiffCounts {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const lines = md.unifiedDiff(arena, before, after) catch return;
-        var changed: usize = 0;
+        const lines = md.unifiedDiff(arena, before, after) catch return .{};
+        var added: usize = 0;
+        var removed: usize = 0;
         for (lines) |l| {
-            if (l.len > 0 and (l[0] == '+' or l[0] == '-')) changed += 1;
+            if (l.len > 0 and l[0] == '+') added += 1;
+            if (l.len > 0 and l[0] == '-') removed += 1;
         }
-        if (changed == 0) return; // nada cambió: no ensuciar el historial
+        if (added == 0 and removed == 0) {
+            // O no cambió nada, o el fichero pasa de `md.max_diff_lines` y lo
+            // que hay es un aviso. En el segundo caso SÍ se enseña: callarse
+            // sería "no he visto nada" (que es lo que el modelo concluiría).
+            if (lines.len == 1 and std.mem.startsWith(u8, lines[0], "diff omitted")) {
+                const copy = self.allocator.dupe(u8, lines[0]) catch return .{};
+                defer self.allocator.free(copy);
+                self.pushInfo(copy);
+            }
+            return .{}; // nada cambió: no ensuciar el historial
+        }
 
+        var joined: std.ArrayList(u8) = .empty;
+        // `allocatedSlice` y no `items`: en 0.16 `items` es el slice de LONGITUD
+        // y la capacidad va aparte, así que liberar `items` con una capacidad
+        // mayor es un `Invalid free` (petó en el test de diff).
+        defer self.allocator.free(joined.allocatedSlice());
         for (lines) |l| {
-            const copy = self.allocator.dupe(u8, l) catch return;
-            self.pushKind(.diff, copy);
-            self.allocator.free(copy);
+            if (joined.items.len > 0) joined.append(self.allocator, '\n') catch return .{};
+            joined.appendSlice(self.allocator, l) catch return .{};
         }
+        // `pushKind` copia, así que este buffer es temporal.
+        self.pushKind(.diff, joined.items);
+        return .{ .added = added, .removed = removed };
     }
 
     /// Ctrl+R: despliega o repliega el resultado de la última tool.
@@ -1485,6 +1622,17 @@ pub const Model = struct {
         const a = self.activity();
         const ms: u32 = if (a.busy or a.dirty) 40 else 120;
         try ctx.tick(ms, self.widget());
+    }
+
+    /// Marca que hay que pintar. Lo llama el worker en CADA `push*`.
+    ///
+    /// El tick se rearmar siempre por sí solo (ver el handler de `.tick`), así
+    /// que esto no es imprescindible para no morir: es para no esperar al
+    /// siguiente tick cuando el worker acaba de encolar texto, que es justo lo
+    /// que hace que la TUI parezca al día. Un átomo y no un `bool` porque lo
+    /// escribe un hilo y lo lee otro sin el lock.
+    pub fn requestRedraw(self: *Model) void {
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// Sube (`n` > 0) o baja el historial.
@@ -2107,12 +2255,26 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             ctx.redraw = true;
         },
         .tick => {
+            // El tick se rearma SIEMPRE (1.5).
+            //
+            // Antes solo se rearmaba "si hay trabajo", y `busy`/`dirty` tenían
+            // ventanas en las que los dos eran falsos (p. ej. entre `streamEnd`
+            // y `pushToolStart`, con un write(2) de sesión y un DEFLATE-9 en
+            // medio). Un tick que caía ahí dejaba `App.timers` VACÍO, y como el
+            // worker no tiene ni puntero al `EventContext` ni a la cola de
+            // eventos, no había forma de pedir un frame: la pantalla quedaba
+            // muerta hasta que se pulsaba una tecla, la rueda o se redimensionaba.
+            //
+            // El coste de rearmar siempre es un timer cada 120 ms en reposo, que
+            // solo repinta si algo cambió; la alternativa es una app que se
+            // queda muerta sin explicación.
             self.tick_armed = false;
             const a = self.activity();
-            if (a.busy or a.dirty or a.perm or a.picker or self.pal.active) {
+            const asked = self.redraw_requested.swap(false, .seq_cst);
+            if (asked or a.busy or a.dirty or a.perm or a.picker or self.pal.active) {
                 ctx.redraw = true;
-                try self.armTick(ctx); // sigue solo mientras haya trabajo
             }
+            try self.armTick(ctx);
         },
         .init => {
             ctx.redraw = true; // primer frame sin esperar a una tecla
@@ -3248,11 +3410,14 @@ test "diff: pushDiff pinta líneas -/+ tras el resultado de la tool" {
 
     m.pushToolStart("edit", "src/demo.txt");
     m.pushToolDone("edit", "Edited 3 lines", 2, "ok");
-    m.pushDiff("uno\ndos\ntres\n", "uno\nDOS\ntres\ncuatro\n");
+    const counts = m.pushDiff("uno\ndos\ntres\n", "uno\nDOS\ntres\ncuatro\n");
+    // Lo que ya se counting antes y se tiraba: ahora se enseña (`+2 −1`).
+    try std.testing.expectEqual(@as(usize, 2), counts.added);
+    try std.testing.expectEqual(@as(usize, 1), counts.removed);
 
-    // 24 filas: con la fila en blanco entre párrafos, el diff (5 líneas, cada
-    // una en su propio párrafo) ya no cabe en 16 y la última se salía del
-    // viewport. El test grows con el layout, no al revés.
+    // 24 filas: con la fila en blanco entre párrafos, el diff (5 líneas en UN
+    // párrafo) ya no cabe en 16 y la última se salía del viewport. El test
+    // grows con el layout, no al revés.
     const s = try drawTest(&m, arena_state.allocator(), 50, 24);
     var buf: [256]u8 = undefined;
     // No se comprueban filas concretas: desde que los párrafos van separados
@@ -3287,7 +3452,7 @@ test "diff: sin cambios no añade párrafos" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    m.pushDiff("igual\n", "igual\n");
+    _ = m.pushDiff("igual\n", "igual\n");
     const s = try drawTest(&m, arena_state.allocator(), 40, 12);
     var buf: [256]u8 = undefined;
     // Sin párrafos: la fila 0 es el separador/banner, no un diff.
@@ -4159,7 +4324,7 @@ test "pushDiff mete UN parrafo, no uno por linea" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    m.pushDiff("uno\ndos\ntres\n", "uno\nDOS\ntres\ncuatro\n");
+    _ = m.pushDiff("uno\ndos\ntres\n", "uno\nDOS\ntres\ncuatro\n");
     _ = try drawTest(&m, arena_state.allocator(), 60, 20);
 
     var diffs: usize = 0;
@@ -4188,7 +4353,7 @@ test "un diff de 300 lineas no cuelga y sigue siendo UN parrafo" {
         n_after += (std.fmt.bufPrint(after[n_after..], "linea {d}!\n", .{i}) catch break).len;
     }
 
-    m.pushDiff(before[0..n_before], after[0..n_after]);
+    _ = m.pushDiff(before[0..n_before], after[0..n_after]);
     _ = try drawTest(&m, arena_state.allocator(), 80, 24);
     try std.testing.expect(!m.layout_overflow);
 
