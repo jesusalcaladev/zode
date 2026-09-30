@@ -1590,33 +1590,41 @@ pub const Model = struct {
     pub fn streamEnd(self: *Model) void {
         self.lock();
         defer self.unlock();
-        // EMPTIES `pending` BEFORE fixing the assistant paragraph.
+        // The assistant paragraph goes into `pending`, NOT into `paras`.
         //
-        // `pushToolStart`/`pushToolDone` enqueue into `pending` and `pending`
-        // is drained in the next draw, but here the paragraph goes into `paras`
-        // ALREADY. Since `paras` is walked in order, the assistant text ended
-        // up AHEAD of the tool it belonged to: the history showed "Listo." on
-        // top of "⏺ bash(...) ⎿ exit=0".
-        self.drainPendingLocked();
+        // `pending` is FIFO and is drained into `paras` by the DRAW, so
+        // enqueueing here gives the SAME ordering the old code fought for: the
+        // assistant text lands after the `⏺ tool` / `⎿ result` lines that were
+        // already queued, instead of on top of them. (Doing it with an explicit
+        // `drainPendingLocked()` first used to be the way to get that order, and
+        // it is what this replaces.)
+        //
+        // AND, more importantly: `streamEnd` runs on the WORKER thread. Appending
+        // to `paras` from there reallocates `paras.items` while the UI thread is
+        // in the draw reading `paras[i].text` WITHOUT the lock — the old buffer
+        // gets freed under its feet. That was a hard crash (SIGSEGV inside
+        // `mem.count` on a freed paragraph), reproducible with any prompt that
+        // ran a tool. Enqueueing keeps `paras` owned by the UI thread alone.
+        //
         // `or stream_buf.len > 0`: if nobody opened a paragraph (an iteration
         // that never got a `streamStart`) the text is NOT lost. Before, the `if
         // (streaming)` discarded it silently and the final answer of a turn
-        // with tools never appeared: the model answered, the tokens arrived,
-        // and the history stayed on the tool.
+        // with tools never appeared.
         if (self.streaming or self.stream_buf.items.len > 0) {
-            const text = self.allocator.dupe(u8, self.stream_buf.items) catch "";
-            self.paras.append(self.allocator, .{ .kind = .assistant, .text = text }) catch {
-                self.allocator.free(text);
-            };
+            if (self.allocator.dupe(u8, self.stream_buf.items)) |text| {
+                self.pending.append(self.allocator, .{ .kind = .assistant, .text = text }) catch {
+                    self.allocator.free(text);
+                };
+            } else |_| {}
             self.streaming = false;
             self.stream_buf.clearRetainingCapacity();
         }
         self.busy = false;
-        // `dirty` is MANDATORY here: this paragraph has just gone into `paras`,
-        // and without `dirty` draw is not requested until a key arrives. The
-        // window between this `streamEnd` and the next `pushToolStart` (with a
-        // session write(2) and a DEFLATE-9 in between) was exactly where the
-        // tick chain failed to rearm and the screen died.
+        // `dirty` is MANDATORY here: a paragraph has just been enqueued, and
+        // without `dirty` draw is not requested until a key arrives. The window
+        // between this `streamEnd` and the next `pushToolStart` (with a session
+        // write(2) and a DEFLATE-9 in between) was exactly where the tick chain
+        // failed to rearm and the screen died.
         self.dirty = true;
     }
 
@@ -1899,8 +1907,14 @@ pub const Model = struct {
 
     /// Moves `pending` to `paras`. The caller holds the lock.
     ///
-    /// CAREFUL: Zig's Mutex is not reentrant, so whoever already holds the lock
-    /// (like `streamEnd`) uses this and NOT `drainPending`.
+    /// THE ONLY PLACE `paras` GROWS, and it runs on the UI thread (from the
+    /// draw). That is a hard invariant, not a style preference: the draw then
+    /// reads `paras[i].text` WITHOUT the lock (it is the whole history, every
+    /// frame), so if the worker could append here, the reallocation would free
+    /// the old `items` buffer underneath it. `streamEnd` used to append from the
+    /// worker and crashed with SIGSEGV on any turn that ran a tool.
+    ///
+    /// If you need a new paragraph from the worker: enqueue it in `pending`.
     fn drainPendingLocked(self: *Model) void {
         // Re-anchor at the bottom ONLY if something really came in. Before,
         // `scroll = 0` was set every frame, and since `drainPending` is always
@@ -4685,12 +4699,41 @@ test "streamEnd vacía pending ANTES de fijar el párrafo (si no, el texto sale 
     m.streamDelta("despues");
     m.streamEnd();
 
-    // What you see is the order of `paras`.
+    // What you see is the order of `paras`, which the DRAW produces by draining
+    // `pending`. `streamEnd` enqueues instead of appending (see its comment:
+    // appending reallocated `paras.items` under the UI thread's feet).
+    m.drainPending();
     const kinds = [_]md.Kind{ .tool_run, .tool_res, .assistant, .assistant };
     try std.testing.expectEqual(kinds.len, m.paras.items.len);
     for (kinds, m.paras.items) |want, got| try std.testing.expectEqual(want, got.kind);
     try std.testing.expectEqualStrings("antes", m.paras.items[2].text);
     try std.testing.expectEqualStrings("despues", m.paras.items[3].text);
+}
+
+test "streamEnd NO toca paras: se encola (si no, el worker realloca bajo la UI)" {
+    // The invariant that keeps a hard crash away. `paras` is the array the draw
+    // walks EVERY FRAME without taking the lock; appending to it from the
+    // worker reallocates `items` and frees the buffer the draw is reading. It
+    // crashed with SIGSEGV inside `mem.count` on a freed paragraph, with any
+    // prompt that ran a tool.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamDelta("hola");
+    m.streamEnd();
+
+    // Nothing has reached `paras` yet: it is all sitting in `pending`.
+    try std.testing.expectEqual(@as(usize, 0), m.paras.items.len);
+    try std.testing.expectEqual(@as(usize, 1), m.pending.items.len);
+
+    // And the draw is what moves it.
+    m.drainPending();
+    try std.testing.expectEqual(@as(usize, 1), m.paras.items.len);
+    try std.testing.expectEqual(@as(usize, 0), m.pending.items.len);
+    try std.testing.expectEqualStrings("hola", m.paras.items[0].text);
 }
 
 test "la cabecera de una tool marca el nombre para que el parser lo resalte" {
