@@ -328,15 +328,38 @@ fichero entero) · `/help` que liste también los atajos · preview del fichero 
 | 3 | Completa. `TurnStats` + `pushTurnSummary`. |
 | 4 | Completa. 4.1 bloques con gutter/fondo/chip, 4.2 diff por tokens, 4.3 sangría de continuación, 4.4 paleta en `theme.zig` truecolor, 4.5 `T.def` atenuado y `fn_call` con color, 4.6 verde de strings != verde de diff, 4.7 `generic` poblado + `normalizeLang`, 4.8 strings multilínea, 4.9 margen izquierdo. |
 | 5 | 5.1/5.2/5.4/5.5 hechas. **5.3** hecha de facto (el default ya es release+strip). |
-| 6 | Pendiente. |
+| 6 | Hecha, **con un diseño distinto al propuesto** (ver abajo). |
+| 7 | Diff con hunks reales. Queda header, columna de usage, `/help` con atajos y preview del `write`. |
+
+**Medido, no estimado (esto cambió dos decisiones)**
+
+| Cosa | Cifra real | Consecuencia |
+|---|---|---|
+| `Model.paras` con 128 párrafos de 16 KB | **2 MB de texto**, sin límite | Esta era la fuga de verdad. |
+| Ventana de segmentos (`seg_cache`) | ~2.7 MB en el peor caso | Ya estaba acotada por el diseño de ventana, no hacía falta 5.6. |
+| `CellRun` | 40 B | Con la ventana acotada, 5.6 ahorraría cientos de KB, no los ~14 MB que decía el ROADMAP. **No hecha.** |
+| `fillRange` del historial | 200×45×136 B ≈ 1.2 MB por frame | 5.8 sigue sin hacerse: es la red anti-fantasmas del párrafo en vivo y sin TTY no se puede verificar que se pueda tocar. |
+
+**Por qué la Fase 6 se ha hecho distinto**
+
+El ROADMAP proponía podar `paras` y **rehidratar desde el JSONL de sesión**. Eso
+no encaja: no todos los párrafos tienen un mensaje de sesión detrás (cabeceras de
+tool, diffs, avisos del agente), así que no habría de dónde releerlos. Perder la
+mitad del historial para ahorrar memoria es peor que no ahorrar nada.
+
+Lo que sí se ha hecho: **comprimir en frío con `zjsonl`** (DEFLATE raw + base64,
+round trip ya testeado). Al salir de la ventana el párrafo se comprime (~10×); al
+volver a entrar, `Para.textLive` lo descomprime. Se pierde memoria, nunca
+información, y no hace falta ningún mapeo con la sesión. `pruneCold` solo toca
+párrafos cuya altura ya está medida, que es lo que permite que `ensureParaHeights`
+siga funcionando sobre base64 sin descomprimir nada.
 
 **Pendiente**
 
 | Fase | Qué |
 |---|---|
-| 5 | 5.6 `CellRun` 40 B -> 12 B, 5.7 `arena.reset(.retain_capacity)` en vaxis, 5.8 pintar solo filas visibles, 5.9/5.10 arranque. |
-| 6 | Poda por bytes con rehidratación desde el JSONL. `para_heights` ya está, que es la pieza que lo hace posible. |
-| 7 | Pulido. |
+| 5 | 5.6 (descartada por medición), 5.7/5.9/5.10 (requieren parche de vaxis, documentado en AGENTS.md), 5.8 (no verificable sin TTY). |
+| 7 | Header de 5 filas que se lea al instante, segunda columna de usage, `/help` con atajos, preview del fichero en `write`. |
 
 **Correcciones de AGENTS.md**: las tres del ROADMAP están escritas (el bucle del layout, la cadena de ticks, y el diagnóstico **erróneo** del `Io.sleep` en ACP: en Linux es `clock_nanosleep` por hilo y no toca `t.mutex`, así que el reloj se congelaba por los puntos 1 y 2, no por el sleep). Añadida además una sección de trampas de Zig 0.16 que costaron una tarde.
 
