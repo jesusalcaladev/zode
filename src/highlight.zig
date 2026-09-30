@@ -243,16 +243,77 @@ fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
 
+/// Estado del escáner ENTRE líneas.
+///
+/// Sin esto, un `\\` de Zig al final de la línea o una comilla sin cerrar
+/// hacían que la línea siguiente se pintara de verde ENTERA: el scanner no
+/// tenía forma de saber que seguía dentro de un string. Es el bug clásico de
+/// los highlighters línea a línea, y se nota muchísimo en un `edit` de un
+/// fichero con cadenas multilínea.
+pub const State = struct {
+    /// Dentro de un string sin cerrar.
+    in_str: bool = false,
+    /// Cierre del string en curso: `"`, `'` o `` ` ``.
+    str_quote: u8 = 0,
+    /// Dentro de un comentario de bloque `/* … */` sin cerrar.
+    in_block: bool = false,
+};
+
 /// Token scanner genérico de UNA línea. Soporta strings con escapes y
 /// prefijos (r"…", b'…'), números (hex/bin/floats), comentarios de línea y
 /// bloque, keywords/control/builtins/tipos, llamadas fn y decoradores.
 /// Lenguaje desconocido → config genérica segura.
+///
+/// `state` se lleva entre líneas de un MISMO bloque para que los strings y los
+/// comentarios de bloque multilínea se pinten bien (ver `State`). Quien llama
+/// línea a línea sin estado (el diff) pasa uno nuevo por línea.
 pub fn highlightLine(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![]md.Segment {
+    var st = State{};
+    return highlightLineState(arena, line, lang, &st);
+}
+
+/// Como `highlightLine` pero con estado entre líneas.
+pub fn highlightLineState(
+    arena: std.mem.Allocator,
+    line: []const u8,
+    lang: []const u8,
+    state: *State,
+) ![]md.Segment {
     const cfg = cfgFor(lang);
 
     var segs: std.ArrayList(md.Segment) = .empty;
     var i: usize = 0;
     var run_start: usize = 0; // inicio del tramo sin estilo pendiente
+
+    // Si veníamos dentro de un string o de un comentario de bloque, TODO lo
+    // que quede de la línea es de ese color (hasta donde cierre, si cierra).
+    const resume_str = state.in_str;
+    const resume_block = state.in_block;
+    if (resume_block) {
+        const close = cfg.block_comment_end orelse "*/";
+        if (std.mem.indexOf(u8, line, close)) |end| {
+            try segs.append(arena, .{ .text = line[0 .. end + close.len], .style = T.comment });
+            run_start = end + close.len;
+            i = end + close.len;
+            state.in_block = false;
+        } else {
+            try segs.append(arena, .{ .text = line, .style = T.comment });
+            return segs.toOwnedSlice(arena);
+        }
+    }
+    if (resume_str) {
+        const q = state.str_quote;
+        const end = findStrEnd(line, 0, q);
+        if (end) |e| {
+            try segs.append(arena, .{ .text = line[0..e], .style = T.str });
+            run_start = e;
+            i = e;
+            state.in_str = false;
+        } else {
+            try segs.append(arena, .{ .text = line, .style = T.str });
+            return segs.toOwnedSlice(arena);
+        }
+    }
 
     const flushDef = struct {
         fn f(a: std.mem.Allocator, s: *std.ArrayList(md.Segment), from: usize, to: usize, text: []const u8) !void {
@@ -279,6 +340,7 @@ pub fn highlightLine(arena: std.mem.Allocator, line: []const u8, lang: []const u
                 } else {
                     try segs.append(arena, .{ .text = line[i..], .style = T.comment });
                     i = line.len;
+                    state.in_block = true; // sigue en la línea siguiente
                 }
                 run_start = i;
                 continue;
@@ -290,6 +352,14 @@ pub fn highlightLine(arena: std.mem.Allocator, line: []const u8, lang: []const u
             try flushDef(arena, &segs, run_start, i, line);
             try segs.append(arena, .{ .text = line[i..sres.end], .style = T.str });
             i = sres.end;
+            // String sin cerrar en esta línea: el resto de la línea y la
+            // siguiente son string. Sin esto, una comilla sin cerrar pintaba de
+            // verde el resto del fichero.
+            if (sres.open) {
+                state.in_str = true;
+                state.str_quote = sres.quote;
+                return segs.toOwnedSlice(arena);
+            }
             run_start = i;
             continue;
         }
@@ -382,7 +452,7 @@ fn lineCommentAt(line: []const u8, at: usize, prefixes: []const []const u8) ?usi
     return null;
 }
 
-const StrStart = struct { end: usize };
+const StrStart = struct { end: usize, open: bool = false, quote: u8 = '"' };
 
 /// Devuelve el índice final (exclusivo) del string que EMPIEZA en `at`,
 /// o null si ahí no empieza un string.
@@ -415,8 +485,23 @@ fn scanString(line: []const u8, open: usize) ?StrStart {
         }
         if (line[j] == quote) return .{ .end = j + 1 };
     }
-    // string sin cierre en la línea: pintar hasta el final
-    return .{ .end = line.len };
+    // String sin cierre en la línea: se pinta hasta el final Y se recuerda
+    // (`open = true`) para que la línea siguiente siga siendo string.
+    return .{ .end = line.len, .open = true, .quote = quote };
+}
+
+/// Índice final (exclusivo) del string que sigue ABIERTO desde `from`, o null
+/// si en esta línea no se cierra. `quote` es el delimitador.
+fn findStrEnd(line: []const u8, from: usize, quote: u8) ?usize {
+    var j = from;
+    while (j < line.len) : (j += 1) {
+        if (line[j] == '\\' and j + 1 < line.len) {
+            j += 1;
+            continue;
+        }
+        if (line[j] == quote) return j + 1;
+    }
+    return null;
 }
 
 // ── tests ────────────────────────────────────────────────────
@@ -527,4 +612,67 @@ test "línea vacía y solo espacios" {
     try std.testing.expectEqual(@as(usize, 1), e.len);
     const w = try highlightLine(arena, "   ", "zig");
     try std.testing.expectEqualStrings("   ", try joinedText(arena, w));
+}
+
+test "un string multilínea no pinta de verde el resto del bloque" {
+    // 4.8 del ROADMAP. El scanner era línea a línea sin estado, así que un `\`
+    // de Zig o una comilla sin cerrar hacían que la línea siguiente saliera
+    // verde ENTERA (y a veces el resto del fichero).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var st = State{};
+    // Línea 1: abre un string multilínea y NO lo cierra. El caso real es un
+    // `\\` de Zig al final (continuación de línea) o una comilla desbalanceada
+    // en un fichero largo.
+    const l1 = try highlightLineState(arena, "const s = \"hola", "zig", &st);
+    try std.testing.expect(st.in_str);
+    try std.testing.expectEqualStrings("const s = \"hola", try joinedText(arena, l1));
+
+    // Línea 2: sigue dentro del string hasta que lo cierra.
+    const l2 = try highlightLineState(arena, "  mundo\";", "zig", &st);
+    try std.testing.expect(!st.in_str); // el " de aquí lo cerró
+    try std.testing.expectEqualStrings("  mundo\";", try joinedText(arena, l2));
+
+    // Línea 3: ya es código normal (el string se cerró en la 2).
+    const l3 = try highlightLineState(arena, "const n = 1;", "zig", &st);
+    try std.testing.expectEqualStrings("const n = 1;", try joinedText(arena, l3));
+    if (findSeg(l3, "const")) |kw| try std.testing.expectEqual(T.kw, kw.style);
+}
+
+test "un comentario de bloque multilínea tampoco se propaga mal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var st = State{};
+    const l1 = try highlightLineState(arena, "/* abre", "c", &st);
+    try std.testing.expect(st.in_block);
+    for (l1) |s| try std.testing.expectEqual(T.comment, s.style);
+
+    const l2 = try highlightLineState(arena, "sigue comentario", "c", &st);
+    for (l2) |s| try std.testing.expectEqual(T.comment, s.style);
+    try std.testing.expect(st.in_block);
+
+    const l3 = try highlightLineState(arena, "*/ const n = 1;", "c", &st);
+    try std.testing.expect(!st.in_block);
+    try std.testing.expectEqualStrings("*/ const n = 1;", try joinedText(arena, l3));
+}
+
+test "el estado se reinicia entre fences distintos" {
+    // Si un bloque acaba con un string abierto, el SIGUIENTE fence no puede
+    // seguir en verde por arrastrar el estado.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var st = State{};
+    _ = try highlightLineState(arena, "const s = \"", "zig", &st);
+    try std.testing.expect(st.in_str);
+    st = .{}; // nuevo fence
+    const l = try highlightLineState(arena, "const n = 1;", "zig", &st);
+    // Nada de esta línea es string: `const` es keyword y el resto texto.
+    try std.testing.expect(findSeg(l, "const") != null);
+    if (findSeg(l, "const")) |kw| try std.testing.expectEqual(T.kw, kw.style);
 }
