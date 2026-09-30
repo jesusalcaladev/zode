@@ -17,6 +17,14 @@ pub fn build(b: *std.Build) void {
         "optimize",
         "Modo de optimización (default: ReleaseSafe)",
     ) orelse .ReleaseSafe;
+    // Strip is ON by default because it takes the binary from 10.78 MB to 1.89 MB
+    // (measured), and zode is I/O-bound so it costs nothing at runtime.
+    //
+    // But a STRIPPED BINARY HAS NO STACK TRACE: when zode crashed with SIGSEGV
+    // the only thing on screen was "Cannot print stack trace: stack tracing is
+    // disabled", which is exactly the moment you least want the build to be
+    // mute. So `-Dstrip=false` is the documented way to get a debuggable build,
+    // and `zig build -Dstrip=false` is what to run when something crashes.
     const strip = b.option(bool, "strip", "Quita las secciones de debug (default: true)") orelse true;
     // Los tests van en Debug a propósito (el DebugAllocator y las
     // comprobaciones de overflow son los que cazan los bugs), pero su binario
@@ -48,6 +56,16 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run zode");
     run_step.dependOn(&run_cmd.step);
+
+    // `zig build debug` = the same binary but NOT stripped, which is what to use
+    // when something crashes. The default binary has no symbols, so a panic comes
+    // out as "Cannot print stack trace: stack tracing is disabled" — which is
+    // precisely the moment you least want the build to be mute. (It happened: a
+    // SIGSEGV with no way to tell where from.)
+    const debug_exe = b.addExecutable(.{ .name = "zode-debug", .root_module = exe_mod });
+    b.installArtifact(debug_exe);
+    b.step("debug", "Build an UNSTRIPPED zode-debug (has symbols, for crash traces)")
+        .dependOn(&debug_exe.step);
 
     // tool_test binario temporal
     const tt_mod = b.createModule(.{
