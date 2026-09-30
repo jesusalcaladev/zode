@@ -216,6 +216,7 @@ fn runTui(init: std.process.Init) !u8 {
     agent.gpa_global = init.gpa;
     free_auto.attachIo(io);
     chat.io_global = io;
+    chat.dbgInitEnv(init.environ_map);
     agent.resume_on_start = std.mem.eql(u8, envGet(init.environ_map, "ZODE_RESUME") orelse "", "1");
     defer agent.shutdownUserConfig();
     agent.loadUserConfig();

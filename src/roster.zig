@@ -47,10 +47,27 @@ pub const max_rotations_per_task = 10;
 /// (más "quota" que "rate limit"), no un reintento automático.
 pub const cooldown_ms: i128 = 10 * 60 * 1000;
 
+/// Cuánto está fuera de juego un par según POR QUÉ murió.
+///
+/// Un solo tope para todo era un error: un 429 de openrouter y un 503 pasajero
+/// no son lo mismo, y 10 minutos de castigo por un blip de un segundo quitan un
+/// modelo bueno del pool cuando el usuario más lo necesita. La cuota (402/429) sí
+/// dura: es lo que tarda en volver.
+pub const failed_cooldown_ms: i128 = 60 * 1000;
+
 /// Tope de candidatos. Con 5 providers y 3 free cada uno son 15; el tope es para
-/// que un provider que devuelva el catálogo entero (openrouter tiene ~300) no
-/// infle el array fijo.
+/// que un provider que devuelva el catálogo entero (openrouter tiene ~460
+/// modelos) no infle el array fijo.
 pub const max_candidates = 24;
+
+/// Cuántos free se quedan de CADA provider.
+///
+/// Existe por un motivo que la sonda enseñó: openrouter publica 20 free y
+/// opencode 8, y con un tope SOLO global el primero que se lista se come el
+/// pool entero. O sea, que el provider con más modelos (el más útil) era el
+/// que peor salía. Con este tope cada uno aporta sus mejores y la suma decide
+/// quién entra.
+pub const per_provider_max = 8;
 
 /// Un par provider/modelo que se puede usar.
 pub const Candidate = struct {
@@ -104,6 +121,12 @@ pub const Why = enum {
     misconfigured,
     /// Se quedó a medias dos veces.
     stalled,
+    /// Se agotaron los reintentos con este par (3 intentos con backoff) sin que
+    /// el error fuera de cuota. Verá: un 5xx o un body raro NO es motivo para
+    /// rotar en el momento (el modelo no tiene la culpa y puede ser un blip), pero
+    /// si el turno se muere con él, el SIGUIENTE turno tiene que empezar en otro
+    /// sitio o el usuario se queda atascado en el mismo modelo para siempre.
+    failed,
 
     pub fn label(self: Why) []const u8 {
         return switch (self) {
@@ -112,6 +135,7 @@ pub const Why = enum {
             .gated => "gated to the official client",
             .misconfigured => "not available on this account",
             .stalled => "stalled twice",
+            .failed => "failed 3 times",
         };
     }
 };
@@ -181,6 +205,9 @@ pub const Roster = struct {
 
         var found_any_key = false;
         for (defs) |def| {
+            // Inicio del tramo que aporta este provider, para poder recortar SUS
+            // candidatos sin tocar los de los anteriores.
+            const start: u8 = self.len;
             // Sin key no se pregunta: un 401 aquí solo genera ruido.
             if (providers.keyFor(&def, env) == null) continue;
             found_any_key = true;
@@ -206,6 +233,8 @@ pub const Roster = struct {
                 };
                 self.len += 1;
             }
+
+            trimProvider(self, start);
         }
 
         if (!found_any_key) {
@@ -235,6 +264,35 @@ pub const Roster = struct {
     fn sort(self: *Roster) void {
         const items = self.items[0..self.len];
         std.mem.sort(Candidate, items, {}, less);
+    }
+
+    /// Recorta a `per_provider_max` los candidatos que aporta ESTE provider (el
+    /// tramo `start..self.len`), quedándose con los de contexto más grande.
+    ///
+    /// Va fuera de `build` a propósito: `build` habla con la red y no se puede
+    /// testear, y el recorte es justo la parte donde el fallo se esconde. Así lo
+    /// comprueba un test sin salir a la red (el fallo lo encontró la sonda
+    /// `zig build roster-probe`: con el tope solo global, openrouter se comía el
+    /// pool y de los 20 free solo entraban 16 en cualquier orden).
+    fn trimProvider(self: *Roster, start: u8) void {
+        const added = self.len - start;
+        if (added <= per_provider_max) return;
+        // Ordenar ANTES de tirar el resto (y no al revés) es lo que deja en el
+        // pool los mejores. Recortar primero se quedaría con los 8 primeros que
+        // publicó el provider, que pueden ser los peores.
+        std.mem.sort(Candidate, self.items[start..self.len], {}, byCtxThenName);
+        self.len = start + per_provider_max;
+    }
+
+    /// Contexto grande primero, y alfabético como desempate. Se usa para
+    /// recortar los candidatos de UN provider antes de meterlos en el pool.
+    ///
+    /// No reutiliza `less` a propósito: aquí todos los candidatos son del mismo
+    /// provider, así que ni `worked` ni `gated_opencode` los distinguen, y
+    /// ordenar por el comparador global mezclaría tramos.
+    fn byCtxThenName(_: void, a: Candidate, b: Candidate) bool {
+        if (a.ctx != b.ctx) return a.ctx > b.ctx;
+        return std.mem.lessThan(u8, a.model_id, b.model_id);
     }
 
     /// Orden total en UN solo comparador.
@@ -326,7 +384,11 @@ pub const Roster = struct {
         else
             std.fmt.bufPrint(&tmp, "{s}: {s}", .{ why.label(), detail }) catch why.label();
 
-        var d = Dead{ .idx = idx, .until_ms = now_ms + cooldown_ms, .reason_len = 0 };
+        const cool: i128 = switch (why) {
+            .failed, .stalled => failed_cooldown_ms,
+            else => cooldown_ms,
+        };
+        var d = Dead{ .idx = idx, .until_ms = now_ms + cool, .reason_len = 0 };
         const n = @min(text.len, d.reason.len);
         @memcpy(d.reason[0..n], text[0..n]);
         d.reason_len = @intCast(n);
@@ -410,6 +472,95 @@ fn fakeRoster(gpa: std.mem.Allocator, n: u8) Roster {
         };
     }
     return r;
+}
+
+test "trimProvider: de cada provider solo entran los mejores, no los primeros" {
+    // El fallo que encontró la sonda: con el tope SOLO global, el provider con más
+    // modelos se comía el pool. Y lo peyor: entraban los 8 primeros que publicó,
+    // no los 8 mejores.
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    var r = Roster.init(astate.allocator());
+
+    // 20 candidatos de UN provider, en orden de publicación (contexto growing,
+    // como los devuelve openrouter: no viene ordenados por nada útil).
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        r.items[i] = .{ .provider_id = "openrouter", .model_id = "m", .ctx = 1000 + @as(u32, i) * 10 };
+    }
+    r.len = 20;
+
+    Roster.trimProvider(&r, 0);
+    try std.testing.expectEqual(@as(u8, per_provider_max), r.len);
+    // Los 8 de más contexto, no los 8 primeros.
+    try std.testing.expectEqual(@as(u32, 1000 + 19 * 10), r.items[0].ctx);
+    try std.testing.expectEqual(@as(u32, 1000 + 12 * 10), r.items[per_provider_max - 1].ctx);
+}
+
+test "trimProvider: no toca los candidatos de los providers anteriores" {
+    // El recorte va por TRAMO, no sobre el array entero: si ordenara todo, los
+    // 8 mejores serían del provider más grande y volveríamos al bug original.
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    var r = Roster.init(astate.allocator());
+
+    // 6 del primer provider (cabe entero), 18 del segundo (hay que recortar; y
+    // 6+18 son justo los 24 del tope, como en `build`).
+    for (0..6) |k| {
+        r.items[@intCast(k)] = .{ .provider_id = "a", .model_id = "a", .ctx = 10 };
+    }
+    for (0..18) |k| {
+        r.items[6 + @as(u8, @intCast(k))] = .{
+            .provider_id = "b",
+            .model_id = "b",
+            .ctx = 1000 + @as(u32, @intCast(k)) * 10,
+        };
+    }
+    r.len = 24;
+
+    Roster.trimProvider(&r, 6);
+    try std.testing.expectEqual(@as(u8, 6 + per_provider_max), r.len);
+    // Los 6 primeros siguen siendo del provider "a" y con su contexto intacto.
+    for (0..6) |k| {
+        try std.testing.expectEqualStrings("a", r.items[@intCast(k)].provider_id);
+        try std.testing.expectEqual(@as(u32, 10), r.items[@intCast(k)].ctx);
+    }
+    try std.testing.expectEqualStrings("b", r.items[6].provider_id);
+    try std.testing.expectEqual(@as(u32, 1000 + 17 * 10), r.items[6].ctx);
+}
+
+test "trimProvider: un provider con 100 free no deja sin sitio al siguiente" {
+    // El caso límite del bug original. Con el recorte por tramo, el primer
+    // provider llena los 24 slots, se le recortan a 8, y el siguiente tiene sitio
+    // de verdad. (Con el tope solo global, el segundo se quedaba con 0 y el
+    // free-auto no tenía plan B aunque hubiera 3 providers con key.)
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    var r = Roster.init(astate.allocator());
+
+    for (0..max_candidates) |k| {
+        r.items[@intCast(k)] = .{
+            .provider_id = "openrouter",
+            .model_id = "m",
+            .ctx = 1000 + @as(u32, @intCast(k)),
+        };
+    }
+    r.len = max_candidates;
+    Roster.trimProvider(&r, 0);
+    try std.testing.expectEqual(@as(u8, per_provider_max), r.len);
+
+    // Y ahora entra el segundo con sitio de sobra.
+    for (0..4) |k| {
+        r.items[per_provider_max + @as(u8, @intCast(k))] = .{
+            .provider_id = "groq",
+            .model_id = "g",
+            .ctx = 2000,
+        };
+    }
+    r.len = per_provider_max + 4;
+    Roster.trimProvider(&r, per_provider_max);
+    try std.testing.expectEqual(@as(u8, per_provider_max + 4), r.len);
+    try std.testing.expectEqualStrings("groq", r.items[per_provider_max].provider_id);
 }
 
 test "currentCandidate es el que se está usando, aunque esté muerto" {
@@ -576,6 +727,26 @@ test "exhaustedReport lista qué se probó y por qué" {
     try std.testing.expect(std.mem.indexOf(u8, rep, "no free model left") != null);
     try std.testing.expect(std.mem.indexOf(u8, rep, "prov/m0 (no credits") != null);
     try std.testing.expect(std.mem.indexOf(u8, rep, "prov/m1 (gated") != null);
+}
+
+test "el cooldown depende de POR QUÉ murió, no es uno para todo" {
+    // 10 minutos por un 503 pasajero quitaban un modelo bueno del pool justo
+    // cuando el usuario lo necesita. Y al revés: un 402 sí tiene que durar.
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    var r = fakeRoster(astate.allocator(), 2);
+
+    r.noteDead(0, 0, .failed, "JSON parsing failed");
+    r.noteDead(1, 0, .no_credits, "402");
+
+    // El que fallo por un blip vuelve antes que el que se quedo sin creditos:
+    // sigue fuera a los 59 s (el tope de un minuto) y ya esta dentro a los 60.
+    try std.testing.expect(r.isDead(0, failed_cooldown_ms - 1));
+    try std.testing.expect(!r.isDead(0, failed_cooldown_ms));
+    try std.testing.expect(r.isDead(1, cooldown_ms - 1));
+    try std.testing.expect(!r.isDead(1, cooldown_ms));
+    // Y la etiqueta lo dice, para que el historial no mienta.
+    try std.testing.expect(std.mem.indexOf(u8, r.deadReason(0), "failed 3 times") != null);
 }
 
 test "noteDead con detalle larguísimo no se desborda" {
