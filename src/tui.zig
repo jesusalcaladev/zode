@@ -2928,6 +2928,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     }
     if (info.len > 0) drawSessionInfo(&p, status_row, width, info, self.activity().busy);
 
+    // Second column, at the right edge: what the session has cost. Painted
+    // AFTER the session column so it wins any overlap, and only if the session
+    // column left room (`reserved`).
+    if (usageInfo(ctx.arena)) |usage| {
+        drawUsageColumn(&p, status_row, width, usage, sessionInfoWidth(info));
+    }
+
     // ── `/` autocompletion (right above the input) ──
     if (ac_rows > 0) {
         drawAutocomplete(&p, self, input_top - ac_rows, width, ac_rows);
@@ -3400,6 +3407,90 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     if (out.items.len == 0) return null;
     return out.items;
 }
+
+/// La SEGUNDA columna del status: cuánto cuesta la sesión.
+///
+/// Va pegada a la derecha y separada de la de sesión por un `│`, porque son
+/// cosas distintas y no encajan en la misma frase: la izquierda dice con QUÉ
+/// estás trabajando y la derecha, lo que te ha costado.
+///
+/// Antes estos datos solo salían con `/cache` y al abrir `/context`, que es
+/// justo cuando ya no sirven: el número que quieres ver es el de ahora, sin
+/// tener que abrir nada.
+fn usageInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
+    var out: std.ArrayList(InfoSeg) = .empty;
+
+    const st = &agent.cacheSessionStats();
+    // Nada de datos todavía: se Would poner un `0%` que miente.
+    if (st.requests == 0) return null;
+
+    const pct: u8 = @intFromFloat(std.math.clamp(st.hitRatePct(), 0, 100));
+    const tag = std.fmt.allocPrint(arena, " {d:.0}% cached", .{st.hitRatePct()}) catch return null;
+    out.append(arena, .{ .text = tag, .style = theme.ctxColor(pct) }) catch return null;
+
+    const tok = std.fmt.allocPrint(
+        arena,
+        " \u{b7} {d}k prompt",
+        .{@divTrunc(st.prompt_tokens + 500, 1000)},
+    ) catch return null;
+    out.append(arena, .{ .text = tok, .style = theme.brand_faint }) catch return null;
+
+    if (st.completion_tokens > 0) {
+        const comp = std.fmt.allocPrint(
+            arena,
+            " \u{b7} {d}k out",
+            .{@divTrunc(st.completion_tokens + 500, 1000)},
+        ) catch return null;
+        out.append(arena, .{ .text = comp, .style = theme.brand_faint }) catch return null;
+    }
+    return out.items;
+}
+
+/// Dibuja la columna de usage pegada a la derecha, con un `│` que la separa de
+/// la de sesión.
+///
+/// Se degrada quitando pedazos ANTES de invadir el texto de la otra columna:
+/// si no cabe entero, no se pinta nada. Un `62% cached` a medias, o metido
+/// encima del modelo, se lee peor que no tenerlo.
+fn drawUsageColumn(p: *Painter, row: u16, width: u16, segs: []const InfoSeg, reserved: u16) void {
+    const sep_w: u16 = 3; // " │ "
+    const total: u16 = segsWidth(segs);
+    const needed = total + sep_w;
+    if (needed + reserved + 2 >= width) return;
+    if (total == 0) return;
+
+    var col: u16 = width - total;
+    // The separator, three columns to the left of the column's first glyph.
+    _ = p.putStable(col - sep_w, row, "\u{2502}", 1, theme.brand_faint);
+    for (segs) |sg| {
+        var it = vaxis.unicode.graphemeIterator(sg.text);
+        while (it.next()) |g| {
+            const b = g.bytes(sg.text);
+            const w = theme.graphemeWidth(p.ctx, b);
+            if (col + w <= width) _ = p.putStable(col, row, b, w, sg.style);
+            col += w;
+        }
+    }
+}
+
+/// Anchcho en COLUMNAS de un grupo de segmentos del status.
+///
+/// Se mide con el iterador de graphemes y no con `.len`: `⚡` son 3 bytes para 1
+/// columna, así que alinear por bytes descentra la fila entera. Esta función
+/// la usan las dos columnas, y tienen que medir IGUAL o se pisan.
+fn segsWidth(segs: []const InfoSeg) u16 {
+    var total: u16 = 0;
+    for (segs) |sg| {
+        var it = vaxis.unicode.graphemeIterator(sg.text);
+        while (it.next()) |g| {
+            _ = g;
+            total += 1;
+        }
+    }
+    return total;
+}
+
+const sessionInfoWidth = segsWidth;
 
 /// Draws the session info right-aligned, measuring the total width with the
 /// REAL cell width (not `len`): emojis and `·` take 1, but if a 2-column
@@ -5249,4 +5340,47 @@ test "poda: el ahorro es real (no solo un boolean)" {
         const live = p.textLive(std.testing.allocator);
         try std.testing.expectEqual(big.len, live.len);
     }
+}
+
+test "columna de usage: sin datos no se pinta (un 0% miente)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // With an empty cache session there is nothing to say. These numbers used
+    // to show up only with `/cache`, which is exactly when they stop being
+    // useful.
+    try std.testing.expect(usageInfo(arena_state.allocator()) == null);
+}
+
+test "columna de usage: con datos, el pct de cache y los tokens de la sesion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    agent.cacheSessionStatsForTest().* = .{};
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 1000, .cached = 900, .completion = 100 });
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 1000, .cached = 0, .completion = 50 });
+    defer agent.cacheSessionStatsForTest().* = .{};
+
+    const segs = usageInfo(arena) orelse return error.TestUnexpectedResult;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (segs) |s| try joined.appendSlice(std.testing.allocator, s.text);
+    const all = joined.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, all, "45% cached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "2k prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "out") != null);
+}
+
+test "las dos columnas del status miden el ancho igual (si no, se pisan)" {
+    // The bug of measuring with `.len` instead of columns: `⚡` is 3 bytes for 1
+    // column, so aligning by bytes knocks the whole row off. Both columns use
+    // the SAME function on purpose.
+    const segs = [_]InfoSeg{
+        .{ .text = "\u{26a1} 3 tok/s", .style = theme.tool },
+        .{ .text = " \u{b7} \u{00f1}", .style = theme.dim },
+    };
+    // "⚡ 3 tok/s" son 9 graphemes y " · ñ" son 4: 13 columnas. En BYTES serían
+    // 15 y 7, o sea 22, y la fila quedaría 9 columnas corrida.
+    try std.testing.expectEqual(@as(u16, 13), segsWidth(&segs));
 }
