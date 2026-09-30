@@ -411,6 +411,20 @@ fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
     return fresh;
 }
 
+/// El diff de un fichero lleva el LENGUAJE para que el cuerpo de cada línea
+/// El diff de un fichero lleva el LENGUAJE para que el cuerpo de cada línea
+/// se tokenice (`+const n: u32 = 42`: keyword, tipo y número se distinguen).
+///
+/// Sin esto el diff salía entero del color del prefijo, que es el muro verde
+/// del ROADMAP. La extensión del path es la fuente: es lo que hay, y no
+/// requiere pedirle nada al modelo.
+fn langFromPath(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return "";
+    if (dot + 1 >= base.len) return "";
+    return base[dot + 1 ..];
+}
+
 /// Crea una sesión nueva y descarta la actual.
 pub fn newSession(m: *tui.Model) void {
     if (session) |old| {
@@ -2073,7 +2087,9 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
                 const after = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch {
                     continue;
                 };
-                const dc = m.pushDiff(old, after);
+                // El lenguaje sale de la extensión del path, para que el cuerpo de cada línea
+                // del diff se tokenice en vez de salir del color del prefijo.
+                const dc = m.pushDiffLang(old, after, langFromPath(pth));
                 turn_stats.noteDiff(pth, dc);
             }
         }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const hl = @import("highlight.zig");
+const theme = @import("theme.zig");
 
 pub const Style = vaxis.Style;
 
@@ -83,6 +84,23 @@ pub fn parseBase(
     base_override: ?Style,
     mood_style: ?Style,
 ) ![]Block {
+    return parseLang(arena, kind, text, base_override, mood_style, "");
+}
+
+/// Como `parseBase` pero sabiendo en qué LENGUAJE está el contenido.
+///
+/// Ahora mismo solo lo usa el diff: sin la extensión del fichero no se puede
+/// tokenizar el cuerpo de una línea (`+const x: u32 = 4`) y sale entero del
+/// color del prefijo, que es el muro verde que había.
+pub fn parseLang(
+    arena: std.mem.Allocator,
+    kind: Kind,
+    text: []const u8,
+    base_override: ?Style,
+    mood_style: ?Style,
+    lang: []const u8,
+) ![]Block {
+    const diff_lang = lang;
     var blocks: std.ArrayList(Block) = .empty;
     var inline_lines: std.ArrayList([]const Segment) = .empty;
 
@@ -148,7 +166,10 @@ pub fn parseBase(
             }
         }
 
-        try inline_lines.append(arena, try inlineSegmentsBase(arena, line, kind, base_override, mood_style));
+        // El diff necesita el LENGUAJE del fichero para tokenizar el cuerpo; el
+        // resto de kinds lo ignoran (se les pasa "").
+        const line_lang: []const u8 = if (kind == .diff) diff_lang else "";
+        try inline_lines.append(arena, try inlineSegmentsLang(arena, line, kind, base_override, mood_style, line_lang));
     }
     // código pendiente sin cierre
     if (in_code and code_lines.items.len > 0) {
@@ -182,19 +203,66 @@ fn baseStyle(kind: Kind) Style {
     };
 }
 
-/// Una línea de diff unificado coloreada por su prefijo.
-fn diffSegments(arena: std.mem.Allocator, line: []const u8) ![]Segment {
-    const style: Style = if (line.len == 0)
-        styles.diff_ctx
-    else switch (line[0]) {
-        '+' => styles.diff_add,
-        '-' => styles.diff_del,
+/// Una línea de diff unificada: prefijo por su color + el resto POR TOKENS.
+///
+/// Antes era UN solo segmento de toda la línea con `diff_add`, que es un verde
+/// sólido (#00cd00). Escribir un fichero de 200 líneas daba 200 filas verde
+/// plano: no se distinguía una string de un número de un tipo, y además ese
+/// verde era el MISMO que el de las strings del código (`highlight.zig`), así
+/// que "verde" no significaba nada.
+///
+/// Ahora el prefijo `+`/`-`/` ` va con su color y el cuerpo pasa por el
+/// highlighter con `lang`, que es lo que hace legible un diff: los números se
+/// ven números y los identificadores en Pascal se ven tipos.
+fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![]Segment {
+    if (line.len == 0) {
+        const segs = try arena.alloc(Segment, 1);
+        segs[0] = .{ .text = line, .style = theme.diff_ctx };
+        return segs;
+    }
+    const pre_style: Style = switch (line[0]) {
+        '+' => theme.diff_add,
+        '-' => theme.diff_del,
         '@' => styles.heading, // cabecera @@ hunk @@
-        else => styles.diff_ctx,
+        else => theme.diff_ctx,
     };
-    const segs = try arena.alloc(Segment, 1);
-    segs[0] = .{ .text = line, .style = style };
-    return segs;
+    // `@@ … @@` es una cabecera de hunk, no código: entero del color del heading.
+    if (line[0] == '@') {
+        const segs = try arena.alloc(Segment, 1);
+        segs[0] = .{ .text = line, .style = pre_style };
+        return segs;
+    }
+
+    // El prefijo (`+`, `-` o el espacio de contexto) es un segmento propio, y
+    // el resto se tokeniza. El espacio de contexto NO se incluye en el cuerpo
+    // que va al highlighter: si no, el lenguaje no reconocería nada hasta el
+    // primer carácter real.
+    const lead: usize = if (line[0] == '+' or line[0] == '-')
+        1
+    else if (line[0] == ' ')
+        @min(1, line.len)
+    else
+        0;
+    var out: std.ArrayList(Segment) = .empty;
+    if (lead > 0) {
+        try out.append(arena, .{ .text = line[0..lead], .style = pre_style });
+    }
+    const body = line[lead..];
+    if (body.len > 0) {
+        const toks = try hl.highlightLine(arena, body, lang);
+        for (toks) |t| {
+            // Los tokens del highlight traen sus propios colores; el prefijo
+            // del diff ya va aparte. Para el contexto (líneas ` `) sí se
+            // atenúa el cuerpo, que si no el diff de un fichero entero sale
+            // con el mismo contraste que las líneas cambiadas.
+            var st = t.style;
+            if (lead == 0 or (lead == 1 and line[0] == ' ')) {
+                st = theme.diff_ctx;
+            }
+            try out.append(arena, .{ .text = t.text, .style = st });
+        }
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Tope de líneas por fichero para el diff.
@@ -291,9 +359,23 @@ pub fn inlineSegmentsBase(
     base_override: ?Style,
     mood_style: ?Style,
 ) ![]Segment {
-    // Las líneas de diff se colorean por su prefijo: +verde, -rojo, espacio
-    // gris. Es lo que hace legible un edit sin abrir un file externo.
-    if (kind == .diff) return diffSegments(arena, line);
+    return inlineSegmentsLang(arena, line, kind, base_override, mood_style, "");
+}
+
+/// Como `inlineSegmentsBase` pero con el LENGUAJE de la línea.
+///
+/// Hace falta para el diff: el prefijo va con su color y el cuerpo se tokeniza
+/// como código, así que hay que saber en qué lenguaje está el fichero que se
+/// edita. Para el resto de kinds el idioma da igual.
+pub fn inlineSegmentsLang(
+    arena: std.mem.Allocator,
+    line: []const u8,
+    kind: Kind,
+    base_override: ?Style,
+    mood_style: ?Style,
+    lang: []const u8,
+) ![]Segment {
+    if (kind == .diff) return diffSegments(arena, line, lang);
 
     // Cabecera: `*zode*` y `*─────*` brillan dentro del arte del búho. Con
     // esto el brillo cae DENTRO del dibujo en vez de pintar una línea entera,
@@ -483,20 +565,82 @@ test "unifiedDiff: borrado" {
     try std.testing.expectEqualStrings(" c", d[2]);
 }
 
-test "diffSegments colorea por prefijo" {
+test "diffSegments: el prefijo va con su color y el cuerpo POR TOKENS" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // El prefijo es su propio segmento...
     const add = try inlineSegments(arena, "+nuevo", .diff);
-    try std.testing.expectEqualStrings("+nuevo", add[0].text);
-    try std.testing.expectEqual(styles.diff_add.fg, add[0].style.fg);
+    try std.testing.expectEqualStrings("+", add[0].text);
+    try std.testing.expectEqual(theme.diff_add.fg, add[0].style.fg);
 
     const del = try inlineSegments(arena, "-viejo", .diff);
-    try std.testing.expectEqual(styles.diff_del.fg, del[0].style.fg);
+    try std.testing.expectEqualStrings("-", del[0].text);
+    try std.testing.expectEqual(theme.diff_del.fg, del[0].style.fg);
 
     const ctx = try inlineSegments(arena, " igual", .diff);
-    try std.testing.expectEqual(styles.diff_ctx.fg, ctx[0].style.fg);
+    try std.testing.expectEqualStrings(" ", ctx[0].text);
+    try std.testing.expectEqual(theme.diff_ctx.fg, ctx[0].style.fg);
+
+    // ...y el texto NO se pierde nunca: invariante del módulo.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (add) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+    try std.testing.expectEqualStrings("+nuevo", joined.items);
+}
+
+test "una línea + del diff lleva tokens, no un segmento verde" {
+    // El muro verde: `+const n: u32 = 42` era UN segmento con `diff_add`. Ahora
+    // el prefijo va con su color y el cuerpo se tokeniza, así que `const` es
+    // keyword, `u32` un tipo y `42` un número. Es lo que hace legible un diff
+    // sin abrir el fichero.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const segs = try inlineSegmentsLang(arena, "+const n: u32 = 42", .diff, null, null, "zig");
+    try std.testing.expect(segs.len >= 4);
+
+    const kw = findDiffSeg(segs, "const") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(theme.code_kw.fg, kw.style.fg);
+    const typ = findDiffSeg(segs, "u32") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(theme.code_type.fg, typ.style.fg);
+    const num = findDiffSeg(segs, "42") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(theme.code_num.fg, num.style.fg);
+
+    // Y el prefijo conserva su verde de diff, que es DISTINTO del verde de las
+    // strings del código (antes ambos eran `index 2`).
+    try std.testing.expect(!std.meta.eql(theme.diff_add.fg, theme.code_str.fg));
+
+    // Invariante: se conserva cada byte.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+    try std.testing.expectEqualStrings("+const n: u32 = 42", joined.items);
+}
+
+fn findDiffSeg(segs: []const Segment, needle: []const u8) ?Segment {
+    for (segs) |s| {
+        if (std.mem.eql(u8, s.text, needle)) return s;
+    }
+    return null;
+}
+
+test "el diff sin saber el lenguaje sale plano pero conserva el prefijo" {
+    // Con `lang = ""` cae en el `generic`, que ahora tiene tabla: no es un
+    // muro verde, pero tampoco inventa colores.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const segs = try inlineSegments(arena, "+hola", .diff);
+    try std.testing.expectEqualStrings("+", segs[0].text);
+    try std.testing.expectEqual(theme.diff_add.fg, segs[0].style.fg);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+    try std.testing.expectEqualStrings("+hola", joined.items);
 }
 
 test "un banner que empieza por ## NO se come como encabezado" {

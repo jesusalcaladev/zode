@@ -58,6 +58,50 @@ pub fn ctxColor(pct: u8) vaxis.Style {
 /// Background del item seleccionado en un picker.
 pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 } };
 
+// ── paleta de tokens de código (Fase 4.4/4.5/4.6 del ROADMAP) ───
+//
+// Estaban hardcodeados en `highlight.zig` como índices xterm-256, sin importar
+// `theme.zig`. Dos consecuencias:
+//  - El código se veía con los colores de la terminal por defecto, no con los
+//    de la app: la cabecera en azul de marca y el bloque de código en 256 son
+//    de sistemas distintos.
+//  - `str` y `diff_add` eran AMBOS `index 2`. Es decir, una string de código y
+//    una línea añadida de un diff salían del MISMO verde, que es justo lo que
+//    hace que "todo el diff es verde" no se distinga de "esto es una string".
+//
+// Aquí se separan: strings en verde apagado (#9ece6a) y las líneas añadidas en
+// un verde más brillante (#73daca), y el texto normal (`def`) baja a un gris
+// claro (#a9b1d6) en vez de `Style{}`, que es el color por defecto de la
+// terminal: lo MÁS BRILLANTE de la pantalla. Con ~90 % de las líneas del
+// código cayendo en `def`, el bloque entero era el punto más llamativo.
+
+/// Texto normal de código. Antes `Style{}` = el color por defecto de la
+/// terminal, es decir lo más brillante que hay en pantalla.
+pub const code_text: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xa9, 0xb1, 0xd6 } } };
+pub const code_kw: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } } }; // lila
+pub const code_kw2: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } }, .italic = true };
+pub const code_builtin: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // azul
+pub const code_type: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x2a, 0xc7, 0xb9 } } }; // cian
+pub const code_str: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x9e, 0xce, 0x6a } } }; // verde apagado
+pub const code_comment: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } }, .italic = true };
+pub const code_num: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xe0, 0xaf, 0x68 } } }; // ámbar
+/// Llamada a función: ahora con COLOR, no solo `bold` (que no se distingue de
+/// un texto normal en negrita).
+pub const code_fn: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } }, .bold = true };
+pub const code_deco: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xe0, 0xaf, 0x68 } }, .italic = true };
+
+// ── diff ───────────────────────────────────────────────────────
+// Desacoplados de `code_str` a propósito: ver arriba.
+pub const diff_add: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x73, 0xda, 0xca } } };
+pub const diff_del: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf7, 0x76, 0x8e } } };
+pub const diff_ctx: vaxis.Style = code_comment;
+
+/// Fondo y gutter de un bloque de código (Fase 4.1).
+pub const code_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x1a, 0x1b, 0x26 } } };
+pub const code_gutter: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x3b, 0x42, 0x61 } } };
+/// Chip con el lenguaje del bloque.
+pub const code_lang: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } }, .italic = true };
+
 // ── paleta modal (Ctrl+P) ────────────────────────────────────
 
 /// Item no resaltado: texto normal, no gris, para que la lista se lea.

@@ -178,7 +178,20 @@ fn buildLines(
     text: []const u8,
     width: u16,
 ) ![]const PLine {
-    return buildLinesBase(pa, ctx, kind, text, width, null, null);
+    return buildLinesBase(pa, ctx, kind, text, width, null, null, "");
+}
+
+/// `buildLines` con el LENGUAJE del contenido (solo lo usa el diff, para
+/// tokenizar el cuerpo de cada línea).
+fn buildLinesLang(
+    pa: std.mem.Allocator,
+    ctx: vxfw.DrawContext,
+    kind: md.Kind,
+    text: []const u8,
+    width: u16,
+    lang: []const u8,
+) ![]const PLine {
+    return buildLinesBase(pa, ctx, kind, text, width, null, null, lang);
 }
 
 /// `buildLines` con estilo base impuesto (ver `md.parseBase`).
@@ -190,8 +203,9 @@ fn buildLinesBase(
     width: u16,
     base: ?md.Style,
     mood: ?vaxis.Style,
+    lang: []const u8,
 ) ![]const PLine {
-    const blocks = try md.parseBase(pa, kind, text, base, mood);
+    const blocks = try md.parseLang(pa, kind, text, base, mood, lang);
     var lines: std.ArrayList(PLine) = .empty;
     var first_line = true;
 
@@ -456,6 +470,9 @@ pub const Model = struct {
         text: []const u8,
         base: ?md.Style = null,
         mood: ?vaxis.Style = null,
+        /// Lenguaje del contenido (solo lo usa el diff, para tokenizar el
+        /// cuerpo de cada línea). `""` = sin saber.
+        lang: []const u8 = "",
     };
 
     /// Último tool call, para que Ctrl+R pueda mostrar su resultado completo.
@@ -488,6 +505,16 @@ pub const Model = struct {
         }
     };
 
+    /// Libera los buffers propios de un párrafo (`text` y `lang`).
+    ///
+    /// `lang` solo lo rellena el diff, y es gpa-owned como `text` porque viene
+    /// de la arena del worker. Liberar los dos juntos evita el forget tipico: si
+    /// uno se queda, es una fuga por párrafo; si se libera dos veces, un crash.
+    fn freePara(gpa: std.mem.Allocator, p: anytype) void {
+        gpa.free(p.text);
+        if (p.lang.len > 0) gpa.free(p.lang);
+    }
+
     const Pending = struct {
         kind: md.Kind,
         text: []const u8, // copia gpa, liberada en drain
@@ -495,6 +522,8 @@ pub const Model = struct {
         base: ?md.Style = null,
         /// Color del mood de Zo: pinta lo marcado con `~…~` en la cabecera.
         mood: ?vaxis.Style = null,
+        /// Lenguaje del contenido (ver `Para.lang`). gpa-owned como `text`.
+        lang: []const u8 = "",
     };
 
     const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
@@ -527,9 +556,9 @@ pub const Model = struct {
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
-        for (self.paras.items) |p| self.allocator.free(p.text);
+        for (self.paras.items) |p| freePara(self.allocator, p);
         self.paras.deinit(self.allocator);
-        for (self.pending.items) |p| self.allocator.free(p.text);
+        for (self.pending.items) |p| freePara(self.allocator, .{ .kind = p.kind, .text = p.text, .lang = p.lang });
         self.pending.deinit(self.allocator);
         if (self.last_tool) |*lt| lt.deinit(self.allocator);
         if (self.tool_run) |tr| tr.deinit(self.allocator);
@@ -871,7 +900,7 @@ pub const Model = struct {
             self.allocator.destroy(para_arena);
         }
 
-        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_.kind, p_.text, width, p_.base, p_.mood);
+        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_.kind, p_.text, width, p_.base, p_.mood, p_.lang);
         // Una fila en blanco ENTRE párrafos: sin ella el historial es un muro
         // de texto y no se ve dónde acaba una respuesta y empieza otra.
         //
@@ -1549,6 +1578,17 @@ pub fn ttftPending(self: *const Model) bool {
     /// Devuelve cuántas líneas se añadieron y cuántas se quitaron (ya se
     /// contaban y se tiraban); el llamante puede enseñarlo en el resumen.
     pub fn pushDiff(self: *Model, before: []const u8, after: []const u8) DiffCounts {
+        return self.pushDiffLang(before, after, "");
+    }
+
+    /// Como `pushDiff` pero sabiendo el lenguaje del fichero, para tokenizar el
+    /// cuerpo de cada línea (ver `agent.langFromPath`).
+    pub fn pushDiffLang(
+        self: *Model,
+        before: []const u8,
+        after: []const u8,
+        lang: []const u8,
+    ) DiffCounts {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -1582,8 +1622,39 @@ pub fn ttftPending(self: *const Model) bool {
             joined.appendSlice(self.allocator, l) catch return .{};
         }
         // `pushKind` copia, así que este buffer es temporal.
-        self.pushKind(.diff, joined.items);
+        const copy = self.allocator.dupe(u8, joined.items) catch return .{};
+        defer self.allocator.free(copy);
+        self.pushDiffKind(copy, lang);
         return .{ .added = added, .removed = removed };
+    }
+
+    /// Encola un párrafo de diff CON su lenguaje (`agent.langFromPath` lo saca
+    /// de la extensión del path).
+    ///
+    /// El idioma no se guarda como string propia sino como el MISMO slice que
+    /// `pushToolStart` ya copió del path: si no, el párrafo apuntaría a la
+    /// arena del worker, que se libera al final del turno.
+    fn pushDiffKind(self: *Model, text: []const u8, lang: []const u8) void {
+        const lang_copy = self.allocator.dupe(u8, lang) catch {
+            self.pushKind(.diff, text);
+            return;
+        };
+        self.lock();
+        defer self.unlock();
+        self.pending.append(self.allocator, .{
+            .kind = .diff,
+            .text = self.allocator.dupe(u8, text) catch {
+                self.allocator.free(lang_copy);
+                self.allocator.free(text);
+                return;
+            },
+            .lang = lang_copy,
+        }) catch {
+            self.allocator.free(lang_copy);
+            self.allocator.free(text);
+        };
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// Ctrl+R: despliega o repliega el resultado de la última tool.
@@ -1635,8 +1706,15 @@ pub fn drainPending(self: *Model) void {
         // NADA y parecía que el scroll no funcionaba.
         const hubo_nuevo = self.pending.items.len > 0;
         for (self.pending.items) |p| {
-            self.paras.append(self.allocator, .{ .kind = p.kind, .text = p.text, .base = p.base, .mood = p.mood }) catch {
+            self.paras.append(self.allocator, .{
+                .kind = p.kind,
+                .text = p.text,
+                .base = p.base,
+                .mood = p.mood,
+                .lang = p.lang,
+            }) catch {
                 self.allocator.free(p.text);
+                if (p.lang.len > 0) self.allocator.free(p.lang);
             };
         }
         self.pending.clearRetainingCapacity();
@@ -1650,7 +1728,7 @@ pub fn drainPending(self: *Model) void {
     /// y la sesión en disco no se toca.
     pub fn clearHistory(self: *Model) void {
         self.clearSegCache();
-        for (self.paras.items) |p| self.allocator.free(p.text);
+        for (self.paras.items) |p| freePara(self.allocator, p);
         self.paras.clearRetainingCapacity();
         self.scroll = 0;
     }
@@ -4619,4 +4697,48 @@ test "drawHints no existe: la línea de atajos se quitó de la vista" {
     // la paleta de Ctrl+P y en `/help`, y una línea más en la vista es
     // justamente lo que se pidió quitar ("basura en la vista").
     try std.testing.expect(@hasDecl(@import("tui.zig"), "Model"));
+}
+
+test "el diff del TUI usa el lenguaje del path: una línea + lleva tokens" {
+    // El muro verde del ROADMAP: `+const n: u32 = 4` era UN segmento con el
+    // color del prefijo. Ahora el prefijo va con su color y el cuerpo se
+    // tokeniza con el lenguaje que sale de la extensión del path.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    _ = m.pushDiffLang("x\n", "const n: u32 = 4\n", "zig");
+    _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+
+    // El párrafo lleva el lenguaje consigo (no un puntero a la arena del worker).
+    var langs_ok = false;
+    for (m.paras.items) |p| {
+        if (p.kind == .diff) {
+            langs_ok = std.mem.eql(u8, p.lang, "zig");
+        }
+    }
+    try std.testing.expect(langs_ok);
+
+    // Y al pintar hay más de un segmento: el texto se parte.
+    const s = try drawTest(&m, arena_state.allocator(), 60, 20);
+    var buf: [128]u8 = undefined;
+    const row = rowText(s, findRow(s, "+const").?, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, row, "const") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "u32") != null);
+}
+
+test "el prefijo + y el cuerpo tienen colores DISTINTOS (muro verde eliminado)" {
+    // El invariante anti-todo-verde del ROADMAP. Con `+const n: u32 = 4` en
+    // zig: el prefijo es `diff_add` y `const` es keyword de código. Antes los
+    // dos verdes eran además EL MISMO color (`str` y `diff_add` eran `index 2`).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const segs = try md.inlineSegmentsLang(arena, "+const n", .diff, null, null, "zig");
+    try std.testing.expect(segs.len >= 2);
+    try std.testing.expectEqualStrings("+", segs[0].text);
+    try std.testing.expect(!std.meta.eql(segs[0].style.fg, segs[1].style.fg));
+    try std.testing.expect(!std.meta.eql(theme.diff_add.fg, theme.code_str.fg));
 }
