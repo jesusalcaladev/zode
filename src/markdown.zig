@@ -107,6 +107,9 @@ pub fn parseLang(
     var in_code = false;
     var code_lang: []const u8 = "";
     var code_lines: std.ArrayList([]const Segment) = .empty;
+    // Estado del highlighter entre líneas (strings y comentarios de bloque
+    // sin cerrar). Se reinicia al abrir cada fence.
+    var code_state = hl.State{};
 
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |line| {
@@ -134,12 +137,18 @@ pub fn parseLang(
                 in_code = true;
                 const trimmed = std.mem.trimStart(u8, line, " ");
                 code_lang = if (trimmed.len > 3) trimmed[3..] else "";
+                // Cada fence arranca sin estado: lo que quedó abierto en el
+                // bloque anterior no se arrastra.
+                code_state = .{};
             }
             continue;
         }
 
         if (in_code) {
-            const segs = hl.highlightLine(arena, line, code_lang) catch
+            // El estado se lleva ENTRE LÍNEAS del bloque: sin esto un `\` de
+            // Zig o una comilla sin cerrar hacían que la línea siguiente
+            // saliera de verde entera, y a veces el resto del fichero.
+            const segs = hl.highlightLineState(arena, line, code_lang, &code_state) catch
                 try arena.alloc(Segment, 0);
             try code_lines.append(arena, segs);
             continue;
