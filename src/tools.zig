@@ -149,7 +149,56 @@ fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]c
     }) catch |err| {
         return std.fmt.allocPrint(arena, "error writing {s}: {t}", .{ path, err });
     };
-    return std.fmt.allocPrint(arena, "wrote {s} ({d} bytes)", .{ path, content.len });
+    // The result is NOT just "wrote X (N bytes)": it carries a PREVIEW of what
+    // was written. A tool result that says only "ok" makes you open the file to
+    // find out whether the model wrote what you asked for, and in an agent loop
+    // that check is exactly the step you skip.
+    //
+    // The preview is part of the tool result (what the MODEL sees to decide
+    // whether it worked), not a UI decoration, so it survives to the session
+    // file and to `/resume`. It is capped so a 400-line file does not turn into
+    // 400 lines of tool result (which would then be elided by the compaction
+    // tier and cost a whole extra request).
+    var out: std.ArrayList(u8) = .empty;
+    // A file ending in `\n` has N lines, not N+1: counting the newline as a
+    // separator would report one more line than there is (and the "N more
+    // lines" below would be off by one too). Same rule as `splitLines`.
+    const total = lineCount(content);
+    out.appendSlice(arena, try std.fmt.allocPrint(
+        arena,
+        "wrote {s} ({d} bytes, {d} lines)",
+        .{ path, content.len, total },
+    )) catch return std.fmt.allocPrint(arena, "wrote {s}", .{path});
+
+    const max_preview = 12;
+    out.appendSlice(arena, "\n--- preview ---") catch return out.items;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var shown: usize = 0;
+    while (lines.next()) |l| {
+        if (shown >= max_preview) break;
+        out.append(arena, '\n') catch return out.items;
+        out.appendSlice(arena, l) catch return out.items;
+        shown += 1;
+    }
+    if (total > shown) {
+        out.appendSlice(arena, try std.fmt.allocPrint(
+            arena,
+            "\n\u{2026} {d} more lines",
+            .{total - shown},
+        )) catch {};
+    }
+    return out.items;
+}
+
+/// Lines in `text`, ignoring the final newline: "a\nb\n" is 2 lines, not 3.
+///
+/// `std.mem.splitScalar` would report the empty string after the last `\n` as a
+/// line, and every count derived from it (the header, the "N more lines") would
+/// be one too high.
+fn lineCount(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    const n = std.mem.count(u8, text, "\n");
+    return if (std.mem.endsWith(u8, text, "\n")) n else n + 1;
 }
 
 // ── edit: single hunk (compat) or multi-hunk via `edits: [...]` ─
@@ -938,4 +987,34 @@ test "grep nativo encuentra patrón" {
         return err;
     };
     try std.testing.expect(std.mem.indexOf(u8, out, "toolGrep") != null);
+}
+
+test "write devuelve un PREVIEW del fichero, no un OK opaco" {
+    // Un tool result que solo dice "ok" obliga a abrir el fichero para saber si
+    // el modelo escribio lo que se le pidio, y en un bucle agéntico ese paso es
+    // justo el que se salta uno.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(arena, "{\"path\":\"/tmp/opencode/preview-test.txt\",\"content\":\"");
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try body.appendSlice(arena, try std.fmt.allocPrint(arena, "linea {d}\\n", .{i}));
+    }
+    try body.appendSlice(arena, "\"}");
+
+    const out = try execute(std.testing.io, "write", body.items, arena);
+
+    // La cabecera dice qué y cuánto.
+    try std.testing.expect(std.mem.indexOf(u8, out, "preview-test.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "30 lines") != null);
+    // Y viene el preview.
+    try std.testing.expect(std.mem.indexOf(u8, out, "preview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "linea 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "linea 11") != null);
+    // Pero NO el fichero entero: se corta, y se dice cuántas líneas faltan.
+    try std.testing.expect(std.mem.indexOf(u8, out, "linea 12\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "more lines") != null);
 }

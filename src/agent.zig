@@ -741,11 +741,55 @@ pub const commands = [_]Cmd{
     .{ .key = "/context", .desc = "tokens used vs budget (compaction at 80%)" },
     .{ .key = "/session", .desc = "session info" },
     .{ .key = "/cache", .desc = "cache hit-rate for this session" },
-    .{ .key = "/quit", .desc = "quit" },
+    .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
 };
 
-/// `/allowlist`: which tools are in "always allow".
+/// Atajos que NO son comandos: hay que teclearlos, no van en la paleta.
 ///
+/// `/help` solo listaba la tabla de comandos, así que la mitad de los atajos
+/// (los que no tienen comando detrás) no estaban escritos en ningún sitio, y
+/// los que sí lo tienen aparecían sin su atajo. Con Ctrl+P se descubren, pero
+/// quien acaba de abrir la app no sabe que existe.
+pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
+    .{ .key = "ctrl+p", .desc = "command palette (executes the one you pick)" },
+    .{ .key = "ctrl+t", .desc = "model palette (providers | models)" },
+    .{ .key = "ctrl+a", .desc = "connect a provider (paste its key)" },
+    .{ .key = "ctrl+l", .desc = "clear the view (the session file is untouched)" },
+    .{ .key = "ctrl+r", .desc = "expand / collapse the last tool result" },
+    .{ .key = "ctrl+c", .desc = "quit" },
+    .{ .key = "ctrl+u / ctrl+d", .desc = "scroll half a page" },
+    .{ .key = "page up / down", .desc = "scroll a page" },
+    .{ .key = "shift+enter", .desc = "newline (enter sends)" },
+    .{ .key = "esc", .desc = "stop the turn / close a modal" },
+    .{ .key = "tab", .desc = "complete a `/` command" },
+    .{ .key = "↑ / ↓", .desc = "command history (empty line keeps the draft)" },
+};
+
+/// `/help`: commands (with their shortcut) and then the bare shortcuts.
+///
+/// Two blocks because they answer two different questions: "what can I type"
+/// and "what can I press". Before this there was only the first one, and only
+/// without the shortcut column, so half the keybindings were written down
+/// nowhere — you find them by hitting Ctrl+P and hoping.
+fn cmdHelp(m: *tui.Model) void {
+    const gpa = m.allocator;
+    pushInfoOwned(m, gpa.dupe(u8, "commands") catch return);
+    for (commands) |c| {
+        const line = if (c.key_hint) |h|
+            std.fmt.allocPrint(gpa, "{s: <14} {s}  ({s})", .{ c.key, c.desc, h }) catch continue
+        else
+            std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
+        pushInfoOwned(m, line);
+    }
+
+    pushInfoOwned(m, gpa.dupe(u8, "shortcuts") catch return);
+    for (shortcuts) |s| {
+        const line = std.fmt.allocPrint(gpa, "{s: <18} {s}", .{ s.key, s.desc }) catch continue;
+        pushInfoOwned(m, line);
+    }
+}
+
+/// `/allowlist`: which tools are in "always allow".
 /// The allowlist lives in `~/.config/zode/permissions.json` and there was no
 /// way to see it: if a tool stopped asking and you did not know why, the only
 /// way was to open the file by hand. It also says whether `/yolo` is on, which
@@ -961,10 +1005,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     const arg: ?[]const u8 = if (rest.len == 0) null else rest;
 
     if (std.mem.eql(u8, cmd, "help")) {
-        for (commands) |c| {
-            const line = std.fmt.allocPrint(m.allocator, "{s} — {s}", .{ c.key, c.desc }) catch continue;
-            pushInfoOwned(m, line);
-        }
+        cmdHelp(m);
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // the TUI handles it
     } else if (std.mem.eql(u8, cmd, "models")) {
@@ -1705,6 +1746,23 @@ fn cacheHitPct() u8 {
     return @intFromFloat(std.math.clamp(r, 0, 100));
 }
 
+/// The session's cache stats, for the usage column of the status bar.
+///
+/// A snapshot by value and not a pointer to the global: the status bar is read
+/// once per frame from the UI thread while the worker writes `session`, and a
+/// `*CacheStats` would invite reading it mid-update.
+pub fn cacheSessionStats() cache_stats.CacheStats {
+    return cache_stats.session;
+}
+
+/// The same stats, but as a pointer, so tests can seed and reset them.
+///
+/// A mutable view of a global that the worker also writes: only for tests, and
+/// only where no turn is in flight.
+pub fn cacheSessionStatsForTest() *cache_stats.CacheStats {
+    return &cache_stats.session;
+}
+
 /// Userdata of the three callbacks of a turn.
 ///
 /// CAREFUL: `onDelta`, `onToolCall` and `onFinish` receive the SAME
@@ -2193,6 +2251,9 @@ fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator
     if (res.len == 0) return "";
     var it = std.mem.splitScalar(u8, res, '\n');
     const first = it.next() orelse return "";
+    // `write` says "wrote X (N bytes, M lines)" and then a preview. The one-line
+    // summary is that first line: the preview is the tool result (what the
+    // model sees) and shows up in the history under it.
     if (std.mem.eql(u8, name, "read")) {
         // The read lines carry "   12│ text": count them.
         var n: usize = 0;
@@ -3197,4 +3258,57 @@ test "cmdAllowlist lista lo que hay y avisa si esta vacia" {
     try std.testing.expectEqual(before + 1, m.paras.items.len);
 
     always_lens = @splat(0); // do not leave the global state dirty
+}
+
+test "/help lista los atajos, no solo los comandos" {
+    // `/help` solo recorria la tabla de comandos, y sin la columna de atajo: la
+    // mitad de las combinaciones no estaba escrita en ningun sitio y se
+    // descubria por accidente (pulsando Ctrl+P y rezando).
+    var backing: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    var m = tui.Model.init(fba.allocator());
+    defer m.deinit();
+
+    cmdHelp(&m);
+    m.drainPending();
+
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (m.paras.items) |p| {
+        try joined.appendSlice(std.testing.allocator, p.text);
+        try joined.append(std.testing.allocator, '\n');
+    }
+    const all = joined.items;
+
+    // Bloque de comandos, con su atajo cuando lo tienen.
+    try std.testing.expect(std.mem.indexOf(u8, all, "commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "/allowlist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "(ctrl+p)") != null);
+
+    // Bloque de atajos, con los que NO son comando.
+    try std.testing.expect(std.mem.indexOf(u8, all, "shortcuts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "ctrl+l") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "ctrl+r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "esc") != null);
+}
+
+test "cada atajo listado existe de verdad (nada de documentacion inventada)" {
+    // Un atajo en `/help` que no hace nada es peor que no listarlo: alguien lo
+    // prueba, no pasa, y deja de fiarse de la lista entera.
+    const listed = [_][]const u8{
+        "ctrl+p", "ctrl+t", "ctrl+a", "ctrl+l", "ctrl+r", "ctrl+c", "ctrl+u", "ctrl+d", "esc",
+    };
+    for (listed) |k| {
+        var found = false;
+        for (shortcuts) |s| {
+            if (std.mem.indexOf(u8, s.key, k) != null) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    // Y al reves: ningun atajo de la lista puede estar vacio (un `""` en la
+    // lista se lee como atajo sin nombre).
+    for (shortcuts) |s| {
+        try std.testing.expect(s.key.len > 0);
+        try std.testing.expect(s.desc.len > 0);
+    }
 }
