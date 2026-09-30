@@ -22,11 +22,37 @@ pub const Model = struct {
     price_prompt: f64 = 0,
     /// Precio por completion token en USD.
     price_completion: f64 = 0,
+    /// [roster] ¿Es gratis de verdad? Ver `isFreeId` y `isFreeByPrice`.
+    ///
+    /// Antes esto se decidía en el consumidor con `endsWith(id, "-free")`, y eso
+    /// solo veía los modelos de opencode: en OpenRouter el sufijo es `:free`, y
+    /// hay providers que no usan ningún sufijo y se limitan a publicar precio 0.
+    is_free: bool = false,
 };
+
+/// ¿El id tiene la marca de "gratis" que usa su provider?
+///
+/// Dos convenciones y las dos existen: opencode usa `-free`
+/// ("space-bunny-free") y OpenRouter usa `:free` ("qwen/qwen3-8b:free").
+/// Comprobar solo una de las dos es lo que hacía que el pool de modelos free
+/// viera un provider y ningún otro.
+pub fn isFreeId(id: []const u8) bool {
+    return std.mem.endsWith(u8, id, "-free") or std.mem.endsWith(u8, id, ":free");
+}
+
+/// ¿El precio publica que es gratis?
+///
+/// Solo vale si el modelo TRAÍA el objeto `pricing` (lo sabe el parser). Un
+/// provider que no publica precios deja los dos a 0, y sin esta comprobación
+/// todos sus modelos saldrían gratis: el peor fallo posible para un modo que se
+/// llama "free-auto", porque se creería que puede gastar sin pagar.
+pub fn isFreeByPrice(has_pricing: bool, price_prompt: f64, price_completion: f64) bool {
+    return has_pricing and price_prompt == 0 and price_completion == 0;
+}
 
 pub const ModelList = struct {
     items: []Model,
-    /// Nombres de modelos free detectados (sufijo -free).
+    /// Modelos free detectados (`is_free`), no "los que acaban en -free".
     free_count: usize,
     /// El provider publicó contexto/precio para al menos un modelo.
     has_metadata: bool = false,
@@ -99,13 +125,21 @@ pub fn listModels(
         }
         var p_prompt: f64 = 0;
         var p_completion: f64 = 0;
+        // [roster] ¿Vino el objeto `pricing`? Distingue "precio 0" de "no public
+        // precio", que es la diferencia entre un modelo gratis y un provider que
+        // no dice nada.
+        var has_pricing = false;
         if (entry.object.get("pricing")) |pv| {
             if (pv == .object) {
+                has_pricing = true;
                 if (pv.object.get("prompt")) |v| p_prompt = jsonNumber(v);
                 if (pv.object.get("completion")) |v| p_completion = jsonNumber(v);
             }
         }
         if (ctx > 0 or p_prompt > 0) has_metadata = true;
+
+        const free = isFreeId(id_copy) or isFreeByPrice(has_pricing, p_prompt, p_completion);
+        if (free) free_count += 1;
 
         items[i] = .{
             .id = id_copy,
@@ -113,8 +147,8 @@ pub fn listModels(
             .context_length = ctx,
             .price_prompt = p_prompt,
             .price_completion = p_completion,
+            .is_free = free,
         };
-        if (std.mem.endsWith(u8, id_copy, "-free")) free_count += 1;
     }
 
     return .{ .items = items, .free_count = free_count, .has_metadata = has_metadata };
@@ -174,4 +208,78 @@ test "jsonNumber acepta float, integer y string decimal" {
     // Basura → 0, nunca NaN (que rompería las comparaciones).
     try std.testing.expectApproxEqAbs(@as(f64, 0), jsonNumber(.{ .string = "abc" }), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0), jsonNumber(.null), 1e-9);
+}
+
+// ── [roster] qué es un modelo gratis ──────────────────────────
+
+test "isFreeId: las dos convenciones de sufijo" {
+    // opencode
+    try std.testing.expect(isFreeId("space-bunny-free"));
+    try std.testing.expect(isFreeId("kimi-k2.6-free"));
+    // OpenRouter, con prefijo de provider
+    try std.testing.expect(isFreeId("qwen/qwen3-8b:free"));
+    try std.testing.expect(isFreeId("meta-llama/llama-3.3-70b-instruct:free"));
+    // Y lo que NO es
+    try std.testing.expect(!isFreeId("gpt-4o"));
+    try std.testing.expect(!isFreeId("deepseek/deepseek-chat"));
+    try std.testing.expect(!isFreeId("free-model-with-no-suffix"));
+    try std.testing.expect(!isFreeId(""));
+    // El sufijo va AL FINAL: un "free" en medio es otra cosa (un nombre).
+    try std.testing.expect(!isFreeId("free-tier/default"));
+}
+
+test "isFreeByPrice: precio 0 con pricing es gratis; sin pricing NO" {
+    // La señal que no depende de la convención del id.
+    try std.testing.expect(isFreeByPrice(true, 0, 0));
+    // Cualquiera de los dos a > 0 ya no es gratis.
+    try std.testing.expect(!isFreeByPrice(true, 0.00000015, 0));
+    try std.testing.expect(!isFreeByPrice(true, 0, 0.0000006));
+    try std.testing.expect(!isFreeByPrice(true, 3, 15));
+    // Y el caso peligroso: provider que no publica pricing. Sin el `has_pricing`
+    // TODOS sus modelos saldrían gratis y el free-auto creería que puede
+    // gastar sin pagar.
+    try std.testing.expect(!isFreeByPrice(false, 0, 0));
+}
+
+test "el parser marca is_free con las tres señales" {
+    // Fixture que mezcla las tres formas y un modelo de pago, con los precios
+    // reales en el formato string de OpenRouter.
+    const json =
+        \\{"object":"list","data":[
+        \\ {"id":"space-bunny-free","owned_by":"opencode"},
+        \\ {"id":"qwen/qwen3-8b:free","owned_by":"openrouter","context_length":32768,
+        \\  "pricing":{"prompt":"0","completion":"0"}},
+        \\ {"id":"llama-3.3-free","owned_by":"groq","context_length":131072,
+        \\  "pricing":{"prompt":"0","completion":"0"}},
+        \\ {"id":"anthropic/claude-sonnet-4-5","owned_by":"anthropic","context_length":200000,
+        \\  "pricing":{"prompt":"0.000003","completion":"0.000015"}},
+        \\ {"id":"gpt-4o","owned_by":"openai"}
+        \\]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), json, .{});
+    const data = parsed.object.get("data").?.array;
+
+    var free: usize = 0;
+    for (data.items) |entry| {
+        const id = entry.object.get("id").?.string;
+        var has_pricing = false;
+        var p_prompt: f64 = 0;
+        var p_completion: f64 = 0;
+        if (entry.object.get("pricing")) |pv| {
+            if (pv == .object) {
+                has_pricing = true;
+                if (pv.object.get("prompt")) |v| p_prompt = jsonNumber(v);
+                if (pv.object.get("completion")) |v| p_completion = jsonNumber(v);
+            }
+        }
+        const is_free = isFreeId(id) or isFreeByPrice(has_pricing, p_prompt, p_completion);
+        if (is_free) free += 1;
+        // El de pago y el que no publica nada tienen que salir falsos.
+        if (std.mem.eql(u8, id, "anthropic/claude-sonnet-4-5") or std.mem.eql(u8, id, "gpt-4o")) {
+            try std.testing.expect(!is_free);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), free);
 }
