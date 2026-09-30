@@ -307,7 +307,7 @@ fijar el contrato y dale una vuelta al resultado.
   se reensambla".
 - **Fuga en el path de error**: `streamChatCtx` usaba `errdefer gpa.destroy(ctx)`,
   que no libera `parts` ni `line_buf` → fuga en cada 429/5xx. Ahora
-  `errdefer ctx.deinit()`.
+  `errdefer ctx.destroy()`.
 
 ### Trampas de terminal que costaron un rato (útiles para cualquier TUI)
 
@@ -1246,3 +1246,23 @@ estabiliza (las alturas empiezan estimadas y se corrigen al parsear).
 - **`rowText` devuelve BYTES, no columnas**: `◆` son 3 bytes para 2 columnas y
   `─` 3 bytes para 1. Comparar bytes contra columnas da un test rojo con el
   layout correcto.
+
+## vaxis NO se parchea en el arbol (5.7 y 5.9)
+
+El ROADMAP propone dos parches sobre `zig-pkg/vaxis-…/src/vxfw/App.zig`:
+
+- **5.7** `arena.reset(.free_all)` -> `.retain_capacity`, para que el frame sea
+  bump en vez de 1.36 MB de malloc/free por frame.
+- **5.9** bajar el timeout de `vx.queryTerminal` (`.fromSeconds(1)`), que son
+  hasta **1 s de pantalla en blanco** al arrancar en terminales que no
+  responden.
+
+No se hacen aqui porque `zig-pkg/` es una cache de dependencia: un parche en
+ese directorio se pierde en el siguiente `zig fetch` y no se ve en el diff del
+repo (es la peor combinacion: un fix que parece estar y no esta). Si se
+quieren, el camino es **PR upstream a vaxis** o un `patch` declarado en
+`build.zig.zon` que se aplique de forma visible y reproducible.
+
+**5.10** (quitar `subscribeToColorSchemeUpdates`) tampoco se toca por lo mismo:
+esta DENTRO de `App.run`, asi que tampoco se puede desde fuera sin lo anterior.
+Y aunque se pudiera, el ahorro es un viaje de ida y vuelta al arrancar.
