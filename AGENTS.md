@@ -1489,3 +1489,83 @@ funcione.
   él, la TUI solo decía «HTTP 400».
 - `zig build roster-probe` para el pool de verdad.
 
+## La sexta vez: `catch "literal"` a `pushInfoOwned` (13 sitios, todos fijos)
+
+La sección de arriba dice que `pushInfoOwned` toma posesión del texto. El patrón
+que se ha escrito **13 veces** en el repo era:
+
+```zig
+const msg = std.fmt.allocPrint(a, "…", args) catch "un literal";
+pushInfoOwned(m, msg);
+```
+
+En el camino feliz `msg` es del heap y no pasa nada. Con el allocator **sin
+memoria**, `msg` es un puntero a `.rodata`, `pushInfoOwned` lo toma y
+`Model.deinit` lo libera: dos fallos que se cancelan en «zode ha crasheado y no
+sé por qué». Es un fallo que solo aparece cuando ya hay otro fallo, que es
+justo cuando no lo puedes diagnosticar.
+
+**El arreglo es `Model.pushInfoFmt(fmt, args)`**: compone Y es dueña del texto,
+así que el error no se puede escribir. Los 13 sitios usan esa.
+
+Y el peor de los 13 estaba en `tui.zig`, en `submitInput`:
+
+```zig
+const msg = std.fmt.allocPrint(ctx.alloc, "error: {t}", .{err}) catch "error";
+self.pushInfoOwned(msg);
+```
+
+`ctx.alloc` es el **arena del frame**, que se resetea en cada frame y **no es**
+el allocator del modelo. O sea que `pushInfoOwned`:(a) lo metía en la cola y
+vaxis leía los bytes después de que el arena se hubiera reiniciado (puntero
+colgando en el renderer) y (b) lo liberaba con otro allocator («Invalid free»
+al salir). Los dos a la vez.
+
+**Regla que sale de aquí**: si la memoria cambia de manos, la *longitud* tiene
+que ser la que se reservó. `providerEnvNames` devolvía `buf[0..n]` de un bloque
+de 512, y `std.testing.allocator` trata eso —con razón— como un «Invalid free»
+de 33 bytes en un bloque de 512. Un `Writer.fixed` es la forma equivocada para
+memoria que otro va a liberar.
+
+## Dos errores de mensaje que no dicen la verdad
+
+Un error cuyo trabajo es decir *qué mirar* no puede mentir en la mitad. Las dos
+cosas que se encontraron juntas, en el mismo mensaje:
+
+1. `ZODE_{s}_KEY` sobre `key_env[0]`, que **ya es el nombre entero**
+   (`ZODE_OPENROUTER_KEY`). Salía `check ZODE_ZODE_OPENROUTER_KEY_KEY`: una
+   variable que no puede existir. Y solo citaba la primera de la cadena, así que
+   en opencode (`ZODE_OPENCODE_KEY` o `ZODE_API_KEY`) mandaba al sitio
+   equivocado. Ahora van **verbatim y todas**.
+2. El `reason` del server se tiraba en el 401, siendo la única rama que lo
+   hacía (las otras cinco lo enseñan). Found con un 401 real de openrouter, que
+   contestaba `{"error":{"message":"User not found."}}`: eso es la **cuenta**,
+   no la key, y decir «key rejected» manda a rotar una key que está perfecta.
+   Un 401 **no siempre** es la key, y el server lo dice cuando quiere decirlo.
+
+## `@fichero`: un snippet con decoradores se come las menciones
+
+`@Override`, `@deprecated`, `@staticmethod`, `@import`… son tokens que pasan el
+escáner de menciones. Con 8 ranuras, **siete decoradores y el `@src/agent.zig`
+de verdad ya no se miraba** — medido, sin aviso. Y cada decorador contaba como
+«no encontrado», así que el usuario veía un «1 not found» sin haber pedido nada.
+
+El filtro (`looksLikePath`: una `/` o una extensión) va en `scan` y **no** en
+`expand`, y esa es la parte importante: si el filtro estuviera abajo, los
+decoradores seguirían gastando el presupuesto del escáner y la mención real
+seguiría perdiéndose. `expand` ya no cuenta contra el presupuesto, pero `scan`
+sí, y por eso el filtro tiene que estar arriba.
+
+Coste: `@Makefile` a secas ya no se expande. Se escribe `@./Makefile`, que además
+no depende de dónde se esté mirando.
+
+## La precedencia de las keys, que confunde al depurar
+
+Un 401 en la TUI con la key **del `.env`**, cuando `~/.config/zode/auth.json`
+tiene **otra** que sí funciona. No es un bug: la key guardada gana al entorno a
+propósito (ver «La key guardada no se usaba»), así que probar con un `HOME`
+limpio **cambia la key que se manda**. Lo que sí salió del lío es el mensaje del
+401, que entonces decía «key rejected» sin dejar ver el «User not found.» del server.
+
+Para probar de verdad hay que usar el `HOME` real, o borrar el `auth.json` del
+sandbox a propósito y saber que se está probando la key del entorno.
