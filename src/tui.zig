@@ -1549,6 +1549,30 @@ pub const Model = struct {
         self.enqueueOwned(.info, text);
     }
 
+    /// A line of history, formatted, and the OWNERSHIP is this function's
+    /// problem. Use it instead of `pushInfoOwned(allocPrint(...) catch "…")`.
+    ///
+    /// That pattern is the "Invalid free" of this repo, and it is a landmine
+    /// with a very long fuse: `allocPrint` returns heap memory, so on the happy
+    /// path the literal fallback is never used, and when the allocator IS out of
+    /// memory `pushInfoOwned` stores a pointer to `.rodata` and `Model.deinit`
+    /// frees it -> "Invalid free" while the app is dying of something else.
+    /// Thirteen call sites had it. The two failures cancel out into "zode
+    /// crashed and I do not know why", which is the worst possible outcome.
+    ///
+    /// The ownership has to live in the SIGNATURE and not in a comment (the same
+    /// rule as `Palette.setItemsOwned`): here the `[]u8` is created and consumed
+    /// inside, so there is no way to get it wrong.
+    pub fn pushInfoFmt(self: *Model, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(self.allocator, fmt, args) catch {
+            // `pushInfo` COPIES, and a dupe that fails just returns: a literal
+            // is safe here, which is the whole difference.
+            self.pushInfo(fmt);
+            return;
+        };
+        self.pushInfoOwned(text);
+    }
+
     fn enqueueOwned(self: *Model, kind: md.Kind, text: []const u8) void {
         self.lock();
         defer self.unlock();
@@ -2325,8 +2349,13 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     self.pushKind(.user, trimmed);
 
     agent.submit(self, owned) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.alloc, "error: {t}", .{err}) catch "error";
-        self.pushInfoOwned(msg);
+        // `pushInfoFmt` and NOT `allocPrint(ctx.alloc, …) + pushInfoOwned`: the
+        // frame arena is reset at the end of the frame and is NOT the model's
+        // allocator, so handing its memory to `pushInfoOwned` was two bugs at
+        // once — a dangling pointer read by the renderer, and an "Invalid free"
+        // on exit because it was freed with the wrong allocator. This is the
+        // fifth time that family of bug shows up in this repo.
+        self.pushInfoFmt("error: {t}", .{err});
     };
 
     self.ed.commit(); // saves to history and clears
@@ -5241,6 +5270,60 @@ test "streamEnd marca dirty: un cambio de estado pide un frame" {
     m.drainPending();
     m.toolRunEnd();
     try std.testing.expect(m.activity().dirty);
+}
+
+test "pushInfoFmt: formatea, pinta, y NO deja un literal que liberar al salir" {
+    // The "Invalid free" that has bitten this repo five times, as a test instead
+    // of a post-mortem.
+    //
+    // The old shape, at thirteen call sites, was:
+    //
+    //     const msg = allocPrint(a, ...) catch "literal";
+    //     pushInfoOwned(m, msg);
+    //
+    // On the happy path `msg` is heap, so nothing is wrong. When the allocator
+    // IS out of memory, `msg` becomes a pointer to `.rodata`, `pushInfoOwned`
+    // takes ownership of it, and `Model.deinit` calls `free` on it. Two failures
+    // that cancel out into "zode crashed and I do not know why".
+    //
+    // Reproduced here WITHOUT an OOM, by proving the good path is owned: the
+    // `defer m.deinit()` below frees every text `pushInfoFmt` produced, and
+    // `std.testing.allocator` reports a bad free as a test failure.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushInfoFmt("effort \u{2192} {s}", .{"high"});
+    m.pushInfoFmt("{d} models on {s}", .{ 42, "openrouter" });
+    _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+
+    const all = allText(try drawTest(&m, arena_state.allocator(), 60, 20));
+    try std.testing.expect(std.mem.indexOf(u8, all, "effort \u{2192} high") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "42 models on openrouter") != null);
+}
+
+test "un literal NUNCA se guarda en la historia, y eso es lo que evita el Invalid free" {
+    // The counterpart: it says the trap is real rather than folklore, and it
+    // pins the property that actually prevents the crash — whatever goes into
+    // `pending` is HEAP memory, so `Model.deinit` can free all of it.
+    //
+    // `pushInfo` copies (a literal is safe and produces a normal line) and
+    // `pushInfoOwned` does NOT (a literal is an "Invalid free"). The test can
+    // only check the first half, because the second half is a crash: what it
+    // does check is that a literal, pushed the copying way, lands as its own
+    // heap copy and never as a pointer into `.rodata`.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const lit: []const u8 = "no soy del heap";
+    m.pushInfo(lit);
+    m.drainPending();
+
+    try std.testing.expectEqual(@as(usize, 1), m.paras.items.len);
+    try std.testing.expectEqualStrings(lit, m.paras.items[0].text);
+    // Different pointer: it is a copy, and the copy is what `deinit` frees.
+    try std.testing.expect(m.paras.items[0].text.ptr != lit.ptr);
 }
 
 test "un error sale en rojo con ✗, no como una línea de info más" {
