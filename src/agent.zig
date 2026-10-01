@@ -456,8 +456,7 @@ pub fn newSession(m: *tui.Model) void {
         session = null;
     }
     const s = ensureSession(m, m.allocator);
-    const msg = std.fmt.allocPrint(m.allocator, "new session: {s}", .{s.id[0..]}) catch "new session";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
 }
 
@@ -679,8 +678,7 @@ pub fn resetSession(m: *tui.Model) void {
         s.flush();
     }
     session_elided = 0;
-    const msg = std.fmt.allocPrint(m.allocator, "session reset", .{}) catch "session reset";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("session reset", .{});
 }
 
 /// Opens the session at startup: the most recent one if it was asked for
@@ -917,8 +915,7 @@ fn cmdSession(m: *tui.Model) void {
     ) catch "sesión";
     pushInfoOwned(m, l1);
     if (s.path) |p| {
-        const l2 = std.fmt.allocPrint(m.allocator, "  {s}", .{p}) catch "ruta";
-        pushInfoOwned(m, l2);
+        m.pushInfoFmt("  {s}", .{p});
     }
 }
 
@@ -957,8 +954,7 @@ fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
             .medium => "medium",
             .high => "high",
         };
-        const msg = std.fmt.allocPrint(m.allocator, "effort → {s}", .{name}) catch "effort";
-        pushInfoOwned(m, msg);
+        m.pushInfoFmt("effort → {s}", .{name});
         return;
     }
     openEffortPicker(m);
@@ -967,8 +963,7 @@ fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
 /// `/use <provider> [model]`.
 fn cmdUse(m: *tui.Model, arg: ?[]const u8) void {
     const a = arg orelse {
-        const msg = allocPrint(m, "usage: /use <provider> [model]", .{}) catch "uso";
-        pushInfoOwned(m, msg);
+        m.pushInfoFmt("usage: /use <provider> [model]", .{});
         return;
     };
     var it = std.mem.tokenizeScalar(u8, a, ' ');
@@ -1798,8 +1793,7 @@ fn startChat(m: *tui.Model, input: []const u8) !void {
     // cut itself off.
     if (m.isBusy()) {
         _ = m.enqueuePrompt(copy);
-        const qn = std.fmt.allocPrint(m.allocator, "⏳ queued ({d} waiting)", .{m.queuedCount()}) catch "⏳ queued";
-        pushInfoOwned(m, qn);
+        m.pushInfoFmt("⏳ queued ({d} waiting)", .{m.queuedCount()});
         return;
     }
 
@@ -2631,12 +2625,11 @@ fn cmdUndo(m: *tui.Model) void {
             if (undone == 1) "" else "s",
         }) catch "undo: done";
 
-    const msg = std.fmt.allocPrint(m.allocator, "{s} · from: {s}", .{ head_buf, cp.labelOf() }) catch
-        "undo: done";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("{s} · from: {s}", .{ head_buf, cp.labelOf() });
     if (w.buffered().len > 0) {
-        const detail_msg = std.fmt.allocPrint(m.allocator, "{s}", .{w.buffered()}) catch "";
-        pushInfoOwned(m, detail_msg);
+        // `pushInfoOwned` of an EMPTY string would push a blank line; the old
+        // `catch ""` made that reachable on OOM and printed nothing instead.
+        m.pushInfoFmt("{s}", .{w.buffered()});
     }
     if (skipped > 0 or failed > 0) {
         const warn = std.fmt.allocPrint(m.allocator, "{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
@@ -2689,8 +2682,7 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
     // With OWN memory (not the turn's arena): the text lives in the pending
     // queue and a later frame paints it.
     const pl = m.planCopy();
-    const msg = std.fmt.allocPrint(m.allocator, "{s}", .{pl.summary(m.allocator)}) catch "plan updated";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("{s}", .{pl.summary(m.allocator)});
     if (pl.allDone()) setStatusWithZo(m, .done, "all plan steps done");
 }
 
@@ -3130,13 +3122,33 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             setStatusWithZo(m, .warn, "interrupted");
             return;
         },
-        // A genuinely bad key (401). Here it IS the key.
+        // 401. It USUALLY is the key, but not always: openrouter answers
+        // `{"error":{"message":"User not found."}}`, que es la cuenta y no la
+        // key, asi que el mensaje del server se enseña siempre que haya uno.
         error.AuthFailed => {
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "key rejected by {s}. check ZODE_{s}_KEY (/provider shows the state)",
-                .{ cur_provider_id, providerEnvName() },
-            ) catch "key rechazada";
+            // The names go in VERBATIM, not wrapped in a `ZODE_{s}_KEY` template.
+            // `key_env` already holds the WHOLE variable name
+            // ("ZODE_OPENROUTER_KEY"), so the template produced
+            // "check ZODE_ZODE_OPENROUTER_KEY_KEY": a variable that cannot exist,
+            // in the one message whose entire job is to name a variable. It is
+            // the whole list too, because `key_env` is a fallback chain and the
+            // key can be sitting in any of them.
+            const names = providerEnvNames(gpa);
+            defer gpa.free(names);
+            // And the server's own words come along, which this branch is the
+            // only one that used to throw away. A 401 is NOT always a bad key:
+            // openrouter answers `{"error":{"message":"User not found."}}`, que
+            // es la CUENTA y no la key, and saying "key rejected" sends the user
+            // to rotate a key that is fine. `reason` is empty when the server
+            // said nothing, and then the old wording is all there is to say.
+            const msg = if (reason.len > 0)
+                std.fmt.allocPrint(gpa, "auth failed on {s}: {s}\n  check {s} (/provider shows the state)", .{
+                    cur_provider_id, reason, names,
+                }) catch "auth failed"
+            else
+                std.fmt.allocPrint(gpa, "key rejected by {s}. check {s} (/provider shows the state)", .{
+                    cur_provider_id, names,
+                }) catch "key rechazada";
             pushErrorOwned(m, msg);
         },
         // 402: the account has no balance. It is not a zode bug nor the key.
@@ -3200,12 +3212,39 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
     setStatusWithZo(m, .warn, errPhrase(err));
 }
 
-/// Name of the environment variable with the active provider's key, so we can
-/// say WHICH key to change without guessing.
-fn providerEnvName() []const u8 {
+/// The environment variables that can hold the active provider's key, as a
+/// comma-separated list the caller owns.
+///
+/// It is the WHOLE chain and not just the first, because `key_env` is a
+/// fallback list (`ZODE_OPENCODE_KEY` then `ZODE_API_KEY` for opencode) and
+/// telling the user to check only the first one sends them to fix a variable
+/// that was never set while the one that was set stayed broken.
+///
+/// A provider that needs no key gets "none", so the message still says
+/// something true instead of a variable name invented out of nothing.
+fn providerEnvNames(gpa: std.mem.Allocator) []u8 {
     const d = activeProviderDef(environ_global);
-    if (d.key_env.len == 0) return "API_KEY";
-    return d.key_env[0];
+    if (d.key_env.len == 0) return gpa.dupe(u8, "none") catch unreachable;
+    // The allocation is EXACTLY the length of the result, not a 512-byte buffer
+    // with the answer written at the front: the caller frees this, and
+    // `std.testing.allocator` (rightly) treats freeing a 20-byte slice of a
+    // 512-byte block as an "Invalid free". A fixed writer is the wrong shape for
+    // memory that changes hands.
+    const sep = " or ";
+    const sep_len = sep.len;
+    var need: usize = sep_len * (d.key_env.len - 1); // the separator goes BETWEEN
+    for (d.key_env) |name| need += name.len;
+    const buf = gpa.alloc(u8, need) catch return gpa.dupe(u8, d.key_env[0]) catch unreachable;
+    var n: usize = 0;
+    for (d.key_env, 0..) |name, i| {
+        if (i != 0) {
+            @memcpy(buf[n..][0..sep_len], sep);
+            n += sep_len;
+        }
+        @memcpy(buf[n..][0..name.len], name);
+        n += name.len;
+    }
+    return buf[0..n];
 }
 
 // ── tier 2 compaction: an LLM summary of the old turns ────────
@@ -3352,8 +3391,7 @@ fn modelsWorker(job: *ModelsJob) void {
 
     var list = models_mod.listModels(gpa, &http, def.models_url, key) catch |err| {
         if (err == error.HttpError) {
-            const msg = std.fmt.allocPrint(gpa, "models: HTTP error at {s}", .{def.models_url}) catch "models error";
-            pushInfoOwned(m, msg);
+            m.pushInfoFmt("models: HTTP error at {s}", .{def.models_url});
         } else {
             const msg = std.fmt.allocPrint(gpa, "models: {t}", .{err}) catch "models error";
             pushInfoOwned(m, msg);
@@ -3393,8 +3431,7 @@ fn modelsWorker(job: *ModelsJob) void {
             ) catch continue;
             pushInfoOwned(m, line);
         }
-        const n = std.fmt.allocPrint(gpa, "{d} models on {s}", .{ sorted.len, def.id }) catch "modelos";
-        pushInfoOwned(m, n);
+        m.pushInfoFmt("{d} models on {s}", .{ sorted.len, def.id });
     }
     setStatusWithZo(m, .done, "models ready");
 }
@@ -3644,8 +3681,7 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
 /// Applies a model chosen in the palette (or in `/model`).
 pub fn applyModel(m: *tui.Model, name: []const u8) !void {
     setModel(name);
-    const msg = std.fmt.allocPrint(m.allocator, "model → {s}", .{name}) catch "modelo";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("model → {s}", .{name});
     setStatusWithZo(m, .done, name);
     refreshContextUsage(m);
 }
@@ -4056,6 +4092,28 @@ test "withMentions: no toca un mensaje que no sea de usuario" {
     const vacia: []chat.ChatMessage = vacia_arr[0..0];
     try std.testing.expectEqual(@as(usize, 0), withMentions(arena, vacia, &count).len);
     try std.testing.expect(withMentions(arena, vacia, &count).ptr == vacia.ptr);
+}
+
+test "el error de key dice una variable que EXISTE, y son todas" {
+    // El mensaje de 401 es el ÚNICO trabajo que tiene: decir qué variable
+    // mirar. Componía el nombre con una plantilla `ZODE_{s}_KEY` sobre
+    // `key_env[0]`, que YA es el nombre entero ("ZODE_OPENROUTER_KEY"), y
+    // salía "check ZODE_ZODE_OPENROUTER_KEY_KEY": una variable que no puede
+    // existir. Leido en un 401 real, en medio de un error, no dice nada.
+    //
+    // Y solo citaba la primera de la cadena: en opencode el key puede estar en
+    // `ZODE_OPENCODE_KEY` o en `ZODE_API_KEY`, y mandar al usuario al primero
+    // cuando el que esta roto es el segundo le deja igual.
+    const names = providerEnvNames(std.testing.allocator);
+    defer std.testing.allocator.free(names);
+
+    try std.testing.expect(names.len > 0);
+    // Lo que se compone no lleva el prefijo de la plantilla dos veces.
+    try std.testing.expect(std.mem.indexOf(u8, names, "ZODE_ZODE_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, names, "_KEY_KEY") == null);
+    // Y las dos piezas de la cadena de opencode estan las dos.
+    try std.testing.expect(std.mem.indexOf(u8, names, "ZODE_OPENCODE_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, names, "ZODE_API_KEY") != null);
 }
 
 test "quotaVerdict: la tabla de las siete senales" {
