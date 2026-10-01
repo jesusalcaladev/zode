@@ -1,4 +1,5 @@
 const std = @import("std");
+const plan_mod = @import("plan.zig");
 const http = @import("http_client.zig");
 const web = @import("web.zig");
 
@@ -20,6 +21,7 @@ pub const defs = [_]ToolDef{
     .{ .name = "web_fetch", .desc = "Fetch a URL and return it as readable text (HTML stripped)" },
     .{ .name = "web_search", .desc = "Search the web: titles, URLs and snippets" },
     .{ .name = "think", .desc = "Private scratchpad to reason before acting (no side effects)" },
+    .{ .name = "todo", .desc = "Write the visible task list the user watches (full list, not a diff)" },
 };
 
 /// Declares the tools to the LLM (OpenAI format). Static: 0 allocs per request.
@@ -35,7 +37,8 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; ask for a deeper offset if the text is cut.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Search the web and get titles, URLs and snippets. Use it when you need something you do not know yet (docs, versions, error messages), then web_fetch the promising URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 8"}},"required":["query"]}}},
-    \\{"type":"function","function":{"name":"think","description":"Think privately step by step before acting. Use for planning and complex reasoning. No side effects.","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}}
+    \\{"type":"function","function":{"name":"think","description":"Think privately step by step before acting. Use for planning and complex reasoning. No side effects.","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}},
+    \\{"type":"function","function":{"name":"todo","description":"Write the task list the USER SEES on screen, for tasks with more than about two steps. Send the WHOLE list every time (it replaces the previous one), each item {content, status: pending|in_progress|done}. Mark exactly one in_progress while you work on it, and never more than one. Call it again when a step finishes or the plan changes, and send an empty list when everything is done. Do not use it for a single obvious step or for thinking out loud.","parameters":{"type":"object","properties":{"items":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string","description":"imperative, short (a single line)"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content","status"]}}},"required":["items"]}}}
     \\]
     ;
 }
@@ -52,7 +55,8 @@ pub fn needsPermission(name: []const u8) bool {
         std.mem.eql(u8, name, "list_files") or
         std.mem.eql(u8, name, "web_fetch") or
         std.mem.eql(u8, name, "web_search") or
-        std.mem.eql(u8, name, "think"));
+        std.mem.eql(u8, name, "think") or
+        std.mem.eql(u8, name, "todo"));
 }
 
 /// Runs a tool with JSON args. Returns the (truncated) result —
@@ -82,6 +86,8 @@ pub fn execute(io: std.Io, name: []const u8, args_json: []const u8, arena: std.m
         return toolWebSearch(io, obj, arena);
     } else if (std.mem.eql(u8, name, "think")) {
         return toolThink(obj, arena);
+    } else if (std.mem.eql(u8, name, "todo")) {
+        return toolTodo(obj, arena);
     }
     return error.UnknownTool;
 }
@@ -683,6 +689,34 @@ fn looksLikeHtml(body: []const u8) bool {
 fn toolThink(obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const thought = getStr(obj, "thought") orelse return error.MissingPath;
     return std.fmt.allocPrint(arena, "noted ({d} chars). Continue with your plan.", .{thought.len});
+}
+
+// ── todo: el plan que el usuario ve en pantalla ────────────────
+//
+// NO pide permiso. No toca el disco ni la red: solo guarda una lista en la
+// sesión, que es exactamente lo mismo que hace `think` pero en vez deirselo al
+// modelo se lo enseña al usuario.
+
+/// Aplica la lista y devuelve lo que hay que contarle al modelo.
+///
+/// OJO con la propiedad de la memoria: lo que sale de aquí va al `tool_result`
+/// del historial (que es de largo plazo) y al plan de la pantalla. El texto es
+/// una copia en `arena`, nunca un slice de los buffers fijos de `Item`, porque
+/// esos los pisa la siguiente llamada.
+fn toolTodo(obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    // `fromValue` y no `parseItems`: el JSON ya está parseado (lo parsea
+    // `execute` para todas las tools), y volver a parsear 4 KB para sacar 20
+    // strings es tirar trabajo.
+    const parsed = plan_mod.fromValue(.{ .object = obj }, &items) catch |err| switch (err) {
+        error.TooManyItems => return error.TooManyPlanItems,
+        error.BadPlan => return error.BadPlan,
+    };
+    if (parsed.len == 0) return error.EmptyPlan;
+    return std.fmt.allocPrint(arena, "plan recorded ({d} step{s}). Keep it updated as you go.", .{
+        parsed.len,
+        if (parsed.len == 1) "" else "s",
+    });
 }
 
 fn looksLikeText(path: []const u8) bool {

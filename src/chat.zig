@@ -123,6 +123,27 @@ fn setServerMessage(body: []const u8) void {
 pub var last_error_buf: [512]u8 = undefined;
 pub var last_error_len: usize = 0;
 
+// ── ZODE_DBG_ERR: volcar la respuesta del server ──────────────
+//
+// `ZODE_DBG_ERR=1` imprime a stderr el status y los primeros bytes de CADA
+// respuesta (buena o mala). Existe por una razón concreta: el mensaje de error
+// que se ve en la TUI sale de `"message":"..."` del body, y cuando el body no
+// tiene ese campo (o viene troceado) lo que se muestra es "HTTP 403" y no hay
+// por dónde tirar. Con esto se lee lo que contestó de verdad.
+//
+// Se lee UNA vez al arrancar (`dbgInitEnv`): el `Io` no expone el entorno, y
+// leerlo por cada respuesta sería una lookup por request.
+pub var dbg_err_flag: bool = false;
+
+pub fn dbgInitEnv(env: ?*const std.process.Environ.Map) void {
+    const v = if (env) |e| e.get("ZODE_DBG_ERR") else null;
+    dbg_err_flag = if (v) |x| x.len > 0 and x[0] != '0' else false;
+}
+
+fn dbg_err() bool {
+    return dbg_err_flag;
+}
+
 pub fn lastErrorBody() []const u8 {
     return last_error_buf[0..last_error_len];
 }
@@ -648,9 +669,13 @@ fn streamRaw(
     };
 
     if (res.status != 200) {
+        if (dbg_err()) {
+            std.debug.print("[DBG] status={d} raw={s}\n", .{ res.status, ctx.raw[0..@min(ctx.raw_len, 240)] });
+        }
         if (res.retry_after) |ra| retry_after_secs = ra;
         // Each status gets its own error because the ACTION to take differs,
         // and "HTTP 403" says nothing:
+        //   400  bad request    -> do not retry (repeating it does not fix it)
         //   401  invalid key    -> do not retry, check the key
         //   402  no credits     -> do not retry (it used to retry 3 times!)
         //   403  access denied  -> almost always the MODEL, not the key
@@ -665,6 +690,11 @@ fn streamRaw(
             // account does not have it)". Retrying 3 times is waiting for
             // nothing.
             404 => error.ModelNotFound,
+            // 400: the REQUEST is wrong. Retrying the same thing 3 times is
+            // 3.5 s of clock and a turn that looks hung. With free-auto on,
+            // `noteTurnFailure` drops that pair so the next turn starts
+            // somewhere else.
+            400 => error.BadRequest,
             else => error.ServerError,
         };
         // The server's message is what actually explains the failure; it is
@@ -678,6 +708,7 @@ fn streamRaw(
         }
         return err;
     }
+    if (dbg_err()) std.debug.print("[DBG] 200 raw={s}\n", .{ctx.raw[0..@min(ctx.raw_len, 240)]});
     retry_after_secs = null;
     if (res.retry_after) |ra| retry_after_secs = ra;
     ctx.finish() catch |err| switch (err) {

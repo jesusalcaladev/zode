@@ -9,6 +9,8 @@ const theme = @import("theme.zig");
 const ed_mod = @import("editor.zig");
 const mascot = @import("mascot.zig");
 const palette = @import("palette.zig");
+const plan_mod = @import("plan.zig");
+const checkpoint = @import("checkpoint.zig");
 const models_mod = @import("models.zig");
 const zjsonl = @import("zjsonl.zig");
 
@@ -397,6 +399,19 @@ pub const Model = struct {
     /// worker pulls them out as it finishes its turn.
     queue: std.ArrayList([]u8) = .empty,
 
+    /// The visible plan (the `todo` tool). The worker writes it from another
+    /// thread and the draw reads it every frame, so it lives under the SAME lock
+    /// as the rest.
+    ///
+    /// It is not an `ArrayList`: the list is a fixed-size array (see `plan.zig`),
+    /// so the draw paints it without allocating.
+    plan: plan_mod.Plan = .{},
+
+    /// The file snapshots per turn, for `/undo`. It is the only thing that
+    /// survives from one turn to the next (the worker's arena does not), which
+    /// is why the stack carries its own allocator.
+    checkpoints: checkpoint.Stack = undefined,
+
     /// Moment the current turn started, in nanoseconds, for the activity strip
     /// clock. 0 = no turn. Written by `streamStart`.
     busy_started_ns: i128 = 0,
@@ -677,12 +692,21 @@ pub const Model = struct {
             .paras = .empty,
             .pending = .empty,
             .seg_cache = .empty,
+            // The checkpoint stack needs the allocator when it is created (it is
+            // who holds the memory of the snapshots). It could be left
+            // `undefined` and set in `deinit`, but then any test that calls
+            // `snapshotFile` without it reads garbage.
+            .checkpoints = .init(allocator),
         };
         m.setStatusText("zode v0.3 \u{b7} esc interrupts \u{b7} ctrl+c exits");
         return m;
     }
 
     pub fn deinit(self: *Model) void {
+        // The checkpoint snapshots are memory of the model's allocator and
+        // nobody else frees them: without this, every turn with tools leaves the
+        // whole repo in memory until exit.
+        self.checkpoints.deinit();
         // `clearQueue` keeps the capacity (good, so we don't reallocate on
         // every prompt), so the list's buffer must be freed separately or it
         // leaks on exit.
@@ -1610,7 +1634,14 @@ pub const Model = struct {
         // that never got a `streamStart`) the text is NOT lost. Before, the `if
         // (streaming)` discarded it silently and the final answer of a turn
         // with tools never appeared.
-        if (self.streaming or self.stream_buf.items.len > 0) {
+        //
+        // And ONLY if there IS text. A turn that dies with an error (403, 5xx
+        // after 3 retries) opened the live paragraph and closed it empty, leaving
+        // a "◆" alone in the history: noise that looks like content. With no
+        // text there is nothing to keep, and the `busy = false` below still does
+        // its job.
+        const has_text = !std.mem.eql(u8, std.mem.trim(u8, self.stream_buf.items, " \t\n\r"), "");
+        if (has_text and (self.streaming or self.stream_buf.items.len > 0)) {
             if (self.allocator.dupe(u8, self.stream_buf.items)) |text| {
                 self.pending.append(self.allocator, .{ .kind = .assistant, .text = text }) catch {
                     self.allocator.free(text);
@@ -1895,6 +1926,107 @@ pub const Model = struct {
         self.scroll = 0;
         self.unlock();
         return true;
+    }
+
+    /// `Stack.init` needs the allocator and `Model.init` already has it.
+    pub fn initCheckpoints(self: *Model) void {
+        self.checkpoints = .init(self.allocator);
+    }
+
+    /// Applies the list the `todo` tool sends and returns what the history has
+    /// to say about it (`.same` when the list did not change, which is the
+    /// normal case: the model resends the same list).
+    ///
+    /// The caller owns the summary text: here the plan is only copied into
+    /// fixed buffers, which is what can live between frames.
+    pub fn applyPlan(self: *Model, items: []const plan_mod.Item, n: u8) plan_mod.Plan.Applied {
+        self.lock();
+        defer self.unlock();
+        const r = self.plan.apply(items, n);
+        if (r == .changed or r == .empty) {
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+        }
+        return r;
+    }
+
+    /// Opens the checkpoint of a turn (`startChat` calls it, once per prompt,
+    /// before spawning the worker).
+    pub fn beginCheckpoint(self: *Model, label: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        self.checkpoints.begin(label);
+    }
+
+    /// Adds the snapshot of a file to the checkpoint of the turn in progress.
+    ///
+    /// `existed` is explicit and not deduced from the contents: "the file was
+    /// not there" and "the file was empty" are undone differently (delete vs
+    /// write empty), and a `catch ""` does not tell the two apart.
+    pub fn snapshotFile(
+        self: *Model,
+        path: []const u8,
+        content: []const u8,
+        existed: bool,
+    ) void {
+        self.lock();
+        defer self.unlock();
+        if (self.checkpoints.isEmpty()) return;
+        _ = self.checkpoints.last().?.addFile(self.allocator, path, content, existed);
+    }
+
+    /// Takes the checkpoint of the last turn to undo it, and CONSUMES it (it
+    /// leaves the stack): otherwise two `/undo` in a row would restore the same
+    /// thing twice, and a second `/undo` would have to undo the PREVIOUS turn.
+    ///
+    /// The memory of the snapshots goes to the CALLER, which has to do
+    /// `defer cp.deinit(...)`. That is why the name says `_Owned`: the first
+    /// version did `deinit` here and returned a copy whose `data` was already
+    /// freed, and `/undo` wrote released memory (a segfault when WRITING the
+    /// file, not when reading it, which is why the test caught it in
+    /// `expectEqualStrings` and not in the undo itself).
+    pub fn takeCheckpointOwned(self: *Model) ?checkpoint.Checkpoint {
+        self.lock();
+        defer self.unlock();
+        const cp = self.checkpoints.last() orelse return null;
+        const taken = cp.*;
+        // `len = 0` BEFORE shifting: the source slot stops having snapshots to
+        // free (or the teardown's `deinit` would free them A SECOND time).
+        cp.len = 0;
+        cp.bytes = 0;
+        // The rest moves down one. With a single element the stack ends empty.
+        var i: usize = 0;
+        while (i + 1 < self.checkpoints.len) : (i += 1) {
+            self.checkpoints.items[i] = self.checkpoints.items[i + 1];
+        }
+        self.checkpoints.items[self.checkpoints.len - 1].len = 0;
+        self.checkpoints.len -= 1;
+        return taken;
+    }
+
+    /// Is there anything to undo? (so `/undo` does not say "nothing" when there
+    /// is)
+    pub fn canUndo(self: *Model) bool {
+        self.lock();
+        defer self.unlock();
+        const cp = self.checkpoints.last() orelse return false;
+        return cp.len > 0;
+    }
+
+    /// Copy of the plan for the draw (under the lock, because the worker writes
+    /// it).
+    pub fn planCopy(self: *Model) plan_mod.Plan {
+        self.lock();
+        defer self.unlock();
+        return self.plan;
+    }
+
+    pub fn clearPlan(self: *Model) void {
+        self.lock();
+        defer self.unlock();
+        self.plan.clear();
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// Moves `pending` to `paras`. Called by draw; `pub` so the tests can check
@@ -2708,6 +2840,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     const queued = self.queuedCount();
     const act_rows: u16 = if (act.busy or queued > 0) 1 else 0;
 
+    // The plan (the `todo` tool): one checkbox per step, above the activity
+    // strip. It only takes rows if there is a plan, and at most
+    // `plan_max_rows`: a 20-step plan cannot eat the history.
+    const pl_now = self.planCopy();
+    const plan_rows: u16 = if (pl_now.isEmpty()) 0 else @min(@as(u16, pl_now.len), plan_max_rows);
+
     // Autocompletion popup: only if there are matches.
     const ac_rows: u16 = if (self.ac.active and matchCount(self) > 0)
         @as(u16, @intCast(@min(matchCount(self), self.ac.max_visible) + 1))
@@ -2716,10 +2854,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     // The input grows with the text but never eats the history: if both do not
     // fit, the input is clipped (and its view anchors to the bottom).
-    const chrome: u16 = 4 + ac_rows + act_rows; // status + borders + popup + strip
+    const chrome: u16 = 4 + ac_rows + act_rows + plan_rows; // status + borders + popup + strip + plan
     const avail: u16 = if (height > chrome + 2) height - chrome - 2 else 1;
     const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(text_w), max_input_lines))), avail), 1);
-    const input_top: u16 = height - 4 - act_rows - input_h;
+    // The order from the bottom up is: status · strip · PLAN · input box. The
+    // plan goes between the strip and the input (and not over the status)
+    // because it is what you look at while the model works, next to the clock.
+    const input_top: u16 = height - 4 - act_rows - plan_rows - input_h;
     const history_h: u16 = if (input_top > 1) input_top - 1 else 1;
     // The key handler needs the height to jump a whole page.
     self.hist_rows = history_h;
@@ -2960,8 +3101,11 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // says nothing: you couldn't tell whether it was thinking, waiting or hung.
     // Here it is the face + the state + the elapsed SECONDS, which is what
     // really answers "is it working or is it stuck?".
-    if (act_rows == 1 and input_top > 0) {
-        drawActivityStrip(&p, input_top - 1, width, self, act, queued);
+    if (plan_rows > 0) {
+        drawPlanBlock(&p, input_top - plan_rows, width, plan_rows, pl_now);
+    }
+    if (act_rows == 1 and input_top > act_rows + plan_rows) {
+        drawActivityStrip(&p, input_top - act_rows - plan_rows - 1, width, self, act, queued);
     }
 
     drawInput(&p, &surface, self, input_top, width, input_h);
@@ -3237,6 +3381,81 @@ fn drawPermissionModal(
 ///
 /// When there is a queue the queued prompts are shown too, so you know what is
 /// coming next instead of having to remember it.
+/// How many plan steps are painted at most.
+///
+/// With 20 rows the plan eats the whole history, which is exactly what a plan
+/// must NOT do (the history is the conversation). Six is a number thought for a
+/// normal terminal: you see the beginning and the state, and the rest follows
+/// from the "2/8" of the status bar.
+pub const plan_max_rows: u16 = 6;
+
+/// The plan block: one checkbox per step, with the step in progress highlighted.
+///
+/// Why it is ON SCREEN and not only in the history: the question "how much is
+/// left?" has to be answerable without Ask Mode, and the history means
+/// scrolling. And the step in progress goes in the brand color because it is the
+/// only information that changes from frame to frame.
+///
+/// When everything is done it draws ONE line ("all N steps done") instead of N
+/// checkboxes: a finished plan does not need to be on screen, and leaving it
+/// there pushes the input up for no reason.
+fn drawPlanBlock(
+    p: *Painter,
+    top: u16,
+    width: u16,
+    rows: u16,
+    pl: plan_mod.Plan,
+) void {
+    if (pl.allDone()) {
+        p.fillRow(top, " ", .{});
+        var buf: [64]u8 = undefined;
+        const txt = std.fmt.bufPrint(&buf, "☑ all {d} steps done", .{pl.len}) catch "☑ done";
+        _ = p.putText(1, top, txt, theme.ok);
+        return;
+    }
+
+    const cur = pl.currentIndex();
+    for (0..rows) |i| {
+        const row: u16 = top + @as(u16, @intCast(i));
+        p.fillRow(row, " ", .{});
+        const it = pl.items[i];
+        const is_cur = cur != null and @as(u8, @intCast(i)) == cur.?;
+        // The step in progress: brand color in BOLD. The other styles are
+        // already complete Styles from the theme, and mixing a literal with a
+        // theme value is exactly the type error that reads as "expected Color,
+        // found Style".
+        const style: vaxis.Style = if (is_cur) theme.brand_bold else if (it.status == .done) theme.brand_faint else theme.brand_soft;
+
+        var col: u16 = 1;
+        col = p.putText(col, row, it.status.glyph(), style);
+        // The number is what lets you say "the 3" out loud, and it takes 3
+        // columns: `☐ 12. ` against `☐ 1. `.
+        col = p.putText(col + 1, row, tryNum(p.arena, @as(u8, @intCast(i)) + 1), theme.brand_faint);
+        col = p.putText(col + 1, row, it.textOf(), style);
+        if (col >= width) return;
+    }
+
+    // If the plan is longer than the rows, the last row says so. Without this
+    // the user sees 6 of 20 and cannot tell whether the list ended or was cut.
+    if (pl.len > rows) {
+        const row: u16 = top + rows - 1;
+        var buf: [64]u8 = undefined;
+        const txt = std.fmt.bufPrint(
+            &buf,
+            "  +{d} more · {d}/{d} done",
+            .{ pl.len - rows, pl.doneCount(), pl.len },
+        ) catch "";
+        _ = p.putText(1, row, txt, theme.brand_faint);
+    }
+}
+
+/// "3" as memory owned by the frame.
+fn tryNum(arena: std.mem.Allocator, n: u8) []const u8 {
+    var buf: [4]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}.", .{n}) catch return "";
+    return arena.dupe(u8, s) catch "";
+}
+
 fn drawActivityStrip(
     p: *Painter,
     row: u16,
@@ -5426,4 +5645,247 @@ test "las dos columnas del status miden el ancho igual (si no, se pisan)" {
     // "⚡ 3 tok/s" son 9 graphemes y " · ñ" son 4: 13 columnas. En BYTES serían
     // 15 y 7, o sea 22, y la fila quedaría 9 columnas corrida.
     try std.testing.expectEqual(@as(u16, 13), segsWidth(&segs));
+}
+
+// ── plan visible, /undo y paragraphs (feat/roster) ─────────────────────
+
+/// How many assistant paragraphs the history has (after a `drainPending`).
+fn countAssistant(m: *Model) usize {
+    var n: usize = 0;
+    for (m.paras.items) |p| {
+        if (p.kind == .assistant) n += 1;
+    }
+    return n;
+}
+
+test "el bloque del plan: un checkbox por paso, y el paso en marcha resaltado" {
+    // Lo que se comprueba es lo que el usuario VE (la lógica del plan ya esta
+    // testeada en plan.zig): que hay un checkbox por paso y que el paso en
+    // marcha es el único con color de marca. Esa diferencia entre "por dónde va"
+    // y "una lista" es justo lo que hace útil el bloque.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const args =
+        \\{"items":[
+        \\{"content":"leer el roadmap","status":"done"},
+        \\{"content":"implementar la tool","status":"in_progress"},
+        \\{"content":"escribir los tests","status":"pending"}
+        \\]}
+    ;
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    const parsed = try plan_mod.parseItems(arena, args, &items);
+    _ = m.applyPlan(&parsed.items, parsed.len);
+    // Aplicar el plan es un cambio de estado: tiene que pedir frame.
+    try std.testing.expect(m.activity().dirty);
+
+    const s = try drawTest(&m, arena, 100, 30);
+    const r_done = findRow(s, "leer el roadmap") orelse return error.TestUnexpectedResult;
+    const r_cur = findRow(s, "implementar la tool") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(findRow(s, "escribir los tests") != null);
+    // En el orden de la lista, de arriba abajo.
+    try std.testing.expect(r_done < r_cur);
+
+    var buf: [256]u8 = undefined;
+    // El hecho hecho lleva su check (no una flecha) y el apagado.
+    const done_row = rowText(s, r_done, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, done_row, "☑") != null);
+    const done_cell = s.readCell(1, r_done);
+    try std.testing.expectEqual(theme.brand_faint.fg, done_cell.style.fg);
+    try std.testing.expect(!done_cell.style.bold);
+
+    // El paso en marcha: MISMO texto, color de marca y en negrita.
+    const cur_cell = s.readCell(1, r_cur);
+    try std.testing.expectEqual(theme.brand_bold.fg, cur_cell.style.fg);
+    try std.testing.expect(cur_cell.style.bold);
+    const cur_row = rowText(s, r_cur, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, cur_row, "◐") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cur_row, "2.") != null);
+
+    // Y el pendiente va en el soft, sin negrita: se distinguen los tres estados
+    // de un vistazo.
+    const r_next = findRow(s, "escribir los tests") orelse return error.TestUnexpectedResult;
+    const next_cell = s.readCell(1, r_next);
+    try std.testing.expectEqual(theme.brand_soft.fg, next_cell.style.fg);
+    try std.testing.expect(!next_cell.style.bold);
+}
+
+test "el plan se dibuja ENCIMA del input y lo empuja, sin comerse el historial" {
+    // El orden de las filas de abajo arriba es status · franja · PLAN · input.
+    // Si el plan se dibujara en otro sitio taparía el historial, que es justo lo
+    // que un plan no debe hacer.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushKind(.user, "hola");
+
+    const s_sin = try drawTest(&m, arena, 100, 30);
+    const input_sin = findRow(s_sin, "Ask anything") orelse return error.TestUnexpectedResult;
+
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    const texts = [_][]const u8{ "primero", "segundo", "tercero" };
+    for (0..3) |i| {
+        var it = plan_mod.Item{ .status = .pending };
+        const t = texts[i];
+        @memcpy(it.text[0..t.len], t);
+        it.len = @intCast(t.len);
+        items[i] = it;
+    }
+    _ = m.applyPlan(&items, 3);
+    const s_con = try drawTest(&m, arena, 100, 30);
+    const input_con = findRow(s_con, "Ask anything") orelse return error.TestUnexpectedResult;
+    // El primer paso del plan: suficiente para saber DÓNDE está el bloque.
+    const r_plan = findRow(s_con, "primero") orelse return error.TestUnexpectedResult;
+
+    // El plan queda por ENCIMA del input (el input está siempre abajo del todo),
+    // y el input SUBE 3 filas: las filas del plan se le quitan de encima, no se
+    // las come el historial.
+    try std.testing.expect(r_plan < input_con);
+    try std.testing.expectEqual(input_sin - 3, input_con);
+    // Y el historial sigue ahí arriba (con 30 filas hay sitio de sobra).
+    try std.testing.expect(findRow(s_con, "hola") != null);
+    try std.testing.expect(findRow(s_con, "hola").? < r_plan);
+
+    // Sin plan, no hay filas de checkboxes.
+    m.clearPlan();
+    const s_limpio = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(s_limpio, "☐") == null);
+    try std.testing.expectEqual(input_sin, findRow(s_limpio, "Ask anything").?);
+}
+
+test "el plan terminado se dibuja en UNA línea" {
+    // Un plan terminado con 20 checkboxes solo empuja el input hacia arriba sin
+    // motivo: una línea dice lo mismo.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    for (0..8) |i| {
+        var it = plan_mod.Item{ .status = .done };
+        it.text[0] = 'a' + @as(u8, @intCast(i));
+        it.len = 1;
+        items[i] = it;
+    }
+    _ = m.applyPlan(&items, 8);
+
+    const s = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(s, "all 8 steps done") != null);
+    // Ojo: el check del resumen es "☑ all...", así que buscar "☑ a" casaría
+    // con el propio resumen. Lo que se busca es el NÚMERO de cada paso, que
+    // solo aparece cuando la lista se pinta entera.
+    try std.testing.expect(findRow(s, "1. a") == null);
+    try std.testing.expect(findRow(s, "4. d") == null);
+}
+
+test "un plan largo dice cuantos pasos se han quedado sin pintar" {
+    // Sin el "+N more", ver 6 de 20 parece un plan entero. Y el recorte tiene un
+    // tope (`plan_max_rows`) porque un plan de 20 no puede comerse el historial.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    for (0..20) |i| {
+        var it = plan_mod.Item{ .status = .pending };
+        it.text[0] = 'a' + @as(u8, @intCast(i % 26));
+        it.len = 1;
+        items[i] = it;
+    }
+    items[0].status = .done;
+    _ = m.applyPlan(&items, 20);
+
+    const s = try drawTest(&m, arena, 120, 44);
+    const r = findRow(s, "+14 more") orelse return error.TestUnexpectedResult;
+    var buf: [128]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, r, &buf), "1/20 done") != null);
+    // Y solo se pintan `plan_max_rows` pasos: ni uno más.
+    try std.testing.expectEqual(plan_max_rows, r - findRow(s, "a").? + 1);
+}
+
+test "el checkpoint se abre por TURNO y consume el último al deshacer" {
+    // Lo que importa del contrato: un prompt = un checkpoint (aunque el turno
+    // haga 5 tools), y `takeCheckpoint` lo QUITA, para que un segundo `/undo`
+    // deshaga el turno anterior y no repita el mismo.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try std.testing.expect(!m.canUndo());
+    m.beginCheckpoint("turno 1");
+    m.snapshotFile("a.txt", "v1", true);
+    m.snapshotFile("a.txt", "v2", true); // la segunda se ignora
+    try std.testing.expect(m.canUndo());
+
+    m.beginCheckpoint("turno 2");
+    m.snapshotFile("b.txt", "x", true);
+    var c2 = m.takeCheckpointOwned() orelse return error.TestUnexpectedResult;
+    defer c2.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("turno 2", c2.labelOf());
+    try std.testing.expectEqual(@as(u8, 1), c2.len);
+    // La foto de "a.txt" era del turno 1 y sigue ahí: `b.txt` no la pisó.
+    try std.testing.expect(m.canUndo());
+    var c1 = m.takeCheckpointOwned() orelse return error.TestUnexpectedResult;
+    defer c1.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("turno 1", c1.labelOf());
+    try std.testing.expectEqual(@as(u8, 1), c1.len);
+    try std.testing.expectEqualStrings("a.txt", c1.files[0].pathOf());
+    try std.testing.expectEqualStrings("v1", c1.files[0].data);
+
+    // Y ya no queda nada: `canUndo` en vez de un crash.
+    try std.testing.expect(!m.canUndo());
+    try std.testing.expect(m.takeCheckpointOwned() == null);
+}
+
+test "un snapshot sin checkpoint abierto no se guarda (ni rompe)" {
+    // `execToolCalls` puede correr antes de que `startChat` abra el checkpoint
+    // (turnos encadenados). Sin este guardia sería un acceso a un array vacío.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.snapshotFile("a.txt", "contenido", true);
+    try std.testing.expect(!m.canUndo());
+    try std.testing.expect(m.takeCheckpointOwned() == null);
+}
+
+test "streamEnd sin texto no deja un parrafo vacio en el historial" {
+    // Un turno que muere con un error abre el parrafo en vivo y lo cierra vacio.
+    // Con el "◆" solo dejas ruido que parece contenido. Se vio en la E2E del
+    // free-auto: 403 -> 5xx x3 -> historial con un "◆" sin nada detras.
+    //
+    // OJO: `streamEnd` ENCOLA el parrafo en `pending` (lo drena el draw), asi que
+    // hay que drenar antes de mirar `paras`. Antes de ese cambio se metia en
+    // `paras` directamente y este test contaba sin drenar.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamEnd();
+    m.drainPending();
+    try std.testing.expectEqual(@as(usize, 0), countAssistant(&m));
+
+    // Pero si HAY texto se guarda.
+    m.streamStart();
+    m.streamDelta("OK");
+    m.streamEnd();
+    m.drainPending();
+    try std.testing.expectEqual(@as(usize, 1), countAssistant(&m));
+
+    // Y solo espacios cuenta como vacio: es lo que devuelve un modelo que
+    // responde con un "\n" y nada mas, y un parrafo con un espacio es ruido
+    // igual que uno vacio. El conteo TOTAL no cambia: sigue habiendo un
+    // parrafo, el que tiene texto de verdad.
+    m.streamStart();
+    m.streamDelta("  \n ");
+    m.streamEnd();
+    m.drainPending();
+    try std.testing.expectEqual(@as(usize, 1), countAssistant(&m));
+    try std.testing.expect(!m.busy);
 }

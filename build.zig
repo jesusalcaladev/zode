@@ -62,7 +62,14 @@ pub fn build(b: *std.Build) void {
     // out as "Cannot print stack trace: stack tracing is disabled" — which is
     // precisely the moment you least want the build to be mute. (It happened: a
     // SIGSEGV with no way to tell where from.)
-    const debug_exe = b.addExecutable(.{ .name = "zode-debug", .root_module = exe_mod });
+    const debug_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    debug_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const debug_exe = b.addExecutable(.{ .name = "zode-debug", .root_module = debug_mod });
+    debug_exe.root_module.strip = null;
     b.installArtifact(debug_exe);
     b.step("debug", "Build an UNSTRIPPED zode-debug (has symbols, for crash traces)")
         .dependOn(&debug_exe.step);
@@ -101,6 +108,26 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| probe_run.addArgs(args);
     const probe_step = b.step("acp-probe", "Habla con el agente ACP real y enseña el tráfico");
     probe_step.dependOn(&probe_run.step);
+
+    // Free-auto probe: which providers have a key, how many free models each
+    // one publishes, and the pool already sorted the way the wheel will use it.
+    // Not a test: it talks to the network.
+    //
+    // Only `vaxis` is declared here; the probe picks the other modules BY PATH
+    // (which is why the probe lives in `src/`, not `src/bin/`). Declaring them
+    // here clashes too: a file cannot be the root of two modules in the same
+    // compilation, and `providers.zig` already is the root of `agent`.
+    const roster_mod = b.createModule(.{
+        .root_source_file = b.path("src/roster_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    roster_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const roster_probe = b.addExecutable(.{ .name = "roster_probe", .root_module = roster_mod });
+    const roster_probe_run = b.addRunArtifact(roster_probe);
+    if (b.args) |args| roster_probe_run.addArgs(args);
+    const roster_probe_step = b.step("roster-probe", "Shows the pool of free models of every provider");
+    roster_probe_step.dependOn(&roster_probe_run.step);
 
     // Tests con acceso a vaxis (markdown/highlight testean estilos).
     // SIEMPRE en Debug: el binario ya sale ReleaseSafe+strip, pero compilar la
