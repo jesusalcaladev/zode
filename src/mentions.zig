@@ -91,8 +91,26 @@ pub fn scan(text: []const u8, out: *[scanned_max]Mention) u8 {
             i = end + 1;
             continue;
         }
-        if (n >= scanned_max) return n;
         const path = text[start..end];
+        // Una mención tiene forma de RUTA: una `/` o una extensión.
+        //
+        // Sin esta comprobación, pegar un trozo de código con decoradores
+        // (`@Override`, `@click.command`, `@import`, `@deprecated`, `@final`…)
+        // llenaba el presupuesto del escaner: son 8 menciones, y la novena, que
+        // era el `@src/agent.zig` de verdad, ya no se miraba. Medido: siete
+        // decoradores y la mención real desaparece, sin aviso. Peor todavía,
+        // cada decorador conta como "no encontrado" y el usuario ve un
+        // "1 not found" sin haber pedido nada.
+        //
+        // El coste del filtro: `@Makefile` a secas (fichero sin extensión en la
+        // raíz) ya no se expande. Se escribe `@./Makefile`, que además es lo
+        // que se debería escribir para no dejar el path al criterio de donde se
+        // esté mirando.
+        if (!looksLikePath(path)) {
+            i = end;
+            continue;
+        }
+        if (n >= scanned_max) return n;
         var dup = false;
         for (out[0..n]) |prev| {
             if (std.mem.eql(u8, prev.pathOf(), path)) dup = true;
@@ -107,6 +125,20 @@ pub fn scan(text: []const u8, out: *[scanned_max]Mention) u8 {
         i = end;
     }
     return n;
+}
+
+/// ¿El token es una ruta y no una palabra?
+///
+/// `/` o una extensión. Es lo que separa `@src/agent.zig` y `@notas.txt` de
+/// `@Override`, y está en `scan` (no en `expand`) a propósito: si el filtro
+/// estuviese abajo, los decoradores seguirían gastando el presupuesto del
+/// escaner y la mención real se seguiría perdiendo.
+fn looksLikePath(token: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, token, '/') != null) return true;
+    // La extensión es el último `.` y no es un punto inicial ("`.gitignore`"
+    // no lleva extensión: se escribe `@./.gitignore`).
+    const dot = std.mem.lastIndexOfScalar(u8, token, '.') orelse return false;
+    return dot > 0 and dot + 1 < token.len;
 }
 
 /// Un resultado de `expand`.
@@ -271,6 +303,34 @@ test "scan: la @ suelta y el texto sin ruta no son menciones" {
     try std.testing.expectEqual(@as(u8, 0), scan("", &out));
     // Y una mención justo al principio del texto sí vale.
     try std.testing.expectEqual(@as(u8, 1), scan("@a.txt", &out));
+}
+
+test "scan: los decoradores de un snippet NO gastan el presupuesto" {
+    // El bug que motivó `looksLikePath`. Pegar código con `@Override`,
+    // `@deprecated`, `@staticmethod`… llenaba las 8 ranuras del escaner y la
+    // mención real, que venía después, ya no se miraba: se perdía en silencio.
+    // Medido con siete decoradores antes de encontrar el filtro.
+    var out: [scanned_max]Mention = undefined;
+    const prompt = "revisa esto @Override @deprecated @staticmethod @final " ++
+        "@pure @param @import y mira @src/agent.zig";
+    const n = scan(prompt, &out);
+    try std.testing.expectEqual(@as(u8, 1), n);
+    try std.testing.expectEqualStrings("src/agent.zig", out[0].pathOf());
+}
+
+test "looksLikePath: una ruta o una extensión; una palabra suelta no" {
+    // Lo que separa `@src/agent.zig` y `@notas.txt` de `@Override`.
+    try std.testing.expect(looksLikePath("src/agent.zig"));
+    try std.testing.expect(looksLikePath("notas.txt"));
+    try std.testing.expect(looksLikePath("a/b/c"));
+    try std.testing.expect(looksLikePath("guía.md"));
+    try std.testing.expect(!looksLikePath("Override"));
+    try std.testing.expect(!looksLikePath("import"));
+    try std.testing.expect(!looksLikePath("deprecated"));
+    // Un punto inicial no es una extensión: `.gitignore` se escribe
+    // `@./.gitignore`, que además no depende de dónde se esté mirando.
+    try std.testing.expect(!looksLikePath(".gitignore"));
+    try std.testing.expect(!looksLikePath("Makefile"));
 }
 
 test "scan: no repite el mismo fichero" {
