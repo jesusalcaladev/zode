@@ -506,6 +506,45 @@ server, banner nuevo con la mascota en color de marca.
 
 **Siguiente**: Skills, MCP over stdio, `@file` mentions (aplazado), y lo que acordemos al final de esta sesión.
 
+## `/clean`: borra basura del AGENTE, y solo eso
+
+`src/clean.zig`, puro y testeado sin TUI. `/clean` (**simula**, `/clean yes`
+aplica, o `ZODE_YES=1` para cuando lo ejecuta el modelo).
+
+**Lo unico que borra**: sesiones de 0 bytes (el residuo de 58 ficheros / 24
+vacos de cuando se creaba una por arranque), `zode-*.tmp` de una escritura
+atomica cortada, e instancias muertas del registro `<gitdir>/zode/inst`
+(pid muerto, latido > 30 s, o JSON que no se entiende). Las **sesiones viejas
+se listan pero NO se borran**: `/clean yes` no las toca, que para eso estan
+`old_session` y `deletable()` es `false` para ese cubo.
+
+**Nunca**: `.zig-cache`, `zig-out`, `zig-pkg`, el codigo, `auth.json` y
+`permissions.json`. La exclusion vive en `clean.isProtected`, al lado del scan
+que podria alcanzarlas, y no en la UI: una lista de "no tocar" escrita en el
+render solo aguanta hasta que alguien anade un scan nuevo.
+
+Tres cosas que costaron:
+
+1. **`const a = std.mem.Allocator;` dentro de `cmdClean` rompe el modulo
+   entero.** El `a` local tapa el TIPO `a` en el resto de la funcion, asi que
+   `allocPrint(a, ...)` resuelve a una variable de tipo `type` y el error sale
+   en `clean.instanceDir` (un fichero que no se ha tocado), no en la linea que
+   lo causo. Los tests que construyen un `Model` sobre un `FixedBufferAllocator`
+   lo cazan; el modulo suelto no.
+2. **`sb.path(buf, …)` escribe en el buffer que le pasas.** Guardarse
+   `const a = sb.path(&b, …)` y luego volver a llamar con el MISMO `b` deja `a`
+   apuntando al segundo path: el test acaba comprobando el fichero
+   equivocado contra la expectativa equivocada y falla sin motivo aparente.
+   Cada path que sobrevive a otra llamada necesita su propio buffer.
+3. **`isProtected` por segmento, no por prefijo.** `a/b/.zig-cache/o` es tan
+   artefacto de compilacion como `.zig-cache/o`, y un test de prefijo lo pasa
+   por alto. Al reves tambien: `zig-out-mio` NO es `zig-out` y borrarlo seria un
+   fallo. Con test de los dos sentidos.
+
+La exclusion de `.zig-cache` es estructural ademas de explicita: los tres
+directorios que se recorren (`sessions/`, el registro, `~/.config/zode`) no
+contienen artefactos de compilacion, asi que ni siquiera se pueden alcanzar.
+
 ## Bugs de la ronda de fuzzing (2026-06-29)
 
 Todos aparecieron con `fuzz.py` (secuencias aleatorias de teclas contra la TUI
@@ -1291,3 +1330,162 @@ quieren, el camino es **PR upstream a vaxis** o un `patch` declarado en
 **5.10** (quitar `subscribeToColorSchemeUpdates`) tampoco se toca por lo mismo:
 esta DENTRO de `App.run`, asi que tampoco se puede desde fuera sin lo anterior.
 Y aunque se pudiera, el ahorro es un viaje de ida y vuelta al arrancar.
+
+---
+
+# Branch `feat/roster`: what the other session does not cover (2026-09-30)
+
+Este worktree (`/home/jesusalcala/Projects/zode-agente`, rama `feat/roster`)
+implements what the other session's `ROADMAP.md` does **not** cover. The task
+digest is ceded to them (their Phase 3 is more detailed).
+
+| area | who | note |
+|---|---|---|
+| task digest | **them** | ceded, their Phase 3 is more detailed |
+| render / size / RAM | **them** | their Phases 4 and 5 |
+| `is_free` (3 signals) | **us** | useful for both: the pool would not exist without it |
+| free-auto (rotation) | us | `/free-auto`, `roster.zig`, `free_auto.zig` |
+| visible plan | us | `todo` tool + on-screen block |
+| `/undo` | us | file snapshots per turn |
+| `@file` | us | the content goes with the prompt |
+
+**3 RED tests in that worktree belong to the other session** (estaban en el
+commit base, no los ha tocado nadie aquí):
+`tui.test.pushDiff mete UN parrafo…`, `tui.test.un diff de 300 lineas…` y
+—esto sí lo arreglamos— `tui.test.streamEnd marca dirty` (ya pasa).
+
+Merged on 2026-09-30 (see the merge commit for the conflict resolutions).
+
+## free-auto: rota entre modelos free de todos los providers
+
+`/free-auto on` (o `ZODE_FREE_AUTO=1`) lista los modelos free de cada provider
+que tenga key y reparte turnos entre ellos. Cuando uno se queda sin cuota, el
+turno **sigue solo** con el siguiente: no hay que escribir «continúa».
+
+- `src/roster.zig` — el pool: orden, topes, cooldowns, rotación, informe de
+  agotamiento. Puro y testeado (sin red).
+- `src/free_auto.zig` — el modo: estado global con spinlock, el worker que
+  construye el pool, y `/free-auto [on|off|status]`.
+- `zig build roster-probe` — **la pregunta que importa**: ¿tengo de verdad algún
+  plan B? Lista providers con key, cuántos free publica cada uno y el pool ya
+  ordenado. Vive en `src/` y no en `src/bin/` porque su module path es el
+  directorio, y con la sonda en `src/bin/` los `@import("agent.zig")` de al lado
+  se salen del módulo. Lo único que `build.zig` declara es `vaxis`: un fichero
+  no puede ser raíz de dos módulos y `providers.zig` ya lo es de `agent`.
+
+### La tabla que decide si un error rota
+
+`agent.quotaVerdict(err, detail)` → `?roster.Why`. Es fina a propósito, porque
+la acción que corresponde a cada fila es **opuesta**:
+
+| error | veredicto | por qué |
+|---|---|---|
+| 402 sin créditos | rota | repetir lo mismo es tonto |
+| 429 rate limited | rota | cuota del modelo, no de la key |
+| 403 con el texto del gate | rota | el 403 de opencode es un GATE, no config |
+| 403 sin el gate | **NO** | un modelo no disponible en tu cuenta |
+| 401 | **NO** | es la key: rotar daría 401 en los 16 |
+| 404 | **NO** | id malo, no cuota |
+| 5xx | **NO** | el modelo no tiene la culpa: es backoff |
+
+Frases del gate que existen de verdad (verificadas el 2026-09-30):
+`can only be used from within OpenCode`, `Model access is disabled`,
+`is only available on agentic harnesses` (openrouter; da igual que zode sea un
+agente, no está en su lista de apps), `not available on this account`.
+
+Y 400 = `error.BadRequest`, que **no** se reintenta: antes caía en el `else` →
+`ServerError` → 3 reintentos con backoff para repetir una petición que el server
+ya ha dicho que no quiere.
+
+### Tres cosas del wiring que no son evidentes
+
+1. **`Target` en vez de consultar el global en tres sitios.** El `pick` se
+   REEMPLAZA dentro del bucle de reintentos; si el body, la url y la key
+   consultaran cada uno el provider activo, media petición iría al sitio
+   equivocado. Hay test de que la key es la del candidato y no la del activo.
+2. **El body se compone DENTRO del bucle.** El body lleva el nombre del modelo
+   dentro, así que al rotar hay que rehacerlo. Con el body fuera: la petición iba
+   al provider/modelo nuevo con el nombre del viejo, y openrouter contestaba un
+   400 `JSON parsing failed` tres veces, que no cuadraba con nada.
+3. **`nowMs()` necesita `attachIo`.** `agent.io_global` es `undefined` hasta que
+   el arranque lo asigna, y leer el reloj de un `Io` sin inicializar es saltar
+   por una vtable de basura (GPF, no un 0). Es la trampa de `Model.attachIo`.
+
+## El plan visible (tool `todo`)
+
+El modelo se escribe la lista y el usuario la ve encima del input, sin Ask Mode.
+Lista COMPLETA en cada llamada (reemplaza a la anterior); acepta
+`items`/`todos` y `content`/`text`/`task`; un `status` desconocido cae en
+`pending` (el paso no está mal, está mal etiquetado); más de 20 pasos es un
+ERROR y no un recorte silencioso. Terminado se dibuja en una línea. Tope de 6
+filas (`plan_max_rows`) y, si no cabe, `+N more · 1/20 done`. `/plan` lo limpia.
+
+Bug propio que los tests cazaron: en `Plan.apply` el bucle escribía
+`self.items[self.len] = it` y `self.len` solo se actualizaba al final, así que
+**todas** las iteraciones caían en la casilla 0: el plan era un paso repetido,
+con basura sin inicializar en el texto (los `Item.text` son buffers fijos).
+
+## `/undo`
+
+Deshace **archivos**, no mensajes: la sesión es append-only y reescribirla a
+mitad de un turno no tiene explicación. La foto se toma antes de cada tool que
+toca un archivo; `existed` va explícito («no estaba» y «estaba vacío» se
+deshacen distinto) y si la lectura falla por otro motivo **no** se fotografía
+nada. Anillo de 8 turnos, 24 archivos, 256 KB por archivo, 1 MB por turno; lo que
+no cabe se marca y el mensaje lo dice.
+
+## `@fichero`
+
+El contenido va con el prompt, en un bloque al final (no en el sitio de la `@`,
+para que el prefijo del provider siga siendo estable). 4 ficheros, 32 KB cada
+uno, leídos como **prefijo** con `readPositional`: `readFileAlloc(.limited(n))`
+no recorta, devuelve `error.FileTooBig`, y con eso los ficheros grandes no se
+inyectaban nunca. Se amplía solo lo que va al modelo (la sesión guarda el prompt
+con su `@ruta`), y solo el **último mensaje de usuario**: el último mensaje de la
+lista es el `system`, porque el system prompt se añade al final.
+
+El escaner no se come los correos (`jorge@example.com` no es una mención: si
+detrás del token hay otra `@`, es un correo) ni la puntuación final
+(`@notas.txt,` es `notas.txt`), y acepta bytes ≥ 0x80 para que `@docs/guía.md`
+funcione.
+
+## Tres bugs de la TUI que solo se ven en la pty
+
+1. **`streamEnd` se comía el `dirty` del worker.** `streamEnd` llama a
+   `drainPendingLocked` (para que el texto del asistente no acabe por delante de
+   su tool) y esa función bajaba `dirty = false`: el worker empujaba el error y
+   acto seguido se borraba a sí mismo la petición de repintar. En pantalla se
+   quedaba el frame viejo, con la franja congelada en «streaming 3.9s» para
+   siempre, hasta que el usuario pulsaba una tecla. Ahora el que baja `dirty` es
+   el DRAW, después de pintar, y `streamEnd`, `setStatusWithMood` y `toolRunEnd`
+   lo ponen a true.
+2. **El tick se desarmaba en reposo, y un worker no puede despertar la UI.** Con
+   el tick desarmado, lo que empujaba un worker en segundo plano (pool del
+   free-auto, conexión ACP, lista de modelos) se quedaba en `pending` hasta que
+   llegase una tecla: el síntoma era «el comando no hace nada». Ahora el tick se
+   rearma SIEMPRE y en reposo va a 250 ms (`Model.tickIntervalMs`): el coste es
+   un spinlock 4 veces por segundo y **no** un redraw, que es lo que de verdad
+   quería decir la nota de «0 CPU en idle».
+3. **Un turno muerto dejaba un párrafo vacío** (`◆` solo en el historial).
+   `streamEnd` solo guarda el párrafo si hay texto, con trim.
+
+## La familia de bugs de la memoria (cinco veces este mes)
+
+- `pushInfoOwned` **toma posesión** del texto y lo libera en `Model.deinit`:
+  un literal ahí es un «Invalid free» (la paleta), un `catch "literal"` igual
+  (`/free-auto status`), un `bufPrint` a stack es un puntero a temporal (el
+  titular del undo se veía como `�`), y **texto de la arena del turno** deja un
+  puntero colgando que vaxis lee en el renderer → segfault (el aviso de
+  `@fichero`).
+- `pushInfo` **copia**: para texto de stack, o de una arena que vive menos que
+  el frame, es lo único seguro.
+- Lo mismo con `takeCheckpointOwned`: la primera versión hacía `deinit` y
+  devolvía la copia con los `data` ya liberados.
+
+## Diagnóstico
+
+- `ZODE_DBG_ERR=1` vuelca status + los primeros bytes de cada respuesta a
+  stderr. Con eso se leyó el 400 de openrouter que se comía los reintentos; sin
+  él, la TUI solo decía «HTTP 400».
+- `zig build roster-probe` para el pool de verdad.
+

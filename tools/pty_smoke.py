@@ -134,6 +134,16 @@ def main() -> int:
     out3, t3 = drive([b"hola", b"\r", b"\x0c", b"\x1b[B", b"\x1b[B"])
     ok &= check("ctrl+l + scroll no rompen nada", "panic" not in t3.lower(), t3)
 
+    # 4) `/clean`: un comando de limpieza que se ejecuta en la TUI sin pedir
+    #    nada tiene que salir bien SIEMPRE, y sin `yes` no puede borrar. Se
+    #    comprueba el texto del dry run, no que se borre: en el HOME del smoke
+    #    puede no haber ni una sesion vacia, y un test que depende de que haya
+    #    basura que borrar solo verifica el caso-afortunado.
+    out4, t4 = drive([b"/clean", b"\r"])
+    ok &= check("/clean responde (dry run)", "/clean" in t4 and "dry run" in t4, t4)
+    ok &= check("/clean ofrece el 'yes'", "/clean yes" in t4, t4)
+    ok &= check("/clean no rompe nada", "panic" not in t4.lower(), t4)
+
     if not ok:
         print("\n--- texto plano (recortado) ---")
         for line in t.splitlines()[:40]:
