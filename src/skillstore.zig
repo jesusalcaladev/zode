@@ -10,6 +10,12 @@
 //! usually the answer to "how does THIS project want this done", and a global
 //! default that half-overrides the project's own file is worse than not having
 //! one.
+//!
+//! Four roots, not two: `.zode/skills` is this harness's own convention and
+//! `.agents/skills` is the one shared with other agents, so a skill written for
+//! one works in the other. Both are scanned in the cwd, and both are scanned again
+//! in the repository root when zode was launched below it — which is the whole
+//! reason `project.zig` exists.
 
 const std = @import("std");
 const skills = @import("skills.zig");
@@ -29,6 +35,16 @@ pub const Loader = struct {
     /// the suite would leave junk in their repo, which is exactly the mistake the
     /// fuzzer made with `~/.config/zode/auth.json`.
     project_dir: []const u8 = skills.project_dir,
+    /// `.agents/skills`, the cross-agent convention. Same reason it is a field:
+    /// the tests must not write into the real one.
+    agents_dir: []const u8 = skills.agents_dir,
+    /// Absolute path of the git repository root, when zode was launched BELOW it.
+    ///
+    /// This is the fix for "cd src && zode sees no project skills at all": the
+    /// project's skills live in the root, and the root is a fact git already
+    /// knows. It is `null` when the cwd IS the root (nothing to add) or when there
+    /// is no repository.
+    repo_root: ?[]const u8 = null,
     /// Scratch used for the joined paths; the caller's `Io.Dir` calls need a
     /// buffer and allocating one per path would be a lot of garbage on a
     /// directory walk.
@@ -38,7 +54,53 @@ pub const Loader = struct {
         return .{ .gpa = gpa, .io = io, .env = env };
     }
 
-    /// The user's skills root, or `null` when there is no HOME.
+    /// Every root that will be scanned, in shadowing order, into `out`.
+    ///
+    /// Exposed because the freshness check needs the same list the scan used, and
+    /// recomputing it here with a second, subtly different rule would be a bug
+    /// waiting to happen: "the cache is valid for the roots I remember" has to be
+    /// the same roots.
+    ///
+    /// `bufs` is one buffer per root and NOT `self.path_buf`: every path here has
+    /// to survive the loop, and a shared scratch buffer would leave the earlier
+    /// roots pointing at the last one (the `sb.path` trap from the fuzzer round).
+    pub fn roots(self: *Loader, bufs: *[max_roots][std.fs.max_path_bytes]u8, out: [][]const u8) usize {
+        var n: usize = 0;
+
+        if (bufs[n].len >= self.project_dir.len) {
+            @memcpy(bufs[n][0..self.project_dir.len], self.project_dir);
+            out[n] = bufs[n][0..self.project_dir.len];
+            n += 1;
+        }
+        if (bufs[n].len >= self.agents_dir.len) {
+            @memcpy(bufs[n][0..self.agents_dir.len], self.agents_dir);
+            out[n] = bufs[n][0..self.agents_dir.len];
+            n += 1;
+        }
+
+        // The same two, in the repository root, when that is not the cwd. Guarded
+        // on `n + 2 < max_roots` so adding a root later cannot write past the end.
+        if (self.repo_root) |root| {
+            if (!std.mem.eql(u8, root, self.project_dir)) {
+                for ([_][]const u8{ self.project_dir, self.agents_dir }) |sub| {
+                    if (n + 1 >= max_roots) break;
+                    const joined = std.fmt.bufPrint(&bufs[n], "{s}/{s}", .{ root, sub }) catch continue;
+                    out[n] = joined;
+                    n += 1;
+                }
+            }
+        }
+
+        if (self.joinHome()) |home| {
+            if (n >= max_roots) return n;
+            const joined = std.fmt.bufPrint(&bufs[n], "{s}/.config/{s}", .{ home, skills.user_subdir }) catch return n;
+            out[n] = joined;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The user's HOME, or `null` when there is none.
     ///
     /// `null` makes the USER skills silently absent, which is the right behaviour
     /// for a sandboxed test and would be the wrong one for a real user with a
@@ -62,16 +124,11 @@ pub const Loader = struct {
     pub fn scan(self: *Loader, out: []skills.Entry, cap: usize) []skills.Entry {
         var n: usize = 0;
 
-        // Two roots: project (wins) then user.
-        const roots = [_]struct { sub: []const u8, user: bool }{
-            .{ .sub = self.project_dir, .user = false },
-            .{ .sub = skills.user_subdir, .user = true },
-        };
+        var bufs: [max_roots][std.fs.max_path_bytes]u8 = undefined;
+        var paths: [max_roots][]const u8 = undefined;
+        const root_count = self.roots(&bufs, &paths);
 
-        for (roots) |root| {
-            const dir_path: []const u8 = if (root.user) self.joinHome() else root.sub;
-            if (dir_path.len == 0) continue;
-
+        for (paths[0..root_count]) |dir_path| {
             var d = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch continue;
             defer d.close(self.io);
 
@@ -129,14 +186,14 @@ pub const Loader = struct {
         return out[0..n];
     }
 
-    /// `<HOME>/.config/zode/skills`, written into `self.path_buf`.
+    /// `<HOME>/.config`, or `null` when there is no HOME.
     ///
-    /// Returns "" (not null) so the caller's `if (p.len > 0)` reads as "skip this
-    /// root", and the ROOT that is skipped is visible in the code right there.
-    fn joinHome(self: *Loader) []const u8 {
-        var home: [std.fs.max_path_bytes]u8 = undefined;
-        const h = self.userHome(&home) orelse return "";
-        return std.fmt.bufPrint(&self.path_buf, "{s}/.config/{s}", .{ h, skills.user_subdir }) catch "";
+    /// The caller joins `user_subdir` (and the repository-root roots) onto it,
+    /// because `roots` needs a DIFFERENT buffer per path: one shared scratch
+    /// buffer left every path pointing at the last one written, which is the
+    /// `sb.path` trap from the fuzzer round.
+    fn joinHome(self: *Loader) ?[]const u8 {
+        return self.userHome(&self.path_buf);
     }
 
     /// The body of a skill, framed for the model. Writes into `out` and returns a
@@ -195,7 +252,58 @@ fn readPrefix(io: std.Io, path: []const u8, out: []u8) ?[]const u8 {
 /// generous frontmatter, and anything past it is body we would throw away.
 pub const max_scan = 32 * 1024;
 
-/// True once a closing `---` fence has been seen on its own line.
+/// How many roots `Loader.roots` can return: two in the cwd, two in the
+/// repository root, one user. A constant and not a count because every root needs
+/// its own `max_path_bytes` buffer, and a stack array sized by a variable would be
+/// a 20 KB `scan` frame.
+pub const max_roots = 5;
+
+/// The `mtime` + size of one path, for deciding whether a cached list is stale.
+///
+/// Size is in it because a same-second edit of a same-length file is exactly the
+/// case where `mtime` alone (in whole seconds) lies, and this repo has already
+/// been bitten by filesystem timestamp granularity elsewhere.
+pub const Stamp = struct {
+    path: [stamp_path_max]u8 = undefined,
+    path_len: u16 = 0,
+    mtime_ns: i128 = 0,
+    size: u64 = 0,
+    exists: bool = false,
+
+    pub fn pathOf(self: *const Stamp) []const u8 {
+        return self.path[0..self.path_len];
+    }
+
+    pub fn sameAs(self: *const Stamp, other: *const Stamp) bool {
+        if (self.exists != other.exists) return false;
+        if (!self.exists) return true; // both missing: unchanged, and that is a fact
+        return self.mtime_ns == other.mtime_ns and self.size == other.size;
+    }
+};
+
+/// Paths are stored in the stamp, not pointed at: the point of a stamp is to
+/// survive the rescan that produced it, and a pointer into the freed previous list
+/// would be a dangling read on the exact path that decides freshness.
+pub const stamp_path_max = std.fs.max_path_bytes;
+
+/// `true` when `path` can be stored (fits in a stamp) and the stamp was filled.
+pub fn stampPath(io: std.Io, path: []const u8, out: *Stamp) bool {
+    out.* = .{};
+    if (path.len == 0 or path.len > stamp_path_max) return false;
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+        // A path that is gone is NOT a failure: it is a fact about the disk, and
+        // `exists = false` is what makes the cache notice the deletion.
+        out.exists = false;
+        return true;
+    };
+    @memcpy(out.path[0..path.len], path);
+    out.path_len = @intCast(path.len);
+    out.mtime_ns = st.mtime.nanoseconds;
+    out.size = st.size;
+    out.exists = true;
+    return true;
+}
+
 /// True once a closing `---` fence has been seen on its own line.
 ///
 /// It is what says "we have everything we need from the head", and the test below
@@ -455,6 +563,127 @@ test "load: un skill sin frontmatter tambien funciona (es markdown y punto)" {
         gpa.free(e.description);
         gpa.free(e.path);
     }
+}
+
+test "roots: el orden es el del shadowing y la ultima raiz es la del usuario" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var root_buf: [256]u8 = undefined;
+    const root = try tmpRoot(&root_buf);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const proj = try skillRootOf(gpa, root, ".zode/skills");
+    const agents = try skillRootOf(gpa, root, ".agents/skills");
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    loader.project_dir = proj;
+    loader.agents_dir = agents;
+
+    var bufs: [store.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [store.max_roots][]const u8 = undefined;
+    const n = loader.roots(&bufs, &paths);
+    // Sin HOME (env = null) las dos son las unicas.
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings(proj, paths[0]);
+    try std.testing.expectEqualStrings(agents, paths[1]);
+
+    // Cada path sobrevive a la llamada siguiente: un unico buffer de scratch
+    // dejaba TODOS apuntando al ultimo escrito (la trampa de `sb.path`).
+    try std.testing.expect(!std.mem.eql(u8, paths[0], paths[1]));
+}
+
+test "roots: con repo_root se anaden sus dos directorios, y el cwd no se repite" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    loader.project_dir = ".zode/skills";
+    loader.agents_dir = ".agents/skills";
+    loader.repo_root = "/home/x/proj";
+
+    var bufs: [store.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [store.max_roots][]const u8 = undefined;
+    const n = loader.roots(&bufs, &paths);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualStrings(".zode/skills", paths[0]);
+    try std.testing.expectEqualStrings(".agents/skills", paths[1]);
+    try std.testing.expectEqualStrings("/home/x/proj/.zode/skills", paths[2]);
+    try std.testing.expectEqualStrings("/home/x/proj/.agents/skills", paths[3]);
+
+    // El cwd YA es la raiz: leer las mismas rutas dos veces seria work sin
+    // resultado, asi que no se anaden.
+    loader.project_dir = "/home/x/proj/.zode/skills";
+    loader.agents_dir = "/home/x/proj/.agents/skills";
+    var bufs2: [store.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths2: [store.max_roots][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), loader.roots(&bufs2, &paths2));
+}
+
+test "scan: .agents/skills tambien se lee, y .zode gana si estan los dos" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var root_buf: [256]u8 = undefined;
+    const root = try tmpRoot(&root_buf);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    // El mismo nombre en las dos: `.zode/skills/shared` gana.
+    try writeFixture(root, ".zode/skills/shared/SKILL.md", "---\ndescription: del propio harness\n---\nbody zode\n");
+    try writeFixture(root, ".agents/skills/shared/SKILL.md", "---\ndescription: del convenio\n---\nbody agents\n");
+    // Y uno solo en `.agents`, que tambien tiene que aparecer.
+    try writeFixture(root, ".agents/skills/solo-agents/SKILL.md", "---\ndescription: solo en agents\n---\nbody\n");
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
+    loader.agents_dir = try skillRootOf(gpa, root, ".agents/skills");
+    var buf: [8]skills.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqualStrings("shared", found[0].name);
+    try std.testing.expectEqualStrings("del propio harness", found[0].description);
+    try std.testing.expectEqualStrings("solo-agents", found[1].name);
+
+    for (found) |e| {
+        gpa.free(e.name);
+        gpa.free(e.description);
+        gpa.free(e.path);
+    }
+}
+
+test "stampPath: un fichero que desaparece se recuerda como ausente" {
+    var root_buf: [256]u8 = undefined;
+    const root = try tmpRoot(&root_buf);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    var rel: [64]u8 = undefined;
+    const rel_path = try std.fmt.bufPrint(&rel, "{s}/SKILL.md", .{root});
+    try writeFixture(root, "SKILL.md", "---\ndescription: x\n---\n");
+
+    var before: store.Stamp = .{};
+    try std.testing.expect(store.stampPath(std.testing.io, rel_path, &before));
+    try std.testing.expect(before.exists);
+
+    var now: store.Stamp = .{};
+    try std.testing.expect(store.stampPath(std.testing.io, rel_path, &now));
+    // Mismo contenido: el stamp compara igual, y por eso la cache no se invalida.
+    try std.testing.expect(before.sameAs(&now));
+
+    try writeFixture(root, "SKILL.md", "---\ndescription: x\n---\ncuerpo nuevo\n");
+    var after: store.Stamp = .{};
+    try std.testing.expect(store.stampPath(std.testing.io, rel_path, &after));
+    try std.testing.expect(!before.sameAs(&after));
+
+    // Y BORRARLO es un cambio, no "no ha pasado nada": si no, el prompt seguiria
+    // ofreciendo un skill cuyo fichero ya no existe.
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var gone: store.Stamp = .{};
+    try std.testing.expect(store.stampPath(std.testing.io, rel_path, &gone));
+    try std.testing.expect(!gone.exists);
+    try std.testing.expect(!after.sameAs(&gone));
 }
 
 test "scan: un directorio que no existe no es un error (0 skills, sin ruido)" {

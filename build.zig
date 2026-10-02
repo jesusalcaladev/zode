@@ -2,21 +2,36 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // ReleaseSafe POR DEFECTO (Fase 5.1/5.2 del ROADMAP).
+    // ReleaseSmall POR DEFECTO.
     //
-    // Antes `zig build` producía un binario Debug: 10.8 MB (el 79 % secciones de
-    // debug), con el `DebugAllocator` en el camino caliente y sin las
-    // comprobaciones de overflow. Medido: ReleaseSafe tal cual 10.78 MB,
-    // ReleaseSafe + strip 2.06 MB, ReleaseSmall 1.12 MB. La app es I/O-bound
-    // (espera red y esperas del usuario), así que la diferencia de velocidad
-    // entre modos es indistinguible y el default correcto es el stripped.
+    // Antes `zig build` producía un binario Debug (10.8 MB, el 79 % secciones de
+    // debug, con el `DebugAllocator` en el camino caliente). Luego se pasó a
+    // ReleaseSafe + strip, y ahora a ReleaseSmall + strip. Medido HOY sobre este
+    // árbol (nm/llvm-size sobre el binario sin strip, y tools/measure.py en pty):
     //
-    // Para el debug de verdad: `zig build -Doptimize=Debug`.
+    //   ReleaseSafe + strip   2.20 MB   (.text 1.82 MB · .rodata 0.51 MB)
+    //   ReleaseSmall + strip  1.34 MB   (.text 0.86 MB · .rodata 0.38 MB)   <--
+    //
+    // Y no cuesta velocidad, al menos en lo que se nota al arrancar: measure.py da
+    // 11 ms / 6.22 MB RSS con ReleaseSafe contra 6 ms / 5.79 MB con ReleaseSmall.
+    // La app es I/O-bound (espera red y esperas del usuario), así que el modo de
+    // optimización casi solo decide cómo de grande queda el fichero.
+    //
+    // EL SUELO, para no volver a medir lo que no depende de nosotros (nm sobre
+    // zode-debug, ReleaseSafe): crypto 509 KB — `std.crypto.tls.Client` manda key
+    // shares de x25519_ml_kem768/secp256r1/secp384r1/x25519 sin opción para
+    // recortarlos, y la verificación de certificados arrastra RSA, P-256, P-384,
+    // ed25519 y SHA-1 — más 185 KB de rodata de las tablas unicode de `uucode` que
+    // entra por `vaxis.gwidth`. Los dos son dependencia (std y vaxis); tocarlos es
+    // un `patch` declarado en build.zig.zon, como 5.7/5.9.
+    //
+    // Para el debug de verdad: `zig build -Doptimize=Debug`, y `-Doptimize=ReleaseSafe`
+    // si alguna vez make falta el binario rápido en vez del pequeño.
     const optimize = b.option(
         std.builtin.OptimizeMode,
         "optimize",
-        "Modo de optimización (default: ReleaseSafe)",
-    ) orelse .ReleaseSafe;
+        "Modo de optimización (default: ReleaseSmall)",
+    ) orelse .ReleaseSmall;
     // Strip is ON by default because it takes the binary from 10.78 MB to 1.89 MB
     // (measured), and zode is I/O-bound so it costs nothing at runtime.
     //
