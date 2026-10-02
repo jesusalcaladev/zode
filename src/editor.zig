@@ -75,6 +75,25 @@ pub const Editor = struct {
         try self.insert(&one);
     }
 
+    /// Deletes bytes [start, end) and leaves the cursor at `start`.
+    ///
+    /// Used by the `@` autocomplete to replace the token being typed with the
+    /// completed path: the replacement must cover ONLY the token, so that
+    /// accepting mid-sentence keeps the rest of the sentence.
+    pub fn deleteRange(self: *Editor, start: usize, end: usize) !void {
+        if (start >= end or end > self.buf.items.len) return error.BadRange;
+        try self.buf.replaceRange(self.gpa, start, end - start, &.{});
+        self.cursor = start;
+        self.hist_idx = -1;
+        self.draft.clearRetainingCapacity();
+        self.recountLines();
+    }
+
+    /// Moves the cursor to a byte offset (clamped to the buffer).
+    pub fn setCursor(self: *Editor, pos: usize) void {
+        self.cursor = @min(pos, self.buf.items.len);
+    }
+
     pub fn clear(self: *Editor) void {
         self.buf.clearRetainingCapacity();
         self.cursor = 0;

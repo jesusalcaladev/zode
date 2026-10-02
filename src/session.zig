@@ -90,6 +90,33 @@ pub const Session = struct {
         if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
     }
 
+    /// Replaces the content of the existing `system` message, or appends one if
+    /// there is none.
+    ///
+    /// It exists because the system prompt now DEPENDS on things that change
+    /// during a session (read-only mode on/off, a skill that appeared on disk).
+    /// Appending a second `system` would be the exact bug the agent loop had
+    /// before: two system messages on the wire, one at the end, and providers
+    /// reject or misread that.
+    ///
+    /// Returns true if it wrote. The JSONL on disk keeps the FIRST system
+    /// message: the file is the record of the session, and rewriting it would
+    /// mean rewriting an append-only log. So `/resume` brings back the original
+    /// prompt and the first request of the resumed session fixes it.
+    pub fn replaceSystem(self: *Session, content: []const u8) !bool {
+        for (self.messages.items) |*m| {
+            if (m.role != .system) continue;
+            const copy = try self.allocator.dupe(u8, content);
+            errdefer self.allocator.free(copy);
+            self.allocator.free(m.content);
+            m.content = copy;
+            m.tool_calls_json = null;
+            return true;
+        }
+        try self.append(.system, content);
+        return true;
+    }
+
     /// Adds a message with tool_calls metadata (assistant).
     pub fn appendAssistant(
         self: *Session,
