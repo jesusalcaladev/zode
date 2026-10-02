@@ -48,6 +48,10 @@ pub const filename = "SKILL.md";
 
 /// Directories, in order. The first one that has a skill wins for that name.
 pub const project_dir = ".zode/skills";
+/// The cross-agent convention, so a skill written for another harness works here
+/// without being copied. It is scanned right after `project_dir` and BEFORE the
+/// user's own: a project's shared skill beats a personal one, same as `.zode`.
+pub const agents_dir = ".agents/skills";
 pub const user_subdir = "zode/skills";
 
 /// Above this a skill is not a skill, it is a document. A 500 KB SKILL.md inlined

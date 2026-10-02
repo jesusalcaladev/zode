@@ -60,6 +60,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     agent.gpa_global = gpa;
     agent.environ_global = env;
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
+    agent.initProjectInfo(io, env); // cwd + repo root, before any prompt is composed
     chat.io_global = io;
     free_auto.attachIo(io); // el reloj de los cooldowns del free-auto
     models.dbg_io = io;
@@ -234,18 +235,20 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
 /// Returns gpa-owned memory. The caller frees it (the `arena` of the run owns it
 /// for the whole process, which is the simplest correct owner here).
 fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.Map) []u8 {
+    // BORROWED, like everywhere else: `discoverSkills` owns the list, and the headless
+    // runner has no teardown of its own to free it in.
     const entries = agent.discoverSkills(a, env);
-    // NOT freed: `discoverSkills` CACHES the slice, so freeing it here would leave
-    // the cache pointing at freed memory. It lives in the run's arena, which dies
-    // with the process.
     var list_buf: [8 * 1024]u8 = undefined;
     const section = skills.systemPromptSection(entries, &list_buf);
+
+    var loc_buf: [512]u8 = undefined;
+    const location = agent.projectInfoPromptLines(&loc_buf);
 
     var sp_buf: [16 * 1024]u8 = undefined;
     const sp = std.fmt.bufPrint(
         &sp_buf,
-        "{s}\n{s}\n{s}",
-        .{ agent.default_system_prompt, ask.guidance, section },
+        "{s}\n{s}\n{s}{s}",
+        .{ agent.default_system_prompt, ask.guidance, section, location },
     ) catch return a.dupe(u8, agent.default_system_prompt) catch "";
     return a.dupe(u8, sp) catch a.dupe(u8, agent.default_system_prompt) catch "";
 }
@@ -293,6 +296,9 @@ fn runTui(init: std.process.Init) !u8 {
     agent.api_key_global = envGet(init.environ_map, "ZODE_API_KEY");
     agent.environ_global = init.environ_map;
     agent.gpa_global = init.gpa;
+    // Before `bootstrapSession` and before anything composes a prompt: the AGENTS.md
+    // and the skills roots are both derived from it.
+    agent.initProjectInfo(io, init.environ_map);
     free_auto.attachIo(io);
     chat.io_global = io;
     chat.dbgInitEnv(init.environ_map);

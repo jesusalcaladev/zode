@@ -24,6 +24,7 @@ const bgproc = @import("bgproc.zig");
 const bench_mod = @import("bench.zig");
 const skills = @import("skills.zig");
 const skillstore = @import("skillstore.zig");
+const project = @import("project.zig");
 const subagent_mod = @import("subagent.zig");
 
 /// Io and API key configured by the TUI at startup.
@@ -34,6 +35,46 @@ pub var gpa_global: std.mem.Allocator = undefined;
 
 // ── system prompt: the project's AGENTS.md (cached) ──────────
 var agents_md_cache: ?[]u8 = null;
+
+/// Where zode is running, resolved ONCE at startup.
+///
+/// Fixed buffers and no lock: the cwd cannot change while zode runs, so this is
+/// written once during `initProjectInfo` and only read afterwards — from the
+/// worker that composes the prompt and from the UI thread that draws `/context`.
+/// That is what makes it safe without a mutex, and also why it is a plain global
+/// rather than a `Model` field (the prompt is composed where there is no model at
+/// hand, which is the trap `io_global` already is).
+var project_info: project.Info = .{};
+
+/// Fills `project_info`, if it has not been filled yet.
+///
+/// Called from the startup path and from tests. Idempotent on purpose: the second
+/// call is a no-op, so a test that points it at a fixture does not leak the real
+/// one into the next test (that would be a test whose result depends on the order
+/// the suite runs in).
+pub fn initProjectInfo(io: std.Io, env: ?*const std.process.Environ.Map) void {
+    if (project_info.cwd_len != 0) return;
+    project.detect(io, env, &project_info);
+}
+
+/// Fills `project_info` from a given directory. For tests only.
+pub fn setProjectInfoForTest(io: std.Io, start: []const u8) void {
+    project.detectAt(io, start, &project_info);
+}
+
+/// `true` when `project_info` has been filled. For tests only.
+pub fn projectInfoReady() bool {
+    return project_info.cwd_len != 0;
+}
+
+/// The cwd + git paragraph, for callers that compose their own prompt.
+///
+/// Exists because the headless runner builds its own (it has no session to sync),
+/// and because the alternative — reaching into `project_info` from `main.zig` — is
+/// how a global turns into something three files depend on.
+pub fn projectInfoPromptLines(out: []u8) []const u8 {
+    return project_info.promptLines(out);
+}
 
 pub const default_system_prompt =
     \\You are zode, a coding agent running inside a terminal harness.
@@ -92,25 +133,82 @@ pub const tool_routing_prompt =
     \\
 ;
 
-/// Skills found on disk, discovered ONCE per process.
+/// Skills found on disk, discovered ONCE and then re-validated by mtime.
 ///
 /// The list is cached because it goes into the system prompt, which is rebuilt
-/// for every request: walking two directories and reading the frontmatter of
-/// every `SKILL.md` on every request would be silly I/O on the hot path. The
-/// BODY is never cached — that is loaded on demand by the `skill` tool, which is
-/// the whole point (see `skills.zig`).
+/// for every request: walking the roots and reading the frontmatter of every
+/// `SKILL.md` on every request would be silly I/O on the hot path. The BODY is
+/// never cached — that is loaded on demand by the `skill` tool, which is the whole
+/// point (see `skills.zig`).
+///
+/// ## The list is BORROWED, and that is the whole ownership story
+///
+/// `scan` allocates the entries AND their strings, and hands ownership to the
+/// caller. So the module owns them, and the callers of `discoverSkills` must NOT
+/// free them. The old code had a `freeSkillEntries` that the caller called with a
+/// `defer`, which freed the cache out from under itself: the second
+/// `syncSystemPrompt` of the session read a freed slice. It did not show up
+/// because the block is usually reused by the next allocation and the list still
+/// "looked" right, and because the test that exercises `buildSystemPrompt` runs in
+/// the repo root, where `.zode/skills` does not exist, so there were no strings to
+/// free at all. Hence: borrowed slice, freed once, at teardown, by the module.
+///
+/// ## Why the mtime check and not "discover once forever"
+///
+/// `buildSystemPrompt`'s own doc comment claims a skill that appears on disk
+/// should be usable without a restart. With a permanent cache that was false. The
+/// check is N `stat`s (one per root, one per known `SKILL.md`) and no reads, which
+/// is nothing next to a request to a model; the expensive half (reading and
+/// parsing frontmatter) only happens when something actually changed.
 var skills_cache: ?[]skills.Entry = null;
+/// `mtime` + size of every path the cached list was built from: the roots and each
+/// `SKILL.md`. A change in any of them invalidates the list.
+var skills_stamps: [skills_stamp_max]skillstore.Stamp = undefined;
+var skills_stamp_len: usize = 0;
+/// Roots + skills. The array is sized from the loader's own caps so the two can
+/// never drift apart.
+const skills_stamp_max = 64 + skillstore.max_roots;
 
-pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []skills.Entry {
-    if (skills_cache) |c| return c;
-    const found = loadSkillsNow(gpa, env);
-    skills_cache = found;
-    return found;
+/// Rescans before the cache is trusted forever.
+///
+/// Bounded on purpose: a `stat` per root and per skill is nothing next to a
+/// request, but the RESCAN reads and parses every frontmatter. A directory whose
+/// mtime changes on every turn (a sync client, a build that rewrites skills) would
+/// pay that on every turn forever. After the cap the cache is trusted as-is, and
+/// `/new` is what picks up a late arrival.
+const skills_rescan_max: usize = 4;
+
+var skills_lock: std.atomic.Mutex = .unlocked;
+var skills_rescans: usize = 0;
+
+/// The skills on disk, or an empty list. BORROWED: do not free.
+///
+/// The lock is held for the whole function, rescan included. `tryLock` in a spin
+/// loop and not `lock`, because this sits on the request path and the critical
+/// section is a handful of `stat`s. Holding it across the rescan is what makes the
+/// swap safe: the old list may be being walked by another thread right now (the
+/// prompt is composed on the worker, `/skills` is drawn on the UI thread), and
+/// that is the exact race the palette had.
+pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []const skills.Entry {
+    while (skills_lock.tryLock()) {}
+    defer skills_lock.unlock();
+
+    if (skills_cache != null and skillsFresh(gpa, env)) return skills_cache.?;
+    if (skills_rescans >= skills_rescan_max) return skills_cache orelse &.{};
+    skills_rescans += 1;
+
+    const fresh = loadSkillsNow(gpa, env);
+    // Freed HERE, after the new list exists and only here. Freeing first would be
+    // a use-after-free of the list a reader is walking.
+    freeSkillsCacheLocked();
+    skills_cache = fresh;
+    stampSkills(gpa, env);
+    return fresh;
 }
 
-/// Walks the two roots right now and allocates the entries.
+/// Walks the roots right now and allocates the entries. The caller owns them.
 fn loadSkillsNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []skills.Entry {
-    var loader = skillstore.Loader.init(gpa, io_global, env);
+    var loader = skillsLoader(gpa, env);
     var buf: [64]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
     const copy = gpa.dupe(skills.Entry, found) catch {
@@ -126,19 +224,114 @@ fn loadSkillsNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) [
     return copy;
 }
 
-/// Frees the entries AND the slice they live in.
+/// The loader, with its roots made ABSOLUTE and pointed at the repository root
+/// when zode was launched below it.
+///
+/// The absolute part is not cosmetic: it is what lets the tests point the loader
+/// at a fixture instead of at the repo of whoever runs the suite, and it removes
+/// any dependence on the process cwd staying put under a caller's feet. In
+/// production `cwd()` IS the process cwd, so the paths are the ones `Dir.cwd()`
+/// would have resolved anyway.
+///
+/// The `repo_root` part is the fix for "cd src && zode sees no skills": the
+/// project's skills live in the root, and git already knows where the root is.
+fn skillsLoader(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) skillstore.Loader {
+    var loader = skillstore.Loader.init(gpa, io_global, env);
+    const proj = &project_info;
+    const cwd = proj.cwd();
+    if (cwd.len == 0) return loader;
+
+    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    loader.project_dir = std.fmt.bufPrint(&bufs[0], "{s}/{s}", .{ cwd, skills.project_dir }) catch loader.project_dir;
+    loader.agents_dir = std.fmt.bufPrint(&bufs[1], "{s}/{s}", .{ cwd, skills.agents_dir }) catch loader.agents_dir;
+
+    // Only when it IS a different directory: pointing the loader at the same path
+    // twice would read every skill twice and dedupe it away, which works but pays
+    // the reads for nothing.
+    if (proj.root()) |root| {
+        if (!std.mem.eql(u8, root, cwd)) loader.repo_root = root;
+    }
+    return loader;
+}
+
+/// Records the mtime + size of every root and every `SKILL.md` that was read.
+fn stampSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
+    skills_stamp_len = 0;
+    var loader = skillsLoader(gpa, env);
+    var bufs: [skillstore.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [skillstore.max_roots][]const u8 = undefined;
+    const root_count = loader.roots(&bufs, &paths);
+    for (paths[0..root_count]) |p| addStamp(p);
+    if (skills_cache) |list| {
+        for (list) |e| addStamp(e.path);
+    }
+}
+
+fn addStamp(path: []const u8) void {
+    if (skills_stamp_len >= skills_stamps.len) return;
+    if (!skillstore.stampPath(io_global, path, &skills_stamps[skills_stamp_len])) return;
+    skills_stamp_len += 1;
+}
+
+/// Are all the paths the cached list was built from exactly as they were?
+///
+/// A DELETED skill counts as a change: it has to disappear from the prompt, and a
+/// missing file is exactly what `stampPath` records as `exists = false`. Treating
+/// "cannot stat" as "nothing changed" would leave the model reading a skill whose
+/// file is gone, and the `skill` tool would then fail on the very name the prompt
+/// just offered.
+fn skillsFresh(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) bool {
+    var loader = skillsLoader(gpa, env);
+    var bufs: [skillstore.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [skillstore.max_roots][]const u8 = undefined;
+    const root_count = loader.roots(&bufs, &paths);
+
+    for (paths[0..root_count]) |p| if (!stampUnchanged(p)) return false;
+    if (skills_cache) |list| {
+        for (list) |e| if (!stampUnchanged(e.path)) return false;
+    }
+    return true;
+}
+
+fn stampUnchanged(path: []const u8) bool {
+    for (skills_stamps[0..skills_stamp_len]) |*st| {
+        if (!std.mem.eql(u8, st.pathOf(), path)) continue;
+        var now: skillstore.Stamp = .{};
+        if (!skillstore.stampPath(io_global, path, &now)) return false;
+        return st.sameAs(&now);
+    }
+    // A path with no stamp is a path we never recorded, which can only happen if
+    // the cap was hit. Not "unchanged": that would silently freeze the list.
+    return false;
+}
+
+/// Frees the cached entries AND the slice they live in.
 ///
 /// Both halves, on purpose: they are two allocations and freeing one without the
-/// other is the leak/give-the-wrong-length pair. The slice is the second argument
-/// position so the caller cannot pass the entries without saying what to do with
-/// the array.
-pub fn freeSkillEntries(gpa: std.mem.Allocator, entries: []skills.Entry) void {
-    for (entries) |e| {
-        gpa.free(e.name);
-        gpa.free(e.description);
-        gpa.free(e.path);
+/// other is the leak/give-the-wrong-length pair.
+///
+/// Called from the teardown and from the rescan, and from NOWHERE else. The slice
+/// is borrowed by `discoverSkills`, so a caller freeing it is a double free of
+/// memory that is still in use. The lock is NOT taken here: `discoverSkills` calls
+/// it while holding it, and `std.atomic.Mutex` is not reentrant (it would hang).
+pub fn freeSkillsCache() void {
+    while (skills_lock.tryLock()) {}
+    defer skills_lock.unlock();
+    freeSkillsCacheLocked();
+}
+
+fn freeSkillsCacheLocked() void {
+    const gpa = gpa_global;
+    if (skills_cache) |list| {
+        for (list) |e| {
+            gpa.free(e.name);
+            gpa.free(e.description);
+            gpa.free(e.path);
+        }
+        gpa.free(list);
+        skills_cache = null;
     }
-    gpa.free(entries);
+    skills_stamp_len = 0;
 }
 
 /// Composes the system prompt for a request.
@@ -153,18 +346,24 @@ pub fn freeSkillEntries(gpa: std.mem.Allocator, entries: []skills.Entry) void {
 ///    page about games" turned into `bash curl`.
 /// 4. Then the ask guidance and the skills section, which are the same for every
 ///    project and go AFTER the user's file so a project can override them.
+/// 5. And the cwd + git line, which is last of all: it is the only piece that
+///    changes when zode is started somewhere else, so putting it at the end means
+///    changing directory does not invalidate the whole stable prefix.
 ///
 /// The caching here is the AGENTS.md file (it does not change while zode runs,
 /// and it is up to 256 KB). The skills section is composed per request into a
 /// caller-provided buffer, because the skills on disk CAN change while zode runs
-/// and a new one appearing should be usable without a restart.
+/// and a new one appearing should be usable without a restart (`discoverSkills`
+/// re-validates by mtime).
 fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process.Environ.Map) []const u8 {
     const base = systemPromptBase(gpa);
     const entries = discoverSkills(gpa, env);
-    defer freeSkillEntries(gpa, entries);
 
     var list_buf: [8 * 1024]u8 = undefined;
     const section = skills.systemPromptSection(entries, &list_buf);
+
+    var loc_buf: [512]u8 = undefined;
+    const location = project_info.promptLines(&loc_buf);
 
     // The routing table goes in its OWN slot, right after the base, and is
     // emitted whether the base came from `AGENTS.md` or from the built-in text.
@@ -181,12 +380,13 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     else
         "";
 
-    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}\n{s}{s}", .{
+    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}\n{s}{s}{s}", .{
         base,
         routing,
         ask.guidance,
         mode_note,
         section,
+        location,
     }) catch return base;
     return composed;
 }
@@ -214,14 +414,40 @@ pub fn syncSystemPrompt(s: *session_mod.Session) void {
 
 /// The user-facing half of the system prompt: their `AGENTS.md` if they have one,
 /// the built-in one if not.
+///
+/// The cwd wins over the repository root, and that ORDER is the design: a
+/// subdirectory with its own `AGENTS.md` is a deliberate, narrower set of
+/// instructions and must not be shadowed by the tree above it.
+///
+/// Two paths, not one, is the fix for `cd src && zode` silently running with no
+/// project instructions at all. Which is the same bug class as the skills roots:
+/// the project lives in the root, and the root is what git already knows.
 fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
     if (agents_md_cache == null) {
         // The user's project AGENTS.md / CLAUDE.md take priority.
-        agents_md_cache = std.Io.Dir.cwd().readFileAlloc(io_global, "AGENTS.md", gpa, .limited(256 * 1024)) catch
-            std.Io.Dir.cwd().readFileAlloc(io_global, "CLAUDE.md", gpa, .limited(256 * 1024)) catch null;
+        agents_md_cache = readAgentsIn(gpa, ".") orelse readAgentsIn(gpa, project_info.root()) orelse null;
     }
     if (agents_md_cache) |c| return c;
     return default_system_prompt;
+}
+
+/// `AGENTS.md` then `CLAUDE.md` under `dir`, or null.
+///
+/// `dir` is a path prefix, so it is `.` for the cwd and the absolute root
+/// otherwise; the two names mean the same thing here, which is why `AGENTS.md`
+/// wins: it is the name the harness docs use.
+fn readAgentsIn(gpa: std.mem.Allocator, dir: ?[]const u8) ?[]u8 {
+    if (dir) |d| {
+        if (readAgentsAt(gpa, d, "AGENTS.md")) |t| return t;
+        return readAgentsAt(gpa, d, "CLAUDE.md");
+    }
+    return null;
+}
+
+fn readAgentsAt(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ?[]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return null;
+    return std.Io.Dir.cwd().readFileAlloc(io_global, path, gpa, .limited(256 * 1024)) catch null;
 }
 
 pub var current_effort: chat.Effort = .medium;
@@ -753,6 +979,10 @@ pub fn shutdownUserConfig() void {
     }
     providers.setSavedKeys(null);
     user_config = .{};
+    // The skills cache is the third arena-like thing in the process and the only
+    // one with heap strings owned by the module. It is BORROWED by everyone, so
+    // this is the one place it can be freed — at exit, with no worker left.
+    freeSkillsCache();
 }
 
 // ── session ───────────────────────────────────────────────────
@@ -1249,6 +1479,13 @@ fn cmdContext(m: *tui.Model) void {
         .{ session_elided, tps_last },
     ) catch "details";
     pushInfoOwned(m, l3);
+
+    // Where the tools are actually reading and writing. It is here and not only in
+    // the prompt because the USER needs it too: "why did it edit that file?" is
+    // answered by the cwd, and without it the answer is a guess.
+    var loc_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const loc = project_info.oneLine(&loc_buf);
+    if (loc.len > 0) pushInfoFmt(m, "  {s}", .{loc});
 
     refreshContextUsage(m);
 }
@@ -5703,6 +5940,173 @@ test "prompt: la guia de routing sobrevive al AGENTS.md del proyecto" {
     const at_base = std.mem.indexOf(u8, composed, "No hagas esto.").?;
     const at_rule = std.mem.indexOf(u8, composed, "NEVER use bash").?;
     try std.testing.expect(at_base < at_rule);
+}
+
+test "prompt: el modelo recibe el cwd y, si hay repo, la rama" {
+    // La pregunta "¿zode trabaja desde la carpeta en la que lo lanzo?" tiene dos
+    // mitades: las tools SI usan el cwd (todo va por `std.Io.Dir.cwd()`), pero el
+    // modelo no lo sabia. Sin esta linea no puede contestar en terminos absolutos
+    // ni notar que se lanzo en un subdirectorio.
+    const saved_io = io_global;
+    const saved_info = project_info;
+    const saved_agents = agents_md_cache;
+    const saved_cache = skills_cache;
+    const saved_stamp_len = skills_stamp_len;
+    const saved_rescans = skills_rescans;
+    defer {
+        io_global = saved_io;
+        project_info = saved_info;
+        agents_md_cache = saved_agents;
+        skills_cache = saved_cache;
+        skills_stamp_len = saved_stamp_len;
+        skills_rescans = saved_rescans;
+    }
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    // Un repo de mentira en /tmp: `sandbox` debajo del cwd esta DENTRO del repo de
+    // zode, y un test de "no hay repositorio" ahi seria falso.
+    const root = "/tmp/zode-prompt-repo-test";
+    std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+    var head_buf: [256]u8 = undefined;
+    const dotgit = try std.fmt.bufPrint(&head_buf, "{s}/.git", .{root});
+    // El `.git` tiene que existir como DIRECTORIO antes de escribir HEAD dentro:
+    // `writeFile` no crea el padre y falla con FileNotFound.
+    try std.Io.Dir.cwd().createDirPath(io_global, dotgit);
+    var head_buf2: [256]u8 = undefined;
+    const head = try std.fmt.bufPrint(&head_buf2, "{s}/HEAD", .{dotgit});
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = head, .data = "ref: refs/heads/mi-rama\n" });
+
+    setProjectInfoForTest(io_global, root);
+    // The repo's own `AGENTS.md` is 119 KB: it would not fit in the 16 KB
+    // composition buffer, `bufPrint` would fail, and `buildSystemPrompt` would
+    // return the base alone — which is the right behaviour, and would make this
+    // test fail for a reason that has nothing to do with the cwd line.
+    agents_md_cache = try std.testing.allocator.dupe(u8, "# proyecto de prueba\n");
+    defer if (agents_md_cache != null and saved_agents == null) std.testing.allocator.free(agents_md_cache.?);
+    skills_cache = null;
+    skills_stamp_len = 0;
+    skills_rescans = 0;
+
+    var out: [16 * 1024]u8 = undefined;
+    const composed = buildSystemPrompt(std.testing.allocator, &out, null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "Working directory:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, root) != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "branch mi-rama") != null);
+    // La guia de routing sigue alli: el cwd no la ha empujado fuera.
+    try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
+    // Y git se nombra por su nombre, para que "que ha cambiado" sea un `git diff`
+    // y no un `ls` con grep.
+    try std.testing.expect(std.mem.indexOf(u8, composed, "git status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "git diff") != null);
+
+    // La cache de skills que este test dejo puesta la libera el `defer`.
+    freeSkillsCacheLocked();
+}
+
+test "prompt: el AGENTS.md del REPO se usa cuando el cwd no tiene el suyo" {
+    // `cd src && zode` era el caso roto: sin AGENTS.md en el cwd, zode se
+    // lanzaba con el prompt built-in y el modelo no tenia ni una instruccion del
+    // proyecto. Ahora la raiz del repo es el segundo sitio donde se busca.
+    //
+    // Se prueba `readAgentsIn` y no `buildSystemPrompt` a proposito: la suite se
+    // ejecuta en la raiz de zode, donde HAY un `AGENTS.md`, y la regla "el cwd
+    // gana" lo haria aparecer en el prompt composed enmascarando el del fixture.
+    // La regla del cwd tiene su propio sitio (es la primera rama del `orelse`).
+    const saved_io = io_global;
+    defer io_global = saved_io;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    const root = "/tmp/zode-agents-repo-test";
+    std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_global, root);
+
+    var agents_buf: [256]u8 = undefined;
+    const agents = try std.fmt.bufPrint(&agents_buf, "{s}/AGENTS.md", .{root});
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = agents, .data = "REGLA DEL REPO" });
+
+    const got = readAgentsIn(std.testing.allocator, root) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "REGLA DEL REPO") != null);
+
+    // Y un directorio sin ninguno de los dos nombres NO es un error (devuelve
+    // null, que es como el `orelse` encadena el siguiente sitio).
+    try std.testing.expect(readAgentsIn(std.testing.allocator, "/tmp") == null);
+    try std.testing.expect(readAgentsIn(std.testing.allocator, null) == null);
+}
+
+test "skills: la lista se invalida cuando un SKILL.md cambia en disco" {
+    // El bug: `discoverSkills` cacheaba para todo el proceso, asi que un skill
+    // creado durante la sesion no aparecia hasta reiniciar, y el comentario de
+    // `buildSystemPrompt` decia lo contrario. Ahora hay mtime, y este test lo
+    // comprueba con ficheros de verdad.
+    const saved_io = io_global;
+    const saved_info = project_info;
+    const saved_gpa = gpa_global;
+    const saved_cache = skills_cache;
+    const saved_stamp_len = skills_stamp_len;
+    const saved_rescans = skills_rescans;
+    defer {
+        io_global = saved_io;
+        project_info = saved_info;
+        gpa_global = saved_gpa;
+        skills_cache = saved_cache;
+        skills_stamp_len = saved_stamp_len;
+        skills_rescans = saved_rescans;
+    }
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+
+    const root = "/tmp/zode-skills-mtime-test";
+    std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+    var skill_dir: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&skill_dir, "{s}/.zode/skills/nuevo", .{root});
+    try std.Io.Dir.cwd().createDirPath(io_global, dir);
+    defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+
+    // CWD = root, para que el repo root no anada raices de sobra.
+    setProjectInfoForTest(io_global, root);
+    skills_cache = null;
+    skills_stamp_len = 0;
+    skills_rescans = 0;
+
+    // 1) Todavia no hay ningun skill.
+    var env_map: std.process.Environ.Map = undefined;
+    _ = &env_map;
+    const empty = discoverSkills(std.testing.allocator, null);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    // 2) Aparece uno. El `stat` del root ha cambiado, asi que tiene que aparecer
+    //    sin reiniciar nada.
+    var skill_file: [512]u8 = undefined;
+    const skill_path = try std.fmt.bufPrint(&skill_file, "{s}/SKILL.md", .{dir});
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = skill_path, .data = "---\ndescription: recien creado\n---\nbody\n" });
+
+    const found = discoverSkills(std.testing.allocator, null);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqualStrings("nuevo", found[0].name);
+    try std.testing.expectEqualStrings("recien creado", found[0].description);
+
+    // 3) Y la lista es PRESTADA: volver a pedirla sin cambios no libera nada (si
+    //    el llamante laoneyera, esto seria un doble free de memoria viva).
+    const again = discoverSkills(std.testing.allocator, null);
+    try std.testing.expectEqual(@as(usize, 1), again.len);
+    try std.testing.expectEqualStrings("nuevo", again[0].name);
+
+    // El estado global se deja como estaba para el siguiente test, y la lista se
+    // LIBERA de verdad: es memoria de `std.testing.allocator` y el teardown del
+    // proceso no llega en un test.
+    freeSkillsCacheLocked();
+    skills_rescans = saved_rescans;
 }
 
 test "tools: `ask`, `skill`, `bash_output` y `bash_kill` NO piden permiso" {
