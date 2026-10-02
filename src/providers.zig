@@ -10,8 +10,18 @@ pub const ProviderDef = struct {
     /// Environment variables holding the API key, in order of preference.
     /// The first non-empty one wins; "" = needs no key.
     key_env: []const []const u8,
-    /// Default model for this provider.
-    default_model: []const u8,
+    /// The model to use when the user has NOT chosen one.
+    ///
+    /// It is a LAST RESORT and not a promise: a name hardcoded here is a bomb
+    /// with a timer, because the day a provider retires it, EVERY request starts
+    /// failing with a 403 that says nothing about why. So it is only reached after
+    /// asking the provider what its catalogue actually contains (see
+    /// `agent.resolveModel`), and every provider without one leaves it EMPTY: an
+    /// empty field is what makes zode ask instead of guessing.
+    ///
+    /// It is also not what the status bar shows as "the" model once something has
+    /// been chosen, obviously.
+    default_model: []const u8 = "",
     /// Short description for the picker.
     note: []const u8 = "",
     /// Whether the provider exposes pricing/context in /models.
@@ -25,8 +35,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://opencode.ai/inference/openai/v1",
         .models_url = "https://opencode.ai/inference/v1/models",
         .key_env = &.{ "ZODE_OPENCODE_KEY", "ZODE_API_KEY" },
-        .default_model = "space-bunny-free",
-        .note = "solo space-bunny-free responde: el resto del free tier exige el cliente oficial",
+        .note = "el free tier exige el cliente oficial: /model o /free-auto",
     },
     .{
         .id = "openrouter",
@@ -34,7 +43,6 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://openrouter.ai/api/v1",
         .models_url = "https://openrouter.ai/api/v1/models",
         .key_env = &.{"ZODE_OPENROUTER_KEY"},
-        .default_model = "openrouter/auto",
         .note = "catálogo grande · contexto y precios por modelo",
         .has_pricing = true,
     },
@@ -44,7 +52,6 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.anthropic.com/v1",
         .models_url = "https://api.anthropic.com/v1/models",
         .key_env = &.{"ZODE_ANTHROPIC_KEY"},
-        .default_model = "claude-sonnet-4-5",
         .note = "Messages API nativa con prompt caching",
     },
     .{
@@ -53,7 +60,6 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.openai.com/v1",
         .models_url = "https://api.openai.com/v1/models",
         .key_env = &.{ "ZODE_OPENAI_KEY", "ZODE_API_KEY" },
-        .default_model = "gpt-5",
         .note = "usa max_completion_tokens y reasoning_effort",
     },
     .{
@@ -62,7 +68,6 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.groq.com/openai/v1",
         .models_url = "https://api.groq.com/openai/v1/models",
         .key_env = &.{"ZODE_GROQ_KEY"},
-        .default_model = "moonshotai/kimi-k2-instruct",
         .note = "muy baja latencia",
     },
     .{
@@ -71,7 +76,6 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.deepseek.com/v1",
         .models_url = "https://api.deepseek.com/v1/models",
         .key_env = &.{"ZODE_DEEPSEEK_KEY"},
-        .default_model = "deepseek-chat",
         .note = "razonamiento económico",
     },
     .{
@@ -80,7 +84,6 @@ pub const defs = [_]ProviderDef{
         .base_url = "http://localhost:11434/v1",
         .models_url = "http://localhost:11434/v1/models",
         .key_env = &.{},
-        .default_model = "qwen3-coder",
         .note = "sin key · overrides por config.json",
     },
 };
@@ -184,4 +187,21 @@ test "keyFor: sin nada devuelve null" {
     const def = byId("anthropic").?;
     try std.testing.expect(keyFor(def, null) == null);
     try std.testing.expect(!hasKey(def, null));
+}
+
+test "ningun provider compilado trae un modelo por defecto" {
+    // La razon de que el campo exista y este VACIO en todos: un nombre de modelo
+    // escrito en el codigo es una bomba de relojería. Cuando el provider lo retira
+    // (que es lo que paso con `kimi-k2.6`, y dejo TODAS las peticiones en 403 sin
+    // explicacion), zode no tiene ni donde mirar: solo puede preguntarle al
+    // provider. Con el campo vacio, pregunta.
+    //
+    // Un provider de usuario SI puede traer uno (esta en su config.json, que el
+    // Dueño puede cambiar cuando quiera); los compilados, no.
+    for (&defs) |d| {
+        if (d.default_model.len != 0) {
+            std.debug.print("provider {s} tiene default_model = \"{s}\"\n", .{ d.id, d.default_model });
+            return error.TestUnexpectedResult;
+        }
+    }
 }

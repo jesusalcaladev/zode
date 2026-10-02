@@ -12,6 +12,7 @@ const palette = @import("palette.zig");
 const plan_mod = @import("plan.zig");
 const checkpoint = @import("checkpoint.zig");
 const bgproc = @import("bgproc.zig");
+const readcache = @import("readcache.zig");
 const bench_mod = @import("bench.zig");
 const models_mod = @import("models.zig");
 const zjsonl = @import("zjsonl.zig");
@@ -635,6 +636,14 @@ pub const Model = struct {
     /// Background jobs (see `bgproc.zig`): id, how many were started, whether
     /// ESC has been pressed since the last one.
     bg: bgproc.Registry = .{},
+    /// Which files the agent has already read, and which of those are STILL in the
+    /// context (see `readcache.zig`).
+    ///
+    /// In the `Model` and not a module global for the same reason as `bg`: the
+    /// tests build their own `Model`s, and two of them must not share a cache that
+    /// says "you already have this file". Fixed buffers inside, so there is
+    /// nothing to deinit.
+    reads: readcache.Cache = .{},
     /// Bench counters for `/bench`.
     bench: bench_mod.Stats = .{},
 

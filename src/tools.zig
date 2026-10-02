@@ -3,6 +3,7 @@ const plan_mod = @import("plan.zig");
 const http = @import("http_client.zig");
 const web = @import("web.zig");
 const bgproc = @import("bgproc.zig");
+const readcache = @import("readcache.zig");
 
 pub const max_tool_output = 16 * 1024; // output budget per tool
 
@@ -55,7 +56,7 @@ pub fn isParallelSafe(name: []const u8) bool {
 pub fn toolsJson() []const u8 {
     return
     \\[
-    \\{"type":"function","function":{"name":"read","description":"Read a file from disk. Optionally read a specific line range with offset/limit.","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"read","description":"Read a file from disk. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, or several at once via edits:[{old_string,new_string},...] (applied in order, all validated first). old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
@@ -119,19 +120,25 @@ pub fn needsPermission(name: []const u8) bool {
 /// in the background then gets an error that says exactly that instead of
 /// silently running in the foreground (which would look like `run_in_background`
 /// works).
+///
+/// `cache` is the read cache, for the same reason and with the same shape: it
+/// lives in the `Model`, `read` runs in parallel with other reads so the lock is
+/// inside the cache, and `null` (which is what the tests pass) means every read
+/// sends its body as always — the behaviour we want to be able to test both ways.
 pub fn execute(
     io: std.Io,
     name: []const u8,
     args_json: []const u8,
     arena: std.mem.Allocator,
     bg: ?*bgproc.Registry,
+    cache: ?*readcache.Cache,
 ) ![]const u8 {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
     if (parsed != .object) return error.BadArgs;
     const obj = parsed.object;
 
     if (std.mem.eql(u8, name, "read")) {
-        return toolRead(io, obj, arena);
+        return toolRead(io, obj, arena, cache);
     } else if (std.mem.eql(u8, name, "write")) {
         return toolWrite(io, obj, arena);
     } else if (std.mem.eql(u8, name, "edit")) {
@@ -236,17 +243,110 @@ fn toolBashKill(
 }
 
 // ── read ─────────────────────────────────────────────────────
-fn toolRead(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+
+/// Line numbers past this are not worth caching precisely. Nothing real gets
+/// there, and the point of the cap is to keep the arithmetic in `usize` until the
+/// very last step, not to be right about a 4-million-line generated file.
+const read_line_cap: u32 = 1 << 22;
+
+/// `read`, with the cache.
+///
+/// The shape is: ask the cache with a `stat` first (cheap, no read at all), and
+/// only read the bytes when it cannot answer. Three outcomes, and the order
+/// matters because each one is cheaper and more certain than the next:
+///
+/// 1. same inode+mtime+size AND those lines were already sent → the content is
+///    in the model's context, so say so in five lines instead of sending it;
+/// 2. the cache has seen the file but the stat moved → read it and compare the
+///    HASH, because a moved mtime does not mean changed content (`git checkout`,
+///    `cp -p`) and an unchanged mtime does not mean unchanged content (same
+///    second, same length);
+/// 3. otherwise send the body as always.
+fn toolRead(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator, cache: ?*readcache.Cache) ![]const u8 {
     const path = getStr(obj, "path") orelse return error.MissingPath;
     const offset: usize = if (getInt(obj, "offset")) |o| (if (o > 0) @intCast(o) else 1) else 1;
     const default_limit: usize = 2000;
     const limit: usize = if (getInt(obj, "limit")) |l| (if (l > 0) @intCast(l) else default_limit) else default_limit;
+    // The escape hatch, and it is NOT optional. A cache that says "you already
+    // have this" when it is wrong leaves the model with no way to get the file
+    // back, and it cannot argue its way out of a tool result. One boolean in the
+    // schema is cheaper than a turn lost.
+    const force = getBool(obj, "force");
 
     var dir = std.Io.Dir.cwd();
-    const data = dir.readFileAlloc(io, path, arena, .limited(8 * 1024 * 1024)) catch |err| {
+    const first_line: u32 = @intCast(@min(offset, read_line_cap));
+    const last_line: u32 = @intCast(@min(offset + limit, read_line_cap));
+
+    if (cache) |c| {
+        if (!force) {
+            if (dir.statFile(io, path, .{})) |st| {
+                switch (c.check(path, st, first_line, last_line)) {
+                    .already_sent => |sent| return unchangedNote(arena, path, sent.lines),
+                    .read_then_decide => |prev| {
+                        const data = try readAll(arena, io, path);
+                        const hash = readcache.hashBytes(data);
+                        const lines: u32 = @intCast(@min(lineCount(data), read_line_cap));
+                        // Same bytes, different timestamp: the model DOES have
+                        // these lines, they are the ones it read before, and only
+                        // the stat is stale. So refresh it and answer short.
+                        //
+                        // `covers` is part of the condition and NOT an
+                        // afterthought: the cache is per RANGE. Same content with
+                        // a wider request ("I had read lines 1-2, now give me the
+                        // whole file") has to send the whole file, and answering
+                        // "unchanged" there is a lie about lines the model never
+                        // got. The test that pins it is "un rango que no se ha
+                        // leido SI se manda".
+                        if (prev.in_context and prev.hash == hash and c.coversRangeOf(path, first_line, last_line)) {
+                            const saved: usize = @intCast(@min(data.len, readcache.max_saved));
+                            c.confirmUnchanged(path, st, first_line, last_line, saved);
+                            return unchangedNote(arena, path, lines);
+                        }
+                        const out = try formatBody(arena, path, data, offset, limit);
+                        c.record(path, st, hash, first_line, last_line, lines);
+                        return out;
+                    },
+                }
+            } else |_| {
+                // No `stat`: no fast path. The read below produces the real error,
+                // which says more than a cache miss would.
+            }
+        }
+    }
+
+    const data = try readAll(arena, io, path);
+    return formatBody(arena, path, data, offset, limit);
+}
+
+fn readAll(arena: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    var dir = std.Io.Dir.cwd();
+    return dir.readFileAlloc(io, path, arena, .limited(8 * 1024 * 1024)) catch |err| {
         return std.fmt.allocPrint(arena, "error reading {s}: {t}", .{ path, err });
     };
+}
 
+/// The answer when the file is already in the context.
+///
+/// It says three things, and each one is there because of a specific way this
+/// goes wrong without it: that the content is STILL THERE (so the model does not
+/// re-read it out of anxiety), that it can get it back anyway (`force`), and what
+/// it is being told NO rather than handed nothing.
+fn unchangedNote(arena: std.mem.Allocator, path: []const u8, lines: u32) ![]const u8 {
+    return std.fmt.allocPrint(arena,
+        \\unchanged: {s} — {d} lines, byte-identical to the content already in your
+        \\context, so it is not repeated here. It is still above you in this
+        \\conversation: quote from it, or read it again with {{"force": true}} if you
+        \\genuinely need the text again.
+    , .{ path, lines });
+}
+
+/// The body, numbered, with the truncation notice.
+///
+/// `path` is only for the error string the caller may return; the body itself
+/// says nothing about the file, because the header above it in the history
+/// already says it.
+fn formatBody(arena: std.mem.Allocator, path: []const u8, data: []const u8, offset: usize, limit: usize) ![]const u8 {
+    _ = path;
     var out: std.ArrayList(u8) = .empty;
     var line_no: usize = 1;
     var lines_shown: usize = 0;
@@ -262,7 +362,7 @@ fn toolRead(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
         }
         // Truncate huge (minified) lines to 2000 chars.
         const shown = line[0..@min(line.len, 2000)];
-        out.print(arena, "{d: >6}│ {s}\n", .{ line_no, shown }) catch break;
+        out.print(arena, "{d: >6}| {s}\n", .{ line_no, shown }) catch break;
         lines_shown += 1;
     }
     if (truncated) {
@@ -1082,7 +1182,7 @@ test "needsPermission" {
 test "list_files lista este src" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "list_files", "{\"path\":\"src\"}", arena_state.allocator(), null);
+    const out = try execute(std.testing.io, "list_files", "{\"path\":\"src\"}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "f main.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "f tools.zig") != null);
 }
@@ -1090,7 +1190,7 @@ test "list_files lista este src" {
 test "think devuelve OK sin efectos" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "think", "{\"thought\":\"plan: read file first\"}", arena_state.allocator(), null);
+    const out = try execute(std.testing.io, "think", "{\"thought\":\"plan: read file first\"}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "noted") != null);
 }
 
@@ -1133,21 +1233,21 @@ test "web_fetch y web_search aparecen en el JSON con su descripción" {
 test "web_fetch rechaza lo que no es http(s) sin tocar la red" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "web_fetch", "{\"url\":\"file:///etc/passwd\"}", arena_state.allocator(), null);
+    const out = try execute(std.testing.io, "web_fetch", "{\"url\":\"file:///etc/passwd\"}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "only http:// and https://") != null);
 }
 
 test "web_fetch sin url lo dice" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "web_fetch", "{}", arena_state.allocator(), null);
+    const out = try execute(std.testing.io, "web_fetch", "{}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "needs a `url`") != null);
 }
 
 test "web_search sin query lo dice" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "web_search", "{}", arena_state.allocator(), null);
+    const out = try execute(std.testing.io, "web_search", "{}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "needs a `query`") != null);
 }
 
@@ -1189,7 +1289,7 @@ fn isNetError(err: anyerror) bool {
 test "web_fetch real: el HTML llega como texto, no como etiquetas" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = execute(std.testing.io, "web_fetch", "{\"url\":\"https://example.com/\"}", arena_state.allocator(), null) catch |err| {
+    const out = execute(std.testing.io, "web_fetch", "{\"url\":\"https://example.com/\"}", arena_state.allocator(), null, null) catch |err| {
         if (isNetError(err)) return error.SkipZigTest;
         return err;
     };
@@ -1207,7 +1307,7 @@ test "web_fetch real: el HTML llega como texto, no como etiquetas" {
 test "web_search real: devuelve resultados con URL" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = execute(std.testing.io, "web_search", "{\"query\":\"zig programming language\",\"max_results\":3}", arena_state.allocator(), null) catch |err| {
+    const out = execute(std.testing.io, "web_search", "{\"query\":\"zig programming language\",\"max_results\":3}", arena_state.allocator(), null, null) catch |err| {
         if (isNetError(err)) return error.SkipZigTest;
         return err;
     };
@@ -1221,21 +1321,21 @@ test "tool read lee este archivo" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const args = "{\"path\":\"src/tools.zig\"}";
-    const out = try execute(std.testing.io, "read", args, arena_state.allocator(), null);
+    const out = try execute(std.testing.io, "read", args, arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "toolRead") != null);
 }
 
 test "glob encuentra zigs" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "glob", "{\"pattern\":\"src/*.zig\"}", arena_state.allocator(), null);
+    const out = try execute(std.testing.io, "glob", "{\"pattern\":\"src/*.zig\"}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "src/main.zig") != null);
 }
 
 test "grep nativo encuentra patrón" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = execute(std.testing.io, "grep", "{\"pattern\":\"toolGrep\",\"subdir\":\"src\"}", arena_state.allocator(), null) catch |err| {
+    const out = execute(std.testing.io, "grep", "{\"pattern\":\"toolGrep\",\"subdir\":\"src\"}", arena_state.allocator(), null, null) catch |err| {
         if (err == error.FileNotFound) return error.SkipZigTest; // no rg/grep in PATH
         return err;
     };
@@ -1258,7 +1358,7 @@ test "write devuelve un PREVIEW del fichero, no un OK opaco" {
     }
     try body.appendSlice(arena, "\"}");
 
-    const out = try execute(std.testing.io, "write", body.items, arena, null);
+    const out = try execute(std.testing.io, "write", body.items, arena, null, null);
 
     // La cabecera dice qué y cuánto.
     try std.testing.expect(std.mem.indexOf(u8, out, "preview-test.txt") != null);
@@ -1270,4 +1370,179 @@ test "write devuelve un PREVIEW del fichero, no un OK opaco" {
     // Pero NO el fichero entero: se corta, y se dice cuántas líneas faltan.
     try std.testing.expect(std.mem.indexOf(u8, out, "linea 12\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "more lines") != null);
+}
+
+// ── la cache de lecturas, probada a traves de la tool ────────
+//
+// La cache vive en `readcache.zig` y ahi se prueba la tabla. Estos tests son de
+// otro tipo: prueban que la TOOL responde corto, que el texto que recibe el
+// modelo es el que puede, y que el `force` existe. Un modulo bien probado al que
+// la tool no le pase la cache no ahorra un solo token.
+
+fn writeTmp(arena: std.mem.Allocator, path: []const u8, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena,
+        \\{{"path":"{s}","content":"{s}"}}
+    , .{ path, body });
+}
+
+test "read: la SEGUNDA lectura de lo mismo no repite el fichero" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    const path = "/tmp/opencode/readcache-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "primera linea\nsegunda linea\ntercera linea\n",
+    });
+
+    var args = try writeTmp(arena, path, "");
+    args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+
+    const first = try execute(std.testing.io, "read", args, arena, null, &cache);
+    // La primera manda el cuerpo: es la que lo mete en el contexto.
+    try std.testing.expect(std.mem.indexOf(u8, first, "primera linea") != null);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats.hits);
+
+    const second = try execute(std.testing.io, "read", args, arena, null, &cache);
+    // La segunda NO: dice que no ha cambiado y que sigue arriba.
+    try std.testing.expect(std.mem.indexOf(u8, second, "unchanged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "primera linea") == null);
+    // Y lo dice de forma USABLE: donde está y cómo volver a pedirlo.
+    try std.testing.expect(std.mem.indexOf(u8, second, path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "force") != null);
+    // Y son cuatro lineas de las que el modelo no ha vuelto a pagar.
+    try std.testing.expect(second.len < 400);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats.hits);
+    try std.testing.expect(cache.stats.saved > 0);
+}
+
+test "read: si el fichero cambia, se vuelve a mandar entero" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    const path = "/tmp/opencode/readcache-change-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "version uno\n",
+    });
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+    _ = try execute(std.testing.io, "read", args, arena, null, &cache);
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "version dos, y es distinto\n",
+    });
+    const after = try execute(std.testing.io, "read", args, arena, null, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, after, "version dos") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "unchanged") == null);
+}
+
+test "read: el mismo contenido con otra marca de tiempo NO se re-manda" {
+    // Un `touch` o un `git checkout` mueven el mtime sin tocar el contenido. Si
+    // aqui se re-mandara el cuerpo, la cache solo serviria para el caso facil.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    const path = "/tmp/opencode/readcache-touch-test.txt";
+    const body = "contenido estable\n";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = body });
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+    _ = try execute(std.testing.io, "read", args, arena, null, &cache);
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = body });
+    // Con el mtime nuevo el fast path ya no acierta, asi que se lee y se compara
+    // el hash: y aqui es donde se gana el segundo turno.
+    const again = try execute(std.testing.io, "read", args, arena, null, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, again, "unchanged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "contenido estable") == null);
+}
+
+test "read: force:true lo devuelve todo aunque no haya cambiado" {
+    // El escape hatch. Sin el, un acierto falso del cache deja al modelo sin
+    // manera de conseguir el fichero, y no puede argumentar su salida de un
+    // tool result.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    const path = "/tmp/opencode/readcache-force-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "contenido que se quiere otra vez\n",
+    });
+    const plain = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+    _ = try execute(std.testing.io, "read", plain, arena, null, &cache);
+
+    const forced = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"force\":true}}", .{path});
+    const out = try execute(std.testing.io, "read", forced, arena, null, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, out, "contenido que se quiere otra vez") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
+}
+
+test "read: un rango que no se ha leido SI se manda" {
+    // La cache es de RANGOS, no de ficheros: haber leido 1-100 no dice nada
+    // sobre 500-600, y mandar "unchanged" ahi seria mentira.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    const path = "/tmp/opencode/readcache-range-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "uno\ndos\ntres\n" });
+    const first = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"limit\":1}}", .{path});
+    _ = try execute(std.testing.io, "read", first, arena, null, &cache);
+
+    const wide = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+    const out = try execute(std.testing.io, "read", wide, arena, null, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tres") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
+}
+
+test "read: invalidate manda el contenido nuevo aunque el stat no se mueva" {
+    // Lo que hace `write`/`edit` por detras: sin esto, editar un fichero y
+    // volverlo a leer daria el texto viejo con un "unchanged" por delante.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    const path = "/tmp/opencode/readcache-invalidate-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "antes de editar\n" });
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+    _ = try execute(std.testing.io, "read", args, arena, null, &cache);
+
+    cache.invalidate(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "despues de editar\n" });
+    const out = try execute(std.testing.io, "read", args, arena, null, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, out, "despues de editar") != null);
+}
+
+test "read: markDroppedAt deshace el cache cuando la compaction se lleva el resultado" {
+    // El final de la historia: la compaction puede borrar del cable el resultado
+    // de un `read`. Si la cache no se enterase, el modelo receberia "unchanged,
+    // ya lo tienes" sobre un contenido que ya no tiene.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    const path = "/tmp/opencode/readcache-dropped-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "contenido que se perdio\n" });
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+    _ = try execute(std.testing.io, "read", args, arena, null, &cache);
+    cache.setMessageIndex(path, 9);
+    try std.testing.expectEqual(@as(usize, 1), cache.liveEntries());
+
+    // La compaction se lleva el mensaje 9.
+    cache.markDroppedAt(9);
+    const out = try execute(std.testing.io, "read", args, arena, null, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, out, "contenido que se perdio") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
 }
