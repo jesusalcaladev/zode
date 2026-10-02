@@ -14,6 +14,9 @@ const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
 const compaction_mod = @import("compaction.zig");
 const mascot = @import("mascot.zig");
+const bgproc = @import("bgproc.zig");
+const skills = @import("skills.zig");
+const ask = @import("ask.zig");
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = map orelse return null;
@@ -78,11 +81,41 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     const arena = arena_state.allocator();
 
     var msgs: std.ArrayList(chat.ChatMessage) = .empty;
-    try msgs.append(arena, .{ .role = "system", .content = agent.default_system_prompt });
-    try msgs.append(arena, .{ .role = "user", .content = text });
+    // The `arena`, not the `gpa`: this text lives as long as the conversation
+    // does, and the arena dies at the end of the run. With `gpa` it was a leak
+    // per process (the DebugAllocator says so on exit, which is how it showed up).
+    try msgs.append(arena, .{ .role = "system", .content = headlessSystemPrompt(arena, env) });
+    // `@file` mentions work in headless too: the TUI expands them in
+    // `runOneTurn` (`withMentions`), but this runner sent the raw text, so
+    // `zode --chat "explain @src/foo.zig"` made the model answer "I don't have
+    // the file". Expanded HERE, on the session's own text, because the headless
+    // runner has no per-iteration arena like `runOneTurn` has.
+    const mentions_mod = @import("mentions.zig");
+    const expanded = mentions_mod.expand(arena, io, text) catch
+        mentions_mod.Expansion{ .text = text, .files = 0, .missing = 0 };
+    try msgs.append(arena, .{ .role = "user", .content = expanded.text });
 
-    const effort: chat.Effort = if (envGet(env, "ZODE_EFFORT")) |e| (chat.Effort.parse(e) orelse .medium) else .medium;
+    // The headless runner gets a background registry too, so `run_in_background`
+    // works there instead of erroring out. The registry is freed on exit, which
+    // also kills anything still running: a `zode --chat` that exits with an
+    // orphaned build writing to a closed pipe is worse than waiting.
+    var bg = bgproc.Registry{};
+    defer bg.deinit(io, gpa);
+
     const model_name = envGet(env, "ZODE_MODEL") orelse def.default_model;
+
+    // El effort sale del MODELO, no de un `.medium` fijo: si `ZODE_EFFORT` no
+    // esta, se pide el default de la escalera que tenga ese modelo. Y lo que
+    // llega de la variable se ajusta a esa escalera, para que
+    // `ZODE_EFFORT=xhigh` contra un `gemini-2.5` no mande un nivel que no
+    // existe.
+    const effort_pref: chat.Effort = chat.clampEffort(
+        model_name,
+        if (envGet(env, "ZODE_EFFORT")) |e|
+            chat.Effort.parse(e) orelse chat.defaultEffort(model_name)
+        else
+            chat.defaultEffort(model_name),
+    );
 
     const body_buf = try gpa.alloc(u8, 256 * 1024);
     defer gpa.free(body_buf);
@@ -113,7 +146,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                         key,
                         kind,
                         model_name,
-                        effort,
+                        effort_pref,
                         cur[sum_from..upto],
                         arena,
                     )) |s| {
@@ -135,7 +168,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             msgs.clearRetainingCapacity();
             try msgs.appendSlice(arena, cur);
         }
-        const body = chat.buildBodyMessages(body_buf, model_name, msgs.items, effort, tools_mod.toolsJson(), kind) catch return error.BodyTooBig;
+        const body = chat.buildBodyMessages(body_buf, model_name, msgs.items, effort_pref, tools_mod.toolsJson(), kind) catch return error.BodyTooBig;
 
         const Cb = struct {
             fn onDelta(_: ?*anyopaque, delta: []const u8) void {
@@ -170,7 +203,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         try msgs.append(arena, .{ .role = "assistant", .content = "", .tool_calls_json = tc_json });
         for (result.ctx.parts.items) |*p| {
             models.dbg("\n[tool {s}] {s}\n", .{ p.name.items, p.args.items });
-            const res = tools_mod.execute(io, p.name.items, p.args.items, arena) catch |err| {
+            const res = execHeadless(io, &bg, p.name.items, p.args.items, arena) catch |err| {
                 try msgs.append(arena, .{
                     .role = "tool",
                     .content = try std.fmt.allocPrint(arena, "error: {t}", .{err}),
@@ -188,6 +221,48 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     }
     models.dbg("\n[iteration limit]\n", .{});
     return 0;
+}
+
+/// The headless system prompt: the default one plus the ask guidance, and the
+/// skills section when the project has any.
+///
+/// Built per run and freed by the caller (a `const` string literal cannot carry
+/// the skill list, which depends on what is on disk). `ask.guidance` goes in even
+/// though the headless runner refuses `ask`: the guidance is about WHEN to
+/// consider a question, and `task` returns "the user has to decide X" to the main
+/// agent, which is the same decision arriving through a different door.
+/// Returns gpa-owned memory. The caller frees it (the `arena` of the run owns it
+/// for the whole process, which is the simplest correct owner here).
+fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.Map) []u8 {
+    const entries = agent.discoverSkills(a, env);
+    // NOT freed: `discoverSkills` CACHES the slice, so freeing it here would leave
+    // the cache pointing at freed memory. It lives in the run's arena, which dies
+    // with the process.
+    var list_buf: [8 * 1024]u8 = undefined;
+    const section = skills.systemPromptSection(entries, &list_buf);
+
+    var sp_buf: [16 * 1024]u8 = undefined;
+    const sp = std.fmt.bufPrint(
+        &sp_buf,
+        "{s}\n{s}\n{s}",
+        .{ agent.default_system_prompt, ask.guidance, section },
+    ) catch return a.dupe(u8, agent.default_system_prompt) catch "";
+    return a.dupe(u8, sp) catch a.dupe(u8, agent.default_system_prompt) catch "";
+}
+
+/// `tools_mod.execute` plus the background registry.
+///
+/// A thin wrapper and not a change to the signature of `execute`: the registry
+/// lives in the `Model` in the TUI, and a headless run has none, so it is passed
+/// as a parameter that only the caller knows about.
+fn execHeadless(
+    io: std.Io,
+    bg: *bgproc.Registry,
+    name: []const u8,
+    args: []const u8,
+    arena: std.mem.Allocator,
+) ![]const u8 {
+    return tools_mod.execute(io, name, args, arena, bg);
 }
 
 /// TUI mode: zode (no args)

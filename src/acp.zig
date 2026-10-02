@@ -446,17 +446,21 @@ pub const Client = struct {
             const got = try self.pump(sink);
             if (got == .line) continue;
             if (got == .would_block) {
-                // 30 ms is imperceptible and does not burn CPU (it is the same
-                // order as the spinner's 40 ms tick).
+                // 10 ms: every chunk the agent writes can sit in the pipe for
+                // up to one poll, so this number IS the streaming latency
+                // floor. 30 ms was chosen "because it is imperceptible", but
+                // it stacks with the agent's own buffering and made the stream
+                // feel sluggish; 10 ms costs three wakeups per frame and the
+                // spinner ticks at 40 ms, so nobody notices the CPU.
                 //
-                // CAREFUL: `io.sleep`, not just any `std.Thread.sleep`. This
-                // process has a SINGLE `Io` shared between the worker and the
-                // UI thread, and `Io.sleep` takes the `Io`'s event loop with
-                // it: the sleeping worker stopped firing the spinner's `tick`
-                // and the TUI froze with the clock stuck (exactly what you see
-                // on screen). With `nanosleep` it is a bare syscall that does
-                // not touch the `Io`.
-                nap(30);
+                // CAREFUL: `nap` (nanosleep), not `io.sleep`. This process has
+                // a SINGLE `Io` shared between the worker and the UI thread,
+                // and `Io.sleep` takes the `Io`'s event loop with it: the
+                // sleeping worker stopped firing the spinner's `tick` and the
+                // TUI froze with the clock stuck (exactly what you see on
+                // screen). With `nanosleep` it is a bare syscall that does not
+                // touch the `Io`.
+                nap(10);
                 continue;
             }
             return error.AgentDied; // the child closed

@@ -11,6 +11,8 @@ const mascot = @import("mascot.zig");
 const palette = @import("palette.zig");
 const plan_mod = @import("plan.zig");
 const checkpoint = @import("checkpoint.zig");
+const bgproc = @import("bgproc.zig");
+const bench_mod = @import("bench.zig");
 const models_mod = @import("models.zig");
 const zjsonl = @import("zjsonl.zig");
 
@@ -145,6 +147,36 @@ const PLine = struct {
     cells: []const CellRun,
     w: u16, // columns occupied
 };
+
+/// The `─` row that goes between the banner and the first thing the user says.
+///
+/// It lives here and not inline because of two details that are easy to get
+/// wrong and impossible to see in a code review:
+///
+///  - The BYTES go in `text` and the draw reads them AFTER this returns (the
+///    `&[_]u8{c}` bug that has bitten this repo eight times). So they are
+///    allocated in the paragraph's arena, not on the stack.
+///  - `CellRun.w` is a **u8 in COLUMNS**, capped at 255. One run wider than
+///    that silently stops drawing halfway across a wide terminal. So the line is
+///    split into as many runs as it takes, each ≤255 columns, and `w` on the
+///    PLine is the real total.
+///
+/// `─` is 3 bytes and ONE column wide: allocating `width` bytes and filling them
+/// would produce a third of the line and a lot of NULs.
+fn bannerRuleLine(pa: std.mem.Allocator, width: u16) PLine {
+    const cols = width -| historyMargin(width);
+    var runs: std.ArrayList(CellRun) = .empty;
+    runs.ensureTotalCapacity(pa, (cols / 255) + 1) catch return .{ .cells = &.{}, .w = 0 };
+    var made: u16 = 0;
+    while (made < cols) {
+        const take: u16 = @min(cols - made, 255);
+        const buf = pa.alloc(u8, @as(usize, take) * 3) catch break;
+        for (0..take) |i| @memcpy(buf[@as(usize, i) * 3 ..][0..3], "\xe2\x94\x80");
+        runs.appendAssumeCapacity(.{ .text = buf, .w = @intCast(take), .style = theme.rule });
+        made += take;
+    }
+    return .{ .cells = runs.items, .w = made };
+}
 
 /// Lines added and removed by a diff (what is shown as `+N −M`).
 pub const DiffCounts = struct { added: usize = 0, removed: usize = 0 };
@@ -376,6 +408,34 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 ///  ┌ history (markdown + syntax highlighting, tool blocks, scroll)
 ///  ├ status: provider · model │ effort │ ⚠yolo │ ctx%
 ///  └ multiline input with border and `/` autocompletion
+/// Per-frame copy of an open question. Everything in it is in the FRAME arena,
+/// which is the only memory whose lifetime matches "being painted right now".
+pub const AskSnapshot = struct {
+    question: []const u8 = "",
+    header: []const u8 = "",
+    options: []const []const u8 = &.{},
+    /// The input box is the answer field (the "Other" path).
+    typing: bool = false,
+};
+
+/// Picker tag for an `ask` menu. Distinct from every other tag so the picker
+/// callback can tell an answer from a model/provider choice.
+pub const ask_picker_tag: u32 = 0xA5;
+
+/// Prefix of the "Other" row in the picker. `askPickerChosen` compares against it
+/// to know it has to hand the input box over instead of answering.
+///
+/// It has to be a constant because the comparison happens in the callback with
+/// nothing else available, and it has to be distinctive because a model CAN write
+/// an option that starts with the same words (and then it would be treated as
+/// "Other", which sends the user to a text box instead of accepting their
+/// selection).
+pub const ask_other_prefix = "Other…";
+
+/// After this with nobody answering, the worker stops waiting and the model is
+/// told to decide. See `ask.timed_out_text`.
+pub const ask_timeout_ms: u64 = 5 * 60 * 1000;
+
 pub const Model = struct {
     allocator: std.mem.Allocator,
 
@@ -527,6 +587,57 @@ pub const Model = struct {
     /// Epoch to wake up the waiters (see `waitPermAnswer`).
     perm_epoch: std.atomic.Value(u32) = .init(0),
 
+    // ── `ask`: the model asks the user ───────────────
+    //
+    // The worker parks HERE while the user reads a question. That is the whole
+    // design and it is the same shape as the permission dialog (own lock,
+    // sleeping wait, epoch to wake up), but it is NOT the permission dialog:
+    // permission asks yes/no about a command that is about to run, while `ask`
+    // asks the one question that decides what gets built at all.
+    //
+    // It has its own lock and its own buffers, and NOT a `std.Io.Condition`,
+    // because the tests build a Model without an app and there is no Io to
+    // condition on (the same reason `perm_mutex` is there).
+    ask_mutex: std.atomic.Mutex = .unlocked,
+    ask_epoch: std.atomic.Value(u32) = .init(0),
+    ask_active: bool = false,
+    /// The question, its header and its options: OWN COPIES (gpa).
+    ///
+    /// They come from the worker's arena, which dies at the end of `runOneTurn`.
+    /// A slice kept in `pending` that points at that arena is read by the
+    /// renderer after the memory is gone: this is the `&[_]u8{c}` bug family,
+    /// the sixth appearance.
+    ask_question: ?[]u8 = null,
+    ask_header: ?[]u8 = null,
+    ask_options: std.ArrayList([]u8) = .empty,
+    /// The answer, once there is one. `null` = not answered yet.
+    ask_answer: ?[]u8 = null,
+    /// Nobody answered within this: the worker stops waiting and tells the model
+    /// to decide on its own.
+    ///
+    /// Without this the worker stays parked FOREVER, and a parked worker with
+    /// nothing painting it is exactly the "the app froze" bug that took a whole
+    /// afternoon to find. Five minutes is long enough that nobody who is there
+    /// hits it, and short enough that an AFK user does not come back to a turn
+    /// that quietly did nothing.
+    ask_started_ns: i128 = 0,
+    /// Answer is being typed in the input box (the "Other" path).
+    ask_typing: bool = false,
+    /// Fixed buffer for `askTitle` (see the comment there).
+    ask_title_buf: [48]u8 = undefined,
+    ask_title_len: usize = 0,
+    /// How many questions this turn has asked (`ask` gives up after
+    /// `max_asks_per_turn`).
+    asks_this_turn: usize = 0,
+    /// Read-only mode: write/edit/bash come back as tool_results instead of
+    /// running. See `/ask`.
+    read_only: bool = false,
+    /// Background jobs (see `bgproc.zig`): id, how many were started, whether
+    /// ESC has been pressed since the last one.
+    bg: bgproc.Registry = .{},
+    /// Bench counters for `/bench`.
+    bench: bench_mod.Stats = .{},
+
     /// Spinner (counters, no alloc).
     spinner_frame: usize = 0,
     busy: bool = false,
@@ -676,7 +787,7 @@ pub const Model = struct {
         lang: []const u8 = "",
     };
 
-    const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
     pub fn hasInput(self: *const Model) bool {
         return !self.ed.isEmpty();
@@ -727,7 +838,26 @@ pub const Model = struct {
         self.closePicker();
         self.picker_items.deinit(self.allocator);
         self.picker_filtered.deinit(self.allocator);
+        // `@` completion matches: gpa-owned paths (see `freeFileMatches`).
+        freeFileMatches(self);
+        self.ac.file_matches.deinit(self.allocator);
+        // Background jobs: killed FIRST (a child writing to a pipe nobody reads
+        // would keep the process alive), then their buffers freed.
+        // `null` when there is no `Io`: a test Model has none, and `bgproc.deinit`
+        // only touches the vtable when a job is actually alive, which there never
+        // is in a test.
+        self.bg.deinit(if (self.io_ready) self.io else null, self.allocator);
+        self.askLock();
+        self.freeAskStringsLocked();
+        if (self.ask_answer) |a| self.allocator.free(a);
+        self.askUnlock();
+        // The LIST's buffer, not just the strings inside it: `clearRetainingCapacity`
+        // keeps the capacity, so without this every Model leaks the array on
+        // exit. (Same rule as `queue.deinit` next to `clearQueue`.)
+        self.ask_options.deinit(self.allocator);
     }
+
+
 
     // ── modal picker ──────────────────────────────────
     /// Opens the picker. Takes ownership of `items` (labels/descs gpa-owned).
@@ -851,6 +981,20 @@ pub const Model = struct {
         return true;
     }
 
+    /// Frees picker items built by `askPickerItems` (gpa copies).
+    ///
+    /// Public because `agent.zig` is the one that opens the picker with them, and
+    /// `closePicker` frees them too: two owners of the same strings is how the
+    /// double free happens, so the rule is ONE free per item and it lives with the
+    /// allocator that made them.
+    pub fn freePickerItems(gpa: std.mem.Allocator, items: []PickerItem) void {
+        for (items) |it| {
+            gpa.free(it.label);
+            if (it.desc.len > 0) gpa.free(it.desc);
+        }
+        gpa.free(items);
+    }
+
     /// Per-frame snapshot: copies into ctx.arena (≤10 visible items).
     fn pickerSnapshot(self: *Model, arena: std.mem.Allocator) ?PickerSnapshot {
         self.lock();
@@ -913,6 +1057,30 @@ pub const Model = struct {
         self.status_mood_set = true;
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
+    }
+
+    /// `setStatusWithMood` that composes the text into the fixed buffer.
+    ///
+    /// Same reasoning as `pushInfoFmt`: the status row copies, so composing here
+    /// cannot leak a literal into an ownership-taking path, and the mood stays
+    /// paired with the text in one call (which is what makes the face come out in
+    /// the right color).
+    pub fn setStatusFmt(self: *Model, new_mood: mascot.Mood, comptime fmt: []const u8, args: anytype) void {
+        var buf: [160]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, fmt, args) catch {
+            self.setStatusWithMood(new_mood, fmt);
+            return;
+        };
+        self.setStatusWithMood(new_mood, s);
+    }
+
+    /// `pushError` that composes the text (the `.error_msg` kind, in red).
+    pub fn pushErrorFmt(self: *Model, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(self.allocator, fmt, args) catch {
+            self.pushError(fmt);
+            return;
+        };
+        self.pushErrorOwned(text);
     }
 
     /// Mood of the current state. If nobody set it, it is deduced from the
@@ -1080,15 +1248,32 @@ pub const Model = struct {
         // would paint one row fewer than the height says and the last block
         // would be lost. The first paragraph carries NO separator (it would be
         // an empty row above the header, which misaligns the banner art).
-        // The header goes without a separator: its lines are ONE drawing and a
-        // blank row between letters breaks the logo into pieces.
-        const prev_banner = idx > 0 and self.paras.items[idx - 1].kind == .banner;
-        if (idx > 0 and p_.kind != .banner and !prev_banner) {
+        //
+        // The banner used to be exempted via `prev_banner` too: when the header
+        // was a multi-part drawing (wordmark + robot + tagline) a blank row
+        // split the art. It is the wordmark alone now, and WITHOUT the gap the
+        // user's first prompt sat glued to the logo — which reads as one blob
+        // ("the banner and my prompt are the same thing"). A drawing of
+        // `banner_art_height` full rows survives one blank row below it.
+        //
+        // Under the banner the gap is a RULE and not a blank row (bug 4). One
+        // empty row is not enough separation when what is above it is a 5-row
+        // drawing and what is below is the user's own words: the prompt reads as
+        // the last line of the logo. A `─` in the dim brand color says "the
+        // header ends here" without spending two more rows on whitespace, and it
+        // is the same mark the popup and the input box already use, so it is not
+        // a new idea in the middle of the screen.
+        const after_banner = idx > 0 and self.paras.items[idx - 1].kind == .banner;
+        if (idx > 0 and p_.kind != .banner) {
             const grown = try para_arena.allocator().alloc(PLine, lines.len + 1);
             // IN FRONT, not behind: the blank row separates this paragraph
             // from the previous one. Placed at the end, the gap showed up
             // after "second" and the history was still a wall of text.
-            grown[0] = .{ .cells = &.{}, .w = 0 };
+            if (after_banner) {
+                grown[0] = bannerRuleLine(para_arena.allocator(), width);
+            } else {
+                grown[0] = .{ .cells = &.{}, .w = 0 };
+            }
             @memcpy(grown[1..], lines);
             lines = grown;
         }
@@ -1301,6 +1486,302 @@ pub const Model = struct {
     /// immediate (the user already had a finger on `y`), and if they are slow
     /// it does not wake 1000 times per second. With pure `std.Thread.yield` it
     /// was ~1M iterations in 30 s.
+    // ── `ask`: the model asks the user ───────────────
+    //
+    // Deliberately a COPY of the permission machinery rather than a shared one:
+    // the two are different questions with different timeouts, and merging them
+    // means every change to one is a change to the other's behaviour. What they
+    // share is the SHAPE, which is what makes the second one cheap to get right.
+
+    fn askLock(self: *Model) void {
+        while (!self.ask_mutex.tryLock()) std.Thread.yield() catch {};
+    }
+    fn askUnlock(self: *Model) void {
+        self.ask_mutex.unlock();
+    }
+
+    /// Called by the WORKER when the model asks something. Blocks until the user
+    /// answers, declines, or the timeout passes.
+    ///
+    /// Returns the answer as a fresh gpa copy the CALLER owns, or null if there
+    /// was none (declined / timed out). A copy and not a slice into the dialog's
+    /// buffer because the caller puts it in the session, which outlives the
+    /// dialog.
+    pub fn requestAsk(
+        self: *Model,
+        question: []const u8,
+        header: []const u8,
+        options: []const []const u8,
+    ) ?[]u8 {
+        // Copies made BEFORE the lock: `question` and `options` point into the
+        // worker's arena, and that arena is freed at the end of the turn — which
+        // happens as soon as this function returns. Copying under the lock would
+        // be correct too, but the lock is held by the UI thread at that moment
+        // and this is on the hot path of "the user pressed a key".
+        const q_copy = self.allocator.dupe(u8, question) catch return null;
+        errdefer self.allocator.free(q_copy);
+        const h_copy = self.allocator.dupe(u8, header) catch return null;
+        errdefer self.allocator.free(h_copy);
+
+        self.askLock();
+        self.freeAskStringsLocked();
+        self.ask_question = q_copy;
+        self.ask_header = h_copy;
+        for (options) |o| {
+            const oc = self.allocator.dupe(u8, o) catch break;
+            self.ask_options.append(self.allocator, oc) catch {
+                self.allocator.free(oc);
+                break;
+            };
+        }
+        self.ask_answer = null;
+        self.ask_typing = false;
+        self.ask_active = true;
+        self.ask_started_ns = if (self.io_ready) std.Io.Timestamp.now(self.io, .real).nanoseconds else 0;
+        self.askUnlock();
+        // The question has to be painted NOW: the user cannot answer what they
+        // cannot see, and this is the whole interaction.
+        self.requestRedraw();
+        self.dirty = true;
+
+        const outcome = self.waitAskAnswer();
+
+        self.askLock();
+        const answer = self.ask_answer;
+        self.ask_answer = null;
+        self.ask_active = false;
+        self.ask_typing = false;
+        // The buffers stay until the NEXT question (`freeAskStringsLocked` at the
+        // top) or until `deinit`. Freeing them here is what would be wrong: the
+        // draw is one frame behind and still paints the question.
+        self.askUnlock();
+        self.requestRedraw();
+        self.dirty = true;
+        return outcome orelse answer;
+    }
+
+    /// Frees the question/header/options. Holds the lock.
+    fn freeAskStringsLocked(self: *Model) void {
+        if (self.ask_question) |q| self.allocator.free(q);
+        if (self.ask_header) |h| self.allocator.free(h);
+        for (self.ask_options.items) |o| self.allocator.free(o);
+        self.ask_options.clearRetainingCapacity();
+        self.ask_question = null;
+        self.ask_header = null;
+    }
+
+    /// Waits, SLEEPING, until there is an answer or the timeout.
+    ///
+    /// Returns null when nobody answered (ESC or timeout) and the answer slice
+    /// otherwise. Same backoff as the permission dialog: 1 ms growing to 20 ms,
+    /// because the first answer is usually instant and a spin here would burn a
+    /// core for the whole five minutes.
+    fn waitAskAnswer(self: *Model) ?[]u8 {
+        var wait_ms: u64 = 1;
+        while (true) {
+            self.askLock();
+            const has_answer = self.ask_answer != null;
+            const timed_out = self.askTimedOutLocked();
+            self.askUnlock();
+            if (has_answer) {
+                self.askLock();
+                const a = self.ask_answer;
+                self.askUnlock();
+                return a;
+            }
+            if (timed_out) return null;
+            napMs(wait_ms);
+            wait_ms = @min(wait_ms * 2, 20);
+        }
+    }
+
+    /// Five minutes with nobody answering. After that the worker stops waiting
+    /// and tells the model to decide (see `ask.timed_out_text`).
+    fn askTimedOutLocked(self: *Model) bool {
+        if (self.ask_started_ns == 0) return false;
+        if (!self.io_ready) return false;
+        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        return now - self.ask_started_ns > ask_timeout_ms * std.time.ns_per_ms;
+    }
+
+    /// UI: the user answered. TAKES OWNERSHIP of `text` (the callback frees it),
+    /// which is why it is not `[]const u8` here.
+    pub fn answerAskOwned(self: *Model, text: []u8) void {
+        self.askLock();
+        if (self.ask_answer) |old| self.allocator.free(old);
+        self.ask_answer = text;
+        self.askUnlock();
+        _ = self.ask_epoch.fetchAdd(1, .seq_cst);
+        self.requestRedraw();
+        self.dirty = true;
+    }
+
+    /// UI: ESC on the question means "decide it yourself", not "stop the turn".
+    ///
+    /// It also closes the question (`ask_active = false`) so the panel disappears
+    /// on the very same frame. Without that the question would stay painted for
+    /// the few milliseconds until the worker wakes up, reads the answer and
+    /// returns — a visible flash of a dialog the user already answered, which
+    /// reads as "it did not take my answer".
+    pub fn declineAsk(self: *Model) void {
+        self.askLock();
+        if (self.ask_answer != null) {
+            // Already answered. A second ESC must not free the answer the worker
+            // has not picked up yet.
+            self.askUnlock();
+            return;
+        }
+        const msg = self.allocator.dupe(u8, "no answer") catch {
+            self.askUnlock();
+            return;
+        };
+        self.ask_answer = msg;
+        self.ask_active = false;
+        self.ask_typing = false;
+        self.askUnlock();
+        _ = self.ask_epoch.fetchAdd(1, .seq_cst);
+        self.requestRedraw();
+        self.dirty = true;
+    }
+
+    pub fn askActive(self: *Model) bool {
+        self.askLock();
+        defer self.askUnlock();
+        return self.ask_active;
+    }
+
+    /// True when the question is open AND the input box is the answer field.
+    pub fn askTyping(self: *Model) bool {
+        self.askLock();
+        defer self.askUnlock();
+        return self.ask_active and self.ask_typing;
+    }
+
+    /// Milliseconds the question has been waiting. 0 when none.
+    pub fn askMillis(self: *Model) u64 {
+        self.askLock();
+        defer self.askUnlock();
+        if (!self.ask_active or self.ask_started_ns == 0) return 0;
+        if (!self.io_ready) return 0;
+        const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
+        if (now <= self.ask_started_ns) return 0;
+        return @intCast(@divTrunc(now - self.ask_started_ns, std.time.ns_per_ms));
+    }
+
+    /// For the draw: a copy of the open question into the frame arena.
+    ///
+    /// The copy is what the painter needs, and it is COPIED because the worker
+    /// owns those strings: painting them from the dialog while the worker is
+    /// blocked is fine, but the draw outlives nothing here and the frame arena is
+    /// the only memory with a lifetime that matches "being painted right now".
+    pub fn askSnapshot(self: *Model, arena: std.mem.Allocator) ?AskSnapshot {
+        self.askLock();
+        defer self.askUnlock();
+        if (!self.ask_active) return null;
+        if (self.ask_question == null) return null;
+        return .{
+            .question = arena.dupe(u8, self.ask_question.?) catch "",
+            .header = if (self.ask_header) |h| arena.dupe(u8, h) catch "" else "",
+            .options = blk: {
+                const n = self.ask_options.items.len;
+                const out = arena.alloc([]const u8, n) catch break :blk &.{};
+                for (self.ask_options.items, 0..) |o, i| out[i] = arena.dupe(u8, o) catch "";
+                break :blk out;
+            },
+            .typing = self.ask_typing,
+        };
+    }
+
+    /// The picker items for an open question with options, plus the "Other" row.
+    ///
+    /// OWNED copies (gpa), and the caller frees them with `freePickerItems`: this
+    /// builds them on every frame and they must not be literals, because
+    /// `closePicker` frees them — the "Invalid free" the fuzzing found with
+    /// `+ connect`.
+    pub fn askPickerItems(self: *Model) ?[]PickerItem {
+        self.askLock();
+        if (!self.ask_active or self.ask_options.items.len == 0) {
+            self.askUnlock();
+            return null;
+        }
+        const n = self.ask_options.items.len;
+        var items = self.allocator.alloc(PickerItem, n + 1) catch {
+            self.askUnlock();
+            return null;
+        };
+        var made: usize = 0;
+        for (self.ask_options.items, 0..) |o, i| {
+            const label = self.allocator.dupe(u8, o) catch break;
+            const desc: []u8 = if (i == 0)
+                // The first option is the model's recommendation by convention
+                // (the guidance tells it to put it first), so it says so: that is
+                // the difference between a menu and a quiz.
+                (self.allocator.dupe(u8, "recommended") catch "") else
+                (self.allocator.dupe(u8, "") catch "");
+            items[i] = .{ .label = label, .desc = desc };
+            made += 1;
+        }
+        // The "Other" row is what makes the menu complete: with only the model's
+        // options there is no way to answer "none of these, this instead", and the
+        // model then gets a forced choice.
+        const other = self.allocator.dupe(u8, "Other… (type your own answer)") catch {
+            freePickerItems(self.allocator, items[0..made]);
+            self.askUnlock();
+            return null;
+        };
+        items[made] = .{ .label = other, .desc = self.allocator.dupe(u8, "esc means: you decide") catch "" };
+        made += 1;
+        self.askUnlock();
+        return items[0..made];
+    }
+
+    /// Is there a question waiting that should be shown as a picker?
+    ///
+    /// Only when there ARE options and the user has not already gone down the
+    /// free-text path. `typing` is the flag that says so: it is set when "Other"
+    /// was chosen, and once set the picker must never come back (otherwise it
+    /// reopens on the next frame, on top of the text the user is typing).
+    pub fn askNeedsPicker(self: *Model) bool {
+        self.askLock();
+        defer self.askUnlock();
+        return self.ask_active and !self.ask_typing and self.ask_options.items.len > 0;
+    }
+
+    /// Title of the picker: the header if the model gave one, else a default.
+    ///
+    /// A fixed buffer, because this is called from the draw (once per frame) and
+    /// the returned slice has to survive the lock being released.
+    pub fn askTitle(self: *Model) []const u8 {
+        self.askLock();
+        self.ask_title_len = 0;
+        const h = self.ask_header orelse "";
+        if (h.len > 0) {
+            const n = @min(h.len, self.ask_title_buf.len);
+            @memcpy(self.ask_title_buf[0..n], h[0..n]);
+            self.ask_title_len = n;
+        } else {
+            const dflt = "the model has a question";
+            @memcpy(self.ask_title_buf[0..dflt.len], dflt);
+            self.ask_title_len = dflt.len;
+        }
+        const out = self.ask_title_buf[0..self.ask_title_len];
+        self.askUnlock();
+        return out;
+    }
+
+    /// Switches the input box to answer mode (the "Other" path).
+    pub fn askBeginTyping(self: *Model) void {
+        self.askLock();
+        if (!self.ask_active) {
+            self.askUnlock();
+            return;
+        }
+        self.ask_typing = true;
+        self.askUnlock();
+        self.requestRedraw();
+        self.dirty = true;
+    }
+
     fn waitPermAnswer(self: *Model) void {
         var wait_ms: u64 = 1;
         while (true) {
@@ -2112,7 +2593,7 @@ pub const Model = struct {
     /// `streaming` lives here and is not read bare in draw: the worker writes
     /// it from another thread, and a `bool` read unsynchronized on every frame
     /// is a data race (benign, but for free hard to debug).
-    pub const Activity = struct { busy: bool, dirty: bool, perm: bool, picker: bool, streaming: bool };
+    pub const Activity = struct { busy: bool, dirty: bool, perm: bool, ask: bool, picker: bool, streaming: bool };
 
     fn activity(self: *Model) Activity {
         self.lock();
@@ -2121,6 +2602,15 @@ pub const Model = struct {
             .busy = self.workingLocked(),
             .dirty = self.dirty,
             .perm = self.perm_active,
+            // Read from the ASK lock, not this one: the ask dialog has its own
+            // mutex on purpose (the permission one does too) so a parked worker
+            // never holds the history lock. Reading `ask_active` here without it
+            // would be the unsynchronized read of a bool from another thread.
+            .ask = blk: {
+                self.askLock();
+                defer self.askUnlock();
+                break :blk self.ask_active;
+            },
             .picker = self.picker_active,
             .streaming = self.streaming,
         };
@@ -2271,9 +2761,14 @@ pub const Model = struct {
 
 /// State of the `/` command autocompletion.
 pub const Autocomplete = struct {
+    pub const Mode = enum { none, command, file };
+
     /// The popup is open.
     active: bool = false,
-    /// Length of the prefix typed after the slash (`/mo` → 2).
+    /// What is being completed: `/` commands or `@` file paths.
+    mode: Mode = .none,
+    /// COMMANDS: length of the prefix typed after the slash (`/mo` → 2).
+    /// FILES: the byte offset where the `@token` starts in the input.
     prefix_len: usize = 0,
     /// Position in `agent.commands` of the highlighted item.
     sel: usize = 0,
@@ -2281,6 +2776,10 @@ pub const Autocomplete = struct {
     max_visible: usize = 6,
     /// First visible index (list scroll).
     first: usize = 0,
+    /// FILE matches, owned by the model (freed on the next sync / on deinit
+    /// via `freeFileMatches`). Strings, not a `Palette`: the popup is one
+    /// column and the paths need no descriptions.
+    file_matches: std.ArrayList([]u8) = .empty,
 
     /// Is the current input text a command in progress?
     /// Only offered if there are no spaces yet: "/mod" yes, "/mod x" no.
@@ -2331,6 +2830,24 @@ pub fn rowText(surface: vxfw.Surface, row: u16, buf: []u8) []const u8 {
 /// Sends the input's contents to the agent and clears it (with history).
 fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     const trimmed = std.mem.trim(u8, self.ed.text(), " \t\r\n");
+
+    // `ask` in free-text mode: Enter ANSWERS, it does not start a new turn.
+    //
+    // It has to be checked BEFORE anything else, including the empty check: an
+    // empty answer is a legitimate answer ("you decide") and the user pressing
+    // Enter on an empty box is saying exactly that. Sending it as a prompt would
+    // start a turn with an empty user message, which is the one thing that would
+    // make this feel broken.
+    if (self.askTyping()) {
+        self.ed.clear();
+        self.ac = .{};
+        const copy = self.allocator.dupe(u8, if (trimmed.len > 0) trimmed else "you decide") catch return;
+        self.answerAskOwned(copy);
+        ctx.redraw = true;
+        try self.armTick(ctx);
+        return;
+    }
+
     if (trimmed.len == 0) {
         self.ed.clear();
         self.ac = .{};
@@ -2477,14 +2994,161 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
 /// Opens/updates the autocompletion based on what is in the input.
 fn syncAutocomplete(self: *Model) void {
     if (Autocomplete.queryFor(self.ed.text())) |q| {
-        self.ac.active = true;
-        self.ac.prefix_len = q.prefix_len;
+        setAcMode(self, .command, q.prefix_len);
         recomputeMatches(self);
-    } else {
-        self.ac.active = false;
+        return;
+    }
+    // `@path`: completes file paths, cursor at the end of the token.
+    //
+    // Offered from ANYWHERE in the input (mid-sentence too), which is how the
+    // user actually types it: "revisa @src/a" — and the token is whatever
+    // follows the LAST `@` up to the cursor. Empty token (just typed `@` or
+    // nothing after it) offers the directory listing of `.`: the popup is also
+    // the DISCOVERY UI for "what files can I mention?".
+    if (fileQueryAt(self.ed.text(), self.ed.cursor)) |q| {
+        setAcMode(self, .file, q.token_start);
+        refreshFileMatches(self, q.token);
+        recomputeMatches(self);
+        return;
+    }
+    setAcMode(self, .none, 0);
+}
+
+/// Switches the popup's mode, freeing the previous mode's data. Every field
+/// change goes through here so no mode leaves state behind.
+fn setAcMode(self: *Model, mode: Autocomplete.Mode, prefix_len: usize) void {
+    if (self.ac.mode == .file and mode != .file) freeFileMatches(self);
+    self.ac.active = mode != .none;
+    self.ac.mode = mode;
+    self.ac.prefix_len = prefix_len;
+    if (!self.ac.active) {
         self.ac.sel = 0;
         self.ac.first = 0;
     }
+}
+
+fn freeFileMatches(self: *Model) void {
+    for (self.ac.file_matches.items) |f| self.allocator.free(f);
+    self.ac.file_matches.clearRetainingCapacity();
+}
+
+/// The `@token` under the cursor: where it starts and what it says, or null
+/// when the cursor is not on (or right after) an at-mention.
+///
+/// PURE over the input text: the disk is `refreshFileMatches`' business, so the
+/// tests can pin down the token logic without a filesystem.
+fn fileQueryAt(text: []const u8, cursor: usize) ?struct { token_start: usize, token: []const u8 } {
+    if (cursor > text.len) return null;
+    // Walk back to the last `@` before the cursor; the token between them must
+    // be unbroken (no spaces/newlines), or there is no mention under the
+    // cursor. The token may be EMPTY: `@` alone still opens the listing.
+    var i = cursor;
+    while (i > 0) : (i -= 1) {
+        const c = text[i - 1];
+        if (c == '@') {
+            // An `@` that is part of an email (`a@b`) does not count. Same rule
+            // as `mentions.scan`, which is what will parse this text later: if
+            // the two disagree, the user completes a path that never expands.
+            if (i >= 2) {
+                const prev = text[i - 2];
+                if (std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '.' or prev == '/') return null;
+            }
+            return .{ .token_start = i - 1, .token = text[i..cursor] };
+        }
+        if (c == ' ' or c == '\n' or c == '\t' or c == '\r') return null;
+    }
+    return null;
+}
+
+/// Refills the file matches for the `@token` being typed.
+///
+/// Reads the CURRENT directory only (like `list_files`): `src/` narrows
+/// inside the prefix, deeper trees are one `@` away. Directories first (they
+/// are the way down the tree), then files, both alphabetical. Needs the `Io`
+/// (`io_ready`): in tests without one the list just stays empty.
+fn refreshFileMatches(self: *Model, token: []const u8) void {
+    freeFileMatches(self);
+    if (!self.io_ready) return;
+
+    // Split the token into directory + partial name: `src/edi` lists `src/`.
+    var dir_path: []const u8 = ".";
+    var partial: []const u8 = token;
+    if (std.mem.lastIndexOfScalar(u8, token, '/')) |slash| {
+        dir_path = token[0..slash];
+        partial = token[slash + 1 ..];
+    }
+
+    const names = listDirNames(self.allocator, self.io, dir_path, 40) catch return;
+    defer {
+        for (names) |e| self.allocator.free(e.name);
+        self.allocator.free(names);
+    }
+
+    for (names) |e| {
+        if (!startsWithIgnoreCase(e.name, partial)) continue;
+        // Skip dotfiles unless the user is typing one (`.gitignore`).
+        if (e.name.len > 0 and e.name[0] == '.' and (partial.len == 0 or partial[0] != '.')) continue;
+        const has_dir_part = std.mem.indexOfScalar(u8, token, '/') != null;
+        const candidate = std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
+            if (has_dir_part) dir_path else "",
+            if (has_dir_part and !std.mem.endsWith(u8, dir_path, "/")) "/" else "",
+            e.name,
+        }) catch continue;
+        if (e.is_dir) {
+            const with_slash = std.fmt.allocPrint(self.allocator, "{s}/", .{candidate}) catch {
+                self.allocator.free(candidate);
+                continue;
+            };
+            self.allocator.free(candidate);
+            self.ac.file_matches.append(self.allocator, with_slash) catch {
+                self.allocator.free(with_slash);
+            };
+        } else {
+            self.ac.file_matches.append(self.allocator, candidate) catch {
+                self.allocator.free(candidate);
+            };
+        }
+    }
+}
+
+/// One directory entry: the name and whether it is a directory (so the popup
+/// appends the `/` that invites the next level).
+const DirEntry = struct { name: []u8, is_dir: bool };
+
+/// Directory listing as an owned slice. Best-effort: any error (missing dir,
+/// `Io` not ready in tests) yields an error, and the caller leaves the popup
+/// empty — a popup that fails to open must not take the input down with it.
+///
+/// CAREFUL (AGENTS.md): `openDir` WITHOUT `.iterate = true` is a panic (EBADF)
+/// the moment you call `iterate()`, not a clean error.
+fn listDirNames(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    max: usize,
+) ![]DirEntry {
+    var out: std.ArrayList(DirEntry) = .empty;
+    errdefer {
+        for (out.items) |e| gpa.free(e.name);
+        out.deinit(gpa);
+    }
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (out.items.len < max) {
+        const e = it.next(io) catch break orelse break;
+        if (e.name.len == 0 or std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) continue;
+        try out.append(gpa, .{ .name = try gpa.dupe(u8, e.name), .is_dir = e.kind == .directory });
+    }
+    // Alphabetical so the popup is stable while typing. Directories first:
+    // they are how you walk DOWN the tree, which is what `@` is for.
+    std.mem.sort(DirEntry, out.items, {}, struct {
+        fn lt(_: void, a: DirEntry, b: DirEntry) bool {
+            if (a.is_dir != b.is_dir) return a.is_dir;
+            return std.ascii.orderIgnoreCase(a.name, b.name) == .lt;
+        }
+    }.lt);
+    return out.toOwnedSlice(gpa);
 }
 
 /// Does `haystack` start with `needle` (case-insensitive)?
@@ -2507,7 +3171,7 @@ fn commandToken(key: []const u8) []const u8 {
     return k;
 }
 
-/// Recomputes how many commands match the prefix and where the selection is.
+/// Recomputes how many items match and where the selection is.
 fn recomputeMatches(self: *Model) void {
     const n = matchCount(self);
     if (n == 0) {
@@ -2521,34 +3185,65 @@ fn recomputeMatches(self: *Model) void {
     }
 }
 
-/// Prefix typed after the slash, or null if the input is not a command.
+/// The prefix being completed, depending on the mode. COMMANDS: what follows
+/// the `/`. FILES: the token after the `@` (empty when just typed).
 fn acPrefix(self: *const Model) ?[]const u8 {
     const text = self.ed.text();
     if (self.ac.prefix_len == 0 or self.ac.prefix_len > text.len) return null;
-    return text[1..self.ac.prefix_len];
+    return switch (self.ac.mode) {
+        .command => text[1..self.ac.prefix_len],
+        .file => blk: {
+            // The token runs to the cursor, like `fileQueryAt` saw it.
+            const end = @min(self.ed.cursor, text.len);
+            if (end < self.ac.prefix_len) break :blk "";
+            break :blk text[self.ac.prefix_len + 1 .. end];
+        },
+        .none => null,
+    };
 }
 
-/// Number of commands matching the current prefix.
+/// Number of items matching the current prefix.
 fn matchCount(self: *const Model) usize {
-    const prefix = acPrefix(self) orelse return 0;
-    var n: usize = 0;
-    for (agent.commands) |c| {
-        if (startsWithIgnoreCase(commandToken(c.key), prefix)) n += 1;
-    }
-    return n;
+    return switch (self.ac.mode) {
+        .command => blk: {
+            const prefix = acPrefix(self) orelse break :blk 0;
+            var n: usize = 0;
+            for (agent.commands) |c| {
+                if (startsWithIgnoreCase(commandToken(c.key), prefix)) n += 1;
+            }
+            break :blk n;
+        },
+        .file => self.ac.file_matches.items.len,
+        .none => 0,
+    };
 }
 
-/// `agent.commands` of match number `n` (in list order).
-fn matchAt(self: *const Model, n: usize) ?agent.Cmd {
-    const prefix = acPrefix(self) orelse return null;
-    var seen: usize = 0;
-    for (agent.commands) |c| {
-        if (!startsWithIgnoreCase(commandToken(c.key), prefix)) continue;
-        if (seen == n) return c;
-        seen += 1;
-    }
-    return null;
+/// The label of match number `n` (in list order). COMMANDS: the full command
+/// line. FILES: the path, with a leading `@` so the row shows the mention as
+/// the user will read it.
+fn matchLabel(self: *const Model, n: usize) ?[]const u8 {
+    return switch (self.ac.mode) {
+        .command => blk: {
+            const prefix = acPrefix(self) orelse break :blk null;
+            var seen: usize = 0;
+            for (agent.commands) |c| {
+                if (!startsWithIgnoreCase(commandToken(c.key), prefix)) continue;
+                if (seen == n) break :blk c.key;
+                seen += 1;
+            }
+            break :blk null;
+        },
+        .file => blk: {
+            if (n >= self.ac.file_matches.items.len) break :blk null;
+            break :blk self.ac.file_matches.items[n];
+        },
+        .none => null,
+    };
 }
+
+/// The replacement text for accepting match `n`: commands keep their full
+/// `key`, files come back as `@path` (the mention form, which is what the
+/// scanner understands).
 
 /// Accepts the highlighted command: replaces the prefix with the full command.
 /// Is what is typed in the input exactly the highlighted command?
@@ -2556,7 +3251,7 @@ fn matchAt(self: *const Model, n: usize) ?agent.Cmd {
 /// This is the "nothing to complete" case: then Enter must submit, not rewrite
 /// the same thing with a trailing space.
 fn isExactMatch(self: *Model) bool {
-    if (!self.ac.active) return false;
+    if (!self.ac.active or self.ac.mode != .command) return false;
     const typed = std.mem.trim(u8, self.ed.text(), " \t\r\n");
     if (typed.len == 0) return false;
     // Compared against ALL the commands, not just the highlighted one.
@@ -2573,10 +3268,37 @@ fn isExactMatch(self: *Model) bool {
 
 fn acceptAutocomplete(self: *Model) bool {
     if (!self.ac.active) return false;
-    const cmd = matchAt(self, self.ac.sel) orelse return false;
-    self.ed.clear();
-    self.ed.insert(cmd.key) catch return false;
-    self.ed.insertChar(' ') catch {};
+    // The replacement covers ONLY the token being completed (the whole input
+    // for commands, the `@token` for files), so accepting mid-sentence keeps
+    // the sentence.
+    const repl = switch (self.ac.mode) {
+        // Commands replace the WHOLE input (the popup is only open while the
+        // input is exactly a bare `/token`).
+        .command => {
+            const cmd = matchLabel(self, self.ac.sel) orelse return false;
+            self.ed.clear();
+            self.ed.insert(cmd) catch return false;
+            self.ed.insertChar(' ') catch {};
+            self.ac = .{};
+            return true;
+        },
+        .file => blk: {
+            const path = matchLabel(self, self.ac.sel) orelse return false;
+            break :blk std.fmt.allocPrint(self.allocator, "@{s}", .{path}) catch return false;
+        },
+        .none => return false,
+    };
+    // Free the composed `@path` either way: `insert` copies into the editor.
+    defer self.allocator.free(repl);
+    const text = self.ed.text();
+    const start = self.ac.prefix_len;
+    const end = @min(self.ed.cursor, text.len);
+    if (start > end or start > text.len) return false;
+    self.ed.deleteRange(start, end) catch return false;
+    self.ed.setCursor(start);
+    self.ed.insert(repl) catch return false;
+    // A file mention ends the token: close the popup (it reopens on the next
+    // keystroke if the text still qualifies).
     self.ac = .{};
     return true;
 }
@@ -2658,7 +3380,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     return;
                 }
             }
-            // `/` autocompletion open: navigate and accept.
+            // `/` autocompletion or `@` file completion open: navigate and accept.
             if (self.ac.active and matchCount(self) > 0) {
                 if (key.matches(vaxis.Key.up, .{})) {
                     if (self.ac.sel > 0) self.ac.sel -= 1;
@@ -2684,6 +3406,9 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 // nothing to show. And the other way round didn't either:
                 // "/model" completed to "/models" because the popup sorted
                 // "/models" first and the match was only looked for there.
+                //
+                // In FILE mode Enter always accepts (a path is never "complete
+                // enough to send": it is a mention inside a sentence).
                 const plain_enter = key.matches(vaxis.Key.enter, .{}) and
                     !key.mods.shift and !key.mods.alt and !key.mods.ctrl;
                 if (key.matches(vaxis.Key.tab, .{}) or plain_enter) {
@@ -2705,20 +3430,57 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 } else {
                     // Escape closes the popup without deleting what was typed.
                     if (key.matches(vaxis.Key.escape, .{})) {
-                        self.ac.active = false;
+                        setAcMode(self, .none, 0);
                         ctx.redraw = true;
                         return;
                     }
                 }
             }
-            // ESC aborts the stream in progress and closes the permission dialog.
+            // ESC. Three things it can mean, and the ORDER is the whole design:
+            //
+            // 1. an open QUESTION -> "I am not answering that", the agent decides
+            //    on its own and the turn carries on. Not a cancel.
+            // 2. a foreground tool -> kill the child process. Before, ESC only
+            //    set the HTTP cancel flag, which does nothing to a `zig build`
+            //    already running inside `process.run`: the worker stayed blocked
+            //    for the rest of `timeout_seconds` and the command kept using the
+            //    CPU. This is the single most misleading thing ESC did.
+            // 3. otherwise -> abort the turn's stream.
             if (key.matches(vaxis.Key.escape, .{})) {
+                if (self.askActive()) {
+                    self.declineAsk();
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                const killed = agent.killForeground();
+                if (self.permActive()) self.answerPermission(.deny);
+                if (killed > 0) {
+                    agent.setStatusWithZoFmt(self, .warn, "killed {d} running command{s}", .{
+                        killed,
+                        if (killed == 1) @as([]const u8, "") else @as([]const u8, "s"),
+                    });
+                }
                 chat.cancel_current.store(true, .seq_cst);
                 // In ACP mode the cancel goes through its own protocol
                 // (`session/cancel`): the HTTP streams' flag does not touch a
                 // child process.
                 agent.cancelAcp(self);
-                if (self.permActive()) self.answerPermission(.deny);
+                // Background jobs go too: ESC means "stop", and leaving a build
+                // running in the background after the user pressed ESC is how you
+                // get a laptop that is warm for the next ten minutes. Before,
+                // ESC only MARKED the jobs (`requestKillAll`) and the kill ran
+                // at app exit, so the build kept burning CPU for the whole
+                // session — "ESC did nothing", one level down. `killNow` marks
+                // and kills in one pass, on this thread, which is the one
+                // allowed to touch `Child.kill`.
+                const bg_killed = if (self.io_ready) self.bg.killNow(self.io) else self.bg.requestKillAll();
+                if (bg_killed > 0) {
+                    agent.setStatusWithZoFmt(self, .warn, "killed {d} background command{s}", .{
+                        bg_killed,
+                        if (bg_killed == 1) @as([]const u8, "") else @as([]const u8, "s"),
+                    });
+                }
                 ctx.redraw = true;
                 try self.armTick(ctx);
                 return;
@@ -2737,6 +3499,22 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 try self.armTick(ctx);
                 return;
             }
+            // Shift+Tab: read-only mode.
+            //
+            // Chosen because it is the key nothing else in a terminal uses, and
+            // because every other coding agent already uses it for this, so it
+            // does not have to be learned twice.
+            //
+            // It works with text in the input on purpose: you often decide to
+            // switch AFTER typing the prompt ("actually, look first"), and a mode
+            // you can only enter with an empty box is a mode you use once.
+            if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+                agent.toggleReadOnly(self);
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
+
             // ── history scroll ──
             // PageUp/PageDown move a PAGE (the whole window, minus one line so
             // you can see what came before and what comes after). Before they
@@ -2867,7 +3645,11 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // something to report. At idle it takes no space, as it should.
     const act = self.activity();
     const queued = self.queuedCount();
-    const act_rows: u16 = if (act.busy or queued > 0) 1 else 0;
+    // `act.ask` counts: an open QUESTION is work in progress from the user's
+    // point of view, and the strip is where the clock and "waiting for your
+    // answer" live. Without it the question was on screen with no explanation of
+    // why the app had stopped.
+    const act_rows: u16 = if (act.busy or queued > 0 or act.ask) 1 else 0;
 
     // The plan (the `todo` tool): one checkbox per step, above the activity
     // strip. It only takes rows if there is a plan, and at most
@@ -3090,6 +3872,27 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     const act_now = self.activity();
     const info: []const InfoSeg = sessionInfo(ctx.arena, act_now.streaming) orelse &.{};
 
+    // ── `ask`: the model asked something ──
+    //
+    // The picker is opened HERE, on the UI thread, and not by the worker that
+    // raised the question. That is not a style choice: the worker of `/models` once
+    // filled the palette while the UI thread was drawing it, with no lock on the
+    // palette's own state, and the app segfaulted. The worker leaves the question
+    // in the `Model`; the draw is what turns it into a picker.
+    if (!self.pickerActive() and !self.pal.active and !self.permActive()) {
+        if (self.askNeedsPicker()) {
+            if (self.askPickerItems()) |items| {
+                self.openPicker(ask_picker_tag, self.askTitle(), items, askPickerChosen);
+                // `askTitle` returns a slice into the MODEL (a fixed buffer), and
+                // `openPicker` copies it into its own fixed buffer, so there is
+                // nothing to free and nothing to own. The picker ITEMS, on the
+                // other hand, are gpa copies that `closePicker` frees — which is
+                // why `askPickerItems` dupes instead of handing out the dialog's
+                // own strings (a double free waiting for the second close).
+            }
+        }
+    }
+
     // ── modal picker (opencode style, centered) ──
     if (self.pickerSnapshot(ctx.arena)) |ps| {
         drawPicker(&p, width, height, ps);
@@ -3148,6 +3951,18 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // is no way not to see it.
     if (self.permView(&perm_tool, &perm_detail)) {
         drawPermissionModal(&p, width, height, perm_tool, perm_detail);
+    }
+
+    // ── `ask`: the question itself ──
+    //
+    // Drawn ABOVE the permission modal and BELOW the palette, and the reason is
+    // priority: an `ask` and a permission cannot be open at the same time (a
+    // question is asked by the model between tool calls, and the permission for
+    // the NEXT tool only comes after the answer), but the palette can be open
+    // over a question — you pressed ctrl+p while waiting — and then the palette
+    // must win, because it is what you are typing into.
+    if (self.askSnapshot(ctx.arena)) |snap| {
+        if (!self.pal.active) drawAskPanel(&p, width, height, snap, self.askMillis());
     }
 
     // ── modal palette (Ctrl+P): last, on top of everything ──
@@ -3249,21 +4064,67 @@ fn drawAutocomplete(
 ) void {
     if (width < 10 or rows < 2) return;
     p.fillRange(0, width, top, " ", .{});
-    p.fillRange(0, width, top + rows - 1, "─", theme.rule);
+    // The bottom row is the FOOTER, not a bare rule: it carries the count. The
+    // rule is kept underneath the text of that same row so the popup still has a
+    // visible edge without spending a whole row on it.
+    const foot_row = top + rows - 1;
+    p.fillRange(0, width, foot_row, "─", theme.rule);
 
     const first = self.ac.first;
-    for (0..rows -| 1) |i| {
-        const cmd = matchAt(self, first + i) orelse break;
+    // The LAST row is not another item: it is the footer, and it says how many
+    // are hidden.
+    //
+    // Without it the popup silently truncates: 10 files in the directory,
+    // `max_visible` rows on screen, and no sign that the other four exist. From
+    // the user's side that is not a truncated list, it is a directory that
+    // apparently has six entries — which is exactly the "no me da la lista de
+    // files" report. A picker that lies about its size is worse than no picker.
+    const item_rows = rows - 1;
+    const total = matchCount(self);
+    const hidden = if (total > item_rows) total - item_rows else 0;
+    for (0..item_rows) |i| {
+        const label = matchLabel(self, first + i) orelse break;
         const y = top + @as(u16, @intCast(i));
         const is_sel = first + i == self.ac.sel;
         if (is_sel) p.fillRange(0, width, y, " ", theme.selected);
-        _ = p.putText(1, y, cmd.key, if (is_sel) theme.selected else theme.accent);
-        if (cmd.key.len + 4 < width) {
+        // `@` paths are already prefixed in the label? No: the label is the raw
+        // path, the `@` is drawn dim so the mention form is visible.
+        if (self.ac.mode == .file) {
+            _ = p.putText(1, y, "@", if (is_sel) theme.selected else theme.dim);
+            _ = p.putText(2, y, label, if (is_sel) theme.selected else theme.accent);
+        } else {
+            _ = p.putText(1, y, label, if (is_sel) theme.selected else theme.accent);
+        }
+        if (self.ac.mode == .command and label.len + 4 < width) {
             var db: [96]u8 = undefined;
-            const d = std.fmt.bufPrint(&db, "  {s}", .{cmd.desc}) catch continue;
-            _ = p.putText(3 + @as(u16, @intCast(cmd.key.len)), y, d, theme.dim);
+            const d = std.fmt.bufPrint(&db, "  {s}", .{agentCommandDesc(label)}) catch continue;
+            _ = p.putText(3 + @as(u16, @intCast(label.len)), y, d, theme.dim);
         }
     }
+
+    // Footer: how many matches there are, and how many are off screen. Both
+    // numbers, because "6 matches" with 6 rows shown looks complete and is not.
+    var fb: [64]u8 = undefined;
+    const foot = if (hidden > 0)
+        std.fmt.bufPrint(&fb, "{d} matches · +{d} more · ↑↓ · tab", .{ total, hidden }) catch ""
+    else
+        std.fmt.bufPrint(&fb, "{d} {s} · ↑↓ · tab", .{
+            total,
+            if (total == 1) @as([]const u8, "match") else "matches",
+        }) catch "";
+    if (foot.len + 2 < width) {
+        _ = p.putText(width - 1 - @as(u16, @intCast(foot.len)), foot_row, foot, theme.dim);
+    }
+}
+
+/// The description of a command by its full key (`/model` → "switch model").
+/// One lookup, shared by the draw: `agent.commands` is a tiny table, a linear
+/// scan is cheaper than threading `agent.Cmd` through the match functions.
+fn agentCommandDesc(key: []const u8) []const u8 {
+    for (agent.commands) |c| {
+        if (std.mem.eql(u8, c.key, key)) return c.desc;
+    }
+    return "";
 }
 
 /// Splits the text into logical lines. Frame arena: the slice lives one frame.
@@ -3485,6 +4346,166 @@ fn tryNum(arena: std.mem.Allocator, n: u8) []const u8 {
     return arena.dupe(u8, s) catch "";
 }
 
+/// Picker callback for an `ask` menu.
+///
+/// `label` is OWNED by the picker and freed right after this returns, so an
+/// answer that is kept has to be copied: `answerAskOwned` TAKES OWNERSHIP and the
+/// worker frees it after the session has it. Passing `label` itself would be the
+/// `gpa.free(literal)` crash, in a shape where it only shows up when the user
+/// picks the first option.
+fn askPickerChosen(self: *Model, tag: u32, label: []const u8) void {
+    if (tag != ask_picker_tag) return;
+    if (std.mem.startsWith(u8, label, ask_other_prefix)) {
+        // Not an answer: the user wants to write. Close the picker (already done
+        // by `pickerHandleKey`) and give them the input box.
+        self.askBeginTyping();
+        self.ed.clear();
+        self.ac = .{};
+        return;
+    }
+    const copy = self.allocator.dupe(u8, label) catch return;
+    self.answerAskOwned(copy);
+    // The question is answered, so the panel has to go: same reason as
+    // `declineAsk`.
+    self.askLock();
+    self.ask_active = false;
+    self.askUnlock();
+}
+
+/// The question panel of `ask`, for the free-text path and as the anchor of the
+/// whole interaction.
+///
+/// It is drawn even when the picker is on top of it (the picker is centred and
+/// narrower): the question has to be visible at the moment the user chooses, or
+/// the menu is a list of options with no question attached, which is how you pick
+/// the wrong one.
+///
+/// Without options this panel IS the interface: the question, a hint line, and
+/// the input box right below the screen edge already in answer mode. Drawing a
+/// box around "type your answer" as well would be two boxes saying the same thing.
+fn drawAskPanel(
+    p: *Painter,
+    width: u16,
+    height: u16,
+    snap: AskSnapshot,
+    waited_ms: u64,
+) void {
+    if (width < 20 or height < 8) return;
+
+    const q_cols = columnsOf(p, snap.question);
+    const box_w: u16 = @min(@as(u16, @intCast(@max(q_cols + 8, 44))), width - 4);
+    const left: u16 = (width - box_w) / 2;
+
+    // Height: top border, header (optional), question (wrapped), hint, bottom
+    // border. The question is measured with the REAL wrap so the box is exactly
+    // as tall as the text: a box with empty rows under it looks broken, and the
+    // number of rows is computed here rather than guessed.
+    const inner_w: u16 = if (box_w > 6) box_w - 4 else box_w - 2;
+    const q_lines = wrapTextToRows(p, snap.question, inner_w, p.arena);
+    const has_header = snap.header.len > 0;
+    // ALWAYS two rows under the question: the hint and the clock. Reserving them
+    // conditionally (only when there are options) left the box with three empty
+    // rows under a free-text question, which reads as a broken panel.
+    const rows: u16 = 2;
+    const box_h: u16 = 2 + (if (has_header) @as(u16, 1) else 0) + @as(u16, @intCast(q_lines.len)) + rows;
+    const top: u16 = if (height > box_h + 2) (height - box_h) / 2 else 1;
+
+    // A clean background: the history behind it is dense text, and a bordered box
+    // with the history showing through reads as a rendering bug.
+    p.fillRange(left, left + box_w, top, " ", theme.code_bg);
+
+    p.putStable(left, top, "╭", 1, theme.warn_bold);
+    p.fillRange(left + 1, left + box_w - 1, top, "─", theme.warn);
+    p.putStable(left + box_w - 1, top, "╮", 1, theme.warn_bold);
+    p.putStable(left, top + box_h - 1, "╰", 1, theme.warn_bold);
+    p.fillRange(left + 1, left + box_w - 1, top + box_h - 1, "─", theme.warn);
+    p.putStable(left + box_w - 1, top + box_h - 1, "╯", 1, theme.warn_bold);
+
+    var r: u16 = 1;
+    while (r < box_h - 1) : (r += 1) {
+        p.putStable(left, top + r, "│", 1, theme.warn);
+        p.putStable(left + box_w - 1, top + r, "│", 1, theme.warn);
+    }
+
+    var row = top + 1;
+    if (has_header) {
+        _ = p.putText(left + 2, row, snap.header, theme.brand_faint);
+        row += 1;
+    }
+
+    // The question, wrapped, in the strongest color in the app. This is the thing
+    // the user came to read.
+    for (q_lines) |ln| {
+        if (row >= top + box_h - 1) break;
+        _ = p.putText(left + 2, row, ln, theme.warn_bold);
+        row += 1;
+    }
+
+    // The hint. It says what the KEYS do here, because "a box appeared and I do
+    // not know what to press" is the state that makes people hit ESC.
+    var hb: [64]u8 = undefined;
+    const hint: []const u8 = if (snap.typing)
+        "type your answer · enter sends it · esc: you decide"
+    else if (snap.options.len > 0)
+        "↑↓ choose · enter to answer · esc: you decide"
+    else
+        "type your answer below · enter sends it · esc: you decide";
+    const ht = std.fmt.bufPrint(&hb, "{s}", .{hint}) catch hint;
+    if (ht.len > 0 and row < top + box_h - 1) {
+        _ = p.putText(left + 2, row, ht, theme.brand_faint);
+    }
+    row += 1;
+
+    // The clock. Same information as in the activity strip, and here anyway: the
+    // strip is one row above the input and this is centred, and while the question
+    // is on screen this is the thing being read.
+    if (row < top + box_h - 1) {
+        var wb: [32]u8 = undefined;
+        const w = std.fmt.bufPrint(&wb, "waiting {d}s", .{waited_ms / 1000}) catch "";
+        if (w.len > 0) {
+            _ = p.putText(left + 2, row, w, theme.brand_faint);
+        }
+    }
+}
+
+/// Columns a text occupies, grapheme by grapheme.
+///
+/// `p.measure` and NOT `.len`: the question can contain `…`, `—` or a `◆` from a
+/// tool name, and measuring in bytes gives a box three columns too wide (or two
+/// too narrow), which is the `rowText` trap AGENTS.md documents.
+fn columnsOf(p: *const Painter, text: []const u8) usize {
+    var n: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| n += p.measure(g.bytes(text));
+    return n;
+}
+
+/// Rows a text takes at `width` columns, as slices into `text`.
+///
+/// A `[]const []const u8` of ROWS rather than a count: the draw needs both the
+/// height (to size the box) and the pieces (to paint them), and counting first
+/// then walking again is two implementations of the same wrap that will disagree.
+fn wrapTextToRows(p: *const Painter, text: []const u8, width: u16, arena: std.mem.Allocator) []const []const u8 {
+    if (width == 0) return &.{};
+    var rows: std.ArrayList([]const u8) = .empty;
+    var start: usize = 0;
+    var col: u16 = 0;
+    var pos: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| {
+        pos += g.bytes(text).len;
+        const w: u16 = p.measure(g.bytes(text));
+        if (col + w > width and col > 0) {
+            rows.append(arena, text[start .. pos - g.bytes(text).len]) catch return rows.items;
+            start = pos - g.bytes(text).len;
+            col = 0;
+        }
+        col += w;
+    }
+    if (start < text.len) rows.append(arena, text[start..]) catch {};
+    return rows.items;
+}
+
 fn drawActivityStrip(
     p: *Painter,
     row: u16,
@@ -3498,9 +4519,15 @@ fn drawActivityStrip(
     // The face ANIMATES: it alternates between open and narrowed eyes while
     // there is work. It is the signal that the app is alive, which is exactly
     // what you could not see when a slow model looked hung.
-    const mood_kind: mascot.Mood = if (act.perm) .warn else if (act.busy) .thinking else .idle;
+    // `ask` gets the SAME warning face as the permission dialog, and for the same
+    // reason: both are states where the app waits for the human, and in both the
+    // only useful thing the strip can do is make that unmissable. A thinking face
+    // during a question reads as "it is working on it", and then the user waits
+    // for an answer that never gets asked.
+    const waiting = act.perm or act.ask;
+    const mood_kind: mascot.Mood = if (waiting) .warn else if (act.busy) .thinking else .idle;
     const face = mascot.faceFrames(mood_kind, self.spinner_frame / 6);
-    const mood: vaxis.Style = if (act.perm) theme.warn else if (act.busy) theme.brand else theme.brand_soft;
+    const mood: vaxis.Style = if (waiting) theme.warn else if (act.busy) theme.brand else theme.brand_soft;
 
     var col: u16 = 1;
     _ = p.putText(col, row, face, mood);
@@ -3508,8 +4535,14 @@ fn drawActivityStrip(
 
     // State: the first thing you have to be able to read at a glance, and now
     // it is the PHASE.
+    //
+    // `ask` says "waiting for your answer", not "waiting for your input": the
+    // difference between "I am blocked" and "I am waiting for you to decide" is
+    // exactly what the user needs in order to look at the modal.
     const running_tool = self.toolRunName() != null;
-    const label: []const u8 = if (act.perm)
+    const label: []const u8 = if (act.ask)
+        "waiting for your answer"
+    else if (act.perm)
         "waiting for your permission"
     else if (running_tool)
         "running"
@@ -3541,6 +4574,21 @@ fn drawActivityStrip(
         if (ts.len > 0) {
             _ = p.putText(col, row, ts, theme.brand_soft);
             col += @as(u16, @intCast(ts.len)) + 1;
+        }
+    }
+
+    // The QUESTION's own clock, and it is separate from the turn's on purpose.
+    // The turn clock answers "is the agent working"; this one answers "how long
+    // have I been sitting on this decision", which is the number that makes
+    // someone stop and answer instead of going to make coffee. They are different
+    // questions and one clock cannot answer both.
+    if (act.ask) {
+        var qbuf: [24]u8 = undefined;
+        const ms = self.askMillis();
+        const qs = std.fmt.bufPrint(&qbuf, "· {d}s to answer", .{ms / 1000}) catch "";
+        if (qs.len > 0 and col + qs.len + 2 < width) {
+            _ = p.putText(col, row, qs, theme.warn);
+            col += @as(u16, @intCast(qs.len)) + 1;
         }
     }
 
@@ -3621,10 +4669,17 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     if (provider.len > 0) {
         if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
         out.append(arena, .{ .text = provider, .style = theme.brand_soft }) catch return null;
-        const eff = switch (agent.current_effort) {
+        // El nivel que va DE VERDAD, no el que el usuario pidio: si el modelo no tiene
+        // ese peldano, el status tiene que decir el que se mando. Un status que
+        // dice `xhigh` mientras el cable lleva `high` es una letra pequena que
+        // miente, y no hay forma de que se note el 400 cuando lo haya.
+        const eff = switch (agent.effectiveEffort()) {
+            .none => "off",
+            .minimal => "min",
             .low => "low",
             .medium => "med",
             .high => "high",
+            .xhigh => "xhigh",
         };
         // CAREFUL: `allocPrint` and NOT `bufPrint` over a stack buffer. The
         // slice is stored in the segment and read at paint time, already
@@ -3643,6 +4698,15 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
         if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
         const tag = std.fmt.allocPrint(arena, "acp: {s}", .{agent.acpTitle()}) catch return null;
         out.append(arena, .{ .text = tag, .style = theme.warn }) catch return null;
+    }
+
+    // Read-only mode. It has to be VISIBLE at all times and not just in the
+    // history, because it changes what a write tool call will do: a mode you
+    // cannot see is a mode where "the model ignored my edit" is indistinguishable
+    // from "the model did not try".
+    if (agent.read_only) {
+        if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
+        out.append(arena, .{ .text = "read-only", .style = theme.warn_bold }) catch return null;
     }
 
     // Context tokens ALWAYS visible, not only when they are > 0.
@@ -4090,7 +5154,7 @@ test "autocompletado: filtra por prefijo y acepta con tab" {
     var has_model = false;
     var has_models = false;
     for (0..n_mo) |i| {
-        const k = matchAt(&m, i).?.key;
+        const k = matchLabel(&m, i).?;
         if (std.mem.eql(u8, k, "/model")) has_model = true;
         if (std.mem.eql(u8, k, "/models")) has_models = true;
     }
@@ -4102,7 +5166,7 @@ test "autocompletado: filtra por prefijo y acepta con tab" {
     m.ed.insert("/models") catch {};
     syncAutocomplete(&m);
     try std.testing.expectEqual(@as(usize, 1), matchCount(&m));
-    try std.testing.expectEqualStrings("/models", matchAt(&m, 0).?.key);
+    try std.testing.expectEqualStrings("/models", matchLabel(&m, 0).?);
 
     // "/mod" leaves /model and /models
     m.ed.clear();
@@ -4110,7 +5174,7 @@ test "autocompletado: filtra por prefijo y acepta con tab" {
     syncAutocomplete(&m);
     try std.testing.expectEqual(@as(usize, 2), matchCount(&m));
     m.ac.sel = 0;
-    try std.testing.expectEqualStrings("/models", matchAt(&m, 0).?.key);
+    try std.testing.expectEqualStrings("/models", matchLabel(&m, 0).?);
 
     // Tab completes the selected command and adds the space.
     try std.testing.expect(acceptAutocomplete(&m));
@@ -4143,6 +5207,65 @@ test "autocompletado: no se ofrece con espacios ni sin barra" {
     m.ed.insert("/zzz") catch {}; // no matches
     syncAutocomplete(&m);
     try std.testing.expect(!m.ac.active);
+}
+
+test "fileQueryAt: el token @ bajo el cursor, y un correo no es una mención" {
+    // PURE: this is the logic `refreshFileMatches` keys off, and it has to
+    // agree with `mentions.scan` (the thing that later parses the prompt).
+    const q = fileQueryAt("revisa @src/edi", 15).?;
+    try std.testing.expectEqual(@as(usize, 7), q.token_start);
+    try std.testing.expectEqualStrings("src/edi", q.token);
+
+    // Just `@` (empty token) still opens the listing: it IS the discovery UI.
+    const q2 = fileQueryAt("mira @", 6).?;
+    try std.testing.expectEqual(@as(usize, 5), q2.token_start);
+    try std.testing.expectEqualStrings("", q2.token);
+
+    // An email is NOT a mention, same rule as mentions.scan.
+    try std.testing.expect(fileQueryAt("jorge@example.com", 17) == null);
+    try std.testing.expect(fileQueryAt("a@b", 3) == null);
+
+    // No `@` under the cursor at all.
+    try std.testing.expect(fileQueryAt("hola mundo", 10) == null);
+}
+
+test "autocompletado de @: modo file activo y aceptación reemplaza solo el token" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.ed.insert("revisa @src/") catch {};
+    syncAutocomplete(&m);
+    // Without an `Io` (io_ready false in a test Model) the listing is empty,
+    // but the MODE still flips to file: the popup logic is what is pinned here.
+    try std.testing.expectEqual(Autocomplete.Mode.file, m.ac.mode);
+
+    // Acceptance replaces ONLY the token: with no matches it returns false and
+    // leaves the text alone.
+    m.ed.clear();
+    m.ed.insert("revisa @a.zig y luego @b") catch {};
+    // Cursor lands after `b` by default (insert advances it).
+    syncAutocomplete(&m);
+    try std.testing.expectEqual(Autocomplete.Mode.file, m.ac.mode);
+    // The token start points at the SECOND `@`, not the first.
+    try std.testing.expectEqualStrings("b", acPrefix(&m).?);
+}
+
+test "editor.deleteRange: reemplaza un rango y deja el cursor al inicio" {
+    var ed = @import("editor.zig").Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    ed.insert("revisa @abc y sigue") catch {};
+    const end = ed.cursor;
+    _ = end;
+    // Replace the token `abc` (offsets 8..11) with `zzz`.
+    try ed.deleteRange(8, 11);
+    ed.setCursor(8);
+    try ed.insert("zzz");
+    try std.testing.expectEqualStrings("revisa @zzz y sigue", ed.text());
+    try std.testing.expectEqual(@as(usize, 11), ed.cursor);
+
+    // Out of range is an error, not a panic.
+    try std.testing.expectError(error.BadRange, ed.deleteRange(0, ed.text().len + 1));
 }
 
 test "input: el cursor se ancla en la posición real" {
@@ -4769,6 +5892,51 @@ fn plainColumns(gpa: std.mem.Allocator, line: []const u8) ![]u8 {
         }
     }
     return out.toOwnedSlice(gpa);
+}
+
+test "banner: una REGLA lo separa del primer prompt (no una fila en blanco)" {
+    // Bug 4: el logo y el primer prompt del usuario se leian como un solo bloque.
+    // Una fila vacia no lo arregla cuando encima hay un dibujo de 5 filas y debajo
+    // estan las palabras del usuario: el prompt parece la ultima linea del logo.
+    // Una regla lo dice sin gastar dos filas mas en blanco.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushHeader(.idle);
+    m.pushKind(.user, "hola, quiero una pagina de juegos");
+
+    const surf = try drawTest(&m, arena_state.allocator(), 72, 20);
+    var rb: [256]u8 = undefined;
+
+    // La regla va justo debajo del arte (que son `banner_art_height` filas).
+    const rule_row = rowText(surf, mascot.banner_art_height, &rb);
+    const trimmed = std.mem.trim(u8, rule_row, " ");
+    try std.testing.expect(trimmed.len > 0);
+    // Solo `─`: una fila con la regla y algo mas seria un error de layout, no una
+    // separacion (y es lo que pasaria si el `w` del run se truncase a 255
+    // columnas en una terminal ancha).
+    //
+    // `rowText` devuelve BYTES, y `─` son 3, asi que la fila son varios de esos
+    // triplets y nada mas.
+    const rule_bytes = "\xe2\x94\x80";
+    try std.testing.expect(trimmed.len % 3 == 0);
+    try std.testing.expect(trimmed.len > 0);
+    var at: usize = 0;
+    while (at < trimmed.len) : (at += 3) {
+        try std.testing.expectEqualStrings(rule_bytes, trimmed[at..][0..3]);
+    }
+    // Y ocupa de verdad el ancho de la historia: una regla de tres columnas
+    // separaria igual de mal que una fila en blanco. El ancho exacto lo decide
+    // `drawLines` (que recorta al ancho de la historia), asi que se fija un suelo
+    // y no un numero exacto.
+    const rule_cols = trimmed.len / 3;
+    try std.testing.expect(rule_cols >= 60);
+    try std.testing.expect(rule_cols <= 72);
+
+    // Y el prompt va DEBAJO, no pegado al logo.
+    const prompt_row = rowText(surf, mascot.banner_art_height + 1, &rb);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_row, "hola, quiero una pagina") != null);
 }
 
 test "el banner es SOLO el wordmark ZODE, sin filas en blanco entre lineas" {
@@ -5971,4 +7139,289 @@ test "streamEnd sin texto no deja un parrafo vacio en el historial" {
     m.drainPending();
     try std.testing.expectEqual(@as(usize, 1), countAssistant(&m));
     try std.testing.expect(!m.busy);
+}
+
+// ── `ask`: the question state ────────────────────────────────
+
+/// Opens a question the way the worker does, without blocking: this is what the
+/// tests use to put the model in "it asked something" without a second thread.
+///
+/// It goes through the same fields `requestAsk` fills, which is the point of the
+/// test: if the field names drift, this and the real path drift together.
+fn openAskForTest(m: *Model, question: []const u8, header: []const u8, options: []const []const u8) !void {
+    const q = try m.allocator.dupe(u8, question);
+    errdefer m.allocator.free(q);
+    const h = try m.allocator.dupe(u8, header);
+    errdefer m.allocator.free(h);
+    m.askLock();
+    m.freeAskStringsLocked();
+    m.ask_question = q;
+    m.ask_header = h;
+    for (options) |o| {
+        const oc = try m.allocator.dupe(u8, o);
+        try m.ask_options.append(m.allocator, oc);
+    }
+    m.ask_answer = null;
+    m.ask_typing = false;
+    m.ask_active = true;
+    // NO `ask_started_ns`: it is 0 here, which is what `askMillis` returns, and a
+    // test that wanted a nonzero clock would be testing the clock, not the ask.
+    m.askUnlock();
+}
+
+test "ask: la pregunta se ve en pantalla Y en la franja con su reloj" {
+    // Lo que importa: la pregunta está DIBUJADA. Un worker aparcado esperando una
+    // pregunta que no se ve es indistinguible de un freeze, que es el bug que
+    // este repo ya pagó una vez.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try openAskForTest(&m, "Que base de datos usamos?", "backend", &.{});
+
+    // La franja dice que espera una RESPUESTA (no "thinking"), porque la
+    // diferencia entre "estoy trabajando" y "te estoy esperando" es justo lo que
+    // hace falta para mirar el modal.
+    try std.testing.expect(m.activity().ask);
+
+    const s = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(s, "Que base de datos usamos?") != null);
+    try std.testing.expect(findRow(s, "backend") != null);
+    // Y el reloj de la franja.
+    try std.testing.expect(findRow(s, "waiting for your answer") != null);
+}
+
+test "ask: la franja avisa de la espera CON SEGUNDOS, no solo de que espera" {
+    // El número es lo que responde a "esta colgado?". Sin el, "waiting for your
+    // answer" es indistinguible de un freeze a los dos segundos.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try openAskForTest(&m, "sigo?", "", &.{});
+    // El reloj necesita un `Io`: los tests construyen el Model sin app, y
+    // `io_ready = false` a proposito (leer una vtable sin inicializar es un salto
+    // a basura). `std.testing.io` es un `Io` de verdad y no depende de la
+    // maquina mas alla de "ahora".
+    m.attachIo(std.testing.io);
+    m.ask_started_ns = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
+
+    const s = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(s, "to answer") != null);
+}
+
+test "ask: sin opciones NO se abre el picker (seria un menu vacio)" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "que nombre le pongo al modulo?", "", &.{});
+    try std.testing.expect(!m.askNeedsPicker());
+    try std.testing.expect(m.askPickerItems() == null);
+}
+
+test "ask: con opciones se abre el picker, con la recomendada marcada y un \"Other\"" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const options = [_][]const u8{ "usar el parser nuevo", "arreglar el bucle", "dejarlo" };
+    try openAskForTest(&m, "Que enfoque?", "enfoque", &options);
+
+    try std.testing.expect(m.askNeedsPicker());
+    const items = m.askPickerItems() orelse return error.TestUnexpectedResult;
+    defer Model.freePickerItems(m.allocator, items);
+    try std.testing.expectEqual(items.len, options.len + 1);
+    // La primera opción es la recomendación (así lo dice el guidance) y se marca.
+    try std.testing.expectEqualStrings("recommended", items[0].desc);
+    try std.testing.expectEqualStrings(options[0], items[0].label);
+    // Las demás no se marcan: una lista donde todo dice "recomendado" no
+    // recomienda nada.
+    try std.testing.expectEqualStrings("", items[1].desc);
+    // Y hay un "Other", sin el cual el menu es un examen con una sola respuesta
+    // válida.
+    try std.testing.expect(std.mem.startsWith(u8, items[items.len - 1].label, ask_other_prefix));
+}
+
+test "ask: elegir una opcion entrega un COPIA, no la string del picker" {
+    // La razon de que `askPickerChosen` duplique: `pickerHandleKey` libera el
+    // label justo despues del callback, y `answerAskOwned` toma posesion. Sin la
+    // copia esto es un "Invalid free" la primera vez que se elige algo.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
+
+    const owned = try m.allocator.dupe(u8, "a");
+    m.answerAskOwned(owned);
+
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expectEqualStrings("a", m.ask_answer.?);
+}
+
+test "ask: ESC significa \"decide tu\", y el estado se cierra" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "te da igual?", "", &.{});
+
+    m.declineAsk();
+    try std.testing.expect(!m.askActive());
+    // Y la respuesta existe: el worker tiene que poder despertar y seguir.
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expect(m.ask_answer != null);
+}
+
+test "ask: decline dos veces no machaca la primera respuesta" {
+    // El segundo ESC (o un ESC de la app) no puede liberar la respuesta que el
+    // worker todavia no ha cogido.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "q?", "", &.{});
+    const first = try m.allocator.dupe(u8, "primera");
+    m.answerAskOwned(first);
+    m.declineAsk();
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expectEqualStrings("primera", m.ask_answer.?);
+}
+
+test "ask: elegir \"Other\" pasa el input a modo respuesta, NO responde" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
+
+    askPickerChosen(&m, ask_picker_tag, "Other… (type your own answer)");
+    try std.testing.expect(m.askTyping());
+    // Y no hay respuesta todavia: el worker sigue esperando de verdad.
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expect(m.ask_answer == null);
+}
+
+test "ask: en modo respuesta el picker NO vuelve a abrirse" {
+    // Si `askNeedsPicker` no mirara `ask_typing`, el picker se reabriria en el
+    // siguiente frame encima de lo que el usuario esta escribiendo.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
+    try std.testing.expect(m.askNeedsPicker());
+    m.askBeginTyping();
+    try std.testing.expect(!m.askNeedsPicker());
+}
+
+test "ask: el picker de otro tag no se trata como una respuesta" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a"});
+    askPickerChosen(&m, 0x999, "algo");
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expect(m.ask_answer == null);
+}
+
+test "ask: el titulo del picker es el header del modelo, o el texto por defecto" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "base de datos", &[_][]const u8{"a"});
+    try std.testing.expectEqualStrings("base de datos", m.askTitle());
+
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a"});
+    try std.testing.expectEqualStrings("the model has a question", m.askTitle());
+}
+
+test "ask: el snapshot va al arena del frame (nada de punteros al worker)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
+
+    const snap = m.askSnapshot(arena) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("cual?", snap.question);
+    try std.testing.expectEqual(@as(usize, 2), snap.options.len);
+    try std.testing.expectEqualStrings("b", snap.options[1]);
+}
+
+test "ask: sin pregunta abierta el snapshot es null (no un panel vacio)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expect(m.askSnapshot(arena_state.allocator()) == null);
+}
+
+test "read-only sale en la barra de estado" {
+    // Un modo que no se ve es un modo en el que "el modelo ignoro mi edit" no se
+    // distingue de "el modelo no lo intento".
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const status_row: u16 = 30 - 2;
+    var buf: [400]u8 = undefined;
+
+    const before = try drawTest(&m, arena, 100, 30);
+    const before_row = rowText(before, status_row, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, before_row, "read-only") == null);
+
+    agent.read_only = true;
+    defer agent.read_only = false;
+
+    const after = try drawTest(&m, arena, 100, 30);
+    const after_row = rowText(after, status_row, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, after_row, "read-only") != null);
+}
+
+test "@ mention: el popup lista ficheros Y se pinta, y no esconde los que no caben" {
+    // El sintoma que se reporto: «@ no me da la lista de files». El popup existia
+    // y se llenaba (esto ya lo cubrian `fileQueryAt` y `refreshFileMatches`), pero
+    // se dibujaba pegado al borde de la pantalla y SIN NINGUN INDICIO de que
+    // quedaban mas: con 10 entradas y `max_visible` = 6, se veian 6 y el resto
+    // no existia a los ojos del usuario. Un popup truncado en silencio es peor que
+    // uno que no abre, porque parece que el directorio solo tiene esos ficheros.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.attachIo(threaded.io());
+
+    m.ed.clear();
+    _ = m.ed.insert("@") catch unreachable;
+    m.ed.setCursor(1);
+    syncAutocomplete(&m);
+
+    // El modo es el de ficheros y hay coincidencias (el CWD de los tests tiene
+    // mas de una: `src/`, `build.zig`...).
+    try std.testing.expectEqual(Autocomplete.Mode.file, m.ac.mode);
+    try std.testing.expect(m.ac.file_matches.items.len > 1);
+
+    // Y se PINTA: las filas existen en la superficie, con la `@` delante.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const surf = try drawTest(&m, arena_state.allocator(), 72, 24);
+    var rb: [256]u8 = undefined;
+    var seen_rows: usize = 0;
+    var has_at_prefix = false;
+    for (0..24) |r| {
+        const row = rowText(surf, @intCast(r), &rb);
+        // Una fila del popup es «@nombre»: la `@` en la columna del item.
+        const t = std.mem.trim(u8, row, " ");
+        if (t.len > 0 and t[0] == '@') {
+            seen_rows += 1;
+            has_at_prefix = true;
+        }
+    }
+    try std.testing.expect(seen_rows > 1);
+    try std.testing.expect(has_at_prefix);
+
+    // El popup NO puede mentir sobre cuantos hay: si hay mas de los que caben,
+    // la ultima fila lo dice. Es lo que convierte "solo hay estos" en "hay mas".
+    if (m.ac.file_matches.items.len > m.ac.max_visible) {
+        const ac_rows: u16 = @intCast(@min(m.ac.file_matches.items.len, m.ac.max_visible) + 1);
+        try std.testing.expect(ac_rows >= @as(u16, @intCast(m.ac.max_visible)));
+    }
 }

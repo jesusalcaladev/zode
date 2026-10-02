@@ -2,6 +2,7 @@ const std = @import("std");
 const plan_mod = @import("plan.zig");
 const http = @import("http_client.zig");
 const web = @import("web.zig");
+const bgproc = @import("bgproc.zig");
 
 pub const max_tool_output = 16 * 1024; // output budget per tool
 
@@ -22,7 +23,33 @@ pub const defs = [_]ToolDef{
     .{ .name = "web_search", .desc = "Search the web: titles, URLs and snippets" },
     .{ .name = "think", .desc = "Private scratchpad to reason before acting (no side effects)" },
     .{ .name = "todo", .desc = "Write the visible task list the user watches (full list, not a diff)" },
+    .{ .name = "ask", .desc = "Ask the user one question when the answer changes what you do" },
+    .{ .name = "skill", .desc = "Load a skill's full instructions on demand (cheap: only its name is in your prompt)" },
+    .{ .name = "task", .desc = "Send a read-only search to a subagent with its own context, get back a short report" },
+    .{ .name = "bash_output", .desc = "New output of a backgrounded command (incremental) plus its exit status" },
+    .{ .name = "bash_kill", .desc = "Kill a backgrounded command" },
 };
+
+/// Tools that can run at the same time as each other.
+///
+/// Every one of these only READS: `read`/`grep`/`glob`/`list_files` see the
+/// filesystem, `web_*` see the network, and none of them can observe or change
+/// another. That is the whole requirement — not "they are cheap", not "they
+/// usually do not conflict" — because `execToolCalls` runs a batch of these
+/// concurrently and a tool that writes, or that the model expects to see the
+/// world after, has to be in the serial part or the result is a race.
+///
+/// `bash` is NOT here even when it is `cat file`: a `bash` can write, and the
+/// model may have asked for two `bash` in a row where the second reads what the
+/// first wrote.
+pub fn isParallelSafe(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "grep") or
+        std.mem.eql(u8, name, "glob") or
+        std.mem.eql(u8, name, "list_files") or
+        std.mem.eql(u8, name, "web_fetch") or
+        std.mem.eql(u8, name, "web_search");
+}
 
 /// Declares the tools to the LLM (OpenAI format). Static: 0 allocs per request.
 pub fn toolsJson() []const u8 {
@@ -31,14 +58,19 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"read","description":"Read a file from disk. Optionally read a specific line range with offset/limit.","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, or several at once via edits:[{old_string,new_string},...] (applied in order, all validated first). old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated).","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"}},"required":["command"]}}},
+    \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
     \\{"type":"function","function":{"name":"glob","description":"Find files matching a glob pattern like src/**/*.zig.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
     \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regex. Returns path:line:text matches.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"subdir":{"type":"string"}},"required":["pattern"]}}},
     \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; ask for a deeper offset if the text is cut.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Search the web and get titles, URLs and snippets. Use it when you need something you do not know yet (docs, versions, error messages), then web_fetch the promising URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 8"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"think","description":"Think privately step by step before acting. Use for planning and complex reasoning. No side effects.","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}},
-    \\{"type":"function","function":{"name":"todo","description":"Write the task list the USER SEES on screen, for tasks with more than about two steps. Send the WHOLE list every time (it replaces the previous one), each item {content, status: pending|in_progress|done}. Mark exactly one in_progress while you work on it, and never more than one. Call it again when a step finishes or the plan changes, and send an empty list when everything is done. Do not use it for a single obvious step or for thinking out loud.","parameters":{"type":"object","properties":{"items":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string","description":"imperative, short (a single line)"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content","status"]}}},"required":["items"]}}}
+    \\{"type":"function","function":{"name":"todo","description":"Write the task list the USER SEES on screen, for tasks with more than about two steps. Send the WHOLE list every time (it replaces the previous one), each item {content, status: pending|in_progress|done}. Mark exactly one in_progress while you work on it, and never more than one. Call it again when a step finishes or the plan changes, and send an empty list when everything is done. Do not use it for a single obvious step or for thinking out loud.","parameters":{"type":"object","properties":{"items":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string","description":"imperative, short (a single line)"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content","status"]}}},"required":["items"]}}},
+    \\{"type":"function","function":{"name":"ask","description":"Ask the USER one question, and wait for the answer. Use it when the answer changes what you do next: a choice between approaches, an ambiguous request with two real readings, a 'which one'. Do NOT ask what you can find out yourself — read the file, grep, run the command first, and only ask if it is still unclear after that. One question per step, at most three in a whole turn. Put your recommendation first in the question text so the user can just press enter. With 2 to 5 `options` it becomes a menu; with no options the user types free text. If the user does not answer (esc) you must decide on your own, say which option you picked and why, and carry on: do not ask again. `header` is a 2-3 word label for the dialog, not the question.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"the question, with your recommendation and its reason up front"},"header":{"type":"string","description":"2-3 word label for the dialog"},"options":{"type":"array","minItems":2,"maxItems":5,"items":{"type":"string","description":"one choice, on a single line"}}},"required":["question"]}}},
+    \\{"type":"function","function":{"name":"skill","description":"Load a skill: a folder of instructions written for a specific kind of task. Your prompt lists only the name and when to use it (the body is not in your prompt, so it costs nothing until you ask). Load one when its description matches what you are about to do, and load none when none of them do.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"the skill's name, exactly as listed"}},"required":["name"]}}},
+    \\{"type":"function","function":{"name":"task","description":"Send a read-only investigation to a SUBAGENT that has its own context window, and get back a short report (a few lines with paths and line numbers). Use it when the search is big: grepping across a large tree, tracing where something is used, reading many files to answer one question. Everything the subagent reads is paid for ONCE in a window that is then thrown away, instead of staying in your context and being resent on every remaining step — so for a wide search this is much cheaper than doing it yourself. It cannot write anything and cannot ask the user anything; if it needs a decision only the user can make, it says so in the report and you decide whether to ask. Use it for search; do it yourself when you already know the file to change.","parameters":{"type":"object","properties":{"description":{"type":"string","description":"one line: what to find out"},"prompt":{"type":"string","description":"the full question, including where to look and what to report back"}},"required":["description"]}}},
+    \\{"type":"function","function":{"name":"bash_output","description":"Read the NEW output of a command you started with run_in_background, plus whether it is still running or what it exited with. Incremental: you get what appeared since your last call, not the whole buffer, so polling is cheap. Poll once per step, and do not poll in a tight loop — do something else in between.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}},
+    \\{"type":"function","function":{"name":"bash_kill","description":"Kill a backgrounded command. Use it when you no longer need the result, or when it is clearly going the wrong way.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}}
     \\]
     ;
 }
@@ -48,6 +80,20 @@ pub fn toolsJson() []const u8 {
 /// `web_fetch` and `web_search` do NOT ask: they are reads, they write nothing, and
 /// a dialog for every internet query turns the agent loop into an interrogation.
 /// Same criterion as `read` or `grep`.
+///
+/// The three new ones are in the no-permission group for different reasons, and
+/// it is worth being explicit about each:
+///
+/// - `ask` asks by DESIGN. Putting it behind a permission dialog would be two
+///   dialogs for one question, and the second would be a yes/no about the first.
+/// - `skill` only reads a file and returns text.
+/// - `bash_output`/`bash_kill` only talk to processes THIS TURN started, whose
+///   creation already went through the `bash` permission. Asking again would be
+///   asking twice about the same command.
+///
+/// `task` DOES ask: a subagent spends tokens and can read the whole repo, so it
+/// goes through the same dialog as `web_fetch` would if we had not decided reads
+/// are free. What makes it acceptable is that it cannot write.
 pub fn needsPermission(name: []const u8) bool {
     return !(std.mem.eql(u8, name, "read") or
         std.mem.eql(u8, name, "glob") or
@@ -56,12 +102,30 @@ pub fn needsPermission(name: []const u8) bool {
         std.mem.eql(u8, name, "web_fetch") or
         std.mem.eql(u8, name, "web_search") or
         std.mem.eql(u8, name, "think") or
-        std.mem.eql(u8, name, "todo"));
+        std.mem.eql(u8, name, "todo") or
+        std.mem.eql(u8, name, "ask") or
+        std.mem.eql(u8, name, "skill") or
+        std.mem.eql(u8, name, "bash_output") or
+        std.mem.eql(u8, name, "bash_kill"));
 }
 
 /// Runs a tool with JSON args. Returns the (truncated) result —
 /// `arena` memory, valid until the arena is freed.
-pub fn execute(io: std.Io, name: []const u8, args_json: []const u8, arena: std.mem.Allocator) ![]const u8 {
+///
+/// `bg` is the background-process registry, and it is a PARAMETER rather than a
+/// global because it lives in the `Model`: two `Model`s (the real one and the
+/// ones the tests build) must not share a list of running processes. `null` means
+/// "no registry", which only happens in the tests, and a `bash` that asks to run
+/// in the background then gets an error that says exactly that instead of
+/// silently running in the foreground (which would look like `run_in_background`
+/// works).
+pub fn execute(
+    io: std.Io,
+    name: []const u8,
+    args_json: []const u8,
+    arena: std.mem.Allocator,
+    bg: ?*bgproc.Registry,
+) ![]const u8 {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
     if (parsed != .object) return error.BadArgs;
     const obj = parsed.object;
@@ -73,7 +137,7 @@ pub fn execute(io: std.Io, name: []const u8, args_json: []const u8, arena: std.m
     } else if (std.mem.eql(u8, name, "edit")) {
         return toolEdit(io, obj, arena);
     } else if (std.mem.eql(u8, name, "bash")) {
-        return toolBash(io, obj, arena);
+        return toolBash(io, obj, arena, bg);
     } else if (std.mem.eql(u8, name, "glob")) {
         return toolGlob(io, obj, arena);
     } else if (std.mem.eql(u8, name, "grep")) {
@@ -88,7 +152,17 @@ pub fn execute(io: std.Io, name: []const u8, args_json: []const u8, arena: std.m
         return toolThink(obj, arena);
     } else if (std.mem.eql(u8, name, "todo")) {
         return toolTodo(obj, arena);
+    } else if (std.mem.eql(u8, name, "bash_output")) {
+        return toolBashOutput(obj, arena, bg);
+    } else if (std.mem.eql(u8, name, "bash_kill")) {
+        return toolBashKill(obj, arena, bg, io);
     }
+    // `ask`, `task` and `skill` are NOT here on purpose: they need the `Model`
+    // (the dialog, the worker loop, the loaded skills), which `tools.zig` cannot
+    // see without importing `tui.zig`, which imports this. `agent.execToolCalls`
+    // intercepts them BEFORE calling `execute`. Reaching here means the
+    // interception is missing, and saying so is better than an `UnknownTool`
+    // that looks like a typo in the model's arguments.
     return error.UnknownTool;
 }
 
@@ -102,6 +176,63 @@ fn getInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const v = obj.get(key) orelse return null;
     if (v != .integer) return null;
     return v.integer;
+}
+
+/// `true`, `false`, or absent. A STRING `"true"` counts: models emit both, and
+/// rejecting the string form makes `run_in_background` silently false, which
+/// looks like the tool ignoring the flag.
+fn getBool(obj: std.json.ObjectMap, key: []const u8) bool {
+    const v = obj.get(key) orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        .string => |s| std.ascii.eqlIgnoreCase(s, "true"),
+        .integer => |i| i != 0,
+        else => false,
+    };
+}
+
+/// `bash_output`: the new output plus the status.
+fn toolBashOutput(obj: std.json.ObjectMap, arena: std.mem.Allocator, reg: ?*bgproc.Registry) ![]const u8 {
+    const r = reg orelse return error.NoBackgroundRegistry;
+    const id_i = getInt(obj, "id") orelse return error.MissingId;
+    if (id_i <= 0) return error.MissingId;
+    const id: u32 = @intCast(id_i);
+
+    var out = bgproc.Output{};
+    const text = bgproc.read(r, &out, id) catch |err| switch (err) {
+        // `NoNewOutput` is NOT reported as an error string: the model would read
+        // it as "the command failed". It is the normal answer to "anything new?".
+        error.NoNewOutput => return std.fmt.allocPrint(arena, "[job {d}] still running, nothing new yet", .{id}),
+        error.UnknownJob => return std.fmt.allocPrint(arena,
+            \\no job {d}. Start one with bash and run_in_background: true. (Jobs are
+            \\also forgotten when zode restarts.)
+            \\
+        , .{id}),
+    };
+
+    // Tell it what to do next in the same breath, because the common failure is
+    // the model polling three times in a row with nothing else happening.
+    if (std.mem.eql(u8, bgproc.stateWord(r, id), "running")) {
+        return std.fmt.allocPrint(arena, "{s}\n(do something else before polling again)", .{text});
+    }
+    return text;
+}
+
+/// `bash_kill`.
+fn toolBashKill(
+    obj: std.json.ObjectMap,
+    arena: std.mem.Allocator,
+    reg: ?*bgproc.Registry,
+    io: std.Io,
+) ![]const u8 {
+    const r = reg orelse return error.NoBackgroundRegistry;
+    const id_i = getInt(obj, "id") orelse return error.MissingId;
+    if (id_i <= 0) return error.MissingId;
+    const id: u32 = @intCast(id_i);
+    if (bgproc.kill(r, io, id)) {
+        return std.fmt.allocPrint(arena, "killed job {d}. You can still read what it printed with bash_output.", .{id});
+    }
+    return std.fmt.allocPrint(arena, "job {d} was not running ({s})", .{ id, bgproc.stateWord(r, id) });
 }
 
 // ── read ─────────────────────────────────────────────────────
@@ -293,20 +424,108 @@ fn allocReplace(a: std.mem.Allocator, data: []const u8, old: []const u8, new: []
 }
 
 // ── bash ─────────────────────────────────────────────────────
-fn toolBash(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+/// Runs a command in the FOREGROUND and collects its output, publishing the pid
+/// so ESC can kill it.
+///
+/// This is `std.process.run` with one difference that matters: the child is
+/// spawned HERE and its pid published, because `run` keeps the `Child` in its own
+/// frame and returns only the output. Without the pid, ESC had nothing to kill and
+/// a 30 s build ran to the end of its timeout while the UI said it had been
+/// cancelled.
+///
+/// The timeout is applied on the READ (like `run` does) rather than by killing
+/// the child: a command whose output pipe is full is stuck writing, not stuck
+/// running, and reading with a timeout is the only way to notice that.
+pub fn runForeground(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    command: []const u8,
+    timeout_s: u64,
+    out_limit: usize,
+) !std.process.RunResult {
+    var argv = [_][]const u8{ "/bin/sh", "-c", command };
+    var child = try std.process.spawn(io, .{
+        .argv = &argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    defer child.kill(io);
+
+    if (child.id) |pid| setForeground(pid);
+
+    var mr_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var mr: std.Io.File.MultiReader = undefined;
+    mr.init(gpa, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer mr.deinit();
+
+    const timeout: std.Io.Timeout = .{
+        .duration = .{ .raw = .fromSeconds(@intCast(timeout_s)), .clock = .awake },
+    };
+    const stdout_reader = mr.reader(0);
+    const stderr_reader = mr.reader(1);
+
+    while (mr.fill(4096, timeout)) |_| {
+        // Same rule as `run`: over the limit is an error, not a silent cut. A tool
+        // result that stops mid-line looks to the model like the output ended.
+        if (stdout_reader.buffered().len > out_limit) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > out_limit) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        error.Timeout => return error.Timeout,
+        else => |e| return e,
+    }
+
+    const term = try child.wait(io);
+    clearForeground();
+
+    const stdout_slice = try mr.toOwnedSlice(0);
+    errdefer gpa.free(stdout_slice);
+    const stderr_slice = try mr.toOwnedSlice(1);
+    errdefer gpa.free(stderr_slice);
+
+    return .{ .term = term, .stdout = stdout_slice, .stderr = stderr_slice };
+}
+
+/// Foreground command in flight, for ESC to kill. Re-exported from `bgproc`
+/// because that is where the pid lives (a `pid` and its process group are the same
+/// subject) and this module is what spawns the command.
+const setForeground = bgproc.setForeground;
+const clearForeground = bgproc.clearForeground;
+
+/// `bash` — foreground by default, background when asked.
+///
+/// The schema advertises `run_in_background`, and it is on the tool rather than as
+/// a separate tool on purpose: the model decides *this command* is long, not that
+/// it wants to be in a different mode. A `bash_background` tool would have to be
+/// discovered and remembered, and would be wrong for the common case.
+fn toolBash(
+    io: std.Io,
+    obj: std.json.ObjectMap,
+    arena: std.mem.Allocator,
+    reg: ?*bgproc.Registry,
+) ![]const u8 {
     const command = getStr(obj, "command") orelse return error.MissingCommand;
     const timeout_s: u64 = if (getInt(obj, "timeout_seconds")) |t| (if (t > 0) @intCast(t) else 30) else 30;
 
-    const argv = [_][]const u8{ "/bin/sh", "-c", command };
-    const result = std.process.run(arena, io, .{
-        .argv = &argv,
-        .stdout_limit = .limited(max_tool_output),
-        .stderr_limit = .limited(max_tool_output),
-        .reserve_amount = 4096,
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(@intCast(timeout_s)), .clock = .awake } },
-    }) catch |err| {
-        return std.fmt.allocPrint(arena, "error running: {t}", .{err});
-    };
+    if (getBool(obj, "run_in_background")) {
+        const r = reg orelse return error.NoBackgroundRegistry;
+        const id = try bgproc.spawn(r, arena, io, command);
+        return std.fmt.allocPrint(arena,
+            \\started in the background as job {d}
+            \\
+            \\It is running NOW and you are not blocked. Keep working: read a file,
+            \\grep the error, ask the user something — anything. When you need the
+            \\result, call bash_output with id {d}: it gives you the output that
+            \\appeared since your last call plus whether it is still running.
+            \\
+            \\Do not poll in a loop. Do one poll per step.
+            \\
+        , .{ id, id });
+    }
+
+    const result = try runForeground(arena, io, command, timeout_s, max_tool_output);
 
     var out: std.ArrayList(u8) = .empty;
     const exit_code: u8 = switch (result.term) {
@@ -863,7 +1082,7 @@ test "needsPermission" {
 test "list_files lista este src" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "list_files", "{\"path\":\"src\"}", arena_state.allocator());
+    const out = try execute(std.testing.io, "list_files", "{\"path\":\"src\"}", arena_state.allocator(), null);
     try std.testing.expect(std.mem.indexOf(u8, out, "f main.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "f tools.zig") != null);
 }
@@ -871,7 +1090,7 @@ test "list_files lista este src" {
 test "think devuelve OK sin efectos" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "think", "{\"thought\":\"plan: read file first\"}", arena_state.allocator());
+    const out = try execute(std.testing.io, "think", "{\"thought\":\"plan: read file first\"}", arena_state.allocator(), null);
     try std.testing.expect(std.mem.indexOf(u8, out, "noted") != null);
 }
 
@@ -914,21 +1133,21 @@ test "web_fetch y web_search aparecen en el JSON con su descripción" {
 test "web_fetch rechaza lo que no es http(s) sin tocar la red" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "web_fetch", "{\"url\":\"file:///etc/passwd\"}", arena_state.allocator());
+    const out = try execute(std.testing.io, "web_fetch", "{\"url\":\"file:///etc/passwd\"}", arena_state.allocator(), null);
     try std.testing.expect(std.mem.indexOf(u8, out, "only http:// and https://") != null);
 }
 
 test "web_fetch sin url lo dice" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "web_fetch", "{}", arena_state.allocator());
+    const out = try execute(std.testing.io, "web_fetch", "{}", arena_state.allocator(), null);
     try std.testing.expect(std.mem.indexOf(u8, out, "needs a `url`") != null);
 }
 
 test "web_search sin query lo dice" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "web_search", "{}", arena_state.allocator());
+    const out = try execute(std.testing.io, "web_search", "{}", arena_state.allocator(), null);
     try std.testing.expect(std.mem.indexOf(u8, out, "needs a `query`") != null);
 }
 
@@ -970,7 +1189,7 @@ fn isNetError(err: anyerror) bool {
 test "web_fetch real: el HTML llega como texto, no como etiquetas" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = execute(std.testing.io, "web_fetch", "{\"url\":\"https://example.com/\"}", arena_state.allocator()) catch |err| {
+    const out = execute(std.testing.io, "web_fetch", "{\"url\":\"https://example.com/\"}", arena_state.allocator(), null) catch |err| {
         if (isNetError(err)) return error.SkipZigTest;
         return err;
     };
@@ -988,7 +1207,7 @@ test "web_fetch real: el HTML llega como texto, no como etiquetas" {
 test "web_search real: devuelve resultados con URL" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = execute(std.testing.io, "web_search", "{\"query\":\"zig programming language\",\"max_results\":3}", arena_state.allocator()) catch |err| {
+    const out = execute(std.testing.io, "web_search", "{\"query\":\"zig programming language\",\"max_results\":3}", arena_state.allocator(), null) catch |err| {
         if (isNetError(err)) return error.SkipZigTest;
         return err;
     };
@@ -1002,21 +1221,21 @@ test "tool read lee este archivo" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const args = "{\"path\":\"src/tools.zig\"}";
-    const out = try execute(std.testing.io, "read", args, arena_state.allocator());
+    const out = try execute(std.testing.io, "read", args, arena_state.allocator(), null);
     try std.testing.expect(std.mem.indexOf(u8, out, "toolRead") != null);
 }
 
 test "glob encuentra zigs" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = try execute(std.testing.io, "glob", "{\"pattern\":\"src/*.zig\"}", arena_state.allocator());
+    const out = try execute(std.testing.io, "glob", "{\"pattern\":\"src/*.zig\"}", arena_state.allocator(), null);
     try std.testing.expect(std.mem.indexOf(u8, out, "src/main.zig") != null);
 }
 
 test "grep nativo encuentra patrón" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const out = execute(std.testing.io, "grep", "{\"pattern\":\"toolGrep\",\"subdir\":\"src\"}", arena_state.allocator()) catch |err| {
+    const out = execute(std.testing.io, "grep", "{\"pattern\":\"toolGrep\",\"subdir\":\"src\"}", arena_state.allocator(), null) catch |err| {
         if (err == error.FileNotFound) return error.SkipZigTest; // no rg/grep in PATH
         return err;
     };
@@ -1039,7 +1258,7 @@ test "write devuelve un PREVIEW del fichero, no un OK opaco" {
     }
     try body.appendSlice(arena, "\"}");
 
-    const out = try execute(std.testing.io, "write", body.items, arena);
+    const out = try execute(std.testing.io, "write", body.items, arena, null);
 
     // La cabecera dice qué y cuánto.
     try std.testing.expect(std.mem.indexOf(u8, out, "preview-test.txt") != null);

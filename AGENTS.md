@@ -1569,3 +1569,499 @@ limpio **cambia la key que se manda**. Lo que sí salió del lío es el mensaje 
 
 Para probar de verdad hay que usar el `HOME` real, o borrar el `auth.json` del
 sandbox a propósito y saber que se está probando la key del entorno.
+
+---
+
+# El salto de "agente que ejecuta" a "agente que collaborate" (2026-10-01)
+
+Ocho cosas nuevas, y lo que se aprendió de cada una. La del `ask` es la que
+cambia el carácter de la cosa; las otras cuatro son de precio (tiempo y
+tokens) y la última es el ahorro en tokens.
+
+## 1. `ask`: que el modelo te pregunte
+
+Es LA pieza que faltaba. Antes el modelo o acertaba o se inventaba, y la única
+interacción era el permiso sí/no sobre un comando que ya estaba decidido.
+
+**Por qué la respuesta es un `tool_result` y no un mensaje `user` nuevo.** Un
+mensaje del asistente que pregunta, seguido de un `user`, no lo acepta ningún
+provider: el turno de usuario tiene que seguir a un turno de usuario, no a un
+asistente con `tool_calls` pendientes. Un tool call deja el turno aparcado
+justo donde la API espera, así que el formato del cable no cambia y **todos los
+providers lo aceptan sin tocar nada**.
+
+**El módulo puro (`src/ask.zig`) va aparte del wiring** porque lo que sale mal
+aquí es siempre la FORMA de la pregunta y, sobre todo, el texto que el MODELO
+lee de vuelta. Eso se testea sin TUI y sin red, que es como se pudo comprobar que
+`formatAnswered` nunca corta la respuesta del usuario en silencio.
+
+Tres salidas, y cada una dice una cosa distinta al modelo:
+
+| Salida | Qué le dice |
+|---|---|
+| `The user answered: X` | las palabras del usuario, textuales |
+| `declined_text` | «no contestaré eso» → **decide tú y dilo** |
+| `timed_out_text` | 5 min sin nadie → lo mismo, pero «estabas fuera» |
+
+Un modelo al que le dicen «no» sin más se queda parado o repite la pregunta. Lo
+único accionable es «elige la opción más razonable, di cuál has elegido y por qué,
+sigue». Y las dos frases NO contienen la palabra *stop*: el modelo la lee como
+permiso para abandonar.
+
+**El diálogo NO es el diálogo de permisos.** Es una copia de su forma (lock
+propio, espera dormida con backoff 1→20 ms, epoch para despertar) y no de su
+código, porque son preguntas distintas con timeouts distintos, y compartirlas
+hace que cada cambio en una sea un cambio en el comportamiento de la otra.
+
+**El worker NO abre la palette.** Es la regla que ya costó dos segfaults (ver
+«Workers desacoplados»): el worker deja la pregunta en el `Model` y el **draw**
+la convierte en picker. Lo que se ve en el código es `askNeedsPicker()` dentro
+de `typeErasedDrawFn`.
+
+**La franja tiene que salir aunque no haya turno.** `act_rows` cuenta `act.ask`,
+no solo `busy`. Sin eso la pregunta se pintaba en el centro sin nada que dijera
+por qué la app se había parado, y un worker aparcado sin reloj es
+**indistinguible de los freezes que este repo ya pagó una tarde entera**.
+
+**El panel reserva las filas SIEMPRE.** La primera versión reservaba 4 filas bajo
+la pregunta y 2 si había opciones, así que una pregunta de texto libre salía con
+tres filas vacías debajo: parecía un panel roto. Ahora son 2 fijas (la ayuda de
+teclas y el reloj).
+
+**ESC significa tres cosas, y el ORDEN es el diseño entero**:
+
+1. Pregunta abierta → «no lo sé, decides tú». **No** es cancelar el turno.
+2. Tool en foreground → **matar el hijo** (ver el punto 4).
+3. Si no → abortar el stream.
+
+Y `declineAsk` cierra el diálogo en el MISMO frame. Sin eso la pregunta se
+quedaba pintada unos milisegundos después de haberla respondido, que se lee como
+«no me cogió la respuesta».
+
+**El input en modo respuesta.** Enter responde en vez de mandar un prompt, y una
+respuesta VACÍA es una respuesta válida («you decide»): por eso la comprobación
+va **antes** que la del prompt vacío, o mandarías un turno con un `user` vacío.
+
+**El tope de 3 por turno** se reinicia en cada turno (si no, una sesión larga
+dejaba de poder preguntar a la hora) y al llegar el cap **degrada en «decide tú»**,
+no en un turno roto. El número de preguntas del turno está en `/bench`.
+
+## 2. Ask mode (read-only): shift+tab
+
+`write`/`edit`/`bash` vuelven como `tool_result` con un texto que **dice que no
+se reintente** (si no, el modelo repite y el bucle se come las iteraciones) y que
+ofrece `ask` como salida.
+
+La decisión es por TOOL, no parseando el comando: si se mirase el comando,
+`bash ls` serviría para descubrir qué quiere ejecutar de verdad el modelo y el
+modo se podría saltar. `bash` está bloqueado aunque solo vaya a leer.
+
+El modo se inyecta en el **system prompt**, no solo en el error de la tool: si no,
+el modelo planea un `write` y se encuentra un error, y lo lee como un bug del
+harness y busca el rodeo. Sale en la barra de estado siempre, porque un modo que
+no se ve es un modo donde «el modelo ignoró mi edit» no se distingue de «el
+modelo no lo intentó».
+
+`Session.replaceSystem` existe por esto: el prompt depende de cosas que cambian
+durante la sesión, y **añadir** un segundo `system` es exactamente el bug que
+tuvo el bucle del agente (`[user, system, tool, system]`, y un 400 en el turno
+siguiente). Se compara antes de escribir: en un turno estable es un `memcmp`.
+
+## 3. Background bash: `run_in_background`
+
+El `bash` normal metía al worker dentro de `std.process.run` **30 s**: no podía
+leer un fichero, ni grep un error, ni contestar. El trabajo interesante («¿cuál de
+estos 40 errores es el mío?») pasa a ocurrir **durante** la espera en lugar de
+después.
+
+- `bash_output` es **incremental**: lo que apareció desde la última llamada. Sin
+  eso, un agente que hace polling paga dos veces por la misma salida y el
+  contexto se llena de duplicados. El estado (¿sigue? ¿exit=?) **no** es
+  incremental, porque es corto y es lo que responde a «¿terminó?».
+- El tope de 64 KB **reserva sitio para el aviso de corte desde el principio**.
+  Sin la reserva el aviso nunca se puede escribir: cuando descubres que el buffer
+  está lleno es justo cuando no queda espacio, así que el mensaje que dice «no lo
+  estás viendo todo» es el único que se pierde.
+- El id es un **contador, no un puntero**: un slot liberado y reutilizado no puede
+  hacer que el id 3 devuelva la salida de otro trabajo.
+- El hilo lector tiene **su propia copia del `Child`**. `wait()` lo muta y
+  `kill()` le pone el id a null, así que compartirlo con el registry es una
+  carrera entre `bash_kill` y el lector.
+- El reader **nunca** libera el slot (compara el id y nada más): el teardown del
+  modelo puede haber soltado la memoria mientras el proceso seguía vivo.
+
+## 4. ESC mata al hijo
+
+`std.process.run` se guarda el `Child` en su propio frame y no le pasa un handle
+a nadie, así que ESC solo ponía un flag que `run` nunca mira: un `zig build` de
+30 s seguía vivo, con el worker bloqueado dentro y la CPU al 100 %. Ahora
+`tools.runForeground` hace el spawn a mano y publica el pid.
+
+`kill(-pid, SIGKILL)`, con el **pid negativo**: un `sh -c "a && b"` tiene hijos, y
+matar solo el shell deja al nieto (`zig`, `npm`) corriendo. El grupo de proceso
+es lo que se mata. El camino de foreground NO pone `pgid` a propósito (el hijo
+comparte nuestro grupo y el negativo se llevaría zode por delante), así que ahí
+cae al pid suelto y se mata el shell: es el intercambio honesto.
+
+Y ESC marca además **todos los jobs en background**. ESC significa «para», y
+dejar compilando en segundo plano después de pulsar ESC es como se acaba con el
+portátil caliente.
+
+## 5. Tools en paralelo
+
+Se paralelizan **solo** las que no pueden observarse entre sí: `read`, `grep`,
+`glob`, `list_files`, `web_fetch`, `web_search`. El criterio no es «son rápidas»
+ni «suelen no chocar»: es que no escriben y no necesitan ver el mundo después.
+`bash` queda fuera aunque parezca de lectura, porque puede escribir y el modelo
+puede haber pedido dos `bash` donde el segundo lee lo que escribió el primero.
+El test `isParallelSafe` ∧ `isWriteSafe` == ∅ fija que las dos listas no se
+contradicen, porque un tool en las dos sería un fallo de seguridad con forma de
+feature.
+
+Lo que salió:
+
+- **Arena propia por llamada.** La arena del turno se comparte entre las tres y
+  su `ArrayList` de longitud es una carrera **silenciosa**, no un crash.
+- **Resultados en orden de petición.** Ordenarlos por tiempo de respuesta sería
+  más rápido de mirar y haría que la misma petición diera transcripciones
+  distintas en cada ejecución.
+- **Cabeceras primero, resultados después.** Todas las líneas `⏺ grep(...)` salen
+  antes que cualquier `⎿ 12 matches`, para que el historial lea «estas cuatro
+  cosas a la vez» en vez de cuatro pares sueltos.
+- **La espera NO cuenta `m.workerCount()`**: ese contador global incluye al worker
+  del turno, así que esperar por él aquí sería esperar a que termine el turno, que
+  está esperando a esta función. Es un contador **local al lote**.
+- Los hilos van sueltos (`detach`) y con `beginWorker`/`endWorker`, porque al
+  salir `waitWorkers` tiene que aguantar a que terminen o `app.deinit()` destruye
+  el `Io` mientras uno está dentro de `process.run`.
+
+## 6. Subagentes (`task`)
+
+El segundo hueco grande, y el mayor ahorro de tokens. **Todo lo que el agente
+principal lee entra en su contexto, y ese contexto se reenvía en cada iteración y
+se factura cada vez.** Un `grep -r` de 40 KB son 10k tokens en el prompt de las
+iteraciones 2, 3, 4… y lo útil eran dos líneas que decían qué función mirar. El
+subagente paga esos 10k **una vez**, en una ventana que se tira, y devuelve un
+párrafo.
+
+Decisiones que no son obvias:
+
+- **No ve la conversación.** Solo el prompt de la tarea. Si heredara el historial
+  heredaría los tokens, que es justo lo que esto evita.
+- **Effort `low` siempre.** Es una búsqueda acotada, no un diseño, y no hay nadie
+  a quien impresionar. Aquí es donde se ahorra el dinero y no se pierde calidad.
+- **Profundidad 1.** Un subagente que puede anidar es una forma de gastar cien
+  veces los tokens por accidente y no se puede presupuestar.
+- **Sus tools son las de lectura y SOLO esas.** `ask` está fuera a propósito: un
+  subagente que pregunta desde un hilo que no es el del turno deja al usuario sin
+  saber cuál de los dos agentes le está hablando. Lo que necesita el usuario lo
+  devuelve como «necesita que decidas X» y decide el agente principal.
+- **Presupuesto de 24k, constante**, no derivado de `ZODE_CONTEXT_LIMIT`: la
+  ventana del subagente es desechable, y derivarla de la del usuario la haría de
+  100k para alguien con una ventana grande.
+- **Se queda sin pasos NO es un error.** El informe que llevaba escribiendo suele
+  bastar, y tirarlo porque la búsqueda no acabó es lo peor de las dos opciones.
+- Un fallo suyo (sin key, provider caído) vuelve como **texto**, no como error: el
+  turno tiene que poder continuar, y el agente principal necesita saber que le
+  toca buscar a él.
+
+## 7. `/bench` y el límite de iteraciones
+
+`max_iterations` eran 8, nadie sabía cuánto se alcanzaba, y «subirlo a 20» era una
+apuesta en las dos direcciones. Ahora son 12 y configurables con `ZODE_MAX_ITER`,
+y `/bench` dice **el porcentaje de turnos que llegaron al tope**, que es el
+número que decide.
+
+`first token` es la media y el p95 del TTFT, que es lo que separa «el modelo es
+lento» de «hemos hecho mal la petición». El anillo de muestras se queda con las
+**últimas 64**: un p95 de toda la sesión describe una máquina que hace una hora
+estaba compilando otra cosa.
+
+El límite por defecto subió a 12 porque 8 era para un bucle donde cada iteración
+es una edición, y una tarea de verdad es «leer tres ficheros, grep dos veces,
+editar, compilar, leer el error, arreglar, compilar» — 8 o 9 antes incluso de
+escribir la respuesta final. Y subirlo no cuesta nada en el caso normal, porque el
+bucle se acaba solo en cuanto el modelo deja de pedir tools.
+
+## 8. Skills
+
+`.zode/skills/<nombre>/SKILL.md` (proyecto) y
+`~/.config/zode/skills/<nombre>/SKILL.md` (persona), con frontmatter de `name` y
+`description`.
+
+**El diseño entero es: al prompt solo van nombre y descripción.** El cuerpo se
+carga con la tool `skill` en el momento en que el modelo decide que lo necesita.
+La alternativa — meterlo todo — es como un proyecto acaba con 40 KB de
+instrucciones que el modelo ya ha aprendido a saltar, en cada request, para
+siempre, diga o no la tarea con ellas. `description` tiene que decir **CUÁNDO**
+usarlo, no QUÉ es: «después de tocar el dibujo de tui.zig» decide bien; «notas
+sobre pty» obliga al modelo a adivinar.
+
+El proyecto **tapa** al global, no se fusionan: un skill de proyecto mezclado con
+el global es peor que no tenerlo, porque la mitad de las instrucciones serían de
+otro proyecto.
+
+Sin frontmatter también vale (es markdown y punto) y entonces el nombre sale del
+**directorio**, que es lo que existe de verdad en disco: un `name` del frontmatter
+que no coincide con el directorio haría que la tool call fallara y el modelo no
+tiene forma de recuperar.
+
+## Tres cosas que se colgaron por el camino
+
+1. **`readPrefix` devolvía un slice de su propio stack** (`.zode-skills-test-N`).
+   Los fixtures se escribían en una ruta de basura y los seis tests de
+   descubrimiento fallaban con «found 0» sin motivo visible. Octava vez de la
+   familia `&[_]u8{c}`.
+2. **`splitFrontmatter` reventaba con un fichero que ACABA en el `---` de
+   cierre.** Sin newline final, `nl` es 0 y el índice se pasaba una posición;
+   `rest[i..]` con `i > len` es un panic, no un slice vacío. Los tests puros
+   todos tenían newline final, así que solo lo cazaron los de disco — que es
+   exactamente para lo que existen.
+3. **El smoke test no esperaba después de la última tecla.** Mandaba el `\r` y
+   cerraba en el acto, así que `/skills` se comprobaba contra un frame en el que
+   la app todavía no había respondido. Un test que depende de eso no prueba la
+   feature, prueba la velocidad de la máquina. Ahora hay un turno de espera
+   antes del ctrl+c.
+
+Y uno de diseño que salió al escribir los tests:
+
+**Los `PickerItem` de una pregunta son copias propias (gpa).** `closePicker` los
+libera, y `askPickerChosen` recibe una etiqueta que el picker libera justo
+después del callback. Sin la copia, elegir la primera opción es un «Invalid
+free». Es el mismo bug que el fuzzing encontró con el item `+ connect`.
+
+## Qué NO se ha hecho
+
+- **MCP**, a propósito (fuera de alcance).
+- **Router de modelo barato para el turno principal.** Se quedó en el subagente
+  (effort `low`), que es donde se paga sin riesgo: mandar el turno principal a
+  un modelo pequeño puede dar 403 en cuanto ese modelo no esté disponible para
+  la cuenta, y eso es un error que no se ve venir.
+- **El modelo sigue sin poder preguntar desde un subagente** (por diseño, ver el
+  punto 6).
+
+---
+
+# Seis bugs reportados (2026-10-01)
+
+Todos verificados antes y despues: el que se puede reproducir con un test se
+reproduce primero, se quita el fix, y se ve el test en rojo.
+
+## 1. ESC no paraba los procesos: no existia el grupo que matar
+
+**El sintoma**: «ESC no para los procesos». ESC ponia el flag de cancelacion y
+mataba el pid del shell. El shell moria. **El nieto no.**
+
+Medido con una sonda que cronometra `tools.runForeground` sobre
+`sleep 30 & wait`:
+
+```
+killForeground returned true
+elapsed=30034ms term=signal      <-- 30 s: el sleep sigue a medias
+```
+
+y en la tabla de procesos, tres segundos despues del ESC:
+
+```
+PID    PPID  PGID  COMM
+10174  10171 10171  escprobe
+10179  826   10171  sleep      <-- PPID 826 = reparentado a init. Huerfano.
+```
+
+**La causa**: `kill(-pid, SIGKILL)` (el negative, para matar el GRUPO) nunca
+podia funcionar, porque el hijo no era lider de su propio grupo: `std.process.spawn`
+sin `pgid` deja al hijo en el grupo de zode. Asi que `kill(-pid)` fallaba con
+ESRCH y el codigo caia al `kill(pid)` de siempre. El comentario del codigo
+decia «un shell tiene hijos, por eso uso el negative», y el negative no
+funcionaba: era la intencion correcta con la primitiva equivocada.
+
+**El fix**: `.pgid = 0` en los DOS spawns (el foreground de `tools.zig` y el
+background de `bgproc.zig`), y `killTree` para los jobs en background, que antes
+usaban `Child.kill` (un pid) igual que el resto.
+
+Con el fix: `elapsed=700ms`, y no queda ni el shell ni el nieto.
+
+Lo que hacia falta escribir:
+
+- **Los dos spawns, no solo el que se vio.** El foreground y el background
+  tienen el mismo bug y caminos distintos de entrada.
+- **`Job.pgid` aparte de `child.id`.** El hilo lector hace `wait()` sobre su
+  propia copia del `Child` y pone `id` a null; ademas el pid se recicla en
+  cuanto se recoge el hijo. `kill(-<pid-reciclado>)` es matar a un desconocido.
+- **`tools/esc_kill_pty.py`**: la unica prueba que mira el NIETO en la tabla de
+  procesos. Y mira al nieto, no al shell, por una razon que costo una vuelta: el
+  shell SI moria sin el fix, asi que un test que lo mirara daria verde con y sin
+  el fix. El marcador es `sleep 301 & wait` (dos pids) y se busca el argv
+  exacto `sleep 301`. Con `exec` el shell se reemplaza, queda un proceso, y la
+  prueba no distingue nada.
+
+## 2. `reasoning_effort`: el enum era el techo de tokens
+
+**El sintoma**: «no hacen bien la inferencia del esfuerzo, hay modelos que
+soportan mas».
+
+**La causa** eran dos cosas a la vez:
+
+1. `Effort` era un `enum(u32)` cuyo VALOR era `max_tokens` (`low = 4096`,
+   `xhigh = 49152`). Effort y longitud de respuesta quedaban atados: pedir mas
+   razonamiento tambien acortaba la respuesta, y pedir `low` daba 4096 tokens
+   TOTALES (budget de pensar + respuesta), que parte una respuesta con tools
+   por la mitad.
+2. `reasoningToken` mandaba `.xhigh` como `"high"` **para todos**, y
+   `familyForModel` solo reconocia o-series/gpt-5. Asi que Gemini
+   (`minimal`), gpt-5.1 (`xhigh`) y cualquier modelo con niveles propios no
+   tenian forma de que se les pidiera nada: el enum no tenia esos miembros.
+
+**El fix**: `Effort` es un enum de NIVELES y nada mas. El techo vive en
+`outputCeiling`, el presupuesto de pensar en `thinkingBudget`, y una tabla
+`effortSupport(model)` decide que nivel va de verdad al cable.
+
+`effortFor` degrada **hacia abajo** y nunca hacia arriba (subir es un 400), y
+`/effort` dice en voz alta lo que va a ir de verdad («xhigh (este modelo topa en
+high)») en vez de acceptarlo en silencio. El picker ofrece `effortLevels(model)`,
+que es la MISMA imagen que `effortFor` — un test exige que lo que el picker ofrece
+salga exacto, sin degradarse en silencio.
+
+El `reasoning_effort` ahora sale siempre que el MODELO lo tenga, no solo para
+o-series. Y el clamp de `thinking.budget_tokens` contra el techo se hace en el
+sitio que compone el body (el unico que sabe los dos numeros), no en el llamante.
+
+### La tabla se verifico contra las DOCS, y la primera version era FALSA
+
+Esto es lo importante, y es un modo de fallo que **ningun test de este repo
+caza**: un test que compara el JSON que genera zode contra el JSON que el
+propio codigo de zode dice que deberia generar. Si los dos estan equivocados, el
+test pasa. Escribi la tabla de memoria, los tests pasaron en verde, y al buscar la
+documentacion resulto que tres filas eran inventadas:
+
+| lo que puse | la realidad |
+|---|---|
+| `xhigh` en `gpt-5.1` | `xhigh` es **solo** de `gpt-5.1-codex-max`. En 5.1 a secas es un 400. |
+| `minimal` en todo GPT-5 | `minimal` es de **5.1 en adelante**. En GPT-5 previo es un 400. |
+| `minimal` en Gemini | `gemini-2.5-*` es `low/medium/high`. `minimal` es de Gemini 3.5+. |
+
+Y un cuarto, que no es de niveles: Gemini llama al campo `thinking_level`, no
+`reasoning_effort`. Se manda el nombre de OpenAI porque es por donde habla zode
+(`/v1beta/openai/`, OpenRouter), pero los **valores** son los de Gemini.
+
+La tabla corregida (verificada contra la matriz de niveles de OpenAI y la tabla de
+`thinking_level` de Google):
+
+| modelo | niveles |
+|---|---|
+| `kimi-k2.6` (sin palanca) | no se manda el campo |
+| `gpt-5`, `o3`, `o1`, `gemini-2.5-*` | low / medium / high |
+| `gpt-5.1` | + none, minimal |
+| `gemini-3.5+`, `gemini-3-flash` | minimal / low / medium / high |
+| `gpt-5.1-codex-max` | + xhigh |
+
+**La leccion**: un test que verifica la composicion de un payload **no** verifica
+que el servidor lo acepte. Para eso hace falta mirar la documentacion del
+proveedor, y el test tiene que tener la lista de "aceptados" escrita **a mano**,
+no derivada de la tabla que prueba. Es lo que hace ahora
+`effortFor: NUNCA pide un nivel que el modelo no documenta`: recorre toda la
+combinacion de modelo x nivel con una lista de aceptados escrita aparte. Si las
+dos se derivaran la una de la otra, el test pasaria con las dos equivocadas —
+que es justo como se colaron los tres fallos.
+
+### Y el effort se decide SOLO, por modelo
+
+Pedido literal: «que lo sepa el harness, no yo». O sea que `zode` deduce la
+escalera del modelo y no hay que investigar nada:
+
+- **`defaultEffort(model)`** es el escalon de EN MEDIO de la escalera de ese
+  modelo, no un `.medium` fijo. El indice es lo que decide, y las escaleras no
+  tienen la misma longitud: 3 niveles → `medium`, 5 → `low`, 6 → `medium`.
+- **`clampEffort`** se aplica en `setModel`, o sea **al cambiar de modelo**: un
+  `xhigh` elegido en un codex-max pasa a `high` al cambiar a un `gemini-2.5`. Sin
+  esto se quedaba degradandose en silencio en cada request, con el status bar
+  diciendo `xhigh` y el cable llevando `high`: dos textos para lo mismo y nada
+  que indique que son distintos.
+- **`effectiveEffort(model, want)`** colapsa el `?Effort` de `effortFor` a un
+  `Effort`. El `null` («este modelo no tiene la palanca») no es un error, pero
+  obligaba a que cada llamante se acordara; ahora el camino del request no tiene
+  que saber nada.
+- En el bucle de `free-auto` se resuelve contra **`pick.model`**, no contra el
+  modelo activo: ese bucle rota entre modelos del pool y cada uno tiene su
+  escalera, asi que usar el del activo mandaria un nivel que el candidato no
+  conoce.
+- El status bar y el `/effort` muestran el nivel **efectivo**, no la preferencia.
+- El picker se titula `effort · <modelo> goes up to <nivel>` (o «no effort
+  control»), que es el automatico hecho visible: no hace falta saber de
+  antemano que este modelo llega hasta `high` y otro hasta `xhigh`.
+
+**El caso que demuestra que el indice no es un detalle**: `gemini-3-pro-preview`
+no tiene `medium` (docs: `low` y `high`). Con un default literal `.medium`
+recibiria un nivel inexistente y el primer turno de una sesion nueva —donde el
+usuario no ha tocado `/effort`— se comeria un 400. Tiene su propia fila en la
+tabla (`no_medium`) por eso.
+
+Verificado en la pty real con `space-bunny-free`: el picker se abre con el titulo
+`effort · space-bunny-free (no effort control)` y ofrece `low/medium/high`, sin
+`minimal` ni `xhigh`; y `/effort xhigh` contesta «this model has no effort knob»
+en vez de aceptarlo en silencio.
+
+## 3. La guia de herramientas desaparecia con `AGENTS.md`
+
+**El sintoma**: «le pedi buscarme una pagina de juegos y se puso a hacer Bash».
+
+**La causa**: `systemPromptBase` devuelve el `AGENTS.md` del proyecto **en lugar
+de** `default_system_prompt`. Y la tabla de routing («anything on the INTERNET
+belongs to web_search/web_fetch, NEVER use bash») vivia DENTRO de
+`default_system_prompt`. O sea: en cualquier proyecto que tenga un `AGENTS.md` —el
+caso normal— el modelo no veia **una sola** regla de routing. Con la shell
+disponible y ninguna tabla, `curl` es la forma obvia de preguntarle a internet
+algo.
+
+La regla de enrutado de herramientas no es del PROYECTO. Un `AGENTS.md` dice que
+es el codigo y como trabajar en el; no le toca decidir que este harness tiene un
+`web_search`.
+
+**El fix**: `tool_routing_prompt` es su propia constante, se compone SIEMPRE
+despues de la base (elija la que elija), y hay un test que la mete en una cache
+de `AGENTS.md` a proposito y comprueba que sigue ahi.
+
+Medido en la pty real, con el prompt exacto del reporte: antes `bash(...)`,
+ahora `web_search`.
+
+## 4. `@` no aparece la lista de ficheros
+
+El popup existia, se llenaba y se pintaba. Lo que no existia era **decir que
+habia mas**: con 10 entradas en el directorio y `max_visible` = 6 se veian 6 y
+nada mas, sin ningun indicio. Desde fuera eso no es una lista truncada, es un
+directorio que aparentemente tiene seis cosas.
+
+El footer del popup ahora dice el total y lo que falta
+(`10 matches · +4 more`), en las dos filas del popup que ya se reservaban. Un
+picker que miente sobre su tamano es peor que no tener picker.
+
+La expansion del contenido (`@fichero` -> el texto del fichero en el prompt) ya
+funcionaba y se comprobó con ficheros reales de este repo.
+
+## 5. El banner y el primer prompt se leian como un bloque
+
+Una fila en blanco no separa un dibujo de 5 filas de las palabras del usuario: el
+prompt parece la ultima linea del logo. Ahora debajo del banner hay una **regla**
+(la misma marca `─` que ya usan el popup y la caja del input), no una fila
+vacia. Cuesta lo mismo y dice «aquí acaba la cabecera» sin gastar dos filas mas
+en blanco.
+
+`bannerRuleLine` parte el `─` en trozos de 255 columnas porque `CellRun.w` es un
+**u8**: un solo run mas ancho se deja de dibujar a mitad de una terminal ancha y
+parece un fallo de render.
+
+## 6. ACP: medido, y no era lo que parecía
+
+Con una sonda de tiempo contra el agente real y contra uno de mentira:
+
+```
+handshake (spawn+init+newsession): 4228 ms     <-- opencode real
+primer token: +10 ms, 20 chunks en 560 ms     <-- el cable va bien
+```
+
+El streaming ya es incremental de verdad (10 ms de latencia, la del poll). Lo
+que queda lento es el **arranque en frio**: 4.2 s de `opencode acp` levantando su
+servidor privado, que ya se conectaba en segundo plano al escribir `/acp` (esta
+ parte estaba ya resuelta). No se ha tocado nada de ACP en esta ronda porque no
+hay un fallo que reproducir: lo que hay es un coste de arranque que ya se paga
+en paralelo con el usuario escribiendo.

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const tui = @import("tui.zig");
 const providers = @import("providers.zig");
 const chat = @import("chat.zig");
@@ -17,6 +18,13 @@ const mascot = @import("mascot.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
 const acp = @import("acp.zig");
+
+const ask = @import("ask.zig");
+const bgproc = @import("bgproc.zig");
+const bench_mod = @import("bench.zig");
+const skills = @import("skills.zig");
+const skillstore = @import("skillstore.zig");
+const subagent_mod = @import("subagent.zig");
 
 /// Io and API key configured by the TUI at startup.
 pub var io_global: std.Io = undefined;
@@ -37,17 +45,176 @@ pub const default_system_prompt =
     \\   glob, grep, list_files, web_fetch, web_search, think. Prefer
     \\   grep/glob first, then read only what you need.
     \\ - For edits, use the edit tool with exact old_string/new_string.
-    \\ - web_fetch returns a URL as readable text (HTML stripped);
-    \\   web_search gives titles, URLs and snippets. Use them when you need
-    \\   facts you do not have (library docs, versions, exact error messages),
-    \\   and say so when an answer comes from the web.
     \\ - Keep answers concise. Use markdown. Code blocks must include the
     \\   language tag so the terminal UI can highlight them.
     \\ - If a tool call is denied by the user, do not retry it; adjust approach.
     \\
 ;
 
-fn systemPrompt(gpa: std.mem.Allocator) []const u8 {
+/// Which tool to reach for. NEVER dropped, even when the project has an
+/// `AGENTS.md` — see `buildSystemPrompt`.
+///
+/// It used to live inside `default_system_prompt`, which made it a casualty of
+/// the user's own instruction file: `systemPromptBase` returns `AGENTS.md` INSTEAD
+/// of the built-in text, so in any project that has one the model never saw a
+/// single routing rule. The symptom was exactly the one that made this a bug
+/// report — asked to find a page about games, it ran `bash curl …` instead of
+/// `web_search`, because with no routing table and a shell available, a shell is
+/// the obvious way to ask the internet something.
+///
+/// Tool selection is not the PROJECT's business. An `AGENTS.md` says what the
+/// code is and how to work in it; it does not get to decide that this harness
+/// has a `web_search`. Keeping the two apart is also what makes this text
+/// testable on its own.
+pub const tool_routing_prompt =
+    \\Choosing the right tool (do not guess — route):
+    \\
+    \\ - Anything on the INTERNET (find a site, look up a game, a product, docs,
+    \\   prices, news) belongs to web_search / web_fetch. NEVER use bash (curl,
+    \\   wget, pip, npm ...) to reach the web: it is slower, un-asked-for and
+    \\   cannot show results as links.
+    \\   web_search = you do NOT have the URL and need to find pages.
+    \\   web_fetch  = you HAVE a URL and need its content. A natural flow is
+    \\   search first, fetch the 1-2 promising URLs, then answer with links.
+    \\   If the user names a site ("find a games site"), web_search is the first
+    \\   tool to call, before any bash, and you answer with real links.
+    \\ - bash is for EXECUTING things on this machine: builds, tests, git, file
+    \\   inspection that grep/glob cannot express. It is not a general-purpose
+    \\   "find out" tool: before bash, ask if read/grep/glob/web_* would do it
+    \\   better and cheaper.
+    \\ - Local code questions start with glob/grep (find) and read (understand);
+    \\   do not bash your way through what those tools answer directly.
+    \\ - A wide search (grep across a big tree, "where is X used?", reading many
+    \\   files to answer one question) goes to the `task` subagent, not to a
+    \\   dozen reads in your own context.
+    \\ - If the request is ambiguous in a way that changes what you build, use
+    \\   ask instead of guessing.
+    \\
+;
+
+/// Skills found on disk, discovered ONCE per process.
+///
+/// The list is cached because it goes into the system prompt, which is rebuilt
+/// for every request: walking two directories and reading the frontmatter of
+/// every `SKILL.md` on every request would be silly I/O on the hot path. The
+/// BODY is never cached — that is loaded on demand by the `skill` tool, which is
+/// the whole point (see `skills.zig`).
+var skills_cache: ?[]skills.Entry = null;
+
+pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []skills.Entry {
+    if (skills_cache) |c| return c;
+    const found = loadSkillsNow(gpa, env);
+    skills_cache = found;
+    return found;
+}
+
+/// Walks the two roots right now and allocates the entries.
+fn loadSkillsNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []skills.Entry {
+    var loader = skillstore.Loader.init(gpa, io_global, env);
+    var buf: [64]skills.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+    const copy = gpa.dupe(skills.Entry, found) catch {
+        // Out of memory: no skills rather than a half-built list. The system
+        // prompt still works, and the tool can still be called by name.
+        for (found) |e| {
+            gpa.free(e.name);
+            gpa.free(e.description);
+            gpa.free(e.path);
+        }
+        return &.{};
+    };
+    return copy;
+}
+
+/// Frees the entries AND the slice they live in.
+///
+/// Both halves, on purpose: they are two allocations and freeing one without the
+/// other is the leak/give-the-wrong-length pair. The slice is the second argument
+/// position so the caller cannot pass the entries without saying what to do with
+/// the array.
+pub fn freeSkillEntries(gpa: std.mem.Allocator, entries: []skills.Entry) void {
+    for (entries) |e| {
+        gpa.free(e.name);
+        gpa.free(e.description);
+        gpa.free(e.path);
+    }
+    gpa.free(entries);
+}
+
+/// Composes the system prompt for a request.
+///
+/// Five pieces, and the ORDER is not cosmetic:
+///
+/// 1. The project's `AGENTS.md`/`CLAUDE.md` if there is one. It is the user's
+///    own instruction file and it wins.
+/// 2. Otherwise the built-in one.
+/// 3. `tool_routing_prompt`, ALWAYS — see its doc comment. It is the piece that
+///    used to vanish in any project with an `AGENTS.md`, which is how "find me a
+///    page about games" turned into `bash curl`.
+/// 4. Then the ask guidance and the skills section, which are the same for every
+///    project and go AFTER the user's file so a project can override them.
+///
+/// The caching here is the AGENTS.md file (it does not change while zode runs,
+/// and it is up to 256 KB). The skills section is composed per request into a
+/// caller-provided buffer, because the skills on disk CAN change while zode runs
+/// and a new one appearing should be usable without a restart.
+fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process.Environ.Map) []const u8 {
+    const base = systemPromptBase(gpa);
+    const entries = discoverSkills(gpa, env);
+    defer freeSkillEntries(gpa, entries);
+
+    var list_buf: [8 * 1024]u8 = undefined;
+    const section = skills.systemPromptSection(entries, &list_buf);
+
+    // The routing table goes in its OWN slot, right after the base, and is
+    // emitted whether the base came from `AGENTS.md` or from the built-in text.
+    // It is not part of `default_system_prompt` for the reason in its own doc
+    // comment: a project's `AGENTS.md` replaces the built-in prompt, and the one
+    // thing that must survive that replacement is which tool to call.
+    const routing = tool_routing_prompt;
+
+    // Read-only mode goes in the SYSTEM prompt, not just in the tool result: the
+    // model has to know before it decides what to call, or it plans a `write`
+    // and then gets an error, which it reads as a bug and works around.
+    const mode_note: []const u8 = if (read_only)
+        "READ-ONLY MODE is on (shift+tab to turn it off). You cannot write, edit or run bash: those calls come back with an error saying so. Investigate, then use `ask` to tell the user what you found and ask how to proceed.\n\n"
+    else
+        "";
+
+    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}\n{s}{s}", .{
+        base,
+        routing,
+        ask.guidance,
+        mode_note,
+        section,
+    }) catch return base;
+    return composed;
+}
+
+/// Writes the current system prompt into the session, REPLACING the one that is
+/// there.
+///
+/// Only called when the composed text differs from what the session already has:
+/// on a steady-state turn this is a memcmp and nothing else. That matters because
+/// the system prompt is the biggest stable prefix in the request, and rewriting it
+/// to the same bytes would still change nothing for the provider's cache — but a
+/// naive "always replace" would rewrite the whole thing on every one of the eight
+/// iterations of every turn, which is 16 KB of pointless copying.
+pub fn syncSystemPrompt(s: *session_mod.Session) void {
+    const gpa = s.allocator;
+    var buf: [16 * 1024]u8 = undefined;
+    const want = buildSystemPrompt(gpa, &buf, null);
+    for (s.messages.items) |m| {
+        if (m.role != .system) continue;
+        if (std.mem.eql(u8, m.content, want)) return;
+        break;
+    }
+    _ = s.replaceSystem(want) catch {};
+}
+
+/// The user-facing half of the system prompt: their `AGENTS.md` if they have one,
+/// the built-in one if not.
+fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
     if (agents_md_cache == null) {
         // The user's project AGENTS.md / CLAUDE.md take priority.
         agents_md_cache = std.Io.Dir.cwd().readFileAlloc(io_global, "AGENTS.md", gpa, .limited(256 * 1024)) catch
@@ -62,8 +229,146 @@ pub var current_effort: chat.Effort = .medium;
 /// Permission mode: false = asks before write/edit/bash, true = auto.
 pub var yolo: bool = false;
 
-/// Max number of agentic iterations per request.
-const max_iterations: usize = 8;
+/// Max number of agentic iterations per request. Overridable with
+/// `ZODE_MAX_ITER` (see `iterationLimit`).
+///
+/// 12 and not 8: 8 is what a loop needs when every iteration is a file edit, but
+/// a real task is "read three files, grep twice, edit, build, read the error, fix,
+/// build" and that is 8-9 before the final answer has even been written. And 12 is
+/// not a raise by much: the loop ends by itself the moment the model stops asking
+/// for tools, so the limit only bounds the pathological cases (a model that keeps
+/// re-reading the same file, or a tool that keeps failing). What it costs in the
+/// pathological case is exactly what `/bench`'s "hit the limit" percentage
+/// measures.
+pub const default_max_iterations: usize = 12;
+
+/// Read-only mode: `write`/`edit`/`bash` come back as tool results instead of
+/// running. Set by `shift+tab` or `/ask on`.
+///
+/// A module global and not a `Model` field because it has to be visible in three
+/// places that do not have the model at hand: `systemPromptBase` (composed on a
+/// worker), `execToolCalls` (the check), and the status bar (the indicator). It
+/// only ever changes from the UI thread, which happens on a key press while the
+/// worker is not being written to; a torn read of a bool is the one theoretical
+/// race here and it would only ever delay the change by one iteration.
+pub var read_only: bool = false;
+
+/// Turns read-only mode on or off and says so.
+pub fn toggleReadOnly(m: *tui.Model) void {
+    read_only = !read_only;
+    m.read_only = read_only;
+    if (read_only) {
+        setStatusWithZo(m, .warn, "read-only · the agent investigates and asks");
+        pushInfo(m, "read-only mode ON (shift+tab to turn it off): write, edit and bash will come back with an error instead of running. The agent investigates and asks you with `ask`.");
+    } else {
+        setStatusWithZo(m, .done, "read-only off");
+        pushInfo(m, "read-only mode OFF");
+    }
+}
+
+/// `/ask [on|off]`.
+fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
+        const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
+        if (on and !read_only) {
+            toggleReadOnly(m);
+            return;
+        }
+        if (off and read_only) {
+            toggleReadOnly(m);
+            return;
+        }
+        if (!on and !off) {
+            pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (read_only) "on" else "off"});
+            return;
+        }
+    }
+    toggleReadOnly(m);
+}
+
+/// `/bench`: the numbers that decide whether to tune anything.
+fn cmdBench(m: *tui.Model) void {
+    var buf: [1024]u8 = undefined;
+    const text = m.bench.report(&buf, iterationLimit(), cacheHitPct()) catch {
+        pushInfo(m, "/bench: could not compose the report");
+        return;
+    };
+    // `pushInfo` COPIES, so `buf` (a stack buffer) can die right after: this is
+    // the documented difference from `pushInfoOwned`, which would leave the
+    // pending queue pointing at a dead frame.
+    pushInfo(m, text);
+}
+
+/// `/skills`: what is loadable, and from where.
+fn cmdSkills(m: *tui.Model) void {
+    const entries = discoverSkills(m.allocator, m.environ);
+    if (entries.len == 0) {
+        pushInfo(m, "no skills found. Put them in .zode/skills/<name>/SKILL.md (this project) or ~/.config/zode/skills/<name>/SKILL.md (yours)");
+        return;
+    }
+    pushInfoFmt(m, "{d} skill{s} (only the name and description are in the prompt; the body loads on demand)", .{
+        entries.len,
+        if (entries.len == 1) @as([]const u8, "") else @as([]const u8, "s"),
+    });
+    for (entries) |e| {
+        const line = std.fmt.allocPrint(m.allocator, "  {s}: {s}", .{
+            e.name,
+            if (e.description.len > 0) e.description else "(no description)",
+        }) catch continue;
+        pushInfoOwned(m, line);
+    }
+}
+
+/// `/bg`: the background jobs, and the two ways to stop them.
+fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
+    const arg = arg_in orelse "";
+    if (std.ascii.eqlIgnoreCase(arg, "killall")) {
+        // `killNow`, not just `requestKillAll`: "killall" that only MARKS the
+        // jobs and leaves them running until the app exits is a lie with extra
+        // steps. The io_ready guard is the same one ESC uses (a test Model has
+        // no `Io`).
+        const n = if (m.io_ready) m.bg.killNow(io_global) else m.bg.requestKillAll();
+        pushInfoFmt(m, "killed {d} background command{s}", .{
+            n,
+            if (n == 1) @as([]const u8, "") else @as([]const u8, "s"),
+        });
+        return;
+    }
+    if (std.ascii.startsWithIgnoreCase(arg, "kill")) {
+        var it = std.mem.tokenizeAny(u8, arg, " \t");
+        _ = it.next(); // "kill"
+        const id_str = it.next() orelse {
+            pushInfo(m, "/bg kill <id> · /bg killall");
+            return;
+        };
+        const id = std.fmt.parseInt(u32, id_str, 10) catch {
+            pushInfo(m, "/bg kill <id> · /bg killall");
+            return;
+        };
+        if (m.bg.kill(io_global, id)) {
+            pushInfoFmt(m, "killed job {d}", .{id});
+        } else {
+            pushInfoFmt(m, "job {d} was not running ({s})", .{ id, m.bg.stateWord(id) });
+        }
+        return;
+    }
+
+    var line: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line);
+    var any = false;
+    for (0..bgproc.max_jobs) |i| {
+        const slot = &m.bg.slots[i];
+        if (!slot.isLive()) continue;
+        any = true;
+        w.print("  job {d} [{s}] {s}\n", .{ slot.id, slot.stateWord(), slot.command orelse "?" }) catch {};
+    }
+    if (!any) {
+        pushInfo(m, "no background commands");
+        return;
+    }
+    pushInfo(m, std.mem.trimEnd(u8, w.buffered(), "\n"));
+}
 
 /// Tool results elided in the session (for /context).
 var session_elided: usize = 0;
@@ -138,6 +443,23 @@ pub fn setModel(name: []const u8) void {
     const n = @min(name.len, cur_model_buf.len);
     @memcpy(cur_model_buf[0..n], name[0..n]);
     cur_model = cur_model_buf[0..n];
+    // El effort se ajusta SOLO al cambiar de modelo (bug 3). Sin esto, un
+    // `xhigh` elegido en un codex-max se queda puesto en un gemini-2.5 que no lo
+    // tiene: cada request degrada en silencio a `high`, y el status bar sigue
+    // diciendo `xhigh`. Dos textos distintos para lo mismo, y nada que indique
+    // que lo son.
+    current_effort = chat.clampEffort(cur_model, current_effort);
+}
+
+/// El nivel de effort que va DE VERDAD en el request.
+///
+/// Todo el mundo usa esto en vez de `current_effort`, porque `current_effort` es
+/// la PREFERENCIA del usuario y esta es la realidad tras pasar por la escalera
+/// del modelo: un modelo sin palanca devuelve su default, y uno que no tiene el
+/// nivel pedido degrada. La preferencia se guarda aparte para que cambiar de
+/// modelo no pierda lo que el usuario habia elegido.
+pub fn effectiveEffort() chat.Effort {
+    return chat.effectiveEffort(cur_model, current_effort);
 }
 
 // ── permissions: "always allow" per tool (session) ───────────
@@ -286,6 +608,27 @@ fn pushErrorOwned(m: *tui.Model, text: []const u8) void {
 /// [roster] `pub` so `free_auto.zig` can use it.
 pub fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void {
     m.setStatusWithMood(mood, text);
+}
+
+/// `setStatusWithZo` that composes the text itself.
+///
+/// It exists because of the rule AGENTS.md writes down the hard way: the composed
+/// string has to be COPIED (`Model.setStatusText` copies into a fixed buffer), and
+/// the tempting alternative is `allocPrint(m.allocator, …)` + `pushInfoOwned`,
+/// which on an out-of-memory path hands a LITERAL to a function that frees it.
+/// Composing and copying in one call makes that mistake unrepresentable.
+pub fn setStatusWithZoFmt(m: *tui.Model, mood: mascot.Mood, comptime fmt: []const u8, args: anytype) void {
+    m.setStatusFmt(mood, fmt, args);
+}
+
+/// `pushError` that composes the text. Same reason as `setStatusWithZoFmt`.
+pub fn pushErrorFmt(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
+    m.pushErrorFmt(fmt, args);
+}
+
+/// `pushInfo` that composes the text. Same reason as `setStatusWithZoFmt`.
+pub fn pushInfoFmt(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
+    m.pushInfoFmt(fmt, args);
 }
 
 // ── providers: config.json > built-in ────────────────────────
@@ -756,19 +1099,23 @@ pub const commands = [_]Cmd{
     .{ .key = "/provider", .desc = "pick a provider in a modal" },
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
-    .{ .key = "/effort", .desc = "low|medium|high (no args: picker)" },
+    .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
     .{ .key = "/free-auto", .desc = "on|off: rotate free models across providers when one runs out" },
     .{ .key = "/plan", .desc = "clear the visible task list" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)" },
     .{ .key = "/yolo", .desc = "toggle auto permissions" },
     .{ .key = "/allowlist", .desc = "tools always allowed (persisted)" },
+    .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall" },
     .{ .key = "/acp", .desc = "on|off|<cmd>: delegate the turn to an ACP agent (opencode acp)" },
     .{ .key = "/new", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget (compaction at 80%)" },
+    .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times" },
     .{ .key = "/session", .desc = "session info" },
     .{ .key = "/cache", .desc = "cache hit-rate for this session" },
+    .{ .key = "/ask", .desc = "on|off: read-only mode (shift+tab); the agent investigates and asks" },
+    .{ .key = "/skills", .desc = "list the loadable skills" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
 };
 
@@ -788,7 +1135,8 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "ctrl+u / ctrl+d", .desc = "scroll half a page" },
     .{ .key = "page up / down", .desc = "scroll a page" },
     .{ .key = "shift+enter", .desc = "newline (enter sends)" },
-    .{ .key = "esc", .desc = "stop the turn / close a modal" },
+    .{ .key = "shift+tab", .desc = "read-only mode: no writes, the agent asks you" },
+    .{ .key = "esc", .desc = "stop the turn, kill a running command, or answer a question with \"you decide\"" },
     .{ .key = "tab", .desc = "complete a `/` command" },
     .{ .key = "↑ / ↓", .desc = "command history (empty line keeps the draft)" },
 };
@@ -935,26 +1283,40 @@ fn cmdProviders(m: *tui.Model) void {
 }
 
 /// `/effort low|medium|high`, or the picker if it comes without arguments.
+///
+/// The level asked for is kept as-is; `chat.effortFor` is what maps it onto what
+/// the CURRENT model accepts at request time. That split is deliberate: the user
+/// picks an intent ("as much as this model can do") and the harness is the thing
+/// that knows the vocabulary, so switching models does not silently change the
+/// meaning of a setting the user already chose.
+///
+/// What it does NOT do is accept a level the model cannot take and say nothing:
+/// `/effort xhigh` on a three-rung model says so, because the alternative is the
+/// user finding out from a 400 halfway through a turn.
 fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
     if (arg) |a| {
-        if (std.mem.eql(u8, a, "low")) {
-            current_effort = .low;
-        } else if (std.mem.eql(u8, a, "medium") or std.mem.eql(u8, a, "med")) {
-            current_effort = .medium;
-        } else if (std.mem.eql(u8, a, "high")) {
-            current_effort = .high;
-        } else {
-            const msg = std.fmt.allocPrint(m.allocator, "unknown effort: {s} (low|medium|high)", .{a}) catch
-                "effort";
-            pushInfoOwned(m, msg);
+        const want = chat.Effort.parse(a) orelse {
+            m.pushInfoFmt("unknown effort: {s} (none|minimal|low|medium|high|xhigh)", .{a});
             return;
-        }
-        const name = switch (current_effort) {
-            .low => "low",
-            .medium => "medium",
-            .high => "high",
         };
-        m.pushInfoFmt("effort → {s}", .{name});
+        current_effort = want;
+        // Lo que va DE VERDAD, que no es siempre lo que se escribio. Se dice en
+        // voz alta porque la alternativa es que el usuario descubra el 400 a
+        // mitad de un turno.
+        const got = chat.effortFor(cur_model, want);
+        if (got == null) {
+            m.pushInfoFmt("effort → {s} (this model has no effort knob; the level only sets the answer length)", .{
+                want.label(),
+            });
+        } else if (got.? != want) {
+            m.pushInfoFmt("effort → {s} (this model tops out at {s}, so {s} is what goes on the wire)", .{
+                want.label(),
+                chat.maxEffortFor(cur_model).label(),
+                got.?.label(),
+            });
+        } else {
+            m.pushInfoFmt("effort → {s}", .{want.label()});
+        }
         return;
     }
     openEffortPicker(m);
@@ -1061,6 +1423,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdClean(m, cleanWanted(m.environ, arg));
     } else if (std.mem.eql(u8, cmd, "free-auto")) {
         free_auto.cmdFreeAuto(m, arg);
+    } else if (std.mem.eql(u8, cmd, "bg")) {
+        cmdBg(m, arg);
     } else if (std.mem.eql(u8, cmd, "yolo")) {
         cmdYolo(m);
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
@@ -1073,6 +1437,12 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {
         cmdCache(m);
+    } else if (std.mem.eql(u8, cmd, "bench")) {
+        cmdBench(m);
+    } else if (std.mem.eql(u8, cmd, "ask")) {
+        cmdAskMode(m, arg);
+    } else if (std.mem.eql(u8, cmd, "skills")) {
+        cmdSkills(m);
     } else if (std.mem.eql(u8, cmd, "new")) {
         newSession(m);
     } else if (std.mem.eql(u8, cmd, "resume")) {
@@ -1298,16 +1668,37 @@ fn ensureAcp(m: *tui.Model) !*acp.Client {
     if (st == .off) {
         acpUnlock();
         // Nobody is connecting (cold start, e.g. `--resume`): start it in the
-        // worker thread and wait here.
+        // worker thread and fall through to the wait loop below.
+        //
+        // Before, this branch checked the state ONCE right after launching the
+        // connect thread: `opencode acp` boots a private server and that takes
+        // several seconds, so the state was still `.connecting` and the FIRST
+        // prompt died with `SpawnFailed` even though the connection came up a
+        // moment later. The user retried and it worked, which reads exactly
+        // like "ACP is broken/slow". Waiting here is the same thing `cmdAcp`
+        // does in the background, and the wait loop already caps it at ~60 s.
         _ = startAcpConnect(m, m.allocator, m.environ);
-        acpLock();
-        if (acp_state != .ready) {
+        setStatusWithZo(m, .thinking, "connecting to the ACP agent…");
+        var cold_spins: usize = 0;
+        while (cold_spins < 1200) : (cold_spins += 1) {
+            acpLock();
+            const s2 = acp_state;
+            const c2 = acp_client;
             acpUnlock();
-            return error.SpawnFailed;
+            if (s2 == .ready) {
+                if (c2) |cc| return cc;
+                continue;
+            }
+            if (s2 == .failed) {
+                acpLock();
+                const err = acp_start_err;
+                acp_state = .off;
+                acpUnlock();
+                return err;
+            }
+            acp.nap(50);
         }
-        const c = acp_client.?;
-        acpUnlock();
-        return c;
+        return error.HandshakeFailed;
     }
     acpUnlock();
 
@@ -1581,7 +1972,7 @@ const AcpTurn = struct {
             return null;
         }
 
-        const ask = if (tool.len > 0) tool else "the ACP agent wants to run a tool";
+        const prompt = if (tool.len > 0) tool else "the ACP agent wants to run a tool";
         const answer = t.m.requestPermission("acp", detail);
         const want: []const u8 = switch (answer) {
             .allow => "allow_once",
@@ -1601,7 +1992,7 @@ const AcpTurn = struct {
         for (options) |o| {
             if (std.mem.startsWith(u8, o.kind, "reject")) return o.id;
         }
-        _ = ask;
+        _ = prompt;
         return null;
     }
 };
@@ -1856,7 +2247,20 @@ fn chatWorker(job: *ChatJob) void {
     var last_user: []const u8 = user_text;
     var owned: ?[]u8 = null; // synthesized text of an iteration (owned)
 
-    while (iterations < max_iterations) : (iterations += 1) {
+    // The per-turn question budget resets with the turn. Without the reset a
+    // long session would stop being able to ask anything after three questions
+    // EVER, which is a bug that only shows up an hour in.
+    m.asks_this_turn = 0;
+
+    // A NEW turn clears the ESC flag: ESC blocked spawns so that the turn in
+    // flight could not start anything else after the user said "stop", but if it
+    // stayed set forever every `run_in_background` of every later turn would die
+    // with `Cancelled` and nothing would ever say why. Same idea as the ask
+    // budget above: the state of one turn must not poison the next one.
+    m.bg.cancel_all = false;
+
+    const limit = iterationLimit();
+    while (iterations < limit) : (iterations += 1) {
         turn_stats.iterations = iterations + 1;
         const again = runOneTurn(m, last_user, iterations) catch |err| {
             reportErr(m, err);
@@ -1874,9 +2278,37 @@ fn chatWorker(job: *ChatJob) void {
         last_user = text;
     }
     if (owned) |o| m.allocator.free(o);
-    if (iterations >= max_iterations) pushError(m, "agent iteration limit reached: stopping the turn");
+    const capped = iterations >= iterationLimit();
+    if (capped) pushErrorFmt(m, "agent iteration limit reached ({d}): stopping the turn", .{iterationLimit()});
     m.streamEnd();
+    // The bench sample is taken HERE, once per turn, and not per iteration: a
+    // turn is the unit the user thinks in ("that took 40 s"), and a per-iteration
+    // sample would make the average turn time a fiction.
+    m.bench.noteTurn(iterations, turn_stats.elapsedMs(nowNs()), m.ttftMillis(), capped);
     pushTurnSummary(m);
+}
+
+/// The iteration limit, from `ZODE_MAX_ITER` or the default.
+///
+/// It was a hardcoded 8 and nobody knew how often it was reached, so changing it
+/// was a guess in both directions. It is configurable now and `/bench` reports the
+/// percentage of turns that hit it: a limit that is hit 0% is too high (it costs
+/// nothing to raise) and one hit by 30% is too low (real tasks are being cut).
+///
+/// The floor matters: at 2 the agent cannot even read a file and act on it, and a
+/// turn that dies mid-way leaves the user with a half-changed tree.
+pub fn iterationLimit() usize {
+    const raw = envGet(environ_global, "ZODE_MAX_ITER") orelse return default_max_iterations;
+    const n = std.fmt.parseInt(usize, raw, 10) catch return default_max_iterations;
+    if (n < 4) return 4;
+    if (n > 200) return 200;
+    return n;
+}
+
+/// The moment the turn started, for the bench sample. Taken here because the
+/// worker's start is not the same as the model's first token.
+fn nowNs() i128 {
+    return std.Io.Timestamp.now(io_global, .real).nanoseconds;
 }
 
 /// The turn summary in the history: 2 lines that say what happened.
@@ -2285,9 +2717,11 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         if (mm.role == .system) has_system = true;
     }
     if (!has_system) {
-        const sp = systemPrompt(gpa);
-        s.append(.system, sp) catch {};
+        s.append(.system, systemPromptBase(gpa)) catch {};
     }
+    // The prompt that goes out on the wire can differ from the one in the session
+    // (read-only mode, the skill list), so it is synced AFTER the append.
+    syncSystemPrompt(s);
 
     // Tier 1 compaction before building the body: it is a VIEW of the wire, the
     // session on disk keeps everything.
@@ -2364,7 +2798,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         const it = std.fmt.allocPrint(
             gpa,
             "thinking · iteration {d}/{d}",
-            .{ iteration + 1, max_iterations },
+            .{ iteration + 1, iterationLimit() },
         ) catch "thinking";
         setStatusWithZo(m, .thinking, it);
     } else {
@@ -2394,7 +2828,13 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             body_buf,
             pick.model,
             comp.msgs,
-            current_effort,
+            // El effort se resuelve contra `pick.model`, NO contra el modelo
+            // activo: con `free-auto` este bucle rota entre modelos del pool, y
+            // cada uno tiene su propia escalera. Usar el del modelo activo
+            // mandaria un nivel que el candidato no conoce (un 400) en cuanto la
+            // rotacion moviera a uno mas pequeno. Es el mismo `Target` del que
+            // habla el resto del camino de rotacion.
+            chat.effectiveEffort(pick.model, current_effort),
             tools_mod.toolsJson(),
             pick.kind,
         );
@@ -2694,6 +3134,781 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
 /// opaque "OK".
 /// Runs the tool calls. Returns the synthesized text of the next turn, owned by
 /// the caller (see `runOneTurn`).
+/// `ask`: the model asks, the user answers, the answer goes back as a tool result.
+///
+/// Returns 1 if the tool ran (whatever the outcome), 0 otherwise, so the caller
+/// can count it like any other tool.
+///
+/// The three outcomes and what each one tells the model are the whole design:
+///
+/// - answered: the user's own words, verbatim.
+/// - ESC: "you decide". NOT a cancel and NOT an error.
+/// - five minutes: same, but it says the user was probably away.
+///
+/// A cap of `max_asks_per_turn` exists because the failure mode without it is
+/// real and unpleasant: a model that asks three questions is a collaborator, and a
+/// model that asks fifteen is an interrogation that costs a full round trip each
+/// time. At the cap the question is refused with the DECLINE text, which tells
+/// the agent to decide and carry on — so the cap degrades into "you decide", not
+/// into a broken turn.
+fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+
+    const question = ask.parse(arena, call.args_json) catch {
+        // A malformed question is the model's mistake, and it gets told what a
+        // valid one looks like rather than "BadQuestion".
+        const bad =
+            \\The `ask` call was not usable: it needs a non-empty "question" and,
+            \\optionally, "options" (2 to 5 short strings) and a "header" (2-3 words).
+            \\Do not retry the same call. Either ask again properly with one question, or,
+            \\if you already know enough, just continue.
+        ;
+        m.pushToolDone("ask", "malformed question", 0, bad);
+        s.appendToolResult(call.id, "ask", bad) catch {};
+        return 1;
+    };
+
+    if (m.asks_this_turn >= max_asks_per_turn) {
+        pushInfoFmt(m, "the model wanted to ask a 4th question this turn: not showing it (the cap is {d}). It will decide on its own.", .{max_asks_per_turn});
+        m.pushToolDone("ask", "refused (too many questions this turn)", 0, ask.declined_text);
+        s.appendToolResult(call.id, "ask", ask.declined_text) catch {};
+        return 1;
+    }
+
+    m.asks_this_turn += 1;
+    m.bench.asks += 1;
+
+    // The header shows the question, so that is what goes into the history next
+    // to `ask(...)`. A history that says `ask(Which database?)` is the difference
+    // between being able to scroll back and understanding what happened.
+    m.pushToolStart("ask", question.question);
+    setStatusWithZo(m, .warn, "the model has a question");
+
+    // The answer comes back as a gpa copy that this function OWNS. It is freed
+    // exactly once, right after the two things that read it (the result text and
+    // the one-line summary) have been built — reading it after the free is the
+    // use-after-free that the "pointer to a stack buffer in the pending queue"
+    // bug is made of.
+    const answer = m.requestAsk(question.question, question.header, question.options);
+
+    var res_buf: [ask.answered_buf_len]u8 = undefined;
+    var sum_buf: [80]u8 = undefined;
+    var res: []const u8 = ask.declined_text;
+    var sum: []const u8 = "no answer";
+    if (answer) |a| {
+        const t = std.mem.trim(u8, a, " \t\r\n");
+        const formatted = ask.formatAnswered(t);
+        @memcpy(res_buf[0..formatted.len], formatted.slice());
+        res = res_buf[0..formatted.len];
+        // The summary is the user's own words, cut to one line. NOT the framed
+        // result: the history line next to `ask(...)` has to read as what they
+        // said, not as what zode told the model about it.
+        const head = if (t.len > 60) t[0..60] else t;
+        sum = std.fmt.bufPrint(&sum_buf, "{s}{s}", .{ head, if (t.len > 60) "…" else "" }) catch "answer";
+    }
+    if (answer) |a| m.allocator.free(a);
+
+    m.pushToolDone("ask", sum, 0, res);
+    s.appendToolResult(call.id, "ask", res) catch {};
+    return 1;
+}
+
+/// `skill`: load a skill's body on demand.
+///
+/// This is the tool that makes a library of skills affordable: the prompt carries
+/// only the names, and the 4 KB of instructions that go with one are read the
+/// moment the model decides it needs them (and never otherwise).
+fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
+        const bad = "The `skill` call needs {\"name\": \"...\"}. No such skill was loaded; continue without it.";
+        m.pushToolDone("skill", "malformed arguments", 0, bad);
+        s.appendToolResult(call.id, "skill", bad) catch {};
+        return 1;
+    };
+    var want: []const u8 = "";
+    if (v == .object) {
+        if (v.object.get("name")) |nv| {
+            if (nv == .string) want = std.mem.trim(u8, nv.string, " \t\r\n");
+        }
+    }
+
+    const entries = discoverSkills(m.allocator, m.environ);
+    if (entries.len == 0) {
+        const none = "This zode has no skills installed (look in .zode/skills/ or ~/.config/zode/skills/). Continue without one.";
+        m.pushToolDone("skill", "no skills installed", 0, none);
+        s.appendToolResult(call.id, "skill", none) catch {};
+        return 1;
+    }
+
+    var found: ?skills.Entry = null;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.name, want)) {
+            found = e;
+            break;
+        }
+    }
+    const entry = found orelse {
+        // The list of what IS available goes back: a model that guessed a name
+        // can correct itself in one step instead of guessing again.
+        var names: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&names);
+        w.print("no skill called \"{s}\". Available:", .{want}) catch {};
+        for (entries) |e| {
+            w.print(" {s}", .{e.name}) catch {};
+        }
+        w.writeAll(". Call one of those, or continue without a skill.") catch {};
+        m.pushToolDone("skill", "unknown skill", 0, w.buffered());
+        s.appendToolResult(call.id, "skill", w.buffered()) catch {};
+        return 1;
+    };
+
+    var loader = skillstore.Loader.init(m.allocator, io_global, m.environ);
+    var body: [skills.max_inline + 1024]u8 = undefined;
+    const text = loader.load(entry, &body) orelse {
+        const bad = std.fmt.allocPrint(arena, "the skill \"{s}\" could not be read ({s}). Continue without it.", .{ entry.name, entry.path }) catch "the skill could not be read";
+        m.pushToolDone("skill", "unreadable", 0, bad);
+        s.appendToolResult(call.id, "skill", bad) catch {};
+        return 1;
+    };
+
+    m.pushToolDone("skill", entry.name, 0, text);
+    s.appendToolResult(call.id, "skill", text) catch {};
+    return 1;
+}
+
+/// `task`: a read-only investigation in its own context.
+///
+/// The subagent loop is the same machinery as the main one (`streamChat` +
+/// `execToolCalls`-shaped tool handling) but with a fresh message list, a
+/// restricted tool list, `effort = low` and its own iteration cap. It returns
+/// the report as the tool result and NOTHING of it goes into the main context
+/// except that string, which is the entire reason it saves tokens.
+fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator) usize {
+    const task = subagent_mod.parseTask(arena, call.args_json) catch {
+        const bad =
+            \\The `task` call needs a "description" (one line: what to find out) and
+            \\may have a "prompt" (the full question). Nothing was searched. Do it
+            \\yourself with grep/glob/read, or call `task` again with a description.
+        ;
+        m.pushToolDone("task", "malformed arguments", 0, bad);
+        s.appendToolResult(call.id, "task", bad) catch {};
+        return 1;
+    };
+
+    m.pushToolStart("task", task.description);
+    m.bench.subagents += 1;
+
+    var rep = subagent_mod.Report{};
+    const text = runSubagent(m, task, &rep);
+    m.pushToolDone("task", "report", 0, text);
+    s.appendToolResult(call.id, "task", text) catch {};
+    return 1;
+}
+
+/// The subagent loop. Returns a slice of `rep`.
+///
+/// Refusals are RESULTS and not errors: a subagent that cannot run still has to
+/// leave the turn able to continue, and the main agent needs to know it has to do
+/// the search itself.
+fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report) []const u8 {
+    // Permission: a subagent spends the user's tokens and reads the whole repo.
+    // `task` IS in `needsPermission`, so the dialog has already been shown by
+    // `execToolCalls`'s gate before this is reached.
+    const pick = pickTarget(m);
+    const key = pick.key orelse return subagent_mod.refused("no api key for this provider", rep);
+
+    var gpa = m.allocator;
+    var http = http_client.Http.init(gpa, io_global);
+    defer http.deinit();
+
+    var json_buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&json_buf);
+    w.writeByte('[') catch return subagent_mod.refused("no memory for the tool list", rep);
+    var kept: usize = 0;
+    for (subagent_mod.tool_names) |tn| {
+        // Reuse the MAIN schemas verbatim: a second hand-written copy of `read`'s
+        // schema is a second thing to keep correct, and the day they diverge the
+        // subagent calls a tool with arguments the main loop would not accept.
+        if (findToolJson(tools_mod.toolsJson(), tn)) |obj| {
+            if (kept > 0) w.writeByte(',') catch {};
+            w.writeAll(obj) catch {};
+            kept += 1;
+        }
+    }
+    w.writeByte(']') catch {};
+    const tools_json = w.buffered();
+    if (kept == 0) return subagent_mod.refused("the tool list could not be built", rep);
+
+    // The subagent's OWN history. It does not inherit anything from the main
+    // conversation: inheriting it would inherit the tokens, which is the thing
+    // this whole feature exists to avoid.
+    var msgs: std.ArrayList(chat.ChatMessage) = .empty;
+    var tstate = SubTurn{ .m = m };
+    defer tstate.deinit(gpa);
+
+    const user_msg = if (task.prompt.len > 0)
+        std.fmt.allocPrint(
+            gpa,
+            "{s}\n\n{s}",
+            .{ task.description, task.prompt },
+        ) catch return subagent_mod.refused("no memory for the prompt", rep)
+    else
+        gpa.dupe(u8, task.description) catch return subagent_mod.refused("no memory for the prompt", rep);
+    defer gpa.free(user_msg);
+
+    msgs.append(gpa, .{ .role = "system", .content = subagent_mod.system_prompt }) catch
+        return subagent_mod.refused("no memory for the system prompt", rep);
+    msgs.append(gpa, .{ .role = "user", .content = user_msg }) catch
+        return subagent_mod.refused("no memory for the prompt", rep);
+
+    var url_buf: [1024]u8 = undefined;
+    const url = if (pick.kind == .anthropic)
+        std.fmt.bufPrint(&url_buf, "{s}/messages", .{pick.base_url}) catch pick.base_url
+    else
+        std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{pick.base_url}) catch pick.base_url;
+
+    var body_buf: [256 * 1024]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < subagent_mod.max_iterations) : (iteration += 1) {
+        // Budget enforcement on the SUBCOMPACTED view: the subagent's window is
+        // small by design, and letting it grow past `budget_tokens` would mean
+        // paying for a grep dump it does not need.
+        var cstate = std.heap.ArenaAllocator.init(gpa);
+        const carena = cstate.allocator();
+        const comp = compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens) catch
+            compaction.Compacted{ .msgs = msgs.items };
+
+        const body = chat.buildBodyMessages(
+            &body_buf,
+            pick.model,
+            comp.msgs,
+            // LOW effort, always: this is a bounded search, not a design, and
+            // there is nobody to impress. This is where most of the money is
+            // saved and no quality is lost.
+            .low,
+            tools_json,
+            pick.kind,
+        ) catch {
+            cstate.deinit();
+            return subagent_mod.refused("the request was too large", rep);
+        };
+
+        chat.cancel_current.store(false, .seq_cst);
+        const bearer: ?[]const u8 = if (pick.kind == .anthropic) null else key;
+        // `streamChat` returns `void`: it owns the StreamCtx and destroys it.
+        // (`streamChatCtx` is the other one, and it hands the ctx over — mixing
+        // them up is how a subagent leaks 8 KB per iteration.)
+        chat.streamChat(
+            gpa,
+            &http,
+            url,
+            bearer,
+            @constCast(body),
+            .{
+                .userdata = &tstate,
+                .onDelta = SubTurn.subOnDelta,
+                .onToolCall = SubTurn.subOnToolCall,
+                .onFinish = SubTurn.subOnFinish,
+            },
+            pick.kind,
+        ) catch |err| {
+            cstate.deinit();
+            // A cancelled subagent returns what it found, if anything. Treating
+            // ESC as "refused" would throw away a report the user paid for.
+            if (err == error.Cancelled and tstate.text.items.len > 0) {
+                const partial = subagent_mod.formatReport(tstate.text.items, rep);
+                return partial;
+            }
+            return subagent_mod.refused(@errorName(err), rep);
+        };
+        cstate.deinit();
+
+        if (tstate.calls.items.len == 0) {
+            // Done: the text IS the report.
+            const out = subagent_mod.formatReport(tstate.text.items, rep);
+            return out;
+        }
+
+        // Tool round. The assistant message carries its `tool_calls` or the next
+        // request is a 400 (the bug the TUI agent loop had).
+        const tc_json = if (tstate.calls.items.len > 0)
+            toolCallsJsonFromCalls(gpa, tstate.calls.items)
+        else
+            null;
+        msgs.append(gpa, .{ .role = "assistant", .content = tstate.text.items, .tool_calls_json = tc_json }) catch
+            return subagent_mod.refused("out of memory during the subagent loop", rep);
+
+        for (tstate.calls.items) |call| {
+            // A tool the subagent is not allowed to use comes back as a tool
+            // result, NOT as a crash: the model asked for something out of scope
+            // and it should find out by being told, in the same turn.
+            if (!subagent_mod.allowsTool(call.name)) {
+                const denied = std.fmt.allocPrint(gpa, "the subagent may not use `{s}`. It can only search and read.", .{call.name}) catch "not allowed";
+                msgs.append(gpa, .{ .role = "tool", .content = denied, .tool_call_id = call.id }) catch break;
+                continue;
+            }
+            const res_text = tools_mod.execute(
+                io_global,
+                call.name,
+                call.args_json,
+                gpa,
+                // NO background registry: a subagent must not leave processes
+                // behind that nobody is tracking, and `run_in_background` on a
+                // read-only tool is not a thing.
+                null,
+            ) catch |err| {
+                const emsg = gpa.dupe(u8, @errorName(err)) catch continue;
+                msgs.append(gpa, .{ .role = "tool", .content = emsg, .tool_call_id = call.id }) catch break;
+                continue;
+            };
+            // The per-result cap is the subagent's own, tighter one: 16 KB of grep
+            // in a 24k budget is two thirds of the window in a single call.
+            const capped = if (res_text.len > subagent_mod.max_tool_output)
+                res_text[0..subagent_mod.max_tool_output]
+            else
+                res_text;
+            msgs.append(gpa, .{ .role = "tool", .content = capped, .tool_call_id = call.id }) catch break;
+        }
+        tstate.clearCalls(gpa);
+        tstate.text.clearRetainingCapacity();
+    }
+
+    // Out of steps. The report it managed to write is usually good enough, and
+    // throwing it away because the search did not FINISH is the worst of both.
+    if (tstate.text.items.len > 0) {
+        const out = subagent_mod.formatReport(tstate.text.items, rep);
+        return out;
+    }
+    return subagent_mod.refused("it ran out of steps without reporting anything", rep);
+}
+
+/// The subagent's own turn state.
+///
+/// It is NOT `TurnCtx`: that one paints into the history and counts the turn's
+/// stats, and a subagent's intermediate steps must not appear in the user's
+/// history at all. The only thing the user sees is `task(description)` and the
+/// report.
+const SubTurn = struct {
+    m: *tui.Model,
+    text: std.ArrayList(u8) = .empty,
+    calls: std.ArrayList(TurnCtx.Call) = .empty,
+
+    fn deinit(self: *SubTurn, gpa: std.mem.Allocator) void {
+        self.clearCalls(gpa);
+        self.text.deinit(gpa);
+    }
+
+    fn clearCalls(self: *SubTurn, gpa: std.mem.Allocator) void {
+        for (self.calls.items) |c| {
+            gpa.free(c.id);
+            gpa.free(c.name);
+            gpa.free(c.args_json);
+        }
+        self.calls.clearRetainingCapacity();
+    }
+
+    fn subOnDelta(ud: ?*anyopaque, delta: []const u8) void {
+        const t: *SubTurn = @ptrCast(@alignCast(ud.?));
+        // The report is accumulated silently. Painting it would put the
+        // subagent's half-formed sentences in the middle of the user's history.
+        t.text.appendSlice(t.m.allocator, delta) catch {};
+    }
+
+    fn subOnToolCall(ud: ?*anyopaque, id: []const u8, name: []const u8, args_json: []const u8) void {
+        const t: *SubTurn = @ptrCast(@alignCast(ud.?));
+        const gpa = t.m.allocator;
+        // One copy each, and `clearCalls` frees exactly those lengths: the rule
+        // that `gpa.free(list.items)` is an "Invalid free" in 0.16 because `items`
+        // is the length slice and the capacity is elsewhere.
+        const id_c = gpa.dupe(u8, id) catch return;
+        errdefer gpa.free(id_c);
+        const name_c = gpa.dupe(u8, name) catch return;
+        errdefer gpa.free(name_c);
+        const args_c = gpa.dupe(u8, args_json) catch return;
+        t.calls.append(gpa, .{ .id = id_c, .name = name_c, .args_json = args_c }) catch {
+            gpa.free(id_c);
+            gpa.free(name_c);
+            gpa.free(args_c);
+        };
+    }
+
+    fn subOnFinish(_: ?*anyopaque, _: []const u8) void {}
+};
+
+/// The `{"type":"function",...}` object for one tool, inside the full list.
+///
+/// `null` when not found. A scan rather than a parse because this runs once per
+/// subagent and the input is our own constant; a parse+reserialize would be 8 KB
+/// of garbage per call for nothing.
+fn findToolJson(all: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < all.len) {
+        if (all[i] != '{') {
+            i += 1;
+            continue;
+        }
+        const end = bgproc_matchObject(all, i) orelse return null;
+        const span = all[i..end];
+        var key_buf: [80]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "\"name\":\"{s}\"", .{name}) catch return null;
+        if (std.mem.indexOf(u8, span, key) != null) return span;
+        i = end;
+    }
+    return null;
+}
+
+fn bgproc_matchObject(s: []const u8, start: usize) ?usize {
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (in_str) {
+            if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true else if (c == '{') depth += 1 else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return i + 1;
+        }
+    }
+    return null;
+}
+
+/// Questions one turn may ask.
+///
+/// Three is the number where "the agent checks with me" stops being useful and
+/// starts being an obstacle, and it is a cap on the ASK count rather than on the
+/// time: three quick questions are fine, and a turn that takes forty steps without
+/// asking anything is not what this cap is about.
+pub const max_asks_per_turn = 3;
+
+/// Read-only mode's answer to a write tool. Said as a tool result so the model
+/// changes plan instead of retrying (a retry of the same call is an immediate
+/// loop, and the cap is what saves you from it).
+pub const read_only_text =
+    "read-only mode is on: the user asked zode to look before it touches anything, " ++
+    "so write/edit/bash did not run. Do NOT retry it. Either use `ask` to tell the " ++
+    "user what you found and what you would change, or (if you are already sure) say " ++
+    "so in one line — the user can turn read-only off with shift+tab.";
+
+/// ESC: kills the foreground command if there is one. Returns how many were
+/// killed. See `bgproc.killForeground` for why this is not a no-op.
+pub fn killForeground() usize {
+    return if (bgproc.killForeground()) 1 else 0;
+}
+
+/// One tool call, in series. Returns 1 if it ran, 0 if it was denied.
+///
+/// This is the serial path: everything with side effects, and the single-call
+/// case for a read-only tool (a batch of one is not worth a thread).
+fn execOneCall(
+    m: *tui.Model,
+    s: *session_mod.Session,
+    call: TurnCtx.Call,
+    arena: std.mem.Allocator,
+    denied: *usize,
+) usize {
+    const arg = toolArgSummary(call.name, call.args_json, arena);
+    m.pushToolStart(call.name, arg);
+    // The status says WHAT is running, not a generic "working": with a slow `bash`
+    // that is the difference between "working" and "hung". The text is
+    // copied to a fixed buffer, so the arg from the worker's arena can die
+    // without a problem.
+    setStatusWithZo(m, .tooling, arg);
+
+    // ── read-only mode ──
+    //
+    // BEFORE the permission dialog, and that order is the point: in read-only the
+    // call is not going to happen, so asking "may I run this write?" and then
+    // saying no is a dialog that lies. The user asked for "look, don't touch", and
+    // a permission prompt for a write in that mode is a bug in the UI.
+    if (read_only and isWriteTool(call.name)) {
+        m.pushToolDone(call.name, "read-only", 0, read_only_text);
+        s.appendToolResult(call.id, call.name, read_only_text) catch {};
+        return 0;
+    }
+
+    // ── permission ──
+    if (!yolo and tools_mod.needsPermission(call.name) and !isAlwaysAllowed(call.name)) {
+        var dbuf: [384]u8 = undefined;
+        const detail = std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
+        switch (m.requestPermission(call.name, detail)) {
+            .allow => {},
+            .allow_always => setAlwaysAllowed(m, call.name),
+            .deny, .none => {
+                // The denial is handed back to the model as a result
+                // so it changes strategy instead of retrying.
+                denied.* += 1;
+                turn_stats.noteDenied();
+                m.pushToolDone(call.name, "denied: permission required", 0, "denied");
+                s.appendToolResult(call.id, call.name, "denied: permission required") catch {};
+                return 0;
+            },
+        }
+    }
+
+    const call_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
+
+    // [undo] La foto de ANTES. `existed` va aparte porque "no estaba" y
+    // "estaba vacío" se deshacen distinto (borrar vs escribir vacío), y un
+    // `catch ""` no lo distingue. Y si el fallo NO es "no existe" (permisos,
+    // un directorio), NO se fotografía nada: `/undo` borraría un archivo que
+    // no llegó a leer, que es lo peor que puede hacer un undo.
+    var before: ?[]const u8 = null;
+    if (touchesFile(call.name)) {
+        if (filePathOf(call.args_json, arena)) |pth| {
+            if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
+                before = content;
+                m.snapshotFile(pth, content, true);
+            } else |err| {
+                switch (err) {
+                    error.FileNotFound => m.snapshotFile(pth, "", false),
+                    else => {},
+                }
+            }
+        }
+    }
+
+    // La tool `todo` no tiene resultado que mirar: su efecto es el PLAN que
+    // ve el usuario, y se aplica aquí (no dentro de `execute`) porque el plan
+    // vive en el `Model`, que es de la TUI.
+    if (std.mem.eql(u8, call.name, "todo")) {
+        applyPlanCall(m, call.args_json, arena);
+    }
+
+    const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg) catch |err| {
+        const ms = elapsedMs(call_t0);
+        const emsg = std.fmt.allocPrint(arena, "{t}", .{err}) catch "error";
+        m.pushToolDone(call.name, emsg, ms, emsg);
+        s.appendToolResult(call.id, call.name, emsg) catch {};
+        return 0;
+    };
+    const ms = elapsedMs(call_t0);
+    turn_stats.noteTool();
+    if (std.mem.eql(u8, call.name, "bash") and startedBackground(res)) m.bench.bg_jobs += 1;
+    const summary = toolResultSummary(call.name, res, arena);
+    m.pushToolDone(call.name, summary, ms, res);
+
+    // Diff against the previous content, if the tool touched a file.
+    if (before) |old| {
+        if (filePathOf(call.args_json, arena)) |pth| {
+            const after = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch {
+                s.appendToolResult(call.id, call.name, res) catch {};
+                return 1;
+            };
+            // The language comes from the path's extension, so the body of each line
+            // is tokenized instead of coming out in the prefix's color.
+            const dc = m.pushDiffLang(old, after, langFromPath(pth));
+            turn_stats.noteDiff(pth, dc);
+        }
+    }
+
+    s.appendToolResult(call.id, call.name, res) catch {};
+    return 1;
+}
+
+/// Did this `bash` result start a background job?
+///
+/// Parsed from the RESULT text and not from the arguments: by the time the result
+/// exists the registry is the truth, and matching the model's own wording would
+/// count a foreground `bash` whose output happened to contain the words.
+fn startedBackground(res: []const u8) bool {
+    return std.mem.startsWith(u8, res, "started in the background as job ");
+}
+
+/// Runs a run of consecutive read-only tool calls at the same time.
+///
+/// One thread per call, each with its OWN arena, and the results collected into a
+/// slice the caller walks in order. Three things are load-bearing here:
+///
+/// - **Own arena per call.** The main `arena` of `execToolCalls` is shared by the
+///   whole turn and freed when it returns; appending to it from three threads is a
+///   data race on the ArrayList's length, and that is a silent corruption, not a
+///   crash.
+/// - **Results in request order.** The model asked for them in an order and reads
+///   them in that order; sorting by completion time would be faster-looking and
+///   would make the same request produce different transcripts run to run.
+/// - **Headers first, then results.** All the `⏺ grep(...)` lines go out before
+///   any `⎿ 12 matches · 30ms`, so the history reads as "these four things at
+///   once" instead of four unrelated call/result pairs, which is what a
+///   per-call `pushToolStart`/`pushToolDone` pair would produce.
+fn runParallelBatch(
+    m: *tui.Model,
+    s: *session_mod.Session,
+    t: *TurnCtx,
+    from: usize,
+    to: usize,
+    arena: std.mem.Allocator,
+) struct { ok: usize, denied: usize } {
+    const n = to - from;
+    const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
+
+    // One header per call, in order, all before anything runs.
+    for (t.calls.items[from..to]) |call| {
+        const arg = toolArgSummary(call.name, call.args_json, arena);
+        m.pushToolStart(call.name, arg);
+    }
+    // The strip says "running" with the batch, not one tool: with four greps
+    // there is no single tool that is "the" one, and a name that changes every
+    // frame reads as a flicker.
+    var batch_buf: [128]u8 = undefined;
+    const batch_label = std.fmt.bufPrint(&batch_buf, "{d} searches in parallel", .{n}) catch "searching";
+    setStatusWithZo(m, .tooling, batch_label);
+    // `pushToolStart` set `tool_run` to the last one; clear it so the clock line
+    // does not claim a single tool is running.
+    m.toolRunEnd();
+
+    const Job = struct {
+        name: []const u8,
+        args: []const u8,
+        id: []const u8,
+        text: []const u8,
+        ms: u64,
+        err: bool,
+    };
+    var results = arena.alloc(Job, n) catch {
+        // Out of memory for the results: fall back to serial. A correct-but-slow
+        // turn beats a broken one.
+        var ok: usize = 0;
+        var denied: usize = 0;
+        for (t.calls.items[from..to]) |call| {
+            ok += execOneCall(m, s, call, arena, &denied);
+        }
+        return .{ .ok = ok, .denied = denied };
+    };
+    @memset(results, .{ .name = "", .args = "", .id = "", .text = "", .ms = 0, .err = false });
+
+    const Ctx = struct {
+        call: TurnCtx.Call,
+        out: *Job,
+        m: *tui.Model,
+        pending: *std.atomic.Value(usize),
+    };
+    var ctxs = arena.alloc(Ctx, n) catch return .{ .ok = 0, .denied = 0 };
+    // The per-batch pending count, decremented by each thread. `m.workerCount()`
+    // is NOT used to wait: it includes the chat worker, and waiting for it here
+    // would be waiting for the turn to finish (see `waitForBatch`).
+    var pending = std.atomic.Value(usize).init(n);
+    for (t.calls.items[from..to], 0..) |call, k| {
+        ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending };
+    }
+    // `beginWorker`/`endWorker` around the thread as well: at exit `waitWorkers`
+    // has to hold until these are done, or `app.deinit()` destroys the `Io` while
+    // one of them is inside `std.process.run` (the AGENTS.md detached-worker trap).
+    const Runner = struct {
+        fn run(ctx: *Ctx) void {
+            ctx.m.beginWorker();
+            defer ctx.m.endWorker();
+            defer _ = ctx.pending.fetchSub(1, .seq_cst);
+            const call_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
+            // A per-call arena: the shared one is off limits from two threads
+            // (its ArrayList length would be a data race, and a silent one).
+            var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
+            defer astate.deinit();
+            const a = astate.allocator();
+            const text = tools_mod.execute(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg) catch |err| {
+                ctx.out.err = true;
+                ctx.out.text = @constCast(@errorName(err));
+                ctx.out.ms = elapsedMs(call_t0);
+                return;
+            };
+            // COPIED into the turn arena: `a` dies with this thread's defer and the
+            // text is read by the caller afterwards.
+            ctx.out.text = a.dupe(u8, text) catch "";
+            ctx.out.ms = elapsedMs(call_t0);
+        }
+    };
+    for (ctxs) |*c| {
+        // A SPAWN FAILURE has to run the call inline, or the result slot stays
+        // empty and the model gets a tool result with no tool call behind it.
+        const th = std.Thread.spawn(.{}, Runner.run, .{c}) catch {
+            Runner.run(c);
+            continue;
+        };
+        th.detach();
+    }
+    waitForBatch(&pending, 120_000);
+
+    // Results, in request order.
+    var ok: usize = 0;
+    for (results, 0..) |r, k| {
+        if (r.text.len == 0 and r.err) {
+            m.pushToolDone(t.calls.items[from + k].name, "failed", r.ms, "the parallel search failed");
+            s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, "the parallel search failed") catch {};
+            continue;
+        }
+        ok += 1;
+        turn_stats.noteTool();
+        const summary = toolResultSummary(t.calls.items[from + k].name, r.text, arena);
+        m.pushToolDone(t.calls.items[from + k].name, summary, r.ms, r.text);
+        s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, r.text) catch {};
+    }
+
+    // The batch's own clock: it is the number the user can compare against a
+    // serial run of the same searches, which is the whole point of doing this.
+    const total_ms = elapsedMs(t0);
+    var sum_buf: [128]u8 = undefined;
+    const sum = std.fmt.bufPrint(&sum_buf, "{d} searches in parallel · {d}.{d}s", .{
+        n,
+        total_ms / 1000,
+        (total_ms % 1000) / 100,
+    }) catch "searches";
+    setStatusWithZo(m, .tooling, sum);
+    return .{ .ok = ok, .denied = 0 };
+}
+
+/// A plain `nanosleep`, NOT `Io.sleep`.
+///
+/// `Io.sleep` goes through the shared `Io` and takes its event loop with it, so
+/// sleeping on it from a worker stops the TUI's redraw ticks: the clock in the
+/// activity strip freezes and the screen looks dead. Same trap as `Retry.wait` and
+/// the ACP cancel loop, documented in AGENTS.md.
+fn napMs(ms: u64) void {
+    if (builtin.os.tag != .linux) {
+        std.Thread.yield() catch {};
+        return;
+    }
+    const ts = std.os.linux.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.os.linux.nanosleep(&ts, null);
+}
+
+/// Waits for the batch's threads.
+///
+/// It counts DOWN a local counter and not `m.workerCount()`, because that counter
+/// is global: the chat worker itself is one of them, so waiting for "workers == 0"
+/// here would also wait for the turn to finish, which is a deadlock (the turn is
+/// waiting for this function).
+///
+/// A join per thread is what would be the obvious thing and it is NOT possible
+/// here: the threads are detached so a tool that hangs cannot keep the process
+/// alive, and a detached thread has nothing to join. So this is a bounded spin on
+/// a per-batch atomic, sleeping so it costs nothing.
+///
+/// The deadline exists because `web_fetch` can sit in a TLS read: without a cap, a
+/// server that never answers would park the turn forever, which is the freeze this
+/// project has already paid for once.
+fn waitForBatch(pending: *std.atomic.Value(usize), deadline_ms: u64) void {
+    var waited: u64 = 0;
+    while (pending.load(.seq_cst) > 0 and waited < deadline_ms) : (waited += 5) {
+        napMs(5);
+    }
+}
+
 fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     const gpa = m.allocator;
     var astate = std.heap.ArenaAllocator.init(gpa);
@@ -2703,91 +3918,60 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     var ran: usize = 0;
     var denied: usize = 0;
 
-    for (t.calls.items) |call| {
-        const arg = toolArgSummary(call.name, call.args_json, arena);
-        m.pushToolStart(call.name, arg);
-        // The status says WHAT is running, not a generic "working": with a slow `bash`
-        // that is the difference between "working" and "hung". The text is
-        // copied to a fixed buffer, so the arg from the worker's arena can die
-        // without a problem.
-        setStatusWithZo(m, .tooling, arg);
+    var i: usize = 0;
+    while (i < t.calls.items.len) {
+        const call = t.calls.items[i];
 
-        // ── permission ──
-        if (!yolo and tools_mod.needsPermission(call.name) and !isAlwaysAllowed(call.name)) {
-            var dbuf: [384]u8 = undefined;
-            const detail = std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
-            switch (m.requestPermission(call.name, detail)) {
-                .allow => {},
-                .allow_always => setAlwaysAllowed(m, call.name),
-                .deny, .none => {
-                    // The denial is handed back to the model as a result
-                    // so it changes strategy instead of retrying.
-                    denied += 1;
-                    turn_stats.noteDenied();
-                    m.pushToolDone(call.name, "denied: permission required", 0, "denied");
-                    s.appendToolResult(call.id, call.name, "denied: permission required") catch {};
-                    continue;
-                },
-            }
-        }
-
-        const call_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-
-        // [undo] La foto de ANTES. `existed` va aparte porque "no estaba" y
-        // "estaba vacío" se deshacen distinto (borrar vs escribir vacío), y un
-        // `catch ""` no lo distingue. Y si el fallo NO es "no existe" (permisos,
-        // un directorio), NO se fotografía nada: `/undo` borraría un archivo que
-        // no llegó a leer, que es lo peor que puede hacer un undo.
-        var before: ?[]const u8 = null;
-        if (touchesFile(call.name)) {
-            if (filePathOf(call.args_json, arena)) |pth| {
-                if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
-                    before = content;
-                    m.snapshotFile(pth, content, true);
-                } else |err| {
-                    switch (err) {
-                        error.FileNotFound => m.snapshotFile(pth, "", false),
-                        else => {},
-                    }
-                }
-            }
-        }
-
-        // La tool `todo` no tiene resultado que mirar: su efecto es el PLAN que
-        // ve el usuario, y se aplica aquí (no dentro de `execute`) porque el plan
-        // vive en el `Model`, que es de la TUI.
-        if (std.mem.eql(u8, call.name, "todo")) {
-            applyPlanCall(m, call.args_json, arena);
-        }
-
-        const res = tools_mod.execute(io_global, call.name, call.args_json, arena) catch |err| {
-            const ms = elapsedMs(call_t0);
-            const emsg = std.fmt.allocPrint(arena, "{t}", .{err}) catch "error";
-            m.pushToolDone(call.name, emsg, ms, emsg);
-            s.appendToolResult(call.id, call.name, emsg) catch {};
+        // The three tools that need the Model are intercepted HERE, before
+        // `tools.execute`, because they cannot work without it: `ask` needs the
+        // dialog, `task` needs to run a nested loop with this turn's HTTP client,
+        // and `skill` needs the discovered entries. Reaching `execute` with one of
+        // them is `error.UnknownTool`, which reads as a typo in the model's
+        // arguments; the interception is the fix, not a nicer error.
+        if (std.mem.eql(u8, call.name, "ask")) {
+            i += 1;
+            ran += askCall(m, s, call);
             continue;
-        };
-        const ms = elapsedMs(call_t0);
-        ran += 1;
-        turn_stats.noteTool();
-        const summary = toolResultSummary(call.name, res, arena);
-        m.pushToolDone(call.name, summary, ms, res);
-
-        // Diff against the previous content, if the tool touched a file.
-        if (before) |old| {
-            if (filePathOf(call.args_json, arena)) |pth| {
-                const after = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch {
-                    continue;
-                };
-                // The language comes from the path's extension, so the body of each line
-                // of the diff is tokenized instead of coming out in the
-                // prefix's color.
-                const dc = m.pushDiffLang(old, after, langFromPath(pth));
-                turn_stats.noteDiff(pth, dc);
-            }
+        }
+        if (std.mem.eql(u8, call.name, "skill")) {
+            i += 1;
+            ran += skillCall(m, s, call);
+            continue;
+        }
+        if (std.mem.eql(u8, call.name, "task")) {
+            i += 1;
+            ran += taskCall(m, s, call, arena);
+            continue;
         }
 
-        s.appendToolResult(call.id, call.name, res) catch {};
+        // ── parallel batch of read-only tools ──
+        //
+        // Consecutive calls that only READ are gathered and run at the same time.
+        // Three greps over a big tree is the common case (the model fans out to
+        // find something), and in series that is 3x the wait for a result that
+        // does not depend on any of the other two.
+        //
+        // What makes it safe is NOT "they are fast" but "they cannot observe each
+        // other": no shared output buffer, no ordering requirement, no
+        // permission dialog (they are all in the no-permission group). A tool
+        // that wrote anything, or that the model expects to see the world after,
+        // is not in `isParallelSafe` and stays in the serial path below.
+        //
+        // The results are appended to the session in the ORIGINAL order, because
+        // that is the order the model asked for and the order it reads.
+        var batch: usize = i;
+        while (batch < t.calls.items.len and tools_mod.isParallelSafe(t.calls.items[batch].name)) batch += 1;
+
+        if (batch - i > 1) {
+            const n = runParallelBatch(m, s, t, i, batch, arena);
+            ran += n.ok;
+            denied += n.denied;
+            i = batch;
+            continue;
+        }
+
+        i += 1;
+        ran += execOneCall(m, s, call, arena, &denied);
     }
     s.flush();
     // "tools done" says nothing. With the numbers it does: you know whether it was
@@ -2821,6 +4005,18 @@ pub const syntheticUserText = "Continue with the tool results above.";
 /// Does this tool modify a file on disk?
 fn touchesFile(name: []const u8) bool {
     return std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit");
+}
+
+/// Tools blocked in read-only mode.
+///
+/// `bash` is in the list even though a `bash` can be a pure read, because it can
+/// also be `rm`: the mode has to be decided from the tool, not from parsing the
+/// command string, or every read-only mode would be bypassable by writing
+/// `bash ls` first to learn what the model "really" wants to run.
+pub fn isWriteTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "edit") or
+        std.mem.eql(u8, name, "bash");
 }
 
 /// Path of the file a writing tool touches (or null if it does not say).
@@ -3549,19 +4745,56 @@ fn openProviderPicker(m: *tui.Model) void {
     m.openPicker(2, "provider", items, onProviderPick);
 }
 
-/// `/effort` without args: a 3-option picker.
+/// `/effort` without args: the levels the CURRENT model accepts.
+///
+/// It used to be a fixed `low/medium/high/xhigh`, which offered `xhigh` to a
+/// model whose top rung is `high` and never offered `none`/`minimal` to one
+/// that has them below `low`. Offering a level the model does not take is not a
+/// harmless extra row: picking it means the request 400s, and the picker had no
+/// way to say so. The list is `chat.effortLevels(cur_model)`, so it is exactly
+/// the vocabulary that `effortFor` will send.
 fn openEffortPicker(m: *tui.Model) void {
     const gpa = m.allocator;
-    const opts = [_][]const u8{ "low", "medium", "high" };
-    const items = gpa.alloc(tui.PickerItem, opts.len) catch return;
-    const descs = [_][]const u8{ "fastest", "balanced", "slower, more thorough" };
-    for (opts, 0..) |o, i| {
+    const levels = chat.effortLevels(cur_model);
+    const items = gpa.alloc(tui.PickerItem, levels.len) catch return;
+    for (levels, 0..) |lv, i| {
+        // El que esta activo de verdad se marca con una flecha, para que se vea
+        // de un vistazo que el modelo decidio (o que el usuario movio).
+        const desc = if (lv == effectiveEffort())
+            std.fmt.allocPrint(gpa, "← {s}", .{effortDesc(lv)}) catch ""
+        else
+            gpa.dupe(u8, effortDesc(lv)) catch "";
         items[i] = .{
-            .label = gpa.dupe(u8, o) catch return,
-            .desc = gpa.dupe(u8, descs[i]) catch "",
+            .label = gpa.dupe(u8, lv.label()) catch return,
+            .desc = desc,
         };
     }
-    m.openPicker(3, "effort", items, onEffortPick);
+    // El TITULO dice que escalera tiene el modelo. Es el "automatico" hecho
+    // visible: no hace falta que el usuario sepa de antemano que este modelo
+    // llega hasta `high` y otro hasta `xhigh` — el picker se lo enseña.
+    var title_buf: [128]u8 = undefined;
+    const title = if (chat.effortSupport(cur_model) == .none)
+        std.fmt.bufPrint(&title_buf, "effort · {s} (no effort control)", .{cur_model}) catch "effort"
+    else
+        std.fmt.bufPrint(&title_buf, "effort · {s} goes up to {s}", .{
+            cur_model,
+            chat.maxEffortFor(cur_model).label(),
+        }) catch "effort";
+
+    m.openPicker(3, title, items, onEffortPick);
+}
+
+/// One line per level, saying what it COSTS, not what it is. "minimal" on its
+/// own tells the user nothing they can act on.
+fn effortDesc(e: chat.Effort) []const u8 {
+    return switch (e) {
+        .none => "no reasoning at all (fastest)",
+        .minimal => "barely thinks",
+        .low => "fast",
+        .medium => "balanced",
+        .high => "slower, more thorough",
+        .xhigh => "maximum",
+    };
 }
 
 // ── modal palette (Ctrl+P) ────────────────────────────────────
@@ -4377,5 +5610,149 @@ test "cada atajo listado existe de verdad (nada de documentacion inventada)" {
     for (shortcuts) |s| {
         try std.testing.expect(s.key.len > 0);
         try std.testing.expect(s.desc.len > 0);
+    }
+}
+
+// ── tests: read-only, limite de iteraciones y skills ─────────
+
+test "read-only: `bash` esta bloqueado aunque sea solo un ls" {
+    // Se decide por TOOL, no parseando el comando: si se hiciera por el comando,
+    // el modo se podria saltar con un `bash` "de lectura" primero.
+    try std.testing.expect(isWriteTool("bash"));
+    try std.testing.expect(isWriteTool("write"));
+    try std.testing.expect(isWriteTool("edit"));
+    try std.testing.expect(!isWriteTool("read"));
+    try std.testing.expect(!isWriteTool("grep"));
+    try std.testing.expect(!isWriteTool("ask"));
+}
+
+test "read-only: el texto que vuelve al modelo dice que NO se reintente" {
+    // Sin el "do NOT retry", el modelo repite la llamada y el bucle se come las
+    // iteraciones que quedan. Y sin "ask", el modo no ofrece salida.
+    try std.testing.expect(std.mem.indexOf(u8, read_only_text, "Do NOT retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_only_text, "ask") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_only_text, "shift+tab") != null);
+}
+
+test "iterationLimit: por defecto 12, y el entorno lo puede mover" {
+    // Sin entorno (los tests lo son) sale el default. Con `ZODE_MAX_ITER` se
+    // lee en CADA llamada, no al arrancar: asi se puede cambiar entre turnos.
+    try std.testing.expectEqual(default_max_iterations, iterationLimit());
+    try std.testing.expect(default_max_iterations > 8);
+}
+
+test "ask: el tope por turno es 3, y esta en el guidance" {
+    try std.testing.expectEqual(max_asks_per_turn, 3);
+    // Y el modelo lo sabe: un tope que no esta en el prompt se cumple por
+    // casualidad y el usuario ve una pregunta消失 sin explicacion.
+    try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "three in a whole turn") != null);
+}
+
+test "skills: sin directorios la seccion del prompt esta VACIA (0 tokens)" {
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("", skills.systemPromptSection(&.{}, &buf));
+}
+
+test "prompt: la guia de routing sobrevive al AGENTS.md del proyecto" {
+    // El bug: `systemPromptBase` devuelve el `AGENTS.md` del proyecto EN LUGAR del
+    // prompt built-in, asi que en cualquier proyecto con uno el modelo no veia
+    // una sola regla de routing. Se manifolds como "buscame una pagina de
+    // juegos" -> `bash curl` en vez de `web_search`.
+    //
+    // Se testea lo que se puede testear sin disco: que la guia este SUELTA (no
+    // dentro de `default_system_prompt`, que es lo que se pierde) y que `buildSystemPrompt`
+    // la ponga siempre, elija la base que elija.
+    //
+    // `buildSystemPrompt` lee el `AGENTS.md` del CWD a traves de la cache, asi que
+    // se pone en una cache puesta a mano: el punto es que la composicion la mete
+    // igual en los dos casos.
+    const saved_cache = agents_md_cache;
+    const saved_io = io_global;
+    defer {
+        agents_md_cache = saved_cache;
+        io_global = saved_io;
+    }
+
+    // 1) La guia NO puede estar dentro del prompt built-in: ese texto es el que
+    //    `AGENTS.md` reemplaza. (Ojo: el built-in SI nombra las tools en su lista
+    //    de "Environment"; lo que no puede estar es la TABLA de routing.)
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "NEVER use bash") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Choosing the right tool") == null);
+
+    // 2) La guia esta a mano, y es completa.
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "web_search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "NEVER use bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "task") != null);
+
+    // 3) Con un "AGENTS.md" cacheado, la guia sigue en el prompt compuesto.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    const fake_agents = try std.testing.allocator.dupe(u8, "# proyecto\nNo hagas esto.");
+    defer std.testing.allocator.free(fake_agents);
+    agents_md_cache = fake_agents;
+
+    var out: [8192]u8 = undefined;
+    const composed = buildSystemPrompt(std.testing.allocator, &out, null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "No hagas esto.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "web_search = you do NOT have the URL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
+
+    // Y la guia va DESPUES de la base del proyecto: el archivo del usuario se lee
+    // primero, y una regla del harness no se pierde por estar despues.
+    const at_base = std.mem.indexOf(u8, composed, "No hagas esto.").?;
+    const at_rule = std.mem.indexOf(u8, composed, "NEVER use bash").?;
+    try std.testing.expect(at_base < at_rule);
+}
+
+test "tools: `ask`, `skill`, `bash_output` y `bash_kill` NO piden permiso" {
+    // Preguntar "¿puedo preguntarte?" es dos dialogos para una pregunta, y
+    // `bash_output` pide permiso sobre un comando que YA se aprobo cuando se
+    // lanzo en background.
+    try std.testing.expect(!tools_mod.needsPermission("ask"));
+    try std.testing.expect(!tools_mod.needsPermission("skill"));
+    try std.testing.expect(!tools_mod.needsPermission("bash_output"));
+    try std.testing.expect(!tools_mod.needsPermission("bash_kill"));
+    // Y `task` SI: gasta tokens del usuario y lee el repo entero.
+    try std.testing.expect(tools_mod.needsPermission("task"));
+    // `bash` en foreground sigue pidiendo, como siempre.
+    try std.testing.expect(tools_mod.needsPermission("bash"));
+}
+
+test "tools: paralelizables son SOLO las que no pueden observarse entre si" {
+    try std.testing.expect(tools_mod.isParallelSafe("read"));
+    try std.testing.expect(tools_mod.isParallelSafe("grep"));
+    try std.testing.expect(tools_mod.isParallelSafe("glob"));
+    try std.testing.expect(tools_mod.isParallelSafe("list_files"));
+    try std.testing.expect(tools_mod.isParallelSafe("web_fetch"));
+    try std.testing.expect(tools_mod.isParallelSafe("web_search"));
+    // Y las que escriben NO, ni siquiera cuando el comando parece de lectura:
+    try std.testing.expect(!tools_mod.isParallelSafe("bash"));
+    try std.testing.expect(!tools_mod.isParallelSafe("write"));
+    try std.testing.expect(!tools_mod.isParallelSafe("edit"));
+    try std.testing.expect(!tools_mod.isParallelSafe("task"));
+}
+
+test "tools: el schema anuncia las 5 tools nuevas" {
+    // Un tool que existe en el codigo y no en el JSON no se puede llamar, y el
+    // unico sintoma es que el modelo nunca la menciona.
+    const json = tools_mod.toolsJson();
+    for ([_][]const u8{ "ask", "skill", "task", "bash_output", "bash_kill" }) |name| {
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "\"name\":\"{s}\"", .{name}) catch unreachable;
+        try std.testing.expect(std.mem.indexOf(u8, json, key) != null);
+    }
+    // Y `run_in_background` esta en el schema de `bash`, que es donde se decide.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"run_in_background\"") != null);
+}
+
+test "isParallelSafe e isWriteSafe no se contradicen en lo que importa" {
+    // Una tool que fuera a la vez "paralela" y "escribe" seria un fallo de
+    // seguridad con forma de feature: el criterio de las dos listas tiene que
+    // ser el mismo.
+    for (tools_mod.defs) |d| {
+        if (tools_mod.isParallelSafe(d.name)) {
+            try std.testing.expect(!isWriteTool(d.name));
+        }
     }
 }

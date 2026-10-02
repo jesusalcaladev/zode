@@ -9,16 +9,89 @@ const acp = @import("acp.zig");
 /// of the HTTP layer.
 pub var io_global: std.Io = undefined;
 
-pub const Effort = enum(u32) {
-    low = 1024,
-    medium = 4096,
-    high = 16384,
+/// How hard the model should think.
+///
+/// It is an enum of LEVELS and nothing else: the output ceiling lives in
+/// `outputCeiling` and the thinking budget in `thinkingBudget`. It used to be an
+/// `enum(u32)` whose VALUE was `max_tokens` (low=4096, xhigh=49152), which
+/// welded two unrelated decisions together and produced two real bugs:
+///
+///  - "more effort" silently also meant "shorter answers". Asking for xhigh
+///    thinking gave the model a 49152-token ceiling but anything above `high`
+///    was squashed to `"high"` on the wire, so the extra room bought nothing
+///    and the model still could not think longer.
+///  - A model that supports MORE than our top level (Gemini's `minimal`,
+///    OpenAI's `none`, OpenRouter's `xhigh`) had no way to be asked for it,
+///    because the enum had no such member. `maxEffortFor` is how a model that
+///    supports more gets used instead of clamped.
+pub const Effort = enum {
+    /// Spend nothing on reasoning. OpenAI o-series and gpt-5 take it; a model
+    /// that does not will simply get the closest level it does accept.
+    none,
+    /// The cheapest level that is still "some" reasoning. Gemini 2.5 and
+    /// OpenAI's newer reasoning models call it `minimal`.
+    minimal,
+    low,
+    medium,
+    high,
+    /// Above `high`. Only some models take it (OpenAI gpt-5.1+, OpenRouter).
+    xhigh,
 
     pub fn parse(s: []const u8) ?Effort {
-        if (std.mem.eql(u8, s, "low")) return .low;
-        if (std.mem.eql(u8, s, "medium")) return .medium;
-        if (std.mem.eql(u8, s, "high")) return .high;
+        const eq = std.ascii.eqlIgnoreCase;
+        if (eq(s, "none") or eq(s, "off")) return .none;
+        if (eq(s, "minimal")) return .minimal;
+        if (eq(s, "low")) return .low;
+        if (eq(s, "medium") or eq(s, "med")) return .medium;
+        if (eq(s, "high")) return .high;
+        if (eq(s, "xhigh") or eq(s, "max")) return .xhigh;
         return null;
+    }
+
+    pub fn label(self: Effort) []const u8 {
+        return @tagName(self);
+    }
+
+    /// What to ask for when this model does not take the level we want: the
+    /// nearest one BELOW it. Never above, because overshooting is what 400s.
+    pub fn degrade(self: Effort) Effort {
+        return switch (self) {
+            .none => .none,
+            .minimal => .minimal,
+            .low => .low,
+            .medium => .low,
+            .high => .medium,
+            .xhigh => .high,
+        };
+    }
+
+    /// Ceiling for the WHOLE response, thinking included. Generous on purpose:
+    /// it is a safety limit against a runaway, not a length target, and the old
+    /// version made "low effort" mean "4096 tokens total", which cut a
+    /// tool-using answer in half.
+    pub fn outputCeiling(self: Effort) u32 {
+        return switch (self) {
+            .none => 16384,
+            .minimal => 16384,
+            .low => 32768,
+            .medium => 32768,
+            .high => 65536,
+            .xhigh => 65536,
+        };
+    }
+
+    /// `thinking.budget_tokens` for Anthropic. Must stay STRICTLY below
+    /// `outputCeiling` or the API answers 400, which is why
+    /// `thinkingBudgetFor` re-clamps instead of trusting the caller.
+    pub fn thinkingBudget(self: Effort) u32 {
+        return switch (self) {
+            .none => 0,
+            .minimal => 1024,
+            .low => 4096,
+            .medium => 8192,
+            .high => 16384,
+            .xhigh => 24576,
+        };
     }
 };
 
@@ -60,6 +133,222 @@ pub fn familyForModel(model: []const u8) Family {
         "o1", "o3", "o4", "gpt-5", "gpt5", "o1-", "o3-", "o4-", "gpt-5-",
     })) return .openai_reasoning;
     return .generic_openai;
+}
+
+/// Which effort levels a model actually accepts.
+///
+/// This is the piece that was missing, and its absence is bug 3 in one line:
+/// every model got the same three-and-a-bit levels, so "some models support more"
+/// was true and unreachable.
+///
+/// **Esta tabla se verifico contra las docs, no contra lo que parece reasonable.**
+/// La primera version la escribi de memoria y era FALSA en tres sitios, que es
+/// exactamente el modo de fallo que un test de este repo no caza: los tests
+/// comparan el JSON que genera zode contra el JSON que el propio codigo de zode
+/// dice que deberia generar. Si los dos estan equivocados, el test pasa. Lo que
+/// hace falta es mirar la documentacion del proveedor, y:
+///
+///   - `xhigh` NO existe en `gpt-5.1`. Solo en `gpt-5.1-codex-max` (verificado:
+///     la matriz de niveles de OpenAI lista none/low/medium/high para 5.1, y
+///     anade xhigh solo para codex-max). Habia puesto `xhigh` para todo 5.1,
+///     o sea un 400 en cuanto alguien escribiera `/effort xhigh`.
+///   - `minimal` NO existe en los GPT-5 anteriores a 5.1, ni en `gemini-2.5-*`.
+///     Es de 5.1 en adelante y de certainos Gemini 3.
+///   - Gemini llama al campo `thinking_level`, no `reasoning_effort`. Por el
+///     camino OpenAI-compatible (`/v1beta/openai/`, y OpenRouter) se mapea, que
+///     es por lo que se manda el nombre de OpenAI. Los VALORES son los de Gemini.
+///
+/// El resto del criterio es el de siempre: un nivel que el modelo no conoce es un
+/// 400, y un 400 a mitad de un turno es invisible. Ante la duda, **degradar**.
+pub const EffortSupport = enum {
+    /// No `reasoning_effort` at all. Do not send the field: a model with no such
+    /// knob answers 400, and a model that ignores it costs only the setting.
+    none,
+    /// `low | medium | high`. The floor that o1/o3/o4 and every GPT-5 before 5.1
+    /// accept, and the only ladder Gemini 2.5 accepts.
+    basic,
+    /// `basic` plus `none`. GPT-5.1 and later.
+    gpt51,
+    /// `basic` plus `none` and `xhigh`. ONLY the codex-max models; verified
+    /// against OpenAI's own matrix, which does not list xhigh for plain 5.1.
+    codex_max,
+    /// `minimal | low | medium | high`. The Gemini 3 flash family. NOT every
+    /// Gemini: `gemini-2.5-*` is `basic`, and `gemini-3-pro-preview` takes only
+    /// `low`/`high`, which is why it is not in here.
+    gemini3_minimal,
+    /// `low | high`. Documented for `gemini-3-pro-preview` (and
+    /// `gemini-3.1-pro-preview`), which is the one family WITHOUT `medium`.
+    ///
+    /// Existe por el motivo que importa: es el unico caso donde el default "de
+    /// en medio" NO puede ser `medium`. Sin esta fila, un modelo sin `medium`
+    /// receberia `medium` por ser el escalon central de una escalera inventada.
+    no_medium,
+};
+
+pub fn effortSupport(model: []const u8) EffortSupport {
+    // The most specific first, and by SUBSTRING: the ids arrive with four shapes
+    // (`gpt-5`, `openai/gpt-5`, `anthropic/claude-sonnet-4-5`, `google/gemini-3`).
+    //
+    // `codex-max` has to come before `gpt-5.1`, because `gpt-5.1-codex-max`
+    // contains `gpt-5.1` and would otherwise be demoted to the 5.1 ladder.
+    if (containsAny(model, &.{ "codex-max", "codex_max" })) return .codex_max;
+    if (containsAny(model, &.{ "gpt-5.1", "gpt5.1" })) return .gpt51;
+    if (containsAny(model, &.{ "gemini-3.5", "gemini-3.6", "gemini-3-flash", "gemini-3.7", "gemini-3.8" })) return .gemini3_minimal;
+    // Los pro de Gemini 3 no admiten `medium` (docs: low y high). Es el unico
+    // modelo conocido sin el escalon de en medio, asi que tiene su propia fila
+    // en vez de caer en `basic` y recibir un `medium` que no existe.
+    if (containsAny(model, &.{ "gemini-3-pro", "gemini-3.1-pro" })) return .no_medium;
+    // Everything else with a knob: the basic ladder. Gemini 2.5 and the odd
+    // `gemini-3-pro-preview` are here on purpose — `basic` is a subset of what
+    // they take, and `medium` is the only level that could surprise us (it is
+    // documented as unsupported on 3-pro-preview), so that one degrades high.
+    if (containsAny(model, &.{ "gemini" })) return .basic;
+    if (containsAny(model, &.{ "gpt-5", "gpt5", "o3", "o4", "o1" })) return .basic;
+    return .none;
+}
+
+/// The level to actually put on the wire, given what the model accepts.
+///
+/// `degrade` is the whole point: asking for xhigh on a model with four levels
+/// has to arrive as `high`, and asking for `none` on a model with no `none` has
+/// to arrive as `low` (spending nothing is `minimal` at worst). Returning a
+/// level the model does not know is an instant 400, and there is no way to
+/// discover the vocabulary from the id, so the table above is the contract.
+pub fn effortFor(model: []const u8, want: Effort) ?Effort {
+    return switch (effortSupport(model)) {
+        .none => null,
+        // `minimal` NO esta en esta escalera: mandarlo a un GPT-5 de antes de
+        // 5.1 es un 400. `none` tampoco, y "no pensar" cae a `low`, que es lo
+        // mas barato que el modelo sabe hacer.
+        .basic => switch (want) {
+            .none, .minimal, .low => .low,
+            .medium => .medium,
+            .high, .xhigh => .high,
+        },
+        .gpt51 => switch (want) {
+            .none => .none,
+            .minimal => .minimal,
+            .low => .low,
+            .medium => .medium,
+            .high, .xhigh => .high,
+        },
+        .codex_max => want,
+        // Gemini no tiene `none`: el piso es `minimal`.
+        .gemini3_minimal => switch (want) {
+            .none, .minimal => .minimal,
+            .low => .low,
+            .medium => .medium,
+            .high, .xhigh => .high,
+        },
+        // Sin `medium`: degradar hacia `low` (el nivel pedido es mas de lo que el
+        // modelo sabe hacer, y `low` es el mas cercano por debajo).
+        .no_medium => switch (want) {
+            .none, .minimal, .low, .medium => .low,
+            .high, .xhigh => .high,
+        },
+    };
+}
+
+/// The `reasoning_effort` STRING for a model that has the field.
+///
+/// The NAME is OpenAI's on purpose even for Gemini: Gemini llama al campo
+/// `thinking_level`, pero por el camino OpenAI-compatible (que es por donde
+/// habla zode, via OpenRouter o `/v1beta/openai/`) se mapea desde
+/// `reasoning_effort`. Los VALORES, en cambio, son los de Gemini.
+///
+/// Y elLevels se escribe "x-high" en ningun sitio: la palabra es `xhigh`.
+pub fn reasoningEffortString(model: []const u8, want: Effort) ?[]const u8 {
+    const e = effortFor(model, want) orelse return null;
+    return switch (e) {
+        .none => "none",
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
+}
+
+/// The TOP effort a model accepts, for the `/effort` picker and the status bar.
+///
+/// Without this the picker offers levels the current model cannot take, and the
+/// user finds out by getting a 400 — which is the worst way to learn that your
+/// model has four rungs and you have five.
+pub fn maxEffortFor(model: []const u8) Effort {
+    return switch (effortSupport(model)) {
+        .none, .basic, .gpt51, .gemini3_minimal, .no_medium => .high,
+        .codex_max => .xhigh,
+    };
+}
+
+/// Every level the picker should offer for a model, cheapest first.
+///
+/// It is `effortFor`'s image: offering a level here that `effortFor` would
+/// silently degrade is offering a knob that does nothing, and offering one it
+/// cannot represent at all is offering a 400.
+pub fn effortLevels(model: []const u8) []const Effort {
+    return switch (effortSupport(model)) {
+        .none => &.{ .low, .medium, .high },
+        .basic => &.{ .low, .medium, .high },
+        .gpt51 => &.{ .none, .minimal, .low, .medium, .high },
+        .codex_max => &.{ .none, .minimal, .low, .medium, .high, .xhigh },
+        .gemini3_minimal => &.{ .minimal, .low, .medium, .high },
+        .no_medium => &.{ .low, .high },
+    };
+}
+
+/// Where a model's ladder SITS, so a default can be chosen without hardcoding a
+/// level that the model might not have.
+///
+/// It is the index into `effortLevels`, and NOT a level: `basic` has three
+/// rungs and `codex_max` six, and "the middle" of those is `low` and `high`
+/// respectively. Any function that returns "the model's default" and then clamps
+/// it is fine, but one that assumes `medium` exists is not — that assumption is
+/// exactly what made the old fixed `.medium` wrong for Gemini 3 Pro.
+fn ladderMid(model: []const u8) ?Effort {
+    const lv = effortLevels(model);
+    if (lv.len == 0) return null;
+    return lv[lv.len / 2];
+}
+
+/// The effort a model gets when the user has NOT chosen one.
+///
+/// Deliberately the middle of whatever the model offers, not a constant:
+/// `medium` is not on every ladder (Gemini 3 Pro takes only `low`/`high`), and
+/// a default that a model does not have is a request that 400s on the very first
+/// turn of a session where the user never touched `/effort`.
+pub fn defaultEffort(model: []const u8) Effort {
+    return ladderMid(model) orelse .medium;
+}
+
+/// The level that will ACTUALLY go on the wire, given a preference.
+///
+/// This is the function the request path should call, and the reason it exists
+/// is that `effortFor` returns an OPTIONAL: `null` means "this model has no
+/// knob at all", which is not an error, it just means the effort setting does
+/// not apply. Collapsing that here means nobody has to remember it, which is the
+/// whole point of doing it automatically.
+pub fn effectiveEffort(model: []const u8, want: Effort) Effort {
+    return effortFor(model, want) orelse defaultEffort(model);
+}
+
+/// Snap a preference to the TOP of a model's ladder.
+///
+/// Used when the model CHANGES: an `xhigh` chosen on `codex-max` has to become
+/// `high` on `gemini-2.5`, not sit there degrading silently on every request
+/// (the user would see `xhigh` in the status bar and `high` on the wire, and
+/// have no way to tell that those are different things).
+pub fn clampEffort(model: []const u8, want: Effort) Effort {
+    const top = maxEffortFor(model);
+    if (@intFromEnum(want) > @intFromEnum(top)) return top;
+    return want;
+}
+
+fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, haystack, n) != null) return true;
+    }
+    return false;
 }
 
 fn startsWithAny(haystack: []const u8, prefixes: []const []const u8) bool {
@@ -834,6 +1123,17 @@ fn buildBodyOpenAI(
     }
     try w.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true}");
 
+    // `reasoning_effort` goes out whenever the MODEL takes it, not only for the
+    // o-series: Gemini, DeepSeek's thinking models and OpenRouter's front door
+    // all read the same field name, and every one of them has levels our enum
+    // did not used to have. `familyForModel` decides the `max_tokens` FIELD NAME
+    // (below), which is a different question from "does this model think".
+    if (reasoningEffortString(model, effort)) |tok| {
+        try w.writeAll(",\"reasoning_effort\":\"");
+        try w.writeAll(tok);
+        try w.writeAll("\"");
+    }
+
     // OpenAI's o-series / gpt-5 reject `max_tokens` (they want
     // `max_completion_tokens`) and do not accept `temperature`. Sending the
     // wrong field is an instant 400, so branch by family.
@@ -841,23 +1141,12 @@ fn buildBodyOpenAI(
     switch (fam) {
         .openai_reasoning => {
             try w.writeAll(",\"max_completion_tokens\":");
-            try w.print("{d}", .{@intFromEnum(effort)});
+            try w.print("{d}", .{effort.outputCeiling()});
         },
         else => {
             try w.writeAll(",\"max_tokens\":");
-            try w.print("{d}", .{@intFromEnum(effort)});
+            try w.print("{d}", .{effort.outputCeiling()});
         },
-    }
-    if (fam == .openai_reasoning) {
-        // low/medium/high mapped onto OpenAI's vocabulary.
-        const re: []const u8 = switch (effort) {
-            .low => "low",
-            .high => "high",
-            .medium => "medium",
-        };
-        try w.writeAll(",\"reasoning_effort\":\"");
-        try w.writeAll(re);
-        try w.writeAll("\"");
     }
 
     // tools FIRST after messages? No: tools goes outside messages (root level),
@@ -899,14 +1188,16 @@ fn buildBodyAnthropic(
     // Anthropic REQUIRES max_tokens (it has no default). On top of that, with
     // extended thinking the reasoning budget is separate and has to be SMALLER
     // than max_tokens, otherwise the server answers 400.
-    const think_budget: u32 = switch (effort) {
-        .low => 1024,
-        .medium => 4096,
-        .high => 16384,
-    };
-    const max_tok: u32 = @intFromEnum(effort);
-    try w.print("\",\"max_tokens\":{d},\"stream\":true", .{max_tok});
-    if (max_tok > think_budget) {
+    //
+    // `thinkingBudget` can return a value that is NOT below the ceiling (a huge
+    // budget on a small ceiling), so the clamp lives HERE and not in the caller:
+    // this is the one place that knows the two numbers go out in the same
+    // request, and a 400 here is invisible until a turn dies mid-stream.
+    const ceiling = effort.outputCeiling();
+    const want_budget = effort.thinkingBudget();
+    const think_budget: u32 = if (want_budget == 0) 0 else @min(want_budget, ceiling -| 1);
+    try w.print("\",\"max_tokens\":{d},\"stream\":true", .{ceiling});
+    if (think_budget > 0) {
         try w.print(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{think_budget});
     }
 
@@ -1218,7 +1509,7 @@ test "buildBody escapa JSON y fija max_tokens" {
     var buf: [512]u8 = undefined;
     const body = try buildBody(&buf, "m1", "linea\ncon \"quotes\"", .medium);
     try std.testing.expectEqualStrings(
-        "{\"model\":\"m1\",\"messages\":[{\"role\":\"user\",\"content\":\"linea\\ncon \\\"quotes\\\"\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"max_tokens\":4096}",
+        "{\"model\":\"m1\",\"messages\":[{\"role\":\"user\",\"content\":\"linea\\ncon \\\"quotes\\\"\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true},\"max_tokens\":32768}",
         body,
     );
 }
@@ -1233,7 +1524,7 @@ test "buildBodyMessages con tool result y tools" {
     const body = try buildBodyMessages(&buf, "m", &msgs, .low, "[{\"type\":\"function\",\"function\":{\"name\":\"read\"}}]", .openai);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":\"c1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
 }
 
 test "scanSse parsea eventos Anthropic (delta, tool_use y usage)" {
@@ -1300,7 +1591,9 @@ test "buildBodyAnthropic convierte tool_calls/results y ancla cache_control" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_use_id\":\"c1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":{\"pattern\":\"foo\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\",\"text\":\"be terse\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1024") != null);
+    // El techo es el de `.low` (32768), no su presupuesto de pensamiento (4096):
+    // son dos numeros distintos y confundirlos era media parte del bug 3.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
     // The role "tool" does not exist in Anthropic: they go as tool_result in user.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") == null);
     // 3 breakpoints: system, last tool and last message.
@@ -1434,7 +1727,7 @@ test "buildBodyOpenAI: o-series usa max_completion_tokens + reasoning_effort" {
 
     // gpt-5: `max_tokens` gives a 400 in OpenAI's API.
     const body = try buildBodyMessages(&buf, "gpt-5", &msgs, .medium, "", .openai);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":32768") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
     // Reasoning models do not accept temperature.
@@ -1442,8 +1735,26 @@ test "buildBodyOpenAI: o-series usa max_completion_tokens + reasoning_effort" {
 
     // o3 also enters through the reasoning branch.
     const o3 = try buildBodyMessages(&buf, "o3-mini", &msgs, .high, "", .openai);
-    try std.testing.expect(std.mem.indexOf(u8, o3, "\"max_completion_tokens\":16384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o3, "\"max_completion_tokens\":65536") != null);
     try std.testing.expect(std.mem.indexOf(u8, o3, "\"reasoning_effort\":\"high\"") != null);
+
+    // xhigh asked on a model that tops out at high goes out AS high: an unknown
+    // level is an instant 400, and which models know the word is not knowable
+    // from the id, hence `effortSupport`.
+    const xh = try buildBodyMessages(&buf, "gpt-5", &msgs, .xhigh, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, xh, "\"reasoning_effort\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xh, "\"max_completion_tokens\":65536") != null);
+
+    // Y en un modelo que SI lo toma, sale xhigh de verdad. Antes no habia forma de
+    // llegar aqui. OJO: `gpt-5.1` a secas NO lo toma (xhigh es solo de codex-max),
+    // y mandarselo seria un 400: la primera version de esta tabla lo decia al
+    // reves y el test lo daba por bueno.
+    const xh2 = try buildBodyMessages(&buf, "gpt-5.1-codex-max", &msgs, .xhigh, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, xh2, "\"reasoning_effort\":\"xhigh\"") != null);
+
+    // Y `gpt-5.1` a secas degrada xhigh a high, que es lo que hacen las docs.
+    const xh3 = try buildBodyMessages(&buf, "gpt-5.1", &msgs, .xhigh, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, xh3, "\"reasoning_effort\":\"high\"") != null);
 }
 
 test "buildBodyOpenAI: modelo normal conserva max_tokens" {
@@ -1451,28 +1762,260 @@ test "buildBodyOpenAI: modelo normal conserva max_tokens" {
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
     const body = try buildBodyMessages(&buf, "kimi-k2.6", &msgs, .low, "", .openai);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
+    // Un modelo SIN la palanca no recibe el campo: mandarselo es un 400.
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "buildBodyOpenAI: un modelo con mas niveles los recibe (Gemini, gpt-5.1)" {
+    // El bug 3: "hay modelos que soportan mas" era verdad y no habia forma de
+    // aprovecharla. Ahora el campo sale siempre que el modelo lo tenga, y con el
+    // nivel que ESE modelo entiende.
+    var buf: [64 * 1024]u8 = undefined;
+    const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
+
+    // Gemini 3 llama `minimal` a su primer escalon y no tiene `none`: pedir "no
+    // pensar" llega como `minimal`, que es lo mas cerca que existe.
+    const g_min = try buildBodyMessages(&buf, "gemini-3.5-flash", &msgs, .minimal, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, g_min, "\"reasoning_effort\":\"minimal\"") != null);
+
+    const g_none = try buildBodyMessages(&buf, "gemini-3.5-flash", &msgs, .none, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, g_none, "\"reasoning_effort\":\"minimal\"") != null);
+
+    // Y xhigh en Gemini degrada a high (su techo), no a algo inventado.
+    const g_x = try buildBodyMessages(&buf, "gemini-3.5-flash", &msgs, .xhigh, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, g_x, "\"reasoning_effort\":\"high\"") != null);
+
+    // Gemini 2.5 NO tiene `minimal` (docs: low/medium/high), asi que pedirlo
+    // degrada a `low` en vez de mandar un nivel que no existe.
+    const g25 = try buildBodyMessages(&buf, "gemini-2.5-pro", &msgs, .minimal, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, g25, "\"reasoning_effort\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g25, "minimal") == null);
+
+    // `none` de verdad, en un modelo que lo tiene. Antes el enum ni siquiera
+    // tenia ese nivel.
+    const o_none = try buildBodyMessages(&buf, "gpt-5.1", &msgs, .none, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, o_none, "\"reasoning_effort\":\"none\"") != null);
+}
+
+test "effortSupport: la escalera de cada modelo sale de las DOCS, no de la intuicion" {
+    // Esta tabla se corrigio tras verificar contra la matriz de niveles de
+    // OpenAI y la tabla de `thinking_level` de Google. Los tres fallos eran
+    // inventados:
+    //
+    //   - `xhigh` NO existe en `gpt-5.1` (solo en codex-max). Mandarlo = 400.
+    //   - `minimal` NO existe en GPT-5 previos a 5.1, ni en gemini-2.5.
+    //   - gemini-2.5 no tiene `minimal` y gemini-3-pro-preview no tiene `medium`.
+    try std.testing.expectEqual(EffortSupport.none, effortSupport("kimi-k2.6"));
+    try std.testing.expectEqual(EffortSupport.codex_max, effortSupport("gpt-5.1-codex-max"));
+    // `codex-max` tiene que ganarle a `gpt-5.1` en el orden, no al reves.
+    try std.testing.expectEqual(EffortSupport.gpt51, effortSupport("gpt-5.1"));
+    // Un GPT-5 de antes de 5.1: la escalera basica, sin `minimal` ni `none`.
+    try std.testing.expectEqual(EffortSupport.basic, effortSupport("gpt-5"));
+    try std.testing.expectEqual(EffortSupport.basic, effortSupport("o3-mini"));
+    try std.testing.expectEqual(EffortSupport.basic, effortSupport("o1"));
+    // Gemini 2.5 es `basic` (docs: low/medium/high), y los 3.5+Suben a minimal.
+    try std.testing.expectEqual(EffortSupport.basic, effortSupport("gemini-2.5-pro"));
+    try std.testing.expectEqual(EffortSupport.gemini3_minimal, effortSupport("gemini-3.5-flash"));
+
+    // Los ids llegan con prefijo de proveedor (`openai/gpt-5.1`), asi que la
+    // busqueda es por SUBSTRING y no por prefijo.
+    try std.testing.expectEqual(EffortSupport.gpt51, effortSupport("openai/gpt-5.1"));
+    try std.testing.expectEqual(EffortSupport.gemini3_minimal, effortSupport("google/gemini-3.6-flash"));
+
+    // Un modelo sin la palanca NO recibe nivel: `effortFor` dice null y el body
+    // se queda sin el campo.
+    try std.testing.expectEqual(@as(?Effort, null), effortFor("kimi-k2.6", .high));
+
+    // Y el techo del picker es el del modelo, no el nuestro.
+    try std.testing.expectEqual(Effort.xhigh, maxEffortFor("gpt-5.1-codex-max"));
+    try std.testing.expectEqual(Effort.high, maxEffortFor("gpt-5.1"));
+    try std.testing.expectEqual(Effort.high, maxEffortFor("gpt-5"));
+    try std.testing.expectEqual(Effort.high, maxEffortFor("gemini-2.5-pro"));
+}
+
+test "effortFor: NUNCA pide un nivel que el modelo no documenta" {
+    // Este es el invariante que de verdad importa, y es el que la primera version
+    // incumplia en tres modelos. Se recorre TODA la combinacion de modelo x
+    // nivel y se exige que lo que sale sea un nivel que ese modelo acepte.
+    //
+    // La lista de "aceptados" esta escrita a mano de las docs. Es codigo, no una
+    // verdad que salga de la tabla de arriba: si las dos se derivaran la una de
+    // la otra, el test pasaria con las dos equivocadas (que es exactamente como
+    // se colaron los tres fallos).
+    const Cases = struct {
+        model: []const u8,
+        /// Los niveles que las DOCS dicen que acepta.
+        ok: []const Effort,
+    };
+    const cases = [_]Cases{
+        .{ .model = "kimi-k2.6", .ok = &.{} },
+        .{ .model = "gpt-5", .ok = &.{ .low, .medium, .high } },
+        .{ .model = "o3-mini", .ok = &.{ .low, .medium, .high } },
+        .{ .model = "gpt-5.1", .ok = &.{ .none, .minimal, .low, .medium, .high } },
+        .{ .model = "gpt-5.1-codex-max", .ok = &.{ .none, .minimal, .low, .medium, .high, .xhigh } },
+        .{ .model = "gemini-2.5-pro", .ok = &.{ .low, .medium, .high } },
+        .{ .model = "gemini-3.5-flash", .ok = &.{ .minimal, .low, .medium, .high } },
+    };
+    const all = [_]Effort{ .none, .minimal, .low, .medium, .high, .xhigh };
+
+    for (cases) |c| {
+        for (all) |want| {
+            const got = effortFor(c.model, want);
+            if (got == null) {
+                // Sin palanca: esta bien no mandar nada. Pero si el modelo
+                // estaba en la tabla con escalera, no puede desaparecer.
+                try std.testing.expectEqual(EffortSupport.none, effortSupport(c.model));
+                continue;
+            }
+            var accepted = false;
+            for (c.ok) |k| {
+                if (k == got.?) accepted = true;
+            }
+            if (!accepted) {
+                std.debug.print(
+                    "\\n  {s}: pidió {s} y salió {s}, que no está en sus docs\\n",
+                    .{ c.model, want.label(), got.?.label() },
+                );
+            }
+            try std.testing.expect(accepted);
+        }
+    }
+}
+
+test "effortLevels (el picker) y effortFor (el cable) no se contradicen" {
+    // Un nivel que el picker ofrece y `effortFor` no puede representar es un
+    // 400 esperando a que el usuario lo pulse; uno que degrada en silencio es un
+    // boton que no hace nada. Las dos cosas son senales  de un picker roto.
+    const models = [_][]const u8{
+        "kimi-k2.6",       "gpt-5",         "o3-mini",        "gpt-5.1",
+        "gpt-5.1-codex-max", "gemini-2.5-pro", "gemini-3.5-flash",
+    };
+    for (models) |m| {
+        for (effortLevels(m)) |lv| {
+            const got = effortFor(m, lv);
+            if (got == null) continue;
+            // Lo que se ofrece tiene que salir EXACTO, no una version degradada.
+            try std.testing.expectEqual(lv, got.?);
+        }
+    }
+}
+
+test "effort automatico: el default sale de la escalera del modelo, no de un `medium` fijo" {
+    // El default era `.medium` para TODO, y `medium` no esta en la escalera de
+    // todos los modelos. El default es el escalon de EN MEDIO de la escalera que
+    // tenga ese modelo, que es lo unico que se puede decir sin conocer cada
+    // modelo de memoria.
+    const models = [_][]const u8{
+        "kimi-k2.6",         "gpt-5",          "gpt-5.1",
+        "gpt-5.1-codex-max", "gemini-2.5-pro", "gemini-3.5-flash",
+    };
+    for (models) |m| {
+        const d = defaultEffort(m);
+        // Tiene que ser un nivel que el modelo ACEPTE de verdad...
+        const lv = effortLevels(m);
+        var on_ladder = false;
+        for (lv) |k| {
+            if (k == d) on_ladder = true;
+        }
+        try std.testing.expect(on_ladder);
+        // ...y tiene que ser representable: no vale con que no reviente.
+        _ = effortFor(m, d);
+    }
+
+    // El indice es lo que decide (el escalon de EN MEDIO), y se pinea caso por
+    // caso porque el enum esta ORDENADO pero las escaleras no tienen por que
+    // tener la misma longitud:
+    //   3 niveles (low/medium/high)      -> indice 1 -> medium
+    //   5 niveles (none..high)           -> indice 2 -> low
+    //   6 niveles (none..xhigh)          -> indice 3 -> medium
+    //   2 niveles (low/high)             -> indice 1 -> high   <-- sin `medium`
+    //   none..high (5)         -> indice 2 -> low
+    //   none..xhigh (6)        -> indice 3 -> medium
+    try std.testing.expectEqual(Effort.medium, defaultEffort("gemini-2.5-pro"));
+    try std.testing.expectEqual(Effort.medium, defaultEffort("gpt-5"));
+    try std.testing.expectEqual(Effort.low, defaultEffort("gpt-5.1"));
+    try std.testing.expectEqual(Effort.medium, defaultEffort("gpt-5.1-codex-max"));
+
+    // Y el caso que de verdad demuestra el punto: un modelo SIN `medium`.
+    // Si el default fuese el literal `.medium`, aqui recibiria un nivel que no
+    // existe, y el primer turno de una sesion nueva (donde el usuario no ha
+    // tocado `/effort`) se comeria un 400.
+    try std.testing.expectEqual(Effort.high, defaultEffort("gemini-3-pro-preview"));
+    try std.testing.expectEqual(@as(?Effort, .low), effortFor("gemini-3-pro-preview", .medium));
+}
+
+test "clampEffort: cambiar de modelo baja el peldano que ya no existe" {
+    // El `xhigh` que se eligio en un codex-max tiene que dejar de existir al
+    // cambiar a un gemini-2.5, no quedarse puesto degradandose en silencio (el
+    // status bar diria `xhigh` y el cable llevaria `high`, que son dos cosas
+    // distintas sin ninguna pista de que lo sean).
+    try std.testing.expectEqual(Effort.high, clampEffort("gemini-2.5-pro", .xhigh));
+    try std.testing.expectEqual(Effort.xhigh, clampEffort("gpt-5.1-codex-max", .xhigh));
+    // Y algo que el modelo SI tiene no se toca.
+    try std.testing.expectEqual(Effort.low, clampEffort("gpt-5", .low));
+    try std.testing.expectEqual(Effort.none, clampEffort("gpt-5.1", .none));
+
+    // Y el clamp es IDEMPOTENTE y nunca SUBE un nivel (subir por encima del
+    // techo es el 400).
+    const models = [_][]const u8{ "kimi-k2.6", "gpt-5", "gpt-5.1", "gpt-5.1-codex-max", "gemini-2.5-pro" };
+    for (models) |m| {
+        for ([_]Effort{ .none, .minimal, .low, .medium, .high, .xhigh }) |lv| {
+            const once = clampEffort(m, lv);
+            const twice = clampEffort(m, once);
+            try std.testing.expectEqual(once, twice);
+            try std.testing.expect(@intFromEnum(once) <= @intFromEnum(lv));
+        }
+    }
+}
+
+test "effectiveEffort: nunca devuelve null (un modelo sin palanca usa su default)" {
+    // La razon de que esta funcion exista: `effortFor` devuelve `?Effort` y
+    // `null` significa "este modelo no tiene la palanca", que NO es un error
+    // pero obliga a que cada llamante se acuerde. Aqui se colapsa, y el camino
+    // del request no tiene que saber nada.
+    // Sin palanca: cae al default, que es el medio de `low/medium/high`.
+    try std.testing.expectEqual(Effort.medium, effectiveEffort("kimi-k2.6", .high));
+    try std.testing.expectEqual(Effort.medium, effectiveEffort("gpt-5", .medium));
+    try std.testing.expectEqual(Effort.high, effectiveEffort("gpt-5.1", .xhigh));
+    try std.testing.expectEqual(Effort.xhigh, effectiveEffort("gpt-5.1-codex-max", .xhigh));
+    // Y lo que sale tiene que ser algo que el modelo acepta.
+    const m = "gemini-2.5-pro";
+    const e = effectiveEffort(m, .xhigh);
+    var ok = false;
+    for (effortLevels(m)) |k| {
+        if (k == e) ok = true;
+    }
+    try std.testing.expect(ok);
 }
 
 test "buildBodyAnthropic: thinking con budget menor que max_tokens" {
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
-    // effort=high → max_tokens 16384 > budget 16384? No: it must be strictly
-    // smaller, so with high no thinking is sent.
+    // effort=high → techo 65536 > budget 16384: thinking enabled.
     const high = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .high, "", .anthropic);
-    try std.testing.expect(std.mem.indexOf(u8, high, "\"max_tokens\":16384") != null);
-    try std.testing.expect(std.mem.indexOf(u8, high, "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, high, "\"max_tokens\":65536") != null);
+    try std.testing.expect(std.mem.indexOf(u8, high, "\"budget_tokens\":16384") != null);
 
-    // effort=medium → max_tokens 4096 > budget 4096, neither.
+    // effort=medium → techo 32768 > budget 8192: thinking enabled too.
     const med = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .medium, "", .anthropic);
-    try std.testing.expect(std.mem.indexOf(u8, med, "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, med, "\"budget_tokens\":8192") != null);
 
-    // effort=low → max_tokens 1024 == budget 1024: neither (it must be <).
+    // effort=low → techo 32768 > budget 4096. Antes `low` era un techo de 4096
+    // con un budget de 2048: dos veces menos sitio para la respuesta que para
+    // pensar, y una respuesta con tools se cortaba a la mitad.
     const low = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .low, "", .anthropic);
-    try std.testing.expect(std.mem.indexOf(u8, low, "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, low, "\"budget_tokens\":4096") != null);
+
+    // effort=none → sin thinking en absoluto (budget 0 = no se manda el bloque).
+    const none = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .none, "", .anthropic);
+    try std.testing.expect(std.mem.indexOf(u8, none, "\"thinking\"") == null);
+
+    // Y xhigh sube el budget de verdad (24576), que antes se aplastaba a 16384.
+    const xh = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .xhigh, "", .anthropic);
+    try std.testing.expect(std.mem.indexOf(u8, xh, "\"budget_tokens\":24576") != null);
 
     // The thinking budget can never equal max_tokens: Anthropic
     // requires budget_tokens < max_tokens.
