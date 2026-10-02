@@ -103,7 +103,26 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     var bg = bgproc.Registry{};
     defer bg.deinit(io, gpa);
 
-    const model_name = envGet(env, "ZODE_MODEL") orelse def.default_model;
+    // El modelo del headless tambien se PREGUNTA. Sin esto, `--chat` con un
+    // provider sin `default_model` mandaria `"model": ""` y el error del server
+    // no diria nada de por que. Y si el catalogo no se puede leer, se dice y se
+    // sale con codigo 1 sin haber gastado un turno.
+    var model_name: []const u8 = "";
+    if (envGet(env, "ZODE_MODEL")) |mm| {
+        if (mm.len > 0) model_name = mm;
+    }
+    if (model_name.len == 0) model_name = agent.userModel();
+    if (model_name.len == 0) {
+        // El modelo del headless tambien se PREGUNTA. Sin esto, `--chat` contra
+        // un provider sin `default_model` mandaria `"model": ""` y el error del
+        // server no diria nada de por que.
+        model_name = agent.resolveModelHeadless(gpa, &http, env) catch |err| {
+            std.debug.print("error: could not read {s}'s model catalog ({t}).\n", .{ def.id, err });
+            std.debug.print("       set ZODE_MODEL=<id> or add a model to ~/.config/zode/config.json.\n", .{});
+            return error.NoModel;
+        };
+        std.debug.print("model: {s} (first free in the catalog; ZODE_MODEL to override)\n", .{model_name});
+    }
 
     // El effort sale del MODELO, no de un `.medium` fijo: si `ZODE_EFFORT` no
     // esta, se pide el default de la escalera que tenga ese modelo. Y lo que
@@ -265,7 +284,11 @@ fn execHeadless(
     args: []const u8,
     arena: std.mem.Allocator,
 ) ![]const u8 {
-    return tools_mod.execute(io, name, args, arena, bg);
+    // NO read cache in the headless runner: it is one turn, one context, and the
+    // cache would only be able to help within it. The headless agent is also where
+    // a "you already have this" answer is most confusing to debug, because there
+    // is no session on screen to compare against.
+    return tools_mod.execute(io, name, args, arena, bg, null);
 }
 
 /// TUI mode: zode (no args)

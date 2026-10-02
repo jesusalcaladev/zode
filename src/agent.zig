@@ -666,8 +666,13 @@ pub fn curModel() []const u8 {
     return cur_model;
 }
 pub fn setModel(name: []const u8) void {
+    // `copyForwards` and not `@memcpy`: `name` can BE the buffer (a
+    // `setModel(curModel())`, which is what `defer setModel(saved)` in a test
+    // does, and what any "go back to what I had" would do). `@memcpy` on
+    // overlapping slices is undefined behaviour, and here it panicked instead of
+    // being a no-op, because the source IS the destination.
     const n = @min(name.len, cur_model_buf.len);
-    @memcpy(cur_model_buf[0..n], name[0..n]);
+    std.mem.copyForwards(u8, cur_model_buf[0..n], name[0..n]);
     cur_model = cur_model_buf[0..n];
     // El effort se ajusta SOLO al cambiar de modelo (bug 3). Sin esto, un
     // `xhigh` elegido en un codex-max se queda puesto en un gemini-2.5 que no lo
@@ -904,7 +909,15 @@ pub fn loadUserConfig() void {
         if (user_config.model.len > 0) {
             setModel(user_config.model);
         } else if (cur_model.len == 0) {
-            setModel(activeProviderDef(environ_global).default_model);
+            // NO se pone el `default_model` del provider aqui, y no por pereza:
+            // un nombre de modelo en el codigo deja de existir el dia que el
+            // provider lo retira, y entonces TODAS las peticiones fallan con un
+            // 403 que no dice nada. Sin modelo, `resolveModel` pregunta al
+            // provider que tiene (y elige el primero gratis), que es un dato que
+            // se puede volver a mirar cuando cambia.
+            if (activeProviderDef(environ_global).default_model.len > 0) {
+                setModel(activeProviderDef(environ_global).default_model);
+            }
         }
         loadAllowlist();
         loadAuthKeys(cfg_arena_state.?.allocator());
@@ -1479,6 +1492,17 @@ fn cmdContext(m: *tui.Model) void {
         .{ session_elided, tps_last },
     ) catch "details";
     pushInfoOwned(m, l3);
+
+    // The read cache, in tokens saved rather than in hits: "it worked" is a number
+    // the user can compare against the size of the files they are working with.
+    if (m.reads.stats.hits > 0 or m.reads.stats.misses > 0) {
+        const l4 = std.fmt.allocPrint(
+            m.allocator,
+            "  read cache: {d} re-reads avoided · ~{d} KB not re-sent ({d} files still in context)",
+            .{ m.reads.stats.hits, m.reads.stats.saved / 1024, m.reads.liveEntries() },
+        ) catch "details";
+        pushInfoOwned(m, l4);
+    }
 
     // Where the tools are actually reading and writing. It is here and not only in
     // the prompt because the USER needs it too: "why did it edit that file?" is
@@ -2522,6 +2546,10 @@ fn chatWorker(job: *ChatJob) void {
     // turn is the unit the user thinks in ("that took 40 s"), and a per-iteration
     // sample would make the average turn time a fiction.
     m.bench.noteTurn(iterations, turn_stats.elapsedMs(nowNs()), m.ttftMillis(), capped);
+    // The read cache's hit count, ONCE per turn: reading `m.reads.stats` from the
+    // draw every frame would take the cache's lock 60 times a second for a number
+    // that changes once per turn.
+    m.bench.read_hits = m.reads.stats.hits;
     pushTurnSummary(m);
 }
 
@@ -2758,6 +2786,116 @@ fn pickTarget(m: *tui.Model) Target {
     if (free_auto.poolSize() == 0) return active;
     const cand = free_auto.rosterGet(m.allocator).active(free_auto.nowMs()) orelse return active;
     return targetForCandidate(m, cand) orelse active;
+}
+
+/// Picks a model when the user has not chosen one, by ASKING the provider.
+///
+/// Why this exists: the compiled providers carry no `default_model` on purpose. A
+/// hardcoded model id is a timed bomb — the day the provider retires it, every
+/// request comes back 403 with a message about access and not about the name, and
+/// zode has nothing to fall back on. Here the catalogue is asked, which is a fact
+/// that can be asked again tomorrow.
+///
+/// The choice: the first model marked free (the ones that work without credits),
+/// alphabetical within the group so the same catalogue always picks the same one
+/// (a model that changes between two turns of the same session reads as a bug in
+/// zode even when it is not). If the provider publishes none, the first it lists.
+///
+/// And when the catalogue cannot be read it does NOT send anything: it says so and
+/// leaves the picker in front of the user. A turn burnt on a 403 teaches nobody
+/// anything, and "the catalog could not be read" and "that model does not exist"
+/// are two problems that deserve two different answers.
+///
+/// It runs on the worker thread, so `setModel` is called from there. Safe because
+/// `cur_model` is written under `model_lock` and every reader goes through
+/// `curModel()`.
+fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
+    if (curModel().len > 0) return curModel();
+    const gpa = m.allocator;
+    const def = activeProviderDef(m.environ);
+
+    setStatusWithZo(m, .thinking, "no model chosen · asking the provider");
+
+    var list = models_mod.listModels(gpa, http, def.models_url, providers.keyFor(def, m.environ) orelse curKey(m)) catch |err| {
+        const msg = std.fmt.allocPrint(
+            gpa,
+            "no model chosen, and {s}'s catalog could not be read ({t}). Open /model to pick one.",
+            .{ def.id, err },
+        ) catch "no model chosen: the catalog could not be read";
+        pushInfoOwned(m, msg);
+        setStatusWithZo(m, .warn, "no model · /model");
+        return null;
+    };
+    defer list.deinit(gpa);
+
+    if (list.items.len == 0) {
+        pushInfoFmt(m, "{s} publishes no models. Open /model to check the base URL.", .{def.id});
+        setStatusWithZo(m, .warn, "no models published");
+        return null;
+    }
+
+    var best: ?models_mod.Model = null;
+    for (list.items) |info| {
+        if (!isFree(info)) continue;
+        if (best == null or std.mem.lessThan(u8, info.id, best.?.id)) best = info;
+    }
+    const chosen = best orelse list.items[0];
+
+    setModel(chosen.id);
+    const why = if (chosen.is_free)
+        "the first free model in its catalog"
+    else
+        "the first model in its catalog (it publishes no free ones)";
+    // WHICH and WHY, in the history and not only in the status bar: a silent
+    // choice is indistinguishable from a hardcoded default, which is the thing
+    // this exists to replace.
+    pushInfoFmt(m, "model → {s} ({s}; /model to change it)", .{ chosen.id, why });
+    setStatusWithZo(m, .done, chosen.id);
+    refreshContextUsage(m);
+    return curModel();
+}
+
+/// The headless runner's version of `resolveModel`: same question, same choice,
+/// no UI to say it in.
+///
+/// It lives here rather than in `main.zig` because the CHOICE is one decision and
+/// it must not be made twice: two pickers that disagree on which free model is
+/// "the first" would make the TUI and `--chat` behave differently against the same
+/// provider, and that difference only shows up as a bug report.
+pub fn resolveModelHeadless(
+    gpa: std.mem.Allocator,
+    http: *http_client.Http,
+    env: ?*const std.process.Environ.Map,
+) ![]const u8 {
+    const def = activeProviderDef(env);
+    var list = try models_mod.listModels(gpa, http, def.models_url, providers.keyFor(def, env));
+    defer list.deinit(gpa);
+    if (list.items.len == 0) return error.NoModelsPublished;
+
+    var best: ?models_mod.Model = null;
+    for (list.items) |info| {
+        if (!isFree(info)) continue;
+        if (best == null or std.mem.lessThan(u8, info.id, best.?.id)) best = info;
+    }
+    const chosen = best orelse list.items[0];
+    // Into the static buffer: the caller keeps this for the whole run and the
+    // list is freed on the way out.
+    setModel(chosen.id);
+    return curModel();
+}
+
+/// The model the USER chose, or `""`.
+///
+/// Separate from `curModel()` because this one is a QUESTION ("has anybody chosen
+/// one?") and the other reads the current value. The headless runner asks the
+/// question before talking to any provider, and conflating the two would make a
+/// provider's fallback answer as if the user had chosen it.
+pub fn userModel() []const u8 {
+    if (envGet(environ_global, "ZODE_MODEL")) |mm| {
+        if (mm.len > 0) return mm;
+    }
+    if (user_config.model.len > 0) return user_config.model;
+    return "";
 }
 
 /// El `Target` del provider/modelo activos.
@@ -3010,6 +3148,11 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
         pushInfoOwned(m, msg);
     }
+    // [readcache] Lo que la compactacion se ha llevado ya NO esta en el contexto,
+    // asi que la cache de lecturas tiene que olvidarlo. Sin esto, el proximo `read`
+    // de uno de esos ficheros responderia "unchanged, ya lo tienes" sobre un
+    // contenido que el modelo ya no tiene: el peor fallo que puede tener una cache.
+    for (comp.elided_at) |idx| m.reads.markDroppedAt(idx);
     // Notice that byte elision is not enough and a summary is needed. Before, tier
     // 2 only existed in the headless runner, so in the TUI the ctx% climbed
     // without anything being said.
@@ -3021,10 +3164,23 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // it is the live candidate of the pool (which may be another provider), and
     // while the pool is still being built it is the active one: the listing is N
     // requests and the first prompt cannot wait for them.
-    var pick = pickTarget(m);
-
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
+
+    // Sin modelo elegido, se pregunta al provider ANTES de componer nada. Y si no
+    // se puede, el turno se corta aqui: es preferible no responder a que
+    // responderse a si mismo con un 403 que no explica su causa.
+    if (pickTarget(m).model.len == 0) {
+        _ = resolveModel(m, &http);
+    }
+
+    var pick = pickTarget(m);
+    if (pick.model.len == 0) {
+        m.streamEnd();
+        pushInfo(m, "no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
+        setStatusWithZo(m, .warn, "no model");
+        return null;
+    }
 
     chat.cancel_current.store(false, .seq_cst);
     // The status names the ITERATION from the second one on: plain "thinking" for
@@ -3699,6 +3855,12 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
                 // behind that nobody is tracking, and `run_in_background` on a
                 // read-only tool is not a thing.
                 null,
+                // NO read cache either, and that is a real decision rather than an
+                // omission: the subagent has its own throwaway window, so nothing
+                // it reads is ever "already in the context" of the main one. A
+                // shared cache would answer "unchanged, it is in your context" to a
+                // window that is thrown away a second later.
+                null,
             ) catch |err| {
                 const emsg = gpa.dupe(u8, @errorName(err)) catch continue;
                 msgs.append(gpa, .{ .role = "tool", .content = emsg, .tool_call_id = call.id }) catch break;
@@ -3925,7 +4087,7 @@ fn execOneCall(
         applyPlanCall(m, call.args_json, arena);
     }
 
-    const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg) catch |err| {
+    const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg, &m.reads) catch |err| {
         const ms = elapsedMs(call_t0);
         const emsg = std.fmt.allocPrint(arena, "{t}", .{err}) catch "error";
         m.pushToolDone(call.name, emsg, ms, emsg);
@@ -3952,7 +4114,29 @@ fn execOneCall(
         }
     }
 
+    // [readcache] Two things that need the message this result is about to become.
+    //
+    // 1) A `write`/`edit` invalidates the file in the cache. Without this, the next
+    //    `read` of the file the model JUST edited would take the fast path (the
+    //    stat does not have to change for the answer to be wrong: the content
+    //    lives in the model only) and answer "unchanged, it is in your context"
+    //    with the OLD text in the context. `mtime` would catch it a second later;
+    //    this catches it now.
+    // 2) A `read` records WHICH message its content went into, which is how
+    //    compaction can tell the cache that it just deleted that content.
+    if (filePathOf(call.args_json, arena)) |pth| {
+        if (isWriteTool(call.name)) {
+            m.reads.invalidate(pth);
+        }
+    }
+
     s.appendToolResult(call.id, call.name, res) catch {};
+    if (std.mem.eql(u8, call.name, "read")) {
+        if (s.messages.items.len > 0) {
+            const idx: u32 = @intCast(s.messages.items.len - 1);
+            if (filePathOf(call.args_json, arena)) |pth| m.reads.setMessageIndex(pth, idx);
+        }
+    }
     return 1;
 }
 
@@ -4055,7 +4239,7 @@ fn runParallelBatch(
             var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
             defer astate.deinit();
             const a = astate.allocator();
-            const text = tools_mod.execute(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg) catch |err| {
+            const text = tools_mod.execute(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads) catch |err| {
                 ctx.out.err = true;
                 ctx.out.text = @constCast(@errorName(err));
                 ctx.out.ms = elapsedMs(call_t0);
@@ -5137,13 +5321,26 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
         return;
     };
     cur_provider_id = def.id;
-    setModel(def.default_model);
+    // Un modelo del provider ANTERIOR no sirve para el nuevo (es lo que paso al
+    // saltar de opencode a anthropic: un id de opencode en una petición de
+    // Messages API es un 400). Sin `default_model` compilado, lo unico honesto es
+    // dejarlo vacio y que lo resuelva el catalogo del provider nuevo.
+    const had_model = cur_model.len > 0;
+    setModel("");
+    // Y SOLO si el provider declara uno propio (config.json del usuario), se usa.
+    if (def.default_model.len > 0) setModel(def.default_model);
     const msg = std.fmt.allocPrint(
         m.allocator,
         "provider → {s} · model {s}",
-        .{ def.id, def.default_model },
+        .{ def.id, if (cur_model.len > 0) cur_model else "(auto: se elige del catalogo)" },
     ) catch "provider";
     pushInfoOwned(m, msg);
+    if (had_model and def.default_model.len == 0) {
+        // The model of the PREVIOUS provider is not valid here, and staying
+        // silent about it means the next turn spends itself on a 400 that says
+        // nothing about the cause.
+        pushInfo(m, "that model was from another provider; /model picks one from this provider's catalog");
+    }
     setStatusWithZo(m, .done, def.id);
     refreshContextUsage(m);
 }
@@ -6159,4 +6356,110 @@ test "isParallelSafe e isWriteSafe no se contradicen en lo que importa" {
             try std.testing.expect(!isWriteTool(d.name));
         }
     }
+}
+
+test "la cache de lecturas se vacia de lo que la compactacion se llevo" {
+    // El encadenado entero, y en el sitio donde se rompe: la compaction produce
+    // `elided_at`, el agent se lo pasa a la cache, y la cache marca esas entradas
+    // como "ya no estan en el contexto". Sin el ultimo paso, un `read` de un
+    // fichero elido responderia "unchanged, ya lo tienes" y el modelaria
+    // contestaria sobre un fichero que no tiene.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const path = "/tmp/opencode/agent-readcache-drop.txt";
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = "una linea\n" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+
+    // 1) La tool lee y la entrada queda "en el contexto", en el mensaje 7.
+    _ = try tools_mod.execute(io_global, "read", args, arena, null, &m.reads);
+    m.reads.setMessageIndex(path, 7);
+    try std.testing.expectEqual(@as(usize, 1), m.reads.liveEntries());
+
+    // 2) La compaction se lleva ese mensaje (a mano aqui, que el bucle entero
+    //    necesita red).
+    m.reads.markDroppedAt(7);
+    try std.testing.expectEqual(@as(usize, 0), m.reads.liveEntries());
+
+    // 3) El siguiente read MANDA el cuerpo otra vez. Que sea el mismo contenido
+    //    da igual: lo que cuenta es que vuelva a estar en el contexto.
+    const out = try tools_mod.execute(io_global, "read", args, arena, null, &m.reads);
+    try std.testing.expect(std.mem.indexOf(u8, out, "una linea") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
+}
+
+test "tras un write, la cache no dice que el fichero esta igual" {
+    // El caso del bucle real: edit → read para verificar. Sin invalidar, el read
+    // responderia "unchanged" con el texto ANTIGUO en el contexto, que es
+    // exactamente el bucle que hace que un agente se convenza de que su edicion
+    // funciono cuando no toco nada.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = "/tmp/opencode/agent-readcache-write.txt";
+
+    const write_args = try std.fmt.allocPrint(arena,
+        \\{{"path":"{s}","content":"contenido nuevo\n"}}
+    , .{path});
+    const read_args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
+
+    // Read (old), write, read: the second read must show the NEW content.
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = "contenido viejo\n" });
+    _ = try tools_mod.execute(io_global, "read", read_args, arena, null, &m.reads);
+    _ = try tools_mod.execute(io_global, "write", write_args, arena, null, &m.reads);
+    // Esto es lo que hace `execOneCall` con el path del write.
+    m.reads.invalidate(path);
+
+    const out = try tools_mod.execute(io_global, "read", read_args, arena, null, &m.reads);
+    try std.testing.expect(std.mem.indexOf(u8, out, "contenido nuevo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
+}
+
+test "sin modelo no se manda NADA: se pide al catalogo y se dice cual" {
+    // El comportamiento del que no hay vuelta atras: un nombre de modelo escrito
+    // en el codigo (el `default_model` de cada provider) es una bomba de relojería.
+    // `kimi-k2.6` desaparecio del catalogo de opencode y TODAS las peticiones
+    // empezaron a dar 403 "Model access is disabled", que no dice nada de por que.
+    //
+    // Con `default_model` vacio en todos los providers, la unica forma de tener un
+    // modelo es que el usuario lo elija, o que zode le pregunte al provider. Y al
+    // elegir, lo dice en pantalla: una eleccion silenciosa es indistinguible de un
+    // default.
+    for (&providers.defs) |d| {
+        try std.testing.expectEqualStrings("", d.default_model);
+    }
+}
+
+test "curModel se puede dejar vacio y eso se ve" {
+    // El estado "sin modelo" tiene que ser representable: es lo que pasa entre
+    // que se cambia de provider y que el catalogo responde, y un `setModel("")`
+    // que se traga el nombre anterior sin dejarlo ver seria un 400 sin explicacion
+    // en el turno siguiente.
+    const saved = curModel();
+    defer setModel(saved);
+    setModel("gpt-5");
+    try std.testing.expectEqualStrings("gpt-5", curModel());
+    setModel("");
+    try std.testing.expectEqualStrings("", curModel());
 }

@@ -32,6 +32,10 @@ turn_ms: u64 = 0,
 ttft: [max_samples]u64 = undefined,
 ttft_len: usize = 0,
 ttft_dropped: usize = 0,
+/// Reads the file cache answered without sending the body. It is here and not
+/// only in `/context` because this is the number that says whether the cache
+/// EARNS its keep: a read cache with zero hits is code that only adds risk.
+read_hits: usize = 0,
 
 pub fn reset(self: *Stats) void {
     self.* = .{};
@@ -123,7 +127,7 @@ pub fn report(self: *const Stats, out: []u8, max_iter: usize, hit_pct: u8) ![]co
         \\iterations {d:.1} avg (limit {d}) · {d}% hit the limit
         \\first token {d}ms avg · p50 {d}ms · p95 {d}ms{s}
         \\tools {d} · asks {d} · subagents {d} · bg jobs {d}
-        \\cache hit {d}%
+        \\cache hit {d}% · read cache: {d} re-reads avoided
         \\
     , .{
         self.turns,
@@ -142,6 +146,7 @@ pub fn report(self: *const Stats, out: []u8, max_iter: usize, hit_pct: u8) ![]co
         self.subagents,
         self.bg_jobs,
         hit_pct,
+        self.read_hits,
     }) catch {};
     return w.buffered();
 }

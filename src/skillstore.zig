@@ -284,7 +284,11 @@ pub const Stamp = struct {
 /// Paths are stored in the stamp, not pointed at: the point of a stamp is to
 /// survive the rescan that produced it, and a pointer into the freed previous list
 /// would be a dangling read on the exact path that decides freshness.
-pub const stamp_path_max = std.fs.max_path_bytes;
+/// 512 and not `max_path_bytes`: there are ~70 stamps and each one carries its
+/// path, so at 4096 they were 284 KB of `.bss` that the binary never used for
+/// anything. A skill path over 512 bytes is not a thing, and if it happens the
+/// stamp is skipped (a miss, not an error).
+pub const stamp_path_max = 512;
 
 /// `true` when `path` can be stored (fits in a stamp) and the stamp was filled.
 pub fn stampPath(io: std.Io, path: []const u8, out: *Stamp) bool {

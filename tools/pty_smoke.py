@@ -144,6 +144,17 @@ def main() -> int:
     ok &= check("/clean ofrece el 'yes'", "/clean yes" in t4, t4)
     ok &= check("/clean no rompe nada", "panic" not in t4.lower(), t4)
 
+    # 5) `/context` dice DONDE se esta trabajando. Es la linea que responde a
+    #    "de verdad esta leyendo los ficheros de aqui?", y no aparece en ningun
+    #    otro sitio de la pantalla.
+    # DOS enters: el primero lo acepta el autocompletado (que esta abierto
+    # porque `/context` es un prefijo de comando) y el segundo lo manda. Con uno
+    # solo el comando se queda en el input y el test passaria/fallaria por el
+    # popup, no por `/context`.
+    out5, t5 = drive([b"/context", b"\r", b"\r"], budget=9.0)
+    ok &= check("/context dice el cwd", "cwd" in t5, t5)
+    ok &= check("/context no rompe nada", "panic" not in t5.lower(), t5)
+
     if not ok:
         print("\n--- texto plano (recortado) ---")
         for line in t.splitlines()[:40]:

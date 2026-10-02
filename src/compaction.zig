@@ -42,6 +42,15 @@ pub const Compacted = struct {
     msgs: []chat.ChatMessage,
     /// How many tool results were elided (tier 1).
     elided: usize = 0,
+    /// Indices (into the ORIGINAL `msgs`) of the tool results tier 1 replaced with
+    /// a marker.
+    ///
+    /// The read cache NEEDS this: it remembers which message each file's content
+    /// went into, and if that message is replaced by "tool result elided" the model
+    /// no longer has the file. Without this handover it would answer "unchanged,
+    /// it is in your context" about content that is not there, which is the worst
+    /// thing a cache can do to an agent.
+    elided_at: []const usize = &.{},
     /// True if tier 2 (LLM summary) is still needed to reach budget.
     needs_summary: bool = false,
     /// Slice of msgs[0..summary_upto] that tier 2 should summarize
@@ -56,6 +65,7 @@ pub fn elideTier(arena: std.mem.Allocator, msgs: []const chat.ChatMessage, budge
     @memcpy(out, msgs);
 
     var elided: usize = 0;
+    var elided_at: std.ArrayList(usize) = .empty;
     // Elide from oldest to newest, skipping system (0) and the recent window.
     const protect_from: usize = if (out.len > recent_window) out.len - recent_window else 0;
 
@@ -72,9 +82,10 @@ pub fn elideTier(arena: std.mem.Allocator, msgs: []const chat.ChatMessage, budge
         );
         m.content = marker;
         elided += 1;
+        try elided_at.append(arena, i);
     }
 
-    var res = Compacted{ .msgs = out, .elided = elided };
+    var res = Compacted{ .msgs = out, .elided = elided, .elided_at = elided_at.items };
     if (estimateTokens(out) > budget) {
         res.needs_summary = true;
         // Suggest summarizing everything after system and before the window.
@@ -172,4 +183,47 @@ test "sin necesidad de summary si elide alcanza" {
     const res = try elideTier(arena, msgs, 9000);
     try std.testing.expect(!res.needs_summary);
     try std.testing.expect(res.elided > 0);
+}
+
+test "elideTier dice QUE mensajes se llevo, no solo cuantos" {
+    // El por que: la cache de lecturas recuerda en que mensaje quedo el contenido
+    // de cada fichero, y sin saber quais se elidieron seguiria diciendo "ya lo
+    // tienes" sobre texto que el modelo ya no tiene. Un contador no sirve.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var msgs: std.ArrayList(chat.ChatMessage) = .empty;
+    try msgs.append(arena, .{ .role = "system", .content = "system" });
+    // Alternancia assistant/tool como en el resto de los tests, con resultados
+    // grandes (los de menos de 256 bytes no se eliden por diseño).
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        try msgs.append(arena, .{ .role = "assistant", .content = "a" });
+        try msgs.append(arena, .{ .role = "tool", .content = "x" ** 4000 });
+    }
+
+    const res = try elideTier(arena, msgs.items, 1000);
+    try std.testing.expect(res.elided > 0);
+    try std.testing.expectEqual(res.elided, res.elided_at.len);
+
+    // Los indices son de los ORIGINALES (que es lo que tiene el mensaje en la
+    // sesion), no de la copia recortada, y todos son de role "tool".
+    for (res.elided_at) |idx| {
+        try std.testing.expect(idx < msgs.items.len);
+        try std.testing.expectEqualStrings("tool", msgs.items[idx].role);
+    }
+}
+
+test "elideTier no reporta nada cuando no elide nada" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const msgs = [_]chat.ChatMessage{
+        .{ .role = "system", .content = "system" },
+        .{ .role = "user", .content = "hola" },
+    };
+    const res = try elideTier(arena, &msgs, 1_000_000);
+    try std.testing.expectEqual(@as(usize, 0), res.elided);
+    try std.testing.expectEqual(@as(usize, 0), res.elided_at.len);
 }
