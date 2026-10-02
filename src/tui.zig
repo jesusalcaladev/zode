@@ -4,18 +4,18 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const agent = @import("agent.zig");
 const chat = @import("chat.zig");
-const md = @import("markdown.zig");
-const theme = @import("theme.zig");
-const ed_mod = @import("editor.zig");
-const mascot = @import("mascot.zig");
+const md = @import("lib/markdown.zig");
+const theme = @import("lib/theme.zig");
+const ed_mod = @import("lib/editor.zig");
+const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
-const plan_mod = @import("plan.zig");
-const checkpoint = @import("checkpoint.zig");
+const plan_mod = @import("lib/plan.zig");
+const checkpoint = @import("lib/checkpoint.zig");
 const bgproc = @import("bgproc.zig");
-const readcache = @import("readcache.zig");
-const bench_mod = @import("bench.zig");
-const models_mod = @import("models.zig");
-const zjsonl = @import("zjsonl.zig");
+const readcache = @import("lib/readcache.zig");
+const bench_mod = @import("lib/bench.zig");
+const models_mod = @import("lib/models.zig");
+const zjsonl = @import("lib/zjsonl.zig");
 
 /// Item of the modal picker (opencode style). Labels/descs are gpa-owned
 /// and closePicker frees them.
@@ -5260,7 +5260,7 @@ test "autocompletado de @: modo file activo y aceptación reemplaza solo el toke
 }
 
 test "editor.deleteRange: reemplaza un rango y deja el cursor al inicio" {
-    var ed = @import("editor.zig").Editor.init(std.testing.allocator);
+    var ed = @import("lib/editor.zig").Editor.init(std.testing.allocator);
     defer ed.deinit();
 
     ed.insert("revisa @abc y sigue") catch {};

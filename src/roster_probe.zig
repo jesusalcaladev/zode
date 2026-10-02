@@ -9,10 +9,10 @@ const std = @import("std");
 // declara es `vaxis`, que sí viene de un paquete.
 const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
-const providers = @import("providers.zig");
+const providers = @import("lib/providers.zig");
 const roster = @import("roster.zig");
-const models = @import("models.zig");
-const http_client = @import("http_client.zig");
+const models = @import("lib/models.zig");
+const http_client = @import("lib/http_client.zig");
 
 /// Sonda del free-auto: qué providers tienen key, qué modelos free publican, y
 /// cómo queda el pool con el orden que la rueda va a usar.

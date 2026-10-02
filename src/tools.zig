@@ -1,9 +1,9 @@
 const std = @import("std");
-const plan_mod = @import("plan.zig");
-const http = @import("http_client.zig");
-const web = @import("web.zig");
+const plan_mod = @import("lib/plan.zig");
+const http = @import("lib/http_client.zig");
+const web = @import("lib/web.zig");
 const bgproc = @import("bgproc.zig");
-const readcache = @import("readcache.zig");
+const readcache = @import("lib/readcache.zig");
 
 pub const max_tool_output = 16 * 1024; // output budget per tool
 
@@ -735,7 +735,7 @@ fn truncateLines(arena: std.mem.Allocator, data: []const u8, max_lines: usize) [
 
 /// Pure-Zig fallback for when there is neither rg nor grep (rare on dev boxes).
 fn fallbackGrep(io: std.Io, pattern: []const u8, subdir: []const u8, arena: std.mem.Allocator) ![]const u8 {
-    const regex = @import("regex.zig").Regex.compile(pattern);
+    const regex = @import("lib/regex.zig").Regex.compile(pattern);
 
     var out: std.ArrayList(u8) = .empty;
     var matches: usize = 0;

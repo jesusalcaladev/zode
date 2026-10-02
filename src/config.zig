@@ -1,5 +1,5 @@
 const std = @import("std");
-const providers = @import("providers.zig");
+const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 
 /// User config: `~/.config/zode/config.json`.

@@ -2,21 +2,21 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const tui = @import("tui.zig");
-const http_client = @import("http_client.zig");
-const models = @import("models.zig");
+const http_client = @import("lib/http_client.zig");
+const models = @import("lib/models.zig");
 const models_mod = models;
-const provider = @import("provider.zig");
-const providers = @import("providers.zig");
+const provider = @import("lib/provider.zig");
+const providers = @import("lib/providers.zig");
 const tools_mod = @import("tools.zig");
 const cache_stats = @import("cache_stats.zig");
 const chat = @import("chat.zig");
 const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
 const compaction_mod = @import("compaction.zig");
-const mascot = @import("mascot.zig");
+const mascot = @import("lib/mascot.zig");
 const bgproc = @import("bgproc.zig");
-const skills = @import("skills.zig");
-const ask = @import("ask.zig");
+const skills = @import("lib/skills.zig");
+const ask = @import("lib/ask.zig");
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = map orelse return null;
@@ -91,7 +91,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // `zode --chat "explain @src/foo.zig"` made the model answer "I don't have
     // the file". Expanded HERE, on the session's own text, because the headless
     // runner has no per-iteration arena like `runOneTurn` has.
-    const mentions_mod = @import("mentions.zig");
+    const mentions_mod = @import("lib/mentions.zig");
     const expanded = mentions_mod.expand(arena, io, text) catch
         mentions_mod.Expansion{ .text = text, .files = 0, .missing = 0 };
     try msgs.append(arena, .{ .role = "user", .content = expanded.text });
