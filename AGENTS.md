@@ -24,7 +24,7 @@ Harness de código en Zig puro (sin C deps), estilo Claude Code, con enfoque en 
 - **Child.Term**: tags en minúscula (`.exited`, `.signal`); `signal` es enum `std.posix.SIG` → `@intFromEnum` + truncate a u8.
 - **Dirs**: NO hay `makePath`; usar `dir.createDirPath(io, path)` (mkdir -p). Para iterar un dir: `openDir(io, path, .{ .iterate = true })` — sin el flag, iterar es Illegal Behavior (EBADF panic en debug). `dir.iterate()` devuelve `Iterator` que lleva su propio buffer; `Iterator.next(io)`.
 - **File.Writer**: `file.writer(io, &buf)` devuelve struct con `.interface: *Writer` estable; guarda el struct completo, no el puntero.
-- **process.run**: `std.process.run(gpa, io, .{ .argv, .stdout_limit, .stderr_limit, .timeout })` → `RunResult{ .term, .stdout, .stderr }`. No existe `std.regex` (hay mini-motor propio en `src/regex.zig`).
+- **process.run**: `std.process.run(gpa, io, .{ .argv, .stdout_limit, .stderr_limit, .timeout })` → `RunResult{ .term, .stdout, .stderr }`. No existe `std.regex` (hay mini-motor propio en `src/lib/regex.zig`).
 - **Escritura directa de archivos**: `dir.writeFile(io, .{ .sub_path, .data })` para crear/ sobreescribir entero.
 - **grep tool**: usa `rg` nativo → `grep -rn` nativo → fallback regex propio (en ese orden). Respeta .gitignore via rg.
 - **graphemes NUNCA con `&[_]u8{c}`**: `vxfw.Surface.writeCell` guarda la `Cell` POR VALOR, pero vaxis lee los BYTES de `char.grapheme` en `Vaxis.render()`, es decir DESPUÉS de que `drawFn` haya retornado. Un puntero a temporal de stack llega al renderer como basura (NULs) → pantalla en blanco salvo los literales. Usar SIEMPRE `Painter.putText` (copia al arena del frame) o `putStable` (literal/arena propia del párrafo). Tests en `tui.zig` lo cubren.
@@ -508,7 +508,7 @@ server, banner nuevo con la mascota en color de marca.
 
 ## `/clean`: borra basura del AGENTE, y solo eso
 
-`src/clean.zig`, puro y testeado sin TUI. `/clean` (**simula**, `/clean yes`
+`src/lib/clean.zig`, puro y testeado sin TUI. `/clean` (**simula**, `/clean yes`
 aplica, o `ZODE_YES=1` para cuando lo ejecuta el modelo).
 
 **Lo unico que borra**: sesiones de 0 bytes (el residuo de 58 ficheros / 24
@@ -1590,7 +1590,7 @@ asistente con `tool_calls` pendientes. Un tool call deja el turno aparcado
 justo donde la API espera, así que el formato del cable no cambia y **todos los
 providers lo aceptan sin tocar nada**.
 
-**El módulo puro (`src/ask.zig`) va aparte del wiring** porque lo que sale mal
+**El módulo puro (`src/lib/ask.zig`) va aparte del wiring** porque lo que sale mal
 aquí es siempre la FORMA de la pregunta y, sobre todo, el texto que el MODELO
 lee de vuelta. Eso se testea sin TUI y sin red, que es como se pudo comprobar que
 `formatAnswered` nunca corta la respuesta del usuario en silencio.
@@ -2065,3 +2065,45 @@ servidor privado, que ya se conectaba en segundo plano al escribir `/acp` (esta
  parte estaba ya resuelta). No se ha tocado nada de ACP en esta ronda porque no
 hay un fallo que reproducir: lo que hay es un coste de arranque que ya se paga
 en paralelo con el usuario escribiendo.
+
+## `src/lib/`: los módulos que se prueban sin arrancar la app
+
+Desde 2026-10-02 el árbol tiene dos carpetas y la línea que las separa es una
+sola: **¿este módulo se puede testear sin TUI y sin red?**
+
+```
+src/     main, tui, agent, tools (dispatcher), chat, acp, bgproc, palette,
+         session, config, compaction, cache_stats, roster, free_auto
+src/lib/ todo lo demás: readcache, project, skills, skillstore, mentions,
+         markdown, highlight, web, models, providers, provider, http_client,
+         subagent, ask, plan, checkpoint, editor, bench, clean, regex, mascot,
+         theme, zjsonl
+```
+
+La razón de que sea `lib/` y no `core/` o `pure/`: "pure" describe lo que hace el
+módulo y `lib` describe **cómo se testea**, que es lo que importa aquí. Un módulo
+en `lib/` se importa con `@import("lib/x.zig")` desde arriba y con
+`@import("x.zig")` desde dentro de la carpeta (las rutas de Zig son relativas al
+fichero), y por eso mover uno de dentro a fuera **no toca sus imports internos**:
+si `markdown.zig` importa `highlight.zig` y los dos se mueven juntos, esa línea no
+cambia.
+
+Tres módulos que NO se mueven aunque parezcan de `lib`, y por qué:
+
+- **`tools.zig`**: la mitad de sus tools son puras, pero el dispatcher recibe el
+  registro de procesos en segundo plano, que vive en el `Model`. Se podría separar
+  en `lib/tools/*.zig` + un dispatcher arriba; no está hecho porque sería el
+  primer movimiento *dentro* de un fichero que además está creciendo.
+- **`roster.zig`**: depende de `config.zig`, que ya depende del cliente de chat.
+- **`compaction.zig` y `cache_stats.zig`**: dependen de `chat.ChatMessage`, y ese
+  tipo es parte del formato del cable. Importar el cliente entero para tener el
+  tipo sería peor que dejarlo arriba.
+
+Y el que se queda en `src/` a propósito aunque solo use red: `roster_probe.zig`
+(necesita el path del módulo = el directorio, ver más abajo).
+
+`src/bin/` son ejecutables auxiliares declarados como módulos aparte en
+`build.zig` (`tool-test`, `acp-probe`), y por eso importan por **nombre de módulo**
+(`@import("tools")`) y no por ruta. `tool_test.zig` estaba roto desde que `execute`
+cambió de firma: nadie lo ejecutaba, y un `zig build tool-test` que no compila es
+la forma más rápida de que nadie lo vuelva a ejecutar.

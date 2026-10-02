@@ -1,5 +1,5 @@
 const std = @import("std");
-const http_client = @import("http_client.zig");
+const http_client = @import("lib/http_client.zig");
 const acp = @import("acp.zig");
 
 /// Io set up by the TUI/CLI at startup.

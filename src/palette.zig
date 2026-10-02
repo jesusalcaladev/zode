@@ -2,7 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const theme = @import("theme.zig");
+const theme = @import("lib/theme.zig");
 const tui = @import("tui.zig");
 
 const Painter = tui.Painter;

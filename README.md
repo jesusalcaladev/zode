@@ -228,40 +228,63 @@ la config de quien la ejecuta.
 
 ## Arquitectura
 
+Dos carpetas, y la línea que las separa es si el módulo puede probarse sin terminal:
+
 ```
-src/
-├── main.zig          CLI: --models / --chat / TUI / --resume
-├── tui.zig           la TUI (vxfw): dibujo, input, scroll, paletas
-├── agent.zig         bucle de agente, comandos, permisos, turnos
-├── tools.zig         las 16 tools (puro: sin TUI ni red)
-├── chat.zig          cliente streaming SSE + parser + Anthropic
-├── http_client.zig   HTTP JSON sobre std.http.Client
-├── providers.zig     providers compilados + keys (env > auth.json)
-├── config.zig        config.json de usuario
-├── models.zig        catálogo de modelos y sus metadatos
-├── skills.zig        formato de un SKILL.md (puro)
-├── skillstore.zig    descubrimiento de skills en disco
-├── project.zig       cwd, raíz del repo y rama de git
-├── compaction.zig    presupuesto de contexto, elisión y resumen
-├── roster.zig        pool de modelos free (puro)
-├── subagent.zig      la tool `task`
-├── bgproc.zig        comandos en segundo plano
-├── ask.zig           la tool `ask` (puro)
-├── session.zig       sesiones JSONL comprimidas
-├── markdown.zig      markdown + diff unificado (puro)
-├── highlight.zig     resaltado de sintaxis universal (puro)
-├── palette.zig       paleta modal de Ctrl+P / Ctrl+T
-└── acp.zig           cliente ACP v1 por JSON-RPC
+src/                    lo que necesita la TUI, un hilo o la red
+  main.zig              CLI: --models / --chat / TUI / --resume
+  tui.zig               la TUI (vxfw): dibujo, input, scroll, paletas
+  agent.zig             bucle de agente, comandos, permisos, turnos
+  tools.zig             las 16 tools: dispatcher y las que no tocan disco
+  chat.zig              cliente streaming SSE + parser + Anthropic nativo
+  acp.zig               cliente ACP v1 por JSON-RPC
+  bgproc.zig            comandos en segundo plano
+  palette.zig           paleta modal de Ctrl+P / Ctrl+T
+  session.zig           sesiones JSONL comprimidas
+  config.zig            config.json de usuario
+  compaction.zig        presupuesto de contexto, elisión y resumen
+  cache_stats.zig       hit-rate de la cache del provider
+  roster.zig            pool de modelos free
+  free_auto.zig         /free-auto sobre el pool
+  roster_probe.zig      la sonda de `zig build roster-probe`
+  test_all.zig          el agregador de tests
+  bin/                  ejecutables auxiliares (tool_test, acp_probe)
+
+src/lib/                módulos que se testean solos, sin TUI y sin red
+  readcache.zig         qué ficheros ya se han mandado al modelo
+  project.zig           cwd, raíz del repositorio y rama de git
+  skills.zig            el formato de un SKILL.md
+  skillstore.zig        descubrimiento de skills en disco
+  mentions.zig          @fichero
+  markdown.zig          markdown + diff unificado
+  highlight.zig         resaltado de sintaxis universal
+  web.zig               HTML → texto, y el buscador de resultados
+  models.zig            catálogo de modelos y sus metadatos
+  providers.zig         providers compilados + precedencia de keys
+  provider.zig          config por entorno (compat)
+  http_client.zig       HTTP JSON sobre std.http.Client
+  subagent.zig          el informe del subagente
+  ask.zig               la tool `ask`
+  plan.zig              la lista de tareas visible
+  checkpoint.zig        las fotos de /undo
+  editor.zig            el editor de una línea
+  bench.zig             /bench
+  clean.zig             /clean
+  regex.zig             mini-motor de regex
+  mascot.zig            Zo
+  theme.zig             colores
+  zjsonl.zig            DEFLATE + base64 por línea
 ```
 
-Lo que no depende de la TUI ni de la red está en módulos **puros** con sus
-tests: `tools`, `chat`, `markdown`, `highlight`, `skills`, `roster`, `plan`,
-`mentions`, `ask`, `project`, `compaction`, `web`. Lo que sí la depende (el
-agente, la TUI) se prueba en `@import` directo contra la superficie real.
+`src/lib/` no es "los ficheros pequeños": es **los que se pueden testear sin
+arrancar la app**. Por eso `tools.zig` se queda arriba (su dispatcher necesita el
+`Model` para el registro de procesos en segundo plano) aunque la mitad de sus
+tools sean puras, y por eso `roster.zig` no se mueve: depende de `config.zig`, que
+ya depende del cliente de chat.
 
 Provider OpenAI-compatible: funciona con OpenCode, OpenRouter, Groq, DeepSeek y
 cualquier gateway que hable el mismo formato, cambiando el `base_url`.
 
-`AGENTS.md` tiene las convenciones del código y **por qué** cada decisión rare
+`AGENTS.md` tiene las convenciones del código y **por qué** cada decisión rara
 salió cara (qué trampas de Zig 0.16 ya se pagaron, qué bugs de memoria hay, y
 qué NO se debe hacer). Es el fichero que hay que leer antes de tocar nada.

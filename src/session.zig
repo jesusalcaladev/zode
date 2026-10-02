@@ -1,6 +1,6 @@
 const std = @import("std");
 const chat = @import("chat.zig");
-const zjsonl = @import("zjsonl.zig");
+const zjsonl = @import("lib/zjsonl.zig");
 
 /// A conversation message. Efficient design:
 /// - `content` is the plain text (what goes in and out of the LLM).

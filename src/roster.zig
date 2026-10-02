@@ -1,8 +1,8 @@
 const std = @import("std");
-const models = @import("models.zig");
-const providers = @import("providers.zig");
+const models = @import("lib/models.zig");
+const providers = @import("lib/providers.zig");
 const config_mod = @import("config.zig");
-const http_client = @import("http_client.zig");
+const http_client = @import("lib/http_client.zig");
 
 /// El pool de modelos gratis de TODOS los providers con key, y la rueda que
 /// reparte turnos entre ellos.

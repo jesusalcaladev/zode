@@ -1,31 +1,31 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const tui = @import("tui.zig");
-const providers = @import("providers.zig");
+const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
-const http_client = @import("http_client.zig");
+const http_client = @import("lib/http_client.zig");
 const tools_mod = @import("tools.zig");
 const roster_mod = @import("roster.zig");
 const free_auto = @import("free_auto.zig");
-const plan_mod = @import("plan.zig");
-const clean_mod = @import("clean.zig");
-const mentions = @import("mentions.zig");
+const plan_mod = @import("lib/plan.zig");
+const clean_mod = @import("lib/clean.zig");
+const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
-const models_mod = @import("models.zig");
+const models_mod = @import("lib/models.zig");
 const cache_stats = @import("cache_stats.zig");
 const compaction = @import("compaction.zig");
-const mascot = @import("mascot.zig");
+const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
 const acp = @import("acp.zig");
 
-const ask = @import("ask.zig");
+const ask = @import("lib/ask.zig");
 const bgproc = @import("bgproc.zig");
-const bench_mod = @import("bench.zig");
-const skills = @import("skills.zig");
-const skillstore = @import("skillstore.zig");
-const project = @import("project.zig");
-const subagent_mod = @import("subagent.zig");
+const bench_mod = @import("lib/bench.zig");
+const skills = @import("lib/skills.zig");
+const skillstore = @import("lib/skillstore.zig");
+const project = @import("lib/project.zig");
+const subagent_mod = @import("lib/subagent.zig");
 
 /// Io and API key configured by the TUI at startup.
 pub var io_global: std.Io = undefined;
