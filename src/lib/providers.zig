@@ -35,7 +35,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://opencode.ai/inference/openai/v1",
         .models_url = "https://opencode.ai/inference/v1/models",
         .key_env = &.{ "ZODE_OPENCODE_KEY", "ZODE_API_KEY" },
-        .note = "el free tier exige el cliente oficial: /model o /free-auto",
+        .note = "the free tier requires the official client: /model or /free-auto",
     },
     .{
         .id = "openrouter",
@@ -43,7 +43,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://openrouter.ai/api/v1",
         .models_url = "https://openrouter.ai/api/v1/models",
         .key_env = &.{"ZODE_OPENROUTER_KEY"},
-        .note = "catálogo grande · contexto y precios por modelo",
+        .note = "big catalogue · context and prices per model",
         .has_pricing = true,
     },
     .{
@@ -52,7 +52,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.anthropic.com/v1",
         .models_url = "https://api.anthropic.com/v1/models",
         .key_env = &.{"ZODE_ANTHROPIC_KEY"},
-        .note = "Messages API nativa con prompt caching",
+        .note = "native Messages API with prompt caching",
     },
     .{
         .id = "openai",
@@ -60,7 +60,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.openai.com/v1",
         .models_url = "https://api.openai.com/v1/models",
         .key_env = &.{ "ZODE_OPENAI_KEY", "ZODE_API_KEY" },
-        .note = "usa max_completion_tokens y reasoning_effort",
+        .note = "uses max_completion_tokens and reasoning_effort",
     },
     .{
         .id = "groq",
@@ -68,7 +68,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.groq.com/openai/v1",
         .models_url = "https://api.groq.com/openai/v1/models",
         .key_env = &.{"ZODE_GROQ_KEY"},
-        .note = "muy baja latencia",
+        .note = "very low latency",
     },
     .{
         .id = "deepseek",
@@ -76,7 +76,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "https://api.deepseek.com/v1",
         .models_url = "https://api.deepseek.com/v1/models",
         .key_env = &.{"ZODE_DEEPSEEK_KEY"},
-        .note = "razonamiento económico",
+        .note = "cheap reasoning",
     },
     .{
         .id = "local",
@@ -84,7 +84,7 @@ pub const defs = [_]ProviderDef{
         .base_url = "http://localhost:11434/v1",
         .models_url = "http://localhost:11434/v1/models",
         .key_env = &.{},
-        .note = "sin key · overrides por config.json",
+        .note = "no key · overrides via config.json",
     },
 };
 
@@ -144,7 +144,7 @@ fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
-test "keyFor: la key guardada en la paleta gana a la del entorno" {
+test "keyFor: the key saved from the palette beats the one from the environment" {
     // The order matters: if the env won, connecting a provider from the TUI
     // would be useless as long as there is an .env with an old key.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -168,7 +168,7 @@ test "keyFor: la key guardada en la paleta gana a la del entorno" {
     try std.testing.expect(hasKey(def, &env));
 }
 
-test "keyFor: sin key guardada cae al entorno" {
+test "keyFor: with no saved key it falls back to the environment" {
     setSavedKeys(null);
     defer setSavedKeys(null);
 
@@ -181,7 +181,7 @@ test "keyFor: sin key guardada cae al entorno" {
     try std.testing.expectEqualStrings("sk-entorno", keyFor(def, &env).?);
 }
 
-test "keyFor: sin nada devuelve null" {
+test "keyFor: with nothing it returns null" {
     setSavedKeys(null);
     defer setSavedKeys(null);
     const def = byId("anthropic").?;
@@ -189,18 +189,18 @@ test "keyFor: sin nada devuelve null" {
     try std.testing.expect(!hasKey(def, null));
 }
 
-test "ningun provider compilado trae un modelo por defecto" {
-    // La razon de que el campo exista y este VACIO en todos: un nombre de modelo
-    // escrito en el codigo es una bomba de relojería. Cuando el provider lo retira
-    // (que es lo que paso con `kimi-k2.6`, y dejo TODAS las peticiones en 403 sin
-    // explicacion), zode no tiene ni donde mirar: solo puede preguntarle al
-    // provider. Con el campo vacio, pregunta.
+test "no built-in provider ships with a default model" {
+    // The reason the field exists and is EMPTY in all of them: a model name
+    // written in the code is a clockwork time bomb. When the provider retires it
+    // (which is what happened with `kimi-k2.6`, and left EVERY request at a 403
+    // with no explanation), zode has nowhere to look: it can only ask the
+    // provider. With the field empty, it asks.
     //
-    // Un provider de usuario SI puede traer uno (esta en su config.json, que el
-    // Dueño puede cambiar cuando quiera); los compilados, no.
+    // A user provider CAN bring one (it is in their config.json, which the
+    // owner can change whenever they want); the compiled ones cannot.
     for (&defs) |d| {
         if (d.default_model.len != 0) {
-            std.debug.print("provider {s} tiene default_model = \"{s}\"\n", .{ d.id, d.default_model });
+            std.debug.print("provider {s} has default_model = \"{s}\"\n", .{ d.id, d.default_model });
             return error.TestUnexpectedResult;
         }
     }

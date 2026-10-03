@@ -168,4 +168,31 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // ── pty checks: the only verification that sees what vaxis renders ──
+    //
+    // vaxis renders DIFFERENTIALLY and queries the terminal (colors,
+    // capabilities, size), so a `drawTest` surface cannot tell you what the
+    // terminal ends up showing: a working turn can look frozen and a broken one
+    // can look fine. These two scripts drive the real binary in a real pty.
+    //
+    // `zig build pty-check` builds the app and runs both. They need no API key
+    // and take a few seconds each, which is the point: they are fast enough to
+    // run after every change instead of "when something looks wrong".
+    //
+    // Both scripts use their OWN HOME under /tmp/opencode and must never be
+    // pointed at the real one: the app writes `~/.config/zode/auth.json` and
+    // `sessions/`, and the June fuzzer once saved a pasted key there.
+    const pty_check = b.step("pty-check", "Build and run the pty checks (scroll + smoke)");
+    // The scripts exec `./zig-out/bin/zode` by path, so the INSTALL step is what
+    // has to have run, not just the compile step.
+    pty_check.dependOn(b.getInstallStep());
+    const run_smoke = b.addSystemCommand(&.{ "python3", "tools/pty_smoke.py" });
+    run_smoke.setName("pty_smoke");
+    run_smoke.has_side_effects = true;
+    const run_scroll = b.addSystemCommand(&.{ "python3", "tools/scroll_repro.py" });
+    run_scroll.setName("scroll_repro");
+    run_scroll.has_side_effects = true;
+    pty_check.dependOn(&run_smoke.step);
+    pty_check.dependOn(&run_scroll.step);
 }

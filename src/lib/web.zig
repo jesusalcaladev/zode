@@ -289,11 +289,52 @@ fn namedEntity(name: []const u8) ?[]const u8 {
 /// none it returns a message saying what to do (and not an
 /// opaque error), because this scraper breaks the day they change one of the HTML classes.
 pub fn searchResults(arena: std.mem.Allocator, html: []const u8, max: usize) []const u8 {
+    return renderResults(arena, html, max, "class=\"result__a\"", "class=\"result__snippet\"");
+}
+
+/// The same thing from DuckDuckGo's `lite/` endpoint.
+///
+/// It exists because `html/` is not always there: when it answers 200 with a
+/// layout this parser does not know, the honest thing would be to say so, and it
+/// does say so — but the tool then has NO results at all for a query the engine
+/// answered fine. `lite/` is a different page with different classes, and it is
+/// the cheapest way to turn "the scraper broke" into "here are your results".
+pub fn liteSearchResults(arena: std.mem.Allocator, html: []const u8, max: usize) []const u8 {
+    return renderResults(arena, html, max, "class=\"result-link\"", "class=\"result-snippet\"");
+}
+
+/// Parses one of the two shapes and renders the numbered list.
+///
+/// The one thing this gets right that the original did not: **a snippet belongs to
+/// the result it follows**. The snippet was searched for from the end of the title
+/// to the end of the DOCUMENT, so a result with no snippet of its own was given
+/// the NEXT one's, and the model read a description that had nothing to do with
+/// the title above it. Here the search for the next title bounds it.
+/// `indexOf` inside a window. `std.mem` has no `indexOfPosPos` in 0.16 and the
+/// window is the whole point (a snippet must not come from the next result).
+fn indexOfIn(haystack: []const u8, from: usize, to: usize, needle: []const u8) ?usize {
+    if (from >= to or to > haystack.len) return null;
+    const at = std.mem.indexOfPos(u8, haystack, from, needle) orelse return null;
+    return if (at < to) at else null;
+}
+
+fn renderResults(
+    arena: std.mem.Allocator,
+    html: []const u8,
+    max: usize,
+    title_class: []const u8,
+    snippet_class: []const u8,
+) []const u8 {
     var out: std.ArrayList(u8) = .empty;
     var n: usize = 0;
     var pos: usize = 0;
+    // The same URL twice is not two results, and the second one only makes the
+    // model think it has more to read than it does.
+    var seen = std.StringHashMap(void).init(arena);
+    defer seen.deinit();
+
     while (n < max) {
-        const anchor = std.mem.indexOfPos(u8, html, pos, "class=\"result__a\"") orelse break;
+        const anchor = std.mem.indexOfPos(u8, html, pos, title_class) orelse break;
         const href_at = std.mem.indexOfPos(u8, html, anchor, "href=\"") orelse break;
         const href_start = href_at + 6;
         const href_end = std.mem.indexOfScalarPos(u8, html, href_start, '"') orelse break;
@@ -303,27 +344,32 @@ pub fn searchResults(arena: std.mem.Allocator, html: []const u8, max: usize) []c
         const title_start = (std.mem.indexOfScalarPos(u8, html, href_end, '>') orelse break) + 1;
         const title_end = std.mem.indexOfPos(u8, html, title_start, "</a>") orelse break;
 
+        const url = realUrl(arena, href);
+        const title = cleanText(arena, html[title_start..title_end]);
+        // Where this result ENDS: the next title. The snippet has to be looked for
+        // inside that window and nowhere else.
+        const next_title = std.mem.indexOfPos(u8, html, title_end, title_class);
+        const block_end = next_title orelse html.len;
+
         pos = title_end;
+        if (url.len == 0 or title.len == 0) continue;
+        if (seen.contains(url)) continue;
+        seen.put(url, {}) catch {};
 
         n += 1;
         out.print(arena, "{d}. ", .{n}) catch return "";
-        out.appendSlice(arena, cleanText(arena, html[title_start..title_end])) catch return "";
+        out.appendSlice(arena, title) catch return "";
         out.append(arena, '\n') catch return "";
+        out.print(arena, "   {s}\n", .{url}) catch return "";
 
-        const url = realUrl(arena, href);
-        if (url.len > 0) {
-            out.print(arena, "   {s}\n", .{url}) catch return "";
-        }
-
-        // The snippet comes after the title, in another `<a>`.
-        if (std.mem.indexOfPos(u8, html, pos, "class=\"result__snippet\"")) |sn| {
+        // The snippet, inside THIS result's block.
+        if (indexOfIn(html, title_end, block_end, snippet_class)) |sn| {
             const s_start = (std.mem.indexOfScalarPos(u8, html, sn, '>') orelse sn) + 1;
-            const s_end = std.mem.indexOfPos(u8, html, s_start, "</a>") orelse html.len;
+            const s_end = indexOfIn(html, s_start, block_end, "</a>") orelse block_end;
             const snip = cleanText(arena, html[s_start..@min(s_end, s_start + 400)]);
             if (snip.len > 0) {
                 out.print(arena, "   {s}\n", .{snip}) catch return "";
             }
-            pos = s_end;
         }
         out.append(arena, '\n') catch return "";
     }
@@ -361,7 +407,7 @@ fn cleanText(arena: std.mem.Allocator, raw: []const u8) []const u8 {
 
 // ── tests ─────────────────────────────────────────────────────
 
-test "htmlToText quita script, style y etiquetas" {
+test "htmlToText removes script, style and tags" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const html =
@@ -377,7 +423,7 @@ test "htmlToText quita script, style y etiquetas" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Title") != null);
 }
 
-test "htmlToText: los saltos de bloque no dejan huecos" {
+test "htmlToText: block breaks leave no gaps" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const text = htmlToText(arena_state.allocator(), "<li>one</li><li>two</li><br><p>three</p>");
@@ -385,21 +431,21 @@ test "htmlToText: los saltos de bloque no dejan huecos" {
     try std.testing.expectEqualStrings("one\ntwo\n\nthree", text);
 }
 
-test "htmlToText decodifica entidades, incluidas las numéricas" {
+test "htmlToText decodes entities, including the numeric ones" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const text = htmlToText(arena_state.allocator(), "<p>a &lt; b &#39;c&#39; caf&eacute;</p>");
     try std.testing.expectEqualStrings("a < b 'c' café", text);
 }
 
-test "htmlToText no inventa texto con un & suelto" {
+test "htmlToText invents no text out of a lone &" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const text = htmlToText(arena_state.allocator(), "<p>Tom & Jerry <3</p>");
     try std.testing.expectEqualStrings("Tom & Jerry <3", text);
 }
 
-test "htmlToText: <head></head> vacío no deja el cierre en el texto" {
+test "htmlToText: an empty <head></head> leaves no closing tag in the text" {
     // Regression: the jump to the closing tag was computed over `html[i..]` and
     // used as an index into the whole HTML. With an empty `<head></head>` the jump
     // landed on the `/` of the closing tag and the whole `</head>` came out in the text.
@@ -411,7 +457,7 @@ test "htmlToText: <head></head> vacío no deja el cierre en el texto" {
     try std.testing.expectEqualStrings("a", text);
 }
 
-test "searchResults saca título, URL y snippet" {
+test "searchResults pulls out title, URL and snippet" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const html =
@@ -427,9 +473,99 @@ test "searchResults saca título, URL y snippet" {
     try std.testing.expect(std.mem.indexOf(u8, out, "https://example.com/x") != null);
 }
 
-test "searchResults sin resultados devuelve vacío (no texto basura)" {
+test "searchResults with no results returns empty (no garbage text)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const out = searchResults(arena_state.allocator(), "<html><body>no results here</body></html>", 8);
     try std.testing.expectEqualStrings("", out);
+}
+
+
+// ── search result parsing ──────────────────────────────────────
+
+const search_html_fixture =
+    \\<div class="result results_links results_links_deep web-result">
+    \\  <h2 class="result__title"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.example%2Fone">One &amp; only</a></h2>
+    \\  <a class="result__snippet" href="#">The snippet of the FIRST result.</a>
+    \\</div>
+    \\<div class="result results_links results_links_deep web-result">
+    \\  <h2 class="result__title"><a class="result__a" href="https://b.example/two">Two</a></h2>
+    \\  <a class="result__snippet" href="#">The snippet of the SECOND result.</a>
+    \\</div>
+;
+
+test "searchResults: the snippet belongs to the result above it" {
+    // The regression: the snippet was searched for from the end of the title to
+    // the END OF THE DOCUMENT, so a result without a snippet of its own got the
+    // next one's, and the model read a description that had nothing to do with the
+    // title above it.
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const out = searchResults(a.allocator(), search_html_fixture, 8);
+    try std.testing.expect(std.mem.indexOf(u8, out, "One & only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "snippet of the FIRST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "snippet of the SECOND") != null);
+    // And the URL of the redirect wrapper is unwrapped: `//duckduckgo.com/l/?uddg=…`
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://a.example/one") != null);
+    // The `&amp;` is a real entity in the title, not text the model should read.
+    try std.testing.expect(std.mem.indexOf(u8, out, "One & only") != null);
+}
+
+const search_html_no_snippet_first =
+    \\<a class="result__a" href="https://a.example/one">One</a>
+    \\<a class="result__a" href="https://b.example/two">Two</a>
+    \\<a class="result__snippet" href="#">ONLY the second result has one.</a>
+;
+
+test "searchResults: a result with no snippet does NOT borrow the next one's" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const out = searchResults(a.allocator(), search_html_no_snippet_first, 8);
+    // The snippet is only inside the second result's block, so only the second
+    // entry gets it.
+    const first = out[0..std.mem.indexOf(u8, out, "2. ") orelse out.len];
+    try std.testing.expect(std.mem.indexOf(u8, first, "ONLY the second") == null);
+    const rest = out[std.mem.indexOf(u8, out, "2. ") orelse 0 ..];
+    try std.testing.expect(std.mem.indexOf(u8, rest, "ONLY the second") != null);
+}
+
+test "searchResults: the same URL twice is one result" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const dup =
+        \\<a class="result__a" href="https://same.example/x">Same</a>
+        \\<a class="result__a" href="https://same.example/x">Same again</a>
+        \\<a class="result__a" href="https://other.example/y">Other</a>
+    ;
+    const out = searchResults(a.allocator(), dup, 8);
+    // ONE line with that URL, not two: it appears once per result kept.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "https://same.example/x"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "2. ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "3. ") == null);
+}
+
+test "liteSearchResults reads the OTHER endpoint's classes" {
+    // `lite/` is a different page: different class names. Without this the tool
+    // has NO results whenever `html/` changes its layout, for a query the engine
+    // answered perfectly well.
+    const lite =
+        \\<a class="result-link" href="https://lite.example/one">Lite one</a>
+        \\<td class="result-snippet">A lite snippet.</td>
+        \\<a class="result-link" href="https://lite.example/two">Lite two</a>
+        \\<td class="result-snippet">Another lite snippet.</td>
+    ;
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const out = liteSearchResults(a.allocator(), lite, 8);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Lite one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://lite.example/one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "A lite snippet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Lite two") != null);
+}
+
+test "searchResults: nothing to parse is an empty string, never a half result" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expectEqualStrings("", searchResults(a.allocator(), "<html>changed</html>", 8));
+    try std.testing.expectEqualStrings("", liteSearchResults(a.allocator(), "<html>changed</html>", 8));
 }

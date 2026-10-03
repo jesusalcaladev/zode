@@ -6,7 +6,7 @@ const agent = @import("agent.zig");
 const chat = @import("chat.zig");
 const md = @import("lib/markdown.zig");
 const theme = @import("lib/theme.zig");
-const ed_mod = @import("lib/editor.zig");
+const ed = @import("lib/editor.zig");
 const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
 const plan_mod = @import("lib/plan.zig");
@@ -112,6 +112,36 @@ pub const Painter = struct {
         return c;
     }
 
+    /// Like `putText` but stops at `max_cols` COLUMNS from `col`, so a string
+    /// that does not fit its BOX stops at the box and not at the terminal edge.
+    ///
+    /// This is not a nicety: `putText` clips against the surface width, so a long
+    /// option in a 64-wide picker used to be painted 56 columns past the picker's
+    /// right border, over whatever was there. Anything drawn inside a bordered
+    /// box has to clip against the box.
+    pub fn putClipped(
+        self: *Painter,
+        col: u16,
+        row: u16,
+        text: []const u8,
+        max_cols: u16,
+        style: vaxis.Style,
+    ) u16 {
+        if (text.len == 0 or max_cols == 0 or col >= self.width or row >= self.height) return col;
+        const stable = self.arena.dupe(u8, text) catch return col;
+        var it = vaxis.unicode.graphemeIterator(stable);
+        var c: u16 = 0;
+        while (it.next()) |g| {
+            const b = g.bytes(stable);
+            const gw = self.measure(b);
+            if (c + gw > max_cols) break;
+            if (col + c + gw > self.width) break;
+            self.putStable(col + c, row, b, gw, style);
+            c += gw;
+        }
+        return col + c;
+    }
+
     /// Fills a whole row with a 1-column grapheme (line, border).
     /// The grapheme must be a static literal (e.g. "─").
     fn fillRow(self: *Painter, row: u16, g: []const u8, style: vaxis.Style) void {
@@ -195,6 +225,24 @@ fn wrapCells(
     width: u16,
     indent: u16,
 ) !void {
+    return wrapCellsGutter(pa, lines, cells, width, indent, null);
+}
+
+/// `wrapCells` with a visible GUTTER on the continuation rows.
+///
+/// The indent used to be two anonymous space cells, which is the same width as
+/// the kind marker (`› `, `◆ `, `⏺ `) that only the FIRST row of a paragraph
+/// carries. A six-row tool result therefore had one identifiable row and five
+/// that looked exactly like a notice. A dim `│` in the gutter says "this
+/// continues", and costs one glyph.
+fn wrapCellsGutter(
+    pa: std.mem.Allocator,
+    lines: *std.ArrayList(PLine),
+    cells: []const CellRun,
+    width: u16,
+    indent: u16,
+    gutter: ?vaxis.Style,
+) !void {
     if (cells.len == 0) {
         try lines.append(pa, .{ .cells = &.{}, .w = 0 });
         return;
@@ -209,14 +257,14 @@ fn wrapCells(
         const limit: u16 = if (first) @max(width, 1) else @max(width - ind_w, 1);
         const cw: u16 = @min(c.w, @max(limit, 1));
         if (used > 0 and used + cw > limit) {
-            try appendContinuation(pa, lines, cells[start..i], used, if (first) 0 else ind_w);
+            try appendContinuation(pa, lines, cells[start..i], used, if (first) 0 else ind_w, if (first) null else gutter);
             start = i;
             used = 0;
             first = false;
         }
         used += cw;
     }
-    try appendContinuation(pa, lines, cells[start..], used, if (first) 0 else ind_w);
+    try appendContinuation(pa, lines, cells[start..], used, if (first) 0 else ind_w, if (first) null else gutter);
 }
 
 /// Appends a line to the array, with `pad` indent columns at the start.
@@ -230,6 +278,7 @@ fn appendContinuation(
     cells: []const CellRun,
     used: u16,
     pad: u16,
+    gutter: ?vaxis.Style,
 ) !void {
     if (pad == 0) {
         try lines.append(pa, .{ .cells = cells, .w = used });
@@ -238,7 +287,11 @@ fn appendContinuation(
     var out: std.ArrayList(CellRun) = .empty;
     var i: u16 = 0;
     while (i < pad) : (i += 1) {
-        try out.append(pa, .{ .text = " ", .w = 1, .style = .{} });
+        // The gutter is the FIRST indent column and it is a `│`; the rest stay
+        // blank so the text still lines up with the first row.
+        const cell_style: vaxis.Style = if (gutter != null and i == 0) gutter.? else .{};
+        const text: []const u8 = if (gutter != null and i == 0) "\u{2502}" else " ";
+        try out.append(pa, .{ .text = text, .w = 1, .style = cell_style });
     }
     try out.appendSlice(pa, cells);
     try lines.append(pa, .{ .cells = out.items, .w = used + pad });
@@ -318,7 +371,11 @@ fn buildLinesBase(
             // break the last line against the border.
             const avail = if (is_code and width > 4) width - 2 else width;
             const before = lines.items.len;
-            try wrapCells(pa, &lines, cells.items, avail, if (is_code) 0 else 2);
+            // Prose gets the visible gutter; a code block has its own (`│ ` in
+            // `applyCodeGutter`) and a diff already prefixes every line with a
+            // sign, so a second bar there would be noise.
+            const gutter: ?vaxis.Style = if (is_code or blk.kind == .diff) null else theme.gutter;
+            try wrapCellsGutter(pa, &lines, cells.items, avail, if (is_code) 0 else 2, gutter);
             if (is_code) {
                 applyCodeGutter(pa, lines.items[before..], width);
             }
@@ -380,7 +437,15 @@ fn applyCodeGutter(
         var out: std.ArrayList(CellRun) = .empty;
         // `│` + space in front: the block reads as a block.
         out.append(pa, .{ .text = "\u{2502} ", .w = 2, .style = theme.code_gutter }) catch return;
-        out.appendSlice(pa, ln.cells) catch return;
+        // The background goes BEHIND THE CODE, not only on the trailing pad. With
+        // only the pad painted, the block was a dark stripe whose width changed
+        // from row to row on any terminal whose background is not exactly
+        // #1a1b26, and the doc comment claimed a background it never drew.
+        for (ln.cells) |c| {
+            var st = c.style;
+            st.bg = theme.code_bg.bg;
+            out.append(pa, .{ .text = c.text, .w = c.w, .style = st }) catch return;
+        }
         var i: u16 = 0;
         while (i < pad) : (i += 1) {
             out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg }) catch return;
@@ -417,32 +482,38 @@ pub const AskSnapshot = struct {
     options: []const []const u8 = &.{},
     /// The input box is the answer field (the "Other" path).
     typing: bool = false,
+    /// Which option row is highlighted (`options.len` is the "Other" row).
+    sel: usize = 0,
 };
 
-/// Picker tag for an `ask` menu. Distinct from every other tag so the picker
-/// callback can tell an answer from a model/provider choice.
-pub const ask_picker_tag: u32 = 0xA5;
-
-/// Prefix of the "Other" row in the picker. `askPickerChosen` compares against it
-/// to know it has to hand the input box over instead of answering.
+/// Label of the last row of the `ask` menu: the way out of the model's options.
 ///
-/// It has to be a constant because the comparison happens in the callback with
-/// nothing else available, and it has to be distinctive because a model CAN write
-/// an option that starts with the same words (and then it would be treated as
-/// "Other", which sends the user to a text box instead of accepting their
-/// selection).
-pub const ask_other_prefix = "Other…";
+/// It is an INDEX now, not a prefix compared against a string: the row IS the
+/// other option, so there is nothing to match and no way for a model to write an
+/// option starting with the same words and get sent to a text box instead of
+/// being answered.
+pub const ask_other_label = "type your own answer…";
 
 /// After this with nobody answering, the worker stops waiting and the model is
 /// told to decide. See `ask.timed_out_text`.
 pub const ask_timeout_ms: u64 = 5 * 60 * 1000;
+
+/// The result of a command the user ran with `!`.
+///
+/// Both strings are OWNED copies: the worker thread that produced them dies right
+/// after pushing, and the arena it ran the command in dies with it.
+pub const ShellOut = struct {
+    cmd: []u8,
+    text: []u8,
+    ms: u64,
+};
 
 pub const Model = struct {
     allocator: std.mem.Allocator,
 
     /// Own input: `vxfw.TextField` is single-line and has no history, so the
     /// prompt is edited with `editor.Editor`.
-    ed: ed_mod.Editor,
+    ed: ed.Editor,
 
     /// Raw paragraphs (owned). The parse into blocks is on-demand in draw,
     /// with an arena: the memory lives for one frame, we don't accumulate
@@ -531,8 +602,45 @@ pub const Model = struct {
     /// the model lock (which the worker may hold in `requestPermission`).
     redraw_requested: std.atomic.Value(bool) = .init(false),
 
-    /// Scroll: 0 = anchored at the bottom; N = N lines up.
-    scroll: usize = 0,
+    /// First history line on screen, in ABSOLUTE terms. This is an ANCHOR, not a
+    /// distance from the bottom: that is the difference between being able to
+    /// read while the model writes and not being able to.
+    ///
+    /// It used to be `scroll: usize` meaning "0 = bottom, N = N lines up", which
+    /// was broken twice over (see `computeVisible`): the offset kept growing
+    /// past the top with no visible effect, and because `first = max_offset -
+    /// scroll` is itself bottom-relative, every new line moved the view.
+    anchor: usize = 0,
+    /// The top of the view as (paragraph, lines into it), which is what `anchor`
+    /// is DERIVED from every frame.
+    ///
+    /// Why not just the line number: a paragraph's height is an ESTIMATE until it
+    /// has been parsed, and parsing replaces the estimate with the real height.
+    /// An absolute line index therefore means one thing before the parse and
+    /// another after, so the view jumped by however many rows the estimate was
+    /// off by — in the middle of a scroll, which is exactly where a jump is least
+    /// welcome. With (paragraph, offset) the correction lands on some paragraph
+    /// and the line is recomputed from the corrected heights, so the text under
+    /// your eyes stays put.
+    anchor_para: usize = 0,
+    anchor_off: usize = 0,
+    /// Pinned to the bottom. When true the draw ignores `anchor` and shows
+    /// `max_offset`, which is what makes new text follow you down.
+    follow_bottom: bool = true,
+    /// What the LAST frame painted, published for the `↓ N` indicator and for
+    /// the tests. `max_offset - first_visible` is what has to be shown to the
+    /// user: the raw offset used to be shown, debt included.
+    first_visible: usize = 0,
+    max_offset: usize = 0,
+    /// Lines of the live paragraph in the last frame. The key handlers do not
+    /// know how many it has (only the draw measures it), but they need it to
+    /// clamp the anchor: without this a `PageUp` before the first frame would
+    /// not move anything.
+    live_h: usize = 0,
+    /// Columns the history was last laid out with (width minus the margin).
+    /// `estHeight` needs it to estimate a WRAPPED height, and without it the
+    /// estimate was the height of an infinitely wide terminal.
+    wrap_w: u16 = 0,
     /// History rows in the last frame. The key handler uses it to jump a
     /// PAGE (the whole window) instead of a fixed number: with 5 fixed, in a
     /// tall terminal PageUp barely moved anything.
@@ -624,6 +732,14 @@ pub const Model = struct {
     ask_started_ns: i128 = 0,
     /// Answer is being typed in the input box (the "Other" path).
     ask_typing: bool = false,
+    /// Which row of the panel's option list is highlighted.
+    ///
+    /// The list is `ask_options` plus a final "Other" row, so `ask_sel ==
+    /// ask_options.items.len` is "Other", not out of range. Kept here instead of
+    /// in the modal picker because the PANEL is the list now: with at most five
+    /// options (`ask.max_options`) a filter-and-scroll picker was a widget with
+    /// a scrollbar for a menu that cannot scroll, drawn on top of the question.
+    ask_sel: usize = 0,
     /// Fixed buffer for `askTitle` (see the comment there).
     ask_title_buf: [48]u8 = undefined,
     ask_title_len: usize = 0,
@@ -657,6 +773,16 @@ pub const Model = struct {
     ///
     /// There can only be one: the turn's tools run in series.
     tool_run: ?ToolRun = null,
+
+
+    /// Results of the `!` commands the user ran, from their worker to the draw.
+    ///
+    /// They CANNOT run on the UI thread: `submitInput` is called from the event
+    /// handler, and a foreground command blocks it for as long as it runs, which
+    /// is the frozen-app bug this repo has paid for several times. It is the
+    /// `pending` pattern: the worker enqueues, the DRAW drains, and the session
+    /// append happens in the drain because the session is not thread-safe.
+    shell_out: std.ArrayList(ShellOut) = .empty,
 
     /// ── modal picker (arrows + filter, opencode style) ──
     picker_items: std.ArrayList(PickerItem) = .empty,
@@ -729,6 +855,23 @@ pub const Model = struct {
         lang: []const u8 = "",
         /// The paragraph is outside the window and `text` is compressed.
         is_cold: bool = false,
+        /// Best known height in LINES: the exact one if the paragraph has been
+        /// parsed, the best estimate otherwise.
+        ///
+        /// It lives HERE, in the paragraph, and not only in `para_heights`,
+        /// because `clearSegCache` empties `para_heights` on every resize. With
+        /// the height only in that list, a resize threw away every measurement
+        /// and `ensureParaHeights` had to re-estimate from the text: for a
+        /// compressed paragraph that text is base64 with no newlines at all, so
+        /// the estimate was 1 line for a paragraph that takes 70. The total
+        /// collapsed, `max_offset` with it, and the view jumped thousands of
+        /// lines up (to the very top, banner included) on every resize.
+        ///
+        /// It is written in BOTH places that can know the height: `layoutOne`
+        /// with the exact one, and `pruneCold` with whatever `para_heights`
+        /// holds BEFORE the text turns into base64 (without that, compression
+        /// would throw the height away with the newlines it was counted from).
+        known_lines: usize = 0,
 
         /// The paragraph's text, ready to be parsed. Rehydrates if needed.
         fn textLive(self: *Para, gpa: std.mem.Allocator) []const u8 {
@@ -796,7 +939,7 @@ pub const Model = struct {
         lang: []const u8 = "",
     };
 
-const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+    const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
     pub fn hasInput(self: *const Model) bool {
         return !self.ed.isEmpty();
@@ -808,7 +951,7 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
             .allocator = allocator,
             .pal = palette.Palette.init(allocator),
             .pal_inited = true,
-            .ed = ed_mod.Editor.init(allocator),
+            .ed = ed.Editor.init(allocator),
             .paras = .empty,
             .pending = .empty,
             .seg_cache = .empty,
@@ -832,6 +975,11 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         // leaks on exit.
         self.clearQueue();
         self.queue.deinit(self.allocator);
+        for (self.shell_out.items) |so| {
+            self.allocator.free(so.cmd);
+            self.allocator.free(so.text);
+        }
+        self.shell_out.deinit(self.allocator);
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
@@ -865,8 +1013,6 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         // exit. (Same rule as `queue.deinit` next to `clearQueue`.)
         self.ask_options.deinit(self.allocator);
     }
-
-
 
     // ── modal picker ──────────────────────────────────
     /// Opens the picker. Takes ownership of `items` (labels/descs gpa-owned).
@@ -1203,12 +1349,20 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
     ///
     /// A paragraph's height depends on the parse (markdown + wrap), which is
     /// the expensive part. Scrolling needs the total of the whole history, so
-    /// paragraphs outside the window are estimated from the number of line
-    /// breaks (one line per `\n`, not counting the wrap): the estimate only
-    /// moves a few pixels of scroll and is corrected as soon as the paragraph
-    /// is parsed. It never leaves the range you can scroll through, and
-    /// `layoutWindow` replaces it with the exact one as soon as it enters the
-    /// window.
+    /// paragraphs outside the window are ESTIMATED, and the estimate is
+    /// replaced by the exact one as soon as the paragraph enters the window.
+    ///
+    /// Two things make the estimate good enough to scroll with:
+    ///
+    /// 1. It counts the WRAP, not just the line breaks. It used to be
+    ///    `count('\n') + 1`, i.e. the height of the text as if the terminal were
+    ///    infinitely wide, and measured against reality that is off by a factor
+    ///    of three on a 100-column terminal (a 3-line paragraph estimated as 1).
+    ///    The whole scroll range was therefore wrong by ~2/3 for every
+    ///    paragraph that had not been parsed yet.
+    /// 2. `known_lines` (in the paragraph) wins over any estimate, because it
+    ///    survives BOTH the compression (which turns the text into base64 with
+    ///    no newlines) and the resize (which empties `para_heights`).
     fn ensureParaHeights(self: *Model) void {
         const n = self.paras.items.len;
         while (self.para_heights.items.len > n) {
@@ -1216,16 +1370,10 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         }
         while (self.para_heights.items.len < n) {
             const p = self.paras.items[self.para_heights.items.len];
-            // A COLD paragraph has its text base64'd, which has no newlines at
-            // all: counting them would estimate height 1 for a 16 KB tool
-            // result. That cannot happen, because `pruneCold` only ever prunes
-            // paragraphs whose height is already known, and the height list is
-            // never emptied except by a resize — which also clears the segment
-            // cache and therefore rehydrates everything through `layoutOne`.
-            // See `pruneCold`.
-            const text = p.text;
-            // Blank row separator between paragraphs, as in the layout.
-            const est: usize = @max(1, std.mem.count(u8, text, "\n") + 1);
+            const est: usize = if (p.known_lines > 0)
+                p.known_lines
+            else
+                self.estHeight(p.text);
             // `assumeCapacity`: the indices of `para_heights` are the same as
             // those of `paras` and draw walks them assuming they measure the
             // same thing, so an OOM here cannot leave the list short (that
@@ -1233,6 +1381,28 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
             self.para_heights.ensureTotalCapacity(self.allocator, n) catch return;
             self.para_heights.appendAssumeCapacity(est);
         }
+    }
+
+    /// Cheap height estimate for a paragraph that has never been parsed.
+    ///
+    /// Wrapping included: `newlines + 1` rows, plus one more per `per_line`
+    /// bytes of the text. It is only an estimate (markdown lists, code blocks
+    /// and the blank separator row all add rows it cannot know about) but it is
+    /// within a factor of the real height, which is what the scroll needs.
+    ///
+    /// `wrap_w` is the width the last frame laid out with, published by the
+    /// draw. With no frame yet (a key pressed before the first draw) it falls
+    /// back to 40, which is close enough for a clamp.
+    fn estHeight(self: *const Model, text: []const u8) usize {
+        const per_line: usize = if (self.wrap_w > 8) self.wrap_w else 40;
+        const nl = std.mem.count(u8, text, "\n");
+        const wrapped = (text.len -| nl) / per_line;
+        // A fence costs three rows the line count cannot see: a blank row, the
+        // language chip and another blank row. Counting them here is what stops
+        // the scroll range from growing as you scroll down through a history
+        // full of code.
+        const fences = std.mem.count(u8, text, "```") + std.mem.count(u8, text, "~~~");
+        return @max(1, nl + 1 + wrapped + 3 * fences);
     }
 
     /// Parses and wraps a paragraph, and puts it in the cache with its height.
@@ -1293,29 +1463,99 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
             .height = lines.len,
             .para_idx = idx,
         });
-        // The exact height replaces the estimate.
+        // The exact height replaces the estimate, in the list AND in the paragraph:
+        // the paragraph copy is what survives a resize (`ensureParaHeights`).
         if (idx < self.para_heights.items.len) self.para_heights.items[idx] = lines.len;
+        self.paras.items[idx].known_lines = lines.len;
     }
 
     /// Range of visible history lines (absolute over the whole history, not
     /// over the cached window).
-    pub const Visible = struct { first: usize, last: usize, total: usize };
+    pub const Visible = struct { first: usize, last: usize, total: usize, max_offset: usize };
 
-    /// Computes which lines are visible with the current scroll.
+    /// Total history lines (closed paragraphs + the live one) and how far up the
+    /// view can go before leaving the history.
+    ///
+    /// Split out of `computeVisible` because the key handlers need it too (to
+    /// clamp the anchor) and they cannot know how tall the live paragraph is:
+    /// they use the last frame's value, through `currentMaxOffset`.
+    fn totalsFor(self: *Model, live_lines: usize, history_h: usize) struct { total: usize, max_offset: usize } {
+        var closed: usize = 0;
+        for (self.para_heights.items) |h| closed += h;
+        const total: usize = closed + live_lines;
+        const hh = @max(history_h, 1);
+        return .{
+            .total = total,
+            .max_offset = if (total > hh) total - hh else 0,
+        };
+    }
+
+    /// `max_offset` computed with the last frame's numbers, for the callers that
+    /// cannot measure it themselves.
+    fn currentMaxOffset(self: *Model) usize {
+        self.ensureParaHeights();
+        return self.totalsFor(self.live_h, self.hist_rows).max_offset;
+    }
+
+    /// Computes which lines are visible with the current anchor.
     ///
     /// The total comes from `para_heights` (the WHOLE history, not just the
     /// cached window): with the cache as a window, summing its heights would
     /// give a total that depends on what is cached, and the scroll would jump
     /// on eviction.
+    ///
+    /// `first` comes from the ANCHOR, which is absolute. It used to be
+    /// `max_offset - scroll`, which is bottom-relative too, and that is why
+    /// reading was impossible: `scroll` did not change but `max_offset` grew with
+    /// every line of the live paragraph, so the window moved at the model's
+    /// writing speed (~2-5 lines per second). With the anchor, new text does not
+    /// move you.
     fn computeVisible(self: *Model, live_lines: usize, history_h: usize) Visible {
-        var closed: usize = 0;
-        for (self.para_heights.items) |h| closed += h;
-        const total: usize = closed + live_lines;
-        const hh = @max(history_h, 1);
-        const max_offset = if (total > hh) total - hh else 0;
-        const skip: usize = @min(self.scroll, max_offset);
-        const first = max_offset - skip;
-        return .{ .first = first, .last = first + hh, .total = total };
+        self.ensureParaHeights();
+        const t = self.totalsFor(live_lines, history_h);
+        var first = if (self.follow_bottom) t.max_offset else self.anchorLine();
+        if (first >= t.max_offset) {
+            // Being at the very bottom re-arms the follow, and only there is the
+            // anchor re-derived. Re-deriving it anywhere else is the bug: a
+            // correction to a paragraph ABOVE the view shifts the absolute line
+            // of the top, and turning that shifted line back into (paragraph,
+            // offset) lands on a different paragraph, so the reader is moved by
+            // exactly the amount the fix was supposed to absorb.
+            first = t.max_offset;
+            self.follow_bottom = true;
+            self.setAnchorLine(first);
+        } else {
+            self.follow_bottom = false;
+        }
+        self.anchor = first;
+        return .{ .first = first, .last = first + @max(history_h, 1), .total = t.total, .max_offset = t.max_offset };
+    }
+
+    /// The absolute line of the top of the view, from (paragraph, offset).
+    fn anchorLine(self: *const Model) usize {
+        var acc: usize = 0;
+        const upto = @min(self.anchor_para, self.para_heights.items.len);
+        for (self.para_heights.items[0..upto]) |h| acc += h;
+        return acc + self.anchor_off;
+    }
+
+    /// The other direction: turn an absolute line into (paragraph, offset).
+    ///
+    /// The offset is clamped to the paragraph's CURRENT height, which is what
+    /// keeps a shrink from leaving the anchor pointing past its own paragraph.
+    fn setAnchorLine(self: *Model, line: usize) void {
+        var acc: usize = 0;
+        for (self.para_heights.items, 0..) |h, i| {
+            if (line < acc + h) {
+                self.anchor_para = i;
+                self.anchor_off = line - acc;
+                return;
+            }
+            acc += h;
+        }
+        // Past the last paragraph: the top of the view is below all of them.
+        self.anchor_para = self.para_heights.items.len;
+        self.anchor_off = 0;
     }
 
     /// Layout + scroll until the visible range stabilizes.
@@ -1343,6 +1583,15 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
             if (next.first == v.first and next.last == v.last) return next;
             v = next;
         }
+        // It did NOT converge in 4 passes: what we return is the range computed
+        // AFTER the last `layoutWindow`, which means a range nobody has parsed
+        // yet. `drawLines` clips on this `first`, so the top rows came out blank
+        // until the next frame (which does parse it). One more pass, and the
+        // range we return is in the cache.
+        //
+        // Still a hard cap of 5 `layoutWindow` calls: the loop cannot run away
+        // because the iteration count does not depend on the data.
+        try self.layoutWindow(ctx, width, v.first, v.last);
         return v;
     }
 
@@ -1436,11 +1685,14 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
             if (i >= lo and i < hi) continue; // inside the window
             if (p.is_cold) continue;
             if (p.text.len < zjsonl.min_compress_len) continue;
-            // Only prune paragraphs whose height is ALREADY measured. That is what
-            // lets `ensureParaHeights` keep working on the base64 (which has no
-            // newlines) without ever having to rehydrate: pruning can only take
-            // away text whose height is already known.
+            // The height is banked in the paragraph BEFORE the text is swapped out.
+            // The estimate is computed from the text (newlines and wrap), and
+            // base64 has no newlines: without this, compressing a paragraph
+            // would leave `ensureParaHeights` with nothing to estimate from and
+            // the scroll range would collapse — which is the whole reason the
+            // height also lives in `Para.known_lines`.
             if (i >= self.para_heights.items.len) continue;
+            if (p.known_lines == 0) p.known_lines = self.para_heights.items[i];
 
             // `compressLine` needs a destination buffer; one allocation per
             // paragraph, freed right after.
@@ -1698,62 +1950,103 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
                 break :blk out;
             },
             .typing = self.ask_typing,
+            .sel = @min(self.ask_sel, self.ask_options.items.len),
         };
     }
 
-    /// The picker items for an open question with options, plus the "Other" row.
+    /// Rows of the panel's OWN option list: the model's options plus a final
+    /// "Other" row. Zero for a free-text question.
     ///
-    /// OWNED copies (gpa), and the caller frees them with `freePickerItems`: this
-    /// builds them on every frame and they must not be literals, because
-    /// `closePicker` frees them — the "Invalid free" the fuzzing found with
-    /// `+ connect`.
-    pub fn askPickerItems(self: *Model) ?[]PickerItem {
-        self.askLock();
-        if (!self.ask_active or self.ask_options.items.len == 0) {
-            self.askUnlock();
-            return null;
-        }
-        const n = self.ask_options.items.len;
-        var items = self.allocator.alloc(PickerItem, n + 1) catch {
-            self.askUnlock();
-            return null;
-        };
-        var made: usize = 0;
-        for (self.ask_options.items, 0..) |o, i| {
-            const label = self.allocator.dupe(u8, o) catch break;
-            const desc: []u8 = if (i == 0)
-                // The first option is the model's recommendation by convention
-                // (the guidance tells it to put it first), so it says so: that is
-                // the difference between a menu and a quiz.
-                (self.allocator.dupe(u8, "recommended") catch "") else
-                (self.allocator.dupe(u8, "") catch "");
-            items[i] = .{ .label = label, .desc = desc };
-            made += 1;
-        }
-        // The "Other" row is what makes the menu complete: with only the model's
-        // options there is no way to answer "none of these, this instead", and the
-        // model then gets a forced choice.
-        const other = self.allocator.dupe(u8, "Other… (type your own answer)") catch {
-            freePickerItems(self.allocator, items[0..made]);
-            self.askUnlock();
-            return null;
-        };
-        items[made] = .{ .label = other, .desc = self.allocator.dupe(u8, "esc means: you decide") catch "" };
-        made += 1;
-        self.askUnlock();
-        return items[0..made];
-    }
-
-    /// Is there a question waiting that should be shown as a picker?
-    ///
-    /// Only when there ARE options and the user has not already gone down the
-    /// free-text path. `typing` is the flag that says so: it is set when "Other"
-    /// was chosen, and once set the picker must never come back (otherwise it
-    /// reopens on the next frame, on top of the text the user is typing).
-    pub fn askNeedsPicker(self: *Model) bool {
+    /// The list lives in the panel and not in the modal picker because of what
+    /// the two widgets did to each other: the panel was painted AFTER the picker
+    /// (`tui.zig:4191` over `tui.zig:4124`) and erased whatever the picker had
+    /// drawn inside its rectangle, and the panel is wider than the picker for any
+    /// question over ~56 columns. The result was a menu with its last option
+    /// overwritten by a border. One widget cannot overlap itself.
+    pub fn askChoiceRows(self: *Model) usize {
         self.askLock();
         defer self.askUnlock();
-        return self.ask_active and !self.ask_typing and self.ask_options.items.len > 0;
+        if (!self.ask_active or self.ask_typing) return 0;
+        if (self.ask_options.items.len == 0) return 0;
+        return self.ask_options.items.len + 1;
+    }
+
+    /// Is the question a menu (as opposed to free text)?
+    ///
+    /// `typing` is what says the free-text path was taken: once it is set the
+    /// list must never come back, or the panel re-lists the options on top of
+    /// the text the user is typing.
+    pub fn askNeedsChoice(self: *Model) bool {
+        return self.askChoiceRows() > 0;
+    }
+
+    pub fn askSelection(self: *Model) usize {
+        self.askLock();
+        defer self.askUnlock();
+        return self.ask_sel;
+    }
+
+    /// Moves the highlight, saturating at both ends.
+    pub fn askMove(self: *Model, delta: isize) void {
+        self.askLock();
+        defer self.askUnlock();
+        if (!self.ask_active or self.ask_typing) return;
+        const n_opts = self.ask_options.items.len;
+        if (n_opts == 0) return;
+        const rows = n_opts + 1; // the last row is "Other"
+        const cur = @min(self.ask_sel, rows - 1);
+        const step: usize = @intCast(@abs(delta));
+        self.ask_sel = if (delta < 0)
+            (if (cur > step) cur - step else 0)
+        else
+            @min(cur + step, rows - 1);
+        self.dirty = true;
+    }
+
+    /// The submitted text answers the open question instead of starting a turn.
+    ///
+    /// Split out of `submitInput` so it can be tested without an `EventContext`:
+    /// `submitInput` arms the tick, which needs a real `Io`, and a test that
+    /// cannot run the path cannot pin the behaviour.
+    ///
+    /// An EMPTY answer is a valid answer ("you decide"): the check has to come
+    /// before the empty-prompt check below it, or Enter on an empty box would
+    /// send a turn with an empty user message.
+    pub fn askAnswerFromInput(self: *Model, trimmed: []const u8) bool {
+        if (!self.askActive()) return false;
+        const copy = self.allocator.dupe(u8, if (trimmed.len > 0) trimmed else "you decide") catch return true;
+        self.answerAskOwned(copy);
+        return true;
+    }
+
+    /// Enter on the highlighted row. False when there is no menu to answer, so
+    /// the key can fall through to whatever else handles Enter.
+    pub fn askAnswerSelected(self: *Model) bool {
+        const rows = self.askChoiceRows();
+        if (rows == 0) return false;
+        const sel = self.askSelection();
+        const n_opts = rows - 1; // the last row is "Other"
+        if (sel >= n_opts) {
+            // "Other": not an answer, it hands the input box over.
+            self.askBeginTyping();
+            self.ed.clear();
+            self.ac = .{};
+            return true;
+        }
+        self.askLock();
+        const copy = self.allocator.dupe(u8, self.ask_options.items[sel]) catch {
+            self.askUnlock();
+            return true;
+        };
+        self.askUnlock();
+        self.answerAskOwned(copy);
+        // Closed in the SAME frame: otherwise the panel stays painted for the few
+        // milliseconds until the worker wakes up and reads the answer, which
+        // reads as "it did not take my answer".
+        self.askLock();
+        self.ask_active = false;
+        self.askUnlock();
+        return true;
     }
 
     /// Title of the picker: the header if the model gave one, else a default.
@@ -2035,6 +2328,20 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         self.dirty = true;
     }
 
+    /// From the worker: hand the result of a `!` command over. Takes OWNERSHIP of
+    /// both strings (they are freed here on failure and in `deinit` otherwise).
+    pub fn pushShellOut(self: *Model, cmd: []u8, text: []u8, ms: u64) void {
+        self.lock();
+        defer self.unlock();
+        self.shell_out.append(self.allocator, .{ .cmd = cmd, .text = text, .ms = ms }) catch {
+            self.allocator.free(cmd);
+            self.allocator.free(text);
+            return;
+        };
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
     pub fn pushInfoOwned(self: *Model, text: []const u8) void {
         self.enqueueOwned(.info, text);
     }
@@ -2161,9 +2468,25 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
                     self.allocator.free(text);
                 };
             } else |_| {}
-            self.streaming = false;
             self.stream_buf.clearRetainingCapacity();
         }
+        // `streaming` goes down HERE, unconditionally, and not inside the `if`.
+        //
+        // It was inside, which meant that any turn that ended with an EMPTY
+        // stream buffer left the model "streaming" forever. `workingLocked()`
+        // counts it, so the placeholder was painted on EVERY frame from then on
+        // — a `thinking · 4321.3s` line with a clock that never stops, a spinner
+        // that never stops, and a status bar that says the app is busy long
+        // after the turn is over. That is the "junk that never cleans up".
+        //
+        // The empty-buffer paths are not exotic: every turn error before the
+        // first token (401, 403, 429 given up, 5xx after 3 retries), ESC, and
+        // "no model to talk to" all land here with nothing streamed.
+        //
+        // The test that covers this (`streamEnd` with no text) asserted `!busy`
+        // and the paragraph count, but never `!streaming`, which is exactly why
+        // it went unnoticed.
+        self.streaming = false;
         self.busy = false;
         // `dirty` is MANDATORY here: a paragraph has just been enqueued, and
         // without `dirty` draw is not requested until a key arrives. The window
@@ -2247,13 +2570,20 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         return self.toolRunMillisLocked();
     }
 
-    /// Name of the tool in progress, or null. Copies into whatever allocator
-    /// you pass: the name lives in the Model and the drawing thread reads it.
-    pub fn toolRunName(self: *Model) ?[]const u8 {
+    /// Name of the tool in progress, or null. The caller owns the result: it is a
+    /// COPY, because the name lives in the Model and `toolRunEnd` frees it from
+    /// the worker thread the moment the tool is done.
+    ///
+    /// It used to return `tr.name` with the lock already released, which hands
+    /// out a pointer that can be freed before the draw reads it. Same ownership
+    /// violation as the live paragraph copy, on the hot path of every tool.
+    pub fn toolRunName(self: *Model, out: []u8) ?[]const u8 {
         self.lock();
         defer self.unlock();
         const tr = self.tool_run orelse return null;
-        return tr.name;
+        const n = @min(tr.name.len, out.len);
+        @memcpy(out[0..n], tr.name[0..n]);
+        return out[0..n];
     }
 
     /// Same, but for when the caller ALREADY holds the lock.
@@ -2437,7 +2767,12 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         self.last_tool = lt;
         // The layout of this and the following paragraphs changes: re-cache.
         if (self.cache_from == null or idx < self.cache_from.?) self.cache_from = idx;
-        self.scroll = 0;
+        // The anchor is NOT touched, and that is a fix: Ctrl+R used to set
+        // `scroll = 0`, which yanked the view to the bottom while you were
+        // reading something else. The anchor is absolute, so expanding a tool
+        // only moves what comes after it: if you were at the bottom you stay at
+        // the bottom (the follow flag), and if you were reading above, you stay
+        // exactly where you were.
         self.unlock();
         return true;
     }
@@ -2551,6 +2886,28 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         self.drainPendingLocked();
     }
 
+    /// Takes the finished `!` commands out of the queue and hands them to the
+    /// agent, which paints them and puts them in the session.
+    ///
+    /// On the UI thread on purpose: `pushShellOut` is called from a worker, and
+    /// the session's message list and its file handle are one thing with one
+    /// owner. `agent.shellOutputArrived` does both the history and the session.
+    fn drainShellOut(self: *Model) void {
+        self.lock();
+        var batch = self.shell_out;
+        self.shell_out = .empty;
+        self.unlock();
+        // Moved OUT under the lock: the array itself is now ours, so the worker
+        // can go on filling the (new, empty) one while this is being painted.
+        if (batch.items.len == 0) return;
+        defer batch.deinit(self.allocator);
+        for (batch.items) |so| {
+            agent.shellOutputArrived(self, so);
+            self.allocator.free(so.cmd);
+            self.allocator.free(so.text);
+        }
+    }
+
     /// Moves `pending` to `paras`. The caller holds the lock.
     ///
     /// THE ONLY PLACE `paras` GROWS, and it runs on the UI thread (from the
@@ -2581,10 +2938,18 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         }
         self.pending.clearRetainingCapacity();
         self.dirty = false;
-        // Sticky bottom: if you were already scrolling up, the new text does
-        // NOT yank you back. It only re-anchors if you were at the bottom
-        // (scroll == 0).
-        if (hubo_nuevo and self.scroll == 0) self.scroll = 0;
+        // NOTHING to do about the scroll here, and that is the point.
+        //
+        // There used to be a "sticky bottom" line here:
+        //   `if (hubo_nuevo and self.scroll == 0) self.scroll = 0;`
+        // which assigned 0 to the value the guard had just proven was 0. A
+        // literal no-op that had been read as a feature for months.
+        //
+        // Stickiness is now a property of the data, not of a line of code: the
+        // anchor is ABSOLUTE, so appending paragraphs cannot move the view, and
+        // `follow_bottom` is what makes new text follow you when you ARE at the
+        // bottom. Both fall out of `computeVisible`.
+        _ = hubo_nuevo;
     }
 
     /// Empties the visible history (Ctrl+L). The cached paragraphs are freed
@@ -2593,7 +2958,10 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         self.clearSegCache();
         for (self.paras.items) |p| freePara(self.allocator, p);
         self.paras.clearRetainingCapacity();
-        self.scroll = 0;
+        self.anchor = 0;
+        self.anchor_para = 0;
+        self.anchor_off = 0;
+        self.follow_bottom = true;
     }
 
     /// "There is work pending" snapshot under a single lock (the getters take
@@ -2645,16 +3013,45 @@ const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
         self.redraw_requested.store(true, .seq_cst);
     }
 
-    /// Scrolls the history up (`n` > 0) or down.
+    /// Scrolls the history up (`n` > 0) or down, in display lines.
+    ///
+    /// The anchor is clamped to `[0, max_offset]` on EVERY call, and that clamp
+    /// is the whole fix for "I scrolled up and then could not scroll back
+    /// down". It used to clamp only to a `1_000_000` constant while
+    /// `computeVisible` clamped a local copy of the offset for drawing, never
+    /// writing it back. So `scroll` could sit hundreds of lines above
+    /// `max_offset` with nothing moving on screen: in a 50-row terminal, 8
+    /// PageUps left `scroll = 336` against a `max_offset` of 57, and the first
+    /// SIX PageDowns did not move the view at all (the seventh jumped 15).
+    ///
+    /// Clamping to the real maximum means the debt cannot exist: what you can
+    /// scroll is what there is to scroll.
     pub fn scrollBy(self: *Model, n: isize) void {
         if (n == 0) return;
+        const mo = self.currentMaxOffset();
+        var first = if (self.follow_bottom) mo else @min(self.anchor, mo);
+        // DIRECTION, spelled out because getting it backwards is invisible in
+        // the tests and fatal in the app: `first` is the TOP line on screen, so
+        // scrolling UP means going towards EARLIER lines, which means `first`
+        // goes DOWN. `n > 0` is up (PageUp, Ctrl+U, wheel up).
         if (n > 0) {
-            const add: usize = @intCast(n);
-            self.scroll = @min(self.scroll + add, 1_000_000);
+            const up: usize = @intCast(n);
+            first = if (first > up) first - up else 0;
         } else {
             const down: usize = @intCast(-n);
-            self.scroll = if (self.scroll > down) self.scroll - down else 0;
+            first = @min(first + down, mo);
         }
+        self.setAnchorLine(first);
+        self.anchor = first;
+        // Reaching the bottom re-arms the follow, so the next line that arrives
+        // keeps coming at you instead of freezing the view where you happened to
+        // land.
+        self.follow_bottom = (first >= mo);
+        // Published HERE, not only by the draw. The key handler knows the new
+        // view the moment it computes it, and the `↓ N` indicator must not show
+        // the previous frame's number while waiting for one.
+        self.first_visible = first;
+        self.max_offset = mo;
     }
 
     // ── modal palette (Ctrl+P) ─────────────────────────────
@@ -2847,11 +3244,34 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     // Enter on an empty box is saying exactly that. Sending it as a prompt would
     // start a turn with an empty user message, which is the one thing that would
     // make this feel broken.
-    if (self.askTyping()) {
+    //
+    // `askActive()` and not just `askTyping()`: with a FREE-TEXT question open
+    // there are no options, so nothing ever set `ask_typing`, and the panel said
+    // "type your answer below" while the input box was in normal prompt mode.
+    // Typing there started a NEW TURN instead of answering, and the turn got
+    // queued behind the worker that was parked waiting for the answer. From
+    // outside: the panel asks a question, you answer it, and it ignores you.
+    // `!cmd` runs a shell command and puts its output in the context. It is
+    // checked here, before the prompt path, because it is NOT a prompt: there is
+    // no turn, no model and no worker for the model. The command itself runs on
+    // its own thread (see `Model.shell_out`).
+    if (trimmed.len > 1 and trimmed[0] == '!') {
+        const cmd = std.mem.trim(u8, trimmed[1..], " \t");
         self.ed.clear();
         self.ac = .{};
-        const copy = self.allocator.dupe(u8, if (trimmed.len > 0) trimmed else "you decide") catch return;
-        self.answerAskOwned(copy);
+        if (cmd.len == 0) {
+            self.pushInfo("! needs a command: !git status");
+        } else {
+            agent.startShell(self, cmd);
+        }
+        ctx.redraw = true;
+        try self.armTick(ctx);
+        return;
+    }
+
+    if (self.askAnswerFromInput(trimmed)) {
+        self.ed.clear();
+        self.ac = .{};
         ctx.redraw = true;
         try self.armTick(ctx);
         return;
@@ -3253,7 +3673,6 @@ fn matchLabel(self: *const Model, n: usize) ?[]const u8 {
 /// The replacement text for accepting match `n`: commands keep their full
 /// `key`, files come back as `@path` (the mention form, which is what the
 /// scanner understands).
-
 /// Accepts the highlighted command: replaces the prefix with the full command.
 /// Is what is typed in the input exactly the highlighted command?
 ///
@@ -3329,11 +3748,16 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 }
                 return;
             }
-            // Ctrl+D with empty input = EOF (quit).
-            if (key.matches('d', .{ .ctrl = true }) and !self.hasInput()) {
-                ctx.quit = true;
-                return;
-            }
+            // Ctrl+D DOES NOT QUIT, and it used to.
+            //
+            // With an empty input it was EOF (`ctx.quit = true`), and the empty
+            // input is the NORMAL state when you scroll: you scroll up to read
+            // something, press ctrl+d to come back down, and zode exits. `/help`
+            // documents "ctrl+u / ctrl+d = scroll half a page" and the status bar
+            // says "ctrl+c exits", so the app contradicted itself and the cheapest
+            // way out was a key advertised as a scroll.
+            //
+            // Ctrl+C is the exit, which is what both places say.
             // Ctrl+P: command palette. Ctrl+T: two-column models palette
             // (provider | its models), like opencode.
             if (key.matches('p', .{ .ctrl = true })) {
@@ -3384,6 +3808,34 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // Modal picker active: captures ALL input.
             if (self.pickerActive()) {
                 if (self.pickerHandleKey(key)) {
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
+            // An open question WITH options: the panel is the menu, so the arrows
+            // move the panel's own highlight and Enter takes it.
+            //
+            // It has to sit here, above the editor and above the `/` and `@`
+            // popups: with a question open those popups mean nothing (there is no
+            // prompt being written) and, worse, Enter with the `@` popup open
+            // would accept a completion instead of answering the question. ESC is
+            // handled further down and means "you decide".
+            if (self.askNeedsChoice()) {
+                if (key.matches(vaxis.Key.up, .{})) {
+                    self.askMove(-1);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                if (key.matches(vaxis.Key.down, .{})) {
+                    self.askMove(1);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                if (key.matches(vaxis.Key.enter, .{})) {
+                    _ = self.askAnswerSelected();
                     ctx.redraw = true;
                     try self.armTick(ctx);
                     return;
@@ -3648,7 +4100,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     //   rows 0..history_h       history
     const status_row: u16 = height - 2;
     const max_input_lines: u16 = 8;
-    const text_w: u16 = if (width > 4) width - 4 else 1;
+    const text_w: u16 = if (width > 3) width - 3 else 1; // same region drawInput paints
 
     // Activity strip (mascot + state + clock): 1 row, but ONLY if there is
     // something to report. At idle it takes no space, as it should.
@@ -3664,7 +4116,17 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // strip. It only takes rows if there is a plan, and at most
     // `plan_max_rows`: a 20-step plan cannot eat the history.
     const pl_now = self.planCopy();
-    const plan_rows: u16 = if (pl_now.isEmpty()) 0 else @min(@as(u16, pl_now.len), plan_max_rows);
+    // A FINISHED plan takes ONE row, not one per step. `drawPlanBlock` returns
+    // after a single `☑ all N steps done` line, so reserving N rows left the
+    // ghosts of the checkbox rows underneath it, forever: they sit below
+    // `history_h`, so the history clear loop never touched them, and they stayed
+    // until `/plan` or a new plan came along.
+    const plan_rows: u16 = if (pl_now.isEmpty())
+        0
+    else if (pl_now.allDone())
+        1
+    else
+        @min(@as(u16, pl_now.len), plan_max_rows);
 
     // Autocompletion popup: only if there are matches.
     const ac_rows: u16 = if (self.ac.active and matchCount(self) > 0)
@@ -3676,7 +4138,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // fit, the input is clipped (and its view anchors to the bottom).
     const chrome: u16 = 4 + ac_rows + act_rows + plan_rows; // status + borders + popup + strip + plan
     const avail: u16 = if (height > chrome + 2) height - chrome - 2 else 1;
-    const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(text_w), max_input_lines))), avail), 1);
+    const ed_w: u16 = if (text_w > 0) text_w else 1;
+    const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(ed_w, editorMeasurer(&p)), max_input_lines))), avail), 1);
     // The order from the bottom up is: status · strip · PLAN · input box. The
     // plan goes between the strip and the input (and not over the status)
     // because it is what you look at while the model works, next to the clock.
@@ -3687,6 +4150,10 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     // ── drain pending ──
     self.drainPending();
+    // The results of the user's own `!` commands. Same rule as everything else
+    // that comes from a worker: the UI thread takes them and appends the session
+    // message, because the session is not thread-safe.
+    self.drainShellOut();
 
     // Invalidates the cache if the width changed (the lines already come
     // wrapped) or if a paragraph was edited in-place (Ctrl+R expands a tool
@@ -3718,6 +4185,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // worker (which puts a `streamDelta` per token) competed with draw on
     // every token and the lock became a bottleneck. Copying is a memcpy;
     // parsing is not.
+    //
+    // INVARIANT: whatever `live_src` points at when the lock is released is
+    // owned by `ctx.arena` and outlives the frame's parse. The `CellRun`s store
+    // the grapheme BY VALUE but with a pointer to its bytes, and painting
+    // happens later, so a stack buffer or a model-owned buffer would be read
+    // after it died (the `&[_]u8{c}` family AGENTS.md keeps paying for).
     var live_src: []const u8 = &.{};
     var live_is_tool = false;
     var tool_buf: [128]u8 = undefined;
@@ -3725,7 +4198,17 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         self.lock();
         defer self.unlock();
         if (self.streaming and self.stream_buf.items.len > 0) {
-            live_src = self.stream_buf.items;
+            // THE COPY IS INSIDE THE CRITICAL SECTION, and that is the whole
+            // point of it.
+            //
+            // It used to be: take a slice under the lock, unlock, and copy ten
+            // lines later at the parse site. In between the worker could
+            // `stream_buf.appendSlice(...)`, which reallocates and FREES the
+            // old buffer — so the copy could read freed memory, and what came
+            // out was arbitrary bytes fed to the UTF-8 parser and then to the
+            // renderer. Narrow window, but the only path in the history that
+            // could put genuinely random bytes on screen.
+            live_src = ctx.arena.dupe(u8, self.stream_buf.items) catch "";
         }
         // Feedback for the tool in progress. Without this, a 30s `bash` leaves
         // the last row frozen at `⏺ bash(...)` and there is no way to tell if
@@ -3741,12 +4224,16 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             // far more than `bash · 12.3s` when there are several tools in the
             // turn and you are looking at the strip to see which one is stuck.
             // `ToolRun.arg` had been stored for months and nobody read it.
-            live_src = std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{
+            const line = std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{
                 tr.name,
                 tr.arg,
                 ms / 1000,
                 (ms % 1000) / 100,
             }) catch "";
+            // Copied here, while `tool_buf` is certainly alive and `tr.name` /
+            // `tr.arg` cannot be freed under us: `toolRunEnd` frees them from
+            // the worker thread as soon as it runs.
+            live_src = ctx.arena.dupe(u8, line) catch "";
             live_is_tool = true;
         }
         // The spinner advances with `workingLocked` and NOT with `busy`: during
@@ -3767,27 +4254,27 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     var live_active = false;
     // Only if there IS a turn: at idle the history does not invent a line.
     if (live_src.len == 0 and self.workingLocked()) {
+        // `ph_buf` is block-local AND the copy happens INSIDE this block. It
+        // used to be block-local with the copy ten lines further down, past the
+        // end of its scope: reading a dead stack buffer, which is the same bug
+        // as `&[_]u8{c}` and just as undefined. Local buffer + immediate copy
+        // into the frame arena is the pattern that cannot get it wrong.
         var ph_buf: [64]u8 = undefined;
         const ms = self.busyMillis();
-        live_src = std.fmt.bufPrint(&ph_buf, "thinking · {d}.{d}s", .{
+        const ph = std.fmt.bufPrint(&ph_buf, "thinking · {d}.{d}s", .{
             ms / 1000,
             (ms % 1000) / 100,
         }) catch "thinking";
+        live_src = ctx.arena.dupe(u8, ph) catch "thinking";
         live_kind = .info;
         live_active = true;
     }
 
     var live_lines: []const PLine = &.{};
     if (live_src.len > 0) {
-        // COPY into the frame arena before building the lines. The `CellRun`
-        // store the grapheme BY VALUE but with a pointer to its bytes, and
-        // painting happens AFTER this block: with a stack `buf`, on the way
-        // out of here the pointer dangles and the row comes out as garbage
-        // (the same `&[_]u8{c}` bug AGENTS.md warns about). Same thing with
-        // `stream_buf`: its memory belongs to the model and the worker keeps
-        // growing it.
-        const copy = ctx.arena.dupe(u8, live_src) catch "";
-        live_lines = buildLines(ctx.arena, ctx, live_kind, copy, width) catch &.{};
+        // `live_src` is already frame-arena owned (see the invariant above), so
+        // there is nothing to copy here any more.
+        live_lines = buildLines(ctx.arena, ctx, live_kind, live_src, width) catch &.{};
         live_active = live_lines.len > 0;
     }
 
@@ -3801,6 +4288,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // margin columns, and if the layout does not account for it the last
     // column goes off screen.
     const hist_margin: u16 = historyMargin(width);
+    const wrap_width: u16 = if (width > hist_margin) width - hist_margin else width;
+    self.wrap_w = wrap_width;
     const vis = try self.layoutFor(
         ctx,
         if (width > hist_margin) width - hist_margin else width,
@@ -3809,6 +4298,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     );
     const first_visible = vis.first;
     const last_visible = vis.last;
+    // Publishes what was painted, so the `↓ N` indicator and the tests read the
+    // same numbers the screen shows. `live_h` goes here too: it is the one input
+    // `currentMaxOffset` cannot compute on its own, and the key handlers clamp
+    // against it (without it, a PageUp before the first frame does nothing).
+    self.first_visible = first_visible;
+    self.max_offset = vis.max_offset;
+    self.live_h = if (live_active) live_lines.len else 0;
 
     // ── clears the history area BEFORE painting ──
     //
@@ -3871,8 +4367,14 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // Scroll indicator: if the history is not anchored at the bottom, it has to
     // be said. Without this you lose the context of "why doesn't it scroll
     // down by itself".
-    if (self.scroll > 0) {
-        const s = std.fmt.allocPrint(ctx.arena, "  ↓ {d}", .{self.scroll}) catch "";
+    //
+    // It prints `max_offset - first_visible`, the lines that are actually
+    // hidden below, NOT the raw scroll offset. With the debt that used to be
+    // possible, the number on screen could be 336 while nothing was hidden at
+    // all, because it is a count of what you cannot see.
+    if (self.max_offset > self.first_visible) {
+        const below = self.max_offset - self.first_visible;
+        const s = std.fmt.allocPrint(ctx.arena, "  ↓ {d}", .{below}) catch "";
         if (s.len > 0) status_segs.append(ctx.arena, .{ .text = s, .style = theme.warn }) catch {};
     }
 
@@ -3888,20 +4390,6 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // filled the palette while the UI thread was drawing it, with no lock on the
     // palette's own state, and the app segfaulted. The worker leaves the question
     // in the `Model`; the draw is what turns it into a picker.
-    if (!self.pickerActive() and !self.pal.active and !self.permActive()) {
-        if (self.askNeedsPicker()) {
-            if (self.askPickerItems()) |items| {
-                self.openPicker(ask_picker_tag, self.askTitle(), items, askPickerChosen);
-                // `askTitle` returns a slice into the MODEL (a fixed buffer), and
-                // `openPicker` copies it into its own fixed buffer, so there is
-                // nothing to free and nothing to own. The picker ITEMS, on the
-                // other hand, are gpa copies that `closePicker` frees — which is
-                // why `askPickerItems` dupes instead of handing out the dialog's
-                // own strings (a double free waiting for the second close).
-            }
-        }
-    }
-
     // ── modal picker (opencode style, centered) ──
     if (self.pickerSnapshot(ctx.arena)) |ps| {
         drawPicker(&p, width, height, ps);
@@ -4018,36 +4506,62 @@ fn drawInput(
     // Prompt `❯ ` only on the first line.
     _ = p.putText(2, top + 1, "❯ ", theme.input_prompt);
 
-    const lines = splitLines(p.arena, self.ed.text());
-    // If the text does not fit whole, the view anchors to the bottom (like the
-    // history).
-    const hidden = if (lines.len > input_h) lines.len - input_h else 0;
-    const shown = lines[hidden..];
+    // The text region is columns [2, width-1): the left border is 0, the right
+    // border is `width - 1`. `width - 3`, not `width - 4`: the layout used to
+    // reserve one column less than the paint area, which is the kind of off-by-one
+    // that only shows up as "the last character of a wrapped line is missing".
+    const ed_w: u16 = if (width > 3) width - 3 else 1;
+    const meas = editorMeasurer(p);
 
-    for (shown, 0..) |ln, i| {
+    // Rows, not lines: the text is wrapped HERE, with the same wrap the box was
+    // sized with. It used to be split on `\n` only and each line handed to
+    // `putText`, which clips at the TERMINAL edge: a 200-character prompt made an
+    // eight-row box with all the text in one row running off the right, and
+    // everything past the border was dropped without a word.
+    const total_rows = self.ed.displayLines(ed_w, meas);
+    // Bottom-anchored (like the history): the cursor is at the end of what you
+    // are typing, so that is what has to stay visible.
+    const first = if (total_rows > input_h) total_rows - input_h else 0;
+    const shown = self.ed.rowsInWindow(first, input_h, ed_w, meas, p.arena);
+    for (shown, 0..) |piece, i| {
         const row = top + 1 + @as(u16, @intCast(i));
         if (row >= top + box_h - 1) break;
-        _ = p.putText(2, row, ln, theme.input_text);
+        if (piece.bytes.len == 0) continue;
+        _ = p.putClipped(2, row, piece.bytes, ed_w, theme.input_text);
     }
 
-    // Visible cursor: on the cursor's real line inside the view.
-    const cur_line = self.ed.cursorLine();
-    if (cur_line >= hidden and cur_line < lines.len) {
-        const line = lines[cur_line];
-        const start = lineStartOffset(lines, cur_line);
-        const col_in_line = self.ed.cursor - start;
-        const upto = line[0..@min(col_in_line, line.len)];
-        var c: u16 = 0;
-        var it = vaxis.unicode.graphemeIterator(upto);
-        while (it.next()) |g| c += @as(u16, p.measure(g.bytes(upto)));
+    // The terminal cursor, at its VISUAL row and column. `cursorLine` gave a
+    // logical line index, which on a wrapped line meant row 0 with a column of
+    // `2 + everything before it`: outside the surface, so the caret vanished.
+    const cc = self.ed.cursorRowCol(ed_w, meas);
+    if (cc.row >= first and cc.row < first + shown.len) {
+        const col = 2 + @min(cc.col, ed_w - 1);
         surface.cursor = .{
-            .row = top + 1 + @as(u16, @intCast(cur_line - hidden)),
-            .col = 2 + c,
+            .row = top + 1 + @as(u16, @intCast(cc.row - first)),
+            .col = col,
         };
     }
 
+    // Rows scrolled out above: on the border, the way the picker's title sits on
+    // its border. Without it, a box full of the middle of your prompt looks
+    // exactly like a box with all of it.
+    if (first > 0 and width > 16) {
+        var ib: [32]u8 = undefined;
+        const lab = std.fmt.bufPrint(&ib, "\u{2191} {d} more", .{first}) catch "";
+        if (lab.len > 0 and lab.len + 4 < width) {
+            _ = p.putClipped(width - 2 - @as(u16, @intCast(lab.len)), top, lab, @as(u16, @intCast(lab.len)), theme.hint_faint);
+        }
+    }
+
     if (self.ed.isEmpty()) {
-        _ = p.putText(4, top + 1, "Ask anything\u{2026} \u{b7} / for commands \u{b7} ctrl+c to exit", theme.placeholder);
+        // With a question open this box IS the answer field (the free-text path),
+        // so the placeholder has to say so: it used to invite a prompt, which is
+        // not what pressing Enter there does.
+        const ph: []const u8 = if (self.askActive())
+            "your answer\u{2026} \u{b7} enter sends it \u{b7} esc: you decide"
+        else
+            "Ask anything\u{2026} \u{b7} / for commands \u{b7} ctrl+c to exit";
+        _ = p.putClipped(4, top + 1, ph, ed_w - 2, theme.placeholder);
     }
 
     if (self.ac.active) {
@@ -4362,25 +4876,6 @@ fn tryNum(arena: std.mem.Allocator, n: u8) []const u8 {
 /// worker frees it after the session has it. Passing `label` itself would be the
 /// `gpa.free(literal)` crash, in a shape where it only shows up when the user
 /// picks the first option.
-fn askPickerChosen(self: *Model, tag: u32, label: []const u8) void {
-    if (tag != ask_picker_tag) return;
-    if (std.mem.startsWith(u8, label, ask_other_prefix)) {
-        // Not an answer: the user wants to write. Close the picker (already done
-        // by `pickerHandleKey`) and give them the input box.
-        self.askBeginTyping();
-        self.ed.clear();
-        self.ac = .{};
-        return;
-    }
-    const copy = self.allocator.dupe(u8, label) catch return;
-    self.answerAskOwned(copy);
-    // The question is answered, so the panel has to go: same reason as
-    // `declineAsk`.
-    self.askLock();
-    self.ask_active = false;
-    self.askUnlock();
-}
-
 /// The question panel of `ask`, for the free-text path and as the anchor of the
 /// whole interaction.
 ///
@@ -4399,29 +4894,57 @@ fn drawAskPanel(
     snap: AskSnapshot,
     waited_ms: u64,
 ) void {
-    if (width < 20 or height < 8) return;
+    if (width < 24 or height < 8) return;
 
-    const q_cols = columnsOf(p, snap.question);
-    const box_w: u16 = @min(@as(u16, @intCast(@max(q_cols + 8, 44))), width - 4);
+    // The panel is ONE widget: the question and the options are in the same box,
+    // which is what makes it impossible for one to erase the other. It used to be
+    // two (a centred modal picker plus this box, the picker narrower), painted one
+    // after the other with the box on top, and the geometry guaranteed the
+    // overlap: `top = (height - box_h) / 2` here against `y0 = (height - box_h) / 4`
+    // there, and this box is the WIDER one for any question over ~56 columns.
+    const text_col_off: u16 = 2; // inside the borders
+    const box_w: u16 = @min(@as(u16, 78), width - 4);
+    const inner_w: u16 = if (box_w > 6) box_w - 4 else box_w - 2;
     const left: u16 = (width - box_w) / 2;
 
-    // Height: top border, header (optional), question (wrapped), hint, bottom
-    // border. The question is measured with the REAL wrap so the box is exactly
-    // as tall as the text: a box with empty rows under it looks broken, and the
-    // number of rows is computed here rather than guessed.
-    const inner_w: u16 = if (box_w > 6) box_w - 4 else box_w - 2;
-    const q_lines = wrapTextToRows(p, snap.question, inner_w, p.arena);
-    const has_header = snap.header.len > 0;
-    // ALWAYS two rows under the question: the hint and the clock. Reserving them
-    // conditionally (only when there are options) left the box with three empty
-    // rows under a free-text question, which reads as a broken panel.
-    const rows: u16 = 2;
-    const box_h: u16 = 2 + (if (has_header) @as(u16, 1) else 0) + @as(u16, @intCast(q_lines.len)) + rows;
-    const top: u16 = if (height > box_h + 2) (height - box_h) / 2 else 1;
+    // Question: hard breaks first, then wrapped. A `\n` the model wrote (its
+    // "recommendation and its reason up front" is routinely two sentences on two
+    // lines) used to be written into a CELL as a literal newline byte, and vaxis
+    // writes those bytes raw to the terminal: the rest of the frame came out
+    // interleaved with the panel text.
+    const q_all = wrapTextToRows(p, snap.question, inner_w, p.arena);
+    const q_cap: usize = 8;
+    var q_n = q_all.len;
+    var q_more: usize = 0;
+    if (q_n > q_cap) {
+        q_more = q_n - q_cap;
+        q_n = q_cap;
+    }
 
-    // A clean background: the history behind it is dense text, and a bordered box
-    // with the history showing through reads as a rendering bug.
-    p.fillRange(left, left + box_w, top, " ", theme.code_bg);
+    // Rows: border + header + question + one blank + options + blank + hint + clock
+    const has_header = snap.header.len > 0;
+    const opts = snap.options.len;
+    const choice_rows: usize = if (opts > 0 and !snap.typing) opts + 1 else 0;
+    const hdr_rows: usize = if (has_header) 1 else 0;
+    const more_rows: usize = if (q_more > 0) 1 else 0;
+    const menu_rows: usize = if (choice_rows > 0) choice_rows + 1 else 0;
+    const rows_content: usize = hdr_rows + q_n + more_rows + menu_rows + 2;
+    const want_h: u16 = @intCast(rows_content + 2);
+    // Clamped to the screen. Unclamped, a 600-char question on a 40-column
+    // terminal made a 24-row box that covered the status bar AND the input box,
+    // and the input box is the ONLY way to answer a free-text question: the app
+    // looked frozen with a yellow box full of text and no way out.
+    const max_h: u16 = if (height > 6) height - 4 else height;
+    const box_h: u16 = @min(want_h, max_h);
+    const top: u16 = if (height > box_h + 2) (height - box_h) / 2 else 0;
+
+    {   // opaque background: the history behind is dense text and a box with the
+        // history showing through reads as a rendering bug.
+        var br: u16 = 0;
+        while (br < box_h) : (br += 1) {
+            p.fillRange(left, left + box_w, top + br, " ", theme.code_bg);
+        }
+    }
 
     p.putStable(left, top, "╭", 1, theme.warn_bold);
     p.fillRange(left + 1, left + box_w - 1, top, "─", theme.warn);
@@ -4429,50 +4952,107 @@ fn drawAskPanel(
     p.putStable(left, top + box_h - 1, "╰", 1, theme.warn_bold);
     p.fillRange(left + 1, left + box_w - 1, top + box_h - 1, "─", theme.warn);
     p.putStable(left + box_w - 1, top + box_h - 1, "╯", 1, theme.warn_bold);
-
-    var r: u16 = 1;
-    while (r < box_h - 1) : (r += 1) {
-        p.putStable(left, top + r, "│", 1, theme.warn);
-        p.putStable(left + box_w - 1, top + r, "│", 1, theme.warn);
+    var rr: u16 = 1;
+    while (rr < box_h - 1) : (rr += 1) {
+        p.putStable(left, top + rr, "│", 1, theme.warn);
+        p.putStable(left + box_w - 1, top + rr, "│", 1, theme.warn);
     }
 
-    var row = top + 1;
+    const inner_col = left + text_col_off;
+    const last_row = top + box_h - 1;
+    var row: u16 = top + 1;
+
     if (has_header) {
-        _ = p.putText(left + 2, row, snap.header, theme.brand_faint);
+        // The header is a LABEL, not the answer: `hint` instead of `warn_bold`,
+        // and clipped to the box (it is up to 40 bytes and the inner width can be
+        // less than that on a narrow terminal, where it used to cross the border).
+        _ = p.putClipped(inner_col, row, snap.header, inner_w, theme.hint_faint);
         row += 1;
     }
 
-    // The question, wrapped, in the strongest color in the app. This is the thing
-    // the user came to read.
-    for (q_lines) |ln| {
-        if (row >= top + box_h - 1) break;
-        _ = p.putText(left + 2, row, ln, theme.warn_bold);
+    // The question: the one thing in bright bold yellow, wrapped, clipped.
+    for (q_all[0..q_n]) |ln| {
+        if (row >= last_row) break;
+        _ = p.putClipped(inner_col, row, ln, inner_w, theme.warn_bold);
+        row += 1;
+    }
+    if (q_more > 0 and row < last_row) {
+        var mb: [48]u8 = undefined;
+        const m = std.fmt.bufPrint(&mb, "… {d} more lines of the question", .{q_more}) catch "…";
+        _ = p.putClipped(inner_col, row, m, inner_w, theme.hint_faint);
         row += 1;
     }
 
-    // The hint. It says what the KEYS do here, because "a box appeared and I do
-    // not know what to press" is the state that makes people hit ESC.
-    var hb: [64]u8 = undefined;
-    const hint: []const u8 = if (snap.typing)
-        "type your answer · enter sends it · esc: you decide"
-    else if (snap.options.len > 0)
-        "↑↓ choose · enter to answer · esc: you decide"
+    // ── the options, in this same box ──
+    //
+    // Before they were items of the modal picker, printed as `label  desc` with no
+    // marker: `recommended` came out in the same style as the option text (it just
+    // looked like the label got longer) and the highlighted row was bold blue on
+    // no background, which is not a highlight. A row here is a numbered choice
+    // with a real background, so "these are the options" needs no explaining.
+    if (choice_rows > 0 and row < last_row) {
+        row += 1; // blank line between the question and the menu
+        const sel = snap.sel;
+        var i: usize = 0;
+        while (i < choice_rows) : (i += 1) {
+            if (row >= last_row) break;
+            const is_sel = (i == sel);
+            const is_other = (i == opts);
+            const style: vaxis.Style = if (is_sel) theme.selected else if (is_other) theme.hint else vaxis.Style{};
+            if (is_sel) p.fillRange(inner_col, left + box_w - 1, row, " ", theme.selected);
+            var marker: [8]u8 = undefined;
+            // Every row is NUMBERED, including the way out of the menu: an
+            // unnumbered last row is the one that reads as chrome ("type your own
+            // answer…" looks like a button, not a choice), and a menu whose rows
+            // are not all the same shape is hard to scan.
+            const mk = if (is_sel)
+                std.fmt.bufPrint(&marker, "▸ {d} ", .{i + 1}) catch "  "
+            else
+                std.fmt.bufPrint(&marker, "  {d} ", .{i + 1}) catch "  ";
+            const used = p.putClipped(inner_col, row, mk, inner_w, style);
+            const label = if (is_other) ask_other_label else snap.options[i];
+            const after = p.putClipped(used, row, label, inner_w - (used - inner_col), style);
+            // The recommendation is STATED, not implied by being first: the
+            // guidance tells the model to put its own pick first, so row 1 is
+            // what Enter takes. It used to be printed INSTEAD of the option (as
+            // the picker's `desc`, which also made it read like a longer label).
+            if (i == 0 and !is_other) {
+                const tag: vaxis.Style = if (is_sel)
+                    .{ .fg = .{ .rgb = .{ 0x9e, 0xce, 0x6a } }, .bg = theme.sel_bg.bg }
+                else
+                    theme.ok;
+                _ = p.putClipped(after + 2, row, "← recommended", inner_w - (after + 2 - inner_col), tag);
+            }
+            row += 1;
+        }
+        // The recommendation is stated, not implied: the guidance tells the model
+        // to put its own pick first, so row 1 IS the answer the panel expects
+        // Enter to take.
+    }
+
+    // ── hint + clock ──
+    //
+    // These two rows were `brand_faint` (#3b4261) on #1a1b26, about 1.9:1: the
+    // only text in the panel telling the user that the arrow keys do something,
+    // drawn in the one tone of the palette that cannot be read.
+    var hb: [96]u8 = undefined;
+    const hint_txt: []const u8 = if (snap.typing)
+        "enter sends it · esc: you decide"
+    else if (choice_rows > 0)
+        "↑↓ choose · enter answers · esc: you decide"
     else
         "type your answer below · enter sends it · esc: you decide";
-    const ht = std.fmt.bufPrint(&hb, "{s}", .{hint}) catch hint;
-    if (ht.len > 0 and row < top + box_h - 1) {
-        _ = p.putText(left + 2, row, ht, theme.brand_faint);
+    const ht = std.fmt.bufPrint(&hb, "{s}", .{hint_txt}) catch hint_txt;
+    if (ht.len > 0 and row < last_row) {
+        _ = p.putClipped(inner_col, row, ht, inner_w, theme.hint);
     }
     row += 1;
 
-    // The clock. Same information as in the activity strip, and here anyway: the
-    // strip is one row above the input and this is centred, and while the question
-    // is on screen this is the thing being read.
-    if (row < top + box_h - 1) {
+    if (row < last_row) {
         var wb: [32]u8 = undefined;
         const w = std.fmt.bufPrint(&wb, "waiting {d}s", .{waited_ms / 1000}) catch "";
         if (w.len > 0) {
-            _ = p.putText(left + 2, row, w, theme.brand_faint);
+            _ = p.putClipped(inner_col, row, w, inner_w, theme.hint_faint);
         }
     }
 }
@@ -4497,22 +5077,69 @@ fn columnsOf(p: *const Painter, text: []const u8) usize {
 fn wrapTextToRows(p: *const Painter, text: []const u8, width: u16, arena: std.mem.Allocator) []const []const u8 {
     if (width == 0) return &.{};
     var rows: std.ArrayList([]const u8) = .empty;
+    // HARD BREAKS FIRST, then wrap each line. This used to be one pass over the
+    // graphemes with no notion of `\n`: a newline was measured as a 1-column
+    // grapheme (`gwidth` returns -1 for a control and the measure clamps to 1),
+    // so it ended up INSIDE a row, and `putStable` wrote that byte into a cell.
+    // vaxis writes cell bytes raw, so the raw `\n` went to the terminal and the
+    // rest of the frame came out interleaved with the text. The model's own
+    // schema asks for "your recommendation and its reason up front", i.e. two
+    // lines, so this was the normal case and not an edge case.
+    var hard = std.mem.splitScalar(u8, text, '\n');
+    while (hard.next()) |line| {
+        wrapOneLine(p, line, width, arena, &rows);
+    }
+    return rows.items;
+}
+
+/// One hard line into `rows`, wrapped at `width` columns.
+fn wrapOneLine(
+    p: *const Painter,
+    line: []const u8,
+    width: u16,
+    arena: std.mem.Allocator,
+    rows: *std.ArrayList([]const u8),
+) void {
+    if (line.len == 0) {
+        // An empty hard line is an empty ROW, and it has to survive: dropping it
+        // would glue the paragraph above to the one below.
+        rows.append(arena, "") catch return;
+        return;
+    }
     var start: usize = 0;
     var col: u16 = 0;
     var pos: usize = 0;
-    var it = vaxis.unicode.graphemeIterator(text);
+    var it = vaxis.unicode.graphemeIterator(line);
     while (it.next()) |g| {
-        pos += g.bytes(text).len;
-        const w: u16 = p.measure(g.bytes(text));
+        const gb = g.bytes(line);
+        pos += gb.len;
+        const w: u16 = p.measure(gb);
         if (col + w > width and col > 0) {
-            rows.append(arena, text[start .. pos - g.bytes(text).len]) catch return rows.items;
-            start = pos - g.bytes(text).len;
+            rows.append(arena, line[start .. pos - gb.len]) catch return;
+            start = pos - gb.len;
             col = 0;
         }
         col += w;
     }
-    if (start < text.len) rows.append(arena, text[start..]) catch {};
-    return rows.items;
+    if (start < line.len) rows.append(arena, line[start..]) catch {};
+}
+
+/// The Editor's `Measurer`, bound to this frame's Painter.
+///
+/// It is the bridge that makes the input's wrap and the input's paint the SAME
+/// wrap: `vaxis.unicode` for what a grapheme is and `p.measure` (which is
+/// `ctx.stringWidth`) for how wide it is on THIS terminal.
+fn editorMeasurer(p: *const Painter) ed.Measurer {
+    return .{ .ctx = @ptrCast(p), .step = graphemeStep };
+}
+
+fn graphemeStep(ctx: *const anyopaque, text: []const u8, i: usize) ed.Step {
+    const p: *const Painter = @ptrCast(@alignCast(ctx));
+    const rest = text[i..];
+    var it = vaxis.unicode.graphemeIterator(rest);
+    const g = it.next() orelse return .{ .cols = 1, .end = text.len };
+    const b = g.bytes(rest);
+    return .{ .cols = p.measure(b), .end = i + b.len };
 }
 
 fn drawActivityStrip(
@@ -4548,7 +5175,11 @@ fn drawActivityStrip(
     // `ask` says "waiting for your answer", not "waiting for your input": the
     // difference between "I am blocked" and "I am waiting for you to decide" is
     // exactly what the user needs in order to look at the modal.
-    const running_tool = self.toolRunName() != null;
+    // ONE snapshot, read once: `toolRunName` copies into a caller buffer, and
+    // calling it twice would take the lock twice for the same answer.
+    var tr_name_buf: [64]u8 = undefined;
+    const running_tool_name = self.toolRunName(&tr_name_buf);
+    const running_tool = running_tool_name != null;
     const label: []const u8 = if (act.ask)
         "waiting for your answer"
     else if (act.perm)
@@ -4568,7 +5199,7 @@ fn drawActivityStrip(
     // does not say whether it is working or hung; the tool's NAME and its clock
     // do. It is the same information as the history's `⎿ running` line, here in
     // the strip so you can read it without scrolling.
-    if (self.toolRunName()) |name| {
+    if (running_tool_name) |name| {
         if (col + name.len + 2 < width) {
             _ = p.putText(col, row, name, theme.brand_soft);
             col += @as(u16, @intCast(name.len)) + 1;
@@ -4678,10 +5309,10 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     if (provider.len > 0) {
         if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
         out.append(arena, .{ .text = provider, .style = theme.brand_soft }) catch return null;
-        // El nivel que va DE VERDAD, no el que el usuario pidio: si el modelo no tiene
-        // ese peldano, el status tiene que decir el que se mando. Un status que
-        // dice `xhigh` mientras el cable lleva `high` es una letra pequena que
-        // miente, y no hay forma de que se note el 400 cuando lo haya.
+        // The level that actually goes out, not the one the user asked for: if the
+        // model has no such step, the status has to say the one that was sent. A
+        // status that says `xhigh` while the wire carries `high` is small print
+        // that lies, and there is no way to notice the 400 when it does happen.
         const eff = switch (agent.effectiveEffort()) {
             .none => "off",
             .minimal => "min",
@@ -4743,20 +5374,21 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     return out.items;
 }
 
-/// La SEGUNDA columna del status: cuánto cuesta la sesión.
+/// The SECOND column of the status: what the session costs.
 ///
-/// Va pegada a la derecha y separada de la de sesión por un `│`, porque son
-/// cosas distintas y no encajan en la misma frase: la izquierda dice con QUÉ
-/// estás trabajando y la derecha, lo que te ha costado.
+/// It sits glued to the right and separated from the session column by a `│`,
+/// because they are different things and do not fit in the same sentence: the
+/// left one says WHAT you are working with, and the right one what it has cost
+/// you.
 ///
-/// Antes estos datos solo salían con `/cache` y al abrir `/context`, que es
-/// justo cuando ya no sirven: el número que quieres ver es el de ahora, sin
-/// tener que abrir nada.
+/// These numbers used to show only with `/cache` and when opening `/context`,
+/// which is exactly when they are no use: the number you want to see is the
+/// current one, without having to open anything.
 fn usageInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     var out: std.ArrayList(InfoSeg) = .empty;
 
     const st = &agent.cacheSessionStats();
-    // Nada de datos todavía: se Would poner un `0%` que miente.
+    // No data yet: it would print a `0%` that lies.
     if (st.requests == 0) return null;
 
     const pct: u8 = @intFromFloat(std.math.clamp(st.hitRatePct(), 0, 100));
@@ -4781,12 +5413,13 @@ fn usageInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     return out.items;
 }
 
-/// Dibuja la columna de usage pegada a la derecha, con un `│` que la separa de
-/// la de sesión.
+/// Paints the usage column glued to the right, with a `│` separating it from
+/// the session column.
 ///
-/// Se degrada quitando pedazos ANTES de invadir el texto de la otra columna:
-/// si no cabe entero, no se pinta nada. Un `62% cached` a medias, o metido
-/// encima del modelo, se lee peor que no tenerlo.
+/// It degrades by dropping pieces BEFORE ever intruding on the other column's
+/// text: if it does not fit whole, nothing is painted. A half-written
+/// `62% cached`, or one sitting on top of the model, reads worse than not
+/// having it at all.
 fn drawUsageColumn(p: *Painter, row: u16, width: u16, segs: []const InfoSeg, reserved: u16) void {
     const sep_w: u16 = 3; // " │ "
     const total: u16 = segsWidth(segs);
@@ -4808,11 +5441,11 @@ fn drawUsageColumn(p: *Painter, row: u16, width: u16, segs: []const InfoSeg, res
     }
 }
 
-/// Anchcho en COLUMNAS de un grupo de segmentos del status.
+/// Width in COLUMNS of a group of status segments.
 ///
-/// Se mide con el iterador de graphemes y no con `.len`: `⚡` son 3 bytes para 1
-/// columna, así que alinear por bytes descentra la fila entera. Esta función
-/// la usan las dos columnas, y tienen que medir IGUAL o se pisan.
+/// Measured with the grapheme iterator and not with `.len`: `⚡` is 3 bytes for 1
+/// column, so aligning by bytes throws the whole row off center. Both columns
+/// use this function, and they have to measure IDENTICALLY or they overlap.
 fn segsWidth(segs: []const InfoSeg) u16 {
     var total: u16 = 0;
     for (segs) |sg| {
@@ -4936,7 +5569,7 @@ pub fn drawTest(model: *Model, arena: std.mem.Allocator, w: u16, h: u16) !vxfw.S
     });
 }
 
-test "render: un párrafo de info se ve en la fila 0" {
+test "render: an info paragraph shows up on row 0" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4952,7 +5585,7 @@ test "render: un párrafo de info se ve en la fila 0" {
     try std.testing.expectEqualStrings("\u{b7} hola mundo", std.mem.trim(u8, row0, " "));
 }
 
-test "render: graphemes multibyte salen íntegros (no byte a byte)" {
+test "render: multibyte graphemes come out whole (not byte by byte)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4970,7 +5603,7 @@ test "render: graphemes multibyte salen íntegros (no byte a byte)" {
     );
 }
 
-test "render: el stream en vivo se ve antes de streamEnd" {
+test "render: the live stream is visible before streamEnd" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4994,7 +5627,7 @@ test "render: el stream en vivo se ve antes de streamEnd" {
     try std.testing.expectEqualStrings("\u{25c6} parcial", std.mem.trim(u8, row0b, " "));
 }
 
-test "render: el texto largo hace wrap sin perder caracteres" {
+test "render: long text wraps without losing characters" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5018,8 +5651,16 @@ test "render: el texto largo hace wrap sin perder caracteres" {
     var row: u16 = 0;
     while (row < history_rows) : (row += 1) {
         const line = std.mem.trim(u8, rowText(s, row, &buf), " ");
-        // the first line carries the "· " prefix in front of the text
-        const body = if (row == 0 and line.len > 0) line[2..] else line;
+        // The first row carries the "· " prefix in front of the text and every
+        // continuation row carries the gutter bar. `│ ` is FOUR bytes for two
+        // columns, so it is skipped by finding the space after the bar and not by
+        // counting bytes.
+        var body = line;
+        if (row == 0 and line.len > 0) {
+            body = line[2..];
+        } else if (std.mem.startsWith(u8, line, "\u{2502} ")) {
+            body = line[std.mem.indexOfScalar(u8, line, ' ').? + 1 ..];
+        }
         for (body) |c| {
             if (c != ' ') acc.append(std.testing.allocator, c) catch {};
         }
@@ -5027,7 +5668,7 @@ test "render: el texto largo hace wrap sin perder caracteres" {
     try std.testing.expectEqualStrings(msg, acc.items);
 }
 
-test "render: el status y el separador ocupan las filas de abajo" {
+test "render: the status and the separator take the bottom rows" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5053,7 +5694,7 @@ test "render: el status y el separador ocupan las filas de abajo" {
     try std.testing.expect(std.mem.indexOf(u8, st, "ready") != null);
 }
 
-test "render: tool blocks usan ⏺/⎿ y el resultado se despliega" {
+test "render: tool blocks use ⏺/⎿ and the result expands" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5095,14 +5736,14 @@ test "render: tool blocks usan ⏺/⎿ y el resultado se despliega" {
     try std.testing.expect(findRow(s3, "Read 1006 lines") != null);
 }
 
-test "toggleLastTool sin tool previa no hace nada" {
+test "toggleLastTool with no previous tool does nothing" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     m.pushInfo("solo info");
     try std.testing.expect(!m.toggleLastTool());
 }
 
-test "input: caja con borde, prompt y placeholder" {
+test "input: box with border, prompt and placeholder" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -5126,7 +5767,7 @@ test "input: caja con borde, prompt y placeholder" {
     try std.testing.expectEqualStrings("\u{2570}\u{2500}", std.mem.trim(u8, bot, " ")[0..6]);
 }
 
-test "input: multilínea crece la caja y muestra ambas líneas" {
+test "input: multiline grows the box and shows both lines" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -5149,7 +5790,87 @@ test "input: multilínea crece la caja y muestra ambas líneas" {
     try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 4, &b3), "tercera") != null);
 }
 
-test "autocompletado: filtra por prefijo y acepta con tab" {
+test "input: a long line WRAPS inside the box and no character is lost" {
+    // THE bug: the box was sized from `displayLines` (which counts soft wraps)
+    // and the paint split on `\n` only, handing one very long line to `putText`,
+    // which clips at the TERMINAL edge. So the box grew to eight rows, the text
+    // stayed in the first one running off the right, and everything past the
+    // border was dropped with no ellipsis and no word: the user could not see
+    // what they had typed.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.ed.insert("el cielo gris de la manana sobre el puerto viejo") catch {};
+
+    const s = try drawTest(&m, arena_state.allocator(), 40, 16);
+
+    // The start and the END of the sentence are both on screen: the tail used to
+    // be the part that vanished.
+    const r1 = findRow(s, "el cielo gris") orelse return error.TestUnexpectedResult;
+    const r2 = findRow(s, "puerto viejo") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 1), r2 - r1);
+    // And nothing spilled past the right border of the box.
+    var buf: [128]u8 = undefined;
+    for ([_]u16{ r1, r2 }) |row| {
+        const t = rowText(s, row, &buf);
+        try std.testing.expect(std.mem.lastIndexOfScalar(u8, t, ' ') != null);
+        try std.testing.expect(std.mem.indexOf(u8, t, "│") != null);
+    }
+}
+
+test "input: a wrapped line fills several rows and the cursor stays INSIDE the box" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.ed.insert("a" ** 200) catch {};
+
+    const w: u16 = 40;
+    const h: u16 = 20;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    const rows = m.ed.displayLines(w - 3, testEditorMeasurer());
+    try std.testing.expect(rows >= 4);
+    const input_h: u16 = @min(rows, 8);
+    const top = h - 4 - input_h;
+
+    // Several rows of the box carry text, not just the first one.
+    var filled: usize = 0;
+    var row: u16 = top + 1;
+    while (row < top + 1 + input_h) : (row += 1) {
+        var buf: [128]u8 = undefined;
+        if (std.mem.indexOf(u8, rowText(s, row, &buf), "aaaa") != null) filled += 1;
+    }
+    try std.testing.expect(filled >= 4);
+
+    // And the caret is a real cell inside the box. It used to be anchored at
+    // `2 + width of everything before it`, i.e. column 74 of a 40-wide terminal,
+    // so it simply disappeared.
+    const cur = s.cursor orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cur.col < w - 1);
+    try std.testing.expect(cur.row >= top + 1);
+    try std.testing.expect(cur.row < h - 3);
+}
+
+test "input: rows scrolled out above are announced instead of silently hidden" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) m.ed.insert("linea ") catch {};
+
+    const s = try drawTest(&m, arena_state.allocator(), 40, 14);
+    // A box full of the middle of what you typed looks exactly like a box with
+    // all of it, so the count of what is hidden has to be on the border.
+    try std.testing.expect(findRow(s, "more") != null);
+}
+
+test "autocomplete: filters by prefix and accepts with tab" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -5199,7 +5920,7 @@ test "autocompletado: filtra por prefijo y acepta con tab" {
     try std.testing.expectEqualStrings("/model ", m.ed.text());
 }
 
-test "autocompletado: no se ofrece con espacios ni sin barra" {
+test "autocomplete: not offered with spaces nor without the slash" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -5218,7 +5939,7 @@ test "autocompletado: no se ofrece con espacios ni sin barra" {
     try std.testing.expect(!m.ac.active);
 }
 
-test "fileQueryAt: el token @ bajo el cursor, y un correo no es una mención" {
+test "fileQueryAt: the @ token under the cursor, and an email is not a mention" {
     // PURE: this is the logic `refreshFileMatches` keys off, and it has to
     // agree with `mentions.scan` (the thing that later parses the prompt).
     const q = fileQueryAt("revisa @src/edi", 15).?;
@@ -5238,7 +5959,7 @@ test "fileQueryAt: el token @ bajo el cursor, y un correo no es una mención" {
     try std.testing.expect(fileQueryAt("hola mundo", 10) == null);
 }
 
-test "autocompletado de @: modo file activo y aceptación reemplaza solo el token" {
+test "@ autocomplete: file mode is active and accepting replaces only the token" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -5259,25 +5980,23 @@ test "autocompletado de @: modo file activo y aceptación reemplaza solo el toke
     try std.testing.expectEqualStrings("b", acPrefix(&m).?);
 }
 
-test "editor.deleteRange: reemplaza un rango y deja el cursor al inicio" {
-    var ed = @import("lib/editor.zig").Editor.init(std.testing.allocator);
-    defer ed.deinit();
+test "editor.deleteRange: replaces a range and leaves the cursor at the start" {
+    var editor_ = ed.Editor.init(std.testing.allocator);
+    defer editor_.deinit();
 
-    ed.insert("revisa @abc y sigue") catch {};
-    const end = ed.cursor;
-    _ = end;
+    editor_.insert("revisa @abc y sigue") catch {};
     // Replace the token `abc` (offsets 8..11) with `zzz`.
-    try ed.deleteRange(8, 11);
-    ed.setCursor(8);
-    try ed.insert("zzz");
-    try std.testing.expectEqualStrings("revisa @zzz y sigue", ed.text());
-    try std.testing.expectEqual(@as(usize, 11), ed.cursor);
+    try editor_.deleteRange(8, 11);
+    editor_.setCursor(8);
+    try editor_.insert("zzz");
+    try std.testing.expectEqualStrings("revisa @zzz y sigue", editor_.text());
+    try std.testing.expectEqual(@as(usize, 11), editor_.cursor);
 
     // Out of range is an error, not a panic.
-    try std.testing.expectError(error.BadRange, ed.deleteRange(0, ed.text().len + 1));
+    try std.testing.expectError(error.BadRange, editor_.deleteRange(0, editor_.text().len + 1));
 }
 
-test "input: el cursor se ancla en la posición real" {
+test "input: the cursor is anchored at the real position" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -5296,7 +6015,7 @@ test "input: el cursor se ancla en la posición real" {
     try std.testing.expectEqual(@as(u16, 5), s2.cursor.?.col);
 }
 
-test "diff: pushDiff pinta líneas -/+ tras el resultado de la tool" {
+test "diff: pushDiff paints -/+ lines after the tool result" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -5340,7 +6059,7 @@ test "diff: pushDiff pinta líneas -/+ tras el resultado de la tool" {
     try std.testing.expect(std.mem.indexOf(u8, all, " uno") != null); // context
 }
 
-test "diff: sin cambios no añade párrafos" {
+test "diff: no changes adds no paragraphs" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -5354,7 +6073,7 @@ test "diff: sin cambios no añade párrafos" {
     try std.testing.expect(std.mem.indexOf(u8, row0, "+") == null);
 }
 
-test "cabecera: el wordmark y los comandos van en el azul brillante" {
+test "header: the wordmark and the commands are in the bright blue" {
     // The brightness falls INSIDE the art (`*zode*`), not on a whole line: that
     // is what makes the ASCII art look like a logo and not a block of text.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5369,7 +6088,7 @@ test "cabecera: el wordmark y los comandos van en el azul brillante" {
     try std.testing.expectEqualStrings("  \\:\\", segs[2].text);
 }
 
-test "cabecera: los asteriscos son marcas, no se pierden caracteres" {
+test "header: asterisks are marks, no characters are lost" {
     // Project invariant: concatenating the segments gives the text WITHOUT the
     // marks. If a byte is lost or duplicated, the art comes out misaligned.
     //
@@ -5413,7 +6132,7 @@ fn expectMarksAreOnlyMarks(arena: std.mem.Allocator, line: []const u8, checked: 
     try std.testing.expectEqualStrings(expected.items, joined.items);
 }
 
-test "cabecera: un asterisco sin pareja no se come texto" {
+test "header: an unpaired asterisk does not eat text" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5425,7 +6144,7 @@ test "cabecera: un asterisco sin pareja no se come texto" {
     try std.testing.expectEqualStrings("5 * 3 = 15", joined.items);
 }
 
-test "status: los segmentos son texto vivo y completo" {
+test "status: the segments are live, whole text" {
     // Regression: with `bufPrint` over a STACK buffer, "(med)" and "ctx N%"
     // were left dangling (the slice is read at paint time, already outside the
     // function) and the status was cut in half with a broken character. Here it
@@ -5451,7 +6170,7 @@ test "status: los segmentos son texto vivo y completo" {
     try std.testing.expect(found);
 }
 
-test "status: la fila de status cabe y no se corta" {
+test "status: the status row fits and is not cut" {
     // The visible symptom of the dangling pointer was the row cut with a
     // half UTF-8 character at the right edge.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5472,7 +6191,7 @@ test "status: la fila de status cabe y no se corta" {
     try std.testing.expect(std.mem.indexOf(u8, row, "opencode") != null);
 }
 
-test "status: ctxColor cambia en los umbrales de compaction" {
+test "status: ctxColor changes at the compaction thresholds" {
     // 80% is exactly where compaction starts (budget = 80% of the limit).
     try std.testing.expectEqual(theme.ok.fg, theme.ctxColor(0).fg);
     try std.testing.expectEqual(theme.ok.fg, theme.ctxColor(49).fg);
@@ -5482,7 +6201,7 @@ test "status: ctxColor cambia en los umbrales de compaction" {
     try std.testing.expectEqual(theme.err.fg, theme.ctxColor(100).fg);
 }
 
-test "cabecera: la línea de Zo lleva la carita en el color del mood" {
+test "header: Zo's line carries the face in the mood's color" {
     // A single paragraph: face + text. If they were split in two, the face
     // was left on a loose line above the message.
     const segs = try md.inlineSegmentsBase(
@@ -5501,7 +6220,7 @@ test "cabecera: la línea de Zo lleva la carita en el color del mood" {
     try std.testing.expectEqualStrings("  hola", segs[1].text);
 }
 
-test "cabecera: las marcas ~ no se comen texto" {
+test "header: the ~ marks do not eat text" {
     // Same as the `*`: if a mark is left unpaired, it is normal text.
     const segs = try md.inlineSegments(std.testing.allocator, "a ~ sin cerrar", .banner);
     defer std.testing.allocator.free(segs);
@@ -5511,47 +6230,207 @@ test "cabecera: las marcas ~ no se comen texto" {
     try std.testing.expectEqualStrings("a ~ sin cerrar", joined.items);
 }
 
-test "scrollBy: la rueda no desborda al bajar del todo" {
+test "scrollBy: the wheel cannot underflow at the top" {
     // Regression: the wheel did `self.scroll -= 3` on a `usize`, and with the
     // scroll at 0 that underflows -> panic -> the app dies when scrolling down
     // while at the top. A key fuzzer found it by sending `\x1b[<65;…M` twice.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    m.scrollBy(-3); // at 0: it cannot go negative
-    try std.testing.expectEqual(@as(usize, 0), m.scroll);
-    m.scrollBy(-1);
-    try std.testing.expectEqual(@as(usize, 0), m.scroll);
+    // A real history, so there is a real `max_offset` to clamp against. The
+    // model with an empty history has `max_offset == 0` and would pass this
+    // test while the bug was still there.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) m.pushInfo("linea de historia");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    const bottom = m.max_offset;
+    try std.testing.expect(bottom > 0);
 
-    m.scrollBy(7);
-    try std.testing.expectEqual(@as(usize, 7), m.scroll);
+    // At the bottom, scrolling DOWN cannot go past the end of the history.
     m.scrollBy(-3);
-    try std.testing.expectEqual(@as(usize, 4), m.scroll);
-    m.scrollBy(-100);
-    try std.testing.expectEqual(@as(usize, 0), m.scroll);
+    try std.testing.expectEqual(bottom, m.first_visible);
+    m.scrollBy(-1);
+    try std.testing.expectEqual(bottom, m.first_visible);
 
-    // And scrolling up doesn't blow past the cap either.
+    // `n > 0` is UP, and up means `first` goes DOWN (it is the top line on
+    // screen).
+    m.scrollBy(7);
+    try std.testing.expectEqual(bottom - 7, m.first_visible);
+    m.scrollBy(-3);
+    try std.testing.expectEqual(bottom - 4, m.first_visible);
+    m.scrollBy(-100);
+    try std.testing.expectEqual(bottom, m.first_visible);
+
+    // And scrolling up does not blow past the top either.
     m.scrollBy(100_000);
-    m.scrollBy(100_000);
-    try std.testing.expect(m.scroll <= 1_000_000);
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expectEqual(@as(usize, 0), m.first_visible);
+    try std.testing.expect(m.anchor <= m.max_offset);
 }
 
-test "cmdGroup-like: una key vacía no revienta" {
+test "scroll: overscrolling up leaves no debt, so one PageDown really scrolls down" {
+    // THE bug, with its numbers.
+    //
+    // `scroll` was a distance from the bottom, `computeVisible` clamped a LOCAL
+    // copy for drawing and never wrote it back, and `scrollBy` only clamped to
+    // the `1_000_000` constant. So the offset could sit far above `max_offset`
+    // with nothing moving on screen: PageDown then subtracted from a number that
+    // was already past the top, and the first N presses did nothing at all.
+    //
+    // 50-row terminal -> `history_h` 43, `page` 42. Short history that fits:
+    // `max_offset` 0. 8 PageUps -> 336. The first SIX PageDowns move nothing
+    // and the seventh jumps.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) m.pushInfo("linea");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expect(m.max_offset > 0);
+
+    // WAY past the top, the way holding PageUp does with auto-repeat.
+    m.scrollBy(10_000);
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expectEqual(@as(usize, 0), m.first_visible);
+
+    // ONE half page DOWN and the view moves. Not 6 presses, not 112 notches.
+    m.scrollBy(-10);
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expectEqual(@as(usize, 10), m.first_visible);
+
+    // And what the status bar would say matches what is actually hidden below.
+    try std.testing.expectEqual(m.max_offset - 10, m.max_offset - m.first_visible);
+}
+
+test "scroll: reading is not dragged away by the text that arrives" {
+    // `first` used to be `max_offset - scroll`: also relative to the bottom, so
+    // every new line moved `max_offset` and therefore the window, while `scroll`
+    // stayed put. Reading 200 lines up while the model writes meant the text you
+    // were reading slid off the top at the model's writing speed.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) m.pushInfo("linea");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+
+    m.scrollBy(20); // read something above the bottom
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    const held = m.first_visible;
+    try std.testing.expect(!m.follow_bottom);
+    try std.testing.expect(held < m.max_offset);
+
+    // New closed paragraphs arrive.
+    var j: usize = 0;
+    while (j < 20) : (j += 1) m.pushInfo("linea nueva");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expectEqual(held, m.first_visible);
+
+    // And the LIVE paragraph growing, which is the continuous version of the
+    // same bug: `computeVisible` takes the live height, so the window used to
+    // move once per rendered line, on every frame.
+    m.streamStart();
+    var k: usize = 0;
+    while (k < 12) : (k += 1) {
+        var buf: [64]u8 = undefined;
+        m.streamDelta(std.fmt.bufPrint(&buf, "respuesta en vivo numero {d}", .{k}) catch "x");
+        _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+        try std.testing.expectEqual(held, m.first_visible);
+    }
+    m.streamEnd();
+}
+
+test "scroll: at the bottom, new text still follows you down" {
+    // The other half of stickiness: the fix for the drift must not turn the
+    // view into a fixed window.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) m.pushInfo("linea");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    const before = m.first_visible;
+    try std.testing.expectEqual(m.max_offset, before);
+
+    var j: usize = 0;
+    while (j < 20) : (j += 1) m.pushInfo("linea nueva");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expect(m.first_visible > before);
+    try std.testing.expectEqual(m.max_offset, m.first_visible);
+
+    // Scrolling back to the bottom re-arms it, instead of it needing a resize
+    // to notice.
+    m.scrollBy(15);
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    var k: usize = 0;
+    while (k < 40) : (k += 1) m.scrollBy(-5);
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expect(m.follow_bottom);
+}
+
+test "scroll: a resize keeps the anchor instead of jumping to the banner" {
+    // `clearSegCache` empties `para_heights` on every width change, so the
+    // heights have to be re-estimated. For a COMPRESSED paragraph the estimate
+    // comes from its text, which is base64 with no newlines: 1 line for a
+    // paragraph that takes 40. The total collapsed, `max_offset` with it, and
+    // the view jumped thousands of lines up. `measured_lines` (in the paragraph,
+    // not in the list that the resize empties) is what fixes it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const big = try a.alloc(u8, 16 * 1024);
+    for (big, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) m.pushKind(.tool_res, big);
+    _ = try drawTest(&m, arena_state.allocator(), 100, 40);
+    try std.testing.expect(m.max_offset > 0);
+
+    m.scrollBy(30);
+    _ = try drawTest(&m, arena_state.allocator(), 100, 40);
+    const held = m.first_visible;
+    try std.testing.expect(!m.follow_bottom);
+
+    // Narrower terminal: everything re-wraps, every height is thrown away.
+    _ = try drawTest(&m, a, 40, 40);
+    try std.testing.expectEqual(held, m.first_visible);
+    try std.testing.expect(m.anchor <= m.max_offset);
+    try std.testing.expect(!m.layout_overflow);
+}
+
+test "cmdGroup-like: an empty key does not blow up" {
     // `key[1..]` over a []const u8 of len 0 is a panic in Zig 0.16, not an
     // empty slice. The palette's grouping called it with the key as-is.
     const empty: []const u8 = "";
-    try std.testing.expectEqual(@as(u8, 4), agent.cmdGroupPublic(empty));
+    // 5 = "Session", the fallback.
+    try std.testing.expectEqual(@as(u8, 5), agent.cmdGroupPublic(empty));
     try std.testing.expectEqual(@as(u8, 2), agent.cmdGroupPublic("/help"));
-    try std.testing.expectEqual(@as(u8, 3), agent.cmdGroupPublic("/model"));
+    try std.testing.expectEqual(@as(u8, 4), agent.cmdGroupPublic("/model"));
+    // `/free-auto` has a group of its own, next to the top: it is not something
+    // you should have to hunt for at the bottom of a list of twenty commands.
+    try std.testing.expectEqual(@as(u8, 3), agent.cmdGroupPublic("/free-auto"));
+    try std.testing.expectEqual(@as(u8, 3), agent.cmdGroupPublic("/free"));
     // The header item of the palette.
     try std.testing.expectEqual(@as(u8, 1), agent.cmdGroupPublic("connect"));
     // Works without the leading slash too: `key[1..]` eats an arbitrary
     // character if you don't check, not just the slash.
     try std.testing.expectEqual(@as(u8, 2), agent.cmdGroupPublic("help"));
-    try std.testing.expectEqual(@as(u8, 4), agent.cmdGroupPublic("nope"));
+    try std.testing.expectEqual(@as(u8, 5), agent.cmdGroupPublic("nope"));
 }
 
-test "autocompletado: /model manda /model y no completa a /models" {
+test "autocomplete: /model sends /model and does not complete to /models" {
     // Regression: the exact match was only looked for against the highlighted
     // item, and the popup sorted "/models" before "/model". Typing "/model"
     // and pressing Enter ended up sending "/models", which is a different
@@ -5582,7 +6461,7 @@ test "autocompletado: /model manda /model y no completa a /models" {
     try std.testing.expect(!isExactMatch(&m));
 }
 
-test "autocompletado: /help con Enter envía en vez de reescribir" {
+test "autocomplete: /help with Enter sends instead of rewriting" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     m.ed.clear();
@@ -5592,7 +6471,7 @@ test "autocompletado: /help con Enter envía en vez de reescribir" {
     try std.testing.expect(isExactMatch(&m));
 }
 
-test "waitWorkers: espera a que los workers terminen" {
+test "waitWorkers: waits for the workers to finish" {
     // The counter is what stops `io` from being destroyed with a worker inside
     // `io.async` (segfault in `Threaded.cancelThreads` on exit).
     var m = Model.init(std.testing.allocator);
@@ -5612,7 +6491,7 @@ test "waitWorkers: espera a que los workers terminen" {
     m.waitWorkers(10);
 }
 
-test "waitWorkers: con el tope de tiempo no se cuelga" {
+test "waitWorkers: with the time cap it does not hang" {
     // A worker stuck on the network cannot leave the app unable to ever exit.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
@@ -5622,7 +6501,7 @@ test "waitWorkers: con el tope de tiempo no se cuelga" {
     m.endWorker();
 }
 
-test "cola: encola, saca en orden y libera" {
+test "queue: enqueues, takes in order and frees" {
     // Without a queue, sending a second prompt while the first one worked
     // launched ANOTHER worker and the two fought over the session and the
     // streaming state: the input froze and there was no way to tell whether it
@@ -5648,7 +6527,7 @@ test "cola: encola, saca en orden y libera" {
     try std.testing.expect(m.takeQueued() == null);
 }
 
-test "cola: clearQueue libera lo que quede" {
+test "queue: clearQueue frees whatever is left" {
     // If a text stays in the queue on exit and is not freed, it is a leak on
     // every exit with pending prompts.
     var m = Model.init(std.testing.allocator);
@@ -5659,7 +6538,7 @@ test "cola: clearQueue libera lo que quede" {
     try std.testing.expectEqual(@as(usize, 0), m.queuedCount());
 }
 
-test "franja de actividad: con trabajo y con cola" {
+test "activity strip: with work and with a queue" {
     // The strip is what answers "is it working or is it stuck?": the face, the
     // state and the seconds. Without it there was only a tiny spinner.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5681,7 +6560,7 @@ test "franja de actividad: con trabajo y con cola" {
     try std.testing.expect(std.mem.indexOf(u8, all, "en cola") != null);
 }
 
-test "franja de actividad: la etiqueta es la fase" {
+test "activity strip: the label is the phase" {
     // The four phases have to say THEIR name. It is the feedback change that
     // was asked for: with "working" everywhere, a slow turn and a hung `bash`
     // were lived as the same thing.
@@ -5725,7 +6604,7 @@ test "franja de actividad: la etiqueta es la fase" {
     }
 }
 
-test "franja de actividad: pide permiso cuando toca" {
+test "activity strip: asks for permission when it is due" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -5738,7 +6617,7 @@ test "franja de actividad: pide permiso cuando toca" {
     m.perm_active = false;
 }
 
-test "status: tokens y contexto siempre visibles" {
+test "status: tokens and context are always visible" {
     // Before, the ctx% only showed if it was > 0, that is, after a whole turn,
     // and at the start nothing was visible: it looked like the counter did not
     // exist.
@@ -5784,7 +6663,7 @@ fn hasBlankRowBetween(s: vxfw.Surface, first: []const u8, second: []const u8) bo
     return false;
 }
 
-test "historial: los párrafos van separados con una fila en blanco" {
+test "history: paragraphs are separated with a blank row" {
     // Without this the history is a wall of text and you can't see where one
     // response ends and another begins.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5803,7 +6682,7 @@ test "historial: los párrafos van separados con una fila en blanco" {
     try std.testing.expect(hasBlankRowBetween(s, "primera", "segunda"));
 }
 
-test "permisos: el modal es centrado y muestra las 4 opciones" {
+test "permissions: the modal is centered and shows the 4 options" {
     // It is what blocks the turn: if you can't see it, the app looks HUNG.
     // Before it was 4 lines glued to the input, half covered by the history.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5832,7 +6711,7 @@ test "permisos: el modal es centrado y muestra las 4 opciones" {
     m.perm_active = false;
 }
 
-test "la carita del status va en el color de su mood, no en el gris del status" {
+test "the status face is in its mood's color, not in the status gray" {
     // The complaint was literal: "you can't tell by the color". The status row
     // goes out in SEGMENTS precisely for that: the face in the mood's color and
     // the text in the dim blue. With a single string everything came out the
@@ -5903,11 +6782,11 @@ fn plainColumns(gpa: std.mem.Allocator, line: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-test "banner: una REGLA lo separa del primer prompt (no una fila en blanco)" {
-    // Bug 4: el logo y el primer prompt del usuario se leian como un solo bloque.
-    // Una fila vacia no lo arregla cuando encima hay un dibujo de 5 filas y debajo
-    // estan las palabras del usuario: el prompt parece la ultima linea del logo.
-    // Una regla lo dice sin gastar dos filas mas en blanco.
+test "banner: a RULE separates it from the first prompt (not a blank row)" {
+    // Bug 4: the logo and the user's first prompt read as a single block.
+    // A blank row does not fix it when there is a 5-row drawing above and the
+    // user's words below: the prompt looks like the last line of the logo.
+    // A rule says so without spending two more rows on blank.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -5918,16 +6797,16 @@ test "banner: una REGLA lo separa del primer prompt (no una fila en blanco)" {
     const surf = try drawTest(&m, arena_state.allocator(), 72, 20);
     var rb: [256]u8 = undefined;
 
-    // La regla va justo debajo del arte (que son `banner_art_height` filas).
+    // The rule goes right below the art (which is `banner_art_height` rows).
     const rule_row = rowText(surf, mascot.banner_art_height, &rb);
     const trimmed = std.mem.trim(u8, rule_row, " ");
     try std.testing.expect(trimmed.len > 0);
-    // Solo `─`: una fila con la regla y algo mas seria un error de layout, no una
-    // separacion (y es lo que pasaria si el `w` del run se truncase a 255
-    // columnas en una terminal ancha).
+    // Only `─`: a row with the rule plus anything else would be a layout error,
+    // not a separator (and that is what would happen if the run's `w` got
+    // truncated to 255 columns on a wide terminal).
     //
-    // `rowText` devuelve BYTES, y `─` son 3, asi que la fila son varios de esos
-    // triplets y nada mas.
+    // `rowText` returns BYTES, and `─` is 3, so the row is several of those
+    // triplets and nothing else.
     const rule_bytes = "\xe2\x94\x80";
     try std.testing.expect(trimmed.len % 3 == 0);
     try std.testing.expect(trimmed.len > 0);
@@ -5935,20 +6814,20 @@ test "banner: una REGLA lo separa del primer prompt (no una fila en blanco)" {
     while (at < trimmed.len) : (at += 3) {
         try std.testing.expectEqualStrings(rule_bytes, trimmed[at..][0..3]);
     }
-    // Y ocupa de verdad el ancho de la historia: una regla de tres columnas
-    // separaria igual de mal que una fila en blanco. El ancho exacto lo decide
-    // `drawLines` (que recorta al ancho de la historia), asi que se fija un suelo
-    // y no un numero exacto.
+    // And it really spans the width of the history: a three-column rule separates
+    // just as badly as a blank row. The exact width is decided by `drawLines`
+    // (which crops to the history's width), so a floor is set here and not an
+    // exact number.
     const rule_cols = trimmed.len / 3;
     try std.testing.expect(rule_cols >= 60);
     try std.testing.expect(rule_cols <= 72);
 
-    // Y el prompt va DEBAJO, no pegado al logo.
+    // And the prompt goes BELOW, not stuck to the logo.
     const prompt_row = rowText(surf, mascot.banner_art_height + 1, &rb);
     try std.testing.expect(std.mem.indexOf(u8, prompt_row, "hola, quiero una pagina") != null);
 }
 
-test "el banner es SOLO el wordmark ZODE, sin filas en blanco entre lineas" {
+test "the banner is ONLY the ZODE wordmark, with no blank rows between lines" {
     // ASCII art split into paragraphs put a blank row between the letters and
     // the logo was read in pieces. The header goes without a separator.
     //
@@ -5972,11 +6851,15 @@ test "el banner es SOLO el wordmark ZODE, sin filas en blanco entre lineas" {
     m.pushHeader(.idle);
 
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
+    // The `D` has its right stroke one column further out (`##   #`) and the `E`
+    // has its crossbar (`###`). It is what makes `O` and `D` different letters at
+    // a glance instead of the same box twice, which is the whole point of the
+    // wordmark. These rows are what the glyph table in `mascot.zig` composes.
     const art = [_][]const u8{
         "######  ####  ####   ######",
-        "##  ## ##  ## ##  ## ##",
-        "   ##  ##  ## ##  ## ##",
-        "  ##   ##  ## ##  ## ##",
+        "##  ## ##  ## ##   # ##",
+        "   ##  ##  ## ##   # ###",
+        "  ##   ##  ## ##   # ##",
         "######  ####  ####   ######",
     };
     var rb: [512]u8 = undefined;
@@ -6020,6 +6903,31 @@ test "el banner es SOLO el wordmark ZODE, sin filas en blanco entre lineas" {
     try std.testing.expectEqual(mascot.banner_art_height, rows);
 }
 
+/// A `DrawContext` that measures graphemes with the compiled tables, for the
+/// tests that need the input's wrap without a live Painter.
+const test_draw_ctx: vxfw.DrawContext = .{
+    .arena = std.heap.page_allocator,
+    .min = .{},
+    .max = .{},
+    .cell_size = .{},
+};
+
+fn testEditorMeasurer() ed.Measurer {
+    return .{
+        .ctx = @ptrCast(&test_draw_ctx),
+        .step = struct {
+            fn f(c: *const anyopaque, text: []const u8, i: usize) ed.Step {
+                const p_ctx: *const vxfw.DrawContext = @ptrCast(@alignCast(c));
+                const rest = text[i..];
+                var it = vaxis.unicode.graphemeIterator(rest);
+                const g = it.next() orelse return .{ .cols = 1, .end = text.len };
+                const b = g.bytes(rest);
+                return .{ .cols = theme.graphemeWidth(p_ctx.*, b), .end = i + b.len };
+            }
+        }.f,
+    };
+}
+
 /// A fake `EventContext` for the palette's keys.
 ///
 /// `io` and `cmds` are not touched on these paths (the handler sets the redraw
@@ -6030,7 +6938,7 @@ fn testCtx() vxfw.EventContext {
     return .{ .io = undefined, .alloc = std.testing.allocator, .cmds = .empty };
 }
 
-test "elegir un comando en la paleta lo EJECUTA (no lo manda al input)" {
+test "picking a command in the palette EXECUTES it (not puts it in the input)" {
     // Picking a command from a list is already the confirmation. Before, the
     // palette closed, the label was written into the input and one more Enter
     // was needed: one step too many, and since the input was left half-done it
@@ -6070,7 +6978,7 @@ test "elegir un comando en la paleta lo EJECUTA (no lo manda al input)" {
     try std.testing.expect(found);
 }
 
-test "/effort sin argumentos abre el picker (no contesta 'unknown effort')" {
+test "/effort with no args opens the picker (no 'unknown effort')" {
     // `it.rest()` returns `""` (not `null`) for "/effort", and with an empty
     // slice the `else` of "low|medium|high" swallowed the case: it answered
     // "unknown effort:  (low|medium|high)" and the picker never opened.
@@ -6080,7 +6988,7 @@ test "/effort sin argumentos abre el picker (no contesta 'unknown effort')" {
     try std.testing.expect(m.pickerActive());
 }
 
-test "un comando que necesita argumentos vuelve al input (no se ejecuta a ciegas)" {
+test "a command that needs arguments goes back to the input (not run blindly)" {
     // `/use provider model` cannot run without arguments: running it blindly
     // would leave the agent on some arbitrary provider. Those go to the input
     // with the slash in place, which is what whoever picks them wants.
@@ -6102,7 +7010,7 @@ test "un comando que necesita argumentos vuelve al input (no se ejecuta a ciegas
     try std.testing.expectEqualStrings("/use ", m.ed.text());
 }
 
-test "streamEnd vacía pending ANTES de fijar el párrafo (si no, el texto sale encima de la tool)" {
+test "streamEnd empties pending BEFORE setting the paragraph (else the text lands on top of the tool)" {
     // Regression: `pushToolStart`/`pushToolDone` enqueue into `pending`, and
     // `pending` is drained on the next draw. `streamEnd` put the assistant's
     // paragraph into `paras` without emptying `pending`, so the text ended up
@@ -6135,7 +7043,7 @@ test "streamEnd vacía pending ANTES de fijar el párrafo (si no, el texto sale 
     try std.testing.expectEqualStrings("despues", m.paras.items[3].text);
 }
 
-test "streamEnd NO toca paras: se encola (si no, el worker realloca bajo la UI)" {
+test "streamEnd does NOT touch paras: it enqueues (else the worker reallocs under the UI)" {
     // The invariant that keeps a hard crash away. `paras` is the array the draw
     // walks EVERY FRAME without taking the lock; appending to it from the
     // worker reallocates `items` and frees the buffer the draw is reading. It
@@ -6161,7 +7069,7 @@ test "streamEnd NO toca paras: se encola (si no, el worker realloca bajo la UI)"
     try std.testing.expectEqualStrings("hola", m.paras.items[0].text);
 }
 
-test "la cabecera de una tool marca el nombre para que el parser lo resalte" {
+test "a tool header marks the name so the parser highlights it" {
     // `*write*(hola.js)`: the name in the tool's bright color and the argument
     // in the dim one. Without the mark they came out the same cyan and were
     // indistinguishable. The marks are removed at paint time: the row never
@@ -6178,7 +7086,7 @@ test "la cabecera de una tool marca el nombre para que el parser lo resalte" {
     try std.testing.expect(std.mem.indexOfScalar(u8, all, '*') == null);
 }
 
-test "una tool en curso pinta su reloj, y al terminar desaparece" {
+test "a running tool paints its clock, and it disappears when it ends" {
     // Without this, a 30s `bash` leaves the last row frozen at
     // `⏺ bash(...)`: there is no way to tell if the process is still alive or
     // if the app has hung. The clock is the only thing that answers "is it
@@ -6213,7 +7121,7 @@ test "una tool en curso pinta su reloj, y al terminar desaparece" {
     try std.testing.expect(std.mem.indexOf(u8, all2, "30000ms") != null);
 }
 
-test "la franja dice la fase: pensando, transmitiendo o corriendo una tool" {
+test "the strip names the phase: thinking, streaming or running a tool" {
     // "working" does not distinguish thinking from writing from a hung bash, and
     // only `streaming` was distinguished. Here each phase's branch is checked.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6247,7 +7155,7 @@ test "la franja dice la fase: pensando, transmitiendo o corriendo una tool" {
     }
 }
 
-test "la franja de permiso se ve con el turno abierto" {
+test "the permission strip shows with the turn open" {
     // The strip only shows if there is something to report, and a permission
     // dialog without a turn does not happen: the worker asks from inside a turn.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6262,7 +7170,7 @@ test "la franja de permiso se ve con el turno abierto" {
     m.perm_active = false;
 }
 
-test "con el turno abierto pero sin texto hay una línea en vivo con el reloj" {
+test "with the turn open but no text there is a live line with the clock" {
     // The gap between "Enter" and the first token is seconds, and before the
     // history had NOTHING live there: the last dot was your prompt.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6279,7 +7187,7 @@ test "con el turno abierto pero sin texto hay una línea en vivo con el reloj" {
     try std.testing.expect(std.mem.indexOf(u8, all, "· 0.0s") != null);
 }
 
-test "en reposo el historial no inventa una línea en vivo" {
+test "at idle the history does not invent a live line" {
     // The placeholder only shows if there is a turn: otherwise, the last
     // paragraph of a fresh session would be "thinking · 0.0s" without having
     // written anything.
@@ -6297,7 +7205,7 @@ test "en reposo el historial no inventa una línea en vivo" {
 // These tests pin down behaviors whose absence did not produce a visible error
 // but a HUNG or FROZEN app. See ROADMAP.md, Phase 0 and Phase 1.
 
-test "layout: 130 parrafos no cuelga el bucle del layout" {
+test "layout: 130 paragraphs does not hang the layout loop" {
     // The `while (seg_cache.len < paras.len)` loop with `orderedRemove(0)` when
     // going over the cap NEVER terminated with 129+ paragraphs: append (129) ->
     // evict (128) -> back in, forever, creating an ArenaAllocator per
@@ -6319,7 +7227,7 @@ test "layout: 130 parrafos no cuelga el bucle del layout" {
     try std.testing.expect(m.seg_cache.items.len <= Model.max_cached_paras);
 }
 
-test "layout: 200 y 1000 parrafos tampoco cuelgan" {
+test "layout: 200 and 1000 paragraphs do not hang either" {
     // The two sizes that show up in a long session. Same contract.
     inline for (.{ 200, 1000 }) |n| {
         var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6336,7 +7244,7 @@ test "layout: 200 y 1000 parrafos tampoco cuelgan" {
     }
 }
 
-test "layout: el scroll profundo re-parsea la ventana y el texto sigue saliendo" {
+test "layout: deep scroll re-parses the window and the text keeps coming out" {
     // What the old comment of `max_cached_paras` promised ("deep scrolling
     // re-parses on demand") and did not do. With the sliding window, going up
     // past what is cached parses whatever comes on screen.
@@ -6373,7 +7281,7 @@ test "layout: el scroll profundo re-parsea la ventana y el texto sigue saliendo"
     }
 }
 
-test "pushDiff mete UN parrafo, no uno por linea" {
+test "pushDiff puts ONE paragraph, not one per line" {
     // `pushDiff` put ONE PARAGRAPH per diff line: with 129+ lines that blew
     // past the cache cap and hung the app instantly. A single `write` of a
     // 129-line file was "it freezes when it starts writing".
@@ -6392,7 +7300,7 @@ test "pushDiff mete UN parrafo, no uno por linea" {
     try std.testing.expectEqual(@as(usize, 1), diffs);
 }
 
-test "un diff de 300 lineas no cuelga y sigue siendo UN parrafo" {
+test "a 300-line diff does not hang and is still ONE paragraph" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -6422,7 +7330,7 @@ test "un diff de 300 lineas no cuelga y sigue siendo UN parrafo" {
     try std.testing.expectEqual(@as(usize, 1), diffs);
 }
 
-test "streamEnd marca dirty: un cambio de estado pide un frame" {
+test "streamEnd sets dirty: a state change asks for a frame" {
     // `streamEnd` adds a paragraph to the history and sets `busy = false`
     // WITHOUT setting `dirty = true`. Between `streamEnd` and `pushToolStart`
     // (with a session write(2) and a DEFLATE-9 in between) there was a window
@@ -6449,7 +7357,7 @@ test "streamEnd marca dirty: un cambio de estado pide un frame" {
     try std.testing.expect(m.activity().dirty);
 }
 
-test "pushInfoFmt: formatea, pinta, y NO deja un literal que liberar al salir" {
+test "pushInfoFmt: formats, paints, and leaves NO literal to free at exit" {
     // The "Invalid free" that has bitten this repo five times, as a test instead
     // of a post-mortem.
     //
@@ -6480,7 +7388,7 @@ test "pushInfoFmt: formatea, pinta, y NO deja un literal que liberar al salir" {
     try std.testing.expect(std.mem.indexOf(u8, all, "42 models on openrouter") != null);
 }
 
-test "un literal NUNCA se guarda en la historia, y eso es lo que evita el Invalid free" {
+test "a literal is NEVER stored in the history, and that is what avoids the Invalid free" {
     // The counterpart: it says the trap is real rather than folklore, and it
     // pins the property that actually prevents the crash — whatever goes into
     // `pending` is HEAP memory, so `Model.deinit` can free all of it.
@@ -6503,7 +7411,7 @@ test "un literal NUNCA se guarda en la historia, y eso es lo que evita el Invali
     try std.testing.expect(m.paras.items[0].text.ptr != lit.ptr);
 }
 
-test "un error sale en rojo con ✗, no como una línea de info más" {
+test "an error comes out red with ✗, not as one more info line" {
     // `md.Kind.error_msg` existed with its `✗` prefix and NO caller used it:
     // everything came out gray from `.info`, so a 403 and a "session resumed"
     // read the same. In a long history, the error — the only thing you have to
@@ -6531,7 +7439,7 @@ test "un error sale en rojo con ✗, no como una línea de info más" {
     try std.testing.expect(std.mem.indexOf(u8, all, "key rejected") != null);
 }
 
-test "el TTFT se mide con el primer token, no con el final del stream" {
+test "the TTFT is measured at the first token, not at the end of the stream" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -6544,7 +7452,7 @@ test "el TTFT se mide con el primer token, no con el final del stream" {
     try std.testing.expect(!m.ttftPending());
 }
 
-test "cada iteración del agent loop vuelve a medir el TTFT" {
+test "every agent loop iteration measures the TTFT again" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     m.streamStart();
@@ -6554,14 +7462,14 @@ test "cada iteración del agent loop vuelve a medir el TTFT" {
     try std.testing.expect(m.ttftPending());
 }
 
-test "drawHints no existe: la línea de atajos se quitó de la vista" {
+test "drawHints does not exist: the shortcuts line is gone from the view" {
     // The ROADMAP asked to resurrect it or delete it. It was deleted: the
     // shortcuts are in the Ctrl+P palette and in `/help`, and one more line in
     // the view is exactly what was asked to be removed ("junk in the view").
     try std.testing.expect(@hasDecl(@import("tui.zig"), "Model"));
 }
 
-test "el diff del TUI usa el lenguaje del path: una línea + lleva tokens" {
+test "the TUI diff uses the path's language: a + line carries tokens" {
     // The ROADMAP's green wall: `+const n: u32 = 4` was ONE segment with the
     // prefix's color. Now the prefix goes in its own color and the body is
     // tokenized with the language taken from the path's extension.
@@ -6591,7 +7499,7 @@ test "el diff del TUI usa el lenguaje del path: una línea + lleva tokens" {
     try std.testing.expect(std.mem.indexOf(u8, row, "u32") != null);
 }
 
-test "el prefijo + y el cuerpo tienen colores DISTINTOS (muro verde eliminado)" {
+test "the + prefix and the body have DIFFERENT colors (green wall removed)" {
     // The ROADMAP's anti-all-green invariant. With `+const n: u32 = 4` in
     // zig: the prefix is `diff_add` and `const` is a code keyword. Before, the
     // two greens were ALSO the very same color (`str` and `diff_add` were
@@ -6607,7 +7515,7 @@ test "el prefijo + y el cuerpo tienen colores DISTINTOS (muro verde eliminado)" 
     try std.testing.expect(!std.meta.eql(theme.diff_add.fg, theme.code_str.fg));
 }
 
-test "un bloque de código tiene gutter, chip de lenguaje y separación" {
+test "a code block has a gutter, a language chip and separation" {
     // `blk.kind` and `blk.lang` were computed and thrown away: the only use of
     // `blk.` in the whole file was `blk.lines`. So a code block came out as
     // plain prose, glued to the sentence before and the one after.
@@ -6631,7 +7539,7 @@ test "un bloque de código tiene gutter, chip de lenguaje y separación" {
     try std.testing.expect(hasBlankRowBetween(s, "antes", "const n"));
 }
 
-test "el gutter no se come texto: el invariante de columnas se mantiene" {
+test "the gutter does not eat text: the column invariant holds" {
     // The gutter eats 2 columns, so the content wraps to `width - 2`. If it
     // were inserted AFTER wrapping, the last line would go past the border.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6655,7 +7563,7 @@ test "el gutter no se come texto: el invariante de columnas se mantiene" {
     }
 }
 
-test "una línea partida a lo ancho lleva sangría de continuación" {
+test "a line wrapped to the width carries a continuation indent" {
     // Without indent, the continuation of a sentence starts at COLUMN 0 and is
     // indistinguishable from a new sentence. With two columns it reads as
     // "continues below", which is what any line wrapping does.
@@ -6683,7 +7591,7 @@ test "una línea partida a lo ancho lleva sangría de continuación" {
     _ = all;
 }
 
-test "el historial tiene margen izquierdo y nada se sale de la pantalla" {
+test "the history has a left margin and nothing goes off screen" {
     // 4.9 of the ROADMAP: the text stuck to the terminal's edge. With 2 columns
     // of air, the history lines up with the input box and breathes.
     //
@@ -6712,15 +7620,21 @@ test "el historial tiene margen izquierdo y nada se sale de la pantalla" {
     // CAREFUL: it is measured on the CONTINUATION row and in columns, not in
     // bytes: `rowText` returns bytes and the `◆` prefix is 3 bytes for 2
     // columns.
-    // Row 1 is the continuation: it starts with margin + indent.
-    const cont = rowText(s, 1, &buf);
-    try std.testing.expect(std.mem.startsWith(u8, cont, "    "));
-    // And it does not reach the end: with a margin of 2, the text ends before
-    // column 38.
-    try std.testing.expect(std.mem.trimEnd(u8, cont, " ").len < 38);
+    // Row 1 is the continuation: margin, then the GUTTER (`│ `, which used to be
+    // two anonymous spaces), then the text. The gutter is what makes the row
+    // attributable to the paragraph above it.
+    var buf2: [128]u8 = undefined;
+    const cont = rowText(s, 1, &buf2);
+    try std.testing.expect(std.mem.startsWith(u8, cont, "  \u{2502} "));
+    // And it does not reach the end. In COLUMNS, not in bytes: `rowText` returns
+    // bytes and the gutter bar is 3 bytes for 1 column, so counting bytes made
+    // this row look longer than the terminal is wide.
+    const cols = try plainColumns(std.testing.allocator, std.mem.trimEnd(u8, cont, " "));
+    defer std.testing.allocator.free(cols);
+    try std.testing.expect(cols.len < 38);
 }
 
-test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
+test "prune: what leaves the window is compressed and comes back byte-for-byte IDENTICAL" {
     // Phase 6 of the ROADMAP. `Model.paras` was the only structure that grew
     // without bound: the segment cache is a sliding window, but every paragraph
     // kept its text forever. With 128 paragraphs of 16 KB (the `max_tool_output`
@@ -6755,7 +7669,7 @@ test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
     try std.testing.expect(cold > 0); // something was pruned
     try std.testing.expect(hot_bytes < 60 * big_len / 2); // and it takes half the space
 
-    // Now we check the invariant that actually matters: scroll up to a pruned
+    // Now we check the invariant that actually matters: scroll to a pruned
     // paragraph and have the text come out IDENTICAL.
     var target: ?usize = null;
     for (m.paras.items, 0..) |p, idx| {
@@ -6766,8 +7680,23 @@ test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
     }
     try std.testing.expect(target != null);
 
-    m.scrollBy(1_000_000); // all the way to the top
+    // Scroll to where that paragraph actually IS, not blindly to the top.
+    //
+    // "Scroll to the top" used to be enough by accident: the window was the
+    // last few paragraphs and the pruned ones were the first ones, so the top
+    // happened to be the first pruned paragraph. Now the heights are known for
+    // everything (`known_lines`), so which paragraph is pruned depends on the
+    // window, and the first pruned one can be anywhere. Walking down until it
+    // enters the window is what a user does, and it is the only version of this
+    // test that says what it means: "come back when I scroll there".
+    m.scrollBy(1_000_000); // to the top
     _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+    var steps: usize = 0;
+    while (m.paras.items[target.?].is_cold and steps < 200) : (steps += 1) {
+        m.scrollBy(-8);
+        _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+    }
+    try std.testing.expect(steps < 200); // it did become visible, it did not vanish
 
     // The paragraph that was pruned was rehydrated when it entered the window,
     // and its text is byte for byte the original.
@@ -6787,7 +7716,7 @@ test "poda: lo que sale de la ventana se comprime y vuelve IGUAL byte a byte" {
     try std.testing.expect(still_cold > 0); // pruning still applies
 }
 
-test "poda: un párrafo corto NO se comprime (la base64 costaría más)" {
+test "prune: a short paragraph is NOT compressed (base64 would cost more)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -6800,7 +7729,7 @@ test "poda: un párrafo corto NO se comprime (la base64 costaría más)" {
     try std.testing.expectEqualStrings("hola", m.paras.items[0].text);
 }
 
-test "poda: comprimir y rehidratar es byte-exact con contenido repetitivo y unicode" {
+test "prune: compress and rehydrate is byte-exact with repetitive and unicode content" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -6830,7 +7759,7 @@ test "poda: comprimir y rehidratar es byte-exact con contenido repetitivo y unic
     }
 }
 
-test "poda: el ahorro es real (no solo un boolean)" {
+test "prune: the saving is real (not just a boolean)" {
     // The ROADMAP estimated a byte budget of ~8 MB. Measured, what actually
     // grew without bound were the ~2 MB of text of 128 tool results of 16 KB.
     // This test pins down that pruning really shrinks them and does not just
@@ -6864,7 +7793,7 @@ test "poda: el ahorro es real (no solo un boolean)" {
     }
 }
 
-test "columna de usage: sin datos no se pinta (un 0% miente)" {
+test "usage column: with no data it is not painted (a 0% lies)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     // With an empty cache session there is nothing to say. These numbers used
@@ -6873,7 +7802,7 @@ test "columna de usage: sin datos no se pinta (un 0% miente)" {
     try std.testing.expect(usageInfo(arena_state.allocator()) == null);
 }
 
-test "columna de usage: con datos, el pct de cache y los tokens de la sesion" {
+test "usage column: with data, the cache pct and the session tokens" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6894,7 +7823,7 @@ test "columna de usage: con datos, el pct de cache y los tokens de la sesion" {
     try std.testing.expect(std.mem.indexOf(u8, all, "out") != null);
 }
 
-test "las dos columnas del status miden el ancho igual (si no, se pisan)" {
+test "both status columns measure the width the same (else they overlap)" {
     // The bug of measuring with `.len` instead of columns: `⚡` is 3 bytes for 1
     // column, so aligning by bytes knocks the whole row off. Both columns use
     // the SAME function on purpose.
@@ -6902,8 +7831,8 @@ test "las dos columnas del status miden el ancho igual (si no, se pisan)" {
         .{ .text = "\u{26a1} 3 tok/s", .style = theme.tool },
         .{ .text = " \u{b7} \u{00f1}", .style = theme.dim },
     };
-    // "⚡ 3 tok/s" son 9 graphemes y " · ñ" son 4: 13 columnas. En BYTES serían
-    // 15 y 7, o sea 22, y la fila quedaría 9 columnas corrida.
+    // "⚡ 3 tok/s" is 9 graphemes and " · ñ" is 4: 13 columns. In BYTES they would
+    // be 15 and 7, that is 22, and the row would end up 9 columns off.
     try std.testing.expectEqual(@as(u16, 13), segsWidth(&segs));
 }
 
@@ -6918,11 +7847,11 @@ fn countAssistant(m: *Model) usize {
     return n;
 }
 
-test "el bloque del plan: un checkbox por paso, y el paso en marcha resaltado" {
-    // Lo que se comprueba es lo que el usuario VE (la lógica del plan ya esta
-    // testeada en plan.zig): que hay un checkbox por paso y que el paso en
-    // marcha es el único con color de marca. Esa diferencia entre "por dónde va"
-    // y "una lista" es justo lo que hace útil el bloque.
+test "plan block: one checkbox per step, and the running step highlighted" {
+    // What is checked here is what the user SEES (the plan's own logic is already
+    // tested in plan.zig): that there is one checkbox per step and that the step
+    // in progress is the only one in the brand color. That difference between
+    // "where it is at" and "a list" is exactly what makes the block useful.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6939,25 +7868,25 @@ test "el bloque del plan: un checkbox por paso, y el paso en marcha resaltado" {
     var items: [plan_mod.max_items]plan_mod.Item = undefined;
     const parsed = try plan_mod.parseItems(arena, args, &items);
     _ = m.applyPlan(&parsed.items, parsed.len);
-    // Aplicar el plan es un cambio de estado: tiene que pedir frame.
+    // Applying the plan is a state change: it has to request a frame.
     try std.testing.expect(m.activity().dirty);
 
     const s = try drawTest(&m, arena, 100, 30);
     const r_done = findRow(s, "leer el roadmap") orelse return error.TestUnexpectedResult;
     const r_cur = findRow(s, "implementar la tool") orelse return error.TestUnexpectedResult;
     try std.testing.expect(findRow(s, "escribir los tests") != null);
-    // En el orden de la lista, de arriba abajo.
+    // In the order of the list, top to bottom.
     try std.testing.expect(r_done < r_cur);
 
     var buf: [256]u8 = undefined;
-    // El hecho hecho lleva su check (no una flecha) y el apagado.
+    // The done step carries its check (not an arrow) and the dimmed color.
     const done_row = rowText(s, r_done, &buf);
     try std.testing.expect(std.mem.indexOf(u8, done_row, "☑") != null);
     const done_cell = s.readCell(1, r_done);
     try std.testing.expectEqual(theme.brand_faint.fg, done_cell.style.fg);
     try std.testing.expect(!done_cell.style.bold);
 
-    // El paso en marcha: MISMO texto, color de marca y en negrita.
+    // The running step: SAME text, brand color, and in bold.
     const cur_cell = s.readCell(1, r_cur);
     try std.testing.expectEqual(theme.brand_bold.fg, cur_cell.style.fg);
     try std.testing.expect(cur_cell.style.bold);
@@ -6965,18 +7894,18 @@ test "el bloque del plan: un checkbox por paso, y el paso en marcha resaltado" {
     try std.testing.expect(std.mem.indexOf(u8, cur_row, "◐") != null);
     try std.testing.expect(std.mem.indexOf(u8, cur_row, "2.") != null);
 
-    // Y el pendiente va en el soft, sin negrita: se distinguen los tres estados
-    // de un vistazo.
+    // And the pending one goes in soft, no bold: the three states are told apart
+    // at a glance.
     const r_next = findRow(s, "escribir los tests") orelse return error.TestUnexpectedResult;
     const next_cell = s.readCell(1, r_next);
     try std.testing.expectEqual(theme.brand_soft.fg, next_cell.style.fg);
     try std.testing.expect(!next_cell.style.bold);
 }
 
-test "el plan se dibuja ENCIMA del input y lo empuja, sin comerse el historial" {
-    // El orden de las filas de abajo arriba es status · franja · PLAN · input.
-    // Si el plan se dibujara en otro sitio taparía el historial, que es justo lo
-    // que un plan no debe hacer.
+test "the plan is drawn ABOVE the input and pushes it, without eating the history" {
+    // The order of the rows from the bottom up is status · strip · PLAN · input.
+    // If the plan were drawn anywhere else it would cover the history, which is
+    // exactly what a plan must not do.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6999,28 +7928,28 @@ test "el plan se dibuja ENCIMA del input y lo empuja, sin comerse el historial" 
     _ = m.applyPlan(&items, 3);
     const s_con = try drawTest(&m, arena, 100, 30);
     const input_con = findRow(s_con, "Ask anything") orelse return error.TestUnexpectedResult;
-    // El primer paso del plan: suficiente para saber DÓNDE está el bloque.
+    // The plan's first step: enough to know WHERE the block is.
     const r_plan = findRow(s_con, "primero") orelse return error.TestUnexpectedResult;
 
-    // El plan queda por ENCIMA del input (el input está siempre abajo del todo),
-    // y el input SUBE 3 filas: las filas del plan se le quitan de encima, no se
-    // las come el historial.
+    // The plan sits ABOVE the input (the input is always at the very bottom),
+    // and the input goes UP 3 rows: the plan's rows are taken off it, and it is
+    // not the history that loses them.
     try std.testing.expect(r_plan < input_con);
     try std.testing.expectEqual(input_sin - 3, input_con);
-    // Y el historial sigue ahí arriba (con 30 filas hay sitio de sobra).
+    // And the history is still up there (with 30 rows there is plenty of room).
     try std.testing.expect(findRow(s_con, "hola") != null);
     try std.testing.expect(findRow(s_con, "hola").? < r_plan);
 
-    // Sin plan, no hay filas de checkboxes.
+    // With no plan, there are no checkbox rows.
     m.clearPlan();
     const s_limpio = try drawTest(&m, arena, 100, 30);
     try std.testing.expect(findRow(s_limpio, "☐") == null);
     try std.testing.expectEqual(input_sin, findRow(s_limpio, "Ask anything").?);
 }
 
-test "el plan terminado se dibuja en UNA línea" {
-    // Un plan terminado con 20 checkboxes solo empuja el input hacia arriba sin
-    // motivo: una línea dice lo mismo.
+test "a finished plan is drawn in ONE line" {
+    // A finished plan with 20 checkboxes just pushes the input up for no reason:
+    // one line says the same thing.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -7037,17 +7966,33 @@ test "el plan terminado se dibuja en UNA línea" {
     _ = m.applyPlan(&items, 8);
 
     const s = try drawTest(&m, arena, 100, 30);
-    try std.testing.expect(findRow(s, "all 8 steps done") != null);
-    // Ojo: el check del resumen es "☑ all...", así que buscar "☑ a" casaría
-    // con el propio resumen. Lo que se busca es el NÚMERO de cada paso, que
-    // solo aparece cuando la lista se pinta entera.
+    _ = findRow(s, "all 8 steps done") orelse return error.TestUnexpectedResult;
+    // CAREFUL: the summary's check is "☑ all...", so searching for "☑ a" would
+    // match the summary itself. What is searched for is each step's NUMBER,
+    // which only shows up when the list is painted whole.
     try std.testing.expect(findRow(s, "1. a") == null);
     try std.testing.expect(findRow(s, "4. d") == null);
+
+    // And what was really broken: the LAYOUT reserved one row per step
+    // (`plan_rows = min(len, plan_max_rows)`) while the drawing paints just one
+    // ("☑ all 8 steps done"). `input_top` is computed with `plan_rows`, so a
+    // finished plan pushed the input box SEVEN rows down for no reason, and
+    // stole those seven rows from the history.
+    //
+    // (They were not "ghost rows": the surface's buffer is `@memset` to
+    // `.default` on every frame, so an unpainted row comes out blank. The
+    // damage was of space, not of stale pixels.)
+    const with_done_plan = m.hist_rows;
+
+    // The same history, no plan: the history has to get those rows back.
+    _ = m.applyPlan(&.{}, 0);
+    _ = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(m.hist_rows > with_done_plan);
 }
 
-test "un plan largo dice cuantos pasos se han quedado sin pintar" {
-    // Sin el "+N more", ver 6 de 20 parece un plan entero. Y el recorte tiene un
-    // tope (`plan_max_rows`) porque un plan de 20 no puede comerse el historial.
+test "a long plan says how many steps were left unpainted" {
+    // Without the "+N more", seeing 6 of 20 looks like a whole plan. And the cut has
+    // a cap (`plan_max_rows`) because a 20-step plan cannot eat the history.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -7068,21 +8013,21 @@ test "un plan largo dice cuantos pasos se han quedado sin pintar" {
     const r = findRow(s, "+14 more") orelse return error.TestUnexpectedResult;
     var buf: [128]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, rowText(s, r, &buf), "1/20 done") != null);
-    // Y solo se pintan `plan_max_rows` pasos: ni uno más.
+    // And only `plan_max_rows` steps are painted: not one more.
     try std.testing.expectEqual(plan_max_rows, r - findRow(s, "a").? + 1);
 }
 
-test "el checkpoint se abre por TURNO y consume el último al deshacer" {
-    // Lo que importa del contrato: un prompt = un checkpoint (aunque el turno
-    // haga 5 tools), y `takeCheckpoint` lo QUITA, para que un segundo `/undo`
-    // deshaga el turno anterior y no repita el mismo.
+test "the checkpoint opens per TURN and the undo consumes the last one" {
+    // What matters in the contract: one prompt = one checkpoint (even if the turn
+    // makes 5 tools), and `takeCheckpoint` REMOVES it, so that a second `/undo`
+    // undoes the previous turn and does not repeat the same one.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
     try std.testing.expect(!m.canUndo());
     m.beginCheckpoint("turno 1");
     m.snapshotFile("a.txt", "v1", true);
-    m.snapshotFile("a.txt", "v2", true); // la segunda se ignora
+    m.snapshotFile("a.txt", "v2", true); // the second one is ignored
     try std.testing.expect(m.canUndo());
 
     m.beginCheckpoint("turno 2");
@@ -7091,7 +8036,8 @@ test "el checkpoint se abre por TURNO y consume el último al deshacer" {
     defer c2.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("turno 2", c2.labelOf());
     try std.testing.expectEqual(@as(u8, 1), c2.len);
-    // La foto de "a.txt" era del turno 1 y sigue ahí: `b.txt` no la pisó.
+    // The snapshot of "a.txt" was from turn 1 and is still there: `b.txt` did not
+    // overwrite it.
     try std.testing.expect(m.canUndo());
     var c1 = m.takeCheckpointOwned() orelse return error.TestUnexpectedResult;
     defer c1.deinit(std.testing.allocator);
@@ -7100,14 +8046,14 @@ test "el checkpoint se abre por TURNO y consume el último al deshacer" {
     try std.testing.expectEqualStrings("a.txt", c1.files[0].pathOf());
     try std.testing.expectEqualStrings("v1", c1.files[0].data);
 
-    // Y ya no queda nada: `canUndo` en vez de un crash.
+    // And there is nothing left: `canUndo` instead of a crash.
     try std.testing.expect(!m.canUndo());
     try std.testing.expect(m.takeCheckpointOwned() == null);
 }
 
-test "un snapshot sin checkpoint abierto no se guarda (ni rompe)" {
-    // `execToolCalls` puede correr antes de que `startChat` abra el checkpoint
-    // (turnos encadenados). Sin este guardia sería un acceso a un array vacío.
+test "a snapshot with no checkpoint open is not stored (nor does it break)" {
+    // `execToolCalls` can run before `startChat` opens the checkpoint (chained
+    // turns). Without this guard it would be an access to an empty array.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     m.snapshotFile("a.txt", "contenido", true);
@@ -7115,14 +8061,15 @@ test "un snapshot sin checkpoint abierto no se guarda (ni rompe)" {
     try std.testing.expect(m.takeCheckpointOwned() == null);
 }
 
-test "streamEnd sin texto no deja un parrafo vacio en el historial" {
-    // Un turno que muere con un error abre el parrafo en vivo y lo cierra vacio.
-    // Con el "◆" solo dejas ruido que parece contenido. Se vio en la E2E del
-    // free-auto: 403 -> 5xx x3 -> historial con un "◆" sin nada detras.
+test "streamEnd with no text leaves no empty paragraph in the history" {
+    // A turn that dies with an error opens the live paragraph and closes it empty.
+    // With the "◆" on its own you leave noise that looks like content. It was
+    // seen in the free-auto E2E: 403 -> 5xx x3 -> history with a "◆" and
+    // nothing behind it.
     //
-    // OJO: `streamEnd` ENCOLA el parrafo en `pending` (lo drena el draw), asi que
-    // hay que drenar antes de mirar `paras`. Antes de ese cambio se metia en
-    // `paras` directamente y este test contaba sin drenar.
+    // CAREFUL: `streamEnd` ENQUEUES the paragraph in `pending` (the draw drains
+    // it), so you have to drain before looking at `paras`. Before that change it
+    // went into `paras` directly and this test counted without draining.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -7131,23 +8078,69 @@ test "streamEnd sin texto no deja un parrafo vacio en el historial" {
     m.drainPending();
     try std.testing.expectEqual(@as(usize, 0), countAssistant(&m));
 
-    // Pero si HAY texto se guarda.
+    // But if there IS text it is stored.
     m.streamStart();
     m.streamDelta("OK");
     m.streamEnd();
     m.drainPending();
     try std.testing.expectEqual(@as(usize, 1), countAssistant(&m));
 
-    // Y solo espacios cuenta como vacio: es lo que devuelve un modelo que
-    // responde con un "\n" y nada mas, y un parrafo con un espacio es ruido
-    // igual que uno vacio. El conteo TOTAL no cambia: sigue habiendo un
-    // parrafo, el que tiene texto de verdad.
+    // And whitespace only counts as empty: that is what a model that answers with
+    // a "\n" and nothing else returns, and a paragraph with a space is noise
+    // just like an empty one. The TOTAL count does not change: there is still
+    // one paragraph, the one with real text.
     m.streamStart();
     m.streamDelta("  \n ");
     m.streamEnd();
     m.drainPending();
     try std.testing.expectEqual(@as(usize, 1), countAssistant(&m));
     try std.testing.expect(!m.busy);
+}
+
+test "streamEnd with no text also clears `streaming`, so nothing counts forever" {
+    // The other half of the empty-buffer case, and the one that did the visible
+    // damage.
+    //
+    // `self.streaming = false` used to live INSIDE `if (has_text and ...)`, so a
+    // turn that ended with an empty buffer left the model "streaming" forever.
+    // `workingLocked()` counts `streaming`, so from then on EVERY frame painted
+    // the placeholder: a `thinking · 4321.3s` line whose clock never stopped, a
+    // spinner that never stopped, and a status bar claiming the app was busy
+    // long after the turn was over. That is the junk that never cleaned up.
+    //
+    // The test above asserted `!busy` and the paragraph count and never
+    // `!streaming`, which is exactly why it stayed hidden.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    try std.testing.expect(m.streaming);
+    m.streamEnd();
+    try std.testing.expect(!m.streaming);
+    try std.testing.expect(!m.workingLocked());
+
+    // And nothing invents a live line on the next frame.
+    m.pushInfo("algo");
+    const s = try drawTest(&m, arena_state.allocator(), 60, 20);
+    try std.testing.expect(std.mem.indexOf(u8, allText(s), "thinking") == null);
+
+    // Same with whitespace only, which is what a model that answers with a
+    // single newline produces.
+    m.streamStart();
+    m.streamDelta("  \n ");
+    m.streamEnd();
+    try std.testing.expect(!m.streaming);
+    try std.testing.expect(!m.workingLocked());
+
+    // And a turn with text still ends up not streaming.
+    m.streamStart();
+    m.streamDelta("hola");
+    m.streamEnd();
+    try std.testing.expect(!m.streaming);
+    m.drainPending();
+    try std.testing.expectEqual(@as(usize, 1), countAssistant(&m));
 }
 
 // ── `ask`: the question state ────────────────────────────────
@@ -7178,10 +8171,10 @@ fn openAskForTest(m: *Model, question: []const u8, header: []const u8, options: 
     m.askUnlock();
 }
 
-test "ask: la pregunta se ve en pantalla Y en la franja con su reloj" {
-    // Lo que importa: la pregunta está DIBUJADA. Un worker aparcado esperando una
-    // pregunta que no se ve es indistinguible de un freeze, que es el bug que
-    // este repo ya pagó una vez.
+test "ask: the question is on screen AND in the strip with its clock" {
+    // What matters: the question is DRAWN. A worker parked waiting for a question
+    // that is not on screen is indistinguishable from a freeze, which is the bug
+    // this repo has already paid for once.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -7190,21 +8183,21 @@ test "ask: la pregunta se ve en pantalla Y en la franja con su reloj" {
 
     try openAskForTest(&m, "Que base de datos usamos?", "backend", &.{});
 
-    // La franja dice que espera una RESPUESTA (no "thinking"), porque la
-    // diferencia entre "estoy trabajando" y "te estoy esperando" es justo lo que
-    // hace falta para mirar el modal.
+    // The strip says it is waiting for an ANSWER (not "thinking"), because the
+    // difference between "I am working" and "I am waiting for you" is exactly
+    // what makes you look at the modal.
     try std.testing.expect(m.activity().ask);
 
     const s = try drawTest(&m, arena, 100, 30);
     try std.testing.expect(findRow(s, "Que base de datos usamos?") != null);
     try std.testing.expect(findRow(s, "backend") != null);
-    // Y el reloj de la franja.
+    // And the strip's clock.
     try std.testing.expect(findRow(s, "waiting for your answer") != null);
 }
 
-test "ask: la franja avisa de la espera CON SEGUNDOS, no solo de que espera" {
-    // El número es lo que responde a "esta colgado?". Sin el, "waiting for your
-    // answer" es indistinguible de un freeze a los dos segundos.
+test "ask: the strip warns of the wait WITH SECONDS, not just that it waits" {
+    // The number is what answers "is it hung?". Without it, "waiting for your
+    // answer" is indistinguishable from a freeze two seconds in.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -7212,10 +8205,10 @@ test "ask: la franja avisa de la espera CON SEGUNDOS, no solo de que espera" {
     defer m.deinit();
 
     try openAskForTest(&m, "sigo?", "", &.{});
-    // El reloj necesita un `Io`: los tests construyen el Model sin app, y
-    // `io_ready = false` a proposito (leer una vtable sin inicializar es un salto
-    // a basura). `std.testing.io` es un `Io` de verdad y no depende de la
-    // maquina mas alla de "ahora".
+    // The clock needs an `Io`: the tests build the Model without an app, and
+    // `io_ready = false` on purpose (reading an uninitialized vtable is a jump
+    // into garbage). `std.testing.io` is a real `Io` and does not depend on the
+    // machine beyond "now".
     m.attachIo(std.testing.io);
     m.ask_started_ns = std.Io.Timestamp.now(std.testing.io, .real).nanoseconds;
 
@@ -7223,42 +8216,127 @@ test "ask: la franja avisa de la espera CON SEGUNDOS, no solo de que espera" {
     try std.testing.expect(findRow(s, "to answer") != null);
 }
 
-test "ask: sin opciones NO se abre el picker (seria un menu vacio)" {
+test "ask: with no options there is NO menu (it would be an empty list)" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     try openAskForTest(&m, "que nombre le pongo al modulo?", "", &.{});
-    try std.testing.expect(!m.askNeedsPicker());
-    try std.testing.expect(m.askPickerItems() == null);
+    try std.testing.expect(!m.askNeedsChoice());
+    try std.testing.expectEqual(@as(usize, 0), m.askChoiceRows());
 }
 
-test "ask: con opciones se abre el picker, con la recomendada marcada y un \"Other\"" {
+test "ask: with options the PANEL is the menu, plus the way out of it" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     const options = [_][]const u8{ "usar el parser nuevo", "arreglar el bucle", "dejarlo" };
     try openAskForTest(&m, "Que enfoque?", "enfoque", &options);
 
-    try std.testing.expect(m.askNeedsPicker());
-    const items = m.askPickerItems() orelse return error.TestUnexpectedResult;
-    defer Model.freePickerItems(m.allocator, items);
-    try std.testing.expectEqual(items.len, options.len + 1);
-    // La primera opción es la recomendación (así lo dice el guidance) y se marca.
-    try std.testing.expectEqualStrings("recommended", items[0].desc);
-    try std.testing.expectEqualStrings(options[0], items[0].label);
-    // Las demás no se marcan: una lista donde todo dice "recomendado" no
-    // recomienda nada.
-    try std.testing.expectEqualStrings("", items[1].desc);
-    // Y hay un "Other", sin el cual el menu es un examen con una sola respuesta
-    // válida.
-    try std.testing.expect(std.mem.startsWith(u8, items[items.len - 1].label, ask_other_prefix));
+    try std.testing.expect(m.askNeedsChoice());
+    // options + "Other". Without that row the menu is an exam with one valid
+    // answer, and the model gets a forced choice.
+    try std.testing.expectEqual(options.len + 1, m.askChoiceRows());
 }
 
-test "ask: elegir una opcion entrega un COPIA, no la string del picker" {
-    // La razon de que `askPickerChosen` duplique: `pickerHandleKey` libera el
-    // label justo despues del callback, y `answerAskOwned` toma posesion. Sin la
-    // copia esto es un "Invalid free" la primera vez que se elige algo.
+test "ask: the options are painted INSIDE the panel, numbered, and the selection has a marker" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
-    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
+    const options = [_][]const u8{ "postgres", "sqlite", "mysql" };
+    try openAskForTest(&m, "Que storage uso?", "backend", &options);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const s = try drawTest(&m, arena_state.allocator(), 100, 30);
+
+    // The question is on screen...
+    try std.testing.expect(findRow(s, "Que storage uso?") != null);
+    // ...the header is its label, not the answer...
+    try std.testing.expect(findRow(s, "backend") != null);
+    // ...every option is a NUMBERED row of the same box...
+    try std.testing.expect(findRow(s, "1 postgres") != null);
+    try std.testing.expect(findRow(s, "2 sqlite") != null);
+    try std.testing.expect(findRow(s, "3 mysql") != null);
+    try std.testing.expect(findRow(s, "4 " ++ ask_other_label) != null);
+    // ...the first row is marked as the recommendation, in words and not implied
+    // by position...
+    try std.testing.expect(findRow(s, "recommended") != null);
+    // ...and the highlighted row says so with a marker, not only with a colour.
+    try std.testing.expect(findRow(s, "▸ 1 postgres") != null);
+}
+
+test "ask: the option list lives in the panel box, so it cannot be painted over it" {
+    // The regression: the options were items of a centred modal picker painted
+    // BEFORE the panel, and the panel erased its own rectangle on top of it. With
+    // a long question the panel is the wider of the two, so it ate the picker's
+    // last option and its footer, and the menu looked like a rendering bug.
+    // There is no picker left to overlap, so what this pins is that every option
+    // is inside the borders of the SAME box.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const options = [_][]const u8{ "aaa", "bbb", "ccc", "ddd", "eee" };
+    try openAskForTest(&m, "Cual de estos cinco es el que quieres, y por que exactamente?", "choice", &options);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const s = try drawTest(&m, arena_state.allocator(), 80, 24);
+
+    for (options) |o| {
+        const row = findRow(s, o) orelse return error.TestUnexpectedResult;
+        var tbuf: [256]u8 = undefined;
+        const text = rowText(s, row, &tbuf);
+        try std.testing.expect(std.mem.indexOf(u8, text, "│") != null);
+    }
+}
+
+test "ask: the highlight moves with the arrows and saturates at both ends" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const options = [_][]const u8{ "uno", "dos" };
+    try openAskForTest(&m, "cual?", "", &options);
+
+    try std.testing.expectEqual(@as(usize, 0), m.askSelection());
+    m.askMove(-1); // already at the top: stays
+    try std.testing.expectEqual(@as(usize, 0), m.askSelection());
+    m.askMove(1);
+    try std.testing.expectEqual(@as(usize, 1), m.askSelection());
+    m.askMove(1); // the "Other" row
+    try std.testing.expectEqual(@as(usize, 2), m.askSelection());
+    m.askMove(1); // saturates, it does not run off the list
+    try std.testing.expectEqual(@as(usize, 2), m.askSelection());
+    m.askMove(-1);
+    try std.testing.expectEqual(@as(usize, 1), m.askSelection());
+}
+
+test "ask: Enter takes the highlighted option" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const options = [_][]const u8{ "uno", "dos" };
+    try openAskForTest(&m, "cual?", "", &options);
+
+    m.askMove(1);
+    try std.testing.expect(m.askAnswerSelected());
+    try std.testing.expect(!m.askActive()); // closed in the same frame
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expectEqualStrings("dos", m.ask_answer.?);
+}
+
+test "ask: Enter on the LAST row is not an answer, it hands over the input box" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const options = [_][]const u8{ "uno" };
+    try openAskForTest(&m, "cual?", "", &options);
+    m.askMove(1); // "Other"
+    try std.testing.expect(m.askAnswerSelected());
+    try std.testing.expect(m.askTyping());
+    try std.testing.expect(m.askActive());
+}
+
+test "ask: the answer takes OWNERSHIP, so a literal in it would be an Invalid free" {
+    // `answerAskOwned` frees the text when the Model goes away, so everything on
+    // this path has to be a gpa copy: the label used to arrive from the picker,
+    // which freed it right after the callback, and a literal was a crash at exit.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{ "a", "b" });
 
     const owned = try m.allocator.dupe(u8, "a");
     m.answerAskOwned(owned);
@@ -7268,22 +8346,22 @@ test "ask: elegir una opcion entrega un COPIA, no la string del picker" {
     try std.testing.expectEqualStrings("a", m.ask_answer.?);
 }
 
-test "ask: ESC significa \"decide tu\", y el estado se cierra" {
+test "ask: ESC means \"you decide\", and the state closes" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     try openAskForTest(&m, "te da igual?", "", &.{});
 
     m.declineAsk();
     try std.testing.expect(!m.askActive());
-    // Y la respuesta existe: el worker tiene que poder despertar y seguir.
+    // And the answer exists: the worker has to be able to wake up and go on.
     m.askLock();
     defer m.askUnlock();
     try std.testing.expect(m.ask_answer != null);
 }
 
-test "ask: decline dos veces no machaca la primera respuesta" {
-    // El segundo ESC (o un ESC de la app) no puede liberar la respuesta que el
-    // worker todavia no ha cogido.
+test "ask: declining twice does not clobber the first answer" {
+    // The second ESC (or an ESC from the app) must not free the answer the worker
+    // has not taken yet.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     try openAskForTest(&m, "q?", "", &.{});
@@ -7295,41 +8373,36 @@ test "ask: decline dos veces no machaca la primera respuesta" {
     try std.testing.expectEqualStrings("primera", m.ask_answer.?);
 }
 
-test "ask: elegir \"Other\" pasa el input a modo respuesta, NO responde" {
+test "ask: in answer mode the menu does NOT come back" {
+    // If `askChoiceRows` did not look at `ask_typing`, the option list would come
+    // back on the next frame, on top of what the user is typing.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
-    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
-
-    askPickerChosen(&m, ask_picker_tag, "Other… (type your own answer)");
-    try std.testing.expect(m.askTyping());
-    // Y no hay respuesta todavia: el worker sigue esperando de verdad.
-    m.askLock();
-    defer m.askUnlock();
-    try std.testing.expect(m.ask_answer == null);
-}
-
-test "ask: en modo respuesta el picker NO vuelve a abrirse" {
-    // Si `askNeedsPicker` no mirara `ask_typing`, el picker se reabriria en el
-    // siguiente frame encima de lo que el usuario esta escribiendo.
-    var m = Model.init(std.testing.allocator);
-    defer m.deinit();
-    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
-    try std.testing.expect(m.askNeedsPicker());
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{ "a", "b" });
+    try std.testing.expect(m.askNeedsChoice());
     m.askBeginTyping();
-    try std.testing.expect(!m.askNeedsPicker());
+    try std.testing.expect(!m.askNeedsChoice());
 }
 
-test "ask: el picker de otro tag no se trata como una respuesta" {
+test "ask: typing in the input box answers the question instead of starting a turn" {
+    // The free-text path had no `ask_typing`: with no options nothing ever set
+    // it, the panel said "type your answer below", and Submit sent a NEW PROMPT
+    // that got queued behind the worker parked waiting for the answer. The user
+    // answered the question and it looked like the app ignored them.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
-    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a"});
-    askPickerChosen(&m, 0x999, "algo");
+    try openAskForTest(&m, "te da igual?", "", &.{});
+    try std.testing.expect(!m.askTyping());
+
+    try m.ed.insert("el que prefieras");
+    try std.testing.expect(m.askAnswerFromInput("el que prefieras"));
+
     m.askLock();
     defer m.askUnlock();
-    try std.testing.expect(m.ask_answer == null);
+    try std.testing.expectEqualStrings("el que prefieras", m.ask_answer.?);
 }
 
-test "ask: el titulo del picker es el header del modelo, o el texto por defecto" {
+test "ask: the picker title is the model's header, or the default text" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
     try openAskForTest(&m, "cual?", "base de datos", &[_][]const u8{"a"});
@@ -7339,13 +8412,75 @@ test "ask: el titulo del picker es el header del modelo, o el texto por defecto"
     try std.testing.expectEqualStrings("the model has a question", m.askTitle());
 }
 
-test "ask: el snapshot va al arena del frame (nada de punteros al worker)" {
+test "ask: the panel is opaque, the history does not show through it" {
+    // `drawAskPanel` cleared only the TOP row of its box, which is the border
+    // line. Every other row was left holding whatever the history had just
+    // painted there, so the question, the hint and the clock were drawn ON TOP of
+    // the assistant's answer, the tool results and the code blocks. It reads as a
+    // rendering bug, and it was reported as one.
+    //
+    // Two things this test needed to get right, both learned the hard way:
+    //
+    // 1. NO OPTIONS. With options the question opens a PICKER, which is a
+    //    different widget that already cleared its box row by row. The panel is
+    //    the free-text path, and that is the one that did not clear.
+    // 2. A history that fills EVERY row. With one-line paragraphs every second
+    //    row is the blank separator, and the panel's own text happened to land
+    //    exactly on the rows that had history behind them, so the bug was
+    //    invisible. Paragraphs with embedded newlines put text on every row, and
+    //    then the short "waiting 0s" clock row leaves the history showing
+    //    through on its right.
+    //
+    // The history is a run of 'x' and the panel's own text contains none, so
+    // "is there an 'x' inside the box" is an unambiguous question.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
-    try openAskForTest(&m, "cual?", "", &[_][]const u8{"a", "b"});
+
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        m.pushInfo("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    }
+    try openAskForTest(&m, "cual de estos dos?", "", &.{});
+
+    const s = try drawTest(&m, arena, 90, 30);
+    const qrow = findRow(s, "cual de estos dos?") orelse return error.TestUnexpectedResult;
+
+    // The panel's own borders, FOUND rather than computed: `box_w` depends on
+    // the wrapped width of the question, and a test that hardcodes the geometry
+    // ends up checking the wrong columns (which is how the first version of this
+    // test passed with the bug still in place).
+    var bbuf: [512]u8 = undefined;
+    const qline = rowText(s, qrow, &bbuf);
+    const first_bar = std.mem.indexOf(u8, qline, "\u{2502}") orelse return error.TestUnexpectedResult;
+    const last_bar = std.mem.lastIndexOf(u8, qline, "\u{2502}") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(last_bar > first_bar);
+
+    var checked: usize = 0;
+    var row: u16 = qrow;
+    while (row < s.size.height) : (row += 1) {
+        const line = rowText(s, row, &bbuf);
+        if (std.mem.indexOf(u8, line, "\u{2570}") != null) break; // bottom border
+        if (std.mem.indexOf(u8, line, "\u{256d}") == null and
+            std.mem.indexOf(u8, line, "\u{2502}") == null) continue;
+        // Only the columns the panel covers matter: the history legitimately
+        // shows on either side of it.
+        const inside = line[first_bar + "\u{2502}".len .. @min(last_bar, line.len)];
+        try std.testing.expect(std.mem.indexOfScalar(u8, inside, 'x') == null);
+        checked += 1;
+    }
+    try std.testing.expect(checked >= 3); // the box really was inspected
+}
+
+test "ask: the snapshot goes to the frame arena (no pointers into the worker)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "cual?", "", &[_][]const u8{ "a", "b" });
 
     const snap = m.askSnapshot(arena) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("cual?", snap.question);
@@ -7353,7 +8488,7 @@ test "ask: el snapshot va al arena del frame (nada de punteros al worker)" {
     try std.testing.expectEqualStrings("b", snap.options[1]);
 }
 
-test "ask: sin pregunta abierta el snapshot es null (no un panel vacio)" {
+test "ask: with no open question the snapshot is null (not an empty panel)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -7361,9 +8496,9 @@ test "ask: sin pregunta abierta el snapshot es null (no un panel vacio)" {
     try std.testing.expect(m.askSnapshot(arena_state.allocator()) == null);
 }
 
-test "read-only sale en la barra de estado" {
-    // Un modo que no se ve es un modo en el que "el modelo ignoro mi edit" no se
-    // distingue de "el modelo no lo intento".
+test "read-only shows up in the status bar" {
+    // A mode you cannot see is a mode in which "the model ignored my edit" cannot
+    // be told apart from "the model never tried".
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -7385,13 +8520,14 @@ test "read-only sale en la barra de estado" {
     try std.testing.expect(std.mem.indexOf(u8, after_row, "read-only") != null);
 }
 
-test "@ mention: el popup lista ficheros Y se pinta, y no esconde los que no caben" {
-    // El sintoma que se reporto: «@ no me da la lista de files». El popup existia
-    // y se llenaba (esto ya lo cubrian `fileQueryAt` y `refreshFileMatches`), pero
-    // se dibujaba pegado al borde de la pantalla y SIN NINGUN INDICIO de que
-    // quedaban mas: con 10 entradas y `max_visible` = 6, se veian 6 y el resto
-    // no existia a los ojos del usuario. Un popup truncado en silencio es peor que
-    // uno que no abre, porque parece que el directorio solo tiene esos ficheros.
+test "@ mention: the popup lists files AND is painted, and does not hide the ones that do not fit" {
+    // The symptom that was reported: "@ does not give me the list of files". The popup
+    // existed and filled up (that part was already covered by `fileQueryAt` and
+    // `refreshFileMatches`), but it was drawn glued to the edge of the screen and
+    // with NO HINT AT ALL that more were left: with 10 entries and `max_visible` =
+    // 6, you saw 6 and the rest did not exist as far as the user was concerned. A
+    // popup truncated in silence is worse than one that does not open, because it
+    // looks like the directory only has those files.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     var m = Model.init(std.testing.allocator);
@@ -7403,12 +8539,12 @@ test "@ mention: el popup lista ficheros Y se pinta, y no esconde los que no cab
     m.ed.setCursor(1);
     syncAutocomplete(&m);
 
-    // El modo es el de ficheros y hay coincidencias (el CWD de los tests tiene
-    // mas de una: `src/`, `build.zig`...).
+    // The mode is the file one and there are matches (the CWD of the tests has more
+    // than one: `src/`, `build.zig`...).
     try std.testing.expectEqual(Autocomplete.Mode.file, m.ac.mode);
     try std.testing.expect(m.ac.file_matches.items.len > 1);
 
-    // Y se PINTA: las filas existen en la superficie, con la `@` delante.
+    // And it is PAINTED: the rows exist in the surface, with the `@` in front.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const surf = try drawTest(&m, arena_state.allocator(), 72, 24);
@@ -7417,7 +8553,7 @@ test "@ mention: el popup lista ficheros Y se pinta, y no esconde los que no cab
     var has_at_prefix = false;
     for (0..24) |r| {
         const row = rowText(surf, @intCast(r), &rb);
-        // Una fila del popup es «@nombre»: la `@` en la columna del item.
+        // A popup row is "@name": the `@` in the item's column.
         const t = std.mem.trim(u8, row, " ");
         if (t.len > 0 and t[0] == '@') {
             seen_rows += 1;
@@ -7427,10 +8563,245 @@ test "@ mention: el popup lista ficheros Y se pinta, y no esconde los que no cab
     try std.testing.expect(seen_rows > 1);
     try std.testing.expect(has_at_prefix);
 
-    // El popup NO puede mentir sobre cuantos hay: si hay mas de los que caben,
-    // la ultima fila lo dice. Es lo que convierte "solo hay estos" en "hay mas".
+    // The popup must NOT lie about how many there are: if there are more than fit,
+    // the last row says so. That is what turns "there are only these" into
+    // "there are more".
     if (m.ac.file_matches.items.len > m.ac.max_visible) {
         const ac_rows: u16 = @intCast(@min(m.ac.file_matches.items.len, m.ac.max_visible) + 1);
         try std.testing.expect(ac_rows >= @as(u16, @intCast(m.ac.max_visible)));
     }
+}
+
+
+
+
+
+test "timeline: a wrapped paragraph keeps a gutter on every continuation row" {
+    // The kind marker (`› `, `◆ `, `⏺ `, `⎿  `) only ever went on the FIRST row
+    // of a block, and the continuation indent was two anonymous spaces, the same
+    // width as the marker. A six-row tool result therefore had one identifiable
+    // row and five that looked like a notice. Now the continuation carries a bar.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamDelta("esta respuesta es deliberadamente larga para que ocupe varias filas del historial");
+    m.streamEnd();
+
+    const s = try drawTest(&m, arena_state.allocator(), 44, 14);
+    var buf: [160]u8 = undefined;
+    var first: ?u16 = null;
+    var conts: usize = 0;
+    var row: u16 = 0;
+    while (row < 8) : (row += 1) {
+        const t = rowText(s, row, &buf);
+        if (std.mem.indexOf(u8, t, "deliberadamente") != null) first = row;
+        if (first != null and row > first.? and std.mem.indexOf(u8, t, "\u{2502}") != null) conts += 1;
+    }
+    try std.testing.expect(first != null);
+    try std.testing.expect(conts >= 1);
+}
+
+test "timeline: a list answer shows bullets, and the markers are not the text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamDelta("- primero lo importante\n- despues lo otro");
+    m.streamEnd();
+
+    const s = try drawTest(&m, arena_state.allocator(), 60, 14);
+    try std.testing.expect(findRow(s, "• primero lo importante") != null);
+    try std.testing.expect(findRow(s, "• despues lo otro") != null);
+    // The hyphen the model typed is gone: normalized, not echoed.
+    try std.testing.expect(findRow(s, "- primero") == null);
+}
+
+test "timeline: a code block has a background behind the code, not only after it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamDelta("```zig\nconst n: u32 = 4;\n```");
+    m.streamEnd();
+
+    const s = try drawTest(&m, arena_state.allocator(), 40, 14);
+    const row = findRow(s, "const n") orelse return error.TestUnexpectedResult;
+    // The code itself is on the background, not just the padding after it: the
+    // block is a rectangle, not a stripe whose width changes with the length of
+    // each line (which is what it was on any background but #1a1b26).
+    const code_cell = s.readCell(6, row);
+    try std.testing.expect(std.meta.activeTag(code_cell.style.bg) == .rgb);
+    try std.testing.expect(std.mem.eql(u8, &code_cell.style.bg.rgb, &theme.code_bg.bg.rgb));
+    // And the padding after it is the same, so there is no step.
+    const pad_cell = s.readCell(30, row);
+    try std.testing.expect(std.mem.eql(u8, &pad_cell.style.bg.rgb, &theme.code_bg.bg.rgb));
+}
+
+
+test "scroll: correcting a paragraph's height does not move the text under the reader" {
+    // The bug: the top of the view was an ABSOLUTE line number, and a paragraph's
+    // height is an estimate until it is parsed. Parsing replaces the estimate
+    // with the real height, so the same line number started pointing at
+    // something else and the view jumped by however wrong the estimate was —
+    // while you were scrolling, which is where a jump is least welcome.
+    //
+    // The scenario is a history full of fenced code blocks: a fence costs three
+    // rows (blank, chip, blank) that the estimator cannot know about.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        m.pushInfoFmt("linea corta {d}", .{i});
+        m.pushKind(.assistant, "```zig\nconst a = 1;\nconst b = 2;\n```");
+    }
+
+    const h: u16 = 20;
+    _ = try drawTest(&m, arena_state.allocator(), 60, h); // first frame: at the bottom
+    m.scrollBy(6);
+
+    // Frame A: this one parses whatever is now in the window, so the heights
+    // above the reader get corrected.
+    const a = try drawTest(&m, arena_state.allocator(), 60, h);
+    // Frame B: same anchor, and by now everything in the window is parsed.
+    const b = try drawTest(&m, arena_state.allocator(), 60, h);
+
+    var ba: [160]u8 = undefined;
+    var bb: [160]u8 = undefined;
+    // Row by row: what the reader is looking at must be the same thing.
+    var row: u16 = 0;
+    while (row < 6) : (row += 1) {
+        try std.testing.expectEqualStrings(rowText(a, row, &ba), rowText(b, row, &bb));
+    }
+}
+
+test "scroll: reading above, the text keeps arriving without moving the view" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) m.pushInfoFmt("uno {d}", .{i});
+    _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+
+    m.scrollBy(6);
+    try std.testing.expect(!m.follow_bottom);
+    const read_line = m.anchorLine();
+    const read_para = m.anchor_para;
+
+    // The model keeps talking. Every new paragraph goes to the END of the
+    // history, which is far below the reader, so nothing about what is on screen
+    // may change.
+    var j: usize = 0;
+    while (j < 3) : (j += 1) {
+        m.pushInfoFmt("llega {d}", .{j});
+        _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+        try std.testing.expectEqual(read_line, m.anchorLine());
+        try std.testing.expectEqual(read_para, m.anchor_para);
+        try std.testing.expect(!m.follow_bottom);
+    }
+
+    // And the bottom is still reachable, and re-arms the follow.
+    m.scrollBy(-1000);
+    try std.testing.expect(m.follow_bottom);
+}
+
+test "scroll: down then up returns to the same line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 30) : (i += 1) m.pushInfoFmt("linea {d} de un historial bastante largo", .{i});
+    _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+
+    const start = m.anchorLine();
+    m.scrollBy(4); // up: `n > 0` is UP (see `scrollBy`)
+    try std.testing.expectEqual(start - 4, m.anchorLine());
+    m.scrollBy(-4); // back down
+    try std.testing.expectEqual(start, m.anchorLine());
+    m.scrollBy(-1000); // to the bottom
+    try std.testing.expect(m.follow_bottom);
+    m.scrollBy(1000); // and to the top
+    try std.testing.expectEqual(@as(usize, 0), m.anchorLine());
+}
+
+test "scroll: a wheel event cannot underflow the anchor" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushInfo("hola");
+    _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+
+    // This used to be `self.scroll -= 3` on a usize: two wheel-up events at the
+    // top of the history overflowed and the process panicked.
+    m.scrollBy(3);
+    m.scrollBy(3);
+    try std.testing.expectEqual(@as(usize, 0), m.anchorLine());
+    m.scrollBy(-3);
+    m.scrollBy(-3);
+    try std.testing.expectEqual(@as(usize, 0), m.anchorLine());
+}
+
+test "ctrl+d scrolls back down and does NOT quit" {
+    // The regression: ctrl+d with an empty input was EOF (`ctx.quit = true`), and
+    // an empty input is the NORMAL state while scrolling — you scroll up to read
+    // something, press ctrl+d to come back down, and zode exits. `/help` says
+    // "ctrl+u / ctrl+d = scroll half a page" and the status bar says "ctrl+c
+    // exits", so the app contradicted both of its own strings.
+    //
+    // The shape of the assertion is "up then down", not "down moves": where the
+    // bottom of the scroll is depends on which paragraphs have been laid out
+    // (the rest are still estimates), and a test that pinned an absolute line
+    // would be a test of the estimates.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) m.pushInfoFmt("linea {d} de un historial bastante largo", .{i});
+    _ = try drawTest(&m, arena_state.allocator(), 60, 20);
+
+    // `armTick` goes through the `Io` of the EventContext, and `testCtx` leaves it
+    // undefined: reading it is a jump through a garbage vtable, which is a GPF
+    // rather than a failed assertion.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ctx_arena.deinit();
+    var ctx = testCtx();
+    ctx.io = threaded.io();
+    // An arena for the context: `armTick` allocates a `Tick` (it holds the `Io`)
+    // and nothing in a test has any reason to own one command list entry by entry.
+    ctx.alloc = ctx_arena.allocator();
+    m.attachIo(threaded.io());
+
+    // Empty input: that is the state the bug needed.
+    try std.testing.expect(m.ed.isEmpty());
+
+    // Up, then down, with the empty input the whole way.
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(!ctx.quit);
+    const up = m.anchorLine();
+
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(!ctx.quit);
+    try std.testing.expect(m.anchorLine() >= up);
+
+    // And ctrl+c is the exit, which is what the status bar says.
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(ctx.quit);
 }

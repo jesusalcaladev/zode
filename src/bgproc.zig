@@ -561,7 +561,6 @@ fn reader(ctx: *ReaderCtx) void {
 /// Runs on the UI thread (the one allowed to call `Child.kill`, see `killAll`):
 /// the marking is atomic enough for the reader thread, which only ever reads
 /// `kill_requested` to decide the final `.killed` state.
-
 /// Releases a finished job so its slot can be reused. Only the caller that owns
 /// the model does this (never the reader thread: see the header).
 pub fn reap(reg: *Registry, gpa: std.mem.Allocator, id: u32) void {
@@ -627,16 +626,16 @@ fn napMs(ms: u64) void {
 
 const bgproc = @This();
 
-test "read: unknown id es un error con nombre, no un panic" {
+test "read: an unknown id is a named error, not a panic" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     var out = bgproc.Output{};
     try std.testing.expectError(error.UnknownJob, bgproc.read(&reg, &out, 42));
 }
 
-test "read: un id liberado vuelve a ser desconocido (no resurrecta)" {
-    // El id es un contador, no un puntero: si `read` guardase el indice, el
-    // recycled slot 0 devolveria la salida de OTRO trabajo.
+test "read: a freed id becomes unknown again (it does not resurrect)" {
+    // The id is a counter, not a pointer: if `read` kept the index, the recycled
+    // slot 0 would return the output of ANOTHER job.
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     reg.slots[0] = .{ .state = .finished, .id = 7, .exit = 0 };
@@ -646,9 +645,9 @@ test "read: un id liberado vuelve a ser desconocido (no resurrecta)" {
     try std.testing.expectError(error.UnknownJob, bgproc.read(&reg, &out, 7));
 }
 
-test "read: devuelve lo nuevo y NO repite lo viejo" {
-    // Es la propiedad que hace que un agente que hace polling no pague dos
-    // veces por la misma salida.
+test "read: returns what is new and does NOT repeat the old" {
+    // This is the property that stops a polling agent from paying twice for the
+    // same output.
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     // OWNED command: `deinit` frees it, so a literal here is an "Invalid free"
@@ -663,15 +662,15 @@ test "read: devuelve lo nuevo y NO repite lo viejo" {
     try std.testing.expect(std.mem.indexOf(u8, first, "linea1") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "exit=0") != null);
 
-    // La segunda vez ya no hay salida nueva, pero el estado sigue importando:
-    // es la respuesta a "termino?".
+    // The second time there is no new output, but the state still matters: it is
+    // the answer to "did it finish?".
     var o2 = bgproc.Output{};
     const second = try bgproc.read(&reg, &o2, 3);
     try std.testing.expect(std.mem.indexOf(u8, second, "linea1") == null);
     try std.testing.expect(std.mem.indexOf(u8, second, "exit=0") != null);
 }
 
-test "read: un job vivo sin salida nueva es NoNewOutput, no una cadena vacia" {
+test "read: a live job with no new output is NoNewOutput, not an empty string" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     reg.slots[0] = .{ .state = .running, .id = 1 };
@@ -679,7 +678,7 @@ test "read: un job vivo sin salida nueva es NoNewOutput, no una cadena vacia" {
     try std.testing.expectError(error.NoNewOutput, bgproc.read(&reg, &o3, 1));
 }
 
-test "read: lo que se perdio por el cap se DICE" {
+test "read: what was lost to the cap is REPORTED" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     reg.slots[0] = .{ .state = .finished, .id = 1, .exit = 0 };
@@ -690,7 +689,7 @@ test "read: lo que se perdio por el cap se DICE" {
     try std.testing.expect(std.mem.indexOf(u8, out, "exit status is still exact") != null);
 }
 
-test "el cap de salida avisa UNA vez, no en cada trozo" {
+test "the output cap warns ONCE, not on every chunk" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     reg.slots[0] = .{ .state = .running, .id = 1 };
@@ -698,13 +697,13 @@ test "el cap de salida avisa UNA vez, no en cada trozo" {
     const big = [_]u8{'x'} ** 1024;
     var i: usize = 0;
     while (i < 200) : (i += 1) bgproc.appendLocked(j, std.testing.allocator, &big);
-    // Lo que se perdio es todo menos lo que cupo, y lo que cupo deja sitio para
-    // el aviso: el total del buffer nunca pasa de `max_output`.
+    // What was lost is everything that did not fit, and what fit leaves room for
+    // the notice: the buffer total never passes `max_output`.
     try std.testing.expect(j.dropped > 0);
     try std.testing.expect(j.buf.items.len <= bgproc.max_output);
     try std.testing.expect(std.mem.endsWith(u8, j.buf.items, "polling for the exit status)\n"));
-    // Y el aviso aparece UNA vez dentro del buffer, no una por trozo discarded:
-    // 200 trozos de "truncated" es el mismo ruido que no avisar nunca.
+    // And the notice shows up ONCE inside the buffer, not once per discarded
+    // chunk: 200 chunks of "truncated" is the same noise as never warning.
     var count: usize = 0;
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, j.buf.items, pos, "output truncated")) |at| {
@@ -714,7 +713,7 @@ test "el cap de salida avisa UNA vez, no en cada trozo" {
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
-test "stateWord y statusLine cuentan lo que toca" {
+test "stateWord and statusLine count what they should" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     var sl0: [16]u8 = undefined;
@@ -730,16 +729,16 @@ test "stateWord y statusLine cuentan lo que toca" {
     try std.testing.expectEqualStrings("running", bgproc.stateWord(&reg, 3));
 }
 
-test "cancel_all: ESC impide que arranque lo siguiente" {
+test "cancel_all: ESC stops the next one from starting" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     reg.cancel_all = true;
-    // Sin `io` no se puede ni intentar el spawn, y aun asi el refusal tiene que
-    // ser el de ESC y no un crash: es la condicion que se comprueba primero.
+    // Without `io` the spawn cannot even be attempted, and still the refusal has
+    // to be ESC's and not a crash: it is the first condition checked.
     try std.testing.expectError(error.Cancelled, bgproc.spawn(&reg, std.testing.allocator, undefined, "ls"));
 }
 
-test "reap no toca un job vivo" {
+test "reap does not touch a live job" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     reg.slots[0] = .{ .state = .running, .id = 1 };
@@ -747,33 +746,33 @@ test "reap no toca un job vivo" {
     try std.testing.expect(bgproc.liveCount(&reg) == 1);
 }
 
-test "spawn: el hijo LIDERA su grupo de procesos (o ESC no puede matarlo)" {
-    // El bug 1. `bash` es `/bin/sh -c "..."`, y un shell tiene hijos: sin que el
-    // hijo sea su propio lider de grupo, `kill(-pid, SIGKILL)` no tiene ningun
-    // grupo al que apuntar, ESC cae al `kill(pid)` de siempre, y lo que sobrevive
-    // es el NIETO (`sleep`, `zig`, `npm`) con el core prendido. Medido: un
-    // `sleep 30 & wait` siguo vivo 30 s despues de "ESC lo paro".
+test "spawn: the child LEADS its process group (or ESC cannot kill it)" {
+    // Bug 1. `bash` is `/bin/sh -c "..."`, and a shell has children: without the
+    // child leading its own group, `kill(-pid, SIGKILL)` has no group to aim
+    // at, ESC falls back to the usual `kill(pid)`, and what survives is the
+    // GRANDCHILD (`sleep`, `zig`, `npm`) with the core burning. Measured: a
+    // `sleep 30 & wait` was still alive 30 s after "ESC stopped it".
     //
-    // Aqui se mira el invariante sobre un hijo REAL, no una cadena en el fuente: se
-    // hace el mismo `std.process.spawn` que hace `spawn`, con y sin `pgid = 0`, y
-    // se comprueba que el grupo cambia.
+    // Here the invariant is checked against a REAL child, not a string in the
+    // source: the same `std.process.spawn` that `spawn` does, with and without
+    // `pgid = 0`, and the group is checked to change.
     //
-    // NO se pasa por `bgproc.spawn`: ese deja un hilo lector que hace `wait()`
-    // sobre su copia del `Child`, y un `std.Io.Threaded` hecho a mano tambien
-    // recoge los hijos. Dos `wait` sobre el mismo proceso, el segundo recibe
-    // `ECHILD`, y Zig 0.16 convierte `error.CHILD` en un PANIC que tumba el
-    // runner entero (no solo el test). Es una peculiaridad de un `Threaded` de
-    // pruebas, no de `spawn` en produccion — y el camino de produccion esta
-    // cubierto por `tools/esc_kill_pty.py`, que es donde se prueba de verdad que
-    // ESC mata al NIETO.
+    // It does NOT go through `bgproc.spawn`: that leaves a reader thread doing
+    // `wait()` on its copy of the `Child`, and a hand-made `std.Io.Threaded`
+    // also reaps children. Two `wait`s on the same process, the second one gets
+    // `ECHILD`, and Zig 0.16 turns `error.CHILD` into a PANIC that takes down
+    // the whole runner (not just the test). That is a quirk of a test
+    // `Threaded`, not of `spawn` in production — and the production path is
+    // covered by `tools/esc_kill_pty.py`, which is where ESC really killing
+    // the GRANDCHILD is proven.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     const own = try procPgrp(io, std.os.linux.getpid());
 
-    // Sin `pgid = 0`: el hijo comparte nuestro grupo. Esta es la situacion que
-    // hacia que `kill(-pid)` no tuviera nada a lo que apuntar.
+    // Without `pgid = 0`: the child shares our group. This is the situation that
+    // left `kill(-pid)` with nothing to aim at.
     {
         var argv = [_][]const u8{ "/bin/sh", "-c", "sleep 30" };
         const c = try std.process.spawn(io, .{
@@ -787,7 +786,7 @@ test "spawn: el hijo LIDERA su grupo de procesos (o ESC no puede matarlo)" {
         std.posix.kill(pid, std.posix.SIG.KILL) catch {};
     }
 
-    // Con `pgid = 0`: el hijo LIDERA su propio grupo, y ese grupo es su pid.
+    // With `pgid = 0`: the child LEADS its own group, and that group is its pid.
     {
         var argv = [_][]const u8{ "/bin/sh", "-c", "sleep 30" };
         const c = try std.process.spawn(io, .{
@@ -801,42 +800,41 @@ test "spawn: el hijo LIDERA su grupo de procesos (o ESC no puede matarlo)" {
         const child = try procPgrp(io, pid);
         try std.testing.expect(child != own);
         try std.testing.expectEqual(@as(i64, pid), child);
-        // Y `kill(-pid)` alcanza al grupo entero, que es lo que hace `killTree`.
+        // And `kill(-pid)` reaches the whole group, which is what `killTree` does.
         std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
     }
 
-    // Y el resto: los dos spawns REALES (el de `spawn` y el del foreground de
-    // `tools.zig`) tienen que pasar por aqui. Es una guarda por SOURCE, no por
-    // comportamiento, y es a proposito: los dos bloques de arriba no pueden
-    // llegar a `spawn` sin el panic del `ECHILD` que explica el comentario, asi
-    // que sin esta linea el test describiria el mecanismo y no protegeria el
-    // sitio donde se decidio. El comportamiento de verdad esta en
-    // `tools/esc_kill_pty.py`, que mata un nieto de verdad en la pty real.
+    // And the rest: the two REAL spawns (the one in `spawn` and the foreground one
+    // in `tools.zig`) have to go through here. It is a guard on SOURCE, not on
+    // behaviour, and deliberately so: the two blocks above cannot reach `spawn`
+    // without the `ECHILD` panic the comment explains, so without these lines
+    // the test would describe the mechanism instead of protecting the place
+    // where the decision was made. The real behaviour lives in
+    // `tools/esc_kill_pty.py`, which kills a real grandchild in a real pty.
     //
-    // Se miran las DOS lineas porque los dos caminos tienen el mismo bug: el
-    // foreground es el que se usa el 99% de las veces y el background el que mas
-    // duele (un build en segundo plano).
+    // BOTH lines are checked because both paths carry the same bug: foreground
+    // is the one used 99% of the time, and background is the one that hurts
+    // most (a build running in the background).
     //
-    // `@embedFile` con ruta RELATIVA al modulo (`src/bgproc.zig` se compila
-    // desde `src/test_all.zig`, asi que la ruta es `bgproc.zig`), y el path del
-    // modulo no se puede escribir en un `@embedFile` de comptime.
+    // `@embedFile` with a path RELATIVE to the module (`src/bgproc.zig` is
+    // compiled from `src/test_all.zig`, so the path is `bgproc.zig`), and the
+    // module path cannot be written into a comptime `@embedFile`.
     const bg_src = @embedFile("bgproc.zig");
     try std.testing.expect(std.mem.indexOf(u8, bg_src, ".pgid = 0,") != null);
     const tools_src = @embedFile("tools.zig");
     try std.testing.expect(std.mem.indexOf(u8, tools_src, ".pgid = 0,") != null);
 }
 
-/// Campo 5 de `/proc/<pid>/stat` (el `pgrp`), o error si no se puede leer.
+/// Field 5 of `/proc/<pid>/stat` (the `pgrp`), or an error if it cannot be read.
 ///
-/// El campo 2 (`comm`) va entre parentesis y PUEDE contener espacios y
-/// parentesis (`(mi (proceso))`), asi que no se puede partir por campo a pelo:
-/// se parte por el ULTIMO `)`, que es el que cierra `comm`.
+/// Field 2 (`comm`) is wrapped in parentheses and CAN contain spaces and
+/// parentheses (`(my (process))`), so it cannot be split by field blindly: it
+/// splits on the LAST `)`, the one that closes `comm`.
 ///
-/// `readFileAlloc` NO sirve aqui, y el motivo es de procfs: `st_size` de un
-/// fichero de `/proc` es 0, asi que cualquier lector que se guie por el tamaño
-/// (que es lo que hace `allocRemaining`) se devuelve VACIO sin error. Se lee con
-/// un `readSliceShort` sobre un buffer fijo, que pregunta al kernel y no al
-/// `stat`.
+/// `readFileAlloc` does NOT work here, and the reason is procfs: `st_size` of a
+/// `/proc` file is 0, so any reader that goes by the size (which is what
+/// `allocRemaining` does) returns EMPTY with no error. This reads with a
+/// `readSliceShort` over a fixed buffer, which asks the kernel and not `stat`.
 fn procPgrp(io: std.Io, pid: std.posix.pid_t) !i64 {
     var path_buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return error.NoPath;

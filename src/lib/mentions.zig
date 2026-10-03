@@ -1,36 +1,35 @@
 const std = @import("std");
 
-/// Las menciones `@fichero` del prompt.
+/// The `@file` mentions in the prompt.
 ///
-/// ## Qué hace
+/// ## What it does
 ///
-/// Escribe `@src/agent.zig` y el contenido del fichero va al modelo, sin que
-/// tenga que gastar un turno en un `read`. El prompt del usuario se queda como
-/// está (con su `@ruta`) y los bloques se añaden al final, para que la frase que
-/// escribió siga siendo legible en el historial.
+/// You type `@src/agent.zig` and the file's contents go to the model, without
+/// it having to spend a turn on a `read`. The user's prompt stays as written
+/// (with its `@path`) and the blocks are appended at the end, so the sentence
+/// they typed stays readable in the history.
 ///
-/// ## Por qué NO se inyecta en el sitio de la `@`
+/// ## Why it is NOT injected at the position of the `@`
 ///
-/// Por la razón de la cache: el contenido del fichero va dentro del mensaje de
-/// usuario, y si el usuario edita el prompt (o el mismo prompt se reenvía en una
-/// iteración del agent loop) el texto inyectado cambiaría y el prefijo del
-/// provider se invalidaría entero. Al final, después de la frase, el bloque es
-/// estable mientras el fichero no cambie.
+/// Because of the cache: the file content goes inside the user message, and if
+/// the user edits the prompt (or the same prompt is resent in an iteration of
+/// the agent loop) the injected text would change and the provider's prefix
+/// would be invalidated wholesale. At the end, after the sentence, the block is
+/// stable as long as the file does not change.
 ///
-/// ## Los topes
+/// ## The caps
 ///
-/// 4 ficheros, 32 KB cada uno. Un `@` a un fichero de 2 MB no es una mención,
-/// es un accidente: el modelo recibe 2 MB de contexto que no ha pedido y la
-/// compactación lo paga. Y cuando se corta, el bloque lo DICE, porque un fichero
-/// truncado en silencio es la forma más rápida de que el modelo se invente el
-/// final.
+/// 4 files, 32 KB each. An `@` on a 2 MB file is not a mention, it is an
+/// accident: the model gets 2 MB of context it did not ask for and compaction
+/// pays for it. And when it is cut, the block SAYS so, because a file truncated
+/// in silence is the fastest way to get the model to invent the ending.
 pub const max_files = 4;
 pub const file_max = 32 * 1024;
 pub const path_max = 200;
 pub const scanned_max = 8;
 
 pub const Mention = struct {
-    /// El camino tal cual lo escribió el usuario (para el bloque).
+    /// The path exactly as the user typed it (for the block).
     path: [path_max]u8 = undefined,
     len: u8 = 0,
 
@@ -39,10 +38,10 @@ pub const Mention = struct {
     }
 };
 
-/// Busca las menciones en un texto. PURE: no toca el disco.
+/// Finds the mentions in a text. PURE: it does not touch the disk.
 ///
-/// Devuelve cuántas encontró (como máximo `scanned_max`) y las deja en `out` en
-/// el orden en que aparecen, sin repetir.
+/// Returns how many it found (at most `scanned_max`) and leaves them in `out` in
+/// order of appearance, without repeats.
 pub fn scan(text: []const u8, out: *[scanned_max]Mention) u8 {
     var n: u8 = 0;
     var i: usize = 0;
@@ -51,10 +50,10 @@ pub fn scan(text: []const u8, out: *[scanned_max]Mention) u8 {
             i += 1;
             continue;
         }
-        // Una `@` solo cuenta si NO es parte de otra cosa. El caso real que
-        // importa es el correo: `user@example.com` NO es una mención de
-        // `example.com`, y si lo fuera se leería un fichero que no existe en
-        // cada prompt con una dirección de email.
+        // An `@` only counts if it is NOT part of something else. The real case that
+        // matters is the email: `user@example.com` is NOT a mention of
+        // `example.com`, and if it were, every prompt with an email address
+        // would read a file that does not exist.
         if (i > 0) {
             const prev = text[i - 1];
             if (std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '@' or prev == '.' or prev == '/') {
@@ -66,14 +65,14 @@ pub fn scan(text: []const u8, out: *[scanned_max]Mention) u8 {
         var j = start;
         while (j < text.len) : (j += 1) {
             const c = text[j];
-            // `>= 0x80` es lo que deja pasar `guía.md` o `año.txt`: los bytes de
-            // continuación UTF-8 son todos >= 0x80, así que la condición es
-            // segura y no parte nada a mitad de un carácter.
+            // `>= 0x80` is what lets `guía.md` or `año.txt` through: UTF-8 continuation
+            // bytes are all >= 0x80, so the condition is safe and never splits
+            // anything in the middle of a character.
             if (std.ascii.isAlphanumeric(c) or c >= 0x80 or c == '_' or c == '/' or c == '-' or c == '.') continue;
             break;
         }
-        // La `@` suelta ("@ los tres") y los signs de puntuación que se han
-        // comido la ruta ("@notas.txt,") no son menciones.
+        // A bare `@` ("@ los tres") and the punctuation that swallowed the path
+        // ("@notas.txt,") are not mentions.
         var end = j;
         while (end > start and (text[end - 1] == '.' or text[end - 1] == ',' or text[end - 1] == ':')) {
             end -= 1;
@@ -82,30 +81,30 @@ pub fn scan(text: []const u8, out: *[scanned_max]Mention) u8 {
             i += 1;
             continue;
         }
-        // `nombre@dominio` es un correo, y en un correo la parte de la derecha es
-        // el dominio. Es el caso que rompe la regla de "la @ tiene que estar
-        // precedida de un espacio": en `@jorge@example.com` la primera `@` está
-        // al principio del texto. Mirar lo que HAY DETRÁS lo resuelve sin
-        // excepciones raras.
+        // `name@domain` is an email, and in an email the right side is the domain.
+        // That is the case that breaks the "the @ must be preceded by a space"
+        // rule: in `@jorge@example.com` the first `@` is at the very start of
+        // the text. Looking at what comes AFTER resolves it without weird
+        // exceptions.
         if (end < text.len and text[end] == '@') {
             i = end + 1;
             continue;
         }
         const path = text[start..end];
-        // Una mención tiene forma de RUTA: una `/` o una extensión.
+        // A mention looks like a PATH: a `/` or an extension.
         //
-        // Sin esta comprobación, pegar un trozo de código con decoradores
+        // Without this check, pasting a snippet with decorators
         // (`@Override`, `@click.command`, `@import`, `@deprecated`, `@final`…)
-        // llenaba el presupuesto del escaner: son 8 menciones, y la novena, que
-        // era el `@src/agent.zig` de verdad, ya no se miraba. Medido: siete
-        // decoradores y la mención real desaparece, sin aviso. Peor todavía,
-        // cada decorador conta como "no encontrado" y el usuario ve un
-        // "1 not found" sin haber pedido nada.
+        // filled the scanner's budget: they are 8 mentions, and the ninth, which
+        // was the real `@src/agent.zig`, was never looked at. Measured: seven
+        // decorators and the real mention disappears, without warning. Worse,
+        // each decorator counts as "not found" and the user sees a "1 not
+        // found" without having asked for anything.
         //
-        // El coste del filtro: `@Makefile` a secas (fichero sin extensión en la
-        // raíz) ya no se expande. Se escribe `@./Makefile`, que además es lo
-        // que se debería escribir para no dejar el path al criterio de donde se
-        // esté mirando.
+        // The cost of the filter: a bare `@Makefile` (a file with no extension
+        // in the root) no longer expands. You write `@./Makefile`, which is
+        // also what you should write to stop the path depending on where you
+        // happen to be looking.
         if (!looksLikePath(path)) {
             i = end;
             continue;
@@ -127,32 +126,32 @@ pub fn scan(text: []const u8, out: *[scanned_max]Mention) u8 {
     return n;
 }
 
-/// ¿El token es una ruta y no una palabra?
+/// Is the token a path and not a word?
 ///
-/// `/` o una extensión. Es lo que separa `@src/agent.zig` y `@notas.txt` de
-/// `@Override`, y está en `scan` (no en `expand`) a propósito: si el filtro
-/// estuviese abajo, los decoradores seguirían gastando el presupuesto del
-/// escaner y la mención real se seguiría perdiendo.
+/// A `/` or an extension. It is what separates `@src/agent.zig` and `@notas.txt`
+/// from `@Override`, and it lives in `scan` (not in `expand`) on purpose: if
+/// the filter were down below, the decorators would keep spending the scanner's
+/// budget and the real mention would keep getting lost.
 fn looksLikePath(token: []const u8) bool {
     if (std.mem.indexOfScalar(u8, token, '/') != null) return true;
-    // La extensión es el último `.` y no es un punto inicial ("`.gitignore`"
-    // no lleva extensión: se escribe `@./.gitignore`).
+    // The extension is the last `.`, and not a leading dot ("`.gitignore`"
+    // has no extension: you write `@./.gitignore`).
     const dot = std.mem.lastIndexOfScalar(u8, token, '.') orelse return false;
     return dot > 0 and dot + 1 < token.len;
 }
 
-/// Un resultado de `expand`.
+/// A result of `expand`.
 pub const Expansion = struct {
-    /// El texto que se manda al modelo. Es de `arena`.
+    /// The text that is sent to the model. It comes from `arena`.
     text: []const u8,
-    /// Cuántos ficheros se metieron de verdad.
+    /// How many files actually went in.
     files: u8,
-    /// Menciones que no se pudieron meter (no existen, o son directorios).
+    /// Mentions that could not be included (they do not exist, or are directories).
     missing: u8,
 };
 
-/// La cabecera de cada bloque. Compartida con el test para no duplicar el
-/// formato (que es justo lo que hay que fijar).
+/// The header of each block. Shared with the test so the format is not
+/// duplicated (and the format is exactly what needs pinning).
 pub fn blockHeader(w: *std.Io.Writer, path: []const u8, bytes: usize, truncated: bool) !void {
     try w.print("--- {s} ({d} bytes{s}) ---\n", .{
         path,
@@ -161,10 +160,10 @@ pub fn blockHeader(w: *std.Io.Writer, path: []const u8, bytes: usize, truncated:
     });
 }
 
-/// Amplía el prompt con el contenido de los ficheros mencionados.
+/// Extends the prompt with the contents of the mentioned files.
 ///
-/// Devuelve el texto ORIGINAL (sin copiar) si no hay nada que añadir, que es el
-/// caso normal y no debe costar una asignación.
+/// Returns the ORIGINAL text (without copying it) if there is nothing to add,
+/// which is the normal case and must not cost an allocation.
 pub fn expand(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -174,14 +173,14 @@ pub fn expand(
     const n = scan(text, &found);
     if (n == 0) return .{ .text = text, .files = 0, .missing = 0 };
 
-    // +1 KB de holgura para las cabeceras y los separadores de los 4 bloques.
+    // +1 KB of slack for the headers and separators of the 4 blocks.
     var w: std.Io.Writer = .fixed(arena.alloc(u8, file_max * max_files + 1024) catch return .{
         .text = text,
         .files = 0,
         .missing = 0,
     });
     try w.writeAll(text);
-    try w.writeAll("\n\nArchivos mencionados:\n\n");
+    try w.writeAll("\n\nMentioned files:\n\n");
 
     var files: u8 = 0;
     var missing: u8 = 0;
@@ -191,7 +190,7 @@ pub fn expand(
             continue;
         }
         const path = ment.pathOf();
-        // El mismo filtro que las tools: ni `.git` ni `zig-out` ni el caché.
+        // The same filter the tools use: neither `.git` nor `zig-out` nor the cache.
         if (!looksLikeSource(path)) {
             missing += 1;
             continue;
@@ -205,14 +204,14 @@ pub fn expand(
             missing += 1;
             continue;
         }
-        // Leer un PREFIJO, no el fichero entero.
+        // Read a PREFIX, not the whole file.
         //
-        // `readFileAlloc(..., .limited(n))` no recorta: si el fichero pasa de `n`
-        // bytes devuelve `error.FileTooBig`. Así que un `@src/tui.zig` (250 KB)
-        // se contaba como "not found" y no se inyectaba NUNCA, que es justo el
-        // caso que más falta hace. Con `readPositional` se leen los primeros
-        // `file_max` bytes y se marca como truncado, que es lo que el modelo
-        // necesita para no inventarse el final.
+        // `readFileAlloc(..., .limited(n))` does not truncate: if the file goes
+        // over `n` bytes it returns `error.FileTooBig`. So a `@src/tui.zig`
+        // (250 KB) counted as "not found" and was NEVER injected, which is
+        // exactly the case that needed it most. With `readPositional` the first
+        // `file_max` bytes are read and flagged as truncated, which is what the
+        // model needs so it does not invent the ending.
         const content = readPrefix(io, dir, path, arena) catch {
             missing += 1;
             continue;
@@ -221,25 +220,25 @@ pub fn expand(
         const kept = content.bytes;
         try blockHeader(&w, path, kept.len, truncated);
         try w.writeAll(kept);
-        // Un separador entre ficheros: sin él, dos bloques pegados parecen uno
-        // solo y el modelo no sabe dónde acaba cada uno.
+        // A separator between files: without it, two blocks glued together look like
+        // one and the model does not know where each one ends.
         if (!std.mem.endsWith(u8, kept, "\n")) try w.writeAll("\n");
         try w.writeAll("\n");
         files += 1;
     }
 
     if (files == 0) {
-        // Ningún fichero servible: mejor el prompt limpio que un bloque vacío
-        // con "Archivos mencionados:" y nada debajo.
+        // No servable file: the clean prompt is better than an empty block with
+        // "Mentioned files:" and nothing under it.
         return .{ .text = text, .files = 0, .missing = missing };
     }
     return .{ .text = w.buffered(), .files = files, .missing = missing };
 }
 
-/// Los primeros `file_max` bytes de un fichero.
+/// The first `file_max` bytes of a file.
 ///
-/// Devuelve el bloque y si se cortó. `arena` porque el contenido vive en el
-/// prompt ampliado, que es de la arena del turno.
+/// Returns the block and whether it was cut. `arena` because the content lives
+/// in the extended prompt, which comes from the turn's arena.
 fn readPrefix(
     io: std.Io,
     dir: std.Io.Dir,
@@ -250,13 +249,13 @@ fn readPrefix(
     defer f.close(io);
     const buf = try arena.alloc(u8, file_max);
     const n = try f.readPositional(io, &.{buf}, 0);
-    // Si el buffer se ha llenado, puede que haya más detrás: se marca como
-    // truncado. (Un fichero de EXACTAMENTE `file_max` sale también marcado, que
-    // es inofensivo: el bloque dice "truncated" y no le falta nada.)
+    // If the buffer filled up there may be more behind it: it is flagged as
+    // truncated. (A file of EXACTLY `file_max` comes out flagged too, which is
+    // harmless: the block says "truncated" and nothing is missing from it.)
     return .{ .bytes = buf[0..n], .truncated = n >= file_max };
 }
 
-/// Un fichero que tiene sentido meter en un prompt.
+/// A file that makes sense to put in a prompt.
 fn looksLikeSource(path: []const u8) bool {
     const skip = [_][]const u8{ ".zig-cache/", "zig-out/", ".git/", "node_modules/", "sessions/" };
     for (skip) |d| {
@@ -267,7 +266,7 @@ fn looksLikeSource(path: []const u8) bool {
 
 // ── tests ─────────────────────────────────────────────────────
 
-test "scan: encuentra las menciones en orden" {
+test "scan: finds the mentions in order" {
     var out: [scanned_max]Mention = undefined;
     const n = scan("revisa @src/agent.zig y luego @src/tui.zig", &out);
     try std.testing.expectEqual(@as(u8, 2), n);
@@ -275,19 +274,19 @@ test "scan: encuentra las menciones en orden" {
     try std.testing.expectEqualStrings("src/tui.zig", out[1].pathOf());
 }
 
-test "scan: un correo NO es una mención" {
-    // El caso que hace falta de verdad: escribirle a alguien con su dirección.
+test "scan: an email address is NOT a mention" {
+    // The case that is really needed: writing to someone with their address.
     var out: [scanned_max]Mention = undefined;
     try std.testing.expectEqual(@as(u8, 0), scan("mándaselo a jorge@example.com", &out));
     try std.testing.expectEqual(@as(u8, 0), scan("@jorge@example.com", &out));
-    // Y el caso difícil: la `@` pegada a una letra por delante no la salva nadie.
+    // And the hard case: an `@` glued to a letter in front is saved by nothing.
     try std.testing.expectEqual(@as(u8, 0), scan("a@b", &out));
 }
 
-test "scan: la puntuación final no se come la ruta" {
-    // `@notas.txt,` y `@notas.txt.` son el fichero `notas.txt` con la coma o el
-    // punto de la frase detrás. Sin quitarlo, `statFile` fallaba y la mención se
-    // perdía en silencio.
+test "scan: trailing punctuation does not eat the path" {
+    // `@notas.txt,` and `@notas.txt.` are the file `notas.txt` with the sentence's
+    // comma or period behind it. Without stripping it, `statFile` failed and
+    // the mention was lost in silence.
     var out: [scanned_max]Mention = undefined;
     const n = scan("mira @notas.txt, y @docs/guía.md.", &out);
     try std.testing.expectEqual(@as(u8, 2), n);
@@ -295,21 +294,21 @@ test "scan: la puntuación final no se come la ruta" {
     try std.testing.expectEqualStrings("docs/guía.md", out[1].pathOf());
 }
 
-test "scan: la @ suelta y el texto sin ruta no son menciones" {
+test "scan: a bare @ and text without a path are not mentions" {
     var out: [scanned_max]Mention = undefined;
     try std.testing.expectEqual(@as(u8, 0), scan("4 de 3 personas @ los tres", &out));
     try std.testing.expectEqual(@as(u8, 0), scan("@", &out));
     try std.testing.expectEqual(@as(u8, 0), scan("sin nada", &out));
     try std.testing.expectEqual(@as(u8, 0), scan("", &out));
-    // Y una mención justo al principio del texto sí vale.
+    // And a mention right at the start of the text does count.
     try std.testing.expectEqual(@as(u8, 1), scan("@a.txt", &out));
 }
 
-test "scan: los decoradores de un snippet NO gastan el presupuesto" {
-    // El bug que motivó `looksLikePath`. Pegar código con `@Override`,
-    // `@deprecated`, `@staticmethod`… llenaba las 8 ranuras del escaner y la
-    // mención real, que venía después, ya no se miraba: se perdía en silencio.
-    // Medido con siete decoradores antes de encontrar el filtro.
+test "scan: the decorators of a snippet do NOT spend the budget" {
+    // The bug that motivated `looksLikePath`. Pasting code with `@Override`,
+    // `@deprecated`, `@staticmethod`… filled the scanner's 8 slots and the real
+    // mention, which came after, was never looked at: it was lost in silence.
+    // Measured with seven decorators before the filter was found.
     var out: [scanned_max]Mention = undefined;
     const prompt = "revisa esto @Override @deprecated @staticmethod @final " ++
         "@pure @param @import y mira @src/agent.zig";
@@ -318,8 +317,8 @@ test "scan: los decoradores de un snippet NO gastan el presupuesto" {
     try std.testing.expectEqualStrings("src/agent.zig", out[0].pathOf());
 }
 
-test "looksLikePath: una ruta o una extensión; una palabra suelta no" {
-    // Lo que separa `@src/agent.zig` y `@notas.txt` de `@Override`.
+test "looksLikePath: a path or an extension; a bare word is not" {
+    // What separates `@src/agent.zig` and `@notas.txt` from `@Override`.
     try std.testing.expect(looksLikePath("src/agent.zig"));
     try std.testing.expect(looksLikePath("notas.txt"));
     try std.testing.expect(looksLikePath("a/b/c"));
@@ -327,14 +326,14 @@ test "looksLikePath: una ruta o una extensión; una palabra suelta no" {
     try std.testing.expect(!looksLikePath("Override"));
     try std.testing.expect(!looksLikePath("import"));
     try std.testing.expect(!looksLikePath("deprecated"));
-    // Un punto inicial no es una extensión: `.gitignore` se escribe
-    // `@./.gitignore`, que además no depende de dónde se esté mirando.
+    // A leading dot is not an extension: `.gitignore` is written `@./.gitignore`,
+    // which also does not depend on where you happen to be looking.
     try std.testing.expect(!looksLikePath(".gitignore"));
     try std.testing.expect(!looksLikePath("Makefile"));
 }
 
-test "scan: no repite el mismo fichero" {
-    // Meter dos veces el mismo fichero son 32 KB de contexto de regalo.
+test "scan: does not repeat the same file" {
+    // Including the same file twice is 32 KB of context for free.
     var out: [scanned_max]Mention = undefined;
     const n = scan("@a.txt y otra vez @a.txt y @b.txt", &out);
     try std.testing.expectEqual(@as(u8, 2), n);
@@ -342,23 +341,23 @@ test "scan: no repite el mismo fichero" {
     try std.testing.expectEqualStrings("b.txt", out[1].pathOf());
 }
 
-test "scan: una mención dentro de paréntesis o comillas también vale" {
+test "scan: a mention inside parentheses or quotes counts too" {
     var out: [scanned_max]Mention = undefined;
     const n = scan("(mira @src/a.zig) y \"@src/b.zig\"", &out);
     try std.testing.expectEqual(@as(u8, 2), n);
 }
 
-test "readPrefix: un fichero grande sale recortado, no error" {
-    // El bug de la pty: con `readFileAlloc(.limited(file_max))` un fichero de
-    // 250 KB daba `error.FileTooBig` y la mención se contaba como "not found".
-    // Aquí se comprueba que el prefijo sale y que se marca el recorte.
+test "readPrefix: a large file comes out truncated, not an error" {
+    // The pty bug: with `readFileAlloc(.limited(file_max))` a 250 KB file gave
+    // `error.FileTooBig` and the mention counted as "not found". Here we check
+    // that the prefix comes out and that the cut is flagged.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
     const io = std.testing.io;
     const dir: std.Io.Dir = .cwd();
 
-    // 3 file_max de contenido: tiene que salir 1 file_max y "truncated".
+    // 3 file_max of content: 1 file_max must come out, plus "truncated".
     var big: [8192]u8 = undefined;
     @memset(&big, 'g');
     var f = try dir.createFile(io, "mencion_test_grande.txt", .{});
@@ -375,7 +374,7 @@ test "readPrefix: un fichero grande sale recortado, no error" {
     try std.testing.expectEqual(@as(usize, file_max), r.bytes.len);
     try std.testing.expect(r.truncated);
 
-    // Y un fichero pequeño: entero y sin marcar.
+    // And a small file: whole and unflagged.
     {
         var w: std.Io.Writer = .fixed(arena.alloc(u8, 64) catch unreachable);
         try w.writeAll("hola");
@@ -387,11 +386,11 @@ test "readPrefix: un fichero grande sale recortado, no error" {
     try std.testing.expect(!r2.truncated);
 }
 
-test "un fichero más grande que el tope se mete TRUNCADO, no se pierde" {
-    // El fallo que salió en la pty: con `.limited(file_max)` un fichero de 250 KB
-    // devolvía `error.FileTooBig`, se contaba como "not found" y el modelo se
-    // enteraba de que el fichero no existía. Con el +1 y el recorte sale el
-    // bloque con su "(truncated)".
+test "a file bigger than the cap goes in TRUNCATED, not lost" {
+    // The failure that showed up in the pty: with `.limited(file_max)` a 250 KB
+    // file returned `error.FileTooBig`, counted as "not found", and the model
+    // concluded the file did not exist. With the +1 and the cut, the block comes
+    // out with its "(truncated)".
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -406,11 +405,11 @@ test "un fichero más grande que el tope se mete TRUNCADO, no se pierde" {
     const e = try expand(arena, std.testing.io, "mira @mencion_test_peque.txt");
     try std.testing.expectEqual(@as(u8, 1), e.files);
     try std.testing.expect(std.mem.indexOf(u8, e.text, "1234567890") != null);
-    // Y la cabecera lleva los bytes de verdad, no los del buffer de entrada.
+    // And the header carries the real byte count, not the input buffer's.
     try std.testing.expect(std.mem.indexOf(u8, e.text, "--- mencion_test_peque.txt (10 bytes) ---") != null);
 }
 
-test "expand: sin ficheros servibles devuelve el texto ORIGINAL (sin copias)" {
+test "expand: with no servable files it returns the ORIGINAL text (no copies)" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -418,14 +417,14 @@ test "expand: sin ficheros servibles devuelve el texto ORIGINAL (sin copias)" {
     const e = try expand(arena, std.testing.io, original);
     try std.testing.expectEqual(@as(u8, 0), e.files);
     try std.testing.expectEqual(@as(u8, 1), e.missing);
-    // Un bloque "Archivos mencionados:" vacío sería peor que no tocar nada.
+    // An empty "Mentioned files:" block would be worse than not touching anything.
     try std.testing.expect(e.text.ptr == original.ptr);
     try std.testing.expectEqualStrings(original, e.text);
 }
 
-test "la cabecera del bloque dice si está truncado" {
-    // Un fichero cortado en silencio hace que el modelo se invente el final, así
-    // que el "(truncated)" va SIEMPRE que se corte.
+test "the block header says whether it is truncated" {
+    // A file cut in silence makes the model invent the ending, so "(truncated)"
+    // goes in ALWAYS, whenever there is a cut.
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
@@ -436,9 +435,9 @@ test "la cabecera del bloque dice si está truncado" {
     try std.testing.expect(std.mem.indexOf(u8, out, "--- b.zig (32768 bytes, truncated) ---") != null);
 }
 
-test "lookslikeSource: ni el caché ni git" {
-    // Meter 40 MB de `.zig-cache` en un prompt no es una mención, es un
-    // accidente.
+test "lookslikeSource: neither the cache nor git" {
+    // Putting 40 MB of `.zig-cache` into a prompt is not a mention, it is an
+    // accident.
     try std.testing.expect(looksLikeSource("src/agent.zig"));
     try std.testing.expect(looksLikeSource("notas.txt"));
     try std.testing.expect(!looksLikeSource(".zig-cache/o/abc/tablas.zig"));

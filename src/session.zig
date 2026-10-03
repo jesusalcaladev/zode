@@ -318,7 +318,7 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Message {
     return .{ .role = role, .content = content, .tool_calls_json = tcj, .tool_call_id = tcid, .tool_name = tname };
 }
 
-test "session append + persist en memoria" {
+test "session append + persist in memory" {
     var s = Session.init(std.testing.allocator);
     defer s.deinit();
     try s.append(.user, "hola \"mundo\"\nlinea2");
@@ -328,7 +328,7 @@ test "session append + persist en memoria" {
     try std.testing.expectEqualStrings("hola \"mundo\"\nlinea2", s.messages.items[0].content);
 }
 
-test "round trip: sesion comprimida en disco" {
+test "round trip: session compressed on disk" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
 

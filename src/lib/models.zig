@@ -22,30 +22,84 @@ pub const Model = struct {
     price_prompt: f64 = 0,
     /// Price per completion token in USD.
     price_completion: f64 = 0,
-    /// [roster] ¿Es gratis de verdad? Ver `isFreeId` y `isFreeByPrice`.
+    /// [roster] Is it really free? See `isFreeId` and `isFreeByPrice`.
     ///
-    /// Antes esto se decidía en el consumidor con `endsWith(id, "-free")`, y eso
-    /// solo veía los modelos de opencode: en OpenRouter el sufijo es `:free`, y
-    /// hay providers que no usan ningún sufijo y se limitan a publicar precio 0.
+    /// Before, this was decided by the consumer with `endsWith(id, "-free")`, and
+    /// that only saw opencode's models: on OpenRouter the suffix is `:free`, and
+    /// some providers use no suffix at all and just publish price 0.
     is_free: bool = false,
 };
 
-/// ¿El id tiene la marca de "gratis" que usa su provider?
+/// Does the id carry the "free" mark its provider uses?
 ///
-/// Dos convenciones y las dos existen: opencode usa `-free`
-/// ("space-bunny-free") y OpenRouter usa `:free` ("qwen/qwen3-8b:free").
-/// Comprobar solo una de las dos es lo que hacía que el pool de modelos free
-/// viera un provider y ningún otro.
+/// Two conventions, and both are real: opencode uses `-free`
+/// ("space-bunny-free") and OpenRouter uses `:free` ("qwen/qwen3-8b:free").
+/// Checking only one of the two is what made the pool of free models see one
+/// provider and no other.
 pub fn isFreeId(id: []const u8) bool {
     return std.mem.endsWith(u8, id, "-free") or std.mem.endsWith(u8, id, ":free");
 }
 
-/// ¿El precio publica que es gratis?
+/// Is this model one a CODING AGENT can hold a conversation with?
 ///
-/// Solo vale si el modelo TRAÍA el objeto `pricing` (lo sabe el parser). Un
-/// provider que no publica precios deja los dos a 0, y sin esta comprobación
-/// todos sus modelos saldrían gratis: el peor fallo posible para un modo que se
-/// llama "free-auto", porque se creería que puede gastar sin pagar.
+/// "Free" and "usable" are different questions, and the pool was answering only
+/// the first one. `zig build roster-probe` showed what that costs: the free
+/// models of a big aggregator include `google/lyria-3-pro-preview` (music
+/// generation), `google/lyria-3-clip-preview` and `clip-*` (embeddings), and the
+/// pool dutifully offered them as the model to write code with. The turn then
+/// fails on the first token, the error is attributed to the quota, and the pool
+/// rotates — to the next image model.
+///
+/// The test is on the ID, because that is all several providers publish: a
+/// name that says what it does. It is a filter, not a guarantee, and being wrong
+/// here costs one rotation.
+pub fn isConversational(id: []const u8) bool {
+    const needles = [_][]const u8{
+        // embeddings / retrieval
+        "clip",           "embed",         "bge-",           "gte-",
+        "e5-",            "minilm",        "jina-",          "voyage",
+        "rerank",         "retriev",
+        // images and video
+        "flux",           "stable-diffusion", "sdxl",        "sd3",
+        "sora",           "veo",           "imagen",         "dall-e",
+        "ideogram",       "recraft",       "ideogram",
+        // audio
+        "tts",            "whisper",       "lyria",          "elevenlabs",
+        "suno",           "audi",          "speech",         "transcribe",
+        // safety and moderation: they answer 200 and then say no
+        "moderation",     "guard",         "safety",
+        // image EDITING models, which live next to the chat ones in the same list
+        "kontext",        "background-removal",
+    };
+    for (needles) |n| {
+        if (containsIgnoreCase(id, n)) return false;
+    }
+    return true;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var ok = true;
+        for (needle, 0..) |nc, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+/// Does the published price say it is free?
+///
+/// It only counts if the model CAME WITH a `pricing` object (the parser knows
+/// whether it did). A provider that publishes no prices leaves both at 0, and
+/// without this check every one of its models would come out free: the worst
+/// possible failure for a mode called "free-auto", because it would believe it
+/// can spend without paying.
 pub fn isFreeByPrice(has_pricing: bool, price_prompt: f64, price_completion: f64) bool {
     return has_pricing and price_prompt == 0 and price_completion == 0;
 }
@@ -127,9 +181,9 @@ pub fn listModels(
         }
         var p_prompt: f64 = 0;
         var p_completion: f64 = 0;
-        // [roster] ¿Vino el objeto `pricing`? Distingue "precio 0" de "no public
-        // precio", que es la diferencia entre un modelo gratis y un provider que
-        // no dice nada.
+        // [roster] Did the `pricing` object arrive? It tells "price 0" apart from
+        // "no price published", which is the difference between a free model
+        // and a provider that says nothing.
         var has_pricing = false;
         if (entry.object.get("pricing")) |pv| {
             if (pv == .object) {
@@ -169,7 +223,7 @@ fn jsonNumber(v: std.json.Value) f64 {
     };
 }
 
-test "listModels parsea context_length y pricing de OpenRouter" {
+test "listModels parses OpenRouter's context_length and pricing" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -203,7 +257,7 @@ test "listModels parsea context_length y pricing de OpenRouter" {
     try std.testing.expect(no_price == null);
 }
 
-test "jsonNumber acepta float, integer y string decimal" {
+test "jsonNumber accepts float, integer and decimal string" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), jsonNumber(.{ .float = 1.5 }), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 7.0), jsonNumber(.{ .integer = 7 }), 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), jsonNumber(.{ .number_string = "0.25" }), 1e-12);
@@ -212,40 +266,40 @@ test "jsonNumber acepta float, integer y string decimal" {
     try std.testing.expectApproxEqAbs(@as(f64, 0), jsonNumber(.null), 1e-9);
 }
 
-// ── [roster] qué es un modelo gratis ──────────────────────────
+// ── [roster] what counts as a free model ──────────────────────
 
-test "isFreeId: las dos convenciones de sufijo" {
+test "isFreeId: the two suffix conventions" {
     // opencode
     try std.testing.expect(isFreeId("space-bunny-free"));
     try std.testing.expect(isFreeId("kimi-k2.6-free"));
-    // OpenRouter, con prefijo de provider
+    // OpenRouter, with a provider prefix
     try std.testing.expect(isFreeId("qwen/qwen3-8b:free"));
     try std.testing.expect(isFreeId("meta-llama/llama-3.3-70b-instruct:free"));
-    // Y lo que NO es
+    // And what is NOT one
     try std.testing.expect(!isFreeId("gpt-4o"));
     try std.testing.expect(!isFreeId("deepseek/deepseek-chat"));
     try std.testing.expect(!isFreeId("free-model-with-no-suffix"));
     try std.testing.expect(!isFreeId(""));
-    // El sufijo va AL FINAL: un "free" en medio es otra cosa (un nombre).
+    // The suffix goes at the END: a "free" in the middle is something else (a name).
     try std.testing.expect(!isFreeId("free-tier/default"));
 }
 
-test "isFreeByPrice: precio 0 con pricing es gratis; sin pricing NO" {
-    // La señal que no depende de la convención del id.
+test "isFreeByPrice: price 0 with pricing is free; without pricing, NO" {
+    // The signal that does not depend on the id convention.
     try std.testing.expect(isFreeByPrice(true, 0, 0));
-    // Cualquiera de los dos a > 0 ya no es gratis.
+    // Either one above 0 and it is no longer free.
     try std.testing.expect(!isFreeByPrice(true, 0.00000015, 0));
     try std.testing.expect(!isFreeByPrice(true, 0, 0.0000006));
     try std.testing.expect(!isFreeByPrice(true, 3, 15));
-    // Y el caso peligroso: provider que no publica pricing. Sin el `has_pricing`
-    // TODOS sus modelos saldrían gratis y el free-auto creería que puede
-    // gastar sin pagar.
+    // And the dangerous case: a provider that publishes no pricing. Without
+    // `has_pricing` ALL of its models come out free and free-auto would believe
+    // it can spend without paying.
     try std.testing.expect(!isFreeByPrice(false, 0, 0));
 }
 
-test "el parser marca is_free con las tres señales" {
-    // Fixture que mezcla las tres formas y un modelo de pago, con los precios
-    // reales en el formato string de OpenRouter.
+test "the parser flags is_free with the three signals" {
+    // Fixture that mixes the three forms plus a paid model, with real prices in
+    // OpenRouter's string format.
     const json =
         \\{"object":"list","data":[
         \\ {"id":"space-bunny-free","owned_by":"opencode"},
@@ -278,10 +332,32 @@ test "el parser marca is_free con las tres señales" {
         }
         const is_free = isFreeId(id) or isFreeByPrice(has_pricing, p_prompt, p_completion);
         if (is_free) free += 1;
-        // El de pago y el que no publica nada tienen que salir falsos.
+        // The paid one and the one that publishes nothing must come out false.
         if (std.mem.eql(u8, id, "anthropic/claude-sonnet-4-5") or std.mem.eql(u8, id, "gpt-4o")) {
             try std.testing.expect(!is_free);
         }
     }
     try std.testing.expectEqual(@as(usize, 3), free);
+}
+
+test "isConversational: embeddings, images and audio are not coding agents" {
+    // Exactly the ids the free pool was offering, from `zig build roster-probe`.
+    try std.testing.expect(!isConversational("google/lyria-3-pro-preview"));
+    try std.testing.expect(!isConversational("google/lyria-3-clip-preview"));
+    try std.testing.expect(!isConversational("openai/clip-vit-large-patch14"));
+    try std.testing.expect(!isConversational("openai/dall-e-3"));
+    try std.testing.expect(!isConversational("black-forest-labs/flux-1.1-pro"));
+    try std.testing.expect(!isConversational("stabilityai/stable-diffusion-xl-base"));
+    try std.testing.expect(!isConversational("openai/whisper-large-v3"));
+    try std.testing.expect(!isConversational("openai/text-embedding-3-small"));
+    try std.testing.expect(!isConversational("cohere/embed-english-v3.0"));
+    try std.testing.expect(!isConversational("openai/omni-moderation-latest"));
+
+    // And the ones a turn actually runs on.
+    try std.testing.expect(isConversational("qwen/qwen3-8b:free"));
+    try std.testing.expect(isConversational("deepseek/deepseek-chat-v3-0324:free"));
+    try std.testing.expect(isConversational("google/gemini-2.5-flash-lite"));
+    try std.testing.expect(isConversational("space-bunny-free"));
+    // A name that CONTAINS one of the words but is a chat model anyway.
+    try std.testing.expect(isConversational("inception/mercury-coder-small"));
 }

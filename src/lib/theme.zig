@@ -30,6 +30,26 @@ pub const brand_faint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x3b, 0x42, 0x61 } } 
 pub const assistant: vaxis.Style = .{ .fg = .{ .index = 5 } }; // magenta
 pub const assistant_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 5 } };
 pub const tool: vaxis.Style = .{ .fg = .{ .index = 6 } }; // cyan
+
+// ── readable secondary text ────────────────────────────────────
+//
+// `brand_faint` (#3b4261) is ~1.9:1 against a dark background: fine for a
+// hairline border, UNREADABLE for a line of text. It was doing both jobs —
+// the `ask` panel's hint and clock, the key hints under the code chips — and
+// the only legible thing in that panel was the question itself.
+//
+// The split is by ROLE, not by taste:
+//   - `brand_faint`  hairlines: borders, separators, rules. Never text.
+//   - `hint`         text the user is meant to read but that is not the
+//                    answer. ~4.5:1 on the dark backgrounds we use.
+//   - `brand_soft`   text that is genuinely tertiary (a label, a counter).
+pub const hint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0x83, 0x99 } } };
+/// One step below `hint`: a key hint next to something already labelled.
+pub const hint_faint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x65, 0x6d, 0x82 } } };
+/// Background of the selected row in a list. It has to be a BACKGROUND: with
+/// only a foreground change, a selected item is distinguishable only by bold,
+/// which is a difference most people do not see across a 60-column row.
+pub const sel_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x2a, 0x2f, 0x45 } } };
 pub const ok: vaxis.Style = .{ .fg = .{ .index = 2 } }; // green
 pub const warn: vaxis.Style = .{ .fg = .{ .index = 3 } }; // yellow
 pub const warn_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 3 } };
@@ -56,8 +76,9 @@ pub fn ctxColor(pct: u8) vaxis.Style {
     return err;
 }
 
-/// Background of the selected item in a picker.
-pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 } };
+/// Selected row: brand blue AND a background. See `sel_bg` for why the
+/// background is not optional.
+pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 }, .bg = sel_bg.bg };
 
 // ── code token palette (ROADMAP Phase 4.4/4.5/4.6) ──────────────
 //
@@ -99,15 +120,23 @@ pub const diff_ctx: vaxis.Style = code_comment;
 
 /// Background and gutter of a code block (Phase 4.1).
 pub const code_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x1a, 0x1b, 0x26 } } };
-pub const code_gutter: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x3b, 0x42, 0x61 } } };
+/// The `│` in the gutter of a CONTINUATION row: the line under a tool result or
+/// a wrapped paragraph still belongs to it. One glyph per row, and it is the
+/// difference between "one result plus five anonymous rows" and "a result".
+pub const gutter: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x4a, 0x51, 0x70 } } };
+
+/// The `│` that frames a code block. It was `brand_faint` (#3b4261, 1.9:1),
+/// which made the ONE thing that says "this is a block" the least visible mark
+/// in the UI. `hint_faint` is 3.4:1 and still recedes.
+pub const code_gutter: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x65, 0x6d, 0x82 } } };
 /// Chip with the block's language.
-pub const code_lang: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } }, .italic = true };
+pub const code_lang: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0x83, 0x99 } }, .italic = true };
 
 // ── modal palette (Ctrl+P) ───────────────────────────────────
 
 /// Unhighlighted item: normal text, not grey, so the list stays readable.
 pub const item: vaxis.Style = .{};
-/// Group heading ("Suggested", "Prompt", "Sesión"...).
+/// Group heading ("Suggested", "Model", "Session"...).
 pub const group: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } } };
 /// Highlighted row: accent bar + text in brand blue.
 pub const item_sel: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
@@ -121,7 +150,7 @@ pub fn graphemeWidth(ctx: vxfw.DrawContext, g: []const u8) u8 {
     return @intCast(@max(1, w));
 }
 
-test "graphemeWidth: ascii=1, vacío=1" {
+test "graphemeWidth: ascii=1, empty=1" {
     const ctx = vxfw.DrawContext{
         .arena = std.testing.allocator,
         .min = .{},

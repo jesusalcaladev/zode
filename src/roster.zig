@@ -4,93 +4,93 @@ const providers = @import("lib/providers.zig");
 const config_mod = @import("config.zig");
 const http_client = @import("lib/http_client.zig");
 
-/// El pool de modelos gratis de TODOS los providers con key, y la rueda que
-/// reparte turnos entre ellos.
+/// The pool of free models from EVERY provider that has a key, and the wheel that
+/// hands turns out among them.
 ///
-/// ## Qué resuelve
+/// ## What it solves
 ///
-/// Con un solo provider, cuando se le acaba la cuota (402) o el gate lo rechaza
-/// (403 "can only be used from within OpenCode"), el turno se muere y el
-/// usuario tiene que escribir "continúa" con otro modelo. Aquí, en vez de eso,
-/// el turno sigue solo: se marca el par provider/modelo como muerto un rato y se
-/// reintenta la misma petición con el siguiente candidato.
+/// With a single provider, when its quota runs out (402) or the gate rejects it
+/// (403 "can only be used from within OpenCode"), the turn dies and the user has
+/// to type "continue" with a different model. Here, instead of that, the turn
+/// goes on by itself: the provider/model pair is marked dead for a while and the
+/// same request is retried with the next candidate.
 ///
-/// ## Por qué NO se espera a la rotación
+/// ## Why it does NOT wait for the rotation
 ///
-/// `build` habla con N providers, y eso son N peticiones (cientos de ms cada
-/// una). Si se hiciera en el primer fallo, el usuario vería "se queda
-/// pensando" justo cuando necesita que pase algo. Se construye en un worker al
-/// arrancar, y si no está listo el turno sigue con el modelo actual: la rotación
-/// espera al siguiente turno, nunca bloquea.
+/// `build` talks to N providers, and that is N requests (hundreds of ms each).
+/// If it happened on the first failure, the user would watch it "think" exactly
+/// when they need something to happen. It is built in a worker at startup, and if
+/// it is not ready the turn proceeds with the current model: the rotation waits
+/// for the next turn, it never blocks.
 ///
-/// ## Lo que NO hace
+/// ## What it does NOT do
 ///
-/// - No adivina providers: solo los que `providers.keyFor` devuelve key, que son
-///   los que el usuario ha conectado de verdad.
-/// - No persiste entre procesos (todavía). El pool se rehace al arrancar, que
-///   son N peticiones en background.
-/// - No toca `cur_provider_id`/`cur_model`: el modo es una capa encima, y
-///   `/use` y `/model` siguen mandando sobre lo que hay activo.
-/// Tope de rotaciones por turno. Tres: más que eso y casi seguro es un problema
-/// de configuracion (todos los free caidos), no de cuota, y a partir de ahí lo
-/// que se hace es dar vueltas y tarayar al usuario.
+/// - It does not guess providers: only the ones `providers.keyFor` returns a key
+///   for, which are the ones the user actually connected.
+/// - It does not persist across processes (yet). The pool is rebuilt at startup,
+///   which is N requests in the background.
+/// - It does not touch `cur_provider_id`/`cur_model`: the mode is a layer on top,
+///   and `/use` and `/model` still rule over whatever is active.
+/// Cap on rotations per turn. Three: past that it is almost certainly a
+/// configuration problem (all the free ones down), not a quota one, and from
+/// there on what you are doing is spinning and annoying the user.
 pub const max_rotations_per_turn = 3;
-/// Tope por tarea (prompt). Diez: cubre una sesión larga con varios proveedores
-/// muriendo, y corta antes de que el turno parezca colgado.
+/// Cap per task (prompt). Ten: covers a long session with several providers
+/// dying, and cuts off before the turn looks hung.
 pub const max_rotations_per_task = 10;
 
-/// Cuánto está muerto un par antes de volver a intentarlo.
+/// How long a pair stays dead before it is tried again.
 ///
-/// Diez minutos. Un rate limit de openrouter/sonido dura segundos o minutos; una
-/// cuota diaria (deepseek) dura horas, y para esa el mensaje al usuario es otro
-/// (más "quota" que "rate limit"), no un reintento automático.
+/// Ten minutes. An openrouter/sound rate limit lasts seconds or minutes; a daily
+/// quota (deepseek) lasts hours, and for that one the message to the user is a
+/// different one (more "quota" than "rate limit"), not an automatic retry.
 pub const cooldown_ms: i128 = 10 * 60 * 1000;
 
-/// Cuánto está fuera de juego un par según POR QUÉ murió.
+/// How long a pair is out of the game depending on WHY it died.
 ///
-/// Un solo tope para todo era un error: un 429 de openrouter y un 503 pasajero
-/// no son lo mismo, y 10 minutos de castigo por un blip de un segundo quitan un
-/// modelo bueno del pool cuando el usuario más lo necesita. La cuota (402/429) sí
-/// dura: es lo que tarda en volver.
+/// A single cap for everything was wrong: an openrouter 429 and a passing 503
+/// are not the same thing, and 10 minutes of punishment for a one-second blip
+/// takes a good model out of the pool exactly when the user needs it most. A
+/// quota (402/429) does last: that is what takes a while to come back.
 pub const failed_cooldown_ms: i128 = 60 * 1000;
 
-/// Tope de candidatos. Con 5 providers y 3 free cada uno son 15; el tope es para
-/// que un provider que devuelva el catálogo entero (openrouter tiene ~460
-/// modelos) no infle el array fijo.
+/// Candidate cap. With 5 providers and 3 free each that is 15; the cap is there
+/// so a provider that returns the whole catalog (openrouter has ~460 models)
+/// does not blow up the fixed array.
 pub const max_candidates = 24;
 
-/// Cuántos free se quedan de CADA provider.
+/// How many free models are kept from EACH provider.
 ///
-/// Existe por un motivo que la sonda enseñó: openrouter publica 20 free y
-/// opencode 8, y con un tope SOLO global el primero que se lista se come el
-/// pool entero. O sea, que el provider con más modelos (el más útil) era el
-/// que peor salía. Con este tope cada uno aporta sus mejores y la suma decide
-/// quién entra.
+/// It exists for a reason the probe showed: openrouter publishes 20 free models
+/// and opencode 8, and with a GLOBAL-only cap whichever is listed first eats the
+/// whole pool. In other words, the provider with the most models (the most
+/// useful one) was the one that came out worst. With this cap each contributes
+/// its best ones and the sum decides who gets in.
 pub const per_provider_max = 8;
 
-/// Un par provider/modelo que se puede usar.
+/// A provider/model pair that can be used.
 pub const Candidate = struct {
-    /// Copias propias en el arena del roster (nunca un slice del worker que
-    /// construyó la lista de modelos: ese arena muere al salir).
+    /// Own copies in the roster arena (never a slice from the worker that built
+    /// the model list: that arena dies on the way out).
     provider_id: []const u8,
     model_id: []const u8,
-    /// Ventana de contexto publicada, 0 = desconocida.
+    /// Published context window, 0 = unknown.
     ctx: u32 = 0,
-    /// Baraja estable: menor = preferido. Ver `rankFor`.
+    /// Stable shuffling: lower = preferred. See `rankFor`.
     rank: u8 = 0,
-    /// El provider es opencode, cuyos `-free` dan 403 fuera del cliente oficial.
-    /// Se quedan los ultimos: hay que probarlos alguna vez, pero no son un
-    /// plan de Contingencia.
+    /// The provider is opencode, whose `-free` models answer 403 outside the
+    /// official client. They stay last: they have to be tried once in a while,
+    /// but they are not a plan B.
     gated_opencode: bool = false,
-    /// Ya ha completado un turno con tools en esta sesion: sube de prioridad.
+    /// Already finished a turn with tools in this session: it goes up in priority.
     worked: bool = false,
-    /// Veces que se quedo a medias (subio 2 veces sin cerrar el turno).
+    /// Times it went half way (came up twice without closing the turn).
     stalls: u8 = 0,
 };
 
-/// Un par que no esta disponible ahora mismo, y por que.
-/// Longitud del motivo. Con los 4 KB que devuelve a veces un body de error, el
-/// texto se recorta: lo que se guarda es "qué pasó", no la respuesta entera.
+/// A pair that is not available right now, and why.
+/// Reason length. With the 4 KB an error body sometimes returns, the text gets
+/// truncated: what is kept is "what happened", not the whole response.
 pub const reason_len_max = 96;
 
 pub const Dead = struct {
@@ -108,23 +108,23 @@ pub const Dead = struct {
     }
 };
 
-/// Por que se murió un par, en una frase que el usuario pueda usar.
+/// Why a pair died, in a phrase the user can act on.
 pub const Why = enum {
-    /// 402: sin créditos. No vuelve solo.
+    /// 402: out of credits. It does not come back on its own.
     no_credits,
-    /// 429: rate limit. Vuelve solo en un rato.
+    /// 429: rate limit. It comes back on its own in a while.
     rate_limited,
-    /// 403 con el texto del gate de opencode: no es la key ni el config.
+    /// 403 with the opencode gate text: it is neither the key nor the config.
     gated,
-    /// 403/404 sin más historia: casi siempre es un id malo o una config.
+    /// 403/404 with no further story: almost always a bad id or a config.
     misconfigured,
-    /// Se quedó a medias dos veces.
+    /// Went half way twice.
     stalled,
-    /// Se agotaron los reintentos con este par (3 intentos con backoff) sin que
-    /// el error fuera de cuota. Verá: un 5xx o un body raro NO es motivo para
-    /// rotar en el momento (el modelo no tiene la culpa y puede ser un blip), pero
-    /// si el turno se muere con él, el SIGUIENTE turno tiene que empezar en otro
-    /// sitio o el usuario se queda atascado en el mismo modelo para siempre.
+    /// The retries with this pair ran out (3 attempts with backoff) without the
+    /// error being a quota one. You see: a 5xx or a weird body is NOT a reason
+    /// to rotate on the spot (the model is not to blame and it can be a blip),
+    /// but if the turn dies with it, the NEXT turn has to start somewhere else
+    /// or the user stays stuck on the same model forever.
     failed,
 
     pub fn label(self: Why) []const u8 {
@@ -140,20 +140,21 @@ pub const Why = enum {
 };
 
 pub const Roster = struct {
-    /// Arena propia: los strings de los candidatos son copias suyas, y el roster
-    /// sobrevive a los workers que lo construyeron.
+    /// Its own arena: the candidate strings are its copies, and the roster
+    /// outlives the workers that built it.
     arena: std.mem.Allocator = undefined,
     inited: bool = false,
-    /// El worker terminó de construirlo (o/video terminó de intentarlo).
+    /// The worker finished building it (or finished trying to).
     built: bool = false,
-    /// Hubo key pero ningún modelo free (o no hubo key). Es un estado LÍCITO.
+    /// There was a key but no free model (or there was no key). That is a LEGAL
+    /// state.
     empty_reason: []const u8 = "",
 
     items: [max_candidates]Candidate = undefined,
     len: u8 = 0,
-    /// Índice del candidato activo. Apunta al vivo, no al bruto.
+    /// Index of the active candidate. It points at the live list, not the raw one.
     idx: u8 = 0,
-    /// Posición real en `items` del activo, para poder marcarlo muerto.
+    /// Real position in `items` of the active one, so it can be marked dead.
     cur_raw: u8 = 0,
 
     dead: [max_candidates]Dead = undefined,
@@ -162,7 +163,7 @@ pub const Roster = struct {
     rotations_turn: u8 = 0,
     rotations_task: u8 = 0,
 
-    /// Por que fallo el ultimo provider que se listo (para diagnostics).
+    /// Why the last provider that was asked failed (for diagnostics).
     last_error: ?anyerror = null,
 
     pub fn init(gpa: std.mem.Allocator) Roster {
@@ -177,11 +178,11 @@ pub const Roster = struct {
         return self.len == 0;
     }
 
-    /// Construye el pool: por cada provider con key, sus modelos free.
+    /// Builds the pool: for every provider with a key, its free models.
     ///
-    /// Falla el conjunto (no el turno): si un provider da 403 o no tiene key, se
-    /// salta y se sigue con los demás. Un solo provider que responde 200 pero sin
-    /// modelos free NO es un error.
+    /// It fails as a whole (not the turn): if a provider answers 403 or has no
+    /// key, it is skipped and the rest continue. A single provider that answers
+    /// 200 with no free models is NOT an error.
     pub fn build(
         self: *Roster,
         io: std.Io,
@@ -204,18 +205,18 @@ pub const Roster = struct {
 
         var found_any_key = false;
         for (defs) |def| {
-            // Inicio del tramo que aporta este provider, para poder recortar SUS
-            // candidatos sin tocar los de los anteriores.
+            // Start of the run this provider contributes, so its candidates can be
+            // trimmed without touching the earlier ones.
             const start: u8 = self.len;
-            // Sin key no se pregunta: un 401 aquí solo genera ruido.
+            // No key, no question: a 401 here is only noise.
             if (providers.keyFor(&def, env) == null) continue;
             found_any_key = true;
             if (self.len >= max_candidates) break;
 
-            // `var` y no `const`: `deinit` necesita un puntero no-const para
-            // liberar la lista (Zig no deja pasar un `*const` a un `*`).
+            // `var` and not `const`: `deinit` needs a non-const pointer to free
+            // the list (Zig does not let a `*const` be passed to a `*`).
             var list = models.listModels(self.arena, &http, def.models_url, providers.keyFor(&def, env)) catch {
-                // Un provider caído no tumba el pool: se sigue con el resto.
+                // A down provider does not bring the pool down: carry on with the rest.
                 self.last_error = error.ProviderListFailed;
                 continue;
             };
@@ -223,6 +224,11 @@ pub const Roster = struct {
 
             for (list.items) |mo| {
                 if (!mo.is_free) continue;
+                // Free is not the same as usable: an aggregator's free tier is
+                // full of embeddings, image and audio models, and offering one of
+                // those as "the model to write code with" fails on the first
+                // token and then looks like a quota problem.
+                if (!models.isConversational(mo.id)) continue;
                 if (self.len >= max_candidates) break;
                 self.items[self.len] = .{
                     .provider_id = self.arena.dupe(u8, def.id) catch continue,
@@ -250,66 +256,68 @@ pub const Roster = struct {
         self.cur_raw = 0;
     }
 
-    /// Orden estable y con criterio. Importa: no todos los free saben usar tools
-    /// multi-paso, y caer en uno malo produce ediciones basura.
+    /// Stable order, and one with a rationale. It matters: not every free model
+    /// knows how to use multi-step tools, and landing on a bad one produces
+    /// garbage edits.
     ///
-    /// 1. Los que ya han funcionado (`worked`): lo que se sabe, vale.
-    /// 2. Los que no están gateados a opencode (su 403 es conocido y no lo
-    ///    arregla nada: probar el último es perder un intento).
-    /// 3. Contexto más grande primero: menos probabilidad de compactar a mitad
-    ///    de un turno, que es donde duele.
-    /// 4. Alfabético como desempate, para que la lista sea la misma en cada
-    ///    arranque y los tests puedan fijarla.
+    /// 1. The ones that already worked (`worked`): what is known to work wins.
+    /// 2. The ones not gated to opencode (their 403 is known and nothing fixes
+    ///    it: trying them last is wasting an attempt).
+    /// 3. Bigger context first: less chance of compacting halfway through a
+    ///    turn, which is where it hurts.
+    /// 4. Alphabetical as the tie-breaker, so the list is the same on every
+    ///    startup and the tests can pin it.
     fn sort(self: *Roster) void {
         const items = self.items[0..self.len];
         std.mem.sort(Candidate, items, {}, less);
     }
 
-    /// Recorta a `per_provider_max` los candidatos que aporta ESTE provider (el
-    /// tramo `start..self.len`), quedándose con los de contexto más grande.
+    /// Trims the candidates THIS provider contributes (the run `start..self.len`)
+    /// down to `per_provider_max`, keeping the ones with the biggest context.
     ///
-    /// Va fuera de `build` a propósito: `build` habla con la red y no se puede
-    /// testear, y el recorte es justo la parte donde el fallo se esconde. Así lo
-    /// comprueba un test sin salir a la red (el fallo lo encontró la sonda
-    /// `zig build roster-probe`: con el tope solo global, openrouter se comía el
-    /// pool y de los 20 free solo entraban 16 en cualquier orden).
+    /// It lives outside `build` on purpose: `build` talks to the network and
+    /// cannot be tested, and the trim is exactly where the bug hides. This way a
+    /// test checks it without going near the network (the bug was found by the
+    /// `zig build roster-probe` probe: with the global-only cap, openrouter ate
+    /// the pool and out of its 20 free models only 16 got in, in any order).
     fn trimProvider(self: *Roster, start: u8) void {
         const added = self.len - start;
         if (added <= per_provider_max) return;
-        // Ordenar ANTES de tirar el resto (y no al revés) es lo que deja en el
-        // pool los mejores. Recortar primero se quedaría con los 8 primeros que
-        // publicó el provider, que pueden ser los peores.
+        // Sorting BEFORE throwing the rest away (not the other way round) is
+        // what leaves the best ones in the pool. Trimming first would keep the
+        // first 8 the provider published, which can be the worst ones.
         std.mem.sort(Candidate, self.items[start..self.len], {}, byCtxThenName);
         self.len = start + per_provider_max;
     }
 
-    /// Contexto grande primero, y alfabético como desempate. Se usa para
-    /// recortar los candidatos de UN provider antes de meterlos en el pool.
+    /// Bigger context first, alphabetical as the tie-breaker. Used to trim the
+    /// candidates of ONE provider before they go into the pool.
     ///
-    /// No reutiliza `less` a propósito: aquí todos los candidatos son del mismo
-    /// provider, así que ni `worked` ni `gated_opencode` los distinguen, y
-    /// ordenar por el comparador global mezclaría tramos.
+    /// It deliberately does not reuse `less`: here all the candidates are from
+    /// the same provider, so neither `worked` nor `gated_opencode` tells them
+    /// apart, and sorting by the global comparator would mix the runs.
     fn byCtxThenName(_: void, a: Candidate, b: Candidate) bool {
         if (a.ctx != b.ctx) return a.ctx > b.ctx;
         return std.mem.lessThan(u8, a.model_id, b.model_id);
     }
 
-    /// Orden total en UN solo comparador.
+    /// Total order in ONE single comparator.
     ///
-    /// OJO: NO son cuatro `std.mem.sort` seguidos por clave. `std.mem.sort` es un
-    /// block sort INESTABLE, así que en una cadena de sorts solo sobrevive el
-    /// último: el orden final habría sido solo el alfabético, y los tres
-    /// criterios escritos antes se habrían perdido sin avisar. Un comparador
-    /// único con desempate alfabético es un orden total y no tiene ese problema.
+    /// CAREFUL: it is NOT four `std.mem.sort` calls chained by key. `std.mem.sort`
+    /// is an UNSTABLE block sort, so in a chain of sorts only the last one
+    /// survives: the final order would have been alphabetical only, and the
+    /// three criteria written before would have been lost without warning. A
+    /// single comparator with an alphabetical tie-breaker is a total order and
+    /// does not have that problem.
     fn less(_: void, a: Candidate, b: Candidate) bool {
-        // `return a.worked` y no `!a.worked`: los que YA han funcionado van
-        // primero. (La primera versión tenía el signo invertido y el test de
-        // orden lo cazó: un `!` de más y el pool empezaba por el peor modelo.)
+        // `return a.worked` and not `!a.worked`: the ones that ALREADY worked go
+        // first. (The first version had the sign inverted and the sort test
+        // caught it: one `!` too many and the pool started with the worst model.)
         if (a.worked != b.worked) return a.worked;
-        // Los gateados a opencode al final: su 403 es conocido y no lo arregla
-        // nada, así que son el último recurso, no el primero.
+        // The ones gated to opencode last: their 403 is known and nothing fixes
+        // it, so they are the last resort, not the first option.
         if (a.gated_opencode != b.gated_opencode) return !a.gated_opencode;
-        // Contexto grande primero: menos compactación a mitad de turno.
+        // Bigger context first: less compaction halfway through a turn.
         if (a.ctx != b.ctx) return a.ctx > b.ctx;
         if (!std.mem.eql(u8, a.provider_id, b.provider_id)) {
             return std.mem.lessThan(u8, a.provider_id, b.provider_id);
@@ -317,18 +325,18 @@ pub const Roster = struct {
         return std.mem.lessThan(u8, a.model_id, b.model_id);
     }
 
-    /// El candidato activo (sin mirar cooldowns: el que se está usando ahora
-    /// mismo, aunque esté a punto de morir). Null si el pool está vacío.
+    /// The active candidate (ignoring cooldowns: the one in use right now, even if
+    /// it is about to die). Null if the pool is empty.
     pub fn currentCandidate(self: *const Roster) ?Candidate {
         if (self.len == 0 or self.cur_raw >= self.len) return null;
         return self.items[self.cur_raw];
     }
 
-    /// El candidato activo, o null si no queda ninguno vivo.
+    /// The active candidate, or null if none is left alive.
     ///
-    /// Avanza solo sobre los que NO están en cooldown: `active()` no muta el
-    /// índice, solo lo lee y lo normaliza. (Si todos están muertos, deja el
-    /// índice donde estaba y devuelve null: el llamante avisa.)
+    /// It only moves forward over the ones NOT in cooldown: `active()` does not
+    /// mutate the index, it only reads and normalizes it. (If they are all dead,
+    /// it leaves the index where it was and returns null: the caller warns.)
     pub fn active(self: *const Roster, now_ms: i128) ?Candidate {
         if (self.len == 0) return null;
         var i: u8 = self.idx;
@@ -340,10 +348,10 @@ pub const Roster = struct {
         return null;
     }
 
-    /// El siguiente vivo DESPUÉS del actual, o null si no queda ninguno.
+    /// The next live one AFTER the current, or null if none is left.
     ///
-    /// Es lo que llama el fallo de cuota: no rota hasta que se le llama, para que
-    /// un turno que va bien no consuma rotaciones.
+    /// This is what the quota failure calls: it does not rotate until it is
+    /// called, so that a turn going fine does not burn rotations.
     pub fn nextLive(self: *Roster, now_ms: i128) ?u8 {
         if (self.len == 0) return null;
         var i: u8 = @intCast((self.cur_raw + 1) % self.len);
@@ -359,11 +367,10 @@ pub const Roster = struct {
         return null;
     }
 
-    /// Marca el candidato actual como muerto y salta al siguiente vivo.
+    /// Marks the current candidate dead and jumps to the next live one.
     ///
-    /// Devuelve el índice del nuevo activo, o null si no queda ninguno (que es
-    /// la señal de que hay que rendirse y explicar por qué, no seguir
-    /// probando).
+    /// Returns the index of the new active one, or null if none is left (which
+    /// is the signal to give up and explain why, not to keep trying).
     pub fn rotate(self: *Roster, now_ms: i128, why: Why, detail: []const u8) ?u8 {
         self.noteDead(self.cur_raw, now_ms, why, detail);
         return self.nextLive(now_ms);
@@ -373,10 +380,10 @@ pub const Roster = struct {
         if (idx >= self.len) return;
         if (self.dead_len >= self.dead.len) return;
 
-        // OJO: el texto se compone en un buffer LOCAL y luego se copia a
-        // `d.reason`. Escribir en `d.reason` mientras se lee de un slice de
-        // `d.reason` es aliasing, y con un detalle largo revienta en mitad del
-        // bufPrint (que es justo lo que hace un body de error de 4 KB).
+        // CAREFUL: the text is composed into a LOCAL buffer and then copied to
+        // `d.reason`. Writing into `d.reason` while reading from a slice of
+        // `d.reason` is aliasing, and with a long detail it blows up in the
+        // middle of bufPrint (which is exactly what a 4 KB error body does).
         var tmp: [reason_len_max]u8 = undefined;
         const text = if (detail.len == 0)
             std.fmt.bufPrint(&tmp, "{s}", .{why.label()}) catch why.label()
@@ -395,7 +402,7 @@ pub const Roster = struct {
         self.dead_len += 1;
     }
 
-    /// ¿El candidato `idx` está en cooldown ahora mismo?
+    /// Is candidate `idx` in cooldown right now?
     pub fn isDead(self: *const Roster, idx: u8, now_ms: i128) bool {
         for (self.dead[0..self.dead_len]) |*d| {
             if (d.idx == idx and !d.expired(now_ms)) return true;
@@ -403,8 +410,8 @@ pub const Roster = struct {
         return false;
     }
 
-    /// La razón por la que murió el candidato activo, para el mensaje al
-    /// usuario ("groq/openai-free: rate limited: 429 Too Many Requests").
+    /// The reason the active candidate died, for the message to the user
+    /// ("groq/openai-free: rate limited: 429 Too Many Requests").
     pub fn deadReason(self: *const Roster, idx: u8) []const u8 {
         for (self.dead[0..self.dead_len]) |*d| {
             if (d.idx == idx) return d.reasonStr();
@@ -412,10 +419,11 @@ pub const Roster = struct {
         return "";
     }
 
-    /// "2/7 · openrouter/qwen3-free", para el status bar.
+    /// "2/7 · openrouter/qwen3-free", for the status bar.
     ///
-    /// Con la lista vacía devuelve el motivo (o una cadena vacía): el status bar
-    /// tiene que poder decir "por qué no hay free-auto" y no solo callarse.
+    /// With an empty list it returns the reason (or an empty string): the status
+    /// bar has to be able to say "why there is no free-auto" and not just stay
+    /// silent.
     pub fn statusLabel(self: *const Roster, arena: std.mem.Allocator) []const u8 {
         if (!self.built) return "";
         if (self.len == 0) {
@@ -431,8 +439,8 @@ pub const Roster = struct {
         return std.fmt.allocPrint(arena, "free-auto {d}/{d} · exhausted", .{ n, self.len }) catch "free-auto";
     }
 
-    /// El informe final cuando no queda ningún par vivo: qué se probó y por qué
-    /// murió cada uno. Es lo que convierte un fallo opaco en algo accionable.
+    /// The final report when no pair is left alive: what was tried and why each one
+    /// died. It is what turns an opaque failure into something actionable.
     pub fn exhaustedReport(self: *const Roster, arena: std.mem.Allocator) []const u8 {
         var out: std.ArrayList(u8) = .empty;
         out.appendSlice(arena, "free-auto: no free model left. ") catch return "";
@@ -454,12 +462,12 @@ pub const Roster = struct {
 
 // ── tests ─────────────────────────────────────────────────────
 //
-// Todos son PUROS: no tocan la red ni el disco. El `build` con providers reales
-// se prueba en el test de integración del final, y lo que se testea aquí es la
-// lógica de la rueda, que es donde están los bugs caros (rotar a uno muerto,
-// quedarse sin candidatos, pasar el techo).
+// They are all PURE: they touch neither the network nor the disk. `build` with
+// real providers is covered by the integration test at the end, and what is
+// tested here is the wheel logic, which is where the expensive bugs live
+// (rotating to a dead one, running out of candidates, blowing past the cap).
 
-/// Roster de mentira: `n` candidatos con nombre predecible.
+/// A fake roster: `n` candidates with a predictable name.
 fn fakeRoster(gpa: std.mem.Allocator, n: u8) Roster {
     var r = Roster.init(gpa);
     r.built = true;
@@ -473,16 +481,16 @@ fn fakeRoster(gpa: std.mem.Allocator, n: u8) Roster {
     return r;
 }
 
-test "trimProvider: de cada provider solo entran los mejores, no los primeros" {
-    // El fallo que encontró la sonda: con el tope SOLO global, el provider con más
-    // modelos se comía el pool. Y lo peyor: entraban los 8 primeros que publicó,
-    // no los 8 mejores.
+test "trimProvider: only the best of each provider get in, not the first ones" {
+    // The failure the probe found: with the GLOBAL-only cap, the provider with the
+    // most models ate the pool. And worse: the first 8 it published got in, not
+    // the best 8.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = Roster.init(astate.allocator());
 
-    // 20 candidatos de UN provider, en orden de publicación (contexto growing,
-    // como los devuelve openrouter: no viene ordenados por nada útil).
+    // 20 candidates from ONE provider, in publication order (growing context, the
+    // way openrouter returns them: they are not sorted by anything useful).
     var i: u8 = 0;
     while (i < 20) : (i += 1) {
         r.items[i] = .{ .provider_id = "openrouter", .model_id = "m", .ctx = 1000 + @as(u32, i) * 10 };
@@ -491,20 +499,21 @@ test "trimProvider: de cada provider solo entran los mejores, no los primeros" {
 
     Roster.trimProvider(&r, 0);
     try std.testing.expectEqual(@as(u8, per_provider_max), r.len);
-    // Los 8 de más contexto, no los 8 primeros.
+    // The 8 with the biggest context, not the first 8.
     try std.testing.expectEqual(@as(u32, 1000 + 19 * 10), r.items[0].ctx);
     try std.testing.expectEqual(@as(u32, 1000 + 12 * 10), r.items[per_provider_max - 1].ctx);
 }
 
-test "trimProvider: no toca los candidatos de los providers anteriores" {
-    // El recorte va por TRAMO, no sobre el array entero: si ordenara todo, los
-    // 8 mejores serían del provider más grande y volveríamos al bug original.
+test "trimProvider: it does not touch the candidates of the earlier providers" {
+    // The trim goes by RUN, not over the whole array: if it sorted everything, the
+    // best 8 would all be from the biggest provider and we would be back to the
+    // original bug.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = Roster.init(astate.allocator());
 
-    // 6 del primer provider (cabe entero), 18 del segundo (hay que recortar; y
-    // 6+18 son justo los 24 del tope, como en `build`).
+    // 6 from the first provider (fits whole), 18 from the second (has to be
+    // trimmed; and 6+18 is exactly the 24 of the cap, as in `build`).
     for (0..6) |k| {
         r.items[@intCast(k)] = .{ .provider_id = "a", .model_id = "a", .ctx = 10 };
     }
@@ -519,7 +528,7 @@ test "trimProvider: no toca los candidatos de los providers anteriores" {
 
     Roster.trimProvider(&r, 6);
     try std.testing.expectEqual(@as(u8, 6 + per_provider_max), r.len);
-    // Los 6 primeros siguen siendo del provider "a" y con su contexto intacto.
+    // The first 6 are still from provider "a" with their context untouched.
     for (0..6) |k| {
         try std.testing.expectEqualStrings("a", r.items[@intCast(k)].provider_id);
         try std.testing.expectEqual(@as(u32, 10), r.items[@intCast(k)].ctx);
@@ -528,11 +537,11 @@ test "trimProvider: no toca los candidatos de los providers anteriores" {
     try std.testing.expectEqual(@as(u32, 1000 + 17 * 10), r.items[6].ctx);
 }
 
-test "trimProvider: un provider con 100 free no deja sin sitio al siguiente" {
-    // El caso límite del bug original. Con el recorte por tramo, el primer
-    // provider llena los 24 slots, se le recortan a 8, y el siguiente tiene sitio
-    // de verdad. (Con el tope solo global, el segundo se quedaba con 0 y el
-    // free-auto no tenía plan B aunque hubiera 3 providers con key.)
+test "trimProvider: a provider with 100 free models does not leave the next one without room" {
+    // The edge case of the original bug. With the per-run trim, the first provider
+    // fills the 24 slots, gets trimmed to 8, and the next one has room for
+    // real. (With the global-only cap the second one was left with 0 and
+    // free-auto had no plan B even with 3 providers holding keys.)
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = Roster.init(astate.allocator());
@@ -548,7 +557,7 @@ test "trimProvider: un provider con 100 free no deja sin sitio al siguiente" {
     Roster.trimProvider(&r, 0);
     try std.testing.expectEqual(@as(u8, per_provider_max), r.len);
 
-    // Y ahora entra el segundo con sitio de sobra.
+    // And now the second one comes in with room to spare.
     for (0..4) |k| {
         r.items[per_provider_max + @as(u8, @intCast(k))] = .{
             .provider_id = "groq",
@@ -562,9 +571,10 @@ test "trimProvider: un provider con 100 free no deja sin sitio al siguiente" {
     try std.testing.expectEqualStrings("groq", r.items[per_provider_max].provider_id);
 }
 
-test "currentCandidate es el que se está usando, aunque esté muerto" {
-    // Es lo que necesita la línea de "cambié de modelo": el par que se cae, no el
-    // siguiente. Y tiene que seguir dando el muerto (es justo cuando se consulta).
+test "currentCandidate is the one in use, even if it is dead" {
+    // It is what the "I switched model" line needs: the pair that dropped, not the
+    // next one. And it has to keep returning the dead one (that is exactly when
+    // it is asked for).
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 3);
@@ -573,13 +583,13 @@ test "currentCandidate es el que se está usando, aunque esté muerto" {
     try std.testing.expectEqualStrings("m0", before.model_id);
 
     _ = r.rotate(0, .no_credits, "402");
-    // El activo ya es otro, y el muerto se puede consultar por su motivo.
+    // The active one is another now, and the dead one can be asked for its reason.
     const now = r.currentCandidate().?;
     try std.testing.expectEqualStrings("m1", now.model_id);
     try std.testing.expect(std.mem.indexOf(u8, r.deadReason(0), "402") != null);
 }
 
-test "active devuelve el primero y respeta la longitud" {
+test "active returns the first one and respects the length" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 3);
@@ -589,43 +599,43 @@ test "active devuelve el primero y respeta la longitud" {
     try std.testing.expectEqual(@as(u8, 3), r.total());
     try std.testing.expect(!r.isEmpty());
 
-    // Pool vacío: null y no un crash.
+    // Empty pool: null and not a crash.
     var empty = Roster.init(astate.allocator());
     try std.testing.expect(empty.active(0) == null);
     try std.testing.expect(empty.nextLive(0) == null);
     try std.testing.expect(empty.isEmpty());
 }
 
-test "rotate mata el actual y salta al siguiente vivo" {
+test "rotate kills the current one and jumps to the next live one" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 3);
 
-    // El primero muere → el activo pasa a ser el segundo.
+    // The first dies → the active one becomes the second.
     const next = r.rotate(0, .rate_limited, "429 Too Many Requests").?;
     try std.testing.expectEqualStrings("m1", r.items[next].model_id);
     try std.testing.expect(r.isDead(0, 0));
     try std.testing.expect(!r.isDead(1, 0));
-    // Y el motivo guardado es legible, no un código.
+    // And the reason stored is readable, not a code.
     try std.testing.expect(std.mem.indexOf(u8, r.deadReason(0), "rate limited") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.deadReason(0), "429") != null);
 }
 
-test "rotate se salta los que siguen en cooldown" {
+test "rotate skips the ones still in cooldown" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 4);
 
-    // m0 muere, y al rotar cae en m1.
+    // m0 dies, and rotating lands on m1.
     _ = r.rotate(0, .rate_limited, "429").?;
-    // m1 también muere a mano (como si hubiera caído entre medias).
+    // m1 also dies by hand (as if it had dropped in between).
     r.noteDead(1, 0, .no_credits, "402 out of credits");
-    // El siguiente vivo tiene que ser m2, no m1.
+    // The next live one has to be m2, not m1.
     const next = r.nextLive(0).?;
     try std.testing.expectEqualStrings("m2", r.items[next].model_id);
 }
 
-test "el cooldown expira: pasado el rato el par vuelve a ser usable" {
+test "the cooldown expires: after a while the pair is usable again" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 2);
@@ -633,11 +643,11 @@ test "el cooldown expira: pasado el rato el par vuelve a ser usable" {
     r.noteDead(0, 0, .rate_limited, "429");
     try std.testing.expect(r.isDead(0, 0));
     try std.testing.expect(r.isDead(0, cooldown_ms - 1));
-    // Justo al cumplirse deja de estar muerto (rate limits de segundos).
+    // Right when it elapses it stops being dead (rate limits last seconds).
     try std.testing.expect(!r.isDead(0, cooldown_ms));
 }
 
-test "sin candidatos vivos devuelve null, y no un bucle infinito" {
+test "with no live candidates it returns null, not an infinite loop" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 2);
@@ -649,13 +659,13 @@ test "sin candidatos vivos devuelve null, y no un bucle infinito" {
     try std.testing.expect(r.rotate(0, .no_credits, "402") == null);
 }
 
-test "sort: workings primero, luego sin gate, luego contexto, y alfabético" {
+test "sort: working ones first, then ungated, then context size, then alphabetical" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = Roster.init(astate.allocator());
     r.built = true;
-    // a: gateado y pequeño. b: grande pero gateado. c: grande sin gate.
-    // d: pequeño sin gate pero YA FUNCIONÓ.
+    // a: gated and small. b: big but gated. c: big, not gated.
+    // d: small, not gated, but ALREADY WORKED.
     r.items[0] = .{ .provider_id = "a", .model_id = "small-gated", .ctx = 1000, .gated_opencode = true };
     r.items[1] = .{ .provider_id = "b", .model_id = "big-gated", .ctx = 200000, .gated_opencode = true };
     r.items[2] = .{ .provider_id = "c", .model_id = "big-open", .ctx = 200000 };
@@ -663,18 +673,18 @@ test "sort: workings primero, luego sin gate, luego contexto, y alfabético" {
     r.len = 4;
     r.sort();
 
-    // 1º el que ya funcionó, aunque sea el más pequeño.
+    // 1st the one that already worked, even if it is the smallest.
     try std.testing.expectEqualStrings("small-open-worked", r.items[0].model_id);
-    // 2º el grande sin gate.
+    // 2nd the big one without a gate.
     try std.testing.expectEqualStrings("big-open", r.items[1].model_id);
-    // 3º y 4º los gateados, por contexto.
+    // 3rd and 4th the gated ones, by context.
     try std.testing.expectEqualStrings("big-gated", r.items[2].model_id);
     try std.testing.expectEqualStrings("small-gated", r.items[3].model_id);
 }
 
-test "sort es estable y determinista" {
-    // Mismo input, mismo output: si no, la lista de candidatos cambia entre
-    // arranques y el test de la rotación no puede fijar nada.
+test "sort is stable and deterministic" {
+    // Same input, same output: otherwise the candidate list changes between
+    // startups and the rotation test cannot pin anything.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const ids = [_][]const u8{ "z", "a", "m", "b" };
@@ -690,7 +700,7 @@ test "sort es estable y determinista" {
     }
 }
 
-test "statusLabel dice dónde está y por qué no hay pool" {
+test "statusLabel says where it is and why there is no pool" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -700,21 +710,21 @@ test "statusLabel dice dónde está y por qué no hay pool" {
     try std.testing.expect(std.mem.indexOf(u8, lbl, "free-auto 1/3") != null);
     try std.testing.expect(std.mem.indexOf(u8, lbl, "prov/m0") != null);
 
-    // Sin construir: nada (no se molesta al usuario con un modo que no ha
-    // pedido).
+    // Not built: nothing (it does not bother the user with a mode they did not
+    // ask for).
     var fresh = Roster.init(arena);
     try std.testing.expectEqualStrings("", fresh.statusLabel(arena));
 
-    // Construido y vacío: SÍ tiene que decir por qué.
+    // Built and empty: it DOES have to say why.
     var e = Roster.init(arena);
     e.built = true;
     e.empty_reason = "no provider has an API key";
     try std.testing.expect(std.mem.indexOf(u8, e.statusLabel(arena), "no provider has an API key") != null);
 }
 
-test "exhaustedReport lista qué se probó y por qué" {
-    // El fallo que el usuario lee cuando ya no queda nada: si esto no dice qué
-    // pasó con cada provider, no hay nada que hacer salvo adivinar.
+test "exhaustedReport lists what was tried and why" {
+    // The failure the user reads when there is nothing left: if this does not say
+    // what happened with each provider, there is nothing to do but guess.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -728,9 +738,9 @@ test "exhaustedReport lista qué se probó y por qué" {
     try std.testing.expect(std.mem.indexOf(u8, rep, "prov/m1 (gated") != null);
 }
 
-test "el cooldown depende de POR QUÉ murió, no es uno para todo" {
-    // 10 minutos por un 503 pasajero quitaban un modelo bueno del pool justo
-    // cuando el usuario lo necesita. Y al revés: un 402 sí tiene que durar.
+test "the cooldown depends on WHY it died, it is not one size for all" {
+    // 10 minutes for a passing 503 took a good model out of the pool exactly when
+    // the user needed it. And the other way round: a 402 does have to last.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 2);
@@ -738,20 +748,19 @@ test "el cooldown depende de POR QUÉ murió, no es uno para todo" {
     r.noteDead(0, 0, .failed, "JSON parsing failed");
     r.noteDead(1, 0, .no_credits, "402");
 
-    // El que fallo por un blip vuelve antes que el que se quedo sin creditos:
-    // sigue fuera a los 59 s (el tope de un minuto) y ya esta dentro a los 60.
+    // The one that failed from a blip comes back before the one that ran out of
+    // credits: still out at 59 s (the one minute cap) and back in at 60.
     try std.testing.expect(r.isDead(0, failed_cooldown_ms - 1));
     try std.testing.expect(!r.isDead(0, failed_cooldown_ms));
     try std.testing.expect(r.isDead(1, cooldown_ms - 1));
     try std.testing.expect(!r.isDead(1, cooldown_ms));
-    // Y la etiqueta lo dice, para que el historial no mienta.
+    // And the label says so, so the history does not lie.
     try std.testing.expect(std.mem.indexOf(u8, r.deadReason(0), "failed 3 times") != null);
 }
 
-test "noteDead con detalle larguísimo no se desborda" {
-    // El reason es un buffer fijo de 96: un body de error de 4 KB no puede
-    // escribir más allá (es el mismo trabajo que hace un path de error de otro
-    // sitio: truncado, no panic).
+test "noteDead with an overlong detail does not overflow" {
+    // The reason is a fixed 96 byte buffer: a 4 KB error body cannot write past it
+    // (it is the same job an error path elsewhere does: truncated, not a panic).
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 1);

@@ -25,6 +25,11 @@ $ zode
   que hace, y en modo read-only investiga y te pregunta).
 - **Tools en paralelo** para las que solo leen, **bash en segundo plano** con
   salida incremental, y **ESC mata el grupo de procesos** (el nieto también).
+- **Subagentes en paralelo**: varias búsquedas independientes en un mismo mensaje
+  van a subagentes a la vez (3 por defecto, `ZODE_TASK_PARALLEL`), cada uno con su
+  propia ventana desechable, y los informes vuelven en el orden pedido.
+- **`!` en el input**: `!git status` ejecuta el comando y mete la salida en el
+  contexto, sin gastar un turno ni un token.
 - **Subagentes**: una búsqueda ancha va a un subagente con su propia ventana, que
   se tira después. Lo que lee se paga **una vez**, no en cada iteración.
 - **Skills**: carpetas de instrucciones que se cargan **solo cuando hacen falta**.
@@ -159,6 +164,9 @@ paleta que los **ejecuta**.
 | `ZODE_BASE_URL` / `ZODE_MODELS_URL` | endpoints, para providers o gateways propios |
 | `ZODE_CONTEXT_LIMIT` | tokens de contexto (por defecto 128k; el presupuesto de compactación es el 80%) |
 | `ZODE_MAX_ITER` | iteraciones del bucle de agente por turno (12) |
+| `ZODE_TASK_PARALLEL` | subagentes a la vez (3; `1` = en serie) |
+| `ZODE_RECENT_WINDOW` | mensajes recientes que la compactación no toca (8) |
+| `ZODE_AUTO_BG` | `0` desactiva pasar a background las verificaciones lentas |
 | `ZODE_FREE_AUTO` | `1` arranca con `/free-auto on` |
 | `ZODE_RESUME` | `1` reabre la última sesión |
 | `ZODE_ACP_CMD` | comando del agente ACP, en vez de `opencode acp` |

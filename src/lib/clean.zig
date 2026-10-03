@@ -558,7 +558,7 @@ const Sandbox = struct {
 
 const now = 1_800_000_000; // a fixed "now" so the age buckets do not drift
 
-test "scan: la simulacion no borra NADA" {
+test "scan: the dry run deletes NOTHING" {
     var sb = try Sandbox.init("dry");
     defer sb.deinit();
 
@@ -574,7 +574,7 @@ test "scan: la simulacion no borra NADA" {
     try testing.expect(exists(sb.io, sb.path(&b, "{s}/zode-empty.jsonl", .{sb.sessions})));
 }
 
-test "apply: borra SOLO los ficheros de 0 bytes" {
+test "apply: deletes ONLY the 0-byte files" {
     var sb = try Sandbox.init("apply");
     defer sb.deinit();
 
@@ -597,7 +597,7 @@ test "apply: borra SOLO los ficheros de 0 bytes" {
     try testing.expect(exists(sb.io, sb.path(&b, "{s}/zode-full.jsonl", .{sb.sessions})));
 }
 
-test "clean NUNCA toca auth.json ni permissions.json, ni con apply" {
+test "clean NEVER touches auth.json or permissions.json, not even with apply" {
     var sb = try Sandbox.init("protected");
     defer sb.deinit();
 
@@ -618,7 +618,7 @@ test "clean NUNCA toca auth.json ni permissions.json, ni con apply" {
     try testing.expect(exists(sb.io, sb.path(&b, "{s}/permissions.json", .{sb.config})));
 }
 
-test "clean NUNCA toca .zig-cache, zig-out ni zig-pkg" {
+test "clean NEVER touches .zig-cache, zig-out or zig-pkg" {
     // Even if one of them is somehow named like a session: the guard is on the
     // PATH, not on the file name, because a build artifact can be called
     // anything.
@@ -632,7 +632,7 @@ test "clean NUNCA toca .zig-cache, zig-out ni zig-pkg" {
     try testing.expect(!isProtected("sessions/zode-1.jsonl"));
 }
 
-test "sessions viejas: se listan pero apply NO las borra" {
+test "old sessions: they are listed but apply does NOT delete them" {
     var sb = try Sandbox.init("old");
     defer sb.deinit();
 
@@ -658,7 +658,7 @@ test "sessions viejas: se listan pero apply NO las borra" {
     try testing.expect(exists(sb.io, old));
 }
 
-test "temporales: un zode-*.tmp dentro de un directorio de zode se borra" {
+test "temporaries: a zode-*.tmp inside a zode directory is deleted" {
     var sb = try Sandbox.init("temps");
     defer sb.deinit();
 
@@ -678,7 +678,7 @@ test "temporales: un zode-*.tmp dentro de un directorio de zode se borra" {
     try testing.expect(exists(sb.io, sb.path(&b, "{s}/notas.txt", .{sb.config})));
 }
 
-test "instancias: pid muerto o latido viejo = basura; el vivo no se toca" {
+test "instances: dead pid or stale heartbeat = garbage; a live one is left alone" {
     var sb = try Sandbox.init("inst");
     defer sb.deinit();
 
@@ -711,7 +711,7 @@ test "instancias: pid muerto o latido viejo = basura; el vivo no se toca" {
     try testing.expect(exists(sb.io, live_path));
 }
 
-test "instancias: un JSON que no se entiende se limpia, uno de version nueva no" {
+test "instances: JSON that cannot be parsed is cleaned, one from a newer version is not" {
     var sb = try Sandbox.init("inst-json");
     defer sb.deinit();
 
@@ -730,7 +730,7 @@ test "instancias: un JSON que no se entiende se limpia, uno de version nueva no"
     try testing.expect(exists(sb.io, sb.path(&b, "{s}/d.json", .{sb.instances})));
 }
 
-test "sessions/ inexistente: lo dice y NO lo crea" {
+test "missing sessions/: it says so and does NOT create it" {
     var sb = try Sandbox.init("nosessions");
     defer sb.deinit();
     std.Io.Dir.cwd().deleteTree(sb.io, sb.sessions) catch {};
@@ -744,7 +744,7 @@ test "sessions/ inexistente: lo dice y NO lo crea" {
     try testing.expect(!exists(sb.io, sb.sessions));
 }
 
-test "sin roots de git ni de config, scan no falla y no inventa directorios" {
+test "with no git or config roots, scan does not fail and invents no directories" {
     var sb = try Sandbox.init("bare");
     defer sb.deinit();
 
@@ -760,7 +760,7 @@ test "sin roots de git ni de config, scan no falla y no inventa directorios" {
     try testing.expectEqual(@as(usize, 1), try apply(sb.io, &rep, .{ .sessions = sb.sessions }));
 }
 
-test "el informe ordena por cubo, para que las cifras salgan agrupadas" {
+test "the report sorts by bucket, so the numbers come out grouped" {
     var sb = try Sandbox.init("order");
     defer sb.deinit();
 
@@ -777,7 +777,7 @@ test "el informe ordena por cubo, para que las cifras salgan agrupadas" {
     try testing.expectEqual(Bucket.stale_instance, rep.items[2].bucket);
 }
 
-test "instanceDir: con .git como DIRECTORIO, y sin repo, NO inventa nada" {
+test "instanceDir: with .git as a DIRECTORY, and with no repo, it invents nothing" {
     var sb = try Sandbox.init("gitdir");
     defer sb.deinit();
 
@@ -797,7 +797,7 @@ test "instanceDir: con .git como DIRECTORIO, y sin repo, NO inventa nada" {
     try testing.expectEqualStrings(".git/zode/inst", got.?);
 }
 
-test "parseGitdirPointer: el puntero de un worktree, que es el caso que importa" {
+test "parseGitdirPointer: the pointer of a worktree, which is the case that matters" {
     // Two zodes in two worktrees must NOT end up in the same registry: that is
     // the whole isolation story, and it hangs on this one line of parsing.
     const a = try parseGitdirPointer(testing.allocator, "gitdir: /repo/.git/worktrees/wt-a\n");

@@ -25,7 +25,11 @@ turns_capped: usize = 0,
 iterations: usize = 0,
 tool_calls: usize = 0,
 asks: usize = 0,
-subagents: usize = 0,
+/// Counted from several threads at once now that subagents run in parallel, so
+/// it is atomic. A plain `usize += 1` from N threads is a lost update, and the
+/// only reader is `/bench`: a wrong number there is not a crash, it is a number
+/// nobody can trust.
+subagents: std.atomic.Value(usize) = .init(0),
 bg_jobs: usize = 0,
 /// Wall time of the turns, in ms.
 turn_ms: u64 = 0,
@@ -143,7 +147,7 @@ pub fn report(self: *const Stats, out: []u8, max_iter: usize, hit_pct: u8) ![]co
         dropped_tail,
         self.tool_calls,
         self.asks,
-        self.subagents,
+        self.subagents.load(.seq_cst),
         self.bg_jobs,
         hit_pct,
         self.read_hits,
@@ -153,7 +157,7 @@ pub fn report(self: *const Stats, out: []u8, max_iter: usize, hit_pct: u8) ![]co
 
 const bench = @This();
 
-test "reset deja todo a cero" {
+test "reset sets everything to zero" {
     var s = Stats{};
     s.noteTurn(3, 1200, 400, false);
     s.tool_calls = 5;
@@ -163,7 +167,7 @@ test "reset deja todo a cero" {
     try std.testing.expectEqual(@as(u64, 0), s.avgTtft());
 }
 
-test "noteTurn: promedios y contador de topes" {
+test "noteTurn: averages and the cap counter" {
     var s = Stats{};
     s.noteTurn(2, 1000, 300, false);
     s.noteTurn(4, 3000, 500, true);
@@ -174,17 +178,17 @@ test "noteTurn: promedios y contador de topes" {
     try std.testing.expectEqual(@as(u8, 50), s.cappedPct());
 }
 
-test "noteTtft: sin muestras no hay NaN ni division por cero" {
+test "noteTtft: with no samples there is no NaN and no division by zero" {
     var s = Stats{};
     try std.testing.expectEqual(@as(u64, 0), s.avgTtft());
     try std.testing.expectEqual(@as(u64, 0), s.percentiles(&.{}).p95);
-    // Un turno sin stream (todo error, por ejemplo) NO cuenta como TTFT 0: un
-    // cero aqui hundiria la media y haria parecer que la red va bien.
+    // A turn without a stream (all errors, say) does NOT count as TTFT 0: a
+    // zero here would sink the average and make the network look healthy.
     s.noteTurn(1, 500, 0, false);
     try std.testing.expectEqual(@as(u64, 0), s.avgTtft());
 }
 
-test "percentiles ordena sin pisar el array del caller" {
+test "percentiles sorts without clobbering the caller's array" {
     var s = Stats{};
     var i: usize = 0;
     // Inserted descending: 1000, 900, ... 100. After `percentiles` the array
@@ -200,24 +204,24 @@ test "percentiles ordena sin pisar el array del caller" {
     try std.testing.expectEqual(@as(u64, 1000), pc.p95);
 }
 
-test "el anillo de TTFT conserva los ULTIMOS, no los primeros" {
+test "the TTFT ring keeps the LATEST samples, not the first ones" {
     var s = Stats{};
     var i: usize = 0;
     while (i < max_samples) : (i += 1) s.noteTtft(1000);
-    s.noteTtft(10); // el mas reciente
+    s.noteTtft(10); // the most recent one
     try std.testing.expectEqual(@as(usize, max_samples), s.ttft_len);
     try std.testing.expectEqual(@as(u64, 10), s.ttft[max_samples - 1]);
     try std.testing.expectEqual(@as(u64, 1000), s.ttft[0]);
     try std.testing.expectEqual(@as(usize, 1), s.ttft_dropped);
 }
 
-test "report: sale una linea legible y no revienta con el buffer dado" {
+test "report: prints one readable line and does not blow up with the given buffer" {
     var s = Stats{};
     s.noteTurn(5, 8000, 900, false);
     s.tool_calls = 12;
     s.asks = 2;
-    // Buffer pequeno a proposito: el `report` tiene que recortar sin panic, que
-    // es lo que pasaria si imprimiera en un buffer de la UI asumiendo que cabe.
+    // Deliberately small buffer: `report` must truncate without panicking, which
+    // is what would happen if it printed into a UI buffer assuming it fits.
     var tiny: [64]u8 = undefined;
     const t = s.report(&tiny, 12, 80) catch unreachable;
     try std.testing.expect(t.len <= tiny.len);
@@ -230,7 +234,7 @@ test "report: sale una linea legible y no revienta con el buffer dado" {
     try std.testing.expect(std.mem.indexOf(u8, full, "asks 2") != null);
 }
 
-test "report con cero turnos no inventa datos" {
+test "report with zero turns invents no data" {
     var s = Stats{};
     var buf: [512]u8 = undefined;
     const t = try s.report(&buf, 8, 0);

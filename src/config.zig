@@ -183,7 +183,7 @@ pub fn find(cfg: Config, id: []const u8) ?*const providers.ProviderDef {
 
 // ── tests ─────────────────────────────────────────────────────
 
-test "parse: provider extra completo" {
+test "parse: a complete extra provider" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -207,7 +207,7 @@ test "parse: provider extra completo" {
     try std.testing.expect(!isAnthropic(cfg, "vllm"));
 }
 
-test "parse: key_env acepta array" {
+test "parse: key_env accepts an array" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -221,7 +221,7 @@ test "parse: key_env acepta array" {
     try std.testing.expectEqualStrings("B_KEY", cfg.extra[0].key_env[1]);
 }
 
-test "parse: kind anthropic marca el wire format" {
+test "parse: kind anthropic marks the wire format" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -236,7 +236,7 @@ test "parse: kind anthropic marca el wire format" {
     try std.testing.expect(!isAnthropic(cfg, "openrouter"));
 }
 
-test "parse: un provider sin base_url se ignora, no rompe el resto" {
+test "parse: a provider without base_url is ignored, it does not break the rest" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -249,7 +249,7 @@ test "parse: un provider sin base_url se ignora, no rompe el resto" {
     try std.testing.expectEqualStrings("ok", cfg.extra[0].id);
 }
 
-test "parse: no se puede shadowear un provider compilado" {
+test "parse: a built-in provider cannot be shadowed" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -263,7 +263,7 @@ test "parse: no se puede shadowear un provider compilado" {
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", find(cfg, "openrouter").?.base_url);
 }
 
-test "parse: JSON corrupto devuelve error, no panic" {
+test "parse: corrupt JSON returns an error, not a panic" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -272,7 +272,7 @@ test "parse: JSON corrupto devuelve error, no panic" {
     try std.testing.expectError(error.BadConfig, parse(arena, "[1,2,3]", "/tmp/c.json"));
 }
 
-test "allDefs: compila los de config detrás de los built-in" {
+test "allDefs: the config ones come after the built-in ones" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -389,7 +389,7 @@ pub fn writeJsonString(out: *std.Io.Writer, gpa: std.mem.Allocator, s: []const u
     try out.writeAll("\"");
 }
 
-test "writeFileSecure: crea el directorio y escribe con 0600" {
+test "writeFileSecure: creates the directory and writes with 0600" {
     // The full flow: mkdir -p of the directory, temp file, and rename. This is
     // what "Connect an integration" uses, and if it fails you end up with no key.
     // An environment with its own HOME: `writeFileSecure` needs it to know

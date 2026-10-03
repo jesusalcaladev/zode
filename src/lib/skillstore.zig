@@ -329,15 +329,15 @@ fn hasFrontmatterEnd(prefix: []const u8) bool {
     return false;
 }
 
-test "hasFrontmatterEnd: distingue el cierre del que abre" {
+test "hasFrontmatterEnd: tells the closing fence from the opening one" {
     try std.testing.expect(hasFrontmatterEnd("---\nname: x\n---\nbody"));
     try std.testing.expect(!hasFrontmatterEnd("---\nname: x\n"));
     try std.testing.expect(!hasFrontmatterEnd("no frontmatter\n---\n"));
-    // Una linea horizontal dentro del frontmatter NO lo cierra.
+    // A horizontal line inside the frontmatter does NOT close it.
     try std.testing.expect(!hasFrontmatterEnd("---\nname: x\n-----------\nmore"));
 }
 
-test "alreadyIn: encuentra duplicados exactos y no parecidos" {
+test "alreadyIn: finds exact duplicates, not similar ones" {
     var list = [_]skills.Entry{
         .{ .name = "pty-tests" },
         .{ .name = "other" },
@@ -349,16 +349,17 @@ test "alreadyIn: encuentra duplicados exactos y no parecidos" {
     try std.testing.expect(!alreadyIn(&list, ""));
 }
 
-// ── tests con FIXTURES en disco de verdad ────────────────────
+// ── tests with FIXTURES on a real disk ───────────────────────
 //
-// Estos SÍ tocan el sistema de ficheros (a diferencia de `skills.zig`, que es puro
-// y se testea con strings). La razón está en el header: lo que falla siempre al
-// descubrir skills es la I/O — el `openDir` sin `.iterate`, el `createDirPath`, el
-// nombre del fichero — y eso no se puede probar con un string.
+// These DO touch the filesystem (unlike `skills.zig`, which is pure and tested
+// with strings). The reason is in the header: what always fails when discovering
+// skills is the I/O — the `openDir` without `.iterate`, the `createDirPath`, the
+// file name — and that cannot be tested with a string.
 //
-// El `HOME` es el del sandbox de pruebas y los directorios se borran al final:
-// un test automático que escribiera en el `~/.config` real sería el error que el
-// fuzzer de junio ya cometio (guardo una key pegada y dejo el provider con 401).
+// The `HOME` is the test sandbox's, and the directories are deleted at the end:
+// an automated test that wrote into the real `~/.config` would be the mistake
+// the June fuzzer already made (it saved a pasted key and left the provider
+// with a 401).
 
 /// A unique temp root, written into `out`.
 ///
@@ -384,7 +385,7 @@ fn writeFixture(root: []const u8, rel: []const u8, body: []const u8) !void {
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = full, .data = body });
 }
 
-test "scan: encuentra un skill del PROYECTO y lee su frontmatter" {
+test "scan: finds a skill from the PROJECT and reads its frontmatter" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -417,9 +418,9 @@ test "scan: encuentra un skill del PROYECTO y lee su frontmatter" {
     }
 }
 
-test "scan: el PROYECTO tapa al usuario con el mismo nombre (no se fusionan)" {
-    // Un skill de proyecto que se mezcla con el global es peor que no tenerlo:
-    // la mitad de las instrucciones serian del otro proyecto.
+test "scan: the PROJECT shadows the user's one with the same name (they do not merge)" {
+    // A project skill that gets merged with the global one is worse than not
+    // having it: half of the instructions would be from the other project.
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -461,7 +462,7 @@ test "scan: el PROYECTO tapa al usuario con el mismo nombre (no se fusionan)" {
     }
 }
 
-test "scan: ignora ficheros sueltos, directorios con punto y nombres imposibles" {
+test "scan: ignores loose files, dotted directories and impossible names" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -469,13 +470,13 @@ test "scan: ignora ficheros sueltos, directorios con punto y nombres imposibles"
     var root_buf: [256]u8 = undefined;
     const root = try tmpRoot(&root_buf);
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    // Un fichero, no un directorio.
+    // A file, not a directory.
     try writeFixture(root, ".zode/skills/README.md", "no soy un skill");
-    // Un directorio con punto (`.git`).
+    // A dotted directory (`.git`).
     try writeFixture(root, ".zode/skills/.git/SKILL.md", "--- description: x ---");
-    // Un directorio con un nombre que no puede ser un tool arg.
+    // A directory whose name cannot be a tool argument.
     try writeFixture(root, ".zode/skills/con espacio/SKILL.md", "--- description: x ---");
-    // Y uno bueno, para comprobar que el filtro NO se comio el de verdad.
+    // And a good one, to check that the filter did NOT eat the real thing.
     try writeFixture(root, ".zode/skills/bueno/SKILL.md",
         \\---
         \\description: este si
@@ -496,7 +497,7 @@ test "scan: ignora ficheros sueltos, directorios con punto y nombres imposibles"
     }
 }
 
-test "load: el cuerpo llega enmarcado y SIN el frontmatter" {
+test "load: the body arrives framed and WITHOUT the frontmatter" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -522,12 +523,12 @@ test "load: el cuerpo llega enmarcado y SIN el frontmatter" {
 
     var out: [8192]u8 = undefined;
     const text = loader.load(found[0], &out) orelse return error.TestUnexpectedResult;
-    // El nombre y el "cuando usarlo" estan, porque sin ellos el modelo no sabe
-    // que esta leyendo ni cuando aplicarlo.
+    // The name and the "when to use it" are in, because without them the model
+    // does not know what it is reading nor when to apply it.
     try std.testing.expect(std.mem.indexOf(u8, text, "=== skill: guia ===") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "cuando haya dudas de estilo") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Una regla por parrafo.") != null);
-    // Y el frontmatter NO viaja: son tokens de mas en cada llamada.
+    // And the frontmatter does NOT travel: those are wasted tokens on every call.
     try std.testing.expect(std.mem.indexOf(u8, text, "name: guia") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "---") == null);
 
@@ -538,7 +539,7 @@ test "load: el cuerpo llega enmarcado y SIN el frontmatter" {
     }
 }
 
-test "load: un skill sin frontmatter tambien funciona (es markdown y punto)" {
+test "load: a skill without frontmatter works too (it is markdown and a dot)" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -553,8 +554,8 @@ test "load: un skill sin frontmatter tambien funciona (es markdown y punto)" {
     var buf: [8]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
     try std.testing.expectEqual(@as(usize, 1), found.len);
-    // Sin descripcion, el nombre sale del DIRECTORIO (es lo que existe de
-    // verdad en disco) y se marca en el prompt como "(no description)".
+    // With no description, the name comes from the DIRECTORY (that is what really
+    // exists on disk) and it is marked in the prompt as "(no description)".
     try std.testing.expectEqualStrings("simple", found[0].name);
     try std.testing.expectEqualStrings("", found[0].description);
 
@@ -569,7 +570,7 @@ test "load: un skill sin frontmatter tambien funciona (es markdown y punto)" {
     }
 }
 
-test "roots: el orden es el del shadowing y la ultima raiz es la del usuario" {
+test "roots: the order is the shadowing one and the last root is the user's" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -587,17 +588,17 @@ test "roots: el orden es el del shadowing y la ultima raiz es la del usuario" {
     var bufs: [store.max_roots][std.fs.max_path_bytes]u8 = undefined;
     var paths: [store.max_roots][]const u8 = undefined;
     const n = loader.roots(&bufs, &paths);
-    // Sin HOME (env = null) las dos son las unicas.
+    // With no HOME (env = null) the two are the only ones.
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqualStrings(proj, paths[0]);
     try std.testing.expectEqualStrings(agents, paths[1]);
 
-    // Cada path sobrevive a la llamada siguiente: un unico buffer de scratch
-    // dejaba TODOS apuntando al ultimo escrito (la trampa de `sb.path`).
+    // Each path survives the next call: a single scratch buffer left ALL of them
+    // pointing at the last one written (the `sb.path` trap).
     try std.testing.expect(!std.mem.eql(u8, paths[0], paths[1]));
 }
 
-test "roots: con repo_root se anaden sus dos directorios, y el cwd no se repite" {
+test "roots: with repo_root its two directories are added, and the cwd is not repeated" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -616,8 +617,8 @@ test "roots: con repo_root se anaden sus dos directorios, y el cwd no se repite"
     try std.testing.expectEqualStrings("/home/x/proj/.zode/skills", paths[2]);
     try std.testing.expectEqualStrings("/home/x/proj/.agents/skills", paths[3]);
 
-    // El cwd YA es la raiz: leer las mismas rutas dos veces seria work sin
-    // resultado, asi que no se anaden.
+    // The cwd IS already the root: reading the same paths twice would be work
+    // with no result, so they are not added.
     loader.project_dir = "/home/x/proj/.zode/skills";
     loader.agents_dir = "/home/x/proj/.agents/skills";
     var bufs2: [store.max_roots][std.fs.max_path_bytes]u8 = undefined;
@@ -625,7 +626,7 @@ test "roots: con repo_root se anaden sus dos directorios, y el cwd no se repite"
     try std.testing.expectEqual(@as(usize, 4), loader.roots(&bufs2, &paths2));
 }
 
-test "scan: .agents/skills tambien se lee, y .zode gana si estan los dos" {
+test "scan: .agents/skills is read too, and .zode wins when both are present" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -634,10 +635,10 @@ test "scan: .agents/skills tambien se lee, y .zode gana si estan los dos" {
     const root = try tmpRoot(&root_buf);
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    // El mismo nombre en las dos: `.zode/skills/shared` gana.
+    // The same name in both: `.zode/skills/shared` wins.
     try writeFixture(root, ".zode/skills/shared/SKILL.md", "---\ndescription: del propio harness\n---\nbody zode\n");
     try writeFixture(root, ".agents/skills/shared/SKILL.md", "---\ndescription: del convenio\n---\nbody agents\n");
-    // Y uno solo en `.agents`, que tambien tiene que aparecer.
+    // And one only in `.agents`, which must also show up.
     try writeFixture(root, ".agents/skills/solo-agents/SKILL.md", "---\ndescription: solo en agents\n---\nbody\n");
 
     var loader = store.Loader.init(gpa, std.testing.io, null);
@@ -658,7 +659,7 @@ test "scan: .agents/skills tambien se lee, y .zode gana si estan los dos" {
     }
 }
 
-test "stampPath: un fichero que desaparece se recuerda como ausente" {
+test "stampPath: a file that disappears is remembered as missing" {
     var root_buf: [256]u8 = undefined;
     const root = try tmpRoot(&root_buf);
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
@@ -673,7 +674,8 @@ test "stampPath: un fichero que desaparece se recuerda como ausente" {
 
     var now: store.Stamp = .{};
     try std.testing.expect(store.stampPath(std.testing.io, rel_path, &now));
-    // Mismo contenido: el stamp compara igual, y por eso la cache no se invalida.
+    // Same content: the stamps compare equal, and that is why the cache is not
+    // invalidated.
     try std.testing.expect(before.sameAs(&now));
 
     try writeFixture(root, "SKILL.md", "---\ndescription: x\n---\ncuerpo nuevo\n");
@@ -681,8 +683,8 @@ test "stampPath: un fichero que desaparece se recuerda como ausente" {
     try std.testing.expect(store.stampPath(std.testing.io, rel_path, &after));
     try std.testing.expect(!before.sameAs(&after));
 
-    // Y BORRARLO es un cambio, no "no ha pasado nada": si no, el prompt seguiria
-    // ofreciendo un skill cuyo fichero ya no existe.
+    // And DELETING it is a change, not "nothing happened": otherwise the prompt
+    // would keep offering a skill whose file no longer exists.
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     var gone: store.Stamp = .{};
     try std.testing.expect(store.stampPath(std.testing.io, rel_path, &gone));
@@ -690,9 +692,9 @@ test "stampPath: un fichero que desaparece se recuerda como ausente" {
     try std.testing.expect(!after.sameAs(&gone));
 }
 
-test "scan: un directorio que no existe no es un error (0 skills, sin ruido)" {
-    // Es el caso NORMAL de la mayoria de proyectos, y si `scan` protestara el
-    // prompt llevaria un aviso de error en cada request.
+test "scan: a directory that does not exist is not an error (0 skills, no noise)" {
+    // It is the NORMAL case for most projects, and if `scan` complained the
+    // prompt would carry an error notice on every request.
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -706,7 +708,7 @@ test "scan: un directorio que no existe no es un error (0 skills, sin ruido)" {
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
-test "scan: respeta el tope de entradas (no crece sin limite)" {
+test "scan: respects the entry cap (it does not grow without limit)" {
     var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -729,8 +731,8 @@ test "scan: respeta el tope de entradas (no crece sin limite)" {
     loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
     var buf: [5]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
-    // Corta en 5, y los que no entraron NO se filtran con nombre roto: los que
-    // hay son entradas completas y propias.
+    // It cuts at 5, and the ones that did not fit are NOT filtered out with a
+    // broken name: what is there are complete, owned entries.
     try std.testing.expectEqual(@as(usize, 5), found.len);
     for (found) |e| {
         try std.testing.expect(skills.validName(e.name));

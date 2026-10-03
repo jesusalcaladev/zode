@@ -3,3 +3,8 @@ zig-out/
 .zig-cache/
 sessions/
 *.tmp
+
+# Python bytecode: the pty scripts get imported by other scripts, and the
+# .pyc files are per-interpreter-version binaries that do not belong in git.
+__pycache__/
+*.pyc

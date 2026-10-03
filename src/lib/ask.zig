@@ -214,7 +214,7 @@ pub fn answerSummary(answered_text: []const u8) []const u8 {
     return t;
 }
 
-test "parse: question obligatoria y con espacios limpios" {
+test "parse: question is required and its whitespace is trimmed" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     const q = try ask.parse(ast.allocator(),
@@ -225,7 +225,7 @@ test "parse: question obligatoria y con espacios limpios" {
     try std.testing.expectEqualStrings("", q.header);
 }
 
-test "parse: options como array de strings, con header" {
+test "parse: options as an array of strings, with a header" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     const q = try ask.parse(ast.allocator(),
@@ -239,7 +239,7 @@ test "parse: options como array de strings, con header" {
     try std.testing.expectEqualStrings("B", q.options[1]);
 }
 
-test "parse: sin question es BadQuestion, no un crash" {
+test "parse: a missing question is BadQuestion, not a crash" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     const a = ast.allocator();
@@ -254,21 +254,21 @@ test "parse: sin question es BadQuestion, no un crash" {
     try std.testing.expectError(error.BadQuestion, ask.parse(a, "[]"));
 }
 
-test "parse: mas de max_options se rechaza en vez de recortar en silencio" {
+test "parse: more than max_options is rejected instead of silently trimmed" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     const a = ast.allocator();
     try std.testing.expectError(error.TooManyOptions, ask.parse(a,
         \\{"question":"q","options":["1","2","3","4","5","6"]}
     ));
-    // Justo el tope entra.
+    // Exactly at the cap is fine.
     const q = try ask.parse(a,
         \\{"question":"q","options":["1","2","3","4","5"]}
     );
     try std.testing.expectEqual(@as(usize, 5), q.options.len);
 }
 
-test "parse: option vacia se rechaza (una opcion invisible no es una opcion)" {
+test "parse: an empty option is rejected (an invisible option is not an option)" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     try std.testing.expectError(error.EmptyOption, ask.parse(ast.allocator(),
@@ -276,7 +276,7 @@ test "parse: option vacia se rechaza (una opcion invisible no es una opcion)" {
     ));
 }
 
-test "parse: options que no son strings es BadOptions" {
+test "parse: options that are not strings is BadOptions" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     const a = ast.allocator();
@@ -288,7 +288,7 @@ test "parse: options que no son strings es BadOptions" {
     ));
 }
 
-test "parse: question larguisima se corta y header tambien" {
+test "parse: an overlong question is truncated, and the header too" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     // The JSON is assembled by hand instead of with bufPrint: two 4 KB fields do
@@ -311,14 +311,14 @@ test "parse: question larguisima se corta y header tambien" {
     try std.testing.expectEqual(ask.max_header_len, q.header.len);
 }
 
-test "formatAnswered: el prefijo separa la voz del usuario de la del modelo" {
+test "formatAnswered: the prefix separates the user's voice from the model's" {
     const a = ask.formatAnswered("usa el parser nuevo");
     try std.testing.expectEqualStrings("The user answered: usa el parser nuevo", a.slice());
 }
 
-test "formatAnswered: una respuesta larguisima se corta Y se dice" {
-    // Lo unico que no puede pasar aqui es cortar la respuesta del usuario en
-    // silencio: el modelo actua sobre media instruccion y queda seguro de ella.
+test "formatAnswered: an overlong answer is truncated AND it says so" {
+    // The one thing that must not happen here is cutting the user's answer in
+    // silence: the model would act on half an instruction and be certain of it.
     var big: [4096]u8 = @splat('z');
     const a = ask.formatAnswered(&big);
     try std.testing.expect(a.slice().len <= a.buf.len);
@@ -326,29 +326,29 @@ test "formatAnswered: una respuesta larguisima se corta Y se dice" {
     try std.testing.expect(std.mem.endsWith(u8, a.slice(), "(truncated)"));
 }
 
-test "formatAnswered: una respuesta que cabe no lleva marcador" {
-    // El marcador de corte es ruido si no hubo corte: el modelo podria leer
-    // "truncated" como una instruccion suya.
+test "formatAnswered: an answer that fits carries no marker" {
+    // The truncation marker is noise if there was no truncation: the model
+    // could read "truncated" as one of its own instructions.
     const a = ask.formatAnswered("vale, vamos con el parser nuevo");
     try std.testing.expect(std.mem.indexOf(u8, a.slice(), "truncated") == null);
 }
 
-test "formatAnswered: espacios alrededor se van" {
+test "formatAnswered: surrounding whitespace is dropped" {
     const a = ask.formatAnswered("  sí, con el parser  \n");
     try std.testing.expectEqualStrings("The user answered: sí, con el parser", a.slice());
 }
 
-test "decline y timeout le dicen al modelo que decida, no que pare" {
-    // Las dos frases tienen que cumplir dos cosas: no dicen "stop" (que el
-    // modelo interpretaria como permiso para abandonar) y si contienen la
-    // instruccion de elegir, que es lo unico util que puede hacer con un no.
+test "decline and timeout tell the model to decide, not to stop" {
+    // The two phrases have to do two things: they do not say "stop" (which the
+    // model would read as permission to give up) and they DO contain the
+    // instruction to choose, which is the only useful thing to do with a no.
     try std.testing.expect(std.mem.indexOf(u8, ask.declined_text, "Pick the most reasonable") != null);
     try std.testing.expect(std.mem.indexOf(u8, ask.timed_out_text, "Pick the most reasonable") != null);
     try std.testing.expect(std.mem.indexOf(u8, ask.declined_text, "Do not ask again") != null);
 }
 
-test "guidance: prohibe preguntar lo que se puede leer" {
-    // Es la regla que mas valor da y la mas facil de perder en una reescritura.
+test "guidance: forbids asking what can be read" {
+    // It is the rule that gives the most value and the easiest to lose in a rewrite.
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "do NOT ask what you can read") != null);
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "three in a whole turn") != null);
 }
