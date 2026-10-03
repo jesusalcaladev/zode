@@ -95,8 +95,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Rooted at `src/tools_root.zig`, one level ABOVE `src/tools/`, on purpose:
+    // a module's root file sets its module path, and the tools reach `bgproc`,
+    // `readcache`, `regex` and `verify` from `src/`. Rooted inside `src/tools/`
+    // those would be imports from outside the module. It only re-exports the
+    // dispatcher; `tool_test.zig` keeps importing a module named `tools`.
     tt_mod.addImport("tools", b.createModule(.{
-        .root_source_file = b.path("src/tools.zig"),
+        .root_source_file = b.path("src/tools_root.zig"),
         .target = target,
         .optimize = optimize,
     }));

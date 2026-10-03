@@ -116,7 +116,7 @@ def main() -> int:
     ok = True
     print(f"smoke: {len(out)} bytes through the pty")
     ok &= check("banner: first row of the wordmark", "######  ####  ####   ######" in t, t)
-    ok &= check("banner: third row", "   ##  ##  ## ##  ## ##" in t, t)
+    ok &= check("banner: third row", "   ##  ##  ## ##   # ###" in t, t)
     ok &= check("input box (╭ ╰ borders)", "╭" in t and "╰" in t, t)
     ok &= check("status bar", "esc interrupts" in t, t)
     ok &= check("the user prompt echoes", "hola mundo" in t, t)

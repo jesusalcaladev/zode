@@ -821,7 +821,7 @@ test "spawn: the child LEADS its process group (or ESC cannot kill it)" {
     // module path cannot be written into a comptime `@embedFile`.
     const bg_src = @embedFile("bgproc.zig");
     try std.testing.expect(std.mem.indexOf(u8, bg_src, ".pgid = 0,") != null);
-    const tools_src = @embedFile("tools.zig");
+    const tools_src = @embedFile("tools/bg.zig");
     try std.testing.expect(std.mem.indexOf(u8, tools_src, ".pgid = 0,") != null);
 }
 
