@@ -519,7 +519,7 @@ fn joinedText(arena: std.mem.Allocator, segs: []const md.Segment) ![]const u8 {
     return out.items;
 }
 
-test "zig: keyword, número, comentario, builtin y texto íntegro" {
+test "zig: keyword, number, comment, builtin and the text intact" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -543,7 +543,7 @@ test "zig: keyword, número, comentario, builtin y texto íntegro" {
     try std.testing.expectEqual(theme.code_builtin, b.style);
 }
 
-test "python: def kw, print builtin, self tipo, # comentario" {
+test "python: def kw, print builtin, self type, # comment" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -556,7 +556,7 @@ test "python: def kw, print builtin, self tipo, # comentario" {
     try std.testing.expectEqual(theme.code_type, findSeg(segs, "self").?.style);
 }
 
-test "shell: builtin cyan y comentario #" {
+test "shell: cyan builtin and # comment" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -567,7 +567,7 @@ test "shell: builtin cyan y comentario #" {
     try std.testing.expectEqual(theme.code_builtin, findSeg(segs, "grep").?.style);
 }
 
-test "lang desconocida: fallback seguro sin crash y texto íntegro" {
+test "unknown lang: safe fallback without a crash and the text intact" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -578,7 +578,7 @@ test "lang desconocida: fallback seguro sin crash y texto íntegro" {
     try std.testing.expectEqualStrings(line, try joinedText(arena, segs));
 }
 
-test "string con escape y sin cierre no crashea" {
+test "a string with an escape and no closing does not crash" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -588,7 +588,7 @@ test "string con escape y sin cierre no crashea" {
     try std.testing.expectEqualStrings(line, try joinedText(arena, segs));
 }
 
-test "comentario de bloque C en una línea" {
+test "a C block comment on one line" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -603,7 +603,7 @@ test "comentario de bloque C en una línea" {
     try std.testing.expect(found);
 }
 
-test "línea vacía y solo espacios" {
+test "an empty line and spaces only" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -614,7 +614,7 @@ test "línea vacía y solo espacios" {
     try std.testing.expectEqualStrings("   ", try joinedText(arena, w));
 }
 
-test "un string multilínea no pinta de verde el resto del bloque" {
+test "a multiline string does not paint the rest of the block green" {
     // 4.8 of the ROADMAP. The scanner went line by line with no state, so a `\`
     // in Zig or an unclosed quote made the next line come out
     // ENTIRELY green (and sometimes the rest of the file).
@@ -641,7 +641,7 @@ test "un string multilínea no pinta de verde el resto del bloque" {
     if (findSeg(l3, "const")) |kw| try std.testing.expectEqual(T.kw, kw.style);
 }
 
-test "un comentario de bloque multilínea tampoco se propaga mal" {
+test "a multiline block comment does not leak either" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -660,7 +660,7 @@ test "un comentario de bloque multilínea tampoco se propaga mal" {
     try std.testing.expectEqualStrings("*/ const n = 1;", try joinedText(arena, l3));
 }
 
-test "el estado se reinicia entre fences distintos" {
+test "the state resets between different fences" {
     // If a block ends with an open string, the NEXT fence must not
     // stay green by dragging the state along.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

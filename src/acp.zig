@@ -880,7 +880,7 @@ fn testClient() Client {
     return .{ .gpa = testing.allocator, .io = undefined, .child = undefined, .stdin = undefined, .reader = undefined };
 }
 
-test "los chunks de texto llegan al sink en orden" {
+test "the text chunks reach the sink in order" {
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
     const Ctx = struct {
@@ -901,7 +901,7 @@ test "los chunks de texto llegan al sink en orden" {
     try testing.expectEqualStrings("hola mundo", got.items);
 }
 
-test "el razonamiento va a su propio callback" {
+test "the reasoning goes to its own callback" {
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
     const Ctx = struct {
@@ -919,7 +919,7 @@ test "el razonamiento va a su propio callback" {
     try testing.expectEqualStrings("voy a leer el fichero", got.items);
 }
 
-test "una tool nueva se recuerda por id para poder cerrar su linea" {
+test "a new tool is remembered by id so its line can be closed" {
     const Ctx = struct {
         fn onTool(ud: ?*anyopaque, id: []const u8, name: []const u8, title: []const u8) void {
             const s: *[]const u8 = @ptrCast(@alignCast(ud.?));
@@ -941,7 +941,7 @@ test "una tool nueva se recuerda por id para poder cerrar su linea" {
     try testing.expectEqualStrings("bash", c.toolName("c1"));
 }
 
-test "el resumen de un tool_call_update sale de content" {
+test "the summary of a tool_call_update comes out of content" {
     const Ctx = struct {
         fn onUpd(ud: ?*anyopaque, id: []const u8, status: []const u8, text: []const u8) void {
             const s: *[]const u8 = @ptrCast(@alignCast(ud.?));
@@ -960,7 +960,7 @@ test "el resumen de un tool_call_update sale de content" {
     try testing.expectEqualStrings("c1:completed:exit=0", seen);
 }
 
-test "las entradas del plan salen una a una" {
+test "the plan entries come out one by one" {
     const Ctx = struct {
         fn onPlan(ud: ?*anyopaque, text: []const u8) void {
             const l: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
@@ -1030,7 +1030,7 @@ const fake_cancel_script =
 ;
 const fake_cancel_argv = [_][]const u8{ "/bin/sh", "-c", fake_cancel_script };
 
-test "cancel() corta el turno: el agente recibe session/cancel y responde cancelled" {
+test "cancel() cuts the turn: the agent gets session/cancel and answers cancelled" {
     // What ESC really does in the TUI, but without the UI: `cancel()` only
     // sets a flag, and it is the worker (owner of the `Io`) that writes. If
     // `cancel()` wrote from this thread, the `Io` would be used by two threads
@@ -1051,7 +1051,7 @@ test "cancel() corta el turno: el agente recibe session/cancel y responde cancel
     try testing.expectEqualStrings("cancelled", reason);
 }
 
-test "el turno entero pasa por un agente de mentira: handshake, updates y stop" {
+test "the whole turn goes through a fake agent: handshake, updates and stop" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

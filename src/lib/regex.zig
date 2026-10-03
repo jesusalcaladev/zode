@@ -230,7 +230,7 @@ const Atom = struct {
 };
 
 // ── tests ────────────────────────────────────────────────────
-test "literales y anclas" {
+test "literals and anchors" {
     const re = Regex.compile("fn main");
     try std.testing.expect(re.matches("const x = 1; fn main() {}"));
     try std.testing.expect(re.matches("fn mainn")); // substring: unanchored does match
@@ -242,7 +242,7 @@ test "literales y anclas" {
     try std.testing.expect(!end.matches("foo()); x"));
 }
 
-test "clases y cuantificadores" {
+test "classes and quantifiers" {
     try std.testing.expect(Regex.compile("[a-z]+_id").matches("const user_id = 1;"));
     try std.testing.expect(!Regex.compile("[0-9]+x").matches("abc"));
     try std.testing.expect(Regex.compile("\\d").matches("abc123"));
@@ -254,7 +254,7 @@ test "clases y cuantificadores" {
     try std.testing.expect(Regex.compile("colou?r").matches("colour"));
 }
 
-test "alternación" {
+test "alternation" {
     try std.testing.expect(Regex.compile("foo|bar").matches("xbarz"));
     try std.testing.expect(Regex.compile("foo|bar").matches("xfooz"));
     try std.testing.expect(!Regex.compile("foo|bar").matches("xbaz"));

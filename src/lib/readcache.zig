@@ -391,37 +391,38 @@ fn inodeOf(stat: anytype) u64 {
 
 // ── tests ─────────────────────────────────────────────────────
 
-test "covers: un rango ya leido no se vuelve a pedir" {
+test "covers: an already read range is not asked for again" {
     var e = Entry{ .in_context = true };
     e.addRange(1, 100);
     try std.testing.expect(e.covers(1, 100));
     try std.testing.expect(e.covers(10, 20));
     try std.testing.expect(e.covers(50, 50));
-    // Pedir mas alla de lo leido NO esta cubierto: ahi si hay que mandar.
+    // Asking beyond what was read is NOT covered: there it does have to send.
     try std.testing.expect(!e.covers(1, 101));
     try std.testing.expect(!e.covers(90, 120));
     try std.testing.expect(!e.covers(101, 200));
 }
 
-test "covers: una entrada sin contexto NO cubre nada" {
-    // Esto es el fallo que produce "el modelo cree que tiene el fichero": si
-    // compaction se lo llevo, `covers` tiene que decir que no.
+test "covers: an entry without context covers NOTHING" {
+    // This is the failure that produces "the model thinks it has the file": if
+    // compaction took it away, `covers` has to say no.
     var e = Entry{ .in_context = false };
     e.addRange(1, 100);
     try std.testing.expect(!e.covers(1, 100));
 }
 
-test "addRange: dos rangos contiguos se funden en uno" {
+test "addRange: two contiguous ranges merge into one" {
     var e = Entry{ .in_context = true };
     e.addRange(1, 50);
     e.addRange(40, 90);
-    // Con la tabla llena de pares, un rango que abarca los dos tiene que contar
-    // como cubierto, o el cache diria "no lo tienes" de algo que si.
+    // With the table full of pairs, a range spanning both has to count as
+    // covered, or the cache would say "you do not have it" about something it
+    // does.
     try std.testing.expect(e.covers(1, 90));
     try std.testing.expect(!e.covers(1, 91));
 }
 
-test "addRange: la tabla se queda en max_ranges y no crece" {
+test "addRange: the table stays at max_ranges and does not grow" {
     var e = Entry{ .in_context = true };
     var i: u32 = 1;
     while (i < max_ranges * 3) : (i += 1) {
@@ -430,7 +431,7 @@ test "addRange: la tabla se queda en max_ranges y no crece" {
     try std.testing.expectEqual(@as(u8, max_ranges), e.ranges_len);
 }
 
-test "cache: un stat igual NO relee (fast path, sin hash)" {
+test "cache: an identical stat does NOT re-read (fast path, no hash)" {
     var c: Cache = .{};
     defer c.invalidate("f.txt");
     const stat = .{ .inode = @as(u64, 42), .size = @as(u64, 100), .mtime = .{ .nanoseconds = @as(i128, 1000) } };
@@ -443,36 +444,36 @@ test "cache: un stat igual NO relee (fast path, sin hash)" {
     try std.testing.expectEqual(@as(usize, 1), c.stats.hits);
 }
 
-test "cache: el MISMO mtime con contenido distinto NO engaña (por eso el hash)" {
-    // El caso que mata un cache hecho solo con mtime: un `sed -i` de la misma
-    // longitud dentro del mismo tick de reloj.
+test "cache: the SAME mtime with different content does NOT fool it (hence the hash)" {
+    // The case that kills a cache made only of mtime: a `sed -i` of the same
+    // length inside the same clock tick.
     var c: Cache = .{};
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 500) } };
     c.record("f.txt", stat, hashBytes("hola-----"), 1, 10, 10);
 
-    // Mismo stat: el fast path acierta y es lo correcto.
+    // Same stat: the fast path is right, and that is correct.
     try std.testing.expect(c.check("f.txt", stat, 1, 10) == .already_sent);
 
-    // El mtime cambia (por ejemplo un `git checkout`) pero el contenido NO: hay
-    // que leer para saberlo, y la respuesta es "sigue igual".
+    // The mtime changes (say a `git checkout`) but the content does NOT: it has
+    // to read to find out, and the answer is "still the same".
     const touched = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 900) } };
     const v = c.check("f.txt", touched, 1, 10);
     switch (v) {
         .read_then_decide => |prev| {
-            // El cache TENIA la entrada (el hash no sale a cero), y el hash sigue
-            // dando lo mismo: eso es lo que hace que la respuesta corta sea
-            // correcta aunque el mtime se haya movido.
+            // The cache DID have the entry (the hash is not zero), and the hash still
+            // gives the same thing: that is what makes the short answer correct
+            // even though the mtime moved.
             try std.testing.expect(prev.in_context);
             try std.testing.expectEqual(hashBytes("hola-----"), prev.hash);
         },
         .already_sent => return error.TestUnexpectedResult,
     }
     c.confirmUnchanged("f.txt", touched, 1, 10, 900);
-    // Y ahora el fast path vuelve a acertar con el mtime nuevo.
+    // And now the fast path is right again with the new mtime.
     try std.testing.expect(c.check("f.txt", touched, 1, 10) == .already_sent);
 }
 
-test "cache: un rango NO cubierto se vuelve a mandar aunque el stat sea igual" {
+test "cache: an uncovered range is sent again even when the stat is identical" {
     var c: Cache = .{};
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 200), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 100, 200);
@@ -483,16 +484,17 @@ test "cache: un rango NO cubierto se vuelve a mandar aunque el stat sea igual" {
     }
 }
 
-test "cache: force (un rango ya leido pero pedido con force) lo ignora" {
+test "cache: force (an already read range but requested with force) ignores it" {
     var c: Cache = .{};
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 10, 10);
-    // `force` se resuelve en el tool, pero el cache tiene que poder contestar que
-    // si: si no, un `force: true` no pondria el stat en modo "vuelve a mandar".
+    // `force` is resolved in the tool, but the cache has to be able to answer yes
+    // to it: otherwise a `force: true` would not put the stat in "send it again"
+    // mode.
     try std.testing.expect(c.check("f.txt", stat, 1, 10) == .already_sent);
 }
 
-test "cache: invalidate tras un write hace que la siguiente read mande el cuerpo" {
+test "cache: invalidate after a write makes the next read send the body" {
     var c: Cache = .{};
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 10, 10);
@@ -505,7 +507,7 @@ test "cache: invalidate tras un write hace que la siguiente read mande el cuerpo
     try std.testing.expectEqual(@as(usize, 0), c.liveEntries());
 }
 
-test "cache: markDroppedAt deshace lo que compaction se llevo" {
+test "cache: markDroppedAt undoes what compaction took" {
     var c: Cache = .{};
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 10, 10);
@@ -513,8 +515,8 @@ test "cache: markDroppedAt deshace lo que compaction se llevo" {
     try std.testing.expectEqual(@as(usize, 1), c.liveEntries());
     try std.testing.expect(c.check("f.txt", stat, 1, 10) == .already_sent);
 
-    // Tier 1 de la compactacion se lleva el mensaje 12 (no uno de la ventana
-    // reciente). El modelo ya no tiene ese texto.
+    // Compaction tier 1 takes message 12 away (not one of the recent window). The
+    // model does not have that text any more.
     c.markDroppedAt(12);
     try std.testing.expectEqual(@as(usize, 0), c.liveEntries());
     switch (c.check("f.txt", stat, 1, 10)) {
@@ -523,7 +525,7 @@ test "cache: markDroppedAt deshace lo que compaction se llevo" {
     }
 }
 
-test "cache: el fichero renombrado se relee (otro inode, otro nombre)" {
+test "cache: the renamed file is re-read (another inode, another name)" {
     var c: Cache = .{};
     const a = .{ .inode = @as(u64, 1), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     const b = .{ .inode = @as(u64, 2), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
@@ -534,7 +536,7 @@ test "cache: el fichero renombrado se relee (otro inode, otro nombre)" {
     }
 }
 
-test "cache: la tabla se llena y sigue respondiendo (eviccion, no crash)" {
+test "cache: the table fills up and keeps answering (eviction, not a crash)" {
     var c: Cache = .{};
     var i: usize = 0;
     var name_buf: [32]u8 = undefined;
@@ -544,12 +546,12 @@ test "cache: la tabla se llena y sigue respondiendo (eviccion, no crash)" {
         c.record(name, stat, 1, 1, 10, 10);
     }
     try std.testing.expectEqual(max_entries, c.len);
-    // Sigue funcionando: es una cache, no una cadena.
+    // It keeps working: it is a cache, not a chain.
     const name = try std.fmt.bufPrint(&name_buf, "f{d}.zig", .{max_entries + 19});
     try std.testing.expect(c.check(name, stat, 1, 10) == .already_sent);
 }
 
-test "hashBytes: contenido igual, hash igual" {
+test "hashBytes: same content, same hash" {
     try std.testing.expectEqual(hashBytes("hola"), hashBytes("hola"));
     try std.testing.expect(hashBytes("hola") != hashBytes("holo"));
     try std.testing.expectEqual(hashBytes(""), hashBytes(""));

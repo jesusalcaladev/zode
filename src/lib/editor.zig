@@ -294,34 +294,88 @@ pub const Editor = struct {
         self.visual_lines = n;
     }
 
-    /// Number of visual lines the text occupies at `width` columns.
-    /// Counts hard breaks + wrap by columns (not by bytes: a wide grapheme
-    /// takes 2 columns).
-    pub fn displayLines(self: *const Editor, width: u16) usize {
-        if (width == 0) return self.visual_lines;
-        const w: usize = width;
-        var total: usize = 0;
-        var lines = std.mem.splitScalar(u8, self.buf.items, '\n');
-        while (lines.next()) |line| {
-            var used: usize = 0;
-            var count: usize = 1;
-            var it = std.unicode.Utf8Iterator{ .bytes = line, .i = 0 };
-            while (it.nextCodepoint()) |cp| {
-                const gw: usize = if (cp >= 0x1100) 2 else 1;
-                if (used + gw > w and used > 0) {
-                    count += 1;
-                    used = gw;
-                } else {
-                    used += gw;
-                }
-            }
-            total += count;
-        }
-        return @max(total, 1);
+    /// Number of visual rows the text occupies at `width` columns.
+    ///
+    /// A COUNT, computed with the same `RowIter` the painter walks, so the height
+    /// of the box and the rows painted in it cannot disagree. That is not a
+    /// detail: this used to be a second, independent wrap (`count('\n') + extra
+    /// per wrap_w bytes`, wide chars guessed as `cp >= 0x1100`) while the draw
+    /// split on `\n` and let `putText` clip at the terminal edge. The box grew to
+    /// eight rows, the text stayed in one and ran off the right, and the tail was
+    /// dropped silently.
+    pub fn displayLines(self: *const Editor, width: u16, m: Measurer) usize {
+        var it = RowIter.init(self.buf.items, width, m);
+        var n: usize = 0;
+        while (it.next() != null) n += 1;
+        return @max(n, 1);
     }
 
-    /// Visual line (0-based) where the cursor lands, for drawing the input.
-    /// Assumes the text doesn't wrap (or that the caller only uses multiline).
+    /// The `want` rows starting at row `first`, into `arena`.
+    ///
+    /// A window rather than "all the rows": a 256 KB paste at 40 columns is 6500
+    /// rows, and the draw only has room for eight. Counting all of them and
+    /// keeping eight would allocate the other 6492 for nothing, every frame.
+    pub fn rowsInWindow(
+        self: *const Editor,
+        first: usize,
+        want: usize,
+        width: u16,
+        m: Measurer,
+        arena: std.mem.Allocator,
+    ) []Row {
+        var out: std.ArrayList(Row) = .empty;
+        var it = RowIter.init(self.buf.items, width, m);
+        var idx: usize = 0;
+        while (it.next()) |row| {
+            if (idx >= first and out.items.len < want) out.append(arena, row) catch break;
+            idx += 1;
+        }
+        return out.items;
+    }
+
+    /// Where the cursor is, in VISUAL terms: the row it is on and the column
+    /// inside it.
+    ///
+    /// `cursorLine` could not do this: it counted `\n` and returned a LOGICAL
+    /// line, which `drawInput` then used as a ROW index. On a wrapped line that
+    /// put the caret on the first row of the box with a column of
+    /// `2 + width_of_everything_before_the_cursor`, i.e. outside the terminal.
+    pub fn cursorRowCol(self: *const Editor, width: u16, m: Measurer) CursorPos {
+        var it = RowIter.init(self.buf.items, width, m);
+        var idx: usize = 0;
+        var boundary: ?CursorPos = null;
+        while (it.next()) |row| {
+            const end = row.offset + row.bytes.len;
+            if (self.cursor < end) {
+                var col: u16 = 0;
+                var i = row.offset;
+                while (i < self.cursor) {
+                    const st = m.s(self.buf.items, i);
+                    col += st.cols;
+                    i = st.end;
+                }
+                return .{ .row = idx, .col = col };
+            }
+            if (self.cursor == end) {
+                // Exactly on a wrap point. The cursor goes at the END of this row
+                // rather than at column 0 of the next one: the next row may not
+                // exist at all (the text ends here), and a caret off the box is
+                // worse than one column of slack.
+                var col: u16 = 0;
+                var i = row.offset;
+                while (i < end) {
+                    const st = m.s(self.buf.items, i);
+                    col += st.cols;
+                    i = st.end;
+                }
+                boundary = .{ .row = idx, .col = col };
+            }
+            idx += 1;
+        }
+        return boundary orelse .{ .row = idx, .col = 0 };
+    }
+
+    /// Logical line (0-based) of the cursor, for the editor's own logic.
     pub fn cursorLine(self: *const Editor) usize {
         var line: usize = 0;
         var i: usize = 0;
@@ -329,6 +383,125 @@ pub const Editor = struct {
             if (self.buf.items[i] == '\n') line += 1;
         }
         return line;
+    }
+};
+
+/// Where the cursor is, in visual terms.
+pub const CursorPos = struct { row: usize, col: u16 };
+
+/// One visual row: a slice of the text and the byte offset it starts at.
+///
+/// The offset is what makes the cursor work: mapping a byte offset to a row needs
+/// to know where each row began, and a `[]const []const u8` of pieces cannot say
+/// it without walking the text again.
+pub const Row = struct {
+    bytes: []const u8,
+    offset: usize,
+};
+
+/// How to measure one grapheme, provided by the caller.
+///
+/// The Editor deliberately knows neither of the two things this needs: what a
+/// grapheme is (that is `vaxis.unicode`) and how wide the user's terminal says
+/// one is (`ctx.stringWidth`, which depends on what vaxis negotiated at startup).
+/// Guessing either one is how the wrap and the paint drift apart.
+pub const Step = struct {
+    /// Columns the grapheme advances the cursor.
+    cols: u16,
+    /// Byte offset just past it.
+    end: usize,
+};
+
+pub const StepFn = *const fn (ctx: *const anyopaque, text: []const u8, i: usize) Step;
+
+pub const Measurer = struct {
+    ctx: *const anyopaque = undefined,
+    step: StepFn,
+
+    pub fn s(self: Measurer, text: []const u8, i: usize) Step {
+        const st = self.step(self.ctx, text, i);
+        return .{ .cols = @max(1, st.cols), .end = if (st.end > i) st.end else i + 1 };
+    }
+};
+
+/// Walks the text as the input box paints it: hard `\n` first, then a word wrap
+/// at `width` columns.
+///
+/// WORD wrap, not the greedy per-grapheme break the history uses. In the history a
+/// break inside a word is a minor blemish; in the input box it means the user
+/// cannot see what they typed, and the box is three rows tall showing one. A token
+/// longer than the row (a path, a URL, a long identifier) still breaks hard: there
+/// is nowhere else to put it.
+pub const RowIter = struct {
+    text: []const u8,
+    width: u16,
+    m: Measurer,
+    pos: usize = 0,
+    done: bool = false,
+
+    pub fn init(text: []const u8, width: u16, m: Measurer) RowIter {
+        return .{ .text = text, .width = @max(width, 1), .m = m };
+    }
+
+    pub fn next(self: *RowIter) ?Row {
+        if (self.done) return null;
+        if (self.pos >= self.text.len) {
+            // The text always ends in a row, even an empty one: an empty editor
+            // is one row, and the cursor needs somewhere to be.
+            self.done = true;
+            return .{ .bytes = self.text[self.pos..], .offset = self.pos };
+        }
+        if (self.text[self.pos] == '\n') {
+            const off = self.pos;
+            self.pos += 1;
+            return .{ .bytes = self.text[off..off], .offset = off };
+        }
+
+        const start = self.pos;
+        var col: u16 = 0;
+        // Byte offset (relative to `start`) of the run of spaces where this row
+        // MAY be broken, or null when the row has no break opportunity yet.
+        var brk: ?usize = null;
+        var i = start;
+        while (i < self.text.len) {
+            if (self.text[i] == '\n') break;
+            const st = self.m.s(self.text, i);
+            if (col + st.cols > self.width and col > 0) {
+                if (brk != null and brk.? > 0) {
+                    const b = brk.?;
+                    // Word break: the row ends before the space run and the next
+                    // row starts at the first non-space.
+                    const row_end = start + b;
+                    var j = row_end;
+                    while (j < self.text.len and self.text[j] == ' ') j += 1;
+                    self.pos = j;
+                    if (self.pos >= self.text.len) self.done = true;
+                    return .{ .bytes = self.text[start..row_end], .offset = start };
+                }
+                // No word boundary in this row (a long path, a URL): break it
+                // hard, which is the only way it fits at all.
+                self.pos = st.end;
+                if (self.pos >= self.text.len) self.done = true;
+                return .{ .bytes = self.text[start..st.end], .offset = start };
+            }
+            // The LAST run of spaces is where this row may break. It is not
+            // cleared when the word after it arrives: the word might not fit
+            // either, and clearing it turned every wrap into a hard break in the
+            // middle of a word ("hola mundo cr" / "uel").
+            if (self.text[i] == ' ') brk = i - start;
+            col += st.cols;
+            i = st.end;
+        }
+        // The newline belongs to the row that just ended: consuming it here is
+        // what keeps `"uno\ndos"` at two rows instead of three (the `\n` was
+        // otherwise seen again at the start of the next call and emitted as an
+        // empty row of its own).
+        self.pos = if (i < self.text.len and self.text[i] == '\n') i + 1 else i;
+        // A row that reached the end IS the last row: without this the iterator
+        // emitted one more empty row after it, so every non-empty text was one
+        // row taller than it is painted.
+        if (self.pos >= self.text.len) self.done = true;
+        return .{ .bytes = self.text[start..i], .offset = start };
     }
 };
 
@@ -355,7 +528,7 @@ fn lineEnd(s: []const u8, from: usize) usize {
 
 // ── tests ─────────────────────────────────────────────────────
 
-test "insert y cursor" {
+test "insert and cursor" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -370,7 +543,7 @@ test "insert y cursor" {
     try std.testing.expectEqual(@as(usize, 4), e.cursor);
 }
 
-test "insert no parte graphemes multibyte al borrar" {
+test "insert does not split multibyte graphemes when deleting" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -393,7 +566,7 @@ test "insert no parte graphemes multibyte al borrar" {
     try std.testing.expectEqualStrings("a", e.text());
 }
 
-test "movimiento por palabra" {
+test "word movement" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -420,7 +593,7 @@ test "movimiento por palabra" {
     try std.testing.expectEqual(@as(usize, 11), e.cursor);
 }
 
-test "home/end por línea con multilínea" {
+test "home/end per line with multiline content" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -434,7 +607,7 @@ test "home/end por línea con multilínea" {
     try std.testing.expectEqual(@as(usize, 12), e.cursor);
 }
 
-test "multilínea: cursorLine y visual_lines" {
+test "multiline: cursorLine and visual_lines" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -446,7 +619,7 @@ test "multilínea: cursorLine y visual_lines" {
     try std.testing.expectEqual(@as(usize, 1), e.cursorLine());
 }
 
-test "deleteToStart y deleteToEnd" {
+test "deleteToStart and deleteToEnd" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -462,7 +635,7 @@ test "deleteToStart y deleteToEnd" {
     try std.testing.expectEqualStrings("", e.text());
 }
 
-test "historial: ↑/↓ con borrador" {
+test "history: up/down with a draft" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -494,7 +667,7 @@ test "historial: ↑/↓ con borrador" {
     try std.testing.expect(e.isEmpty());
 }
 
-test "historial guarda el borrador si no se envía" {
+test "history keeps the draft when it is not sent" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -509,7 +682,7 @@ test "historial guarda el borrador si no se envía" {
     try std.testing.expectEqualStrings("borrador a medias", e.text());
 }
 
-test "historial no duplica el prompt consecutivo" {
+test "history does not duplicate a consecutive prompt" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
@@ -521,14 +694,133 @@ test "historial no duplica el prompt consecutivo" {
     try std.testing.expectEqual(@as(usize, 1), e.history.items.len);
 }
 
-test "displayLines cuenta wrap" {
+test "displayLines counts the wrap" {
     var e = Editor.init(std.testing.allocator);
     defer e.deinit();
 
-    try e.insert("1234567890"); // 10 chars
-    try std.testing.expectEqual(@as(usize, 1), e.displayLines(20));
-    try std.testing.expectEqual(@as(usize, 2), e.displayLines(5));
+    const m = testMeasurer();
+    try e.insert("1234567890"); // 10 chars, no spaces: a hard wrap
+    try std.testing.expectEqual(@as(usize, 1), e.displayLines(20, m));
+    try std.testing.expectEqual(@as(usize, 2), e.displayLines(5, m));
 
     try e.insert("\nxy");
-    try std.testing.expectEqual(@as(usize, 2), e.displayLines(20));
+    try std.testing.expectEqual(@as(usize, 2), e.displayLines(20, m));
+}
+
+// ── tests ─────────────────────────────────────────────────────
+
+/// 1 column per codepoint, codepoint per codepoint: good enough for the tests
+/// and it keeps this file free of `vaxis` (the real measurer lives in `tui.zig`,
+/// because only the terminal layer knows how wide a grapheme is HERE).
+fn testStep(ctx: *const anyopaque, text: []const u8, i: usize) Step {
+    _ = ctx;
+    var it = std.unicode.Utf8Iterator{ .bytes = text, .i = i };
+    const cp = it.nextCodepoint() orelse return .{ .cols = 1, .end = text.len };
+    const wide: bool = cp >= 0x1100;
+    const cols: u16 = if (wide) @as(u16, 2) else 1;
+    // `it.i` is the offset just past the codepoint: the iterator already knows
+    // the length, so there is no need to ask `utf8ByteSequenceLength` (which
+    // takes the first BYTE, not the codepoint).
+    return .{ .cols = cols, .end = it.i };
+}
+
+fn testMeasurer() Measurer {
+    return .{ .step = testStep };
+}
+
+fn rows(text: []const u8, width: u16, arena: std.mem.Allocator) []Row {
+    var out: std.ArrayList(Row) = .empty;
+    var it = RowIter.init(text, width, testMeasurer());
+    while (it.next()) |r| out.append(arena, r) catch {};
+    return out.items;
+}
+
+test "RowIter: a short line is one row and an empty text is one empty row" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+    const r = rows("hola", 20, gpa);
+    try std.testing.expectEqual(@as(usize, 1), r.len);
+    try std.testing.expectEqualStrings("hola", r[0].bytes);
+    const e = rows("", 20, gpa);
+    try std.testing.expectEqual(@as(usize, 1), e.len);
+    try std.testing.expectEqualStrings("", e[0].bytes);
+}
+
+test "RowIter: a hard break is its own row, and an empty line survives" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+    const r = rows("uno\ndos", 20, gpa);
+    try std.testing.expectEqual(@as(usize, 2), r.len);
+    try std.testing.expectEqualStrings("uno", r[0].bytes);
+    try std.testing.expectEqualStrings("dos", r[1].bytes);
+
+    // The empty line in the middle is a ROW: dropping it would glue the text
+    // above to the text below, which is the paragraph separator the user typed.
+    const b = rows("uno\n\ndos", 20, gpa);
+    try std.testing.expectEqual(@as(usize, 3), b.len);
+    try std.testing.expectEqualStrings("", b[1].bytes);
+}
+
+test "RowIter: it wraps at a WORD, not inside one" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+    const r = rows("hola mundo cruel", 12, gpa);
+    try std.testing.expectEqual(@as(usize, 2), r.len);
+    try std.testing.expectEqualStrings("hola mundo", r[0].bytes);
+    try std.testing.expectEqualStrings("cruel", r[1].bytes);
+    // No row starts with a space: the break eats the run.
+    for (r) |row| try std.testing.expect(row.bytes.len == 0 or row.bytes[0] != ' ');
+}
+
+test "RowIter: a token longer than the row breaks hard (a path has to fit)" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const gpa = a.allocator();
+    const r = rows("src/tui.zig", 6, gpa);
+    try std.testing.expect(r.len >= 2);
+    // No character is lost or duplicated: this is the invariant that matters,
+    // because the old code dropped everything past the right border.
+    var joined: [64]u8 = undefined;
+    var n: usize = 0;
+    for (r) |row| {
+        if (n + row.bytes.len > joined.len) break;
+        @memcpy(joined[n .. n + row.bytes.len], row.bytes);
+        n += row.bytes.len;
+    }
+    try std.testing.expectEqualStrings("src/tui.zig", joined[0..n]);
+}
+
+test "cursorRowCol: on a wrapped line the cursor is on the row it is really on" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    const m = testMeasurer();
+    try e.insert("hola mundo cruel");
+    e.cursor = e.buf.items.len;
+
+    const cc = e.cursorRowCol(12, m);
+    try std.testing.expectEqual(@as(usize, 1), cc.row);
+    try std.testing.expectEqual(@as(u16, 5), cc.col); // "cruel"
+
+    // And with the text NOT wrapped it is row 0 with the whole width.
+    const one = e.cursorRowCol(80, m);
+    try std.testing.expectEqual(@as(usize, 0), one.row);
+    try std.testing.expectEqual(@as(u16, 16), one.col);
+}
+
+test "rowsInWindow returns the LAST rows when there are more than fit" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    const m = testMeasurer();
+    try e.insert("aaa bbb ccc ddd eee");
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const total = e.displayLines(4, m);
+    try std.testing.expect(total > 3);
+    const w = e.rowsInWindow(total - 2, 2, 4, m, a.allocator());
+    try std.testing.expectEqual(@as(usize, 2), w.len);
+    // The window is the tail, which is where the cursor is.
+    try std.testing.expectEqualStrings(w[w.len - 1].bytes, w[1].bytes);
 }

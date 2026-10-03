@@ -28,6 +28,7 @@ pub const subagent = @import("lib/subagent.zig");
 pub const skills = @import("lib/skills.zig");
 pub const project = @import("lib/project.zig");
 pub const readcache = @import("lib/readcache.zig");
+pub const verify = @import("lib/verify.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

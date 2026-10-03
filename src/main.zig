@@ -103,19 +103,19 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     var bg = bgproc.Registry{};
     defer bg.deinit(io, gpa);
 
-    // El modelo del headless tambien se PREGUNTA. Sin esto, `--chat` con un
-    // provider sin `default_model` mandaria `"model": ""` y el error del server
-    // no diria nada de por que. Y si el catalogo no se puede leer, se dice y se
-    // sale con codigo 1 sin haber gastado un turno.
+    // The headless model gets ASKED for too. Without this, `--chat` against a
+    // provider with no `default_model` would send `"model": ""` and the server
+    // error would say nothing about why. And if the catalog cannot be read, it
+    // says so and exits with code 1 without having spent a turn.
     var model_name: []const u8 = "";
     if (envGet(env, "ZODE_MODEL")) |mm| {
         if (mm.len > 0) model_name = mm;
     }
     if (model_name.len == 0) model_name = agent.userModel();
     if (model_name.len == 0) {
-        // El modelo del headless tambien se PREGUNTA. Sin esto, `--chat` contra
-        // un provider sin `default_model` mandaria `"model": ""` y el error del
-        // server no diria nada de por que.
+        // The headless model gets asked for too. Without this, `--chat` against
+        // a provider with no `default_model` would send `"model": ""` and the
+        // server error would say nothing about why.
         model_name = agent.resolveModelHeadless(gpa, &http, env) catch |err| {
             std.debug.print("error: could not read {s}'s model catalog ({t}).\n", .{ def.id, err });
             std.debug.print("       set ZODE_MODEL=<id> or add a model to ~/.config/zode/config.json.\n", .{});
@@ -124,11 +124,11 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         std.debug.print("model: {s} (first free in the catalog; ZODE_MODEL to override)\n", .{model_name});
     }
 
-    // El effort sale del MODELO, no de un `.medium` fijo: si `ZODE_EFFORT` no
-    // esta, se pide el default de la escalera que tenga ese modelo. Y lo que
-    // llega de la variable se ajusta a esa escalera, para que
-    // `ZODE_EFFORT=xhigh` contra un `gemini-2.5` no mande un nivel que no
-    // existe.
+    // The effort comes FROM THE MODEL, not from a fixed `.medium`: with no
+    // `ZODE_EFFORT` it asks for the default of that model's own ladder. And what
+    // arrives from the variable is clamped to that same ladder, so that
+    // `ZODE_EFFORT=xhigh` against a `gemini-2.5` does not send a level that does
+    // not exist.
     const effort_pref: chat.Effort = chat.clampEffort(
         model_name,
         if (envGet(env, "ZODE_EFFORT")) |e|
@@ -147,7 +147,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     while (iteration < 6) : (iteration += 1) {
         // Context under budget: elide old tool dumps (a wire view).
         {
-            const comp = compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetTokens(env)) catch
+            const comp = compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetTokens(env), env) catch
                 compaction_mod.Compacted{ .msgs = msgs.items };
             if (comp.elided > 0) elided_total += comp.elided;
             var cur: []chat.ChatMessage = try arena.dupe(chat.ChatMessage, comp.msgs);
@@ -199,7 +199,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         const result = chat.streamChatCtx(gpa, &http, url, key, @constCast(body), .{
             .userdata = null,
             .onDelta = Cb.onDelta,
-        }, kind) catch |err| {
+        }, kind, true) catch |err| {
             if (err == error.ServerError) {
                 models.dbg("\n[error server] {s}\n", .{chat.lastErrorBody()});
             } else {
@@ -335,10 +335,10 @@ fn runTui(init: std.process.Init) !u8 {
     // instead of `.info` (grey).
     model.pushHeader(.idle);
 
-    // [roster] Free-auto: si el entorno lo pide, el pool de modelos free se
-    // construye en un worker (no bloquea el arranque) y el status bar lo enseña
-    // en cuanto esté. Va DESPUÉS de `loadUserConfig`, porque sin la config del
-    // usuario el pool no vería sus providers.
+    // [roster] Free-auto: if the environment asks for it, the pool of free models
+    // is built in a worker (it does not block startup) and the status bar shows
+    // it as soon as it is there. It runs AFTER `loadUserConfig`, because without
+    // the user's config the pool would not see their providers.
     agent.initFreeAutoFromEnv(&model);
 
     try app.run(model.widget(), .{});
@@ -373,17 +373,17 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, arg0, "--help")) {
             std.debug.print(
-                "zode — harness de código\n\n" ++
-                    "  (sin args)   TUI estilo Claude Code\n" ++
-                    "  --models     lista los modelos del provider\n" ++
-                    "  --chat TXT   envía un mensaje (streaming)\n" ++
-                    "  --resume     reanuda la última sesión\n" ++
-                    "  --help       esta ayuda\n",
+                "zode — code agent harness\n\n" ++
+                    "  (no args)    Claude Code style TUI\n" ++
+                    "  --models     list the models of the provider\n" ++
+                    "  --chat TXT   send a message (streaming)\n" ++
+                    "  --resume     resume the last session\n" ++
+                    "  --help       this help\n",
                 .{},
             );
             return 0;
         }
-        std.debug.print("flag desconocida: {s}\n", .{arg0});
+        std.debug.print("unknown flag: {s}\n", .{arg0});
         return 1;
     }
 

@@ -61,24 +61,24 @@ pub const Info = struct {
     }
 
     /// The same information on ONE line, for the UI.
-///
-/// A paragraph in the middle of a status block is three rows of noise; `/context`
-/// wants to say "here is where you are" in a single line under the gauge.
-pub fn oneLine(self: *const Info, out: []u8) []const u8 {
-    var w: std.Io.Writer = .fixed(out);
-    w.print("cwd {s}", .{self.cwd()}) catch return out[0..0];
-    if (self.root()) |repo| {
-        if (std.mem.eql(u8, repo, self.cwd())) {
-            w.writeAll(" · git repo") catch {};
-        } else {
-            w.print(" · git repo {s}", .{repo}) catch {};
+    ///
+    /// A paragraph in the middle of a status block is three rows of noise; `/context`
+    /// wants to say "here is where you are" in a single line under the gauge.
+    pub fn oneLine(self: *const Info, out: []u8) []const u8 {
+        var w: std.Io.Writer = .fixed(out);
+        w.print("cwd {s}", .{self.cwd()}) catch return out[0..0];
+        if (self.root()) |repo| {
+            if (std.mem.eql(u8, repo, self.cwd())) {
+                w.writeAll(" · git repo") catch {};
+            } else {
+                w.print(" · git repo {s}", .{repo}) catch {};
+            }
+            if (self.branch()) |b| w.print(" ({s})", .{b}) catch {};
         }
-        if (self.branch()) |b| w.print(" ({s})", .{b}) catch {};
+        return w.buffered();
     }
-    return w.buffered();
-}
 
-/// The paragraph the system prompt carries.
+    /// The paragraph the system prompt carries.
     ///
     /// It says the cwd ALWAYS: without it the model works with relative paths and
     /// cannot tell the user which file it means, and it has no way to notice that
@@ -286,29 +286,43 @@ pub fn branchFromHead(head: []const u8, out: []u8) ?[]const u8 {
 
 // ── tests ─────────────────────────────────────────────────────
 
-/// A throwaway tree under the cwd, removed at the end, as an ABSOLUTE path.
+/// Length of the relative name `sandbox` wrote into `rel`.
+///
+/// `sandbox` fills `rel` with a NUL-terminated path and no length attached, so
+/// the length has to be recovered from the buffer. It used to return only the
+/// LAST component (`everything after the last '/'`), which worked while the
+/// directory was directly in the cwd and stopped working the moment it moved
+/// under `.zig-cache/`: the delete needs the whole relative path.
+fn rel_buf_len(rel: []const u8) usize {
+    return if (std.mem.indexOfScalar(u8, rel, 0)) |n| n else rel.len;
+}
+
+/// A throwaway tree, removed at the end, as an ABSOLUTE path.
 ///
 /// Fixtures go in a directory of their own and never in the repo of whoever runs
 /// the suite: the fuzzer once saved a key into the real `~/.config/zode`, and the
 /// lesson was that "just write it to the real path" is never the shortcut it looks
 /// like.
 ///
-/// The name is relative (it must live inside the cwd) but the RETURNED path is
-/// absolute, because `findRoot` walks UP and refuses to walk up from a relative
-/// path. Two buffers, because each path that survives another call needs its own
-/// — the `sb.path` trap from the fuzzer round.
-/// The relative name `sandbox` wrote, as a slice.
+/// It lives under `.zig-cache/`, which is where a disposable directory belongs:
+/// already gitignored, already disposable, and OUT of the tree the user is
+/// looking at. It used to be a `.zode-project-test-<seed>` directory directly in
+/// the cwd, and thirteen of them were sitting in the repo root, because the
+/// `defer` that deletes it never runs when the test binary is interrupted and
+/// every interrupted run left one behind.
 ///
-/// `sandbox` returns the ABSOLUTE path, so the caller needs the relative one back
-/// for the delete, and `rel` is a plain buffer with no length attached. Recovering
-/// it from the absolute path (`everything after the last '/'`) is exact and needs
-/// no extra out-parameter.
-fn rel_buf_len(rel: []const u8) usize {
-    return if (std.mem.lastIndexOfScalar(u8, rel, '/')) |i| rel.len - i - 1 else rel.len;
-}
-
+/// The name is relative (it has to live inside the cwd for `createDirPath`) but
+/// the RETURNED path is absolute, because `findRoot` walks UP and refuses to walk
+/// up from a relative path. Two buffers, because each path that survives another
+/// call needs its own — the `sb.path` trap from the fuzzer round.
 fn sandbox(rel: []u8, abs: []u8) ![]const u8 {
-    const name = try std.fmt.bufPrint(rel, ".zode-project-test-{d}", .{std.testing.random_seed});
+    // `bufPrintZ`, NOT `bufPrint`: the name has to be NUL terminated in `rel`,
+    // because that is the only thing `rel_buf_len` has to recover the length
+    // from. `bufPrint` leaves no terminator, so `rel_buf_len` fell back to the
+    // whole 512-byte buffer, the delete was handed a path with garbage in it,
+    // and the `catch {}` swallowed the failure: the fixture was created and
+    // never removed, which is the very bug this move is fixing.
+    const name = try std.fmt.bufPrintZ(rel, ".zig-cache/zode-project-test-{d}", .{std.testing.random_seed});
     std.Io.Dir.cwd().deleteTree(std.testing.io, name) catch {};
     try std.Io.Dir.cwd().createDirPath(std.testing.io, name);
 
@@ -332,15 +346,14 @@ fn join(comptime fmt: []const u8, args: anytype, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, fmt, args);
 }
 
-
 test "branchFromHead: la rama sale, un sha no" {
     var buf: [max_branch]u8 = undefined;
     try std.testing.expectEqualStrings("main", branchFromHead("ref: refs/heads/main\n", &buf).?);
     try std.testing.expectEqualStrings("feat/algo", branchFromHead("ref: refs/heads/feat/algo", &buf).?);
-    // Detached HEAD: un sha NO es una rama, y devolverlo como tal hace que el
-    // modelo haga checkout de un sha pensando que es un nombre.
+    // Detached HEAD: a sha is NOT a branch, and returning it as one makes the
+    // model check out a sha thinking it is a name.
     try std.testing.expect(branchFromHead("9f2c1ab\n", &buf) == null);
-    // Una rama remota tampoco es la rama actual.
+    // A remote branch is not the current branch either.
     try std.testing.expect(branchFromHead("ref: refs/remotes/origin/main\n", &buf) == null);
     try std.testing.expect(branchFromHead("", &buf) == null);
 }
@@ -368,8 +381,8 @@ test "detect: encuentra la raiz subiendo desde un subdirectorio" {
     var lines: [512]u8 = undefined;
     const text = info.promptLines(&lines);
     try std.testing.expect(std.mem.indexOf(u8, text, "Working directory:") != null);
-    // El modelo tiene que saber que NO esta en la raiz: es lo que explica por que
-    // una ruta relativa no es lo que parece.
+    // The model has to know it is NOT at the root: that is what explains why a
+    // relative path is not what it looks like.
     try std.testing.expect(std.mem.indexOf(u8, text, "subdirectory") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "branch main") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "git") != null);
@@ -406,7 +419,7 @@ test "detect: sin repositorio no inventa uno" {
     detectAt(std.testing.io, dir, &info);
     try std.testing.expect(info.root() == null);
     try std.testing.expect(info.branch() == null);
-    // El cwd se dice igual: es la mitad de la linea que el modelo necesita.
+    // The cwd is stated all the same: it is half the line the model needs.
     var lines: [512]u8 = undefined;
     const text = info.promptLines(&lines);
     try std.testing.expect(std.mem.indexOf(u8, text, "Git repository:") == null);
@@ -476,8 +489,8 @@ test "findRoot: se detiene en el primer .git y no sube mas alla" {
     const rel_len = rel_buf_len(&rel_buf);
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, rel_buf[0..rel_len]) catch {};
 
-    // Un repo DENTRO de otro repo: el que gana es el mas cercano, que es lo que
-    // hace git, y no el de arriba.
+    // A repo INSIDE another repo: the closest one wins, which is what git does,
+    // not the one above.
     var inner_buf: [max_path]u8 = undefined;
     const inner = try join("{s}/vendor/lib", .{root}, &inner_buf);
     var head_buf: [max_path]u8 = undefined;
@@ -499,4 +512,46 @@ test "promptLines: un cwd con espacios y no ascii no se rompe" {
     var lines: [512]u8 = undefined;
     const text = info.promptLines(&lines);
     try std.testing.expect(std.mem.indexOf(u8, text, cwd) != null);
+}
+
+test "the fixtures live under .zig-cache, not in the repo the user is looking at" {
+    // Regression, and not a cosmetic one: the fixture used to be a
+    // `.zode-project-test-<seed>` directory in the cwd, and the suite left
+    // THIRTEEN of them in the repo root. The `defer` that deletes it does not run
+    // when the test binary is interrupted, and an interrupted run is normal
+    // (Ctrl+C, a timeout, a crash in an unrelated test).
+    //
+    // Two separate bugs lived here and both had to go:
+    //
+    // 1. The directory was in the repo. A disposable directory belongs in a
+    //    disposable, already-ignored place: `.zig-cache`.
+    // 2. It was never deleted even on a clean run, because `sandbox` filled `rel`
+    //    with `bufPrint` (no NUL terminator) while `rel_buf_len` recovered the
+    //    length by looking for the NUL. The length came back as the whole
+    //    512-byte buffer, `deleteTree` got a path with garbage in it, and the
+    //    `catch {}` hid it. Fixed with `bufPrintZ`.
+    //
+    // So this test checks both: the path is under `.zig-cache`, AND it can
+    // actually be deleted afterwards (which is the part that was silently broken).
+    var rel_buf: [max_path]u8 = undefined;
+    var root_buf: [max_path]u8 = undefined;
+    const root = try sandbox(&rel_buf, &root_buf);
+    const rel_len = rel_buf_len(&rel_buf);
+
+    const rel = rel_buf[0..rel_len];
+    try std.testing.expect(std.mem.startsWith(u8, rel, ".zig-cache/"));
+    try std.testing.expect(std.mem.indexOf(u8, rel, "zode-project-test-") != null);
+    // A NUL right after the name: this is what makes the length recoverable, and
+    // its absence is what made the delete a no-op.
+    try std.testing.expect(rel_buf[rel_len] == 0);
+
+    var head_buf: [max_path]u8 = undefined;
+    try writeAt(std.testing.io, try join("{s}/.git/HEAD", .{root}, &head_buf), "ref: refs/heads/main\n");
+
+    std.Io.Dir.cwd().deleteTree(std.testing.io, rel) catch {};
+    // And now it is really gone: `openDir` on it must fail.
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openDir(std.testing.io, rel, .{}),
+    );
 }

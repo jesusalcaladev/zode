@@ -31,7 +31,7 @@ pub fn compressLine(buf: []u8, payload: []const u8) ?[]const u8 {
     // Only accept if it actually saves >= 25% (accounting base64 +33%).
     if (compressed.len == 0 or compressed.len * 4 / 3 > payload.len * 3 / 4) return null;
 
-    // base64: ASCII puro, JSON-safe y byte-exact al decodificar.
+    // base64: pure ASCII, JSON-safe and byte-exact when decoded.
     const enc = std.base64.standard.Encoder;
     const b64_len = enc.calcSize(compressed.len);
     if (1 + b64_len > buf.len) return null;
@@ -64,7 +64,7 @@ pub fn decompressInto(alloc: std.mem.Allocator, line: []const u8, max_out: usize
 /// Minimum payload worth compressing (bytes). Below this, JSON wins.
 pub const min_compress_len = 512;
 
-test "round trip comprime y descomprime" {
+test "round trip compresses and decompresses" {
     const alloc = std.testing.allocator;
     const payload =
         "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"" ++
@@ -80,7 +80,7 @@ test "round trip comprime y descomprime" {
     try std.testing.expect(line.len < payload.len / 4); // >= 75% saved
 }
 
-test "payload corto no se comprime" {
+test "a short payload is not compressed" {
     var buf: [8192]u8 = undefined;
     try std.testing.expect(compressLine(&buf, "{\"short\":1}") == null);
 }

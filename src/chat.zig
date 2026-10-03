@@ -141,25 +141,27 @@ pub fn familyForModel(model: []const u8) Family {
 /// every model got the same three-and-a-bit levels, so "some models support more"
 /// was true and unreachable.
 ///
-/// **Esta tabla se verifico contra las docs, no contra lo que parece reasonable.**
-/// La primera version la escribi de memoria y era FALSA en tres sitios, que es
-/// exactamente el modo de fallo que un test de este repo no caza: los tests
-/// comparan el JSON que genera zode contra el JSON que el propio codigo de zode
-/// dice que deberia generar. Si los dos estan equivocados, el test pasa. Lo que
-/// hace falta es mirar la documentacion del proveedor, y:
+/// **This table was verified against the docs, not against what looks reasonable.**
+/// The first version was written from memory and was WRONG in three places,
+/// which is exactly the failure mode no test in this repo catches: the tests
+/// compare the JSON that zode generates against the JSON that zode's own code
+/// says it should generate. If both are wrong, the test passes. What is needed
+/// is to read the provider's documentation, and:
 ///
-///   - `xhigh` NO existe en `gpt-5.1`. Solo en `gpt-5.1-codex-max` (verificado:
-///     la matriz de niveles de OpenAI lista none/low/medium/high para 5.1, y
-///     anade xhigh solo para codex-max). Habia puesto `xhigh` para todo 5.1,
-///     o sea un 400 en cuanto alguien escribiera `/effort xhigh`.
-///   - `minimal` NO existe en los GPT-5 anteriores a 5.1, ni en `gemini-2.5-*`.
-///     Es de 5.1 en adelante y de certainos Gemini 3.
-///   - Gemini llama al campo `thinking_level`, no `reasoning_effort`. Por el
-///     camino OpenAI-compatible (`/v1beta/openai/`, y OpenRouter) se mapea, que
-///     es por lo que se manda el nombre de OpenAI. Los VALORES son los de Gemini.
+///   - `xhigh` does NOT exist in `gpt-5.1`. Only in `gpt-5.1-codex-max` (verified:
+///     OpenAI's effort matrix lists none/low/medium/high for 5.1, and adds xhigh
+///     only for codex-max). I had put `xhigh` for all of 5.1, i.e. a 400 the
+///     moment somebody typed `/effort xhigh`.
+///   - `minimal` does NOT exist in the GPT-5s before 5.1, nor in `gemini-2.5-*`.
+///     It is 5.1 onwards, and certain Gemini 3 models.
+///   - Gemini calls the field `thinking_level`, not `reasoning_effort`. Over the
+///     OpenAI-compatible path (`/v1beta/openai/`, and OpenRouter) it is mapped,
+///     which is why OpenAI's name is the one we send. The VALUES, on the other
+///     hand, are Gemini's.
 ///
-/// El resto del criterio es el de siempre: un nivel que el modelo no conoce es un
-/// 400, y un 400 a mitad de un turno es invisible. Ante la duda, **degradar**.
+/// The rest of the criterion is the usual one: a level the model does not know is
+/// a 400, and a 400 in the middle of a turn is invisible. When in doubt,
+/// **degrade**.
 pub const EffortSupport = enum {
     /// No `reasoning_effort` at all. Do not send the field: a model with no such
     /// knob answers 400, and a model that ignores it costs only the setting.
@@ -179,9 +181,10 @@ pub const EffortSupport = enum {
     /// `low | high`. Documented for `gemini-3-pro-preview` (and
     /// `gemini-3.1-pro-preview`), which is the one family WITHOUT `medium`.
     ///
-    /// Existe por el motivo que importa: es el unico caso donde el default "de
-    /// en medio" NO puede ser `medium`. Sin esta fila, un modelo sin `medium`
-    /// receberia `medium` por ser el escalon central de una escalera inventada.
+    /// It exists for the reason that matters: it is the only case where the
+    /// "middle" default CANNOT be `medium`. Without this row, a model with no
+    /// `medium` would receive `medium` for being the middle rung of a ladder
+    /// that nobody looked up.
     no_medium,
 };
 
@@ -194,15 +197,15 @@ pub fn effortSupport(model: []const u8) EffortSupport {
     if (containsAny(model, &.{ "codex-max", "codex_max" })) return .codex_max;
     if (containsAny(model, &.{ "gpt-5.1", "gpt5.1" })) return .gpt51;
     if (containsAny(model, &.{ "gemini-3.5", "gemini-3.6", "gemini-3-flash", "gemini-3.7", "gemini-3.8" })) return .gemini3_minimal;
-    // Los pro de Gemini 3 no admiten `medium` (docs: low y high). Es el unico
-    // modelo conocido sin el escalon de en medio, asi que tiene su propia fila
-    // en vez de caer en `basic` y recibir un `medium` que no existe.
+    // The Gemini 3 pro models do not take `medium` (docs: low and high). It is
+    // the only known model without the middle rung, so it gets its own row
+    // instead of falling into `basic` and receiving a `medium` that is not there.
     if (containsAny(model, &.{ "gemini-3-pro", "gemini-3.1-pro" })) return .no_medium;
     // Everything else with a knob: the basic ladder. Gemini 2.5 and the odd
     // `gemini-3-pro-preview` are here on purpose — `basic` is a subset of what
     // they take, and `medium` is the only level that could surprise us (it is
     // documented as unsupported on 3-pro-preview), so that one degrades high.
-    if (containsAny(model, &.{ "gemini" })) return .basic;
+    if (containsAny(model, &.{"gemini"})) return .basic;
     if (containsAny(model, &.{ "gpt-5", "gpt5", "o3", "o4", "o1" })) return .basic;
     return .none;
 }
@@ -217,9 +220,9 @@ pub fn effortSupport(model: []const u8) EffortSupport {
 pub fn effortFor(model: []const u8, want: Effort) ?Effort {
     return switch (effortSupport(model)) {
         .none => null,
-        // `minimal` NO esta en esta escalera: mandarlo a un GPT-5 de antes de
-        // 5.1 es un 400. `none` tampoco, y "no pensar" cae a `low`, que es lo
-        // mas barato que el modelo sabe hacer.
+        // `minimal` is NOT on this ladder: sending it to a GPT-5 older than 5.1
+        // is a 400. Neither is `none`, and "do not think" falls to `low`, which
+        // is the cheapest thing the model knows how to do.
         .basic => switch (want) {
             .none, .minimal, .low => .low,
             .medium => .medium,
@@ -233,15 +236,15 @@ pub fn effortFor(model: []const u8, want: Effort) ?Effort {
             .high, .xhigh => .high,
         },
         .codex_max => want,
-        // Gemini no tiene `none`: el piso es `minimal`.
+        // Gemini has no `none`: its floor is `minimal`.
         .gemini3_minimal => switch (want) {
             .none, .minimal => .minimal,
             .low => .low,
             .medium => .medium,
             .high, .xhigh => .high,
         },
-        // Sin `medium`: degradar hacia `low` (el nivel pedido es mas de lo que el
-        // modelo sabe hacer, y `low` es el mas cercano por debajo).
+        // No `medium`: degrade towards `low` (the requested level is more than
+        // the model can do, and `low` is the nearest one below it).
         .no_medium => switch (want) {
             .none, .minimal, .low, .medium => .low,
             .high, .xhigh => .high,
@@ -251,12 +254,12 @@ pub fn effortFor(model: []const u8, want: Effort) ?Effort {
 
 /// The `reasoning_effort` STRING for a model that has the field.
 ///
-/// The NAME is OpenAI's on purpose even for Gemini: Gemini llama al campo
-/// `thinking_level`, pero por el camino OpenAI-compatible (que es por donde
-/// habla zode, via OpenRouter o `/v1beta/openai/`) se mapea desde
-/// `reasoning_effort`. Los VALORES, en cambio, son los de Gemini.
+/// The NAME is OpenAI's on purpose even for Gemini: Gemini calls the field
+/// `thinking_level`, but over the OpenAI-compatible path (which is how zode
+/// talks, via OpenRouter or `/v1beta/openai/`) it is mapped from
+/// `reasoning_effort`. The VALUES, on the other hand, are Gemini's.
 ///
-/// Y elLevels se escribe "x-high" en ningun sitio: la palabra es `xhigh`.
+/// And the level is written "x-high" nowhere: the word is `xhigh`.
 pub fn reasoningEffortString(model: []const u8, want: Effort) ?[]const u8 {
     const e = effortFor(model, want) orelse return null;
     return switch (e) {
@@ -386,8 +389,44 @@ pub const Callbacks = struct {
 /// are about to return an error: parsing it here could only fail again. If the
 /// JSON carries no `message` (or is not JSON), the caller falls back to
 /// "HTTP nnn".
+/// The server's own explanation of a failure, kept per REQUEST.
+///
+/// It used to be two module globals (`last_error_buf`, `last_error_len`). That is
+/// fine for one request at a time and wrong the moment two run at once, which is
+/// what a parallel subagent is: two failures interleaving into one buffer means
+/// each request reports the OTHER one's error.
+pub const ErrBuf = struct {
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const ErrBuf) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+fn setServerMessageInto(out: *ErrBuf, body: []const u8) void {
+    out.len = 0;
+    setServerMessageRaw(out, body);
+}
+
+/// Stores an already-extracted message. Not the same as `setServerMessageInto`,
+/// which PARSES the `"message"` key out of a JSON body.
+fn storeErrText(out: *ErrBuf, msg: []const u8) void {
+    out.len = 0;
+    const n = @min(msg.len, out.buf.len);
+    @memcpy(out.buf[0..n], msg[0..n]);
+    out.len = n;
+}
+
 fn setServerMessage(body: []const u8) void {
-    last_error_len = 0;
+    setServerMessageRaw(&main_err, body);
+}
+
+/// The main turn's error buffer: what `lastErrorBody()` reads.
+pub var main_err: ErrBuf = .{};
+
+fn setServerMessageRaw(out: *ErrBuf, body: []const u8) void {
+    out.len = 0;
     const key = "\"message\"";
     const at = std.mem.indexOf(u8, body, key) orelse return;
     var i = at + key.len;
@@ -400,28 +439,34 @@ fn setServerMessage(body: []const u8) void {
         // Only the backslash and the quote are unescaped: a nested \uXXXX is
         // not worth it, and this is error text, not content.
         if (body[i] == '\\' and i + 1 < body.len) i += 1;
-        if (n + 1 >= last_error_buf.len) break;
-        last_error_buf[n] = body[i];
+        if (n + 1 >= out.buf.len) break;
+        out.buf[n] = body[i];
         n += 1;
     }
     if (n == 0) return;
-    last_error_len = n;
+    out.len = n;
 }
 
-/// Last bytes of the body when the server rejects the request (for diagnostics).
-pub var last_error_buf: [512]u8 = undefined;
-pub var last_error_len: usize = 0;
+/// How many bytes of the last error message are valid.
+pub fn lastErrorLen() usize {
+    return main_err.len;
+}
 
-// ── ZODE_DBG_ERR: volcar la respuesta del server ──────────────
+/// The capacity of the error buffer, for the tests that check it does not overrun.
+pub fn lastErrorCap() usize {
+    return main_err.buf.len;
+}
+
+// ── ZODE_DBG_ERR: dump the server response ────────────────────
 //
-// `ZODE_DBG_ERR=1` imprime a stderr el status y los primeros bytes de CADA
-// respuesta (buena o mala). Existe por una razón concreta: el mensaje de error
-// que se ve en la TUI sale de `"message":"..."` del body, y cuando el body no
-// tiene ese campo (o viene troceado) lo que se muestra es "HTTP 403" y no hay
-// por dónde tirar. Con esto se lee lo que contestó de verdad.
+// `ZODE_DBG_ERR=1` prints to stderr the status and the first bytes of EVERY
+// response (good or bad). It exists for one concrete reason: the error message
+// shown in the TUI comes from `"message":"..."` in the body, and when the body
+// has no such field (or arrives chunked) all that is displayed is "HTTP 403"
+// with nothing to pull on. With this you read what the server actually said.
 //
-// Se lee UNA vez al arrancar (`dbgInitEnv`): el `Io` no expone el entorno, y
-// leerlo por cada respuesta sería una lookup por request.
+// It is read ONCE at startup (`dbgInitEnv`): the `Io` does not expose the
+// environment, and reading it per response would be a lookup per request.
 pub var dbg_err_flag: bool = false;
 
 pub fn dbgInitEnv(env: ?*const std.process.Environ.Map) void {
@@ -434,7 +479,7 @@ fn dbg_err() bool {
 }
 
 pub fn lastErrorBody() []const u8 {
-    return last_error_buf[0..last_error_len];
+    return main_err.slice();
 }
 
 /// Set to true by the UI (ESC) to abort the stream in flight. Atomic: the TUI
@@ -458,6 +503,15 @@ pub const Usage = struct {
     prompt: i64 = 0,
     cached: i64 = 0,
     completion: i64 = 0,
+    /// Tokens WRITTEN into the provider's cache on this request (Anthropic's
+    /// `cache_creation_input_tokens`).
+    ///
+    /// It is the number that decides whether a prefix is well placed. A hit-rate
+    /// can be beautiful while this is enormous, and that combination means the
+    /// prefix is being re-written every turn: the expensive direction. With only
+    /// reads visible, `/cache` could not tell a healthy session from one that
+    /// re-caches 16 KB of tools on every single request.
+    cache_write: i64 = 0,
 };
 pub var last_usage: Usage = .{};
 
@@ -492,9 +546,20 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
                 if (m == .string) msg = m.string;
             }
         }
-        const n = @min(msg.len, last_error_buf.len);
-        @memcpy(last_error_buf[0..n], msg[0..n]);
-        last_error_len = n;
+        // Into the ctx of the request that failed, not into a global: two
+        // concurrent requests must not overwrite each other's explanation.
+        //
+        // CAREFUL: `msg` is the message ALREADY extracted, not a JSON body, so it
+        // is stored as-is. Handing it to `setServerMessage` (which looks for the
+        // `"message"` key) silently stored nothing, and the user saw an empty
+        // error where there was one.
+        if (userdata) |u| {
+            const self: *StreamCtx = @ptrCast(@alignCast(u));
+            storeErrText(&self.err, msg);
+            if (self.mirror_globals) main_err = self.err;
+        } else {
+            storeErrText(&main_err, msg);
+        }
         dispatch(userdata, .{ .err = msg });
         return error.ServerError;
     }
@@ -521,6 +586,9 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
             if (u.object.get("cache_read_input_tokens")) |v| {
                 if (v == .integer and usage.cached == 0) usage.cached = v.integer;
             }
+            if (u.object.get("cache_creation_input_tokens")) |v| {
+                if (v == .integer) usage.cache_write = v.integer;
+            }
             if (usage.prompt > 0 or usage.completion > 0) {
                 dispatch(userdata, .{ .usage = usage });
             }
@@ -543,6 +611,12 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
                                 }
                                 if (u.object.get("cache_read_input_tokens")) |v| {
                                     if (v == .integer) usage.cached = v.integer;
+                                }
+                                if (u.object.get("cache_creation_input_tokens")) |v| {
+                                    if (v == .integer) usage.cache_write = v.integer;
+                                }
+                                if (u.object.get("cache_creation_input_tokens")) |v| {
+                                    if (v == .integer) usage.cache_write = v.integer;
                                 }
                                 if (usage.prompt > 0 or usage.cached > 0) {
                                     dispatch(userdata, .{ .usage = usage });
@@ -700,6 +774,24 @@ pub const StreamCtx = struct {
     raw: [512]u8 = undefined,
     raw_len: usize = 0,
 
+    /// THIS request's usage, and this request's error text.
+    ///
+    /// Both used to be module globals (`last_usage`, `last_error_buf`). That is
+    /// correct for one request at a time and wrong the moment two run at once,
+    /// which is what a parallel subagent is: two requests interleaving into one
+    /// `Usage` make `/cache` a work of fiction, and two failures interleaving into
+    /// one buffer make each report the OTHER one's error.
+    ///
+    /// `mirror_globals` says whether this request is ALSO the main turn, which is
+    /// the only one whose numbers anybody reads.
+    usage: Usage = .{},
+    err: ErrBuf = .{},
+    retry_after: ?u16 = null,
+    /// True for the turn the user is watching: it publishes to the module globals
+    /// and clears the cancel flag on entry. A subagent does neither (see
+    /// `streamRaw`).
+    mirror_globals: bool = true,
+
     const Part = struct {
         index: usize,
         id: std.ArrayList(u8) = .empty,
@@ -816,9 +908,12 @@ pub const StreamCtx = struct {
             .usage => |u| {
                 // Per-field merge: Anthropic splits usage between
                 // message_start (input) and message_delta (output).
-                if (u.prompt > 0) last_usage.prompt = u.prompt;
-                if (u.cached > 0) last_usage.cached = u.cached;
-                if (u.completion > 0) last_usage.completion = u.completion;
+                if (u.prompt > 0) self.usage.prompt = u.prompt;
+                if (u.cached > 0) self.usage.cached = u.cached;
+                if (u.completion > 0) self.usage.completion = u.completion;
+                if (u.cache_write > 0) self.usage.cache_write = u.cache_write;
+                if (self.mirror_globals) last_usage = self.usage;
+                if (u.cache_write > 0) last_usage.cache_write = u.cache_write;
             },
             .delta => |d| self.user.onDelta(self.user.userdata, d),
             .finish => |r| {
@@ -871,7 +966,8 @@ pub const StreamCtx = struct {
     }
 
     /// Recovers tool calls that never made it to being emitted (cut stream).
-    /// The ones that do have executable args are emitted now; the rest are dropped.
+    /// They are all emitted, INCLUDING the ones whose arguments are not valid JSON:
+    /// a dropped call is invisible to the model and unfixable from its side.
     fn flushPendingTools(self: *StreamCtx) void {
         for (self.parts.items) |*p| {
             if (p.emitted) continue;
@@ -880,7 +976,21 @@ pub const StreamCtx = struct {
                 // A tool without arguments is legal: treat it as an empty object.
                 p.args.appendSlice(self.gpa, "{}") catch continue;
             }
-            self.tryEmitTool(p);
+            // EMITTED EVEN IF THE ARGSUMENTS ARE NOT VALID JSON.
+            //
+            // Its own doc said "the rest are dropped", and that is what happened:
+            // a stream cut mid-arguments produced no tool call at all, so the turn
+            // ended as if the model had only sent prose. The model got no result,
+            // no error and no history line, and its next move was to guess again
+            // from nothing.
+            //
+            // Emitting it hands the failure to the executor, which reports it with
+            // `describeError`: the model is told the arguments did not parse AND
+            // what it actually sent, which is the one thing it can act on.
+            p.emitted = true;
+            if (self.user.onToolCall) |f| {
+                f(self.user.userdata, p.id.items, p.name.items, p.args.items);
+            }
         }
     }
 };
@@ -892,6 +1002,10 @@ pub const StreamResult = struct {
 };
 
 /// Stream with tool_call accumulation. The caller does `result.ctx.destroy()`.
+/// `mirror_globals` is TRUE for the turn the user is watching and FALSE for a
+/// subagent: see the `StreamCtx.mirror_globals` doc. It is a parameter and not a
+/// global because a subagent running in parallel with the main turn is exactly
+/// the case where the globals are wrong.
 pub fn streamChatCtx(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
@@ -900,9 +1014,10 @@ pub fn streamChatCtx(
     body: []u8,
     user_cb: Callbacks,
     kind: ProviderKind,
+    mirror_globals: bool,
 ) !StreamResult {
     const ctx = try gpa.create(StreamCtx);
-    ctx.* = .{ .gpa = gpa, .user = user_cb, .kind = kind };
+    ctx.* = .{ .gpa = gpa, .user = user_cb, .kind = kind, .mirror_globals = mirror_globals };
     // CAREFUL: the error path must call `destroy` (NOT `deinit`): the ctx may
     // already have `parts` (accumulated tool calls) and `line_buf` allocated.
     // `destroy` is the one that frees them; a plain `gpa.destroy(ctx)` without
@@ -921,8 +1036,23 @@ fn streamRaw(
     ctx: *StreamCtx,
 ) !void {
     _ = gpa; // the parser lives in the ctx (line_buf)
-    last_usage = .{}; // fresh per request: do not carry over fields from the previous turn
-    clearCancel();
+    // Fresh per request: do not carry over fields from the previous turn.
+    ctx.usage = .{};
+    ctx.err = .{};
+    ctx.retry_after = null;
+    // ...and only the MAIN turn publishes that to the module globals. Two things
+    // here used to be global and are a parallel-subagent hazard:
+    //
+    //  - `last_usage`: two requests interleaving into one Usage make `/cache` a
+    //    work of fiction.
+    //  - `clearCancel()`: a subagent starting would CLEAR the flag the user set
+    //    with ESC, so the turn the user was watching would carry on and the
+    //    subagent would never see the cancel. ESC stays global (it is the user's
+    //    signal and everybody obeys it); only the clearing is per-turn.
+    if (ctx.mirror_globals) {
+        last_usage = .{};
+        clearCancel();
+    }
 
     const Hdr = http_client.Http.ExtraHeader;
     var hdrs_buf: [2]Hdr = undefined;
@@ -961,7 +1091,10 @@ fn streamRaw(
         if (dbg_err()) {
             std.debug.print("[DBG] status={d} raw={s}\n", .{ res.status, ctx.raw[0..@min(ctx.raw_len, 240)] });
         }
-        if (res.retry_after) |ra| retry_after_secs = ra;
+        if (res.retry_after) |ra| {
+            ctx.retry_after = ra;
+            if (ctx.mirror_globals) retry_after_secs = ra;
+        }
         // Each status gets its own error because the ACTION to take differs,
         // and "HTTP 403" says nothing:
         //   400  bad request    -> do not retry (repeating it does not fix it)
@@ -989,17 +1122,19 @@ fn streamRaw(
         // The server's message is what actually explains the failure; it is
         // pulled out of its JSON ("message":"...") and if there is none the
         // status is left as-is.
-        last_error_len = 0;
-        setServerMessage(ctx.raw[0..ctx.raw_len]);
-        if (last_error_len == 0) {
-            const fb = std.fmt.bufPrint(&last_error_buf, "HTTP {d}", .{res.status}) catch return err;
-            last_error_len = fb.len;
+        ctx.err.len = 0;
+        setServerMessageInto(&ctx.err, ctx.raw[0..ctx.raw_len]);
+        if (ctx.mirror_globals) main_err = ctx.err;
+        if (ctx.err.len == 0) {
+            const fb = std.fmt.bufPrint(&ctx.err.buf, "HTTP {d}", .{res.status}) catch return err;
+            ctx.err.len = fb.len;
+            if (ctx.mirror_globals) main_err = ctx.err;
         }
         return err;
     }
     if (dbg_err()) std.debug.print("[DBG] 200 raw={s}\n", .{ctx.raw[0..@min(ctx.raw_len, 240)]});
-    retry_after_secs = null;
-    if (res.retry_after) |ra| retry_after_secs = ra;
+    ctx.retry_after = res.retry_after;
+    if (ctx.mirror_globals) retry_after_secs = ctx.retry_after;
     ctx.finish() catch |err| switch (err) {
         error.ServerError => return error.ServerError,
     };
@@ -1063,9 +1198,10 @@ pub fn streamChat(
     body: []u8,
     cb: Callbacks,
     kind: ProviderKind,
+    mirror_globals: bool,
 ) !void {
     const ctx = try gpa.create(StreamCtx);
-    ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind };
+    ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind, .mirror_globals = mirror_globals };
     defer ctx.destroy(); // frees parts and destroys the struct
     try streamRaw(gpa, http, url, bearer, body, ctx);
 }
@@ -1098,7 +1234,24 @@ fn buildBodyOpenAI(
     var w: std.Io.Writer = .fixed(buf);
     try w.writeAll("{\"model\":\"");
     try jsonEscape(&w, model);
-    try w.writeAll("\",\"messages\":[");
+
+    // TOOLS BEFORE MESSAGES, and the order is load-bearing.
+    //
+    // OpenAI's prompt cache is keyed on the LITERAL PREFIX of the request body,
+    // and the prefix stops being useful at the first byte that changes. The
+    // tools block is ~16 KB of schema that never changes; the messages array
+    // changes with every turn. With tools AFTER messages (where it was), the
+    // cache prefix could only ever reach the system message: the tools were past
+    // the conversation, so they fell outside the cached region on EVERY request.
+    // Putting them first makes the static part of the request the beginning of
+    // the request, which is the only part the cache can ever see.
+    // Closes the model string, which `jsonEscape` left open.
+    try w.writeAll("\"");
+    if (tools_json.len > 0) {
+        try w.writeAll(",\"tools\":");
+        try w.writeAll(tools_json);
+    }
+    try w.writeAll(",\"messages\":[");
     for (messages, 0..) |m, i| {
         if (i > 0) try w.writeAll(",");
         try w.writeAll("{\"role\":\"");
@@ -1149,12 +1302,8 @@ fn buildBodyOpenAI(
         },
     }
 
-    // tools FIRST after messages? No: tools goes outside messages (root level),
-    // and its stable position in the JSON helps the provider's prefix caching.
-    if (tools_json.len > 0) {
-        try w.writeAll(",\"tools\":");
-        try w.writeAll(tools_json);
-    }
+    // (tools went out BEFORE messages, on purpose: see the top of this function.
+    // Keeping them here as well would send the schema twice.)
     try w.writeAll("}");
     return w.buffered();
 }
@@ -1283,9 +1432,15 @@ fn buildBodyAnthropic(
                 try w.writeAll("\",\"content\":\"");
                 try jsonEscape(&w, messages[i].content);
                 try w.writeAll("\"");
-                // Breakpoint at the end of the history: the next turn reuses
-                // the WHOLE prefix from cache (tools+system+messages).
-                if (i == messages.len - 1) try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+                // Two breakpoints here, not one, and the second one is the
+                // ROLLING one. With a single breakpoint on the last message, the
+                // prefix from `system` to the end has to be re-written on every
+                // turn, because it changed: the cache is read at the breakpoints,
+                // not continuously. Anchoring one a message earlier leaves the
+                // older half of the history sitting at a breakpoint that the next
+                // turn still hits, so the provider READS it and only writes the
+                // newest segment.
+                if (i + 1 >= messages.len - 1) try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
                 try w.writeAll("}");
             }
             try w.writeAll("]}");
@@ -1338,7 +1493,10 @@ fn buildBodyAnthropic(
                             }
                         }
                         if (!input_written) try w.writeAll("{}");
-                        if (ti == pv.array.items.len - 1 and i == messages.len - 1) {
+                        // The rolling pair again (see the tool_result branch):
+                        // the last tool_use of the last message, and of the one
+                        // before it.
+                        if (ti == pv.array.items.len - 1 and i + 1 >= messages.len - 1) {
                             try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
                         }
                         try w.writeAll("}");
@@ -1349,8 +1507,9 @@ fn buildBodyAnthropic(
                 try w.writeAll("{\"type\":\"text\",\"text\":\"\"}");
             }
             try w.writeAll("]");
-        } else if (i == messages.len - 1) {
-            // Last message: block form, to anchor the cache breakpoint.
+        } else if (i + 1 >= messages.len - 1) {
+            // Last message (and the one before it): block form, to anchor the two
+            // rolling cache breakpoints.
             try w.writeAll("[{\"type\":\"text\",\"text\":\"");
             try jsonEscape(&w, m.content);
             try w.writeAll("\",\"cache_control\":{\"type\":\"ephemeral\"}}]");
@@ -1424,7 +1583,7 @@ fn jsonEscape(w: *std.Io.Writer, s: []const u8) !void {
 }
 
 // ── hermetic tests ───────────────────────────────────────────
-test "scanSse junta deltas y termina en [DONE]" {
+test "scanSse joins deltas and ends on [DONE]" {
     const sse =
         "data: {\"choices\":[{\"delta\":{\"content\":\"Hola \"}}]}\n" ++
         "\n" ++
@@ -1454,7 +1613,7 @@ test "scanSse junta deltas y termina en [DONE]" {
     try std.testing.expectEqualStrings("Hola mundo", col.text.items);
 }
 
-test "tool_call fragmentado se acumula y emite una vez" {
+test "a fragmented tool_call accumulates and is emitted once" {
     const Collector = struct {
         calls: usize = 0,
         last_name: []const u8 = "",
@@ -1494,7 +1653,7 @@ test "tool_call fragmentado se acumula y emite una vez" {
     try std.testing.expectEqualStrings("{\"pattern\":\"a{b\",\"x\":\"}\"}", col.last_args);
 }
 
-test "detecta error del server" {
+test "detects a server error" {
     const ctx = try std.testing.allocator.create(StreamCtx);
     ctx.* = .{ .gpa = std.testing.allocator, .user = .{} };
     defer ctx.destroy();
@@ -1505,7 +1664,7 @@ test "detecta error del server" {
     try std.testing.expectEqualStrings("no", lastErrorBody());
 }
 
-test "buildBody escapa JSON y fija max_tokens" {
+test "buildBody escapes JSON and sets max_tokens" {
     var buf: [512]u8 = undefined;
     const body = try buildBody(&buf, "m1", "linea\ncon \"quotes\"", .medium);
     try std.testing.expectEqualStrings(
@@ -1514,7 +1673,7 @@ test "buildBody escapa JSON y fija max_tokens" {
     );
 }
 
-test "buildBodyMessages con tool result y tools" {
+test "buildBodyMessages with a tool result and tools" {
     var buf: [1024]u8 = undefined;
     const msgs = [_]ChatMessage{
         .{ .role = "user", .content = "lee a.zig" },
@@ -1527,7 +1686,7 @@ test "buildBodyMessages con tool result y tools" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
 }
 
-test "scanSse parsea eventos Anthropic (delta, tool_use y usage)" {
+test "scanSse parses Anthropic events (delta, tool_use and usage)" {
     const Collector = struct {
         text: std.ArrayList(u8) = .empty,
         calls: usize = 0,
@@ -1575,7 +1734,7 @@ test "scanSse parsea eventos Anthropic (delta, tool_use y usage)" {
     try std.testing.expectEqual(@as(i64, 42), last_usage.completion);
 }
 
-test "buildBodyAnthropic convierte tool_calls/results y ancla cache_control" {
+test "buildBodyAnthropic converts tool_calls/results and anchors cache_control" {
     var buf: [2048]u8 = undefined;
     const msgs = [_]ChatMessage{
         .{ .role = "system", .content = "be terse" },
@@ -1591,16 +1750,23 @@ test "buildBodyAnthropic convierte tool_calls/results y ancla cache_control" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_use_id\":\"c1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":{\"pattern\":\"foo\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":[{\"type\":\"text\",\"text\":\"be terse\"") != null);
-    // El techo es el de `.low` (32768), no su presupuesto de pensamiento (4096):
-    // son dos numeros distintos y confundirlos era media parte del bug 3.
+    // The ceiling is `.low`'s (32768), not its thinking budget (4096): they are
+    // two different numbers, and confusing them was half of bug 3.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
     // The role "tool" does not exist in Anthropic: they go as tool_result in user.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") == null);
-    // 3 breakpoints: system, last tool and last message.
-    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
+    // 4 breakpoints, which is Anthropic's ceiling: the last tool, the system
+    // block, and the ROLLING pair on the last two messages.
+    //
+    // The rolling one is the whole point. With a single breakpoint at the end,
+    // every turn changes the region between the system breakpoint and the end, so
+    // the whole history is re-WRITTEN each turn. With one a message earlier, the
+    // older half sits at a breakpoint the next request still reaches: it is read,
+    // and only the newest segment is written.
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
 }
 
-test "feed: un evento partido a mitad de línea se entrega entero" {
+test "feed: an event split mid-line is delivered whole" {
     const Collector = struct {
         text: std.ArrayList(u8) = .empty,
         fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
@@ -1631,7 +1797,7 @@ test "feed: un evento partido a mitad de línea se entrega entero" {
     try std.testing.expectEqualStrings("Hola mundo", col.text.items);
 }
 
-test "feed: un payload partido a mitad de UTF-8 no se corrompe" {
+test "feed: a payload split mid-UTF-8 is not corrupted" {
     const Collector = struct {
         text: std.ArrayList(u8) = .empty,
         fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
@@ -1658,7 +1824,7 @@ test "feed: un payload partido a mitad de UTF-8 no se corrompe" {
     try std.testing.expectEqualStrings("a\u{00f1}\u{2713}b", col.text.items);
 }
 
-test "feed: un tool call cortado a mitad de args se emite al finish" {
+test "feed: a tool call cut mid-args is emitted at finish" {
     // Regression: with the old trigger ("last byte == '}'") a stream cut
     // before the closing byte hung the agent loop forever.
     const Collector = struct {
@@ -1692,7 +1858,7 @@ test "feed: un tool call cortado a mitad de args se emite al finish" {
     try std.testing.expectEqualStrings("{\"path\":\"a.txt\"}", col.last_args);
 }
 
-test "feed: un tool sin argumentos se trata como objeto vacío" {
+test "feed: a tool without arguments is treated as an empty object" {
     const Collector = struct {
         calls: usize = 0,
         last_args: []const u8 = "",
@@ -1721,7 +1887,7 @@ test "feed: un tool sin argumentos se trata como objeto vacío" {
     try std.testing.expectEqualStrings("{}", col.last_args);
 }
 
-test "buildBodyOpenAI: o-series usa max_completion_tokens + reasoning_effort" {
+test "buildBodyOpenAI: o-series uses max_completion_tokens + reasoning_effort" {
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
@@ -1745,108 +1911,107 @@ test "buildBodyOpenAI: o-series usa max_completion_tokens + reasoning_effort" {
     try std.testing.expect(std.mem.indexOf(u8, xh, "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, xh, "\"max_completion_tokens\":65536") != null);
 
-    // Y en un modelo que SI lo toma, sale xhigh de verdad. Antes no habia forma de
-    // llegar aqui. OJO: `gpt-5.1` a secas NO lo toma (xhigh es solo de codex-max),
-    // y mandarselo seria un 400: la primera version de esta tabla lo decia al
-    // reves y el test lo daba por bueno.
+    // And on a model that DOES take it, xhigh goes out for real. Before there
+    // was no way to get here. CAREFUL: plain `gpt-5.1` does NOT take it (xhigh
+    // is codex-max only), and sending it would be a 400: the first version of
+    // this table said the opposite and the test took it as good.
     const xh2 = try buildBodyMessages(&buf, "gpt-5.1-codex-max", &msgs, .xhigh, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, xh2, "\"reasoning_effort\":\"xhigh\"") != null);
 
-    // Y `gpt-5.1` a secas degrada xhigh a high, que es lo que hacen las docs.
+    // And plain `gpt-5.1` degrades xhigh to high, which is what the docs say.
     const xh3 = try buildBodyMessages(&buf, "gpt-5.1", &msgs, .xhigh, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, xh3, "\"reasoning_effort\":\"high\"") != null);
 }
 
-test "buildBodyOpenAI: modelo normal conserva max_tokens" {
+test "buildBodyOpenAI: a normal model keeps max_tokens" {
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
     const body = try buildBodyMessages(&buf, "kimi-k2.6", &msgs, .low, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
-    // Un modelo SIN la palanca no recibe el campo: mandarselo es un 400.
+    // A model WITHOUT the knob does not get the field: sending it is a 400.
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
 }
 
-test "buildBodyOpenAI: un modelo con mas niveles los recibe (Gemini, gpt-5.1)" {
-    // El bug 3: "hay modelos que soportan mas" era verdad y no habia forma de
-    // aprovecharla. Ahora el campo sale siempre que el modelo lo tenga, y con el
-    // nivel que ESE modelo entiende.
+test "buildBodyOpenAI: a model with more levels gets them (Gemini, gpt-5.1)" {
+    // Bug 3: "some models support more" was true and there was no way to profit
+    // from it. Now the field goes out whenever the model has it, and with the
+    // level THAT model understands.
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
-    // Gemini 3 llama `minimal` a su primer escalon y no tiene `none`: pedir "no
-    // pensar" llega como `minimal`, que es lo mas cerca que existe.
+    // Gemini 3 calls its first rung `minimal` and has no `none`: asking for "no
+    // thinking" arrives as `minimal`, which is the closest thing that exists.
     const g_min = try buildBodyMessages(&buf, "gemini-3.5-flash", &msgs, .minimal, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, g_min, "\"reasoning_effort\":\"minimal\"") != null);
 
     const g_none = try buildBodyMessages(&buf, "gemini-3.5-flash", &msgs, .none, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, g_none, "\"reasoning_effort\":\"minimal\"") != null);
 
-    // Y xhigh en Gemini degrada a high (su techo), no a algo inventado.
+    // And xhigh on Gemini degrades to high (its ceiling), not to something invented.
     const g_x = try buildBodyMessages(&buf, "gemini-3.5-flash", &msgs, .xhigh, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, g_x, "\"reasoning_effort\":\"high\"") != null);
 
-    // Gemini 2.5 NO tiene `minimal` (docs: low/medium/high), asi que pedirlo
-    // degrada a `low` en vez de mandar un nivel que no existe.
+    // Gemini 2.5 does NOT have `minimal` (docs: low/medium/high), so asking for
+    // it degrades to `low` instead of sending a level that does not exist.
     const g25 = try buildBodyMessages(&buf, "gemini-2.5-pro", &msgs, .minimal, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, g25, "\"reasoning_effort\":\"low\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, g25, "minimal") == null);
 
-    // `none` de verdad, en un modelo que lo tiene. Antes el enum ni siquiera
-    // tenia ese nivel.
+    // A real `none`, on a model that has it. Before, the enum did not even have
+    // that level.
     const o_none = try buildBodyMessages(&buf, "gpt-5.1", &msgs, .none, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, o_none, "\"reasoning_effort\":\"none\"") != null);
 }
 
-test "effortSupport: la escalera de cada modelo sale de las DOCS, no de la intuicion" {
-    // Esta tabla se corrigio tras verificar contra la matriz de niveles de
-    // OpenAI y la tabla de `thinking_level` de Google. Los tres fallos eran
-    // inventados:
+test "effortSupport: each model ladder comes from the DOCS, not from intuition" {
+    // This table was corrected after checking it against OpenAI's effort matrix
+    // and Google's `thinking_level` table. All three failures were invented:
     //
-    //   - `xhigh` NO existe en `gpt-5.1` (solo en codex-max). Mandarlo = 400.
-    //   - `minimal` NO existe en GPT-5 previos a 5.1, ni en gemini-2.5.
-    //   - gemini-2.5 no tiene `minimal` y gemini-3-pro-preview no tiene `medium`.
+    //   - `xhigh` does NOT exist in `gpt-5.1` (codex-max only). Sending it = 400.
+    //   - `minimal` does NOT exist in GPT-5s before 5.1, nor in gemini-2.5.
+    //   - gemini-2.5 has no `minimal` and gemini-3-pro-preview has no `medium`.
     try std.testing.expectEqual(EffortSupport.none, effortSupport("kimi-k2.6"));
     try std.testing.expectEqual(EffortSupport.codex_max, effortSupport("gpt-5.1-codex-max"));
-    // `codex-max` tiene que ganarle a `gpt-5.1` en el orden, no al reves.
+    // `codex-max` has to win over `gpt-5.1` in the order, not the other way round.
     try std.testing.expectEqual(EffortSupport.gpt51, effortSupport("gpt-5.1"));
-    // Un GPT-5 de antes de 5.1: la escalera basica, sin `minimal` ni `none`.
+    // A GPT-5 older than 5.1: the basic ladder, with no `minimal` nor `none`.
     try std.testing.expectEqual(EffortSupport.basic, effortSupport("gpt-5"));
     try std.testing.expectEqual(EffortSupport.basic, effortSupport("o3-mini"));
     try std.testing.expectEqual(EffortSupport.basic, effortSupport("o1"));
-    // Gemini 2.5 es `basic` (docs: low/medium/high), y los 3.5+Suben a minimal.
+    // Gemini 2.5 is `basic` (docs: low/medium/high), and the 3.5+ go up to minimal.
     try std.testing.expectEqual(EffortSupport.basic, effortSupport("gemini-2.5-pro"));
     try std.testing.expectEqual(EffortSupport.gemini3_minimal, effortSupport("gemini-3.5-flash"));
 
-    // Los ids llegan con prefijo de proveedor (`openai/gpt-5.1`), asi que la
-    // busqueda es por SUBSTRING y no por prefijo.
+    // The ids arrive with a provider prefix (`openai/gpt-5.1`), so the lookup is
+    // by SUBSTRING and not by prefix.
     try std.testing.expectEqual(EffortSupport.gpt51, effortSupport("openai/gpt-5.1"));
     try std.testing.expectEqual(EffortSupport.gemini3_minimal, effortSupport("google/gemini-3.6-flash"));
 
-    // Un modelo sin la palanca NO recibe nivel: `effortFor` dice null y el body
-    // se queda sin el campo.
+    // A model with no knob gets NO level: `effortFor` says null and the body is
+    // left without the field.
     try std.testing.expectEqual(@as(?Effort, null), effortFor("kimi-k2.6", .high));
 
-    // Y el techo del picker es el del modelo, no el nuestro.
+    // And the picker's ceiling is the model's, not ours.
     try std.testing.expectEqual(Effort.xhigh, maxEffortFor("gpt-5.1-codex-max"));
     try std.testing.expectEqual(Effort.high, maxEffortFor("gpt-5.1"));
     try std.testing.expectEqual(Effort.high, maxEffortFor("gpt-5"));
     try std.testing.expectEqual(Effort.high, maxEffortFor("gemini-2.5-pro"));
 }
 
-test "effortFor: NUNCA pide un nivel que el modelo no documenta" {
-    // Este es el invariante que de verdad importa, y es el que la primera version
-    // incumplia en tres modelos. Se recorre TODA la combinacion de modelo x
-    // nivel y se exige que lo que sale sea un nivel que ese modelo acepte.
+test "effortFor: NEVER asks for a level the model does not document" {
+    // This is the invariant that really matters, and it is the one the first
+    // version broke on three models. It walks the WHOLE model x level
+    // combination and demands that what comes out is a level that model accepts.
     //
-    // La lista de "aceptados" esta escrita a mano de las docs. Es codigo, no una
-    // verdad que salga de la tabla de arriba: si las dos se derivaran la una de
-    // la otra, el test pasaria con las dos equivocadas (que es exactamente como
-    // se colaron los tres fallos).
+    // The "accepted" list is hand-written from the docs. It is code, not a truth
+    // derived from the table above: if the two were derived from each other, the
+    // test would pass with both wrong (which is exactly how the three failures
+    // slipped in).
     const Cases = struct {
         model: []const u8,
-        /// Los niveles que las DOCS dicen que acepta.
+        /// The levels the DOCS say it accepts.
         ok: []const Effort,
     };
     const cases = [_]Cases{
@@ -1864,8 +2029,8 @@ test "effortFor: NUNCA pide un nivel que el modelo no documenta" {
         for (all) |want| {
             const got = effortFor(c.model, want);
             if (got == null) {
-                // Sin palanca: esta bien no mandar nada. Pero si el modelo
-                // estaba en la tabla con escalera, no puede desaparecer.
+                // No knob: sending nothing is fine. But if the model was in the
+                // table WITH a ladder, it cannot have disappeared.
                 try std.testing.expectEqual(EffortSupport.none, effortSupport(c.model));
                 continue;
             }
@@ -1875,7 +2040,7 @@ test "effortFor: NUNCA pide un nivel que el modelo no documenta" {
             }
             if (!accepted) {
                 std.debug.print(
-                    "\\n  {s}: pidió {s} y salió {s}, que no está en sus docs\\n",
+                    "\\n  {s}: asked for {s} and got {s}, which is not in its docs\\n",
                     .{ c.model, want.label(), got.?.label() },
                 );
             }
@@ -1884,81 +2049,81 @@ test "effortFor: NUNCA pide un nivel que el modelo no documenta" {
     }
 }
 
-test "effortLevels (el picker) y effortFor (el cable) no se contradicen" {
-    // Un nivel que el picker ofrece y `effortFor` no puede representar es un
-    // 400 esperando a que el usuario lo pulse; uno que degrada en silencio es un
-    // boton que no hace nada. Las dos cosas son senales  de un picker roto.
+test "effortLevels (the picker) and effortFor (the wire) do not contradict" {
+    // A level the picker offers and `effortFor` cannot represent is a 400
+    // waiting for the user to press it; one that degrades silently is a button
+    // that does nothing. Both are signs of a broken picker.
     const models = [_][]const u8{
-        "kimi-k2.6",       "gpt-5",         "o3-mini",        "gpt-5.1",
+        "kimi-k2.6",         "gpt-5",          "o3-mini",          "gpt-5.1",
         "gpt-5.1-codex-max", "gemini-2.5-pro", "gemini-3.5-flash",
     };
     for (models) |m| {
         for (effortLevels(m)) |lv| {
             const got = effortFor(m, lv);
             if (got == null) continue;
-            // Lo que se ofrece tiene que salir EXACTO, no una version degradada.
+            // What is offered has to go out EXACTLY, not as a degraded version.
             try std.testing.expectEqual(lv, got.?);
         }
     }
 }
 
-test "effort automatico: el default sale de la escalera del modelo, no de un `medium` fijo" {
-    // El default era `.medium` para TODO, y `medium` no esta en la escalera de
-    // todos los modelos. El default es el escalon de EN MEDIO de la escalera que
-    // tenga ese modelo, que es lo unico que se puede decir sin conocer cada
-    // modelo de memoria.
+test "automatic effort: the default comes from the model ladder, not a fixed `medium`" {
+    // The default was `.medium` for EVERYTHING, and `medium` is not on every
+    // model's ladder. The default is the MIDDLE rung of the ladder that model
+    // has, which is the only thing that can be said without knowing every model
+    // from memory.
     const models = [_][]const u8{
         "kimi-k2.6",         "gpt-5",          "gpt-5.1",
         "gpt-5.1-codex-max", "gemini-2.5-pro", "gemini-3.5-flash",
     };
     for (models) |m| {
         const d = defaultEffort(m);
-        // Tiene que ser un nivel que el modelo ACEPTE de verdad...
+        // It has to be a level the model really ACCEPTS...
         const lv = effortLevels(m);
         var on_ladder = false;
         for (lv) |k| {
             if (k == d) on_ladder = true;
         }
         try std.testing.expect(on_ladder);
-        // ...y tiene que ser representable: no vale con que no reviente.
+        // ...and it has to be representable: not crashing is not enough.
         _ = effortFor(m, d);
     }
 
-    // El indice es lo que decide (el escalon de EN MEDIO), y se pinea caso por
-    // caso porque el enum esta ORDENADO pero las escaleras no tienen por que
-    // tener la misma longitud:
-    //   3 niveles (low/medium/high)      -> indice 1 -> medium
-    //   5 niveles (none..high)           -> indice 2 -> low
-    //   6 niveles (none..xhigh)          -> indice 3 -> medium
-    //   2 niveles (low/high)             -> indice 1 -> high   <-- sin `medium`
-    //   none..high (5)         -> indice 2 -> low
-    //   none..xhigh (6)        -> indice 3 -> medium
+    // The index is what decides (the MIDDLE rung), and it is pinned case by case
+    // because the enum is ORDERED but the ladders do not have to be the same
+    // length:
+    //   3 levels (low/medium/high)       -> index 1 -> medium
+    //   5 levels (none..high)            -> index 2 -> low
+    //   6 levels (none..xhigh)           -> index 3 -> medium
+    //   2 levels (low/high)              -> index 1 -> high   <-- no `medium`
+    //   none..high (5)         -> index 2 -> low
+    //   none..xhigh (6)        -> index 3 -> medium
     try std.testing.expectEqual(Effort.medium, defaultEffort("gemini-2.5-pro"));
     try std.testing.expectEqual(Effort.medium, defaultEffort("gpt-5"));
     try std.testing.expectEqual(Effort.low, defaultEffort("gpt-5.1"));
     try std.testing.expectEqual(Effort.medium, defaultEffort("gpt-5.1-codex-max"));
 
-    // Y el caso que de verdad demuestra el punto: un modelo SIN `medium`.
-    // Si el default fuese el literal `.medium`, aqui recibiria un nivel que no
-    // existe, y el primer turno de una sesion nueva (donde el usuario no ha
-    // tocado `/effort`) se comeria un 400.
+    // And the case that really proves the point: a model WITHOUT `medium`.
+    // If the default were the literal `.medium`, this would receive a level that
+    // does not exist, and the first turn of a new session (where the user never
+    // touched `/effort`) would eat a 400.
     try std.testing.expectEqual(Effort.high, defaultEffort("gemini-3-pro-preview"));
     try std.testing.expectEqual(@as(?Effort, .low), effortFor("gemini-3-pro-preview", .medium));
 }
 
-test "clampEffort: cambiar de modelo baja el peldano que ya no existe" {
-    // El `xhigh` que se eligio en un codex-max tiene que dejar de existir al
-    // cambiar a un gemini-2.5, no quedarse puesto degradandose en silencio (el
-    // status bar diria `xhigh` y el cable llevaria `high`, que son dos cosas
-    // distintas sin ninguna pista de que lo sean).
+test "clampEffort: changing model lowers the step that no longer exists" {
+    // The `xhigh` chosen on a codex-max has to stop existing when switching to a
+    // gemini-2.5, not sit there degrading silently (the status bar would say
+    // `xhigh` and the wire would carry `high`, which are two different things
+    // with no hint that they are).
     try std.testing.expectEqual(Effort.high, clampEffort("gemini-2.5-pro", .xhigh));
     try std.testing.expectEqual(Effort.xhigh, clampEffort("gpt-5.1-codex-max", .xhigh));
-    // Y algo que el modelo SI tiene no se toca.
+    // And something the model DOES have is left alone.
     try std.testing.expectEqual(Effort.low, clampEffort("gpt-5", .low));
     try std.testing.expectEqual(Effort.none, clampEffort("gpt-5.1", .none));
 
-    // Y el clamp es IDEMPOTENTE y nunca SUBE un nivel (subir por encima del
-    // techo es el 400).
+    // And the clamp is IDEMPOTENT and never RAISES a level (going above the
+    // ceiling is the 400).
     const models = [_][]const u8{ "kimi-k2.6", "gpt-5", "gpt-5.1", "gpt-5.1-codex-max", "gemini-2.5-pro" };
     for (models) |m| {
         for ([_]Effort{ .none, .minimal, .low, .medium, .high, .xhigh }) |lv| {
@@ -1970,17 +2135,17 @@ test "clampEffort: cambiar de modelo baja el peldano que ya no existe" {
     }
 }
 
-test "effectiveEffort: nunca devuelve null (un modelo sin palanca usa su default)" {
-    // La razon de que esta funcion exista: `effortFor` devuelve `?Effort` y
-    // `null` significa "este modelo no tiene la palanca", que NO es un error
-    // pero obliga a que cada llamante se acuerde. Aqui se colapsa, y el camino
-    // del request no tiene que saber nada.
-    // Sin palanca: cae al default, que es el medio de `low/medium/high`.
+test "effectiveEffort: never returns null (a model with no knob uses its default)" {
+    // Why this function exists: `effortFor` returns `?Effort` and `null` means
+    // "this model has no knob", which is NOT an error but does force every caller
+    // to remember it. It is collapsed here, so the request path does not have to
+    // know anything.
+    // No knob: falls back to the default, which is the middle of `low/medium/high`.
     try std.testing.expectEqual(Effort.medium, effectiveEffort("kimi-k2.6", .high));
     try std.testing.expectEqual(Effort.medium, effectiveEffort("gpt-5", .medium));
     try std.testing.expectEqual(Effort.high, effectiveEffort("gpt-5.1", .xhigh));
     try std.testing.expectEqual(Effort.xhigh, effectiveEffort("gpt-5.1-codex-max", .xhigh));
-    // Y lo que sale tiene que ser algo que el modelo acepta.
+    // And what comes out has to be something the model accepts.
     const m = "gemini-2.5-pro";
     const e = effectiveEffort(m, .xhigh);
     var ok = false;
@@ -1990,30 +2155,30 @@ test "effectiveEffort: nunca devuelve null (un modelo sin palanca usa su default
     try std.testing.expect(ok);
 }
 
-test "buildBodyAnthropic: thinking con budget menor que max_tokens" {
+test "buildBodyAnthropic: thinking with budget lower than max_tokens" {
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
 
-    // effort=high → techo 65536 > budget 16384: thinking enabled.
+    // effort=high → ceiling 65536 > budget 16384: thinking enabled.
     const high = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .high, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, high, "\"max_tokens\":65536") != null);
     try std.testing.expect(std.mem.indexOf(u8, high, "\"budget_tokens\":16384") != null);
 
-    // effort=medium → techo 32768 > budget 8192: thinking enabled too.
+    // effort=medium → ceiling 32768 > budget 8192: thinking enabled too.
     const med = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .medium, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, med, "\"budget_tokens\":8192") != null);
 
-    // effort=low → techo 32768 > budget 4096. Antes `low` era un techo de 4096
-    // con un budget de 2048: dos veces menos sitio para la respuesta que para
-    // pensar, y una respuesta con tools se cortaba a la mitad.
+    // effort=low → ceiling 32768 > budget 4096. Before, `low` was a ceiling of
+    // 4096 with a budget of 2048: twice less room for the answer than for the
+    // thinking, and an answer with tools got cut in half.
     const low = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .low, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, low, "\"budget_tokens\":4096") != null);
 
-    // effort=none → sin thinking en absoluto (budget 0 = no se manda el bloque).
+    // effort=none → no thinking at all (budget 0 = the block is not sent).
     const none = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .none, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, none, "\"thinking\"") == null);
 
-    // Y xhigh sube el budget de verdad (24576), que antes se aplastaba a 16384.
+    // And xhigh really raises the budget (24576), which before was squashed to 16384.
     const xh = try buildBodyMessages(&buf, "claude-sonnet-4-5", &msgs, .xhigh, "", .anthropic);
     try std.testing.expect(std.mem.indexOf(u8, xh, "\"budget_tokens\":24576") != null);
 
@@ -2024,7 +2189,7 @@ test "buildBodyAnthropic: thinking con budget menor que max_tokens" {
     try std.testing.expect(!hasBadThinkingBudget(low));
 }
 
-test "familyForModel detecta razonamiento solo en o-series/gpt-5" {
+test "familyForModel detects reasoning only in o-series/gpt-5" {
     try std.testing.expectEqual(Family.openai_reasoning, familyForModel("gpt-5"));
     try std.testing.expectEqual(Family.openai_reasoning, familyForModel("gpt-5-mini"));
     try std.testing.expectEqual(Family.openai_reasoning, familyForModel("o3"));
@@ -2046,7 +2211,7 @@ fn hasBadThinkingBudget(body: []const u8) bool {
     return budget >= max_tok;
 }
 
-test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
+test "feed: an SSE line bigger than any buffer is reassembled" {
     // Regression: `takeDelimiter` failed with StreamTooLong if the line did not
     // fit in the transfer buffer and the stream died halfway through. The
     // parser has to be able to reassemble it from many pieces.
@@ -2097,7 +2262,7 @@ test "feed: una línea SSE más grande que cualquier buffer se reensambla" {
     try std.testing.expectEqual(@as(u8, 'x'), col.text.items[payload_len - 1]);
 }
 
-test "StreamCtx.destroy no fuga con parts y line_buf poblados" {
+test "StreamCtx.destroy does not leak with parts and line_buf populated" {
     // The error path of `streamChatCtx` must call `destroy` (NOT `deinit`),
     // because by the time a request fails the ctx already has accumulated tool
     // calls and a line buffer. `destroy` is what frees them; without it they
@@ -2121,7 +2286,7 @@ test "StreamCtx.destroy no fuga con parts y line_buf poblados" {
     ctx.destroy();
 }
 
-test "setServerMessage: saca el message del JSON de error" {
+test "setServerMessage: pulls the message out of the error JSON" {
     // It is what turns a useless "HTTP 403" into "Model access is disabled".
     setServerMessage(
         \\{"error":{"type":"server_error","message":"Upstream request failed: Model access is disabled"}}
@@ -2134,27 +2299,27 @@ test "setServerMessage: saca el message del JSON de error" {
     try std.testing.expectEqualStrings("Upstream request failed: Insufficient account funds", lastErrorBody());
 }
 
-test "setServerMessage: aguanta basura sin desbordar" {
+test "setServerMessage: survives garbage without overflowing" {
     // Without "message" (odd JSON), empty, unopened quote, and a huge
     // string: under no circumstances may it overrun the buffer or leave junk.
     setServerMessage("");
-    try std.testing.expectEqual(@as(usize, 0), last_error_len);
+    try std.testing.expectEqual(@as(usize, 0), lastErrorLen());
     setServerMessage("<html>502 Bad Gateway</html>");
-    try std.testing.expectEqual(@as(usize, 0), last_error_len);
+    try std.testing.expectEqual(@as(usize, 0), lastErrorLen());
     setServerMessage("{\"message\": 42}");
-    try std.testing.expectEqual(@as(usize, 0), last_error_len);
+    try std.testing.expectEqual(@as(usize, 0), lastErrorLen());
 
     const huge = "{\"message\":\"" ++ "x" ** 900 ++ "\"}";
     setServerMessage(huge);
-    try std.testing.expect(last_error_len > 0 and last_error_len < last_error_buf.len);
+    try std.testing.expect(lastErrorLen() > 0 and lastErrorLen() < lastErrorCap());
 }
 
-test "setServerMessage: desescapa comilla y barra" {
+test "setServerMessage: unescapes quote and backslash" {
     setServerMessage("{\"message\":\"say \\\"hi\\\" \\\\o/\"}");
     try std.testing.expectEqualStrings("say \"hi\" \\o/", lastErrorBody());
 }
 
-test "noteRaw: guarda solo los primeros bytes, sin desbordar" {
+test "noteRaw: keeps only the first bytes, without overflowing" {
     // The buffer is 512: it serves the short error JSON, and if the body is
     // huge (an error HTML from a proxy) it is cut without blowing anything up.
     // CAREFUL: `destroy` takes the struct with it, so it has to live on the
@@ -2168,7 +2333,7 @@ test "noteRaw: guarda solo los primeros bytes, sin desbordar" {
     ctx.destroy();
 }
 
-test "los 402 y 403 tienen error propio (no se reintentan)" {
+test "402 and 403 have their own error (they are not retried)" {
     // 402 without credits used to be retried 3 times as if it were a 5xx: three
     // backoff waits for an error that is not going to fix itself.
     try std.testing.expect(!isRetryableTest(error.NoCredits));
@@ -2185,4 +2350,28 @@ fn isRetryableTest(err: anyerror) bool {
         error.RateLimited, error.Overloaded, error.ServerError => true,
         else => false,
     };
+}
+
+test "buildBodyOpenAI: the tools schema comes BEFORE the messages" {
+    // It is the whole cache. OpenAI keys the prompt cache on the literal prefix
+    // of the body, so with tools after the messages array the ~16 KB of static
+    // schema sat past the part that changes every turn, and was therefore never
+    // inside the cached region. First means "cached", and the order of a JSON
+    // object is the only thing that decides it.
+    var buf: [64 * 1024]u8 = undefined;
+    const body = try buildBodyMessages(&buf, "m", &[_]ChatMessage{
+        .{ .role = "system", .content = "eres zode" },
+        .{ .role = "user", .content = "hola" },
+    }, .medium, "[{\"type\":\"function\"}]", .openai);
+    const tools_at = std.mem.indexOf(u8, body, "\"tools\"") orelse return error.TestUnexpectedResult;
+    const msgs_at = std.mem.indexOf(u8, body, "\"messages\"") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(tools_at < msgs_at);
+    // And it is sent exactly once.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"tools\""));
+    // The body is still valid JSON with both halves in it.
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), body, .{});
+    try std.testing.expect(v.object.get("tools") != null);
+    try std.testing.expect(v.object.get("messages") != null);
 }

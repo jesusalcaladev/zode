@@ -294,18 +294,18 @@ pub fn iterationLimitText(out: *Report) []const u8 {
     return out.slice();
 }
 
-test "allowsTool: solo lectura, y `ask` fuera a proposito" {
+test "allowsTool: read-only only, and `ask` left out on purpose" {
     try std.testing.expect(allowsTool("read"));
     try std.testing.expect(allowsTool("grep"));
     try std.testing.expect(!allowsTool("write"));
     try std.testing.expect(!allowsTool("edit"));
     try std.testing.expect(!allowsTool("bash"));
-    // `ask` es la razon de que esto este aqui: un subagente que pregunta desde
-    // un hilo que no es el del turno deja al usuario sin saber quien pregunta.
+    // `ask` is the reason this list exists: a subagent that asks from a thread
+    // that is not the turn's leaves the user not knowing who is asking.
     try std.testing.expect(!allowsTool("ask"));
 }
 
-test "filterTools: se queda con las de lectura y quita el resto" {
+test "filterTools: keeps the read ones and drops the rest" {
     const all =
         \\[
         \\{"type":"function","function":{"name":"read","parameters":{}}},
@@ -326,10 +326,10 @@ test "filterTools: se queda con las de lectura y quita el resto" {
     try std.testing.expectEqualStrings("]", kept[kept.len - 1 ..]);
 }
 
-test "filterTools: respeta las llaves DENTRO de los parametros" {
-    // Un `}` de un `properties` mal cerrado, o una llave dentro de un schema,
-    // haria que el escaner cortara el objeto por la mitad y devolviera JSON
-    // invalido al modelo.
+test "filterTools: respects the braces INSIDE the parameters" {
+    // A `}` from a badly closed `properties`, or a brace inside a schema, would
+    // make the scanner cut the object in half and hand invalid JSON to the
+    // model.
     const all =
         \\[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}},
         \\{"type":"function","function":{"name":"write","parameters":{}}}]
@@ -338,13 +338,13 @@ test "filterTools: respeta las llaves DENTRO de los parametros" {
     const kept = subagent.filterTools(all, &out);
     try std.testing.expect(std.mem.indexOf(u8, kept, "\"properties\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, kept, "\"write\"") == null);
-    // Y lo que sale tiene que seguir siendo JSON parseable.
+    // And what comes out must still be parseable JSON.
     const v = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, kept, .{});
     defer v.deinit();
     try std.testing.expectEqual(@as(usize, 1), v.value.array.items.len);
 }
 
-test "filterTools: un input malformado no rompe, devuelve vacio" {
+test "filterTools: malformed input does not break it, it returns empty" {
     var out = Json{};
     const kept = subagent.filterTools("[{\"name\":\"read\"", &out);
     try std.testing.expectEqualStrings("[]", kept);
@@ -352,7 +352,7 @@ test "filterTools: un input malformado no rompe, devuelve vacio" {
     try std.testing.expectEqualStrings("[]", empty);
 }
 
-test "parseTask: description es obligatoria, prompt es opcional" {
+test "parseTask: description is required, prompt is optional" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     const a = ast.allocator();
@@ -364,7 +364,7 @@ test "parseTask: description es obligatoria, prompt es opcional" {
     try std.testing.expectEqualStrings("", t2.prompt);
 }
 
-test "parseTask: sin description es BadDescription" {
+test "parseTask: without description it is BadDescription" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ast.deinit();
     const a = ast.allocator();
@@ -374,14 +374,14 @@ test "parseTask: sin description es BadDescription" {
     try std.testing.expectError(error.BadDescription, subagent.parseTask(a, "no json"));
 }
 
-test "formatReport: el envoltorio dice que no hay que reverificar" {
+test "formatReport: the wrapper says there is no need to re-verify" {
     var out = Report{};
     const r = subagent.formatReport("esta en src/tui.zig:1234", &out);
     try std.testing.expect(std.mem.indexOf(u8, r, "src/tui.zig:1234") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "do not re-read") != null);
 }
 
-test "formatReport: un informe enorme se corta Y se avisa" {
+test "formatReport: a huge report is truncated AND it warns" {
     var big: [40_000]u8 = @splat('r');
     var out = Report{};
     const r = subagent.formatReport(&big, &out);
@@ -389,18 +389,18 @@ test "formatReport: un informe enorme se corta Y se avisa" {
     try std.testing.expect(std.mem.indexOf(u8, r, "truncated") != null);
 }
 
-test "formatReport: un informe corto NO lleva el aviso de corte" {
+test "formatReport: a short report does NOT carry the truncation notice" {
     var out = Report{};
     const r = subagent.formatReport("corto", &out);
     try std.testing.expect(std.mem.indexOf(u8, r, "truncated") == null);
 }
 
-test "refused e iterationLimit son texto, no errores" {
+test "refused and iterationLimit are text, not errors" {
     var out = Report{};
     const r = subagent.refused("no key", &out);
     try std.testing.expect(std.mem.indexOf(u8, r, "no key") != null);
-    // Dice que la puede hacer el otro: un subagente que falla no puede dejar el
-    // turno sin salida.
+    // It says the other one can do it: a subagent that fails cannot leave the
+    // turn without an exit.
     try std.testing.expect(std.mem.indexOf(u8, r, "yourself") != null);
 
     var o2 = Report{};
@@ -408,9 +408,9 @@ test "refused e iterationLimit son texto, no errores" {
     try std.testing.expect(std.mem.indexOf(u8, l, "report above") != null);
 }
 
-test "el system prompt dice explicitamente que no puede preguntar" {
+test "the system prompt explicitly says it cannot ask" {
     try std.testing.expect(std.mem.indexOf(u8, subagent.system_prompt, "CANNOT ask the user") != null);
-    // Y que "no lo encontre" es una respuesta buena: sin esto el subagente
-    // inventa una ruta y el llamante paga otra vuelta por ella.
+    // And that "I did not find it" is a good answer: without this the subagent
+    // invents a path and the caller pays another round trip for it.
     try std.testing.expect(std.mem.indexOf(u8, subagent.system_prompt, "complete and useful") != null);
 }

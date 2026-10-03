@@ -1,28 +1,29 @@
 const std = @import("std");
 
-/// La lista de tareas que el modelo se escribe a sí mismo (`todo`) y que el
-/// usuario ve EN PANTALLA.
+/// The task list the model writes for itself (`todo`) and that the user sees
+/// ON SCREEN.
 ///
-/// ## Por qué una tool y no un bloc de texto
+/// ## Why a tool and not a block of text
 ///
-/// El modelo ya tenía `think` para planificar, y con eso la respuesta de un
-/// agente de 20 tool calls es un muro de texto donde no se sabe qué falta. Lo
-/// que se busca con esto es que en TODO MOMENTO se pueda responder a "¿cuánto
-/// falta y en qué está?" leyendo una fila, sin Ask Mode.
+/// The model already had `think` to plan with, and with that the answer of a
+/// 20-tool-call agent is a wall of text where you cannot tell what is left.
+/// What this is after is being able to answer "how much is left and what is it
+/// on?" at ANY moment by reading one row, with no Ask Mode.
 ///
-/// ## Semántica: reemplazo completo, no parche
+/// ## Semantics: full replacement, not a patch
 ///
-/// Cada llamada manda la lista ENTERA. Es lo que hace Claude Code con
-/// `TodoWrite` y no es capricho: parchea distinto cada modelo y con una lista
-/// parcial el servidor no puede saber qué se ha borrado. Con lista completa,
-/// "quita el paso 3" es "manda 4 pasos sin el 3".
+/// Every call sends the WHOLE list. That is what Claude Code does with
+/// `TodoWrite` and it is not arbitrary: patching differs per model, and with a
+/// partial list the server cannot know what was removed. With a full list,
+/// "drop step 3" is "send 4 steps without the 3rd".
 ///
-/// ## Por qué un array fijo
+/// ## Why a fixed array
 ///
-/// Vive en el `Model`, que la UI lee en cada frame y el worker escribe desde
-/// otro hilo. Un `ArrayList` con lock ya obliga a tomar el lock para pintar;
-/// un array de 20 entradas hace que el draw sea un bucle sin asignar. El techo
-/// es 20 pasos: un plan más largo no es un plan, es un documento.
+/// It lives in the `Model`, which the UI reads every frame and the worker
+/// writes from another thread. An `ArrayList` with a lock already forces you to
+/// take the lock just to paint; an array of 20 entries makes the draw a loop
+/// with no allocation. The ceiling is 20 steps: a longer plan is not a plan,
+/// it is a document.
 pub const max_items = 20;
 pub const text_max = 120;
 
@@ -57,12 +58,12 @@ pub const Item = struct {
     }
 };
 
-/// La lista. Sin allocator: los textos son buffers de tamaño fijo.
+/// The list. No allocator: the texts are fixed-size buffers.
 pub const Plan = struct {
     items: [max_items]Item = undefined,
     len: u8 = 0,
-    /// Lo que tenía antes de la última llamada. Para poder decir "2/4 → 3/4"
-    /// y detectar que el modelo no ha cambiado nada.
+    /// What it had before the last call. To be able to say "2/4 → 3/4"
+    /// and to detect that the model changed nothing.
     prev_done: u8 = 0,
     prev_len: u8 = 0,
 
@@ -82,13 +83,13 @@ pub const Plan = struct {
         return n;
     }
 
-    /// El paso en marcha, o el primero pendiente si ninguno lo ha marcado.
+    /// The step in flight, or the first pending one if none was marked.
     ///
-    /// Se usa para decidir cuál se resalta. Y tiene un criterio que no es
-    /// obvious: si NO hay nada `in_progress` pero quedan pendientes, se resalta
-    /// el primero pendiente. El modelo muchas veces no marca el paso en marcha
-    /// (no le hace falta para él), y quedarse sin nada resaltado hace que el
-    /// plan parezca muerto.
+    /// Used to decide which one is highlighted. And it has a criterion that is
+    /// not obvious: if there is NOTHING `in_progress` but pending steps are
+    /// left, the first pending one is highlighted. The model often does not
+    /// mark the step in flight (it does not need to), and having nothing
+    /// highlighted makes the plan look dead.
     pub fn currentIndex(self: *const Plan) ?u8 {
         for (self.items[0..self.len], 0..) |it, i| {
             if (it.status == .in_progress) return @intCast(i);
@@ -104,21 +105,21 @@ pub const Plan = struct {
         return self.doneCount() == self.len;
     }
 
-    /// Vacía la lista. La usa `/new` y el reinicio de sesión: un plan de la
-    /// sesión anterior no tiene nada que ver con esta.
+    /// Empties the list. Used by `/new` and by the session restart: a plan from
+    /// the previous session has nothing to do with this one.
     pub fn clear(self: *Plan) void {
         self.len = 0;
         self.prev_len = 0;
         self.prev_done = 0;
     }
 
-    /// Aplica una lista nueva. Devuelve un código para el mensaje del historial:
-    /// el llamante decide si dice algo (un "sin cambios" cada tool call es ruido).
+    /// Applies a new list. Returns a code for the history message: the caller
+    /// decides whether it says anything (a "no change" per tool call is noise).
     pub const Applied = enum { changed, same, empty };
 
     pub fn apply(self: *Plan, new_items: []const Item, n: u8) Applied {
-        // La lista manda: se compara ANTES de tocar nada para poder decir "igual
-        // que antes" sin historiales ni asignaciones.
+        // The list rules: it is compared BEFORE touching anything so that "same as
+        // before" can be said with no history and no allocations.
         var same = n == self.len;
         if (same) {
             for (new_items[0..n], self.items[0..self.len]) |a, b| {
@@ -128,28 +129,28 @@ pub const Plan = struct {
                 }
             }
         }
-        // Una lista vacía sobre un plan vacío NO es un cambio (el modelo
-        // repetiría "plan cleared" en cada llamada), pero vaciar un plan que
-        // tenía cosas SÍ lo es: es la señal de que se acabó.
+        // An empty list over an empty plan is NOT a change (the model would repeat
+        // "plan cleared" on every call), but emptying a plan that HAD items IS
+        // one: it is the signal that it is over.
         if (n == 0 and self.len == 0) return .same;
         if (same) return .same;
 
         self.prev_len = self.len;
         self.prev_done = self.doneCount();
-        // OJO: el índice es local a propósito. La primera versión escribía
-        // `self.items[self.len] = it` dentro del bucle, y como `self.len` solo
-        // se actualiza al final, TODAS las iteraciones caían en la casilla 0: al
-        // final el plan era un solo paso repetido. Como `Item.text` es un buffer
-        // de tamaño fijo, el plan se dibujaba con basura en vez de texto.
+        // CAREFUL: the index is local on purpose. The first version wrote
+        // `self.items[self.len] = it` inside the loop, and since `self.len` is
+        // only updated at the end, EVERY iteration landed in slot 0: at the end
+        // the plan was one step repeated. And because `Item.text` is a
+        // fixed-size buffer, the plan was drawn with garbage instead of text.
         var i: u8 = 0;
         while (i < n) : (i += 1) self.items[i] = new_items[i];
         self.len = n;
         return if (n == 0) .empty else .changed;
     }
 
-    /// Una línea de resumen para el historial y para el status.
+    /// A one-line summary for the history and for the status.
     ///
-    /// `arena` porque es un `allocPrint`: el texto es de la duración del turno.
+    /// `arena` because it is an `allocPrint`: the text lives as long as the turn.
     pub fn summary(self: *const Plan, arena: std.mem.Allocator) []const u8 {
         if (self.len == 0) return "plan cleared";
         const d = self.doneCount();
@@ -164,7 +165,7 @@ pub const Plan = struct {
     }
 };
 
-/// Lo que devuelve el parseo: la lista y cuántos pasos hay.
+/// What the parse returns: the list and how many steps there are.
 pub const Result = struct {
     items: [max_items]Item,
     len: u8,
@@ -172,25 +173,25 @@ pub const Result = struct {
 
 pub const ParseError = error{ BadPlan, TooManyItems };
 
-/// Parsea la lista de `todo` desde el JSON.
+/// Parses the `todo` list out of the JSON.
 ///
-/// El `arena` es solo para el árbol de `std.json` (los strings del resultado se
-/// copian a los buffers fijos de `Item` antes de salir, y el parseo se
-/// deserialize... no: `parseFromSliceLeaky` no necesita deserializar). Con un
-/// buffer FIJO de 16 KB esto fallaría en un plan de 20 pasos con textos largos,
-/// y el modelo vería "no me entendido el plan" sin motivo, así que el llamante
-/// pasa un allocator de verdad.
+/// The `arena` is only for `std.json`'s tree (the strings of the result are
+/// copied into `Item`'s fixed buffers before returning, and the parse does not
+/// deserialize... actually: `parseFromSliceLeaky` does not need to
+/// deserialize). With a FIXED 16 KB buffer this would fail on a 20-step plan
+/// with long texts, and the model would see "I did not understand the plan"
+/// for no reason, so the caller passes a real allocator.
 pub fn parseItems(arena: std.mem.Allocator, args_json: []const u8, out: *[max_items]Item) ParseError!Result {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch
         return error.BadPlan;
     return fromValue(parsed, out);
 }
 
-/// Lo mismo, pero desde un JSON ya parseado.
+/// The same, but from already-parsed JSON.
 ///
-/// Existe porque quien tiene el `ObjectMap` en la mano (la tool, que ya parseó
-/// los args para el resto de tools) no debería volver a parsear 2 KB de JSON
-/// para sacar 20 strings.
+/// It exists because whoever holds the `ObjectMap` (the tool, which already
+/// parsed the args for the rest of the tools) should not have to parse 2 KB of
+/// JSON again just to get 20 strings out.
 pub fn fromValue(value: std.json.Value, out: *[max_items]Item) ParseError!Result {
     if (value != .object) return error.BadPlan;
     const maybe = value.object.get("items") orelse value.object.get("todos") orelse
@@ -210,9 +211,9 @@ pub fn fromValue(value: std.json.Value, out: *[max_items]Item) ParseError!Result
             .string => |s| s,
             else => return error.BadPlan,
         };
-        // Un status que no se conoce cae en `pending` en vez de fallar: el paso
-        // no está mal, está mal etiquetado, y tirar el error obligaría a
-        // repetir la llamada.
+        // An unknown status falls back to `pending` instead of failing: the step is
+        // not wrong, it is mislabelled, and throwing the error would force a
+        // retry of the call.
         const st: Status = if (v.object.get("status")) |sv| blk: {
             if (sv != .string) break :blk .pending;
             break :blk Status.parse(sv.string) orelse .pending;
@@ -232,21 +233,21 @@ pub fn fromValue(value: std.json.Value, out: *[max_items]Item) ParseError!Result
 
 // ── tests ─────────────────────────────────────────────────────
 
-test "Status.parse acepta lo que los modelos escriben de verdad" {
-    // Los modelos no se inventan el vocabulario: escriben "in-progress" y
-    // "completed" tan a menudo como "in_progress" y "done", y con guiones bajos
-    // porque el JSON del tool se escribe a mano.
+test "Status.parse accepts what models actually write" {
+    // Models do not invent a vocabulary: they write "in-progress" and "completed"
+    // as often as "in_progress" and "done", with hyphens and underscores
+    // because the tool's JSON is written by hand.
     try std.testing.expectEqual(Status.pending, Status.parse("pending").?);
     try std.testing.expectEqual(Status.in_progress, Status.parse("in_progress").?);
     try std.testing.expectEqual(Status.in_progress, Status.parse("in-progress").?);
     try std.testing.expectEqual(Status.done, Status.parse("done").?);
     try std.testing.expectEqual(Status.done, Status.parse("completed").?);
-    // Y lo que no se sabe: null, no un panic y no un pending silencioso.
+    // And what it does not know: null, not a panic and not a silent pending.
     try std.testing.expect(Status.parse("en curso") == null);
     try std.testing.expect(Status.parse("") == null);
 }
 
-test "parseItems: la forma que manda el modelo" {
+test "parseItems: the shape the model sends" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -267,10 +268,10 @@ test "parseItems: la forma que manda el modelo" {
     try std.testing.expectEqualStrings("escribir el test", r.items[2].textOf());
 }
 
-test "parseItems: acepta `todos`, `text` y `task` como alias" {
-    // Variación REAL entre modelos: el mismo nombre de campo cambiado por el
-    // mismo modelo entre dos llamadas. Si solo se acepta una, el plan se vacía
-    // sin que nadie entienda por qué.
+test "parseItems: accepts `todos`, `text` and `task` as aliases" {
+    // REAL variation between models: the same field name changed by the same
+    // model between two calls. If only one is accepted, the plan empties with
+    // nobody understanding why.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -284,10 +285,11 @@ test "parseItems: acepta `todos`, `text` y `task` como alias" {
     try std.testing.expectEqualStrings("b", b.items[0].textOf());
 }
 
-test "parseItems: un status que no se conoce cae en pending, no en error" {
-    // El caso raro pero real: el modelo escribe "doing" o "finished". Tirar
-    // el error obligaría a repetir la llamada, y el paso no está mal: está mal
-    // etiquetado. Se acepta como pendiente y el modelo ve la lista correcta.
+test "parseItems: an unknown status falls back to pending, not to an error" {
+    // The rare but real case: the model writes "doing" or "finished". Throwing
+    // the error would force a retry of the call, and the step is not wrong: it
+    // is mislabelled. It is accepted as pending and the model sees the right
+    // list.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var out: [max_items]Item = undefined;
@@ -299,39 +301,40 @@ test "parseItems: un status que no se conoce cae en pending, no en error" {
     try std.testing.expectEqual(Status.pending, r.items[0].status);
 }
 
-test "parseItems: lo que esta MAL se rechaza con un motivo" {
+test "parseItems: what is WRONG is rejected with a reason" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const a = astate.allocator();
     var out: [max_items]Item = undefined;
 
-    // OJO: `expectError` NO sirve aquí. Imprime el valor devuelto cuando el
-    // resultado NO es el error esperado, y ese valor es un array de `Item` con
-    // buffers `undefined`: el formateo del enum peta con "invalid enum value" y
-    // el test revienta con un panic en vez de fallar con un mensaje. Por eso
-    // `wantPlanErr`, que solo mira el error.
+    // CAREFUL: `expectError` does NOT work here. It prints the returned value when
+    // the result is NOT the expected error, and that value is an array of
+    // `Item` with `undefined` buffers: formatting the enum blows up with
+    // "invalid enum value" and the test panics instead of failing with a
+    // message. Hence `wantPlanErr`, which only looks at the error.
     try wantPlanErr(a, "no json", &out, error.BadPlan);
     try wantPlanErr(a, "[]", &out, error.BadPlan);
     try wantPlanErr(a, "{}", &out, error.BadPlan);
     try wantPlanErr(a, "{\"items\":\"uno\"}", &out, error.BadPlan);
-    // Un paso sin texto: un checkbox con nada al lado no es un paso.
+    // A step with no text: a checkbox with nothing next to it is not a step.
     try wantPlanErr(a, "{\"items\":[{\"content\":\"   \"}]}", &out, error.BadPlan);
-    // Y más de 20 es un error, no un recorte silencioso: si el modelo se pasa,
-    // tiene que saber que no cabe todo. Silencioso sería peor, porque el plan
-    // parecería corto sin motivo y el modelo no sabría qué se perdió.
+    // And more than 20 is an error, not a silent trim: if the model goes over, it
+    // has to know that not everything fits. Silent would be worse, because the
+    // plan would look short for no reason and the model would not know what was
+    // lost.
     var many: [2048]u8 = undefined;
     try wantPlanErr(a, manyItems(21, &many), &out, error.TooManyItems);
-    // Justo 20 entra y entra entero.
+    // Exactly 20 fits, and fits whole.
     const r = try parseItems(a, manyItems(20, &many), &out);
     try std.testing.expectEqual(@as(u8, 20), r.len);
     try std.testing.expectEqualStrings("paso 20", r.items[19].textOf());
 }
 
-test "Plan.apply: lista completa, y saber si ha cambiado algo" {
+test "Plan.apply: the complete list, and whether anything changed" {
     var p = Plan.init();
     var new: [max_items]Item = undefined;
-    // Una lista vacía sobre un plan vacío no es un cambio: si lo fuera, cada
-    // llamada con la lista vacía repetiría "plan cleared" en el historial.
+    // An empty list over an empty plan is not a change: if it were, every call with
+    // the empty list would repeat "plan cleared" in the history.
     try std.testing.expectEqual(Plan.Applied.same, p.apply(&new, 0));
     try std.testing.expect(p.isEmpty());
 
@@ -340,48 +343,48 @@ test "Plan.apply: lista completa, y saber si ha cambiado algo" {
     try std.testing.expectEqual(@as(u8, 2), p.len);
     try std.testing.expectEqual(@as(u8, 0), p.doneCount());
 
-    // Repetir la MISMA lista no es un cambio: si lo fuera, cada tool call
-    // repetiría "plan: 0/2" en el historial y el mensaje perdería sentido.
+    // Repeating the SAME list is not a change: if it were, every tool call would
+    // repeat "plan: 0/2" in the history and the message would lose its point.
     try std.testing.expectEqual(Plan.Applied.same, p.apply(&a, 2));
 
-    // Cambiar un estado SÍ lo es, aunque el texto no cambie.
+    // Changing a status IS a change, even if the text does not change.
     const b = try two("leer", "escribir", .done, .in_progress);
     try std.testing.expectEqual(Plan.Applied.changed, p.apply(&b, 2));
     try std.testing.expectEqual(@as(u8, 1), p.doneCount());
-    // Lo que había ANTES del cambio, que es lo que permite decir "1/2 -> 2/2" en
-    // el historial en vez de solo "2/2".
+    // What there was BEFORE the change, which is what allows saying "1/2 -> 2/2"
+    // in the history instead of just "2/2".
     try std.testing.expectEqual(@as(u8, 2), p.prev_len);
     try std.testing.expectEqual(@as(u8, 0), p.prev_done);
 
-    // Vaciar un plan que tenía cosas SÍ es cambio: es la señal de "se acabó".
+    // Emptying a plan that had items IS a change: it is the signal of "it's over".
     try std.testing.expectEqual(Plan.Applied.empty, p.apply(&new, 0));
     try std.testing.expect(p.isEmpty());
-    try std.testing.expect(!p.allDone()); // un plan vacío no está "hecho"
+    try std.testing.expect(!p.allDone()); // an empty plan is not "done"
 }
 
-test "Plan.currentIndex: el paso en marcha, o el primero pendiente" {
+test "Plan.currentIndex: the step in progress, or the first pending one" {
     var p = Plan.init();
-    // Vacío: no hay nada que resaltar.
+    // Empty: nothing to highlight.
     try std.testing.expect(p.currentIndex() == null);
 
     const a = try three("a", "b", "c", .done, .pending, .pending);
     try std.testing.expectEqual(Plan.Applied.changed, p.apply(&a, 3));
-    // El modelo no ha marcado ninguno: se resalta el primer pendiente, porque
-    // un plan sin nada resaltado parece un plan parado.
+    // The model marked none: the first pending one is highlighted, because a plan
+    // with nothing highlighted looks like a stalled plan.
     try std.testing.expectEqual(@as(u8, 1), p.currentIndex().?);
 
     const b = try three("a", "b", "c", .done, .pending, .in_progress);
     try std.testing.expectEqual(Plan.Applied.changed, p.apply(&b, 3));
-    // Ahora sí hay uno en marcha, y gana.
+    // Now there is one in flight, and it wins.
     try std.testing.expectEqual(@as(u8, 2), p.currentIndex().?);
 
     const c = try three("a", "b", "c", .done, .done, .done);
     try std.testing.expectEqual(Plan.Applied.changed, p.apply(&c, 3));
-    // Todo hecho: no hay paso actual (el resumen dice "all steps finished").
+    // All done: there is no current step (the summary says "all steps finished").
     try std.testing.expect(p.currentIndex() == null);
 }
 
-test "el texto largo se corta sin desbordar el buffer" {
+test "long text is truncated without overflowing the buffer" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var out: [max_items]Item = undefined;
@@ -393,12 +396,12 @@ test "el texto largo se corta sin desbordar el buffer" {
 
     const r = try parseItems(astate.allocator(), w.buffered(), &out);
     try std.testing.expectEqual(@as(u8, 1), r.len);
-    // Cortado a `text_max`: en el plan se lee "leerse esto entero en una fila"
-    // como una sola linea, y el texto largo esta en el historial del turno.
+    // Cut to `text_max`: in the plan "reading this whole thing on one row" reads
+    // as a single line, and the long text is in the turn's history.
     try std.testing.expectEqual(@as(u8, text_max), r.items[0].len);
 }
 
-test "el resumen dice lo que falta, no el porcentaje" {
+test "the summary says what is missing, not a percentage" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -408,8 +411,8 @@ test "el resumen dice lo que falta, no el porcentaje" {
     _ = p.apply(&a, 3);
     const s = p.summary(arena);
     try std.testing.expect(std.mem.indexOf(u8, s, "1/3") != null);
-    // El nombre del paso que sigue: es lo que convierte el plan en algo
-    // accionable de un vistazo.
+    // The name of the next step: that is what turns the plan into something
+    // actionable at a glance.
     try std.testing.expect(std.mem.indexOf(u8, s, "implementar") != null);
 
     const b = try three("leer el roadmap", "implementar", "testear", .done, .done, .done);
@@ -420,10 +423,10 @@ test "el resumen dice lo que falta, no el porcentaje" {
     try std.testing.expectEqualStrings("plan cleared", p.summary(arena));
 }
 
-// ── helpers de los tests ──────────────────────────────────────
+// ── test helpers ──────────────────────────────────────────────
 
-/// Como `expectError` pero sin imprimir el valor de acierto (que aquí es un
-/// array con buffers sin inicializar y revienta el formateo del enum).
+/// Like `expectError` but without printing the value on success (here it is an
+/// array with uninitialized buffers, which blows up the enum formatting).
 fn wantPlanErr(
     arena: std.mem.Allocator,
     json: []const u8,
@@ -431,7 +434,7 @@ fn wantPlanErr(
     want: ParseError,
 ) !void {
     if (parseItems(arena, json, out)) |_| {
-        std.debug.print("se esperaba {t} y el plan se acepto\n", .{want});
+        std.debug.print("expected {t} but the plan was accepted\n", .{want});
         return error.TestUnexpectedResult;
     } else |err| {
         try std.testing.expectEqual(want, err);

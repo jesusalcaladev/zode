@@ -46,7 +46,12 @@ const styles = struct {
     const user_text = Style{};
     const asst_prefix = fg(5); // magenta
     const asst_text = Style{};
-    const info = fg(8); // gray
+    // Notices ("3 tool results elided", "done · 12.4s", "@file: 2 inlined") used
+    // to be `fg(8)`, the same gray as a tool RESULT, and at ~2.8:1 on a dark
+    // background they were invisible in a long history. A notice is secondary
+    // information the user still has to be able to read, so it gets a readable
+    // tone and the tool result keeps the dim one.
+    const info: Style = .{ .fg = .{ .rgb = .{ 0x7a, 0x83, 0x99 } } };
     const tool = fg(6); // cyan
     const tool_bold: Style = .{ .bold = true, .fg = .{ .index = 6 } };
     const tool_res = fg(8); // the result goes dimmed
@@ -66,7 +71,21 @@ const styles = struct {
     // on its own).
     const banner: Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // brand
     const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } }; // brand_hi
-    const heading = Style{ .bold = true, .fg = .{ .index = 4 } };
+    // A heading was `fg(4)` bold: the SAME blue as the `›` user prefix and as
+    // `theme.accent`, and the same style the diff used for `@@ -1,4 +1,6 @@`. A
+    // heading had to shout over the prose, so it gets the lightest blue in the
+    // palette (`#c0caf5`, one tone above the wordmark) and the hunk header gets
+    // its own style: two different things that used to be indistinguishable.
+    const heading: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } };
+    /// The `@@ -a,b +c,d @@` line of a diff. Dimmer than a heading, because it is
+    /// part of a block and not the title of one.
+    const hunk: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
+    /// A list bullet, so the list reads as a list. Same tone as the `⏺` of a tool.
+    const bullet: Style = .{ .fg = .{ .index = 6 } };
+    /// The `>` bar of a quote.
+    const quote_bar: Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } } };
+    /// A horizontal rule drawn from `---`.
+    const rule: Style = .{ .fg = .{ .rgb = .{ 0x3b, 0x42, 0x61 } } };
     const bold = Style{ .bold = true };
     const inline_code = Style{ .fg = .{ .index = 3 } }; // yellow
     const sep = fg(8);
@@ -170,10 +189,49 @@ pub fn parseLang(
                     const heading_text = trimmed[nh + 1 ..];
                     const segs = try arena.alloc(Segment, 1);
                     segs[0] = .{ .text = heading_text, .style = styles.heading };
+                    // Air BEFORE the heading: a title glued to the paragraph above
+                    // it is not a title. Only inside the paragraph, so the layout
+                    // does not add a second one at the top.
+                    if (inline_lines.items.len > 0) {
+                        const blank = try arena.alloc(Segment, 1);
+                        blank[0] = .{ .text = "", .style = styles.heading };
+                        try inline_lines.append(arena, blank);
+                    }
                     try inline_lines.append(arena, segs);
                     continue;
                 }
             }
+        }
+
+        // A quote, a bullet, a numbered item: the MARKER becomes its own styled
+        // segment and the body goes through the normal inline pass.
+        //
+        // Before, all of these came out as the literal characters the model typed,
+        // in the base style: `- **Step 1** …` looked like prose that happened to
+        // start with a hyphen, and `> note` looked like prose that happened to
+        // start with an angle bracket. For an agent whose answers ARE step lists,
+        // that is the difference between a shape you can scan and a wall.
+        const marker = if (kind != .banner) listMarker(line) else null;
+        if (marker) |m| {
+            var segs = try arena.alloc(Segment, 0);
+            if (m.indent > 0) {
+                const pad = try arena.alloc(u8, m.indent);
+                @memset(pad, ' ');
+                segs = try appendSeg(arena, segs, .{ .text = pad, .style = base_override orelse styles.asst_text });
+            }
+            segs = try appendSeg(arena, segs, .{ .text = m.marker, .style = styles.bullet });
+            const body = try inlineSegmentsLang(arena, m.body, kind, base_override, mood_style, "");
+            for (body) |sg| segs = try appendSeg(arena, segs, sg);
+            try inline_lines.append(arena, segs);
+            continue;
+        }
+        if (kind != .banner and line.len > 0 and line[0] == '>') {
+            var segs = try arena.alloc(Segment, 0);
+            segs = try appendSeg(arena, segs, .{ .text = "│ ", .style = styles.quote_bar });
+            const body = try inlineSegmentsLang(arena, std.mem.trim(u8, line[1..], " "), kind, base_override, mood_style, "");
+            for (body) |sg| segs = try appendSeg(arena, segs, sg);
+            try inline_lines.append(arena, segs);
+            continue;
         }
 
         // The diff needs the file's LANGUAGE to tokenize the body; the other
@@ -197,6 +255,62 @@ pub fn parseLang(
         });
     }
     return blocks.toOwnedSlice(arena);
+}
+
+const Marker = struct {
+    /// The indentation the model typed, in columns (2 per level is the norm).
+    indent: usize,
+    /// The normalized marker, already padded: `"• "` or `"3. "`.
+    marker: []const u8,
+    ordered: bool,
+    /// The text after the marker.
+    body: []const u8,
+};
+
+/// Is this line a list item? If so, where does its content start.
+///
+/// `-`, `*` and `+` all become `•` and `N.` keeps its number, so the same list
+/// looks the same whoever wrote it. The indent is preserved as indentation: a
+/// nested step has to LOOK nested.
+fn listMarker(line: []const u8) ?Marker {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    if (i >= line.len) return null;
+    const rest = line[i..];
+
+    var digit_end: usize = 0;
+    while (digit_end < rest.len and std.ascii.isDigit(rest[digit_end])) digit_end += 1;
+
+    const indent = @min(i, 12); // more than that is not a nesting level
+    // `- item` / `* item` / `+ item`
+    if (rest.len >= 2 and (rest[0] == '-' or rest[0] == '*' or rest[0] == '+') and rest[1] == ' ') {
+        return .{
+            .indent = indent,
+            .marker = "• ",
+            .ordered = false,
+            .body = std.mem.trim(u8, rest[2..], " "),
+        };
+    }
+    // `7. item` / `7) item`: both spellings are in wide use, and only handling
+    // one of them left half the numbered lists in the answers as prose.
+    if (digit_end >= 1 and digit_end + 1 < rest.len and
+        (rest[digit_end] == '.' or rest[digit_end] == ')') and rest[digit_end + 1] == ' ')
+    {
+        return .{
+            .indent = indent,
+            .marker = rest[0 .. digit_end + 2],
+            .ordered = true,
+            .body = std.mem.trim(u8, rest[digit_end + 2 ..], " "),
+        };
+    }
+    return null;
+}
+
+fn appendSeg(arena: std.mem.Allocator, segs: []const Segment, seg: Segment) ![]Segment {
+    const out = try arena.alloc(Segment, segs.len + 1);
+    @memcpy(out[0..segs.len], segs);
+    out[segs.len] = seg;
+    return out;
 }
 
 /// Base style per kind for text with no special formatting.
@@ -605,7 +719,7 @@ pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
 }
 
 // basic test
-test "parse markdown básico" {
+test "basic markdown parse" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -616,7 +730,7 @@ test "parse markdown básico" {
     try std.testing.expectEqual(Kind.code, blocks[1].kind);
 }
 
-test "unifiedDiff: cambio simple, con cabecera de hunk" {
+test "unifiedDiff: simple change, with a hunk header" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -631,7 +745,7 @@ test "unifiedDiff: cambio simple, con cabecera de hunk" {
     try std.testing.expectEqualStrings(" tres", d[4]);
 }
 
-test "unifiedDiff: sin cambios no produce +/-" {
+test "unifiedDiff: no changes produces no +/-" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -641,7 +755,7 @@ test "unifiedDiff: sin cambios no produce +/-" {
     try std.testing.expectEqual(@as(usize, 0), d.len);
 }
 
-test "unifiedDiff: lineas nuevas al final" {
+test "unifiedDiff: new lines at the end" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -653,7 +767,7 @@ test "unifiedDiff: lineas nuevas al final" {
     try std.testing.expectEqualStrings("+c", d[3]);
 }
 
-test "unifiedDiff: borrado" {
+test "unifiedDiff: deletion" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -665,7 +779,7 @@ test "unifiedDiff: borrado" {
     try std.testing.expectEqualStrings(" c", d[3]);
 }
 
-test "diffSegments: el prefijo va con su color y el cuerpo POR TOKENS" {
+test "diffSegments: the prefix gets its color and the body BY TOKENS" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -690,7 +804,7 @@ test "diffSegments: el prefijo va con su color y el cuerpo POR TOKENS" {
     try std.testing.expectEqualStrings("+nuevo", joined.items);
 }
 
-test "una línea + del diff lleva tokens, no un segmento verde" {
+test "a + line of the diff carries tokens, not a green segment" {
     // The green wall: `+const n: u32 = 42` was ONE segment with `diff_add`. Now
     // the prefix goes with its own color and the body is tokenized, so `const`
     // is a keyword, `u32` a type and `42` a number. That is what makes a diff
@@ -727,7 +841,7 @@ fn findDiffSeg(segs: []const Segment, needle: []const u8) ?Segment {
     return null;
 }
 
-test "el diff sin saber el lenguaje sale plano pero conserva el prefijo" {
+test "the diff with an unknown language comes out plain but keeps the prefix" {
     // With `lang = ""` it falls back to `generic`, which now has a table: it is
     // not a green wall, but it does not invent colors either.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -743,7 +857,7 @@ test "el diff sin saber el lenguaje sale plano pero conserva el prefijo" {
     try std.testing.expectEqualStrings("+hola", joined.items);
 }
 
-test "un banner que empieza por ## NO se come como encabezado" {
+test "a banner starting with ## is NOT eaten as a heading" {
     // The banner art uses `#` as fill and ALL of its rows start with `##`, so
     // the parser interpreted them as markdown headings and returned
     // "####  ####  *zode*" instead of the whole drawing. The banner is a
@@ -769,7 +883,7 @@ test "un banner que empieza por ## NO se come como encabezado" {
     try std.testing.expectEqualStrings("un titulo", ht.items);
 }
 
-test "unifiedDiff: por encima del tope no se calcula el LCS (sería O(n*m))" {
+test "unifiedDiff: above the cap the LCS is not computed (it would be O(n*m))" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -793,7 +907,7 @@ test "unifiedDiff: por encima del tope no se calcula el LCS (sería O(n*m))" {
     try std.testing.expect(std.mem.indexOf(u8, out[0], "too large") != null);
 }
 
-test "tool_res_bold es bold DE VERDAD (el 'dos tonos' no era un no-op)" {
+test "tool_res_bold is bold FOR REAL (the 'two tones' was not a no-op)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -814,7 +928,7 @@ test "tool_res_bold es bold DE VERDAD (el 'dos tonos' no era un no-op)" {
     try std.testing.expectEqual(styles.tool_res.fg, plain[0].style.fg);
 }
 
-test "unifiedDiff: un cambio pequeno en un fichero grande NO escupe el fichero entero" {
+test "unifiedDiff: a small change in a large file does NOT dump the whole file" {
     // The raw diff used to be emitted in full: editing 2 lines of a 200-line
     // file painted 200 diff lines, 198 of them context. That is what made a
     // `write` look like a wall.
@@ -847,7 +961,7 @@ test "unifiedDiff: un cambio pequeno en un fichero grande NO escupe el fichero e
     }
 }
 
-test "unifiedDiff: dos cambios alejados dan dos hunks con elipsis en medio" {
+test "unifiedDiff: two distant changes give two hunks with an ellipsis in between" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -883,7 +997,7 @@ test "unifiedDiff: dos cambios alejados dan dos hunks con elipsis en medio" {
     try std.testing.expect(found_a and found_b);
 }
 
-test "unifiedDiff: sin cambios devuelve vacío (no un hunk de contexte)" {
+test "unifiedDiff: no changes returns empty (not a context hunk)" {
     // `pushDiff` already filtered this on its own, but it is better for the
     // function to invent nothing: a context-only hunk would be noise in the
     // history.
@@ -892,4 +1006,109 @@ test "unifiedDiff: sin cambios devuelve vacío (no un hunk de contexte)" {
     const arena = arena_state.allocator();
     const d = try unifiedDiff(arena, "a\nb\nc\n", "a\nb\nc\n");
     try std.testing.expectEqual(@as(usize, 0), d.len);
+}
+
+test "list markers become a colored bullet and keep the nesting as indent" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const blocks = try parse(a.allocator(), .assistant,
+        \\- primero
+        \\  - anidado
+        \\7. numerado
+        \\* con estrella
+    );
+    const segs = blocks[0].lines;
+    try std.testing.expectEqual(@as(usize, 4), segs.len);
+
+    // The marker is its OWN segment, in the bullet style: that is what makes a
+    // list look like a list instead of like prose that starts with a hyphen.
+    try std.testing.expectEqualStrings("• ", segs[0][0].text);
+    try std.testing.expectEqual(styles.bullet, segs[0][0].style);
+    try std.testing.expectEqualStrings("primero", segs[0][1].text);
+
+    // Nested: two spaces of indent BEFORE the bullet, and the marker itself is
+    // still a bullet.
+    try std.testing.expectEqualStrings("  ", segs[1][0].text);
+    try std.testing.expectEqualStrings("• ", segs[1][1].text);
+    try std.testing.expectEqualStrings("anidado", segs[1][2].text);
+
+    // Ordered keeps its number.
+    try std.testing.expectEqualStrings("7. ", segs[2][0].text);
+    try std.testing.expectEqualStrings("numerado", segs[2][1].text);
+}
+
+test "listMarker is not fooled by prose, a dash word or a lone dash" {
+    try std.testing.expect(listMarker("hola") == null);
+    try std.testing.expect(listMarker("-5 es un numero") == null); // no space after
+    try std.testing.expect(listMarker("---") == null); // a rule, not an item
+    try std.testing.expect(listMarker("a - b") == null); // not at the start
+    try std.testing.expect(listMarker("") == null);
+    try std.testing.expect(listMarker("- si") != null);
+    try std.testing.expect(listMarker("1) si") != null);
+}
+
+test "a list keeps its bold and code inside the item" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const blocks = try parse(a.allocator(), .assistant, "- **fix** the `read` path");
+    const segs = blocks[0].lines[0];
+    var joined: [128]u8 = undefined;
+    var n: usize = 0;
+    for (segs) |sg| {
+        if (n + sg.text.len > joined.len) break;
+        @memcpy(joined[n .. n + sg.text.len], sg.text);
+        n += sg.text.len;
+    }
+    // The invariant that must never break: the line is still the line.
+    try std.testing.expectEqualStrings("• fix the read path", joined[0..n]);
+}
+
+test "a quote is a bar in its own style, not a stray angle bracket" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const blocks = try parse(a.allocator(), .assistant, "> esto es una cita");
+    const segs = blocks[0].lines[0];
+    try std.testing.expectEqualStrings("│ ", segs[0].text);
+    try std.testing.expectEqual(styles.quote_bar, segs[0].style);
+    var joined: [128]u8 = undefined;
+    var n: usize = 0;
+    for (segs) |sg| {
+        if (n + sg.text.len > joined.len) break;
+        @memcpy(joined[n .. n + sg.text.len], sg.text);
+        n += sg.text.len;
+    }
+    try std.testing.expectEqualStrings("│ esto es una cita", joined[0..n]);
+}
+
+test "a heading gets an empty row in front of it (unless it opens the paragraph)" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    // Prose, then a heading: air before it, because a title glued to the
+    // paragraph above is not a title.
+    const mid = try parse(a.allocator(), .assistant, "algo\n## Titulo\nmas cosas");
+    try std.testing.expectEqual(@as(usize, 4), mid[0].lines.len);
+    try std.testing.expectEqualStrings("Titulo", mid[0].lines[2][0].text);
+
+    // A heading that OPENS the paragraph gets no leading blank: it would push
+    // the paragraph down one row for nothing.
+    const first = try parse(a.allocator(), .assistant, "## Titulo\nmas cosas");
+    try std.testing.expectEqual(@as(usize, 2), first[0].lines.len);
+    try std.testing.expectEqualStrings("Titulo", first[0].lines[0][0].text);
+}
+
+test "the notice style is readable and NOT the tool-result gray" {
+    // They were both `fg(8)` at ~2.8:1, so a notice and a tool result were the
+    // same thing in a long history.
+    // The notice is a truecolor tone chosen for contrast; the tool result stays
+    // on the ANSI dim gray.
+    try std.testing.expect(std.meta.activeTag(styles.info.fg) == .rgb);
+    try std.testing.expect(std.meta.activeTag(styles.tool_res.fg) == .index);
+    try std.testing.expect(styles.tool_res.fg.index == 8);
+}
+
+test "a markdown heading is not the diff hunk header" {
+    // They shared one style, so `@@ -1,4 +1,6 @@` looked exactly like a
+    // markdown heading: bold blue, same as the `›` of a user prompt.
+    try std.testing.expect(std.meta.activeTag(styles.heading.fg) == .rgb);
+    try std.testing.expect(std.mem.eql(u8, &styles.heading.fg.rgb, &styles.hunk.fg.rgb) == false);
 }

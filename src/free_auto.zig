@@ -3,28 +3,28 @@ const agent = @import("agent.zig");
 const roster_mod = @import("roster.zig");
 const tui = @import("tui.zig");
 
-/// El pool de modelos free y la rueda que reparte turnos entre ellos
+/// The pool of free models and the wheel that hands turns out among them
 /// (`/free-auto`).
 ///
-/// ## Por qué vive en un global con spinlock y no dentro de `Model`
+/// ## Why it lives in a global with a spinlock and not inside `Model`
 ///
-/// Lo escribe un WORKER (el que lista los modelos de cada provider) y lo leen
-/// dos hilos más: el worker del chat, para rotar, y el de la UI, para pintar el
-/// status. Es el mismo problema que `acp_client`, con la misma solución: un
-/// spinlock `tryLock` de secciones de dos líneas, porque `std.atomic.Mutex` no
-/// es reentrante y cogerse el lock con el suyo cuelga la app.
+/// A WORKER writes it (the one listing the models of each provider) and two
+/// other threads read it: the chat worker, to rotate, and the UI one, to paint
+/// the status. It is the same problem as `acp_client`, with the same solution: a
+/// spinlock `tryLock` over two-line sections, because `std.atomic.Mutex` is not
+/// reentrant and taking the lock with your own hangs the app.
 ///
-/// La diferencia con ACP es que aquí el contenido NO se puede invalidar en
-/// runtime: los strings son copias de un arena que vive hasta el teardown, y la
-/// regla del AGENTS.md es exacta: un dato que se lee desde varios hilos no se
-/// libera nunca en runtime.
+/// The difference with ACP is that here the content CANNOT be invalidated at
+/// runtime: the strings are copies from an arena that lives until the teardown,
+/// and the AGENTS.md rule is exact: data read from several threads is never
+/// freed in runtime.
 ///
-/// ## Por qué el pool no espera
+/// ## Why the pool does not wait
 ///
-/// `build` habla con N providers: son N peticiones. Si se hiciera en el primer
-/// fallo, el usuario vería "se queda pensando" justo cuando necesita que pase
-/// algo. Se construye en un worker al encender el modo, y si no está listo el
-/// turno sigue con el modelo activo.
+/// `build` talks to N providers: that is N requests. If it happened on the first
+/// failure, the user would watch it "think" exactly when they need something to
+/// happen. It is built in a worker when the mode is switched on, and if it is
+/// not ready the turn goes on with the active model.
 var free_auto_on: bool = false;
 var roster_state = roster_mod.Roster{};
 var roster_inited = false;
@@ -38,29 +38,30 @@ fn rosterUnlock() void {
     roster_lock.unlock();
 }
 
-/// El `Io` para el reloj, si lo hay.
+/// The `Io` for the clock, if there is one.
 ///
-/// Es `?std.Io` y no `agent.io_global` a pelo porque ese es `undefined` hasta
-/// que el arranque lo asigna, y leer el reloj de un `Io` sin inicializar es
-/// saltar por una vtable de basura: un GPF imediato (y NO un 0). Es la misma
-/// trampa que `Model.attachIo` con su flag `io_ready`, y el mismo remedio.
+/// It is `?std.Io` and not `agent.io_global` bare because that one is
+/// `undefined` until startup assigns it, and reading the clock from an
+/// uninitialized `Io` is jumping through a vtable of garbage: an immediate GPF
+/// (and NOT a 0). It is the same trap as `Model.attachIo` with its `io_ready`
+/// flag, and the same remedy.
 var roster_io: ?std.Io = null;
 
 pub fn attachIo(io: std.Io) void {
     roster_io = io;
 }
 
-/// Milisegundos desde epoch, para los cooldowns del roster.
+/// Milliseconds since epoch, for the roster cooldowns.
 ///
-/// Sin reloj devuelve 0. No es perfecto (los cooldowns no caducan solos) pero es
-/// el fallo que NO puede tumbar la app, y solo pasa en tests: en producción
-/// siempre hay `Io`.
+/// No clock returns 0. It is not perfect (the cooldowns do not expire on their
+/// own) but it is the failure that CANNOT bring the app down, and it only
+/// happens in tests: in production there is always an `Io`.
 pub fn nowMs() i128 {
     const io = roster_io orelse return 0;
     return @divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms);
 }
 
-/// El roster global, creándolo si hace falta.
+/// The global roster, creating it if it is needed.
 pub fn rosterGet(gpa: std.mem.Allocator) *roster_mod.Roster {
     if (!roster_inited) {
         roster_state = roster_mod.Roster.init(gpa);
@@ -69,12 +70,13 @@ pub fn rosterGet(gpa: std.mem.Allocator) *roster_mod.Roster {
     return &roster_state;
 }
 
-/// Etiqueta para el status bar, o "" si el modo está apagado o sin construir.
+/// Label for the status bar, or "" if the mode is off or not built yet.
 ///
-/// OJO al contrato: el slice que devuelve es del allocator que le pasa el
-/// llamante (el del modelo), no del global. Es lo que permite pintar sin
-/// worrying de que el global cambie entre el chequeo y el uso, y es la misma
-/// razón por la que `sessionInfo` usa `allocPrint` y no un buffer fijo.
+/// CAREFUL with the contract: the slice it returns belongs to the allocator the
+/// caller passes in (the model's), not to the global's. That is what lets it
+/// paint without worrying about the global changing between the check and the
+/// use, and it is the same reason `sessionInfo` uses `allocPrint` and not a
+/// fixed buffer.
 pub fn freeAutoLabel(gpa: std.mem.Allocator) []const u8 {
     if (!free_auto_on) return "";
     rosterLock();
@@ -89,8 +91,8 @@ pub fn freeAutoOn() bool {
     return free_auto_on;
 }
 
-/// Cuántos candidatos hay en el pool (0 si no está construido). Para el worker
-/// del chat, que necesita saber si merece la pena rotar.
+/// How many candidates are in the pool (0 if it is not built). For the chat
+/// worker, which needs to know whether rotating is worth it.
 pub fn poolSize() u8 {
     rosterLock();
     defer rosterUnlock();
@@ -98,23 +100,23 @@ pub fn poolSize() u8 {
     return roster_state.len;
 }
 
-/// El resultado de cambiar de par a mitad de un turno.
+/// The result of switching pair halfway through a turn.
 pub const Switch = struct {
-    /// El par al que se pasa.
+    /// The pair being switched to.
     cand: roster_mod.Candidate,
-    /// El par que se queda sin cuota (para el mensaje).
+    /// The pair that ran out of quota (for the message).
     prev_provider: []const u8,
     prev_model: []const u8,
-    /// Por qué murió el anterior, ya con la etiqueta ("rate limited: 429 …").
+    /// Why the previous one died, already with the label ("rate limited: 429 …").
     prev_reason: []const u8,
 };
 
-/// Mata el par actual y devuelve el siguiente vivo, o null si no queda ninguno.
+/// Kills the current pair and returns the next live one, or null if none is left.
 ///
-/// Devuelve EL ANTERIOR también, y no solo el nuevo, porque el mensaje al
-/// usuario tiene que poder decir los dos ("quota gone on groq/x → openrouter/y").
-/// Con el roster solo (`rotate`) hay que acordarse del índice de antes, que es
-/// justo el dato que se pierde en cuanto se mueve.
+/// It returns THE PREVIOUS one too, and not just the new one, because the message
+/// to the user has to be able to name both ("quota gone on groq/x → openrouter/y").
+/// With the roster alone (`rotate`) you have to remember the index from before,
+/// which is exactly the datum that is lost the moment it moves.
 pub fn switchTo(gpa: std.mem.Allocator, why: roster_mod.Why, detail: []const u8) ?Switch {
     const r = rosterGet(gpa);
     const prev_idx = r.cur_raw;
@@ -128,13 +130,13 @@ pub fn switchTo(gpa: std.mem.Allocator, why: roster_mod.Why, detail: []const u8)
     };
 }
 
-// ── puente para los tests de `agent.zig` ──────────────────────
+// ── bridge for the `agent.zig` tests ─────────────────────────────
 //
-// `pickTarget` vive en agent.zig (porque necesita el provider activo) y el
-// estado del modo vive aquí. Los tests de uno necesitan tocar el del otro, y
-// hacerlo con `free_auto_on` a pelo desde el otro fichero no compila (es privado).
-// Estos tres son el puente, y son la razón de que existan en vez de un
-// `pub var` a lo bruto: obligan a restaurar el estado.
+// `pickTarget` lives in agent.zig (because it needs the active provider) and the
+// state of the mode lives here. The tests of one need to touch the other's, and
+// doing that with a bare `free_auto_on` from the other file does not compile (it is
+// private). These three are the bridge, and they are the reason this exists instead
+// of a brute force `pub var`: they force the state to be restored.
 
 pub const StateSnapshot = struct {
     on: bool,
@@ -164,17 +166,17 @@ pub fn stateSet(on: bool, inited: bool, state: roster_mod.Roster) void {
     rosterUnlock();
 }
 
-/// Job del worker que construye el pool.
+/// Job of the worker that builds the pool.
 const RosterJob = struct {
     model: *tui.Model,
 };
 
-/// Construye el pool en segundo plano.
+/// Builds the pool in the background.
 ///
-/// Los `defs` (providers compilados + los de `config.json`) salen de un arena
-/// que muere al terminar el worker, y por eso `Roster.build` DUPLICA todo lo que
-/// necesita del provider: los ids de los candidatos son copias del arena del
-/// roster, no del def.
+/// The `defs` (compiled providers plus the ones from `config.json`) come out of an
+/// arena that dies when the worker ends, and that is why `Roster.build` DUPLICATES
+/// everything it needs from the provider: the candidate ids are copies from the
+/// roster arena, not from the def.
 fn rosterWorker(job: *RosterJob) void {
     const m = job.model;
     defer {
@@ -198,8 +200,8 @@ fn rosterWorker(job: *RosterJob) void {
         return;
     };
 
-    // Se instala SOLO si el global ya existe. Si el usuario no ha dado al
-    // `/free-auto`, este worker no tiene por qué dejar un pool detrás.
+    // It is installed ONLY if the global already exists. If the user has not pressed
+    // `/free-auto`, this worker has no business leaving a pool behind.
     if (roster_inited) {
         rosterLock();
         roster_state.len = r.len;
@@ -222,8 +224,8 @@ fn rosterWorker(job: *RosterJob) void {
     own(m, "free-auto: {d} free model{s} ready", .{ n, if (n == 1) "" else "s" });
 }
 
-/// Lanza el worker que construye el pool. Best-effort: si no se puede lanzar, el
-/// modo sigue funcionando con el modelo activo y lo dirá al rotar.
+/// Launches the worker that builds the pool. Best-effort: if it cannot be launched,
+/// the mode keeps working with the active model and says so when it rotates.
 pub fn startRosterBuild(m: *tui.Model) void {
     _ = rosterGet(m.allocator);
     const job = m.allocator.create(RosterJob) catch return;
@@ -239,16 +241,16 @@ pub fn startRosterBuild(m: *tui.Model) void {
     t.detach();
 }
 
-/// `pushInfoOwned` con un texto propio SIEMPRE.
+/// `pushInfoOwned` with an owned text, ALWAYS.
 ///
-/// Existe porque el fallo es silencioso hasta que la app MUERE: pasar un literal
-/// a `pushInfoOwned` deja un puntero a `.rodata` en `pending`, y `Model.deinit`
-/// lo libera -> "Invalid free" al salir. Es la misma trampa que los literales de
-/// la paleta (ver AGENTS.md, "Un crash al salir por literales"), y ya se ha
-/// escrito dos veces en este repo.
+/// It exists because the failure is silent until the app DIES: passing a literal
+/// to `pushInfoOwned` leaves a pointer to `.rodata` in `pending`, and `Model.deinit`
+/// frees it -> "Invalid free" on exit. It is the same trap as the palette literals
+/// (see AGENTS.md, "A crash on exit over literals"), and it has already been
+/// written twice in this repo.
 ///
-/// Ademas cubre el `catch` del `allocPrint`: sin memoria hay que callarse, no
-/// empujar un literal a una funcion que se supone que toma posesion.
+/// It also covers the `catch` of the `allocPrint`: with no memory you have to stay
+/// quiet, not push a literal into a function that is supposed to take ownership.
 fn own(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
     const msg = std.fmt.allocPrint(m.allocator, fmt, args) catch {
         agent.pushInfo(m, "free-auto: out of memory");
@@ -257,19 +259,42 @@ fn own(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
     agent.pushInfoOwned(m, msg);
 }
 
-/// Cambia el estado del modo. Devuelve `true` si hay que lanzar el worker del
-/// pool (es decir: se acaba de encender y no hay lista todavia).
+/// Changes the state of the mode. Returns `true` if the pool worker has to be
+/// launched (that is: it was just switched on and there is no list yet).
 ///
-/// Va separada de `cmdFreeAuto` por una razon concreta: encender el modo lanza
-/// un hilo que habla con la red, y un test que llame a `cmdFreeAuto("on")`
-/// deja ese hilo vivo con un `Model` ya liberado. Aqui no hay hilo, asi que el
-/// estado SI es comprobable.
+/// It is separate from `cmdFreeAuto` for a concrete reason: switching the mode on
+/// launches a thread that talks to the network, and a test that calls
+/// `cmdFreeAuto("on")` leaves that thread alive with an already freed `Model`. Here
+/// there is no thread, so the state IS checkable.
+/// Re-lists the pool, keeping the mode ON.
+///
+/// Separate from `cmdFreeAuto` because "on" there means TOGGLE (it is the same
+/// command with no argument), so calling it to refresh would switch the mode off.
+/// The pool is built from "the providers that have a key right now", and that
+/// set changes when the user connects one: without this, the rotation keeps
+/// offering the models of the providers that existed at startup, which is not
+/// what "every provider" means.
+pub fn rebuildPool(m: *tui.Model) void {
+    if (!freeAutoOn()) return;
+    rosterLock();
+    if (roster_inited) roster_state.built = false; // forces `setFreeAuto` to rebuild
+    const had_dead = if (roster_inited) roster_state.dead_len > 0 else false;
+    rosterUnlock();
+    // Dead entries were decided against a pool that no longer exists.
+    if (had_dead) {
+        rosterLock();
+        if (roster_inited) roster_state.dead_len = 0;
+        rosterUnlock();
+    }
+    _ = setFreeAuto(m, true);
+}
+
 pub fn setFreeAuto(m: *tui.Model, want_on: bool) bool {
     rosterLock();
     free_auto_on = want_on;
-    // Al apagar se olvida quien estaba muerto: si se vuelve a encender dentro de
-    // un rato, los cooldowns viejos ya no aplican y el pool se prueba entero
-    // otra vez.
+    // Switching it off forgets who was dead: if it is switched on again within a
+    // while, the old cooldowns no longer apply and the whole pool is tried
+    // again.
     if (!want_on) roster_state.dead_len = 0;
     const built = roster_inited and roster_state.built;
     const n = if (roster_inited) roster_state.len else 0;
@@ -297,10 +322,10 @@ pub fn cmdFreeAuto(m: *tui.Model, arg: ?[]const u8) void {
     const a = if (arg) |x| std.mem.trim(u8, x, " \t") else "";
 
     if (std.mem.eql(u8, a, "status")) {
-        // OJO: los literales van por `pushInfo` (que COPIA). Por `pushInfoOwned`
-        // (que toma posesion) un literal se acaba liberando en `Model.deinit`, y
-        // eso es un "Invalid free" al salir. Que se note: `/free-auto status` con
-        // el pool sin construir es justo la rama del literal.
+        // CAREFUL: the literals go through `pushInfo` (which COPIES). Through
+        // `pushInfoOwned` (which takes ownership) a literal ends up being freed
+        // in `Model.deinit`, and that is an "Invalid free" on exit. Worth stressing:
+        // `/free-auto status` with the pool unbuilt is exactly the literal branch.
         if (!freeAutoOn()) {
             agent.pushInfo(m, "free-auto: off");
             return;
@@ -324,10 +349,10 @@ pub fn cmdFreeAuto(m: *tui.Model, arg: ?[]const u8) void {
     if (setFreeAuto(m, want_on)) startRosterBuild(m);
 }
 
-/// Enciende el modo desde el entorno (`ZODE_FREE_AUTO=1`) sin pasar por el
-/// comando. Lo llama el arranque de la TUI. Un valor "0"/"off"/"false" cuenta
-/// como apagado, que es lo que espera cualquiera que ponga la variable por
-/// costumbre.
+/// Switches the mode on from the environment (`ZODE_FREE_AUTO=1`) without going
+/// through the command. The TUI startup calls it. A value of "0"/"off"/"false"
+/// counts as off, which is what anyone who sets the variable out of habit
+/// expects.
 pub fn initFromEnv(m: *tui.Model, env: ?*const std.process.Environ.Map) void {
     const v = if (env) |e| e.get("ZODE_FREE_AUTO") else null;
     const val = v orelse return;
@@ -339,12 +364,12 @@ pub fn initFromEnv(m: *tui.Model, env: ?*const std.process.Environ.Map) void {
 
 // ── tests ─────────────────────────────────────────────────────
 //
-// Todos tocan el global del roster, así que cada uno deja el estado como lo
-// encontró. El lock es un SPINLOCK: cogerse dos veces en el mismo hilo cuelga,
-// y por eso no hay ni un `defer rosterLock()` con un segundo `rosterLock()`
-// dentro (que fue el primer borrador de estos tests).
+// They all touch the roster global, so each one leaves the state the way it
+// found it. The lock is a SPINLOCK: taking it twice in the same thread hangs, and
+// that is why there is not a single `defer rosterLock()` with a second `rosterLock()`
+// inside it (which was the first draft of these tests).
 
-/// Guarda el estado del global y lo devuelve al final.
+/// Saves the global state and gives it back at the end.
 const Saved = struct {
     on: bool,
     inited: bool,
@@ -365,7 +390,7 @@ const Saved = struct {
     }
 };
 
-test "freeAutoLabel: apagado devuelve vacío (el status bar no se ensucia)" {
+test "freeAutoLabel: off returns empty (the status bar stays clean)" {
     const saved = Saved.save();
     defer saved.restore();
 
@@ -376,7 +401,7 @@ test "freeAutoLabel: apagado devuelve vacío (el status bar no se ensucia)" {
     try std.testing.expectEqualStrings("", freeAutoLabel(std.testing.allocator));
 }
 
-test "freeAutoLabel: encendido y construido dice dónde está" {
+test "freeAutoLabel: on and built says where it is" {
     const saved = Saved.save();
     defer saved.restore();
 
@@ -401,9 +426,9 @@ test "freeAutoLabel: encendido y construido dice dónde está" {
     try std.testing.expect(std.mem.indexOf(u8, label, "groq/llama-3.3-70b") != null);
 }
 
-test "freeAutoLabel: encendido y con el pool vacío dice POR QUÉ" {
-    // El caso que hace útil el modo: no hay free porque no hay key, y eso hay que
-    // decirlo. Un "free-auto" a secas en el status no informa de nada.
+test "freeAutoLabel: on with an empty pool says WHY" {
+    // The case that makes the mode useful: there are no free models because there
+    // is no key, and that has to be said. A bare "free-auto" in the status says nothing.
     const saved = Saved.save();
     defer saved.restore();
 
@@ -426,7 +451,7 @@ test "freeAutoLabel: encendido y con el pool vacío dice POR QUÉ" {
     try std.testing.expect(std.mem.indexOf(u8, label, "ctrl+a") != null);
 }
 
-test "cmdFreeAuto: on/off alterna, `status` no cambia nada, basura avisa" {
+test "cmdFreeAuto: on/off toggles, `status` changes nothing, junk warns" {
     const saved = Saved.save();
     defer saved.restore();
 
@@ -439,10 +464,10 @@ test "cmdFreeAuto: on/off alterna, `status` no cambia nada, basura avisa" {
     free_auto_on = false;
     rosterUnlock();
 
-    // OJO: se usa `setFreeAuto` y NO `cmdFreeAuto("on")`, porque este ultimo
-    // lanza el worker del pool (un hilo que habla con la red) y el test lo
-    // dejaria vivo con el `Model` ya liberado. Lo que se prueba aqui es el
-    // estado, que es lo que importa.
+    // CAREFUL: `setFreeAuto` is used and NOT `cmdFreeAuto("on")`, because the latter
+    // launches the pool worker (a thread that talks to the network) and the test
+    // would leave it alive with the `Model` already freed. What is tested here is
+    // the state, which is what matters.
     _ = setFreeAuto(&m, true);
     try std.testing.expect(freeAutoOn());
 
@@ -452,15 +477,15 @@ test "cmdFreeAuto: on/off alterna, `status` no cambia nada, basura avisa" {
     _ = setFreeAuto(&m, false);
     try std.testing.expect(!freeAutoOn());
 
-    // Un argumento raro NO es un "on" silencioso: eso sería la peor forma de
-    // fallar en un modo que cambia de modelo por debajo.
+    // A weird argument is NOT a silent "on": that would be the worst possible way
+    // to fail in a mode that switches models under the hood.
     cmdFreeAuto(&m, "maybe");
     try std.testing.expect(!freeAutoOn());
 }
 
-test "setFreeAuto: pide construir el pool solo cuando no hay lista" {
-    // El `bool` de retorno decide si se lanza el worker. Si dijera que si con el
-    // pool ya construido, cada `/free-auto on` re-listaria N providers.
+test "setFreeAuto: asks to build the pool only when there is no list" {
+    // The return `bool` decides whether the worker is launched. If it said yes
+    // with the pool already built, every `/free-auto on` would re-list N providers.
     const saved = Saved.save();
     defer saved.restore();
 
@@ -470,14 +495,14 @@ test "setFreeAuto: pide construir el pool solo cuando no hay lista" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
 
-    // Sin construir: hay que lanzar el worker.
+    // Not built: the worker has to be launched.
     rosterLock();
     roster_inited = false;
     free_auto_on = false;
     rosterUnlock();
     try std.testing.expect(setFreeAuto(&m, true));
 
-    // Construido: NO hay que lanzar nada.
+    // Built: nothing has to be launched.
     var fake = roster_mod.Roster.init(arena);
     fake.built = true;
     fake.len = 3;
@@ -489,9 +514,9 @@ test "setFreeAuto: pide construir el pool solo cuando no hay lista" {
     try std.testing.expect(!setFreeAuto(&m, true));
 }
 
-test "apagar limpia los cooldowns" {
-    // Si no se limpian, encender y apagar en el mismo minuto deja el pool medio
-    // muerto y el modo parece roto.
+test "turning it off clears the cooldowns" {
+    // Without clearing them, switching it on and off inside the same minute leaves
+    // the pool half dead and the mode looks broken.
     const saved = Saved.save();
     defer saved.restore();
 

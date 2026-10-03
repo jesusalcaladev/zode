@@ -17,8 +17,8 @@ pub fn main(init: std.process.Init) !void {
     };
     std.debug.print("cwd = {s}\n", .{cwd});
 
-    // `ZODE_ACP_CMD` permite apuntar la sonda a otro agente (o al de mentira
-    // de los tests) sin recompilar: "opencode acp", "mi-agente --stdio"…
+    // `ZODE_ACP_CMD` points the probe at another agent (or at the fake one the
+    // tests use) without recompiling: "opencode acp", "my-agent --stdio"...
     var argv_words: [8][]const u8 = undefined;
     var argv: ?[]const []const u8 = null;
     if (init.environ_map.get("ZODE_ACP_CMD")) |cmd| {
@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
             fn ask(_: ?*anyopaque, tool: []const u8, detail: []const u8, opts: []const acp.PermOption) ?[]const u8 {
                 std.debug.print("[PERMISO] {s} {s}\n", .{ tool, detail });
                 for (opts) |o| std.debug.print("   - {s} ({s})\n", .{ o.name, o.kind });
-                // Se concede la primera opción de permitir, como haría /yolo.
+                // The first allow option is granted, the way /yolo does.
                 for (opts) |o| {
                     if (std.mem.startsWith(u8, o.kind, "allow")) return o.id;
                 }
@@ -76,25 +76,25 @@ pub fn main(init: std.process.Init) !void {
         }.ask,
     };
 
-    // `main` recibe `std.process.Init` en 0.16 (ver AGENTS.md): los args vienen
-    // por `init.minimal.args`; `std.process.argsAlloc` ya no existe.
+    // `main` receives `std.process.Init` in 0.16 (see AGENTS.md): the args
+    // come through `init.minimal.args`; `std.process.argsAlloc` is gone.
     var it = std.process.Args.Iterator.init(init.minimal.args);
-    _ = it.next(); // el nombre del programa
+    _ = it.next(); // the program name
     const question = it.next() orelse "di hola en una frase";
     std.debug.print("prompt: {s}\n\n", .{question});
 
     try c.prompt(question);
-    // `CANCEL=1` pide el corte a los 2 s desde OTRO hilo, que es exactamente
-    // lo que hace la TUI con el ESC: la UI pone la bandera y el worker (que es
-    // el dueño del `Io`) es quien escribe el `session/cancel`.
+    // `CANCEL=1` asks for the cut at 2 s from ANOTHER thread, which is exactly
+    // what the TUI does with ESC: the UI sets the flag and the worker (which
+    // owns the `Io`) is the one that writes the `session/cancel`.
     if (init.environ_map.get("CANCEL") != null) {
         const T = struct {
             fn go(cc: *acp.Client) void {
-                // `std.Thread.sleep` no existe en 0.16: se espera con el `Io`.
+                // `std.Thread.sleep` is gone in 0.16: wait with the `Io`.
                 var th = std.Io.Threaded.init(std.heap.page_allocator, .{});
                 defer th.deinit();
                 th.io().sleep(.fromSeconds(2), .awake) catch {};
-                std.debug.print("\n[probe] pido cancelar\n", .{});
+                std.debug.print("\n[probe] asking to cancel\n", .{});
                 cc.cancel();
             }
         };
@@ -102,8 +102,8 @@ pub fn main(init: std.process.Init) !void {
         defer th.join();
     }
     const reason = c.waitTurn(&sink) catch |err| {
-        std.debug.print("\nERROR: {t} · mensaje del agente: «{s}»\n", .{ err, c.lastError() });
-        // SIN `de c.deinit()`: queremos el `wait` para saber cómo murió el hijo
+        std.debug.print("\nERROR: {t} · agent message: \u{00ab}{s}\u{00bb}\n", .{ err, c.lastError() });
+        // WITHOUT `defer c.deinit()`: we want the `wait` to learn how the child died
         // en vez de matarlo nosotros y no enterarnos.
         const term = c.child.wait(io) catch |we| {
             std.debug.print("wait err: {t}\n", .{we});

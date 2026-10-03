@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Smoke test de la TUI en una pty REAL.
+"""Smoke test of the TUI in a REAL pty.
 
-Por que una pty y no los tests de `drawTest`: el render de vaxis es
- DIFERENCIAL y hace consultas al terminal (color, tamaño, capacidades). Un
- emulador casero se pierde la mitad del redraw, que es exactamente lo que hace
- que un turno que funciona parezca congelado. Ademas `pty.fork` + `TIOCSWINSZ`
- es la unica forma de darle a la app un tamaño de ventana de verdad.
+Why a pty and not the `drawTest` tests: vaxis rendering is DIFFERENTIAL and it
+ queries the terminal (color, size, capabilities). A homemade emulator loses half
+ the redraw, which is exactly what makes a working turn look frozen. And
+ `pty.fork` + `TIOCSWINSZ` is the only way to give the app a real window size.
 
-Uso:
-    zig build                       # o `zig build -Doptimize=ReleaseSafe`
+Usage:
+    zig build                       # or `zig build -Doptimize=ReleaseSafe`
     python3 tools/pty_smoke.py
 
-Devuelve 0 si todo lo que se comprueba esta, 1 si algo falla. Imprime el
-volcado plano si algo falla, para poder mirar que se ve.
+Returns 0 if everything checked holds, 1 if something fails. It prints the flat
+dump on failure so you can look at what is on screen.
 
-OJO: `HOME` se apunta a un directorio propio. La app escribe
-`~/.config/zode/auth.json` y `sessions/`, y un script automatico no debe tocar
-la config real de la persona que lo ejecuta (el fuzzer de junio guardo una key
-pegada por error y luego el provider con 401 sin explicacion apparent).
+CAREFUL: `HOME` points at its own directory. The app writes
+`~/.config/zode/auth.json` and `sessions/`, and an automatic script must never
+touch the real config of whoever runs it (the June fuzzer saved a pasted key
+there and the provider then answered 401 with no visible explanation).
 """
 
 import fcntl
@@ -32,17 +31,17 @@ import time
 
 ROWS, COLS = 50, 200
 BINARY = "./zig-out/bin/zode"
-# Un HOME aparte: `auth.json` y `sessions/` son de la persona, no del smoke.
+# A separate HOME: `auth.json` and `sessions/` belong to the person, not to the smoke.
 SANDBOX_HOME = "/tmp/opencode/zode-smoke-home"
 
 
 def strip_ansi(b: bytes) -> str:
-    """Texto plano de lo que salió por la pty.
+    """Plain text of what came out of the pty.
 
-    Hay que quitar tambien el SGR truecolor con dos puntos
-    (`ESC [ [38:2:122:162:247m`), que el regex habitual no cubre y que el
-    banner emite entero: sin esto el ASCII art sale partido y no se puede
-    buscar ni una sola cadena.
+    The truecolor SGR with two colons (`ESC [ [38:2:122:162:247m`) has to go
+    too: the usual regex does not cover it and the banner emits the lot, so
+    without this the ASCII art comes out split and not one string can be
+    searched for.
     """
     s = b.decode("utf-8", "replace")
     s = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?", "", s)  # OSC
@@ -52,9 +51,9 @@ def strip_ansi(b: bytes) -> str:
 
 
 def drive(keys, budget: float = 8.0):
-    """Arranca la TUI, manda `keys` espaciados, y devuelve (salida, texto)."""
+    """Starts the TUI, sends `keys` spaced out, and returns (bytes, text)."""
     if not os.path.exists(BINARY):
-        sys.exit(f"{BINARY} no existe: ejecuta `zig build` primero")
+        sys.exit(f"{BINARY} does not exist: run `zig build` first")
 
     pid, fd = pty.fork()
     if pid == 0:
@@ -67,8 +66,8 @@ def drive(keys, budget: float = 8.0):
         )
         os.execv(BINARY, [BINARY])
 
-    # Sin esto el proceso hijo no tiene una ventana y vaxis hace `width_pix /
-    # width`, que con tamano 0 es division por cero.
+    # Without this the child has no window and vaxis does `width_pix / width`,
+    # which with size 0 is a division by zero.
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
     out = b""
@@ -94,7 +93,7 @@ def drive(keys, budget: float = 8.0):
         except OSError:
             break
 
-    os.write(fd, b"\x03")  # ctrl+c: el camino de salida del propio prompt
+    os.write(fd, b"\x03")  # ctrl+c: the prompt's own exit path
     time.sleep(0.3)
     try:
         os.close(fd)
@@ -112,51 +111,108 @@ def check(name: str, ok: bool, text: str) -> bool:
 def main() -> int:
     os.makedirs(SANDBOX_HOME, exist_ok=True)
 
-    # 1) Arranque: banner, caja del input, status, y que no se rompa nada.
+    # 1) Startup: banner, input box, status bar, and nothing falls over.
     out, t = drive([b"hola mundo", b"\r"])
     ok = True
-    print(f"smoke: {len(out)} bytes por la pty")
-    ok &= check("banner: primera fila del wordmark", "######  ####  ####   ######" in t, t)
-    ok &= check("banner: tercera fila", "   ##  ##  ## ##  ## ##" in t, t)
-    ok &= check("input box (bordes ╭ ╰)", "╭" in t and "╰" in t, t)
+    print(f"smoke: {len(out)} bytes through the pty")
+    ok &= check("banner: first row of the wordmark", "######  ####  ####   ######" in t, t)
+    ok &= check("banner: third row", "   ##  ##  ## ##  ## ##" in t, t)
+    ok &= check("input box (╭ ╰ borders)", "╭" in t and "╰" in t, t)
     ok &= check("status bar", "esc interrupts" in t, t)
-    ok &= check("el prompt del usuario se hace eco", "hola mundo" in t, t)
-    ok &= check("no hay panic", "panic" not in t.lower(), t)
-    ok &= check("no hay 'Invalid free'", "invalid free" not in t.lower(), t)
+    ok &= check("the user prompt echoes", "hola mundo" in t, t)
+    ok &= check("no panic", "panic" not in t.lower(), t)
+    ok &= check("no 'Invalid free'", "invalid free" not in t.lower(), t)
 
-    # 2) Ctrl+P: la paleta modal tiene que abrir Y cerrarse. Este es el camino
-    #    que mas se rompio (items colgando, doble liberacion del allocator).
+    # 2) Ctrl+P: the modal palette has to open AND close. This is the path that
+    #    broke most often (dangling items, double free of the allocator).
     out2, t2 = drive([b"\x10", b"esc"])
-    ok &= check("ctrl+p abre la paleta", "Switch model" in t2 or "Connect" in t2, t2)
-    ok &= check("esc cierra la paleta", "Switch model" not in t2, t2)
+    ok &= check("ctrl+p opens the palette", "Switch model" in t2 or "Connect" in t2, t2)
+    ok &= check("esc closes the palette", "Switch model" not in t2, t2)
 
-    # 3) Ctrl+L (limpiar) y scroll: no deben tumbar la app.
-    out3, t3 = drive([b"hola", b"\r", b"\x0c", b"\x1b[B", b"\x1b[B"])
-    ok &= check("ctrl+l + scroll no rompen nada", "panic" not in t3.lower(), t3)
+    # 3) Ctrl+L (clear) and the REAL scroll keys: they must not take the app
+    #    down.
+    #
+    #    This used to send `\x1b[B` twice and call it "scroll". That is the DOWN
+    #    ARROW, which the input editor consumes as "walk the prompt history" —
+    #    it never reaches the history scroll at all. So the whole scroll path was
+    #    untested here, which is how the scroll bug (page up past the top, then
+    #    nothing moved on page down) shipped with a green smoke test.
+    #
+    #    The keys that DO scroll the history: PageUp `\x1b[5~`, PageDown
+    #    `\x1b[6~`, Ctrl+U `\x15` (half a page up), Ctrl+D `\x04` (half a page
+    #    down) and the wheel (`\x1b[<64;…M` / `\x1b[<65;…M`).
+    out3, t3 = drive(
+        [b"hola", b"\r", b"\x0c", b"\x1b[5~", b"\x1b[5~", b"\x1b[6~", b"\x15", b"\x04"]
+    )
+    ok &= check("ctrl+l + real scroll keys do not break anything", "panic" not in t3.lower(), t3)
+    ok &= check("no 'Invalid free' after scrolling", "invalid free" not in t3.lower(), t3)
 
-    # 4) `/clean`: un comando de limpieza que se ejecuta en la TUI sin pedir
-    #    nada tiene que salir bien SIEMPRE, y sin `yes` no puede borrar. Se
-    #    comprueba el texto del dry run, no que se borre: en el HOME del smoke
-    #    puede no haber ni una sesion vacia, y un test que depende de que haya
-    #    basura que borrar solo verifica el caso-afortunado.
+    # 4) `/clean`: a cleanup command that runs in the TUI without asking anything
+    #    has to work ALWAYS, and without `yes` it must not delete. What is checked
+    #    is the dry-run TEXT, not that something got deleted: the smoke HOME may
+    #    hold no empty session at all, and a test that depends on there being junk
+    #    to delete only ever verifies the happy path.
     out4, t4 = drive([b"/clean", b"\r"])
-    ok &= check("/clean responde (dry run)", "/clean" in t4 and "dry run" in t4, t4)
-    ok &= check("/clean ofrece el 'yes'", "/clean yes" in t4, t4)
-    ok &= check("/clean no rompe nada", "panic" not in t4.lower(), t4)
+    ok &= check("/clean answers (dry run)", "/clean" in t4 and "dry run" in t4, t4)
+    ok &= check("/clean offers the 'yes'", "/clean yes" in t4, t4)
+    ok &= check("/clean does not break anything", "panic" not in t4.lower(), t4)
 
-    # 5) `/context` dice DONDE se esta trabajando. Es la linea que responde a
-    #    "de verdad esta leyendo los ficheros de aqui?", y no aparece en ningun
-    #    otro sitio de la pantalla.
-    # DOS enters: el primero lo acepta el autocompletado (que esta abierto
-    # porque `/context` es un prefijo de comando) y el segundo lo manda. Con uno
-    # solo el comando se queda en el input y el test passaria/fallaria por el
-    # popup, no por `/context`.
+    # 5) `/context` says WHERE the work is happening. It is the line that answers
+    #    "is it really reading the files from here?", and it appears nowhere else
+    #    on screen.
+    # TWO enters: the first is taken by the autocompletion (which is open because
+    #    `/context` is a command prefix) and the second sends it. With only one the
+    #    command stays in the input, and the test would then be passing or failing
+    #    on the popup rather than on `/context`.
     out5, t5 = drive([b"/context", b"\r", b"\r"], budget=9.0)
-    ok &= check("/context dice el cwd", "cwd" in t5, t5)
-    ok &= check("/context no rompe nada", "panic" not in t5.lower(), t5)
+    ok &= check("/context says the cwd", "cwd" in t5, t5)
+    ok &= check("/context does not break anything", "panic" not in t5.lower(), t5)
+
+    # 6) `/free-auto` has to be FINDABLE. It was the last item of the "Session"
+    #    group among twenty others, with no alias and no state in its hint, and
+    #    the report was "there is no command to rotate the free models". A
+    #    feature that exists and cannot be found does not exist.
+    out6, t6 = drive([b"\x10", b"free"])
+    ok &= check("ctrl+p finds /free-auto by typing 'free'", "/free-auto" in t6, t6)
+    out6b, t6b = drive([b"\x1b"])
+
+    # 7) A prompt LONGER THAN THE BOX has to survive: wrapped, not truncated.
+    #    The bug was that the box grew to eight rows while the text stayed in one
+    #    and everything past the border was dropped without a word.
+    #
+    #    What the pty can check, and what it CANNOT, is worth writing down: the
+    #    typed text itself is NOT assertable here. vaxis redraws DIFFERENTLY (it
+    #    moves the cursor and patches cells), and this emulator concatenates the
+    #    byte stream, so the last redraw wins only by luck: typing "a" then "b"
+    #    three seconds apart comes out as "a" followed by a gap where "b" should
+    #    be. Measured, not assumed. So this check is the app SURVIVING a long
+    #    prompt and the START of it echoing back after Enter, and the wrap itself
+    #    is pinned by the `drawTest` unit tests, which read the surface cell by
+    #    cell.
+    out7, t7 = drive(
+        [
+            b"esta es una pregunta muy larga para comprobar que el input "
+            b"envuelve la linea y no se sale de la caja",
+            b"\r",
+        ],
+        budget=14.0,
+    )
+    ok &= check("a long prompt is accepted and echoed", "pregunta muy larga" in t7, t7)
+    ok &= check("a long prompt does not break anything", "panic" not in t7.lower(), t7)
+
+    # 8) `!` shell mode: a command the user typed runs and its output lands in the
+    #    context. It runs on its OWN thread, because `submitInput` is the event
+    #    handler and a foreground command there freezes the app.
+    out8, t8 = drive([b"!echo zode-shell-ok", b"\r"], budget=8.0)
+    ok &= check("`!cmd` runs the command", "zode-shell-ok" in t8, t8)
+    ok &= check("`!cmd` does not break anything", "panic" not in t8.lower(), t8)
+    # And the input is free again afterwards: a `!` that leaves the text in the box
+    # would make the next Enter re-run it.
+    out8b, t8b = drive([b"hola", b"\x15"], budget=8.0)
+    ok &= check("the input is usable after `!`", "panic" not in t8b.lower(), t8b)
 
     if not ok:
-        print("\n--- texto plano (recortado) ---")
+        print("\n--- plain text (truncated) ---")
         for line in t.splitlines()[:40]:
             if line.strip():
                 print("  |", line[:100])

@@ -837,16 +837,30 @@ cambio de layout. Ahora usan `findRow` / `hasBlankRowBetween`, que buscan por
   `providers.keyFor` mira primero las guardadas y luego el entorno, para que
   conectar de verdad sirva para algo.
 
-## UI en ingles
+## Todo el codigo en ingles
 
 La UI visible esta en ingles, el system prompt del agente tambien (los modelos
-responden mejor) y **los comentarios del codigo tambien**. Se cambio en
-septiembre de 2026: el codigo lo lee gente que no es quien lo escribe, y dos
-idiomas en el mismo fichero hacen que las_cauciones se lean a medias.
+responden mejor), **los comentarios del codigo tambien** y **los nombres de test
+tambien**.
 
-Los NOMBRES DE TEST siguen en espanol a proposito: son el indice de lo que
-cubre la suite, y el nombre entero es lo que diria "esto se rompio" si se
-quitara el test.
+Esto se decidio en septiembre de 2026 y se completo en octubre: el codigo lo lee
+gente que no es quien lo escribe, y dos idiomas en el mismo fichero hacen que las
+_cauciones se lean a medias. Un nombre de test es la otra mitad de la precaution:
+es lo que diria "esto se rompio" si se quitara el test, asi que tambien tiene que
+poder leerlo quien no habla el idioma de quien lo escribio.
+
+**Lo que NO se traduce**, porque no es texto: identificadores, nombres de
+protocolo (SSE, JSON-RPC, `session/prompt`), nombres de tool, rutas, cadenas que
+el test assertea (un `⏺` o un `⎿` son parte de la asercion), y los diagramas
+ASCII. El unico sitio donde el Castellano sobrevive es este fichero y el resto
+de la documentacion, que es para el usuario.
+
+Comprobacion (los dos tienen que salir vacios):
+
+```bash
+grep -h '^test "' src/*.zig src/lib/*.zig | grep -P '[\x{00e1}\x{00e9}\x{00ed}\x{00f3}\x{00fa}\x{00f1}\x{00bf}\x{00a1}]'
+grep -rn '^\s*//[/!].*\b\(que\|para\|del\|los\|las\|una\|como\|esta\|mas\)\b' --include=*.zig src/
+```
 
 ## La paleta EJECUTA, no rellena
 
@@ -2107,3 +2121,349 @@ Y el que se queda en `src/` a propósito aunque solo use red: `roster_probe.zig`
 (`@import("tools")`) y no por ruta. `tool_test.zig` estaba roto desde que `execute`
 cambió de firma: nadie lo ejecutaba, y un `zig build tool-test` que no compila es
 la forma más rápida de que nadie lo vuelva a ejecutar.
+
+---
+
+# El modal de `ask`: dos widgets superpuestos (2026-10-02)
+
+El síntoma era "los textos salen de la caga y no se nota qué son opciones". La
+causa no era el texto: eran **DOS widgets** pintados el uno sobre el otro.
+
+- `drawPicker` (tui.zig) se pintaba ANTES y `drawAskPanel` DESPUÉS, y el panel
+  borra su rectángulo con `theme.code_bg`. Las geometrías garantizan el solape:
+  `top = (height - box_h) / 2` contra `y0 = (height - box_h) / 4`, y el panel es
+  además el MÁS ANCHO (`min(max(q_cols+8,44), width-4)` contra `min(width-4,64)`).
+  En 80x24 el borde del panel caía justo encima de la fila `Other…`.
+- El panel **nunca pintaba las opciones**: `snap.options` solo decidía qué texto de
+  ayuda salía. No había forma de que se entendieran, porque no estaban.
+- `desc` ("recommended") se pintaba con el MISMO estilo que el label, así que
+  parecía parte de la opción. Y `theme.selected` era bold+azul **sin fondo**: la
+  fila seleccionada no tenía fondo.
+- header, hint y reloj usaban `brand_faint` (#3b4261) sobre `code_bg` (#1a1b26):
+  1.9:1. Lo único legible del panel era la pregunta.
+- `wrapTextToRows` no miraba `\n`, y el schema de la tool pide "recomendación +
+  razón" (multi-línea): un `\n` interior se pintaba como byte crudo y vaxis lo
+  escribe tal cual.
+
+**Arreglo: un solo widget.** Las opciones se pintan DENTRO del panel, numeradas
+(`▸ 1 postgres ← recommended`), con fondo real y `Other` como última fila. El
+picker modal para `ask` se eliminó (era un menú con filtro y scroll para una lista
+de 5 elementos que no cabe ni desbordarse). `ask_sel` vive en el Model; `↑↓`
+lo mueven, Enter contesta.
+
+Tres cosas más que salieron y que también eran bugs:
+
+1. **El input de texto libre NO respondía la pregunta.** Con pregunta sin
+   opciones, nada ponía `ask_typing`, así que el panel decía "type your answer
+   below" y el input estaba en modo prompt normal: mandar un texto **iniciaba un
+   turno nuevo** en vez de contestar, y quedaba en cola detrás del worker
+   aparcado. Ahora `submitInput` mira `askActive()`, no `askTyping()`.
+2. **`wrapTextToRows` partía por `\n` primero** (ahora), y cada línea se recorta
+   con `putClipped` contra la CAJA y no contra la pantalla. Antes `putText` solo
+   limitaba al ancho del terminal: una opción de 120 columnas en un picker de 64
+   se pintaba 56 columnas fuera de su propio borde.
+3. **El panel tenía alto sin tope**: pregunta larga en terminal estrecha tapaba
+   el input, que es la única forma de contestar. Ahora se recorta a la pantalla y
+   dice `… N more lines of the question`.
+
+Contraste: `theme.brand_faint` es para LÍNEAS (bordes, reglas), nunca para texto.
+`theme.hint` (#7a8399, ~4.5:1) es para texto secundario que hay que poder leer.
+`theme.selected` ganó `.bg`: un resaltado solo con `bold` no se ve a 60 columnas
+de ancho.
+
+# El input: dos wraps distintos (el bug de "no sé qué escribo")
+
+`input_h` se calculaba con `ed.displayLines(text_w)` (cuenta soft wraps) y
+`drawInput` partía con `splitLines` (solo `\n`) y pasaba cada línea a `putText`,
+que **corta en el borde sin avisar**. Resultado: caja de 8 filas, texto en una
+perdiéndose a la derecha, y el cursor anclado a `col = 2 + ancho_acumulado`,
+fuera de la superficie. Cero tests: los de multilínea usan `"a\nb\nc"`, que sí
+pasa.
+
+Ahora hay UNA implementación en `editor.zig`:
+
+- `RowIter` — hard breaks primero, luego wrap **por palabra** (con corte duro para
+  un token más largo que la fila, porque una ruta tiene que caber).
+- `displayLines` = contar filas del iterador (sin alloc).
+- `rowsInWindow(first, want)` = solo las filas que se pintan. Un pegado de 256 KB
+  son ~6500 filas y la caja cabe en 8: contar todas y guardar ocho asignaría las
+  otras 6492 en cada frame.
+- `cursorRowCol` = (fila visual, columna visual). `cursorLine` contaba `\n` y
+  devolvía un índice LÓGICO usado como fila: de ahí el caret fuera de pantalla.
+
+El ancho es `width - 3` en layout y en pintado (la región real va de la columna 2
+a la `width - 1`), y `displayLines` mide con `theme.graphemeWidth` como el pintor
+(antes usaba `cp >= 0x1100`, que no coincide con CJK, emoji ni combining).
+
+`editor.Measure` recibe el `Step` del llamante porque el Editor no sabe qué es un
+grapheme (eso es `vaxis.unicode`) ni cuánto mide en ESTA terminal (`ctx.stringWidth`,
+que depende de lo que vaxis negoció). Adivinar cualquiera de las dos es cómo se
+separan el wrap y el pintado.
+
+# El scroll: el ancla era una línea absoluta (2026-10-02)
+
+`anchor` era un índice de línea absoluto. La altura de un párrafo es una
+**ESTIMACIÓN** hasta que se parsea, y parsear la reemplaza por la real. O sea que
+el mismo número de línea significaba una cosa antes del parseo y otra después: la
+vista saltaba justo cuando el parseo entraba en la ventana, que es mientras te
+estás desplazando. El bucle de convergencia (`layoutFor`, 4 pasadas) lo tapaba en
+el mismo frame, pero el salto ya había pasado.
+
+Arreglo: el ancla es **(párrafo, offset)**, y la línea se deriva de las alturas
+ACTUALES (`anchorLine` / `setAnchorLine`). Si la corrección cae en un párrafo por
+encima, la línea se recalcula y el texto que estás leyendo se queda donde está.
+
+El detalle que hace que funcione: `computeVisible` **solo** re-deriva el ancla
+cuando se queda **sin espacio** (línea > `max_offset`). Re-derivable en cualquier
+otro caso es el bug original con otro nombre: una corrección por encima desplaza
+la línea del ancla, y volver a convertir esa línea desplazada en (párrafo, offset)
+cae en OTRO párrafo, o sea que el lector se mueve justo lo que el arreglo debía
+absorber.
+
+De paso, `estHeight` cuenta los fences (3 filas cada uno: blank + chip + blank),
+que era lo que más lejos se desviaba la estimación.
+
+Tests: "corregir una altura no mueve el texto", "leyendo arriba el texto sigue
+llegando sin mover la vista", "abajo y arriba vuelve a la misma línea", y la
+rueda no desborda el `usize`.
+
+# Markdown y timeline: la mitad del parser no existía (2026-10-02)
+
+`parseLang` distinguía **dos** cosas: bloque de código y "el resto es prosa".
+Cero listas, cero citas, cero rayas, cero links, `*cursiva*` y `~~tachado~~`
+salían literalmente. Y `md.prefix(kind)` iba **solo en la primera fila** de cada
+párrafo, con un sangrado de 2 espacios de continuación igual de ancho que el
+marker: un resultado de 6 filas tenía una fila identificable y cinco que parecían
+un aviso.
+
+Lo que hay ahora (y lo que NO, a propósito):
+
+- **Gutter**: la continuación lleva `│` (`theme.gutter`) en la columna del
+  sangrado. Un glifo por fila y la fila sigue siendo atribuible a su bloque.
+- **Jerarquía mínima**: `-`/`*`/`+` → `•`, `N.`/`N)` conserva el número, la
+  sangría del modelo se vuelve sangría visible, y el cuerpo pasa por el inline
+  normal (el `**bold**` de un item sigue siendo bold). `>` es una barra con su
+  estilo. Un encabezado mete fila en blanco delante (menos cuando abre el
+  párrafo).
+- **Fondo de verdad en los bloques de código**: `applyCodeGutter` pintaba
+  `code_bg` solo en el relleno final, nunca detrás del texto, así que salía una
+  raya oscura de ancho variable en cualquier terminal cuyo fondo no sea #1a1b26.
+  El comentario del código decía que lo daba.
+- **Encabezado ≠ hunk de diff**: ambos eran `bold + fg(4)`, el mismo azul que el
+  `›` del usuario. Ahora el heading es `brand_hi` y el hunk tiene su propio estilo.
+
+El invariante que no se rompe: concatenar los segmentos da la línea original.
+
+# Cache: en OpenAI las tools NO eran cacheables (2026-10-02)
+
+El cache de prompt de OpenAI se indexa por el **prefijo literal** del body, y el
+prefijo deja de servir en el primer byte que cambia. El body era
+`{"model":…,"messages":[…],"stream":…,"tools":[…]}`: como `tools` va DETRÁS del
+array `messages` (que cambia cada turno), esas ~16 KB de schema estático caían
+fuera de la región cacheable en **todas** las peticiones. Poner `tools` antes de
+`messages` las mete de golpe. El orden de un objeto JSON es lo único que decide
+esto, y es fácil de deshacer sin querer: hay un test que mira el orden y que
+parsea el body.
+
+En Anthropic, 3 breakpoints fijos con el tercero en el ÚLTIMO mensaje obligaba a
+reescribir el prefijo entero cada turno (el cache se lee en los breakpoints, no
+de forma continua). Ahora hay 4 (el tope del API) con un par **rodante**: los dos
+últimos mensajes. La mitad vieja se queda en un breakpoint que el turno siguiente
+sí alcanza, así que se LEE y solo se escribe el segmento nuevo.
+
+`cache_creation_input_tokens` no se parseaba, así que `/cache` solo enseñaba
+lecturas. Un prefijo que se reescribe cada turno tiene un hit-rate bonito y sigue
+facturando el prefijo entero: **`writesPerRequest` por encima de 0.5 en una sesión
+larga significa que el prefijo no es estable**.
+
+Y el **orden del system prompt es el cache**: lo que cambia invalida lo que viene
+después. El aviso de read-only (4º de 6) hacía que un `shift+tab` reescribiera
+también la lista de skills y las líneas de ubicación. Ahora el orden es por
+frecuencia de cambio: base · routing · verification · ask · skills · location ·
+(read-only al final).
+
+**Medido o no medido**: en este entorno el hit-rate sale 0% con el router free de
+OpenRouter porque cada request aterriza en un modelo distinto upstream (los prompt
+tokens varían entre 2792 y 3273 para el mismo prompt). El cambio del orden de
+`tools` es correcto según la semántica documentada, pero aquí no se puede ver un
+win.
+
+# Verificar caro: el harness decide, no el modelo (2026-10-02)
+
+La queja: "opencode y claude hacen scripts para verificar cosas y tardan una
+eternidad en terminar una tarea". Dos mitades:
+
+1. **`verification_prompt`** (const propia, como `tool_routing_prompt`, porque un
+   `AGENTS.md` reemplaza el prompt del proyecto): verifica con el comando más
+   estrecho que rompería si estuvieras mal; NO escribas arnés/pty/fuzzer salvo que
+   te lo pidan; lo largo a background y sigue trabajando; no repitas una
+   verificación que ya pasó con el código sin cambios; si falla, arregla la causa
+   y no aflojes el check.
+2. **`src/lib/verify.zig`** — tabla pura y testeada. Un `bash` foreground que
+   coincide con una verificación conocida (`zig build`, `npm test`, `pytest`,
+   `cargo test`, `go test`, `fuzz`, `*_smoke.py`…) **arranca en background
+   aunque el modelo no lo pidiera**, y el resultado le dice que siga trabajando y
+   haga un `bash_output` por paso.
+
+Los tres detalles que costaron:
+
+- **`maketar` no es `make`**: las reglas "en cualquier sitio" buscan PALABRA
+  completa, y `.`, `/`, `-` y `_` son fronteras. Con `.` dentro de la palabra, el
+  `fuzz` no casaba con `fuzz.py` y el `smoke.py` no casaba con `pty_smoke.py`: justo
+  los dos casos que la tabla existe para cazar.
+- **`cd x && cmd`**: los separadores son TODOS. Con `&&` se comía el segundo `&` y
+  la comparación nunca encontraba nada — que es el caso para el que existe la
+  función.
+- **Dos escapes, y son deliberados**: un `timeout_seconds` explícito significa que
+  el modelo sabe lo que hace (eligió un número para ESE comando), y
+  `ZODE_AUTO_BG=0` lo apaga para quien prefiera verlo colgando.
+
+Y lo que NO se automatiza, a propósito: `git commit`, `docker build`, un
+servidor. mandarlos a background sin que nadie los consulte es peor que ser lento.
+
+# `/free-auto`: existía y no se encontraba (2026-10-02)
+
+"no veo el comando de auto-free-model". Estaba en la tabla, pero era el **último
+item del grupo Session** entre veinte más, sin alias y sin estado. Ahora:
+
+- grupo propio **"Free models"**, tercero de la paleta (antes `Session`).
+- alias `/free`.
+- el hint dice el ESTADO: `on · 3/8` cuando está activo. Ver el estado en la
+  paleta es lo que dice que la rotación está corriendo sin tener que preguntarlo.
+- conectar una key **reconstruye el pool**: la lista se construía con los
+  providers que tenían key en ese momento, así que conectar uno después dejaba la
+  rotación ofreciendo los modelos del set viejo.
+
+Y el pool tenía un problema que se ve en `zig build roster-probe` ofrecía
+`google/lyria-3-pro-preview` (música), `lyria-3-clip-preview` y los `clip-*`
+(embeddings) como "el modelo con el que escribir código". El turno falla en el
+primer token, el error se atribuye a la cuota y rota — al siguiente modelo de
+imagen. `models.isConversational(id)` filtra por nombre (es lo único que varios
+providers publican): embeddings, imágenes, vídeo, audio, moderación. Es un filtro,
+no una garantía, y equivocarse cuesta una rotación.
+
+# `tools/pty_smoke.py`: lo que el emulador NO puede comprobar
+
+Descubierto midiendo, no suponiendo: **el texto tecleado en el input no es
+asequible en el smoke**. vaxis redibuja de forma DIFERENCIAL (mueve el cursor y
+parchea celdas) y este emulador concatena el flujo de bytes, así que la última
+redibujada gana por casualidad: teclear "a" y luego "b" tres segundos separados
+sale como "a" seguido de un hueco donde debería estar "b".
+
+Por eso el caso nuevo del prompt largo comprueba que **no se pierde** (que el
+comienzo vuelve en el historial tras Enter) y que la app no se rompe; el wrap de
+verdad lo fijan los tests de `drawTest`, que leen la superficie celda a celda.
+Intentar afinar el emulador para esto es trabajo infinito: la alternativa honesta
+es `tmux`, como ya se hace para ACP.
+
+---
+
+# Subagentes en paralelo, `!` shell, y las tres cosas que limitaban el resto (2026-10-02)
+
+## Subagentes en paralelo: primero hubo que des-globalizar `chat.zig`
+
+`task` se interceptaba ANTES del lote paralelo, así que tres `task` en un mensaje
+eran tres esperas secuenciales, y cada subagente es un bucle de agente completo
+(hasta 8 iteraciones de sus propias llamadas). El criterio de seguridad ya estaba
+escrito y se cumplía: `subagent.tool_names` son solo lecturas.
+
+El bloqueo real eran cuatro globales de módulo que un subagente en paralelo
+pisa:
+
+| Global | Qué pasaba |
+|---|---|
+| `chat.last_usage` | dos peticiones entrelazadas en un `Usage` → `/cache` invención |
+| `chat.last_error_buf/len` | dos fallos entrelazados → cada turno reporta el error del otro |
+| `chat.cancel_current` | el subagente que **empezaba** borraba el ESC del usuario |
+| `bench.subagents` | `usize += 1` desde N hilos es una actualización perdida |
+
+El arreglo no es un candado: es que **el estado sea de la petición**, no del
+módulo. `StreamCtx` lleva ahora `usage`, `err: ErrBuf`, `retry_after` y
+`mirror_globals: bool`. El turno que mira el usuario publica a los globales; un
+subagente no, y además **no llama a `clearCancel()`**: ESC es la señal del usuario
+y se queda puesta para que la obedezca todo el mundo.
+
+Dos trampas que salieron:
+
+- `setServerMessage` PARSEA la clave `"message"` de un cuerpo JSON. El camino del
+  error ya tenía la mensagem extraída, así que pasársela guardaba **nada** y el
+  usuario veía un error vacío donde había uno. Son dos funciones:
+  `setServerMessageInto` (parsea) y `storeErrText` (guarda).
+- `streamRaw` limpiaba `last_usage` y `last_error` al ENTRAR. Con eso dentro de la
+  petición, dos subagentes ya no se pisan: cada uno arranca la suya.
+
+El tope son **3** (`ZODE_TASK_PARALLEL`, `1` = en serie). Tres streams contra la
+misma key son una concurrencia deliberada; seis son un 429 autoinfligido. El paralelismo
+es por OLAS de `limit` hilos, no "N hilos y que se apañen": el contador de
+pendientes ES el semáforo.
+
+Y hay un test que avisa de lo obvio: **la descripción de la tool dice que se pueden
+mandar varios**. Una capacidad que no está en el schema no se usa.
+
+## `!cmd` en el input
+
+Ejecuta el comando y mete la salida **en el contexto**, sin turno y sin token:
+`$ git status` + la salida, como mensaje `user` de la sesión. El modelo ya lo tiene
+la siguiente vez que escribas.
+
+Lo que NO puede ser: correrlo en el hilo de la UI. `submitInput` se llama desde el
+handler de eventos, y un comando foreground ahí congela la app entera (el mismo
+bug del diálogo de permisos, y la misma respuesta): un worker, `beginWorker` /
+`endWorker`, y el resultado entra por la cola `shell_out` que **drena el draw**. El
+append a la sesión pasa en el drain, en el hilo de la UI, porque la sesión (su
+`ArrayList` y su fichero) tiene un dueño y no es thread-safe.
+
+## Tres cosas que limitaban el resto
+
+**1. La compactación tier 2 NO SE EJECUTABA EN LA TUI.** Imprimía "context budget
+reached: summarizing older turns…" y no lo hacía nunca más: `summarizeTurns` tenía
+un único caller, en `main.zig`. Así que el ctx% subía sin freno hasta que el body
+se pasaba del buffer de 1 MiB y el turno moría con un error de writer. El aviso
+era una mentira. Ahora corre antes de la petición, **una vez por sesión** (reintentar
+cada turno es una petición desperdiciada por turno para siempre) y el body se
+compone de la lista ya resumida — porque componerlo de `comp.msgs` hacía de todo
+esto un no-op silencioso.
+
+**2. Los errores de tool volvían al modelo como nombres de Zig.** `allocPrint("{t}",
+.{err})` le daba literalmente `"BadArgs"` o `"UnknownTool"`. Un modelo no puede
+recuperarse de eso: no sabe qué argumento falló, ni si la tool existe, ni qué pide
+el schema. `tools.describeError` dice qué pasó **y qué hacer**, y para
+`UnknownTool` incluye la lista de tools que sí existen.
+
+Y una tool call con argumentos inválidos **no se descartaba en silencio**: se
+emitía igual, para que el ejecutor la reporte. Antes no había tool result, ni error,
+ni línea en el historial, y el turno terminaba como si el modelo solo hubiera
+mandado prosa.
+
+**3. `web_search`: el snippet no era del resultado de al lado.** Se buscaba desde el
+fin del título hasta el **fin del documento**, así que un resultado sin snippet
+propio se llevaba el del siguiente, y el modelo leía una descripción que no tenía
+nada que ver con el título de arriba. Ahora la búsqueda va acotada al bloque. Y si
+`html/` no se parsea, se prueba `lite/` (otra página, otras clases) antes de
+rendirse: un cambio de layout en un endpoint pasa a ser un reintento, no un
+"no hay nada sobre esto".
+
+## Un ctrl+d que salía de la app
+
+`tools/scroll_repro.py` (un script de reproducción en pty, no versionado) falló en
+un caso: "ctrl+d (half page down) redraws". No era el scroll.
+
+`ctrl+d` con el input vacío era **EOF**: `ctx.quit = true`. Y el input vacío es el
+estado NORMAL al desplazar: subes a leer algo, pulsas ctrl+d para volver abajo, y
+**zode se cierra**. `/help` documenta "ctrl+u / ctrl+d = scroll half a page" y la
+barra de estado dice "ctrl+c exits": la app contradecía sus dos propias strings, y
+la tecla de salida era la que anunciaba como scroll.
+
+El handler de scroll estaba DESPUÉS del de EOF, así que el de EOF siempre ganaba.
+La salida es **ctrl+c**, que es lo que dicen los dos sitios.
+
+El test que lo fija hace "arriba y luego abajo" en vez de "abajo se mueve": dónde
+está el final del scroll depende de qué párrafos han sido maquetados (los demás
+siguen con la altura estimada) y un test que fijara una línea absoluta sería un
+test de las estimaciones.
+
+## Verificación
+
+`zig build test` (515), `tools/pty_smoke.py` (con tres casos nuevos: `!cmd` ejecuta
+y deja el input libre, el prompt largo no se pierde, y `/free-auto` se encuentra
+tecleando "free" en Ctrl+P) y `tools/scroll_repro.py`.

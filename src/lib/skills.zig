@@ -206,7 +206,7 @@ pub fn systemPromptSection(entries: []const Entry, out: []u8) []const u8 {
     return w.buffered();
 }
 
-test "splitFrontmatter: separa meta y cuerpo" {
+test "splitFrontmatter: separates meta and body" {
     const text =
         \\---
         \\name: pty-tests
@@ -229,7 +229,7 @@ test "splitFrontmatter: separa meta y cuerpo" {
     try std.testing.expectEqualStrings("# Verifying\nbody here", body_trimmed);
 }
 
-test "splitFrontmatter: comillas, comentarios y CRLF" {
+test "splitFrontmatter: quotes, comments and CRLF" {
     const text =
         \\---
         \\# a comment
@@ -244,22 +244,22 @@ test "splitFrontmatter: comillas, comentarios y CRLF" {
     try std.testing.expectEqualStrings("single quoted", r.meta.description);
 }
 
-test "splitFrontmatter: sin frontmatter es null, y el cuerpo entero es el cuerpo" {
+test "splitFrontmatter: without frontmatter it is null, and the whole body is the body" {
     try std.testing.expect(skills.splitFrontmatter("# just markdown\n\ntext") == null);
-    // Un `---` que no esta al principio de linea es una regla horizontal.
+    // A `---` that is not at the start of a line is a horizontal rule.
     try std.testing.expect(skills.splitFrontmatter("texto --- mas texto") == null);
-    // Frontmatter sin cerrar tambien es null (no se inventa meta).
+    // Unclosed frontmatter is also null (meta is not invented).
     try std.testing.expect(skills.splitFrontmatter("---\nname: x\nsin cerrar") == null);
 }
 
-test "splitFrontmatter: CRLF de verdad" {
+test "splitFrontmatter: real CRLF" {
     const text = "---\r\nname: crlf\r\ndescription: windows\r\n---\r\nbody\r\n";
     const r = skills.splitFrontmatter(text) orelse return error.NoFrontmatter;
     try std.testing.expectEqualStrings("crlf", r.meta.name);
     try std.testing.expectEqualStrings("windows", r.meta.description);
 }
 
-test "validName: lo que se puede meter en un path y en una tool call" {
+test "validName: what can go into a path and into a tool call" {
     try std.testing.expect(skills.validName("pty-tests"));
     try std.testing.expect(skills.validName("skill_2"));
     try std.testing.expect(!skills.validName(""));
@@ -269,25 +269,25 @@ test "validName: lo que se puede meter en un path y en una tool call" {
     try std.testing.expect(!skills.validName("a" ** 65));
 }
 
-test "nameFor: el directorio gana si el frontmatter no sirve" {
+test "nameFor: the directory wins when the frontmatter is unusable" {
     try std.testing.expectEqualStrings("pty-tests", skills.nameFor(.{ .name = "pty-tests" }, "other"));
-    // Un name con una barra es peor que ninguno: la tool call fallaria y el
-    // modelo no tiene forma de descobrir el nombre bueno.
+    // A name with a slash is worse than none: the tool call would fail and the
+    // model has no way to discover the good name.
     try std.testing.expectEqualStrings("dir", skills.nameFor(.{ .name = "bad/name" }, "dir"));
     try std.testing.expectEqualStrings("dir", skills.nameFor(.{}, "dir"));
 }
 
-test "formatSkill: el cuerpo va enmarcado, no suelto" {
+test "formatSkill: the body goes framed, not loose" {
     var buf: [4096]u8 = undefined;
     const out = skills.formatSkill("pty", "use after any tui change", "# Instructions\n", &buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "=== skill: pty ===") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "use when: use after any tui change") != null);
-    // Y dice explicitamente que ahora mandan estas instrucciones.
+    // And it says explicitly that these instructions rule now.
     try std.testing.expect(std.mem.indexOf(u8, out, "they win") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "# Instructions") != null);
 }
 
-test "formatSkill: un skill cortado lo DICE" {
+test "formatSkill: a truncated skill SAYS so" {
     var body: [40_000]u8 = @splat('x');
     var buf: [40_000]u8 = undefined;
     const out = skills.formatSkill("big", "", &body, &buf);
@@ -295,12 +295,12 @@ test "formatSkill: un skill cortado lo DICE" {
     try std.testing.expect(std.mem.indexOf(u8, out, "you are reading part of it") != null);
 }
 
-test "systemPromptSection: sin skills no hay seccion (0 tokens por request)" {
+test "systemPromptSection: with no skills there is no section (0 tokens per request)" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("", skills.systemPromptSection(&.{}, &buf));
 }
 
-test "systemPromptSection: lista nombre + cuando usarla" {
+test "systemPromptSection: lists name + when to use it" {
     const entries = [_]skills.Entry{
         .{ .name = "pty-tests", .description = "after any tui drawing change" },
         .{ .name = "no-desc", .description = "" },
@@ -308,14 +308,14 @@ test "systemPromptSection: lista nombre + cuando usarla" {
     var buf: [2048]u8 = undefined;
     const s = skills.systemPromptSection(&entries, &buf);
     try std.testing.expect(std.mem.indexOf(u8, s, "- pty-tests: after any tui drawing change") != null);
-    // Una skill sin descripcion se lista igual, marcada: esconderla la hace
-    // inusable y el autor ni se entera.
+    // A skill with no description is listed anyway, marked: hiding it makes it
+    // unusable and the author does not even find out.
     try std.testing.expect(std.mem.indexOf(u8, s, "no-desc: (no description") != null);
-    // Y NO lleva el cuerpo: ese es el punto entero del diseño.
+    // And it does NOT carry the body: that is the entire point of the design.
     try std.testing.expect(std.mem.indexOf(u8, s, "load ONE") != null);
 }
 
-test "systemPromptSection: con 50 skills dice cuantas quedan sin listarlas" {
+test "systemPromptSection: with 50 skills it says how many are left without listing them" {
     // Real distinct names, because two skills with the same name would be one
     // skill with a shadowing bug and the test would pass for the wrong reason.
     var entries: [50]skills.Entry = undefined;
@@ -330,18 +330,18 @@ test "systemPromptSection: con 50 skills dice cuantas quedan sin listarlas" {
     try std.testing.expect(std.mem.indexOf(u8, s, "and 10 more") != null);
 }
 
-test "splitFrontmatter: un fichero que ACABA en el fence no revienta" {
-    // El bug que encontraron los tests de `skillstore`: si la ultima linea es el
-    // `---` de cierre y no hay newline final, el indice se pasa una posicion y
-    // `rest[i..]` es un PANIC, no un slice vacio. Y un SKILL.md que termina en el
-    // fence es lo mas normal del mundo.
+test "splitFrontmatter: a file that ENDS at the fence does not blow up" {
+    // The bug the `skillstore` tests found: if the last line is the closing `---`
+    // and there is no final newline, the index goes one position past and
+    // `rest[i..]` is a PANIC, not an empty slice. And a SKILL.md that ends at
+    // the fence is the most normal thing in the world.
     const no_newline = "---\nname: x\ndescription: y\n---";
     const r = skills.splitFrontmatter(no_newline) orelse return error.NoFrontmatter;
     try std.testing.expectEqualStrings("x", r.meta.name);
     try std.testing.expectEqualStrings("y", r.meta.description);
     try std.testing.expectEqualStrings("", r.body);
 
-    // Y con newline, que es el caso de antes, sigue igual.
+    // And with a newline, which was the previous case, it is the same.
     const with_newline = "---\nname: x\n---\nbody\n";
     const r2 = skills.splitFrontmatter(with_newline) orelse return error.NoFrontmatter;
     try std.testing.expectEqualStrings("body", std.mem.trim(u8, r2.body, " \t\r\n"));

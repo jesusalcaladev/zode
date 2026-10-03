@@ -86,6 +86,9 @@ pub const Palette = struct {
     key_len: usize = 0,
     key_msg: [96]u8 = undefined,
     key_msg_len: usize = 0,
+    /// Whether `key_msg` is an error, set by whoever set it. See
+    /// `keyMessageIsError`.
+    key_msg_error: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Palette {
         return .{ .gpa = gpa };
@@ -106,17 +109,24 @@ pub const Palette = struct {
         return self.key_msg[0..self.key_msg_len];
     }
 
-    pub fn setKeyMessage(self: *Palette, msg: []const u8) void {
+    pub fn setKeyMessage(self: *Palette, msg: []const u8, is_error: bool) void {
         const n = @min(msg.len, self.key_msg.len);
         @memcpy(self.key_msg[0..n], msg[0..n]);
         self.key_msg_len = n;
+        self.key_msg_error = is_error;
     }
 
     /// Formatted message (the callers come from `agent`, which cannot touch the
     /// palette's buffer directly).
-    pub fn setKeyMessagef(self: *Palette, comptime fmt: []const u8, args: anytype) void {
+    pub fn setKeyMessagef(self: *Palette, comptime fmt: []const u8, args: anytype, is_error: bool) void {
         const s = std.fmt.bufPrint(&self.key_msg, fmt, args) catch return;
         self.key_msg_len = s.len;
+        self.key_msg_error = is_error;
+    }
+
+    /// Is the current key message an error? Set by whoever set it.
+    pub fn keyMessageIsError(self: *const Palette) bool {
+        return self.key_msg_error;
     }
 
     /// Index (into `items`) of the highlighted provider in the left column, or
@@ -271,6 +281,7 @@ pub const Palette = struct {
         self.query_len = 0;
         self.key_len = 0;
         self.key_msg_len = 0;
+        self.key_msg_error = false;
         self.col = 1;
         self.sel = .{ 0, 0 };
         self.scroll = .{ 0, 0 };
@@ -337,10 +348,14 @@ pub fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
 
 const t = std.testing;
 
-test "matches: prefijo, subcadena, hint y nombre de grupo" {
-    const groups = [_]Group{ .{ .name = "Modelo" }, .{ .name = "Sesión" } };
+test "matches: prefix, substring, hint and group name" {
+    // The group names are what the USER SEES in the palette, so they are English
+    // like the rest of the UI. They used to be "Modelo"/"Sesión" in Spanish,
+    // which made this test a search for "ses" matching "Sesión" by accident of
+    // the accent being absent. It still proves the same thing in English.
+    const groups = [_]Group{ .{ .name = "Model" }, .{ .name = "Session" } };
 
-    // Group "Modelo": searching "model" brings out the whole item.
+    // Group "Model": searching "model" brings out the whole item.
     const it = Item{ .kind = .command, .group = 1, .label = "/model" };
     try t.expect(matches(it, &groups, "")); // empty filter keeps everything
     try t.expect(matches(it, &groups, "/mo")); // prefix
@@ -348,10 +363,10 @@ test "matches: prefijo, subcadena, hint y nombre de grupo" {
     try t.expect(matches(it, &groups, "mod")); // substring: without this it does not show
     try t.expect(matches(it, &groups, "model")); // and by the group name
 
-    // Group "Sesión": "mod" must NOT sneak in (neither by label nor by group).
+    // Group "Session": "mod" must NOT sneak in (neither by label nor by group).
     const it2 = Item{ .kind = .command, .group = 2, .label = "/new" };
     try t.expect(!matches(it2, &groups, "mod"));
-    try t.expect(matches(it2, &groups, "ses")); // yes by the group name
+    try t.expect(matches(it2, &groups, "sess")); // yes by the group name
 
     // A hint matches even when the label does not (the "free" price).
     const it3 = Item{ .kind = .model, .label = "sonnet", .hint = "free" };
@@ -360,7 +375,7 @@ test "matches: prefijo, subcadena, hint y nombre de grupo" {
     try t.expect(!matches(it3, &groups, "gpt"));
 }
 
-test "matches: el grupo NO veta la coincidencia del label" {
+test "matches: the group does NOT veto a label match" {
     // Regression: the group was checked with `return containsIgnoreCase(...)`,
     // that is, as a veto. Searching "sonnet" did not find "claude-sonnet-4",
     // because it lives in the "Models" group and "sonnet" does not appear
@@ -375,7 +390,7 @@ test "matches: el grupo NO veta la coincidencia del label" {
     try t.expect(!matches(m, &groups, "gpt"));
 }
 
-test "refilter: en dos columnas solo filtra la que tiene el foco" {
+test "refilter: in two columns it only filters the one with the focus" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     pal.mode = .models;
@@ -404,7 +419,7 @@ test "refilter: en dos columnas solo filtra la que tiene el foco" {
     try t.expectEqual(@as(usize, 2), pal.countIn(1));
 }
 
-test "refilter: dos columnas, providers y modelos no se mezclan" {
+test "refilter: two columns, providers and models do not mix" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     pal.mode = .models;
@@ -430,7 +445,7 @@ test "refilter: dos columnas, providers y modelos no se mezclan" {
     try t.expectEqual(@as(usize, 3), pal.countIn(0));
 }
 
-test "refilter: la selección se recorta al tamaño de la lista filtrada" {
+test "refilter: the selection is trimmed to the size of the filtered list" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     const items = [_]Item{
@@ -451,7 +466,7 @@ test "refilter: la selección se recorta al tamaño de la lista filtrada" {
     try t.expectEqualStrings("/model", pal.selected().?.label);
 }
 
-test "move: no se sale de los extremos" {
+test "move: does not go past the ends" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     const items = [_]Item{
@@ -470,7 +485,7 @@ test "move: no se sale de los extremos" {
     try t.expectEqual(@as(usize, 0), pal.sel[0]);
 }
 
-test "clampScroll: la selección siempre visible" {
+test "clampScroll: the selection is always visible" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     var items: [10]Item = undefined;
@@ -759,9 +774,19 @@ fn drawKeyPrompt(p: *Painter, pal: *const Palette, box: Box) void {
     const msg = pal.keyMessage();
     const my = top + 5;
     if (msg.len > 0) {
-        const bad = std.mem.indexOf(u8, msg, "no se pudo") != null or
-            std.mem.indexOf(u8, msg, "vacía") != null;
-        _ = p.putText(box.x + 3, my, msg, if (bad) theme.err else theme.brand_soft);
+        // Whether the message is an ERROR is a PROPERTY OF THE MESSAGE, not
+        // something the drawing code re-derives by grepping Spanish words out of
+        // it.
+        //
+        // That is what this used to do: `indexOf(msg, "no se pudo") or
+        // indexOf(msg, "vacía")`. Every caller of `setKeyMessage` had meanwhile
+        // been translated to English ("could not write auth.json", "too many
+        // stored keys", ...), so the flag could never be true and a FAILED key
+        // save was painted in the same calm blue as a successful one. Grepping a
+        // user-facing string for a word in a particular language is the bug: add
+        // one error message in a new language and it silently stops being an
+        // error.
+        _ = p.putText(box.x + 3, my, msg, if (pal.keyMessageIsError()) theme.err else theme.brand_soft);
     }
 
     const hint = "enter saves · esc cancels";
@@ -926,7 +951,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
                     pal.mode = .key_prompt;
                     pal.key_len = 0;
                     pal.key_msg_len = 0;
-                    pal.setKeyMessage("paste the key and press enter");
+                    pal.setKeyMessage("paste the key and press enter", false);
                     break :blk Action{ .none = {} };
                 }
                 break :blk Action{ .set_provider = it.label };
@@ -936,7 +961,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
                 pal.mode = .key_prompt;
                 pal.key_len = 0;
                 pal.key_msg_len = 0;
-                pal.setKeyMessage("choose a provider first");
+                pal.setKeyMessage("choose a provider first", false);
                 break :blk Action{ .none = {} };
             },
         };
@@ -958,7 +983,7 @@ fn backOneGrapheme(s: []const u8) usize {
 
 // ── tests ─────────────────────────────────────────────────────
 
-test "backOneGrapheme: borra un grapheme, no un byte" {
+test "backOneGrapheme: deletes a grapheme, not a byte" {
     // "ñ" is 2 bytes and "🙂" is 4: with a plain `len - 1` stray bytes were
     // left behind and the search accumulated invalid UTF-8 garbage.
     try t.expectEqual(@as(usize, 0), backOneGrapheme(""));
@@ -972,7 +997,7 @@ test "backOneGrapheme: borra un grapheme, no un byte" {
     try t.expectEqual(@as(usize, 4), backOneGrapheme("\xf0\x9f\x99\x82\xc3\xb1"));
 }
 
-test "handleKey: escribir filtra y enter devuelve la acción" {
+test "handleKey: typing filters and enter returns the action" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     const items = [_]Item{
@@ -1001,7 +1026,7 @@ test "handleKey: escribir filtra y enter devuelve la acción" {
     try t.expectEqualStrings("/model", act.run_command);
 }
 
-test "handleKey: esc cierra" {
+test "handleKey: esc closes" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     pal.active = true;
@@ -1010,7 +1035,7 @@ test "handleKey: esc cierra" {
     try t.expect(act == .close);
 }
 
-test "close NO suelta los items propios: los libera el siguiente setItemsOwned" {
+test "close does NOT drop the owned items: the next setItemsOwned frees them" {
     // `close` is called on every Esc and on every executed command, and the
     // palette can be reopened IN PLACE (models → connect). Before, `close` did
     // `items = &.{}` without freeing: every closed Ctrl+P was a leak of the
@@ -1041,7 +1066,7 @@ test "close NO suelta los items propios: los libera el siguiente setItemsOwned" 
     try t.expectEqualStrings("/cache", pal.items[0].label);
 }
 
-test "handleKey: modo modelos, tab cambia de columna" {
+test "handleKey: models mode, tab switches column" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     pal.mode = .models;
@@ -1059,7 +1084,7 @@ test "handleKey: modo modelos, tab cambia de columna" {
     try t.expectEqual(@as(u8, 1), pal.col);
 }
 
-test "handleKey: el prompt de key acumula texto enmascarado" {
+test "handleKey: the key prompt accumulates masked text" {
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     pal.mode = .key_prompt;
@@ -1078,7 +1103,7 @@ test "handleKey: el prompt de key acumula texto enmascarado" {
 
 // ── drawing tests ─────────────────────────────────────────────
 
-test "draw: el modal pinta título, búsqueda y el item resaltado" {
+test "draw: the modal paints title, search and the highlighted item" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var m = tui.Model.init(t.allocator);
@@ -1101,7 +1126,7 @@ test "draw: el modal pinta título, búsqueda y el item resaltado" {
     try t.expect(std.mem.indexOf(u8, all, "/model") != null);
 }
 
-test "draw: los grupos salen con su encabezado y en orden" {
+test "draw: the groups come out with their header and in order" {
     // Regression: each item's row was computed BEFORE the group block, so the
     // label came out one row too high and the header landed on top of the next
     // label. The list looked out of order.
@@ -1139,14 +1164,14 @@ test "draw: los grupos salen con su encabezado y en orden" {
     try t.expect(i_b.? > i_uno.?);
 }
 
-test "draw: modo modelos pinta las dos columnas y el pie" {
+test "draw: models mode paints both columns and the footer" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var m = tui.Model.init(t.allocator);
     defer m.deinit();
 
     m.pal.mode = .models;
-    const groups = [_]Group{ .{ .name = "Providers" }, .{ .name = "" }, .{ .name = "Modelos" } };
+    const groups = [_]Group{ .{ .name = "Providers" }, .{ .name = "" }, .{ .name = "Models" } };
     const items = [_]Item{
         .{ .kind = .provider, .group = 1, .label = "openrouter", .hint = "activo" },
         .{ .kind = .connect, .group = 2, .label = "+ connect" },
@@ -1165,7 +1190,7 @@ test "draw: modo modelos pinta las dos columnas y el pie" {
     try t.expect(std.mem.indexOf(u8, all, "ctrl+a connect") != null);
 }
 
-test "draw: el hint no se pisa con la etiqueta" {
+test "draw: the hint does not overlap the label" {
     // Regression: in the narrow providers column, the default hint was painted
     // on top of the label and you read "anthrclaude-sonnet-4-5".
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -1174,7 +1199,7 @@ test "draw: el hint no se pisa con la etiqueta" {
     defer m.deinit();
 
     m.pal.mode = .models;
-    const groups = [_]Group{ .{ .name = "Providers" }, .{ .name = "" }, .{ .name = "Modelos" } };
+    const groups = [_]Group{ .{ .name = "Providers" }, .{ .name = "" }, .{ .name = "Models" } };
     const items = [_]Item{
         .{ .kind = .provider, .group = 1, .label = "anthropic", .hint = "claude-sonnet-4-5" },
         .{ .kind = .connect, .group = 2, .label = "+ connect" },
@@ -1193,7 +1218,7 @@ test "draw: el hint no se pisa con la etiqueta" {
     try t.expect(std.mem.indexOf(u8, all, "+ connect") != null);
 }
 
-test "displayWidth: cuenta columnas, no bytes" {
+test "displayWidth: counts columns, not bytes" {
     // Model ids carry "/" and "·" (1 column, 1-2 bytes). Counting bytes threw
     // the hint's right column off center.
     try t.expectEqual(@as(usize, 9), displayWidth("anthropic"));
@@ -1201,7 +1226,7 @@ test "displayWidth: cuenta columnas, no bytes" {
     try t.expectEqual(@as(usize, 0), displayWidth(""));
 }
 
-test "draw: el modal Connect lista los providers" {
+test "draw: the Connect modal lists the providers" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     var m = tui.Model.init(t.allocator);
@@ -1223,7 +1248,7 @@ test "draw: el modal Connect lista los providers" {
     try t.expect(std.mem.indexOf(u8, all, "no key") != null);
 }
 
-test "freeItems: todos los strings son copias propias" {
+test "freeItems: all the strings are owned copies" {
     // Regression: the "+ connect" item carried LITERALS ("+ connect", "ctrl+a")
     // and `freeItems` freed them. `gpa.free` on .rodata text is an
     // "Invalid free" that only showed on app exit, with the palette half
@@ -1247,7 +1272,7 @@ test "freeItems: todos los strings son copias propias" {
     freeItems(gpa, items);
 }
 
-test "setItemsOwned: reemplaza y libera lo anterior" {
+test "setItemsOwned: replaces and frees the previous one" {
     const gpa = std.testing.allocator;
     var pal = Palette.init(gpa);
     defer pal.deinit();
@@ -1275,7 +1300,7 @@ test "setItemsOwned: reemplaza y libera lo anterior" {
     try t.expect(!pal.owns_items);
 }
 
-test "modo modelos: la columna de modelos es la que tiene el foco" {
+test "models mode: the models column is the one with the focus" {
     // Regression: `openModelPalette` set the mode AFTER `setItemsOwned`, and
     // `resetSelection` computes the active column from the mode. With the old
     // mode it stayed on the providers column: the arrows did not move the
@@ -1306,7 +1331,7 @@ const model_groups_test = [_]Group{
     .{ .name = "Models" },
 };
 
-test "draw: solo la columna enfocada resalta" {
+test "draw: only the focused column is highlighted" {
     // Both columns highlighted their row and there was no way to know which one
     // had the focus. The one that does not marks with ▸ and dimmed.
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -1328,4 +1353,41 @@ test "draw: solo la columna enfocada resalta" {
     // with the highlight bar, which in plain text is only visible as the whole
     // row.
     try t.expect(std.mem.indexOf(u8, all, "▸") != null);
+}
+
+test "the key message carries whether it is an error, instead of the drawing guessing it" {
+    // Regression. The drawing used to decide whether the "connect a provider"
+    // message was an error by grepping the string for SPANISH words:
+    //
+    //     const bad = indexOf(msg, "no se pudo") != null or indexOf(msg, "vacía") != null;
+    //
+    // Every caller had meanwhile been translated to English ("could not write
+    // auth.json", "too many stored keys", "auth.json is too large"), so `bad`
+    // could never be true: a FAILED key save was painted in the same calm blue
+    // as a successful one, and the only thing that said it had failed was reading
+    // the sentence.
+    //
+    // Grepping a user-facing string for a word in one particular language is the
+    // bug itself: add one error message in another language and it silently stops
+    // being an error. So the flag travels WITH the message now.
+    var pal = Palette.init(std.testing.allocator);
+    defer pal.destroy();
+
+    pal.setKeyMessage("paste the key and press enter", false);
+    try t.expect(!pal.keyMessageIsError());
+
+    pal.setKeyMessage("could not write auth.json", true);
+    try t.expect(pal.keyMessageIsError());
+    try t.expectEqualStrings("could not write auth.json", pal.keyMessage());
+
+    // Formatting keeps the flag too.
+    pal.setKeyMessagef("saved: {s}", .{"opencode"}, false);
+    try t.expect(!pal.keyMessageIsError());
+    try t.expectEqualStrings("saved: opencode", pal.keyMessage());
+
+    // And closing the palette clears it, so a stale error does not colour the
+    // next message.
+    pal.close();
+    try t.expect(!pal.keyMessageIsError());
+    try t.expectEqualStrings("", pal.keyMessage());
 }

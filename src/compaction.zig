@@ -14,8 +14,23 @@ const chat = @import("chat.zig");
 /// full history, so resume/replay never loses data.
 pub const default_context_limit: i64 = 128_000;
 pub const target_pct: i64 = 80;
-/// Recent turns kept verbatim (never elided/summarized).
+/// Recent MESSAGES kept verbatim (never elided/summarized).
+///
+/// It counts messages, not turns, and that is worth knowing: one assistant turn
+/// with tools is 1 assistant message plus N tool messages, so a window of 8 can
+/// be as little as ONE tool round. That is the real ceiling of a long session, and
+/// it is why it is configurable: with a 200k window you can afford to keep more
+/// verbatim and elide less.
+///
+/// `ZODE_RECENT_WINDOW` overrides it.
 pub const recent_window: usize = 8;
+
+pub fn recentWindow(env: ?*const std.process.Environ.Map) usize {
+    const m = env orelse return recent_window;
+    const s = m.get("ZODE_RECENT_WINDOW") orelse return recent_window;
+    const n = std.fmt.parseInt(usize, s, 10) catch return recent_window;
+    return @max(2, @min(n, 200));
+}
 
 pub fn contextLimit(env: ?*const std.process.Environ.Map) i64 {
     const m = env orelse return default_context_limit;
@@ -60,14 +75,23 @@ pub const Compacted = struct {
 
 /// Tier 1: elide old tool results until under budget (or nothing left to
 /// elide). Newest `recent_window` messages are never touched.
-pub fn elideTier(arena: std.mem.Allocator, msgs: []const chat.ChatMessage, budget: i64) !Compacted {
+pub fn elideTier(
+    arena: std.mem.Allocator,
+    msgs: []const chat.ChatMessage,
+    budget: i64,
+    env: ?*const std.process.Environ.Map,
+) !Compacted {
     const out = try arena.alloc(chat.ChatMessage, msgs.len);
     @memcpy(out, msgs);
 
     var elided: usize = 0;
     var elided_at: std.ArrayList(usize) = .empty;
     // Elide from oldest to newest, skipping system (0) and the recent window.
-    const protect_from: usize = if (out.len > recent_window) out.len - recent_window else 0;
+    // The SAME number decides both what is protected and what gets summarized:
+    // with two different numbers the summary could cover messages tier 1 had just
+    // protected, and the summary would be built from already-elided text.
+    const window = recentWindow(env);
+    const protect_from: usize = if (out.len > window) out.len - window else 0;
 
     var i: usize = 1; // skip system
     while (i < protect_from) : (i += 1) {
@@ -116,7 +140,7 @@ pub fn summaryPrompt(arena: std.mem.Allocator, msgs: []const chat.ChatMessage) !
     return out.items;
 }
 
-test "summaryPrompt incluye roles y trunca mensajes largos" {
+test "summaryPrompt includes the roles and truncates long messages" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -140,7 +164,7 @@ test "estimate tokens" {
     try std.testing.expect(t > 100 and t < 130);
 }
 
-test "elide reduce tool dumps pero protege recientes" {
+test "elide shrinks the tool dumps but protects the recent ones" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -157,7 +181,7 @@ test "elide reduce tool dumps pero protege recientes" {
     }
 
     const before = estimateTokens(msgs);
-    const res = try elideTier(arena, msgs, @divTrunc(before, 4)); // very low budget
+    const res = try elideTier(arena, msgs, @divTrunc(before, 4), null); // very low budget
     try std.testing.expect(res.elided > 0);
     try std.testing.expect(estimateTokens(res.msgs) < before);
 
@@ -169,7 +193,7 @@ test "elide reduce tool dumps pero protege recientes" {
     try std.testing.expectEqualStrings("thinking", res.msgs[res.msgs.len - 1].content);
 }
 
-test "sin necesidad de summary si elide alcanza" {
+test "no summary needed when eliding is enough" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -180,42 +204,43 @@ test "sin necesidad de summary si elide alcanza" {
     for (1..12) |i| {
         msgs[i] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c" };
     }
-    const res = try elideTier(arena, msgs, 9000);
+    const res = try elideTier(arena, msgs, 9000, null);
     try std.testing.expect(!res.needs_summary);
     try std.testing.expect(res.elided > 0);
 }
 
-test "elideTier dice QUE mensajes se llevo, no solo cuantos" {
-    // El por que: la cache de lecturas recuerda en que mensaje quedo el contenido
-    // de cada fichero, y sin saber quais se elidieron seguiria diciendo "ya lo
-    // tienes" sobre texto que el modelo ya no tiene. Un contador no sirve.
+test "elideTier says WHICH messages it took, not only how many" {
+    // The reason: the read cache remembers WHICH message the content of each file
+    // ended up in, and without knowing which messages were elided it would keep
+    // saying "you already have that" about text the model no longer has. A count
+    // is not enough.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var msgs: std.ArrayList(chat.ChatMessage) = .empty;
     try msgs.append(arena, .{ .role = "system", .content = "system" });
-    // Alternancia assistant/tool como en el resto de los tests, con resultados
-    // grandes (los de menos de 256 bytes no se eliden por diseño).
+    // assistant/tool alternating like in the rest of the tests, with big
+    // results (the ones under 256 bytes are not elided, by design).
     var i: usize = 0;
     while (i < 6) : (i += 1) {
         try msgs.append(arena, .{ .role = "assistant", .content = "a" });
         try msgs.append(arena, .{ .role = "tool", .content = "x" ** 4000 });
     }
 
-    const res = try elideTier(arena, msgs.items, 1000);
+    const res = try elideTier(arena, msgs.items, 1000, null);
     try std.testing.expect(res.elided > 0);
     try std.testing.expectEqual(res.elided, res.elided_at.len);
 
-    // Los indices son de los ORIGINALES (que es lo que tiene el mensaje en la
-    // sesion), no de la copia recortada, y todos son de role "tool".
+    // The indices are into the ORIGINALS (which is what the message is in the
+    // session), not into the trimmed copy, and they all have role "tool".
     for (res.elided_at) |idx| {
         try std.testing.expect(idx < msgs.items.len);
         try std.testing.expectEqualStrings("tool", msgs.items[idx].role);
     }
 }
 
-test "elideTier no reporta nada cuando no elide nada" {
+test "elideTier reports nothing when it elides nothing" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -223,7 +248,56 @@ test "elideTier no reporta nada cuando no elide nada" {
         .{ .role = "system", .content = "system" },
         .{ .role = "user", .content = "hola" },
     };
-    const res = try elideTier(arena, &msgs, 1_000_000);
+    const res = try elideTier(arena, &msgs, 1_000_000, null);
     try std.testing.expectEqual(@as(usize, 0), res.elided);
     try std.testing.expectEqual(@as(usize, 0), res.elided_at.len);
+}
+
+test "recentWindow is configurable and bounded" {
+    // The window counts MESSAGES, and one assistant turn with tools is 1 + N
+    // messages, so the default of 8 can be a single tool round. Somebody with a
+    // big window wants to keep more verbatim.
+    try std.testing.expectEqual(@as(usize, 8), recentWindow(null));
+
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZODE_RECENT_WINDOW", "24");
+    try std.testing.expectEqual(@as(usize, 24), recentWindow(&map));
+
+    // Nonsense in, default out: a bad environment variable must not elide the
+    // whole history.
+    try map.put("ZODE_RECENT_WINDOW", "muchos");
+    try std.testing.expectEqual(@as(usize, 8), recentWindow(&map));
+    // And it cannot be set to something absurd in either direction.
+    try map.put("ZODE_RECENT_WINDOW", "0");
+    try std.testing.expect(recentWindow(&map) >= 2);
+    try map.put("ZODE_RECENT_WINDOW", "100000");
+    try std.testing.expect(recentWindow(&map) <= 200);
+}
+
+test "a wider window protects more of the tail verbatim" {
+    // The point of the knob: the same history with a wider window keeps more
+    // recent messages out of the elider.
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    var msgs: std.ArrayList(chat.ChatMessage) = .empty;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        try msgs.append(arena, .{
+            .role = "tool",
+            .content = "x" ** 400,
+        });
+    }
+
+    const narrow = try elideTier(arena, msgs.items, 1000, null);
+    var wide_env = std.process.Environ.Map.init(std.testing.allocator);
+    defer wide_env.deinit();
+    try wide_env.put("ZODE_RECENT_WINDOW", "30");
+    const wide = try elideTier(arena, msgs.items, 1000, &wide_env);
+
+    // A wider window protects more, so FEWER messages are elided.
+    try std.testing.expect(wide.elided < narrow.elided);
+    try std.testing.expect(narrow.summary_upto > wide.summary_upto);
 }

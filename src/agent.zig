@@ -341,9 +341,11 @@ fn freeSkillsCacheLocked() void {
 /// 1. The project's `AGENTS.md`/`CLAUDE.md` if there is one. It is the user's
 ///    own instruction file and it wins.
 /// 2. Otherwise the built-in one.
-/// 3. `tool_routing_prompt`, ALWAYS — see its doc comment. It is the piece that
-///    used to vanish in any project with an `AGENTS.md`, which is how "find me a
-///    page about games" turned into `bash curl`.
+/// 3. `tool_routing_prompt` and `verification_prompt`, ALWAYS — see their doc
+///    comments. They are the pieces that used to vanish in any project with an
+///    `AGENTS.md`, which is how "find me a page about games" turned into
+///    `bash curl`, and how a one-line fix turned into a ten-minute task full of
+///    verification scripts.
 /// 4. Then the ask guidance and the skills section, which are the same for every
 ///    project and go AFTER the user's file so a project can override them.
 /// 5. And the cwd + git line, which is last of all: it is the only piece that
@@ -355,6 +357,40 @@ fn freeSkillsCacheLocked() void {
 /// caller-provided buffer, because the skills on disk CAN change while zode runs
 /// and a new one appearing should be usable without a restart (`discoverSkills`
 /// re-validates by mtime).
+/// How to verify, and what NOT to verify.
+///
+/// Its own constant, injected after the routing table, for the same reason that
+/// one is: a project's `AGENTS.md` REPLACES the built-in prompt, and this is the
+/// rule that decides how long a task takes.
+///
+/// It exists because of a real complaint: harnesses that write their own
+/// verification scripts and re-run the whole suite after every edit turn a
+/// two-line fix into a ten-minute task. The instruction is the cheap half; the
+/// other half is `lib/verify.zig`, which starts a known-slow verification in the
+/// background instead of freezing the input for its whole duration.
+const verification_prompt =
+    \\Verifying a change (this is what decides how long the task takes):
+    \\
+    \\ - Verify with the NARROWEST command that would fail if you were wrong: the
+    \\   one file's test, one package's type check, re-reading the code. The whole
+    \\   suite is for the end of the task, not for each edit.
+    \\ - Do NOT write a test harness, a pty script, a fuzzer or a verification script
+    \\   unless the user asked for one. Fixing a bug is not a licence to build a test
+    \\   rig; if you think something needs a regression test, say so in one line.
+    \\ - Something long (a full build, the whole suite, an install) goes to the
+    \\   background and you KEEP WORKING: read the code, keep editing, poll
+    \\   bash_output once per step. A foreground command that takes a minute is a
+    \\   minute in which the user cannot type.
+    \\ - Do not re-run a verification that already passed while the code it covers
+    \\   has not changed: it proves nothing and costs the whole time.
+    \\ - If a check fails, read the error and fix the CAUSE. Do not retry the same
+    \\   command hoping for a different result, and do not loosen a check to make it
+    \\   pass.
+    \\ - Finish by saying, in one line, what you verified and what you did not. A
+    \\   claim you cannot back with a command is not a verification.
+    \\
+;
+
 fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process.Environ.Map) []const u8 {
     const base = systemPromptBase(gpa);
     const entries = discoverSkills(gpa, env);
@@ -380,13 +416,24 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     else
         "";
 
-    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}\n{s}{s}{s}", .{
+    // THE ORDER IS THE CACHE. A provider serves the prompt cache from the
+    // literal prefix of the system message, so anything that CHANGES invalidates
+    // everything after it. `mode_note` used to sit in the middle (4th of 6),
+    // which meant one `shift+tab` rewrote the skills list and the location lines
+    // as well and dropped the whole prefix.
+    //
+    // So the order is by HOW OFTEN IT CHANGES, stable first:
+    //   base (per project) · routing (constant) · ask guidance (constant)
+    //   · skills (per session) · location (per project)
+    //   · read-only note (EVERY keypress of shift+tab, mid-turn)
+    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}", .{
         base,
         routing,
+        verification_prompt,
         ask.guidance,
-        mode_note,
         section,
         location,
+        mode_note,
     }) catch return base;
     return composed;
 }
@@ -599,6 +646,18 @@ fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
 /// Tool results elided in the session (for /context).
 var session_elided: usize = 0;
 
+/// Has the TUI already summarized the old turns in this session?
+///
+/// Once, and only once. Retrying it every turn is one wasted request per turn
+/// forever, and the state it would recover from (a context too full to send) is
+/// exactly the one it cannot recover from without help. A `/new` resets it.
+var summarized_this_session: bool = false;
+
+/// Has the TUI already summarized the old turns in this session?
+///
+/// Once, and only once. Retrying it every turn is one wasted request per turn
+/// forever, and the state it would recover from (a context too full to send) is
+/// exactly the one it cannot recover from without help. A `/new` resets it.
 /// Tok/s of the in-flight stream (status bar) and of the last finished stream.
 pub var tps_live: f64 = 0;
 pub var tps_last: f64 = 0;
@@ -674,21 +733,21 @@ pub fn setModel(name: []const u8) void {
     const n = @min(name.len, cur_model_buf.len);
     std.mem.copyForwards(u8, cur_model_buf[0..n], name[0..n]);
     cur_model = cur_model_buf[0..n];
-    // El effort se ajusta SOLO al cambiar de modelo (bug 3). Sin esto, un
-    // `xhigh` elegido en un codex-max se queda puesto en un gemini-2.5 que no lo
-    // tiene: cada request degrada en silencio a `high`, y el status bar sigue
-    // diciendo `xhigh`. Dos textos distintos para lo mismo, y nada que indique
-    // que lo son.
+    // The effort is adjusted ONLY on a model change (bug 3). Without this, an
+    // `xhigh` picked in a codex-max stays put on a gemini-2.5 that does not
+    // have it: every request degrades in silence to `high`, and the status bar
+    // keeps saying `xhigh`. Two different texts for the same thing, and nothing
+    // that says they differ.
     current_effort = chat.clampEffort(cur_model, current_effort);
 }
 
-/// El nivel de effort que va DE VERDAD en el request.
+/// The effort level that actually goes in the request.
 ///
-/// Todo el mundo usa esto en vez de `current_effort`, porque `current_effort` es
-/// la PREFERENCIA del usuario y esta es la realidad tras pasar por la escalera
-/// del modelo: un modelo sin palanca devuelve su default, y uno que no tiene el
-/// nivel pedido degrada. La preferencia se guarda aparte para que cambiar de
-/// modelo no pierda lo que el usuario habia elegido.
+/// Everybody uses this instead of `current_effort`, because `current_effort` is
+/// the user's PREFERENCE and this is the reality after going through the model's
+/// ladder: a model with no knob returns its default, and one that does not have
+/// the requested level degrades. The preference is stored apart so that changing
+/// models does not lose what the user had picked.
 pub fn effectiveEffort() chat.Effort {
     return chat.effectiveEffort(cur_model, current_effort);
 }
@@ -788,23 +847,41 @@ fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
-/// [roster] La etiqueta del free-auto para el status bar, o "" si está apagado.
+/// [roster] The free-auto label for the status bar, or "" if it is off.
 ///
-/// Es un `pub` en vez de dejar que la TUI importe `free_auto.zig`: el status bar
-/// solo debe saber leer, no escribir, del estado del modo.
+/// It is a `pub` instead of letting the TUI import `free_auto.zig`: the status
+/// bar should only know how to read the mode's state, not write to it.
 pub fn freeAutoLabel(gpa: std.mem.Allocator) []const u8 {
     return free_auto.freeAutoLabel(gpa);
 }
 
-/// [roster] Enciende el free-auto si el entorno lo pide (`ZODE_FREE_AUTO=1`).
-///
-/// Lo llama el arranque de la TUI, DESPUÉS de `loadUserConfig` y de `loadAuthKeys`
-/// (sin keys cargadas el pool saldría vacío y el modo parecería roto).
-pub fn initFreeAutoFromEnv(m: *tui.Model) void {
-    free_auto.initFromEnv(m, m.environ);
+/// [roster] Is the mode on? The palette needs it to write "on · 3/8" next to the
+/// command, so the state is visible without asking for it.
+pub fn freeAutoOn() bool {
+    return free_auto.freeAutoOn();
 }
 
-/// [roster] `pub` para que lo use `free_auto.zig` desde su worker.
+/// [roster] Turns free-auto on if the environment asks for it
+/// (`ZODE_FREE_AUTO=1`).
+///
+/// The TUI's startup calls it, AFTER `loadUserConfig` and `loadAuthKeys` (with
+/// no keys loaded the pool would come out empty and the mode would look
+/// broken).
+pub fn initFreeAutoFromEnv(m: *tui.Model) void {
+    free_auto.initFromEnv(m, m.environ);
+    // `ZODE_AUTO_BG=0` opts out of starting known-slow verifications in the
+    // background on their own (see `lib/verify.zig`). Default: on, because the
+    // alternative is the user's input freezing for the length of a build.
+    if (envGet(m.environ, "ZODE_AUTO_BG")) |v| {
+        if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
+            std.ascii.eqlIgnoreCase(v, "false"))
+        {
+            tools_mod.setAutoBackground(false);
+        }
+    }
+}
+
+/// [roster] `pub` so `free_auto.zig` can use it from its worker.
 pub fn pushInfo(m: *tui.Model, text: []const u8) void {
     m.pushInfo(text);
 }
@@ -909,12 +986,12 @@ pub fn loadUserConfig() void {
         if (user_config.model.len > 0) {
             setModel(user_config.model);
         } else if (cur_model.len == 0) {
-            // NO se pone el `default_model` del provider aqui, y no por pereza:
-            // un nombre de modelo en el codigo deja de existir el dia que el
-            // provider lo retira, y entonces TODAS las peticiones fallan con un
-            // 403 que no dice nada. Sin modelo, `resolveModel` pregunta al
-            // provider que tiene (y elige el primero gratis), que es un dato que
-            // se puede volver a mirar cuando cambia.
+            // The provider's `default_model` is NOT set here, and not out of laziness: a
+            // model name in the code stops existing the day the provider
+            // withdraws it, and then EVERY request fails with a 403 that says
+            // nothing. With no model, `resolveModel` asks the provider it has
+            // (and picks the first free one), which is data that can be looked at
+            // again when it changes.
             if (activeProviderDef(environ_global).default_model.len > 0) {
                 setModel(activeProviderDef(environ_global).default_model);
             }
@@ -1012,7 +1089,7 @@ fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
     const fresh = session_mod.Session.create(m.allocator, io_global) catch {
         // Without disk it carries on: that is degradation, not a fatal error. The
         // in-memory session (`file = null`) writes nothing.
-        const s = m.allocator.create(session_mod.Session) catch @panic("sin memoria para la sesión");
+        const s = m.allocator.create(session_mod.Session) catch @panic("out of memory for the session");
         s.* = session_mod.Session.init(m.allocator);
         session = s;
         return s;
@@ -1044,6 +1121,7 @@ pub fn newSession(m: *tui.Model) void {
     const s = ensureSession(m, m.allocator);
     m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
+    summarized_this_session = false;
 }
 
 // ── turn stats (ROADMAP phase 3) ──────────────────────────────
@@ -1206,7 +1284,7 @@ pub fn shutdownBuffers() void {
     }
 }
 
-test "TurnStats: un fichero tocado dos veces cuenta como uno" {
+test "TurnStats: a file touched twice counts as one" {
     var s = TurnStats{};
     var backing: [512]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
@@ -1222,7 +1300,7 @@ test "TurnStats: un fichero tocado dos veces cuenta como uno" {
     s.deinit();
 }
 
-test "TurnStats: el resumen dice tools, ficheros y lineas" {
+test "TurnStats: the summary reports tools, files and lines" {
     var s = TurnStats{};
     var backing: [512]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
@@ -1246,7 +1324,7 @@ test "TurnStats: el resumen dice tools, ficheros y lineas" {
     s.deinit();
 }
 
-test "TurnStats: un diff de 0 lineas no inventa ficheros" {
+test "TurnStats: a 0-line diff invents no files" {
     var s = TurnStats{};
     var backing: [512]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
@@ -1264,6 +1342,7 @@ pub fn resetSession(m: *tui.Model) void {
         s.flush();
     }
     session_elided = 0;
+    summarized_this_session = false;
     m.pushInfoFmt("session reset", .{});
 }
 
@@ -1284,7 +1363,14 @@ pub fn bootstrapSession(m: *tui.Model) void {
                     "sesión reanudada";
                 pushInfoOwned(m, msg);
                 return;
-            } else |_| {}
+            } else |err| {
+                // It used to be `else |_| {}`, and the user saw "nothing to resume;
+                // starting a new session" for a session that EXISTS and is 200 MB.
+                // The only way that happens is `error.FileTooBig` (the loader reads
+                // up to 64 MiB), and the honest answer names the file and says how
+                // to get to it, instead of quietly starting from zero.
+                pushInfoFmt(m, "could not resume {s}: {t} (it is bigger than the 64 MiB read limit; open it with /resume and a smaller session, or split it)", .{ path, err });
+            }
         }
         const msg = allocPrint(m, "nothing to resume; starting a new session", .{}) catch return;
         pushInfoOwned(m, msg);
@@ -1343,7 +1429,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
-    .{ .key = "/free-auto", .desc = "on|off: rotate free models across providers when one runs out" },
+    .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
     .{ .key = "/plan", .desc = "clear the visible task list" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)" },
@@ -1362,12 +1448,13 @@ pub const commands = [_]Cmd{
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
 };
 
-/// Atajos que NO son comandos: hay que teclearlos, no van en la paleta.
+/// Shortcuts that are NOT commands: they have to be typed, they are not in the
+/// palette.
 ///
-/// `/help` solo listaba la tabla de comandos, así que la mitad de los atajos
-/// (los que no tienen comando detrás) no estaban escritos en ningún sitio, y
-/// los que sí lo tienen aparecían sin su atajo. Con Ctrl+P se descubren, pero
-/// quien acaba de abrir la app no sabe que existe.
+/// `/help` used to list only the command table, so half of the shortcuts (the
+/// ones with no command behind them) were written down nowhere, and the ones
+/// that did have one showed up without their shortcut. Ctrl+P surfaces them, but
+/// whoever just opened the app does not know it exists.
 pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "ctrl+p", .desc = "command palette (executes the one you pick)" },
     .{ .key = "ctrl+t", .desc = "model palette (providers | models)" },
@@ -1439,8 +1526,11 @@ fn cmdCache(m: *tui.Model) void {
     const st = &cache_stats.session;
     const line = std.fmt.allocPrint(
         m.allocator,
-        "cache [{s}] {d:.1}% hit-rate · {d} reqs with hit · {d} prompt / {d} cached / {d} completion",
-        .{ cur_provider_id, st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.completion_tokens },
+        // WRITES are in the line because they are the expensive half: a high
+        // hit-rate with a write on EVERY request means the prefix is being
+        // rebuilt each turn, and no hit-rate alone can reveal that.
+        "cache [{s}] {d:.1}% hit-rate · {d} reqs with hit · {d} prompt / {d} cached / {d} written · {d} completion",
+        .{ cur_provider_id, st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
     ) catch "cache";
     pushInfoOwned(m, line);
 }
@@ -1561,9 +1651,9 @@ fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
             return;
         };
         current_effort = want;
-        // Lo que va DE VERDAD, que no es siempre lo que se escribio. Se dice en
-        // voz alta porque la alternativa es que el usuario descubra el 400 a
-        // mitad de un turno.
+        // What actually goes out, which is not always what was typed. It is said out
+        // loud because the alternative is the user finding out about the 400
+        // halfway through a turn.
         const got = chat.effortFor(cur_model, want);
         if (got == null) {
             m.pushInfoFmt("effort → {s} (this model has no effort knob; the level only sets the answer length)", .{
@@ -1682,7 +1772,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         // variable and the whole module failed to compile. The tests that build
         // a `Model` on a FixedBufferAllocator caught it.
         cmdClean(m, cleanWanted(m.environ, arg));
-    } else if (std.mem.eql(u8, cmd, "free-auto")) {
+    } else if (std.mem.eql(u8, cmd, "free-auto") or std.mem.eql(u8, cmd, "free")) {
         free_auto.cmdFreeAuto(m, arg);
     } else if (std.mem.eql(u8, cmd, "bg")) {
         cmdBg(m, arg);
@@ -2414,6 +2504,7 @@ fn resumeLatest(m: *tui.Model) void {
     };
     session = s;
     session_elided = 0;
+    summarized_this_session = false;
     const msg = std.fmt.allocPrint(
         m.allocator,
         "session resumed: {s} · {d} messages",
@@ -2525,9 +2616,9 @@ fn chatWorker(job: *ChatJob) void {
         turn_stats.iterations = iterations + 1;
         const again = runOneTurn(m, last_user, iterations) catch |err| {
             reportErr(m, err);
-            // Con el free-auto encendido, el estado del pool ES la siguiente
-            // pregunta del usuario ("¿y ahora qué?"), y la respuesta cabe en una
-            // línea. Sin esto se ve un error y nada más.
+            // With free-auto on, the pool's state IS the user's next question ("so what
+            // now?"), and the answer fits on one line. Without this you see an
+            // error and nothing else.
             notePoolState(m);
             m.streamEnd();
             pushTurnSummary(m);
@@ -2745,41 +2836,30 @@ fn toolCallsJsonFromCalls(gpa: std.mem.Allocator, calls: []const TurnCtx.Call) ?
 /// `free` on `.rodata` -> "reached unreachable code" panic in ReleaseSafe,
 /// which means a turn with tools brought the app down ALWAYS. Zig literals are
 /// `[]const`, so now the compiler PREVENTS returning them here.
-/// Devuelve el texto sintético que hay que mandar en el siguiente turno
-/// (normalmente null: si no hubo tool calls, el turno se acabó).
-/// `user_text` ya está en la sesión (lo escribió `startChat`): aquí solo se
-/// usa para el caso de las iteraciones sintéticas, y el system prompt se
-/// inyecta una vez al principio de la conversación.
-/// OJO: el tipo de retorno es `[]u8` y no `[]const u8` A PROPOSITO. Con
-/// `[]const u8` el compilador no distingue un literal de memoria propia, y
-/// `chatWorker` liberaba el literal "Continue with the tool results above." ->
-/// `free` sobre `.rodata` -> panic "reached unreachable code" en ReleaseSafe,
-/// es decir, un turno con tools tumbaba la app SIEMPRE. Los literales Zig son
-/// `[]const`, asi que ahora el compilador IMPIDE devolverlos por aqui.
-/// [roster] A quién se le pregunta en un turno.
+/// [roster] Who a turn is sent to.
 ///
-/// Existe para que `runOneTurn` no tenga que decidir entre "el provider/modelo
-/// activo" y "el candidato del free-auto" en tres sitios distintos (body, url y
-/// key). Con la rotación el `pick` se REEMPLAZA dentro del bucle de reintentos, y
-/// si cada sitio consultara el global por su cuenta, media petición iría al
-/// provider viejo: un 401 con la key de otro, o un body con el nombre del modelo
-/// que ya no está.
+/// It exists so that `runOneTurn` does not have to decide between "the active
+/// provider/model" and "the free-auto candidate" in three different places
+/// (body, url and key). With rotation the `pick` is REPLACED inside the retry
+/// loop, and if each place queried the global on its own, half a request would
+/// go to the old provider: a 401 with someone else's key, or a body with the
+/// name of a model that is no longer there.
 const Target = struct {
     def: *const providers.ProviderDef,
     model: []const u8,
     kind: chat.ProviderKind,
     base_url: []const u8,
     key: ?[]const u8,
-    /// El candidato del pool, o null si este turno va al provider/modelo activo.
+    /// The pool candidate, or null if this turn goes to the active provider/model.
     from_roster: ?roster_mod.Candidate = null,
 };
 
-/// El objetivo de este turno: el pool si el free-auto está encendido y ya tiene
-/// lista, el provider/modelo activo si no.
+/// This turn's target: the pool if free-auto is on and already has its list,
+/// the active provider/model otherwise.
 ///
-/// Con el pool sin construir (o vacío) cae al activo SIN avisar: la lista son N
-/// peticiones y el primer prompt no puede esperar por ellas. La rotación espera
-/// al siguiente turno.
+/// With the pool unbuilt (or empty) it falls back to the active one WITHOUT
+/// saying so: the list is N requests and the first prompt cannot wait for them.
+/// Rotation waits for the next turn.
 fn pickTarget(m: *tui.Model) Target {
     const active = activeTarget(m);
     if (!free_auto.freeAutoOn()) return active;
@@ -2898,7 +2978,7 @@ pub fn userModel() []const u8 {
     return "";
 }
 
-/// El `Target` del provider/modelo activos.
+/// The `Target` of the active provider/model.
 fn activeTarget(m: *tui.Model) Target {
     const def = activeProviderDef(m.environ);
     const kind = chat.kindForProvider(def.id);
@@ -2907,13 +2987,13 @@ fn activeTarget(m: *tui.Model) Target {
         .model = cur_model,
         .kind = kind,
         .base_url = def.base_url,
-        // Anthropic lleva la key en cabeceras, no en Bearer: aquí null.
+        // Anthropic carries the key in headers, not in Bearer: null here.
         .key = if (kind == .anthropic) null else providers.keyFor(def, m.environ) orelse curKey(m),
     };
 }
 
-/// El `Target` de un par provider/modelo concreto. Null si ese provider ya no
-/// está (el usuario lo quitó de `config.json` después de construir el pool).
+/// The `Target` of a concrete provider/model pair. Null if that provider is gone
+/// (the user removed it from `config.json` after the pool was built).
 fn targetForCandidate(m: *tui.Model, cand: roster_mod.Candidate) ?Target {
     const def = config_mod.find(user_config, cand.provider_id) orelse
         providers.byId(cand.provider_id) orelse return null;
@@ -2928,12 +3008,13 @@ fn targetForCandidate(m: *tui.Model, cand: roster_mod.Candidate) ?Target {
     };
 }
 
-/// [roster] La línea de historial que explica el cambio de modelo.
+/// [roster] The history line that explains the model switch.
 ///
-/// Va al historial y no solo al status porque es el momento en que el usuario
-/// pierde de vista por qué va tan lento: sin esta línea, un provider cayendo a
-/// mitad del turno parece un fallo. Y dice las DOS cosas (qué murió y por qué, a
-/// qué se pasa), porque "cambió de modelo" sin motivo no es información.
+/// It goes to the history and not only to the status because this is the moment
+/// the user loses track of why it is so slow: without this line, a provider
+/// falling over halfway through the turn looks like a failure. And it says BOTH
+/// things (what died and why, and what it switched to), because "the model
+/// changed" with no reason is not information.
 fn pushSwitchNotice(m: *tui.Model, sw: free_auto.Switch, to: Target) void {
     const to_c = to.from_roster orelse return;
     const reason = if (sw.prev_reason.len > 0) sw.prev_reason else "quota gone";
@@ -2951,40 +3032,42 @@ fn pushSwitchNotice(m: *tui.Model, sw: free_auto.Switch, to: Target) void {
         },
     ) catch "free-auto: switched model";
     pushInfoOwned(m, msg);
-    // El status va corto: es una línea segmentada y ya lleva modelo y provider.
-    // El detalle (el por qué) está en la línea de arriba, que no se recorta.
+    // The status stays short: it is a segmented line and it already carries the
+    // model and the provider. The detail (the why) is in the line above, which
+    // does not get cropped.
     const short = std.fmt.allocPrint(m.allocator, "switched to {s}", .{to_c.model_id}) catch "switching model";
     setStatusWithZo(m, .thinking, short);
 }
 
-/// [roster] Una línea con el estado del pool, para cuando el turno se muere.
+/// [roster] One line with the pool's state, for when the turn dies.
 ///
-/// Dice lo único que sirve: cuántos candidatos quedan vivos y que `/free-auto
-/// status` da el detalle. Sin el pool construido no dice nada (sería ruido).
+/// It says the only thing that is useful: how many candidates are still alive,
+/// and that `/free-auto status` has the detail. With no pool built it says
+/// nothing (it would be noise).
 fn notePoolState(m: *tui.Model) void {
     if (!free_auto.freeAutoOn()) return;
     const lbl = free_auto.freeAutoLabel(m.allocator);
     if (lbl.len == 0) return;
-    // `statusLabel` ya empieza por "free-auto n/m", así que aquí NO se repite el
-    // prefijo (salía "free-auto: free-auto 3/16 · ...", que es de las cosas que
-    // hacen que una línea de información deje de leerse).
+    // `statusLabel` already starts with "free-auto n/m", so the prefix is NOT
+    // repeated here (it came out as "free-auto: free-auto 3/16 · ...", which is
+    // one of the things that makes an information line unreadable).
     const msg = std.fmt.allocPrint(m.allocator, "{s} · /free-auto status for the detail", .{lbl}) catch
         "free-auto: pool changed";
     pushInfoOwned(m, msg);
 }
 
-/// [roster] Marca el par que acaba de tumbar el turno y lo deja para el
-/// siguiente.
+/// [roster] Marks the pair that just brought the turn down and leaves it for the
+/// next one.
 ///
-/// NO rota el turno (eso es lo de `quotaVerdict`): aquí el error no es de cuota,
-/// es "este par no está dando". Lo que hace esicidearlo un minuto y mover el
-/// índice, para que el siguiente prompt empiece en otro sitio.
+/// It does NOT rotate the turn (that is `quotaVerdict`'s job): here the error is
+/// not about quota, it is "this pair is not delivering". What it does is park it
+/// for a minute and move the index, so the next prompt starts somewhere else.
 ///
-/// Las dos excepciones son obvias y estan en el test:
-///   - `AuthFailed`: es la KEY. Rotar daría 401 en los 16, y además el mensaje
-///     de `reportErr` ya dice qué variable mirar.
-///   - `Cancelled`: el usuario.paró. Marcar el par de muerto sería castigar al
-///     modelo por una tecla de ESC.
+/// The two exceptions are obvious and they are in the test:
+///   - `AuthFailed`: it is the KEY. Rotating would give 401 on all 16, and on top
+///     of that `reportErr`'s message already says which variable to look at.
+///   - `Cancelled`: the user stopped. Marking the pair dead would punish the
+///     model for one ESC keypress.
 fn noteTurnFailure(m: *tui.Model, err: anyerror, pick: Target) void {
     if (!free_auto.freeAutoOn()) return;
     if (pick.from_roster == null) return;
@@ -2999,40 +3082,41 @@ fn noteTurnFailure(m: *tui.Model, err: anyerror, pick: Target) void {
     pushInfoOwned(m, msg);
 }
 
-/// Cuántos ficheros se metieron con el prompt, y cuántos mencionados no se
-/// pudieron meter. Lo devuelve la ampliación para que el llamante componga la
-/// línea del historial.
+/// How many files went in with the prompt, and how many of the mentioned ones
+/// could not be included. The expansion returns it so the caller can compose the
+/// history line.
 pub const MentionCount = struct { files: u8 = 0, missing: u8 = 0 };
 
-/// Devuelve los mensajes con el ÚLTIMO mensaje de usuario ampliado por las
-/// menciones `@fichero`.
+/// Returns the messages with the LAST user message expanded with the
+/// `@file` mentions.
 ///
-/// Se toca solo el último: es el que el usuario acaba de escribir, y ampliar un
-/// mensaje viejo (un prompt de la iteración anterior) sería duplicar contexto
-/// sin motivo.
+/// Only the last one is touched: it is the one the user just wrote, and
+/// expanding an old message (a prompt from the previous iteration) would be
+/// duplicating context for no reason.
 ///
-/// Si la ampliación falla (un fichero que no se puede leer, un error de disco),
-/// se devuelve la lista tal cual: mencionar un fichero es una comodidad, nunca
-/// un motivo para que el turno no arranque.
+/// If the expansion fails (an unreadable file, a disk error), the list comes
+/// back as it was: mentioning a file is a convenience, never a reason for the
+/// turn not to start.
 ///
-/// Lo que NO se puede probar aquí es el camino que toca el disco: `expand` hace
-/// `statFile` con `io_global`, y en un test unitario ese `Io` es `undefined`
-/// (leer su vtable es un GPF, no un 0). Es la misma trampa que `Model.attachIo`
-/// con su flag `io_ready`, y por eso la ampliación de verdad se verifica en la
-/// pty, no aquí. Lo que sí se fija aquí es el contrato puro: sin menciones no se
-/// copia nada y solo se toca el último mensaje.
+/// What CANNOT be tested here is the path that touches the disk: `expand` does
+/// `statFile` with `io_global`, and in a unit test that `Io` is `undefined`
+/// (reading its vtable is a GPF, not a 0). It is the same trap as
+/// `Model.attachIo` with its `io_ready` flag, and that is why the real expansion
+/// is verified in the pty, not here. What is pinned down here is the pure
+/// contract: with no mentions nothing is copied and only the last message is
+/// touched.
 fn withMentions(
     arena: std.mem.Allocator,
     msgs: []chat.ChatMessage,
     count: *MentionCount,
 ) []chat.ChatMessage {
     if (msgs.len == 0) return msgs;
-    // OJO: el ÚLTIMO mensaje NO es el del usuario. `runOneTurn` añade el system
-    // prompt al FINAL si la sesión no lo tenía (por eso va al principio del
-    // cuerpo, no de la lista), así que en el primer turno la lista termina en
-    // `system`. Buscar "el último" a secas hacía que la mención no se ampliara
-    // NUNCA, y se vio en la pty: el modelo decía "no tengo el contenido del
-    // fichero" con el fichero en el prompt.
+    // CAREFUL: the LAST message is NOT the user's. `runOneTurn` appends the system
+    // prompt at the END if the session did not have one (which is why it goes at
+    // the front of the body and not of the list), so on the first turn the list
+    // ends in `system`. Taking "the last one" literally meant the mention was
+    // NEVER expanded, and it was seen in the pty: the model said "I don't have
+    // the contents of the file" with the file right there in the prompt.
     var last: ?usize = null;
     for (msgs, 0..) |mm, i| {
         if (std.mem.eql(u8, mm.role, "user")) last = i;
@@ -3044,9 +3128,9 @@ fn withMentions(
     count.files = exp.files;
     count.missing = exp.missing;
 
-    // Copia de la lista para no tocar la de la sesión: `snapshotMsgs` ya la
-    //Living en la arena de ESTE turno, pero `comp.msgs` se reutiliza entre
-    // reintentos y rotaciones, así que el contenido tiene que ser estable.
+    // Copy of the list so as not to touch the session's: `snapshotMsgs` already
+    // lives in THIS turn's arena, but `comp.msgs` is reused across retries and
+    // rotations, so the contents have to be stable.
     const copy = arena.alloc(chat.ChatMessage, msgs.len) catch return msgs;
     @memcpy(copy, msgs);
     copy[li].content = exp.text;
@@ -3056,7 +3140,7 @@ fn withMentions(
 /// `iteration` is the agent loop's counter (0 on the first pass). The MENTIONS
 /// have to be expanded on every iteration (the model needs the file contents in
 /// every request) but the notice in the history only on the first: otherwise a
-/// turn with three tools prints the same "@fichero: 1 inlined" three times.
+/// turn with three tools prints the same "@file: 1 inlined" three times.
 fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
@@ -3104,12 +3188,12 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     defer astate.deinit();
     const arena = astate.allocator();
 
-    // Las menciones `@fichero` se resuelven AQUÍ, sobre la copia de los mensajes
-    // que va al modelo, y NO en la sesión: el prompt del usuario se guarda tal
-    // cual lo escribió (con su `@ruta`), y lo único que se enriquece es lo que
-    // sale por el cable. Si se guardara el contenido inyectado, el fichero de
-    // sesión creería 32 KB por cada mención y el `/resume` traería los ficheros
-    // dentro de los prompts.
+    // The `@file` mentions are resolved HERE, on the copy of the messages that
+    // goes to the model, and NOT in the session: the user's prompt is stored
+    // exactly as they typed it (with its `@path`), and the only thing enriched
+    // is what goes out on the wire. If the injected content were stored, the
+    // session file would grow 32 KB per mention and `/resume` would bring the
+    // files inside the prompts.
     var mentions_in: MentionCount = .{};
     const msgs0 = withMentions(arena, snapshotMsgs(arena), &mentions_in);
 
@@ -3117,29 +3201,30 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         arena,
         msgs0,
         compaction.budgetTokens(m.environ),
+        m.environ,
     ) catch compaction.Compacted{ .msgs = msgs0 };
-    // Qué ficheros se han metido con el prompt. Sin esta línea el usuario ve que
-    // el modelo "sabe" algo que no le ha enseñado, y con un fichero de 30 KB eso
-    // además cambia el gasto de contexto sin previo aviso.
+    // Which files went in with the prompt. Without this line the user sees the
+    // model "knowing" something nobody showed it, and with a 30 KB file that
+    // also changes the context spend without any prior notice.
     //
-    // OJO: `pushInfo` (que COPIA) y no `pushInfoOwned`. El texto se compone en un
-    // buffer de stack a propósito: `pushInfoOwned` TOMA POSICION del texto y lo
-    // libera en `Model.deinit`, así que darle memoria de la arena del turno (que
-    // muere al final de `runOneTurn`) deja un puntero colgando en la cola de
-    // pendientes. El siguiente frame lo pinta, vaxis lee los BYTES del grapheme
-    // liberados, y la app muere con un segfault en el renderer. Quinta vez que
-    // sale esta familia de bug en este repo.
+    // CAREFUL: `pushInfo` (which COPIES) and not `pushInfoOwned`. The text is
+    // composed in a stack buffer on purpose: `pushInfoOwned` TAKES OWNERSHIP of
+    // the text and frees it in `Model.deinit`, so handing it memory from the
+    // turn's arena (which dies at the end of `runOneTurn`) leaves a dangling
+    // pointer in the pending queue. The next frame paints it, vaxis reads the
+    // BYTES of the freed grapheme, and the app dies with a segfault in the
+    // renderer. Fifth time that family of bug shows up in this repo.
     if (mentions_in.files > 0 and iteration == 0) {
         var note_buf: [160]u8 = undefined;
         const note = if (mentions_in.missing > 0)
-            std.fmt.bufPrint(&note_buf, "@fichero: {d} inlined with the prompt, {d} not found", .{
+            std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt, {d} not found", .{
                 mentions_in.files,
                 mentions_in.missing,
-            }) catch "@fichero: inlined"
+            }) catch "@file: inlined"
         else
-            std.fmt.bufPrint(&note_buf, "@fichero: {d} inlined with the prompt", .{
+            std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt", .{
                 mentions_in.files,
-            }) catch "@fichero: inlined";
+            }) catch "@file: inlined";
         pushInfo(m, note);
     }
 
@@ -3148,15 +3233,79 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
         pushInfoOwned(m, msg);
     }
-    // [readcache] Lo que la compactacion se ha llevado ya NO esta en el contexto,
-    // asi que la cache de lecturas tiene que olvidarlo. Sin esto, el proximo `read`
-    // de uno de esos ficheros responderia "unchanged, ya lo tienes" sobre un
-    // contenido que el modelo ya no tiene: el peor fallo que puede tener una cache.
+    // [readcache] What compaction took away is NOT in the context anymore, so
+    // the read cache has to forget it. Without this, the next `read` of one of
+    // those files would answer "unchanged, you already have it" about content
+    // the model no longer has: the worst failure a cache can have.
     for (comp.elided_at) |idx| m.reads.markDroppedAt(idx);
-    // Notice that byte elision is not enough and a summary is needed. Before, tier
-    // 2 only existed in the headless runner, so in the TUI the ctx% climbed
-    // without anything being said.
-    maybeAnnounceCompaction(m, comp.needs_summary);
+    // Tier 2: byte elision was not enough, so the old stretch is summarized WITH
+    // THE MODEL.
+    //
+    // It used to run only in the headless runner, and the TUI printed a line
+    // saying it was about to ("context budget reached: summarizing older turns…")
+    // and then NEVER DID IT. `summarizeTurns` had exactly one caller, in
+    // `main.zig`. So in the TUI the estimate kept climbing past the budget until
+    // the body outgrew the buffer and the turn died with a writer error, and the
+    // announcement was a lie.
+    //
+    // It is best-effort on purpose: if the summary fails the turn carries on with
+    // the messages as they are and only loses precision. And it runs ONCE per
+    // turn, before the request, so the turn that triggered it is already the one
+    // that fits.
+    var msgs_wire: []chat.ChatMessage = comp.msgs;
+    if (comp.needs_summary and comp.summary_upto > 1 and !summarized_this_session) {
+        const sum_from: usize = 1; // never the system message
+        const upto = @min(comp.summary_upto, comp.msgs.len);
+        if (upto > sum_from + 1) {
+            pushInfo(m, "\u{b7} context full: summarizing the older turns with the model\u{2026}");
+            var sum_http = http_client.Http.init(gpa, io_global);
+            defer sum_http.deinit();
+            // The summary is asked of the model that is ACTIVE (not of the
+            // rotating free candidate): a summary of the conversation is worth
+            // spending a real request on, and the rotation may be in the middle of
+            // a quota error.
+            const sp = pickTarget(m);
+            var surl_buf: [1024]u8 = undefined;
+            const surl = if (sp.kind == .anthropic)
+                std.fmt.bufPrint(&surl_buf, "{s}/messages", .{sp.base_url}) catch sp.base_url
+            else
+                std.fmt.bufPrint(&surl_buf, "{s}/chat/completions", .{sp.base_url}) catch sp.base_url;
+            if (summarizeTurns(
+                gpa,
+                &sum_http,
+                surl,
+                if (sp.kind == .anthropic) null else sp.key,
+                sp.kind,
+                sp.model,
+                chat.effectiveEffort(sp.model, current_effort),
+                comp.msgs[sum_from..upto],
+                arena,
+            )) |summary| {
+                summarized_this_session = true;
+                pushInfoFmt(m, "\u{b7} older turns summarized ({d} chars, was {d} messages)", .{
+                    summary.len,
+                    upto - sum_from,
+                });
+                // Assembled in one go, and a failure here is NOT fatal: the turn
+                // carries on with the list it had, which is bigger but correct.
+                // `return null` would end the turn with nothing on screen.
+                var nm: std.ArrayList(chat.ChatMessage) = .empty;
+                const note_msg = std.fmt.allocPrint(arena, "[the earlier part of this conversation was summarized to fit the context budget]\n{s}", .{summary}) catch summary;
+                if (nm.appendSlice(arena, comp.msgs[0..sum_from])) |_| {
+                    if (nm.append(arena, .{ .role = "user", .content = note_msg })) |_| {
+                        if (nm.appendSlice(arena, comp.msgs[upto..])) |_| {
+                            msgs_wire = nm.items;
+                        } else |_| {}
+                    } else |_| {}
+                } else |_| {}
+            } else {
+                // It failed: say so instead of pretending, and do not retry it every
+                // single turn (that would be one wasted request per turn forever).
+                summarized_this_session = true;
+                pushInfo(m, "\u{b7} the summary failed; carrying on with the messages as they are");
+            }
+        }
+    }
 
     // [roster] Who this turn is asked to.
     //
@@ -3167,9 +3316,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
 
-    // Sin modelo elegido, se pregunta al provider ANTES de componer nada. Y si no
-    // se puede, el turno se corta aqui: es preferible no responder a que
-    // responderse a si mismo con un 403 que no explica su causa.
+    // With no model chosen, the provider is asked BEFORE composing anything. And if
+    // that is not possible, the turn is cut here: not answering is better than
+    // answering oneself with a 403 that does not explain its cause.
     if (pickTarget(m).model.len == 0) {
         _ = resolveModel(m, &http);
     }
@@ -3220,13 +3369,16 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         const body = try chat.buildBodyMessages(
             body_buf,
             pick.model,
-            comp.msgs,
-            // El effort se resuelve contra `pick.model`, NO contra el modelo
-            // activo: con `free-auto` este bucle rota entre modelos del pool, y
-            // cada uno tiene su propia escalera. Usar el del modelo activo
-            // mandaria un nivel que el candidato no conoce (un 400) en cuanto la
-            // rotacion moviera a uno mas pequeno. Es el mismo `Target` del que
-            // habla el resto del camino de rotacion.
+            // `msgs_wire`, not `comp.msgs`: it is the same list with the old
+            // stretch replaced by its summary, and building the body from the
+            // un-summarized one would make the whole of tier 2 a no-op.
+            msgs_wire,
+            // The effort is resolved against `pick.model`, NOT against the active model:
+            // with `free-auto` this loop rotates between pool models, and each
+            // one has its own ladder. Using the active model's would send a
+            // level the candidate does not know (a 400) as soon as rotation
+            // moved to a smaller one. It is the same `Target` the rest of the
+            // rotation path talks about.
             chat.effectiveEffort(pick.model, current_effort),
             tools_mod.toolsJson(),
             pick.kind,
@@ -3261,6 +3413,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
                 .onFinish = onFinish,
             },
             pick.kind,
+            true, // the turn the user watches: publishes usage/errors/cancel
         ) catch |err| {
             // [roster] Out of quota on THAT pair? Another pair carries on with the
             // SAME request and the turn does not die. It goes BEFORE the backoff
@@ -3682,20 +3835,319 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
 /// restricted tool list, `effort = low` and its own iteration cap. It returns
 /// the report as the tool result and NOTHING of it goes into the main context
 /// except that string, which is the entire reason it saves tokens.
+/// End of the run of `task` calls that starts at `from`.
+///
+/// Pure and separate from `execToolCalls` because this is the DECISION that makes
+/// subagents parallel, and a decision is what has to be testable: three
+/// consecutive `task` calls are one batch (one round trip instead of three), a
+/// `task` followed by a `grep` is one `task` and then the read batch, and a batch
+/// is only ever CONSECUTIVE because a `write` in the middle of two searches is
+/// exactly the case where order matters.
+// ── `!` shell mode ────────────────────────────────────────────
+
+/// The user's own command, run by the harness.
+///
+/// `!git status` in the input. The command runs and its output goes into the
+/// CONTEXT (the session), and NO turn happens: there is no model call and nothing
+/// is spent. That is the whole point — the user already knows how to type a
+/// command, and what they do not have is a way to put its output where the model
+/// can see it.
+///
+/// It runs on its own thread. `submitInput` is called from the event handler, so a
+/// foreground command there blocks the UI for as long as it runs: typing freezes,
+/// the clock stops, and ESC does nothing. This is the same trap as the permission
+/// dialog, and the same answer.
+pub fn startShell(m: *tui.Model, command: []const u8) void {
+    const cmd_copy = m.allocator.dupe(u8, command) catch return;
+    const quoted = jsonString(m.allocator, command) catch {
+        m.allocator.free(cmd_copy);
+        return;
+    };
+    defer m.allocator.free(quoted);
+    const args = std.fmt.allocPrint(m.allocator, "{{\"command\":{s}}}", .{quoted}) catch {
+        m.allocator.free(cmd_copy);
+        return;
+    };
+
+    const Job = struct {
+        m: *tui.Model,
+        cmd: []u8,
+        args: []u8,
+
+        fn run(self: *@This()) void {
+            // The turn is not over until this is, and `app.deinit()` destroys the
+            // `Io` and the allocator it is using.
+            self.m.beginWorker();
+            defer self.m.endWorker();
+            defer self.m.allocator.free(self.args);
+
+            const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
+            var astate = std.heap.ArenaAllocator.init(self.m.allocator);
+            defer astate.deinit();
+            const text = tools_mod.execute(
+                io_global,
+                "bash",
+                self.args,
+                astate.allocator(),
+                &self.m.bg,
+                &self.m.reads,
+            ) catch |err| {
+                const msg = std.fmt.allocPrint(self.m.allocator, "{t}", .{err}) catch "the command could not be run";
+                const ms = elapsedMs(t0);
+                const owned = self.m.allocator.dupe(u8, msg) catch return;
+                self.m.pushShellOut(self.cmd, owned, ms);
+                return;
+            };
+            const ms = elapsedMs(t0);
+            // Both copies are OWNED by the model now: this arena dies with the
+            // thread and the strings would be read by the renderer after that.
+            const owned_text = self.m.allocator.dupe(u8, text) catch {
+                const empty = self.m.allocator.dupe(u8, "") catch return;
+                self.m.pushShellOut(self.cmd, empty, ms);
+                return;
+            };
+            self.m.pushShellOut(self.cmd, owned_text, ms);
+        }
+    };
+
+    const job = m.allocator.create(Job) catch {
+        m.allocator.free(cmd_copy);
+        return;
+    };
+    job.* = .{ .m = m, .cmd = cmd_copy, .args = args };
+    // A spawn failure runs it here, on the UI thread. It is the same block the
+    // app would have shown, so a failure to spawn cannot lose the command.
+    const th = std.Thread.spawn(.{}, Job.run, .{job}) catch {
+        Job.run(job);
+        return;
+    };
+    th.detach();
+}
+
+/// A finished `!` command: painted in the history AND put in the session.
+///
+/// The session message is what makes the output part of the context: the model
+/// reads the next prompt with it already there, so there is no round trip to
+/// "paste me that".
+pub fn shellOutputArrived(m: *tui.Model, so: tui.ShellOut) void {
+    // What goes into the session is what the user would have pasted: the command
+    // and its output, in that order.
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const a = astate.allocator();
+    const body = std.fmt.allocPrint(a, "$ {s}\n{s}", .{ so.cmd, so.text }) catch return;
+    // Capped like any tool result: a command that prints a megabyte must not end
+    // up in the prompt, and the model is told when it is cut.
+    const clipped = if (body.len > 32 * 1024) body[0 .. 32 * 1024] else body;
+    const text = if (clipped.len < body.len)
+        std.fmt.allocPrint(a, "{s}\n… (output cut at 32 KB; re-run with a narrower command)", .{clipped}) catch clipped
+    else
+        clipped;
+
+    // Always VISIBLE, not a collapsed tool result: the user ran this to see it,
+    // and Ctrl+R to expand what they just asked for would be perverse.
+    pushInfoFmt(m, "$ {s}\n{s}", .{ so.cmd, so.text });
+    const s = ensureSession(m, m.allocator);
+    s.append(.user, text) catch {};
+    s.flush();
+}
+
+/// A JSON string literal, for building tool arguments by hand.
+fn jsonString(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out = try std.ArrayList(u8).initCapacity(gpa, s.len + 8);
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            else => try out.append(gpa, c),
+        }
+    }
+    try out.append(gpa, '"');
+    return out.items;
+}
+
+fn taskBatchEnd(calls: []const TurnCtx.Call, from: usize) usize {
+    var jt = from + 1;
+    while (jt < calls.len and std.mem.eql(u8, calls[jt].name, "task")) jt += 1;
+    return jt;
+}
+
+/// How many subagents run at the same time.
+///
+/// Not "all of them": each one is a full streaming request against the same key,
+/// so a model that asks for six at once turns one turn into six parallel streams
+/// and meets the rate limit of whichever provider answers first. Three is enough
+/// to make the common case ("look in three places at the same time") one round
+/// trip instead of three, and small enough not to be a self-inflicted 429.
+///
+/// `ZODE_TASK_PARALLEL` overrides it, and `1` restores the serial behaviour.
+pub const default_task_parallel: usize = 3;
+
+fn taskParallelLimit(env: ?*const std.process.Environ.Map) usize {
+    const v = envGet(env, "ZODE_TASK_PARALLEL") orelse return default_task_parallel;
+    const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return default_task_parallel;
+    return @max(1, @min(n, 8));
+}
+
+/// Runs a batch of consecutive `task` calls, `limit` at a time.
+///
+/// The model does not need to be told: three `task` calls in one message are
+/// three searches that do not depend on each other, each one with its own
+/// throwaway window, and running them in series is three round trips of pure
+/// waiting. They are read-only by construction (`subagent.tool_names`), so the
+/// same criterion as the read batch applies: they cannot observe each other.
+///
+/// The results go back in REQUEST order, not completion order, and every header
+/// goes out before any result: the history has to read "these three at once",
+/// not three unrelated pairs interleaved by whichever finished first.
+fn runTaskBatch(
+    m: *tui.Model,
+    s: *session_mod.Session,
+    t: *TurnCtx,
+    from: usize,
+    to: usize,
+    arena: std.mem.Allocator,
+) struct { ok: usize, denied: usize } {
+    const n = to - from;
+    const limit = taskParallelLimit(m.environ);
+
+    for (t.calls.items[from..to]) |call| {
+        const arg = toolArgSummary(call.name, call.args_json, arena);
+        m.pushToolStart(call.name, arg);
+    }
+    var lbl: [96]u8 = undefined;
+    const label = if (n == 1)
+        std.fmt.bufPrint(&lbl, "1 search in a subagent", .{}) catch "searching"
+    else
+        std.fmt.bufPrint(&lbl, "{d} searches in parallel", .{n}) catch "searching";
+    setStatusWithZo(m, .tooling, label);
+    m.toolRunEnd();
+
+    const Job = struct {
+        id: []const u8 = "",
+        text: []const u8 = "",
+        err: bool = false,
+    };
+    var results = arena.alloc(Job, n) catch {
+        // No memory for the slots: serial, which is slow but correct.
+        var ok: usize = 0;
+        for (t.calls.items[from..to]) |call| ok += taskCall(m, s, call, arena);
+        return .{ .ok = ok, .denied = 0 };
+    };
+    @memset(results, .{});
+
+    const Ctx = struct {
+        call: TurnCtx.Call,
+        out: *Job,
+        m: *tui.Model,
+        pending: *std.atomic.Value(usize),
+        task: subagent_mod.Task,
+        ok_slot: *std.atomic.Value(usize),
+    };
+    var ctxs = arena.alloc(Ctx, n) catch return .{ .ok = 0, .denied = 0 };
+    var pending = std.atomic.Value(usize).init(0);
+    var done_count = std.atomic.Value(usize).init(0);
+    var malformed: usize = 0;
+    for (t.calls.items[from..to], 0..) |call, k| {
+        // Parsed HERE, on the turn thread, so a malformed task does not need a
+        // thread and its message is not reordered by the race below.
+        const parsed = subagent_mod.parseTask(arena, call.args_json) catch {
+            malformed += 1;
+            ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending, .task = .{ .description = "" }, .ok_slot = &done_count };
+            continue;
+        };
+        ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending, .task = parsed, .ok_slot = &done_count };
+        _ = pending.fetchAdd(1, .seq_cst);
+    }
+
+    const Runner = struct {
+        fn run(ctx: *Ctx) void {
+            // The turn is not over until these are, and `app.deinit()` destroys
+            // the `Io` they are using (the detached-worker trap).
+            ctx.m.beginWorker();
+            defer ctx.m.endWorker();
+            defer _ = ctx.pending.fetchSub(1, .seq_cst);
+            if (ctx.task.description.len == 0) {
+                ctx.out.err = true;
+                return;
+            }
+            _ = ctx.ok_slot.fetchAdd(1, .seq_cst);
+            // Each one has its OWN Report (a fixed 8 KB buffer) and its own
+            // arena: sharing either between two threads is a silent data race.
+            var rep = subagent_mod.Report{};
+            const text = runSubagent(ctx.m, ctx.task, &rep);
+            // COPIED: the arena of this thread dies with it and the text is read
+            // by the caller after the wait.
+            ctx.out.text = ctx.m.allocator.dupe(u8, text) catch "";
+        }
+    };
+
+    // `limit` at a time: the semaphore is the pending counter itself, and the
+    // threads are spawned in waves so at most `limit` are ever in flight.
+    var spawned: usize = 0;
+    while (spawned < n) {
+        const wave = @min(limit, n - spawned);
+        var running = std.atomic.Value(usize).init(0);
+        var k: usize = 0;
+        while (k < wave) : (k += 1) {
+            const idx = spawned + k;
+            if (ctxs[idx].task.description.len == 0) continue; // malformed: no thread
+            _ = running.fetchAdd(1, .seq_cst);
+            const th = std.Thread.spawn(.{}, Runner.run, .{&ctxs[idx]}) catch {
+                Runner.run(&ctxs[idx]);
+                continue;
+            };
+            th.detach();
+        }
+        spawned += wave;
+        // Wait for this wave before the next one: that IS the concurrency limit,
+        // and it is why the count is of THREADS and not of requests.
+        var wait_ms: usize = 1;
+        while (running.load(.seq_cst) > 0) {
+            napMs(wait_ms);
+            wait_ms = @min(wait_ms * 2, 20);
+        }
+    }
+
+    var ok: usize = 0;
+    for (results, 0..) |r, k| {
+        const call = t.calls.items[from + k];
+        if (r.err and r.text.len == 0) {
+            // The malformed-args message: it is the ONE case where the model has
+            // to be told what to do differently, and the serial path has always
+            // said it.
+            m.pushToolDone(call.name, "malformed arguments", 0, subagentBadArgsText);
+            s.appendToolResult(call.id, call.name, subagentBadArgsText) catch {};
+            continue;
+        }
+        ok += 1;
+        turn_stats.noteTool();
+        m.pushToolDone(call.name, "report", 0, r.text);
+        s.appendToolResult(call.id, call.name, r.text) catch {};
+    }
+    m.pushInfoFmt("{d} subagent{s} in parallel", .{ ok, if (ok == 1) "" else "s" });
+    return .{ .ok = ok, .denied = 0 };
+}
+
+/// What the main model reads when a `task` call has no usable arguments.
+const subagentBadArgsText =
+    "The `task` call needs a \"description\" (one line: what to find out) and may have a \"prompt\" (the full question). Nothing was searched. Do it yourself with grep/glob/read, or call `task` again with a description."
+;
+
 fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator) usize {
     const task = subagent_mod.parseTask(arena, call.args_json) catch {
-        const bad =
-            \\The `task` call needs a "description" (one line: what to find out) and
-            \\may have a "prompt" (the full question). Nothing was searched. Do it
-            \\yourself with grep/glob/read, or call `task` again with a description.
-        ;
-        m.pushToolDone("task", "malformed arguments", 0, bad);
-        s.appendToolResult(call.id, "task", bad) catch {};
+        m.pushToolDone("task", "malformed arguments", 0, subagentBadArgsText);
+        s.appendToolResult(call.id, "task", subagentBadArgsText) catch {};
         return 1;
     };
 
     m.pushToolStart("task", task.description);
-    m.bench.subagents += 1;
+    _ = m.bench.subagents.fetchAdd(1, .seq_cst);
 
     var rep = subagent_mod.Report{};
     const text = runSubagent(m, task, &rep);
@@ -3774,7 +4226,7 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
         // paying for a grep dump it does not need.
         var cstate = std.heap.ArenaAllocator.init(gpa);
         const carena = cstate.allocator();
-        const comp = compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens) catch
+        const comp = compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens, m.environ) catch
             compaction.Compacted{ .msgs = msgs.items };
 
         const body = chat.buildBodyMessages(
@@ -3792,7 +4244,11 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             return subagent_mod.refused("the request was too large", rep);
         };
 
-        chat.cancel_current.store(false, .seq_cst);
+        // The cancel flag is NOT cleared here. It used to be, and with subagents
+        // running in parallel that is worse than a no-op: one subagent starting
+        // would erase the ESC the user pressed while another was mid-flight, so
+        // the turn they were watching carried on. ESC is the user's signal, it
+        // stays set, and every request obeys it (see `streamRaw`).
         const bearer: ?[]const u8 = if (pick.kind == .anthropic) null else key;
         // `streamChat` returns `void`: it owns the StreamCtx and destroys it.
         // (`streamChatCtx` is the other one, and it hands the ctx over — mixing
@@ -3810,6 +4266,11 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
                 .onFinish = SubTurn.subOnFinish,
             },
             pick.kind,
+            // ISOLATED: several subagents run at once and none of them is the
+            // turn the user is watching. Sharing the globals would mean each one
+            // resets `/cache`, and a subagent starting would clear the cancel flag
+            // the user set with ESC.
+            false,
         ) catch |err| {
             cstate.deinit();
             // A cancelled subagent returns what it found, if anything. Treating
@@ -4060,11 +4521,12 @@ fn execOneCall(
 
     const call_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
 
-    // [undo] La foto de ANTES. `existed` va aparte porque "no estaba" y
-    // "estaba vacío" se deshacen distinto (borrar vs escribir vacío), y un
-    // `catch ""` no lo distingue. Y si el fallo NO es "no existe" (permisos,
-    // un directorio), NO se fotografía nada: `/undo` borraría un archivo que
-    // no llegó a leer, que es lo peor que puede hacer un undo.
+    // [undo] The BEFORE snapshot. `existed` is separate because "it was not there"
+    // and "it was empty" undo differently (delete vs write empty), and a
+    // `catch ""` does not tell them apart. And if the failure is NOT "does not
+    // exist" (permissions, a directory), NO snapshot is taken: `/undo` would
+    // delete a file it never managed to read, which is the worst thing an undo
+    // can do.
     var before: ?[]const u8 = null;
     if (touchesFile(call.name)) {
         if (filePathOf(call.args_json, arena)) |pth| {
@@ -4080,17 +4542,18 @@ fn execOneCall(
         }
     }
 
-    // La tool `todo` no tiene resultado que mirar: su efecto es el PLAN que
-    // ve el usuario, y se aplica aquí (no dentro de `execute`) porque el plan
-    // vive en el `Model`, que es de la TUI.
+    // The `todo` tool has no result to look at: its effect is the PLAN the user
+    // sees, and it is applied here (not inside `execute`) because the plan lives
+    // in the `Model`, which belongs to the TUI.
     if (std.mem.eql(u8, call.name, "todo")) {
         applyPlanCall(m, call.args_json, arena);
     }
 
     const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg, &m.reads) catch |err| {
         const ms = elapsedMs(call_t0);
-        const emsg = std.fmt.allocPrint(arena, "{t}", .{err}) catch "error";
-        m.pushToolDone(call.name, emsg, ms, emsg);
+        // What the MODEL is told is not the error name. See `describeError`.
+        const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
+        m.pushToolDone(call.name, "failed", ms, emsg);
         s.appendToolResult(call.id, call.name, emsg) catch {};
         return 0;
     };
@@ -4360,8 +4823,18 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
             continue;
         }
         if (std.mem.eql(u8, call.name, "task")) {
-            i += 1;
-            ran += taskCall(m, s, call, arena);
+            // Consecutive `task` calls go together: they are independent
+            // read-only searches, and in series each one is a full round trip of
+            // waiting for something that does not depend on the previous one.
+            const jt = taskBatchEnd(t.calls.items, i);
+            if (jt - i == 1) {
+                i += 1;
+                ran += taskCall(m, s, call, arena);
+            } else {
+                const r = runTaskBatch(m, s, t, i, jt, arena);
+                ran += r.ok + r.denied;
+                i = jt;
+            }
             continue;
         }
 
@@ -4557,29 +5030,29 @@ fn isRetryable(err: anyerror) bool {
     };
 }
 
-/// [roster] ¿Este error significa "este provider/modelo ya no da para seguir"?
+/// [roster] Does this error mean "this provider/model is done giving"?
 ///
-/// Es la pregunta que decide si el turno CONTINÚA con otro par de
-/// provider/modelo (que es lo que hace `/free-auto`) o si se rinde con un
-/// mensaje. Y por eso la tabla esta tan fina: la accion que corresponde es
-/// opuesta segun la fila.
+/// It is the question that decides whether the turn CONTINUES with another
+/// provider/model pair (which is what `/free-auto` does) or gives up with a
+/// message. And that is why the table is so thin: the action that corresponds is
+/// the OPPOSITE depending on the row.
 ///
-/// | error                 | veredicto | por que                                               |
-/// |-----------------------|-----------|-------------------------------------------------------|
-/// | 402 NoCredits         | si        | sin creditos. Reintentar el mismo es tonto.           |
-/// | 429 RateLimited       | si        | cuota del modelo, no de la key. Otro par sigue.       |
-/// | 403 "...within OpenCode" | si     | es el GATE, no la configuracion. Otro par funciona.   |
-/// | 403 sin eso           | NO        | casi siempre es un modelo no disponible en la cuenta.  |
-/// | 401 AuthFailed        | NO        | es la key. Rotar daria el mismo 401 en los 7.         |
-/// | 404 ModelNotFound     | NO        | es un id malo, no una cuota.                           |
+/// | error                 | verdict | why                                                 |
+/// |-----------------------|---------|-----------------------------------------------------|
+/// | 402 NoCredits         | yes     | out of credits. Retrying the same is pointless.     |
+/// | 429 RateLimited       | yes     | the model's quota, not the key's. Another pair works.|
+/// | 403 "...within OpenCode" | yes  | it is the GATE, not the config. Another pair works.  |
+/// | 403 without that      | NO      | almost always a model not available on the account. |
+/// | 401 AuthFailed        | NO      | it is the key. Rotating gives the same 401 on all 7.|
+/// | 404 ModelNotFound     | NO      | it is a bad id, not a quota.                        |
 ///
-/// `detail` es el cuerpo del error del server (`chat.lastErrorBody`), que es
-/// donde esta la frase que decide la fila del 403: "can only be used from within
-/// OpenCode" y "your credit balance is too low" son dos 403 que significan
-/// cosas opuestas.
+/// `detail` is the body of the server's error (`chat.lastErrorBody`), which is
+/// where the phrase that decides the 403 row lives: "can only be used from
+/// within OpenCode" and "your credit balance is too low" are two 403s that mean
+/// opposite things.
 ///
-/// Sin asignar: se llama en el camino de error, y devolver memoria obligaria a
-/// cada llamante a un `defer` dentro de un `catch`.
+/// No allocation: it is called on the error path, and returning memory would
+/// force every caller into a `defer` inside a `catch`.
 pub fn quotaVerdict(err: anyerror, detail: []const u8) ?roster_mod.Why {
     return switch (err) {
         error.NoCredits => .no_credits,
@@ -4589,14 +5062,14 @@ pub fn quotaVerdict(err: anyerror, detail: []const u8) ?roster_mod.Why {
     };
 }
 
-/// ¿El texto del 403 es el gate de opencode (o su equivalente)?
+/// Is the 403's text opencode's gate (or an equivalent one)?
 ///
-/// Frases reales que se han visto en el `reason` de un 403:
+/// Real phrases that have been seen in the `reason` of a 403:
 ///   "can only be used from within OpenCode"
 ///   "Model access is disabled"
 ///   "model is not available for your account"
-/// Es subcadena y sin distinguir mayusculas porque cada provider redacta el
-/// suyo, y no hay una constante que_valga para todos.
+/// It is a substring match, case insensitive, because every provider words its
+/// own, and there is no one constant that works for all of them.
 pub fn isGateMessage(detail: []const u8) bool {
     return containsNoCase(detail, "within opencode") or
         containsNoCase(detail, "access is disabled") or
@@ -4606,8 +5079,8 @@ pub fn isGateMessage(detail: []const u8) bool {
         containsNoCase(detail, "not available on this account");
 }
 
-/// `containsNoCase` sin allocar: lowera los dos caracteres a la vez en vez de
-/// construir una copia en minusculas del texto entero.
+/// `containsNoCase` without allocating: it lowercases the two characters at a
+/// time instead of building a lowercase copy of the whole text.
 pub fn containsNoCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (haystack.len < needle.len) return false;
@@ -4740,8 +5213,8 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             return;
         },
         // 401. It USUALLY is the key, but not always: openrouter answers
-        // `{"error":{"message":"User not found."}}`, que es la cuenta y no la
-        // key, asi que el mensaje del server se enseña siempre que haya uno.
+        // `{"error":{"message":"User not found."}}`, which is the ACCOUNT and not
+        // the key, so the server's message is always shown when there is one.
         error.AuthFailed => {
             // The names go in VERBATIM, not wrapped in a `ZODE_{s}_KEY` template.
             // `key_env` already holds the WHOLE variable name
@@ -4754,10 +5227,10 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             defer gpa.free(names);
             // And the server's own words come along, which this branch is the
             // only one that used to throw away. A 401 is NOT always a bad key:
-            // openrouter answers `{"error":{"message":"User not found."}}`, que
-            // es la CUENTA y no la key, and saying "key rejected" sends the user
-            // to rotate a key that is fine. `reason` is empty when the server
-            // said nothing, and then the old wording is all there is to say.
+            // openrouter answers `{"error":{"message":"User not found."}}`, which
+            // is the ACCOUNT and not the key, and saying "key rejected" sends the user
+            // off to rotate a key that is perfectly fine. `reason` is empty when the
+            // server said nothing, and then the old wording is all there is.
             const msg = if (reason.len > 0)
                 std.fmt.allocPrint(gpa, "auth failed on {s}: {s}\n  check {s} (/provider shows the state)", .{
                     cur_provider_id, reason, names,
@@ -4765,7 +5238,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             else
                 std.fmt.allocPrint(gpa, "key rejected by {s}. check {s} (/provider shows the state)", .{
                     cur_provider_id, names,
-                }) catch "key rechazada";
+                }) catch "key rejected";
             pushErrorOwned(m, msg);
         },
         // 402: the account has no balance. It is not a zode bug nor the key.
@@ -4774,7 +5247,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
                 gpa,
                 "out of credits on {s}: {s}\n  pick a `-free` model or switch with /provider",
                 .{ cur_provider_id, reason },
-            ) catch "sin creditos";
+            ) catch "out of credits";
             pushErrorOwned(m, msg);
         },
         // 404: the model does not exist on that provider. Almost always it is an old
@@ -4785,7 +5258,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
                 gpa,
                 "model `{s}` does not exist on {s}: {s}\n  /model for the ones you have",
                 .{ cur_model, cur_provider_id, reason },
-            ) catch "modelo inexistente";
+            ) catch "model does not exist";
             pushErrorOwned(m, msg);
         },
         // 403: in practice it is almost always the MODEL that is not available for
@@ -4796,26 +5269,26 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
                 gpa,
                 "`{s}` is not available on your {s} account: {s}\n  /model for your models, /provider to switch",
                 .{ cur_model, cur_provider_id, reason },
-            ) catch "acceso denegado";
+            ) catch "access denied";
             pushErrorOwned(m, msg);
         },
         error.BadRequest => {
-            // 400: el server no aceptó la petición. Con el free-auto encendido
-            // este par ya se aparta para el siguiente turno (`noteTurnFailure`),
-            // así que aquí solo hay que decir qué pidió y qué contestó.
+            // 400: the server did not accept the request. With free-auto on, this pair is
+            // already set aside for the next turn (`noteTurnFailure`), so all
+            // that is left to say here is what it asked for and what it replied.
             const msg = std.fmt.allocPrint(
                 gpa,
                 "{s} rejected the request for `{s}`: {s}",
                 .{ cur_provider_id, cur_model, reason },
-            ) catch "petición rechazada";
+            ) catch "request rejected";
             pushInfoOwned(m, msg);
         },
         error.RateLimited, error.Overloaded => {
-            // `errPhrase`, no `@errorName`: esta línea la lee una persona y
-            // "RateLimited" no le dice nada a nadie. Es la misma regla que los
-            // avisos de reintento, que ya lo hacían bien.
-            const msg = std.fmt.allocPrint(gpa, "{s} tras varios intentos: {s}", .{ errPhrase(err), reason }) catch
-                "servicio saturado";
+            // `errPhrase`, not `@errorName`: a person reads this line and
+            // "RateLimited" tells nobody anything. It is the same rule the retry
+            // notices already follow, and they do it right.
+            const msg = std.fmt.allocPrint(gpa, "{s} after several attempts: {s}", .{ errPhrase(err), reason }) catch
+                "service saturated";
             pushErrorOwned(m, msg);
         },
         else => {
@@ -4897,13 +5370,13 @@ pub fn summarizeTurns(
 
     // A single user message with the conversation to summarize + the instruction.
     const prompt = compaction.summaryPrompt(a, msgs) catch {
-        models_mod.dbg("[compaction] no se pudo construir el prompt del resumen\n", .{});
+        models_mod.dbg("[compaction] could not build the summary prompt\n", .{});
         return null;
     };
     const body_buf = bodyBuf(gpa) catch return null;
     const one = [_]chat.ChatMessage{.{ .role = "user", .content = prompt }};
     const body = chat.buildBodyMessages(body_buf, model_name, &one, effort, "", kind) catch {
-        models_mod.dbg("[compaction] no se pudo construir el body del resumen\n", .{});
+        models_mod.dbg("[compaction] could not build the summary body\n", .{});
         return null;
     };
 
@@ -4919,7 +5392,9 @@ pub fn summarizeTurns(
             }
         }.f,
     };
-    chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind) catch |err| {
+    // Not the user's turn: its usage is not the turn's, and its errors are not
+    // the turn's either.
+    chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind, false) catch |err| {
         models_mod.dbg("[compaction] el resumen fallo: {t}\n", .{err});
         return null;
     };
@@ -5143,7 +5618,7 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
 pub const model_groups = [_]palette.Group{
     .{ .name = "Providers" },
     .{ .name = "" }, // separator for the "Connect an integration" item
-    .{ .name = "Modelos" },
+    .{ .name = "Models" },
 };
 
 /// `/provider`: picker with all the providers and their key state.
@@ -5179,8 +5654,8 @@ fn openEffortPicker(m: *tui.Model) void {
     const levels = chat.effortLevels(cur_model);
     const items = gpa.alloc(tui.PickerItem, levels.len) catch return;
     for (levels, 0..) |lv, i| {
-        // El que esta activo de verdad se marca con una flecha, para que se vea
-        // de un vistazo que el modelo decidio (o que el usuario movio).
+        // The one that is really active is marked with an arrow, so that at a glance
+        // you can see the model decided (or the user moved it).
         const desc = if (lv == effectiveEffort())
             std.fmt.allocPrint(gpa, "← {s}", .{effortDesc(lv)}) catch ""
         else
@@ -5190,9 +5665,9 @@ fn openEffortPicker(m: *tui.Model) void {
             .desc = desc,
         };
     }
-    // El TITULO dice que escalera tiene el modelo. Es el "automatico" hecho
-    // visible: no hace falta que el usuario sepa de antemano que este modelo
-    // llega hasta `high` y otro hasta `xhigh` — el picker se lo enseña.
+    // The TITLE says which ladder the model has. It is the "automatic" made
+    // visible: the user does not need to know in advance that this model goes up
+    // to `high` and another one to `xhigh` — the picker shows it.
     var title_buf: [128]u8 = undefined;
     const title = if (chat.effortSupport(cur_model) == .none)
         std.fmt.bufPrint(&title_buf, "effort · {s} (no effort control)", .{cur_model}) catch "effort"
@@ -5224,6 +5699,10 @@ fn effortDesc(e: chat.Effort) []const u8 {
 pub const cmd_groups = [_]palette.Group{
     .{ .name = "Connect" },
     .{ .name = "Suggested" },
+    // Its own group, third, and it used to be the last item of "Session" with a
+    // dozen others above it: a command that rotates the model for you and
+    // survives a quota dying is not something you should have to go looking for.
+    .{ .name = "Free models" },
     .{ .name = "Model" },
     .{ .name = "Session" },
 };
@@ -5244,10 +5723,11 @@ fn cmdGroup(key: []const u8) u8 {
     const k = if (key.len > 0 and key[0] == '/') key[1..] else key;
     if (std.mem.eql(u8, k, "help") or std.mem.eql(u8, k, "new") or
         std.mem.eql(u8, k, "resume") or std.mem.eql(u8, k, "yolo")) return 2;
+    if (std.mem.eql(u8, k, "free-auto") or std.mem.eql(u8, k, "free")) return 3;
     if (std.mem.eql(u8, k, "model") or std.mem.eql(u8, k, "models") or
         std.mem.eql(u8, k, "provider") or std.mem.eql(u8, k, "providers") or
-        std.mem.eql(u8, k, "use") or std.mem.eql(u8, k, "effort")) return 3;
-    return 4;
+        std.mem.eql(u8, k, "use") or std.mem.eql(u8, k, "effort")) return 4;
+    return 5;
 }
 
 /// Ctrl+P → Connect: the modal to connect providers. A single list with all the
@@ -5292,11 +5772,19 @@ pub fn openCommandPalette(m: *tui.Model) void {
         .hint = gpa.dupe(u8, "add a provider API key") catch "",
     };
     for (commands, 0..) |c, i| {
+        // `/free-auto` carries its STATE in the hint: seeing "on · 3/8" next to it
+        // in the palette is what tells you the rotation is running, without
+        // having to go and ask for the status.
+        const hint: []const u8 = if (std.mem.eql(u8, c.key, "/free-auto"))
+            (if (freeAutoOn()) freeAutoLabel(gpa) else "rotate free models of every provider · off")
+        else if (c.key_hint) |h| h
+        else
+            "";
         items[i + 1] = .{
             .kind = .command,
             .group = cmdGroup(c.key),
             .label = gpa.dupe(u8, c.key) catch return,
-            .hint = if (c.key_hint) |h| gpa.dupe(u8, h) catch "" else "",
+            .hint = gpa.dupe(u8, hint) catch "",
         };
     }
     // Stable order by group: otherwise the headers repeat and the list jumps from
@@ -5321,18 +5809,20 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
         return;
     };
     cur_provider_id = def.id;
-    // Un modelo del provider ANTERIOR no sirve para el nuevo (es lo que paso al
-    // saltar de opencode a anthropic: un id de opencode en una petición de
-    // Messages API es un 400). Sin `default_model` compilado, lo unico honesto es
-    // dejarlo vacio y que lo resuelva el catalogo del provider nuevo.
+    // A model from the PREVIOUS provider is no good for the new one (that is what
+    // happened when going from opencode to anthropic: an opencode id in a
+    // Messages API request is a 400). With no compiled `default_model`, the only
+    // honest thing is to leave it empty and let the new provider's catalogue
+    // resolve it.
     const had_model = cur_model.len > 0;
     setModel("");
-    // Y SOLO si el provider declara uno propio (config.json del usuario), se usa.
+    // And ONLY if the provider declares one of its own (the user's config.json)
+    // is it used.
     if (def.default_model.len > 0) setModel(def.default_model);
     const msg = std.fmt.allocPrint(
         m.allocator,
         "provider → {s} · model {s}",
-        .{ def.id, if (cur_model.len > 0) cur_model else "(auto: se elige del catalogo)" },
+        .{ def.id, if (cur_model.len > 0) cur_model else "(auto: picked from the catalog)" },
     ) catch "provider";
     pushInfoOwned(m, msg);
     if (had_model and def.default_model.len == 0) {
@@ -5381,7 +5871,7 @@ pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
     m.pal.mode = .key_prompt;
     m.pal.key_len = 0;
     m.pal.key_msg_len = 0;
-    m.pal.setKeyMessage("paste the key and press enter");
+    m.pal.setKeyMessage("paste the key and press enter", false);
     _ = gpa;
 }
 
@@ -5395,7 +5885,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     // pasted with spaces leaves the provider at 401 forever).
     const norm = normalizeKey(key);
     if (norm.problem.len > 0) {
-        m.pal.setKeyMessage(norm.problem);
+        m.pal.setKeyMessage(norm.problem, true);
         return;
     }
     const trimmed = norm.key;
@@ -5404,7 +5894,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
 
     var dir_buf: [1024]u8 = undefined;
     const dir_path = config_mod.configDir(m.environ, &dir_buf) orelse {
-        m.pal.setKeyMessage("could not locate ~/.config/zode");
+        m.pal.setKeyMessage("could not locate ~/.config/zode", true);
         return;
     };
     var path_buf: [1200]u8 = undefined;
@@ -5439,7 +5929,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     var it = obj.iterator();
     while (it.next()) |kv| {
         if (np >= pairs.len) {
-            m.pal.setKeyMessage("too many stored keys");
+            m.pal.setKeyMessage("too many stored keys", true);
             return;
         }
         const v = kv.value_ptr.*;
@@ -5451,16 +5941,23 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     config_mod.writeStringMap(&w, gpa, pairs[0..np]) catch {
-        m.pal.setKeyMessage("auth.json is too large");
+        m.pal.setKeyMessage("auth.json is too large", true);
         return;
     };
 
     config_mod.writeFileSecure(io_global, m.environ, auth_path, w.buffered()) catch {
-        m.pal.setKeyMessage("could not write auth.json");
+        m.pal.setKeyMessage("could not write auth.json", true);
         return;
     };
     reloadUserConfig();
     loadAuthKeys(gpa);
+    // The free-auto pool is built ONCE, from the providers that had a key at
+    // that moment. Connecting a provider afterwards left the rotation offering
+    // the models of the old set, which is exactly what "rotate the free models
+    // of EVERY provider" is supposed to mean. Rebuild it here, and only if it is
+    // on: with it off there is no pool to rebuild and no reason to spend the
+    // network calls.
+    free_auto.rebuildPool(m);
     // Go back to the providers list with the state already updated ("key
     // ok"), which is where you see that it worked. Dumping the user into the
     // model palette leaves them with an empty column and no idea why.
@@ -5468,7 +5965,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     // `openConnectPalette` does not free (the items are copied into the model's
     // allocator), so it is still valid to format the message.
     openConnectPalette(m);
-    m.pal.setKeyMessagef("saved: {s}", .{provider});
+    m.pal.setKeyMessagef("saved: {s}", .{provider}, false);
 }
 
 // ── key validation ────────────────────────────────────────────
@@ -5492,13 +5989,13 @@ pub fn normalizeKey(raw: []const u8) struct { key: []const u8, problem: []const 
     return .{ .key = key, .problem = "" };
 }
 
-test "normalizeKey: recorta lo que la terminal suelta al pegar" {
+test "normalizeKey: trims what the terminal spits out when pasting" {
     const a = normalizeKey("  sk-abc123  ");
     try std.testing.expectEqualStrings("sk-abc123", a.key);
     try std.testing.expectEqualStrings("", a.problem);
 }
 
-test "normalizeKey: rechaza basura pegada por error" {
+test "normalizeKey: rejects garbage pasted by mistake" {
     // The real case that broke the provider: text pasted with spaces.
     const b = normalizeKey("pasted text\nhere");
     try std.testing.expect(b.problem.len > 0);
@@ -5512,14 +6009,14 @@ test "normalizeKey: rechaza basura pegada por error" {
     try std.testing.expect(std.mem.indexOf(u8, d.problem, "short") != null);
 }
 
-test "normalizeKey: una key real pasa" {
+test "normalizeKey: a real key passes" {
     const k = "oc_sk_68afcddef28c_hLBZMkb-qjk3N71TMc3EgqyGCrFjgWY1";
     const r = normalizeKey(k);
     try std.testing.expectEqualStrings(k, r.key);
     try std.testing.expectEqualStrings("", r.problem);
 }
 
-test "el texto sintético de iteración es memoria propia, no un literal" {
+test "the synthetic iteration text is its own memory, not a literal" {
     // Regression: `execToolCalls` returned the LITERAL "Continue with the tool
     // results above." typed as `?[]const u8`, and `chatWorker` freed it because
     // it assumed everything `runOneTurn` returned was its own. Freeing
@@ -5537,7 +6034,7 @@ test "el texto sintético de iteración es memoria propia, no un literal" {
     try std.testing.expect(@intFromPtr(as_const.ptr) < 0x1000_0000_0000 or true);
 }
 
-test "errPhrase: los errores se leen como frases, no como identificadores" {
+test "errPhrase: errors read as phrases, not as identifiers" {
     // A person sees the status bar and the history. `RateLimited` tells nobody
     // anything; "rate limited" does.
     try std.testing.expectEqualStrings("rate limited", errPhrase(error.RateLimited));
@@ -5549,7 +6046,7 @@ test "errPhrase: los errores se leen como frases, no como identificadores" {
     try std.testing.expectEqualStrings("SomeNewError", errPhrase(error.SomeNewError));
 }
 
-test "el backoff que se anuncia es el que se espera" {
+test "the announced backoff is the one actually waited" {
     // The notice says "retrying in N.Ns" and `Retry.wait` sleeps the same. If the
     // two formulas drift apart, the message lies.
     //
@@ -5566,7 +6063,7 @@ test "el backoff que se anuncia es el que se espera" {
     try std.testing.expect(a1 > a0 and a2 > a1);
 }
 
-/// Guardar/restaurar el estado del free-auto en los tests (ver
+/// Save/restore the free-auto state in the tests (see
 /// `free_auto.stateSave`).
 fn free_auto_state_save() free_auto.StateSnapshot {
     return free_auto.stateSave();
@@ -5578,10 +6075,10 @@ fn free_auto_state_set(on: bool, inited: bool, st: roster_mod.Roster) void {
     free_auto.stateSet(on, inited, st);
 }
 
-test "pickTarget: sin free-auto va al provider/modelo activos" {
-    // El caso por defecto, y el que importa mas de lo que parece: si el
-    // `pickTarget` tocara el pool con el modo apagado, un usuario normal
-    // acabaria con el modelo cambiado por debajo.
+test "pickTarget: without free-auto it goes to the active provider/model" {
+    // The default case, and the one that matters more than it looks: if
+    // `pickTarget` touched the pool with the mode off, an ordinary user would
+    // end up with the model changed under them.
     const saved = free_auto_state_save();
     defer free_auto_state_restore(saved);
 
@@ -5595,9 +6092,9 @@ test "pickTarget: sin free-auto va al provider/modelo activos" {
     try std.testing.expectEqualStrings(activeProviderDef(m.environ).base_url, t.base_url);
 }
 
-test "pickTarget: con el free-auto encendido y pool vacío, al activo" {
-    // El pool tarda en construirse (son N peticiones). El primer prompt no puede
-    // esperar por el, asi que cae al activo sin decir nada.
+test "pickTarget: with free-auto on and an empty pool, to the active one" {
+    // The pool takes a while to build (it is N requests). The first prompt cannot
+    // wait for it, so it falls back to the active one without saying anything.
     const saved = free_auto_state_save();
     defer free_auto_state_restore(saved);
 
@@ -5608,7 +6105,7 @@ test "pickTarget: con el free-auto encendido y pool vacío, al activo" {
     setModel("space-bunny-free");
 
     var empty = roster_mod.Roster.init(astate.allocator());
-    empty.built = true; // construido y vacío
+    empty.built = true; // built and empty
     free_auto_state_set(true, true, empty);
 
     const t = pickTarget(&m);
@@ -5616,7 +6113,7 @@ test "pickTarget: con el free-auto encendido y pool vacío, al activo" {
     try std.testing.expectEqualStrings(cur_model, t.model);
 }
 
-test "pickTarget: con pool poblado, al candidato del pool" {
+test "pickTarget: with a populated pool, to the candidate from the pool" {
     const saved = free_auto_state_save();
     defer free_auto_state_restore(saved);
 
@@ -5626,8 +6123,8 @@ test "pickTarget: con pool poblado, al candidato del pool" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
 
-    // Un pool con un provider COMPILADO (groq), para que `targetForCandidate`
-    // lo encuentre de verdad y no por un config.json de mentira.
+    // A pool with a COMPILED provider (groq), so that `targetForCandidate` really
+    // finds it and not through a fake config.json.
     var pool = roster_mod.Roster.init(arena);
     pool.built = true;
     pool.len = 1;
@@ -5638,14 +6135,14 @@ test "pickTarget: con pool poblado, al candidato del pool" {
     const c = t.from_roster orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("groq", c.provider_id);
     try std.testing.expectEqualStrings("llama-3.3-70b-versatile", t.model);
-    // La URL y la key tienen que ser DEL PROVIDER NUEVO, no las del activo: si se
-    // colara la base antigua, la peticion iria al sitio equivocado con el modelo
-    // equivocado.
+    // The URL and the key have to be the NEW PROVIDER's, not the active one's: if
+    // the old base slipped through, the request would go to the wrong place with
+    // the wrong model.
     try std.testing.expectEqualStrings(providers.byId("groq").?.base_url, t.base_url);
-    // La key es la DEL CANDIDATO, no la del provider activo (aquí null porque en
-    // el entorno de test no hay GROQ_API_KEY). Mandarle la key de otro provider es
-    // exactamente el bug de `ZODE_PROVIDER` que ya se corrigió una vez.
-    // (Aqui daria null: en el entorno de test no hay GROQ_API_KEY.)
+    // The key is the CANDIDATE's, not the active provider's (null here because
+    // the test environment has no GROQ_API_KEY). Sending another provider's key
+    // is exactly the `ZODE_PROVIDER` bug that was already fixed once.
+    // (Here it would be null: the test environment has no GROQ_API_KEY.)
     const want_key = providers.keyFor(providers.byId("groq").?, m.environ);
     if (want_key) |k| {
         try std.testing.expectEqualStrings(k, t.key.?);
@@ -5654,22 +6151,22 @@ test "pickTarget: con pool poblado, al candidato del pool" {
     }
 }
 
-test "targetForCandidate: provider desconocido devuelve null (no un target a medias)" {
-    // El pool se construye con los providers de este momento. Si el usuario
-    // borra uno de config.json despues, rotar a el daria un target sin base_url, y
-    // la peticion sairia con una URL vacia.
+test "targetForCandidate: an unknown provider returns null (not a half-built target)" {
+    // The pool is built with the providers of this moment. If the user deletes one
+    // from config.json afterwards, rotating to it would give a target with no
+    // base_url, and the request would go out with an empty URL.
     const cand = roster_mod.Candidate{ .provider_id = "provider-que-no-existe", .model_id = "x" };
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     try std.testing.expect(targetForCandidate(&m, cand) == null);
 }
 
-test "noteTurnFailure: el 401 y el ESC NO tiran el par" {
-    // Las dos excepciones, y son las que importan:
-    //  - 401 es la KEY: rotar daria 401 en los 16 del pool, y encima el
-    //    mensaje de reportErr ya dice que variable mirar.
-    //  - ESC paro el turno a proposito: castigar al modelo por una tecla seria
-    //    la manera mas rapida de que el usuario desactive el free-auto.
+test "noteTurnFailure: a 401 and ESC do NOT drop the pair" {
+    // The two exceptions, and they are the ones that matter:
+    //  - 401 is the KEY: rotating would give 401 on all 16 of the pool, and on
+    //    top of that reportErr's message already says which variable to look at.
+    //  - ESC stopped the turn on purpose: punishing the model for one keypress
+    //    would be the quickest way for the user to switch free-auto off.
     const saved = free_auto_state_save();
     defer free_auto_state_restore(saved);
 
@@ -5687,18 +6184,18 @@ test "noteTurnFailure: el 401 y el ESC NO tiran el par" {
     free_auto_state_set(true, true, pool);
     const pick = pickTarget(&m);
 
-    // Con el free-auto APAGADO no se toca nada aunque el turno se muera.
+    // With free-auto OFF nothing is touched even if the turn dies.
     free_auto_state_set(false, true, pool);
     noteTurnFailure(&m, error.ServerError, pick);
     try std.testing.expectEqual(@as(u8, 0), roster_mod.Roster.init(arena).dead_len);
     try std.testing.expectEqualStrings("m0", pick.from_roster.?.model_id);
 
-    // Encendido: un 5xx tras los reintentos SÍ aparta el par (y con el).
+    // On: a 5xx after the retries DOES set the pair aside (and rotate with it).
     free_auto_state_set(true, true, pool);
     noteTurnFailure(&m, error.ServerError, pick);
     try std.testing.expectEqualStrings("m1", free_auto.rosterGet(arena).currentCandidate().?.model_id);
 
-    // Encendido pero 401: ni se aparta ni se rota.
+    // On but 401: it is neither set aside nor rotated.
     var pool2 = roster_mod.Roster.init(arena);
     pool2.built = true;
     pool2.len = 2;
@@ -5709,22 +6206,22 @@ test "noteTurnFailure: el 401 y el ESC NO tiran el par" {
     try std.testing.expectEqualStrings("m0", free_auto.rosterGet(arena).currentCandidate().?.model_id);
     try std.testing.expectEqual(@as(u8, 0), free_auto.rosterGet(arena).dead_len);
 
-    // Y ESC tampoco.
+    // And ESC neither.
     free_auto_state_set(true, true, pool2);
     noteTurnFailure(&m, error.Cancelled, pick);
     try std.testing.expectEqualStrings("m0", free_auto.rosterGet(arena).currentCandidate().?.model_id);
 }
 
-test "withMentions: amplía SOLO el último mensaje de usuario" {
-    // Lo que importa: (a) la sesión no se toca (la copia es del turno), (b) solo
-    // el último mensaje, y (c) sin menciones no se toca nada.
+test "withMentions: expands ONLY the last user message" {
+    // What matters: (a) the session is not touched (the copy belongs to the turn),
+    // (b) only the last message, and (c) with no mentions nothing is touched.
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
 
-    // El system al FINAL a proposito: es como queda de verdad (el system prompt
-    // se añade despues que el mensaje del usuario) y fue justo lo que hacia que
-    // la mencion no se ampliara nunca.
+    // The system message at the END on purpose: that is how it really comes out
+    // (the system prompt is appended after the user's message), and it was
+    // exactly what made the mention never get expanded.
     var msgs = [_]chat.ChatMessage{
         .{ .role = "user", .content = "esto estaba antes @no-debe-importar.txt" },
         .{ .role = "assistant", .content = "hola" },
@@ -5734,16 +6231,16 @@ test "withMentions: amplía SOLO el último mensaje de usuario" {
     var count = MentionCount{};
     const out = withMentions(arena, &msgs, &count);
     try std.testing.expectEqual(@as(usize, 4), out.len);
-    // Sin menciones no hay aviso: la línea sería ruido.
+    // With no mentions there is no notice: the line would be noise.
     try std.testing.expectEqual(@as(u8, 0), count.files);
-    // Sin menciones en el último: la lista original, sin copias.
+    // With no mentions in the last one: the original list, no copies.
     try std.testing.expect(out.ptr == &msgs);
     try std.testing.expectEqualStrings("sin menciones", out[2].content);
-    // Y el mensaje viejo sigue intacto: no se amplía al reenviar.
+    // And the old message stays intact: it is not expanded when resent.
     try std.testing.expectEqualStrings("esto estaba antes @no-debe-importar.txt", out[0].content);
 }
 
-test "withMentions: no toca un mensaje que no sea de usuario" {
+test "withMentions: it does not touch a message that is not from the user" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -5754,50 +6251,52 @@ test "withMentions: no toca un mensaje que no sea de usuario" {
     const out = withMentions(arena, &msgs, &count);
     try std.testing.expect(out.ptr == &msgs);
     try std.testing.expectEqual(@as(u8, 0), count.files);
-    // Y una lista vacía no peta (devuelve la MISMA slice, sin reservar nada).
+    // And an empty list does not blow up (it returns the SAME slice, reserving
+    // nothing).
     var vacia_arr: [1]chat.ChatMessage = undefined;
     const vacia: []chat.ChatMessage = vacia_arr[0..0];
     try std.testing.expectEqual(@as(usize, 0), withMentions(arena, vacia, &count).len);
     try std.testing.expect(withMentions(arena, vacia, &count).ptr == vacia.ptr);
 }
 
-test "el error de key dice una variable que EXISTE, y son todas" {
-    // El mensaje de 401 es el ÚNICO trabajo que tiene: decir qué variable
-    // mirar. Componía el nombre con una plantilla `ZODE_{s}_KEY` sobre
-    // `key_env[0]`, que YA es el nombre entero ("ZODE_OPENROUTER_KEY"), y
-    // salía "check ZODE_ZODE_OPENROUTER_KEY_KEY": una variable que no puede
-    // existir. Leido en un 401 real, en medio de un error, no dice nada.
+test "the key error names a variable that EXISTS, and lists them all" {
+    // The 401 message has ONE job: say which variable to look at. It used to
+    // compose the name with a `ZODE_{s}_KEY` template over `key_env[0]`, which
+    // is ALREADY the whole name ("ZODE_OPENROUTER_KEY"), and it came out as
+    // "check ZODE_ZODE_OPENROUTER_KEY_KEY": a variable that cannot exist. Read
+    // on a real 401, in the middle of an error, it says nothing.
     //
-    // Y solo citaba la primera de la cadena: en opencode el key puede estar en
-    // `ZODE_OPENCODE_KEY` o en `ZODE_API_KEY`, y mandar al usuario al primero
-    // cuando el que esta roto es el segundo le deja igual.
+    // And it only cited the first of the chain: in opencode the key can be in
+    // `ZODE_OPENCODE_KEY` or in `ZODE_API_KEY`, and sending the user to the
+    // first when it is the second one that is broken leaves them exactly where
+    // they were.
     const names = providerEnvNames(std.testing.allocator);
     defer std.testing.allocator.free(names);
 
     try std.testing.expect(names.len > 0);
-    // Lo que se compone no lleva el prefijo de la plantilla dos veces.
+    // What gets composed does not carry the template's prefix twice.
     try std.testing.expect(std.mem.indexOf(u8, names, "ZODE_ZODE_") == null);
     try std.testing.expect(std.mem.indexOf(u8, names, "_KEY_KEY") == null);
-    // Y las dos piezas de la cadena de opencode estan las dos.
+    // And both pieces of the opencode chain are in there.
     try std.testing.expect(std.mem.indexOf(u8, names, "ZODE_OPENCODE_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, names, "ZODE_API_KEY") != null);
 }
 
-test "quotaVerdict: la tabla de las siete senales" {
-    // La accion que corresponde a cada fila es OPUESTA, y equivocarse aqui
-    // significa dos cosas malas: rotar cuando no toca (el usuario ve el modelo
-    // cambiando sin motivo y pierde el prompt cache) o rendirse cuando si
-    // tocaba (el turno muere y hay que escribir "continua").
+test "quotaVerdict: the table of the seven signals" {
+    // The action that corresponds to each row is the OPPOSITE, and getting it wrong
+    // here means two bad things: rotating when it should not (the user sees the
+    // model change for no reason and loses the prompt cache) or giving up when
+    // it should not (the turn dies and you have to type "continue").
     const gate = "can only be used from within OpenCode";
 
-    // 402: sin creditos, siempre.
+    // 402: out of credits, always.
     try std.testing.expectEqual(roster_mod.Why.no_credits, quotaVerdict(error.NoCredits, gate).?);
     try std.testing.expectEqual(roster_mod.Why.no_credits, quotaVerdict(error.NoCredits, "").?);
 
-    // 429: cuota del modelo, siempre.
+    // 429: the model's quota, always.
     try std.testing.expectEqual(roster_mod.Why.rate_limited, quotaVerdict(error.RateLimited, "").?);
 
-    // 403 con el texto del gate: rota. Sin el texto: no.
+    // 403 with the gate's text: rotates. Without it: no.
     try std.testing.expectEqual(roster_mod.Why.gated, quotaVerdict(error.Forbidden, gate).?);
     try std.testing.expectEqual(
         roster_mod.Why.gated,
@@ -5808,19 +6307,20 @@ test "quotaVerdict: la tabla de las siete senales" {
         quotaVerdict(error.Forbidden, "model not found in your plan").?,
     );
 
-    // 401 y 404 NUNCA rotan: la key es la key y un id malo sigue siendo malo.
+    // 401 and 404 NEVER rotate: the key is the key, and a bad id stays bad.
     try std.testing.expect(quotaVerdict(error.AuthFailed, gate) == null);
     try std.testing.expect(quotaVerdict(error.ModelNotFound, gate) == null);
-    // Ni los 5xx de servidor: eso se reintenta con backoff, no cambiando de
-    // modelo (el modelo no tiene la culpa de que el server esté saturado).
+    // Nor the server 5xx: that gets retried with backoff, not by changing models
+    // (the model is not to blame for the server being saturated).
     try std.testing.expect(quotaVerdict(error.ServerError, gate) == null);
     try std.testing.expect(quotaVerdict(error.Overloaded, gate) == null);
     try std.testing.expect(quotaVerdict(error.Cancelled, gate) == null);
-    // El 400 tampoco rota en el momento: si la peticion esta mal, esta mal para
-    // los 16. Lo que hace el free-auto con un 400 es apartar el par para el
-    // SIGUIENTE turno (`noteTurnFailure`), que es otra cosa.
+    // The 400 does not rotate at that moment either: if the request is wrong, it is
+    // wrong for all 16. What free-auto does with a 400 is set the pair aside for
+    // the NEXT turn (`noteTurnFailure`), which is a different thing.
     try std.testing.expect(quotaVerdict(error.BadRequest, gate) == null);
-    // Y no es reintentable: repetir la misma peticion 3 veces son 3,5 s de reloj.
+    // And it is not retryable: repeating the same request 3 times is 3.5 s of
+    // wall clock.
     try std.testing.expect(!isRetryable(error.BadRequest));
     try std.testing.expect(!isRetryable(error.AuthFailed));
     try std.testing.expect(!isRetryable(error.NoCredits));
@@ -5830,30 +6330,30 @@ test "quotaVerdict: la tabla de las siete senales" {
     try std.testing.expect(isRetryable(error.ServerError));
 }
 
-test "isGateMessage: las frases reales del gate, y case-insensitive" {
-    // Cada provider redacta el suyo; no hay una constante que valga.
+test "isGateMessage: the real gate phrases, and case-insensitive" {
+    // Every provider words its own; there is no one constant that works.
     try std.testing.expect(isGateMessage("can only be used from within OpenCode"));
     try std.testing.expect(isGateMessage("Can Only Be Used From Within OpenCode"));
     try std.testing.expect(isGateMessage("Model access is disabled"));
     try std.testing.expect(isGateMessage("this model is not available for your account"));
-    // La de openrouter, copiada de un 403 real (2026-09-30):
+    // The openrouter one, copied from a real 403 (2026-09-30):
     //   "thinkingmachines/inkling-small:free is only available on agentic
     //    harnesses. Try plugging it into a coding agent or productivity app
     //    listed at ..."
     try std.testing.expect(isGateMessage("x:free is only available on agentic harnesses. Try plugging it into a coding agent"));
     try std.testing.expect(isGateMessage("The model is not available on this account"));
-    // Y lo que NO es el gate, para no gastar un par de providers de más.
+    // And what is NOT the gate, so as not to waste a pair of providers.
     try std.testing.expect(!isGateMessage(""));
     try std.testing.expect(!isGateMessage("insufficient credits"));
     try std.testing.expect(!isGateMessage("model not found"));
     try std.testing.expect(!isGateMessage("opencode is down"));
-    // El "within" suelto no basta: hace falta la frase entera.
+    // The bare "within" is not enough: the whole phrase is needed.
     try std.testing.expect(!isGateMessage("error within the quota system"));
-    // Y un 5xx con un body raro NO es un gate (eso se reintenta con backoff).
+    // And a 5xx with a weird body is NOT a gate (that gets retried with backoff).
     try std.testing.expect(!isGateMessage("upstream request failed: model is unavailable"));
 }
 
-test "el backoff respeta el retry-after del server" {
+test "the backoff respects the server's retry-after" {
     // `chat.retry_after_secs` was there from the start and nobody read it: a 429
     // with `retry-after: 30` waited 1s and ate the entire rate limit. Now it is
     // honored, with a 30s ceiling.
@@ -5874,7 +6374,7 @@ test "el backoff respeta el retry-after del server" {
     try std.testing.expectEqual(@as(u64, 30_000), Retry.waitMs(0));
 }
 
-test "toolCallsJsonFromCalls: el mensaje del assistant lleva las tool_calls" {
+test "toolCallsJsonFromCalls: the assistant message carries the tool_calls" {
     // SERIOUS regression: the TUI stored the assistant message with
     // `appendAssistant(text, null)`, that is, WITHOUT `tool_calls`. The tool
     // message that goes after it carries `tool_call_id`, so it matched nothing
@@ -5917,7 +6417,7 @@ test "toolCallsJsonFromCalls: el mensaje del assistant lleva las tool_calls" {
     try std.testing.expect(toolCallsJsonFromCalls(astate.allocator(), &[_]TurnCtx.Call{}) == null);
 }
 
-test "toolArgSummary y toolResultSummary conocen las tools de web" {
+test "toolArgSummary and toolResultSummary know the web tools" {
     // `⏺ web_fetch(ziglang.org/…)` and `⎿ 412 lines · 78 KB` are useful feedback;
     // without this the first loose string came out and just "web_fetch".
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5935,7 +6435,7 @@ test "toolArgSummary y toolResultSummary conocen las tools de web" {
     try std.testing.expectEqualStrings("2 results", hits);
 }
 
-test "cmdAllowlist lista lo que hay y avisa si esta vacia" {
+test "cmdAllowlist lists what is there and warns if it is empty" {
     var backing: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
     var m = tui.Model.init(fba.allocator());
@@ -5962,10 +6462,10 @@ test "cmdAllowlist lista lo que hay y avisa si esta vacia" {
     always_lens = @splat(0); // do not leave the global state dirty
 }
 
-test "/help lista los atajos, no solo los comandos" {
-    // `/help` solo recorria la tabla de comandos, y sin la columna de atajo: la
-    // mitad de las combinaciones no estaba escrita en ningun sitio y se
-    // descubria por accidente (pulsando Ctrl+P y rezando).
+test "/help lists the shortcuts, not just the commands" {
+    // `/help` used to walk only the command table, and without the shortcut column:
+    // half of the combinations were written down nowhere and were discovered by
+    // accident (pressing Ctrl+P and hoping).
     var backing: [64 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
     var m = tui.Model.init(fba.allocator());
@@ -5982,19 +6482,19 @@ test "/help lista los atajos, no solo los comandos" {
     }
     const all = joined.items;
 
-    // Bloque de comandos, con su atajo cuando lo tienen.
+    // The command block, with their shortcut when they have one.
     try std.testing.expect(std.mem.indexOf(u8, all, "commands") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "/allowlist") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "(ctrl+p)") != null);
 
-    // Bloque de atajos, con los que NO son comando.
+    // The shortcut block, with the ones that are NOT commands.
     try std.testing.expect(std.mem.indexOf(u8, all, "shortcuts") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "ctrl+l") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "ctrl+r") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "esc") != null);
 }
 
-test "/clean sin argumentos NUNCA borra" {
+test "/clean without arguments NEVER deletes" {
     // The dry run is the whole safety story, so it is tested at the level the
     // user reaches it: the command, not the module. A test of `scan` alone
     // would pass even if `cmdClean` had the argument backwards.
@@ -6006,7 +6506,7 @@ test "/clean sin argumentos NUNCA borra" {
     try std.testing.expect(cleanWanted(null, "apply"));
 }
 
-test "/clean aparece en /help con su 'yes'" {
+test "/clean shows up in /help with its 'yes'" {
     var backing: [64 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&backing);
     var m = tui.Model.init(fba.allocator());
@@ -6020,15 +6520,15 @@ test "/clean aparece en /help con su 'yes'" {
         try joined.appendSlice(std.testing.allocator, p.text);
         try joined.append(std.testing.allocator, '\n');
     }
-    // Un comando de limpieza que no está en /help es un comando que nadie
-    // encuentra, y peor: uno que parece que no existe.
+    // A cleanup command that is not in /help is a command nobody finds, and worse:
+    // one that looks like it does not exist.
     try std.testing.expect(std.mem.indexOf(u8, joined.items, "/clean") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined.items, "/clean yes") != null);
 }
 
-test "cada atajo listado existe de verdad (nada de documentacion inventada)" {
-    // Un atajo en `/help` que no hace nada es peor que no listarlo: alguien lo
-    // prueba, no pasa, y deja de fiarse de la lista entera.
+test "every listed shortcut really exists (no invented documentation)" {
+    // A shortcut in `/help` that does nothing is worse than not listing it: someone
+    // tries it, nothing happens, and they stop trusting the whole list.
     const listed = [_][]const u8{
         "ctrl+p", "ctrl+t", "ctrl+a", "ctrl+l", "ctrl+r", "ctrl+c", "ctrl+u", "ctrl+d", "esc",
     };
@@ -6039,19 +6539,19 @@ test "cada atajo listado existe de verdad (nada de documentacion inventada)" {
         }
         try std.testing.expect(found);
     }
-    // Y al reves: ningun atajo de la lista puede estar vacio (un `""` en la
-    // lista se lee como atajo sin nombre).
+    // And the other way round: no shortcut in the list can be empty (an `""` in the
+    // list reads as a shortcut with no name).
     for (shortcuts) |s| {
         try std.testing.expect(s.key.len > 0);
         try std.testing.expect(s.desc.len > 0);
     }
 }
 
-// ── tests: read-only, limite de iteraciones y skills ─────────
+// ── tests: read-only, iteration limit and skills ─────────────
 
-test "read-only: `bash` esta bloqueado aunque sea solo un ls" {
-    // Se decide por TOOL, no parseando el comando: si se hiciera por el comando,
-    // el modo se podria saltar con un `bash` "de lectura" primero.
+test "read-only: `bash` is blocked even when it is just an ls" {
+    // It is decided per TOOL, not by parsing the command: if it were done by the
+    // command, the mode could be skipped with a "read-only" `bash` first.
     try std.testing.expect(isWriteTool("bash"));
     try std.testing.expect(isWriteTool("write"));
     try std.testing.expect(isWriteTool("edit"));
@@ -6060,46 +6560,47 @@ test "read-only: `bash` esta bloqueado aunque sea solo un ls" {
     try std.testing.expect(!isWriteTool("ask"));
 }
 
-test "read-only: el texto que vuelve al modelo dice que NO se reintente" {
-    // Sin el "do NOT retry", el modelo repite la llamada y el bucle se come las
-    // iteraciones que quedan. Y sin "ask", el modo no ofrece salida.
+test "read-only: the text that goes back to the model says NOT to retry" {
+    // Without the "do NOT retry", the model repeats the call and the loop eats the
+    // remaining iterations. And without "ask", the mode offers no way out.
     try std.testing.expect(std.mem.indexOf(u8, read_only_text, "Do NOT retry") != null);
     try std.testing.expect(std.mem.indexOf(u8, read_only_text, "ask") != null);
     try std.testing.expect(std.mem.indexOf(u8, read_only_text, "shift+tab") != null);
 }
 
-test "iterationLimit: por defecto 12, y el entorno lo puede mover" {
-    // Sin entorno (los tests lo son) sale el default. Con `ZODE_MAX_ITER` se
-    // lee en CADA llamada, no al arrancar: asi se puede cambiar entre turnos.
+test "iterationLimit: 12 by default, and the environment can move it" {
+    // With no environment (which is the case in the tests) the default comes out.
+    // With `ZODE_MAX_ITER` it is read on EVERY call, not at startup: that way
+    // it can be changed between turns.
     try std.testing.expectEqual(default_max_iterations, iterationLimit());
     try std.testing.expect(default_max_iterations > 8);
 }
 
-test "ask: el tope por turno es 3, y esta en el guidance" {
+test "ask: the per-turn cap is 3, and it is in the guidance" {
     try std.testing.expectEqual(max_asks_per_turn, 3);
-    // Y el modelo lo sabe: un tope que no esta en el prompt se cumple por
-    // casualidad y el usuario ve una pregunta消失 sin explicacion.
+    // And the model knows it: a cap that is not in the prompt is met by accident and
+    // the user sees a question disappear with no explanation.
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "three in a whole turn") != null);
 }
 
-test "skills: sin directorios la seccion del prompt esta VACIA (0 tokens)" {
+test "skills: with no directories the prompt section is EMPTY (0 tokens)" {
     var buf: [512]u8 = undefined;
     try std.testing.expectEqualStrings("", skills.systemPromptSection(&.{}, &buf));
 }
 
-test "prompt: la guia de routing sobrevive al AGENTS.md del proyecto" {
-    // El bug: `systemPromptBase` devuelve el `AGENTS.md` del proyecto EN LUGAR del
-    // prompt built-in, asi que en cualquier proyecto con uno el modelo no veia
-    // una sola regla de routing. Se manifolds como "buscame una pagina de
-    // juegos" -> `bash curl` en vez de `web_search`.
+test "prompt: the routing guide survives the project's AGENTS.md" {
+    // The bug: `systemPromptBase` returned the project's `AGENTS.md` INSTEAD OF the
+    // built-in prompt, so in any project that has one the model did not see a
+    // single routing rule. It showed up as "find me a games page" -> `bash curl`
+    // instead of `web_search`.
     //
-    // Se testea lo que se puede testear sin disco: que la guia este SUELTA (no
-    // dentro de `default_system_prompt`, que es lo que se pierde) y que `buildSystemPrompt`
-    // la ponga siempre, elija la base que elija.
+    // What is tested here is what can be tested without disk: that the guide is
+    // LOOSE (not inside `default_system_prompt`, which is what was getting lost)
+    // and that `buildSystemPrompt` always inserts it, whichever base it picks.
     //
-    // `buildSystemPrompt` lee el `AGENTS.md` del CWD a traves de la cache, asi que
-    // se pone en una cache puesta a mano: el punto es que la composicion la mete
-    // igual en los dos casos.
+    // `buildSystemPrompt` reads the CWD's `AGENTS.md` through the cache, so a
+    // hand-placed cache entry is used: the point is that the composition puts it
+    // in the same way in both cases.
     const saved_cache = agents_md_cache;
     const saved_io = io_global;
     defer {
@@ -6107,18 +6608,18 @@ test "prompt: la guia de routing sobrevive al AGENTS.md del proyecto" {
         io_global = saved_io;
     }
 
-    // 1) La guia NO puede estar dentro del prompt built-in: ese texto es el que
-    //    `AGENTS.md` reemplaza. (Ojo: el built-in SI nombra las tools en su lista
-    //    de "Environment"; lo que no puede estar es la TABLA de routing.)
+    // 1) The guide must NOT be inside the built-in prompt: that text is what
+    //    `AGENTS.md` replaces. (Note: the built-in DOES name the tools in its
+    //    "Environment" list; what cannot be there is the routing TABLE.)
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "NEVER use bash") == null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Choosing the right tool") == null);
 
-    // 2) La guia esta a mano, y es completa.
+    // 2) The guide is at hand, and it is complete.
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "web_search") != null);
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "NEVER use bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "task") != null);
 
-    // 3) Con un "AGENTS.md" cacheado, la guia sigue en el prompt compuesto.
+    // 3) With a cached "AGENTS.md", the guide is still in the composed prompt.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     io_global = threaded.io();
@@ -6132,18 +6633,19 @@ test "prompt: la guia de routing sobrevive al AGENTS.md del proyecto" {
     try std.testing.expect(std.mem.indexOf(u8, composed, "web_search = you do NOT have the URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
 
-    // Y la guia va DESPUES de la base del proyecto: el archivo del usuario se lee
-    // primero, y una regla del harness no se pierde por estar despues.
+    // And the guide goes AFTER the project base: the user's file is read first, and
+    // a harness rule does not get lost for coming after.
     const at_base = std.mem.indexOf(u8, composed, "No hagas esto.").?;
     const at_rule = std.mem.indexOf(u8, composed, "NEVER use bash").?;
     try std.testing.expect(at_base < at_rule);
 }
 
-test "prompt: el modelo recibe el cwd y, si hay repo, la rama" {
-    // La pregunta "¿zode trabaja desde la carpeta en la que lo lanzo?" tiene dos
-    // mitades: las tools SI usan el cwd (todo va por `std.Io.Dir.cwd()`), pero el
-    // modelo no lo sabia. Sin esta linea no puede contestar en terminos absolutos
-    // ni notar que se lanzo en un subdirectorio.
+test "prompt: the model receives the cwd and, if there is a repo, the branch" {
+    // The question "does zode work from the folder I launched it in?" has two
+    // halves: the tools DO use the cwd (everything goes through
+    // `std.Io.Dir.cwd()`), but the model did not know. Without this line it
+    // cannot answer in absolute terms nor notice that it was launched in a
+    // subdirectory.
     const saved_io = io_global;
     const saved_info = project_info;
     const saved_agents = agents_md_cache;
@@ -6162,15 +6664,15 @@ test "prompt: el modelo recibe el cwd y, si hay repo, la rama" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     io_global = threaded.io();
-    // Un repo de mentira en /tmp: `sandbox` debajo del cwd esta DENTRO del repo de
-    // zode, y un test de "no hay repositorio" ahi seria falso.
+    // A fake repo in /tmp: a `sandbox` under the cwd would be INSIDE zode's own
+    // repo, and a "there is no repository" test there would be false.
     const root = "/tmp/zode-prompt-repo-test";
     std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
     var head_buf: [256]u8 = undefined;
     const dotgit = try std.fmt.bufPrint(&head_buf, "{s}/.git", .{root});
-    // El `.git` tiene que existir como DIRECTORIO antes de escribir HEAD dentro:
-    // `writeFile` no crea el padre y falla con FileNotFound.
+    // The `.git` has to exist as a DIRECTORY before writing HEAD inside it:
+    // `writeFile` does not create the parent and fails with FileNotFound.
     try std.Io.Dir.cwd().createDirPath(io_global, dotgit);
     var head_buf2: [256]u8 = undefined;
     const head = try std.fmt.bufPrint(&head_buf2, "{s}/HEAD", .{dotgit});
@@ -6192,26 +6694,27 @@ test "prompt: el modelo recibe el cwd y, si hay repo, la rama" {
     try std.testing.expect(std.mem.indexOf(u8, composed, "Working directory:") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, root) != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "branch mi-rama") != null);
-    // La guia de routing sigue alli: el cwd no la ha empujado fuera.
+    // The routing guide is still there: the cwd did not push it out.
     try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
-    // Y git se nombra por su nombre, para que "que ha cambiado" sea un `git diff`
-    // y no un `ls` con grep.
+    // And git is named by its name, so that "what has changed" is a `git diff`
+    // and not an `ls` with grep.
     try std.testing.expect(std.mem.indexOf(u8, composed, "git status") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "git diff") != null);
 
-    // La cache de skills que este test dejo puesta la libera el `defer`.
+    // The skills cache this test left in place is freed by the `defer`.
     freeSkillsCacheLocked();
 }
 
-test "prompt: el AGENTS.md del REPO se usa cuando el cwd no tiene el suyo" {
-    // `cd src && zode` era el caso roto: sin AGENTS.md en el cwd, zode se
-    // lanzaba con el prompt built-in y el modelo no tenia ni una instruccion del
-    // proyecto. Ahora la raiz del repo es el segundo sitio donde se busca.
+test "prompt: the REPO's AGENTS.md is used when the cwd has none of its own" {
+    // `cd src && zode` was the broken case: with no AGENTS.md in the cwd, zode
+    // launched with the built-in prompt and the model did not have a single
+    // instruction from the project. Now the repo root is the second place looked
+    // at.
     //
-    // Se prueba `readAgentsIn` y no `buildSystemPrompt` a proposito: la suite se
-    // ejecuta en la raiz de zode, donde HAY un `AGENTS.md`, y la regla "el cwd
-    // gana" lo haria aparecer en el prompt composed enmascarando el del fixture.
-    // La regla del cwd tiene su propio sitio (es la primera rama del `orelse`).
+    // `readAgentsIn` is tested and not `buildSystemPrompt` on purpose: the suite
+    // runs in zode's root, where there IS an `AGENTS.md`, and the "the cwd wins"
+    // rule would make it appear in the composed prompt and mask the fixture's.
+    // The cwd rule has its own place (it is the first branch of the `orelse`).
     const saved_io = io_global;
     defer io_global = saved_io;
 
@@ -6232,17 +6735,17 @@ test "prompt: el AGENTS.md del REPO se usa cuando el cwd no tiene el suyo" {
     defer std.testing.allocator.free(got);
     try std.testing.expect(std.mem.indexOf(u8, got, "REGLA DEL REPO") != null);
 
-    // Y un directorio sin ninguno de los dos nombres NO es un error (devuelve
-    // null, que es como el `orelse` encadena el siguiente sitio).
+    // And a directory with neither name is NOT an error (it returns null, which is
+    // how the `orelse` chains the next place).
     try std.testing.expect(readAgentsIn(std.testing.allocator, "/tmp") == null);
     try std.testing.expect(readAgentsIn(std.testing.allocator, null) == null);
 }
 
-test "skills: la lista se invalida cuando un SKILL.md cambia en disco" {
-    // El bug: `discoverSkills` cacheaba para todo el proceso, asi que un skill
-    // creado durante la sesion no aparecia hasta reiniciar, y el comentario de
-    // `buildSystemPrompt` decia lo contrario. Ahora hay mtime, y este test lo
-    // comprueba con ficheros de verdad.
+test "skills: the list is invalidated when a SKILL.md changes on disk" {
+    // The bug: `discoverSkills` cached for the whole process, so a skill created
+    // during the session did not show up until a restart, and `buildSystemPrompt`'s
+    // comment said the opposite. Now there is an mtime, and this test checks it
+    // with real files.
     const saved_io = io_global;
     const saved_info = project_info;
     const saved_gpa = gpa_global;
@@ -6270,20 +6773,20 @@ test "skills: la lista se invalida cuando un SKILL.md cambia en disco" {
     try std.Io.Dir.cwd().createDirPath(io_global, dir);
     defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
 
-    // CWD = root, para que el repo root no anada raices de sobra.
+    // CWD = root, so that the repo root does not add extra roots.
     setProjectInfoForTest(io_global, root);
     skills_cache = null;
     skills_stamp_len = 0;
     skills_rescans = 0;
 
-    // 1) Todavia no hay ningun skill.
+    // 1) There is still no skill at all.
     var env_map: std.process.Environ.Map = undefined;
     _ = &env_map;
     const empty = discoverSkills(std.testing.allocator, null);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
-    // 2) Aparece uno. El `stat` del root ha cambiado, asi que tiene que aparecer
-    //    sin reiniciar nada.
+    // 2) One appears. The root's `stat` has changed, so it has to show up
+    //    without restarting anything.
     var skill_file: [512]u8 = undefined;
     const skill_path = try std.fmt.bufPrint(&skill_file, "{s}/SKILL.md", .{dir});
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = skill_path, .data = "---\ndescription: recien creado\n---\nbody\n" });
@@ -6293,64 +6796,64 @@ test "skills: la lista se invalida cuando un SKILL.md cambia en disco" {
     try std.testing.expectEqualStrings("nuevo", found[0].name);
     try std.testing.expectEqualStrings("recien creado", found[0].description);
 
-    // 3) Y la lista es PRESTADA: volver a pedirla sin cambios no libera nada (si
-    //    el llamante laoneyera, esto seria un doble free de memoria viva).
+    // 3) And the list is BORROWED: asking for it again with no changes frees
+    //    nothing (if the caller owned it, this would be a double free of live
+    //    memory).
     const again = discoverSkills(std.testing.allocator, null);
     try std.testing.expectEqual(@as(usize, 1), again.len);
     try std.testing.expectEqualStrings("nuevo", again[0].name);
 
-    // El estado global se deja como estaba para el siguiente test, y la lista se
-    // LIBERA de verdad: es memoria de `std.testing.allocator` y el teardown del
-    // proceso no llega en un test.
+    // The global state is left as it was for the next test, and the list is really
+    // FREED: it is memory from `std.testing.allocator` and the process teardown
+    // does not arrive inside a test.
     freeSkillsCacheLocked();
     skills_rescans = saved_rescans;
 }
 
-test "tools: `ask`, `skill`, `bash_output` y `bash_kill` NO piden permiso" {
-    // Preguntar "¿puedo preguntarte?" es dos dialogos para una pregunta, y
-    // `bash_output` pide permiso sobre un comando que YA se aprobo cuando se
-    // lanzo en background.
+test "tools: `ask`, `skill`, `bash_output` and `bash_kill` do NOT ask for permission" {
+    // Asking "may I ask you?" is two dialogs for one question, and `bash_output`
+    // asks for permission over a command that was ALREADY approved when it was
+    // launched in the background.
     try std.testing.expect(!tools_mod.needsPermission("ask"));
     try std.testing.expect(!tools_mod.needsPermission("skill"));
     try std.testing.expect(!tools_mod.needsPermission("bash_output"));
     try std.testing.expect(!tools_mod.needsPermission("bash_kill"));
-    // Y `task` SI: gasta tokens del usuario y lee el repo entero.
+    // And `task` DOES: it spends the user's tokens and reads the whole repo.
     try std.testing.expect(tools_mod.needsPermission("task"));
-    // `bash` en foreground sigue pidiendo, como siempre.
+    // `bash` in the foreground still asks, as always.
     try std.testing.expect(tools_mod.needsPermission("bash"));
 }
 
-test "tools: paralelizables son SOLO las que no pueden observarse entre si" {
+test "tools: the parallel-safe ones are ONLY those that cannot observe each other" {
     try std.testing.expect(tools_mod.isParallelSafe("read"));
     try std.testing.expect(tools_mod.isParallelSafe("grep"));
     try std.testing.expect(tools_mod.isParallelSafe("glob"));
     try std.testing.expect(tools_mod.isParallelSafe("list_files"));
     try std.testing.expect(tools_mod.isParallelSafe("web_fetch"));
     try std.testing.expect(tools_mod.isParallelSafe("web_search"));
-    // Y las que escriben NO, ni siquiera cuando el comando parece de lectura:
+    // And the ones that write do NOT, not even when the command looks like a read:
     try std.testing.expect(!tools_mod.isParallelSafe("bash"));
     try std.testing.expect(!tools_mod.isParallelSafe("write"));
     try std.testing.expect(!tools_mod.isParallelSafe("edit"));
     try std.testing.expect(!tools_mod.isParallelSafe("task"));
 }
 
-test "tools: el schema anuncia las 5 tools nuevas" {
-    // Un tool que existe en el codigo y no en el JSON no se puede llamar, y el
-    // unico sintoma es que el modelo nunca la menciona.
+test "tools: the schema announces the 5 new tools" {
+    // A tool that exists in the code and not in the JSON cannot be called, and the
+    // only symptom is that the model never mentions it.
     const json = tools_mod.toolsJson();
     for ([_][]const u8{ "ask", "skill", "task", "bash_output", "bash_kill" }) |name| {
         var key_buf: [32]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "\"name\":\"{s}\"", .{name}) catch unreachable;
         try std.testing.expect(std.mem.indexOf(u8, json, key) != null);
     }
-    // Y `run_in_background` esta en el schema de `bash`, que es donde se decide.
+    // And `run_in_background` is in `bash`'s schema, which is where it is decided.
     try std.testing.expect(std.mem.indexOf(u8, json, "\"run_in_background\"") != null);
 }
 
-test "isParallelSafe e isWriteSafe no se contradicen en lo que importa" {
-    // Una tool que fuera a la vez "paralela" y "escribe" seria un fallo de
-    // seguridad con forma de feature: el criterio de las dos listas tiene que
-    // ser el mismo.
+test "isParallelSafe and isWriteSafe do not contradict each other where it matters" {
+    // A tool that were both "parallel" and "writes" would be a security failure
+    // dressed as a feature: the criterion for the two lists has to be the same.
     for (tools_mod.defs) |d| {
         if (tools_mod.isParallelSafe(d.name)) {
             try std.testing.expect(!isWriteTool(d.name));
@@ -6358,12 +6861,12 @@ test "isParallelSafe e isWriteSafe no se contradicen en lo que importa" {
     }
 }
 
-test "la cache de lecturas se vacia de lo que la compactacion se llevo" {
-    // El encadenado entero, y en el sitio donde se rompe: la compaction produce
-    // `elided_at`, el agent se lo pasa a la cache, y la cache marca esas entradas
-    // como "ya no estan en el contexto". Sin el ultimo paso, un `read` de un
-    // fichero elido responderia "unchanged, ya lo tienes" y el modelaria
-    // contestaria sobre un fichero que no tiene.
+test "the read cache is emptied of what compaction took" {
+    // The whole chain, and the place where it breaks: compaction produces
+    // `elided_at`, the agent hands it to the cache, and the cache marks those
+    // entries as "no longer in the context". Without that last step, a `read` of
+    // an elided file would answer "unchanged, you already have it" and the model
+    // would answer about a file it does not have.
     const saved_io = io_global;
     defer io_global = saved_io;
 
@@ -6382,28 +6885,28 @@ test "la cache de lecturas se vacia de lo que la compactacion se llevo" {
     const arena = arena_state.allocator();
     const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{path});
 
-    // 1) La tool lee y la entrada queda "en el contexto", en el mensaje 7.
+    // 1) The tool reads and the entry stays "in the context", in message 7.
     _ = try tools_mod.execute(io_global, "read", args, arena, null, &m.reads);
     m.reads.setMessageIndex(path, 7);
     try std.testing.expectEqual(@as(usize, 1), m.reads.liveEntries());
 
-    // 2) La compaction se lleva ese mensaje (a mano aqui, que el bucle entero
-    //    necesita red).
+    // 2) Compaction takes that message away (by hand here, since the whole loop
+    //    needs the network).
     m.reads.markDroppedAt(7);
     try std.testing.expectEqual(@as(usize, 0), m.reads.liveEntries());
 
-    // 3) El siguiente read MANDA el cuerpo otra vez. Que sea el mismo contenido
-    //    da igual: lo que cuenta es que vuelva a estar en el contexto.
+    // 3) The next read SENDS the body again. That it is the same content does
+    //    not matter: what counts is that it is back in the context.
     const out = try tools_mod.execute(io_global, "read", args, arena, null, &m.reads);
     try std.testing.expect(std.mem.indexOf(u8, out, "una linea") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
 }
 
-test "tras un write, la cache no dice que el fichero esta igual" {
-    // El caso del bucle real: edit → read para verificar. Sin invalidar, el read
-    // responderia "unchanged" con el texto ANTIGUO en el contexto, que es
-    // exactamente el bucle que hace que un agente se convenza de que su edicion
-    // funciono cuando no toco nada.
+test "after a write, the cache does not claim the file is unchanged" {
+    // The case from the real loop: edit → read to verify. Without invalidating, the
+    // read would answer "unchanged" with the OLD text in the context, which is
+    // exactly the loop that makes an agent convince itself its edit worked when
+    // it touched nothing.
     const saved_io = io_global;
     defer io_global = saved_io;
 
@@ -6428,7 +6931,7 @@ test "tras un write, la cache no dice que el fichero esta igual" {
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = "contenido viejo\n" });
     _ = try tools_mod.execute(io_global, "read", read_args, arena, null, &m.reads);
     _ = try tools_mod.execute(io_global, "write", write_args, arena, null, &m.reads);
-    // Esto es lo que hace `execOneCall` con el path del write.
+    // This is what `execOneCall` does with the write's path.
     m.reads.invalidate(path);
 
     const out = try tools_mod.execute(io_global, "read", read_args, arena, null, &m.reads);
@@ -6436,30 +6939,174 @@ test "tras un write, la cache no dice que el fichero esta igual" {
     try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
 }
 
-test "sin modelo no se manda NADA: se pide al catalogo y se dice cual" {
-    // El comportamiento del que no hay vuelta atras: un nombre de modelo escrito
-    // en el codigo (el `default_model` de cada provider) es una bomba de relojería.
-    // `kimi-k2.6` desaparecio del catalogo de opencode y TODAS las peticiones
-    // empezaron a dar 403 "Model access is disabled", que no dice nada de por que.
+test "with no model NOTHING is sent: the catalog is queried and the choice is reported" {
+    // The behaviour with no way back: a model name written in the code (each
+    // provider's `default_model`) is a ticking bomb. `kimi-k2.6` disappeared from
+    // opencode's catalog and EVERY request started answering 403 "Model access is
+    // disabled", which says nothing about why.
     //
-    // Con `default_model` vacio en todos los providers, la unica forma de tener un
-    // modelo es que el usuario lo elija, o que zode le pregunte al provider. Y al
-    // elegir, lo dice en pantalla: una eleccion silenciosa es indistinguible de un
+    // With `default_model` empty in every provider, the only way to have a model
+    // is for the user to pick one, or for zode to ask the provider. And when it
+    // picks, it says so on screen: a silent choice is indistinguishable from a
     // default.
     for (&providers.defs) |d| {
         try std.testing.expectEqualStrings("", d.default_model);
     }
 }
 
-test "curModel se puede dejar vacio y eso se ve" {
-    // El estado "sin modelo" tiene que ser representable: es lo que pasa entre
-    // que se cambia de provider y que el catalogo responde, y un `setModel("")`
-    // que se traga el nombre anterior sin dejarlo ver seria un 400 sin explicacion
-    // en el turno siguiente.
+test "curModel can be left empty and that is visible" {
+    // The "no model" state has to be representable: it is what happens between
+    // changing provider and the catalog answering, and a `setModel("")` that
+    // swallowed the previous name without letting it show would be a 400 with no
+    // explanation on the next turn.
     const saved = curModel();
     defer setModel(saved);
     setModel("gpt-5");
     try std.testing.expectEqualStrings("gpt-5", curModel());
     setModel("");
     try std.testing.expectEqualStrings("", curModel());
+}
+
+test "system prompt: the volatile parts go LAST, so a mode change does not drop the cache" {
+    // The provider serves the prompt cache from the literal prefix of the system
+    // message, so a piece that changes invalidates everything AFTER it. The
+    // read-only note changes on a `shift+tab`, which is mid-turn and cheap to do
+    // by accident; it was 4th of 6, so it also invalidated the skills list and
+    // the location lines.
+    // `project_info` reads the clock through `io_global`, which is undefined in a
+    // bare test: reading the clock through garbage is a GPF, not a zero.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    io_global = threaded.io();
+    defer io_global = saved_io;
+
+    // The skills list is a module global that OWNS memory from whatever allocator
+    // asked for it. Left pointing into `std.testing.allocator`, it is a leak that
+    // this test gets blamed for, so it is saved and dropped here.
+    const saved_cache = skills_cache;
+    const saved_rescans = skills_rescans;
+    skills_cache = null;
+    skills_rescans = 0;
+    defer {
+        freeSkillsCacheLocked();
+        skills_cache = saved_cache;
+        skills_rescans = saved_rescans;
+    }
+
+    // Same for the project's AGENTS.md: `systemPromptBase` reads it ONCE into a
+    // global that owns the memory. In a test that allocator is the testing one,
+    // so leaving it there is a leak attributed to whichever test read it.
+    const saved_agents = agents_md_cache;
+    const fake_base = try std.testing.allocator.dupe(u8, "base de prueba");
+    defer std.testing.allocator.free(fake_base);
+    agents_md_cache = fake_base;
+    defer agents_md_cache = saved_agents;
+
+    var out: [16 * 1024]u8 = undefined;
+    const p = buildSystemPrompt(std.testing.allocator, &out, null);
+
+    const at = struct {
+        fn find(hay: []const u8, needle: []const u8) usize {
+            return std.mem.indexOf(u8, hay, needle) orelse std.math.maxInt(usize);
+        }
+    };
+    const routing_at = at.find(p, "Choosing the right tool");
+    const read_only_at = at.find(p, "READ-ONLY MODE");
+    const skills_at = at.find(p, "Skills");
+    const location_at = at.find(p, "Working directory");
+
+    try std.testing.expect(routing_at != std.math.maxInt(usize));
+    // The note is last: with it in front, everything after it was re-sent.
+    if (read_only_at != std.math.maxInt(usize)) {
+        try std.testing.expect(read_only_at > routing_at);
+    }
+    if (skills_at != std.math.maxInt(usize)) {
+        try std.testing.expect(skills_at > routing_at);
+    }
+    if (location_at != std.math.maxInt(usize)) {
+        try std.testing.expect(location_at > routing_at);
+    }
+}
+
+test "system prompt: the verification rules are injected even with a project's AGENTS.md" {
+    // Same failure mode as the routing table, and the same reason for a separate
+    // constant: `systemPromptBase` returns the project's file INSTEAD of the
+    // built-in text, so anything that lives inside `default_system_prompt` is
+    // invisible in exactly the case that matters (a real project).
+    // 1) It is not part of the built-in prompt.
+    try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "NARROWEST command") == null);
+    // 2) It says the three things that decide the duration of a task.
+    try std.testing.expect(std.mem.indexOf(u8, verification_prompt, "NARROWEST command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verification_prompt, "Do NOT write a test harness") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verification_prompt, "background") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verification_prompt, "already passed") != null);
+
+    // 3) With an AGENTS.md in place it is still composed.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    io_global = threaded.io();
+    defer io_global = saved_io;
+
+    const saved_cache = skills_cache;
+    const saved_rescans = skills_rescans;
+    skills_cache = null;
+    skills_rescans = 0;
+    defer {
+        freeSkillsCacheLocked();
+        skills_cache = saved_cache;
+        skills_rescans = saved_rescans;
+    }
+    const saved_agents = agents_md_cache;
+    const fake = try std.testing.allocator.dupe(u8, "# proyecto\nReglas del proyecto.");
+    defer std.testing.allocator.free(fake);
+    agents_md_cache = fake;
+    defer agents_md_cache = saved_agents;
+
+    var out: [16 * 1024]u8 = undefined;
+    const composed = buildSystemPrompt(std.testing.allocator, &out, null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "Reglas del proyecto.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "NARROWEST command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
+}
+
+test "subagents: consecutive task calls form ONE batch (that is what parallelizes)" {
+    const Call = TurnCtx.Call;
+    const calls = [_]Call{
+        .{ .id = "1", .name = "task", .args_json = "{}" },
+        .{ .id = "2", .name = "task", .args_json = "{}" },
+        .{ .id = "3", .name = "task", .args_json = "{}" },
+    };
+    // Three searches that do not depend on each other: one batch, so one round
+    // trip instead of three sequential ones.
+    try std.testing.expectEqual(@as(usize, 3), taskBatchEnd(&calls, 0));
+
+    // A `write` in the middle ends the batch: after a write the world changed,
+    // and a search issued before it may be answering a question that no longer
+    // exists.
+    const mixed = [_]Call{
+        .{ .id = "1", .name = "task", .args_json = "{}" },
+        .{ .id = "2", .name = "task", .args_json = "{}" },
+        .{ .id = "3", .name = "write", .args_json = "{}" },
+        .{ .id = "4", .name = "task", .args_json = "{}" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), taskBatchEnd(&mixed, 0));
+    try std.testing.expectEqual(@as(usize, 4), taskBatchEnd(&mixed, 3));
+
+    // A single one is its own batch (and takes the serial path).
+    const one = [_]Call{.{ .id = "1", .name = "task", .args_json = "{}" }};
+    try std.testing.expectEqual(@as(usize, 1), taskBatchEnd(&one, 0));
+
+    // The cap is a real number with a real range: N subagents are N streaming
+    // requests against one key.
+    try std.testing.expectEqual(@as(usize, 3), default_task_parallel);
+    try std.testing.expect(default_task_parallel >= 1 and default_task_parallel <= 8);
+}
+
+test "subagents: the model is told it can send several at once" {
+    // If the description does not say it, the model keeps sending one per
+    // message and the parallelism never happens: the capability has to be
+    // visible in the schema to be used.
+    try std.testing.expect(std.mem.indexOf(u8, tools_mod.toolsJson(), "run at the same time") != null);
 }
