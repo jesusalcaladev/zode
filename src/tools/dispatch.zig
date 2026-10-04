@@ -246,7 +246,10 @@ test "list_files lists this src" {
     defer arena_state.deinit();
     const out = try execute(std.testing.io, "list_files", "{\"path\":\"src\"}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "f main.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "f tools.zig") != null);
+    // The tools are a FOLDER now. It was `f tools.zig`, and deleting the zombie
+    // file that a `git checkout` had put back took this test down with it: two
+    // tests failing for wanting a file that nothing imports.
+    try std.testing.expect(std.mem.indexOf(u8, out, "d tools") != null);
 }
 
 test "think returns OK with no effects" {
@@ -259,7 +262,7 @@ test "think returns OK with no effects" {
 test "the read tool reads this file" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const args = "{\"path\":\"src/tools.zig\"}";
+    const args = "{\"path\":\"src/tools/read.zig\"}";
     const out = try execute(std.testing.io, "read", args, arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "toolRead") != null);
 }
