@@ -2467,3 +2467,129 @@ test de las estimaciones.
 `zig build test` (515), `tools/pty_smoke.py` (con tres casos nuevos: `!cmd` ejecuta
 y deja el input libre, el prompt largo no se pierde, y `/free-auto` se encuentra
 tecleando "free" en Ctrl+P) y `tools/scroll_repro.py`.
+
+---
+
+# El árbol partido: `src/tools/`, `commands.zig`, `acp_bridge.zig`, `lib/prompt.zig` (2026-10-03)
+
+`agent.zig` eran 7112 líneas con 181 funciones y 38 globales de módulo, y
+`tools.zig` eran 1822 líneas con un `if (name == "read") … else if (name == "write")`
+que es un índice disfrazado de fichero. Todo verde antes: 515 tests.
+
+## `src/tools/`: una tool por fichero
+
+Se partió con un script que mueve **bloques**, no reescribiendo: 1800 líneas de
+código que ya funciona, retyped, son 1800 ocasiones de escribir algo que compila
+y significa otra cosa. El script **se niega a correr si hay una declaración sin
+destino**, que es lo único por lo que me fío del resultado.
+
+Tres cosas salieron por el camino y costaron un rato:
+
+1. **Contar llaves sin mirar los literales rompe el parser entero.**
+   `looksLikeHtml` compara `head[0] == '{'`, y contar esa llave como estructura
+   hizo que el extractor se comiera **media tabla de tests** hacia delante. Se ve
+   como "NOT FOUND" para diez funciones que ahí están. `brace_delta` ignora ahora
+   strings y char literals.
+
+2. **Una decl de una línea tiene que terminar en su línea, y el comentario se lo
+   come.** `const max_tool_output = 16 * 1024; // output budget per tool` NO acaba
+   en `;` sino en el comentario, así que el matcher seguía hasta el `};` de la
+   declaración **siguiente** y `ToolDef` desaparecía con ella.
+
+3. **Los helpers compartidos dejan de ser privados el día que hay dos ficheros.**
+   `getStr`/`getInt`/`getBool`, `max_tool_output` y el walker de `.zig` estaban
+   privados dentro de un fichero de 1800 líneas y ahora los usan tools distintas.
+   `walkZig` vive en `common.zig` y no en `glob.zig` porque `grep` también camina
+   el proyecto con él.
+
+**Un test que llama a `execute` está probando el DISPATCHER**, no la tool, y por
+eso viven todos en `dispatch.zig` aunque nombren una tool. Los que prueban un
+helper van junto a él. Los 30 siguen ahí.
+
+### El módulo `tools` de `zig build tool-test`
+
+`zig build tool-test` **no compilaba**, y AGENTS.md ya decía que nadie lo ejecutaba
+— que es exactamente cómo se rompe algo y se queda roto.
+
+La causa es una regla de Zig que no se puede negociar: **un módulo no puede
+importar fuera del directorio de su fichero raíz**. Las tools están en
+`src/tools/` y necesitan `bgproc`, `readcache`, `regex` y `verify`, que viven en
+`src/`. Con el módulo enraizado en `src/tools/` eso son imports fuera del módulo y
+Zig los rechaza con un error que no menciona el módulo ni el path.
+
+La solución es enraizarlo **un nivel arriba**, en `src/tools_root.zig`, que solo
+reexporta el dispatcher. Lo que se pruebe aquí: `acp_probe` ya lo hacía
+(`root_source_file = src/acp.zig`), y por eso funciona. **Un import relativo se
+resuelve contra el fichero que importa, no contra el path del módulo**: por eso
+desde `src/tools/dispatch.zig` hace falta `../bgproc.zig` y no `bgproc.zig`.
+
+También `@embedFile("tools.zig")` en un test de `bgproc`: `zig build` no lo compila
+y `zig build test` sí, así que solo falló al mover el fichero.
+
+## `commands.zig`: `submit` se queda
+
+El patrón que hace esto posible sin ciclo de imports: **`submit` SE QUEDA** en
+`agent.zig`, porque es la única función que decide si una línea del input es un
+comando o un chat (un chat lanza un worker, un comando corre en el hilo de la UI) y
+porque es la que llama la TUI. Todo lo de abajo es trabajo local. `commands.zig`
+importa `agent.zig` para los helpers compartidos y `agent.zig` llama hacia allí:
+**una arista, no dos**.
+
+**`/effort` y `/yolo` NO se movieron**, y el motivo merece escribirse: **escriben
+estado del agente** (`current_effort`, el flag de yolo). Un fichero que importara
+al otro para escribir sería el ciclo, y la salida no es un `usingnamespace`, es
+decidir qué lado tiene la entrada.
+
+## `acp_bridge.zig`: un modo, no una feature
+
+Con `/acp` encendido zode **no corre el bucle de agente**: lanza `opencode acp` y
+habla JSON-RPC por sus pipes. Todo lo que hay en el fichero es la fontanería de
+eso — el hijo, el handshake, el diálogo de permisos mapeado al que ya existía, y
+una cancelación que tiene que pasar por el protocolo y no por un flag.
+
+`acp_on` es un `var` y **un `var` no se puede aliasear con `const`**, así que la TUI
+pregunta por `agent.acpActive()`. Copiarlo a un segundo `var` habría sido peor: dos
+flags que significan lo mismo y solo uno se pone.
+
+## `lib/prompt.zig`: el texto del system prompt
+
+Tres constantes de string y nada más: el prompt, la tabla de enrutado de tools y
+la regla de verificación. Eran 370 líneas de `\\`-string en medio de un fichero con
+38 globales, y son **la única pieza de este repo donde "cambió esto?" es una
+pregunta que merece hacerse en voz alta**, porque son el prefijo estable más grande
+de la petición y eso es lo que indexa la cache del provider.
+
+Puro, así que va en `lib/`: un test lee el prompt sin TUI y el ORDEN de los bloques
+se asserta directamente. Dos cosas que son fáciles de deshacer por accidente:
+
+- **Cada bloque es aparte porque el `AGENTS.md` de un proyecto REEMPLAZA el prompt
+  interno.** Cuando el enrutado y la verificación vivían dentro, todo proyecto con
+  un `AGENTS.md` —el caso normal— no mandaba **ni una** regla de enrutado, y la
+  única forma que tenía de preguntar a internet era `curl`.
+- **El orden ES la cache.** Lo que cambia más a menudo va al final: la cache se lee
+  hasta el primer byte que difiere, y el modo read-only (un `shift+tab` en medio de
+  la sesión) arriba invalidaba la lista de skills y las líneas de ubicación.
+
+## `agent.zig` queda en 6230, y el bucle se queda dentro
+
+Lo que NO se movió es el bucle de agente, y es deliberado: es **a lo que todo lo
+demás es helper**. Partirlo daría ficheros del mismo tamaño con las mismas
+costuras, y el fichero grande que queda es el que de verdad tiene 181 funciones
+que comparten 38 globales.
+
+## Un test cazó una mejora del arte
+
+El smoke de la pty y el test de Zig tenían el **banner viejo** escrito a mano. Alguien
+había mejorado las glifas (la `D` con su trazo derecho, la `E` con travesaño) y no
+había actualizado el arte esperado. El test tenía razón en fallar: la mejora es la
+que hace que `O` y `D` dejen de ser la misma caja dos veces, que es justo el fallo
+que AGENTS.md dice que motivó el diseño v3 del logo.
+
+Un arte de cajetín es un **mapa de celdas**: si las filas no caen en las mismas
+columnas no hay nada que leer, y comparar la fila **completa** es lo único que
+distingue `█████╗` de `███████╗`.
+
+## Verificación
+
+515 tests, `zig build tool-test` **funciona** (no compilaba desde hacía tiempo),
+`zig build acp-probe` compila, pty smoke y scroll_repro en verde.

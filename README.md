@@ -242,10 +242,16 @@ Dos carpetas, y la línea que las separa es si el módulo puede probarse sin ter
 src/                    lo que necesita la TUI, un hilo o la red
   main.zig              CLI: --models / --chat / TUI / --resume
   tui.zig               la TUI (vxfw): dibujo, input, scroll, paletas
-  agent.zig             bucle de agente, comandos, permisos, turnos
-  tools.zig             las 16 tools: dispatcher y las que no tocan disco
+  agent.zig             bucle de agente, permisos, turnos, estado de la sesión
+  commands.zig          los /comandos y las tablas que imprime /help
+  acp_bridge.zig        el turno delegado a otro agente (modo ACP)
   chat.zig              cliente streaming SSE + parser + Anthropic nativo
   acp.zig               cliente ACP v1 por JSON-RPC
+  tools/                las 16 tools, una por fichero
+    dispatch.zig        el nombre que envió el modelo -> la función que corre
+    common.zig          los helpers que usa más de una tool
+    read.zig  write.zig  edit.zig  bash.zig  glob.zig  grep.zig
+    list_files.zig  web.zig  think.zig  todo.zig  bg.zig  errors.zig
   bgproc.zig            comandos en segundo plano
   palette.zig           paleta modal de Ctrl+P / Ctrl+T
   session.zig           sesiones JSONL comprimidas
@@ -285,10 +291,16 @@ src/lib/                módulos que se testean solos, sin TUI y sin red
 ```
 
 `src/lib/` no es "los ficheros pequeños": es **los que se pueden testear sin
-arrancar la app**. Por eso `tools.zig` se queda arriba (su dispatcher necesita el
-`Model` para el registro de procesos en segundo plano) aunque la mitad de sus
-tools sean puras, y por eso `roster.zig` no se mueve: depende de `config.zig`, que
+arrancar la app**. Por eso `roster.zig` no se mueve: depende de `config.zig`, que
 ya depende del cliente de chat.
+
+`src/tools/` es un caso interesante: las tools SÍ son casi todas puras (leen
+ficheros, consultan la red) pero el **dispatcher** necesita el registro de
+procesos en segundo plano, que vive en el `Model`. La solución fue partir el
+fichero en vez de moverlo: cada tool en su fichero, `dispatch.zig` con lo que
+necesita del `Model`. `ask`, `task` y `skill` NO están ahí (necesitan el `Model`
+para el diálogo, el worker y las skills) y se interceptan en `agent.zig`, que es
+donde ya estaban.
 
 Provider OpenAI-compatible: funciona con OpenCode, OpenRouter, Groq, DeepSeek y
 cualquier gateway que hable el mismo formato, cambiando el `base_url`.
