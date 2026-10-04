@@ -162,7 +162,7 @@ pub fn cmdSession(m: *tui.Model) void {
         m.allocator,
         "session {s} · {d} messages",
         .{ s.id[0..], s.messages.items.len },
-    ) catch "sesión";
+    ) catch "session";
     agent.pushInfoOwned(m, l1);
     if (s.path) |p| {
         m.pushInfoFmt("  {s}", .{p});

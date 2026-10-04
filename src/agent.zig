@@ -1260,8 +1260,8 @@ pub fn bootstrapSession(m: *tui.Model) void {
         if (latest) |path| {
             if (session_mod.Session.resumePath(m.allocator, io_global, path)) |s| {
                 session = s;
-                const msg = std.fmt.allocPrint(m.allocator, "sesión reanudada: {s}", .{s.path orelse s.id[0..]}) catch
-                    "sesión reanudada";
+                const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
+                    "session resumed";
                 pushInfoOwned(m, msg);
                 return;
             } else |err| {
@@ -1611,7 +1611,7 @@ fn resumeLatest(m: *tui.Model) void {
         m.allocator,
         "session resumed: {s} · {d} messages",
         .{ path, s.messages.items.len },
-    ) catch "sesión reanudada";
+    ) catch "session resumed";
     pushInfoOwned(m, msg);
     refreshContextUsage(m);
 }

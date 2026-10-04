@@ -1,44 +1,82 @@
 # zode — AGENTS.md
 
-Harness de código en Zig puro (sin C deps), estilo Claude Code, con enfoque en velocidad y ahorro de tokens.
+A code harness in pure Zig (no C deps), in the style of Claude Code, focused on
+speed and on saving tokens.
 
-## Principios del proyecto
+## Project principles
 
-1. **Zig std puro** — sin dependencias C, sin libc obligatoria (target musl posible). Única dep externa: libvaxis (Zig puro).
-2. **Ahorro de tokens por diseño**: el contexto es el recurso caro. Todo lo que entre al LLM debe ganarse su lugar.
-3. **Simplicidad radical**: preferir código directo y legible sobre abstracciones prematuras.
+1. **Pure Zig std** — no C dependencies, no mandatory libc (a musl target is
+   possible). Only external dep: libvaxis (pure Zig).
+2. **Token saving by design**: the context is the expensive resource. Anything
+   that goes into the LLM has to earn its place.
+3. **Radical simplicity**: prefer direct, readable code over premature
+   abstraction.
 
-## Zig 0.16 — trampas conocidas
+## Zig 0.16 — known traps
 
-- **`main` recibe `std.process.Init`**: `init.gpa`, `init.io`, `init.environ_map`, `init.arena`, `init.minimal.args`.
+- **`main` receives `std.process.Init`**: `init.gpa`, `init.io`,
+  `init.environ_map`, `init.arena`, `init.minimal.args`.
 - **Args**: `std.process.Args.Iterator.init(init.minimal.args)` + `.next()`.
-- **Env**: `init.environ_map.get("KEY")` (NO `std.posix.getenv`).
-- **Mutex**: `std.atomic.Mutex` (spinlock `tryLock`/`unlock`); `std.Thread.Mutex` ya no existe. Para locks largos con yield: `while (!m.tryLock()) std.Thread.yield() catch {}`.
-- **HTTP client**: flujo `client.request()` → `sendBodyComplete(body)` / `sendBodiless()` → `receiveHead(&redirect_buf)` → `response.reader(&transfer_buf)` (buffer ≥16KB para streaming) → `allocRemaining()`.
-- **`sendBodyComplete` pide `[]u8` mutable** — los bodies JSON se construyen en buffers de stack y se pasan con `@constCast`.
-- **Compresión**: pedir `.headers = .{ .accept_encoding = .omit }` — std HTTP no descomprime transparente.
-- **JSON**: `std.json.parseFromSliceLeaky(std.json.Value, arena, ...)` con arena por-request.
-- **Writers**: `var w: std.Io.Writer = .fixed(buf)`; `std.io.fixedBufferStream` ya no existe. Salida headless: `std.Io.File.stdout().writer(io, &buf)` + `.interface.print(...)` + `flush()`.
-- **vaxis 0.6**: `App.init(io, gpa, environ_map, tty_buffer)`; widgets vxfw con `userdata/eventHandler/drawFn`; `Surface.children` es slice (asignar, no append); `Cell` es struct con `.default`, no union.
-- **Tiempo**: `std.time.timestamp()` NO existe. Usar `std.Io.Timestamp.now(io, .real).toSeconds()`. Durations: `Io.Duration.fromSeconds(x)`; los `Timeout` de procesos piden `Clock.Duration` = `.{ .raw = .fromSeconds(n), .clock = .awake }` (`.awake`, no `.monotonic`).
-- **Child.Term**: tags en minúscula (`.exited`, `.signal`); `signal` es enum `std.posix.SIG` → `@intFromEnum` + truncate a u8.
-- **Dirs**: NO hay `makePath`; usar `dir.createDirPath(io, path)` (mkdir -p). Para iterar un dir: `openDir(io, path, .{ .iterate = true })` — sin el flag, iterar es Illegal Behavior (EBADF panic en debug). `dir.iterate()` devuelve `Iterator` que lleva su propio buffer; `Iterator.next(io)`.
-- **File.Writer**: `file.writer(io, &buf)` devuelve struct con `.interface: *Writer` estable; guarda el struct completo, no el puntero.
-- **process.run**: `std.process.run(gpa, io, .{ .argv, .stdout_limit, .stderr_limit, .timeout })` → `RunResult{ .term, .stdout, .stderr }`. No existe `std.regex` (hay mini-motor propio en `src/lib/regex.zig`).
-- **Escritura directa de archivos**: `dir.writeFile(io, .{ .sub_path, .data })` para crear/ sobreescribir entero.
-- **grep tool**: usa `rg` nativo → `grep -rn` nativo → fallback regex propio (en ese orden). Respeta .gitignore via rg.
-- **graphemes NUNCA con `&[_]u8{c}`**: `vxfw.Surface.writeCell` guarda la `Cell` POR VALOR, pero vaxis lee los BYTES de `char.grapheme` en `Vaxis.render()`, es decir DESPUÉS de que `drawFn` haya retornado. Un puntero a temporal de stack llega al renderer como basura (NULs) → pantalla en blanco salvo los literales. Usar SIEMPRE `Painter.putText` (copia al arena del frame) o `putStable` (literal/arena propia del párrafo). Tests en `tui.zig` lo cubren.
-- **`ArrayList.clearRetainingCapacity` hace `@memset(items, undefined)`**: no se puede conservar un slice de `items` y luego limpiar. Consumir la línea ANTES de limpiar (ver `StreamCtx.feed`).
-- **`std.ArrayList` de Zig 0.16 es UNMANAGED**: `append(gpa, item)`, `insertSlice(gpa, i, s)`, `replaceRange(gpa, start, len, s)`.
+- **Env**: `init.environ_map.get("KEY")` (NOT `std.posix.getenv`).
+- **Mutex**: `std.atomic.Mutex` (spinlock `tryLock`/`unlock`); `std.Thread.Mutex`
+  does not exist any more. For long locks with yield: `while (!m.tryLock())
+  std.Thread.yield() catch {}`.
+- **HTTP client**: the flow is `client.request()` → `sendBodyComplete(body)` /
+  `sendBodiless()` → `receiveHead(&redirect_buf)` → `response.reader(&transfer_buf)`
+  (buffer ≥16KB for streaming) → `allocRemaining()`.
+- **`sendBodyComplete` wants a mutable `[]u8`** — JSON bodies are built in stack
+  buffers and passed with `@constCast`.
+- **Compression**: ask for `.headers = .{ .accept_encoding = .omit }` — std HTTP
+  does not decompress transparently.
+- **JSON**: `std.json.parseFromSliceLeaky(std.json.Value, arena, ...)` with a
+  per-request arena.
+- **Writers**: `var w: std.Io.Writer = .fixed(buf)`; `std.io.fixedBufferStream`
+  does not exist any more. Headless output: `std.Io.File.stdout().writer(io, &buf)`
+  + `.interface.print(...)` + `flush()`.
+- **vaxis 0.6**: `App.init(io, gpa, environ_map, tty_buffer)`; vxfw widgets with
+  `userdata/eventHandler/drawFn`; `Surface.children` is a slice (assign, do not
+  append); `Cell` is a struct with `.default`, not a union.
+- **Time**: `std.time.timestamp()` does NOT exist. Use
+  `std.Io.Timestamp.now(io, .real).toSeconds()`. Durations:
+  `Io.Duration.fromSeconds(x)`; process `Timeout`s want
+  `Clock.Duration` = `.{ .raw = .fromSeconds(n), .clock = .awake }` (`.awake`,
+  not `.monotonic`).
+- **Child.Term**: lowercase tags (`.exited`, `.signal`); `signal` is an enum
+  `std.posix.SIG` → `@intFromEnum` + truncate to u8.
+- **Dirs**: there is NO `makePath`; use `dir.createDirPath(io, path)` (mkdir -p).
+  To iterate a dir: `openDir(io, path, .{ .iterate = true })` — without the flag,
+  iterating is Illegal Behavior (EBADF panic in debug). `dir.iterate()` returns an
+  `Iterator` that carries its own buffer; `Iterator.next(io)`.
+- **File.Writer**: `file.writer(io, &buf)` returns a struct with a stable
+  `.interface: *Writer`; keep the whole struct, not the pointer.
+- **process.run**: `std.process.run(gpa, io, .{ .argv, .stdout_limit,
+  .stderr_limit, .timeout })` → `RunResult{ .term, .stdout, .stderr }`. There is
+  no `std.regex` (there is a small engine of our own in `src/lib/regex.zig`).
+- **Writing files directly**: `dir.writeFile(io, .{ .sub_path, .data })` to
+  create/overwrite the whole thing.
+- **grep tool**: native `rg` → native `grep -rn` → our own regex fallback (in that
+  order). It respects .gitignore via rg.
+- **graphemes NEVER with `&[_]u8{c}`**: `vxfw.Surface.writeCell` stores the
+  `Cell` BY VALUE, but vaxis reads the BYTES of `char.grapheme` in
+  `Vaxis.render()`, that is AFTER `drawFn` has returned. A pointer to a stack
+  temporary reaches the renderer as garbage (NULs) → blank screen except for the
+  literals. ALWAYS use `Painter.putText` (copies into the frame's arena) or
+  `putStable` (a literal/arena of the paragraph's own). Tests in `tui.zig` cover
+  it.
+- **`ArrayList.clearRetainingCapacity` does `@memset(items, undefined)`**: you
+  cannot keep a slice of `items` and then clear. Consume the line BEFORE
+  clearing (see `StreamCtx.feed`).
+- **`std.ArrayList` in Zig 0.16 is UNMANAGED**: `append(gpa, item)`,
+  `insertSlice(gpa, i, s)`, `replaceRange(gpa, start, len, s)`.
 
-## Comandos
+## Commands
 
 ```bash
 zig build                        # debug
-zig build -Doptimize=ReleaseSafe # release (binario ~8.5MB, 1.6MB stripped)
-zig test src/chat.zig            # tests del parser SSE
-./zig-out/bin/zode --models      # lista modelos (headless, para probar sin TTY)
-./zig-out/bin/zode --chat "txt"  # chat streaming headless
+zig build -Doptimize=ReleaseSafe # release (binary ~8.5MB, 1.6MB stripped)
+zig test src/chat.zig            # tests of the SSE parser
+./zig-out/bin/zode --models      # list models (headless, to try without a TTY)
+./zig-out/bin/zode --chat "txt"  # headless streaming chat
 ./zig-out/bin/zode               # TUI
 ```
 
@@ -48,1308 +86,1351 @@ zig test src/chat.zig            # tests del parser SSE
 - `ZODE_MODELS_URL` (default: `https://opencode.ai/inference/v1/models`)
 - `ZODE_API_KEY`
 - `ZODE_MODEL` (default: `kimi-k2.6`), `ZODE_EFFORT` (low|medium|high)
-- Cargar con `set -a && source .env && set +a` (el `.env` está gitignored)
+- Load with `set -a && source .env && set +a` (`.env` is gitignored)
 
-## Estado y roadmap
+## State and roadmap
 
-**Hecho**: HTTP/TLS std puro verificado contra la API real; modelos multi-provider (opencode/openrouter/anthropic/openai/groq/deepseek/local); **streaming SSE incremental de verdad** (chunks del socket → `StreamCtx.feed` → eventos al instante, con ESC cortando la conexión); chat con tool_calls fragmentados (OpenAI y Anthropic); compaction 2 tiers; sessions JSONL con zjsonl; agent loop con 8 tools; permisos con allowlist persistida; TUI con markdown+syntax highlighting, scroll, spinner, tok/s, pickers modales; highlighter universal; **89 tests**; binario 10MB (1.9MB stripped).
+**Done**: pure std HTTP/TLS verified against the real API; multi-provider models
+(opencode/openrouter/anthropic/openai/groq/deepseek/local); **real incremental
+SSE streaming** (socket chunks → `StreamCtx.feed` → events immediately, with ESC
+cutting the connection); chat with fragmented tool_calls (OpenAI and Anthropic);
+2-tier compaction; JSONL sessions with zjsonl; agent loop with 8 tools;
+permissions with a persisted allowlist; TUI with markdown+syntax highlighting,
+scroll, spinner, tok/s, modal pickers; universal highlighter; **89 tests**; 10MB
+binary (1.9MB stripped).
 
-**Siguiente (orden sugerido)**:
-1. Skills (directorios de instrucciones cargables).
+**Next (suggested order)**:
+1. Skills (loadable instruction directories).
 2. MCP over stdio.
-3. E2E real contra Anthropic con key propia (wire format ya testeado unitariamente; OpenRouter sirve Claude vía OpenAI-compat).
+3. A real E2E against Anthropic with your own key (the wire format is already unit
+   tested; OpenRouter serves Claude through OpenAI-compat).
 
-## Mascota: Zo
+## Mascot: Zo
 
-- `mascot.zig`: Zo. Cara 1-línea por mood (idle/thinking/tooling/done/warn) en el status bar y en la franja de actividad. El banner de arranque es SOLO el wordmark `ZODE`: una mascota de 18 filas se probó (Houston, Astro Boy) y se rechazó por llenar la vista.
-- El agent la usa vía `setStatusWithZo(m, .mood, "text")`.
+- `mascot.zig`: Zo. A one-line face per mood (idle/thinking/tooling/done/warn) in
+  the status bar and in the activity strip. The startup banner is ONLY the `ZODE`
+  wordmark: an 18-row mascot was tried (Houston, Astro Boy) and rejected for
+  filling the view.
+- The agent uses it via `setStatusWithZo(m, .mood, "text")`.
 
-## Cache stats (provider-agnóstico)
+## Cache stats (provider-agnostic)
 
-- `chat.Usage` normaliza OpenAI (`prompt_tokens_details.cached_tokens`) y Anthropic (`cache_read_input_tokens`); llega por SSE con `stream_options:{include_usage:true}`.
-- `cache_stats.zig` acumula por sesión: `hitRatePct()`, reqs con hit, tokens prompt/cached/completion.
-- `/cache` en la TUI lo muestra. El headless agent imprime `[cache] X% hit-rate` al final.
-- Nota: los modelos free de OpenRouter no reportan cache; la métrica brilla con Anthropic/DeepSeek/OpenAI.
+- `chat.Usage` normalizes OpenAI (`prompt_tokens_details.cached_tokens`) and
+  Anthropic (`cache_read_input_tokens`); it arrives over SSE with
+  `stream_options:{include_usage:true}`.
+- `cache_stats.zig` accumulates per session: `hitRatePct()`, requests with a hit,
+  prompt/cached/completion tokens.
+- `/cache` in the TUI shows it. The headless agent prints `[cache] X% hit-rate` at
+  the end.
+- Note: OpenRouter's free models do not report cache; the metric shines with
+  Anthropic/DeepSeek/OpenAI.
 
-## Tools actuales (10)
+## Current tools (10)
 
-read, write, edit (multi-hunk), bash, glob, grep (rg nativo), list_files (listing plano barato), **web_fetch**, **web_search**, think (scratchpad sin efectos para planificar). No piden permiso: read, glob, grep, list_files, think, web_fetch, web_search.
+read, write, edit (multi-hunk), bash, glob, grep (native rg), list_files (a cheap
+flat listing), **web_fetch**, **web_search**, think (a scratchpad with no effects,
+for planning). They do not ask for permission: read, glob, grep, list_files,
+think, web_fetch, web_search.
 
-## Tools de web: `web_fetch` y `web_search`
+## The web tools: `web_fetch` and `web_search`
 
-- `web_fetch {url, max_bytes?}`: GET con `user-agent` de navegador y
-  `accept-encoding: identity`. El HTML se convierte a texto con `web.zig`; un
-  JSON o un texto plano pasan intactos. Un 4xx/5xx devuelve status + cuerpo
-  (que es donde está el motivo real).
-- `web_search {query, max_results?}`: endpoint `html/` de DuckDuckGo (sin key).
-  Es un scrape: `web.searchResults` saca título, URL y snippet por posición de
-  sus clases. Cuando el HTML cambie devuelve un mensaje que lo dice, NUNCA una
-  lista vacía (que el modelo leería como "no hay resultados").
-- `max_tool_output` (16 KB) es el presupuesto por defecto; tope duro 200 KB.
+- `web_fetch {url, max_bytes?}`: a GET with a browser `user-agent` and
+  `accept-encoding: identity`. The HTML is turned into text with `web.zig`; JSON
+  or plain text pass through untouched. A 4xx/5xx returns status + body (which is
+  where the real reason is).
+- `web_search {query, max_results?}`: DuckDuckGo's `html/` endpoint (no key). It
+  is a scrape: `web.searchResults` gets the title, URL and snippet by the position
+  of its classes. When the HTML changes it returns a message saying so, NEVER an
+  empty list (which the model would read as "there are no results").
+- `max_tool_output` (16 KB) is the default budget; hard cap 200 KB.
 
-Cuatro cosas que costaron y hay que saber:
+Four things that cost something and have to be known:
 
-1. **`accept-encoding: identity` explícito.** `openRequest` pone
-   `accept_encoding = .omit`, que es "no mandar el header", y sin él GitHub y
-   compañía responden gzip: el modelo se come 16 KB de bytes ilegibles. std no
-   descomprime de forma transparente. Además `looksCompressed` (magic gzip/zstd +
-   heuristic de binario) es la red de seguridad para cuando un servidor ignora
-   la cabecera: mejor "vino comprimido" que basura.
-2. **El `content-type` NO se puede devolver en `JsonResult`.** Los headers
-   viven en el buffer de redirects de `receiveHead`, que es de STACK y muere al
-   salir de `request`. El tipo se deduce del body (`looksLikeHtml`).
-3. **El resultado se COPIA a memoria propia de la arena.** Devolver una vista
-   del buffer del HTTP es una bomba: el `defer freeBody` la suelta al salir y el
-   ArenaAllocator reutiliza esa memoria en la siguiente allocación. Se vio
-   como `0xAA` donde debía estar el JSON, y solo con arena, por eso los tests
-   de red (que se saltan sin internet) son los que lo cazan.
-4. **El art no puede usar `*` ni `~`** (mismo motivo que el banner:
-   `markedSegments` los come como marcas de estilo). El iris es `=` y la pupila
-   `o`.
+1. **Explicit `accept-encoding: identity`.** `openRequest` sets
+   `accept_encoding = .omit`, which is "do not send the header", and without it
+   GitHub and friends answer gzip: the model eats 16 KB of unreadable bytes. std
+   does not decompress transparently. Also `looksCompressed` (gzip/zstd magic + a
+   binary heuristic) is the safety net for when a server ignores the header:
+   "it arrived compressed" is better than garbage.
+2. **The `content-type` CANNOT be returned in `JsonResult`.** The headers live in
+   `receiveHead`'s redirect buffer, which is on the STACK and dies when `request`
+   returns. The type is deduced from the body (`looksLikeHtml`).
+3. **The result is COPIED into memory of the arena's own.** Returning a view of
+   the HTTP buffer is a bomb: the `defer freeBody` lets it go on return and the
+   ArenaAllocator reuses that memory on the next allocation. It was seen as `0xAA`
+   where the JSON should have been, and only with the arena, which is why the
+   network tests (which are skipped without internet) are the ones that catch it.
+4. **The art cannot use `*` or `~`** (same reason as the banner:
+   `markedSegments` eats them as style marks). The iris is `=` and the pupil `o`.
 
-`web.zig` es PURO (sin red) a propósito: lo que falla siempre es parsear el
-HTML, y eso se testea con fixtures.
+`web.zig` is PURE (no network) on purpose: what always fails is parsing the HTML,
+and that is tested with fixtures.
 
-## Compaction de contexto (80% del límite)
+## Context compaction (80% of the limit)
 
-- `compaction.zig`: `budgetTokens(env)` = 80% de `ZODE_CONTEXT_LIMIT` (default 128k → 102k budget).
-- **Tier 1 (gratis, wired)**: `elideTier()` reemplaza tool results viejos (>256B, fuera de la ventana `recent_window=8`) por `[tool result elided: N bytes — re-run the tool if you need it]`. Es una VISTA del wire: la sesión JSONL conserva todo el historial.
-- Aplicada en `chatWorker` (TUI) y `runChat` (headless) antes de `buildBodyMessages`. El headless imprime `· N tool results elided` junto a `[cache]`.
-- `/context` en la TUI: tokens estimados vs budget y elided acumulado de la sesión.
-- **Tier 2 (wired, verificado E2E)**: si `needs_summary`, `agent.summarizeTurns()` hace UNA llamada LLM con `summaryPrompt()` y reemplaza `msgs[after system..summary_upto]` por una nota user `[earlier conversation summarized to fit the context budget]`. Best-effort: si falla, se sigue sin resumen. Cuenta para cache_stats.
-- Prueba E2E real (con `ZODE_CONTEXT_LIMIT=6000` y 8 reads): dispara `summarizing old turns…` en iteraciones sucesivas y el agente se auto-repara re-leyendo lo resumido cuando lo necesita. Caveat: con contextos muy chicos el límite de iteraciones (6/8) puede alcanzarse antes de terminar.
-- `estimateTokens`: ~4 chars/token + overhead JSON por mensaje.
+- `compaction.zig`: `budgetTokens(env)` = 80% of `ZODE_CONTEXT_LIMIT` (default
+  128k → 102k budget).
+- **Tier 1 (free, wired)**: `elideTier()` replaces old tool results (>256B,
+  outside the `recent_window=8` window) with `[tool result elided: N bytes —
+  re-run the tool if you need it]`. It is a VIEW of the wire: the JSONL session
+  keeps the whole history.
+- Applied in `chatWorker` (TUI) and `runChat` (headless) before
+  `buildBodyMessages`. The headless prints `· N tool results elided` next to
+  `[cache]`.
+- `/context` in the TUI: estimated tokens vs budget and the session's accumulated
+  elided count.
+- **Tier 2 (wired, verified E2E)**: if `needs_summary`,
+  `agent.summarizeTurns()` makes ONE LLM call with `summaryPrompt()` and replaces
+  `msgs[after system..summary_upto]` with a user note `[earlier conversation
+  summarized to fit the context budget]`. Best-effort: if it fails, it carries on
+  without a summary. It counts towards cache_stats.
+- Real E2E test (with `ZODE_CONTEXT_LIMIT=6000` and 8 reads): it fires
+  `summarizing old turns…` on successive iterations and the agent repairs itself
+  by re-reading what was summarized when it needs it. Caveat: with very small
+  contexts the iteration limit (6/8) can be reached before it finishes.
+- `estimateTokens`: ~4 chars/token + JSON overhead per message.
 
-## Pickers modales (estilo opencode)
+## Modal pickers (opencode style)
 
-- `tui.zig`: `openPicker(tag, title, items, cb)` (thread-safe, el worker puede abrirlo), `pickerHandleKey` captura TODO el input mientras está abierto (up/down/enter/esc/backspace + filtro case-insensitive en vivo, scroll de 10 visibles), `closePicker` libera los labels gpa-owned.
-- Dibujo: `drawPicker` box centrado con bordes, título, línea de filtro, items con selección resaltada y footer `up/down · enter · esc (n/total)`. Snapshot por frame (`pickerSnapshot`) copia ≤10 items a la arena del frame.
-- Comandos: `/model` (lista async del provider, free primero + desc "free"), `/provider` (con estado de key y default model), `/effort` sin args (low/medium/high). `/use` y `/effort <arg>` siguen funcionando.
-- Callback: `fn(*Model, tag, label)`; el label es copia heap liberada tras el callback.
-- FIX: `cur_model` ahora vive en `cur_model_buf` estático (`setModel()`) — antes un `/use <model>` con string efímero del input dejaba un slice colgante.
+- `tui.zig`: `openPicker(tag, title, items, cb)` (thread-safe, the worker can open
+  it), `pickerHandleKey` captures ALL the input while it is open (up/down/
+  enter/esc/backspace + a live case-insensitive filter, 10 visible rows of scroll),
+  `closePicker` frees the gpa-owned labels.
+- Drawing: `drawPicker` is a centred box with borders, a title, a filter line,
+  items with the selection highlighted and a footer `up/down · enter · esc
+  (n/total)`. Per-frame snapshot (`pickerSnapshot`) copies ≤10 items into the
+  frame's arena.
+- Commands: `/model` (async list of the provider, free first + a "free" hint),
+  `/provider` (with key state and default model), `/effort` with no args
+  (low/medium/high). `/use` and `/effort <arg>` still work.
+- Callback: `fn(*Model, tag, label)`; the label is a heap copy freed after the
+  callback.
+- FIX: `cur_model` now lives in a static `cur_model_buf` (`setModel()`) — before,
+  a `/use <model>` with an ephemeral string from the input left a dangling slice.
 
-## Contador de tokens (tok/s)
+## Token counter (tok/s)
 
-- `TextSink` mide chars del stream por turno y `updateTps()` calcula tok/s (~4 chars/token) con `Io.Timestamp.now(io_global, .real)` — solo streaming, sin tool execs ni permisos.
-- `agent.tps_live` (en curso) lo pinta el status bar como `⚡ N tok/s` mientras `busy`; `tps_last` queda para `/context`.
+- `TextSink` measures the stream's chars per turn and `updateTps()` computes
+  tok/s (~4 chars/token) with `Io.Timestamp.now(io_global, .real)` — streaming
+  only, without tool execs or permissions.
+- `agent.tps_live` (in flight) paints it in the status bar as `⚡ N tok/s` while
+  `busy`; `tps_last` stays for `/context`.
 
-## /context (gauge y breakdown)
+## /context (gauge and breakdown)
 
-- Línea 1: gauge de 20 celdas `[████░░…]` + `~used / limit tokens (P% of limit)`.
-- Línea 2: `system ~N · history ~N · N turns · budget N (P% used)`.
-- Línea 3: `elided this session: N tool results · last stream: N tok/s`.
+- Line 1: a 20-cell gauge `[████░░…]` + `~used / limit tokens (P% of limit)`.
+- Line 2: `system ~N · history ~N · N turns · budget N (P% used)`.
+- Line 3: `elided this session: N tool results · last stream: N tok/s`.
 
-## Anthropic nativo (Messages API + prompt caching)
+## Native Anthropic (Messages API + prompt caching)
 
-- `chat.ProviderKind{openai, anthropic}` + `kindForProvider(provider_id)`; provider `anthropic` en providers.zig (`ZODE_ANTHROPIC_KEY`, base `https://api.anthropic.com/v1`, default model `claude-sonnet-4-5`).
-- `buildBodyAnthropic`: `system` top-level, tools con `input_schema` (acepta formato OpenAI anidado o plano), `tool_calls` OpenAI → bloques `tool_use`, runs de role=tool → UN mensaje user con bloques `tool_result` (Anthropic no tiene role "tool"). Mensajes de contenido vacío se saltan (Anthropic los rechaza).
-- **3 breakpoints `cache_control:{type:"ephemeral"}`**: última tool, system y último bloque del último mensaje → el prefijo estable (tools+system+historial) se sirve de la cache del server cada turno (la técnica que usa Claude Code para el ~90% de hit-rate).
-- SSE Anthropic parseado en `dispatchEvents`: `message_start` (usage input+cache_read), `content_block_start`/`content_block_delta` (`text_delta`, `input_json_delta`), `message_delta` (output_tokens, stop_reason `tool_use`→`tool_calls`). `last_usage` ahora hace MERGE por campo (Anthropic reparte el usage entre eventos).
-- Auth vía `postJsonWithHeaders` (x-api-key + `anthropic-version: 2023-06-01`); OpenAI sigue con Bearer en `streamRaw`.
-- TRAMPA: `postJsonWithHeaders` NO envía Bearer — en `streamRaw` la elección de método/auth es por `ctx.kind`.
-- `models.zig` tolera `data` anidado (proxies).
+- `chat.ProviderKind{openai, anthropic}` + `kindForProvider(provider_id)`; the
+  `anthropic` provider in providers.zig (`ZODE_ANTHROPIC_KEY`, base
+  `https://api.anthropic.com/v1`, default model `claude-sonnet-4-5`).
+- `buildBodyAnthropic`: `system` at the top level, tools with `input_schema`
+  (accepts the nested OpenAI format or the flat one), OpenAI `tool_calls` →
+  `tool_use` blocks, role=tool runs → ONE user message with `tool_result` blocks
+  (Anthropic has no "tool" role). Messages with empty content are skipped
+  (Anthropic rejects them).
+- **3 `cache_control:{type:"ephemeral"}` breakpoints**: the last tool, the system
+  and the last block of the last message → the stable prefix (tools+system+history)
+  is served from the server's cache every turn (the technique Claude Code uses for
+  a ~90% hit rate).
+- Anthropic SSE parsed in `dispatchEvents`: `message_start` (usage
+  input+cache_read), `content_block_start`/`content_block_delta`
+  (`text_delta`, `input_json_delta`), `message_delta` (output_tokens, stop_reason
+  `tool_use`→`tool_calls`). `last_usage` now MERGES per field (Anthropic spreads
+  the usage across events).
+- Auth via `postJsonWithHeaders` (x-api-key + `anthropic-version: 2023-06-01`);
+  OpenAI still uses Bearer in `streamRaw`.
+- TRAP: `postJsonWithHeaders` does NOT send Bearer — in `streamRaw` the choice of
+  method/auth is by `ctx.kind`.
+- `models.zig` tolerates nested `data` (proxies).
 
-## Arquitectura de sesiones comprimidas (zjsonl)
+## Compressed session architecture (zjsonl)
 
-- Cada línea JSONL cuyo content >= 512 bytes se comprime con DEFLATE raw level 9 y se marca con prefijo `z` + base64 (JSON-safe, byte-exact). Ratio típico: 90-97% de ahorro.
-- Al cargar, las líneas `z` se descomprimen transparentemente. Round-trip testeado byte a byte.
-- Session.create/resumePath devuelven `*Session` heap: el File.Writer referencia write_buf dentro del struct (moverlo por valor = use-after-free).
-- El File.Writer de Zig 0.16 es posicional: para append usar `Writer.initStreaming` (el modo posicional crea holes de 0xFF).
+- Every JSONL line whose content is >= 512 bytes is compressed with raw DEFLATE
+  level 9 and marked with a `z` prefix + base64 (JSON-safe, byte-exact). Typical
+  ratio: 90-97% saving.
+- On load, the `z` lines are decompressed transparently. Round-trip tested byte by
+  byte.
+- Session.create/resumePath return a heap `*Session`: the File.Writer references
+  the write_buf inside the struct (moving it by value = use-after-free).
+- Zig 0.16's File.Writer is positional: to append use `Writer.initStreaming` (the
+  positional mode creates 0xFF holes).
 
-## Highlighter universal (v2)
+## Universal highlighter (v2)
 
-- `highlight.zig`: token scanner genérico de una línea (no por lenguaje): strings con escapes y prefijos r/b/f, comentarios de línea y bloque, números (hex/floats), keywords vs control-flow (2 estilos), builtins (zig `@fn`, rust `macro!`), tipos (+ heurística PascalCase), llamadas fn (`word(`), decoradores `@` (JS/TS).
-- Lenguajes con tabla: zig, js, ts, py, sh, c/cpp, rust, go, sql + fallback `generic` seguro para cualquier fence tag.
-- Invariante testeado: la concatenación de segmentos == línea original (no se pierde texto jamás).
+- `highlight.zig`: a generic one-line token scanner (not per language): strings
+  with escapes and r/b/f prefixes, line and block comments, numbers (hex/floats),
+  keywords vs control-flow (2 styles), builtins (zig `@fn`, rust `macro!`), types
+  (+ a PascalCase heuristic), fn calls (`word(`), `@` decorators (JS/TS).
+- Languages with a table: zig, js, ts, py, sh, c/cpp, rust, go, sql + a `generic`
+  fallback that is safe for any fence tag.
+- Tested invariant: the concatenation of the segments == the original line (text
+  is never lost).
 
-## Render incremental (TUI)
+## Incremental render (TUI)
 
-- Cada párrafo cerrado se parsea UNA vez a segmentos y se cachea con su propia arena (max 128; LIFO eviction). Solo el párrafo en streaming se re-parsea por frame.
-- La caché se invalida al cambiar el ancho de la terminal.
+- Each closed paragraph is parsed ONCE into segments and cached with its own arena
+  (max 128; LIFO eviction). Only the streaming paragraph is re-parsed per frame.
+- The cache is invalidated when the terminal's width changes.
 
 ## Headless agent
 
-- `zode --chat "..."` es un agente completo sin UI: system prompt + tools + loop de hasta 6 iteraciones con yolo implícito. Ideal para probar end-to-end sin TTY.
+- `zode --chat "..."` is a full agent with no UI: system prompt + tools + a loop
+  of up to 6 iterations with implicit yolo. Ideal for testing end-to-end without
+  a TTY.
 
-## Flujo de permisos
+## Permission flow
 
-- Worker de tool llama `model.requestPermission(tool, detail)` → **bloquea el hilo del worker** (spin + yield) hasta que la UI responda.
-- UI: cuando `permActive()`, el event handler captura `y/a/n/Esc` y llama `answerPermission(.allow/.allow_always/.deny)`; el draw pinta el diálogo modal (buffers fijos en el Model, cero allocs por frame).
-- Prioridad: `/yolo` (global) > allowlist "siempre permitir" (persistida en `~/.config/zode/permissions.json`) > diálogo.
-- Respuesta denegada se alimenta al LLM como tool_result `"denied: permission required"` para que re-planifique.
-- Los ticks (`ctx.redraw` en `.tick`) repintan solo mientras hay diálogo o streaming — 0 CPU en idle.
+- The tool worker calls `model.requestPermission(tool, detail)` → **blocks the
+  worker's thread** (spin + yield) until the UI answers.
+- UI: when `permActive()`, the event handler captures `y/a/n/Esc` and calls
+  `answerPermission(.allow/.allow_always/.deny)`; the draw paints the modal dialog
+  (fixed buffers in the Model, zero allocs per frame).
+- Priority: `/yolo` (global) > the "always allow" allowlist (persisted in
+  `~/.config/zode/permissions.json`) > the dialog.
+- A denied answer is fed back to the LLM as a tool_result `"denied: permission
+  required"` so it can re-plan.
+- Ticks (`ctx.redraw` in `.tick`) repaint only while there is a dialog or
+  streaming — 0 CPU when idle.
 
-## Sesiones y resume
+## Sessions and resume
 
-- JSONL append-only en `./sessions/zode-<id>.jsonl` (1 write por evento; tool_calls como JSON crudo para replay fiel).
-- `zode --resume` o `ZODE_RESUME=1` carga la sesión más reciente (por mtime) y la reabre: reescribe el historial una vez (truncate) y sigue appendeando.
-- `/resume` en la TUI reanuda la última; `/new` crea otra.
-- FIX IMPORTANTE: la respuesta final del asistente SÍ se persiste (TextSink acumula deltas en arena del turno).
+- Append-only JSONL in `./sessions/zode-<id>.jsonl` (1 write per event; tool_calls
+  as raw JSON for a faithful replay).
+- `zode --resume` or `ZODE_RESUME=1` loads the most recent session (by mtime) and
+  reopens it: it rewrites the history once (truncate) and keeps appending.
+- `/resume` in the TUI resumes the last one; `/new` creates another.
+- IMPORTANT FIX: the assistant's final answer IS persisted (TextSink accumulates
+  the deltas in the turn's arena).
 
 ## System prompt
 
-- `systemPrompt()` lee `AGENTS.md` (o `CLAUDE.md`) del CWD del proyecto del usuario, lo cachea una vez, y lo inyecta como primer mensaje `system` en cada request → prefijo estable cacheable por el provider.
+- `systemPrompt()` reads the `AGENTS.md` (or `CLAUDE.md`) of the user's project
+  CWD, caches it once, and injects it as the first `system` message in every
+  request → a stable prefix the provider can cache.
 
-## Gotchas del provider OpenCode
+## OpenCode provider gotchas
 
-- Los modelos `-free` solo funcionan desde el cliente oficial de OpenCode (gate server-side, respeta el gate).
-- Modelos pago requieren créditos en opencode.ai/console.
-- Chat: `POST {ZODE_BASE_URL}/chat/completions`; modelos: `GET /inference/v1/models`.
+- The `-free` models only work from the official OpenCode client (server-side
+  gate, and the gate is respected).
+- Paid models need credits in opencode.ai/console.
+- Chat: `POST {ZODE_BASE_URL}/chat/completions`; models: `GET
+  /inference/v1/models`.
 
-## Streaming SSE (incremental de verdad)
+## SSE streaming (really incremental)
 
-- `http_client.streamPost()` entrega el body POR TROZOS (`response.reader` con buffer de 64KB) en vez de bufferearlo entero con `allocRemaining`. Antes la TUI se quedaba congelada hasta que el modelo acababa.
-- `StreamCtx.feed(chunk)` acumula en `line_buf` y despacha cada `data:` en cuanto su línea queda completa. `scanSse` usa el MISMO parser alimentándolo entero (tests y paths sin socket).
-- OJO: `clearRetainingCapacity` hace `@memset(items, undefined)` → consumir la línea ANTES de limpiar.
-- `chat.cancel_current` es `std.atomic.Value(bool)`; ESC lo pone y el `on_chunk` devuelve `error.Cancelled`, que corta la conexión. El texto ya recibido se conserva (`result.partial`).
-- Headers de streaming: `accept: text/event-stream` + `cache-control: no-cache` (varios gateways renegocian el stream según esto).
+- `http_client.streamPost()` delivers the body IN CHUNKS (`response.reader` with a
+  64KB buffer) instead of buffering it whole with `allocRemaining`. Before, the
+  TUI stayed frozen until the model finished.
+- `StreamCtx.feed(chunk)` accumulates into `line_buf` and dispatches each `data:`
+  as soon as its line is complete. `scanSse` uses the SAME parser by feeding it
+  whole (tests and paths with no socket).
+- CAREFUL: `clearRetainingCapacity` does `@memset(items, undefined)` → consume
+  the line BEFORE clearing.
+- `chat.cancel_current` is a `std.atomic.Value(bool)`; ESC sets it and `on_chunk`
+  returns `error.Cancelled`, which cuts the connection. The text already received
+  is kept (`result.partial`).
+- Streaming headers: `accept: text/event-stream` + `cache-control: no-cache`
+  (several gateways renegotiate the stream based on this).
 
-## Tool calls: no colgarse
+## Tool calls: not getting stuck
 
-- El trigger histórico era "el último byte de los args es `}`". Si el stream se cortaba antes, o el modelo mandaba argumentos vacíos, el tool call NUNCA se emitía y el agent loop se quedaba esperando para siempre.
-- Ahora `tryEmitTool` valida JSON real, y `flushPendingTools()` (llamado en `finish`) fuerza la emisión de los que sí son ejecutables. Un tool sin argumentos se trata como `{}`.
-- Tests: "tool call cortado a mitad de args se emite al finish" y "tool sin argumentos".
+- The historical trigger was "the last byte of the args is `}`". If the stream was
+  cut before that, or the model sent empty arguments, the tool call was NEVER
+  emitted and the agent loop waited forever.
+- Now `tryEmitTool` validates real JSON, and `flushPendingTools()` (called in
+  `finish`) forces the emission of the ones that are executable. A tool with no
+  arguments is treated as `{}`.
+- Tests: "tool call cut in half is emitted at finish" and "tool with no arguments".
 
-## Retries y errores
+## Retries and errors
 
-- 429/5xx → `error.RateLimited` / `error.Overloaded` / `error.ServerError`, reintentados con backoff exponencial + jitter (3 intentos, 500ms/1s/2s). Se respeta `Retry-After` si el server lo manda.
-- 401/403 → `error.AuthFailed`, NO se reintenta (la key está mal; insistir no ayuda).
-- `Retry.wait()` duerme en trozos vía `io.sleep` y aborta pronto si hay ESC.
+- 429/5xx → `error.RateLimited` / `error.Overloaded` / `error.ServerError`,
+  retried with exponential backoff + jitter (3 attempts, 500ms/1s/2s).
+  `Retry-After` is respected if the server sends it.
+- 401/403 → `error.AuthFailed`, NOT retried (the key is wrong; insisting does not
+  help).
+- `Retry.wait()` sleeps in slices via `io.sleep` and aborts early if there is an
+  ESC.
 
-## Parámetros por familia de modelo
+## Parameters per model family
 
-- `chat.familyForModel(model)` detecta o-series/gpt-5 → `max_completion_tokens` + `reasoning_effort` (y nada de `temperature`, que ahí da 400). El resto usa `max_tokens`.
-- Anthropic: `max_tokens` es obligatorio, y si se manda `thinking.budget_tokens` tiene que ser ESTRICTAMENTE menor (si no, 400).
-- Tests: "buildBodyOpenAI: o-series usa max_completion_tokens + reasoning_effort".
+- `chat.familyForModel(model)` detects o-series/gpt-5 → `max_completion_tokens` +
+  `reasoning_effort` (and no `temperature` at all, which is a 400 there). The rest
+  use `max_tokens`.
+- Anthropic: `max_tokens` is mandatory, and if `thinking.budget_tokens` is sent it
+  has to be STRICTLY smaller (otherwise 400).
+- Tests: "buildBodyOpenAI: o-series uses max_completion_tokens +
+  reasoning_effort".
 
-## Config por usuario (~/.config/zode/config.json)
+## User config (~/.config/zode/config.json)
 
-- Antes los providers estaban compilados: apuntar a vLLM/LM Studio/Together exigía recompilar. Ahora `src/config.zig` los carga de disco.
-- `provider`, `model` y `providers[]` (id, name, base_url, models_url, key_env string o array, default_model, kind, note).
-- No se puede shadowear un provider compilado (el id gana el built-in).
-- `key_env` es una lista: se usa la primera no vacía. `ZODE_API_KEY` es el fallback genérico.
+- The providers used to be compiled in: pointing at vLLM/LM Studio/Together
+  required recompiling. Now `src/config.zig` loads them from disk.
+- `provider`, `model` and `providers[]` (id, name, base_url, models_url, key_env
+  string or array, default_model, kind, note).
+- A compiled provider cannot be shadowed (the built-in wins on an id clash).
+- `key_env` is a list: the first non-empty one is used. `ZODE_API_KEY` is the
+  generic fallback.
 
-## Metadatos de modelo
+## Model metadata
 
-- `models.zig` parsea `context_length` y `pricing.{prompt,completion}` de OpenRouter (los precios llegan como strings decimales → `jsonNumber` los convierte; nunca devuelve NaN).
+- `models.zig` parses OpenRouter's `context_length` and
+  `pricing.{prompt,completion}` (the prices arrive as decimal strings →
+  `jsonNumber` converts them; it never returns NaN).
 
-## Bugs de userdata / casts cruzados (verificados en pty)
+## Userdata bugs / crossed casts (verified in a pty)
 
-- Los 3 callbacks de un turno (`onDelta`, `onToolCall`, `onFinish`) reciben el MISMO `?*anyopaque`. Cada uno lo castea a su vista, así que hace falta un struct con nombre propio (`TurnCtx{ text, tools }`), no pasar `&tool_sink` y que `onDelta` lo castee a `*TextSink`: eso es "incorrect alignment" en cuanto llega el primer token, y en ReleaseFast es UB silencioso (lee campos de otro tipo).
-- `ZODE_PROVIDER` se ignoraba en la TUI (`cur_provider_id` hardcodeado a "opencode") → mandaba la key de un provider al endpoint de otro y salía 403. Ahora la precedencia es config.json > ZODE_PROVIDER > opencode.
+- The 3 callbacks of a turn (`onDelta`, `onToolCall`, `onFinish`) receive the SAME
+  `?*anyopaque`. Each casts it to its own view, so you need a struct with a proper
+  name (`TurnCtx{ text, tools }`), not passing `&tool_sink` and having `onDelta`
+  cast it to `*TextSink`: that is "incorrect alignment" the moment the first token
+  arrives, and in ReleaseFast it is silent UB (reading fields of another type).
+- `ZODE_PROVIDER` was ignored in the TUI (`cur_provider_id` hardcoded to "opencode")
+  → it sent one provider's key to another one's endpoint and got a 403. Now the
+  precedence is config.json > ZODE_PROVIDER > opencode.
 
-## Verificación sin TTY real
+## Verification without a real TTY
 
-Capturas en pty con `pty.openpty()` + `TIOCSWINSZ` y un emulador de pantalla mínimo (CUP/ED/EL/ED) para replay. Es la única forma fiable de ver la TUI desde un agente: `script` no fija tamaño de ventana y vaxis hace `width_pix / width` → división por cero con tamaño 0.
+Screenshots in a pty with `pty.openpty()` + `TIOCSWINSZ` and a minimal screen
+emulator (CUP/ED/EL/ED) for the replay. It is the only reliable way to see the TUI
+from an agent: `script` does not set the window size and vaxis does
+`width_pix / width` → division by zero with a size of 0.
 
-## Input: editor propio (`editor.zig`)
+## Input: our own editor (`editor.zig`)
 
-- `vxfw.TextField` es de UNA línea y sin historial → se sustituyó por `editor.Editor`: buffer con cursor, graphemes (no bytes), Shift/Alt+Enter = salto de línea, historial con ↑/↓ (con borrador), Ctrl+A/E/U/K/W, Ctrl+←/→ y Alt+B/F por palabra, y tope de 256 KB para que un pegado no tumbe la TUI.
-- La caja se dibuja a mano (`drawInput`): bordes `╭─╮│╰─╯`, prompt `❯`, placeholder, y el **cursor del terminal anclado** en la posición real (`surface.cursor`). Crece hasta 8 líneas y se recorta si no cabe.
-- Layout de abajo hacia arriba: status(height-2) · borde inf · input · borde sup · separador · historial. Se calcula ANTES de layoutear el historial porque `history_h` depende de la altura del input.
-- `doc` de layout en el propio código: si tocas esas filas, mira los comentarios de `typeErasedDrawFn`.
+- `vxfw.TextField` is ONE line and has no history → it was replaced by
+  `editor.Editor`: a buffer with a cursor, graphemes (not bytes), Shift/Alt+Enter =
+  newline, history with ↑/↓ (with a draft), Ctrl+A/E/U/K/W, Ctrl+←/→ and Alt+B/F
+  by word, and a 256 KB cap so a paste cannot take the TUI down.
+- The box is drawn by hand (`drawInput`): borders `╭─╮│╰─╯`, prompt `❯`,
+  placeholder, and the **terminal cursor anchored** at the real position
+  (`surface.cursor`). It grows up to 8 lines and is clipped if it does not fit.
+- Layout from the bottom up: status(height-2) · bottom border · input · top border
+  · separator · history. It is computed BEFORE laying out the history because
+  `history_h` depends on the input's height.
+- The layout `doc` is in the code itself: if you touch those rows, read the
+  comments in `typeErasedDrawFn`.
 
-## Autocompletado de `/`
+## `/` autocomplete
 
-- Se ofrece solo si el input empieza por `/` y NO tiene espacios (si no, ya es un comando con argumentos).
-- El match es por **prefijo del nombre del comando sin la barra** (`/use <prov> [model]` → `use`). Con la línea entera, `/mod` casaba con `/use ... [model]`.
-- Tab **y Enter** aceptan el resaltado; Esc cierra sin borrar; ↑/↓ navegan.
+- It is offered only if the input starts with `/` and has NO spaces (otherwise it
+  is already a command with arguments).
+- The match is by **prefix of the command name without the slash** (`/use <prov>
+  [model]` → `use`). With the whole line, `/mod` matched `/use ... [model]`.
+- Tab **and Enter** accept the highlight; Esc closes without erasing; ↑/↓ navigate.
 
-## Diff de write/edit
+## write/edit diff
 
-- `markdown.unifiedDiff` = LCS por líneas (O(n*m)), prefija ` ` / `+` / `-`. `splitLines` ignora el salto final para no generar una línea espuria.
-- `diffSegments` colorea por prefijo: +verde, -rojo, contexto gris, `@@` como heading.
-- El agent fotografía el archivo ANTES de ejecutar la tool y lo vuelve a leer después (`filePathOf` + `readFileAlloc`); si no cambia, no se añade nada al historial.
+- `markdown.unifiedDiff` = LCS by lines (O(n*m)), prefixed with ` ` / `+` / `-`.
+  `splitLines` ignores the final newline so it does not generate a spurious line.
+- `diffSegments` colours by prefix: +green, -red, context grey, `@@` as a heading.
+- The agent photographs the file BEFORE running the tool and reads it again
+  afterwards (`filePathOf` + `readFileAlloc`); if it did not change, nothing is
+  added to the history.
 
-## Bugs de autocompletado ya arreglados (no reintroducir)
+## Autocomplete bugs already fixed (do not reintroduce them)
 
-- `containsIgnoreCase` es *substring*, no prefijo: usarlo para comandos daba falsos positivos.
-- El prefijo del input va SIN la barra; las claves de `agent.commands` van CON ella. Hay que quitar la barra de un lado.
+- `containsIgnoreCase` is a *substring*, not a prefix: using it for commands gave
+  false positives.
+- The input's prefix goes WITHOUT the slash; the keys of `agent.commands` go WITH
+  it. The slash has to be removed on one side.
 
+## End-to-end example: `examples/platformer`
 
-## Ejemplo end-to-end: `examples/platformer`
+A platformer in pure Zig 0.16, built to put the harness to the test.
+`zig build test` → 34 tests, `zig build run` → play.
 
-Juego de plataformas en Zig 0.16 puro, construido para poner el harness a
-prueba. `zig build test` → 34 tests, `zig build run` → jugar.
+- `src/game.zig` — pure simulation (no I/O, which is why it is testable without
+  a terminal).
+- `src/render.zig` — draws the state. It only reads.
+- `src/main.zig` — the loop: input, fixed step, output.
 
-- `src/game.zig` — simulación pura (sin I/O, por eso testeable sin terminal).
-- `src/render.zig` — dibuja el estado. Solo lee.
-- `src/main.zig` — bucle: input, paso fijo, salida.
+### What the harness CANNOT do (reviewed by hand)
 
-### Lo que el harness NO sabe hacer (revisado a mano)
+When asked for a complete game, the model produced a plausible skeleton that did
+not compile. The concrete errors that came up:
 
-Al pedirle un juego completo, el modelo produjo un esqueleto plausible que no
-compilaba. Errores concretos que aparecieron:
+- **Zig 0.11 API mixed with 0.16**: `std.ArrayList(T).init(gpa)` (in 0.16
+  `ArrayList` is *unmanaged*: `.empty` + `append(gpa, x)`), `std.io.getStdIn()`,
+  `std.time.sleep(nanos)`.
+- **Files with crossed APIs**: `main.zig` called `Game.init()` without an
+  allocator while `game.zig` defined `Game.init(allocator)`, and `game.update()`
+  vs `game.step()`. It iterated `game.platforms` as if it were a slice when it is
+  an `ArrayList`.
+- **A non-existent `build.zig`** and a `build.zig.zon` with an invented
+  fingerprint.
+- **TODOs** in the code, even though the project's `AGENTS.md` forbids them.
 
-- **API de Zig 0.11 mezclada con la de 0.16**: `std.ArrayList(T).init(gpa)`
-  (en 0.16 `ArrayList` es *unmanaged*: `.empty` + `append(gpa, x)`),
-  `std.io.getStdIn()`, `std.time.sleep(nanos)`.
-- **Ficheros con APIs cruzadas**: `main.zig` llamaba `Game.init()` sin
-  allocator mientras `game.zig` definía `Game.init(allocator)`, y
-  `game.update()` vs `game.step()`. Iteraba `game.platforms` como si fuera un
-  slice cuando es un `ArrayList`.
-- **`build.zig` inexistente** y `build.zig.zon` con un fingerprint inventado.
-- **TODOs** en el código, pese a que el `AGENTS.md` del proyecto los prohíbe.
+Practical conclusion: for work spanning several files, the prompt has to fix the
+contract between them (the signature of `init`, the names of the public
+functions) and you have to compile after each step. The harness is good at
+editing a file that already compiles; for one that has to be invented whole, it is
+better to fix the contract and give the result a second look.
 
-Conclusión práctica: para trabajo que abarque varios ficheros, el prompt tiene
-que fijar el contrato entre ellos (firma de `init`, nombres de las funciones
-públicas) y hay que compilar tras cada paso. El harness es bueno editando un
-fichero que ya compila; para uno que tiene que inventarse entero, conviene
-fijar el contrato y dale una vuelta al resultado.
+### Bugs of zode itself that the example uncovered
 
-### Bugs del propio zode que sacó el ejemplo
-
-- **`takeDelimiter` y `StreamTooLong`**: si una línea SSE no cabe en el buffer
-  de transferencia (un tool call enorme, un delta gigante), el stream moría a
-  mitad de respuesta con `error.StreamTooLong`. Ahora el buffer es de 256 KB y,
-  si aun así no cabe, se entrega el buffer lleno tal cual y se sigue (el parser
-  reensambla parciales). Test: "una línea SSE más grande que cualquier buffer
-  se reensambla".
-- **Fuga en el path de error**: `streamChatCtx` usaba `errdefer gpa.destroy(ctx)`,
-  que no libera `parts` ni `line_buf` → fuga en cada 429/5xx. Ahora
+- **`takeDelimiter` and `StreamTooLong`**: if an SSE line does not fit in the
+  transfer buffer (a huge tool call, a giant delta), the stream died halfway
+  through the response with `error.StreamTooLong`. Now the buffer is 256 KB and,
+  if it still does not fit, the full buffer is delivered as is and it carries on
+  (the parser reassembles the partials). Test: "an SSE line bigger than any buffer
+  is reassembled".
+- **A leak in the error path**: `streamChatCtx` used `errdefer gpa.destroy(ctx)`,
+  which frees neither `parts` nor `line_buf` → a leak on every 429/5xx. Now it is
   `errdefer ctx.destroy()`.
 
-### Trampas de terminal que costaron un rato (útiles para cualquier TUI)
+### Terminal traps that cost an afternoon (useful for any TUI)
 
-- **`std.Io.Timestamp.durationTo(from, to)` es `to - from`**. Escribir
-  `now.durationTo(last)` da NEGATIVO siempre; con un `@max(0, …)` el elapsed
-  se queda en 0 y la simulación no avanza nunca (pero el render sí, así que
-  parece que funciona: se repinta un frame estático a 200 fps).
-- **Modo canónico**: sin `tcsetattr` quitando `ICANON`/`ECHO`, la terminal no
-  entrega ni un byte hasta el Enter. Y leer de una TTY es bloqueante aunque
-  esté en raw, así que hace falta un hilo aparte.
-- **No hay evento de "tecla soltada"** en modo raw. Se usa el auto-repeat del
-  terminal: si dejan de llegar bytes durante ~120 ms, la tecla se suelta.
-- **`Writer.fixed` no escribe en la terminal**: compone en su buffer. Hay que
-  volcarlo a un `File.Writer` y hacer `flush()`.
-- **Una secuencia ANSI por celda** son ~350 KB/s. Agrupar celdas contiguas del
-  mismo color en un tramo lo baja a ~40 KB/s.
-- **Al verificar con pty hay que drenar siempre**: si el proceso hijo llena el
-  buffer de la pty (~64 KB) y el padre no lee, se queda bloqueado en `write` y
-  parece un deadlock del programa. No es un bug del programa.
+- **`std.Io.Timestamp.durationTo(from, to)` is `to - from`.** Writing
+  `now.durationTo(last)` is always NEGATIVE; with an `@max(0, …)` the elapsed time
+  stays at 0 and the simulation never advances (but the render does, so it looks
+  like it works: a static frame is repainted at 200 fps).
+- **Canonical mode**: without `tcsetattr` removing `ICANON`/`ECHO`, the terminal
+  does not deliver a single byte until Enter. And reading from a TTY is blocking
+  even when it is in raw mode, so you need a separate thread.
+- **There is no "key released" event** in raw mode. The terminal's auto-repeat is
+  used: if the bytes stop arriving for ~120 ms, the key is considered released.
+- **`Writer.fixed` does not write to the terminal**: it composes into its buffer.
+  You have to dump it into a `File.Writer` and `flush()`.
+- **One ANSI sequence per cell** is ~350 KB/s. Grouping contiguous cells of the
+  same colour into one run brings it down to ~40 KB/s.
+- **When verifying with a pty you have to always drain it**: if the child process
+  fills the pty's buffer (~64 KB) and the parent does not read, it blocks on
+  `write` and looks like the program deadlocked. It is not a bug in the program.
 
+## The Ctrl+P modal palette (`palette.zig`)
 
-## Paleta modal de Ctrl+P (`palette.zig`)
+A modal in the style of opencode/Claude Code, with two modes:
 
-Modal al estilo opencode/Claude Code, con dos modos:
+- **Ctrl+P** — commands, grouped (Suggested · Model · Session) with the shortcut
+  on the right. Enter **puts the command in the input** instead of running it:
+  `/use` needs arguments and the user wants to see what is going to happen.
+- **Ctrl+T** (and `/model`) — two columns: providers on the left (with their key
+  state) and the models of the active provider on the right (with `free` or the
+  context window). `Tab` / `←→` change column. At the bottom, `Connect an
+  integration` + `ctrl+a` to type the API key.
 
-- **Ctrl+P** — comandos, agrupados (Sugerido · Modelo · Sesión) con el atajo
-  a la derecha. Enter **pone el comando en el input** en vez de ejecutarlo:
-  `/use` necesita argumentos y el usuario quiere ver qué va a pasar.
-- **Ctrl+T** (y `/model`) — dos columnas: providers a la izquierda (con su
-  estado de key) y los modelos del provider activo a la derecha (con `free` o
-  la ventana de contexto). `Tab` / `←→` cambian de columna. Abajo,
-  `Connect an integration` + `ctrl+a` para escribir la API key.
+Decisions that are not obvious:
 
-Decisiones que no son obvias:
-
-- **El filtro es por SUBCADENA, no por prefijo.** Es una caja de búsqueda, no
-  el autocompletado de `/`: con prefijo estricto escribir "mod" no encontraba
-  `/model` (que empieza por barra) y parecía roto. Ojo: esto es justo lo
-  contrario de lo que hace el autocompletado de `/`, que sí es por prefijo.
-- **`sel[c]` indexa `filtered[c]`, NUNCA `items`.** Cada columna tiene su
-  lista filtrada. Con una sola lista el dibujo filtraba sobre la marcha
-  mientras la selección contaba sobre la lista completa, y con cualquier
-  filtro la barra de resaltado iba a la fila equivocada.
-- **La fila de un item se calcula DESPUÉS del bloque de encabezado de grupo.**
-  Calculada antes, la etiqueta salía una fila por encima y el encabezado se
-  comía su sitio: la lista parecía desordenada.
-- **`items` y `groups` se copian al allocator del modelo, no a una arena de
-  frame.** La palette vive entre frames; si apuntaran al arena del frame se
-  quedarían colgando al redibujar por el streamer. Es la MISMA trampa que
-  avisa el punto de graphemes, y costó dos crashes.
-- **Toda tecla consumida por la palette pone `ctx.redraw = true`**, incluso
-  las que no cambian nada de la acción. Sin eso, escribir en el buscador
-  mutaba el estado pero la pantalla se quedaba igual (y Esc "no cerraba").
-- **Los modelos se descargan en un worker**; la modal se abre igual solo con la
-  columna de providers (que es local) para no dejar una espera en blanco.
-- **Las keys van a `~/.config/zode/auth.json` con permisos 0600**, nunca a
-  `config.json` (que la gente versiona). Se escribe en un temporal y se
-  renombra, para que un fallo a mitad no deje media key en un 0644.
-- `{f}` **no formatea** `json.ObjectMap` ni `json.Array` en el writer de 0.16:
-  hay serializadores a mano en `config.zig` (`writeStringMap`, `writeJsonString`).
+- **The filter is by SUBSTRING, not by prefix.** It is a search box, not the `/`
+  autocomplete: with a strict prefix, typing "mod" did not find `/model` (which
+  starts with a slash) and looked broken. Mind: this is exactly the opposite of
+  what the `/` autocomplete does, which IS by prefix.
+- **`sel[c]` indexes `filtered[c]`, NEVER `items`.** Each column has its own
+  filtered list. With a single list the drawing filtered on the fly while the
+  selection counted on the complete list, and with any filter the highlight bar
+  went to the wrong row.
+- **An item's row is computed AFTER the group header block.** Computed before, the
+  label came out one row too high and the header ate its place: the list looked
+  disordered.
+- **`items` and `groups` are copied to the model's allocator, not to a frame
+  arena.** The palette lives between frames; if they pointed at the frame's arena
+  they would dangle when the streamer redrew. It is the SAME trap the graphemes
+  point warns about, and it cost two crashes.
+- **Every key the palette consumes sets `ctx.redraw = true`**, including the ones
+  that change nothing about the action. Without that, typing in the search box
+  mutated the state but the screen stayed the same (and Esc "did not close").
+- **The models are downloaded in a worker**; the modal opens right away with just
+  the providers column (which is local) so there is no blank wait.
+- **The keys go to `~/.config/zode/auth.json` with 0600 permissions**, never to
+  `config.json` (which people version). It is written to a temp file and renamed,
+  so a half-way failure does not leave half a key in a 0644.
+- `{f}` does **not** format `json.ObjectMap` or `json.Array` in 0.16's writer:
+  there are hand-written serializers in `config.zig` (`writeStringMap`,
+  `writeJsonString`).
 
 ## Scroll
 
-- PageUp/PageDown mueven una **página** (la ventana, menos una línea), no 5
-  fijas. `hist_rows` se publica desde el draw (el único sitio que sabe el alto).
-- **Ctrl+U / Ctrl+D** = media página, como en less y en Claude Code.
-- Indicador `↓ N` en el status cuando el historial no está anclado abajo: sin
-  él se pierde la noción de "por qué no baja solo".
-- `ctx_used`/`ctx_pct` están **cacheados en el agente** y se refrescan al
-  cerrar cada turno: el status bar los lee en cada frame y recorrer el
-  historial 60 veces por segundo es trabajo tirado.
-
-## Estado
-
-**Hecho**: TUI con editor multilínea propio, autocompletado `/`, diff de
-write/edit, paleta Ctrl+P (comandos + modelos a dos columnas), connect de
-providers, scroll por página, status bar segmentado con la info de sesión, y
-azul de marca (truecolor) en cabecera, bordes y status.
-
-**Siguiente**: Skills, MCP over stdio, E2E contra Anthropic con key propia, y
-`@file` mentions (aplazado).
-
-## Bugs de junio 2026: los que costaron horas (todos verificados)
-
-Estos no son hipotéticos: salieron todos durante una sesión de depuración real.
-tienen ya un test que los caza; **no reintroducirlos**:
-
-### `drainPending` reseteaba el scroll en CADA frame
-`self.scroll = 0` estaba al final de `drainPending`, que se llama en cada draw
-aunque no haya nada nuevo. Resultado: `scrollBy` ponía 17 y el siguiente frame lo
-borraba. **PageUp no movía nada y parecía que el scroll no funcionaba.** Ahora
-solo re-ancla si `pending.items.len > 0` **y** `scroll == 0` (sticky bottom: si
-estás leyendo arriba, el texto nuevo no te tira de vuelta).
-
-### Enter no mandaba si el autocompletado estaba abierto
-`acceptAutocomplete` se llevaba la tecla y reescribía `/help` como `/help ` sin
-enviar. Había que pulsar Enter dos veces, y como tampoco se enviaba nada, la
-vista se quedaba vacía y el scroll "no tenía nada que enseñar". Ahora
-`isExactMatch` detecta que lo escrito ES el comando y deja caer la tecla hasta
-el editor.
-
-### `streamChat` recibía la base URL, no la URL
-`runOneTurn` pasaba `def.base_url` tal cual; `streamChat` espera la URL **completa**
-(`{base}/chat/completions` o `{base}/messages` para Anthropic). Todas las
-peticiones de la TUI eran un 404. El runner headless de `main.zig` sí añade el
-path, por eso ahí funcionaba y era invisible en los tests.
-
-### `writeFileSecure` llamaba a `configDir(null, …)`
-`configDir` devuelve null sin entorno, así que "Connect an integration" **nunca**
-podía guardar: siempre "no se pudo escribir auth.json". El `env` es un parámetro
-de la función, se le pasa `m.environ`.
-
-### La key guardada no se usaba
-`providers.keyFor` solo miraba variables de entorno, así que conectar un provider
-guardaba la key y luego se ignoraba. Ahora hay un `saved_keys` en memoria
-(cargado de `auth.json` al arrancar, actualizado al guardar) que **gana** al
-entorno, y `reloadUserConfig` + `loadAuthKeys` lo refrescan. Con test de orden de
-precedencia.
-
-### `std.atomic.Mutex` no es reentrante
-`pushHeader` cogía el lock y dentro llamaba a `pushKind`, que lo vuelve a coger:
-la app se quedaba esperando un mutex que ella misma tenía y se colgaba **antes
-del primer frame** (pantalla en blanco, 0 bytes escritos). Envolver en un
-`pushPending` que encola con el lock ya cogido una sola vez.
-
-### El hint de la paleta se pintaba encima de la etiqueta
-Solo se comprobaba que el hint cupiera, no que cupieran hint **y** etiqueta: en la
-columna estrecha de providers se leía `anthrclaude-sonnet-4-5`. Ahora se mide en
-columnas (`displayWidth`, no bytes) y si no caben los dos, el hint se omite: la
-etiqueta es lo que se selecciona.
-
-## Errores de red: el mensaje del server es lo único útil
-
-`StreamCtx` guarda los primeros 512 bytes del body (`noteRaw`) porque en un 4xx/5xx
-es el JSON de error, y `setServerMessage` saca el texto de `"message":"…"`.
-"HTTP 403" no dice nada; *"Model access is disabled"* sí.
-
-Cada status tiene su error propio porque la **acción** que toca es distinta:
-
-| status | error        | reintenta | mensaje                                        |
-|--------|--------------|-----------|------------------------------------------------|
-| 401    | AuthFailed   | no        | key rechazada, revisa `ZODE_<P>_KEY`           |
-| 402    | NoCredits    | **no**    | sin créditos → modelo `-free` o `/provider`    |
-| 403    | Forbidden    | no        | el MODELO no está disponible para tu cuenta     |
-| 404    | ModelNotFound| no        | el modelo no existe → `/model`                 |
-| 429    | RateLimited  | **sí**    | reintento con backoff                          |
-| 503    | Overloaded   | **sí**    | reintento con backoff                          |
-
-El 402 se reintentaba 3 veces como si fuera un 5xx: tres esperas de backoff para un
-error que no se arregla solo. Y el 403 se reportaba como "key mala" cuando casi
-siempre es el modelo.
-
-**El default model de un provider es una bomba de relojería**: `kimi-k2.6` desapareció
-de la lista de opencode y TODAS las peticiones dieron 403 hasta cambiarlo. Cuando
-un provider retire un modelo hay que cambiar `default_model` en `providers.zig`.
-
-## Módulos yStreamCtx: `deinit` que se destruye a sí mismo
-
-`StreamCtx.deinit` hacía `gpa.destroy(self)`. Renombrado a **`destroy`** porque
-un `defer ctx.deinit()` sobre un StreamCtx del stack revienta con *Invalid free*.
-Solo se usa con los que salen de `gpa.create`.
-
-## Marcadores de la cabecera: `*…*` y `~…~`
-
-La cabecera tiene DOS tipos de marca porque el logo es fijo y el color de Zo no:
-
-- `*…*` → `brand_hi` (#c0caf5): el wordmark y el tagline, un tono por encima del
-  búho para que el logo se lea encendido contra el arte.
-- `~…~` → el estilo que **pasa el llamante**: la carita de Zo, con el color de su
-  mood (que hasta ahora `Mood.color()` no se usaba para nada visible).
-
-Las marcas se QUITAN del texto: quien llama ve el texto limpio, el dibujo sale con
-varios colores. Una marca sin pareja es texto normal (nunca se pierde un byte).
-El invariante está testeado contra el `mascot.banner` real, no contra una cadena
-escrita a mano, para que el test siga siendo válido si se edita el arte.
-
-## Conectar providers (Ctrl+T → Ctrl+A)
-
-- **Ctrl+T** abre la paleta de modelos a dos columnas (providers | modelos).
-- **Ctrl+A** abre el prompt de key del provider **resaltado en la columna
-  izquierda** (o el activo si no hay ninguno). El pie lo anunciaba y no hacía
-  nada, que es peor que no anunciarlo.
-- El prompt muestra a qué provider va la key, enmascara con los 3 últimos
-  caracteres visibles, y al guardar vuelve a la paleta con el estado actualizado.
-- La key se serializa desde el mapa entero ya actualizado: si además se añadiera a
-  mano, salía duplicada (`{"a":"x","a":"x"}`).
-- `auth.json` con 0600, escrito en temporal y renombrado.
-
-## Estado
-
-**Hecho**: color de marca en cabecera/bordes/status, status bar segmentado con
-`modelo · provider (effort) · ctx% · tok/s`, scroll por página con Ctrl+U/D y
-sticky bottom, paleta Ctrl+P (comandos agrupados) y Ctrl+T (providers | modelos a
-dos columnas), conectar providers con Ctrl+A, errores de red con mensaje del
-server, banner nuevo con la mascota en color de marca.
-
-**Siguiente**: Skills, MCP over stdio, `@file` mentions (aplazado), y lo que acordemos al final de esta sesión.
-
-## `/clean`: borra basura del AGENTE, y solo eso
-
-`src/lib/clean.zig`, puro y testeado sin TUI. `/clean` (**simula**, `/clean yes`
-aplica, o `ZODE_YES=1` para cuando lo ejecuta el modelo).
-
-**Lo unico que borra**: sesiones de 0 bytes (el residuo de 58 ficheros / 24
-vacos de cuando se creaba una por arranque), `zode-*.tmp` de una escritura
-atomica cortada, e instancias muertas del registro `<gitdir>/zode/inst`
-(pid muerto, latido > 30 s, o JSON que no se entiende). Las **sesiones viejas
-se listan pero NO se borran**: `/clean yes` no las toca, que para eso estan
-`old_session` y `deletable()` es `false` para ese cubo.
-
-**Nunca**: `.zig-cache`, `zig-out`, `zig-pkg`, el codigo, `auth.json` y
-`permissions.json`. La exclusion vive en `clean.isProtected`, al lado del scan
-que podria alcanzarlas, y no en la UI: una lista de "no tocar" escrita en el
-render solo aguanta hasta que alguien anade un scan nuevo.
-
-Tres cosas que costaron:
-
-1. **`const a = std.mem.Allocator;` dentro de `cmdClean` rompe el modulo
-   entero.** El `a` local tapa el TIPO `a` en el resto de la funcion, asi que
-   `allocPrint(a, ...)` resuelve a una variable de tipo `type` y el error sale
-   en `clean.instanceDir` (un fichero que no se ha tocado), no en la linea que
-   lo causo. Los tests que construyen un `Model` sobre un `FixedBufferAllocator`
-   lo cazan; el modulo suelto no.
-2. **`sb.path(buf, …)` escribe en el buffer que le pasas.** Guardarse
-   `const a = sb.path(&b, …)` y luego volver a llamar con el MISMO `b` deja `a`
-   apuntando al segundo path: el test acaba comprobando el fichero
-   equivocado contra la expectativa equivocada y falla sin motivo aparente.
-   Cada path que sobrevive a otra llamada necesita su propio buffer.
-3. **`isProtected` por segmento, no por prefijo.** `a/b/.zig-cache/o` es tan
-   artefacto de compilacion como `.zig-cache/o`, y un test de prefijo lo pasa
-   por alto. Al reves tambien: `zig-out-mio` NO es `zig-out` y borrarlo seria un
-   fallo. Con test de los dos sentidos.
-
-La exclusion de `.zig-cache` es estructural ademas de explicita: los tres
-directorios que se recorren (`sessions/`, el registro, `~/.config/zode`) no
-contienen artefactos de compilacion, asi que ni siquiera se pueden alcanzar.
-
-## Bugs de la ronda de fuzzing (2026-06-29)
-
-Todos aparecieron con `fuzz.py` (secuencias aleatorias de teclas contra la TUI
-real, con red y hilos) y tienen ya un test. **La lección: una TUI no se prueba
-pulsando cuatro teclas**; hace falta bombardearla.
-
-### La rueda del raton tumbaba la app
-`self.scroll` es `usize` y la rueda hacia `self.scroll -= 3`: con el scroll en 0
-eso desborda -> panic. Lo minimice a dos `\x1b[<65;...M` seguidos. Ahora la rueda
-usa `scrollBy`, que satura en 0. **Cualquier aritmetica de scroll pasa por
-`scrollBy`; nada toca `self.scroll` a pelo.**
-
-### `key[1..]` sobre una key vacia
-En Zig 0.16 un slice `0..1` sobre un `[]const u8` de len 0 es un panic, no un
-slice vacio. `cmdGroup` quitaba la barra sin mirar. Ahora quita la barra solo si
-la hay, y hay test con key vacia y sin barra.
-
-### `/model` se mandaba como `/models`
-El autocompletado aceptaba con Enter comparando la coincidencia exacta SOLO
-contra el item resaltado, y el popup ordenaba `/models` antes que `/model`.
-Escribiendo `/model` + Enter se acababa mandando `/models` (otro comando).
-Ahora: **si lo escrito es un comando completo se manda; si es parcial, se
-completa.** Tab siempre acepta.
-
-### Un crash al salir por literales en la paleta
-`freeItems` liberaba `label`/`hint` de la paleta, pero el item `+ connect` traia
-**literales** (`"+ connect"`, `"ctrl+a"`). `gpa.free` sobre `.rodata` es un
-*Invalid free* que solo salia al salir de la app, con la paleta ya a medio
-destruir: atribuirlo al item causante es casi imposible. **Todos los label/hint
-de la paleta son copias propias; `buildModelItems` es el unico constructor.**
-
-### Los punteros colgantes de la columna de modelos
-El worker entregaba un `[]models_mod.Model` y acto seguido liberaba la lista: los
-`id` de los items quedaban colgando y el dibujo reventaba con `InvalidStartByte`.
-Ahora el worker construye los **items** (strings propios) y los deja en
-`pending_items`; el draw los recoge. `Palette.setItemsOwned` pasa a ser duena y
-libera los anteriores, asi que tampoco crece la memoria.
-
-### La paleta se modificaba desde dos hilos
-El worker de modelos rellenaba la paleta mientras el hilo de la UI la dibujaba
-**sin lock** (el lock solo cubre el historial) -> segfault. El worker ya no toca
-la paleta: deja los items y el draw los aplica.
-
-### Workers desacoplados + `io` destruido = use-after-free
-Los hilos se lanzan con `detach`: nadie los une. Al salir, `app.deinit()`
-destruia el `Io` mientras un worker seguia dentro de `io.async`
-(`Threaded.cancelThreads` -> segfault). Ahora hay un contador atomico de workers
-y `runTui` hace `model.waitWorkers(2000)` **antes** de que corran los `defer`, con
-tope de tiempo para no colgarse si un worker esta atascado en red. La espera
-cuenta vueltas con `yield`, no con el reloj: durante el apagado consultar la hora
-a traves del `Io` es justo lo que no se debe.
-
-### Recargar el config liberaba la arena de las keys
-Conectar un provider llama a `reloadUserConfig`, que liberaba la arena del
-config. Pero las keys de `auth.json` vivian ahi, y un worker de modelos
-descargando la lista estaba leyendo `saved_keys` por `providers.hasKey` en ese
-mismo instante: uso despues de liberar, sin que nada lo delate (solo pasa si el
-worker cae justo en esa linea).
-
-Ahora las keys tienen **arena propia que no se destruye hasta salir del proceso**
-(`keys_arena_state`): recargar solo reasigna el puntero, que es atomico, y el
-mapa viejo sigue siendo memoria valida hasta el teardown.
-
-**Regla: un mapa que se puede leer desde varios hilos no se libera nunca en
-runtime; se reasigna el puntero y se tira todo en el teardown, cuando ya no
-queda nadie leyendo.**
-
-## Filtrado de la paleta: el grupo veta y las dos columnas se vacian
-
-Dos bugs que hacen que la lista de modelos parezca vacia:
-
-1. **El nombre del grupo VETABA la coincidencia.** En `matches` el grupo se
-   comprobaba con `return containsIgnoreCase(g.name, q)`, o sea "si el grupo no
-   coincide, el item no existe". Buscar `sonnet` no encontraba
-   `claude-sonnet-4`, porque vive en el grupo "Models" y ahi no aparece
-   "sonnet". Con la lista filtrada vacia, Enter acababa aplicando un modelo que
-   **no** era el resaltado (parecia que si, porque la eleccion por indice caia
-   en el primero). El grupo es una via MAS para encontrar, nunca un veto.
-2. **Filtraban las dos columnas.** Con foco en Modelos, escribir `sonnet`
-   vaciaba tambien la columna de providers y se veia "no matches" en las dos:
-   la sensacion de que la lista de modelos no existe. Ahora **solo filtra la
-   columna con el foco**, y la otra se queda de contexto. Al cambiar de columna
-   (`Tab`, flechas) se vuelve a filtrar.
-
-Y el mas tonto de todos: `openModelPalette` fijaba el modo **despues** de
-`setItemsOwned`, y `resetSelection` calcula la columna activa a partir del
-modo. Con el modo viejo se quedaba en providers: las flechas no movian los
-modelos. **El modo va antes que `setItemsOwned`.**
-
-Ademas, las dos columnas resaltaban su fila y no se sabia cual tenia el foco.
-Ahora solo resalta la enfocada; la otra marca la fila elegida con `>` en azul
-apagado (se ve cual es sin parecer que tiene el foco).
-
-## El slime: tres formas fallidas antes de acertar
-
-El ascii art de una mascota es cuestion de gusto, y el de zode paso por tres
-versiones que estaban mal y que dejan en claro lo que hace que algo "se lea":
-
-1. **Cuadrado simetrico** (el primero): no tiene silueta. Es un cojin.
-2. **Cúpula + base que se derrama**: la forma correcta de una gota de agua, no
-   de un slime. Con los anchos subiendo y bajando, parecia un champinon.
-3. **Gota con chorreon arriba**: parecia una gota de agua con burbujas, no un bicho.
-4. **Slime de Minecraft** (el que hay): cubo de esquinas redondeadas MAS ALTO
-   QUE ANCHO, con los dos ojos ovalados y la boca ancha del sprite del juego.
-
-**Lo que importa es la proporcion, no el adorno.** El slime del juego es alto y
-estrecho; cualquier cosa cuadrada lee como caja. Y los ojos y la boca van
-**rellenos** de `█` porque en el sprite son manchas oscuras, no contornos.
-
-Los anchos se calculan centrando cada fila sobre la mas ancha con un script, no
-a ojo: a mano queda torcido en la tercera fila siempre.
-
-## EL FUZZER ESCRIBE EN TU CONFIG REAL
-
-`fuzz.py` teclea teclas pseudoaleatorias, entre ellas `ctrl+a` y `enter`, que
-abren el prompt de "connect" y **guardan una key en `~/.config/zode/auth.json`**.
-En una ronda guardo `"opencode": "pasted texthelpoommxllmm"`, que como la key
-guardada tiene prioridad sobre el entorno, tapaba la key buena del `.env` y dejo
-el provider con 401 "Invalid credential" sin explicacion apparent.
-
-- **El fuzzer corre con `HOME` propio** (`/tmp/opencode/fuzzhome`). No tocar
-  nunca la config real con pruebas automaticas.
-- `normalizeKey` rechaza keys con espacios o demasiado cortas, que es lo que
-  atrapa un texto pegado por error. Con test.
-
-## El default de opencode
-
-Solo `space-bunny-free` responde; el resto del free tier de opencode da 403
-("can only be used from within OpenCode") porque esta gateado al cliente
-oficial. Los de pago dan 402 sin creditos. Asi que el default es ese, y el
-`note` del provider lo dice para no perder tiempo probando los otros.
-
-## La cache de Zig sirve artefactos rancios
-
-`zig build` con el fuente limpio seguia instalando un binario con un `print` de
-depuracion que ya no existia, y `touch` no lo arreglaba. **Si una traza o un
-cambio "no aparece", borra `zig-out/bin/zode` y reconstruye** antes de perder
-media hora creyendose loco. Comprobar con `strings zig-out/bin/zode | grep <texto>`
-es el fastest check.
-
-## Liberar un LITERAL desde el worker: `[]const u8` no lo dice
-
-`execToolCalls` devolvia el literal `"Continue with el tool results above."` con
-el tipo `?[]const u8`, y `chatWorker` lo liberaba porque asumia que todo lo que
-devolvia `runOneTurn` era suyo. Liberar `.rodata` con el allocator del proceso
-es un **"reached unreachable code"** en ReleaseSafe: cualquier turno que usara
-una tool tumbaba la app, siempre.
-
-El arreglo de fondo no es el `dupe` (que arregla el síntoma), sino el **tipo**:
-las funciones que devuelven memoria propiedad del llamante devuelven `[]u8`, y
-los literales de Zig son `[]const u8`, asi que el compilador IMPIDE devolver uno
-por ahi. Mismo criterio que `setItemsOwned` en la paleta: la propiedad tiene que
-estar en la firma, no en un comentario.
-
-## El agent loop de la TUI estaba ROTO con tools (y en silencio)
-
-Un turno con tool en la TUI: la tool se ejecutaba y **la respuesta final nunca
-llegaba**. Sin error visible, porque el aviso del API se quedaba en `pending`
-y hacía falta pulsar una tecla para verlo. Dos bugs encadenados:
-
-1. **El mensaje del asistente se guardaba SIN sus `tool_calls`**
-   (`appendAssistant(text, null)`). El mensaje de tool lleva `tool_call_id`, así
-   que no casaba con nada y el API devolvía 400 `invalid_request_error` en el
-   turno SIGUIENTE. Ahora `toolCallsJsonFromCalls` reconstruye el JSON (el
-   MISMO formato que `chat.StreamCtx.toolCallsJson`, que es el que usa el
-   runner headless: si divergen, uno de los dos clientes manda una conversación
-   que el otro no puede leer). Con test que fija el formato literal.
-2. **Nadie abría el párrafo en vivo de las iteraciones.** `streamEnd` solo fijaba
-   el párrafo `if (streaming)`, y tras la tool no se llamaba a `streamStart`: los
-   deltas de la respuesta se acumulaban en `stream_buf` sin dueño y se
-   descartaban. Ahora cada iteración abre párrafo con `streamStartIteration`
-   (que NO resetea el reloj de la franja, a diferencia de `streamStart`: un reloj
-   que salta a 0 en cada iteración no sirve para distinguir "lento" de
-   "colgado"), y `streamEnd` tiene `or stream_buf.len > 0` para no perder texto.
-
-Y el tercero, ya de paso: **el system prompt se reinsertaba en cada iteración**
-(`items[0].role != .system` con el user ya appendado, así que `items[0]` era
-`user`). El segundo turno salía como `[user, system, tool, system]`. Ahora se
-busca el system en TODA la lista.
-
-Cómo se encontró: la tool nueva (`web_fetch`) prompts, el turno se quedaba en
-"thinking" para siempre, y el primer impulso fue "es la tool nueva". Con el
-`[DBG]` puesto en el bucle salió `iter 1 ERROR ServerError` en un `bash` de
-`echo hola`: no tenía nada que ver con la web.
-
-## `Io.sleep` desde un worker CONGELA la TUI (y ya lo ha hecho dos veces)
-
-`Retry.wait` y `chat.sleepMs` usaban `io_global.sleep`, y eso se lleva por
-delante el event loop del `Io` compartido con la UI: durante el backoff se
-paran los redraws, el reloj de la franja se congela y los avisos de reintento se
-quedan en `pending` sin pintar (hay que pulsar una tecla para verlos). Es
-exactamente el problema que el ACP resolvió con `nap()`, y la solución es la
-misma: un `nanosleep` pelado, sin tocar el `Io`. `Retry.wait` duerme a trozos de
-50 ms para que ESC corte, y respeta `retry-after` del server (que se leía en
-`chat.retry_after_secs` y **no lo leía nadie**: un 429 con `retry-after: 30`
-esperaba 1 s y se comía el rate limit entero, tres veces). Techo de 30 s.
-
-## Los mensajes del status tienen que decir POR QUÉ, no solo QUÉ
-
-- La etiqueta de la franja de actividad es la FASE: `thinking` / `streaming` /
-  `running <tool>` / `waiting for your permission` / `queued`. Antes era
-  "working" siempre, y 40 s de "working" no distinguen pensar de escribir de un
-  `bash` colgado.
-- `pushRetryNotice` dice el error en palabras (`errPhrase`), el texto del server
-  y cuánto falta: `rate limited: Too many requests · retrying in 1.0s (attempt
-  2/3)`. `@errorName` da identificadores (`RateLimited`), no mensajes.
-- `execToolCalls` acaba con `3 tools · 1.2s` (+ `· denied` si hubo) en vez de
-  "tools done", y el turno con `done · 12.4s`.
-- El backoff era `1 << (attempt -| 1)`, que satura a 0: la serie real era
-  500/500/1000 ms, no los 500/1000/2000 que decía el comentario. Ahora `1 <<
-  attempt`, con test.
-- Los tok/s del status bar solo se pintan **mientras hay stream**: `tps_live` es
-  el del último stream y no se borra, así que con un `bash` de 30 s la fila
-  seguía anunciando "⚡ 42 tok/s" sin llegar ni un token.
-
-## Prompts en cola
-
-`startChat` no comprobaba si habia un turno en curso, asi que mandar un segundo
-prompt lanzaba OTRO worker y los dos peleaban por la sesion y por el estado de
-streaming: el input se freezeaba, el historial se entrecortaba y no se tenia ni
-idea de si estaba trabajando o colgado.
-
-- `Model.queue` con `enqueuePrompt` / `takeQueued` / `queuedCount` / `clearQueue`,
-  todo bajo lock.
-- El worker, al terminar sus turnos, **saca el siguiente de la cola y sigue** en
-  vez de terminar y que otro worker compita.
-- `deinit` libera la cola Y su buffer: `clearQueue` conserva la capacidad (bien
-  para no reasignar en cada prompt), asi que `queue.deinit` va aparte o fuga.
-
-## Franja de actividad: la mascotita es el indicador de "trabajando"
-
-Una fila encima de la caja del input, que **solo aparece si hay algo que decir**
-(en reposo no ocupa nada):
-
-- La carita **anima** entre dos fotogramas (`mascot.faceFrames`): ojos abiertos
-  y entornados. Un icono estatico no distingue "pensando" de "colgado".
-- El estado: `working` / `queued` / `waiting for your permission`.
-- **Los segundos transcurridos**: es lo unico que responde a "¿se ha pegado?".
-  Ojo con las unidades: el valor son **milisegundos** y se imprimen como
-  `{ms/1000}.{(ms%1000)/100}s`; tratado como decimas salia "153.3s" con 1.5s.
-- La cola: cuantos y cual es el siguiente.
-
-El reloj usa el `Io` que se pasa con `Model.attachIo` y un flag `io_ready`: los
-tests construyen un Model sin app, y leer un `Io` sin inicializar es usar
-basura como tabla de vtable.
-
-## Limpiar el historial antes de pintar
-
-El parrafo en vivo se re-envuelve en cada frame y al ENCOGER (cada vez que el
-modelo respira entre tokens) las celdas sobrantes conservaban el texto viejo: se
-veia la misma respuesta **dos veces, partida y mezclada** ("deSsyftware:tcorregir").
-Se limpia el area del historial con un `fillRange` antes de pintar los bloques.
-
-## Separacion entre parrafos
-
-Una fila en blanco entre bloques, para que el historial no sea un muro de texto.
-Dos cosas que costaron un rato:
-
-- La fila se **anade al array de lineas** (un `PLine` vacio al principio), no se
-  suma solo al alto: `drawLines` recorre `c.lines`, asi que si el alto dice mas
-  de lo que hay, se pierde el ultimo bloque.
-- Va **delante**, no detras: puesta al final el hueco salia despues de cada
-  parrafo y no separaba nada.
-
-Los tests de render buscaban filas concretas (0, 1, 2) y se rompian con cada
-cambio de layout. Ahora usan `findRow` / `hasBlankRowBetween`, que buscan por
-**contenido**.
-
-## Flujos de la UI (los que pidio el usuario)
-
-- **Ctrl+P** -> paleta de comandos agrupados (Connect · Suggested · Model ·
-  Session). `Enter` **ejecuta** el comando elegido (ver "La paleta EJECUTA, no
-  rellena"). La excepción es `/use`, que necesita argumentos.
-- **Ctrl+P -> Connect -> provider -> key** es la via corta para conectar: el item
-  `Connect` de la cabecera abre un modal con todos los providers y su estado de
-  key; `Enter` en uno abre el campo de la key. Al guardar se vuelve a esa misma
-  lista con el estado ya actualizado (a "key ok"), que es donde se ve que ha
-  funcionado. Tirar al usuario a la paleta de modelos le deja con una columna
-  vacia sin saber por que.
-- **Ctrl+T** o **/model** -> "Switch model" a dos columnas (providers | modelos).
-  **Abre al instante** con la columna de providers (que es local) y los modelos se
-  rellenan cuando llegan de la red: antes no se abria nada hasta que el provider
-  respondia y con uno lento parecia que el comando no hacia nada.
-- **Ctrl+A** abre el modal de conectar directamente.
-- La franja de actividad va encima del input, y los bloques del historial van
-  separados con una fila en blanco. Los tokens y el ctx% salen SIEMPRE en el
-  status bar (antes el ctx% solo aparecia tras un turno entero, y al empezar no
-  se veia nada, que parecia que el contador no existia).
-- Las keys van a `~/.config/zode/auth.json` con 0600, nunca a `config.json`.
-  `providers.keyFor` mira primero las guardadas y luego el entorno, para que
-  conectar de verdad sirva para algo.
-
-## Todo el codigo en ingles
-
-La UI visible esta en ingles, el system prompt del agente tambien (los modelos
-responden mejor), **los comentarios del codigo tambien** y **los nombres de test
-tambien**.
-
-Esto se decidio en septiembre de 2026 y se completo en octubre: el codigo lo lee
-gente que no es quien lo escribe, y dos idiomas en el mismo fichero hacen que las
-_cauciones se lean a medias. Un nombre de test es la otra mitad de la precaution:
-es lo que diria "esto se rompio" si se quitara el test, asi que tambien tiene que
-poder leerlo quien no habla el idioma de quien lo escribio.
-
-**Lo que NO se traduce**, porque no es texto: identificadores, nombres de
-protocolo (SSE, JSON-RPC, `session/prompt`), nombres de tool, rutas, cadenas que
-el test assertea (un `⏺` o un `⎿` son parte de la asercion), y los diagramas
-ASCII. El unico sitio donde el Castellano sobrevive es este fichero y el resto
-de la documentacion, que es para el usuario.
-
-Comprobacion (los dos tienen que salir vacios):
+- PageUp/PageDown move a **page** (the window, minus one line), not a fixed 5.
+  `hist_rows` is published from the draw (the only place that knows the height).
+- **Ctrl+U / Ctrl+D** = half a page, like in less and in Claude Code.
+- A `↓ N` indicator in the status when the history is not anchored at the bottom:
+  without it you lose the notion of "why is it not scrolling down".
+- `ctx_used`/`ctx_pct` are **cached in the agent** and refreshed at the end of
+  each turn: the status bar reads them every frame and walking the history 60
+  times per second is wasted work.
+
+## State
+
+**Done**: TUI with its own multiline editor, `/` autocomplete, write/edit diff,
+Ctrl+P palette (commands + models in two columns), connecting providers, page
+scrolling, a segmented status bar with the session info, and the brand colour
+(truecolor) in the header, borders and status.
+
+**Next**: Skills, MCP over stdio, E2E against Anthropic with your own key, and
+`@file` mentions (deferred).
+
+## Bugs from June 2026: the ones that cost hours (all verified)
+
+These are not hypothetical: they all came out of a real debugging session. They
+all have a test that catches them; **do not reintroduce them**:
+
+### `drainPending` reset the scroll on EVERY frame
+
+`self.scroll = 0` was at the end of `drainPending`, which is called on every draw
+even when there is nothing new. Result: `scrollBy` set 17 and the next frame
+erased it. **PageUp moved nothing and the scroll looked broken.** Now it only
+re-anchors if `pending.items.len > 0` **and** `scroll == 0` (sticky bottom: if
+you are reading above, new text does not drag you back).
+
+### Enter did not send when the autocomplete was open
+
+`acceptAutocomplete` took the key and rewrote `/help` as `/help ` without
+sending. You had to press Enter twice, and since nothing was sent either, the
+view stayed empty and the scroll "had nothing to show". Now `isExactMatch`
+detects that what was typed IS the command and lets the key fall through to the
+editor.
+
+### `streamChat` received the base URL, not the URL
+
+`runOneTurn` passed `def.base_url` as is; `streamChat` expects the **complete**
+URL (`{base}/chat/completions` or `{base}/messages` for Anthropic). Every request
+from the TUI was a 404. `main.zig`'s headless runner does add the path, which is
+why it worked there and was invisible in the tests.
+
+### `writeFileSecure` called `configDir(null, …)`
+
+`configDir` returns null without an environment, so "Connect an integration"
+could **never** save: always "could not write auth.json". `env` is a parameter of
+the function, and it is given `m.environ`.
+
+### The saved key was not used
+
+`providers.keyFor` only looked at environment variables, so connecting a provider
+saved the key and then ignored it. Now there is a `saved_keys` in memory (loaded
+from `auth.json` at startup, updated on save) that **wins** over the environment,
+and `reloadUserConfig` + `loadAuthKeys` refresh it. With a test of the precedence
+order.
+
+### `std.atomic.Mutex` is not reentrant
+
+`pushHeader` took the lock and inside called `pushKind`, which takes it again:
+the app ended up waiting on a mutex it held itself and hung **before the first
+frame** (blank screen, 0 bytes written). Wrap it in a `pushPending` that enqueues
+with the lock already taken, once.
+
+### The palette's hint was painted over the label
+
+It only checked that the hint fit, not that the hint **and** the label fit: in
+the narrow providers column you read `anthrclaude-sonnet-4-5`. Now it is measured
+in columns (`displayWidth`, not bytes) and if both do not fit the hint is
+omitted: the label is what gets selected.
+
+## Network errors: the server's message is the only useful thing
+
+`StreamCtx` keeps the first 512 bytes of the body (`noteRaw`) because on a
+4xx/5xx it is the error JSON, and `setServerMessage` pulls the text out of
+`"message":"…"`. "HTTP 403" says nothing; *"Model access is disabled"* does.
+
+Each status has its own error because the **action** it calls for is different:
+
+| status | error         | retried | message                                    |
+|--------|---------------|---------|--------------------------------------------|
+| 401    | AuthFailed    | no      | key rejected, check `ZODE_<P>_KEY`         |
+| 402    | NoCredits     | **no**  | no credits → a `-free` model or `/provider`|
+| 403    | Forbidden     | no      | the MODEL is not available for your account |
+| 404    | ModelNotFound | no      | the model does not exist → `/model`        |
+| 429    | RateLimited   | **yes** | retry with backoff                        |
+| 503    | Overloaded    | **yes** | retry with backoff                        |
+
+402 was being retried 3 times as if it were a 5xx: three backoff waits for an
+error that does not fix itself. And 403 was reported as "bad key" when it is
+almost always the model.
+
+**A provider's default model is a time bomb**: `kimi-k2.6` disappeared from
+opencode's list and EVERY request got a 403 until it was changed. When a provider
+retires a model you have to change `default_model` in `providers.zig`.
+
+## Modules and StreamCtx: a `deinit` that destroyed itself
+
+`StreamCtx.deinit` did `gpa.destroy(self)`. Renamed to **`destroy`** because a
+`defer ctx.deinit()` over a stack StreamCtx blows up with *Invalid free*. Only
+used with the ones that come out of `gpa.create`.
+
+## Header markers: `*…*` and `~…~`
+
+The header has TWO kinds of marker because the logo is fixed and Zo's colour is
+not:
+
+- `*…*` → `brand_hi` (#c0caf5): the wordmark and the tagline, one tone above the
+  owl so the logo reads lit against the art.
+- `~…~` → the style the **caller passes in**: Zo's face, with the colour of its
+  mood (which until now `Mood.color()` was not used for anything visible).
+
+The markers are REMOVED from the text: the caller sees the clean text, the
+drawing comes out in several colours. An unpaired marker is normal text (a byte
+is never lost). The invariant is tested against the real `mascot.banner`, not
+against a hand-written string, so the test stays valid if the art is edited.
+
+## Connecting providers (Ctrl+T → Ctrl+A)
+
+- **Ctrl+T** opens the two-column model palette (providers | models).
+- **Ctrl+A** opens the key prompt for the provider **highlighted in the left
+  column** (or the active one if there is none). The footer announced it and did
+  nothing, which is worse than not announcing it.
+- The prompt shows which provider the key is for, masks it with the last 3
+  characters visible, and on save returns to the palette with the state updated.
+- The key is serialized from the whole already-updated map: if it were also added
+  by hand it came out duplicated (`{"a":"x","a":"x"}`).
+- `auth.json` with 0600, written to a temp file and renamed.
+
+## State
+
+**Done**: brand colour in header/borders/status, segmented status bar with
+`model · provider (effort) · ctx% · tok/s`, page scrolling with Ctrl+U/D and
+sticky bottom, the Ctrl+P palette (grouped commands) and Ctrl+T (providers |
+models in two columns), connecting providers with Ctrl+A, network errors with the
+server's message, a new banner with the mascot in the brand colour.
+
+**Next**: Skills, MCP over stdio, `@file` mentions (deferred), and whatever we
+agree at the end of this session.
+
+## `/clean`: deletes the AGENT's junk, and only that
+
+`src/lib/clean.zig`, pure and tested without a TUI. `/clean` (**simulates**,
+`/clean yes` applies, or `ZODE_YES=1` for when the model runs it).
+
+**The only thing it deletes**: 0-byte sessions (the leftover of 58 files / 24
+empty ones from when one was created per startup), `zode-*.tmp` from a cut-off
+atomic write, and dead instances of the `<gitdir>/zode/inst` registry (dead pid,
+heartbeat > 30 s, or JSON that does not parse). **Old sessions are LISTED but NOT
+deleted**: `/clean yes` does not touch them, which is what `old_session` is for
+and `deletable()` is `false` for that bucket.
+
+**Never**: `.zig-cache`, `zig-out`, `zig-pkg`, the code, `auth.json` and
+`permissions.json`. The exclusion lives in `clean.isProtected`, next to the scan
+that could reach them, and not in the UI: a "do not touch" list written in the
+render only holds until someone adds a new scan.
+
+Three things that cost something:
+
+1. **`const a = std.mem.Allocator;` inside `cmdClean` breaks the whole module.**
+   The local `a` shadows the TYPE `a` for the rest of the function, so
+   `allocPrint(a, ...)` resolves to a variable of type `type` and the error comes
+   out in `clean.instanceDir` (a file that was never touched), not on the line
+   that caused it. The tests that build a `Model` on a `FixedBufferAllocator`
+   catch it; the module on its own does not.
+2. **`sb.path(buf, …)` writes into the buffer you give it.** Keeping
+   `const a = sb.path(&b, …)` and then calling again with the SAME `b` leaves `a`
+   pointing at the second path: the test ends up checking the wrong file against
+   the wrong expectation and fails for no apparent reason. Every path that
+   survives another call needs its own buffer.
+3. **`isProtected` by segment, not by prefix.** `a/b/.zig-cache/o` is as much a
+   build artifact as `.zig-cache/o`, and a prefix test overlooks it. The other way
+   round too: `zig-out-mine` is NOT `zig-out` and deleting it would be a bug. With
+   a test of both directions.
+
+The `.zig-cache` exclusion is structural as well as explicit: the three
+directories that are walked (`sessions/`, the registry, `~/.config/zode`) do not
+contain build artifacts, so they cannot even be reached.
+
+## Bugs from the fuzzing round (2026-06-29)
+
+They all showed up with `fuzz.py` (random key sequences against the real TUI,
+with network and threads) and they all have a test now. **The lesson: a TUI is
+not tested by pressing four keys**; it has to be bombed.
+
+### The mouse wheel took the app down
+
+`self.scroll` is a `usize` and the wheel did `self.scroll -= 3`: with the scroll
+at 0 that underflows -> panic. Minimised to two `\x1b[<65;...M` in a row. Now the
+wheel uses `scrollBy`, which saturates at 0. **Any scroll arithmetic goes through
+`scrollBy`; nothing touches `self.scroll` by hand.**
+
+### `key[1..]` on an empty key
+
+In Zig 0.16 a `0..1` slice over a `[]const u8` of len 0 is a panic, not an empty
+slice. `cmdGroup` removed the slash without checking. Now it removes the slash
+only if it is there, and there is a test with an empty key and with no slash.
+
+### `/model` was sent as `/models`
+
+The autocomplete accepted with Enter by comparing the exact match ONLY against
+the highlighted item, and the popup sorted `/models` before `/model`. Typing
+`/model` + Enter ended up sending `/models` (a different command). Now: **if what
+was typed is a complete command it is sent; if it is partial, it is completed.**
+Tab always accepts.
+
+### A crash on exit from literals in the palette
+
+`freeItems` freed the palette's `label`/`hint`, but the `+ connect` item brought
+**literals** (`"+ connect"`, `"ctrl+a"`). `gpa.free` on `.rodata` is an *Invalid
+free* that only showed on exit, with the palette already half destroyed: blaming
+it on the offending item is nearly impossible. **Every label/hint in the palette
+is its own copy; `buildModelItems` is the only constructor.**
+
+### Dangling pointers in the models column
+
+The worker delivered a `[]models_mod.Model` and immediately freed the list: the
+items' `id`s were left dangling and the drawing blew up with `InvalidStartByte`.
+Now the worker builds the **items** (own strings) and leaves them in
+`pending_items`; the draw collects them. `Palette.setItemsOwned` is now owned and
+frees the previous ones, so it does not grow either.
+
+### The palette was modified from two threads
+
+The models worker filled the palette while the UI thread drew it **without a
+lock** (the lock only covers the history) -> segfault. The worker no longer
+touches the palette: it leaves the items and the draw applies them.
+
+### Detached workers + destroyed `io` = use-after-free
+
+The threads are spawned with `detach`: nobody joins them. On exit, `app.deinit()`
+destroyed the `Io` while a worker was still inside `io.async`
+(`Threaded.cancelThreads` -> segfault). Now there is an atomic worker counter and
+`runTui` does `model.waitWorkers(2000)` **before** the `defer`s run, with a time
+cap so it does not hang if a worker is stuck in the network. The wait counts
+turns with `yield`, not with the clock: during shutdown, asking the time through
+the `Io` is exactly what you should not do.
+
+### Reloading the config freed the keys' arena
+
+Connecting a provider calls `reloadUserConfig`, which freed the config's arena.
+But the keys from `auth.json` lived there, and a worker downloading the model list
+was reading `saved_keys` through `providers.hasKey` at that very instant: use
+after free, with nothing giving it away (it only happens if the worker lands
+exactly on that line).
+
+Now the keys have **an arena of their own that is not destroyed until the process
+exits** (`keys_arena_state`): reloading only reassigns the pointer, which is
+atomic, and the old map stays valid memory until the teardown.
+
+**Rule: a map that can be read from several threads is never freed at runtime; the
+pointer is reassigned and everything is thrown at the teardown, when there is
+nobody left reading.**
+
+## Palette filtering: the group vetoed, and both columns emptied
+
+Two bugs that make the model list look empty:
+
+1. **The group name VETOED the match.** In `matches` the group was checked with
+   `return containsIgnoreCase(g.name, q)`, that is "if the group does not match,
+   the item does not exist". Searching `sonnet` did not find `claude-sonnet-4`,
+   because it lives in the "Models" group and "sonnet" does not appear there. With
+   the filtered list empty, Enter ended up applying a model that was **not** the
+   highlighted one (it looked like it was, because the index-based selection fell
+   on the first). The group is one MORE way to find things, never a veto.
+2. **Both columns were filtered.** With focus on Models, typing `sonnet` also
+   emptied the providers column and you saw "no matches" on both: the feeling that
+   the model list does not exist. Now **only the focused column is filtered**, and
+   the other one stays as context. When you change column (`Tab`, arrows) it
+   filters again.
+
+And the silliest of all: `openModelPalette` set the mode **after**
+`setItemsOwned`, and `resetSelection` computes the active column from the mode.
+With the old mode it stayed on providers: the arrows did not move the models.
+**The mode goes before `setItemsOwned`.**
+
+On top of that, both columns highlighted their row and there was no way to tell
+which had the focus. Now only the focused one is highlighted; the other marks the
+chosen row with `>` in dim blue (you can see which without it looking focused).
+
+## The slime: three failed versions before getting it right
+
+The ASCII art of a mascot is a matter of taste, and zode's went through three
+versions that were wrong and make clear what makes something "read":
+
+1. **Symmetric square** (the first one): no silhouette. It is a cushion.
+2. **Dome + a base that spills**: the right shape for a drop of water, not for a
+   slime. With the widths going up and down it looked like a mushroom.
+3. **A drop with a drip on top**: it looked like a water drop with bubbles, not a
+   creature.
+4. **Minecraft slime** (the one that stayed): a box with rounded corners TALLER
+   THAN WIDE, with the two oval eyes and the wide mouth of the game's sprite.
+
+**What matters is the proportion, not the decoration.** The game's slime is tall
+and narrow; anything square reads as a box. And the eyes and the mouth are
+**filled** with `█` because in the sprite they are dark patches, not outlines.
+
+The widths are computed by centring each row over the widest one with a script,
+not by eye: by hand it always comes out crooked on the third row.
+
+## THE FUZZER WRITES TO YOUR REAL CONFIG
+
+`fuzz.py` types pseudo-random keys, among them `ctrl+a` and `enter`, which open
+the "connect" prompt and **save a key in `~/.config/zode/auth.json`**. In one
+round it saved `"opencode": "pasted texthelpoommxllmm"`, and since a saved key
+has priority over the environment it masked the good key from `.env` and left the
+provider with a 401 "Invalid credential" and no apparent explanation.
+
+- **The fuzzer runs with its own `HOME`** (`/tmp/opencode/fuzzhome`). Never touch
+  the real config with automated tests.
+- `normalizeKey` rejects keys with spaces or that are too short, which is what
+  catches a text pasted by mistake. With a test.
+
+## OpenCode's default
+
+Only `space-bunny-free` answers; the rest of opencode's free tier gives a 403
+("can only be used from within OpenCode") because it is gated to the official
+client. The paid ones give a 402 without credits. So the default is that one, and
+the provider's `note` says so to avoid wasting time trying the others.
+
+## Zig's cache serves stale artifacts
+
+`zig build` with a clean source kept installing a binary with a debug `print`
+that no longer existed, and `touch` did not fix it. **If a trace or a change "does
+not appear", delete `zig-out/bin/zode` and rebuild** before losing half an hour
+convincing yourself you are going mad. Checking with `strings zig-out/bin/zode |
+grep <text>` is the fastest check.
+
+## Freeing a LITERAL from the worker: `[]const u8` does not say so
+
+`execToolCalls` returned the literal `"Continue with the tool results above."`
+typed as `?[]const u8`, and `chatWorker` freed it because it assumed everything
+`runOneTurn` returned was its own. Freeing `.rodata` with the process allocator is
+a **"reached unreachable code"** in ReleaseSafe: any turn that used a tool took
+the app down, always.
+
+The real fix is not the `dupe` (which fixes the symptom) but the **type**:
+functions that return memory owned by the caller return `[]u8`, and Zig literals
+are `[]const u8`, so the compiler PREVENTS returning one that way. Same criterion
+as `setItemsOwned` in the palette: ownership has to be in the signature, not in a
+comment.
+
+## The TUI's agent loop was BROKEN with tools (and silently)
+
+A turn with a tool in the TUI: the tool ran and **the final answer never
+arrived**. With no visible error, because the API notice stayed in `pending` and
+you had to press a key to see it. Two bugs chained:
+
+1. **The assistant's message was stored WITHOUT its `tool_calls`**
+   (`appendAssistant(text, null)`). The tool message carries a `tool_call_id`, so
+   it matched nothing and the API answered 400 `invalid_request_error` on the
+   NEXT turn. Now `toolCallsJsonFromCalls` rebuilds the JSON (the SAME format as
+   `chat.StreamCtx.toolCallsJson`, which is what the headless runner uses: if they
+   diverge, one of the two clients sends a conversation the other cannot read).
+   With a test that pins the literal format.
+2. **Nobody opened the live paragraph for the iterations.** `streamEnd` only set
+   the paragraph `if (streaming)`, and after the tool `streamStart` was not
+   called: the response's deltas accumulated in `stream_buf` with no owner and
+   were discarded. Now every iteration opens a paragraph with `streamStartIteration`
+   (which does NOT reset the strip's clock, unlike `streamStart`: a clock that
+   jumps to 0 on each iteration cannot tell "slow" from "hung"), and `streamEnd`
+   has `or stream_buf.len > 0` so no text is lost.
+
+And the third one, while we were at it: **the system prompt was re-inserted on
+every iteration** (`items[0].role != .system` with the user already appended, so
+`items[0]` was `user`). The second turn went out as
+`[user, system, tool, system]`. Now the system is looked for in the WHOLE list.
+
+How it was found: the new tool (`web_fetch`) prompts, the turn stayed in
+"thinking" forever, and the first instinct was "it is the new tool". With `[DBG]`
+in the loop it printed `iter 1 ERROR ServerError` on a `bash` of `echo hola`: it
+had nothing to do with the web.
+
+## `Io.sleep` from a worker FREEZES the TUI (and has done it twice)
+
+`Retry.wait` and `chat.sleepMs` used `io_global.sleep`, and that takes the event
+loop of the `Io` shared with the UI away with it: during the backoff the redraws
+stop, the strip's clock freezes and the retry notices stay in `pending` unpainted
+(you have to press a key to see them). It is exactly the problem
+`lib/sleep.zig` exists for, and the solution is the same: a bare `nanosleep`
+syscall that does not touch the `Io`. `Retry.wait` sleeps in 50 ms slices so ESC
+can cut it short, and it respects the server's `retry-after` (which was read into
+`chat.retry_after_secs` and **read by nobody**: a 429 with `retry-after: 30` waited
+1 s and ate the entire rate limit, three times). 30 s ceiling.
+
+## The status messages have to say WHY, not just WHAT
+
+- The activity strip's label is the PHASE: `thinking` / `streaming` /
+  `running <tool>` / `waiting for your permission` / `queued`. Before it was
+  always "working", and 40 s of "working" does not tell thinking from writing from
+  a hung `bash`.
+- `pushRetryNotice` says the error in words (`errPhrase`), the server's text and
+  how long is left: `rate limited: Too many requests · retrying in 1.0s (attempt
+  2/3)`. `@errorName` gives identifiers (`RateLimited`), not messages.
+- `execToolCalls` ends with `3 tools · 1.2s` (+ `· denied` if there were any)
+  instead of "tools done", and the turn with `done · 12.4s`.
+- The backoff was `1 << (attempt -| 1)`, which saturates to 0: the real series was
+  500/500/1000 ms, not the 500/1000/2000 the comment said. Now `1 << attempt`,
+  with a test.
+- The status bar's tok/s are only painted **while there is a stream**: `tps_live`
+  is the last stream's and it is not cleared, so with a 30 s `bash` the row kept
+  announcing "⚡ 42 tok/s" without a single token arriving.
+
+## Queued prompts
+
+`startChat` did not check whether a turn was already in flight, so sending a
+second prompt launched ANOTHER worker and the two fought over the session and the
+streaming state: the input froze, the history cut itself off, and there was no
+way to tell whether it was working or hung.
+
+- `Model.queue` with `enqueuePrompt` / `takeQueued` / `queuedCount` /
+  `clearQueue`, all under a lock.
+- The worker, when it finishes its turns, **takes the next one off the queue and
+  carries on** instead of finishing and letting another worker compete.
+- `deinit` frees the queue AND its buffer: `clearQueue` keeps the capacity (good,
+  so we do not reallocate on every prompt), so `queue.deinit` goes separately or
+  it leaks.
+
+## Activity strip: the little mascot is the "working" indicator
+
+One row above the input box, which **only appears if there is something to say**
+(when idle it takes up nothing):
+
+- The face **animates** between two frames (`mascot.faceFrames`): open eyes and
+  narrowed eyes. A static icon does not tell "thinking" from "hung".
+- The state: `working` / `queued` / `waiting for your permission`.
+- **The elapsed seconds**: it is the only thing that answers "has it hung?".
+  Mind the units: the value is **milliseconds** and it is printed as
+  `{ms/1000}.{(ms%1000)/100}s`; treated as tenths it said "153.3s" for 1.5s.
+- The queue: how many and which is next.
+
+The clock uses the `Io` given by `Model.attachIo` and an `io_ready` flag: the
+tests build a Model without an app, and reading an uninitialized `Io` is using
+garbage as a vtable.
+
+## Clearing the history before painting
+
+The live paragraph is re-wrapped every frame and when it SHRINKS (every time the
+model breathes between tokens) the leftover cells kept the old text: the same
+answer was visible **twice, split and mixed** ("deSsyftware:tcorregir"). The
+history area is cleared with a `fillRange` before painting the blocks.
+
+## Separation between paragraphs
+
+A blank row between blocks, so the history is not a wall of text. Two things that
+cost an afternoon:
+
+- The row is **added to the array of lines** (an empty `PLine` at the front), not
+  just added to the height: `drawLines` walks `c.lines`, so if the height says more
+  than there is, the last block is lost.
+- It goes **before**, not after: placed at the end the gap came out after each
+  paragraph and separated nothing.
+
+The render tests looked for concrete rows (0, 1, 2) and broke with every layout
+change. Now they use `findRow` / `hasBlankRowBetween`, which search by
+**content**.
+
+## UI flows (the ones the user asked for)
+
+- **Ctrl+P** -> grouped command palette (Connect · Suggested · Model · Session).
+  `Enter` **runs** the chosen command (see "The palette RUNS, it does not fill").
+  The exception is `/use`, which needs arguments.
+- **Ctrl+P -> Connect -> provider -> key** is the short way to connect: the
+  `Connect` item in the header opens a modal with all the providers and their key
+  state; `Enter` on one opens the key field. On save it goes back to that same
+  list with the state already updated (to "key ok"), which is where you see that
+  it worked. Dumping the user into the models palette leaves them with an empty
+  column and no idea why.
+- **Ctrl+T** or **/model** -> "Switch model" in two columns (providers | models).
+  It **opens right away** with the providers column (which is local) and the
+  models are filled in when they arrive from the network: before, nothing opened
+  until the provider answered, and with a slow one it looked like the command did
+  nothing.
+- **Ctrl+A** opens the connect modal directly.
+- The activity strip goes above the input, and the history blocks are separated
+  with a blank row. The tokens and the ctx% ALWAYS appear in the status bar
+  (before the ctx% only appeared after a whole turn, and at the start you saw
+  nothing, which made it look like the counter did not exist).
+- The keys go to `~/.config/zode/auth.json` with 0600, never to `config.json`.
+  `providers.keyFor` looks at the saved ones first and the environment second, so
+  connecting actually does something.
+
+## All the code in English
+
+The visible UI is in English, the agent's system prompt too (models answer
+better), **the code comments too** and **the test names too**.
+
+This was decided in September 2026 and completed in October: the code is read by
+people who did not write it, and two languages in the same file make the
+_cautions_ get read halfway. A test name is the other half of the caution: it is
+what would say "this broke" if the test were removed, so it also has to be
+readable by someone who does not speak the language of whoever wrote it.
+
+**What is NOT translated**, because it is not text: identifiers, protocol names
+(SSE, JSON-RPC, `session/prompt`), tool names, paths, strings the test asserts on
+(a `⏺` or a `⎿` are part of the assertion), and the ASCII diagrams.
+
+Check (both have to come out empty):
 
 ```bash
 grep -h '^test "' src/*.zig src/lib/*.zig | grep -P '[\x{00e1}\x{00e9}\x{00ed}\x{00f3}\x{00fa}\x{00f1}\x{00bf}\x{00a1}]'
 grep -rn '^\s*//[/!].*\b\(que\|para\|del\|los\|las\|una\|como\|esta\|mas\)\b' --include=*.zig src/
 ```
 
-## La paleta EJECUTA, no rellena
+## The palette RUNS, it does not fill
 
-Elegir un comando de la lista con `Enter` lo **ejecuta**. Antes ponia la
-etiqueta en el input y hacia falta un `Enter` mas, y como la paleta se cerraba
-antes de escribir, el comando se quedaba a medias hasta la siguiente tecla: se
-leia como "esto no hace nada".
+Choosing a command from the list with `Enter` **runs** it. Before it put the label
+in the input and needed one more `Enter`, and since the palette closed before
+writing, the command was left half-done until the next key: it read as "this does
+nothing".
 
-- `agent.runPaletteCommand` decide y devuelve `done` / `needs_args` / `quit`.
-  `/use` es el UNICO que necesita argumentos (vuelve al input con la barra
-  puesta); `/quit` lo atiende la TUI porque es quien tiene el `ctx.quit`.
-- El comando hace eco en el historial como `.user`, igual que si se hubiera
-  tecleado, para que se vea QUE se ejecuto y no solo que paso algo.
-- La paleta se cierra **antes** de despachar: algunos comandos la reabren con
-  otro contenido (`/model` -> paleta de modelos) y si siguiera activa, esa se
-  dibujaria encima y el `esc` de la nueva no cerraria la vieja.
-- El pie de la paleta dice `enter run`, no `enter insert`.
+- `agent.runPaletteCommand` decides and returns `done` / `needs_args` / `quit`.
+  `/use` is the ONLY one that needs arguments (it goes back to the input with the
+  slash in place); `/quit` is handled by the TUI because it is who has the
+  `ctx.quit`.
+- The command echoes in the history as `.user`, just as if it had been typed, so
+  you see THAT it ran and not just that something happened.
+- The palette closes **before** dispatching: some commands reopen it with
+  different content (`/model` -> the models palette) and if it were still active,
+  that one would be drawn on top and the new `esc` would not close the old one.
+- The palette's footer says `enter run`, not `enter insert`.
 
-De paso, dos bugs que salieron al tocar esto:
+Two bugs that came out while touching this:
 
-- **`Palette.close` soltaba los items sin liberarlos.** Hacia `items = &.{}` a
-  pelo, asi que cada Ctrl+P cerrado era una fuga de las etiquetas, y `owns_items`
-  se quedaba en `true` sobre una lista vacia (la paleta parecia dueña de algo
-  que ya no tenia). Ahora `close` NO toca los items: se liberan en el siguiente
-  `setItemsOwned` o en `destroy` (que es lo que llama `Model.deinit`). Con
-  test.
-- **`/effort` sin argumentos contestaba "unknown effort"**. `it.rest()` devuelve
-  `""`, no `null`, para "/effort", y el `else` de "low|medium|high" se comia el
-  caso: el picker no se abria nunca. En `submit` ahora un resto vacio es un
-  `null` de verdad. Con test.
+- **`Palette.close` let go of the items without freeing them.** It did
+  `items = &.{}` by hand, so every closed Ctrl+P was a leak of the labels, and
+  `owns_items` stayed `true` over an empty list (the palette looked like it owned
+  something it no longer had). Now `close` does NOT touch the items: they are
+  freed in the next `setItemsOwned` or in `destroy` (which is what `Model.deinit`
+  calls). With a test.
+- **`/effort` with no arguments answered "unknown effort"**. `it.rest()` returns
+  `""`, not `null`, for "/effort", and the `else` of "low|medium|high" ate the
+  case: the picker never opened. In `submit` an empty rest is now a real `null`.
+  With a test.
 
-## El banner: ZODE en letras de bloque, y por que NO un bicho dibujado a mano
+## The banner: ZODE in block letters, and why NOT a hand-drawn creature
 
-Tres versiones de criatura (cuadrado simetrico, cupula con base derramada, gota
-con chorreon) salieron mal por la misma razon, y merece escrito porque se va a
-repetir en cuanto alguien quiera "un mascotito mas bonito":
+Three versions of a creature (symmetric square, dome with a spilled base, a drop
+with a drip) came out wrong for the same reason, and it is worth writing down
+because it is going to repeat as soon as someone wants "a nicer little mascot":
 
-**`▀` y `▄` pintan MEDIA celda.** `▀` es la mitad de ABAJO, `▄` la de ARRIBA, y
-`█` la entera. Dibujar un contorno con medias celdas deja los bordes a media
-altura: el resultado no es una silueta, es un monton de barras sueltas. Se
-intentó arreglar conservando y perdiendo mitades y no funciono, porque el
-problema no es cual mitad se conserva sino que el dibujo depende de que la
-terminal alinee filas y columnas con exactitud milimetrica.
+**`▀` and `▄` paint HALF a cell.** `▀` is the bottom half, `▄` the top half, and
+`█` the whole one. Drawing an outline with half cells leaves the edges at half
+height: the result is not a silhouette, it is a pile of loose bars. It was tried
+being fixed by keeping and losing halves and it did not work, because the problem
+is not which half you keep but that the drawing depends on the terminal aligning
+rows and columns with millimetric accuracy.
 
-**Con caracteres de cajetin (`█ ╗ ╝ ═ ║`) todas las celdas se pintan enteras**
-y la forma es la que uno cree. El ASCII art con cajas es engañosamente
-fragil; el de cajetin no.
+**With box-drawing characters (`█ ╗ ╝ ═ ║`) every cell is painted whole** and the
+shape is the one you meant. ASCII art with boxes is deceptively fragile; box
+drawing is not.
 
-Por eso el banner es el nombre en letras de bloque (figlet "big"), 6 lineas, y
-la mascota se queda como **una carita de una linea** para la franja de
-actividad y el status bar, que es donde tiene que ser legible sin ocupar filas.
+That is why the banner is the name in block letters (figlet "big"), 6 lines, and
+the mascot stays as **a one-line face** for the activity strip and the status
+bar, which is where it has to be legible without taking up rows.
 
-## La fila de status va por SEGMENTOS, y la carita en el color de su mood
+## The status row goes by SEGMENTS, and the face in its mood's colour
 
-La queja fue "esto ni se nota por el color". El motivo: la fila se componia
-como **una sola string** pintada entera con `brand_soft` (el azul apagado), asi
-que la carita salia del mismo gris apagado que el texto. `Mood.color()` no se
-usaba para nada visible.
+The complaint was "you cannot even tell by the colour". The reason: the row was
+composed as **a single string** painted entirely in `brand_soft` (the dim blue),
+so the face came out in the same dim grey as the text. `Mood.color()` was not used
+for anything visible.
 
-- La fila se compone como `[]InfoSeg` y se pinta celda a celda: la carita con
-  `Mood.vaxisColor()` en negrita, el texto en `brand_soft`, el spinner aparte.
-- El mood lo pone quien compone el status (`setStatusWithMood(mood, texto)`), no
-  se deduce de `busy`: el agente sabe si esta pensando, esperando permiso o
- colgado, y el estado de la TUI solo sabe dos de esas tres cosas.
-- `setStatusWithZo` YA NO mete la carita en el texto. Antes la metia, y como
-  la fila tambien la pintaba, salian **dos** (una en la franja y otra en el
-  texto) y la segunda en gris. Si se cambia uno, hay que cambiar el otro.
+- The row is composed as `[]InfoSeg` and painted cell by cell: the face with
+  `Mood.vaxisColor()` in bold, the text in `brand_soft`, the spinner separately.
+- The mood is set by whoever composes the status (`setStatusWithMood(mood,
+  text)`), not deduced from `busy`: the agent knows whether it is thinking,
+  waiting for permission or hung, and the TUI's state only knows two of those
+  three.
+- `setStatusWithZo` does NOT put the face in the text any more. Before it did,
+  and since the row also painted it, there were **two** (one in the strip and one
+  in the text) and the second one in grey. If you change one, change the other.
 
-## `putText` devuelve la COLUMNA FINAL, no el ancho
+## `putText` returns the FINAL COLUMN, not the width
 
-`p.putText(col, row, text, style) u16` devuelve la columna en la que acaba. Asi
-que **`col += p.putText(col, ...)` esta mal** (suma dos posiciones absolutas) y
-`col = p.putText(col, ...)` es lo correcto. Ese bug mando la "A" de "always
-allow" a la columna 92 de un panel de 68, fuera de la caja, y hacia fallar el
-test de las cuatro opciones. Solo se haFixed en dos sitios; cualquier bucle
-nuevo que encadene textos tiene que hacerlo asi.
+`p.putText(col, row, text, style) u16` returns the column it ends at. So
+**`col += p.putText(col, ...)` is wrong** (it adds two absolute positions) and
+`col = p.putText(col, ...)` is correct. That bug sent the "A" of "always allow" to
+column 92 of a 68-wide panel, outside the box, and made the test of the four
+options fail. It has only been fixed in two places; any new loop that chains
+texts has to do it this way.
 
-## El dialogo de permisos es un MODAL centrado, no cuatro lineas
+## The permission dialog is a centred MODAL, not four lines
 
-Antes eran cuatro lineas pegadas justo encima de la caja del input, en medio
-del flujo normal: con el historial lleno se veian a medias o las tapaba el
-caja, y la app parecia **colgada** esperando algo que nadie veia. Ahora es
-`drawPermissionModal`: caja centrada, fondo limpio (si no, el historial se
-transparentia debajo), borde en amarillo, tool y argumentos, y las cuatro
-opciones con su tecla resaltada. Se dibuja **encima de todo**, justo antes que
-la paleta.
+Before they were four lines stuck right above the input box, in the middle of the
+normal flow: with a full history they were half visible or the box covered them,
+and the app looked **hung** waiting for something nobody could see. Now it is
+`drawPermissionModal`: a centred box, a clean background (otherwise the history
+shows through underneath), a yellow border, the tool and its arguments, and the
+four options with their key highlighted. It is drawn **on top of everything**,
+just before the palette.
 
-Y la captura de verificacion tiene que **esperar a que el modal aparezca** antes
-de mandar la tecla: mandarla a los 6 s cuando el dialogo tarda 12 s no prueba
-nada, la `n` se va al input y parece que el atajo no funciona.
+And the verification screenshot has to **wait for the modal to appear** before
+sending the key: sending it at 6 s when the dialog takes 12 s proves nothing, the
+`n` goes to the input and it looks like the shortcut does not work.
 
-## Las tools se marcan para que el parser las pinte en dos tonos
+## Tools are marked so the parser paints them in two tones
 
-`pushToolStart` compone `*write*(hola.js)`: el nombre marcado con `*…*` para que
-`markdown.markedSegments` lo pinte en el color fuerte de la tool y el argumento
-en el apagado. Sin la marca, `write` y `hola.js` salian del mismo cyan y no se
-distinguian de un vistazo. El resultado de la tool usa el mismo truco
-(`*resumen* · Nms`) con `tool_res_bold`.
+`pushToolStart` composes `*write*(hola.js)`: the name marked with `*…*` so that
+`markdown.markedSegments` paints it in the tool's strong colour and the argument
+in the dim one. Without the mark, `write` and `hola.js` came out in the same cyan
+and were indistinguishable at a glance. The tool's result uses the same trick
+(`*summary* · Nms`) with `tool_res_bold`.
 
-**Sin espacio antes del parentesis**: los tests buscan `read(src/tui.zig)`, y un
-espacio los rompe. Los marcadores se quitan al pintar: la fila nunca los
-muestra (test).
+**No space before the parenthesis**: the tests look for `read(src/tui.zig)`, and
+a space breaks them. The markers are removed when painting: the row never shows
+them (test).
 
-## La cabecera NO lleva separador de parrafos
+## The header has NO paragraph separator
 
-La separacion de parrafos (una fila en blanco) partia el ASCII art en trozos:
-una fila en blanco entre letras y el logo deja de leerse. `prev_banner` en el
-bucle de la cache de segmentos desactiva el separador alrededor de `.banner`.
+The paragraph separation (a blank row) cut the ASCII art into pieces: a blank row
+between the letters and the logo stops reading. `prev_banner` in the segment cache
+loop disables the separator around `.banner`.
 
-## Detalle al escribir tests de dibujo
+## Detail when writing drawing tests
 
-- Una carita son **varios graphemes** en celdas distintas (`◔◕`): comparar la
-  string entera contra `cell.char.grapheme` no casa nunca. Hay que recorrer con
-  `vaxis.unicode.graphemeIterator`, como hace el painter.
-- Buscar lineas de arte por un **trozo** es fragil: `█████╗` (linea 3) es
-  subcadena de `███████╗` (linea 1), asi que `findRow` devuelve la fila 0 y el
-  test compara una linea consigo misma. Comparar la fila **completa**.
-- La carita sale **tanto en la franja de actividad como en el status**: `findRow`
-  encuentra la primera, y el test acaba comprobando la fila equivocada. Para el
-  status hay que leer `s.readCell(col, height - 2)` directamente.
+- A little face is **several graphemes** in different cells (`◔◕`): comparing the
+  whole string against `cell.char.grapheme` never matches. You have to walk it
+  with `vaxis.unicode.graphemeIterator`, as the painter does.
+- Looking for art lines by a **fragment** is fragile: `█████╗` (line 3) is a
+  substring of `███████╗` (line 1), so `findRow` returns row 0 and the test
+  compares a line with itself. Compare the **whole** row.
+- The face appears **both in the activity strip and in the status**: `findRow`
+  finds the first one, and the test ends up checking the wrong row. For the status
+  you have to read `s.readCell(col, height - 2)` directly.
 
-## Estado
+## State
 
-**Hecho**: tools de web (`web_fetch` con HTML→texto, `web_search` por
-DuckDuckGo, sin permisos) + `web.zig` puro con tests, **agent loop de la TUI
-arreglado** (el mensaje del asistente llevaba `null` en vez de sus
-`tool_calls` y mataba el turno con 400 silencioso; y el párrafo de la
-iteración post-tool no se abría, así que la respuesta final se perdía),
-franja de actividad con la FASE (`thinking`/`streaming`/`running <tool>`) en
-vez de "working", mensajes de reintento con el motivo y la espera, cabecera con
-**solo el wordmark ZODE** (5 filas de ASCII puro, sin mascota ni línea de saludo
-ni línea de atajos: Houston se probó y se rechazó, ver "v4"), la paleta de
-Ctrl+P **ejecuta** el comando elegido en vez de dejarlo en el input, dialogo de
-permisos como modal centrado, fila de status por
-segmentos con la carita en el color de su mood, tools en dos tonos, UI en
-ingles, Ctrl+T (/model instantaneo a dos columnas), Ctrl+A (conectar), scroll
-por pagina con Ctrl+U/D y sticky bottom, errores de red con el mensaje del
-server, y los crashes del fuzzing.
+**Done**: web tools (`web_fetch` with HTML→text, `web_search` via DuckDuckGo, no
+permissions) + pure `web.zig` with tests, **the TUI's agent loop fixed** (the
+assistant's message carried `null` instead of its `tool_calls` and killed the turn
+with a silent 400; and the post-tool iteration's paragraph did not open, so the
+final answer was lost), an activity strip with the PHASE
+(`thinking`/`streaming`/`running <tool>`) instead of "working", retry messages with
+the reason and the wait, a header with **only the ZODE wordmark** (5 rows of plain
+ASCII, no mascot, no greeting line, no shortcuts line: Houston was tried and
+rejected, see "v4"), the Ctrl+P palette **runs** the chosen command instead of
+leaving it in the input, the permission dialog as a centred modal, a status row by
+segments with the face in its mood's colour, tools in two tones, UI in English,
+Ctrl+T (/model instantly in two columns), Ctrl+A (connect), page scrolling with
+Ctrl+U/D and sticky bottom, network errors with the server's message, and the
+fuzzing crashes.
 
-**Siguiente**: Skills, MCP over stdio, `@file` mentions (aplazado), permisos
-selectivos (que las tools inocuas corran sin preguntar en vez de solo con
-`/yolo` global), `web_fetch` con budget por rango (ahora solo lee el principio
-del documento) y un buscador de verdad detrás de `web_search`, y lo que
-acordemos al final de esta sesion.
+**Next**: Skills, MCP over stdio, `@file` mentions (deferred), selective
+permissions (so harmless tools run without asking instead of only with a global
+`/yolo`), `web_fetch` with a per-range budget (now it only reads the beginning of
+the document) and a real search engine behind `web_search`, and whatever we agree
+at the end of this session.
 
-## El banner: tres versiones, y la que se quedó
+## The banner: three versions, and the one that stayed
 
-**v1 (cajetín, figlet "big")** — filas desalineadas, se leía "diec FERE". El
-problema de fondo: un art de cajetín es un **mapa de celdas**, y si las filas no
-caen en las mismas columnas no hay nada que leer. Además el test que lo vigilaba
-medía con `.len`, que son BYTES (la fila 0 "medía" 101 columnas), así que
-pasaba siempre.
+**v1 (box drawing, figlet "big")** — misaligned rows, it read as "diec FERE". The
+underlying problem: box-drawing art is a **map of cells**, and if the rows do not
+land on the same columns there is nothing to read. Also the test that watched it
+measured with `.len`, which is BYTES (row 0 "measured" 101 columns), so it always
+passed.
 
-**v2 (cajetín, composed en comptime)** — bien alineado y bien en la pty de
-pruebas. En la terminal del usuario era **ilegible**: un manchurrón con relieve
-que no se leía como nada. Motivo: un art de `█ ╗ ╝ ═ ║` depende de cómo dibuja
-la fuente el bloque completo, y con doble ancho o sustituto los trazos se
-ensanchan y se solapan.
+**v2 (box drawing, composed at comptime)** — well aligned and good in the test
+pty. In the user's terminal it was **illegible**: a relief smudge that read as
+nothing. Reason: art made of `█ ╗ ╝ ═ ║` depends on how the font draws the full
+block, and with a double width or a substitute the strokes get fat and overlap.
 
-**v3 (ASCII puro, el que hay)** — `#` y espacio, 5 filas, cuatro cajas de 6
-columnas. Se lee igual en cualquier terminal y `O` y `D` se distinguen de una
-vez (que era el otro fallo: se leía "ZOOE").
+**v3 (plain ASCII, the one that is there)** — `#` and space, 5 rows, four boxes of
+6 columns. It reads the same in any terminal and `O` and `D` are distinguishable
+at a glance (which was the other failure: it read as "ZOOE").
 
-Lo que quedó:
+What stayed:
 
 ```
 ######  ####  ####   ######
-##  ## ##  ## ##  ## ##
-   ##  ##  ## ##  ## ##
-  ##   ##  ## ##  ## ##
+##  ## ##  ## ##   # ##
+   ##  ##  ## ##   # ###
+  ##   ##  ## ##   # ##
 ######  ####  ####   ######
 ```
 
-Dos cosas que costaron y hay que saber:
+Two things that cost something and have to be known:
 
-- **`#` choca con el markdown.** Toda fila que empieza por `##` es un
-  ENCABEZADO, y el parser se come los `#`: el logo salía como
-  "####  ####  *zode*". El arreglo de fondo es que `parseBase` no busque
-  estructura en `kind == .banner`: el banner es un dibujo, no prosa. Hay un
-  test en `markdown.zig` que lo fija, y otro que comprueba que el resto de tipos
-  SIGUE interpretando encabezados (el arreglo no es desactivar el parser).
-- **El texto (`zode` / `a code agent` / `in your terminal`) se quitó.** Pedido
-  explícito: solo el ASCII.
+- **`#` clashes with markdown.** Every row that starts with `##` is a HEADING, and
+  the parser eats the `#`: the logo came out as "####  ####  *zode*". The real fix
+  is that `parseBase` does not look for structure in `kind == .banner`: the banner
+  is a drawing, not prose. There is a test in `markdown.zig` that pins it, and
+  another that checks the other kinds STILL interpret headings (the fix is not
+  turning the parser off).
+- **The text (`zode` / `a code agent` / `in your terminal`) was removed.**
+  Explicitly asked for: only the ASCII.
 
-El art se compone en comptime con `bannerRow()` desde la tabla de glifos, porque
-en figlet las letras miden distinto y el relleno a la derecha se pierde cuando
-un editor recorta los espacios del final de la línea. `banner_art_width` es la
-aserción y la comprueba el test del TUI, midiendo en COLUMNAS (`plainColumns`).
+The art is composed at comptime with `bannerRow()` from the glyph table, because
+in figlet the letters have different widths and the padding on the right is lost
+when an editor strips the trailing spaces. `banner_art_width` is the assertion and
+the TUI test checks it, measuring in COLUMNS (`plainColumns`).
 
-## v4: Houston (Astro Boy) — PROBADO Y RECHAZADO
+## v4: Houston (Astro Boy) — TRIED AND REJECTED
 
-Se hizo la mascota que se pidió (Houston de Astro Boy, cúpula maciza, dos ojos
-con anillo/iris/pupila, rejilla de la boca, cuerpo con brazos) y quedó **fuera a
-la primera**, con un "es horrible, solo ZODE y quita eso, me rabia tanta basura en
-la vista".
+The mascot that was asked for got made (Houston from Astro Boy, solid dome, two
+eyes with ring/iris/pupil, a grid mouth, a body with arms) and it was **out on the
+first try**, with a "it's horrible, just ZODE and take that away, all that junk in
+the view annoys me".
 
-El fallo no era el dibujo, y conviene escribirlo porque se va a repetir:
+The failure was not the drawing, and it is worth writing down because it is going
+to repeat:
 
-**Una cabecera de TUI se lee en la primera media segundo, y 20 filas de ASCII art
-son 20 filas de nada.** Medía 18 de robot + 1 de saludo + 1 de atajos = 20 filas
-antes de la primera palabra de la conversación. En una terminal de 30 filas
-quedaban 10, y el art es justo lo que se ve mientras "carga". Un robot dibujado
-bien no compite con el texto: lo aplasta.
+**A TUI header is read in the first half second, and 20 rows of ASCII art are 20
+rows of nothing.** It measured 18 of robot + 1 of greeting + 1 of shortcuts = 20
+rows before the first word of the conversation. In a 30-row terminal 10 were left,
+and the art is exactly what you see while it "loads". A well drawn robot does not
+compete with the text: it crushes it.
 
-Lo que se quedó es lo de antes: **cinco filas con `ZODE`** y nada más. Ni
-mascota, ni "zo the code robot says: hi!…", ni la línea de atajos
-`/help · /model · ctrl+p…` (que ya están en la paleta de Ctrl+P y en `/help`).
+What stayed is what it was before: **five rows with `ZODE`** and nothing else. No
+mascot, no "zo the code robot says: hi!…", no shortcuts line
+`/help · /model · ctrl+p…` (they are already in the Ctrl+P palette and in `/help`).
 
-Detalles que sirvieron y siguen vivos:
+Details that served and are still alive:
 
-- **El art no puede usar `*` ni `~`.** `markedSegments` (`markdown.zig`) quita
-  del banner los `*…*` y los `~…~` porque son MARCAS de estilo: un ojo
-  dibujado con `***` se quedaba sin borde, y con un número impar de filas los
-  asteriscos de una se emparejaban con los de otra.
-- **Las dos mitades se componían por separado** (`robotRow` rellenaba a
-  `robot_art_width`, `bannerRow` componía el wordmark desde la tabla de glifos,
-  `bannerLine` las pegaba con dos columnas de aire y centraba el wordmark en la
-  vertical de la cabeza). El wordmark pegado a la fila 0 se leía a la altura de
-  la cúpula y parecía un rótulo suelto. Para volver a poner una mascota al lado
-  del nombre, ese es el reparto que funciona.
-- **`banner` se armaba con un bucle dentro de un `blk` de comptime**, porque
-  `bannerLine` pide una fila de COMPTIME: con un `for` normal en runtime el
-  índice no lo es y no compila.
+- **The art cannot use `*` or `~`.** `markedSegments` (`markdown.zig`) strips
+  `*…*` and `~…~` from the banner because they are STYLE marks: an eye drawn with
+  `***` ended up with no outline, and with an odd number of rows the asterisks of
+  one paired up with those of another.
+- **The two halves were composed separately** (`robotRow` filled to
+  `robot_art_width`, `bannerRow` composed the wordmark from the glyph table,
+  `bannerLine` glued them with two columns of air and centred the wordmark on the
+  head's vertical). The wordmark glued to row 0 read at the dome's height and
+  looked like a stray label. If a mascot ever goes next to the name again, that
+  is the split that works.
+- **`banner` was assembled with a loop inside a comptime `blk`**, because
+  `bannerLine` wants a COMPTIME row: with a normal runtime `for` the index is not
+  one and it does not compile.
 
-El test de `tui.zig` sigue fijando que debajo del art **no hay nada**: si alguien
-vuelve a colgar una línea (o una mascota) en la cabecera, `zig build test` falla.
+The test in `tui.zig` still pins that below the art **there is nothing**: if
+someone hangs another line (or a mascot) on the header again, `zig build test`
+fails.
 
-## Loading de las tools: "working" no dice si esta vivo
+## Tool loading: "working" does not say whether it is alive
 
-Con un `bash` de 30s la ultima fila se quedaba congelada en `⏺ bash(...)`: no
-hay forma de saber si el proceso sigue o si la app se cuelga. Ahora:
+With a 30s `bash` the last row stayed frozen at `⏺ bash(...)`: there is no way to
+know whether the process is still going or the app hung. Now:
 
-- `Model.tool_run` (`?ToolRun`): lo pone `pushToolStart`, lo quita
-  `pushToolDone` (via `toolRunEnd`). Copias **propias** del nombre y el arg: el
-  arg viene de la arena del worker, que se libera al final del turno.
-- Una linea `⎿  bash running · 21.4s` bajo la cabecera de la tool, **repintada
-  cada frame** desde el bloque de "parrafo en vivo" (el mismo mecanismo que el
-  streaming). Reemplaza al parrafo vivo en vez de anadirse: nunca coexisten.
-- La franja de actividad y el status bar **nombran la tool** (`working bash
-  7.6s`, y el status pone el argumento), porque "working" a secas no dice si
-  esta trabajando o colgado.
-- `Model.workingLocked()` cuenta `tool_run` como trabajo. Sin eso, entre
-  `streamEnd` y `pushToolDone` hay una ventana en la que `busy` ya esta a
-  false: sin spinner, sin reloj y con la franja diciendo "queued".
+- `Model.tool_run` (`?ToolRun`): `pushToolStart` sets it, `pushToolDone` clears it
+  (via `toolRunEnd`). **Own** copies of the name and the argument: the argument
+  comes from the worker's arena, which is freed at the end of the turn.
+- A `⎿  bash running · 21.4s` line under the tool header, **repainted every
+  frame** from the "live paragraph" block (the same mechanism as the streaming).
+  It replaces the live paragraph instead of being added to it: they never coexist.
+- The activity strip and the status bar **name the tool** (`working bash 7.6s`, and
+  the status puts the argument), because "working" on its own does not say whether
+  it is working or hung.
+- `Model.workingLocked()` counts `tool_run` as work. Without that, between
+  `streamEnd` and `pushToolDone` there is a window where `busy` is already false:
+  no spinner, no clock, and the strip saying "queued".
 
-Dos trampas que salieron por el camino:
+Two traps that came out on the way:
 
-- **`toolRunEnd` se llama ANTES del `lock()` de `pushToolDone`**: el
-  `std.atomic.Mutex` no es reentrante y cogerse con el suyo cuelga la app.
-- **El texto de la linea va copiado al arena del frame**, no a un buffer de
-  stack: los `CellRun` guardan el grapheme por valor pero con puntero a sus
-  bytes, y el pintado ocurre DESPUES del bloque. Es el bug de `&[_]u8{c}` de
-  mas arriba, y sale como fila llena de NULs.
+- **`toolRunEnd` is called BEFORE `pushToolDone`'s `lock()`**: `std.atomic.Mutex`
+  is not reentrant and taking it with your own hangs the app.
+- **The line's text is copied into the frame's arena**, not into a stack buffer:
+  the `CellRun`s store the grapheme by value but with a pointer to its bytes, and
+  the painting happens AFTER the block. It is the `&[_]u8{c}` bug from above, and
+  it shows up as a row full of NULs.
 
-## ACP:Implemented, with `/acp`
+## The September 2026 freeze: it was NOT performance
 
-`src/acp.zig` is a full **ACP v1 client**: it launches `opencode acp` as a child
-process and speaks newline-delimited JSON-RPC over its stdin/stdout. This is
-the "trick behind the scenes" in its purest form — zode does not poke opencode's
-terminal, it talks to opencode's engine.
+Full diagnosis in `ROADMAP.md`. What has to be kept, because the three things
+that caused it are invisible in a CPU profile:
 
-- `zig build acp-probe -- "prompt"` shows the traffic against a real agent.
-  `ZODE_ACP_CMD` points it at another agent (or a fake) without recompiling,
-  and `CANCEL=1` exercises the cancellation path.
-- In the TUI: `/acp` on, `/acp off` back, `/acp <cmd>` to use another command.
-  The status bar says `acp: OpenCode` so it is never a mystery who answered.
-- **The connection is opened in the background the moment you type `/acp`**, not
-  on the first prompt: `opencode acp` boots a private server and that takes
-  several seconds, which used to land on the first prompt with the input
-  frozen. The connect thread registers itself as a worker (`beginWorker`) so
-  `waitWorkers` waits for it at shutdown, and it pushes the "ACP connected" line
-  itself — the UI thread never has to poll for it.
-- `pushInfoOwned` takes OWNERSHIP of the text; `pushInfo` copies it. Using the
-  first with a string you then free paints a row of `�`.
+1. **The layout loop did not terminate.** It was
+   `while (seg_cache.len < paras.len)` + `orderedRemove(0)` when going over the
+   cap of 128: append (129) -> evict (128) -> back into the loop, forever. With
+   `pushDiff` putting ONE PARAGRAPH PER DIFF LINE, a single `write` of a 129-line
+   file hung the app instantly. Now the cache is a WINDOW (`layoutWindow`) with
+   `para_idx` per entry and `para_heights` per paragraph, and there is an
+   iteration budget (`layout_iters` / `layout_overflow`) so that a FUTURE
+   regression fails a test in 1 s instead of hanging the process. That budget is
+   not decorative: without it the test hangs the whole runner and there is no CI
+   possible.
 
-What is wired: `initialize` (agent name), `session/new`, `session/prompt`,
-`session/cancel`, and on the way in: `agent_message_chunk`,
-`agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, and
-`session/request_permission` (mapped to the existing y/a/n/Esc dialog, or
-answered automatically under `/yolo`). Anything else (`fs/*`, `terminal/*`) is
-answered with "method not found" — if you stay silent the turn never ends.
+2. **The tick chain could die forever.** The `.tick` only re-armed "if there is
+   work", and `busy`/`dirty` have windows where both are false (between
+   `streamEnd` and `pushToolStart` there is a session `write(2)` and a DEFLATE-9 in
+   between). A tick there left `App.timers` EMPTY, and the worker has neither a
+   pointer to the `EventContext` nor to the event queue: there was no way to ask
+   for a frame. The tick now re-arms ALWAYS.
 
-**There is no tool loop in ACP mode.** The agent runs its own tools; zode only
-draws the `⏺ tool(...)` header and its result. That is why `AcpTurn` has no
-`calls` list and why a turn is one prompt.
+3. **`requestPermission` did spin-yield on the HISTORY's lock** for the 30 s you
+   take to decide: it burned a core and made every UI lock acquisition a failed
+   `yield`. Now it has its OWN lock and a sleeping wait with `nanosleep` and
+   1->20 ms backoff.
 
-### Traps, all of them found by testing
+## Correction: the `Io.sleep` diagnosis was WRONG
 
-1. **`File.flags.nonblocking = true` does NOT set O_NONBLOCK.** That field is
-   only consulted on Windows; on POSIX the `read()` goes out as-is, and with a
-   blocking fd the turn hangs forever on the second read. You have to do the
-   `fcntl(F_SETFL)` yourself, and note that `fcntl` returns the flags raw: a
-   *successful* `GETFL` is a SMALL number (0x44000), errors are huge, so the
-   "did it work" check is `fl <= maxInt(u32)` — the other way round skips the
-   whole block without a word.
-2. **`Io.sleep` from a worker FREEZES the whole TUI.** This is the one that
-   really hurt, because it looks like a hang: the clock in the activity strip
-   stopped dead while a turn was in flight, and the input still worked, so the
-   app looked half-alive. `agent.io_global` and the model share ONE `Io`, and
-   `Io.sleep` takes the `Io`'s event loop with it, so the vaxis `tick` that
-   drives the redraw stopped firing. Now everything that waits inside a worker
-   uses `acp.nap()`, a plain `nanosleep` syscall that does not touch the `Io`.
-   (Using the same `Io` from two threads for *work* is normal here — the HTTP
-   path does it on every request. It is `sleep` specifically that is the trap.)
-3. **`cancel()` only sets a flag.** Writing `session/cancel` from the UI thread
-   would be the obvious thing and it is wrong twice over: a blocking read in
-   the worker would not see it until the agent happened to speak, and the write
-   would race the worker's use of the `Io`. So the pipe is non-blocking, the
-   worker polls every 30 ms, and it is the worker — the only thread that writes
-   — who sends the notification when it sees the flag. The status then says
-   "cancelling…", because the turn does not stop on the spot: the agent has to
-   answer with a `stopReason`.
-4. **The `File.Reader` eats `WouldBlock` and returns `ReadFailed`**, keeping
-   the real error in `reader.err`. Look there, not at what `fillMore` returned.
-5. **`pump` has several early `return .line`s, so the line buffer must be
-   cleared with `defer`, not at the end.** Otherwise the next line comes out
-   glued to the previous one, the JSON does not parse, and the loop eats its own
-   queue: the turn froze after the very first message.
-6. **Responses have no `method` field.** `root.get("method") orelse return`
-   silently swallows the `initialize` response and the handshake waits forever
-   for something that already arrived.
-7. **In ACP the agent interleaves text and tools.** The streaming paragraph
-   must be closed on every tool (`onTool`/`onToolUpdate`), because the live
-   paragraph is always painted last: otherwise the tool header lands *above* the
-   text that preceded it and its result *below* the closing sentence.
-8. **`std.process.spawn` resolves argv[0] with the PATH of the `Io`**, which is
-   not zode's environment: a hand-made `Threaded` has none and the spawn fails
-   with `FileNotFound` although the binary is right there. `resolveArgv` looks it
-   up in the `Environ.Map` and spawns an absolute path. (`statFile` needs a real
-   `Io`; `std.posix` has no `faccessat`; and `std.c.access` would tie the binary
-   to libc, which zode is careful not to do.)
-9. **A `sh` fake agent is not a good test double for a blocking turn**: it
-   cannot read its stdin while it sleeps, and its stdout is block-buffered. It
-   needs short heartbeat batches (`stdbuf -o0` for the buffering) or it will
-   look like a broken client.
+This document used to say (and repeated) that "`Io.sleep` hijacks vaxis's event
+loop". **On Linux it is false**, and it is worth keeping corrected so nobody
+investigates it again:
 
-### How it was actually verified
+- `Io.sleep` is a vtable call. `Threaded.sleep` goes to `sleepPosix` because
+  `use_parking_sleep` is only true on Windows/NetBSD/illumos.
+- `sleepPosix` is a `clock_nanosleep` in the calling thread, with a per-thread
+  `Syscall` that **does not touch `t.mutex`**.
+- vaxis's tick is a normal entry in `App.timers` that evaluates `App.checkTimers`
+  on the UI thread.
 
-- Unit: parse of each `sessionUpdate` variant, the 100 KB line that does not fit
-  in the reader's 64 KB buffer, and the full handshake → prompt → stop round trip
-  against a `sh` agent that speaks real JSON-RPC over real pipes.
-- End to end against the **real** `opencode acp`: handshake OK
-  (`agente = OpenCode`, session created), the prompt goes out, and the error
-  text the server sends comes back verbatim
-  («Insufficient account funds» — the account, not the wire).
-- In the TUI under tmux: streaming, interleaved tool with its clock, result and
-  closing text, in the right order. **Use tmux, not a homemade pty emulator**:
-  vaxis does differential redraws and a small emulator loses half of it (that
-  is what made a working turn look frozen).
+The clock was freezing because of points 1 and 2 above, not because of the sleep.
+That is why `lib/sleep.zig`'s bare `nanosleep` is equally correct: it is what
+`Retry.wait` and the permission dialog's wait use, but for robustness, not because
+`Io.sleep` was a problem.
 
-### What is NOT done
+## Correction: the segment cache's capacity
 
-- `session/load` / `session/resume` / `session/list`: zode creates a fresh ACP
-  session and keeps it for the life of the process. Resuming would mean
-  mapping zode's JSONL sessions to opencode's ids.
-- The ACP history is opencode's, not zode's. zode still appends what the agent
-  said to its own session file so `/resume` and the diffs keep making sense.
-- `current_mode_update` and `config_option_update` (model/effort/mode) are
-  parsed nowhere yet: `/model` and `/effort` still talk to the HTTP provider.
+`max_cached_paras`'s comment said "deep scroll re-parses on demand". **It did
+not**, and that assumption is exactly what made the `tui.zig` loop not terminate.
+Now it does: `layoutWindow` picks the window containing the visible lines and
+`layoutFor` iterates until the range stabilises (the heights start estimated and
+are corrected on parse).
 
-**Decision pending**: the other route — talking HTTP to the *shared* service
-(`opencode service status` → `127.0.0.1:<port>`, which asks for Basic auth) —
-is what would let zode see and drive the sessions of the TUI that is already
-running. ACP is the clean one; HTTP is the one that shares state.
+## Zig 0.16 traps that cost an afternoon
 
-## La congelacion de septiembre 2026: NO era rendimiento
+- **`gpa.free(list.items)` is an `Invalid free`.** In 0.16 `items` is the LENGTH
+  slice and the capacity is separate. To free you have to use `allocatedSlice()`.
+  It blows up in `pushDiff` with "Invalid free".
+- **`clearRetainingCapacity` does `@memset(items, undefined)`.** If it is called in
+  `deinit` AFTER the `deinit` of that same list, it is a memset of `undefined`
+  over freed memory -> GPF.
+- **`std.Thread.Mutex` does not exist any more.** `std.Io.Mutex` /
+  `std.Io.Condition` have it, but they need an `Io` (and the tests build the
+  `Model` without an app). For the permission dialog: its own `std.atomic.Mutex` +
+  a sleeping wait.
+- **Unmanaged `ArrayList` asks for exact capacity**: a 128 B
+  `FixedBufferAllocator` fails when asked for 128 B for 8 pointers. The `TurnStats`
+  tests use 512.
+- **Returning a slice to a stack temporary** (`normalizeLang` did it) is read
+  AFTER the function returns: three red tests in a row until it fell.
+- **`rowText` returns BYTES, not columns**: `◆` is 3 bytes for 2 columns and `─`
+  is 3 bytes for 1. Comparing bytes against columns gives a red test with the
+  layout correct.
 
-Diagnostico completo en `ROADMAP.md`. Lo que hay que retenue, porque las tres
-cosas que lo causaban son invisibles en un perfil de CPU:
+## `tools/pty_smoke.py`: the only verification that is really worth something
 
-1. **El bucle del layout no terminaba.** Era
-   `while (seg_cache.len < paras.len)` + `orderedRemove(0)` al pasar del tope de
-   128: append (129) -> evict (128) -> volver a entrar, para siempre. Con
-   `pushDiff` metiendo un PARRAFO POR LINEA de diff, un solo `write` de un
-   fichero de 129 lineas colgaba la app al instante. Ahora la cache es una
-   VENTANA (`layoutWindow`) con `para_idx` por entrada y `para_heights` por
-   parrafo, y hay un presupuesto de iteraciones (`layout_iters` /
-   `layout_overflow`) para que una regresion FUTURA falle un test en 1 s en vez
-   de colgar el proceso. Ese presupuesto no es decorativo: sin el, el test
-   cuelga el runner entero y no hay CI posible.
+The `drawTest` tests read the surface and check the text and the styles, but they
+do **not** check what breaks most: vaxis's render is DIFFERENTIAL and queries the
+terminal (colour, capabilities, size). A homemade emulator loses half the redraw,
+which is exactly what makes a turn that works look frozen.
 
-2. **La cadena de ticks se podia morir para siempre.** El `.tick` solo se
-   rearmaba "si hay trabajo", y `busy`/`dirty` tienen ventanas en las que los
-   dos son falsos (entre `streamEnd` y `pushToolStart` hay un `write(2)` de
-   sesion y un DEFLATE-9 en medio). Un tick ahi dejaba `App.timers` VACIO, y el
-   worker no tiene ni puntero al `EventContext` ni a la cola de eventos: no
-   habia forma de pedir un frame. El tick se rearma SIEMPRE ahora.
-
-3. **`requestPermission` hacia spin-yield sobre el lock del HISTORIAL** durante
-   los 30 s que tardas en decidir: quemaba un core y hacia que cada adquisicion
-   de lock de la UI fuera un `yield` fallado. Ahora tiene lock PROPIO y espera
-   dormida con `nanosleep` y backoff 1->20 ms.
-
-## Correccion: el diagnostico delACP sobre `Io.sleep` era erroneo
-
-`acp.zig` decia (y este documento lo repetia) que "`Io.sleep` secuestra el bucle
-de eventos de vaxis". **En Linux es falso**, y conviene corregirlo para que
-nadie vuelva a investigarlo:
-
-- `Io.sleep` es una llamada a la vtable. `Threaded.sleep` va a `sleepPosix`
-  porque `use_parking_sleep` solo es true en Windows/NetBSD/illumos.
-- `sleepPosix` es un `clock_nanosleep` en el hilo que llama, con un `Syscall`
-  por hilo que **no toca `t.mutex`**.
-- El tick de vaxis es una entrada normal en `App.timers` que evalua
-  `App.checkTimers` en el hilo de la UI.
-
-El reloj se congelaba por los puntos 1 y 2 de arriba, no por el sleep. Por eso
-`acp.nap` (un `nanosleep` pelado) es igualmente lo correcto: es lo que se usa en
-`Retry.wait` y en la espera del dialogo de permisos, pero por robustez, no
-porque `Io.sleep` fuera un problema.
-
-## Correccion: la capacidad de la cache de segmentos
-
-El comentario de `max_cached_paras` decia "el scroll profundo re-parsea on
-demand". **No lo hacia**, y esa suposicion es justo lo que hacia que el bucle
-de `tui.zig` no terminara. Ahora si lo hace: `layoutWindow` elige la ventana
-que contiene las lineas visibles y `layoutFor` itera hasta que el rango se
-estabiliza (las alturas empiezan estimadas y se corrigen al parsear).
-
-## Trampas de Zig 0.16 que costaron una tarde
-
-- **`gpa.free(list.items)` es `Invalid free`.** En 0.16 `items` es el slice de
-  LONGITUD y la capacidad va aparte. Para liberar hay que usar
-  `allocatedSlice()`. Peta en `pushDiff` con "Invalid free".
-- **`clearRetainingCapacity` hace `@memset(items, undefined)`.** Si se llama en
-  `deinit` DESPUES de `deinit` de esa misma lista, es un memset de `undefined`
-  sobre memoria liberada -> GPF.
-- **`std.Thread.Mutex` ya no existe.** `std.Io.Mutex` / `std.Io.Condition` lo
-  tienen, pero necesitan un `Io` (y los tests construyen el `Model` sin app).
-  Para el dialogo de permisos: `std.atomic.Mutex` propio + espera dormida.
-- **`ArrayList` unmanaged pide capacidad exacta**: un `FixedBufferAllocator` de
-  128 B falla al pedir 128 B para 8 punteros. Los tests de `TurnStats` usan 512.
-- **Devolver un slice a un temporal de pila** (`normalizeLang` lo hacia) se lee
-  DESPUES de que la funcion retorne: tres tests rojos seguidos hasta que se
-  cayera.
-- **`rowText` devuelve BYTES, no columnas**: `◆` son 3 bytes para 2 columnas y
-  `─` 3 bytes para 1. Comparar bytes contra columnas da un test rojo con el
-  layout correcto.
-
-## `tools/pty_smoke.py`: la unica verificacion que de verdad vale
-
-Los tests de `drawTest` leen el surface y comprueban el texto y los estilos, pero
-**no** comprueban lo que mas se rompe: el render de vaxis es DIFERENCIAL y hace
-consultas al terminal (color, capacidades, tamaño). Un emulador casero se pierde
-la mitad del redraw, que es justo lo que hace que un turno que funciona parezca
-congelado.
-
-Asi que hay un smoke test en pty de verdad (`pty.fork` + `TIOCSWINSZ` a 200x50):
-arranque, banner, caja del input, status, eco del prompt, **Ctrl+P abriendo y
-cerrando la paleta**, Ctrl+L, scroll, y que no haya panic ni `Invalid free`.
+So there is a smoke test in a real pty (`pty.fork` + `TIOCSWINSZ` at 200x50):
+startup, banner, input box, status, prompt echo, **Ctrl+P opening and closing the
+palette**, Ctrl+L, scroll, and no panic and no `Invalid free`.
 
 ```
 zig build && python3 tools/pty_smoke.py
 ```
 
-Dos cosas que hace bien y que hay que mantener:
+Two things it does well and have to be kept:
 
-- **`HOME` propio** (`/tmp/opencode/zode-smoke-home`). La app escribe
-  `~/.config/zode/auth.json` y `sessions/`, y un script automatico no debe tocar
-  la config real de quien lo ejecuta. El fuzzer de junio guardo una key pegada
-  por error y dejo el provider con 401 sin explicacion apparent.
-- **`TIOCSWINSZ` antes de nada**: sin tamano de ventana vaxis hace
-  `width_pix / width` y sale con division por cero. `script` NO fija el tamano.
+- **Its own `HOME`** (`/tmp/opencode/zode-smoke-home`). The app writes
+  `~/.config/zode/auth.json` and `sessions/`, and an automated script must not
+  touch the real config of whoever runs it. June's fuzzer saved a key pasted by
+  mistake and left the provider with a 401 and no apparent explanation.
+- **`TIOCSWINSZ` first**: without a window size vaxis does `width_pix / width` and
+  exits with a division by zero. `script` does NOT set the size.
 
-## vaxis NO se parchea en el arbol (5.7 y 5.9)
+## vaxis is NOT patched in the tree (5.7 and 5.9)
 
-El ROADMAP propone dos parches sobre `zig-pkg/vaxis-…/src/vxfw/App.zig`:
+The ROADMAP proposes two patches on `zig-pkg/vaxis-…/src/vxfw/App.zig`:
 
-- **5.7** `arena.reset(.free_all)` -> `.retain_capacity`, para que el frame sea
-  bump en vez de 1.36 MB de malloc/free por frame.
-- **5.9** bajar el timeout de `vx.queryTerminal` (`.fromSeconds(1)`), que son
-  hasta **1 s de pantalla en blanco** al arrancar en terminales que no
-  responden.
+- **5.7** `arena.reset(.free_all)` -> `.retain_capacity`, so the frame is a bump
+  instead of 1.36 MB of malloc/free per frame.
+- **5.9** lower the timeout of `vx.queryTerminal` (`.fromSeconds(1)`), which is up
+  to **1 s of blank screen** at startup on terminals that do not answer.
 
-No se hacen aqui porque `zig-pkg/` es una cache de dependencia: un parche en
-ese directorio se pierde en el siguiente `zig fetch` y no se ve en el diff del
-repo (es la peor combinacion: un fix que parece estar y no esta). Si se
-quieren, el camino es **PR upstream a vaxis** o un `patch` declarado en
-`build.zig.zon` que se aplique de forma visible y reproducible.
+They are not done here because `zig-pkg/` is a dependency cache: a patch in that
+directory is lost on the next `zig fetch` and does not show up in the repo's diff
+(it is the worst combination: a fix that looks like it is there and is not). If you
+want them, the way is an **upstream PR to vaxis** or a `patch` declared in
+`build.zig.zon` that applies visibly and reproducibly.
 
-**5.10** (quitar `subscribeToColorSchemeUpdates`) tampoco se toca por lo mismo:
-esta DENTRO de `App.run`, asi que tampoco se puede desde fuera sin lo anterior.
-Y aunque se pudiera, el ahorro es un viaje de ida y vuelta al arrancar.
+**5.10** (removing `subscribeToColorSchemeUpdates`) is not touched for the same
+reason: it is INSIDE `App.run`, so it cannot be done from outside either. And even
+if it could, the saving is one round trip at startup.
 
 ---
 
 # Branch `feat/roster`: what the other session does not cover (2026-09-30)
 
-Este worktree (`/home/jesusalcala/Projects/zode-agente`, rama `feat/roster`)
+This worktree (`/home/jesusalcala/Projects/zode-agente`, branch `feat/roster`)
 implements what the other session's `ROADMAP.md` does **not** cover. The task
 digest is ceded to them (their Phase 3 is more detailed).
 
@@ -1363,1233 +1444,1208 @@ digest is ceded to them (their Phase 3 is more detailed).
 | `/undo` | us | file snapshots per turn |
 | `@file` | us | the content goes with the prompt |
 
-**3 RED tests in that worktree belong to the other session** (estaban en el
-commit base, no los ha tocado nadie aquí):
-`tui.test.pushDiff mete UN parrafo…`, `tui.test.un diff de 300 lineas…` y
-—esto sí lo arreglamos— `tui.test.streamEnd marca dirty` (ya pasa).
+**3 RED tests in that worktree belong to the other session** (they were in the
+commit base, nobody touched them here):
+`tui.test.pushDiff puts ONE paragraph…`, `tui.test.a diff of 300 lines…` and
+— this one we did fix — `tui.test.streamEnd marks dirty` (it passes now).
 
 Merged on 2026-09-30 (see the merge commit for the conflict resolutions).
 
-## free-auto: rota entre modelos free de todos los providers
+## free-auto: rotates between the free models of every provider
 
-`/free-auto on` (o `ZODE_FREE_AUTO=1`) lista los modelos free de cada provider
-que tenga key y reparte turnos entre ellos. Cuando uno se queda sin cuota, el
-turno **sigue solo** con el siguiente: no hay que escribir «continúa».
+`/free-auto on` (or `ZODE_FREE_AUTO=1`) lists the free models of each provider that
+has a key and spreads the turns between them. When one runs out of quota, the turn
+**carries on by itself** with the next one: there is no need to type "continue".
 
-- `src/roster.zig` — el pool: orden, topes, cooldowns, rotación, informe de
-  agotamiento. Puro y testeado (sin red).
-- `src/free_auto.zig` — el modo: estado global con spinlock, el worker que
-  construye el pool, y `/free-auto [on|off|status]`.
-- `zig build roster-probe` — **la pregunta que importa**: ¿tengo de verdad algún
-  plan B? Lista providers con key, cuántos free publica cada uno y el pool ya
-  ordenado. Vive en `src/` y no en `src/bin/` porque su module path es el
-  directorio, y con la sonda en `src/bin/` los `@import("agent.zig")` de al lado
-  se salen del módulo. Lo único que `build.zig` declara es `vaxis`: un fichero
-  no puede ser raíz de dos módulos y `providers.zig` ya lo es de `agent`.
+- `src/roster.zig` — the pool: order, caps, cooldowns, rotation, exhaustion
+  report. Pure and tested (no network).
+- `src/free_auto.zig` — the mode: a global state with a spinlock, the worker that
+  builds the pool, and `/free-auto [on|off|status]`.
+- `zig build roster-probe` — **the question that matters**: do I really have a plan
+  B? It lists the providers with a key, how many free models each one publishes and
+  the pool already sorted the way the wheel will use it. It lives in `src/` and not
+  in `src/bin/` because its module path is the directory, and with the probe in
+  `src/bin/` the `@import("agent.zig")` next to it falls outside the module. The
+  only thing `build.zig` declares is `vaxis`: a file cannot be the root of two
+  modules and `providers.zig` already is one of `agent`'s.
 
-### La tabla que decide si un error rota
+### The table that decides whether an error rotates
 
-`agent.quotaVerdict(err, detail)` → `?roster.Why`. Es fina a propósito, porque
-la acción que corresponde a cada fila es **opuesta**:
+`agent.quotaVerdict(err, detail)` → `?roster.Why`. It is fine-grained on purpose,
+because the **action** that corresponds to each row is the opposite one:
 
-| error | veredicto | por qué |
+| error | verdict | why |
 |---|---|---|
-| 402 sin créditos | rota | repetir lo mismo es tonto |
-| 429 rate limited | rota | cuota del modelo, no de la key |
-| 403 con el texto del gate | rota | el 403 de opencode es un GATE, no config |
-| 403 sin el gate | **NO** | un modelo no disponible en tu cuenta |
-| 401 | **NO** | es la key: rotar daría 401 en los 16 |
-| 404 | **NO** | id malo, no cuota |
-| 5xx | **NO** | el modelo no tiene la culpa: es backoff |
+| 402 no credits | rotate | repeating the same thing is pointless |
+| 429 rate limited | rotate | the model's quota, not the key's |
+| 403 with the gate text | rotate | opencode's 403 is a GATE, not a config problem |
+| 403 without the gate | **NO** | a model not available on your account |
+| 401 | **NO** | it is the key: rotating would give a 401 on all 16 |
+| 404 | **NO** | bad id, not quota |
+| 5xx | **NO** | the model is not to blame: it is backoff |
 
-Frases del gate que existen de verdad (verificadas el 2026-09-30):
+Gate phrases that really exist (verified on 2026-09-30):
 `can only be used from within OpenCode`, `Model access is disabled`,
-`is only available on agentic harnesses` (openrouter; da igual que zode sea un
-agente, no está en su lista de apps), `not available on this account`.
+`is only available on agentic harnesses` (openrouter; it does not matter that zode
+is an agent, it is not in its app list), `not available on this account`.
 
-Y 400 = `error.BadRequest`, que **no** se reintenta: antes caía en el `else` →
-`ServerError` → 3 reintentos con backoff para repetir una petición que el server
-ya ha dicho que no quiere.
+And 400 = `error.BadRequest`, which is **not** retried: before it fell into the
+`else` → `ServerError` → 3 retries with backoff to repeat a request the server had
+already said it does not want.
 
-### Tres cosas del wiring que no son evidentes
+### Three wiring things that are not obvious
 
-1. **`Target` en vez de consultar el global en tres sitios.** El `pick` se
-   REEMPLAZA dentro del bucle de reintentos; si el body, la url y la key
-   consultaran cada uno el provider activo, media petición iría al sitio
-   equivocado. Hay test de que la key es la del candidato y no la del activo.
-2. **El body se compone DENTRO del bucle.** El body lleva el nombre del modelo
-   dentro, así que al rotar hay que rehacerlo. Con el body fuera: la petición iba
-   al provider/modelo nuevo con el nombre del viejo, y openrouter contestaba un
-   400 `JSON parsing failed` tres veces, que no cuadraba con nada.
-3. **`nowMs()` necesita `attachIo`.** `agent.io_global` es `undefined` hasta que
-   el arranque lo asigna, y leer el reloj de un `Io` sin inicializar es saltar
-   por una vtable de basura (GPF, no un 0). Es la trampa de `Model.attachIo`.
+1. **`Target` instead of consulting the global in three places.** The `pick` is
+   REPLACED inside the retry loop; if the body, the url and the key each consulted
+   the active provider, half the requests would go to the wrong place. There is a
+   test that the key is the candidate's and not the active one's.
+2. **The body is composed INSIDE the loop.** The body carries the model's name
+   inside, so on rotation it has to be redone. With the body outside: the request
+   went to the new provider/model with the old name inside, and openrouter answered
+   a 400 `JSON parsing failed` three times, which made no sense at all.
+3. **`nowMs()` needs `attachIo`.** `agent.io_global` is `undefined` until startup
+   assigns it, and reading the clock from an uninitialized `Io` is jumping through
+   a garbage vtable (a GPF, not a 0). It is the `Model.attachIo` trap.
 
-## El plan visible (tool `todo`)
+## The visible plan (the `todo` tool)
 
-El modelo se escribe la lista y el usuario la ve encima del input, sin Ask Mode.
-Lista COMPLETA en cada llamada (reemplaza a la anterior); acepta
-`items`/`todos` y `content`/`text`/`task`; un `status` desconocido cae en
-`pending` (el paso no está mal, está mal etiquetado); más de 20 pasos es un
-ERROR y no un recorte silencioso. Terminado se dibuja en una línea. Tope de 6
-filas (`plan_max_rows`) y, si no cabe, `+N more · 1/20 done`. `/plan` lo limpia.
+The model writes the list and the user sees it above the input, without Ask Mode.
+A COMPLETE list on every call (it replaces the previous one); it accepts
+`items`/`todos` and `content`/`text`/`task`; an unknown `status` falls into
+`pending` (the step is not wrong, it is mislabelled); more than 20 steps is an
+ERROR and not a silent truncation. Done is drawn on one line. Cap of 6 rows
+(`plan_max_rows`) and, if it does not fit, `+N more · 1/20 done`. `/plan` clears it.
 
-Bug propio que los tests cazaron: en `Plan.apply` el bucle escribía
-`self.items[self.len] = it` y `self.len` solo se actualizaba al final, así que
-**todas** las iteraciones caían en la casilla 0: el plan era un paso repetido,
-con basura sin inicializar en el texto (los `Item.text` son buffers fijos).
+A bug of its own that the tests caught: in `Plan.apply` the loop wrote
+`self.items[self.len] = it` and `self.len` was only updated at the end, so **every**
+iteration landed in slot 0: the plan was one repeated step, with uninitialised
+garbage in the text (the `Item.text`s are fixed buffers).
 
 ## `/undo`
 
-Deshace **archivos**, no mensajes: la sesión es append-only y reescribirla a
-mitad de un turno no tiene explicación. La foto se toma antes de cada tool que
-toca un archivo; `existed` va explícito («no estaba» y «estaba vacío» se
-deshacen distinto) y si la lectura falla por otro motivo **no** se fotografía
-nada. Anillo de 8 turnos, 24 archivos, 256 KB por archivo, 1 MB por turno; lo que
-no cabe se marca y el mensaje lo dice.
+It undoes **files**, not messages: the session is append-only and rewriting it
+halfway through a turn has no explanation. The snapshot is taken before each tool
+that touches a file; `existed` is explicit ("it was not there" and "it was empty"
+undo differently) and if the read fails for another reason **nothing** is
+snapshotted. A ring of 8 turns, 24 files, 256 KB per file, 1 MB per turn; what
+does not fit is marked and the message says so.
 
-## `@fichero`
+## `@file`
 
-El contenido va con el prompt, en un bloque al final (no en el sitio de la `@`,
-para que el prefijo del provider siga siendo estable). 4 ficheros, 32 KB cada
-uno, leídos como **prefijo** con `readPositional`: `readFileAlloc(.limited(n))`
-no recorta, devuelve `error.FileTooBig`, y con eso los ficheros grandes no se
-inyectaban nunca. Se amplía solo lo que va al modelo (la sesión guarda el prompt
-con su `@ruta`), y solo el **último mensaje de usuario**: el último mensaje de la
-lista es el `system`, porque el system prompt se añade al final.
+The content goes with the prompt, in a block at the end (not at the `@` itself, so
+the provider's prefix stays stable). 4 files, 32 KB each, read as a **prefix** with
+`readPositional`: `readFileAlloc(.limited(n))` does not clip, it returns
+`error.FileTooBig`, and with that the big files were never injected. Only what goes
+to the model is expanded (the session stores the prompt with its `@path`), and only
+the **last user message**: the last message in the list is the `system`, because the
+system prompt is appended at the end.
 
-El escaner no se come los correos (`jorge@example.com` no es una mención: si
-detrás del token hay otra `@`, es un correo) ni la puntuación final
-(`@notas.txt,` es `notas.txt`), y acepta bytes ≥ 0x80 para que `@docs/guía.md`
-funcione.
+The scanner does not eat emails (`jorge@example.com` is not a mention: if there is
+another `@` after the token, it is an email) nor trailing punctuation
+(`@notes.txt,` is `notes.txt`), and it accepts bytes ≥ 0x80 so that
+`@docs/guide.md` works.
 
-## Tres bugs de la TUI que solo se ven en la pty
+## Three TUI bugs that only show in the pty
 
-1. **`streamEnd` se comía el `dirty` del worker.** `streamEnd` llama a
-   `drainPendingLocked` (para que el texto del asistente no acabe por delante de
-   su tool) y esa función bajaba `dirty = false`: el worker empujaba el error y
-   acto seguido se borraba a sí mismo la petición de repintar. En pantalla se
-   quedaba el frame viejo, con la franja congelada en «streaming 3.9s» para
-   siempre, hasta que el usuario pulsaba una tecla. Ahora el que baja `dirty` es
-   el DRAW, después de pintar, y `streamEnd`, `setStatusWithMood` y `toolRunEnd`
-   lo ponen a true.
-2. **El tick se desarmaba en reposo, y un worker no puede despertar la UI.** Con
-   el tick desarmado, lo que empujaba un worker en segundo plano (pool del
-   free-auto, conexión ACP, lista de modelos) se quedaba en `pending` hasta que
-   llegase una tecla: el síntoma era «el comando no hace nada». Ahora el tick se
-   rearma SIEMPRE y en reposo va a 250 ms (`Model.tickIntervalMs`): el coste es
-   un spinlock 4 veces por segundo y **no** un redraw, que es lo que de verdad
-   quería decir la nota de «0 CPU en idle».
-3. **Un turno muerto dejaba un párrafo vacío** (`◆` solo en el historial).
-   `streamEnd` solo guarda el párrafo si hay texto, con trim.
+1. **`streamEnd` ate the worker's `dirty`.** `streamEnd` calls `drainPendingLocked`
+   (so the assistant's text does not end up ahead of its tool) and that function
+   lowered `dirty = false`: the worker pushed the error and then immediately erased
+   its own request to repaint. On screen the old frame stayed, with the strip
+   frozen on "streaming 3.9s" forever, until the user pressed a key. Now it is the
+   DRAW that lowers `dirty`, after painting, and `streamEnd`, `setStatusWithMood`
+   and `toolRunEnd` set it to true.
+2. **The tick disarmed when idle, and a worker cannot wake the UI.** With the tick
+   disarmed, whatever a background worker pushed (the free-auto pool, the model
+   list) stayed in `pending` until a key arrived: the symptom was "the command
+   does nothing". Now the tick re-arms ALWAYS and when idle it goes to 250 ms
+   (`Model.tickIntervalMs`): the cost is a spinlock four times per second and
+   **not** a redraw, which is what the "0 CPU when idle" note really meant.
+3. **A dead turn left an empty paragraph** (`◆` alone in the history). `streamEnd`
+   only stores the paragraph if there is text, trimmed.
 
-## La familia de bugs de la memoria (cinco veces este mes)
+## The memory bug family (five times this month)
 
-- `pushInfoOwned` **toma posesión** del texto y lo libera en `Model.deinit`:
-  un literal ahí es un «Invalid free» (la paleta), un `catch "literal"` igual
-  (`/free-auto status`), un `bufPrint` a stack es un puntero a temporal (el
-  titular del undo se veía como `�`), y **texto de la arena del turno** deja un
-  puntero colgando que vaxis lee en el renderer → segfault (el aviso de
-  `@fichero`).
-- `pushInfo` **copia**: para texto de stack, o de una arena que vive menos que
-  el frame, es lo único seguro.
-- Lo mismo con `takeCheckpointOwned`: la primera versión hacía `deinit` y
-  devolvía la copia con los `data` ya liberados.
+- `pushInfoOwned` **takes ownership** of the text and frees it in `Model.deinit`:
+  a literal there is an "Invalid free" (the palette), a `catch "literal"` is the
+  same (`/free-auto status`), a `bufPrint` into a stack is a pointer to a temporary
+  (the undo heading showed up as `�`), and **text from the turn's arena** leaves a
+  dangling pointer that vaxis reads in the renderer → segfault (the `@file`
+  notice).
+- `pushInfo` **copies**: for text on the stack, or from an arena that lives less
+  than the frame, it is the only safe thing.
+- The same with `takeCheckpointOwned`: the first version did `deinit` and returned
+  the copy with the `data` already freed.
 
-## Diagnóstico
+## Diagnosis
 
-- `ZODE_DBG_ERR=1` vuelca status + los primeros bytes de cada respuesta a
-  stderr. Con eso se leyó el 400 de openrouter que se comía los reintentos; sin
-  él, la TUI solo decía «HTTP 400».
-- `zig build roster-probe` para el pool de verdad.
+- `ZODE_DBG_ERR=1` dumps the status + the first bytes of each response to stderr.
+  That is how openrouter's 400 was read, the one that was eating the retries;
+  without it, the TUI only said "HTTP 400".
+- `zig build roster-probe` for the real pool.
 
-## La sexta vez: `catch "literal"` a `pushInfoOwned` (13 sitios, todos fijos)
+## The sixth time: `catch "literal"` into `pushInfoOwned` (13 places, all fixed)
 
-La sección de arriba dice que `pushInfoOwned` toma posesión del texto. El patrón
-que se ha escrito **13 veces** en el repo era:
+The section above says `pushInfoOwned` takes ownership of the text. The pattern
+that had been written **13 times** in the repo was:
 
 ```zig
-const msg = std.fmt.allocPrint(a, "…", args) catch "un literal";
+const msg = std.fmt.allocPrint(a, "…", args) catch "a literal";
 pushInfoOwned(m, msg);
 ```
 
-En el camino feliz `msg` es del heap y no pasa nada. Con el allocator **sin
-memoria**, `msg` es un puntero a `.rodata`, `pushInfoOwned` lo toma y
-`Model.deinit` lo libera: dos fallos que se cancelan en «zode ha crasheado y no
-sé por qué». Es un fallo que solo aparece cuando ya hay otro fallo, que es
-justo cuando no lo puedes diagnosticar.
+On the happy path `msg` is from the heap and nothing happens. With the allocator
+**out of memory**, `msg` is a pointer to `.rodata`, `pushInfoOwned` takes it and
+`Model.deinit` frees it: two failures that cancel out into "zode crashed and I
+don't know why". It is a failure that only shows up when there is already another
+failure, which is exactly when you cannot diagnose it.
 
-**El arreglo es `Model.pushInfoFmt(fmt, args)`**: compone Y es dueña del texto,
-así que el error no se puede escribir. Los 13 sitios usan esa.
+**The fix is `Model.pushInfoFmt(fmt, args)`**: it composes AND owns the text, so
+the mistake cannot be written. All 13 places use that.
 
-Y el peor de los 13 estaba en `tui.zig`, en `submitInput`:
+And the worst of the 13 was in `tui.zig`, in `submitInput`:
 
 ```zig
 const msg = std.fmt.allocPrint(ctx.alloc, "error: {t}", .{err}) catch "error";
 self.pushInfoOwned(msg);
 ```
 
-`ctx.alloc` es el **arena del frame**, que se resetea en cada frame y **no es**
-el allocator del modelo. O sea que `pushInfoOwned`:(a) lo metía en la cola y
-vaxis leía los bytes después de que el arena se hubiera reiniciado (puntero
-colgando en el renderer) y (b) lo liberaba con otro allocator («Invalid free»
-al salir). Los dos a la vez.
+`ctx.alloc` is the **frame's arena**, which is reset on every frame and **is not**
+the model's allocator. So `pushInfoOwned`: (a) put it in the queue and vaxis read
+the bytes after the arena had been reset (a dangling pointer in the renderer) and
+(b) freed it with a different allocator ("Invalid free" on exit). Both at once.
 
-**Regla que sale de aquí**: si la memoria cambia de manos, la *longitud* tiene
-que ser la que se reservó. `providerEnvNames` devolvía `buf[0..n]` de un bloque
-de 512, y `std.testing.allocator` trata eso —con razón— como un «Invalid free»
-de 33 bytes en un bloque de 512. Un `Writer.fixed` es la forma equivocada para
-memoria que otro va a liberar.
+**The rule that comes out of here**: if memory changes hands, the *length* has to
+be the one that was allocated. `providerEnvNames` returned `buf[0..n]` out of a
+512-byte block, and `std.testing.allocator` treats that — rightly — as an
+"Invalid free" of 33 bytes in a 512-byte block. A `Writer.fixed` is the wrong shape
+for memory that someone else is going to free.
 
-## Dos errores de mensaje que no dicen la verdad
+## Two error messages that do not tell the truth
 
-Un error cuyo trabajo es decir *qué mirar* no puede mentir en la mitad. Las dos
-cosas que se encontraron juntas, en el mismo mensaje:
+An error whose job is to say *what to look at* cannot lie in the middle. Both
+things that were found together, in the same message:
 
-1. `ZODE_{s}_KEY` sobre `key_env[0]`, que **ya es el nombre entero**
-   (`ZODE_OPENROUTER_KEY`). Salía `check ZODE_ZODE_OPENROUTER_KEY_KEY`: una
-   variable que no puede existir. Y solo citaba la primera de la cadena, así que
-   en opencode (`ZODE_OPENCODE_KEY` o `ZODE_API_KEY`) mandaba al sitio
-   equivocado. Ahora van **verbatim y todas**.
-2. El `reason` del server se tiraba en el 401, siendo la única rama que lo
-   hacía (las otras cinco lo enseñan). Found con un 401 real de openrouter, que
-   contestaba `{"error":{"message":"User not found."}}`: eso es la **cuenta**,
-   no la key, y decir «key rejected» manda a rotar una key que está perfecta.
-   Un 401 **no siempre** es la key, y el server lo dice cuando quiere decirlo.
+1. `ZODE_{s}_KEY` over `key_env[0]`, which **is already the whole name**
+   (`ZODE_OPENROUTER_KEY`). It printed `check ZODE_ZODE_OPENROUTER_KEY_KEY`: a
+   variable that cannot exist. And it only quoted the first of the list, so on
+   opencode (`ZODE_OPENCODE_KEY` or `ZODE_API_KEY`) it sent you to the wrong place.
+   Now they go **verbatim and all of them**.
+2. The server's `reason` was thrown away on the 401, being the only branch that did
+   so (the other five show it). Found with a real openrouter 401, which answered
+   `{"error":{"message":"User not found."}}`: that is the **account**, not the key,
+   and saying "key rejected" sends you to rotate a key that is perfectly fine. A
+   401 is **not always** the key, and the server says so when it wants to.
 
-## `@fichero`: un snippet con decoradores se come las menciones
+## `@file`: a snippet with decorators eats the mentions
 
-`@Override`, `@deprecated`, `@staticmethod`, `@import`… son tokens que pasan el
-escáner de menciones. Con 8 ranuras, **siete decoradores y el `@src/agent.zig`
-de verdad ya no se miraba** — medido, sin aviso. Y cada decorador contaba como
-«no encontrado», así que el usuario veía un «1 not found» sin haber pedido nada.
+`@Override`, `@deprecated`, `@staticmethod`, `@import`… are tokens that pass the
+mention scanner. With 8 slots, **seven decorators and the real `@src/agent.zig` was
+already not being looked at** — measured, with no warning. And each decorator
+counted as "not found", so the user saw a "1 not found" without having asked for
+anything.
 
-El filtro (`looksLikePath`: una `/` o una extensión) va en `scan` y **no** en
-`expand`, y esa es la parte importante: si el filtro estuviera abajo, los
-decoradores seguirían gastando el presupuesto del escáner y la mención real
-seguiría perdiéndose. `expand` ya no cuenta contra el presupuesto, pero `scan`
-sí, y por eso el filtro tiene que estar arriba.
+The filter (`looksLikePath`: a `/` or an extension) goes in `scan` and **not** in
+`expand`, and that is the important part: if the filter were at the bottom, the
+decorators would keep eating the scanner's budget and the real mention would keep
+being lost. `expand` no longer counts against the budget but `scan` does, and that
+is why the filter has to be at the top.
 
-Coste: `@Makefile` a secas ya no se expande. Se escribe `@./Makefile`, que además
-no depende de dónde se esté mirando.
+The cost: a bare `@Makefile` is no longer expanded. You write `@./Makefile`, which
+also does not depend on where you are looking.
 
-## La precedencia de las keys, que confunde al depurar
+## The key precedence, which confuses debugging
 
-Un 401 en la TUI con la key **del `.env`**, cuando `~/.config/zode/auth.json`
-tiene **otra** que sí funciona. No es un bug: la key guardada gana al entorno a
-propósito (ver «La key guardada no se usaba»), así que probar con un `HOME`
-limpio **cambia la key que se manda**. Lo que sí salió del lío es el mensaje del
-401, que entonces decía «key rejected» sin dejar ver el «User not found.» del server.
+A 401 in the TUI with the key **from `.env`**, when `~/.config/zode/auth.json` has
+**another** one that does work. It is not a bug: the saved key wins over the
+environment on purpose (see "The saved key was not used"), so testing with a clean
+`HOME` **changes the key that gets sent**. What did come out of the mess is the
+401's message, which then said "key rejected" without letting you see the server's
+"User not found.".
 
-Para probar de verdad hay que usar el `HOME` real, o borrar el `auth.json` del
-sandbox a propósito y saber que se está probando la key del entorno.
+To test for real you have to use the real `HOME`, or deliberately delete the
+sandbox's `auth.json` and know that you are testing the environment's key.
 
 ---
 
-# El salto de "agente que ejecuta" a "agente que collaborate" (2026-10-01)
+# From "an agent that executes" to "an agent that collaborates" (2026-10-01)
 
-Ocho cosas nuevas, y lo que se aprendió de cada una. La del `ask` es la que
-cambia el carácter de la cosa; las otras cuatro son de precio (tiempo y
-tokens) y la última es el ahorro en tokens.
+Eight new things, and what was learned from each one. The `ask` one is what
+changes the character of the whole thing; four of the others are about price
+(time and tokens) and the last one is about saving tokens.
 
-## 1. `ask`: que el modelo te pregunte
+## 1. `ask`: the model asks you
 
-Es LA pieza que faltaba. Antes el modelo o acertaba o se inventaba, y la única
-interacción era el permiso sí/no sobre un comando que ya estaba decidido.
+It is THE missing piece. Before, the model either got it right or made it up, and
+the only interaction was the yes/no permission on a command that was already
+decided.
 
-**Por qué la respuesta es un `tool_result` y no un mensaje `user` nuevo.** Un
-mensaje del asistente que pregunta, seguido de un `user`, no lo acepta ningún
-provider: el turno de usuario tiene que seguir a un turno de usuario, no a un
-asistente con `tool_calls` pendientes. Un tool call deja el turno aparcado
-justo donde la API espera, así que el formato del cable no cambia y **todos los
-providers lo aceptan sin tocar nada**.
+**Why the answer is a `tool_result` and not a new `user` message.** An assistant
+message that asks, followed by a `user`, is not accepted by any provider: the user
+turn has to follow a user turn, not an assistant with pending `tool_calls`. A tool
+call parks the turn exactly where the API expects it, so the wire format does not
+change and **every provider accepts it without a change**.
 
-**El módulo puro (`src/lib/ask.zig`) va aparte del wiring** porque lo que sale mal
-aquí es siempre la FORMA de la pregunta y, sobre todo, el texto que el MODELO
-lee de vuelta. Eso se testea sin TUI y sin red, que es como se pudo comprobar que
-`formatAnswered` nunca corta la respuesta del usuario en silencio.
+**The pure module (`src/lib/ask.zig`) is separate from the wiring** because what
+goes wrong here is always the SHAPE of the question and, above all, the text the
+MODEL reads back. That is testable with no TUI and no network, which is how it was
+confirmed that `formatAnswered` never truncates the user's answer silently.
 
-Tres salidas, y cada una dice una cosa distinta al modelo:
+Three outputs, and each one says something different to the model:
 
-| Salida | Qué le dice |
+| Output | What it tells it |
 |---|---|
-| `The user answered: X` | las palabras del usuario, textuales |
-| `declined_text` | «no contestaré eso» → **decide tú y dilo** |
-| `timed_out_text` | 5 min sin nadie → lo mismo, pero «estabas fuera» |
+| `The user answered: X` | the user's words, verbatim |
+| `declined_text` | "I will not answer that" → **decide yourself and say which** |
+| `timed_out_text` | 5 min with nobody there → the same, but "you were away" |
 
-Un modelo al que le dicen «no» sin más se queda parado o repite la pregunta. Lo
-único accionable es «elige la opción más razonable, di cuál has elegido y por qué,
-sigue». Y las dos frases NO contienen la palabra *stop*: el modelo la lee como
-permiso para abandonar.
+A model told just "no" either stops or repeats the question. The only actionable
+thing is "pick the most reasonable option, say which one you picked and why, carry
+on". And neither phrase contains the word *stop*: the model reads it as
+permission to give up.
 
-**El diálogo NO es el diálogo de permisos.** Es una copia de su forma (lock
-propio, espera dormida con backoff 1→20 ms, epoch para despertar) y no de su
-código, porque son preguntas distintas con timeouts distintos, y compartirlas
-hace que cada cambio en una sea un cambio en el comportamiento de la otra.
+**The dialog is NOT the permission dialog.** It is a copy of its shape (its own
+lock, a sleeping wait with 1→20 ms backoff, an epoch to wake on) and not of its
+code, because they are different questions with different timeouts, and sharing
+them makes every change to one a change in the other's behaviour.
 
-**El worker NO abre la palette.** Es la regla que ya costó dos segfaults (ver
-«Workers desacoplados»): el worker deja la pregunta en el `Model` y el **draw**
-la convierte en picker. Lo que se ve en el código es `askNeedsPicker()` dentro
-de `typeErasedDrawFn`.
+**The worker does NOT open the palette.** That is the rule that already cost two
+segfaults (see "Detached workers"): the worker leaves the question in the `Model`
+and the **draw** turns it into a picker. What you see in the code is
+`askNeedsPicker()` inside `typeErasedDrawFn`.
 
-**La franja tiene que salir aunque no haya turno.** `act_rows` cuenta `act.ask`,
-no solo `busy`. Sin eso la pregunta se pintaba en el centro sin nada que dijera
-por qué la app se había parado, y un worker aparcado sin reloj es
-**indistinguible de los freezes que este repo ya pagó una tarde entera**.
+**The strip has to show even when there is no turn.** `act_rows` counts
+`act.ask`, not only `busy`. Without that the question was painted in the middle
+with nothing saying why the app had stopped, and a parked worker with no clock is
+**indistinguishable from the freezes this repo already paid an afternoon for**.
 
-**El panel reserva las filas SIEMPRE.** La primera versión reservaba 4 filas bajo
-la pregunta y 2 si había opciones, así que una pregunta de texto libre salía con
-tres filas vacías debajo: parecía un panel roto. Ahora son 2 fijas (la ayuda de
-teclas y el reloj).
+**The panel reserves its rows ALWAYS.** The first version reserved 4 rows under
+the question and 2 when there were options, so a free-text question came out with
+three empty rows under it: it looked like a broken panel. Now they are 2 fixed ones
+(the key help and the clock).
 
-**ESC significa tres cosas, y el ORDEN es el diseño entero**:
+**ESC means three things, and the ORDER is the whole design**:
 
-1. Pregunta abierta → «no lo sé, decides tú». **No** es cancelar el turno.
-2. Tool en foreground → **matar el hijo** (ver el punto 4).
-3. Si no → abortar el stream.
+1. Open question → "I don't know, you decide". It is **not** cancelling the turn.
+2. Foreground tool → **kill the child** (see point 4).
+3. Otherwise → abort the stream.
 
-Y `declineAsk` cierra el diálogo en el MISMO frame. Sin eso la pregunta se
-quedaba pintada unos milisegundos después de haberla respondido, que se lee como
-«no me cogió la respuesta».
+And `declineAsk` closes the dialog in the SAME frame. Without that the question
+stayed painted for a few milliseconds after you had answered it, which reads as
+"it did not catch my answer".
 
-**El input en modo respuesta.** Enter responde en vez de mandar un prompt, y una
-respuesta VACÍA es una respuesta válida («you decide»): por eso la comprobación
-va **antes** que la del prompt vacío, o mandarías un turno con un `user` vacío.
+**The input in answer mode.** Enter answers instead of sending a prompt, and an
+EMPTY answer is a valid answer ("you decide"): that is why the check goes
+**before** the empty-prompt check, or you would send a turn with an empty `user`.
 
-**El tope de 3 por turno** se reinicia en cada turno (si no, una sesión larga
-dejaba de poder preguntar a la hora) y al llegar el cap **degrada en «decide tú»**,
-no en un turno roto. El número de preguntas del turno está en `/bench`.
+**The cap of 3 per turn** resets on every turn (otherwise a long session would
+eventually be unable to ask) and on reaching the cap it **degrades into "you
+decide"**, not into a broken turn. The turn's number of questions is in `/bench`.
 
 ## 2. Ask mode (read-only): shift+tab
 
-`write`/`edit`/`bash` vuelven como `tool_result` con un texto que **dice que no
-se reintente** (si no, el modelo repite y el bucle se come las iteraciones) y que
-ofrece `ask` como salida.
+`write`/`edit`/`bash` come back as a `tool_result` with a text that **says not to
+retry** (otherwise the model repeats and the loop eats the iterations) and that
+offers `ask` as the way out.
 
-La decisión es por TOOL, no parseando el comando: si se mirase el comando,
-`bash ls` serviría para descubrir qué quiere ejecutar de verdad el modelo y el
-modo se podría saltar. `bash` está bloqueado aunque solo vaya a leer.
+The decision is per TOOL, not by parsing the command: if it looked at the command,
+`bash ls` would serve to find out what the model really wants to run, and the mode
+could be bypassed. `bash` is blocked even when it only reads.
 
-El modo se inyecta en el **system prompt**, no solo en el error de la tool: si no,
-el modelo planea un `write` y se encuentra un error, y lo lee como un bug del
-harness y busca el rodeo. Sale en la barra de estado siempre, porque un modo que
-no se ve es un modo donde «el modelo ignoró mi edit» no se distingue de «el
-modelo no lo intentó».
+The mode is injected into the **system prompt**, not only into the tool's error:
+otherwise the model plans a `write`, hits an error, reads it as a harness bug and
+looks for the workaround. It always shows in the status bar, because a mode you
+cannot see is a mode where "the model ignored my edit" cannot be told apart from
+"the model did not try".
 
-`Session.replaceSystem` existe por esto: el prompt depende de cosas que cambian
-durante la sesión, y **añadir** un segundo `system` es exactamente el bug que
-tuvo el bucle del agente (`[user, system, tool, system]`, y un 400 en el turno
-siguiente). Se compara antes de escribir: en un turno estable es un `memcmp`.
+`Session.replaceSystem` exists for this: the prompt depends on things that change
+during the session, and **adding** a second `system` is exactly the bug the agent
+loop had (`[user, system, tool, system]`, and a 400 on the next turn). It is
+compared before writing: on a stable turn it is a `memcmp`.
 
 ## 3. Background bash: `run_in_background`
 
-El `bash` normal metía al worker dentro de `std.process.run` **30 s**: no podía
-leer un fichero, ni grep un error, ni contestar. El trabajo interesante («¿cuál de
-estos 40 errores es el mío?») pasa a ocurrir **durante** la espera en lugar de
-después.
+A normal `bash` put the worker inside `std.process.run` for **30 s**: it could
+not read a file, grep an error, or answer. The interesting work ("which of these
+40 errors is mine?") happens **during** the wait instead of after it.
 
-- `bash_output` es **incremental**: lo que apareció desde la última llamada. Sin
-  eso, un agente que hace polling paga dos veces por la misma salida y el
-  contexto se llena de duplicados. El estado (¿sigue? ¿exit=?) **no** es
-  incremental, porque es corto y es lo que responde a «¿terminó?».
-- El tope de 64 KB **reserva sitio para el aviso de corte desde el principio**.
-  Sin la reserva el aviso nunca se puede escribir: cuando descubres que el buffer
-  está lleno es justo cuando no queda espacio, así que el mensaje que dice «no lo
-  estás viendo todo» es el único que se pierde.
-- El id es un **contador, no un puntero**: un slot liberado y reutilizado no puede
-  hacer que el id 3 devuelva la salida de otro trabajo.
-- El hilo lector tiene **su propia copia del `Child`**. `wait()` lo muta y
-  `kill()` le pone el id a null, así que compartirlo con el registry es una
-  carrera entre `bash_kill` y el lector.
-- El reader **nunca** libera el slot (compara el id y nada más): el teardown del
-  modelo puede haber soltado la memoria mientras el proceso seguía vivo.
+- `bash_output` is **incremental**: what appeared since the last call. Without
+  that, an agent that polls pays twice for the same output and the context fills
+  up with duplicates. The status (still running? exit=?) is **not** incremental,
+  because it is short and it is what answers "has it finished?".
+- The 64 KB cap **reserves room for the truncation notice from the start**.
+  Without the reservation the notice can never be written: when you find out the
+  buffer is full is exactly when there is no space left, so the message saying
+  "you are not seeing all of it" is the one that gets lost.
+- The id is a **counter, not a pointer**: a freed and reused slot cannot make id 3
+  return the output of another job.
+- The reader thread has **its own copy of the `Child`**. `wait()` mutates it and
+  `kill()` sets its id to null, so sharing it with the registry is a race between
+  `bash_kill` and the reader.
+- The reader **never** frees the slot (it compares the id and nothing else): the
+  model's teardown may have released the memory while the process was still
+  alive.
 
-## 4. ESC mata al hijo
+## 4. ESC kills the child
 
-`std.process.run` se guarda el `Child` en su propio frame y no le pasa un handle
-a nadie, así que ESC solo ponía un flag que `run` nunca mira: un `zig build` de
-30 s seguía vivo, con el worker bloqueado dentro y la CPU al 100 %. Ahora
-`tools.runForeground` hace el spawn a mano y publica el pid.
+`std.process.run` keeps the `Child` in its own frame and does not pass a handle to
+anyone, so ESC only set a flag that `run` never looks at: a 30 s `zig build` kept
+running, with the worker blocked inside and the CPU at 100 %. Now
+`tools.runForeground` does the spawn by hand and publishes the pid.
 
-`kill(-pid, SIGKILL)`, con el **pid negativo**: un `sh -c "a && b"` tiene hijos, y
-matar solo el shell deja al nieto (`zig`, `npm`) corriendo. El grupo de proceso
-es lo que se mata. El camino de foreground NO pone `pgid` a propósito (el hijo
-comparte nuestro grupo y el negativo se llevaría zode por delante), así que ahí
-cae al pid suelto y se mata el shell: es el intercambio honesto.
+`kill(-pid, SIGKILL)`, with the **negative pid**: an `sh -c "a && b"` has children,
+and killing only the shell leaves the grandchild (`zig`, `npm`) running. The
+process group is what gets killed. The foreground path deliberately does NOT set
+`pgid` (the child shares our group and the negative would take zode down with it),
+so there it falls back to the bare pid and kills the shell: that is the honest
+trade-off.
 
-Y ESC marca además **todos los jobs en background**. ESC significa «para», y
-dejar compilando en segundo plano después de pulsar ESC es como se acaba con el
-portátil caliente.
+And ESC marks **all background jobs** too. ESC means "stop", and leaving
+something compiling in the background after pressing ESC is how you end up with a
+warm laptop.
 
-## 5. Tools en paralelo
+## 5. Tools in parallel
 
-Se paralelizan **solo** las que no pueden observarse entre sí: `read`, `grep`,
-`glob`, `list_files`, `web_fetch`, `web_search`. El criterio no es «son rápidas»
-ni «suelen no chocar»: es que no escriben y no necesitan ver el mundo después.
-`bash` queda fuera aunque parezca de lectura, porque puede escribir y el modelo
-puede haber pedido dos `bash` donde el segundo lee lo que escribió el primero.
-El test `isParallelSafe` ∧ `isWriteSafe` == ∅ fija que las dos listas no se
-contradicen, porque un tool en las dos sería un fallo de seguridad con forma de
-feature.
+Only the ones that cannot observe each other are parallelised: `read`, `grep`,
+`glob`, `list_files`, `web_fetch`, `web_search`. The criterion is not "they are
+fast" nor "they usually do not conflict": it is that they do not write and do not
+need to see the world afterwards. `bash` is out even when it looks like a read,
+because it can write and the model may have asked for two `bash` where the second
+reads what the first wrote. The test `isParallelSafe` ∧ `isWriteSafe` == ∅ pins
+that the two lists do not contradict each other, because a tool in both would be a
+security failure shaped like a feature.
 
-Lo que salió:
+What came out of it:
 
-- **Arena propia por llamada.** La arena del turno se comparte entre las tres y
-  su `ArrayList` de longitud es una carrera **silenciosa**, no un crash.
-- **Resultados en orden de petición.** Ordenarlos por tiempo de respuesta sería
-  más rápido de mirar y haría que la misma petición diera transcripciones
-  distintas en cada ejecución.
-- **Cabeceras primero, resultados después.** Todas las líneas `⏺ grep(...)` salen
-  antes que cualquier `⎿ 12 matches`, para que el historial lea «estas cuatro
-  cosas a la vez» en vez de cuatro pares sueltos.
-- **La espera NO cuenta `m.workerCount()`**: ese contador global incluye al worker
-  del turno, así que esperar por él aquí sería esperar a que termine el turno, que
-  está esperando a esta función. Es un contador **local al lote**.
-- Los hilos van sueltos (`detach`) y con `beginWorker`/`endWorker`, porque al
-  salir `waitWorkers` tiene que aguantar a que terminen o `app.deinit()` destruye
-  el `Io` mientras uno está dentro de `process.run`.
+- **An arena per call.** The turn's arena is shared between the three and its
+  `ArrayList` length is a **silent** race, not a crash.
+- **Results in request order.** Ordering them by response time would be faster to
+  look at and would make the same request produce different transcripts on every
+  run.
+- **Headers first, results after.** All the `⏺ grep(...)` lines go out before any
+  `⎿ 12 matches`, so the history reads "these four things at once" instead of
+  four unrelated pairs.
+- **The wait does NOT count `m.workerCount()`**: that global counter includes the
+  turn's worker, so waiting for it here would mean waiting for the turn to finish,
+  which is waiting for this function. It is a counter **local to the batch**.
+- The threads are detached (`detach`) and wrapped in `beginWorker`/`endWorker`,
+  because on exit `waitWorkers` has to wait for them or `app.deinit()` destroys
+  the `Io` while one of them is inside `process.run`.
 
-## 6. Subagentes (`task`)
+## 6. Subagents (`task`)
 
-El segundo hueco grande, y el mayor ahorro de tokens. **Todo lo que el agente
-principal lee entra en su contexto, y ese contexto se reenvía en cada iteración y
-se factura cada vez.** Un `grep -r` de 40 KB son 10k tokens en el prompt de las
-iteraciones 2, 3, 4… y lo útil eran dos líneas que decían qué función mirar. El
-subagente paga esos 10k **una vez**, en una ventana que se tira, y devuelve un
-párrafo.
+The second big gap, and the biggest token saving. **Everything the main agent
+reads goes into its context, and that context is sent again on every iteration and
+billed every time.** A 40 KB `grep -r` is 10k tokens in the prompt of iterations
+2, 3, 4… and what was useful was two lines saying which function to look at. The
+subagent pays those 10k **once**, in a window that is thrown away, and returns a
+paragraph.
 
-Decisiones que no son obvias:
+Decisions that are not obvious:
 
-- **No ve la conversación.** Solo el prompt de la tarea. Si heredara el historial
-  heredaría los tokens, que es justo lo que esto evita.
-- **Effort `low` siempre.** Es una búsqueda acotada, no un diseño, y no hay nadie
-  a quien impresionar. Aquí es donde se ahorra el dinero y no se pierde calidad.
-- **Profundidad 1.** Un subagente que puede anidar es una forma de gastar cien
-  veces los tokens por accidente y no se puede presupuestar.
-- **Sus tools son las de lectura y SOLO esas.** `ask` está fuera a propósito: un
-  subagente que pregunta desde un hilo que no es el del turno deja al usuario sin
-  saber cuál de los dos agentes le está hablando. Lo que necesita el usuario lo
-  devuelve como «necesita que decidas X» y decide el agente principal.
-- **Presupuesto de 24k, constante**, no derivado de `ZODE_CONTEXT_LIMIT`: la
-  ventana del subagente es desechable, y derivarla de la del usuario la haría de
-  100k para alguien con una ventana grande.
-- **Se queda sin pasos NO es un error.** El informe que llevaba escribiendo suele
-  bastar, y tirarlo porque la búsqueda no acabó es lo peor de las dos opciones.
-- Un fallo suyo (sin key, provider caído) vuelve como **texto**, no como error: el
-  turno tiene que poder continuar, y el agente principal necesita saber que le
-  toca buscar a él.
+- **It does not see the conversation.** Only the task's prompt. If it inherited
+  the history it would inherit the tokens, which is exactly what this avoids.
+- **Effort `low` always.** It is a bounded search, not a design, and there is
+  nobody to impress. This is where the money is saved and no quality is lost.
+- **Depth 1.** A subagent that can nest is a way of spending a hundred times the
+  tokens by accident and cannot be budgeted.
+- **Its tools are the read ones and ONLY those.** `ask` is out on purpose: a
+  subagent asking from a thread that is not the turn's leaves the user not knowing
+  which of the two agents is talking to them. What it needs the user to do, it
+  returns as "you need to decide X" and the main agent decides.
+- **A 24k budget, constant**, not derived from `ZODE_CONTEXT_LIMIT`: the subagent's
+  window is disposable, and deriving it from the user's would make it 100k for
+  someone with a big window.
+- **Running out of steps is NOT an error.** The report it was writing is usually
+  enough, and throwing it away because the search did not finish is the worse of
+  the two options.
+- One of its failures (no key, provider down) comes back as **text**, not as an
+  error: the turn has to be able to continue, and the main agent needs to know it
+  is its turn to search.
 
-## 7. `/bench` y el límite de iteraciones
+## 7. `/bench` and the iteration limit
 
-`max_iterations` eran 8, nadie sabía cuánto se alcanzaba, y «subirlo a 20» era una
-apuesta en las dos direcciones. Ahora son 12 y configurables con `ZODE_MAX_ITER`,
-y `/bench` dice **el porcentaje de turnos que llegaron al tope**, que es el
-número que decide.
+`max_iterations` was 8, nobody knew how often it was reached, and "raising it to
+20" was a bet in both directions. Now it is 12 and configurable with
+`ZODE_MAX_ITER`, and `/bench` says **the percentage of turns that reached the cap**,
+which is the number that decides.
 
-`first token` es la media y el p95 del TTFT, que es lo que separa «el modelo es
-lento» de «hemos hecho mal la petición». El anillo de muestras se queda con las
-**últimas 64**: un p95 de toda la sesión describe una máquina que hace una hora
-estaba compilando otra cosa.
+`first token` is the mean and the p95 of the TTFT, which is what separates "the
+model is slow" from "we made the request badly". The sample ring keeps the **last
+64**: a p95 of the whole session describes a machine that an hour ago was
+compiling something else.
 
-El límite por defecto subió a 12 porque 8 era para un bucle donde cada iteración
-es una edición, y una tarea de verdad es «leer tres ficheros, grep dos veces,
-editar, compilar, leer el error, arreglar, compilar» — 8 o 9 antes incluso de
-escribir la respuesta final. Y subirlo no cuesta nada en el caso normal, porque el
-bucle se acaba solo en cuanto el modelo deja de pedir tools.
+The default limit went up to 12 because 8 was for a loop where each iteration is
+an edit, and a real task is "read three files, grep twice, edit, compile, read the
+error, fix it, compile" — 8 or 9 before even writing the final answer. And raising
+it costs nothing in the normal case, because the loop ends on its own as soon as
+the model stops asking for tools.
 
 ## 8. Skills
 
-`.zode/skills/<nombre>/SKILL.md` (proyecto) y
-`~/.config/zode/skills/<nombre>/SKILL.md` (persona), con frontmatter de `name` y
-`description`.
+`.zode/skills/<name>/SKILL.md` (project) and
+`~/.config/zode/skills/<name>/SKILL.md` (personal), with `name` and `description`
+frontmatter.
 
-**El diseño entero es: al prompt solo van nombre y descripción.** El cuerpo se
-carga con la tool `skill` en el momento en que el modelo decide que lo necesita.
-La alternativa — meterlo todo — es como un proyecto acaba con 40 KB de
-instrucciones que el modelo ya ha aprendido a saltar, en cada request, para
-siempre, diga o no la tarea con ellas. `description` tiene que decir **CUÁNDO**
-usarlo, no QUÉ es: «después de tocar el dibujo de tui.zig» decide bien; «notas
-sobre pty» obliga al modelo a adivinar.
+**The whole design is: only the name and the description go into the prompt.** The
+body is loaded with the `skill` tool at the moment the model decides it needs it.
+The alternative — putting it all in — is how a project ends up with 40 KB of
+instructions the model has already learned to skip, on every request, forever,
+whether or not the task needs them. The `description` has to say **WHEN** to use
+it, not WHAT it is: "after touching the drawing code in tui.zig" decides well;
+"notes about pty" makes the model guess.
 
-El proyecto **tapa** al global, no se fusionan: un skill de proyecto mezclado con
-el global es peor que no tenerlo, porque la mitad de las instrucciones serían de
-otro proyecto.
+The project **overrides** the global one, they are not merged: a project skill
+mixed with the global one is worse than not having it, because half the
+instructions would be about another project.
 
-Sin frontmatter también vale (es markdown y punto) y entonces el nombre sale del
-**directorio**, que es lo que existe de verdad en disco: un `name` del frontmatter
-que no coincide con el directorio haría que la tool call fallara y el modelo no
-tiene forma de recuperar.
+No frontmatter works too (it is markdown and a dot) and then the name comes from
+the **directory**, which is what actually exists on disk: a frontmatter `name`
+that does not match the directory would make the tool call fail and the model has
+no way to recover.
 
-## Tres cosas que se colgaron por el camino
+## Three things that hung on the way
 
-1. **`readPrefix` devolvía un slice de su propio stack** (`.zode-skills-test-N`).
-   Los fixtures se escribían en una ruta de basura y los seis tests de
-   descubrimiento fallaban con «found 0» sin motivo visible. Octava vez de la
-   familia `&[_]u8{c}`.
-2. **`splitFrontmatter` reventaba con un fichero que ACABA en el `---` de
-   cierre.** Sin newline final, `nl` es 0 y el índice se pasaba una posición;
-   `rest[i..]` con `i > len` es un panic, no un slice vacío. Los tests puros
-   todos tenían newline final, así que solo lo cazaron los de disco — que es
-   exactamente para lo que existen.
-3. **El smoke test no esperaba después de la última tecla.** Mandaba el `\r` y
-   cerraba en el acto, así que `/skills` se comprobaba contra un frame en el que
-   la app todavía no había respondido. Un test que depende de eso no prueba la
-   feature, prueba la velocidad de la máquina. Ahora hay un turno de espera
-   antes del ctrl+c.
+1. **`readPrefix` returned a slice of its own stack** (`.zode-skills-test-N`).
+   The fixtures were written to a garbage path and the six discovery tests failed
+   with "found 0" for no visible reason. The eighth time round of the `&[_]u8{c}`
+   family.
+2. **`splitFrontmatter` blew up with a file that ENDS in the closing `---`.**
+   Without a final newline, `nl` is 0 and the index went one position past;
+   `rest[i..]` with `i > len` is a panic, not an empty slice. Every pure test had
+   a final newline, so only the on-disk ones caught it — which is exactly what they
+   are for.
+3. **The smoke test did not wait after the last key.** It sent the `\r` and closed
+   right away, so `/skills` was checked against a frame in which the app had not
+   answered yet. A test that depends on that does not prove the feature, it proves
+   the machine's speed. Now there is a turn of waiting before the ctrl+c.
 
-Y uno de diseño que salió al escribir los tests:
+And one design thing that came out while writing the tests:
 
-**Los `PickerItem` de una pregunta son copias propias (gpa).** `closePicker` los
-libera, y `askPickerChosen` recibe una etiqueta que el picker libera justo
-después del callback. Sin la copia, elegir la primera opción es un «Invalid
-free». Es el mismo bug que el fuzzing encontró con el item `+ connect`.
+**A question's `PickerItem`s are their own copies (gpa).** `closePicker` frees
+them, and `askPickerChosen` receives a label the picker frees right after the
+callback. Without the copy, choosing the first option is an "Invalid free". It is
+the same bug the fuzzer found with the `+ connect` item.
 
-## Qué NO se ha hecho
+## What has NOT been done
 
-- **MCP**, a propósito (fuera de alcance).
-- **Router de modelo barato para el turno principal.** Se quedó en el subagente
-  (effort `low`), que es donde se paga sin riesgo: mandar el turno principal a
-  un modelo pequeño puede dar 403 en cuanto ese modelo no esté disponible para
-  la cuenta, y eso es un error que no se ve venir.
-- **El modelo sigue sin poder preguntar desde un subagente** (por diseño, ver el
-  punto 6).
+- **MCP**, on purpose (out of scope).
+- **A cheap model router for the main turn.** It stayed in the subagent (effort
+  `low`), which is where it is paid for without risk: sending the main turn to a
+  small model can give a 403 as soon as that model is not available for the
+  account, and that is an error you cannot see coming.
+- **The model still cannot ask from a subagent** (by design, see point 6).
 
 ---
 
-# Seis bugs reportados (2026-10-01)
+# Six reported bugs (2026-10-01)
 
-Todos verificados antes y despues: el que se puede reproducir con un test se
-reproduce primero, se quita el fix, y se ve el test en rojo.
+All verified before and after: the one that can be reproduced with a test is
+reproduced first, the fix is removed, and the test is seen going red.
 
-## 1. ESC no paraba los procesos: no existia el grupo que matar
+## 1. ESC did not stop the processes: there was no group to kill
 
-**El sintoma**: «ESC no para los procesos». ESC ponia el flag de cancelacion y
-mataba el pid del shell. El shell moria. **El nieto no.**
+**The symptom**: "ESC does not stop the processes". ESC set the cancel flag and
+killed the shell's pid. The shell died. **The grandchild did not.**
 
-Medido con una sonda que cronometra `tools.runForeground` sobre
-`sleep 30 & wait`:
+Measured with a probe that times `tools.runForeground` over `sleep 30 & wait`:
 
 ```
 killForeground returned true
-elapsed=30034ms term=signal      <-- 30 s: el sleep sigue a medias
+elapsed=30034ms term=signal      <-- 30 s: the sleep is still going
 ```
 
-y en la tabla de procesos, tres segundos despues del ESC:
+and in the process table, three seconds after the ESC:
 
 ```
 PID    PPID  PGID  COMM
 10174  10171 10171  escprobe
-10179  826   10171  sleep      <-- PPID 826 = reparentado a init. Huerfano.
+10179  826   10171  sleep      <-- PPID 826 = reparented to init. Orphan.
 ```
 
-**La causa**: `kill(-pid, SIGKILL)` (el negative, para matar el GRUPO) nunca
-podia funcionar, porque el hijo no era lider de su propio grupo: `std.process.spawn`
-sin `pgid` deja al hijo en el grupo de zode. Asi que `kill(-pid)` fallaba con
-ESRCH y el codigo caia al `kill(pid)` de siempre. El comentario del codigo
-decia «un shell tiene hijos, por eso uso el negative», y el negative no
-funcionaba: era la intencion correcta con la primitiva equivocada.
+**The cause**: `kill(-pid, SIGKILL)` (the negative, to kill the GROUP) could never
+work, because the child was not the leader of its own group: `std.process.spawn`
+without `pgid` leaves the child in zode's group. So `kill(-pid)` failed with ESRCH
+and the code fell back to the usual `kill(pid)`. The code's comment said "a shell
+has children, that is why I use the negative", and the negative did not work: it
+was the right intention with the wrong primitive.
 
-**El fix**: `.pgid = 0` en los DOS spawns (el foreground de `tools.zig` y el
-background de `bgproc.zig`), y `killTree` para los jobs en background, que antes
-usaban `Child.kill` (un pid) igual que el resto.
+**The fix**: `.pgid = 0` in BOTH spawns (the foreground one in `tools/` and the
+background one in `bgproc.zig`), and `killTree` for the background jobs, which
+before used `Child.kill` (a single pid) like everything else.
 
-Con el fix: `elapsed=700ms`, y no queda ni el shell ni el nieto.
+With the fix: `elapsed=700ms`, and neither the shell nor the grandchild is left.
 
-Lo que hacia falta escribir:
+What had to be written down:
 
-- **Los dos spawns, no solo el que se vio.** El foreground y el background
-  tienen el mismo bug y caminos distintos de entrada.
-- **`Job.pgid` aparte de `child.id`.** El hilo lector hace `wait()` sobre su
-  propia copia del `Child` y pone `id` a null; ademas el pid se recicla en
-  cuanto se recoge el hijo. `kill(-<pid-reciclado>)` es matar a un desconocido.
-- **`tools/esc_kill_pty.py`**: la unica prueba que mira el NIETO en la tabla de
-  procesos. Y mira al nieto, no al shell, por una razon que costo una vuelta: el
-  shell SI moria sin el fix, asi que un test que lo mirara daria verde con y sin
-  el fix. El marcador es `sleep 301 & wait` (dos pids) y se busca el argv
-  exacto `sleep 301`. Con `exec` el shell se reemplaza, queda un proceso, y la
-  prueba no distingue nada.
+- **Both spawns, not just the one that was seen.** The foreground and the
+  background have the same bug and different entry paths.
+- **`Job.pgid` apart from `child.id`.** The reader thread does `wait()` on its own
+  copy of the `Child` and sets `id` to null; also the pid is recycled as soon as
+  the child is reaped. `kill(-<recycled-pid>)` is killing a stranger.
+- **`tools/esc_kill_pty.py`**: the only test that looks at the GRANDCHILD in the
+  process table. And it looks at the grandchild, not the shell, for a reason that
+  cost a round trip: the shell DID die without the fix, so a test that looked at
+  it would go green with and without the fix. The marker is `sleep 301 & wait`
+  (two pids) and it looks for the exact argv `sleep 301`. With `exec` the shell is
+  replaced, one process is left, and the test distinguishes nothing.
 
-## 2. `reasoning_effort`: el enum era el techo de tokens
+## 2. `reasoning_effort`: the enum was the token ceiling
 
-**El sintoma**: «no hacen bien la inferencia del esfuerzo, hay modelos que
-soportan mas».
+**The symptom**: "they do not infer the effort well, there are models that support
+more".
 
-**La causa** eran dos cosas a la vez:
+**The cause** was two things at once:
 
-1. `Effort` era un `enum(u32)` cuyo VALOR era `max_tokens` (`low = 4096`,
-   `xhigh = 49152`). Effort y longitud de respuesta quedaban atados: pedir mas
-   razonamiento tambien acortaba la respuesta, y pedir `low` daba 4096 tokens
-   TOTALES (budget de pensar + respuesta), que parte una respuesta con tools
-   por la mitad.
-2. `reasoningToken` mandaba `.xhigh` como `"high"` **para todos**, y
-   `familyForModel` solo reconocia o-series/gpt-5. Asi que Gemini
-   (`minimal`), gpt-5.1 (`xhigh`) y cualquier modelo con niveles propios no
-   tenian forma de que se les pidiera nada: el enum no tenia esos miembros.
+1. `Effort` was an `enum(u32)` whose VALUE was `max_tokens` (`low = 4096`,
+   `xhigh = 49152`). Effort and answer length were tied together: asking for more
+   reasoning also shortened the answer, and asking for `low` gave 4096 tokens in
+   TOTAL (thinking budget + answer), which cuts a response with tools in half.
+2. `reasoningToken` sent `.xhigh` as `"high"` **for everyone**, and
+   `familyForModel` only recognised o-series/gpt-5. So Gemini (`minimal`),
+   gpt-5.1 (`xhigh`) and any model with levels of its own had no way to be asked
+   for anything: the enum did not have those members.
 
-**El fix**: `Effort` es un enum de NIVELES y nada mas. El techo vive en
-`outputCeiling`, el presupuesto de pensar en `thinkingBudget`, y una tabla
-`effortSupport(model)` decide que nivel va de verdad al cable.
+**The fix**: `Effort` is an enum of LEVELS and nothing else. The ceiling lives in
+`outputCeiling`, the thinking budget in `thinkingBudget`, and an
+`effortSupport(model)` table decides which level actually goes on the wire.
 
-`effortFor` degrada **hacia abajo** y nunca hacia arriba (subir es un 400), y
-`/effort` dice en voz alta lo que va a ir de verdad («xhigh (este modelo topa en
-high)») en vez de acceptarlo en silencio. El picker ofrece `effortLevels(model)`,
-que es la MISMA imagen que `effortFor` — un test exige que lo que el picker ofrece
-salga exacto, sin degradarse en silencio.
+`effortFor` degrades **downwards** and never upwards (going up is a 400), and
+`/effort` says out loud what is really going out ("xhigh (this model tops out at
+high)") instead of accepting it silently. The picker offers
+`effortLevels(model)`, which is the SAME picture as `effortFor` — a test demands
+that what the picker offers comes out exact, without degrading in silence.
 
-El `reasoning_effort` ahora sale siempre que el MODELO lo tenga, no solo para
-o-series. Y el clamp de `thinking.budget_tokens` contra el techo se hace en el
-sitio que compone el body (el unico que sabe los dos numeros), no en el llamante.
+`reasoning_effort` now goes out whenever the MODEL has it, not only for o-series.
+And the clamp of `thinking.budget_tokens` against the ceiling happens in the place
+that composes the body (the only one that knows both numbers), not in the caller.
 
-### La tabla se verifico contra las DOCS, y la primera version era FALSA
+### The table was verified against the DOCS, and the first version was FALSE
 
-Esto es lo importante, y es un modo de fallo que **ningun test de este repo
-caza**: un test que compara el JSON que genera zode contra el JSON que el
-propio codigo de zode dice que deberia generar. Si los dos estan equivocados, el
-test pasa. Escribi la tabla de memoria, los tests pasaron en verde, y al buscar la
-documentacion resulto que tres filas eran inventadas:
+This is the important part, and it is a failure mode that **no test in this repo
+catches**: a test that compares the JSON zode generates against the JSON zode's
+own code says it should generate. If both are wrong, the test passes. I wrote the
+table from memory, the tests went green, and when I went looking for the
+documentation it turned out that three rows were invented:
 
-| lo que puse | la realidad |
+| what I put | the reality |
 |---|---|
-| `xhigh` en `gpt-5.1` | `xhigh` es **solo** de `gpt-5.1-codex-max`. En 5.1 a secas es un 400. |
-| `minimal` en todo GPT-5 | `minimal` es de **5.1 en adelante**. En GPT-5 previo es un 400. |
-| `minimal` en Gemini | `gemini-2.5-*` es `low/medium/high`. `minimal` es de Gemini 3.5+. |
+| `xhigh` on `gpt-5.1` | `xhigh` is **only** for `gpt-5.1-codex-max`. On plain 5.1 it is a 400. |
+| `minimal` on all of GPT-5 | `minimal` is **5.1 onwards**. On earlier GPT-5 it is a 400. |
+| `minimal` on Gemini | `gemini-2.5-*` is `low/medium/high`. `minimal` is Gemini 3.5+. |
 
-Y un cuarto, que no es de niveles: Gemini llama al campo `thinking_level`, no
-`reasoning_effort`. Se manda el nombre de OpenAI porque es por donde habla zode
-(`/v1beta/openai/`, OpenRouter), pero los **valores** son los de Gemini.
+And a fourth, which is not about levels: Gemini calls the field `thinking_level`,
+not `reasoning_effort`. The OpenAI name is sent because that is how zode talks
+(`/v1beta/openai/`, OpenRouter), but the **values** are Gemini's.
 
-La tabla corregida (verificada contra la matriz de niveles de OpenAI y la tabla de
-`thinking_level` de Google):
+The corrected table (verified against OpenAI's levels matrix and Google's
+`thinking_level` table):
 
-| modelo | niveles |
+| model | levels |
 |---|---|
-| `kimi-k2.6` (sin palanca) | no se manda el campo |
+| `kimi-k2.6` (no knob) | the field is not sent |
 | `gpt-5`, `o3`, `o1`, `gemini-2.5-*` | low / medium / high |
 | `gpt-5.1` | + none, minimal |
 | `gemini-3.5+`, `gemini-3-flash` | minimal / low / medium / high |
 | `gpt-5.1-codex-max` | + xhigh |
 
-**La leccion**: un test que verifica la composicion de un payload **no** verifica
-que el servidor lo acepte. Para eso hace falta mirar la documentacion del
-proveedor, y el test tiene que tener la lista de "aceptados" escrita **a mano**,
-no derivada de la tabla que prueba. Es lo que hace ahora
-`effortFor: NUNCA pide un nivel que el modelo no documenta`: recorre toda la
-combinacion de modelo x nivel con una lista de aceptados escrita aparte. Si las
-dos se derivaran la una de la otra, el test pasaria con las dos equivocadas —
-que es justo como se colaron los tres fallos.
+**The lesson**: a test that verifies how a payload is composed **does not**
+verify that the server accepts it. For that you have to read the provider's
+documentation, and the test has to have the "accepted" list written **by hand**,
+not derived from the table it is proving. That is what `effortFor` does now: it
+NEVER asks for a level the model does not document — it walks the whole model x
+level combination against a separately written list of accepted ones. If the two
+were derived from each other, the test would pass with both wrong — which is
+exactly how the three failures got in.
 
-### Y el effort se decide SOLO, por modelo
+### And the effort is decided ALONE, by model
 
-Pedido literal: «que lo sepa el harness, no yo». O sea que `zode` deduce la
-escalera del modelo y no hay que investigar nada:
+Asked literally: "the harness should know, not me". In other words `zode` works
+out the model's ladder and there is nothing to investigate:
 
-- **`defaultEffort(model)`** es el escalon de EN MEDIO de la escalera de ese
-  modelo, no un `.medium` fijo. El indice es lo que decide, y las escaleras no
-  tienen la misma longitud: 3 niveles → `medium`, 5 → `low`, 6 → `medium`.
-- **`clampEffort`** se aplica en `setModel`, o sea **al cambiar de modelo**: un
-  `xhigh` elegido en un codex-max pasa a `high` al cambiar a un `gemini-2.5`. Sin
-  esto se quedaba degradandose en silencio en cada request, con el status bar
-  diciendo `xhigh` y el cable llevando `high`: dos textos para lo mismo y nada
-  que indique que son distintos.
-- **`effectiveEffort(model, want)`** colapsa el `?Effort` de `effortFor` a un
-  `Effort`. El `null` («este modelo no tiene la palanca») no es un error, pero
-  obligaba a que cada llamante se acordara; ahora el camino del request no tiene
-  que saber nada.
-- En el bucle de `free-auto` se resuelve contra **`pick.model`**, no contra el
-  modelo activo: ese bucle rota entre modelos del pool y cada uno tiene su
-  escalera, asi que usar el del activo mandaria un nivel que el candidato no
-  conoce.
-- El status bar y el `/effort` muestran el nivel **efectivo**, no la preferencia.
-- El picker se titula `effort · <modelo> goes up to <nivel>` (o «no effort
-  control»), que es el automatico hecho visible: no hace falta saber de
-  antemano que este modelo llega hasta `high` y otro hasta `xhigh`.
+- **`defaultEffort(model)`** is the step in the MIDDLE of that model's ladder, not
+  a fixed `.medium`. The index is what decides, and the ladders are not all the
+  same length: 3 levels → `medium`, 5 → `low`, 6 → `medium`.
+- **`clampEffort`** is applied in `setModel`, that is **when the model changes**:
+  an `xhigh` chosen on a codex-max becomes `high` when you switch to a
+  `gemini-2.5`. Without this it degraded in silence on every request, with the
+  status bar saying `xhigh` and the wire carrying `high`: two texts for the same
+  thing and nothing indicating they are different.
+- **`effectiveEffort(model, want)`** collapses `effortFor`'s `?Effort` into an
+  `Effort`. The `null` ("this model has no knob") is not an error, but it forced
+  every caller to remember that; now the request path does not have to know
+  anything.
+- In the `free-auto` loop it is resolved against **`pick.model`**, not against the
+  active model: that loop rotates between pool models and each one has its own
+  ladder, so using the active model's would send a level the candidate does not
+  know.
+- The status bar and `/effort` show the **effective** level, not the preference.
+- The picker is titled `effort · <model> goes up to <level>` (or "no effort
+  control"), which is the automatic made visible: you do not need to know in
+  advance that this model reaches `high` and another one reaches `xhigh`.
 
-**El caso que demuestra que el indice no es un detalle**: `gemini-3-pro-preview`
-no tiene `medium` (docs: `low` y `high`). Con un default literal `.medium`
-recibiria un nivel inexistente y el primer turno de una sesion nueva —donde el
-usuario no ha tocado `/effort`— se comeria un 400. Tiene su propia fila en la
-tabla (`no_medium`) por eso.
+**The case that shows the index is not a detail**: `gemini-3-pro-preview` has no
+`medium` (docs: `low` and `high`). With a literal `.medium` default it would
+receive a level that does not exist and the first turn of a new session — where
+the user has not touched `/effort` — would eat a 400. It has its own row in the
+table (`no_medium`) for that.
 
-Verificado en la pty real con `space-bunny-free`: el picker se abre con el titulo
-`effort · space-bunny-free (no effort control)` y ofrece `low/medium/high`, sin
-`minimal` ni `xhigh`; y `/effort xhigh` contesta «this model has no effort knob»
-en vez de aceptarlo en silencio.
+Verified in the real pty with `space-bunny-free`: the picker opens with the title
+`effort · space-bunny-free (no effort control)` and offers `low/medium/high`,
+without `minimal` or `xhigh`; and `/effort xhigh` answers "this model has no
+effort knob" instead of accepting it silently.
 
-## 3. La guia de herramientas desaparecia con `AGENTS.md`
+## 3. The tool guide disappeared with `AGENTS.md`
 
-**El sintoma**: «le pedi buscarme una pagina de juegos y se puso a hacer Bash».
+**The symptom**: "I asked it to find me a games page and it went off to use Bash".
 
-**La causa**: `systemPromptBase` devuelve el `AGENTS.md` del proyecto **en lugar
-de** `default_system_prompt`. Y la tabla de routing («anything on the INTERNET
-belongs to web_search/web_fetch, NEVER use bash») vivia DENTRO de
-`default_system_prompt`. O sea: en cualquier proyecto que tenga un `AGENTS.md` —el
-caso normal— el modelo no veia **una sola** regla de routing. Con la shell
-disponible y ninguna tabla, `curl` es la forma obvia de preguntarle a internet
-algo.
+**The cause**: `systemPromptBase` returns the project's `AGENTS.md` **instead of**
+`default_system_prompt`. And the routing table ("anything on the INTERNET belongs
+to web_search/web_fetch, NEVER use bash") lived INSIDE
+`default_system_prompt`. So in any project that has an `AGENTS.md` — the normal
+case — the model saw **not one** routing rule. With the shell available and no
+table, `curl` is the obvious way to ask the internet something.
 
-La regla de enrutado de herramientas no es del PROYECTO. Un `AGENTS.md` dice que
-es el codigo y como trabajar en el; no le toca decidir que este harness tiene un
-`web_search`.
+The tool routing rule does not belong to the PROJECT. An `AGENTS.md` says what
+the code is and how to work on it; it is not its job to decide that this harness
+has a `web_search`.
 
-**El fix**: `tool_routing_prompt` es su propia constante, se compone SIEMPRE
-despues de la base (elija la que elija), y hay un test que la mete en una cache
-de `AGENTS.md` a proposito y comprueba que sigue ahi.
+**The fix**: `tool_routing_prompt` is its own constant, it is composed ALWAYS
+after the base (whichever was chosen), and there is a test that puts it into an
+`AGENTS.md` cache on purpose and checks it is still there.
 
-Medido en la pty real, con el prompt exacto del reporte: antes `bash(...)`,
-ahora `web_search`.
+Measured in the real pty, with the exact prompt from the report: before
+`bash(...)`, now `web_search`.
 
-## 4. `@` no aparece la lista de ficheros
+## 4. `@` did not show the file list
 
-El popup existia, se llenaba y se pintaba. Lo que no existia era **decir que
-habia mas**: con 10 entradas en el directorio y `max_visible` = 6 se veian 6 y
-nada mas, sin ningun indicio. Desde fuera eso no es una lista truncada, es un
-directorio que aparentemente tiene seis cosas.
+The popup existed, filled up and was painted. What did not exist was **saying there
+was more**: with 10 entries in the directory and `max_visible` = 6 you saw 6 and
+nothing else, with no hint at all. From outside that is not a truncated list, it is
+a directory that apparently has six things in it.
 
-El footer del popup ahora dice el total y lo que falta
-(`10 matches · +4 more`), en las dos filas del popup que ya se reservaban. Un
-picker que miente sobre su tamano es peor que no tener picker.
+The popup's footer now says the total and what is missing
+(`10 matches · +4 more`), in the two popup rows that were already reserved. A
+picker that lies about its size is worse than no picker.
 
-La expansion del contenido (`@fichero` -> el texto del fichero en el prompt) ya
-funcionaba y se comprobó con ficheros reales de este repo.
+The content expansion (`@file` -> the file's text in the prompt) already worked and
+was checked with real files from this repo.
 
-## 5. El banner y el primer prompt se leian como un bloque
+## 5. The banner and the first prompt read as one block
 
-Una fila en blanco no separa un dibujo de 5 filas de las palabras del usuario: el
-prompt parece la ultima linea del logo. Ahora debajo del banner hay una **regla**
-(la misma marca `─` que ya usan el popup y la caja del input), no una fila
-vacia. Cuesta lo mismo y dice «aquí acaba la cabecera» sin gastar dos filas mas
-en blanco.
+A blank row does not separate a 5-row drawing from the user's words: the prompt
+looks like the last line of the logo. Now there is a **rule** under the banner
+(the same `─` mark the popup and the input box already use), not a blank row. It
+costs the same and says "the header ends here" without spending two more blank
+rows.
 
-`bannerRuleLine` parte el `─` en trozos de 255 columnas porque `CellRun.w` es un
-**u8**: un solo run mas ancho se deja de dibujar a mitad de una terminal ancha y
-parece un fallo de render.
+`bannerRuleLine` splits the `─` into 255-column chunks because `CellRun.w` is a
+**u8**: a single wider run stops being drawn halfway across a wide terminal and
+looks like a rendering bug.
 
-## 6. ACP: medido, y no era lo que parecía
+## `src/lib/`: the modules that are tested without starting the app
 
-Con una sonda de tiempo contra el agente real y contra uno de mentira:
-
-```
-handshake (spawn+init+newsession): 4228 ms     <-- opencode real
-primer token: +10 ms, 20 chunks en 560 ms     <-- el cable va bien
-```
-
-El streaming ya es incremental de verdad (10 ms de latencia, la del poll). Lo
-que queda lento es el **arranque en frio**: 4.2 s de `opencode acp` levantando su
-servidor privado, que ya se conectaba en segundo plano al escribir `/acp` (esta
- parte estaba ya resuelta). No se ha tocado nada de ACP en esta ronda porque no
-hay un fallo que reproducir: lo que hay es un coste de arranque que ya se paga
-en paralelo con el usuario escribiendo.
-
-## `src/lib/`: los módulos que se prueban sin arrancar la app
-
-Desde 2026-10-02 el árbol tiene dos carpetas y la línea que las separa es una
-sola: **¿este módulo se puede testear sin TUI y sin red?**
+Since 2026-10-02 the tree has two folders and the line between them is a single
+one: **can this module be tested without a TUI and without the network?**
 
 ```
-src/     main, tui, agent, tools (dispatcher), chat, acp, bgproc, palette,
+src/     main, tui, agent, tools (the dispatcher), chat, bgproc, palette,
          session, config, compaction, cache_stats, roster, free_auto
-src/lib/ todo lo demás: readcache, project, skills, skillstore, mentions,
-         markdown, highlight, web, models, providers, provider, http_client,
-         subagent, ask, plan, checkpoint, editor, bench, clean, regex, mascot,
-         theme, zjsonl
+src/lib/ everything else: readcache, project, prompt, sleep, skills, skillstore,
+         mentions, markdown, highlight, web, models, providers, provider,
+         http_client, subagent, ask, plan, checkpoint, editor, bench, clean,
+         regex, mascot, theme, zjsonl, verify
 ```
 
-La razón de que sea `lib/` y no `core/` o `pure/`: "pure" describe lo que hace el
-módulo y `lib` describe **cómo se testea**, que es lo que importa aquí. Un módulo
-en `lib/` se importa con `@import("lib/x.zig")` desde arriba y con
-`@import("x.zig")` desde dentro de la carpeta (las rutas de Zig son relativas al
-fichero), y por eso mover uno de dentro a fuera **no toca sus imports internos**:
-si `markdown.zig` importa `highlight.zig` y los dos se mueven juntos, esa línea no
-cambia.
+The reason it is `lib/` and not `core/` or `pure/`: "pure" describes what the
+module DOES and `lib` describes **how it is tested**, which is what matters here.
+A module in `lib/` is imported with `@import("lib/x.zig")` from above and with
+`@import("x.zig")` from inside the folder (Zig's paths are relative to the file),
+and that is why moving one from inside to outside **does not touch its internal
+imports**: if `markdown.zig` imports `highlight.zig` and both move together, that
+line does not change.
 
-Tres módulos que NO se mueven aunque parezcan de `lib`, y por qué:
+Three modules that do NOT move even though they look like `lib`, and why:
 
-- **`tools.zig`**: la mitad de sus tools son puras, pero el dispatcher recibe el
-  registro de procesos en segundo plano, que vive en el `Model`. Se podría separar
-  en `lib/tools/*.zig` + un dispatcher arriba; no está hecho porque sería el
-  primer movimiento *dentro* de un fichero que además está creciendo.
-- **`roster.zig`**: depende de `config.zig`, que ya depende del cliente de chat.
-- **`compaction.zig` y `cache_stats.zig`**: dependen de `chat.ChatMessage`, y ese
-  tipo es parte del formato del cable. Importar el cliente entero para tener el
-  tipo sería peor que dejarlo arriba.
+- **`src/tools/`**: half of its tools are pure, but the dispatcher receives the
+  background process registry, which lives in the `Model`. It could be split into
+  `lib/tools/*.zig` + a dispatcher above; it is not done because it would be the
+  first move *within* a file that is also growing.
+- **`roster.zig`**: it depends on `config.zig`, which already depends on the chat
+  client.
+- **`compaction.zig` and `cache_stats.zig`**: they depend on `chat.ChatMessage`,
+  and that type is part of the wire format. Importing the whole client to have the
+  type would be worse than leaving it up top.
 
-Y el que se queda en `src/` a propósito aunque solo use red: `roster_probe.zig`
-(necesita el path del módulo = el directorio, ver más abajo).
+And the one that stays in `src/` on purpose although it only uses the network:
+`roster_probe.zig` (it needs the module's path = the directory, see below).
 
-`src/bin/` son ejecutables auxiliares declarados como módulos aparte en
-`build.zig` (`tool-test`, `acp-probe`), y por eso importan por **nombre de módulo**
-(`@import("tools")`) y no por ruta. `tool_test.zig` estaba roto desde que `execute`
-cambió de firma: nadie lo ejecutaba, y un `zig build tool-test` que no compila es
-la forma más rápida de que nadie lo vuelva a ejecutar.
-
----
-
-# El modal de `ask`: dos widgets superpuestos (2026-10-02)
-
-El síntoma era "los textos salen de la caga y no se nota qué son opciones". La
-causa no era el texto: eran **DOS widgets** pintados el uno sobre el otro.
-
-- `drawPicker` (tui.zig) se pintaba ANTES y `drawAskPanel` DESPUÉS, y el panel
-  borra su rectángulo con `theme.code_bg`. Las geometrías garantizan el solape:
-  `top = (height - box_h) / 2` contra `y0 = (height - box_h) / 4`, y el panel es
-  además el MÁS ANCHO (`min(max(q_cols+8,44), width-4)` contra `min(width-4,64)`).
-  En 80x24 el borde del panel caía justo encima de la fila `Other…`.
-- El panel **nunca pintaba las opciones**: `snap.options` solo decidía qué texto de
-  ayuda salía. No había forma de que se entendieran, porque no estaban.
-- `desc` ("recommended") se pintaba con el MISMO estilo que el label, así que
-  parecía parte de la opción. Y `theme.selected` era bold+azul **sin fondo**: la
-  fila seleccionada no tenía fondo.
-- header, hint y reloj usaban `brand_faint` (#3b4261) sobre `code_bg` (#1a1b26):
-  1.9:1. Lo único legible del panel era la pregunta.
-- `wrapTextToRows` no miraba `\n`, y el schema de la tool pide "recomendación +
-  razón" (multi-línea): un `\n` interior se pintaba como byte crudo y vaxis lo
-  escribe tal cual.
-
-**Arreglo: un solo widget.** Las opciones se pintan DENTRO del panel, numeradas
-(`▸ 1 postgres ← recommended`), con fondo real y `Other` como última fila. El
-picker modal para `ask` se eliminó (era un menú con filtro y scroll para una lista
-de 5 elementos que no cabe ni desbordarse). `ask_sel` vive en el Model; `↑↓`
-lo mueven, Enter contesta.
-
-Tres cosas más que salieron y que también eran bugs:
-
-1. **El input de texto libre NO respondía la pregunta.** Con pregunta sin
-   opciones, nada ponía `ask_typing`, así que el panel decía "type your answer
-   below" y el input estaba en modo prompt normal: mandar un texto **iniciaba un
-   turno nuevo** en vez de contestar, y quedaba en cola detrás del worker
-   aparcado. Ahora `submitInput` mira `askActive()`, no `askTyping()`.
-2. **`wrapTextToRows` partía por `\n` primero** (ahora), y cada línea se recorta
-   con `putClipped` contra la CAJA y no contra la pantalla. Antes `putText` solo
-   limitaba al ancho del terminal: una opción de 120 columnas en un picker de 64
-   se pintaba 56 columnas fuera de su propio borde.
-3. **El panel tenía alto sin tope**: pregunta larga en terminal estrecha tapaba
-   el input, que es la única forma de contestar. Ahora se recorta a la pantalla y
-   dice `… N more lines of the question`.
-
-Contraste: `theme.brand_faint` es para LÍNEAS (bordes, reglas), nunca para texto.
-`theme.hint` (#7a8399, ~4.5:1) es para texto secundario que hay que poder leer.
-`theme.selected` ganó `.bg`: un resaltado solo con `bold` no se ve a 60 columnas
-de ancho.
-
-# El input: dos wraps distintos (el bug de "no sé qué escribo")
-
-`input_h` se calculaba con `ed.displayLines(text_w)` (cuenta soft wraps) y
-`drawInput` partía con `splitLines` (solo `\n`) y pasaba cada línea a `putText`,
-que **corta en el borde sin avisar**. Resultado: caja de 8 filas, texto en una
-perdiéndose a la derecha, y el cursor anclado a `col = 2 + ancho_acumulado`,
-fuera de la superficie. Cero tests: los de multilínea usan `"a\nb\nc"`, que sí
-pasa.
-
-Ahora hay UNA implementación en `editor.zig`:
-
-- `RowIter` — hard breaks primero, luego wrap **por palabra** (con corte duro para
-  un token más largo que la fila, porque una ruta tiene que caber).
-- `displayLines` = contar filas del iterador (sin alloc).
-- `rowsInWindow(first, want)` = solo las filas que se pintan. Un pegado de 256 KB
-  son ~6500 filas y la caja cabe en 8: contar todas y guardar ocho asignaría las
-  otras 6492 en cada frame.
-- `cursorRowCol` = (fila visual, columna visual). `cursorLine` contaba `\n` y
-  devolvía un índice LÓGICO usado como fila: de ahí el caret fuera de pantalla.
-
-El ancho es `width - 3` en layout y en pintado (la región real va de la columna 2
-a la `width - 1`), y `displayLines` mide con `theme.graphemeWidth` como el pintor
-(antes usaba `cp >= 0x1100`, que no coincide con CJK, emoji ni combining).
-
-`editor.Measure` recibe el `Step` del llamante porque el Editor no sabe qué es un
-grapheme (eso es `vaxis.unicode`) ni cuánto mide en ESTA terminal (`ctx.stringWidth`,
-que depende de lo que vaxis negoció). Adivinar cualquiera de las dos es cómo se
-separan el wrap y el pintado.
-
-# El scroll: el ancla era una línea absoluta (2026-10-02)
-
-`anchor` era un índice de línea absoluto. La altura de un párrafo es una
-**ESTIMACIÓN** hasta que se parsea, y parsear la reemplaza por la real. O sea que
-el mismo número de línea significaba una cosa antes del parseo y otra después: la
-vista saltaba justo cuando el parseo entraba en la ventana, que es mientras te
-estás desplazando. El bucle de convergencia (`layoutFor`, 4 pasadas) lo tapaba en
-el mismo frame, pero el salto ya había pasado.
-
-Arreglo: el ancla es **(párrafo, offset)**, y la línea se deriva de las alturas
-ACTUALES (`anchorLine` / `setAnchorLine`). Si la corrección cae en un párrafo por
-encima, la línea se recalcula y el texto que estás leyendo se queda donde está.
-
-El detalle que hace que funcione: `computeVisible` **solo** re-deriva el ancla
-cuando se queda **sin espacio** (línea > `max_offset`). Re-derivable en cualquier
-otro caso es el bug original con otro nombre: una corrección por encima desplaza
-la línea del ancla, y volver a convertir esa línea desplazada en (párrafo, offset)
-cae en OTRO párrafo, o sea que el lector se mueve justo lo que el arreglo debía
-absorber.
-
-De paso, `estHeight` cuenta los fences (3 filas cada uno: blank + chip + blank),
-que era lo que más lejos se desviaba la estimación.
-
-Tests: "corregir una altura no mueve el texto", "leyendo arriba el texto sigue
-llegando sin mover la vista", "abajo y arriba vuelve a la misma línea", y la
-rueda no desborda el `usize`.
-
-# Markdown y timeline: la mitad del parser no existía (2026-10-02)
-
-`parseLang` distinguía **dos** cosas: bloque de código y "el resto es prosa".
-Cero listas, cero citas, cero rayas, cero links, `*cursiva*` y `~~tachado~~`
-salían literalmente. Y `md.prefix(kind)` iba **solo en la primera fila** de cada
-párrafo, con un sangrado de 2 espacios de continuación igual de ancho que el
-marker: un resultado de 6 filas tenía una fila identificable y cinco que parecían
-un aviso.
-
-Lo que hay ahora (y lo que NO, a propósito):
-
-- **Gutter**: la continuación lleva `│` (`theme.gutter`) en la columna del
-  sangrado. Un glifo por fila y la fila sigue siendo atribuible a su bloque.
-- **Jerarquía mínima**: `-`/`*`/`+` → `•`, `N.`/`N)` conserva el número, la
-  sangría del modelo se vuelve sangría visible, y el cuerpo pasa por el inline
-  normal (el `**bold**` de un item sigue siendo bold). `>` es una barra con su
-  estilo. Un encabezado mete fila en blanco delante (menos cuando abre el
-  párrafo).
-- **Fondo de verdad en los bloques de código**: `applyCodeGutter` pintaba
-  `code_bg` solo en el relleno final, nunca detrás del texto, así que salía una
-  raya oscura de ancho variable en cualquier terminal cuyo fondo no sea #1a1b26.
-  El comentario del código decía que lo daba.
-- **Encabezado ≠ hunk de diff**: ambos eran `bold + fg(4)`, el mismo azul que el
-  `›` del usuario. Ahora el heading es `brand_hi` y el hunk tiene su propio estilo.
-
-El invariante que no se rompe: concatenar los segmentos da la línea original.
-
-# Cache: en OpenAI las tools NO eran cacheables (2026-10-02)
-
-El cache de prompt de OpenAI se indexa por el **prefijo literal** del body, y el
-prefijo deja de servir en el primer byte que cambia. El body era
-`{"model":…,"messages":[…],"stream":…,"tools":[…]}`: como `tools` va DETRÁS del
-array `messages` (que cambia cada turno), esas ~16 KB de schema estático caían
-fuera de la región cacheable en **todas** las peticiones. Poner `tools` antes de
-`messages` las mete de golpe. El orden de un objeto JSON es lo único que decide
-esto, y es fácil de deshacer sin querer: hay un test que mira el orden y que
-parsea el body.
-
-En Anthropic, 3 breakpoints fijos con el tercero en el ÚLTIMO mensaje obligaba a
-reescribir el prefijo entero cada turno (el cache se lee en los breakpoints, no
-de forma continua). Ahora hay 4 (el tope del API) con un par **rodante**: los dos
-últimos mensajes. La mitad vieja se queda en un breakpoint que el turno siguiente
-sí alcanza, así que se LEE y solo se escribe el segmento nuevo.
-
-`cache_creation_input_tokens` no se parseaba, así que `/cache` solo enseñaba
-lecturas. Un prefijo que se reescribe cada turno tiene un hit-rate bonito y sigue
-facturando el prefijo entero: **`writesPerRequest` por encima de 0.5 en una sesión
-larga significa que el prefijo no es estable**.
-
-Y el **orden del system prompt es el cache**: lo que cambia invalida lo que viene
-después. El aviso de read-only (4º de 6) hacía que un `shift+tab` reescribiera
-también la lista de skills y las líneas de ubicación. Ahora el orden es por
-frecuencia de cambio: base · routing · verification · ask · skills · location ·
-(read-only al final).
-
-**Medido o no medido**: en este entorno el hit-rate sale 0% con el router free de
-OpenRouter porque cada request aterriza en un modelo distinto upstream (los prompt
-tokens varían entre 2792 y 3273 para el mismo prompt). El cambio del orden de
-`tools` es correcto según la semántica documentada, pero aquí no se puede ver un
-win.
-
-# Verificar caro: el harness decide, no el modelo (2026-10-02)
-
-La queja: "opencode y claude hacen scripts para verificar cosas y tardan una
-eternidad en terminar una tarea". Dos mitades:
-
-1. **`verification_prompt`** (const propia, como `tool_routing_prompt`, porque un
-   `AGENTS.md` reemplaza el prompt del proyecto): verifica con el comando más
-   estrecho que rompería si estuvieras mal; NO escribas arnés/pty/fuzzer salvo que
-   te lo pidan; lo largo a background y sigue trabajando; no repitas una
-   verificación que ya pasó con el código sin cambios; si falla, arregla la causa
-   y no aflojes el check.
-2. **`src/lib/verify.zig`** — tabla pura y testeada. Un `bash` foreground que
-   coincide con una verificación conocida (`zig build`, `npm test`, `pytest`,
-   `cargo test`, `go test`, `fuzz`, `*_smoke.py`…) **arranca en background
-   aunque el modelo no lo pidiera**, y el resultado le dice que siga trabajando y
-   haga un `bash_output` por paso.
-
-Los tres detalles que costaron:
-
-- **`maketar` no es `make`**: las reglas "en cualquier sitio" buscan PALABRA
-  completa, y `.`, `/`, `-` y `_` son fronteras. Con `.` dentro de la palabra, el
-  `fuzz` no casaba con `fuzz.py` y el `smoke.py` no casaba con `pty_smoke.py`: justo
-  los dos casos que la tabla existe para cazar.
-- **`cd x && cmd`**: los separadores son TODOS. Con `&&` se comía el segundo `&` y
-  la comparación nunca encontraba nada — que es el caso para el que existe la
-  función.
-- **Dos escapes, y son deliberados**: un `timeout_seconds` explícito significa que
-  el modelo sabe lo que hace (eligió un número para ESE comando), y
-  `ZODE_AUTO_BG=0` lo apaga para quien prefiera verlo colgando.
-
-Y lo que NO se automatiza, a propósito: `git commit`, `docker build`, un
-servidor. mandarlos a background sin que nadie los consulte es peor que ser lento.
-
-# `/free-auto`: existía y no se encontraba (2026-10-02)
-
-"no veo el comando de auto-free-model". Estaba en la tabla, pero era el **último
-item del grupo Session** entre veinte más, sin alias y sin estado. Ahora:
-
-- grupo propio **"Free models"**, tercero de la paleta (antes `Session`).
-- alias `/free`.
-- el hint dice el ESTADO: `on · 3/8` cuando está activo. Ver el estado en la
-  paleta es lo que dice que la rotación está corriendo sin tener que preguntarlo.
-- conectar una key **reconstruye el pool**: la lista se construía con los
-  providers que tenían key en ese momento, así que conectar uno después dejaba la
-  rotación ofreciendo los modelos del set viejo.
-
-Y el pool tenía un problema que se ve en `zig build roster-probe` ofrecía
-`google/lyria-3-pro-preview` (música), `lyria-3-clip-preview` y los `clip-*`
-(embeddings) como "el modelo con el que escribir código". El turno falla en el
-primer token, el error se atribuye a la cuota y rota — al siguiente modelo de
-imagen. `models.isConversational(id)` filtra por nombre (es lo único que varios
-providers publican): embeddings, imágenes, vídeo, audio, moderación. Es un filtro,
-no una garantía, y equivocarse cuesta una rotación.
-
-# `tools/pty_smoke.py`: lo que el emulador NO puede comprobar
-
-Descubierto midiendo, no suponiendo: **el texto tecleado en el input no es
-asequible en el smoke**. vaxis redibuja de forma DIFERENCIAL (mueve el cursor y
-parchea celdas) y este emulador concatena el flujo de bytes, así que la última
-redibujada gana por casualidad: teclear "a" y luego "b" tres segundos separados
-sale como "a" seguido de un hueco donde debería estar "b".
-
-Por eso el caso nuevo del prompt largo comprueba que **no se pierde** (que el
-comienzo vuelve en el historial tras Enter) y que la app no se rompe; el wrap de
-verdad lo fijan los tests de `drawTest`, que leen la superficie celda a celda.
-Intentar afinar el emulador para esto es trabajo infinito: la alternativa honesta
-es `tmux`, como ya se hace para ACP.
+`src/bin/` are helper executables declared as separate modules in `build.zig`
+(`tool-test`), and that is why they import by **module name**
+(`@import("tools")`) and not by path. `tool_test.zig` was broken since `execute`
+changed signature: nobody ran it, and a `zig build tool-test` that does not compile
+is the fastest way to stop anyone from ever running it again.
 
 ---
 
-# Subagentes en paralelo, `!` shell, y las tres cosas que limitaban el resto (2026-10-02)
+# The `ask` modal: two widgets on top of each other (2026-10-02)
 
-## Subagentes en paralelo: primero hubo que des-globalizar `chat.zig`
+The symptom was "the texts come out all wrong and you cannot tell what are
+options". The cause was not the text: they were **TWO widgets** painted one over
+the other.
 
-`task` se interceptaba ANTES del lote paralelo, así que tres `task` en un mensaje
-eran tres esperas secuenciales, y cada subagente es un bucle de agente completo
-(hasta 8 iteraciones de sus propias llamadas). El criterio de seguridad ya estaba
-escrito y se cumplía: `subagent.tool_names` son solo lecturas.
+- `drawPicker` (tui.zig) was painted BEFORE and `drawAskPanel` AFTER, and the
+  panel clears its rectangle with `theme.code_bg`. The geometries guarantee the
+  overlap: `top = (height - box_h) / 2` against `y0 = (height - box_h) / 4`, and
+  the panel is also the WIDER one (`min(max(q_cols+8,44), width-4)` against
+  `min(width-4,64)`). At 80x24 the panel's border landed exactly on the `Other…`
+  row.
+- The panel **never painted the options**: `snap.options` only decided what help
+  text showed. There was no way to understand them, because they were not there.
+- `desc` ("recommended") was painted with the SAME style as the label, so it
+  looked like part of the option. And `theme.selected` was bold+blue **without a
+  background**: the selected row had no background.
+- header, hint and clock used `brand_faint` (#3b4261) over `code_bg` (#1a1b26):
+  1.9:1. The only legible thing in the panel was the question.
+- `wrapTextToRows` did not look at `\n`, and the tool's schema asks for
+  "recommendation + reason" (multiline): an interior `\n` was painted as a raw
+  byte and vaxis writes it as is.
 
-El bloqueo real eran cuatro globales de módulo que un subagente en paralelo
-pisa:
+**Fix: a single widget.** The options are painted INSIDE the panel, numbered
+(`▸ 1 postgres ← recommended`), with a real background and `Other` as the last
+row. The modal picker for `ask` was removed (it was a menu with filter and scroll
+for a list of 5 items that neither fits nor overflows). `ask_sel` lives in the
+Model; `↑↓` move it, Enter answers.
 
-| Global | Qué pasaba |
+Three more things that came out and were also bugs:
+
+1. **The free-text input did NOT answer the question.** With a question with no
+   options, nothing set `ask_typing`, so the panel said "type your answer below"
+   and the input was in normal prompt mode: sending text **started a new turn**
+   instead of answering, and it queued up behind the parked worker. Now
+   `submitInput` looks at `askActive()`, not `askTyping()`.
+2. **`wrapTextToRows` splits on `\n` first** (now), and each line is clipped with
+   `putClipped` against the BOX and not against the screen. Before, `putText` only
+   limited to the terminal's width: a 120-column option in a 64-wide picker was
+   painted 56 columns outside its own border.
+3. **The panel had uncapped height**: a long question in a narrow terminal covered
+   the input, which is the only way to answer. Now it is clipped to the screen and
+   says `… N more lines of the question`.
+
+Contrast: `theme.brand_faint` is for LINES (borders, rules), never for text.
+`theme.hint` (#7a8399, ~4.5:1) is for secondary text you have to be able to read.
+`theme.selected` gained `.bg`: a highlight with only `bold` cannot be seen at 60
+columns wide.
+
+# The input: two different wraps (the "I don't know what I'm typing" bug)
+
+`input_h` was computed with `ed.displayLines(text_w)` (which counts soft wraps)
+and `drawInput` split with `splitLines` (only `\n`) and passed each line to
+`putText`, which **cuts at the border without warning**. Result: an 8-row box,
+the text on one line disappearing to the right, and the cursor anchored at
+`col = 2 + accumulated_width`, outside the surface. Zero tests: the multiline ones
+use `"a\nb\nc"`, which does pass.
+
+Now there is ONE implementation in `editor.zig`:
+
+- `RowIter` — hard breaks first, then **word** wrapping (with a hard cut for a
+  token longer than the row, because a path has to fit).
+- `displayLines` = count the iterator's rows (no alloc).
+- `rowsInWindow(first, want)` = only the rows that get painted. A 256 KB paste is
+  ~6500 rows and the box holds 8: counting them all and storing eight would
+  allocate the other 6492 on every frame.
+- `cursorRowCol` = (visual row, visual column). `cursorLine` counted `\n` and
+  returned a LOGICAL index used as a row: that is where the off-screen caret came
+  from.
+
+The width is `width - 3` in layout and in painting (the real region goes from
+column 2 to `width - 1`), and `displayLines` measures with
+`theme.graphemeWidth` like the painter does (before it used `cp >= 0x1100`, which
+does not match CJK, emoji or combining marks).
+
+`editor.Measure` receives the caller's `Step` because the Editor does not know what
+a grapheme is (that is `vaxis.unicode`) nor how much it measures in THIS terminal
+(`ctx.stringWidth`, which depends on what vaxis negotiated). Guessing either of
+the two is how the wrap and the painting get separated.
+
+# Scroll: the anchor was an absolute line (2026-10-02)
+
+`anchor` was an absolute line index. A paragraph's height is an **ESTIMATION**
+until it is parsed, and parsing replaces it with the real one. So the same line
+number meant one thing before the parse and another after: the view jumped right
+when the parse entered the window, which is while you are scrolling. The
+convergence loop (`layoutFor`, 4 passes) hid it in the same frame, but the jump had
+already happened.
+
+Fix: the anchor is **(paragraph, offset)**, and the line is derived from the
+CURRENT heights (`anchorLine` / `setAnchorLine`). If the correction lands in a
+paragraph above, the line is recomputed and the text you were reading stays where
+it is.
+
+The detail that makes it work: `computeVisible` **only** re-derives the anchor when
+it runs **out of space** (line > `max_offset`). Being re-derivable in any other
+case is the original bug with another name: a correction above shifts the anchor's
+line, and converting that shifted line back into (paragraph, offset) lands in
+ANOTHER paragraph, so the reader moves exactly what the fix was supposed to
+absorb.
+
+On the way, `estHeight` counts the fences (3 rows each: blank + chip + blank),
+which was what the estimate was furthest off on.
+
+Tests: "correcting a height does not move the text", "reading above, the text
+keeps arriving without moving the view", "down and up returns to the same line",
+and the wheel does not overflow the `usize`.
+
+# Markdown and the timeline: half the parser did not exist (2026-10-02)
+
+`parseLang` distinguished **two** things: code block and "the rest is prose". Zero
+lists, zero quotes, zero dashes, zero links; `*italic*` and `~~strikethrough~~`
+came out literally. And `md.prefix(kind)` went **only on the first row** of each
+paragraph, with a 2-space continuation indent as wide as the marker: a 6-row
+result had one identifiable row and five that looked like a warning.
+
+What there is now (and what is deliberately NOT there):
+
+- **Gutter**: the continuation carries `│` (`theme.gutter`) in the indent column.
+  One glyph per row and the row is still attributable to its block.
+- **Minimal hierarchy**: `-`/`*`/`+` → `•`, `N.`/`N)` keeps the number, the model's
+  indent becomes visible indent, and the body goes through the normal inline
+  path (an item's `**bold**` is still bold). `>` is a bar with its own style. A
+  heading puts a blank row in front (unless it opens the paragraph).
+- **A real background in code blocks**: `applyCodeGutter` painted `code_bg` only
+  on the final padding, never behind the text, so it came out as a dark stripe of
+  variable width in any terminal whose background is not #1a1b26. The code's
+  comment said it did.
+- **Heading ≠ diff hunk**: both were `bold + fg(4)`, the same blue as the user's
+  `›`. Now the heading is `brand_hi` and the hunk has its own style.
+
+The invariant that does not break: concatenating the segments gives the original
+line.
+
+# Cache: on OpenAI the tools were NOT cacheable (2026-10-02)
+
+OpenAI's prompt cache is indexed by the **literal prefix** of the body, and the
+prefix stops being served at the first byte that changes. The body was
+`{"model":…,"messages":[…],"stream":…,"tools":[…]}`: since `tools` went AFTER the
+`messages` array (which changes every turn), those ~16 KB of static schema fell
+outside the cacheable region in **every** request. Putting `tools` before
+`messages` brings them in all at once. The order of a JSON object is the only
+thing that decides this, and it is easy to undo by accident: there is a test that
+looks at the order and that parses the body.
+
+In Anthropic, 3 fixed breakpoints with the third on the LAST message forced a
+rewrite of the whole prefix every turn (the cache is read at the breakpoints, not
+continuously). Now there are 4 (the API's cap) with a **rolling** pair: the last
+two messages. The older half stays on a breakpoint the next turn does reach, so
+it is READ and only the new segment is written.
+
+`cache_creation_input_tokens` was not parsed, so `/cache` only showed reads. A
+prefix that is rewritten every turn has a pretty hit rate and keeps billing the
+whole prefix: **`writesPerRequest` above 0.5 in a long session means the prefix is
+not stable**.
+
+And the **order of the system prompt is the cache**: what changes invalidates what
+comes after. The read-only notice (4th of 6) made a `shift+tab` also rewrite the
+skills list and the location lines. Now the order is by frequency of change: base
+· routing · verification · ask · skills · location · (read-only last).
+
+**Measured or not measured**: in this environment the hit rate comes out 0% with
+OpenRouter's free router because every request lands in a different upstream model
+(the prompt tokens vary between 2792 and 3273 for the same prompt). The `tools`
+order change is correct according to the documented semantics, but here you cannot
+see a win.
+
+# Expensive verification: the harness decides, not the model (2026-10-02)
+
+The complaint: "opencode and claude write scripts to verify things and take
+forever to finish a task". Two halves:
+
+1. **`verification_prompt`** (its own constant, like `tool_routing_prompt`, because
+   an `AGENTS.md` replaces the project prompt): verify with the narrowest command
+   that would break if you were wrong; do NOT write a harness/pty/fuzzer unless you
+   are asked for one; put the long ones in the background and keep working; do not
+   repeat a verification that already passed with the code unchanged; if it fails,
+   fix the cause and do not loosen the check.
+2. **`src/lib/verify.zig`** — a pure, tested table. A foreground `bash` that
+   matches a known verification (`zig build`, `npm test`, `pytest`, `cargo test`,
+   `go test`, `fuzz`, `*_smoke.py`…) **starts in the background even if the model
+   did not ask for it**, and the result tells it to keep working and do a
+   `bash_output` per step.
+
+The three details that cost something:
+
+- **`maketar` is not `make`**: the "anywhere" rules look for the WHOLE word, and
+  `.`, `/`, `-` and `_` are boundaries. With a `.` inside the word, `fuzz` did not
+  match `fuzz.py` and `smoke.py` did not match `pty_smoke.py`: exactly the two
+  cases the table exists to catch.
+- **`cd x && cmd`**: the separators are ALL of them. With `&&` it ate the second
+  `&` and the comparison never found anything — which is the case the function
+  exists for.
+- **Two escapes, and they are deliberate**: an explicit `timeout_seconds` means the
+  model knows what it is doing (it chose a number for THAT command), and
+  `ZODE_AUTO_BG=0` turns it off for someone who would rather watch it hang.
+
+And what is NOT automated, on purpose: `git commit`, `docker build`, a server.
+Sending them to the background with nobody polling them is worse than being slow.
+
+# `/free-auto`: it existed and could not be found (2026-10-02)
+
+"I cannot see the auto-free-model command". It was in the table, but it was the
+**last item of the Session group** among twenty others, with no alias and no
+state. Now:
+
+- its own **"Free models"** group, third in the palette (before: `Session`).
+- the `/free` alias.
+- the hint says the STATE: `on · 3/8` when it is active. Seeing the state in the
+  palette is what says the rotation is running without having to ask.
+- connecting a key **rebuilds the pool**: the list was built with the providers
+  that had a key at that moment, so connecting one afterwards left the rotation
+  offering the models of the old set.
+
+And the pool had a problem that `zig build roster-probe` shows: it offered
+`google/lyria-3-pro-preview` (music), `lyria-3-clip-preview` and the `clip-*`
+(embeddings) as "the model to write code with". The turn fails on the first token,
+the error is attributed to quota and it rotates — to the next image model.
+`models.isConversational(id)` filters by name (it is the only thing several
+providers publish): embeddings, images, video, audio, moderation. It is a filter,
+not a guarantee, and getting it wrong costs a rotation.
+
+# `tools/pty_smoke.py`: what the emulator CANNOT check
+
+Found by measuring, not by assuming: **the text typed into the input is not
+readable in the smoke test**. vaxis redraws DIFFERENTIALLY (it moves the cursor and
+patches cells) and this emulator concatenates the byte stream, so the last redraw
+wins by luck: typing "a" and then "b" three seconds apart comes out as "a"
+followed by a gap where "b" should be.
+
+That is why the new long-prompt case checks that **nothing is lost** (that the
+beginning comes back in the history after Enter) and that the app does not break;
+the real wrapping is pinned by the `drawTest` tests, which read the surface cell by
+cell. Trying to sharpen the emulator for this is endless work: the honest
+alternative is `tmux`, as is already done.
+
+---
+
+# Parallel subagents, `!` shell, and the three things that limited the rest (2026-10-02)
+
+## Parallel subagents: first `chat.zig` had to be de-globalised
+
+`task` was intercepted BEFORE the parallel batch, so three `task` calls in one
+message were three sequential waits, and each subagent is a full agent loop (up to
+8 iterations of its own calls). The safety criterion was already written and was
+met: `subagent.tool_names` are read-only.
+
+The real blocker was four module globals that a parallel subagent stomps on:
+
+| Global | What happened |
 |---|---|
-| `chat.last_usage` | dos peticiones entrelazadas en un `Usage` → `/cache` invención |
-| `chat.last_error_buf/len` | dos fallos entrelazados → cada turno reporta el error del otro |
-| `chat.cancel_current` | el subagente que **empezaba** borraba el ESC del usuario |
-| `bench.subagents` | `usize += 1` desde N hilos es una actualización perdida |
+| `chat.last_usage` | two requests interleaving into one `Usage` → `/cache` is fiction |
+| `chat.last_error_buf/len` | two failures interleaving → each turn reports the other's error |
+| `chat.cancel_current` | the subagent that **started** erased the user's ESC |
+| `bench.subagents` | `usize += 1` from N threads is a lost update |
 
-El arreglo no es un candado: es que **el estado sea de la petición**, no del
-módulo. `StreamCtx` lleva ahora `usage`, `err: ErrBuf`, `retry_after` y
-`mirror_globals: bool`. El turno que mira el usuario publica a los globales; un
-subagente no, y además **no llama a `clearCancel()`**: ESC es la señal del usuario
-y se queda puesta para que la obedezca todo el mundo.
+The fix is not a lock: it is that **the state belongs to the REQUEST, not to the
+module**. `StreamCtx` now carries `usage`, `err: ErrBuf`, `retry_after` and
+`mirror_globals: bool`. The turn the user is watching publishes to the globals; a
+subagent does not, and it also **does not call `clearCancel()`**: ESC is the user's
+signal and it stays set so that everybody obeys it.
 
-Dos trampas que salieron:
+Two traps that came out:
 
-- `setServerMessage` PARSEA la clave `"message"` de un cuerpo JSON. El camino del
-  error ya tenía la mensagem extraída, así que pasársela guardaba **nada** y el
-  usuario veía un error vacío donde había uno. Son dos funciones:
-  `setServerMessageInto` (parsea) y `storeErrText` (guarda).
-- `streamRaw` limpiaba `last_usage` y `last_error` al ENTRAR. Con eso dentro de la
-  petición, dos subagentes ya no se pisan: cada uno arranca la suya.
+- `setServerMessage` PARSES the `"message"` key out of a JSON body. The error path
+  already had the message extracted, so handing it over stored **nothing** and the
+  user saw an empty error where there was one. They are two functions:
+  `setServerMessageInto` (parses) and `storeErrText` (stores).
+- `streamRaw` cleared `last_usage` and `last_error` on ENTRY. With that inside the
+  request, two subagents no longer stomp on each other: each one starts its own.
 
-El tope son **3** (`ZODE_TASK_PARALLEL`, `1` = en serie). Tres streams contra la
-misma key son una concurrencia deliberada; seis son un 429 autoinfligido. El paralelismo
-es por OLAS de `limit` hilos, no "N hilos y que se apañen": el contador de
-pendientes ES el semáforo.
+The cap is **3** (`ZODE_TASK_PARALLEL`, `1` = in series). Three streams against the
+same key are deliberate concurrency; six are a self-inflicted 429. The parallelism
+is by WAVES of `limit` threads, not "N threads and sort it out": the pending
+counter IS the semaphore.
 
-Y hay un test que avisa de lo obvio: **la descripción de la tool dice que se pueden
-mandar varios**. Una capacidad que no está en el schema no se usa.
+And there is a test that warns about the obvious: **the tool's description says
+that several can be sent**. A capability that is not in the schema does not get
+used.
 
-## `!cmd` en el input
+## `!cmd` in the input
 
-Ejecuta el comando y mete la salida **en el contexto**, sin turno y sin token:
-`$ git status` + la salida, como mensaje `user` de la sesión. El modelo ya lo tiene
-la siguiente vez que escribas.
+It runs the command and puts the output **into the context**, with no turn and no
+token: `$ git status` + the output, as a session `user` message. The model has it
+the next time you type.
 
-Lo que NO puede ser: correrlo en el hilo de la UI. `submitInput` se llama desde el
-handler de eventos, y un comando foreground ahí congela la app entera (el mismo
-bug del diálogo de permisos, y la misma respuesta): un worker, `beginWorker` /
-`endWorker`, y el resultado entra por la cola `shell_out` que **drena el draw**. El
-append a la sesión pasa en el drain, en el hilo de la UI, porque la sesión (su
-`ArrayList` y su fichero) tiene un dueño y no es thread-safe.
+What it CANNOT be: running it on the UI thread. `submitInput` is called from the
+event handler, and a foreground command there freezes the whole app (the same bug
+as the permission dialog, and the same answer): a worker, `beginWorker` /
+`endWorker`, and the result goes in through the `shell_out` queue that the **draw
+drains**. The session append happens in the drain, on the UI thread, because the
+session (its `ArrayList` and its file) has one owner and is not thread-safe.
 
-## Tres cosas que limitaban el resto
+## Three things that limited the rest
 
-**1. La compactación tier 2 NO SE EJECUTABA EN LA TUI.** Imprimía "context budget
-reached: summarizing older turns…" y no lo hacía nunca más: `summarizeTurns` tenía
-un único caller, en `main.zig`. Así que el ctx% subía sin freno hasta que el body
-se pasaba del buffer de 1 MiB y el turno moría con un error de writer. El aviso
-era una mentira. Ahora corre antes de la petición, **una vez por sesión** (reintentar
-cada turno es una petición desperdiciada por turno para siempre) y el body se
-compone de la lista ya resumida — porque componerlo de `comp.msgs` hacía de todo
-esto un no-op silencioso.
+**1. Tier-2 compaction DID NOT RUN IN THE TUI.** It printed "context budget
+reached: summarizing older turns…" and never did it again: `summarizeTurns` had a
+single caller, in `main.zig`. So the ctx% climbed with no brake until the body
+outgrew the 1 MiB buffer and the turn died with a writer error. The announcement
+was a lie. Now it runs before the request, **once per session** (retrying every
+turn is a wasted request per turn forever) and the body is composed from the
+already-summarized list — because composing it from `comp.msgs` made all of this a
+silent no-op.
 
-**2. Los errores de tool volvían al modelo como nombres de Zig.** `allocPrint("{t}",
-.{err})` le daba literalmente `"BadArgs"` o `"UnknownTool"`. Un modelo no puede
-recuperarse de eso: no sabe qué argumento falló, ni si la tool existe, ni qué pide
-el schema. `tools.describeError` dice qué pasó **y qué hacer**, y para
-`UnknownTool` incluye la lista de tools que sí existen.
+**2. Tool errors came back to the model as Zig names.** `allocPrint("{t}", .{err})`
+gave it the literal `"BadArgs"` or `"UnknownTool"`. A model cannot recover from
+that: it does not know which argument failed, whether the tool exists, or what the
+schema asks for. `tools.describeError` says what happened **and what to do**, and
+for `UnknownTool` it includes the list of tools that do exist.
 
-Y una tool call con argumentos inválidos **no se descartaba en silencio**: se
-emitía igual, para que el ejecutor la reporte. Antes no había tool result, ni error,
-ni línea en el historial, y el turno terminaba como si el modelo solo hubiera
-mandado prosa.
+And a tool call with invalid arguments **was not discarded in silence**: it is
+emitted anyway so the executor reports it. Before there was no tool result, no
+error, no history line, and the turn ended as if the model had only sent prose.
 
-**3. `web_search`: el snippet no era del resultado de al lado.** Se buscaba desde el
-fin del título hasta el **fin del documento**, así que un resultado sin snippet
-propio se llevaba el del siguiente, y el modelo leía una descripción que no tenía
-nada que ver con el título de arriba. Ahora la búsqueda va acotada al bloque. Y si
-`html/` no se parsea, se prueba `lite/` (otra página, otras clases) antes de
-rendirse: un cambio de layout en un endpoint pasa a ser un reintento, no un
-"no hay nada sobre esto".
+**3. `web_search`: the snippet was not the neighbouring result's.** It was
+searched for from the end of the title to the **end of the document**, so a result
+with no snippet of its own got the next one's, and the model read a description
+that had nothing to do with the title above it. Now the search is bounded to the
+block. And if `html/` does not parse, `lite/` is tried (another page, other
+classes) before giving up: a layout change on one endpoint becomes a retry, not a
+"there is nothing about this".
 
-## Un ctrl+d que salía de la app
+## A ctrl+d that exited the app
 
-`tools/scroll_repro.py` (un script de reproducción en pty, no versionado) falló en
-un caso: "ctrl+d (half page down) redraws". No era el scroll.
+`tools/scroll_repro.py` (a pty reproduction script, not versioned) failed on one
+case: "ctrl+d (half page down) redraws". It was not the scroll.
 
-`ctrl+d` con el input vacío era **EOF**: `ctx.quit = true`. Y el input vacío es el
-estado NORMAL al desplazar: subes a leer algo, pulsas ctrl+d para volver abajo, y
-**zode se cierra**. `/help` documenta "ctrl+u / ctrl+d = scroll half a page" y la
-barra de estado dice "ctrl+c exits": la app contradecía sus dos propias strings, y
-la tecla de salida era la que anunciaba como scroll.
+`ctrl+d` with an empty input was **EOF**: `ctx.quit = true`. And an empty input is
+the NORMAL state when you scroll: you scroll up to read something, press ctrl+d to
+come back down, and **zode closes**. `/help` documents "ctrl+u / ctrl+d = scroll
+half a page" and the status bar says "ctrl+c exits": the app contradicted both of
+its own strings, and the exit key was the one advertised as a scroll.
 
-El handler de scroll estaba DESPUÉS del de EOF, así que el de EOF siempre ganaba.
-La salida es **ctrl+c**, que es lo que dicen los dos sitios.
+The scroll handler was AFTER the EOF one, so the EOF one always won. The exit is
+**ctrl+c**, which is what both places say.
 
-El test que lo fija hace "arriba y luego abajo" en vez de "abajo se mueve": dónde
-está el final del scroll depende de qué párrafos han sido maquetados (los demás
-siguen con la altura estimada) y un test que fijara una línea absoluta sería un
-test de las estimaciones.
+The test that pins it does "up and then down" instead of "down moves": where the
+end of the scroll is depends on which paragraphs have been laid out (the rest are
+still at their estimated height), and a test that pinned an absolute line would be
+a test of the estimates.
 
-## Verificación
+## Verification
 
-`zig build test` (515), `tools/pty_smoke.py` (con tres casos nuevos: `!cmd` ejecuta
-y deja el input libre, el prompt largo no se pierde, y `/free-auto` se encuentra
-tecleando "free" en Ctrl+P) y `tools/scroll_repro.py`.
+`zig build test` (515), `tools/pty_smoke.py` (with three new cases: `!cmd` runs
+and leaves the input free, the long prompt is not lost, and `/free-auto` is found
+by typing "free" in Ctrl+P) and `tools/scroll_repro.py`.
 
 ---
 
-# El árbol partido: `src/tools/`, `commands.zig`, `acp_bridge.zig`, `lib/prompt.zig` (2026-10-03)
+# The split tree: `src/tools/`, `commands.zig`, `lib/prompt.zig` (2026-10-03)
 
-`agent.zig` eran 7112 líneas con 181 funciones y 38 globales de módulo, y
-`tools.zig` eran 1822 líneas con un `if (name == "read") … else if (name == "write")`
-que es un índice disfrazado de fichero. Todo verde antes: 515 tests.
+`agent.zig` was 7112 lines with 181 functions and 38 module globals, and
+`tools.zig` was 1822 lines with an `if (name == "read") … else if (name == "write")`
+that is a table of contents disguised as a file. Everything green before: 515
+tests.
 
-## `src/tools/`: una tool por fichero
+## `src/tools/`: one tool per file
 
-Se partió con un script que mueve **bloques**, no reescribiendo: 1800 líneas de
-código que ya funciona, retyped, son 1800 ocasiones de escribir algo que compila
-y significa otra cosa. El script **se niega a correr si hay una declaración sin
-destino**, que es lo único por lo que me fío del resultado.
+It was split with a script that moves **blocks**, not by retyping: 1800 lines of
+code that already works, retyped, are 1800 chances to write something that compiles
+and means something else. The script **refuses to run if any declaration has no
+destination**, which is the only reason I trust the result.
 
-Tres cosas salieron por el camino y costaron un rato:
+Three things came out on the way and cost some time:
 
-1. **Contar llaves sin mirar los literales rompe el parser entero.**
-   `looksLikeHtml` compara `head[0] == '{'`, y contar esa llave como estructura
-   hizo que el extractor se comiera **media tabla de tests** hacia delante. Se ve
-   como "NOT FOUND" para diez funciones que ahí están. `brace_delta` ignora ahora
-   strings y char literals.
+1. **Counting braces without looking at literals breaks the whole parser.**
+   `looksLikeHtml` compares `head[0] == '{'`, and counting that brace as structure
+   made the extractor swallow **half the test table** forwards. It shows up as
+   "NOT FOUND" for ten functions that are all there. `brace_delta` now ignores
+   strings and char literals.
 
-2. **Una decl de una línea tiene que terminar en su línea, y el comentario se lo
-   come.** `const max_tool_output = 16 * 1024; // output budget per tool` NO acaba
-   en `;` sino en el comentario, así que el matcher seguía hasta el `};` de la
-   declaración **siguiente** y `ToolDef` desaparecía con ella.
+2. **A one-line declaration has to end on its line, and the comment eats it.**
+   `const max_tool_output = 16 * 1024; // output budget per tool` does NOT end in
+   `;`, it ends in the comment, so the matcher ran on to the `};` of the **next**
+   declaration and `ToolDef` disappeared with it.
 
-3. **Los helpers compartidos dejan de ser privados el día que hay dos ficheros.**
-   `getStr`/`getInt`/`getBool`, `max_tool_output` y el walker de `.zig` estaban
-   privados dentro de un fichero de 1800 líneas y ahora los usan tools distintas.
-   `walkZig` vive en `common.zig` y no en `glob.zig` porque `grep` también camina
-   el proyecto con él.
+3. **Shared helpers stop being private the day there are two files.**
+   `getStr`/`getInt`/`getBool`, `max_tool_output` and the `.zig` walker were private
+   inside an 1800-line file and now different tools use them. `walkZig` lives in
+   `common.zig` and not in `glob.zig` because `grep` walks the project with it too.
 
-**Un test que llama a `execute` está probando el DISPATCHER**, no la tool, y por
-eso viven todos en `dispatch.zig` aunque nombren una tool. Los que prueban un
-helper van junto a él. Los 30 siguen ahí.
+**A test that calls `execute` is testing the DISPATCHER**, not the tool, and that
+is why they all live in `dispatch.zig` even though they name a tool. The ones that
+test a helper go next to it. All 30 are still there.
 
-### El módulo `tools` de `zig build tool-test`
+### The `tools` module of `zig build tool-test`
 
-`zig build tool-test` **no compilaba**, y AGENTS.md ya decía que nadie lo ejecutaba
-— que es exactamente cómo se rompe algo y se queda roto.
+`zig build tool-test` **did not compile**, and AGENTS.md already said nobody ran it
+— which is exactly how something breaks and stays broken.
 
-La causa es una regla de Zig que no se puede negociar: **un módulo no puede
-importar fuera del directorio de su fichero raíz**. Las tools están en
-`src/tools/` y necesitan `bgproc`, `readcache`, `regex` y `verify`, que viven en
-`src/`. Con el módulo enraizado en `src/tools/` eso son imports fuera del módulo y
-Zig los rechaza con un error que no menciona el módulo ni el path.
+The cause is a Zig rule that cannot be negotiated: **a module cannot import
+outside the directory of its root file**. The tools are in `src/tools/` and need
+`bgproc`, `readcache`, `regex` and `verify`, which live in `src/`. With the module
+rooted in `src/tools/` those are imports from outside the module and Zig rejects
+them with an error that mentions neither the module nor the path.
 
-La solución es enraizarlo **un nivel arriba**, en `src/tools_root.zig`, que solo
-reexporta el dispatcher. Lo que se pruebe aquí: `acp_probe` ya lo hacía
-(`root_source_file = src/acp.zig`), y por eso funciona. **Un import relativo se
-resuelve contra el fichero que importa, no contra el path del módulo**: por eso
-desde `src/tools/dispatch.zig` hace falta `../bgproc.zig` y no `bgproc.zig`.
+The solution is to root it **one level up**, at `src/tools_root.zig`, which only
+re-exports the dispatcher. Worth testing here: a probe binary already did it, and
+that is why it works. **A relative import resolves against the file that imports,
+not against the module's path**: that is why from `src/tools/dispatch.zig` you need
+`../bgproc.zig` and not `bgproc.zig`.
 
-También `@embedFile("tools.zig")` en un test de `bgproc`: `zig build` no lo compila
-y `zig build test` sí, así que solo falló al mover el fichero.
+Also `@embedFile("tools.zig")` in a `bgproc` test: `zig build` does not compile it
+and `zig build test` does, so it only failed once the file moved.
 
-## `commands.zig`: `submit` se queda
+## `commands.zig`: `submit` stays
 
-El patrón que hace esto posible sin ciclo de imports: **`submit` SE QUEDA** en
-`agent.zig`, porque es la única función que decide si una línea del input es un
-comando o un chat (un chat lanza un worker, un comando corre en el hilo de la UI) y
-porque es la que llama la TUI. Todo lo de abajo es trabajo local. `commands.zig`
-importa `agent.zig` para los helpers compartidos y `agent.zig` llama hacia allí:
-**una arista, no dos**.
+The pattern that makes this possible without an import cycle: **`submit` STAYS**
+in `agent.zig`, because it is the only function that decides whether a line of
+input is a command or a chat (a chat starts a worker, a command runs on the UI
+thread) and because it is what the TUI calls. Everything below it is local work.
+`commands.zig` imports `agent.zig` for the shared helpers and `agent.zig` calls
+into it: **one edge, not two**.
 
-**`/effort` y `/yolo` NO se movieron**, y el motivo merece escribirse: **escriben
-estado del agente** (`current_effort`, el flag de yolo). Un fichero que importara
-al otro para escribir sería el ciclo, y la salida no es un `usingnamespace`, es
-decidir qué lado tiene la entrada.
+**`/effort` and `/yolo` did NOT move**, and the reason is worth writing down: they
+**write agent state** (`current_effort`, the yolo flag). A file that imported the
+other one to write would be the cycle, and the way out is not a `usingnamespace`,
+it is deciding which side owns the entry point.
 
-## `acp_bridge.zig`: un modo, no una feature
+## `lib/prompt.zig`: the system prompt text
 
-Con `/acp` encendido zode **no corre el bucle de agente**: lanza `opencode acp` y
-habla JSON-RPC por sus pipes. Todo lo que hay en el fichero es la fontanería de
-eso — el hijo, el handshake, el diálogo de permisos mapeado al que ya existía, y
-una cancelación que tiene que pasar por el protocolo y no por un flag.
+Three string constants and nothing else: the prompt, the tool routing table and
+the verification rule. They were 370 lines of `\\`-string in the middle of a file
+with 38 globals, and they are **the only piece of this repo where "did this
+change?" is a question worth asking out loud**, because they are the biggest
+stable prefix in the request and that is what the provider's cache indexes.
 
-`acp_on` es un `var` y **un `var` no se puede aliasear con `const`**, así que la TUI
-pregunta por `agent.acpActive()`. Copiarlo a un segundo `var` habría sido peor: dos
-flags que significan lo mismo y solo uno se pone.
+Pure, so it goes in `lib/`: a test reads the prompt with no TUI and the ORDER of
+the blocks is asserted directly. Two things that are easy to undo by accident:
 
-## `lib/prompt.zig`: el texto del system prompt
+- **Each block is separate because a project's `AGENTS.md` REPLACES the built-in
+  prompt.** When the routing and the verification lived inside, every project with
+  an `AGENTS.md` — the normal case — sent **not one** routing rule, and the only
+  way it had to ask the internet was `curl`.
+- **The order IS the cache.** What changes most often goes last: the cache is read
+  up to the first byte that differs, and read-only mode (a `shift+tab` in the
+  middle of the session) at the top invalidated the skills list and the location
+  lines.
 
-Tres constantes de string y nada más: el prompt, la tabla de enrutado de tools y
-la regla de verificación. Eran 370 líneas de `\\`-string en medio de un fichero con
-38 globales, y son **la única pieza de este repo donde "cambió esto?" es una
-pregunta que merece hacerse en voz alta**, porque son el prefijo estable más grande
-de la petición y eso es lo que indexa la cache del provider.
+## `agent.zig` is 6230, and the loop stays inside
 
-Puro, así que va en `lib/`: un test lee el prompt sin TUI y el ORDEN de los bloques
-se asserta directamente. Dos cosas que son fáciles de deshacer por accidente:
+What did NOT move is the agent loop, and that is deliberate: it is **what
+everything else is a helper of**. Splitting it would give files of the same size
+with the same seams, and the big file that remains is the one that really has 181
+functions sharing 38 globals.
 
-- **Cada bloque es aparte porque el `AGENTS.md` de un proyecto REEMPLAZA el prompt
-  interno.** Cuando el enrutado y la verificación vivían dentro, todo proyecto con
-  un `AGENTS.md` —el caso normal— no mandaba **ni una** regla de enrutado, y la
-  única forma que tenía de preguntar a internet era `curl`.
-- **El orden ES la cache.** Lo que cambia más a menudo va al final: la cache se lee
-  hasta el primer byte que difiere, y el modo read-only (un `shift+tab` en medio de
-  la sesión) arriba invalidaba la lista de skills y las líneas de ubicación.
+## A test caught an improvement to the art
 
-## `agent.zig` queda en 6230, y el bucle se queda dentro
+The pty smoke and the Zig test had the **old banner** written by hand. Someone had
+improved the glyphs (the `D` with its right stroke, the `E` with its crossbar) and
+had not updated the expected art. The test was right to fail: the improvement is
+what makes `O` and `D` stop being the same box twice, which is exactly the failure
+that AGENTS.md says motivated the banner's v3 design.
 
-Lo que NO se movió es el bucle de agente, y es deliberado: es **a lo que todo lo
-demás es helper**. Partirlo daría ficheros del mismo tamaño con las mismas
-costuras, y el fichero grande que queda es el que de verdad tiene 181 funciones
-que comparten 38 globales.
+Box-drawing art is a **map of cells**: if the rows do not land on the same columns
+there is nothing to read, and comparing the **whole** row is the only thing that
+tells `█████╗` from `███████╗`.
 
-## Un test cazó una mejora del arte
+## Verification
 
-El smoke de la pty y el test de Zig tenían el **banner viejo** escrito a mano. Alguien
-había mejorado las glifas (la `D` con su trazo derecho, la `E` con travesaño) y no
-había actualizado el arte esperado. El test tenía razón en fallar: la mejora es la
-que hace que `O` y `D` dejen de ser la misma caja dos veces, que es justo el fallo
-que AGENTS.md dice que motivó el diseño v3 del logo.
-
-Un arte de cajetín es un **mapa de celdas**: si las filas no caen en las mismas
-columnas no hay nada que leer, y comparar la fila **completa** es lo único que
-distingue `█████╗` de `███████╗`.
-
-## Verificación
-
-515 tests, `zig build tool-test` **funciona** (no compilaba desde hacía tiempo),
-`zig build acp-probe` compila, pty smoke y scroll_repro en verde.
+515 tests, `zig build tool-test` **works** (it had not compiled for a long time),
+the pty smoke and scroll_repro green.
