@@ -774,7 +774,6 @@ pub const Model = struct {
     /// There can only be one: the turn's tools run in series.
     tool_run: ?ToolRun = null,
 
-
     /// Results of the `!` commands the user ran, from their worker to the draw.
     ///
     /// They CANNOT run on the UI thread: `submitInput` is called from the event
@@ -4938,7 +4937,7 @@ fn drawAskPanel(
     const box_h: u16 = @min(want_h, max_h);
     const top: u16 = if (height > box_h + 2) (height - box_h) / 2 else 0;
 
-    {   // opaque background: the history behind is dense text and a box with the
+    { // opaque background: the history behind is dense text and a box with the
         // history showing through reads as a rendering bug.
         var br: u16 = 0;
         while (br < box_h) : (br += 1) {
@@ -5334,7 +5333,7 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     // Without this the status keeps saying "space-bunny-free · opencode" while
     // the one answering is someone else, which is exactly the kind of surprise
     // that is not acceptable.
-    if (agent.acp_on) {
+    if (agent.acpActive()) {
         if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
         const tag = std.fmt.allocPrint(arena, "acp: {s}", .{agent.acpTitle()}) catch return null;
         out.append(arena, .{ .text = tag, .style = theme.warn }) catch return null;
@@ -8322,7 +8321,7 @@ test "ask: Enter takes the highlighted option" {
 test "ask: Enter on the LAST row is not an answer, it hands over the input box" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
-    const options = [_][]const u8{ "uno" };
+    const options = [_][]const u8{"uno"};
     try openAskForTest(&m, "cual?", "", &options);
     m.askMove(1); // "Other"
     try std.testing.expect(m.askAnswerSelected());
@@ -8572,10 +8571,6 @@ test "@ mention: the popup lists files AND is painted, and does not hide the one
     }
 }
 
-
-
-
-
 test "timeline: a wrapped paragraph keeps a gutter on every continuation row" {
     // The kind marker (`› `, `◆ `, `⏺ `, `⎿  `) only ever went on the FIRST row
     // of a block, and the continuation indent was two anonymous spaces, the same
@@ -8643,7 +8638,6 @@ test "timeline: a code block has a background behind the code, not only after it
     const pad_cell = s.readCell(30, row);
     try std.testing.expect(std.mem.eql(u8, &pad_cell.style.bg.rgb, &theme.code_bg.bg.rgb));
 }
-
 
 test "scroll: correcting a paragraph's height does not move the text under the reader" {
     // The bug: the top of the view was an ABSOLUTE line number, and a paragraph's
