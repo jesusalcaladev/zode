@@ -1,310 +1,310 @@
 # zode
 
-Un agente de código en el terminal, escrito en **Zig puro** (sin libc, sin
-dependencias de C; la única externa es libvaxis). Binario de **1.29 MB**, RAM
-de ~6 MB, todo el código en un directorio.
+A code agent in the terminal, written in **pure Zig** (no libc, no C
+dependencies; the only external one is libvaxis). **1.29 MB** binary, ~6 MB of
+RAM, all the code in one directory.
 
-No es un wrapper de otro agente: habla HTTP con el provider, ejecuta las tools
-en tu máquina y decide por su cuenta qué tool llamar.
+It is not a wrapper around another agent: it speaks HTTP with the provider, runs
+the tools on your machine, and decides on its own which tool to call.
 
 ```
 $ zode
 ######  ####  ####   ######
-##  ## ##  ## ##  ## ##
-   ##  ##  ## ##  ## ##
-  ##   ##  ## ##  ## ##
+##  ## ##  ## ##   # ##
+   ##  ##  ## ##   # ###
+  ##   ##  ## ##   # ##
 ######  ####  ####   ######
 ────────────────────────────────────────
-❯ lee src/tui.zig y dime por qué el scroll no baja solo
+❯ read src/tui.zig and tell me why the scroll does not follow
 ```
 
-## Qué trae
+## What it does
 
-- **Agente con tools**: lee, escribe, edita, compila, busca, y usa git. El
-  bucle de agente decide por su cuenta (con `ask` cuando la respuesta cambia lo
-  que hace, y en modo read-only investiga y te pregunta).
-- **Tools en paralelo** para las que solo leen, **bash en segundo plano** con
-  salida incremental, y **ESC mata el grupo de procesos** (el nieto también).
-- **Subagentes en paralelo**: varias búsquedas independientes en un mismo mensaje
-  van a subagentes a la vez (3 por defecto, `ZODE_TASK_PARALLEL`), cada uno con su
-  propia ventana desechable, y los informes vuelven en el orden pedido.
-- **`!` en el input**: `!git status` ejecuta el comando y mete la salida en el
-  contexto, sin gastar un turno ni un token.
-- **Subagentes**: una búsqueda ancha va a un subagente con su propia ventana, que
-  se tira después. Lo que lee se paga **una vez**, no en cada iteración.
-- **Skills**: carpetas de instrucciones que se cargan **solo cuando hacen falta**.
-  El prompt lleva el nombre y cuándo usarlo; el cuerpo, no.
-- **Compactación de contexto** en dos niveles: se eliden resultados viejos sin
-  perder el historial, y si no cabe se pide un resumen.
-- **Cache de ficheros**: un `read` de algo que no ha cambiado no se vuelve a
-  enviar. Es el ahorro de tokens más directo que hay.
-- **ACP**: `/acp` delega el turno a otro agente (`opencode acp`) por JSON-RPC.
-- **Providers**: OpenCode, OpenRouter, Anthropic (API nativa con prompt caching),
-  OpenAI, Groq, DeepSeek, y local (Ollama/LM Studio). Se conectan desde la propia
-  TUI, sin tocar ficheros.
-- **`/free-auto`**: reparte los turnos entre los modelos free que publica cada
-  provider y, cuando uno se queda sin cuota, **sigue solo** con el siguiente.
+- **An agent with tools**: it reads, writes, edits, compiles, searches, and uses
+  git. The agent loop decides on its own (with `ask` when the answer changes what
+  it does, and in read-only mode it investigates and asks you).
+- **Tools in parallel** for the read-only ones, **bash in the background** with
+  incremental output, and **ESC kills the whole process group** (the grandchild
+  too).
+- **Parallel subagents**: several independent searches in one message go to
+  subagents at the same time (3 by default, `ZODE_TASK_PARALLEL`), each with its
+  own throwaway window, and the reports come back in the order you asked for them.
+- **`!` in the input**: `!git status` runs the command and puts its output into
+  the context, spending neither a turn nor a token.
+- **Skills**: folders of instructions loaded **only when they are needed**. The
+  prompt carries the name and when to use it; the body does not.
+- **Two-tier context compaction**: old tool results are elided without losing the
+  history, and if it still does not fit, a summary is asked for.
+- **File cache**: a `read` of something that has not changed is not sent again.
+  It is the most direct token saving there is.
+- **Providers**: OpenCode, OpenRouter, Anthropic (native API with prompt
+  caching), OpenAI, Groq, DeepSeek, and local (Ollama/LM Studio). You connect
+  them from the TUI itself, without editing files.
+- **`/free-auto`**: spreads the turns across the free models each provider
+  publishes, and when one runs out of quota it **carries on by itself** with the
+  next one.
 
-## Instalar
+## Install
 
-Coge el binario y ya está. No hay nada que instalar de más.
+Grab the binary and you are done. There is nothing else to install.
 
 ```bash
 ./zode
 ```
 
-## Compilar desde fuente
+## Build from source
 
-Necesitas **Zig 0.16.0**.
+You need **Zig 0.16.0**.
 
 ```bash
 zig build                    # release stripped, 1.29 MB (ReleaseSmall)
-zig build test               # 400+ tests unitarios, en Debug
-zig build -Doptimize=Debug   # con símbolos, para cuando algo peta
+zig build test               # 500+ unit tests, in Debug
+zig build -Doptimize=Debug   # with symbols, for when something crashes
 ```
 
-Ayudas de `zig build`:
+`zig build` steps:
 
-| Paso | Qué hace |
+| Step | What it does |
 |---|---|
-| `zig build` | El binario de siempre |
-| `zig build debug` | Igual pero **sin strip**, con traza de pila legible |
-| `zig build test` | Los tests (`-- <filtro>` corre solo los que Chitnen el filtro) |
-| `zig build tool-test -- "orden"` | Las tools headless, para probar una sin abrir la TUI |
-| `zig build roster-probe` | Qué providers tienes con key y cuántos modelos free publica cada uno |
-| `zig build acp-probe -- "prompt"` | El tráfico JSON-RPC contra un agente ACP real |
+| `zig build` | The usual binary |
+| `zig build debug` | Same but **unstripped**, with a readable stack trace |
+| `zig build test` | The tests (`-- <filter>` runs only the ones whose name matches) |
+| `zig build tool-test -- "command"` | The tools headless, to try one without opening the TUI |
+| `zig build roster-probe` | Which providers you have a key for, and how many free models each publishes |
 
-## Primeros pasos
+## First steps
 
-1. `./zode` y pulsa **Ctrl+T** para elegir provider y modelo, o **Ctrl+A** para
-   pegar la key del provider (se guarda en `~/.config/zode/auth.json` con
-   permisos 0600).
-2. También vale por entorno, que es lo que usarán los guiones:
+1. `./zode` and press **Ctrl+T** to pick a provider and a model, or **Ctrl+A** to
+   paste the provider key (saved in `~/.config/zode/auth.json` with 0600
+   permissions).
+2. The environment works too, which is what the scripts will use:
    `ZODE_OPENCODE_KEY=… ./zode`.
 
-Modo sin TUI, para probar sin terminal y para scripts:
+No-TUI mode, to try it without a terminal and for scripts:
 
 ```bash
-./zode --models              # lista los modelos del provider
-./zode --chat "busca mis TODOs y dime cuales son urgentones"
-./zode --resume             # reabre la última sesión
+./zode --models              # list the provider's models
+./zode --chat "find my TODOs and tell me which ones are urgent"
+./zode --resume             # reopen the last session
 ```
 
-### No hay modelo por defecto
+### There is no default model
 
-Un nombre de modelo escrito en el código es una bomba de relojería: el día que
-el provider lo retira, **todas** las peticiones pasan a fallar con un 403 que no
-explica nada. Por eso los providers no traen modelo, y zode **no adivina**:
+A model name written into the code is a time bomb: the day the provider retires
+it, **every** request starts failing with a 403 that explains nothing. So the
+providers ship without a model and zode **does not guess**:
 
-- si hay `ZODE_MODEL` o lo elegiste con `/model`, se usa ese;
-- si no, zode **pregunta al provider** cuál es el catálogo y elige el primero
-  gratis, y dice en pantalla cuál ha elegido y por qué;
-- si el catálogo no se puede descargar, **no manda nada**: te lo dice y te abre
-  el selector, en vez de gastarse un turno en un 403.
+- if there is a `ZODE_MODEL` or you picked one with `/model`, that one is used;
+- if not, zode **asks the provider** what the catalogue is and picks the first
+  free one, and says on screen which one it chose and why;
+- if the catalogue cannot be downloaded it **sends nothing**: it tells you and
+  opens the picker, instead of spending a turn on a 403.
 
-## Comandos
+## Commands
 
-Se escriben con `/` y se autocompletan con **Tab**. **Ctrl+P** los abre en una
-paleta que los **ejecuta**.
-
-| | |
-|---|---|
-| `/help` | esta lista |
-| `/model` | selector de modelo (modal, dos columnas: providers \| modelos) |
-| `/provider` | selector de provider |
-| `/providers` | lista los providers y si tienen key |
-| `/models` | modelos del provider activo |
-| `/use <provider> [modelo]` | cambia provider y modelo de una vez |
-| `/effort [low\|medium\|high\|…]` | esfuerzo de razonamiento (sin argumento: selector) |
-| `/free-auto [on\|off\|status]` | rota entre modelos free cuando uno agota cuota |
-| `/plan` | borra la lista de tareas visible |
-| `/undo` | devuelve los ficheros al estado anterior a un turno |
-| `/clean [yes]` | purga restos de zode (simula por defecto) |
-| `/yolo` | permisos automáticos |
-| `/allowlist` | tools que siempre se permiten (persistido) |
-| `/ask [on\|off]` | modo read-only (también **Shift+Tab**) |
-| `/skills` | qué skills hay y de dónde |
-| `/acp [on\|off\|<cmd>]` | delega el turno a un agente ACP |
-| `/bg [list\|kill <id>\|killall]` | comandos en segundo plano |
-| `/new` · `/resume` | sesión nueva / reabrir la última |
-| `/context` | tokens usados contra el presupuesto |
-| `/bench` | números de la sesión: turnos, iteraciones, primer token |
-| `/cache` | hit-rate de la cache del provider |
-| `/session` | id, fichero y mensajes de la sesión |
-| `/quit` | salir |
-
-### Atajos
+They start with `/` and autocomplete with **Tab**. **Ctrl+P** opens them in a
+palette that **runs** the one you pick.
 
 | | |
 |---|---|
-| `Ctrl+P` | paleta de comandos |
-| `Ctrl+T` | paleta de modelos |
-| `Ctrl+A` | conectar un provider |
-| `Ctrl+L` | limpiar la vista (el fichero de sesión no se toca) |
-| `Ctrl+R` | plegar/desplegar el último resultado |
-| `Ctrl+U` / `Ctrl+D` | media página de scroll |
-| `PageUp` / `PageDown` | una página |
-| `Shift+Enter` | salto de línea (Enter manda) |
-| `Shift+Tab` | modo read-only |
-| `Esc` | parar el turno, matar el comando, o responder "decídelo tú" |
-| `Tab` | completar un comando `/` |
-| `↑` / `↓` | historial de prompts |
+| `/help` | this list |
+| `/model` | model picker (modal, two columns: providers \| models) |
+| `/provider` | provider picker |
+| `/providers` | list the providers and whether they have a key |
+| `/models` | models of the active provider |
+| `/use <provider> [model]` | change provider and model at once |
+| `/effort [low\|medium\|high\|…]` | reasoning effort (no argument: opens the picker) |
+| `/free-auto [on\|off\|status]` | rotate across free models when one runs out of quota |
+| `/plan` | clear the visible task list |
+| `/undo` | put the files back the way they were before a turn |
+| `/clean [yes]` | purge zode's leftovers (simulates by default) |
+| `/yolo` | automatic permissions |
+| `/allowlist` | tools that are always allowed (persisted) |
+| `/ask [on\|off]` | read-only mode (also **Shift+Tab**) |
+| `/skills` | which skills there are and where they come from |
+| `/bg [list\|kill <id>\|killall]` | background commands |
+| `/new` · `/resume` | new session / reopen the last one |
+| `/context` | tokens used against the budget |
+| `/bench` | session numbers: turns, iterations, first token |
+| `/cache` | the provider's cache hit rate |
+| `/session` | id, file and messages of the session |
+| `/quit` | exit |
 
-## Config
+### Shortcuts
 
-**Por entorno.** Solo hace falta la key si no usas Ctrl+A:
-
-| Variable | Para qué |
+| | |
 |---|---|
-| `ZODE_<PROVIDER>_KEY` | key de ese provider (`ZODE_ANTHROPIC_KEY`, `ZODE_GROQ_KEY`, …) |
-| `ZODE_API_KEY` | key genérica, la última recurso |
-| `ZODE_PROVIDER` | provider inicial |
-| `ZODE_MODEL` | modelo inicial |
+| `Ctrl+P` | command palette |
+| `Ctrl+T` | model palette |
+| `Ctrl+A` | connect a provider |
+| `Ctrl+L` | clear the view (the session file is untouched) |
+| `Ctrl+R` | fold/unfold the last result |
+| `Ctrl+U` / `Ctrl+D` | half a page of scroll |
+| `PageUp` / `PageDown` | a page |
+| `Shift+Enter` | newline (Enter sends) |
+| `Shift+Tab` | read-only mode |
+| `Esc` | stop the turn, kill the command, or answer "you decide" |
+| `Tab` | complete a `/` command |
+| `↑` / `↓` | prompt history |
+
+## Configuration
+
+**By environment.** You only need a key if you are not using Ctrl+A:
+
+| Variable | What it does |
+|---|---|
+| `ZODE_<PROVIDER>_KEY` | that provider's key (`ZODE_ANTHROPIC_KEY`, `ZODE_GROQ_KEY`, …) |
+| `ZODE_API_KEY` | generic key, the last resort |
+| `ZODE_PROVIDER` | starting provider |
+| `ZODE_MODEL` | starting model |
 | `ZODE_EFFORT` | `low` \| `medium` \| `high` |
-| `ZODE_BASE_URL` / `ZODE_MODELS_URL` | endpoints, para providers o gateways propios |
-| `ZODE_CONTEXT_LIMIT` | tokens de contexto (por defecto 128k; el presupuesto de compactación es el 80%) |
-| `ZODE_MAX_ITER` | iteraciones del bucle de agente por turno (12) |
-| `ZODE_TASK_PARALLEL` | subagentes a la vez (3; `1` = en serie) |
-| `ZODE_RECENT_WINDOW` | mensajes recientes que la compactación no toca (8) |
-| `ZODE_AUTO_BG` | `0` desactiva pasar a background las verificaciones lentas |
-| `ZODE_FREE_AUTO` | `1` arranca con `/free-auto on` |
-| `ZODE_RESUME` | `1` reabre la última sesión |
-| `ZODE_ACP_CMD` | comando del agente ACP, en vez de `opencode acp` |
-| `ZODE_DBG_ERR` | `1` vuelca a stderr el status y el cuerpo de cada respuesta |
-| `ZODE_YES` | `1` hace que `/clean` aplique sin confirmar (para cuando lo ejecuta el modelo) |
+| `ZODE_BASE_URL` / `ZODE_MODELS_URL` | endpoints, for your own providers or gateways |
+| `ZODE_CONTEXT_LIMIT` | context tokens (128k by default; the compaction budget is 80% of it) |
+| `ZODE_MAX_ITER` | agent loop iterations per turn (12) |
+| `ZODE_TASK_PARALLEL` | subagents at once (3; `1` = in series) |
+| `ZODE_RECENT_WINDOW` | recent messages compaction leaves alone (8) |
+| `ZODE_AUTO_BG` | `0` turns off auto-backgrounding slow verifications |
+| `ZODE_FREE_AUTO` | `1` starts with `/free-auto on` |
+| `ZODE_RESUME` | `1` reopens the last session |
+| `ZODE_DBG_ERR` | `1` dumps the status and body of every response to stderr |
+| `ZODE_YES` | `1` makes `/clean` apply without asking (for when the model runs it) |
 
-**Por fichero**, en `~/.config/zode/`:
+**By file**, in `~/.config/zode/`:
 
-- `config.json` — providers propios (id, base_url, models_url, `key_env`,
-  `default_model`, `kind`), y `provider`/`model` por defecto. Los providers
-  compilados no se pueden shadowear: gana el built-in.
-- `auth.json` — las keys que pegas con Ctrl+A. **0600**, escrito en temporal y
-  renombrado. Nunca en `config.json`, que la gente versiona.
-- `skills/<nombre>/SKILL.md` — tus skills.
+- `config.json` — your own providers (id, base_url, models_url, `key_env`,
+  `default_model`, `kind`), plus the default `provider`/`model`. Compiled
+  providers cannot be shadowed: the built-in wins.
+- `auth.json` — the keys you paste with Ctrl+A. **0600**, written to a temp file
+  and renamed. Never in `config.json`, which people version.
+- `skills/<name>/SKILL.md` — your skills.
 
-**En el proyecto**, desde donde lo lances:
+**In the project**, from wherever you launch it:
 
-- `AGENTS.md` (o `CLAUDE.md`) — instrucciones del proyecto. Se busca en el
-  directorio actual y, si no hay, en la raíz del repositorio.
-- `.zode/skills/<nombre>/SKILL.md` — skills del harness.
-- `.agents/skills/<nombre>/SKILL.md` — skills, en el convenio compartido con
-  otros agentes.
-- `sessions/zode-*.jsonl` — las sesiones. Comprimidas: las líneas grandes van
-  en DEFLATE y en base64.
+- `AGENTS.md` (or `CLAUDE.md`) — project instructions. It looks in the current
+  directory and, failing that, at the repository root.
+- `.zode/skills/<name>/SKILL.md` — harness skills.
+- `.agents/skills/<name>/SKILL.md` — skills, in the convention shared with other
+  agents.
+- `sessions/zode-*.jsonl` — the sessions. Compressed: the big lines go through
+  DEFLATE and base64.
 
 ## Skills
 
-Una skill es una carpeta con un `SKILL.md` y frontmatter de `name` y
-`description`. El prompt lleva **solo** nombre y descripción; el cuerpo se lee
-cuando el modelo decide que la necesita, con la tool `skill`.
+A skill is a folder with a `SKILL.md` and `name` / `description` frontmatter.
+Only the name and the description go into the prompt; the body is read when the
+model decides it needs it, through the `skill` tool.
 
 ```markdown
 ---
 name: pty-tests
-description: después de tocar el dibujo de tui.zig
+description: after touching the drawing code in tui.zig
 ---
 
-Verifica los cambios de TUI en una pty de verdad: `python3 tools/pty_smoke.py`.
+Verify TUI changes in a real pty: `python3 tools/pty_smoke.py`.
 ```
 
-La `description` tiene que decir **cuándo** usarla, no qué contiene: "después de
-tocar el dibujo de tui.zig" decide bien; "notas sobre pty" obliga al modelo a
-adivinar. Los skills de un proyecto tapan a los globales en vez de mezclarse:
-medio skill de otro proyecto es peor que no tenerlo.
+The `description` has to say **when** to use it, not what it contains: "after
+touching the drawing code in tui.zig" decides well; "notes about pty" makes the
+model guess. A project's skills **override** the global ones instead of merging:
+half a skill from another project is worse than not having it.
 
-`/skills` dice cuáles hay y de dónde.
+`/skills` says which ones exist and where they come from.
 
-## Sesiones
+## Sessions
 
-Cada turno se escribe en `sessions/zode-<id>.jsonl` (una línea por evento, con
-`tool_calls` en crudo para que el replay sea fiel). `/resume` reabre la última y
-`/undo` devuelve **ficheros**, no mensajes: la sesión es append-only y
-reescribirla a mitad de un turno no tiene explicación.
+Every turn is written to `sessions/zode-<id>.jsonl` (one line per event, with
+`tool_calls` raw so the replay is faithful). `/resume` reopens the last one and
+`/undo` gives you back **files**, not messages: the session is append-only and
+rewriting it halfway through a turn has no explanation.
 
-## Desarrollo
+## Development
 
 ```bash
 zig build test                              # unit tests
-zig build && python3 tools/pty_smoke.py     # smoke en pty de verdad
-python3 tools/measure.py ./zig-out/bin/zode # arranque y RSS
-python3 tools/esc_kill_pty.py               # ESC mata al nieto, no al shell
+zig build && python3 tools/pty_smoke.py     # smoke test in a real pty
+python3 tools/measure.py ./zig-out/bin/zode # startup and RSS
+python3 tools/esc_kill_pty.py               # ESC kills the grandchild, not the shell
 ```
 
-`tools/pty_smoke.py` usa un `HOME` propio a propósito: la app escribe
-`~/.config/zode/auth.json` y `sessions/`, y una prueba automática no debe tocar
-la config de quien la ejecuta.
+`tools/pty_smoke.py` uses its own `HOME` on purpose: the app writes
+`~/.config/zode/auth.json` and `sessions/`, and an automated test must not touch
+the config of whoever runs it.
 
-## Arquitectura
+## Architecture
 
-Dos carpetas, y la línea que las separa es si el módulo puede probarse sin terminal:
+Two folders, and the line between them is whether the module can be tested
+without a terminal:
 
 ```
-src/                    lo que necesita la TUI, un hilo o la red
+src/                    what needs the TUI, a thread or the network
   main.zig              CLI: --models / --chat / TUI / --resume
-  tui.zig               la TUI (vxfw): dibujo, input, scroll, paletas
-  agent.zig             bucle de agente, permisos, turnos, estado de la sesión
-  commands.zig          los /comandos y las tablas que imprime /help
-  acp_bridge.zig        el turno delegado a otro agente (modo ACP)
-  chat.zig              cliente streaming SSE + parser + Anthropic nativo
-  acp.zig               cliente ACP v1 por JSON-RPC
-  tools/                las 16 tools, una por fichero
-    dispatch.zig        el nombre que envió el modelo -> la función que corre
-    common.zig          los helpers que usa más de una tool
+  tui.zig               the TUI (vxfw): drawing, input, scroll, palettes
+  agent.zig             agent loop, permissions, turns, session state
+  commands.zig          the /commands and the tables /help prints
+  chat.zig              streaming SSE client + parser + native Anthropic
+  tools/                the 16 tools, one per file
+    dispatch.zig        the name the model sent -> the function that runs
+    common.zig          the helpers more than one tool needs
     read.zig  write.zig  edit.zig  bash.zig  glob.zig  grep.zig
     list_files.zig  web.zig  think.zig  todo.zig  bg.zig  errors.zig
-  bgproc.zig            comandos en segundo plano
-  palette.zig           paleta modal de Ctrl+P / Ctrl+T
-  session.zig           sesiones JSONL comprimidas
-  config.zig            config.json de usuario
-  compaction.zig        presupuesto de contexto, elisión y resumen
-  cache_stats.zig       hit-rate de la cache del provider
-  roster.zig            pool de modelos free
-  free_auto.zig         /free-auto sobre el pool
-  roster_probe.zig      la sonda de `zig build roster-probe`
-  test_all.zig          el agregador de tests
-  bin/                  ejecutables auxiliares (tool_test, acp_probe)
+  bgproc.zig            background commands
+  palette.zig           the Ctrl+P / Ctrl+T modal palette
+  session.zig           compressed JSONL sessions
+  config.zig            the user's config.json
+  compaction.zig        context budget, elision and summary
+  cache_stats.zig       the provider's cache hit rate
+  roster.zig            the free-model pool
+  free_auto.zig         /free-auto over the pool
+  roster_probe.zig      the `zig build roster-probe` probe
+  test_all.zig          the test aggregator
+  bin/                  helper executables (tool_test)
+  tools_root.zig        the `tools` module, re-exporting the dispatcher
 
-src/lib/                módulos que se testean solos, sin TUI y sin red
-  readcache.zig         qué ficheros ya se han mandado al modelo
-  project.zig           cwd, raíz del repositorio y rama de git
-  skills.zig            el formato de un SKILL.md
-  skillstore.zig        descubrimiento de skills en disco
-  mentions.zig          @fichero
-  markdown.zig          markdown + diff unificado
-  highlight.zig         resaltado de sintaxis universal
-  web.zig               HTML → texto, y el buscador de resultados
-  models.zig            catálogo de modelos y sus metadatos
-  providers.zig         providers compilados + precedencia de keys
-  provider.zig          config por entorno (compat)
-  http_client.zig       HTTP JSON sobre std.http.Client
-  subagent.zig          el informe del subagente
-  ask.zig               la tool `ask`
-  plan.zig              la lista de tareas visible
-  checkpoint.zig        las fotos de /undo
-  editor.zig            el editor de una línea
+src/lib/                modules that test on their own, no TUI and no network
+  readcache.zig         which files have already been sent to the model
+  project.zig           cwd, repository root and git branch
+  prompt.zig            the system prompt text
+  sleep.zig             nanosleep that does not touch the shared Io
+  skills.zig            the format of a SKILL.md
+  skillstore.zig        skill discovery on disk
+  mentions.zig          @file
+  markdown.zig          markdown + unified diff
+  highlight.zig         universal syntax highlighting
+  web.zig               HTML -> text, and the search result parser
+  models.zig            the model catalogue and its metadata
+  providers.zig         compiled providers + key precedence
+  provider.zig          per-environment config (compat)
+  http_client.zig       HTTP JSON on top of std.http.Client
+  subagent.zig          the subagent's report
+  ask.zig               the `ask` tool
+  plan.zig              the visible task list
+  checkpoint.zig        /undo's snapshots
+  editor.zig            the one-line editor
   bench.zig             /bench
   clean.zig             /clean
-  regex.zig             mini-motor de regex
+  verify.zig            which verifications are slow enough to background
+  regex.zig             a mini regex engine
   mascot.zig            Zo
-  theme.zig             colores
-  zjsonl.zig            DEFLATE + base64 por línea
+  theme.zig             colours
+  zjsonl.zig            DEFLATE + base64 per line
 ```
 
-`src/lib/` no es "los ficheros pequeños": es **los que se pueden testear sin
-arrancar la app**. Por eso `roster.zig` no se mueve: depende de `config.zig`, que
-ya depende del cliente de chat.
+`src/lib/` is not "the small files": it is **the ones that can be tested without
+starting the app**. That is why `roster.zig` does not move: it depends on
+`config.zig`, which already depends on the chat client.
 
-`src/tools/` es un caso interesante: las tools SÍ son casi todas puras (leen
-ficheros, consultan la red) pero el **dispatcher** necesita el registro de
-procesos en segundo plano, que vive en el `Model`. La solución fue partir el
-fichero en vez de moverlo: cada tool en su fichero, `dispatch.zig` con lo que
-necesita del `Model`. `ask`, `task` y `skill` NO están ahí (necesitan el `Model`
-para el diálogo, el worker y las skills) y se interceptan en `agent.zig`, que es
-donde ya estaban.
+`src/tools/` is the interesting case: the tools ARE nearly all pure (they read
+files, they hit the network) but the **dispatcher** needs the background process
+registry, which lives in the `Model`. The answer was to split the file rather than
+move it: each tool in its own file, `dispatch.zig` holding what it needs from the
+`Model`. `ask`, `task` and `skill` are NOT there (they need the `Model` for the
+dialog, the worker and the skills) and are intercepted in `agent.zig`, which is
+where they already were.
 
-Provider OpenAI-compatible: funciona con OpenCode, OpenRouter, Groq, DeepSeek y
-cualquier gateway que hable el mismo formato, cambiando el `base_url`.
+Any OpenAI-compatible provider works: OpenCode, OpenRouter, Groq, DeepSeek and
+any gateway that speaks the same format, by changing the `base_url`.
 
-`AGENTS.md` tiene las convenciones del código y **por qué** cada decisión rara
-salió cara (qué trampas de Zig 0.16 ya se pagaron, qué bugs de memoria hay, y
-qué NO se debe hacer). Es el fichero que hay que leer antes de tocar nada.
+`AGENTS.md` has the conventions of the code and **why** each unusual decision
+cost something (which Zig 0.16 traps have already been paid for, which memory
+bugs exist, and what must NOT be done). It is the file to read before touching
+anything.
