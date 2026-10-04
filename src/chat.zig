@@ -1,6 +1,6 @@
 const std = @import("std");
 const http_client = @import("lib/http_client.zig");
-const acp = @import("acp.zig");
+const sleep = @import("lib/sleep.zig");
 
 /// Io set up by the TUI/CLI at startup.
 ///
@@ -1153,7 +1153,7 @@ pub var retry_after_secs: ?u16 = null;
 /// This runs in the WORKER, and `Io.sleep` takes the event loop of the `Io`
 /// that the TUI shares in the same event thread away with it: during the backoff
 /// the redraws stop, the clock in the activity strip freezes and the notices stay
-/// in `pending` unpainted. It is the same problem ACP solved with `nap()` and
+/// in `pending` unpainted. It is the same problem `lib/sleep.nap` solves and
 /// the same solution: a real syscall, without touching the `Io`.
 ///
 /// Sleeps in 50 ms slices so ESC can cut the wait short.
@@ -1164,7 +1164,7 @@ pub fn sleepMs(ms_arg: u64) void {
     while (left > 0) {
         if (cancel_current.load(.seq_cst)) return;
         const chunk = @min(left, 50);
-        acp.nap(chunk);
+        sleep.nap(chunk);
         left -= chunk;
     }
 }

@@ -15,7 +15,6 @@ const std = @import("std");
 /// takes 40 seconds and one that takes 40 milliseconds.
 ///
 /// Pure and without I/O on purpose: this is a table, and a table is testable.
-
 pub const Kind = enum {
     /// Fast: it returns in well under a second. Runs in the foreground.
     quick,
@@ -150,8 +149,8 @@ fn commandStartsWith(command: []const u8, needle: []const u8) bool {
     while (true) {
         // Skip the wrappers a command arrives wrapped in.
         const prefixes = [_][]const u8{
-            "env ",       "sudo ",  "nice ",   "time ",   "command ",
-            "npx ",       "pnpm dlx ", "bunx ", "yarn dlx ", "uv run ",
+            "env ",        "sudo ",       "nice ",  "time ",     "command ",
+            "npx ",        "pnpm dlx ",   "bunx ",  "yarn dlx ", "uv run ",
             "poetry run ", "pipenv run ", "xargs ",
         };
         var skipped = false;

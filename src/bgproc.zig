@@ -327,7 +327,7 @@ pub fn killForeground() bool {
 /// one level down).
 ///
 /// Runs on the UI thread, which is the one allowed to call `Child.kill` (two
-/// threads on the same `Child` is the race `acp.zig` documents). The reader
+/// threads on the same `Child` is a race). The reader
 /// thread needs nothing special: the killed process closes its pipes, `fill`
 /// hits EndOfStream, `wait` returns a signal term and the slot lands in
 /// `.killed` on its own.
@@ -352,7 +352,6 @@ pub fn killNow(reg: *Registry, io: std.Io) usize {
 /// Only MARKS them: the actual kill is `killAll`/`killNow`, which run on the
 /// thread that can safely touch the child. Setting the flag from the UI thread
 /// and killing from the same call keeps `Child.kill` off two threads at once,
-/// which is how `acp.zig` notes you must not do it.
 pub fn requestKillAll(reg: *Registry) usize {
     var n: usize = 0;
     for (&reg.slots) |*j| {
@@ -610,7 +609,7 @@ fn killTree(j: *Job, io: std.Io) void {
 
 /// A plain `nanosleep`, NOT `Io.sleep`: `Io.sleep` goes through the shared `Io`,
 /// which the TUI's redraw ticks also use. Sleeping on it from a worker freezes
-/// the screen (this is the trap AGENTS.md documents for `Retry.wait` and the ACP
+/// the screen (this is the trap AGENTS.md documents for `Retry.wait` and the
 /// cancel loop).
 fn napMs(ms: u64) void {
     if (builtin.os.tag != .linux) {

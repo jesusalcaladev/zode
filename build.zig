@@ -111,24 +111,6 @@ pub fn build(b: *std.Build) void {
     const tt_step = b.step("tool-test", "Prueba las tools headless");
     tt_step.dependOn(&tt_run.step);
 
-    // Sonda de ACP contra el agente real (`opencode acp`). No es un test: es
-    // para mirar el cable a pelo, con `zig build acp-probe -- "prompt"`.
-    const probe_mod = b.createModule(.{
-        .root_source_file = b.path("src/bin/acp_probe.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    probe_mod.addImport("acp", b.createModule(.{
-        .root_source_file = b.path("src/acp.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    const probe = b.addExecutable(.{ .name = "acp_probe", .root_module = probe_mod });
-    const probe_run = b.addRunArtifact(probe);
-    if (b.args) |args| probe_run.addArgs(args);
-    const probe_step = b.step("acp-probe", "Habla con el agente ACP real y enseña el tráfico");
-    probe_step.dependOn(&probe_run.step);
-
     // Free-auto probe: which providers have a key, how many free models each
     // one publishes, and the pool already sorted the way the wheel will use it.
     // Not a test: it talks to the network.

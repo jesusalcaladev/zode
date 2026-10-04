@@ -14,7 +14,7 @@ const tui = @import("tui.zig");
 /// spinlock `tryLock` over two-line sections, because `std.atomic.Mutex` is not
 /// reentrant and taking the lock with your own hangs the app.
 ///
-/// The difference with ACP is that here the content CANNOT be invalidated at
+/// The difference with the model pool is that here the content CANNOT be invalidated at
 /// runtime: the strings are copies from an arena that lives until the teardown,
 /// and the AGENTS.md rule is exact: data read from several threads is never
 /// freed in runtime.

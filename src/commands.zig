@@ -236,7 +236,6 @@ pub const commands = [_]Cmd{
     .{ .key = "/agent.yolo", .desc = "toggle auto permissions" },
     .{ .key = "/allowlist", .desc = "tools always allowed (persisted)" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall" },
-    .{ .key = "/acp", .desc = "on|off|<cmd>: delegate the turn to an ACP agent (opencode acp)" },
     .{ .key = "/new", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget (compaction at 80%)" },

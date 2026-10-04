@@ -480,7 +480,6 @@ test "searchResults with no results returns empty (no garbage text)" {
     try std.testing.expectEqualStrings("", out);
 }
 
-
 // ── search result parsing ──────────────────────────────────────
 
 const search_html_fixture =
@@ -523,7 +522,7 @@ test "searchResults: a result with no snippet does NOT borrow the next one's" {
     const out = searchResults(a.allocator(), search_html_no_snippet_first, 8);
     // The snippet is only inside the second result's block, so only the second
     // entry gets it.
-    const first = out[0..std.mem.indexOf(u8, out, "2. ") orelse out.len];
+    const first = out[0 .. std.mem.indexOf(u8, out, "2. ") orelse out.len];
     try std.testing.expect(std.mem.indexOf(u8, first, "ONLY the second") == null);
     const rest = out[std.mem.indexOf(u8, out, "2. ") orelse 0 ..];
     try std.testing.expect(std.mem.indexOf(u8, rest, "ONLY the second") != null);

@@ -1,6 +1,7 @@
 // Test aggregator: it compiles with the vaxis import available.
 pub const chat = @import("chat.zig");
 pub const bgproc = @import("bgproc.zig");
+pub const sleep = @import("lib/sleep.zig");
 pub const bench = @import("lib/bench.zig");
 pub const session = @import("session.zig");
 pub const tools = @import("tools/dispatch.zig");
@@ -9,7 +10,6 @@ pub const highlight = @import("lib/highlight.zig");
 pub const models = @import("lib/models.zig");
 pub const compaction = @import("compaction.zig");
 pub const tui = @import("tui.zig");
-pub const acp = @import("acp.zig");
 pub const theme = @import("lib/theme.zig");
 pub const config = @import("config.zig");
 pub const editor = @import("lib/editor.zig");
@@ -31,7 +31,6 @@ pub const readcache = @import("lib/readcache.zig");
 pub const verify = @import("lib/verify.zig");
 pub const prompt = @import("lib/prompt.zig");
 pub const commands = @import("commands.zig");
-pub const acp_bridge = @import("acp_bridge.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

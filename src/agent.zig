@@ -17,7 +17,6 @@ const compaction = @import("compaction.zig");
 const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
-const acp = @import("acp.zig");
 
 const ask = @import("lib/ask.zig");
 const bgproc = @import("bgproc.zig");
@@ -26,24 +25,9 @@ const skills = @import("lib/skills.zig");
 const skillstore = @import("lib/skillstore.zig");
 const project = @import("lib/project.zig");
 const subagent_mod = @import("lib/subagent.zig");
+const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
 const commands_mod = @import("commands.zig");
-const acp_bridge = @import("acp_bridge.zig");
-
-// The ACP mode, re-exported. `tui.zig` asks "is ACP on?" and "cancel it" on every
-// ESC and every status-bar frame, and it does that through `agent`, not through
-// the bridge: the TUI already depends on this module for everything else, and a
-// second import just for three names is a dependency to keep track of.
-//
-// `acp_on` is a `var` and a `var` cannot be aliased with `const`, so the TUI asks
-// through a function. Copying it into a second `var` would be worse: two flags
-// that mean the same thing and only one of them is ever set.
-pub fn acpActive() bool {
-    return acp_bridge.acp_on;
-}
-pub const acpTitle = acp_bridge.acpTitle;
-pub const cancelAcp = acp_bridge.cancelAcp;
-pub const shutdownAcp = acp_bridge.shutdownAcp;
 
 // The `/help` tables live with the commands they document. Re-exported because
 // the palette builds its items from `commands`, and that is not a commands
@@ -1467,8 +1451,6 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdYolo(m);
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
         commands_mod.cmdAllowlist(m);
-    } else if (std.mem.eql(u8, cmd, "acp")) {
-        acp_bridge.cmdAcp(m, arg orelse "");
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "session")) {
@@ -1603,7 +1585,6 @@ fn cmdClean(m: *tui.Model, aplicar: bool) void {
     pushInfoOwned(m, tail);
 }
 
-/// ACP errors with a text that makes sense in the UI (not `error.X`).
 /// `/resume`: reopens the most recent session by mtime.
 fn resumeLatest(m: *tui.Model) void {
     var astate = std.heap.ArenaAllocator.init(m.allocator);
@@ -1681,13 +1662,7 @@ fn startChat(m: *tui.Model, input: []const u8) !void {
     const job = try m.allocator.create(ChatJob);
     m.beginWorker(); // the worker closes it; if the spawn fails, we close it here
     job.* = .{ .model = m, .text = copy };
-    // ACP mode delegates the turn to another agent: same worker, different body.
-    // CAREFUL: it picks the FUNCTION, not a bool, because `std.Thread.spawn`
-    // with a comptime-only that depends on runtime control does not compile.
-    const spawned = if (acp_bridge.acp_on)
-        std.Thread.spawn(.{}, acp_bridge.acpWorker, .{job}) catch null
-    else
-        std.Thread.spawn(.{}, chatWorker, .{job}) catch null;
+    const spawned = std.Thread.spawn(.{}, chatWorker, .{job}) catch null;
     const th = spawned orelse {
         m.endWorker();
         m.allocator.destroy(job);
@@ -2277,7 +2252,6 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // the loop reaches 8) there was no live paragraph, no activity strip, no
     // spinner, no clock. In other words, everything that says "still working"
     // turned off exactly in the part of the turn where the slow part happens
-    // (after the tools). The ACP path did do it right the whole time.
     m.streamStartIteration();
 
     var tstate = TurnCtx{ .m = m };
@@ -3877,8 +3851,8 @@ fn runParallelBatch(
 ///
 /// `Io.sleep` goes through the shared `Io` and takes its event loop with it, so
 /// sleeping on it from a worker stops the TUI's redraw ticks: the clock in the
-/// activity strip freezes and the screen looks dead. Same trap as `Retry.wait` and
-/// the ACP cancel loop, documented in AGENTS.md.
+/// activity strip freezes and the screen looks dead. Same trap as `Retry.wait`,
+/// documented in AGENTS.md.
 fn napMs(ms: u64) void {
     if (builtin.os.tag != .linux) {
         std.Thread.yield() catch {};
@@ -4259,15 +4233,15 @@ const Retry = struct {
         //
         // CAREFUL about the HOW: this runs from a WORKER, and
         // `io_global.sleep` takes down the event loop of the `Io` shared with
-        // the TUI (the same problem ACP solved with `nap()`). With `sleep` it
+        // the TUI (the same problem `lib/sleep.nap` exists for). With `sleep` it
         // is not just the strip's clock that freezes: the redraws stop, so the
         // retry notices stayed in `pending` unpainted and you had to press a key
-        // to see them. `acp.nap()` is a bare `nanosleep` that does not touch the
+        // to see them. `sleep.nap()` is a bare `nanosleep` that does not touch the
         // `Io`.
         while (left > 0) {
             if (chat.cancelled()) return error.Cancelled;
             const chunk_ms: u64 = @intCast(@min(@divTrunc(left, std.time.ns_per_ms), 50));
-            if (chunk_ms > 0) acp.nap(chunk_ms);
+            if (chunk_ms > 0) sleep.nap(chunk_ms);
             left -= @as(i128, chunk_ms) * std.time.ns_per_ms;
         }
     }

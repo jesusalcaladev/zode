@@ -3922,10 +3922,6 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     });
                 }
                 chat.cancel_current.store(true, .seq_cst);
-                // In ACP mode the cancel goes through its own protocol
-                // (`session/cancel`): the HTTP streams' flag does not touch a
-                // child process.
-                agent.cancelAcp(self);
                 // Background jobs go too: ESC means "stop", and leaving a build
                 // running in the background after the user pressed ESC is how you
                 // get a laptop that is warm for the next ten minutes. Before,
@@ -5327,16 +5323,6 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
         // character).
         const et = std.fmt.allocPrint(arena, " ({s})", .{eff}) catch return null;
         out.append(arena, .{ .text = et, .style = theme.brand_faint }) catch return null;
-    }
-
-    // ACP mode: the turn is NOT done by zode, it is delegated to another agent.
-    // Without this the status keeps saying "space-bunny-free · opencode" while
-    // the one answering is someone else, which is exactly the kind of surprise
-    // that is not acceptable.
-    if (agent.acpActive()) {
-        if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
-        const tag = std.fmt.allocPrint(arena, "acp: {s}", .{agent.acpTitle()}) catch return null;
-        out.append(arena, .{ .text = tag, .style = theme.warn }) catch return null;
     }
 
     // Read-only mode. It has to be VISIBLE at all times and not just in the
@@ -7013,7 +6999,7 @@ test "streamEnd empties pending BEFORE setting the paragraph (else the text land
     // Regression: `pushToolStart`/`pushToolDone` enqueue into `pending`, and
     // `pending` is drained on the next draw. `streamEnd` put the assistant's
     // paragraph into `paras` without emptying `pending`, so the text ended up
-    // AHEAD of the tool it belonged to. It shows up in ACP, where the agent
+    // AHEAD of the tool it belonged to. It shows up when the agent
     // interleaves text and tools: "◆ Listo." showed up above "⎿ exit=0".
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

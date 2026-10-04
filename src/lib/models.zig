@@ -56,20 +56,22 @@ pub fn isFreeId(id: []const u8) bool {
 pub fn isConversational(id: []const u8) bool {
     const needles = [_][]const u8{
         // embeddings / retrieval
-        "clip",           "embed",         "bge-",           "gte-",
-        "e5-",            "minilm",        "jina-",          "voyage",
-        "rerank",         "retriev",
+        "clip",       "embed",              "bge-",     "gte-",
+        "e5-",        "minilm",             "jina-",    "voyage",
+        "rerank",     "retriev",
         // images and video
-        "flux",           "stable-diffusion", "sdxl",        "sd3",
-        "sora",           "veo",           "imagen",         "dall-e",
-        "ideogram",       "recraft",       "ideogram",
+                   "flux",     "stable-diffusion",
+        "sdxl",       "sd3",                "sora",     "veo",
+        "imagen",     "dall-e",             "ideogram", "recraft",
+        "ideogram",
         // audio
-        "tts",            "whisper",       "lyria",          "elevenlabs",
-        "suno",           "audi",          "speech",         "transcribe",
+          "tts",                "whisper",  "lyria",
+        "elevenlabs", "suno",               "audi",     "speech",
+        "transcribe",
         // safety and moderation: they answer 200 and then say no
-        "moderation",     "guard",         "safety",
+        "moderation",         "guard",    "safety",
         // image EDITING models, which live next to the chat ones in the same list
-        "kontext",        "background-removal",
+        "kontext",    "background-removal",
     };
     for (needles) |n| {
         if (containsIgnoreCase(id, n)) return false;
