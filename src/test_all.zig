@@ -30,6 +30,7 @@ pub const project = @import("lib/project.zig");
 pub const readcache = @import("lib/readcache.zig");
 pub const verify = @import("lib/verify.zig");
 pub const prompt = @import("lib/prompt.zig");
+pub const commands = @import("commands.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

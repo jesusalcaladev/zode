@@ -27,6 +27,13 @@ const skillstore = @import("lib/skillstore.zig");
 const project = @import("lib/project.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const prompt_mod = @import("lib/prompt.zig");
+const commands_mod = @import("commands.zig");
+
+// The `/help` tables live with the commands they document. Re-exported because
+// the palette builds its items from `commands`, and that is not a commands
+// concern: it is a "what can I type" concern.
+pub const commands = commands_mod.commands;
+pub const shortcuts = commands_mod.shortcuts;
 
 /// Io and API key configured by the TUI at startup.
 pub var io_global: std.Io = undefined;
@@ -52,7 +59,7 @@ var agents_md_cache: ?[]u8 = null;
 /// That is what makes it safe without a mutex, and also why it is a plain global
 /// rather than a `Model` field (the prompt is composed where there is no model at
 /// hand, which is the trap `io_global` already is).
-var project_info: project.Info = .{};
+pub var project_info: project.Info = .{};
 
 /// Fills `project_info`, if it has not been filled yet.
 ///
@@ -363,7 +370,7 @@ pub fn syncSystemPrompt(s: *session_mod.Session) void {
 /// Two paths, not one, is the fix for `cd src && zode` silently running with no
 /// project instructions at all. Which is the same bug class as the skills roots:
 /// the project lives in the root, and the root is what git already knows.
-fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
+pub fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
     if (agents_md_cache == null) {
         // The user's project AGENTS.md / CLAUDE.md take priority.
         agents_md_cache = readAgentsIn(gpa, ".") orelse readAgentsIn(gpa, project_info.root()) orelse null;
@@ -538,7 +545,7 @@ fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
 }
 
 /// Tool results elided in the session (for /context).
-var session_elided: usize = 0;
+pub var session_elided: usize = 0;
 
 /// Has the TUI already summarized the old turns in this session?
 ///
@@ -595,7 +602,7 @@ fn updateTps(chars: usize, start_ns: i128) void {
 
 // ── active provider / model / session ────────────────────────
 
-var cur_provider_id: []const u8 = "opencode";
+pub var cur_provider_id: []const u8 = "opencode";
 var cur_model: []const u8 = "";
 
 /// Active session (`null` until the first message). The worker creates it, not
@@ -608,7 +615,7 @@ pub var resume_on_start: bool = false;
 
 /// Copies the model name into a static buffer (avoids dangling slices from
 /// ephemeral input strings).
-var cur_model_buf: [128]u8 = undefined;
+pub var cur_model_buf: [128]u8 = undefined;
 
 /// Active provider and model, for the status bar. Exposed as functions (not
 /// the raw `var`s) so the TUI does not depend on the static buffer.
@@ -648,8 +655,8 @@ pub fn effectiveEffort() chat.Effort {
 
 // ── permissions: "always allow" per tool (session) ───────────
 const max_always = 8;
-var always_names: [max_always][48]u8 = undefined;
-var always_lens: [max_always]usize = @splat(0);
+pub var always_names: [max_always][48]u8 = undefined;
+pub var always_lens: [max_always]usize = @splat(0);
 
 fn isAlwaysAllowed(name: []const u8) bool {
     for (always_lens, 0..) |l, i| {
@@ -977,7 +984,7 @@ pub fn shutdownUserConfig() void {
 /// FIRST TIME it is needed, not at startup: so opening the TUI and closing it
 /// without chatting does not leave an empty `sessions/zode-*.jsonl` lying
 /// around.
-fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
+pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
     if (session) |s| return s;
     _ = arena;
     const fresh = session_mod.Session.create(m.allocator, io_global) catch {
@@ -1287,7 +1294,7 @@ fn allocPrint(m: *tui.Model, comptime fmt: []const u8, args: anytype) ![]const u
 ///
 /// `tool` → role "tool" (as OpenAI's API expects), and `system` stays first.
 /// The memory comes from the arena the caller passes in.
-fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
+pub fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
     const s = session orelse return &.{};
     const msgs = arena.alloc(chat.ChatMessage, s.messages.items.len) catch return &.{};
     for (s.messages.items, 0..) |sm, i| {
@@ -1304,227 +1311,53 @@ fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
 
 // ── command table ─────────────────────────────────────────────
 
-pub const Cmd = struct {
-    key: []const u8,
-    desc: []const u8,
-    /// Keyboard shortcut that does the same thing (right column of the palette).
-    /// Only ones that really exist are listed: putting a fake one would be worse
-    /// than putting none.
-    key_hint: ?[]const u8 = null,
+/// What to do with the command that was just chosen in the palette.
+pub const PaletteCmd = enum {
+    /// Executed right here, right now.
+    done,
+    /// Needs arguments: the label goes to the input and the user types what is
+    /// missing.
+    needs_args,
+    /// Leave the app. The TUI handles it (it is who owns `ctx.quit`).
+    quit,
 };
 
-/// `key` comes with the leading slash. The order is the order of appearance in
-/// `/help`.
-pub const commands = [_]Cmd{
-    .{ .key = "/help", .desc = "show commands", .key_hint = "ctrl+p" },
-    .{ .key = "/models", .desc = "list the active provider models" },
-    .{ .key = "/model", .desc = "pick a model in a modal", .key_hint = "ctrl+p" },
-    .{ .key = "/provider", .desc = "pick a provider in a modal" },
-    .{ .key = "/providers", .desc = "list providers" },
-    .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
-    .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
-    .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
-    .{ .key = "/plan", .desc = "clear the visible task list" },
-    .{ .key = "/undo", .desc = "restore the files the last turn changed" },
-    .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)" },
-    .{ .key = "/yolo", .desc = "toggle auto permissions" },
-    .{ .key = "/allowlist", .desc = "tools always allowed (persisted)" },
-    .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall" },
-    .{ .key = "/acp", .desc = "on|off|<cmd>: delegate the turn to an ACP agent (opencode acp)" },
-    .{ .key = "/new", .desc = "new session" },
-    .{ .key = "/resume", .desc = "resume the last session" },
-    .{ .key = "/context", .desc = "tokens used vs budget (compaction at 80%)" },
-    .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times" },
-    .{ .key = "/session", .desc = "session info" },
-    .{ .key = "/cache", .desc = "cache hit-rate for this session" },
-    .{ .key = "/ask", .desc = "on|off: read-only mode (shift+tab); the agent investigates and asks" },
-    .{ .key = "/skills", .desc = "list the loadable skills" },
-    .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
-};
-
-/// Shortcuts that are NOT commands: they have to be typed, they are not in the
-/// palette.
+/// Runs a command chosen in the palette, WITHOUT going through the input.
 ///
-/// `/help` used to list only the command table, so half of the shortcuts (the
-/// ones with no command behind them) were written down nowhere, and the ones
-/// that did have one showed up without their shortcut. Ctrl+P surfaces them, but
-/// whoever just opened the app does not know it exists.
-pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
-    .{ .key = "ctrl+p", .desc = "command palette (executes the one you pick)" },
-    .{ .key = "ctrl+t", .desc = "model palette (providers | models)" },
-    .{ .key = "ctrl+a", .desc = "connect a provider (paste its key)" },
-    .{ .key = "ctrl+l", .desc = "clear the view (the session file is untouched)" },
-    .{ .key = "ctrl+r", .desc = "expand / collapse the last tool result" },
-    .{ .key = "ctrl+c", .desc = "quit" },
-    .{ .key = "ctrl+u / ctrl+d", .desc = "scroll half a page" },
-    .{ .key = "page up / down", .desc = "scroll a page" },
-    .{ .key = "shift+enter", .desc = "newline (enter sends)" },
-    .{ .key = "shift+tab", .desc = "read-only mode: no writes, the agent asks you" },
-    .{ .key = "esc", .desc = "stop the turn, kill a running command, or answer a question with \"you decide\"" },
-    .{ .key = "tab", .desc = "complete a `/` command" },
-    .{ .key = "↑ / ↓", .desc = "command history (empty line keeps the draft)" },
-};
-
-/// `/help`: commands (with their shortcut) and then the bare shortcuts.
+/// Choosing a command from a list is already the confirmation: putting it in
+/// the input and asking for another Enter was a second step nobody asked for,
+/// and in a TUI where keys get eaten along the way it read as "it did
+/// nothing".
 ///
-/// Two blocks because they answer two different questions: "what can I type"
-/// and "what can I press". Before this there was only the first one, and only
-/// without the shortcut column, so half the keybindings were written down
-/// nowhere — you find them by hitting Ctrl+P and hoping.
-fn cmdHelp(m: *tui.Model) void {
-    const gpa = m.allocator;
-    pushInfoOwned(m, gpa.dupe(u8, "commands") catch return);
-    for (commands) |c| {
-        const line = if (c.key_hint) |h|
-            std.fmt.allocPrint(gpa, "{s: <14} {s}  ({s})", .{ c.key, c.desc, h }) catch continue
-        else
-            std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
-        pushInfoOwned(m, line);
-    }
-
-    pushInfoOwned(m, gpa.dupe(u8, "shortcuts") catch return);
-    for (shortcuts) |s| {
-        const line = std.fmt.allocPrint(gpa, "{s: <18} {s}", .{ s.key, s.desc }) catch continue;
-        pushInfoOwned(m, line);
-    }
+/// The EXCEPTION is the commands that need arguments: `/use provider model`
+/// cannot be run blind. Those go back to the input with the label in place,
+/// which is exactly what whoever picks them wants.
+///
+/// The command echoes itself in the history (like the input) so you can see
+/// what was run, not just what happened.
+pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
+    if (std.mem.eql(u8, cmd, "/quit")) return .quit;
+    if (std.mem.eql(u8, cmd, "/use")) return .needs_args;
+    m.pushKind(.user, cmd);
+    submit(m, cmd) catch {};
+    return .done;
 }
 
-/// `/allowlist`: which tools are in "always allow".
-/// The allowlist lives in `~/.config/zode/permissions.json` and there was no
-/// way to see it: if a tool stopped asking and you did not know why, the only
-/// way was to open the file by hand. It also says whether `/yolo` is on, which
-/// is the other way of "don't ask me".
-fn cmdAllowlist(m: *tui.Model) void {
-    var line_buf: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&line_buf);
-    w.writeAll("always allowed: ") catch {};
-    var n: usize = 0;
-    for (always_lens, 0..) |l, i| {
-        if (l == 0) continue;
-        if (n > 0) w.writeAll(" \u{b7} ") catch {};
-        w.writeAll(always_names[i][0..l]) catch {};
-        n += 1;
-    }
-    if (n == 0) w.writeAll("(none)") catch {};
-    if (yolo) w.writeAll("  \u{b7} yolo ON: everything is auto-allowed") catch {};
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "{s}",
-        .{w.buffered()},
-    ) catch return;
-    pushInfoOwned(m, msg);
-}
+/// Entry point of the TUI input: free text or a `/…` command.
+///
+/// A chat starts a WORKER (thread) that talks to the API; a command is resolved
+/// here, in the UI thread, because they are local operations.
 
-/// `/cache`: prompt cache hit-rate of the session.
-fn cmdCache(m: *tui.Model) void {
-    const st = &cache_stats.session;
-    const line = std.fmt.allocPrint(
-        m.allocator,
-        // WRITES are in the line because they are the expensive half: a high
-        // hit-rate with a write on EVERY request means the prefix is being
-        // rebuilt each turn, and no hit-rate alone can reveal that.
-        "cache [{s}] {d:.1}% hit-rate · {d} reqs with hit · {d} prompt / {d} cached / {d} written · {d} completion",
-        .{ cur_provider_id, st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
-    ) catch "cache";
-    pushInfoOwned(m, line);
-}
+// `/effort` and `/yolo` are here and not in `commands.zig` because they WRITE
+// agent state (`current_effort`, the yolo flag) and `commands.zig` importing
+// back for a write is the edge that would make the two files a cycle.
 
-/// `/context`: gauge of context used against the limit and the budget.
-fn cmdContext(m: *tui.Model) void {
-    _ = ensureSession(m, m.allocator);
-    var astate = std.heap.ArenaAllocator.init(m.allocator);
-    defer astate.deinit();
-    const msgs = snapshotMsgs(astate.allocator());
-
-    const used = compaction.estimateTokens(msgs);
-    const budget = compaction.budgetTokens(m.environ);
-    const limit = compaction.contextLimit(m.environ);
-    const sys: i64 = if (msgs.len > 0) compaction.estimateTokens(msgs[0..1]) else 0;
-    const hist = used - sys;
-    const pct_limit = @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(limit)) * 100.0;
-    const pct_budget = @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(budget)) * 100.0;
-    const turns: usize = if (msgs.len > 0) msgs.len - 1 else 0;
-
-    // 20-cell gauge (█ = E2 96 88, ░ = E2 90 8A)
-    var gauge_buf: [60]u8 = undefined;
-    const filled: usize = @intFromFloat(@min(pct_limit, 100.0) / 5.0);
-    var gi: usize = 0;
-    for (0..filled) |_| {
-        @memcpy(gauge_buf[gi .. gi + 3], "█");
-        gi += 3;
-    }
-    for (filled..20) |_| {
-        @memcpy(gauge_buf[gi .. gi + 3], "░");
-        gi += 3;
-    }
-
-    const l1 = std.fmt.allocPrint(
-        m.allocator,
-        "context [{s}] ~{d} / {d} tokens ({d:.1}% of limit)",
-        .{ gauge_buf[0..gi], used, limit, pct_limit },
-    ) catch "context";
-    pushInfoOwned(m, l1);
-    const l2 = std.fmt.allocPrint(
-        m.allocator,
-        "  system ~{d} · history ~{d} · {d} turns · budget {d} ({d:.0}% used)",
-        .{ sys, hist, turns, budget, pct_budget },
-    ) catch "details";
-    pushInfoOwned(m, l2);
-    const l3 = std.fmt.allocPrint(
-        m.allocator,
-        "  elided this session: {d} tool results · last stream: {d:.0} tok/s",
-        .{ session_elided, tps_last },
-    ) catch "details";
-    pushInfoOwned(m, l3);
-
-    // The read cache, in tokens saved rather than in hits: "it worked" is a number
-    // the user can compare against the size of the files they are working with.
-    if (m.reads.stats.hits > 0 or m.reads.stats.misses > 0) {
-        const l4 = std.fmt.allocPrint(
-            m.allocator,
-            "  read cache: {d} re-reads avoided · ~{d} KB not re-sent ({d} files still in context)",
-            .{ m.reads.stats.hits, m.reads.stats.saved / 1024, m.reads.liveEntries() },
-        ) catch "details";
-        pushInfoOwned(m, l4);
-    }
-
-    // Where the tools are actually reading and writing. It is here and not only in
-    // the prompt because the USER needs it too: "why did it edit that file?" is
-    // answered by the cwd, and without it the answer is a guess.
-    var loc_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const loc = project_info.oneLine(&loc_buf);
-    if (loc.len > 0) pushInfoFmt(m, "  {s}", .{loc});
-
-    refreshContextUsage(m);
-}
-
-/// `/session`: id, path and message count.
-fn cmdSession(m: *tui.Model) void {
-    const s = ensureSession(m, m.allocator);
-    const l1 = std.fmt.allocPrint(
-        m.allocator,
-        "session {s} · {d} messages",
-        .{ s.id[0..], s.messages.items.len },
-    ) catch "sesión";
-    pushInfoOwned(m, l1);
-    if (s.path) |p| {
-        m.pushInfoFmt("  {s}", .{p});
-    }
-}
-
-/// `/providers`: lists the providers with their key state.
-fn cmdProviders(m: *tui.Model) void {
-    for (allProviders(m.allocator)) |*d| {
-        const key_state: []const u8 =
-            if (d.key_env.len == 0) "sin key" else if (providers.keyFor(d, m.environ) != null) "key ok" else "SIN KEY";
-        const active: []const u8 = if (std.mem.eql(u8, d.id, cur_provider_id)) " ←" else "";
-        const line = std.fmt.allocPrint(
-            m.allocator,
-            "{s:<11} {s} ({s}){s}  {s}",
-            .{ d.id, d.name, key_state, active, d.note },
-        ) catch "provider";
-        pushInfoOwned(m, line);
-    }
+/// `/agent.yolo`: toggle for automatic permissions.
+fn cmdYolo(m: *tui.Model) void {
+    yolo = !yolo;
+    const msg = if (yolo) "yolo ON: no confirmations" else "yolo OFF: asks for permission";
+    pushInfo(m, msg);
+    setStatusWithZo(m, if (yolo) .warn else .idle, msg);
 }
 
 /// `/effort low|medium|high`, or the picker if it comes without arguments.
@@ -1567,62 +1400,6 @@ fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
     openEffortPicker(m);
 }
 
-/// `/use <provider> [model]`.
-fn cmdUse(m: *tui.Model, arg: ?[]const u8) void {
-    const a = arg orelse {
-        m.pushInfoFmt("usage: /use <provider> [model]", .{});
-        return;
-    };
-    var it = std.mem.tokenizeScalar(u8, a, ' ');
-    const prov = it.next() orelse return;
-    applyProvider(m, prov) catch return;
-    if (it.next()) |mo| applyModel(m, mo) catch {};
-}
-
-/// `/yolo`: toggle for automatic permissions.
-fn cmdYolo(m: *tui.Model) void {
-    yolo = !yolo;
-    const msg = if (yolo) "yolo ON: no confirmations" else "yolo OFF: asks for permission";
-    pushInfo(m, msg);
-    setStatusWithZo(m, if (yolo) .warn else .idle, msg);
-}
-
-/// What to do with the command that was just chosen in the palette.
-pub const PaletteCmd = enum {
-    /// Executed right here, right now.
-    done,
-    /// Needs arguments: the label goes to the input and the user types what is
-    /// missing.
-    needs_args,
-    /// Leave the app. The TUI handles it (it is who owns `ctx.quit`).
-    quit,
-};
-
-/// Runs a command chosen in the palette, WITHOUT going through the input.
-///
-/// Choosing a command from a list is already the confirmation: putting it in
-/// the input and asking for another Enter was a second step nobody asked for,
-/// and in a TUI where keys get eaten along the way it read as "it did
-/// nothing".
-///
-/// The EXCEPTION is the commands that need arguments: `/use provider model`
-/// cannot be run blind. Those go back to the input with the label in place,
-/// which is exactly what whoever picks them wants.
-///
-/// The command echoes itself in the history (like the input) so you can see
-/// what was run, not just what happened.
-pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
-    if (std.mem.eql(u8, cmd, "/quit")) return .quit;
-    if (std.mem.eql(u8, cmd, "/use")) return .needs_args;
-    m.pushKind(.user, cmd);
-    submit(m, cmd) catch {};
-    return .done;
-}
-
-/// Entry point of the TUI input: free text or a `/…` command.
-///
-/// A chat starts a WORKER (thread) that talks to the API; a command is resolved
-/// here, in the UI thread, because they are local operations.
 pub fn submit(m: *tui.Model, input: []const u8) !void {
     if (input.len == 0) return;
     if (input[0] != '/') return startChat(m, input);
@@ -1637,13 +1414,13 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     const arg: ?[]const u8 = if (rest.len == 0) null else rest;
 
     if (std.mem.eql(u8, cmd, "help")) {
-        cmdHelp(m);
+        commands_mod.cmdHelp(m);
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // the TUI handles it
     } else if (std.mem.eql(u8, cmd, "models")) {
         listModelsAsync(m) catch pushError(m, "error starting /models");
     } else if (std.mem.eql(u8, cmd, "providers")) {
-        cmdProviders(m);
+        commands_mod.cmdProviders(m);
     } else if (std.mem.eql(u8, cmd, "provider")) {
         openProviderPicker(m);
     } else if (std.mem.eql(u8, cmd, "model")) {
@@ -1655,7 +1432,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "effort")) {
         cmdEffort(m, arg);
     } else if (std.mem.eql(u8, cmd, "use")) {
-        cmdUse(m, arg);
+        commands_mod.cmdUse(m, arg);
     } else if (std.mem.eql(u8, cmd, "plan")) {
         cmdPlan(m);
     } else if (std.mem.eql(u8, cmd, "undo")) {
@@ -1673,15 +1450,15 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "yolo")) {
         cmdYolo(m);
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
-        cmdAllowlist(m);
+        commands_mod.cmdAllowlist(m);
     } else if (std.mem.eql(u8, cmd, "acp")) {
         cmdAcp(m, arg orelse "");
     } else if (std.mem.eql(u8, cmd, "context")) {
-        cmdContext(m);
+        commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "session")) {
-        cmdSession(m);
+        commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {
-        cmdCache(m);
+        commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         cmdBench(m);
     } else if (std.mem.eql(u8, cmd, "ask")) {
@@ -2590,7 +2367,7 @@ fn pushTurnSummary(m: *tui.Model) void {
 }
 
 /// Cache hit-rate of the session, rounded (0 = no data).
-fn cacheHitPct() u8 {
+pub fn cacheHitPct() u8 {
     const r = cache_stats.session.hitRatePct();
     if (r <= 0) return 0;
     return @intFromFloat(std.math.clamp(r, 0, 100));
@@ -6334,19 +6111,19 @@ test "cmdAllowlist lists what is there and warns if it is empty" {
 
     // Empty: it says so, so that "it doesn't ask" can be told apart from "there is
     // nothing to look at".
-    cmdAllowlist(&m);
+    commands_mod.cmdAllowlist(&m);
     m.drainPending();
     try std.testing.expect(std.mem.indexOf(u8, m.paras.items[0].text, "(none)") != null);
 
     // With a tool in the list: its name shows up.
     _ = setAlwaysAllowedNoSave("bash");
-    cmdAllowlist(&m);
+    commands_mod.cmdAllowlist(&m);
     m.drainPending();
     try std.testing.expect(std.mem.indexOf(u8, m.paras.items[1].text, "bash") != null);
 
     // And it does not duplicate: the count does not grow from asking again.
     const before = m.paras.items.len;
-    cmdAllowlist(&m);
+    commands_mod.cmdAllowlist(&m);
     m.drainPending();
     try std.testing.expectEqual(before + 1, m.paras.items.len);
 
@@ -6362,7 +6139,7 @@ test "/help lists the shortcuts, not just the commands" {
     var m = tui.Model.init(fba.allocator());
     defer m.deinit();
 
-    cmdHelp(&m);
+    commands_mod.cmdHelp(&m);
     m.drainPending();
 
     var joined: std.ArrayList(u8) = .empty;
@@ -6403,7 +6180,7 @@ test "/clean shows up in /help with its 'yes'" {
     var m = tui.Model.init(fba.allocator());
     defer m.deinit();
 
-    cmdHelp(&m);
+    commands_mod.cmdHelp(&m);
     m.drainPending();
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(std.testing.allocator);
