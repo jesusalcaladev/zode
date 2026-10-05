@@ -658,16 +658,16 @@ test "git_status: says what changed, in porcelain, and NOT the English prose git
         // ever built in this test.
         const line = try std.fmt.allocPrint(arena, "git -C {s} {s}", .{ dir, cmd });
         const r = try bg_tool.runForeground(arena, std.testing.io, line, 20, 8192);
-        try std.testing.expectEqual(@as(u8, 0), r.term.exited);
+        try std.testing.expectEqual(@as(u8, 0), r.term.?.exited);
     }
 
     // One committed file, then a modification and an untracked file.
     const a = dir ++ "/a.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = a, .data = "one\n" });
     const add = try bg_tool.runForeground(arena, std.testing.io, try std.fmt.allocPrint(arena, "git -C {s} add -A", .{dir}), 20, 8192);
-    try std.testing.expectEqual(@as(u8, 0), add.term.exited);
+    try std.testing.expectEqual(@as(u8, 0), add.term.?.exited);
     const commit = try bg_tool.runForeground(arena, std.testing.io, try std.fmt.allocPrint(arena, "git -C {s} commit -qm first", .{dir}), 20, 8192);
-    try std.testing.expectEqual(@as(u8, 0), commit.term.exited);
+    try std.testing.expectEqual(@as(u8, 0), commit.term.?.exited);
 
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = a, .data = "one\ntwo\n" });
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dir ++ "/b.txt", .data = "new\n" });
@@ -1565,4 +1565,64 @@ test "check: a PASSING build with no diagnostics says so, and says nothing scary
     const out = try check_tool.report(arena, &reg, 8);
     try std.testing.expect(std.mem.indexOf(u8, out, "no type errors") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FAILED") == null);
+}
+
+test "bash: output over the cap is CUT and says so, not an error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // ~240 KB, which is fifteen times the 16 KB cap. Before this change every one of
+    // these thirty times over returned `error.StreamTooLong`, which the model reads as
+    // "the tool failed" and answers by rephrasing a request that cannot be rephrased
+    // under 16 KB.
+    const out = try execute(std.testing.io, "bash",
+        \\{"command":"seq 1 40000","timeout_seconds":30}
+    , arena, null, null);
+
+    // The output is there, and the notice is there, and the notice says the command
+    // was STOPPED (it really was: a child that kept writing would block on a pipe
+    // nobody reads).
+    try std.testing.expect(std.mem.indexOf(u8, out, "1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "--- stdout ---") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, bg_tool.foreground_truncation_notice) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "stopped") != null);
+    // And no invented exit code: `128+9` looks like a crash the command caused.
+    try std.testing.expect(std.mem.indexOf(u8, out, "exit=(stopped at the tool's output cap)") != null);
+}
+
+test "bash: output UNDER the cap carries no notice at all" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out = try execute(std.testing.io, "bash",
+        \\{"command":"echo hello","timeout_seconds":10}
+    , arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hello") != null);
+    // A notice on every call is worse than none: the model would learn to ignore it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "output cut") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "exit=0") != null);
+}
+
+test "bash: a command that only prints a LOT does not leave a grandchild behind" {
+    // The kill has to be the process GROUP, not the pid: `/bin/sh -c "a && b"` has
+    // children and killing only the shell leaves the grandchild writing into a pipe
+    // nobody reads. This is the same contract `tools/esc_kill_pty.py` checks for ESC,
+    // and it is the reason the truncation path can return at all instead of hanging.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `yes` never stops on its own, so a truncation that did not kill it would hang
+    // here for the full timeout instead of returning.
+    const t0 = std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds();
+    const out = try execute(std.testing.io, "bash",
+        \\{"command":"yes zode","timeout_seconds":30}
+    , arena, null, null);
+    const elapsed_ms = @as(f64, @floatFromInt(std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds() - t0)) / 1e6;
+
+    try std.testing.expect(std.mem.indexOf(u8, out, bg_tool.foreground_truncation_notice) != null);
+    // Nowhere near the 30 s timeout: the point of the cap is that it returns.
+    try std.testing.expect(elapsed_ms < 5000);
 }

@@ -64,13 +64,69 @@ pub fn toolBashKill(
 /// The timeout is applied on the READ (like `run` does) rather than by killing
 /// the child: a command whose output pipe is full is stuck writing, not stuck
 /// running, and reading with a timeout is the only way to notice that.
+/// What a foreground command produced.
+///
+/// It is NOT `std.process.RunResult` because that type has no room for the one thing
+/// that decides how the output may be presented: whether it is the whole thing.
+pub const Foreground = struct {
+    stdout: []u8,
+    stderr: []u8,
+    /// NULL when we stopped the command ourselves at the cap.
+    ///
+    /// It has to be optional because `Child.kill` REAPS: it waits for the process
+    /// and clears the id, so the `wait` that would have told us the term cannot be
+    /// called after it (`wait` asserts `id != null`, and without the assert it comes
+    /// back as `error.Unexpected` from the vtable). Reporting a made-up exit code
+    /// would be worse than reporting nothing: the model reads `exit=` as the
+    /// command's own verdict, and `128+9` looks like a crash it caused.
+    term: ?std.process.Child.Term,
+    /// The output was longer than the cap, so the child was KILLED at the cap.
+    truncated: bool = false,
+
+    fn deinit(self: Foreground, gpa: std.mem.Allocator) void {
+        gpa.free(self.stdout);
+        gpa.free(self.stderr);
+    }
+};
+
+/// What the model is told when a foreground command was cut short.
+///
+/// It says the command was STOPPED and not merely that the text is short, because
+/// the child really is dead: a foreground command that kept running would block
+/// forever on a pipe nobody is reading. "the output was truncated" alone reads as
+/// "there was more and you could get it", and the model then retries the same thing.
+pub const foreground_truncation_notice =
+    "\\n… (output cut at the tool's cap and the command was stopped; re-run it " ++
+    "through `head` or a narrower scope to get the rest)\\n";
+
+/// Runs a command in the FOREGROUND and returns what it printed.
+///
+/// ## Why over the cap truncates instead of failing
+///
+/// This used to `return error.StreamTooLong` past the limit, with the reasoning that
+/// "a tool result that stops mid-line looks to the model like the output ended". The
+/// reasoning is sound and the consequence was not: `bash` is the tool the model
+/// reaches for whenever a dedicated tool does not exist, and with a 16 KB cap
+/// `cat`, `ls -laR`, `git log`, a `grep -r` through the shell and the output of
+/// `zig build` were all DEAD — the model got an error instead of an answer, and no
+/// amount of rephrasing the request gets under 16 KB.
+///
+/// The concern is real and it is answered the way `bgproc` already answers it for
+/// background jobs: cut at the cap, say so in the text, and record it in a flag
+/// (`truncated`) so the caller decides. The cap RESERVES the length of the notice, or
+/// the notice is exactly what does not fit when it is needed most.
+///
+/// ## The child is killed, and that is not optional
+///
+/// Once we stop reading, a child that keeps writing blocks on a full pipe and
+/// `wait()` never returns: the app hangs instead of returning a partial result.
 pub fn runForeground(
     gpa: std.mem.Allocator,
     io: std.Io,
     command: []const u8,
     timeout_s: u64,
     out_limit: usize,
-) !std.process.RunResult {
+) !Foreground {
     var argv = [_][]const u8{ "/bin/sh", "-c", command };
     var child = try std.process.spawn(io, .{
         .argv = &argv,
@@ -79,6 +135,9 @@ pub fn runForeground(
         .stderr = .pipe,
         .pgid = 0,
     });
+    // The `defer` is the normal exit's kill (the process is done by then). After a
+    // truncation there is nothing left to kill: `child.kill` has already zeroed the
+    // id, and killing a reaped pid is how you kill a stranger.
     defer child.kill(io);
 
     if (child.id) |pid| setForeground(pid);
@@ -94,18 +153,32 @@ pub fn runForeground(
     const stdout_reader = mr.reader(0);
     const stderr_reader = mr.reader(1);
 
+    var truncated = false;
     while (mr.fill(4096, timeout)) |_| {
-        // Same rule as `run`: over the limit is an error, not a silent cut. A tool
-        // result that stops mid-line looks to the model like the output ended.
-        if (stdout_reader.buffered().len > out_limit) return error.StreamTooLong;
-        if (stderr_reader.buffered().len > out_limit) return error.StreamTooLong;
+        if (stdout_reader.buffered().len > out_limit or
+            stderr_reader.buffered().len > out_limit)
+        {
+            truncated = true;
+            break;
+        }
     } else |err| switch (err) {
         error.EndOfStream => {},
         error.Timeout => return error.Timeout,
         else => |e| return e,
     }
 
-    const term = try child.wait(io);
+    var term: ?std.process.Child.Term = null;
+    if (truncated) {
+        // The group, not the pid: `/bin/sh -c "a && b"` has children, and killing only
+        // the shell leaves the grandchild writing into the pipe nobody reads. This is
+        // the same reasoning as `bgproc.killTree`.
+        //
+        // `kill` reaps, so there is no `wait` after it (see `Foreground.term`).
+        if (child.id) |pid| std.posix.kill(-pid, std.posix.SIG.KILL) catch {};
+        child.kill(io);
+    } else {
+        term = try child.wait(io);
+    }
     clearForeground();
 
     const stdout_slice = try mr.toOwnedSlice(0);
@@ -113,7 +186,12 @@ pub fn runForeground(
     const stderr_slice = try mr.toOwnedSlice(1);
     errdefer gpa.free(stderr_slice);
 
-    return .{ .term = term, .stdout = stdout_slice, .stderr = stderr_slice };
+    return .{
+        .stdout = stdout_slice,
+        .stderr = stderr_slice,
+        .term = term,
+        .truncated = truncated,
+    };
 }
 
 /// Foreground command in flight, for ESC to kill. Re-exported from `bgproc`

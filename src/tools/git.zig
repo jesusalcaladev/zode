@@ -44,12 +44,12 @@ pub const diff_limit = 16 * 1024;
 
 /// What we let git produce BEFORE we start cutting.
 ///
-/// Separate from `diff_limit` on purpose. `runForeground` returns
-/// `error.StreamTooLong` when the subprocess writes more than its limit, and
-/// that error used to escape to the model as "the result was longer than the
-/// cap, narrow the request" — which is `describeError`'s generic text for a
-/// `grep`. For a diff it is wrong in a way that matters: the tool's own
-/// description promises a truncated diff with a note, and instead of that it
+/// Separate from `diff_limit` on purpose, and the reason is history. `runForeground`
+/// used to return `error.StreamTooLong` past its limit, and that error escaped to the
+/// model as "the result was longer than the cap, narrow the request" — which is
+/// `describeError`'s generic text for a `grep`. For a diff it is wrong in a way that
+/// matters: the tool's own description promises a truncated diff with a note, and
+/// instead of that it
 /// arrived as an error with no diff at all. So git gets a bigger pipe and this
 /// tool does the cutting, which is the only place that knows what a line of a
 /// diff is.
@@ -88,18 +88,22 @@ pub fn toolGitStatus(io: std.Io, arena: std.mem.Allocator) ![]const u8 {
     try out.appendSlice(arena, "git status (XY = staged/worktree, ?? = untracked):\n");
     try out.appendSlice(arena, r.stdout);
     if (r.stdout.len > 0 and r.stdout[r.stdout.len - 1] != '\n') try out.append(arena, '\n');
+    // A working tree with thousands of entries does not fit, and a status that stops
+    // mid-list is worse than no status: the model reads it as the whole picture and
+    // concludes it knows every file that changed.
+    if (r.truncated) try out.appendSlice(arena, bg_tool.foreground_truncation_notice);
 
     // `git status` says nothing about SIZE, and "3 files changed" versus "300
     // files changed" is the difference between a review and a `git reset`. It is
     // one more subprocess and it is what tells the model whether it is looking at
     // its own change or at someone else's.
     const s = try bg_tool.runForeground(arena, io, "git diff --shortstat", 10, 4096);
-    if (s.term.exited == 0 and s.stdout.len > 0) {
+    if (s.term != null and s.term.?.exited == 0 and s.stdout.len > 0) {
         try out.appendSlice(arena, "\nunstaged: ");
         try out.appendSlice(arena, std.mem.trim(u8, s.stdout, " \t\r\n"));
     }
     const st = try bg_tool.runForeground(arena, io, "git diff --cached --shortstat", 10, 4096);
-    if (st.term.exited == 0 and st.stdout.len > 0) {
+    if (st.term != null and st.term.?.exited == 0 and st.stdout.len > 0) {
         try out.appendSlice(arena, "staged: ");
         try out.appendSlice(arena, std.mem.trim(u8, st.stdout, " \t\r\n"));
     }
@@ -119,13 +123,12 @@ pub fn toolGitDiff(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator
     else
         "git diff --no-color -U3";
 
-    const r = bg_tool.runForeground(arena, io, cmd, 20, diff_capture) catch |err| switch (err) {
-        // Even the wide pipe was not enough (a diff over 256 KB). Say it in this
-        // tool's voice, because "narrow the request" does not tell the model
-        // that a single file would fit where the whole tree does not.
-        error.StreamTooLong => return "the diff is bigger than 256 KB, which is more than this tool captures. Use `bash` with `git diff --stat` to see which files are in it, then `git diff -- <path>` for the one you need.",
-        else => |e| return e,
-    };
+    // `runForeground` no longer fails past its cap: it truncates and sets
+    // `truncated`. This tool's own cut is at `diff_limit`, which is the SMALLER of
+    // the two, so the `r.stdout.len > diff_limit` branch below handles both — and the
+    // arm for `error.StreamTooLong` that used to be here is now unreachable, which is
+    // how a message stops being true without anybody noticing.
+    const r = try bg_tool.runForeground(arena, io, cmd, 20, diff_capture);
     if (isNotARepo(r)) return notARepo();
     if (r.stdout.len == 0) {
         return if (common.getBool(obj, "staged"))
@@ -231,11 +234,18 @@ pub fn toolGitLog(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator)
     const r = try bg_tool.runForeground(arena, io, w.buffered(), 15, diff_limit);
     if (isNotARepo(r)) return notARepo();
     if (r.stdout.len == 0) return "no commits yet: this repository has no history.";
-    return r.stdout;
+    // A history longer than the cap is NORMAL and there is more of it, so the cut
+    // has to say so. Without the notice `git_log` on a busy repository looks like a
+    // complete answer and the model concludes the repository has 16 KB of history.
+    if (!r.truncated) return r.stdout;
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ r.stdout, bg_tool.foreground_truncation_notice }) catch r.stdout;
 }
 
-fn isNotARepo(r: std.process.RunResult) bool {
-    if (r.term.exited == 0) return false;
+fn isNotARepo(r: bg_tool.Foreground) bool {
+    // We stopped it at the cap: no verdict, and in particular not the 128 that would
+    // say "not a repository". The caller's own `truncated` branch says what happened.
+    const t = r.term orelse return false;
+    if (t.exited == 0) return false;
     return std.mem.indexOf(u8, r.stderr, "not a git repository") != null;
 }
 

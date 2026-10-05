@@ -60,15 +60,22 @@ pub fn toolBash(
     const result = try bg_tool.runForeground(arena, io, command, timeout_s, common.max_tool_output);
 
     var out: std.ArrayList(u8) = .empty;
-    const exit_code: u8 = switch (result.term) {
+    // Null means WE stopped it at the cap, so there is no exit code to report and
+    // inventing one (`255`, or a synthetic signal) would read to the model as the
+    // command's own verdict. The notice at the end says what happened instead.
+    const exit_line: ?u8 = if (result.term) |t| switch (t) {
         .exited => |code| code,
         .signal => |sig| blk: {
             out.print(arena, "(signal {d}) ", .{sig}) catch {};
             break :blk @as(u8, @truncate(128 + @intFromEnum(sig)));
         },
         else => 255,
-    };
-    try out.print(arena, "exit={d}\n", .{exit_code});
+    } else null;
+    if (exit_line) |code| {
+        try out.print(arena, "exit={d}\n", .{code});
+    } else {
+        try out.appendSlice(arena, "exit=(stopped at the tool's output cap)\n");
+    }
     if (result.stdout.len > 0) {
         try out.appendSlice(arena, "--- stdout ---\n");
         try out.appendSlice(arena, result.stdout[0..@min(result.stdout.len, common.max_tool_output)]);
@@ -79,6 +86,11 @@ pub fn toolBash(
         try out.appendSlice(arena, result.stderr[0..@min(result.stderr.len, common.max_tool_output)]);
         try out.appendSlice(arena, "\n");
     }
+    // The notice, and it is the LAST thing: anything after it reads as part of the
+    // output. A silent cut is the failure this replaces — with one, the model can
+    // tell "that was everything" from "that was the first 16 KB", which is the whole
+    // difference between rephrasing the request and repeating it.
+    if (result.truncated) try out.appendSlice(arena, bg_tool.foreground_truncation_notice);
     return out.items;
 }
 

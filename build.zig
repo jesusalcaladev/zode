@@ -135,6 +135,18 @@ pub fn build(b: *std.Build) void {
     const check_probe_step = b.step("check-probe", "Runs the automatic typecheck against a project with a deliberate error");
     check_probe_step.dependOn(&check_probe_run.step);
 
+    const shell_mod = b.createModule(.{
+        .root_source_file = b.path("src/shell_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    shell_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const shell_probe = b.addExecutable(.{ .name = "shell_probe", .root_module = shell_mod });
+    const shell_probe_run = b.addRunArtifact(shell_probe);
+    if (b.args) |args| shell_probe_run.addArgs(args);
+    const shell_probe_step = b.step("shell-probe", "Measures what a bash tool call costs in the harness, against the child alone");
+    shell_probe_step.dependOn(&shell_probe_run.step);
+
     const roster_mod = b.createModule(.{
         .root_source_file = b.path("src/roster_probe.zig"),
         .target = target,
