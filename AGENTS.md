@@ -2649,3 +2649,171 @@ tells `█████╗` from `███████╗`.
 
 515 tests, `zig build tool-test` **works** (it had not compiled for a long time),
 the pty smoke and scroll_repro green.
+
+---
+
+# Ultrafast, minus the OpenAI part (2026-10-05)
+
+Six commits. Everything measured in a pty or in a probe that measures the floor in the
+SAME process, because "faster" without a number is a wish.
+
+## Where the 1 second was, and where it was not
+
+`ZODE_DBG_BOOT=1` prints the startup breakdown to stderr. The probe lives in
+`agent.zig` and not `main.zig` because `tui` has to reach it from the draw function.
+It keeps its OWN `Io` and its OWN t0 rather than the agent globals: the first mark sits
+inside `vxfw.App.init`, BEFORE `environ_global` and `gpa_global` are assigned, and a
+probe reading a global that is still `undefined` prints nothing at all — which is
+indistinguishable from "the marks do not fire" and cost a round trip.
+
+    vxfw.App.init             0.95 ms
+    initProjectInfo           1.46 ms
+    loadUserConfig            1.51 ms
+    bootstrapSession          1.52 ms
+    initFreeAutoFromEnv       1.55 ms
+    app.run start             1.55 ms
+    first frame drawn      1005.91 ms
+
+ALL of our startup is 1.55 ms. The other 1004 ms is inside `vxfw.App.run`: vaxis calls
+`vx.queryTerminal(tty.writer(), .fromSeconds(1))` with a hardcoded second, and the wait
+ends ONLY on a DA1 reply (`Loop.zig` wakes the futex in the `.cap_da1` branch and
+nowhere else).
+
+`ZODE_TERM_QUERY_MS` (default 250, 0 to leave vaxis alone) bounds it with a thread that
+calls `std.Io.futexWake(vx.io, &vx.query_futex, 1)` — the same call vaxis makes when a
+DA1 arrives, only on a timer.
+
+    terminal answers, cap on        17.65 ms
+    terminal silent,   cap on      273.25 ms
+    terminal silent,   cap off    1016.42 ms
+
+Three traps in that work, all of them reusable:
+
+- **A plain `query_futex.store(1)` does NOT wake the wait.** It changes the value the
+  waiter compares against and the full second still runs, because `futexWait` goes
+  through the `Io` vtable, which keeps its own waiter bookkeeping. Only `futexWake`
+  unblocks it.
+- **The mark belongs in OUR `drawFn`.** It started after `app.run`, which measures when
+  the user QUIT — and it printed "first paint" on a line whose number was the length of
+  the session.
+- **The probe's stderr must not share the pty.** The marker arrives in the middle of
+  vaxis's redraw, so an anchor on the start of a line finds nothing while the marks are
+  firing.
+
+`tools/pty_smoke.py` takes the SAME 1m31s with the cap on and off: its wall time is its
+own `drain()` budgets. The cap's benefit is the user's blank screen, not that suite.
+
+## Exit: `quitFast`
+
+    idle                      0.018 s  ->  0.018 s
+    with a turn in flight     0.767 s  ->  0.048 s
+    with a background job     1.470 s  ->  0.042 s
+
+Two costs: `waitWorkers(2000)` counts SPINS (`budget_ms * 200` yields), and
+`bgproc.deinit` had a hardcoded `killAll(..., 1000)`.
+
+`std.process.exit` skips every defer, so nothing is freed while a worker might still be
+inside `io.async` — the segfault the wait was added for. Only three things still have to
+happen: children die, `chat.cancel_current` is set (the SSE loop polls it), and the
+session's last append is on disk. A half-written last line costs ONE append: the loader
+already skips what it cannot parse.
+
+**The half that is easy to forget is the FOREGROUND child.** A `bash` without
+`run_in_background` keeps its pid in the foreground slot, not in the job registry, so
+`killAll` walks past it. Measured: a `sleep` survived ctrl+c, 0.05 s after the exit.
+`tools/esc_kill_pty.py` now has a second case for this.
+
+In that script: `BINARY` is absolute from the start, because one case `chdir`s before
+`execv` and a relative path made the child die with FileNotFoundError — which the "the
+grandchild never started" SKIP swallowed into a green test.
+
+## `bash` over the cap was DEAD
+
+`runForeground` returned `error.StreamTooLong` past 16 KB, with a comment saying why:
+"a tool result that stops mid-line looks to the model like the output ended". Sound
+reasoning, and the consequence was that `cat`, `ls -laR`, `git log`, a `grep -r`
+through the shell and the output of `zig build` all returned an ERROR. No rephrasing
+gets a file under 16 KB.
+
+Now it truncates and says so, which is what `bgproc` has always done for background
+jobs. `Foreground.term` is OPTIONAL because `Child.kill` REAPS: it waits and clears the
+id, so the `wait` that would report the term cannot follow it (`wait` asserts
+`id != null`; without the assert it comes back as `error.Unexpected`). So `bash` prints
+`exit=(stopped at the tool's output cap)` instead of inventing `128+9`, which reads to
+the model as a crash it caused. A test runs `yes` and asserts the call returns in under
+5 s with a 30 s timeout: that is what proves the child died.
+
+## `zig build shell-probe`: there is nothing to win on a shell call
+
+    case                                child    through OUR overhead
+    no output                          3.40ms     3.46ms      +0.06ms
+    8 KB of output                     4.62ms     4.83ms      +0.21ms
+    512 KB of output (truncated)       5.33ms     4.99ms      -0.35ms
+
+Our overhead is under a third of a millisecond and NEGATIVE in one case, which is what
+noise looks like. A `bash` call costs what `/bin/sh` costs. A probe that reported "8x
+faster shell calls" for this code would be measuring something other than zode.
+
+The probe's loops are INTERLEAVED on purpose: measuring the floor for 30 rounds and
+then the tool for 30 charged all the process-creation warmup to the first one and came
+out as our overhead being negative (18.5 ms through the tool against a 20.7 ms "floor").
+A number below the floor is not a result, it is a warmup.
+
+## Compactación configurable
+
+`ZODE_COMPACT=off|elide|full`, `ZODE_COMPACT_PCT=10..95`, `/compact [off|elide|full|default]`.
+
+`elide` exists because tier 1 replaces OLD tool results with a marker and costs nothing
+(no request, no tokens, and the session file still has everything) while tier 2 spends a
+request and can drop a detail. The percentage is clamped because 0% fires the summary on
+EVERY turn and 100% never compacts until the provider 400s. An unknown value means
+`full`, never `off`: a typo must not disable compaction.
+
+`elideTier` takes the mode as a PARAMETER instead of reading the environment, because
+with three definitions of "what compaction does" (the env, a `/compact` override, the
+caller's assumption) every one of them drifts — and `main.zig`'s headless runner WAS a
+third definition, ignoring `off` entirely.
+
+`describe` takes a Mode and not the environment, because `/compact off` came to answer
+"elide, then summarize": the command described the env while the override was what it
+had just set.
+
+## Seguridad
+
+**Las sesiones eran legibles por todos.** `-rw-r--r-- sessions/*.jsonl`, con todo lo que
+leíste, la salida de los comandos y lo que pegaste. Ahora `drwx------` y `-rw-------`,
+con el modo puesto SOBRE EL FICHERO ABIERTO (no `create` + `chmod`, que deja una ventana
+en la que existe a 0644) y otra vez al reanudar, porque un resume trunca y recrea.
+`auth.json` ya usaba 0600: el principio estaba en el repo y este fichero quedó fuera.
+
+**`web_fetch` podía llegar al servicio de metadatos.** `web_fetch` NO pide permiso y
+`bash` sí, así que es una cuestión de permisos y no de sandbox: un modelo siempre puede
+llegar con `curl` por `bash`, detrás de un diálogo. Ahora se rechazan
+`169.254.0.0/16` (AWS, GCP, Azure y DigitalOcean sirven ahí las credenciales de
+instancia), `metadata.google.internal` y `fd00:ec2::254`. Loopback y rangos privados son
+otro predicado y otro interruptor, porque fetchear tu propio servidor de desarrollo es
+algo normal y una regla que lo rompiera se desactivaría entera, llevándose el bloqueo de
+metadatos con ella.
+
+Un bug lo cazó mi propio test: el primer blocklist comparaba las dos primeras ETIQUETAS
+punteadas, así que `169.254.169.254.example.com` —un host público— quedaba bloqueado.
+Leer etiquetas iniciales no es leer octetos; ahora hay un parseo IPv4 de verdad.
+
+Verificado E2E: el modelo recibe el refusal y **se niega** a poner
+`ZODE_WEB_ALLOW_LOCAL=1` para saltárselo, ofreciéndolo sólo como instrucción explícita.
+
+## Un check que afirmaba algo que sólo era cierto por suerte
+
+`router_smoke` decía que el aviso no decía cómo apagar el router, con el aviso en
+pantalla. Tres cosas en medio, las tres la app funcionando bien: el stripper no conocía
+los dos puntos de `[38:2:74:81:112m`; el GUTTER de párrafo (`│`) va en cada fila de
+continuación; y dónde cae el wrap depende del CATÁLOGO EN VIVO, porque el aviso empieza
+con un id de modelo. Ahora busca en una copia con el gutter y los espacios ELIMINADOS
+(eliminados, no sustituidos por un espacio: el wrap cae DENTRO del token, y
+`ZODE_CHE AP_TURN=0` tampoco contiene `ZODE_CHEAP_TURN=0`).
+
+## Lo que sigue flaky
+
+`tools.web.test.web_search for real` falla de vez en cuando contra DuckDuckGo. Es un test
+de RED, no tiene que ver con nada de esto, y pasa al re-ejecutarlo. Está porque el
+endpoint es un scrape.
