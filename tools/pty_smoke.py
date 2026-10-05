@@ -26,7 +26,10 @@ import re
 import select
 import struct
 import sys
+import shutil
+import subprocess
 import termios
+import time
 import time
 
 ROWS, COLS = 50, 200
@@ -108,8 +111,35 @@ def check(name: str, ok: bool, text: str) -> bool:
     return ok
 
 
+def copy_key_into_sandbox() -> str:
+    """Puts the saved provider key in the sandbox HOME, if there is one.
+
+    The rule this follows is the one every pty script here follows: an automated
+    script must not touch the real config of whoever runs it, so the file is COPIED
+    into `/tmp` and never written to. The copy is what makes the model-dependent
+    checks able to run at all — without it a `bash` the model was asked to start
+    never starts, and the check for "ctrl+c orphans nothing" has nothing to look at
+    and skips every time.
+
+    `ram_probe.py` has always done this. `pty_smoke.py` did not, which is why it
+    could not test anything that needs the model.
+    """
+    real = os.path.expanduser("~/.config/zode/auth.json")
+    if not os.path.exists(real):
+        return ""
+    dst_dir = os.path.join(SANDBOX_HOME, ".config", "zode")
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, "auth.json")
+    shutil.copyfile(real, dst)
+    os.chmod(dst, 0o600)
+    return "auth.json copied into the sandbox"
+
+
 def main() -> int:
     os.makedirs(SANDBOX_HOME, exist_ok=True)
+    note = copy_key_into_sandbox()
+    if note:
+        print(f"smoke: {note}")
 
     # 1) Startup: banner, input box, status bar, and nothing falls over.
     out, t = drive([b"hola mundo", b"\r"])

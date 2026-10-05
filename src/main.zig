@@ -456,12 +456,19 @@ fn runTui(init: std.process.Init) !u8 {
 
     try app.run(model.widget(), .{});
 
-    // Workers are spawned with `detach`: nobody joins them. They must be waited for
-    // before the `defer`s run (they destroy the model, the app and the `Io`), or
-    // a worker still inside `io.async` uses freed memory and the app dies with a
-    // segfault on exit.
-    model.waitWorkers(2000);
-    return 0;
+    // Out through `quitFast`, not through the defers.
+    //
+    // Workers are spawned with `detach`, so nobody joins them, and waiting for them
+    // before the defers run was what kept a worker inside `io.async` from touching
+    // freed memory. But it cost 767 ms with a turn in flight and 1.47 s with a
+    // background job, because `waitWorkers` counts spins rather than milliseconds.
+    //
+    // `quitFast` gets the same safety without the wait: it kills the children, asks
+    // the workers to stop, writes the session's last append, and then EXITS without
+    // running a single defer — so nothing is freed and there is nothing for a late
+    // worker to touch. Measured 18 ms idle, and the numbers for the busy cases are in
+    // its own doc comment.
+    agent.quitFast(&model, io);
 }
 
 pub fn main(init: std.process.Init) !u8 {

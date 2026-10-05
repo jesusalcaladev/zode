@@ -4825,6 +4825,73 @@ pub const AutoCheck = struct {
 /// Does a writing tool in this batch touch a file whose contents a compiler
 /// would care about?
 ///
+/// Leaves the process fast, on purpose, and what it gives up is measured.
+///
+/// ## The numbers it replaces
+///
+/// Measured 2026-10-05 in a pty, ctrl+c to process gone:
+///
+///     idle                      0.018 s
+///     with a turn in flight     0.767 s
+///     with a background job     1.470 s
+///
+/// Two things cost all of it. `waitWorkers(2000)` counts SPINS, not milliseconds —
+/// `budget_ms * 200` yields — so "2000" was up to 400 000 yields. And
+/// `bgproc.deinit` had a hardcoded `killAll(..., 1000)` budget behind it.
+///
+/// ## The three things that still have to happen
+///
+/// 1. **Children die.** A `sleep 60` left running after the terminal closes is a
+///    process on somebody's machine with nobody watching it.
+/// 2. **Workers are asked to stop.** `chat.cancel_current` is what the SSE loop
+///    polls, so a request in flight aborts at the next chunk instead of being
+///    waited out.
+/// 3. **The session's last append is on disk.** One `writeAll`.
+///
+/// ## And what does not have to happen
+///
+/// Destroying the model, the app and the `Io` — which is what the `defer`s do, and
+/// which is what the worker wait was protecting: a worker still inside `io.async`
+/// after `app.deinit` used freed memory and killed the process with a segfault.
+///
+/// `std.process.exit` skips every defer, so nothing is freed at all and there is
+/// nothing for a late worker to touch. A process that is exiting does not need its
+/// heap.
+///
+/// ## The one risk, and why it is a risk worth taking
+///
+/// A worker mid-append can leave half a line. The session loader already skips what
+/// it cannot parse (`parseLine(...) catch continue`), so the worst case is losing
+/// that one append — not a corrupt file and not the conversation. Losing the last
+/// line of a session the user just cancelled is the right trade against making every
+/// exit cost a second.
+pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
+    // 1. Children first, so nothing is orphaned even if the rest is cut short.
+    //
+    // The FOREGROUND one is the easy half to forget, and forgetting it orphans a
+    // process: a `bash` that did not get `run_in_background` has its pid in the
+    // foreground slot, not in the job registry, so `killAll` walks past it. ESC kills
+    // that slot (see `bgproc.killForeground`) and quitting did not, which is only
+    // visible when you quit while a foreground command is still running.
+    //
+    // Measured: a `sleep 331` started by a `bash` that the model ran in the
+    // foreground survived ctrl+c with `killAll` alone, 0.05 s after the exit.
+    _ = killForeground();
+    _ = bgproc.requestKillAll(&m.bg);
+    bgproc.killAll(&m.bg, io, 120);
+
+    // 2. Workers: ask, then a SHORT wait. 60 ms is not arbitrary either — it is
+    // long enough for a worker that is between operations to notice and leave, and
+    // short enough that the common case (idle, nothing running) costs nothing at all.
+    chat.cancel_current.store(true, .seq_cst);
+    m.waitWorkers(60);
+
+    // 3. The session. One write, and it is the only reason any of this exists.
+    if (session) |s| s.flush();
+
+    std.process.exit(0);
+}
+
 /// How many automatic checks one turn may start.
 ///
 /// 2, not 1: the shape of a task is "edit, read the errors, fix, edit, read the
