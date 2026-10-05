@@ -1,4 +1,6 @@
 const std = @import("std");
+const sleepz = @import("lib/sleep.zig");
+const vaxis = @import("vaxis");
 const builtin = @import("builtin");
 const tui = @import("tui.zig");
 const providers = @import("lib/providers.zig");
@@ -4906,6 +4908,111 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
     if (session) |s| s.flush();
 
     std.process.exit(0);
+}
+
+/// Starts the startup probe: reads `ZODE_DBG_BOOT` and takes t0.
+///
+/// It has to be called BEFORE anything is measured, which in `runTui` is the very
+/// first thing: the first mark sits inside `vxfw.App.init`, before `bootMark` would
+/// otherwise have an `Io` to read a clock from.
+pub fn bootStart(io: std.Io, env: ?*const std.process.Environ.Map) void {
+    boot_io = io;
+    boot_t0 = bootNowMs(io);
+    boot_dbg = blk: {
+        const v = if (env) |m| m.get("ZODE_DBG_BOOT") orelse "" else "";
+        break :blk v.len > 0 and !std.mem.eql(u8, v, "0");
+    };
+}
+
+var boot_dbg = false;
+var boot_io: ?std.Io = null;
+var boot_t0: f64 = 0;
+
+fn bootNowMs(io: std.Io) f64 {
+    const ns = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
+pub fn bootMark(label: []const u8) void {
+    if (!boot_dbg) return;
+    const io = boot_io orelse return;
+    var buf: [192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("[boot] {s: <22} {d:>7.2} ms\n", .{ label, bootNowMs(io) - boot_t0 }) catch return;
+    // A SECOND buffer for the file: the writer takes one and the formatter above
+    // writes into the same one, so sharing it prints the writer's idea of a buffer
+    // header over the line.
+    var fbuf: [256]u8 = undefined;
+    var f = std.Io.File.stderr().writerStreaming(io, &fbuf);
+    f.interface.writeAll(w.buffered()) catch {};
+    // The `flush` is not optional: `writeAll` on a `File.Writer` appends to ITS
+    // buffer, and a probe that measures startup and never flushed printed nothing at
+    // all — which is indistinguishable from the marks not firing, and cost a round
+    // trip to tell apart.
+    f.interface.flush() catch {};
+}
+
+/// How long the terminal gets to answer vaxis's capability query.
+///
+/// vaxis hardcodes one second (`vx.queryTerminal(tty.writer(), .fromSeconds(1))` in
+/// `vxfw/App.zig`) and the wait ends ONLY on a `DA1` reply — nothing else wakes it.
+/// Measured with `ZODE_DBG_BOOT=1` in a pty that does not answer: 1.55 ms of our own
+/// startup and 1004 ms inside `App.run`, which is this wait, not our work.
+///
+/// A terminal that speaks `DA1` replies in single-digit milliseconds (it answers the
+/// instant it reads the query), so the second is only ever paid by a terminal that is
+/// not going to answer: `dumb`, some `screen`/container setups, and every pty harness
+/// in this repo. 250 ms is generous for any real terminal and bounds the pathological
+/// case, and losing the answers only leaves vaxis on its defaults, which is the path
+/// it already takes for a terminal without those capabilities.
+pub const term_query_ms: u64 = 250;
+
+/// The thread that caps the query wait, and the `App` it points into.
+///
+/// A global and not a field of the Model because the thing it has to outlive is
+/// `App.run` itself, which no Model is passed to. It is joined by
+/// `stopTermQueryCap`, registered as a defer AFTER `defer app.deinit()` so it runs
+/// BEFORE it: the error path of `App.run` returns and deinits the App while this
+/// thread could still be counting, and that would be a write into freed memory.
+///
+/// The normal exit does not go through that path — `quitFast` is `noreturn` and skips
+/// every defer, so on ctrl+c nothing is freed and the thread's store lands in memory
+/// that is still mapped. That is the same trade `quitFast` makes on purpose.
+var cap_thread: ?std.Thread = null;
+
+fn capTermQuery(vx: *vaxis.Vaxis, ms: u64) void {
+    // In slices, not one nap: the whole point of the thread is to be interruptible,
+    // and a single `nap(ms)` could not be.
+    var waited: u64 = 0;
+    while (waited < ms) : (waited += 10) {
+        sleepz.nap(@min(10, ms - waited));
+    }
+    // `futexWake` and NOT a plain `query_futex.store(1)`: a raw store changed the
+    // value the waiter is comparing against and the wait still ran the full second,
+    // because `futexWait` goes through the `Io` vtable, which keeps its own waiter
+    // bookkeeping. This is the same call vaxis makes when a `DA1` arrives
+    // (`Loop.zig`, on `.cap_da1`) — only on a timer instead of on a reply.
+    std.Io.futexWake(vx.io, std.atomic.Value(u32), &vx.query_futex, 1);
+}
+
+/// `ZODE_TERM_QUERY_MS`: 0 means "do not touch it" (vaxis's own one second).
+pub fn termQueryCapMs(env: ?*const std.process.Environ.Map) u64 {
+    const m = env orelse return term_query_ms;
+    const s = m.get("ZODE_TERM_QUERY_MS") orelse return term_query_ms;
+    return std.fmt.parseInt(u64, s, 10) catch term_query_ms;
+}
+
+pub fn startTermQueryCap(vx: *vaxis.Vaxis, env: ?*const std.process.Environ.Map) void {
+    const ms = termQueryCapMs(env);
+    if (ms == 0) return;
+    cap_thread = std.Thread.spawn(.{}, capTermQuery, .{ vx, ms }) catch return;
+}
+
+/// Joins the cap thread. Must run before the `App` it points into is destroyed.
+pub fn stopTermQueryCap() void {
+    const t = cap_thread orelse return;
+    cap_thread = null;
+    t.join();
 }
 
 /// How many automatic checks one turn may start.

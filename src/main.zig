@@ -412,9 +412,24 @@ fn execHeadless(
 }
 
 /// TUI mode: zode (no args)
+/// Startup breakdown, printed to stderr when `ZODE_DBG_BOOT` is set.
+///
+/// It exists because "the launch takes 56 ms" does not say WHICH 56 ms, and the two
+/// halves behave completely differently: the work in this function is ours and can be
+/// moved, while `vxfw.App.run`'s terminal query is inside vaxis and cannot be touched
+/// from here (ROADMAP patch 5.9 — patching the dependency cache is worse than no
+/// patch). Without the split, a regression in our startup and a terminal that takes a
+/// second to answer look identical on screen.
+///
+/// **Its own state, not the agent's globals.** The first mark is inside `runTui`
+/// BEFORE `agent.environ_global` and `agent.gpa_global` are assigned, and a probe
+/// that reads a global that is still `undefined` does not print nothing: it prints
+/// garbage or jumps through a null vtable. The first version did exactly that and
+/// showed nothing at all, which is indistinguishable from "the marks do not fire".
 fn runTui(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
+    agent.bootStart(io, init.environ_map);
 
     // 64 KiB instead of 1 MB (5.4 of the ROADMAP): the TTY buffer is PERMANENT
     // memory (it lives for the whole process) and 1 MB is paid for 99% of the
@@ -424,6 +439,12 @@ fn runTui(init: std.process.Init) !u8 {
 
     var app = try vxfw.App.init(io, gpa, init.environ_map, tty_buffer);
     defer app.deinit();
+    // Registered AFTER `defer app.deinit()` so it runs BEFORE it: the thread writes
+    // into `app.vx`, and the error path of `App.run` frees the App while it might
+    // still be counting.
+    agent.startTermQueryCap(&app.vx, init.environ_map);
+    defer agent.stopTermQueryCap();
+    agent.bootMark("vxfw.App.init");
 
     var model = tui.Model.init(gpa);
     defer model.deinit();
@@ -442,6 +463,7 @@ fn runTui(init: std.process.Init) !u8 {
     // Before `bootstrapSession` and before anything composes a prompt: the AGENTS.md
     // and the skills roots are both derived from it.
     agent.initProjectInfo(io, init.environ_map);
+    agent.bootMark("initProjectInfo");
     free_auto.attachIo(io);
     chat.io_global = io;
     chat.dbgInitEnv(init.environ_map);
@@ -449,7 +471,9 @@ fn runTui(init: std.process.Init) !u8 {
     defer agent.shutdownUserConfig();
     defer agent.shutdownBuffers(); // the 1 MiB body buffer (see `bodyBuf`)
     agent.loadUserConfig();
+    agent.bootMark("loadUserConfig");
     agent.bootstrapSession(&model);
+    agent.bootMark("bootstrapSession");
 
     // Welcome header: just the wordmark, in the `.banner` Kind (brand blue)
     // instead of `.info` (grey).
@@ -460,8 +484,10 @@ fn runTui(init: std.process.Init) !u8 {
     // it as soon as it is there. It runs AFTER `loadUserConfig`, because without
     // the user's config the pool would not see their providers.
     agent.initFreeAutoFromEnv(&model);
+    agent.bootMark("initFreeAutoFromEnv");
     agent.initCheapRouterFromEnv(model.environ);
 
+    agent.bootMark("app.run start");
     try app.run(model.widget(), .{});
 
     // Out through `quitFast`, not through the defers.

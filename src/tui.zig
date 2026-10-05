@@ -843,6 +843,8 @@ pub const Model = struct {
     /// session does — so there is exactly one answer to "what is compaction doing"
     /// and it is `compaction.effectiveMode`, not this field on its own.
     compact_mode: ?compaction.Mode = null,
+    /// Set after the first frame so the startup probe can mark it once.
+    boot_painted: bool = false,
 
     pub const PermAnswer = enum { none, allow, allow_always, deny };
 
@@ -4210,8 +4212,26 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
 }
 
 // ── drawing helpers ────────────────────────────────────────
+/// Called on the FIRST frame only, from `tui`, when `ZODE_DBG_BOOT` is set.
+///
+/// The first `drawFn` IS the first paint: it is the first thing of ours that runs
+/// after vaxis has queried the terminal, so it is the moment the user sees a window
+/// with something in it. Measuring after `app.run` instead — which is where this
+/// mark started — measures when the user QUIT, and it printed "first paint" on a
+/// line whose number was the length of the session.
+fn firstPaintMark() void {
+    const env = agent.environ_global orelse return;
+    const on = env.get("ZODE_DBG_BOOT") orelse return;
+    if (on.len == 0 or std.mem.eql(u8, on, "0")) return;
+    agent.bootMark("first frame drawn");
+}
+
 fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     const self: *Model = @ptrCast(@alignCast(ud));
+    if (!self.boot_painted) {
+        self.boot_painted = true;
+        firstPaintMark();
+    }
 
     const width: u16 = @intCast(ctx.max.width orelse ctx.min.width);
     const height: u16 = @intCast(ctx.max.height orelse ctx.min.height);
