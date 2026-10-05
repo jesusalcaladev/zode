@@ -149,12 +149,16 @@ pub const tool_routing_prompt =
     \\ - A skill exists for something non-obvious and you have been told about it:
     \\   load it with `skill` before improvising. The body is not in your context
     \\   on purpose — that is the whole point of loading it on demand.
-    \\ - If a task has more than about two steps, write the plan with `todo` so
-    \\   the user can see what is left. Send the WHOLE list once with `items`, and
-    \\   afterwards change single steps with `update` ({index, status}), `remove`
-    \\   or `add` — indexes are 1-BASED. Mark a step done as it happens: resending
-    \\   a twelve-step list to change one entry is a chance to lose a step, and the
-    \\   user is reading that list to know where you are.
+    \\ - When you FINISH a step and another one is still open, say so with `todo`.
+    \\   That is the moment it is worth a call: the user is waiting and reading
+    \\   your last line is how they know whether you are still working or stuck.
+    \\   Send the whole list once with `items` to lay it out, then change single
+    \\   steps with `update` ({index, status}) — indexes are 1-BASED — or `remove`
+    \\   and `add`. Do not rewrite the list to change one entry: resending twelve
+    \\   steps to mark one done is a chance to lose a step, and the user is
+    \\   reading that list to know where you are.
+    \\   Do NOT use it for a single obvious step, or to think out loud: a list
+    \\   that does not change as you work is noise.
     \\ - If the request is ambiguous in a way that changes what you build, use
     \\   ask instead of guessing.
     \\
