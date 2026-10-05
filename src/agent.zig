@@ -2813,10 +2813,22 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
                     pick = active_pick;
                     used_cheap = false;
                     setAnswering(pick.model);
+                    // The REASON is in the sentence, and it is not decoration: a
+                    // model id the provider does not know is fixed by fixing the
+                    // name, and a gated one is fixed by picking another model.
+                    // Saying "not available on this account" about a typo sends
+                    // somebody to /model for a problem /model cannot see.
+                    const w = router_mod.why(err, chat.lastErrorBody());
                     pushInfoFmt(
                         m,
-                        "{s} is not available on this account, so this turn went to {s}. It will not be tried again this session; {s}=0 turns the cheap router off.",
-                        .{ cheap_router.cheap_model, pick.model, router_mod.cheap_env },
+                        "{s} {s} {s}. It will not be tried again this session — {s}. {s}=0 turns the cheap router off.",
+                        .{
+                            cheap_router.cheap_model,
+                            router_mod.phrase(w),
+                            pick.model,
+                            router_mod.remedy(w),
+                            router_mod.cheap_env,
+                        },
                     );
                     continue;
                 }

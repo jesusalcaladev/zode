@@ -147,28 +147,146 @@ pub fn onFailure(st: *State, err: anyerror, detail: []const u8, active_model: []
     return !(active_model.len > 0 and std.mem.eql(u8, st.cheap_model, active_model));
 }
 
+/// Why the cheap model was given up on, in words the user can act on.
+///
+/// It exists because the message it feeds said "not available on this account"
+/// for BOTH failures, and that is wrong for one of them: a model id the provider
+/// does not know is fixed by fixing the name, while a gated model is fixed by
+/// picking a different one. Sending somebody to `/model` because of a typo is the
+/// kind of message that teaches people to ignore messages.
+pub const Why = enum {
+    /// 403: the provider will not serve it here. Pick another model.
+    gated,
+    /// 404: the provider does not know this id. Fix the name.
+    unknown_model,
+};
+
+/// The reason, which needs the body as well as the error for the two cases whose
+/// status does not say it: a 400 and a 5xx arrive for "no such model" as often as
+/// for a malformed request, and the difference is only in the text.
+pub fn why(err: anyerror, detail: []const u8) Why {
+    return switch (err) {
+        error.ModelNotFound => .unknown_model,
+        error.BadRequest, error.ServerError => if (namesTheModel(detail)) .unknown_model else .gated,
+        else => .gated,
+    };
+}
+
+/// The sentence, without the names: the caller formats it, so the wording lives in
+/// ONE place and the two model names are substituted where they are known.
+pub fn phrase(w: Why) []const u8 {
+    return switch (w) {
+        .gated => "is not available on this account, so this turn went to",
+        .unknown_model => "is a model this provider does not know, so this turn went to",
+    };
+}
+
+/// What to do about it, and the two need DIFFERENT actions: a gated model is fixed
+/// by picking another one, and a name the provider does not know is fixed by
+/// fixing the name. Sending somebody to `/model` because of a typo is the kind of
+/// message that teaches people to ignore messages.
+pub fn remedy(w: Why) []const u8 {
+    return switch (w) {
+        .gated => "pick another model with /model",
+        .unknown_model => "check the name, or pick one from /model",
+    };
+}
+
 /// Whether THIS error means the model is unusable, as opposed to the account.
 ///
-/// `_detail` is the server's body and it is DELIBERATELY not read, which is the
-/// whole difference from `agent.quotaVerdict` (that one reads it to tell
-/// opencode's gate from "not on your account", because there the fallback is
-/// another pair in the pool; here both mean the same thing).
+/// ## It reads the body, and it used not to
 ///
-/// It stays in the signature on purpose. A parameter named `_detail` makes the
-/// compiler point at the next person who wonders whether they should read it,
-/// which is the only moment that question is worth asking.
-pub fn disqualifies(err: anyerror, _detail: []const u8) bool {
-    _ = _detail;
+/// The comment this replaces said the body was deliberately not read, because
+/// every disqualifying error was a 403 or a 404 and neither needs the text. That
+/// was true and it was wrong, and `ROUTER_SMOKE_FORCE=1` is what showed it: with
+/// the cheap slot pointed at a model id no provider has, OpenRouter answers
+///
+///     HTTP 400 {"error":{"message":"zode-router-smoke/does-not-exist:free is not
+///              a valid model ID"}}
+///
+/// A 400. Not a 404. So the table said "not a model problem", the fallback did not
+/// fire, and the one case a fallback most obviously exists for — a model id that
+/// has been retired or typed wrong — was the one it could not see. The 400 came
+/// from `disqualifies`'s own `else`, which was a guess dressed as a decision.
+///
+/// So: the body is read for 400 and 403, and only to tell "this MODEL is the
+/// problem" from "this REQUEST is wrong". A 400 about a malformed body is still
+/// not a fallback, and the phrases below are what separate them.
+pub fn disqualifies(err: anyerror, detail: []const u8) bool {
     return switch (err) {
         error.Forbidden => true, // gated or not: either way this model will not answer
         error.ModelNotFound => true,
+        // The two that are about the MODEL wearing a status that is not theirs.
+        error.BadRequest => namesTheModel(detail),
+        error.ServerError => namesTheModel(detail),
         error.AuthFailed => false, // the key. Never the model.
         error.NoCredits => false, // the account. The paid model fails the same way.
         error.RateLimited => false, // transient; the backoff is the answer
         error.Overloaded => false,
-        error.ServerError => false,
         else => false,
     };
+}
+
+/// Does this error body say the MODEL is what was rejected?
+///
+/// Measured phrases, not invented ones. OpenRouter's exact text for a bad id is
+/// `"... is not a valid model ID"` (verified 2026-10-05 with
+/// `ROUTER_SMOKE_FORCE=1`). The others are the shapes the same provider and the
+/// opencode gateway use for "no such model" and "this model is not served here".
+///
+/// Both the model name and a phrase are required, in that order: an error about
+/// the REQUEST that happens to contain a model name ("rate limit for
+/// `x` reached") must not read as the model being unavailable.
+fn namesTheModel(detail: []const u8) bool {
+    const phrases = [_][]const u8{
+        // Measured on OpenRouter (2026-10-05, HTTP 400):
+        "not a valid model",
+        // Measured on the opencode gateway (2026-10-05, HTTP 400, wrapped):
+        //   {"error":{"type":"server_error",
+        //     "message":"Upstream request failed: Model is unavailable."}}
+        // The wrapper says "unavailable" and not "not available", which is why the
+        // first version of this list missed it and the fallback did not fire on the
+        // one provider that answers on this account.
+        "model is unavailable",
+        // The shapes the same two providers use for a retired or hidden id.
+        "invalid model",
+        "no such model",
+        "model not found",
+        "unknown model",
+        "does not exist",
+        "model_not_found",
+        "model_not_supported",
+        "is not available",
+        "not available for",
+        "no longer available",
+        "has been deprecated",
+        "only available on",
+    };
+    // Case-INSENSITIVE, and that is not a detail: the body says "Model is
+    // unavailable" with a capital M, the table said "model is unavailable", and
+    // `indexOf` is case-sensitive — so the one provider that answers on this
+    // account did not match and the fallback did not fire. A phrase table read out
+    // of a message by hand has to survive the capitalisation that message happens
+    // to use.
+    for (phrases) |p| {
+        if (indexOfIgnoreCase(detail, p) != null) return true;
+    }
+    return false;
+}
+
+/// `indexOf` that does not care about case, on ASCII.
+fn indexOfIgnoreCase(hay: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (hay.len < needle.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        var k: usize = 0;
+        while (k < needle.len) : (k += 1) {
+            if (std.ascii.toLower(hay[i + k]) != std.ascii.toLower(needle[k])) break;
+        }
+        if (k == needle.len) return i;
+    }
+    return null;
 }
 
 /// One line for the history, and only when something happened.
@@ -368,4 +486,94 @@ test "it says what happened, because a mode you cannot see cannot be diagnosed" 
     // And it must not claim the cheap model answered all three.
     try std.testing.expect(std.mem.indexOf(u8, bad, "3/3") == null);
     try std.testing.expect(std.mem.indexOf(u8, bad, "1/3") != null);
+}
+
+test "why: a 404 and a 403 need DIFFERENT messages, because they need different fixes" {
+    // The message used to say "not available on this account" for both. For a model
+    // id the provider does not know, that sends somebody to `/model` to pick a
+    // different model — which cannot fix a name that is not in the list, because
+    // the name is not wrong, the thing they typed is.
+    try std.testing.expectEqual(Why.gated, why(error.Forbidden, ""));
+    try std.testing.expectEqual(Why.unknown_model, why(error.ModelNotFound, ""));
+
+    try std.testing.expect(std.mem.indexOf(u8, phrase(Why.gated), "not available on this account") != null);
+    try std.testing.expect(std.mem.indexOf(u8, phrase(Why.unknown_model), "does not know") != null);
+    // And the two remedies are not the same sentence.
+    try std.testing.expect(!std.mem.eql(u8, remedy(Why.gated), remedy(Why.unknown_model)));
+    // Both point at /model, because it is where the alternatives are listed, but
+    // the unknown-model one says the name is the thing to check.
+    try std.testing.expect(std.mem.indexOf(u8, remedy(Why.unknown_model), "check the name") != null);
+}
+
+test "the phrase carries no model name: the caller substitutes both of them" {
+    // Otherwise every caller grows its own sentence and they drift, which is how
+    // one caller ended up saying "on this account" about a 404.
+    try std.testing.expect(std.mem.indexOf(u8, phrase(Why.gated), "{s}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, phrase(Why.unknown_model), "{s}") == null);
+}
+
+test "disqualifies: a 400 that names the model IS a model problem" {
+    // The measured body, verbatim, from `ROUTER_SMOKE_FORCE=1` on 2026-10-05.
+    // OpenRouter answers 400 for an unknown model id, not 404, so a table that
+    // only trusts the status never sees the case a fallback most obviously exists
+    // for.
+    const body =
+        \\{"error":{"message":"zode-router-smoke/does-not-exist:free is not a valid model ID"}}
+    ;
+    try std.testing.expect(disqualifies(error.BadRequest, body));
+    try std.testing.expectEqual(Why.unknown_model, why(error.BadRequest, body));
+
+    // The other measured one: the opencode gateway, which wraps it and says
+    // "unavailable" rather than "not available". With only the OpenRouter phrase in
+    // the table, the fallback did not fire here — on the one provider that answers
+    // on this account.
+    const wrapped =
+        \\{"error":{"type":"server_error","message":"Upstream request failed: Model is unavailable."}}
+    ;
+    try std.testing.expect(disqualifies(error.BadRequest, wrapped));
+    try std.testing.expectEqual(Why.unknown_model, why(error.BadRequest, wrapped));
+}
+
+test "disqualifies: a 400 about the REQUEST is still not a fallback" {
+    // The reason the body is read is to tell these apart, so a body about the
+    // request must not read as "the model is unavailable" — otherwise a malformed
+    // body rotates the model on every turn.
+    for ([_][]const u8{
+        "{\"error\":{\"message\":\"Expected object, received array\"}}",
+        "{\"error\":{\"message\":\"messages is required\"}}",
+        "{\"error\":{\"message\":\"max_tokens is too large\"}}",
+    }) |b| {
+        if (disqualifies(error.BadRequest, b)) return error.FalseDisqualify;
+    }
+    // And a 429 that quotes the model name is still transient.
+    try std.testing.expect(!disqualifies(
+        error.RateLimited,
+        "Rate limit reached for model `x`: free-models-per-day",
+    ));
+}
+
+test "disqualifies: the account-level errors never blame the model" {
+    // The expensive one: if a 429 or a 402 rotates, every turn pays for a second
+    // request to a model that was never the problem.
+    for ([_][]const u8{ "0", "" }) |_| {
+        try std.testing.expect(!disqualifies(error.RateLimited, ""));
+        try std.testing.expect(!disqualifies(error.NoCredits, "insufficient credits"));
+        try std.testing.expect(!disqualifies(error.AuthFailed, "Invalid credential"));
+        try std.testing.expect(!disqualifies(error.Overloaded, ""));
+    }
+    // 403 and 404 stay as they were: the status is enough for both.
+    try std.testing.expect(disqualifies(error.Forbidden, ""));
+    try std.testing.expect(disqualifies(error.ModelNotFound, ""));
+}
+
+test "namesTheModel does not care about capitalisation" {
+    // The body says "Model is unavailable" with a capital M and the table said
+    // "model is unavailable"; `indexOf` is case-sensitive, so the one provider
+    // that answers on this account did not match and the fallback did not fire.
+    // A phrase table copied out of a message by hand has to survive the
+    // capitalisation that message happens to use.
+    try std.testing.expect(namesTheModel("Upstream request failed: Model is unavailable."));
+    try std.testing.expect(namesTheModel("upstream request failed: model is unavailable."));
+    try std.testing.expect(namesTheModel("MODEL IS UNAVAILABLE"));
+    try std.testing.expect(!namesTheModel("Expected object, received array"));
 }
