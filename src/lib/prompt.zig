@@ -65,6 +65,15 @@ pub const tool_routing_prompt =
     \\   better and cheaper.
     \\ - Local code questions start with glob/grep (find) and read (understand);
     \\   do not bash your way through what those tools answer directly.
+    \\ - When you need SEVERAL files, ONE `read` with `paths` is a single round
+    \\   trip and three `read` calls are three. A round trip is a whole request:
+    \\   it costs money, it takes seconds, and it can be rate-limited. Whenever
+    \\   you already know two or more of the files you want (comparing them,
+    \\   checking a list, opening a handful), send them together as
+    \\   `read {paths:[...]}`. Do not ask to be reminded.
+    \\ - The same rule for searches: ONE `grep` with a good pattern beats three
+    \\   with a narrower one. Reach for the second grep only when the first did
+    \\   not answer the question.
     \\ - A wide search (grep across a big tree, "where is X used?", reading many
     \\   files to answer one question) goes to the `task` subagent, not to a
     \\   dozen reads in your own context.

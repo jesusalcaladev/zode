@@ -120,7 +120,7 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
     defer h.freeBody(res.body);
 
     if (res.status < 200 or res.status >= 300) {
-        return std.fmt.allocPrint(arena, "HTTP {d} from the search engine for \"{s}\"", .{ res.status, q });
+        return engineRefused(arena, q, res.status);
     }
 
     if (web.searchResults(arena, res.body, max_results).len > 0) {
@@ -143,7 +143,12 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
         return std.fmt.allocPrint(arena, "error searching \"{s}\": {t} (and the fallback endpoint could not be reached either)", .{ q, err });
     };
     defer h.freeBody(res2.body);
-    if (res2.status < 200 or res2.status >= 300) return searchFailed(arena, q);
+    // The status is carried into the message instead of being dropped. Before, a
+    // 202 here and a 200 with an unreadable page both arrived as the same "no
+    // results could be parsed", and those are two completely different things: one
+    // is the engine refusing this client, the other is our scraper being out of
+    // date.
+    if (res2.status < 200 or res2.status >= 300) return engineRefused(arena, q, res2.status);
 
     if (web.liteSearchResults(arena, res2.body, max_results).len > 0) {
         return web.liteSearchResults(arena, res2.body, max_results);
@@ -191,6 +196,32 @@ pub fn looksCompressed(body: []const u8) ?[]const u8 {
 /// It says what happened AND what to do, because "no results parsed" reads as
 /// "nothing exists on the internet about this", and the model then tells the user
 /// that.
+/// The search ENGINE refused the request, which is not our bug and not the
+/// model's fault either.
+///
+/// DuckDuckGo answers HTTP 202 with a full HTML page (an anomaly-detection
+/// challenge, measured on 2026-10-04 with four consecutive requests from one
+/// machine), so "the endpoint sent nothing parseable" and "the endpoint sent a
+/// captcha" arrive at the parser as the same unreadable HTML. Saying "the HTML
+/// did not match what this build knows how to read" there sends the model off to
+/// rephrase a query that was perfectly fine, and it is what made the live test
+/// flaky instead of skipped.
+pub fn engineRefused(arena: std.mem.Allocator, q: []const u8, status: u16) []const u8 {
+    return switch (status) {
+        // 202 is what DuckDuckGo uses to throttle; it arrives as a captcha page.
+        202, 429 => std.fmt.allocPrint(
+            arena,
+            "the search engine is refusing requests from this machine right now (HTTP {d} for \"{s}\"). That is rate limiting, not a bad query: do NOT rephrase it and do NOT retry in a loop. Wait, or answer from what you already have, or fetch a URL you already know with web_fetch.",
+            .{ status, q },
+        ) catch "the search engine is rate limiting this machine",
+        else => std.fmt.allocPrint(
+            arena,
+            "the search engine answered HTTP {d} for \"{s}\". That is a problem on their side, not a bad query, and not something to rephrase.",
+            .{ status, q },
+        ) catch "the search engine returned an error",
+    };
+}
+
 pub fn searchFailed(arena: std.mem.Allocator, q: []const u8) []const u8 {
     return std.fmt.allocPrint(
         arena,
@@ -354,9 +385,55 @@ test "web_search for real: returns results with a URL" {
 /// only one of them is our bug.
 fn looksRateLimited(out: []const u8) bool {
     if (std.mem.indexOf(u8, out, "1. ") != null) return false; // it worked
-    const lowered = std.ascii.allocLowerString(std.heap.page_allocator, out) catch return false;
-    defer std.heap.page_allocator.free(lowered);
-    return std.mem.indexOf(u8, lowered, "rate") != null or
-        std.mem.indexOf(u8, lowered, "try again") != null or
-        std.mem.indexOf(u8, lowered, "202") != null;
+    // Keyed on the tool's OWN words, not on a guess: `engineRefused` is the one
+    // place that knows the endpoint answered with a refusal, and this test used
+    // to look for "rate"/"202" in free text, which missed the actual message and
+    // made the suite flaky for a day.
+    return std.mem.indexOf(u8, out, "rate limiting") != null or
+        std.mem.indexOf(u8, out, "refusing requests") != null or
+        std.mem.indexOf(u8, out, "problem on their side") != null;
+}
+
+test "engineRefused tells the ENGINE refusing us apart from OUR scraper being stale" {
+    // They used to produce the SAME sentence. Measured on 2026-10-04:
+    // DuckDuckGo answers HTTP 202 with a full anomaly-detection HTML page, four
+    // consecutive times from one machine, and the parser saw unreadable HTML —
+    // exactly what a layout change looks like from in here.
+    //
+    // The consequences were real on both sides: the model was told to rephrase a
+    // query that was fine, and the live test went red for a reason that had
+    // nothing to do with the code.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const throttled = engineRefused(a, "zig language", 202);
+    try std.testing.expect(std.mem.indexOf(u8, throttled, "rate limiting") != null);
+    // It has to say what NOT to do, or the model rephrases and retries.
+    try std.testing.expect(std.mem.indexOf(u8, throttled, "do NOT rephrase") != null);
+    try std.testing.expect(std.mem.indexOf(u8, throttled, "do NOT retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, throttled, "web_fetch") != null);
+
+    // Any other status is still "their side", and still not a bad query.
+    for ([_]u16{ 403, 500, 503 }) |st| {
+        const other = engineRefused(a, "q", st);
+        try std.testing.expect(std.mem.indexOf(u8, other, "their side") != null);
+        try std.testing.expect(std.mem.indexOf(u8, other, "not something to rephrase") != null);
+    }
+
+    // And the stale-scraper message stays DIFFERENT, because that one IS our bug
+    // and it must not be skipped by the test.
+    const stale = searchFailed(a, "q");
+    try std.testing.expect(std.mem.indexOf(u8, stale, "did not match what this build knows") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "rate limiting") == null);
+}
+
+test "looksRateLimited never mistakes a real result for a throttle" {
+    // A result whose title happens to contain the word "rate" must not be
+    // skipped, or the test would pass while the scraper was broken.
+    const good = "1. Rate limiting in nginx\nhttps://example.com\n2. Other\nhttps://b.example";
+    try std.testing.expect(!looksRateLimited(good));
+    // And both real throttle messages are caught.
+    try std.testing.expect(looksRateLimited("the search engine is refusing requests from this machine right now (HTTP 202 for \"q\"). That is rate limiting"));
+    try std.testing.expect(looksRateLimited("the search engine answered HTTP 503 for \"q\". That is a problem on their side"));
 }
