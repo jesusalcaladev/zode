@@ -41,6 +41,31 @@ pub fn main(init: std.process.Init) !u8 {
     const rf = try tools.execute(init.io, "refs", "{\"symbol\":\"hitRatePct\"}", arena, null, null);
     try out.interface.print("REFS: {s}\n", .{rf[0..@min(rf.len, 700)]});
 
+    // rename, on a THROWAWAY copy of this repository: the safest way to see the
+    // scanner agree with itself on real code is to let it change real code.
+    {
+        var ast = std.heap.ArenaAllocator.init(init.gpa);
+        defer ast.deinit();
+        const aa = ast.allocator();
+        try std.Io.Dir.cwd().createDirPath(init.io, "/tmp/opencode/rename-live");
+        // A file with the symbol in every shape that must NOT be touched.
+        try std.Io.Dir.cwd().writeFile(init.io, .{
+            .sub_path = "/tmp/opencode/rename-live/a.zig",
+            .data =
+            \\pub fn widget() void {}
+            \\const note = "widget in a string";
+            \\// widget in a comment
+            \\const widgetCount = 1;
+            \\fn use() void { widget(); }
+            \\
+            ,
+        });
+        const rn = try tools.execute(init.io, "rename", "{\"symbol\":\"widget\",\"to\":\"gadget\",\"subdir\":\"/tmp/opencode/rename-live\"}", aa, null, null);
+        try out.interface.print("RENAME: {s}\n", .{rn});
+        const after = try std.Io.Dir.cwd().readFileAlloc(init.io, "/tmp/opencode/rename-live/a.zig", aa, .limited(1 << 20));
+        try out.interface.print("RENAME-FILE:\n{s}", .{after});
+    }
+
     // read with `paths`: three files, ONE call, on this repository.
     const rp = try tools.execute(init.io, "read", "{\"paths\":[\"src/cache_stats.zig\",\"src/compaction.zig\"]}", arena, null, null);
     try out.interface.print("READ-PATHS: {d} bytes, {d} file(s)\n", .{ rp.len, std.mem.count(u8, rp, "\n--- ") + 1 });

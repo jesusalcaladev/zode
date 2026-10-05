@@ -16,6 +16,7 @@ const edit_tool = @import("edit.zig");
 const bash_tool = @import("bash.zig");
 const git_tool = @import("git.zig");
 const refs_tool = @import("refs.zig");
+const rename_tool = @import("rename.zig");
 const bg_tool = @import("bg.zig");
 const glob_tool = @import("glob.zig");
 const grep_tool = @import("grep.zig");
@@ -29,6 +30,16 @@ pub const ToolDef = struct {
     name: []const u8,
     desc: []const u8,
 };
+
+/// Composes tool arguments from a JSON body with an optional `{s}` slot.
+///
+/// The JSON braces must be DOUBLED (`{{` `}}`) because `allocPrint` reads a `{` as
+/// the start of a placeholder and `{"symbol":` is not one. Four tests in a row
+/// failed on that, each one looking like a bug in the tool under test rather than
+/// in the test.
+pub fn jsonArgs(arena: std.mem.Allocator, comptime body: []const u8, args: anytype) ![]const u8 {
+    return std.fmt.allocPrint(arena, body, args);
+}
 
 pub fn writeTmp(arena: std.mem.Allocator, path: []const u8, body: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena,
@@ -55,6 +66,7 @@ pub fn isParallelSafe(name: []const u8) bool {
         std.mem.eql(u8, name, "git_log") or
         std.mem.eql(u8, name, "grep") or
         std.mem.eql(u8, name, "refs") or
+        std.mem.eql(u8, name, "list_files") or
         std.mem.eql(u8, name, "glob") or
         std.mem.eql(u8, name, "list_files") or
         std.mem.eql(u8, name, "web_fetch") or
@@ -75,6 +87,7 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"git_diff","description":"The unified diff of the working tree against the index (or of the index against HEAD with staged:true). One block per file, each headed by the path, with +N and −M counted for you at the end. Painted with the same colouriser as a write/edit diff. For anything git does that these do not cover (a commit, a checkout, a stash, a log of one path), use `bash`.","parameters":{"type":"object","properties":{"staged":{"type":"boolean","description":"diff the index against HEAD instead of the working tree"}},"required":[]}}},
     \\{"type":"function","function":{"name":"git_log","description":"The last commits, most recent first, one line each (short hash and subject).","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"how many commits (default 20, max 200)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"refs","description":"Where a symbol is DEFINED and where it is USED, in one call and with the two separated: definitions first, then calls, then plain references. One plain identifier, not a pattern (use `grep` for text). Prefer it over grepping: guessing the declaration shape for the language, running two greps and working out which hit is the definition is three round trips, and a round trip is a whole request. Knows the declaration shapes of zig, rust, go, python, js/ts, c, sh, and steps over Go method receivers, so `refs Listen` finds `func (s *Server) Listen()` instead of calling it a use.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"subdir":{"type":"string","description":"where to look (default: the whole project)"}},"required":["symbol"]}}},
+    \\{"type":"function","function":{"name":"rename","description":"Rename a symbol EVERYWHERE it appears as code, in ONE call, and report every file it touched. Prefer it over a series of `edit` calls: a rename applied to nine files out of ten leaves a codebase that does not compile, and only this says which file was skipped. Only whole-word occurrences that are real CODE are changed: the same name inside a string, a comment or a longer identifier is left alone. Two same-named symbols are both renamed — run `refs` first and narrow with `subdir` when that matters.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"to":{"type":"string","description":"the new name; must be a plain identifier"},"subdir":{"type":"string"}},"required":["symbol","to"]}}},
     \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; ask for a deeper offset if the text is cut.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Search the web and get titles, URLs and snippets. Use it when you need something you do not know yet (docs, versions, error messages), then web_fetch the promising URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 8"}},"required":["query"]}}},
@@ -113,12 +126,18 @@ pub fn needsPermission(name: []const u8) bool {
     // The argv is assembled in `git.zig` with nothing but clamped numbers in it,
     // and `status`/`diff`/`log` do not touch the index or the working tree. A
     // permission dialog on "what did I change?" is a dialog about nothing.
+    //
+    // `refs` is exempt for the same reason and `rename` is NOT: it rewrites
+    // files across the tree, so it is exactly the case the dialog exists for.
+    // Putting it in this list would have been one word and would have let a
+    // model rename a symbol across a repository with no question asked.
     return !(std.mem.eql(u8, name, "read") or
         std.mem.eql(u8, name, "git_status") or
         std.mem.eql(u8, name, "git_diff") or
         std.mem.eql(u8, name, "git_log") or
         std.mem.eql(u8, name, "glob") or
         std.mem.eql(u8, name, "grep") or
+        std.mem.eql(u8, name, "refs") or
         std.mem.eql(u8, name, "list_files") or
         std.mem.eql(u8, name, "web_fetch") or
         std.mem.eql(u8, name, "web_search") or
@@ -171,6 +190,8 @@ pub fn execute(
         return grep_tool.toolGrep(io, obj, arena);
     } else if (std.mem.eql(u8, name, "refs")) {
         return refs_tool.toolRefs(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "rename")) {
+        return rename_tool.toolRename(io, obj, arena);
     } else if (std.mem.eql(u8, name, "git_status")) {
         return git_tool.toolGitStatus(io, arena);
     } else if (std.mem.eql(u8, name, "git_diff")) {
@@ -218,6 +239,7 @@ pub const defs = [_]ToolDef{
     .{ .name = "glob", .desc = "Find files matching a glob pattern" },
     .{ .name = "grep", .desc = "Search file contents with regex" },
     .{ .name = "refs", .desc = "Where a symbol is defined and used" },
+    .{ .name = "rename", .desc = "Rename a symbol everywhere, in one call" },
     .{ .name = "git_status", .desc = "Working tree state, machine format" },
     .{ .name = "git_diff", .desc = "Unified diff of the working tree" },
     .{ .name = "git_log", .desc = "Last commits, one line each" },
@@ -1011,7 +1033,11 @@ test "refs: does not walk zig-pkg or zig-out" {
     // From the project root, not from inside zig-pkg: walking `subdir:
     // "zig-pkg"` produces paths RELATIVE to that root, so the check never sees
     // the string "zig-pkg" and passes for the wrong reason.
-    const out = execute(std.testing.io, "refs", "{\"symbol\":\"Evaluator\"}", arena, null, null) catch |err| return err;
+    // A symbol that is REALLY in this repository. The first version used
+    // "Evaluator", which exists in none of these files, so the tool correctly
+    // answered "no declaration" and the assertion that `src/` appears failed for
+    // a reason that had nothing to do with what it was testing.
+    const out = execute(std.testing.io, "refs", "{\"symbol\":\"hitRatePct\"}", arena, null, null) catch |err| return err;
     try std.testing.expect(std.mem.indexOf(u8, out, "zig-pkg/") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "zig-out/") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, ".zig-cache/") == null);
@@ -1120,4 +1146,208 @@ test "edit: `edits` is still the several-HUNKS-in-one-file form, not the files f
 
     const r = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/opencode/mf-hunks.txt", arena, .limited(1 << 20));
     try std.testing.expectEqualStrings("A\nB\n", r);
+}
+
+test "refs: a name inside a STRING is not a use" {
+    // Measured before the mask existed: `refs target` on this file answered
+    // "4 uses" where there are 2, and called one of the fake ones a `[call]`
+    // because it is followed by a `(`. A model trusting that count would rename
+    // inside a string literal.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = "/tmp/opencode/refs-strings";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/a.zig",
+        .data =
+        \\pub fn target() void {}
+        \\const msg = "call target() from inside a string";
+        \\const c = 'x';
+        \\// target in a line comment
+        \\/* target in a block comment */
+        \\/* outer /* target nested */ still outer */
+        \\fn caller() void {
+        \\    target();
+        \\}
+        \\const x = target;
+        \\
+        ,
+    });
+
+    const args = try std.fmt.allocPrint(arena, "{{\"symbol\":\"target\",\"subdir\":\"{s}\"}}", .{dir});
+    const out = try execute(std.testing.io, "refs", args, arena, null, null);
+
+    // Exactly the two real ones, on the lines they are really on.
+    try std.testing.expect(std.mem.indexOf(u8, out, "2 use(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig:8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig:10") != null);
+    // And NOT the four copies in strings and comments.
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig:2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig:4") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig:5") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig:6") == null);
+    // The definition is still found: the mask does not hide the delimiters.
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig:1") != null);
+}
+
+test "rename: it renames the code and NOT the string, the comment or the longer name" {
+    // The whole reason this tool exists is that a rename applied by the model, one
+    // `edit` per occurrence, lands on nine files out of ten without saying which
+    // one it missed. Here the missed one is IMPOSSIBLE: the same scanner found the
+    // occurrences and changed them.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = "/tmp/opencode/rename-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/a.zig",
+        .data =
+        \\pub fn oldName() void {}
+        \\const msg = "oldName in a string";
+        \\// oldName in a comment
+        \\const oldNameExtended = 1;
+        \\fn caller() void { oldName(); }
+        \\
+        ,
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/b.zig",
+        .data =
+        \\fn other() void { oldName(); }
+        \\
+        ,
+    });
+
+    const args = try std.fmt.allocPrint(
+        arena,
+        "{{\"symbol\":\"oldName\",\"to\":\"newName\",\"subdir\":\"{s}\"}}",
+        .{dir},
+    );
+    const out = try execute(std.testing.io, "rename", args, arena, null, null);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "renamed `oldName` to `newName`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "b.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "compiles now") == null); // not a phrase we use
+    try std.testing.expect(std.mem.indexOf(u8, out, "Run the build") != null);
+
+    const a = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, dir ++ "/a.zig", arena, .limited(1 << 20));
+    // The definition and the call were renamed.
+    try std.testing.expect(std.mem.indexOf(u8, a, "pub fn newName()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "newName();") != null);
+    // The string was NOT.
+    try std.testing.expect(std.mem.indexOf(u8, a, "\"oldName in a string\"") != null);
+    // The comment was NOT.
+    try std.testing.expect(std.mem.indexOf(u8, a, "// oldName in a comment") != null);
+    // And the longer identifier was NOT: `oldNameExtended` is a different symbol.
+    try std.testing.expect(std.mem.indexOf(u8, a, "oldNameExtended") != null);
+
+    const b = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, dir ++ "/b.zig", arena, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, b, "newName();") != null);
+}
+
+test "rename: refuses a pattern, a bad new name, no-ops, and a name that only lives in a string" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A pattern is refused: a rename with a pattern renames things nobody meant.
+    const pat = try std.fmt.allocPrint(arena,
+        \\{{"symbol":"foo.*","to":"bar","subdir":"src"}}
+    , .{});
+    var out = try execute(std.testing.io, "rename", pat, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not a plain identifier") != null);
+
+    // A destination that is not an identifier cannot be a new name.
+    const bad = try std.fmt.allocPrint(arena,
+        \\{{"symbol":"main","to":"has space"}}
+    , .{});
+    out = try execute(std.testing.io, "rename", bad, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not a valid identifier") != null);
+
+    // The same name on both sides is a no-op that says so, not a rewrite.
+    const same = try std.fmt.allocPrint(arena,
+        \\{{"symbol":"main","to":"main"}}
+    , .{});
+    out = try execute(std.testing.io, "rename", same, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "already named that") != null);
+
+    // A symbol that exists only inside a string is NOT renamed, and the tool says
+    // why instead of reporting zero changes as a mystery.
+    const dir = "/tmp/opencode/rename-nostr";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/a.txt",
+        .data = "const s = \"ghostSymbol\";\n",
+    });
+    const ghost = try std.fmt.allocPrint(arena,
+        \\{{"symbol":"ghostSymbol","to":"realName","subdir":"{s}"}}
+    , .{dir});
+    out = execute(std.testing.io, "rename", ghost, arena, null, null) catch |err| return err;
+    try std.testing.expect(std.mem.indexOf(u8, out, "Nothing was changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "inside a string") != null);
+
+    // And the file is byte-for-byte untouched.
+    const s = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, dir ++ "/a.txt", arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("const s = \"ghostSymbol\";\n", s);
+}
+
+test "rename asks for permission, and refs does not" {
+    // `refs` only reads. `rename` rewrites files across the tree, which is
+    // exactly what the dialog exists for.
+    try std.testing.expect(!needsPermission("refs"));
+    try std.testing.expect(needsPermission("rename"));
+    // And it is not "parallel safe" for the same reason `bash` is not: it writes,
+    // and a model may ask for two of them where the second reads what the first
+    // wrote.
+    try std.testing.expect(!isParallelSafe("rename"));
+    try std.testing.expect(isParallelSafe("refs"));
+}
+
+test "rename and refs agree on the COUNT, because they share the scanner" {
+    // If the tool that counts and the tool that changes used different scanners,
+    // the number in the answer would be a number about something else. Same
+    // scanner, same occurrences, and the test is on a fixture where the two
+    // differ: inside a string, and inside a longer identifier.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = "/tmp/opencode/rename-agree";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/a.zig",
+        .data =
+        \\pub fn agree() void {}
+        \\const s = "agree";
+        \\const agreeLong = 1;
+        \\fn c() void { agree(); }
+        \\
+        ,
+    });
+
+    const refs_args = try jsonArgs(
+        arena,
+        "{{\"symbol\":\"agree\",\"subdir\":\"{s}\"}}",
+        .{dir},
+    );
+    const refs_out = try execute(std.testing.io, "refs", refs_args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, refs_out, "1 use(s)") != null);
+
+    const rename_args = try jsonArgs(
+        arena,
+        "{{\"symbol\":\"agree\",\"to\":\"consensus\",\"subdir\":\"{s}\"}}",
+        .{dir},
+    );
+    const rename_out = try execute(std.testing.io, "rename", rename_args, arena, null, null);
+    // One definition + one use = 2 replacements, matching what refs reported.
+    try std.testing.expect(std.mem.indexOf(u8, rename_out, "2 replacement(s)") != null);
 }

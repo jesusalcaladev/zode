@@ -117,6 +117,142 @@ pub const Lang = enum {
     }
 };
 
+/// For every byte of the source, is it REAL CODE?
+///
+/// This is the difference between matching a name and matching a SYMBOL, and it
+/// was measured on this repository's own `refs`: `refs target` on a file holding
+///
+/// ```zig
+/// const msg = "call target() from inside a string";
+/// const doc = "target in a doc string";
+/// ```
+///
+/// answered **"4 uses"** — the two real ones plus the two inside string literals,
+/// one of them classified as a `[call]` because it is followed by a `(`. A model
+/// that trusted that number would rename inside a string literal, and one that
+/// used it to decide whether it had found everything would go looking for two
+/// references that do not exist.
+///
+/// A one-byte-per-source mask rather than a token stream, because every question
+/// asked afterwards ("is this occurrence in code?", "does the declaration keyword
+/// end here?") is a lookup and not a scan, and a scan that runs per occurrence is
+/// the O(n²) this file exists to avoid.
+///
+/// It is NOT a full lexer and does not claim to be: it knows strings, character
+/// literals, and comments, which is what separates a name from a copy of one. It
+/// does not parse expressions, resolve scopes or know that `\\` opens a raw
+/// string with its own delimiter rules.
+pub fn codeMask(arena: std.mem.Allocator, src: []const u8) ![]const bool {
+    const mask = try arena.alloc(bool, src.len);
+    @memset(mask, true);
+
+    var i: usize = 0;
+    while (i < src.len) {
+        const c = src[i];
+
+        // Line comments: `//` in most languages, `#` in python/shell/yaml. The
+        // `#` case is language-dependent and the caller cannot tell us, so both
+        // are treated as a comment and a C preprocessor line loses its trailing
+        // part — which is the conservative direction: a missed declaration is
+        // reported as a use, never a use is reported as a declaration.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            const end = lineEnd(src, i);
+            maskRange(mask, i, end, false);
+            i = end;
+            continue;
+        }
+        if (c == '#') {
+            const end = lineEnd(src, i);
+            maskRange(mask, i, end, false);
+            i = end;
+            continue;
+        }
+        // Block comments, nested: `/* /* */ */` is legal in Zig, Rust and C and
+        // treating them as flat gets the nesting wrong.
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '*') {
+            const end = blockCommentEnd(src, i);
+            maskRange(mask, i, end, false);
+            i = end;
+            continue;
+        }
+        // Strings and character literals. A backtick is a raw string in Go and
+        // Zig's simple form, and it does not take backslash escapes.
+        if (c == '"' or c == '\'' or c == '`') {
+            const end = stringEnd(src, i, c);
+            // The delimiters stay "code" so a declaration inside them is still a
+            // candidate for the keyword rule; only the BODY is masked.
+            maskRange(mask, i + 1, end, false);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    return mask;
+}
+
+fn maskRange(mask: []bool, from: usize, to: usize, v: bool) void {
+    const end = @min(to, mask.len);
+    var k = from;
+    while (k < end) : (k += 1) mask[k] = v;
+}
+
+fn lineEnd(src: []const u8, from: usize) usize {
+    const nl = std.mem.indexOfScalarPos(u8, src, from, '\n') orelse src.len;
+    return nl;
+}
+
+/// The offset just past the closing quote, or the end of the line.
+fn stringEnd(src: []const u8, start: usize, quote: u8) usize {
+    var i = start + 1;
+    while (i < src.len) {
+        const c = src[i];
+        if (c == '\\' and quote != '`') {
+            i += 2; // an escaped quote does not close it
+            continue;
+        }
+        if (c == quote) return i + 1;
+        // An unterminated string ends at the newline, not at the end of the file:
+        // otherwise one missing quote masks everything after it and the tool
+        // reports nothing at all instead of reporting most of it.
+        if (c == '\n') return i;
+        i += 1;
+    }
+    return src.len;
+}
+
+fn blockCommentEnd(src: []const u8, start: usize) usize {
+    var depth: usize = 0;
+    var i = start;
+    while (i + 1 < src.len) : (i += 1) {
+        if (src[i] == '/' and src[i + 1] == '*') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (src[i] == '*' and src[i + 1] == '/') {
+            depth -= 1;
+            i += 1;
+            if (depth == 0) return i + 1;
+        }
+    }
+    return src.len;
+}
+
+/// Is this offset real code, according to the mask?
+pub fn isCode(mask: []const bool, at: usize) bool {
+    return at < mask.len and mask[at];
+}
+
+/// The 1-based line of `at`, for the hit a caller reports.
+pub fn lineOf(src: []const u8, at: usize) u32 {
+    var line: u32 = 1;
+    var i: usize = 0;
+    while (i < at and i < src.len) : (i += 1) {
+        if (src[i] == '\n') line += 1;
+    }
+    return line;
+}
+
 /// Is `name` a plain identifier? Rejecting anything else here is what stops
 /// `refs` from being handed a pattern and used as a grep with extra steps.
 pub fn validSymbol(name: []const u8) bool {
@@ -153,11 +289,14 @@ fn isWordChar(c: u8) bool {
 /// the real one.
 /// Is this whole line a comment?
 ///
-/// Separate from `findSymbol` because a comment must also be excluded from the
-/// USES, not only from the definitions. A commented-out line mentioning the
-/// symbol read as a reference, and every one of those inflates the count that the
-/// model is asking for — so `refs helper` answered "3 uses" where one was live and
-/// one was a call and one was dead code someone left behind on purpose.
+/// **This is the LINE-level rule and it is not enough on its own.** A file-level
+/// `codeMask` is what tells a real use from a copy of the name inside a string,
+/// and the caller must consult both. This one still exists because a comment is
+/// cheap to recognise from the line alone and because `#` means "comment" in some
+/// languages and "preprocessor" in others, which needs the prefix table.
+///
+/// A commented-out line mentioning the symbol read as a reference, and every one
+/// of those inflates the count the model asked for.
 pub fn isCommentLine(line: []const u8, prefixes: []const []const u8) bool {
     const trimmed = std.mem.trimStart(u8, line, " \t");
     if (trimmed.len == 0) return false;
@@ -434,4 +573,111 @@ test "render: a truncated result says how many there were" {
     // 500 with 1 shown, so the model knows it is looking at a fragment.
     try std.testing.expect(std.mem.indexOf(u8, out, "500 hits existed") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "subdir") != null);
+}
+
+test "codeMask: a name inside a string is NOT code, and that is the whole point" {
+    // Measured on this repository: `refs target` on a file with a string
+    // mentioning `target()` answered "4 uses" — the two real ones plus the two
+    // inside string literals, one of them classified as a CALL because it is
+    // followed by a `(`. A model that trusted the count would rename inside a
+    // string.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const src =
+        \\pub fn target() void {}
+        \\const msg = "call target() from inside a string";
+        \\const c = 'x';
+        \\fn caller() void { target(); }
+    ;
+    const mask = try codeMask(a, src);
+
+    const at_msg = std.mem.indexOf(u8, src, "\"call target").?;
+    const at_inner = std.mem.indexOfPos(u8, src, at_msg, "target()").?;
+    try std.testing.expect(!isCode(mask, at_inner));
+
+    // And the real ones are still code.
+    try std.testing.expect(isCode(mask, std.mem.indexOf(u8, src, "pub fn target").?));
+    const at_call = std.mem.lastIndexOf(u8, src, "target").?;
+    try std.testing.expect(isCode(mask, at_call));
+}
+
+test "codeMask: comments, and nested block comments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const src =
+        \\fn real() void {}
+        \\// target in a line comment
+        \\/* target in a block comment */
+        \\/* outer /* target in the nested part */ still outer */
+        \\fn after() void {}
+    ;
+    const mask = try codeMask(a, src);
+    try std.testing.expect(isCode(mask, std.mem.indexOf(u8, src, "real").?));
+    try std.testing.expect(isCode(mask, std.mem.indexOf(u8, src, "after").?));
+
+    // Every `target` in a comment is masked, INCLUDING the nested one: treating
+    // block comments as flat gets the nesting wrong and leaves the tail live.
+    var from: usize = 0;
+    var masked: usize = 0;
+    while (std.mem.indexOfPos(u8, src, from, "target")) |at| {
+        if (!isCode(mask, at)) masked += 1;
+        from = at + 1;
+    }
+    // Three: the line comment, the block comment, and the one inside the NESTED
+    // comment. Treating block comments as flat ends the outer at the inner's `*/`
+    // and leaves the rest of the line live, which is the bug this asserts.
+    try std.testing.expectEqual(@as(usize, 3), masked);
+}
+
+test "codeMask: an escaped quote does not end the string" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // `he said "hi"` inside the literal: closing there would unmask everything
+    // after it and report a declaration that is not there.
+    const src = "const s = \"he said \\\"hi\\\" and then target\";\nconst y = target;\n";
+    const mask = try codeMask(a, src);
+    const inner = std.mem.indexOf(u8, src, "target").?;
+    try std.testing.expect(!isCode(mask, inner));
+    const real = std.mem.lastIndexOf(u8, src, "target").?;
+    try std.testing.expect(isCode(mask, real));
+}
+
+test "codeMask: an unterminated string ends at the newline, not at the end of the file" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // One missing quote. Masking to the end of the file would report nothing at
+    // all; masking to the newline reports most of it, which is the useful
+    // direction to be wrong in.
+    const src = "const s = \"oops\nfn target() void {}\nconst x = target;\n";
+    const mask = try codeMask(a, src);
+    try std.testing.expect(isCode(mask, std.mem.indexOf(u8, src, "fn target").?));
+    try std.testing.expect(isCode(mask, std.mem.lastIndexOf(u8, src, "target").?));
+}
+
+test "codeMask: the delimiters themselves stay code, so a declaration inside is still found" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const src = "const s = \"hello\";\n";
+    const mask = try codeMask(a, src);
+    try std.testing.expect(isCode(mask, 0)); // the opening quote
+    try std.testing.expect(!isCode(mask, std.mem.indexOf(u8, src, "hello").?));
+    try std.testing.expect(isCode(mask, std.mem.indexOf(u8, src, ";").?));
+}
+
+test "lineOf: the 1-based line a hit reports" {
+    const src = "a\nbb\nccc\n";
+    try std.testing.expectEqual(@as(u32, 1), lineOf(src, 0));
+    try std.testing.expectEqual(@as(u32, 2), lineOf(src, 2));
+    try std.testing.expectEqual(@as(u32, 3), lineOf(src, 5));
+    try std.testing.expectEqual(@as(u32, 4), lineOf(src, src.len));
 }

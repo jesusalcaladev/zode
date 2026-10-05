@@ -57,6 +57,11 @@ $ zode
 - **Providers**: OpenCode, OpenRouter, Anthropic (native API with prompt
   caching), OpenAI, Groq, DeepSeek, and local (Ollama/LM Studio). You connect
   them from the TUI itself, without editing files.
+- **`rename`**: renames a symbol everywhere it appears as **real code**, in one
+  call, and reports every file it touched. A name inside a string, a comment or a
+  longer identifier is left alone — measured, not assumed. A rename applied by the
+  model one `edit` at a time lands on nine files out of ten and does not say which
+  one it missed; this cannot miss one silently.
 - **`refs`**: where a symbol is defined and where it is used, **in one call and
   with the two separated**. It knows the declaration shapes of zig, rust, go,
   python, js/ts, c and sh, steps over Go method receivers, skips comments and does
@@ -275,8 +280,8 @@ src/                    what needs the TUI, a thread or the network
     dispatch.zig        the name the model sent -> the function that runs
     common.zig          the helpers more than one tool needs
     read.zig  write.zig  edit.zig  bash.zig  glob.zig  grep.zig
-    list_files.zig  web.zig  think.zig  todo.zig  bg.zig  git.zig  refs.zig
-    errors.zig
+    list_files.zig  web.zig  think.zig  todo.zig  bg.zig  git.zig
+    refs.zig  rename.zig  errors.zig
   bgproc.zig            background commands
   palette.zig           the Ctrl+P / Ctrl+T modal palette
   session.zig           compressed JSONL sessions
@@ -314,7 +319,7 @@ src/lib/                modules that test on their own, no TUI and no network
   clean.zig             /clean
   verify.zig            which verifications are slow enough to background
   router.zig             which model answers the main turn (cheap, or yours)
-  symbols.zig            what a declaration looks like, per language (refs)
+  symbols.zig            declarations per language + the string/comment mask
   regex.zig             a mini regex engine
   mascot.zig            Zo
   theme.zig             colours

@@ -117,7 +117,12 @@ pub fn walkZig(io: std.Io, arena: std.mem.Allocator, root: []const u8) !Walker {
 /// It also skips anything starting with `.`, which is what keeps `.git` and
 /// `.zig-cache` out of a `**/*.zig` without listing them.
 pub fn isSkippable(name: []const u8) bool {
-    const skip = [_][]const u8{ ".git", "node_modules", ".zig-cache", "zig-out", ".cache", "target", "dist", "build" };
+    // `zig-pkg` is this project's dependency cache and it is NOT skipped by the
+    // leading-dot rule because it has no dot. It holds the vaxis, zigimg and uucode
+    // checkouts: thousands of files, none of them the user's code. Without it in
+    // the list, `glob`, `grep` and `refs` all walked it, and `refs` read every
+    // file in it looking for a symbol.
+    const skip = [_][]const u8{ ".git", "node_modules", ".zig-cache", "zig-out", "zig-pkg", ".cache", "target", "dist", "build" };
     for (skip) |s| {
         if (std.mem.eql(u8, name, s)) return true;
     }
