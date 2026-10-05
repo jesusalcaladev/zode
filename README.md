@@ -39,6 +39,14 @@ $ zode
   `/context` says which of the three numbers it used.
 - **File cache**: a `read` of something that has not changed is not sent again.
   It is the most direct token saving there is.
+- **A prompt cache you can see**: measured 2026-10-04 with an identical 3.5k
+  prefix, three requests in a row —
+  `openrouter/free` (a **router**) answered 3583 / 3273 / 3381 prompt tokens and
+  served **0%** from cache, and a fixed model answered 3611 / 3613 / 3613 and
+  served **3328 cached (98%)**. A router picks a different upstream per request,
+  the tokenizers differ and the caches are not shared, so no amount of prefix
+  tuning can make one hit. zode says so when you pick one, and `/cache`
+  diagnoses it from the evidence afterwards rather than from a list.
 - **Providers**: OpenCode, OpenRouter, Anthropic (native API with prompt
   caching), OpenAI, Groq, DeepSeek, and local (Ollama/LM Studio). You connect
   them from the TUI itself, without editing files.

@@ -36,8 +36,60 @@ pub const Model = struct {
 /// ("space-bunny-free") and OpenRouter uses `:free` ("qwen/qwen3-8b:free").
 /// Checking only one of the two is what made the pool of free models see one
 /// provider and no other.
+///
+/// ## `openrouter/free` is free and this says NO, and that is deliberate
+///
+/// There is a third spelling: `/free`, and it belongs to a ROUTER. Measured
+/// 2026-10-04: it answers 3583 / 3273 / 3381 prompt tokens for an identical
+/// prefix and serves **0% from cache**, because it picks a different upstream per
+/// request and they do not share a prompt cache.
+///
+/// So the answer is currently right for the wrong reason, and that is worth
+/// writing down rather than leaving to chance: adding `/free` here would put a
+/// router into the free pool, and every turn would then be billed in full for the
+/// 11 KB tool schema. `isFreeId and not isRouter(id)` is the rule the callers
+/// want; this function answers "is this a free MODEL".
 pub fn isFreeId(id: []const u8) bool {
+    if (isRouter(id)) return false;
     return std.mem.endsWith(u8, id, "-free") or std.mem.endsWith(u8, id, ":free");
+}
+
+/// Is this a ROUTER rather than a model?
+///
+/// ## Measured, on 2026-10-04, which is why this exists
+///
+/// The same request with the same prefix, three times in a row:
+///
+/// ```
+/// openrouter/free            prompt=3583   prompt=3273   prompt=3381   cached=0
+/// qwen/qwen3.8-27b:free     prompt=3611   prompt=3613   prompt=3613   cached=3328 (98%)
+/// ```
+///
+/// A router picks a different upstream per request, and different upstreams
+/// have different tokenizers AND different prompt caches. So **a router can
+/// never produce a prefix-cache hit**, no matter how stable the prefix is, and
+/// the prompt token count drifts by several hundred between identical requests —
+/// which is also what makes `zode`'s own token estimate useless on it.
+///
+/// A fixed model, free or not, caches: 98% measured, at no extra cost.
+/// `qwen/...:free` is a MODEL that happens to be free; `openrouter/free` is a
+/// ROUTER. The `:free` suffix does not tell them apart, which is why this is a
+/// list of ids and not a suffix test.
+///
+/// The list is short because there is no other way to tell from the id: OpenRouter
+/// publishes no "this is a router" flag.
+pub fn isRouter(id: []const u8) bool {
+    const routers = [_][]const u8{
+        "openrouter/free",
+        "openrouter/auto",
+        "openrouter/fallback",
+        "openrouter/free-router",
+        "openrouter/bodybuilder",
+    };
+    for (routers) |r| if (std.mem.eql(u8, id, r)) return true;
+    // The `:floor` and `:nitro` variants of opencode's router, same thing.
+    if (std.mem.startsWith(u8, id, "opencode/")) return true;
+    return false;
 }
 
 /// Is this model one a CODING AGENT can hold a conversation with?
@@ -362,4 +414,36 @@ test "isConversational: embeddings, images and audio are not coding agents" {
     try std.testing.expect(isConversational("space-bunny-free"));
     // A name that CONTAINS one of the words but is a chat model anyway.
     try std.testing.expect(isConversational("inception/mercury-coder-small"));
+}
+
+test "isRouter: the ids that measured 0% cached, and the `:free` models that measured 98%" {
+    // The whole point of the table is that the suffix does not tell them apart:
+    // `openrouter/free` is a ROUTER and `qwen/...:free` is a MODEL, and both end
+    // in the same word. Getting this backwards costs the whole prompt cache.
+
+    // Routers. `openrouter/free` was measured answering 3583 / 3273 / 3381 for
+    // an identical prefix: 0% cached, every time, and it cannot be otherwise.
+    for ([_][]const u8{
+        "openrouter/free",
+        "openrouter/auto",
+        "openrouter/fallback",
+    }) |r| {
+        try std.testing.expect(isRouter(r));
+        // A router is NOT offered as a free model, even though it is free. That
+        // is the whole point of the interaction: it measured 0% cached, so the
+        // pool has to be able to say no to it.
+        try std.testing.expect(!isFreeId(r));
+    }
+
+    // Fixed models that happened to be free. `qwen/qwen3.8-27b:free` measured 98%
+    // cached and must NOT be called a router, or the warning would fire on the
+    // one model that works.
+    for ([_][]const u8{
+        "qwen/qwen3.8-27b:free",
+        "cohere/north-mini-code:free",
+        "poolside/laguna-xs-2.1:free",
+        "anthropic/claude-sonnet-5.5",
+    }) |m| {
+        try std.testing.expect(!isRouter(m));
+    }
 }

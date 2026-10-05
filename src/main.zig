@@ -124,6 +124,17 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         std.debug.print("model: {s} (first free in the catalog; ZODE_MODEL to override)\n", .{model_name});
     }
 
+    // Here and not earlier: `model_name` is empty until the block above has run,
+    // and a check on an empty model is a check that never fires — which is what
+    // the first version of this did, in the one path (`--chat`) where a warning
+    // has no UI to be missed in.
+    if (models.isRouter(model_name)) {
+        std.debug.print(
+            "warn: {s} is a ROUTER. It picks a different upstream per request, they do not share a prompt cache, and it measured 0% cached against 98% for a fixed model with an identical prefix. Every request is billed in full, including the 11 KB of tool schema. Pick a model with /model or ZODE_MODEL: `model:free` is a MODEL that happens to be free.\n",
+            .{model_name},
+        );
+    }
+
     // The effort comes FROM THE MODEL, not from a fixed `.medium`: with no
     // `ZODE_EFFORT` it asks for the default of that model's own ladder. And what
     // arrives from the variable is clamped to that same ladder, so that
@@ -213,6 +224,24 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         if (result.ctx.parts.items.len == 0) {
             const s = &cache_stats.session;
             models.dbg("\n[cache] {d:.1}% hit-rate · {d} prompt / {d} cached tokens", .{ s.hitRatePct(), s.prompt_tokens, s.cached_tokens });
+            // WHY, because a rate with no cause is not actionable, and this is
+            // the path a script or a first run actually uses.
+            //
+            // Measured 2026-10-04 with an identical 3.5k prefix: `openrouter/free`
+            // answers 3583 / 3273 / 3381 and serves 0% (it is a router, and routers
+            // do not share a prompt cache with each other), while a fixed model
+            // answers 3611 / 3613 / 3613 and serves 98%.
+            switch (s.verdict()) {
+                .routing => models.dbg(
+                    "\n[cache] the model is a ROUTER: the prompt count moved {d} tokens between requests with the same prefix. It picks a different upstream each time and they do not share a prompt cache, so no prefix arrangement can ever hit. Pick a model, not a router (`model:free` is a MODEL that happens to be free — measured 98% cached).",
+                    .{s.prompt_drift},
+                ),
+                .provider_uncached => models.dbg(
+                    "\n[cache] the prefix is stable ({d} tokens of drift) and this provider does not cache at all. A fixed model on openrouter reaches 98%.",
+                    .{s.prompt_drift},
+                ),
+                else => {},
+            }
             if (elided_total > 0) models.dbg(" · {d} tool results elided", .{elided_total});
             models.dbg("\n", .{});
             return 0; // final answer

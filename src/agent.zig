@@ -2088,6 +2088,52 @@ fn pickTarget(m: *tui.Model) Target {
     return targetForCandidate(m, cand) orelse active;
 }
 
+/// Says, once, that the chosen model is a router and that this costs money.
+///
+/// ## Why it is not a note in the docs
+///
+/// Measured on 2026-10-04, same request, same 3.5k prefix, three times:
+///
+/// ```
+/// openrouter/free          prompt=3583  3273  3381   cached=0
+/// qwen/qwen3.8-27b:free   prompt=3611  3613  3613   cached=3328  (98%)
+/// ```
+///
+/// A router picks a different upstream per request. Different tokenizers, and
+/// **different prompt caches that are not shared**, so a router cannot produce a
+/// prefix-cache hit no matter how stable the prefix is — and the whole 11 KB tool
+/// schema goes out in full on every single request instead of at ~1/50th of the
+/// price.
+///
+/// The fix is one `/model` away and costs nothing (the fixed model measured is
+/// free too), so silence here was the single most expensive missing line in the
+/// whole provider layer. `cache_stats.verdict()` confirms it afterwards from the
+/// evidence, without trusting this list.
+/// The router warning fires ONCE per session, and the "once" is what makes it
+/// usable: a warning on every turn of a long session is a line of noise the
+/// second time and gets ignored, which is the same as never saying it.
+///
+/// It re-arms when the model changes, because after `/model` to another router the
+/// user should be told again — they may not have read it the first time either.
+var router_warned = false;
+
+fn routerWarnOnce(m: *tui.Model, model: []const u8) void {
+    if (router_warned) return;
+    // Set either way: "not a router" is also a decision not to check again, and
+    // the empirical `/cache` verdict is what catches a router this list misses.
+    router_warned = true;
+    warnIfRouter(m, model);
+}
+
+fn warnIfRouter(m: *tui.Model, model: []const u8) void {
+    if (!models_mod.isRouter(model)) return;
+    pushInfoFmt(
+        m,
+        "this model is a ROUTER, so every request is billed in full and nothing is served from cache: it picks a different upstream each time and they do not share a prompt cache. Measured 2026-10-04, same prefix: openrouter/free 0% cached, a fixed model 98%. /model and pick one that is not a router (`model:free` is a MODEL that happens to be free — that one caches).",
+        .{},
+    );
+}
+
 /// Picks a model when the user has not chosen one, by ASKING the provider.
 ///
 /// Why this exists: the compiled providers carry no `default_model` on purpose. A
@@ -2552,6 +2598,15 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         setStatusWithZo(m, .warn, "no model");
         return null;
     }
+
+    // The router warning, ONCE per session, on the first turn that uses one.
+    //
+    // Here and not in `resolveModel`: the model can arrive from four places
+    // (`config.json`, `ZODE_MODEL`, the automatic resolve, the picker) and only
+    // the turn knows which one is actually in use. Warning in each of them is
+    // four places to keep correct, and the one that mattered — the env var, which
+    // is the common case — is a path with no UI to warn into.
+    routerWarnOnce(m, pick.model);
 
     // The cheap router: this turn goes to the small model, and if it will not
     // answer we fall back to the one the user picked.
@@ -5109,6 +5164,8 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
 /// theirs would budget against a model that is no longer answering.
 pub fn applyModel(m: *tui.Model, name: []const u8, ctx_tokens: u32) !void {
     setModelCtx(name, ctx_tokens);
+    router_warned = false; // a new model deserves a new verdict
+    routerWarnOnce(m, name);
     resetCheapRouter(m);
     m.pushInfoFmt("model → {s}", .{name});
     setStatusWithZo(m, .done, name);

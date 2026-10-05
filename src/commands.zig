@@ -84,6 +84,33 @@ pub fn cmdCache(m: *tui.Model) void {
         .{ agent.cur_provider_id, st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
     ) catch "cache";
     agent.pushInfoOwned(m, line);
+
+    // WHY, because a rate with no cause is not actionable. The number alone was
+    // 0.0% on a perfectly healthy setup for weeks, and the only way to find out
+    // that the model was a router was to read the request counts by hand.
+    switch (st.verdict()) {
+        .unknown => {
+            m.pushInfoFmt("not enough requests yet to say anything ({d} so far); the first request of a turn never hits, that is normal)", .{st.requests});
+        },
+        .ok => {
+            m.pushInfoFmt("the prefix is stable and the provider is serving it from cache ({d} tokens of drift across {d} requests)", .{ st.prompt_drift, st.requests });
+        },
+        .stable_prefix => {
+            m.pushInfoFmt("the prefix is stable but nothing has been served from cache yet ({d} requests, {d} tokens of drift)", .{ st.requests, st.prompt_drift });
+        },
+        .provider_uncached => {
+            m.pushInfoFmt(
+                "the prefix is stable ({d} tokens of drift) and still nothing is cached: this provider does not cache at all. Measured on cohere/north-mini-code:free, which answers 0 every time. A fixed model on openrouter reaches 98%.",
+                .{st.prompt_drift},
+            );
+        },
+        .routing => {
+            m.pushInfoFmt(
+                "THE MODEL IS A ROUTER: the prompt count moved {d} tokens across {d} requests with an identical prefix (it answers 3583 / 3273 / 3381 for the same thing). A router picks a different upstream per request, so the tokenizers differ and the caches are not shared. This can NEVER hit, whatever you do to the prefix. Measured on 2026-10-04: openrouter/free 0%, qwen/qwen3.8-27b:free 98%. Pick a model, not a router: /model.",
+                .{ st.prompt_drift, st.requests },
+            );
+        },
+    }
 }
 
 /// `/context`: gauge of context used against the limit and the budget.
