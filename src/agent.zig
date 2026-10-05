@@ -1008,7 +1008,22 @@ pub fn loadUserConfig() void {
                 cur_provider_id = p;
             }
         }
-        if (user_config.model.len > 0) {
+        // `ZODE_MODEL` FIRST, then `config.json`. It was config.json only, and
+        // `userModel()` — the one function that reads the variable — had exactly
+        // one caller, in the headless runner. So in the TUI `ZODE_MODEL` was
+        // silently ignored and the model was resolved from the provider's
+        // catalogue instead, on every startup.
+        //
+        // It went unnoticed because `config.json` and `ZODE_MODEL` usually name
+        // the same thing, and when they disagreed the TUI used the one the user
+        // was less likely to be looking at.
+        //
+        // The order matches `userModel()`, which the headless path uses, so the
+        // two entry points cannot disagree about what the user asked for.
+        if (envGet(environ_global, "ZODE_MODEL")) |mm| {
+            if (mm.len > 0) setModel(mm);
+        }
+        if (user_config.model.len > 0 and cur_model.len == 0) {
             setModel(user_config.model);
         } else if (cur_model.len == 0) {
             // The provider's `default_model` is NOT set here, and not out of laziness: a
