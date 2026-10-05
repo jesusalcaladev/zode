@@ -2525,6 +2525,10 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         const sum_from: usize = 1; // never the system message
         const upto = @min(comp.summary_upto, comp.msgs.len);
         if (upto > sum_from + 1) {
+            // Tell the cache statistics that the history is about to get shorter,
+            // so the next prompt count going DOWN is not mistaken for a router
+            // (see `CacheStats.markCompacted`).
+            cache_stats.session.markCompacted();
             pushInfo(m, "\u{b7} context full: summarizing the older turns with the model\u{2026}");
             var sum_http = http_client.Http.init(gpa, io_global);
             defer sum_http.deinit();

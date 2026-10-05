@@ -63,7 +63,7 @@ pub fn isParallelSafe(name: []const u8) bool {
 pub fn toolsJson() []const u8 {
     return
     \\[
-    \\{"type":"function","function":{"name":"read","description":"Read a file from disk. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"read","description":"Read a file from disk, or SEVERAL at once with `paths` (max 8) — prefer that whenever you are comparing files or opening a handful: one call is one round trip and a round trip is a whole request, so reading three files one by one costs three of them. Each file keeps the same caching. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"description":"read up to 8 files in ONE call; each is cached separately"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":[]}}},
     \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, or several at once via edits:[{old_string,new_string},...] (applied in order, all validated first). old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
@@ -767,4 +767,108 @@ test "every tool has a description long enough to be chosen over `bash`" {
         }
     }
     try std.testing.expect(false); // not found: the schema lost them
+}
+
+test "read: `paths` reads SEVERAL files in ONE call, and each is cached on its own" {
+    // The reason it exists: a round trip is a whole model request, and on a free
+    // tier (measured 2026-10-04: this account has total_credits: 0) every one is
+    // also a chance to be 429'd and to spend 500ms + 1s + 2s of backoff. "Read
+    // these three and compare them" is the most common shape of a real task and
+    // it was costing three requests.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cache: readcache.Cache = .{};
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/multi-a.txt",
+        .data = "contenido del primer fichero\n",
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/multi-b.txt",
+        .data = "contenido del segundo fichero\n",
+    });
+
+    const multi = try std.fmt.allocPrint(arena,
+        \\{{"paths":["/tmp/opencode/multi-a.txt","/tmp/opencode/multi-b.txt"]}}
+    , .{});
+
+    const out = try execute(std.testing.io, "read", multi, arena, null, &cache);
+    // Both arrive, each behind its own header so the model knows which is which.
+    try std.testing.expect(std.mem.indexOf(u8, out, "read 2 file(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "multi-a.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "multi-b.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "contenido del primer fichero") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "contenido del segundo fichero") != null);
+
+    // And the cache is per file: a second call over the same two says neither is
+    // repeated, which is what makes the batch safe to call again.
+    const again = try execute(std.testing.io, "read", multi, arena, null, &cache);
+    try std.testing.expect(std.mem.indexOf(u8, again, "unchanged") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "contenido del primer") == null);
+}
+
+test "read: one bad path in `paths` does not lose the good ones" {
+    // The failure mode of a batch is that one 404 swallows everything, and the
+    // model is left with nothing having spent a round trip to find out.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/multi-ok.txt",
+        .data = "este si se lee\n",
+    });
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"paths":["/tmp/opencode/multi-ok.txt","/tmp/opencode/does-not-exist-xyz.txt"]}}
+    , .{});
+
+    const out = execute(std.testing.io, "read", args, arena, null, null) catch |err| return err;
+    try std.testing.expect(std.mem.indexOf(u8, out, "este si se lee") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "does-not-exist-xyz.txt") != null);
+    // And it is NOT a Zig identifier. `FileNotFound` is what the model used to
+    // receive, and the whole point of the message is that it can act on it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "does not exist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "glob") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FileNotFound") == null);
+}
+
+test "read: `paths` over the cap is refused with a number, not silently truncated" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var args: std.ArrayList(u8) = .empty;
+    try args.appendSlice(arena, "{\"paths\":[");
+    var i: usize = 0;
+    while (i < read_tool.max_paths + 3) : (i += 1) {
+        if (i > 0) try args.appendSlice(arena, ",");
+        try args.print(arena, "\"/tmp/opencode/f{d}.txt\"", .{i});
+    }
+    try args.appendSlice(arena, "]}");
+
+    const out = try execute(std.testing.io, "read", args.items, arena, null, null);
+    // It says how many and what the cap is, so the model can split the call
+    // itself instead of guessing.
+    try std.testing.expect(std.mem.indexOf(u8, out, "over the cap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "8") != null);
+}
+
+test "read: `path` alone still works, because that is most of the calls" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `writeTmp` composes WRITE arguments (`content`), not read ones. Using it here
+    // was the first version and the test failed for a reason that had nothing to do
+    // with what it was testing.
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/single-still.txt",
+        .data = "hola\n",
+    });
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"/tmp/opencode/single-still.txt\"}}", .{});
+    const out = try execute(std.testing.io, "read", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hola") != null);
+    // And it is NOT wrapped in the batch header: the common case pays nothing.
+    try std.testing.expect(std.mem.indexOf(u8, out, "read 1 file(s)") == null);
 }

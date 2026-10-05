@@ -86,30 +86,30 @@ pub fn cmdCache(m: *tui.Model) void {
     agent.pushInfoOwned(m, line);
 
     // WHY, because a rate with no cause is not actionable. The number alone was
-    // 0.0% on a perfectly healthy setup for weeks, and the only way to find out
-    // that the model was a router was to read the request counts by hand.
+    // 0.0% on a perfectly healthy setup for weeks.
+    //
+    // The evidence is the prompt count going DOWN: a conversation only grows, so a
+    // smaller count for the same conversation means a different tokenizer, which
+    // means a different upstream, which means a router. It is NOT the count
+    // growing: a real run went 3611 -> 66946 on a FIXED model while reading three
+    // files, and calling that a router was the first version's bug.
     switch (st.verdict()) {
-        .unknown => {
-            m.pushInfoFmt("not enough requests yet to say anything ({d} so far); the first request of a turn never hits, that is normal)", .{st.requests});
-        },
-        .ok => {
-            m.pushInfoFmt("the prefix is stable and the provider is serving it from cache ({d} tokens of drift across {d} requests)", .{ st.prompt_drift, st.requests });
-        },
-        .stable_prefix => {
-            m.pushInfoFmt("the prefix is stable but nothing has been served from cache yet ({d} requests, {d} tokens of drift)", .{ st.requests, st.prompt_drift });
-        },
-        .provider_uncached => {
-            m.pushInfoFmt(
-                "the prefix is stable ({d} tokens of drift) and still nothing is cached: this provider does not cache at all. Measured on cohere/north-mini-code:free, which answers 0 every time. A fixed model on openrouter reaches 98%.",
-                .{st.prompt_drift},
-            );
-        },
-        .routing => {
-            m.pushInfoFmt(
-                "THE MODEL IS A ROUTER: the prompt count moved {d} tokens across {d} requests with an identical prefix (it answers 3583 / 3273 / 3381 for the same thing). A router picks a different upstream per request, so the tokenizers differ and the caches are not shared. This can NEVER hit, whatever you do to the prefix. Measured on 2026-10-04: openrouter/free 0%, qwen/qwen3.8-27b:free 98%. Pick a model, not a router: /model.",
-                .{ st.prompt_drift, st.requests },
-            );
-        },
+        .unknown => m.pushInfoFmt(
+            "not enough requests to say anything yet ({d} so far). The first request of a turn never hits and the prompt count grows with the conversation: neither is a problem.",
+            .{st.requests},
+        ),
+        .healthy => m.pushInfoFmt(
+            "healthy: {d} request(s), {d} served from cache, and the prompt count only ever went up ({d} shrink(s)).",
+            .{ st.requests, st.cached_tokens, st.prompt_shrinks },
+        ),
+        .provider_uncached => m.pushInfoFmt(
+            "the prompt count only goes up ({d} shrink(s)), so the prefix is fine, and this provider is not serving any of it from cache after {d} requests. Measured on cohere/north-mini-code:free, which answers 0 every time; a fixed model on openrouter reaches 98%.",
+            .{ st.unexplained_shrinks, st.requests },
+        ),
+        .routing => m.pushInfoFmt(
+            "THE MODEL IS A ROUTER: the prompt count went DOWN {d} time(s) with nothing removed from the conversation. Measured 2026-10-04, same prefix three times: openrouter/free 3583/3273/3381 (0% cached), a fixed model 3611/3613/3613 (98%). Routers do not share a prompt cache, so no prefix arrangement can make one hit. /model and pick a model, not a router.",
+            .{st.prompt_shrinks},
+        ),
     }
 }
 

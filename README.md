@@ -29,6 +29,9 @@ $ zode
 - **Parallel subagents**: several independent searches in one message go to
   subagents at the same time (3 by default, `ZODE_TASK_PARALLEL`), each with its
   own throwaway window, and the reports come back in the order you asked for them.
+- **`read` takes several paths at once** — one call is one round trip, and a round
+  trip is a whole request. On a free tier (`total_credits: 0`, measured) every
+  request is also a chance to be rate-limited plus three backoff waits.
 - **`!` in the input**: `!git status` runs the command and puts its output into
   the context, spending neither a turn nor a token.
 - **Skills**: folders of instructions loaded **only when they are needed**. The

@@ -233,12 +233,12 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             // answers 3611 / 3613 / 3613 and serves 98%.
             switch (s.verdict()) {
                 .routing => models.dbg(
-                    "\n[cache] the model is a ROUTER: the prompt count moved {d} tokens between requests with the same prefix. It picks a different upstream each time and they do not share a prompt cache, so no prefix arrangement can ever hit. Pick a model, not a router (`model:free` is a MODEL that happens to be free — measured 98% cached).",
-                    .{s.prompt_drift},
+                    "\n[cache] the model is a ROUTER: the prompt count went DOWN {d} time(s) with nothing removed from the conversation, so a different tokenizer counted the same thing. Routers do not share a prompt cache, so no prefix arrangement can make one hit. Pick a model, not a router (`model:free` is a MODEL that happens to be free — measured 98% cached).",
+                    .{s.prompt_shrinks},
                 ),
                 .provider_uncached => models.dbg(
-                    "\n[cache] the prefix is stable ({d} tokens of drift) and this provider does not cache at all. A fixed model on openrouter reaches 98%.",
-                    .{s.prompt_drift},
+                    "\n[cache] the prefix is fine (the count only went up) and this provider does not cache at all. A fixed model on openrouter reaches 98%.",
+                    .{},
                 ),
                 else => {},
             }
