@@ -16,6 +16,7 @@ const compaction_mod = @import("compaction.zig");
 const mascot = @import("lib/mascot.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
+const plan_mod = @import("lib/plan.zig");
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
 
@@ -88,6 +89,10 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     var pending_images: images_mod.Pending = .{};
     // The automatic typecheck's state for a run that has no `Model` to keep it in.
     var auto_check: agent.AutoCheck = .{};
+    // The plan, on the stack. There is no `Model` here and no screen, so this is
+    // where the steps go: printed, so a run in a script shows the same progress a
+    // TUI session would.
+    var plan: plan_mod.Plan = .init();
     // The `arena`, not the `gpa`: this text lives as long as the conversation
     // does, and the arena dies at the end of the run. With `gpa` it was a leak
     // per process (the DebugAllocator says so on exit, which is how it showed up).
@@ -305,6 +310,17 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             // and it used to exist ONLY there — so `--chat`, the runner every pty
             // test and measurement drives, edited code and never compiled it.
             auto_check.afterTool(&bg, gpa, io, p.name.items, p.args.items);
+
+            // The plan, applied. It used to be a `Model` field and `applyPlanCall`
+            // only ran in the TUI's path, so a `todo` call here answered **"plan
+            // recorded"** and recorded nothing: the model reached for the tool, the
+            // tool reported success, and nothing anywhere changed.
+            if (std.mem.eql(u8, p.name.items, "todo")) {
+                if (agent.applyPlanTo(&plan, p.args.items, arena)) |line| {
+                    models.dbg("[plan] {s}\n", .{line});
+                    if (plan.allDone()) models.dbg("[plan] every step is done\n", .{});
+                }
+            }
         }
 
         // Whatever the automatic check found, before the next request goes out. It

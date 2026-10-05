@@ -270,23 +270,44 @@ pub fn applyPatch(
     }
 
     // ── updates ──
+    //
+    // An update that changes NOTHING is not counted, so a patch repeated with the
+    // same values reports nothing. The replacement path has always done this
+    // (`Plan.apply` returns `.same`), and the patch path did not — so a model that
+    // sent the same `update` twice got a "plan: 1/2 done" line twice, and a line per
+    // tool call that says nothing is the noise the history is not for.
     for (updates) |u| {
         if (u.index < 1 or u.index > self.len) {
             r.unknown += 1;
             continue;
         }
         const i = u.index - 1;
+        const was_status = self.items[i].status;
+        const was_len = self.items[i].len;
+        var was_text: [text_max]u8 = undefined;
+        @memcpy(was_text[0..was_len], self.items[i].text[0..was_len]);
+
         if (u.status) |st| self.items[i].status = st;
         if (u.text) |t| {
             const trimmed = std.mem.trim(u8, t, " \t");
-            if (trimmed.len == 0) {
-                r.unknown += 1;
-                continue;
+            // An empty reword is not a change, and not a bad index either: the step
+            // exists. The STATUS in the same object still lands — the model asked for
+            // two things and one of them is fine, and discarding it over a
+            // whitespace-only string throws away what it did mean.
+            //
+            // So the text write is skipped, NOT the whole update: falling through to
+            // the comparison below is what lets the status count.
+            if (trimmed.len > 0) {
+                const cp = @min(trimmed.len, text_max);
+                @memcpy(self.items[i].text[0..cp], trimmed[0..cp]);
+                self.items[i].len = @intCast(cp);
             }
-            const cp = @min(trimmed.len, text_max);
-            @memcpy(self.items[i].text[0..cp], trimmed[0..cp]);
-            self.items[i].len = @intCast(cp);
         }
+
+        const same = self.items[i].status == was_status and
+            self.items[i].len == was_len and
+            std.mem.eql(u8, self.items[i].text[0..was_len], was_text[0..was_len]);
+        if (same) continue;
         r.updated += 1;
     }
 
@@ -927,4 +948,33 @@ test "parseAdd: an array, one object, and one bare string" {
     , .{});
     try std.testing.expectEqual(@as(u8, 1), try parseAdd(bare.object, &out));
     try std.testing.expectEqualStrings("and check the docs", out[0].textOf());
+}
+
+test "applyPatch: a patch that changes nothing is not counted, and says nothing" {
+    // The replacement path has always detected "same"; the patch path did not, so a
+    // model that sent the same `update` twice got a "plan: 1/2 done" line twice. A
+    // line per tool call that says nothing is exactly the noise the history is not
+    // for.
+    var p = planOf3();
+    const ups = [_]StepUpdate{.{ .index = 1, .status = .done }};
+    const first = applyPatch(&p, &ups, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(u8, 1), first.updated);
+
+    const again = applyPatch(&p, &ups, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(u8, 0), again.updated);
+    try std.testing.expect(!again.anyChange());
+    // And the step is still done: the second patch was a no-op, not an undo.
+    try std.testing.expectEqual(Status.done, p.items[0].status);
+}
+
+test "applyPatch: an empty reword is ignored, and a status in the same object still lands" {
+    var p = planOf3();
+    // Whitespace-only text is not a new wording, and it must not blank the step.
+    const ups = [_]StepUpdate{.{ .index = 2, .status = .in_progress, .text = "   " }};
+    const r = applyPatch(&p, &ups, &.{}, &.{}, 0);
+    try std.testing.expectEqual(Status.in_progress, p.items[1].status);
+    try std.testing.expectEqualStrings("fix it", p.items[1].textOf());
+    try std.testing.expectEqual(@as(u8, 1), r.updated);
+    // And the index was NOT counted as unknown: the step exists, the text was empty.
+    try std.testing.expectEqual(@as(u8, 0), r.unknown);
 }

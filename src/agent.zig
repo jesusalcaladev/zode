@@ -3186,39 +3186,13 @@ fn deleteIfUnchanged(path: []const u8) bool {
 /// The "nothing changed" case matters: the model resends the whole list on every
 /// call, so without this the history would repeat "plan: 1/3" five times in a
 /// turn and the line would stop carrying information.
-fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
-    var items: [plan_mod.max_items]plan_mod.Item = undefined;
-    const parsed = plan_mod.parseItems(arena, args_json, &items) catch |err| {
-        // `parseItems` needs `items`; without it there is nothing to replace, and
-        // the only thing a call can be is a patch. A patch that does not parse is
-        // the error below, and the message names BOTH forms so a model that sent
-        // `update` is not told to send `items`.
-        const msg = switch (err) {
-            error.TooManyItems => "the plan has more than 20 steps: shorten it",
-            error.BadPlan => "the plan did not parse. Send the whole list as {items:[{content,status}]} " ++
-                "or change one step as {update:[{index,status}]} / {remove:[3]} / {add:[{content}]}. " ++
-                "Indexes are 1-based.",
-        };
-        pushInfoOwned(m, msg);
-        return;
-    };
-    const r = m.applyPlan(&parsed.items, parsed.len);
-    if (r == .same) return;
-    // With OWN memory (not the turn's arena): the text lives in the pending
-    // queue and a later frame paints it.
-    const pl = m.planCopy();
-    m.pushInfoFmt("{s}", .{pl.summary(m.allocator)});
-    if (pl.allDone()) setStatusWithZo(m, .done, "all plan steps done");
-}
-
 /// Does this `todo` call carry a patch key (`update`, `remove`, `add`)?
 ///
-/// It is a substring test and not a parse, deliberately: this runs on the hot path
-/// of deciding which of the two handlers the call goes to, and a full JSON parse
-/// there would mean parsing every `todo` twice. The three keys are distinctive
-/// enough that a model prompt containing them inside another argument is not a
-/// realistic false positive — and the consequence of a false positive is a handler
-/// that reports "the patch had nothing in it", never a mangled plan.
+/// A substring test and not a parse, deliberately: this decides which of the two
+/// handlers a call goes to, and parsing every `todo` twice for that is work with
+/// no payoff. The three keys are distinctive enough that a false positive is not a
+/// realistic shape, and the consequence of one is a handler that reports "the patch
+/// had nothing in it" — never a mangled plan.
 fn planPatchKeysPresent(args_json: []const u8) bool {
     for ([_][]const u8{ "\"update\"", "\"updates\"", "\"remove\"", "\"removed\"", "\"add\"" }) |k| {
         if (std.mem.indexOf(u8, args_json, k) != null) return true;
@@ -3232,64 +3206,109 @@ fn planHasItems(args_json: []const u8) bool {
         std.mem.indexOf(u8, args_json, "\"todos\"") != null;
 }
 
+/// Applies a `todo` call to a plan, with no `Model` in it, and returns a line to
+/// show — or null when nothing changed.
+///
+/// ## Why it is not `m.applyPlan`
+///
+/// Because `applyPlanCall` and `applyPlanPatch` lived only in the TUI's
+/// `execOneCall`, `zode --chat` answered **"plan recorded"** and recorded nothing:
+/// the plan is a `Model` field, and the headless runner has no `Model`. Measured, by
+/// asking the model for a plan and watching the tool report success while nothing
+/// anywhere changed.
+///
+/// That is the failure this repository keeps meeting in a new shape: a capability in
+/// the schema, reached for by the model, and dropped by one of the two runners. The
+/// plan is now a plain value the caller owns — `Model.plan` for the TUI, a stack
+/// variable for `--chat` — and both call this.
+pub fn applyPlanTo(
+    plan: *plan_mod.Plan,
+    args_json: []const u8,
+    arena: std.mem.Allocator,
+) ?[]const u8 {
+    if (planPatchKeysPresent(args_json) or !planHasItems(args_json)) {
+        return applyPlanPatchTo(plan, args_json, arena);
+    }
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    const parsed = plan_mod.parseItems(arena, args_json, &items) catch |err| {
+        return switch (err) {
+            error.TooManyItems => "the plan has more than 20 steps: shorten it",
+            // The message names BOTH forms, because a model that sent `update` must
+            // not be told to send `items`.
+            error.BadPlan => "the plan did not parse. Send the whole list as {items:[{content,status}]} " ++
+                "or change one step as {update:[{index,status}]} / {remove:[3]} / {add:[{content}]}. " ++
+                "Indexes are 1-based.",
+        };
+    };
+    switch (plan.apply(items[0..], parsed.len)) {
+        .same => return null,
+        .empty => return "plan cleared",
+        .changed => return plan.summary(arena),
+    }
+}
+
 /// The patch form of `todo`: change, drop or add ONE step without resending the
 /// list.
 ///
-/// It is a separate function and not a branch inside `applyPlanCall` because the
-/// two answer different questions. A replacement says "here is the plan"; a patch
-/// says "step 3 is done". The screen shows the difference too — a replacement
-/// rewrites every row, a patch moves one.
-fn applyPlanPatch(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
+/// It is a separate function and not a branch inside the replacement because the two
+/// answer different questions. A replacement says "here is the plan"; a patch says
+/// "step 3 is done".
+pub fn applyPlanPatchTo(
+    plan: *plan_mod.Plan,
+    args_json: []const u8,
+    arena: std.mem.Allocator,
+) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
-        pushInfoOwned(m, "the plan patch did not parse: send {update:[{index,status}]}");
-        return;
+        return "the plan patch did not parse: send {update:[{index,status}]}";
     };
-    if (parsed != .object) {
-        pushInfoOwned(m, "the plan patch did not parse: send {update:[{index,status}]}");
-        return;
-    }
+    if (parsed != .object) return "the plan patch did not parse: send {update:[{index,status}]}";
 
     var updates: [plan_mod.max_items]plan_mod.StepUpdate = undefined;
     const n_upd = plan_mod.parseUpdates(parsed.object, &updates) catch {
-        pushInfoOwned(m, "the plan patch did not parse. Send {update:[{index,status,text}]} with a 1-based index.");
-        return;
+        return "the plan patch did not parse. Send {update:[{index,status,text}]} with a 1-based index.";
     };
     var remove: [plan_mod.max_items]u8 = undefined;
     const n_rm = plan_mod.parseRemove(parsed.object, &remove) catch {
-        pushInfoOwned(m, "the plan patch did not parse: send {remove:[3]} with 1-based indexes.");
-        return;
+        return "the plan patch did not parse: send {remove:[3]} with 1-based indexes.";
     };
     var add: [plan_mod.max_items]plan_mod.Item = undefined;
     const n_add = plan_mod.parseAdd(parsed.object, &add) catch {
-        pushInfoOwned(m, "the plan patch did not parse: send {add:[{content}]}.");
-        return;
+        return "the plan patch did not parse: send {add:[{content}]}.";
     };
-
     if (n_upd == 0 and n_rm == 0 and n_add == 0) {
-        pushInfoOwned(m, "the plan patch had nothing in it: send update, remove or add.");
-        return;
+        return "the plan patch had nothing in it: send update, remove or add.";
     }
 
-    const before = m.plan.len;
-    var snapshot = m.planCopy();
-    const res = plan_mod.applyPatch(&snapshot, updates[0..n_upd], remove[0..n_rm], add[0..n_add], n_add);
-    if (!res.anyChange() and snapshot.len == before) {
+    const before = plan.len;
+    const res = plan_mod.applyPatch(plan, updates[0..n_upd], remove[0..n_rm], add[0..n_add], n_add);
+    if (!res.anyChange() and plan.len == before) {
         // Nothing happened. Saying so is the point: a silent no-op reads as "the
         // step was marked done" and the model will not send it again.
         if (res.unknown > 0) {
-            m.pushInfoFmt("plan patch did nothing: {d} index/indices do not exist (the plan has {d} steps, indexes are 1-based).", .{ res.unknown, before });
+            return std.fmt.allocPrint(
+                arena,
+                "plan patch did nothing: {d} index/indices do not exist (the plan has {d} steps, indexes are 1-based)",
+                .{ res.unknown, before },
+            ) catch null;
         }
-        return;
+        return null;
     }
-    m.replacePlan(snapshot);
-
     if (res.unknown > 0) {
-        m.pushInfoFmt("plan patched ({d} applied) · {d} index/indices did not exist and were ignored", .{
-            res.updated + res.removed + res.added, res.unknown,
-        });
-    } else {
-        m.pushInfoFmt("plan: {s}", .{snapshot.summary(m.allocator)});
+        return std.fmt.allocPrint(
+            arena,
+            "plan: {s} · {d} index/indices did not exist and were ignored",
+            .{ plan.summary(arena), res.unknown },
+        ) catch null;
     }
+    return plan.summary(arena);
+}
+
+/// The TUI's half: same functions, plus the status line and the screen.
+fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
+    var snapshot = m.planCopy();
+    const line = applyPlanTo(&snapshot, args_json, arena) orelse return;
+    m.replacePlan(snapshot);
+    m.pushInfoFmt("{s}", .{line});
     if (snapshot.allDone()) setStatusWithZo(m, .done, "all plan steps done");
 }
 
@@ -4181,14 +4200,12 @@ fn execOneCall(
     }
 
     if (std.mem.eql(u8, call.name, "todo")) {
-        // Which of the two forms it is: a patch has one of these keys, and a
-        // replacement does not. Deciding it by the KEYS and not by "does it have
-        // items" is what lets a call do both — replace the list and then patch it.
-        if (planPatchKeysPresent(call.args_json) or !planHasItems(call.args_json)) {
-            applyPlanPatch(m, call.args_json, arena);
-        } else {
-            applyPlanCall(m, call.args_json, arena);
-        }
+        // Which of the two forms it is — a patch has one of those keys and a
+        // replacement does not — is decided inside `applyPlanTo`, so the headless
+        // runner cannot pick the other one. Deciding it by the KEYS and not by "does
+        // it have items" is what lets a call do both: replace the list and then
+        // patch it.
+        applyPlanCall(m, call.args_json, arena);
     }
 
     const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg, &m.reads) catch |err| {
@@ -7393,4 +7410,68 @@ test "iterationLimit is the SAME for both runners, and ZODE_MAX_ITER moves it" {
 
     try std.testing.expectEqual(agent_default_iterations(), iterationLimit());
     try std.testing.expect(iterationLimit() > 6);
+}
+
+test "applyPlanTo works with NO Model, which is what --chat has" {
+    // The bug this pins: `applyPlanCall` was a method on the TUI's `Model`, so
+    // `zode --chat` answered **"plan recorded"** and recorded nothing — the model
+    // reached for the tool, the tool reported success, and nothing anywhere changed.
+    //
+    // A plain value the caller owns: `Model.plan` for the TUI, a stack variable for
+    // the headless runner. Same code either way.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var plan = plan_mod.Plan.init();
+    try std.testing.expect(plan.isEmpty());
+
+    // The replacement form.
+    const line = applyPlanTo(&plan,
+        \\{"items":[{"content":"read it"},{"content":"fix it","status":"in_progress"}]}
+    , a) orelse {
+        std.debug.print("applyPlanTo returned nothing for the replacement form\n", .{});
+        return error.NoLine;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, line, "0/2 done") != null);
+    try std.testing.expectEqual(@as(u8, 2), plan.len);
+    try std.testing.expectEqual(plan_mod.Status.in_progress, plan.items[1].status);
+
+    // And the patch form, in the same function: the branch is decided inside, so a
+    // caller cannot pick the wrong one.
+    const patch = applyPlanTo(&plan, "{\"update\":[{\"index\":1,\"status\":\"done\"}]}", a) orelse {
+        std.debug.print("patch form returned nothing (len={d})\n", .{plan.len});
+        return error.NoPatchLine;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, patch, "1/2 done") != null);
+    try std.testing.expectEqual(plan_mod.Status.done, plan.items[0].status);
+    // The other step is untouched, which is the whole point of the patch form.
+    try std.testing.expectEqual(plan_mod.Status.in_progress, plan.items[1].status);
+
+    // "Same as before" says nothing, so a repeated call is not noise in the history.
+    try std.testing.expect(applyPlanTo(&plan, "{\"update\":[{\"index\":1,\"status\":\"done\"}]}", a) == null);
+
+    // And a patch with a bad index is reported, not swallowed.
+    const bad = applyPlanTo(&plan, "{\"update\":[{\"index\":9,\"status\":\"done\"}]}", a) orelse {
+        std.debug.print("bad index returned nothing\n", .{});
+        return error.NoBadIndexLine;
+    };
+    try std.testing.expect(std.mem.indexOf(u8, bad, "do not exist") != null);
+}
+
+test "a cleared plan is a change, and an empty one is not" {
+    // The model repeats "plan cleared" on every call if an empty list over an empty
+    // plan counts as a change, and it looks like noise on the screen.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var plan = plan_mod.Plan.init();
+    // An empty list over an EMPTY plan is `.same`, and says nothing: the model
+    // would repeat "plan cleared" on every call otherwise.
+    try std.testing.expect(applyPlanTo(&plan, "{\"items\":[]}", a) == null);
+
+    // And a list that HAD items, emptied, IS a change: it is the signal it is over.
+    _ = applyPlanTo(&plan, "{\"items\":[{\"content\":\"one\"}]}", a);
+    try std.testing.expectEqualStrings("plan cleared", applyPlanTo(&plan, "{\"items\":[]}", a).?);
 }
