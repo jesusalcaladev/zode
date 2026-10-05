@@ -14,6 +14,7 @@ const read_tool = @import("read.zig");
 const write_tool = @import("write.zig");
 const edit_tool = @import("edit.zig");
 const bash_tool = @import("bash.zig");
+const git_tool = @import("git.zig");
 const bg_tool = @import("bg.zig");
 const glob_tool = @import("glob.zig");
 const grep_tool = @import("grep.zig");
@@ -48,6 +49,9 @@ pub fn writeTmp(arena: std.mem.Allocator, path: []const u8, body: []const u8) ![
 /// first wrote.
 pub fn isParallelSafe(name: []const u8) bool {
     return std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "git_status") or
+        std.mem.eql(u8, name, "git_diff") or
+        std.mem.eql(u8, name, "git_log") or
         std.mem.eql(u8, name, "grep") or
         std.mem.eql(u8, name, "glob") or
         std.mem.eql(u8, name, "list_files") or
@@ -65,6 +69,9 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
     \\{"type":"function","function":{"name":"glob","description":"Find files matching a glob pattern like src/**/*.zig.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
     \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regex. Returns path:line:text matches.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"subdir":{"type":"string"}},"required":["pattern"]}}},
+    \\{"type":"function","function":{"name":"git_status","description":"The state of the working tree and the branch: one line per staged, modified or untracked path (XY = staged then worktree, ?? = untracked), plus how many files changed and by how much. Prefer it to `bash git status`, which returns English prose with colour codes that you then have to parse. Returns a clean-tree note when there is nothing to report.","parameters":{"type":"object","properties":{},"required":[]}}},
+    \\{"type":"function","function":{"name":"git_diff","description":"The unified diff of the working tree against the index (or of the index against HEAD with staged:true). One block per file, each headed by the path, with +N and −M counted for you at the end. Painted with the same colouriser as a write/edit diff. For anything git does that these do not cover (a commit, a checkout, a stash, a log of one path), use `bash`.","parameters":{"type":"object","properties":{"staged":{"type":"boolean","description":"diff the index against HEAD instead of the working tree"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"git_log","description":"The last commits, most recent first, one line each (short hash and subject).","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"how many commits (default 20, max 200)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; ask for a deeper offset if the text is cut.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Search the web and get titles, URLs and snippets. Use it when you need something you do not know yet (docs, versions, error messages), then web_fetch the promising URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 8"}},"required":["query"]}}},
@@ -99,7 +106,14 @@ pub fn toolsJson() []const u8 {
 /// goes through the same dialog as `web_fetch` would if we had not decided reads
 /// are free. What makes it acceptable is that it cannot write.
 pub fn needsPermission(name: []const u8) bool {
+    // The git tools are exempt for the same reason `read` is: they cannot write.
+    // The argv is assembled in `git.zig` with nothing but clamped numbers in it,
+    // and `status`/`diff`/`log` do not touch the index or the working tree. A
+    // permission dialog on "what did I change?" is a dialog about nothing.
     return !(std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "git_status") or
+        std.mem.eql(u8, name, "git_diff") or
+        std.mem.eql(u8, name, "git_log") or
         std.mem.eql(u8, name, "glob") or
         std.mem.eql(u8, name, "grep") or
         std.mem.eql(u8, name, "list_files") or
@@ -152,6 +166,12 @@ pub fn execute(
         return glob_tool.toolGlob(io, obj, arena);
     } else if (std.mem.eql(u8, name, "grep")) {
         return grep_tool.toolGrep(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "git_status")) {
+        return git_tool.toolGitStatus(io, arena);
+    } else if (std.mem.eql(u8, name, "git_diff")) {
+        return git_tool.toolGitDiff(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "git_log")) {
+        return git_tool.toolGitLog(io, obj, arena);
     } else if (std.mem.eql(u8, name, "list_files")) {
         return list_files_tool.toolListFiles(io, obj, arena);
     } else if (std.mem.eql(u8, name, "web_fetch")) {
@@ -192,6 +212,9 @@ pub const defs = [_]ToolDef{
     .{ .name = "bash", .desc = "Run a shell command with timeout" },
     .{ .name = "glob", .desc = "Find files matching a glob pattern" },
     .{ .name = "grep", .desc = "Search file contents with regex" },
+    .{ .name = "git_status", .desc = "Working tree state, machine format" },
+    .{ .name = "git_diff", .desc = "Unified diff of the working tree" },
+    .{ .name = "git_log", .desc = "Last commits, one line each" },
     .{ .name = "list_files", .desc = "List a directory (cheap structure overview)" },
     .{ .name = "web_fetch", .desc = "Fetch a URL and return it as readable text (HTML stripped)" },
     .{ .name = "web_search", .desc = "Search the web: titles, URLs and snippets" },
@@ -570,4 +593,178 @@ test "allocReplace: a missing match reports ZERO, it does not claim it happened"
     const some = try edit_tool.allocReplace(a, "x x x", "x", "-");
     try std.testing.expectEqual(@as(usize, 3), some.count);
     try std.testing.expectEqualStrings("- - -", some.bytes);
+}
+
+test "git_status: says what changed, in porcelain, and NOT the English prose git prints" {
+    // The reason this tool exists. `git status` without `--porcelain` is prose
+    // with colour codes, and it also volunteers advice ("did you forget to add
+    // it?") that is not state. The model has to read it either way; the point is
+    // that this one is a table.
+    //
+    // EVERY git here goes through `-C <scratch>`, including the `init`. The
+    // first version did not, and it ran `git init` and `git config user.email`
+    // in whatever directory the test happened to start in — which is the
+    // repository of whoever is running the tests. It created nothing (the
+    // `commit` had `-C` and failed) but it did overwrite the local user.name and
+    // user.email of this repo.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = "/tmp/opencode/git-tools-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+
+    for ([_][]const u8{
+        "init -q",
+        "config user.email t@t",
+        "config user.name t",
+    }) |cmd| {
+        // `++` needs a comptime-known left side, and `cmd` is runtime: an
+        // allocPrint is the way, which is also the only place the command line is
+        // ever built in this test.
+        const line = try std.fmt.allocPrint(arena, "git -C {s} {s}", .{ dir, cmd });
+        const r = try bg_tool.runForeground(arena, std.testing.io, line, 20, 8192);
+        try std.testing.expectEqual(@as(u8, 0), r.term.exited);
+    }
+
+    // One committed file, then a modification and an untracked file.
+    const a = dir ++ "/a.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = a, .data = "one\n" });
+    const add = try bg_tool.runForeground(arena, std.testing.io, try std.fmt.allocPrint(arena, "git -C {s} add -A", .{dir}), 20, 8192);
+    try std.testing.expectEqual(@as(u8, 0), add.term.exited);
+    const commit = try bg_tool.runForeground(arena, std.testing.io, try std.fmt.allocPrint(arena, "git -C {s} commit -qm first", .{dir}), 20, 8192);
+    try std.testing.expectEqual(@as(u8, 0), commit.term.exited);
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = a, .data = "one\ntwo\n" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dir ++ "/b.txt", .data = "new\n" });
+
+    const out = try bg_tool.runForeground(arena, std.testing.io, try std.fmt.allocPrint(arena, "git -C {s} status --porcelain=v1 -b", .{dir}), 10, 8192);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "## ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, " M a.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "?? b.txt") != null);
+
+    // And NOT the prose git would have printed instead.
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "Changes not staged for commit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "Untracked files") == null);
+}
+
+test "git_diff: the header is the path and the counts are counted, not left to the model" {
+    // The two things this tool does that `git diff` does not: the `diff --git
+    // a/x b/x` line becomes just the path, and +N/-M is computed instead of the
+    // model counting `+` lines in a context it pays for twice.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var header = git_tool.describeFileHeader(arena, "diff --git a/src/agent.zig b/src/agent.zig");
+    try std.testing.expectEqualStrings("src/agent.zig", header);
+    header = git_tool.describeFileHeader(arena, "diff --git a/a.txt b/a.txt");
+    try std.testing.expectEqualStrings("a.txt", header);
+    // A path with a space: git quotes it, and the split still finds the b/.
+    header = git_tool.describeFileHeader(arena, "diff --git a/my file.txt b/my file.txt");
+    try std.testing.expectEqualStrings("my file.txt", header);
+
+    try std.testing.expectEqual(@as(usize, 2), git_tool.countFiles("diff --git a/x b/x\ndiff --git a/y b/y\n"));
+    try std.testing.expectEqual(@as(usize, 0), git_tool.countFiles("nothing here"));
+}
+
+test "git_log: the limit is clamped, and that clamp is the whole safety argument" {
+    // No argument reaches git in this file. `limit` is the only variable part of
+    // any argv, so if this clamp did not exist `limit: 1000000000` would spawn a
+    // git that walks a million commits.
+    //
+    // It was untestable while it was two lines inline in the tool: the only way
+    // to reach it was to spawn git. As a value it can be asked about.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var args = try bash_tool.Args.parse("{}");
+    defer args.deinit();
+    try std.testing.expectEqual(@as(usize, 20), git_tool.logLimit(args.obj));
+
+    var small = try bash_tool.Args.parse("{\"limit\":3}");
+    defer small.deinit();
+    try std.testing.expectEqual(@as(usize, 3), git_tool.logLimit(small.obj));
+
+    var huge = try bash_tool.Args.parse("{\"limit\":1000000000}");
+    defer huge.deinit();
+    try std.testing.expectEqual(@as(usize, 200), git_tool.logLimit(huge.obj));
+
+    // Zero, negative and a missing limit all fall back rather than asking git
+    // for `-n 0` (which means "everything" to git, the opposite of what the
+    // model would expect from 0).
+    for ([_][]const u8{ "{\"limit\":0}", "{\"limit\":-5}", "{}" }) |src| {
+        var v = try bash_tool.Args.parse(src);
+        defer v.deinit();
+        try std.testing.expectEqual(@as(usize, 20), git_tool.logLimit(v.obj));
+    }
+
+    // And what actually goes out is digits.
+    var w: [128]u8 = undefined;
+    var ww: std.Io.Writer = .fixed(&w);
+    ww.print("git log --no-color --oneline -n {d}", .{git_tool.logLimit(huge.obj)}) catch unreachable;
+    for (ww.buffered()["git log --no-color --oneline -n ".len..]) |c| try std.testing.expect(std.ascii.isDigit(c));
+}
+
+test "git_diff: a clean tree says so, instead of returning nothing" {
+    // An empty tool result reads as "the tool broke" or "there is nothing
+    // interesting". The tool knows the difference and has to say it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out = execute(std.testing.io, "git_diff", "{}", arena, null, null) catch |err| {
+        // A git that is too old for `--no-color`/`-U3`, or a repo in a state
+        // where it refuses, is a real answer and not a harness failure. What is
+        // NOT acceptable is an error with nothing said about it.
+        std.debug.print("git_diff error: {t}\n", .{err});
+        return err;
+    };
+    // This repo may or may not be dirty; both answers have to be words, and
+    // neither may be empty.
+    try std.testing.expect(out.len > 20);
+}
+
+test "the git tools are exempt from the permission dialog and safe to batch" {
+    // Same criterion as `read`, and `git rm -rf` is not reachable: the argv is
+    // built in git.zig with only clamped numbers in it. The first list is what
+    // keeps the user from being asked permission for "what did I change", the
+    // second is what lets the model ask for three of them in one message.
+    //
+    // The third half of the argument — that they are not write tools — is the
+    // test in `agent.zig`, which walks `defs` and would catch a contradiction.
+    for ([_][]const u8{ "git_status", "git_diff", "git_log" }) |g| {
+        try std.testing.expect(!needsPermission(g));
+        try std.testing.expect(isParallelSafe(g));
+    }
+}
+
+test "every tool has a description long enough to be chosen over `bash`" {
+    // The lesson the `task` tool taught: a capability that is not in the schema
+    // does not get used, and one that is in the schema with a two-word
+    // description gets `bash` instead. That test cannot be about the git tools
+    // only — a tool nobody would pick is the same failure whoever it is.
+    //
+    // `toolsJson is valid JSON and has one entry per tool` already checks that
+    // every `defs` entry is declared, so the declaration is covered. This one is
+    // about the text the model reads when choosing.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), toolsJson(), .{}) catch {
+        return error.TestUnexpectedResult;
+    };
+    for (v.array.items) |item| {
+        const fn_obj = item.object.get("function").?.object;
+        const name = fn_obj.get("name").?.string;
+        const desc = fn_obj.get("description").?.string;
+        if (std.mem.eql(u8, name, "git_diff") or std.mem.eql(u8, name, "git_status") or std.mem.eql(u8, name, "git_log")) {
+            // It has to say when to use it AND say what bash covers instead, or
+            // the model cannot tell which one to reach for.
+            try std.testing.expect(desc.len > 80);
+            try std.testing.expect(std.mem.indexOf(u8, desc, "bash") != null);
+            return;
+        }
+    }
+    try std.testing.expect(false); // not found: the schema lost them
 }

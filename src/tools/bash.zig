@@ -90,7 +90,7 @@ pub const Args = struct {
     state: std.heap.ArenaAllocator,
     obj: std.json.ObjectMap,
 
-    fn parse(json: []const u8) !Args {
+    pub fn parse(json: []const u8) !Args {
         var self: Args = .{ .state = std.heap.ArenaAllocator.init(std.testing.allocator), .obj = .{} };
         errdefer self.state.deinit();
         const parsed = try std.json.parseFromSliceLeaky(std.json.Value, self.state.allocator(), json, .{});
@@ -98,7 +98,7 @@ pub const Args = struct {
         return self;
     }
 
-    fn deinit(self: *Args) void {
+    pub fn deinit(self: *Args) void {
         self.state.deinit();
     }
 };

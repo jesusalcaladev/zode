@@ -26,6 +26,16 @@ pub fn main(init: std.process.Init) !u8 {
     const r5 = try tools.execute(init.io, "edit", "{\"path\":\"/tmp/zode_edit_test.txt\",\"old_string\":\"mundo\",\"new_string\":\"zode\"}", arena, null, null);
     try out.interface.print("EDIT: {s}\n", .{r5});
 
+    // The git tools, on THIS repository: the only honest way to see whether the
+    // header rewriting and the counts work is against a real diff.
+    const g1 = try tools.execute(init.io, "git_status", "{}", arena, null, null);
+    try out.interface.print("GIT_STATUS: {s}\n", .{g1[0..@min(g1.len, 300)]});
+    const g2 = try tools.execute(init.io, "git_diff", "{}", arena, null, null);
+    const tail_start = if (g2.len > 400) g2.len - 400 else 0;
+    try out.interface.print("GIT_DIFF (fin): {s}\n", .{g2[tail_start..]});
+    const g3 = try tools.execute(init.io, "git_log", "{\"limit\":3}", arena, null, null);
+    try out.interface.print("GIT_LOG: {s}\n", .{g3[0..@min(g3.len, 300)]});
+
     try out.interface.flush();
     return 0;
 }
