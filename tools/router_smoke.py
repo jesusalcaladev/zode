@@ -130,7 +130,12 @@ def run(argv, env, feed, cols=200, rows=50, settle=1.0):
 
 
 def strip_ansi(s):
-    return re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][B0]", "", s)
+    # The COLON in a truecolor SGR matters: `\x1b[38:2:74:81:112m` is what zode emits for
+    # the brand colour, `[0-9;?]*` does not match it, and the escape then survives into
+    # the text and can land INSIDE the string a check asserts on. That is how
+    # `ZODE_CHEAP_TURN=0` came out as `ZODE_CHE\x1b[38:2:74:81:112mAP_TURN=0` and the
+    # router smoke reported a notice that was on the screen all along.
+    return re.sub(r"\x1b\[[0-9;:?]*[a-zA-Z@]|\x1b\][^\x07]*\x07|\x1b[()][B0]", "", s)
 
 
 def main():
@@ -238,7 +243,26 @@ def main():
     # model that is gated on this account is fixed by picking another model, and one
     # that does not exist is fixed by fixing the name. Asserting on one exact
     # sentence made the test depend on which failure it happened to get.
-    if "ZODE_CHEAP_TURN=0" in text:
+    # In a flattened copy, because the screen is ROWS and the sentence is not.
+    #
+    # Two things go between the halves of `ZODE_CHEAP_TURN=0` at 200 columns, and both
+    # are zode working correctly rather than the notice being wrong:
+    #
+    #   - the paragraph GUTTER (`│`, U+2502), which the markdown renderer puts on every
+    #     continuation row so each row stays attributable to its block. Measured:
+    #     'ZODE_CHE│AP_TURN=0 turns the cheap router off.'
+    #   - the terminal's own newline.
+    #
+    # Asserting on a substring that only exists when the wrap point happens to fall
+    # elsewhere ties the check to the length of a model id that comes from the LIVE
+    # catalogue, so it went red whenever the ids changed and green when they did not.
+    # DELETED, not replaced with a space: the wrap lands INSIDE the token, so
+    # 'ZODE_CHE AP_TURN=0' still does not contain 'ZODE_CHEAP_TURN=0'. Collapsing to a
+    # space was the first version and it failed for exactly that reason. Removing every
+    # space would also join neighbouring words, which is harmless here because the only
+    # thing looked up is one environment-variable name.
+    flat = re.sub(r"[\s│]+", "", text)
+    if "ZODE_CHEAP_TURN=0" in flat:
         ok("the notice says how to turn it off")
     else:
         fail("the notice does not say how to turn the router off")
