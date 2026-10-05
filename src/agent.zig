@@ -3062,9 +3062,15 @@ fn deleteIfUnchanged(path: []const u8) bool {
 fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
     var items: [plan_mod.max_items]plan_mod.Item = undefined;
     const parsed = plan_mod.parseItems(arena, args_json, &items) catch |err| {
+        // `parseItems` needs `items`; without it there is nothing to replace, and
+        // the only thing a call can be is a patch. A patch that does not parse is
+        // the error below, and the message names BOTH forms so a model that sent
+        // `update` is not told to send `items`.
         const msg = switch (err) {
             error.TooManyItems => "the plan has more than 20 steps: shorten it",
-            error.BadPlan => "the plan did not parse: send {items:[{content, status}]}",
+            error.BadPlan => "the plan did not parse. Send the whole list as {items:[{content,status}]} " ++
+                "or change one step as {update:[{index,status}]} / {remove:[3]} / {add:[{content}]}. " ++
+                "Indexes are 1-based.",
         };
         pushInfoOwned(m, msg);
         return;
@@ -3076,6 +3082,88 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
     const pl = m.planCopy();
     m.pushInfoFmt("{s}", .{pl.summary(m.allocator)});
     if (pl.allDone()) setStatusWithZo(m, .done, "all plan steps done");
+}
+
+/// Does this `todo` call carry a patch key (`update`, `remove`, `add`)?
+///
+/// It is a substring test and not a parse, deliberately: this runs on the hot path
+/// of deciding which of the two handlers the call goes to, and a full JSON parse
+/// there would mean parsing every `todo` twice. The three keys are distinctive
+/// enough that a model prompt containing them inside another argument is not a
+/// realistic false positive — and the consequence of a false positive is a handler
+/// that reports "the patch had nothing in it", never a mangled plan.
+fn planPatchKeysPresent(args_json: []const u8) bool {
+    for ([_][]const u8{ "\"update\"", "\"updates\"", "\"remove\"", "\"removed\"", "\"add\"" }) |k| {
+        if (std.mem.indexOf(u8, args_json, k) != null) return true;
+    }
+    return false;
+}
+
+/// Does it carry the replacement key?
+fn planHasItems(args_json: []const u8) bool {
+    return std.mem.indexOf(u8, args_json, "\"items\"") != null or
+        std.mem.indexOf(u8, args_json, "\"todos\"") != null;
+}
+
+/// The patch form of `todo`: change, drop or add ONE step without resending the
+/// list.
+///
+/// It is a separate function and not a branch inside `applyPlanCall` because the
+/// two answer different questions. A replacement says "here is the plan"; a patch
+/// says "step 3 is done". The screen shows the difference too — a replacement
+/// rewrites every row, a patch moves one.
+fn applyPlanPatch(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
+        pushInfoOwned(m, "the plan patch did not parse: send {update:[{index,status}]}");
+        return;
+    };
+    if (parsed != .object) {
+        pushInfoOwned(m, "the plan patch did not parse: send {update:[{index,status}]}");
+        return;
+    }
+
+    var updates: [plan_mod.max_items]plan_mod.StepUpdate = undefined;
+    const n_upd = plan_mod.parseUpdates(parsed.object, &updates) catch {
+        pushInfoOwned(m, "the plan patch did not parse. Send {update:[{index,status,text}]} with a 1-based index.");
+        return;
+    };
+    var remove: [plan_mod.max_items]u8 = undefined;
+    const n_rm = plan_mod.parseRemove(parsed.object, &remove) catch {
+        pushInfoOwned(m, "the plan patch did not parse: send {remove:[3]} with 1-based indexes.");
+        return;
+    };
+    var add: [plan_mod.max_items]plan_mod.Item = undefined;
+    const n_add = plan_mod.parseAdd(parsed.object, &add) catch {
+        pushInfoOwned(m, "the plan patch did not parse: send {add:[{content}]}.");
+        return;
+    };
+
+    if (n_upd == 0 and n_rm == 0 and n_add == 0) {
+        pushInfoOwned(m, "the plan patch had nothing in it: send update, remove or add.");
+        return;
+    }
+
+    const before = m.plan.len;
+    var snapshot = m.planCopy();
+    const res = plan_mod.applyPatch(&snapshot, updates[0..n_upd], remove[0..n_rm], add[0..n_add], n_add);
+    if (!res.anyChange() and snapshot.len == before) {
+        // Nothing happened. Saying so is the point: a silent no-op reads as "the
+        // step was marked done" and the model will not send it again.
+        if (res.unknown > 0) {
+            m.pushInfoFmt("plan patch did nothing: {d} index/indices do not exist (the plan has {d} steps, indexes are 1-based).", .{ res.unknown, before });
+        }
+        return;
+    }
+    m.replacePlan(snapshot);
+
+    if (res.unknown > 0) {
+        m.pushInfoFmt("plan patched ({d} applied) · {d} index/indices did not exist and were ignored", .{
+            res.updated + res.removed + res.added, res.unknown,
+        });
+    } else {
+        m.pushInfoFmt("plan: {s}", .{snapshot.summary(m.allocator)});
+    }
+    if (snapshot.allDone()) setStatusWithZo(m, .done, "all plan steps done");
 }
 
 /// Runs a turn's tool calls and returns the synthesized text for the next one
@@ -3951,7 +4039,14 @@ fn execOneCall(
     // sees, and it is applied here (not inside `execute`) because the plan lives
     // in the `Model`, which belongs to the TUI.
     if (std.mem.eql(u8, call.name, "todo")) {
-        applyPlanCall(m, call.args_json, arena);
+        // Which of the two forms it is: a patch has one of these keys, and a
+        // replacement does not. Deciding it by the KEYS and not by "does it have
+        // items" is what lets a call do both — replace the list and then patch it.
+        if (planPatchKeysPresent(call.args_json) or !planHasItems(call.args_json)) {
+            applyPlanPatch(m, call.args_json, arena);
+        } else {
+            applyPlanCall(m, call.args_json, arena);
+        }
     }
 
     const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg, &m.reads) catch |err| {

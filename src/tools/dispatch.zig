@@ -94,7 +94,7 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; ask for a deeper offset if the text is cut.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Search the web and get titles, URLs and snippets. Use it when you need something you do not know yet (docs, versions, error messages), then web_fetch the promising URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 8"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"think","description":"Think privately step by step before acting. Use for planning and complex reasoning. No side effects.","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}},
-    \\{"type":"function","function":{"name":"todo","description":"Write the task list the USER SEES on screen, for tasks with more than about two steps. Send the WHOLE list every time (it replaces the previous one), each item {content, status: pending|in_progress|done}. Mark exactly one in_progress while you work on it, and never more than one. Call it again when a step finishes or the plan changes, and send an empty list when everything is done. Do not use it for a single obvious step or for thinking out loud.","parameters":{"type":"object","properties":{"items":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string","description":"imperative, short (a single line)"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content","status"]}}},"required":["items"]}}},
+    \\{"type":"function","function":{"name":"todo","description":"Write the task list the USER SEES on screen, for tasks with more than about two steps. Two forms: send the WHOLE list in `items` when you make the plan or it changes shape, and afterwards change single steps with `update` ({index, status} or {index, text}), `remove` ([3]) or `add` ([{content}]); indexes are 1-BASED. Prefer `update` over resending the list to mark a step done: a twelve-step plan resent to change one can lose a step on the way. Mark exactly one step in_progress while you work on it, and never more than one. Call it again when a step finishes, and clear it when everything is done. Do not use it for a single obvious step or for thinking out loud.","parameters":{"type":"object","properties":{"items":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string","description":"imperative, short: what this step does"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content"]},"description":"the WHOLE list, which REPLACES the previous one."},"update":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"index":{"type":"integer","description":"1-based position of the step"},"status":{"type":"string","enum":["pending","in_progress","done"]},"text":{"type":"string","description":"new wording for the step"}},"required":["index"]},"description":"change ONE step in place: {index,status} to mark it, {index,text} to reword it."},"remove":{"type":"array","maxItems":20,"items":{"type":"integer"},"description":"drop steps by 1-based position."},"add":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content"]},"description":"append a step discovered while working."}}}}},
     \\{"type":"function","function":{"name":"ask","description":"Ask the USER one question, and wait for the answer. Use it when the answer changes what you do next: a choice between approaches, an ambiguous request with two real readings, a 'which one'. Do NOT ask what you can find out yourself — read the file, grep, run the command first, and only ask if it is still unclear after that. One question per step, at most three in a whole turn. Put your recommendation first in the question text so the user can just press enter. With 2 to 5 `options` it becomes a menu; with no options the user types free text. If the user does not answer (esc) you must decide on your own, say which option you picked and why, and carry on: do not ask again. `header` is a 2-3 word label for the dialog, not the question.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"the question, with your recommendation and its reason up front"},"header":{"type":"string","description":"2-3 word label for the dialog"},"options":{"type":"array","minItems":2,"maxItems":5,"items":{"type":"string","description":"one choice, on a single line"}}},"required":["question"]}}},
     \\{"type":"function","function":{"name":"skill","description":"Load a skill: a folder of instructions written for a specific kind of task. Your prompt lists only the name and when to use it (the body is not in your prompt, so it costs nothing until you ask). Load one when its description matches what you are about to do, and load none when none of them do.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"the skill's name, exactly as listed"}},"required":["name"]}}},
     \\{"type":"function","function":{"name":"task","description":"Send a read-only investigation to a SUBAGENT that has its own context window, and get back a short report (a few lines with paths and line numbers). Use it when the search is big: grepping across a large tree, tracing where something is used, reading many files to answer one question. Everything the subagent reads is paid for ONCE in a window that is then thrown away, instead of staying in your context and being resent on every remaining step — so for a wide search this is much cheaper than doing it yourself. It cannot write anything and cannot ask the user anything; if it needs a decision only the user can make, it says so in the report and you decide whether to ask. Use it for search; do it yourself when you already know the file to change. You can send SEVERAL task calls in one message when the searches are independent (a different area each one): they run at the same time instead of one after the other, and the reports come back in the order you asked. Do not send two tasks that need the answer of the other, and do not send one task per file when a single grep covers it.","parameters":{"type":"object","properties":{"description":{"type":"string","description":"one line: what to find out"},"prompt":{"type":"string","description":"the full question, including where to look and what to report back"}},"required":["description"]}}},
@@ -1421,4 +1421,76 @@ test "the schema of check does not require the model to know the command" {
         found = true;
     };
     try std.testing.expect(found);
+}
+
+test "todo: the patch form works, and marking one step done does not rewrite the list" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // One step done, out of a plan the model does not resend.
+    const args = try jsonArgs(arena, "{{\"update\":[{{\"index\":2,\"status\":\"done\"}}]}}", .{});
+    const out = try execute(std.testing.io, "todo", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1 step changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Keep it updated") != null);
+}
+
+test "todo: an index that does not exist is told, not swallowed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A silent no-op reads as "the step was marked done" and the model will not
+    // send it again. Saying the index was wrong is what lets it correct itself.
+    const args = try jsonArgs(arena, "{{\"update\":[{{\"index\":9,\"status\":\"done\"}}]}}", .{});
+    const out = try execute(std.testing.io, "todo", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1 step changed") != null);
+}
+
+test "todo: remove and add, and both forms at once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try jsonArgs(
+        arena,
+        "{{\"remove\":[2],\"add\":[{{\"content\":\"and re-run the check\"}}]}}",
+        .{},
+    );
+    const out = try execute(std.testing.io, "todo", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1 removed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1 added") != null);
+}
+
+test "todo: the schema documents BOTH forms, so the model knows the patch exists" {
+    // A capability that is not in the schema does not get used — the lesson the
+    // `task` tool taught. `update` in the schema with no explanation is worse: the
+    // model has to guess whether indices are 0-based or 1-based.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), toolsJson(), .{}) catch
+        return error.BadSchema;
+
+    for (v.array.items) |item| {
+        const fn_obj = item.object.get("function").?.object;
+        if (!std.mem.eql(u8, fn_obj.get("name").?.string, "todo")) continue;
+        const desc = fn_obj.get("description").?.string;
+        for ([_][]const u8{ "update", "remove", "add", "1-BASED" }) |needle| {
+            if (std.mem.indexOf(u8, desc, needle) == null) {
+                std.debug.print("the todo description does not mention {s}\n", .{needle});
+                return error.SchemaIncomplete;
+            }
+        }
+        // And the parameters really expose them, not only the prose.
+        const params = fn_obj.get("parameters").?.object;
+        const props = params.get("properties").?.object;
+        for ([_][]const u8{ "items", "update", "remove", "add" }) |k| {
+            if (props.get(k) == null) return error.SchemaIncomplete;
+        }
+        // None of them is REQUIRED: a patch and a replacement are both complete on
+        // their own, and requiring one of them would forbid the other.
+        if (params.get("required") != null) return error.SchemaTooStrict;
+        return;
+    }
+    return error.NoTodo;
 }

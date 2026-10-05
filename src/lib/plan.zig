@@ -10,12 +10,18 @@ const std = @import("std");
 /// What this is after is being able to answer "how much is left and what is it
 /// on?" at ANY moment by reading one row, with no Ask Mode.
 ///
-/// ## Semantics: full replacement, not a patch
+/// ## Semantics: full replacement AND in-place patches
 ///
-/// Every call sends the WHOLE list. That is what Claude Code does with
-/// `TodoWrite` and it is not arbitrary: patching differs per model, and with a
-/// partial list the server cannot know what was removed. With a full list,
-/// "drop step 3" is "send 4 steps without the 3rd".
+/// `items` replaces the whole list, which is what Claude Code does with
+/// `TodoWrite` and what models are trained to emit. It stays the base form.
+///
+/// On top of it, `update`, `remove` and `add` address single steps by their
+/// 1-based position. They exist because replacement has a cost that only shows up
+/// in a long task: marking step 3 done means resending twelve steps, and a model
+/// that resends them can drop one. The original argument for replacement — "with a
+/// partial list the server cannot know what was removed" — is about a REMOTE
+/// server. This list is in this process. The harness is the one that removes it,
+/// so it knows.
 ///
 /// ## Why a fixed array
 ///
@@ -172,6 +178,134 @@ pub const Result = struct {
 };
 
 pub const ParseError = error{ BadPlan, TooManyItems };
+
+/// A change to ONE step, addressed by its 1-based position.
+///
+/// Why this exists when `apply` already replaces the whole list: with only
+/// replacement, marking step 3 done means resending all twelve steps, and a model
+/// that resends them can drop one. The list lives in this process, in the `Model`,
+/// so the argument the doc comment above makes for full replacement — "with a
+/// partial list the server cannot know what was removed" — does not apply here.
+/// The harness knows exactly what was removed, because it is the one that removed
+/// it.
+pub const StepUpdate = struct {
+    /// 1-based. Zero is rejected rather than clamped: an index of 0 is an off-by-one
+    /// in the model's counting, and silently updating step 1 when it meant "none"
+    /// is worse than telling it the index was wrong.
+    index: u8,
+    /// null = leave the text as it is.
+    text: ?[]const u8 = null,
+    /// null = leave the status as it is.
+    status: ?Status = null,
+};
+
+/// What a patch did, for the message the model reads and the tests.
+pub const PatchResult = struct {
+    updated: u8 = 0,
+    removed: u8 = 0,
+    added: u8 = 0,
+    /// Indices the model sent that do not exist. Reported instead of ignored: a
+    /// silent no-op reads as "the step was marked done", and the model will not
+    /// send it again.
+    unknown: u8 = 0,
+
+    pub fn anyChange(self: PatchResult) bool {
+        return self.updated > 0 or self.removed > 0 or self.added > 0;
+    }
+};
+
+/// Applies changes to the CURRENT list, in place.
+///
+/// The order is fixed and it is the only thing that makes indices unambiguous:
+/// removals first, then updates, then additions. So an index in `update` names a
+/// step that survived `remove`, and an index in `add` has nothing to do with the
+/// positions at all.
+///
+/// `remove` is applied from the highest index down. Going upwards would shift every
+/// later step by one and remove the wrong ones — the bug this order exists to make
+/// impossible rather than unlikely.
+pub fn applyPatch(
+    self: *Plan,
+    updates: []const StepUpdate,
+    remove: []const u8,
+    add: []const Item,
+    add_n: u8,
+) PatchResult {
+    var r = PatchResult{};
+    const before_len = self.len;
+    const before_done = self.doneCount();
+
+    // ── removals, HIGHEST INDEX FIRST ──
+    //
+    // The sort is not an optimisation, it is what makes the indices mean what the
+    // model thinks they mean. Removing index 1 first shifts every later step down
+    // by one, so a `remove: [1, 3]` sent in that order then tries to remove what is
+    // now step 2 — the wrong step. The doc comment claimed this order and the code
+    // did not do it; a test that removes 1 and 3 and expects "fix it" and
+    // "check it" is what caught it.
+    //
+    // Insertion sort, on a fixed array of at most `max_items` entries: the data is
+    // tiny and this is not a place where an allocator should appear.
+    var order: [max_items]u8 = undefined;
+    var n_ord: usize = 0;
+    for (remove) |raw| {
+        // Out-of-range indices are counted, not clamped: a `remove: [9]` on a
+        // three-step plan is the model miscounting, and clamping it to the last
+        // step would delete something it never named.
+        if (raw < 1 or raw > self.len) {
+            r.unknown += 1;
+            continue;
+        }
+        var j = n_ord;
+        while (j > 0 and order[j - 1] < raw) : (j -= 1) order[j] = order[j - 1];
+        order[j] = raw;
+        n_ord += 1;
+    }
+    for (order[0..n_ord]) |raw| {
+        const i = raw - 1;
+        var k = i;
+        while (k + 1 < self.len) : (k += 1) self.items[k] = self.items[k + 1];
+        self.len -= 1;
+        r.removed += 1;
+    }
+
+    // ── updates ──
+    for (updates) |u| {
+        if (u.index < 1 or u.index > self.len) {
+            r.unknown += 1;
+            continue;
+        }
+        const i = u.index - 1;
+        if (u.status) |st| self.items[i].status = st;
+        if (u.text) |t| {
+            const trimmed = std.mem.trim(u8, t, " \t");
+            if (trimmed.len == 0) {
+                r.unknown += 1;
+                continue;
+            }
+            const cp = @min(trimmed.len, text_max);
+            @memcpy(self.items[i].text[0..cp], trimmed[0..cp]);
+            self.items[i].len = @intCast(cp);
+        }
+        r.updated += 1;
+    }
+
+    // ── additions ──
+    var a: u8 = 0;
+    while (a < add_n and self.len < max_items) : (a += 1) {
+        self.items[self.len] = add[a];
+        self.len += 1;
+        r.added += 1;
+    }
+    // Anything that did not fit is not silently dropped.
+    if (add_n > a) r.unknown += add_n - a;
+
+    if (r.anyChange() or self.len != before_len) {
+        self.prev_len = before_len;
+        self.prev_done = before_done;
+    }
+    return r;
+}
 
 /// Parses the `todo` list out of the JSON.
 ///
@@ -479,4 +613,318 @@ fn manyItems(n: usize, buf: []u8) []const u8 {
     }
     w.print("]}}", .{}) catch return "";
     return w.buffered();
+}
+
+/// `update` / `remove` / `add`: the keys that make a `todo` call a PATCH.
+pub fn parseUpdates(obj: std.json.ObjectMap, out: *[max_items]StepUpdate) !u8 {
+    const v = obj.get("update") orelse obj.get("updates") orelse return 0;
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadPlan,
+    };
+    if (arr.items.len > max_items) return error.TooManyPlanItems;
+    var n: u8 = 0;
+    for (arr.items) |e| {
+        if (e != .object) return error.BadPlan;
+        const iv = e.object.get("index") orelse e.object.get("step") orelse return error.BadPlan;
+        const idx = asIndex(iv) orelse return error.BadPlan;
+
+        var u = StepUpdate{ .index = idx };
+        if (e.object.get("status")) |sv| {
+            if (sv != .string) return error.BadPlan;
+            // An unknown status is a MISLABELLED step, not a broken call: leaving the
+            // status alone still applies the text change in the same object, and
+            // failing the whole patch over one word throws away the rest.
+            u.status = Status.parse(sv.string);
+        }
+        if (e.object.get("text") orelse e.object.get("content")) |tv| {
+            if (tv != .string) return error.BadPlan;
+            u.text = tv.string;
+        }
+        out[n] = u;
+        n += 1;
+    }
+    return n;
+}
+
+/// `remove: [3, 5]`
+pub fn parseRemove(obj: std.json.ObjectMap, out: *[max_items]u8) !u8 {
+    const v = obj.get("remove") orelse obj.get("removed") orelse return 0;
+    const arr = switch (v) {
+        .array => |a| a,
+        else => return error.BadPlan,
+    };
+    if (arr.items.len > max_items) return error.TooManyPlanItems;
+    var n: u8 = 0;
+    for (arr.items) |e| {
+        out[n] = asIndex(e) orelse return error.BadPlan;
+        n += 1;
+    }
+    return n;
+}
+
+/// `add: [{content, status}]` — steps discovered while working.
+///
+/// A single step may arrive without the array, because a model that discovers one
+/// more step writes `add: "text"` about as often as `add: [{…}]`.
+pub fn parseAdd(obj: std.json.ObjectMap, out: *[max_items]Item) !u8 {
+    const v = obj.get("add") orelse return 0;
+    switch (v) {
+        .array => |a| {
+            if (a.items.len > max_items) return error.TooManyPlanItems;
+            var n: u8 = 0;
+            for (a.items) |e| {
+                out[n] = try itemFromValue(e);
+                n += 1;
+            }
+            return n;
+        },
+        .object => |o| {
+            out[0] = try itemFromValue(.{ .object = o });
+            return 1;
+        },
+        .string => |str| {
+            out[0] = try itemFromContent(str, .pending);
+            return 1;
+        },
+        else => return error.BadPlan,
+    }
+}
+
+fn itemFromValue(v: std.json.Value) !Item {
+    if (v != .object) return error.BadPlan;
+    const c = v.object.get("content") orelse v.object.get("text") orelse
+        v.object.get("task") orelse return error.BadPlan;
+    if (c != .string) return error.BadPlan;
+    // An unknown status is a MISLABELLED step, not a broken call: it falls back to
+    // pending, which is what `fromValue` does for the same reason.
+    const st = if (v.object.get("status")) |sv| blk: {
+        if (sv != .string) break :blk .pending;
+        break :blk Status.parse(sv.string) orelse .pending;
+    } else .pending;
+    return itemFromContent(c.string, st);
+}
+
+fn itemFromContent(text: []const u8, st: Status) !Item {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    if (trimmed.len == 0) return error.BadPlan;
+    var it = Item{ .status = st };
+    const cp = @min(trimmed.len, text_max);
+    @memcpy(it.text[0..cp], trimmed[0..cp]);
+    it.len = @intCast(cp);
+    return it;
+}
+
+/// A JSON index, accepting the string form.
+fn asIndex(v: std.json.Value) ?u8 {
+    const raw: i64 = switch (v) {
+        .integer => |i| i,
+        // `"3"` is a real thing models send, and rejecting it costs a retry of a
+        // call that was understood perfectly well.
+        .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " \\t"), 10) catch return null,
+        else => return null,
+    };
+    if (raw < 0 or raw > 255) return null;
+    return @intCast(raw);
+}
+
+// ── patch tests ────────────────────────────────────────────────
+
+/// A plan with three steps, for the patch tests.
+fn planOf3() Plan {
+    var p = Plan.init();
+    var items: [3]Item = undefined;
+    const texts = [_][]const u8{ "read the code", "fix it", "check it" };
+    for (texts, 0..) |t, i| {
+        @memcpy(items[i].text[0..t.len], t);
+        items[i].len = @intCast(t.len);
+        items[i].status = .pending;
+    }
+    _ = p.apply(items[0..], 3);
+    return p;
+}
+
+test "applyPatch: marking ONE step done does not touch the others" {
+    // The whole reason this exists. With only replacement, marking step 2 done
+    // means resending three steps, and a model that resends them can drop one.
+    var p = planOf3();
+    const ups = [_]StepUpdate{.{ .index = 2, .status = .done }};
+    const r = applyPatch(&p, &ups, &.{}, &.{}, 0);
+
+    try std.testing.expectEqual(@as(u8, 1), r.updated);
+    try std.testing.expectEqual(@as(u8, 3), p.len);
+    try std.testing.expectEqualStrings("read the code", p.items[0].textOf());
+    try std.testing.expectEqualStrings("fix it", p.items[1].textOf());
+    try std.testing.expectEqual(Status.done, p.items[1].status);
+    try std.testing.expectEqualStrings("check it", p.items[2].textOf());
+    // And the untouched ones are still pending, which is the half that used to go
+    // wrong when a model resends the list and reclassifies everything.
+    try std.testing.expectEqual(Status.pending, p.items[0].status);
+    try std.testing.expectEqual(Status.pending, p.items[2].status);
+}
+
+test "applyPatch: removals go from the highest index down" {
+    // Four steps, and the two removed are sent in ASCENDING order: 1 then 3.
+    //
+    // This is the case the order exists for. Removing 1 first shifts every later
+    // step down by one, so the next index — 3 — now names what was step 4, and the
+    // model never asked for it to go anywhere. The first version of this function
+    // did exactly that while its comment claimed otherwise; the comment was right
+    // and the code was not.
+    var p = Plan.init();
+    var items: [4]Item = undefined;
+    const texts = [_][]const u8{ "one", "two", "three", "four" };
+    for (texts, 0..) |t, i| {
+        @memcpy(items[i].text[0..t.len], t);
+        items[i].len = @intCast(t.len);
+        items[i].status = .pending;
+    }
+    _ = p.apply(items[0..], 4);
+    try std.testing.expectEqual(@as(u8, 4), p.len);
+
+    const rm = [_]u8{ 1, 3 };
+    const r = applyPatch(&p, &.{}, &rm, &.{}, 0);
+    try std.testing.expectEqual(@as(u8, 2), r.removed);
+    try std.testing.expectEqual(@as(u8, 0), r.unknown);
+    try std.testing.expectEqual(@as(u8, 2), p.len);
+    // Steps 2 and 4 survive, IN THAT ORDER. With the ascending removal it would be
+    // "two" and "four" too by luck, so the third assertion is what pins it: only
+    // two steps are left, and neither is "one" or "three".
+    try std.testing.expectEqualStrings("two", p.items[0].textOf());
+    try std.testing.expectEqualStrings("four", p.items[1].textOf());
+}
+
+test "applyPatch: a remove index out of range is counted, never clamped" {
+    var p = planOf3();
+    // `remove: [9]` on a three-step plan is the model miscounting. Clamping it to
+    // the last step would delete something it never named, which is the one
+    // outcome a user cannot undo by looking at the plan.
+    const rm = [_]u8{9};
+    const r = applyPatch(&p, &.{}, &rm, &.{}, 0);
+    try std.testing.expectEqual(@as(u8, 0), r.removed);
+    try std.testing.expectEqual(@as(u8, 1), r.unknown);
+    try std.testing.expectEqual(@as(u8, 3), p.len);
+    try std.testing.expectEqualStrings("check it", p.items[2].textOf());
+}
+
+test "applyPatch: an index that does not exist is COUNTED, not silently ignored" {
+    // A silent no-op reads as "the step was marked done", and the model will not
+    // send it again — so the plan and the model disagree with no way to find out.
+    var p = planOf3();
+    const ups = [_]StepUpdate{
+        .{ .index = 1, .status = .done },
+        .{ .index = 9, .status = .done },
+        .{ .index = 0, .status = .done },
+    };
+    const r = applyPatch(&p, &ups, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(u8, 1), r.updated);
+    try std.testing.expectEqual(@as(u8, 2), r.unknown);
+    // Index 0 is rejected rather than clamped: an off-by-one in the model's
+    // counting, and silently marking step 1 when it meant "none" is worse than
+    // saying the index was wrong. The valid update still landed.
+    try std.testing.expectEqual(Status.done, p.items[0].status);
+    try std.testing.expectEqual(Status.pending, p.items[1].status);
+}
+
+test "applyPatch: reword a step without changing its status" {
+    var p = planOf3();
+    const ups = [_]StepUpdate{.{ .index = 1, .status = .in_progress }};
+    _ = applyPatch(&p, &ups, &.{}, &.{}, 0);
+    const rew = [_]StepUpdate{.{ .index = 1, .text = "read the WHOLE file, not the excerpt" }};
+    const r = applyPatch(&p, &rew, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(u8, 1), r.updated);
+    try std.testing.expectEqualStrings("read the WHOLE file, not the excerpt", p.items[0].textOf());
+    // The status survived, because the patch did not mention it.
+    try std.testing.expectEqual(Status.in_progress, p.items[0].status);
+}
+
+test "applyPatch: add appends, and what does not fit is reported" {
+    var p = planOf3();
+    var add: [max_items]Item = undefined;
+    add[0] = try itemFromContent("write the test", .pending);
+    const r = applyPatch(&p, &.{}, &.{}, add[0..1], 1);
+    try std.testing.expectEqual(@as(u8, 1), r.added);
+    try std.testing.expectEqual(@as(u8, 4), p.len);
+    try std.testing.expectEqualStrings("write the test", p.items[3].textOf());
+
+    // A full plan rejects the extra step AND says so.
+    var full = planOf3();
+    full.len = max_items;
+    const r2 = applyPatch(&full, &.{}, &.{}, add[0..1], 1);
+    try std.testing.expectEqual(@as(u8, 0), r2.added);
+    try std.testing.expectEqual(@as(u8, 1), r2.unknown);
+    try std.testing.expectEqual(max_items, full.len);
+}
+
+test "parseUpdates: 1-based, a string index, and a missing index" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var out: [max_items]StepUpdate = undefined;
+
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"update":[{"index":2,"status":"done"},{"index":"3","text":"new"},{"step":1}]}
+    , .{});
+    const n = try parseUpdates(v.object, &out);
+    try std.testing.expectEqual(@as(u8, 3), n);
+    try std.testing.expectEqual(@as(u8, 2), out[0].index);
+    try std.testing.expectEqual(Status.done, out[0].status.?);
+    // `"3"` is a real thing models send, and rejecting it costs a retry of a call
+    // that was understood perfectly well.
+    try std.testing.expectEqual(@as(u8, 3), out[1].index);
+    try std.testing.expectEqualStrings("new", out[1].text.?);
+    try std.testing.expect(out[1].status == null); // not mentioned: leave it alone
+    // `step` is the other name for it.
+    try std.testing.expectEqual(@as(u8, 1), out[2].index);
+
+    // No index at all is a broken call, not a silent no-op.
+    const bad = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"update":[{"status":"done"}]}
+    , .{});
+    try std.testing.expectError(error.BadPlan, parseUpdates(bad.object, &out));
+}
+
+test "parseUpdates: an unknown status leaves the step's status alone and keeps the text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var out: [max_items]StepUpdate = undefined;
+
+    // Failing the whole patch over one misspelled word throws away the reword that
+    // was in the same object, which is the part the model actually cared about.
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"update":[{"index":1,"status":"finished","text":"the new wording"}]}
+    , .{});
+    const n = try parseUpdates(v.object, &out);
+    try std.testing.expectEqual(@as(u8, 1), n);
+    try std.testing.expect(out[0].status == null);
+    try std.testing.expectEqualStrings("the new wording", out[0].text.?);
+}
+
+test "parseAdd: an array, one object, and one bare string" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var out: [max_items]Item = undefined;
+
+    const arr = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"add":[{"content":"one"},{"content":"two","status":"in_progress"}]}
+    , .{});
+    try std.testing.expectEqual(@as(u8, 2), try parseAdd(arr.object, &out));
+    try std.testing.expectEqualStrings("one", out[0].textOf());
+    try std.testing.expectEqual(Status.in_progress, out[1].status);
+
+    const one = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"add":{"content":"solo"}}
+    , .{});
+    try std.testing.expectEqual(@as(u8, 1), try parseAdd(one.object, &out));
+    try std.testing.expectEqualStrings("solo", out[0].textOf());
+
+    // A model that discovers one extra step writes the bare string about as often
+    // as the array.
+    const bare = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"add":"and check the docs"}
+    , .{});
+    try std.testing.expectEqual(@as(u8, 1), try parseAdd(bare.object, &out));
+    try std.testing.expectEqualStrings("and check the docs", out[0].textOf());
 }

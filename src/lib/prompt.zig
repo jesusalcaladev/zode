@@ -144,6 +144,12 @@ pub const tool_routing_prompt =
     \\ - A skill exists for something non-obvious and you have been told about it:
     \\   load it with `skill` before improvising. The body is not in your context
     \\   on purpose — that is the whole point of loading it on demand.
+    \\ - If a task has more than about two steps, write the plan with `todo` so
+    \\   the user can see what is left. Send the WHOLE list once with `items`, and
+    \\   afterwards change single steps with `update` ({index, status}), `remove`
+    \\   or `add` — indexes are 1-BASED. Mark a step done as it happens: resending
+    \\   a twelve-step list to change one entry is a chance to lose a step, and the
+    \\   user is reading that list to know where you are.
     \\ - If the request is ambiguous in a way that changes what you build, use
     \\   ask instead of guessing.
     \\
@@ -244,7 +250,7 @@ test "the built-in prompt says the rules that prevent the bad outcomes" {
 test "the routing table is about ROUND TRIPS, and says so" {
     // Every rule in it is "one call instead of N". If a future rewrite turns it
     // into prose about tools in general it has lost the reason it exists.
-    for ([_][]const u8{ "paths", "files", "refs", "round trip", "task", "git_status", "check" }) |k| {
+    for ([_][]const u8{ "paths", "files", "refs", "round trip", "task", "git_status", "check", "todo" }) |k| {
         if (std.mem.indexOf(u8, tool_routing_prompt, k) == null) {
             std.debug.print("the routing table lost: {s}\n", .{k});
             return error.RuleMissing;

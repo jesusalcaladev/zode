@@ -2889,6 +2889,20 @@ pub const Model = struct {
         return self.plan;
     }
 
+    /// Puts a whole plan back, under the lock.
+    ///
+    /// It exists for the PATCH form of `todo`: the worker computes the new list on
+    /// a copy (`Plan` is a plain value with fixed buffers, so a copy is a memcpy)
+    /// and hands it over once it is complete. Doing it in place would mean a
+    /// half-applied patch visible to the draw, and the draw runs 60 times a second
+    /// on another thread.
+    pub fn replacePlan(self: *Model, p: plan_mod.Plan) void {
+        self.lock();
+        defer self.unlock();
+        self.plan = p;
+        self.dirty = true;
+    }
+
     pub fn clearPlan(self: *Model) void {
         self.lock();
         defer self.unlock();
