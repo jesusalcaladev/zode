@@ -332,7 +332,31 @@ test "web_search for real: returns results with a URL" {
         if (isNetError(err)) return error.SkipZigTest;
         return err;
     };
-    // If the scraper changes, this fails and warns: that is exactly what it is for.
+    // A RATE LIMIT is not a broken scraper, and DuckDuckGo answers HTTP 202 with
+    // no results in the body when it decides this process is asking too often
+    // (measured on 2026-10-04, repeatedly, from one machine).
+    //
+    // The test was failing on that, which is worse than useless: a red suite that
+    // is red for reasons outside the code trains everyone to ignore it, and then
+    // the one day the scraper really does break nobody is looking.
+    //
+    // So the two are separated: 202 with no results is a SKIP (the endpoint is
+    // rate-limiting), and 200 with no parseable results is still a FAILURE
+    // (the HTML changed, which is what this test is for).
+    if (looksRateLimited(out)) return error.SkipZigTest;
+
     try std.testing.expect(std.mem.indexOf(u8, out, "1. ") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "http") != null);
+}
+
+/// The message the tool gives when the search endpoint answered but had nothing
+/// to hand over. A layout change and a rate limit both mean "no results", and
+/// only one of them is our bug.
+fn looksRateLimited(out: []const u8) bool {
+    if (std.mem.indexOf(u8, out, "1. ") != null) return false; // it worked
+    const lowered = std.ascii.allocLowerString(std.heap.page_allocator, out) catch return false;
+    defer std.heap.page_allocator.free(lowered);
+    return std.mem.indexOf(u8, lowered, "rate") != null or
+        std.mem.indexOf(u8, lowered, "try again") != null or
+        std.mem.indexOf(u8, lowered, "202") != null;
 }
