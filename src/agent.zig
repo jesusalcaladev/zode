@@ -583,7 +583,7 @@ pub fn refreshContextUsage(m: *tui.Model) void {
     defer astate.deinit();
     const msgs = snapshotMsgs(astate.allocator());
     ctx_used = compaction.estimateTokens(msgs);
-    const limit = @max(1, compaction.contextLimit(m.environ));
+    const limit = @max(1, compaction.contextLimitFor(m.environ, curModelContext()));
     const pct = (@as(f64, @floatFromInt(ctx_used)) / @as(f64, @floatFromInt(limit))) * 100.0;
     ctx_pct = @intFromFloat(std.math.clamp(pct, 0, 999));
 }
@@ -617,6 +617,13 @@ pub var resume_on_start: bool = false;
 /// ephemeral input strings).
 pub var cur_model_buf: [128]u8 = undefined;
 
+/// Context window of the active model, 0 when the provider does not publish it.
+///
+/// It is a plain integer and NOT a slice into the catalogue for the reason the
+/// `ctx_tokens` field in `palette.Item` says: the palette owns copies and the
+/// worker's arena dies with the request.
+pub var cur_model_ctx: u32 = 0;
+
 /// Active provider and model, for the status bar. Exposed as functions (not
 /// the raw `var`s) so the TUI does not depend on the static buffer.
 pub fn curProvider() []const u8 {
@@ -626,6 +633,19 @@ pub fn curModel() []const u8 {
     return cur_model;
 }
 pub fn setModel(name: []const u8) void {
+    setModelCtx(name, 0);
+}
+
+/// `setModel` plus the model's context window, in tokens.
+///
+/// **It RESETS to 0 when called without one**, on purpose. That is not a
+/// default: a `setModel("")` (switching provider, `setModel(name)` from a `/use`)
+/// must NOT keep the previous model's window, or a 200k model followed by a
+/// provider whose catalogue does not publish one would keep budgeting 200k and
+/// never compact. Zero means "the provider does not say", and `contextLimit`
+/// falls through to the environment and then to 128k — which is exactly what it
+/// did before any of this.
+pub fn setModelCtx(name: []const u8, ctx_tokens: u32) void {
     // `copyForwards` and not `@memcpy`: `name` can BE the buffer (a
     // `setModel(curModel())`, which is what `defer setModel(saved)` in a test
     // does, and what any "go back to what I had" would do). `@memcpy` on
@@ -634,12 +654,24 @@ pub fn setModel(name: []const u8) void {
     const n = @min(name.len, cur_model_buf.len);
     std.mem.copyForwards(u8, cur_model_buf[0..n], name[0..n]);
     cur_model = cur_model_buf[0..n];
+    cur_model_ctx = ctx_tokens;
     // The effort is adjusted ONLY on a model change (bug 3). Without this, an
     // `xhigh` picked in a codex-max stays put on a gemini-2.5 that does not
     // have it: every request degrades in silence to `high`, and the status bar
     // keeps saying `xhigh`. Two different texts for the same thing, and nothing
     // that says they differ.
     current_effort = chat.clampEffort(cur_model, current_effort);
+}
+
+/// The active model's context window, 0 when nothing knows it.
+///
+/// OpenRouter publishes `context_length` in the catalogue, `roster.zig` already
+/// carries it for the free pool, and until this existed the compaction budget
+/// ignored all of it and used a fixed 128k. On a 1M model that is a budget of
+/// 102k for a window that would take 800k — the compaction starts, and the tier-2
+/// summary, and the LLM call that costs money, thousands of tokens early.
+pub fn curModelContext() u32 {
+    return cur_model_ctx;
 }
 
 /// The effort level that actually goes in the request.
@@ -2017,7 +2049,10 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     }
     const chosen = best orelse list.items[0];
 
-    setModel(chosen.id);
+    // The window comes with the choice: this function downloaded the catalogue
+    // to make the decision and threw `context_length` away on the way out, so
+    // the budget stayed at 128k for a model that publishes 200k.
+    setModelCtx(chosen.id, chosen.context_length);
     const why = if (chosen.is_free)
         "the first free model in its catalog"
     else
@@ -2056,7 +2091,7 @@ pub fn resolveModelHeadless(
     const chosen = best orelse list.items[0];
     // Into the static buffer: the caller keeps this for the whole run and the
     // list is freed on the way out.
-    setModel(chosen.id);
+    setModelCtx(chosen.id, chosen.context_length);
     return curModel();
 }
 
@@ -2295,7 +2330,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     const comp: compaction.Compacted = compaction.elideTier(
         arena,
         msgs0,
-        compaction.budgetTokens(m.environ),
+        compaction.budgetFor(m.environ, curModelContext()),
         m.environ,
     ) catch compaction.Compacted{ .msgs = msgs0 };
     // Which files went in with the prompt. Without this line the user sees the
@@ -4686,6 +4721,7 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
             .group = 3,
             .label = gpa.dupe(u8, mi.id) catch return null,
             .hint = if (hint.len > 0) (gpa.dupe(u8, hint) catch "") else "",
+            .ctx_tokens = mi.context_length,
         };
         i += 1;
     }
@@ -4928,8 +4964,14 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
 }
 
 /// Applies a model chosen in the palette (or in `/model`).
-pub fn applyModel(m: *tui.Model, name: []const u8) !void {
-    setModel(name);
+///
+/// `ctx_tokens` is the model's context window, 0 when the provider does not
+/// publish it. It goes through `setModelCtx` so the compaction budget is the
+/// model's instead of a constant, and it is reset on every model change: keeping
+/// the previous model's window after switching to one that does not publish
+/// theirs would budget against a model that is no longer answering.
+pub fn applyModel(m: *tui.Model, name: []const u8, ctx_tokens: u32) !void {
+    setModelCtx(name, ctx_tokens);
     m.pushInfoFmt("model → {s}", .{name});
     setStatusWithZo(m, .done, name);
     refreshContextUsage(m);
@@ -6201,4 +6243,28 @@ test "subagents: the model is told it can send several at once" {
     // message and the parallelism never happens: the capability has to be
     // visible in the schema to be used.
     try std.testing.expect(std.mem.indexOf(u8, tools_mod.toolsJson(), "run at the same time") != null);
+}
+
+test "setModelCtx RESETS the window when a change carries none" {
+    // Keeping the previous model's number is the failure that would stay
+    // invisible until a turn died on a writer error: pick a 1M model, switch to
+    // a provider whose catalogue does not publish a window, and the budget stays
+    // at 800k for a model that has 128k. `setModel` is the "no idea" call and it
+    // has to clear it.
+    const saved_model = curModel();
+    const saved_ctx = curModelContext();
+    defer setModelCtx(saved_model, saved_ctx);
+
+    setModelCtx("big-model", 1_000_000);
+    try std.testing.expectEqual(@as(u32, 1_000_000), curModelContext());
+    try std.testing.expectEqualStrings("big-model", curModel());
+
+    setModel("other-model");
+    try std.testing.expectEqual(@as(u32, 0), curModelContext());
+    try std.testing.expectEqualStrings("other-model", curModel());
+
+    // Switching provider goes through `setModel("")`.
+    setModelCtx("big-model", 1_000_000);
+    setModelCtx("", 0);
+    try std.testing.expectEqual(@as(u32, 0), curModelContext());
 }

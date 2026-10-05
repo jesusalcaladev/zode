@@ -147,7 +147,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     while (iteration < 6) : (iteration += 1) {
         // Context under budget: elide old tool dumps (a wire view).
         {
-            const comp = compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetTokens(env), env) catch
+            const comp = compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetFor(env, agent.curModelContext()), env) catch
                 compaction_mod.Compacted{ .msgs = msgs.items };
             if (comp.elided > 0) elided_total += comp.elided;
             var cur: []chat.ChatMessage = try arena.dupe(chat.ChatMessage, comp.msgs);

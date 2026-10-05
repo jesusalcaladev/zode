@@ -48,6 +48,18 @@ pub const Item = struct {
     label: []const u8 = "",
     /// Right column: keyboard shortcut, "free", price…
     hint: []const u8 = "",
+    /// Context window of a model, in tokens (0 = the provider does not publish
+    /// it, or this is not a model row).
+    ///
+    /// It is here because the palette is the ONLY place that ever holds the
+    /// downloaded catalogue: the worker builds the items and the draw collects
+    /// them, so a `models_mod.Model` never survives long enough to be consulted
+    /// later. Without this field `context_length` was computed in
+    /// `buildModelItems`, formatted into the hint as "200k" and thrown away —
+    /// and the compaction budget had no way to learn it. It is a plain integer
+    /// and NOT a pointer into the catalogue, because the items outlive the
+    /// worker's arena: same dangling-pointer family the labels would fall into.
+    ctx_tokens: u32 = 0,
 };
 
 pub const Group = struct {
@@ -820,8 +832,13 @@ pub const Action = union(enum) {
     run_command: []const u8,
     /// Switch to this provider.
     set_provider: []const u8,
-    /// Switch to this model.
-    set_model: []const u8,
+    /// Switch to this model, with its context window in tokens.
+    ///
+    /// A struct, not a bare `[]const u8`, because the window is what makes the
+    /// compaction budget right for this model instead of a fixed 128k — and a
+    /// bare string had no room for it, so the number that `buildModelItems` read
+    /// out of the catalogue had nowhere to go.
+    set_model: struct { id: []const u8, ctx_tokens: u32 },
     /// Connect a provider with this key. Both slices point at the palette's own
     /// buffers: whoever receives the action must copy them BEFORE closing the
     /// palette.
@@ -956,7 +973,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
                 }
                 break :blk Action{ .set_provider = it.label };
             },
-            .model => .{ .set_model = it.label },
+            .model => .{ .set_model = .{ .id = it.label, .ctx_tokens = it.ctx_tokens } },
             .connect => blk: {
                 pal.mode = .key_prompt;
                 pal.key_len = 0;

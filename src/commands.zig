@@ -94,8 +94,8 @@ pub fn cmdContext(m: *tui.Model) void {
     const msgs = agent.snapshotMsgs(astate.allocator());
 
     const used = compaction.estimateTokens(msgs);
-    const budget = compaction.budgetTokens(m.environ);
-    const limit = compaction.contextLimit(m.environ);
+    const budget = compaction.budgetFor(m.environ, agent.curModelContext());
+    const limit = compaction.contextLimitFor(m.environ, agent.curModelContext());
     const sys: i64 = if (msgs.len > 0) compaction.estimateTokens(msgs[0..1]) else 0;
     const hist = used - sys;
     const pct_limit = @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(limit)) * 100.0;
@@ -127,10 +127,19 @@ pub fn cmdContext(m: *tui.Model) void {
         .{ sys, hist, turns, budget, pct_budget },
     ) catch "details";
     agent.pushInfoOwned(m, l2);
+    // WHERE the limit came from, because the number is now an automatic: with a
+    // fixed 128k you could not tell "the model has 128k" from "zode is budgeting
+    // 128k for a 1M model" from "the catalogue was never downloaded", and all
+    // three look the same on the same line.
+    const src = compaction.limitSource(m.environ, agent.curModelContext());
     const l3 = std.fmt.allocPrint(
         m.allocator,
-        "  elided this session: {d} tool results · last stream: {d:.0} tok/s",
-        .{ agent.session_elided, agent.tps_last },
+        "  limit from: {s} · elided this session: {d} tool results · last stream: {d:.0} tok/s",
+        .{ switch (src) {
+            .model => "the model's own context window",
+            .env => "ZODE_CONTEXT_LIMIT",
+            .default_ => "the 128k default (this provider does not publish a window; /model from a catalogue that has one)",
+        }, agent.session_elided, agent.tps_last },
     ) catch "details";
     agent.pushInfoOwned(m, l3);
 
@@ -193,7 +202,10 @@ pub fn cmdUse(m: *tui.Model, arg: ?[]const u8) void {
     var it = std.mem.tokenizeScalar(u8, a, ' ');
     const prov = it.next() orelse return;
     agent.applyProvider(m, prov) catch return;
-    if (it.next()) |mo| agent.applyModel(m, mo) catch {};
+    // 0: `/use <provider> <model>` types a name, it does not come from the
+    // catalogue, so there is no window to carry. It resets to the fallback, which
+    // is the honest answer for a model nobody has looked up yet.
+    if (it.next()) |mo| agent.applyModel(m, mo, 0) catch {};
 }
 
 /// Shortcuts that are NOT commands: they have to be typed, they are not in the

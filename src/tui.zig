@@ -3136,7 +3136,10 @@ pub const Model = struct {
             },
             .set_model => |mo| {
                 self.closePalette();
-                try agent.applyModel(self, mo);
+                // The window goes with the model: it is what the compaction
+                // budget is computed from, and dropping it here is what kept the
+                // budget at 128k for every model.
+                try agent.applyModel(self, mo.id, mo.ctx_tokens);
                 return true;
             },
             .connect => |conn| {

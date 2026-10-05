@@ -33,9 +33,54 @@ pub fn recentWindow(env: ?*const std.process.Environ.Map) usize {
 }
 
 pub fn contextLimit(env: ?*const std.process.Environ.Map) i64 {
-    const m = env orelse return default_context_limit;
-    const s = m.get("ZODE_CONTEXT_LIMIT") orelse return default_context_limit;
-    return std.fmt.parseInt(i64, s, 10) catch default_context_limit;
+    return contextLimitFor(env, 0);
+}
+
+/// Where the limit came from, so `/context` can say it.
+///
+/// **It has to agree with `contextLimitFor`, in the SAME order**, and it did not
+/// the first time: this checked the model first and that checked the env first,
+/// so `/context` answered "the model's own context window" while the number on
+/// screen was the env var's. The two are twenty lines apart and the only thing
+/// that catches that is a test that compares them, which is why there is one.
+///
+/// A budget the user cannot trace is a budget they cannot trust: with a fixed
+/// 128k it was indistinguishable from "the model has 128k" and from "zode is
+/// broken", and the three look the same on screen.
+pub const LimitSource = enum { model, env, default_ };
+
+pub fn limitSource(env: ?*const std.process.Environ.Map, model_ctx: u32) LimitSource {
+    if (env) |m| {
+        if (m.get("ZODE_CONTEXT_LIMIT")) |s| {
+            if (std.fmt.parseInt(i64, s, 10)) |_| return .env else |_| {}
+        }
+    }
+    if (model_ctx > 0) return .model;
+    return .default_;
+}
+
+/// The context window: `ZODE_CONTEXT_LIMIT`, then what the MODEL says it has,
+/// then 128k.
+///
+/// `ZODE_CONTEXT_LIMIT` comes FIRST, and that order is the point: somebody who
+/// sets it knows something the catalogue does not — a gateway that truncates, a
+/// provider whose published window is not what your account gets. That is the
+/// entire reason the variable exists, so putting the model's number ahead of it
+/// would make the override useless in the only case it is for.
+///
+/// The model's own number was the missing input. It was parsed all along
+/// (`models.zig` fills `context_length`, `roster.zig` already carries it for the
+/// free pool) and the budget ignored it in favour of a constant, so a 1M model
+/// compacted at 102k: tier 1 eliding and tier 2 asking an LLM to summarize
+/// thousands of tokens early, over and over, for nothing.
+pub fn contextLimitFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
+    if (env) |m| {
+        if (m.get("ZODE_CONTEXT_LIMIT")) |s| {
+            return std.fmt.parseInt(i64, s, 10) catch default_context_limit;
+        }
+    }
+    if (model_ctx > 0) return @intCast(model_ctx);
+    return default_context_limit;
 }
 
 /// Rough token estimate: ~4 chars/token for code+English mix, plus ~4 tokens
@@ -49,8 +94,13 @@ pub fn estimateTokens(msgs: []const chat.ChatMessage) i64 {
     return total;
 }
 
+/// The compaction budget: 80% of the limit.
 pub fn budgetTokens(env: ?*const std.process.Environ.Map) i64 {
-    return @divTrunc(contextLimit(env) * target_pct, 100);
+    return budgetFor(env, 0);
+}
+
+pub fn budgetFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
+    return @divTrunc(contextLimitFor(env, model_ctx) * target_pct, 100);
 }
 
 pub const Compacted = struct {
@@ -300,4 +350,107 @@ test "a wider window protects more of the tail verbatim" {
     // A wider window protects more, so FEWER messages are elided.
     try std.testing.expect(wide.elided < narrow.elided);
     try std.testing.expect(narrow.summary_upto > wide.summary_upto);
+}
+
+test "the context limit is the model's own window, not the 128k constant" {
+    // The bug: `context_length` was parsed in `models.zig` and carried by
+    // `roster.zig`, and the budget used a constant. A 1M model compacted at 102k,
+    // which means tier 1 eliding and tier 2 asking an LLM to summarize thousands
+    // of tokens early, over and over, for nothing.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+
+    // No env var set: the model's number is what there is.
+    try std.testing.expectEqual(@as(i64, 128_000), contextLimitFor(&env, 0));
+    try std.testing.expectEqual(@as(i64, 200_000), contextLimitFor(&env, 200_000));
+    try std.testing.expectEqual(@as(i64, 1_000_000), contextLimitFor(&env, 1_000_000));
+
+    // And the budget follows at 80%.
+    try std.testing.expectEqual(@as(i64, 160_000), budgetFor(&env, 200_000));
+    try std.testing.expectEqual(@as(i64, 800_000), budgetFor(&env, 1_000_000));
+}
+
+test "ZODE_CONTEXT_LIMIT still overrides the model's number" {
+    // It is an OVERRIDE and that order is the point: somebody who sets it knows
+    // something the catalogue does not — a gateway that truncates, or an account
+    // whose real window is not the published one. If the model's number came
+    // first, the variable would be useless in the only case it exists for.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_CONTEXT_LIMIT", "6000");
+
+    try std.testing.expectEqual(@as(i64, 6000), contextLimitFor(&env, 0));
+    try std.testing.expectEqual(@as(i64, 6000), contextLimitFor(&env, 1_000_000));
+    try std.testing.expectEqual(@as(i64, 4800), budgetFor(&env, 1_000_000));
+}
+
+test "with no model and no env var the limit is EXACTLY what it was before" {
+    // The regression this could have caused: every other path must be the old
+    // constant. A change in the budget is invisible until a long turn dies on a
+    // writer error, and this is the line that proves nothing moved.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectEqual(@as(i64, 128_000), contextLimitFor(&env, 0));
+    try std.testing.expectEqual(@as(i64, 102_400), budgetFor(&env, 0));
+    // And with no environment at all either.
+    try std.testing.expectEqual(@as(i64, 128_000), contextLimitFor(null, 0));
+    // A model number with no env to override it is still the model's number:
+    // "no env var" is not the same as "nothing to say about the window".
+    try std.testing.expectEqual(@as(i64, 200_000), contextLimitFor(null, 200_000));
+}
+
+test "limitSource agrees with contextLimitFor, which is the whole point of it" {
+    // It did not, the first time: this checked the model before the env var and
+    // that checked the env var first, so `/context` named a source that was not
+    // the one that produced the number. A test that only checked each function
+    // on its own passed both.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    // `Environ.Map` has no `remove`, and it needs a non-const map to be
+    // deinit'ed, so "no override" is `null` rather than an emptied map.
+    const cases = [_]struct { env: ?*const std.process.Environ.Map, ctx: u32 }{
+        .{ .env = null, .ctx = 0 },
+        .{ .env = null, .ctx = 200_000 },
+        .{ .env = &env, .ctx = 0 },
+        .{ .env = &env, .ctx = 200_000 },
+    };
+    for (cases) |c| {
+        try env.put("ZODE_CONTEXT_LIMIT", "6000");
+        const limit = contextLimitFor(c.env, c.ctx);
+        const src = limitSource(c.env, c.ctx);
+        // Each source implies its own limit, and nothing else.
+        switch (src) {
+            .model => try std.testing.expectEqual(@as(i64, 200_000), limit),
+            .env => try std.testing.expectEqual(@as(i64, 6000), limit),
+            .default_ => try std.testing.expectEqual(@as(i64, 128_000), limit),
+        }
+    }
+}
+
+test "a provider that publishes a 0 window does not turn the limit into 0" {
+    // The catalogue only fills `context_length` when the provider sends it. Zero
+    // means "does not say", and taking it literally would make the budget 0 and
+    // compact the entire history on the first message.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectEqual(@as(i64, 128_000), contextLimitFor(&env, 0));
+    try std.testing.expectEqual(@as(i64, 102_400), budgetFor(&env, 0));
+}
+
+test "limitSource says which of the three it was, because the number is automatic" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectEqual(LimitSource.default_, limitSource(&env, 0));
+    try std.testing.expectEqual(LimitSource.model, limitSource(&env, 200_000));
+
+    try env.put("ZODE_CONTEXT_LIMIT", "6000");
+    try std.testing.expectEqual(LimitSource.env, limitSource(&env, 0));
+    // And the env var wins, so it is what /context must name.
+    try std.testing.expectEqual(LimitSource.env, limitSource(&env, 200_000));
+
+    // A var that does not parse is not an override: it falls through to the
+    // model, and /context must not claim the env when it ignored it.
+    try env.put("ZODE_CONTEXT_LIMIT", "not a number");
+    try std.testing.expectEqual(LimitSource.model, limitSource(&env, 200_000));
+    try std.testing.expectEqual(LimitSource.default_, limitSource(&env, 0));
 }
