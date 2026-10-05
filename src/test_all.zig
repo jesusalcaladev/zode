@@ -19,6 +19,7 @@ pub const palette = @import("palette.zig");
 pub const web = @import("lib/web.zig");
 pub const roster = @import("roster.zig");
 pub const free_auto = @import("free_auto.zig");
+pub const router = @import("lib/router.zig");
 pub const plan = @import("lib/plan.zig");
 pub const checkpoint = @import("lib/checkpoint.zig");
 pub const mentions = @import("lib/mentions.zig");

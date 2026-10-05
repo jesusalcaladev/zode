@@ -34,12 +34,17 @@ $ zode
 - **Skills**: folders of instructions loaded **only when they are needed**. The
   prompt carries the name and when to use it; the body does not.
 - **Two-tier context compaction**: old tool results are elided without losing the
-  history, and if it still does not fit, a summary is asked for.
+  history, and if it still does not fit, a summary is asked for. The budget is
+  the **model's own** context window when the provider publishes one, and
+  `/context` says which of the three numbers it used.
 - **File cache**: a `read` of something that has not changed is not sent again.
   It is the most direct token saving there is.
 - **Providers**: OpenCode, OpenRouter, Anthropic (native API with prompt
   caching), OpenAI, Groq, DeepSeek, and local (Ollama/LM Studio). You connect
   them from the TUI itself, without editing files.
+- **The repository as tools**: `git_status`, `git_diff` and `git_log` with
+  **fixed arguments** — no argument reaches git, so there is no new injection
+  surface, and `bash` is still there for a commit or a checkout.
 - **`/free-auto`**: spreads the turns across the free models each provider
   publishes, and when one runs out of quota it **carries on by itself** with the
   next one.
@@ -164,6 +169,8 @@ palette that **runs** the one you pick.
 | `ZODE_TASK_PARALLEL` | subagents at once (3; `1` = in series) |
 | `ZODE_RECENT_WINDOW` | recent messages compaction leaves alone (8) |
 | `ZODE_AUTO_BG` | `0` turns off auto-backgrounding slow verifications |
+| `ZODE_CHEAP_TURN` | a small model id: the main turn goes to it and falls back if it will not answer (off by default) |
+| `ZODE_CHEAP_MODEL` | the same thing, named separately, for when the flag is just `1` |
 | `ZODE_FREE_AUTO` | `1` starts with `/free-auto on` |
 | `ZODE_RESUME` | `1` reopens the last session |
 | `ZODE_DBG_ERR` | `1` dumps the status and body of every response to stderr |
@@ -246,7 +253,7 @@ src/                    what needs the TUI, a thread or the network
     dispatch.zig        the name the model sent -> the function that runs
     common.zig          the helpers more than one tool needs
     read.zig  write.zig  edit.zig  bash.zig  glob.zig  grep.zig
-    list_files.zig  web.zig  think.zig  todo.zig  bg.zig  errors.zig
+    list_files.zig  web.zig  think.zig  todo.zig  bg.zig  git.zig  errors.zig
   bgproc.zig            background commands
   palette.zig           the Ctrl+P / Ctrl+T modal palette
   session.zig           compressed JSONL sessions
@@ -283,6 +290,7 @@ src/lib/                modules that test on their own, no TUI and no network
   bench.zig             /bench
   clean.zig             /clean
   verify.zig            which verifications are slow enough to background
+  router.zig             which model answers the main turn (cheap, or yours)
   regex.zig             a mini regex engine
   mascot.zig            Zo
   theme.zig             colours

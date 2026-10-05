@@ -5297,7 +5297,7 @@ const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     var out: std.ArrayList(InfoSeg) = .empty;
 
-    const model = agent.curModel();
+    const model = agent.curAnswering();
     const provider = agent.curProvider();
     if (model.len == 0 and provider.len == 0) return null;
 

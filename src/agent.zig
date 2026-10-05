@@ -7,6 +7,7 @@ const http_client = @import("lib/http_client.zig");
 const tools_mod = @import("tools/dispatch.zig");
 const roster_mod = @import("roster.zig");
 const free_auto = @import("free_auto.zig");
+const router_mod = @import("lib/router.zig");
 const plan_mod = @import("lib/plan.zig");
 const clean_mod = @import("lib/clean.zig");
 const mentions = @import("lib/mentions.zig");
@@ -472,6 +473,23 @@ fn cmdBench(m: *tui.Model) void {
     // the documented difference from `pushInfoOwned`, which would leave the
     // pending queue pointing at a dead frame.
     pushInfo(m, text);
+
+    // The cheap router's numbers, when it is on. It is the one feature whose
+    // whole point is a number the user cannot otherwise see, and a saving you
+    // cannot check is a saving you will assume worked.
+    const cs = cheapRouterStats();
+    if (cs.on) {
+        pushInfoFmt(
+            m,
+            "cheap router: {s} · {d} turn(s) sent to it · {d} fell back{s}",
+            .{
+                cs.model,
+                cs.attempts,
+                cs.fallbacks,
+                if (cs.given_up) @as([]const u8, " · out of play for the rest of the session") else @as([]const u8, ""),
+            },
+        );
+    }
 }
 
 /// `/skills`: what is loadable, and from where.
@@ -663,6 +681,30 @@ pub fn setModelCtx(name: []const u8, ctx_tokens: u32) void {
     current_effort = chat.clampEffort(cur_model, current_effort);
 }
 
+/// The model that is answering RIGHT NOW, which is not always `curModel()`.
+///
+/// The status bar reads this instead of `curModel()`, and it is the only thing
+/// that makes `/free-auto` and the cheap router diagnosable: a mode you cannot
+/// see is a mode where "the model ignored my edit" cannot be told apart from
+/// "the model was never asked".
+///
+/// The cheap router flips this for the duration of the turn; `/free-auto` sets
+/// the same field for its own. Empty means "the active model", so the common
+/// case costs nothing.
+pub var cur_answering: [128]u8 = undefined;
+var cur_answering_len: usize = 0;
+
+pub fn setAnswering(model: []const u8) void {
+    const n = @min(model.len, cur_answering.len);
+    std.mem.copyForwards(u8, cur_answering[0..n], model[0..n]);
+    cur_answering_len = n;
+}
+
+pub fn curAnswering() []const u8 {
+    if (cur_answering_len == 0) return cur_model;
+    return cur_answering[0..cur_answering_len];
+}
+
 /// The active model's context window, 0 when nothing knows it.
 ///
 /// OpenRouter publishes `context_length` in the catalogue, `roster.zig` already
@@ -802,6 +844,7 @@ pub fn freeAutoOn() bool {
 /// broken).
 pub fn initFreeAutoFromEnv(m: *tui.Model) void {
     free_auto.initFromEnv(m, m.environ);
+
     // `ZODE_AUTO_BG=0` opts out of starting known-slow verifications in the
     // background on their own (see `lib/verify.zig`). Default: on, because the
     // alternative is the user's input freezing for the length of a build.
@@ -812,6 +855,55 @@ pub fn initFreeAutoFromEnv(m: *tui.Model) void {
             tools_mod.setAutoBackground(false);
         }
     }
+}
+
+/// The cheap router's state: which small model to try, and whether it has already
+/// said no.
+///
+/// A module global and not a `Model` field because the decision has to survive
+/// across turns to be worth anything: a model that is gated is gated for the
+/// rest of the session, and a per-turn flag would spend a 403 on every turn.
+var cheap_router: router_mod.State = .{};
+/// Read once at startup, like every other `ZODE_*` switch, so a turn does not
+/// re-parse the environment and so the flag cannot change mid-turn.
+var router_cheap_on: bool = false;
+
+/// `ZODE_CHEAP_TURN`, read once at startup.
+pub fn initCheapRouterFromEnv(env: ?*const std.process.Environ.Map) void {
+    cheap_router = router_mod.initFromEnv(env);
+    router_cheap_on = cheap_router.cheap_model.len > 0;
+}
+
+/// Puts the cheap model back in play after a model or provider change.
+///
+/// After switching, the "cheap" model is very unlikely to be available, and
+/// finding that out with a 403 instead of with a line of text is the thing the
+/// notice is for.
+pub fn resetCheapRouter(m: *tui.Model) void {
+    if (!router_cheap_on or !cheap_router.given_up) return;
+    pushInfo(m, "the cheap model is in play again after the model change");
+    cheap_router.given_up = false;
+    cheap_router.attempts = 0;
+    cheap_router.fallbacks = 0;
+}
+
+/// What the cheap router has been doing, for `/bench`.
+pub const CheapStats = struct {
+    on: bool,
+    model: []const u8,
+    attempts: u32,
+    fallbacks: u32,
+    given_up: bool,
+};
+
+pub fn cheapRouterStats() CheapStats {
+    return .{
+        .on = router_cheap_on,
+        .model = cheap_router.cheap_model,
+        .attempts = cheap_router.attempts,
+        .fallbacks = cheap_router.fallbacks,
+        .given_up = cheap_router.given_up,
+    };
 }
 
 /// [roster] `pub` so `free_auto.zig` can use it from its worker.
@@ -2461,6 +2553,27 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         return null;
     }
 
+    // The cheap router: this turn goes to the small model, and if it will not
+    // answer we fall back to the one the user picked.
+    //
+    // `active_pick` is kept because the fallback needs somewhere to go back TO,
+    // and because after a rotation the two are no longer the same thing.
+    const active_pick = pick;
+    var used_cheap = false;
+    if (router_cheap_on and
+        router_mod.decide(&cheap_router, pick.model, router_cheap_on) == .cheap)
+    {
+        // The SAME provider and the same key, a different model name: unlike
+        // `/free-auto` there is no provider to switch, no key to juggle and no
+        // second `Target` to build. That is why this is cheap to add and why the
+        // risk is only "that model is not available on your account".
+        pick.model = cheap_router.cheap_model;
+        used_cheap = true;
+        setAnswering(pick.model);
+        setStatusWithZoFmt(m, .thinking, "thinking · {s} (cheap)", .{pick.model});
+    }
+    defer setAnswering("");
+
     chat.cancel_current.store(false, .seq_cst);
     // The status names the ITERATION from the second one on: plain "thinking" for
     // 8 turns in a row does not say whether it will take long or it has already
@@ -2545,6 +2658,30 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             pick.kind,
             true, // the turn the user watches: publishes usage/errors/cancel
         ) catch |err| {
+            // The cheap router falls back BEFORE anything else touches the error,
+            // because this is the one case where the failure is a fact about the
+            // model rather than about the turn: the small model will not answer,
+            // the one the user picked will, and continuing would spend three
+            // retries and a backoff on something already known.
+            if (used_cheap) {
+                if (router_mod.onFailure(&cheap_router, err, chat.lastErrorBody(), active_pick.model)) {
+                    pick = active_pick;
+                    used_cheap = false;
+                    setAnswering(pick.model);
+                    pushInfoFmt(
+                        m,
+                        "{s} is not available on this account, so this turn went to {s}. It will not be tried again this session; {s}=0 turns the cheap router off.",
+                        .{ cheap_router.cheap_model, pick.model, router_mod.cheap_env },
+                    );
+                    continue;
+                }
+                // An account error (401, 402, a 429): the fallback would fail the
+                // same way, so this is NOT the small model's fault and it keeps
+                // its place. The normal retry below handles it and reports it.
+                used_cheap = false;
+                setAnswering("");
+            }
+
             // [roster] Out of quota on THAT pair? Another pair carries on with the
             // SAME request and the turn does not die. It goes BEFORE the backoff
             // retry because a 429 with `retry-after: 30` waiting 30 s on the same
@@ -4972,6 +5109,7 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
 /// theirs would budget against a model that is no longer answering.
 pub fn applyModel(m: *tui.Model, name: []const u8, ctx_tokens: u32) !void {
     setModelCtx(name, ctx_tokens);
+    resetCheapRouter(m);
     m.pushInfoFmt("model → {s}", .{name});
     setStatusWithZo(m, .done, name);
     refreshContextUsage(m);
@@ -6267,4 +6405,60 @@ test "setModelCtx RESETS the window when a change carries none" {
     setModelCtx("big-model", 1_000_000);
     setModelCtx("", 0);
     try std.testing.expectEqual(@as(u32, 0), curModelContext());
+}
+
+test "the status bar names the model that is ANSWERING, not the one that is configured" {
+    // The one thing that makes `/free-auto` and the cheap router diagnosable.
+    // Without it the row keeps saying the model you picked while a different one
+    // writes the answer, and "the model ignored my edit" cannot be told apart
+    // from "the model was never asked".
+    const saved_model = curModel();
+    const saved_ctx = curModelContext();
+    defer {
+        setAnswering("");
+        setModelCtx(saved_model, saved_ctx);
+    }
+
+    setModelCtx("the-picked-one", 200_000);
+    // Nothing is overriding: what answers is what is configured.
+    try std.testing.expectEqualStrings("the-picked-one", curAnswering());
+
+    setAnswering("the-small-one");
+    try std.testing.expectEqualStrings("the-small-one", curAnswering());
+
+    // Back to empty: the override is per turn, not sticky.
+    setAnswering("");
+    try std.testing.expectEqualStrings("the-picked-one", curAnswering());
+}
+
+test "the cheap router is off unless ZODE_CHEAP_TURN names a model" {
+    // The default matters more than the feature: a small model that is not
+    // available for your account answers 403 and the model has no way to know
+    // the fallback would have worked. So nothing happens unless it is asked for.
+    var off = std.process.Environ.Map.init(std.testing.allocator);
+    defer off.deinit();
+
+    initCheapRouterFromEnv(&off);
+    const a = cheapRouterStats();
+    try std.testing.expect(!a.on);
+    try std.testing.expectEqualStrings("", a.model);
+    try std.testing.expectEqual(@as(u32, 0), a.attempts);
+
+    var on = std.process.Environ.Map.init(std.testing.allocator);
+    defer on.deinit();
+    try on.put(router_mod.cheap_env, "some-small-model");
+    initCheapRouterFromEnv(&on);
+    const b = cheapRouterStats();
+    try std.testing.expect(b.on);
+    try std.testing.expectEqualStrings("some-small-model", b.model);
+}
+
+test "a cheap model equal to the active one is not used, because it is not cheaper" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put(router_mod.cheap_env, "the-same-one");
+
+    var st = router_mod.initFromEnv(&env);
+    try std.testing.expectEqual(router_mod.Decision.active, router_mod.decide(&st, "the-same-one", true));
+    try std.testing.expectEqual(@as(u32, 0), st.attempts);
 }

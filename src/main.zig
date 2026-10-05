@@ -340,6 +340,7 @@ fn runTui(init: std.process.Init) !u8 {
     // it as soon as it is there. It runs AFTER `loadUserConfig`, because without
     // the user's config the pool would not see their providers.
     agent.initFreeAutoFromEnv(&model);
+    agent.initCheapRouterFromEnv(model.environ);
 
     try app.run(model.widget(), .{});
 
