@@ -15,6 +15,7 @@ const write_tool = @import("write.zig");
 const edit_tool = @import("edit.zig");
 const bash_tool = @import("bash.zig");
 const git_tool = @import("git.zig");
+const refs_tool = @import("refs.zig");
 const bg_tool = @import("bg.zig");
 const glob_tool = @import("glob.zig");
 const grep_tool = @import("grep.zig");
@@ -53,6 +54,7 @@ pub fn isParallelSafe(name: []const u8) bool {
         std.mem.eql(u8, name, "git_diff") or
         std.mem.eql(u8, name, "git_log") or
         std.mem.eql(u8, name, "grep") or
+        std.mem.eql(u8, name, "refs") or
         std.mem.eql(u8, name, "glob") or
         std.mem.eql(u8, name, "list_files") or
         std.mem.eql(u8, name, "web_fetch") or
@@ -72,6 +74,7 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"git_status","description":"The state of the working tree and the branch: one line per staged, modified or untracked path (XY = staged then worktree, ?? = untracked), plus how many files changed and by how much. Prefer it to `bash git status`, which returns English prose with colour codes that you then have to parse. Returns a clean-tree note when there is nothing to report.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"git_diff","description":"The unified diff of the working tree against the index (or of the index against HEAD with staged:true). One block per file, each headed by the path, with +N and −M counted for you at the end. Painted with the same colouriser as a write/edit diff. For anything git does that these do not cover (a commit, a checkout, a stash, a log of one path), use `bash`.","parameters":{"type":"object","properties":{"staged":{"type":"boolean","description":"diff the index against HEAD instead of the working tree"}},"required":[]}}},
     \\{"type":"function","function":{"name":"git_log","description":"The last commits, most recent first, one line each (short hash and subject).","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"how many commits (default 20, max 200)"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"refs","description":"Where a symbol is DEFINED and where it is USED, in one call and with the two separated: definitions first, then calls, then plain references. One plain identifier, not a pattern (use `grep` for text). Prefer it over grepping: guessing the declaration shape for the language, running two greps and working out which hit is the definition is three round trips, and a round trip is a whole request. Knows the declaration shapes of zig, rust, go, python, js/ts, c, sh, and steps over Go method receivers, so `refs Listen` finds `func (s *Server) Listen()` instead of calling it a use.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"subdir":{"type":"string","description":"where to look (default: the whole project)"}},"required":["symbol"]}}},
     \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; ask for a deeper offset if the text is cut.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Search the web and get titles, URLs and snippets. Use it when you need something you do not know yet (docs, versions, error messages), then web_fetch the promising URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 8"}},"required":["query"]}}},
@@ -166,6 +169,8 @@ pub fn execute(
         return glob_tool.toolGlob(io, obj, arena);
     } else if (std.mem.eql(u8, name, "grep")) {
         return grep_tool.toolGrep(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "refs")) {
+        return refs_tool.toolRefs(io, obj, arena);
     } else if (std.mem.eql(u8, name, "git_status")) {
         return git_tool.toolGitStatus(io, arena);
     } else if (std.mem.eql(u8, name, "git_diff")) {
@@ -212,6 +217,7 @@ pub const defs = [_]ToolDef{
     .{ .name = "bash", .desc = "Run a shell command with timeout" },
     .{ .name = "glob", .desc = "Find files matching a glob pattern" },
     .{ .name = "grep", .desc = "Search file contents with regex" },
+    .{ .name = "refs", .desc = "Where a symbol is defined and used" },
     .{ .name = "git_status", .desc = "Working tree state, machine format" },
     .{ .name = "git_diff", .desc = "Unified diff of the working tree" },
     .{ .name = "git_log", .desc = "Last commits, one line each" },
@@ -871,4 +877,144 @@ test "read: `path` alone still works, because that is most of the calls" {
     try std.testing.expect(std.mem.indexOf(u8, out, "hola") != null);
     // And it is NOT wrapped in the batch header: the common case pays nothing.
     try std.testing.expect(std.mem.indexOf(u8, out, "read 1 file(s)") == null);
+}
+
+test "refs: finds the definition, separates it from the uses, and says which is which" {
+    // The tool exists so the model does not have to guess the declaration shape
+    // for the language, run two greps, and work out which hit is the definition.
+    // Three round trips where one answers directly.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = "/tmp/opencode/refs-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/lib.zig",
+        .data =
+        \\pub fn helper(n: i32) i32 {
+        \\    return n + 1;
+        \\}
+        \\
+        \\fn helper2(n: i32) i32 {
+        \\    return helper(n) * 2;
+        \\}
+        \\
+        ,
+    });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/use.zig",
+        .data =
+        \\const x = helper(1);
+        \\// helper is commented out here
+        \\const helper_varname = 2;
+        \\
+        ,
+    });
+
+    const args = try std.fmt.allocPrint(arena, "{{\"symbol\":\"helper\",\"subdir\":\"{s}\"}}", .{dir});
+    const out = try execute(std.testing.io, "refs", args, arena, null, null);
+    // The definition is there and it is labelled as one.
+    try std.testing.expect(std.mem.indexOf(u8, out, "definition(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "lib.zig:1") != null);
+    // And the CALL is labelled as a call, in the other section.
+    // The kind and the path are NOT adjacent (`[call] /abs/path:1`), so the
+    // assertion matches the file:line on its own. Written as "[call] use.zig:1"
+    // it never matches and the test was failing on its own typo.
+    try std.testing.expect(std.mem.indexOf(u8, out, "use.zig:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[call]") != null);
+
+    // Definitions come BEFORE uses: burying the answer under the uses is what
+    // makes the model read the file anyway.
+    const def_at = std.mem.indexOf(u8, out, "definition(s)").?;
+    const use_at = std.mem.indexOf(u8, out, "use(s)").?;
+    try std.testing.expect(def_at < use_at);
+
+    // The three that must NOT be there, each for its own reason:
+    // Three exclusions, each for its own reason:
+    // line 3 holds `helper_varname`, which is not a whole word;
+    // line 2 is a comment, which is not a use;
+    // `helper2` is a different symbol entirely.
+    try std.testing.expect(std.mem.indexOf(u8, out, "helper_varname") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "use.zig:2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "use.zig:3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "helper2") == null);
+    // And the count says 2, not 3: the comment did not sneak in as a use.
+    try std.testing.expect(std.mem.indexOf(u8, out, "2 use(s)") != null);
+}
+
+test "refs: a symbol with no declaration says so instead of returning nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try std.fmt.allocPrint(arena, "{{\"symbol\":\"main\",\"subdir\":\"{s}\"}}", .{"src/tools"});
+    const out = execute(std.testing.io, "refs", args, arena, null, null) catch |err| return err;
+    // Either it found the real `main` or it says there is no declaration. Both are
+    // answers; an empty string is not.
+    try std.testing.expect(out.len > 20);
+    if (std.mem.indexOf(u8, out, "definition(s)") == null) {
+        try std.testing.expect(std.mem.indexOf(u8, out, "no declaration") != null);
+    }
+}
+
+test "refs: a PATTERN is refused and pointed at grep, so this cannot become a grep" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try std.fmt.allocPrint(arena, "{{\"symbol\":\"foo.*bar\"}}", .{});
+    const out = execute(std.testing.io, "refs", args, arena, null, null) catch |err| return err;
+    try std.testing.expect(std.mem.indexOf(u8, out, "not a plain identifier") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "grep") != null);
+}
+
+test "refs: it finds a Go METHOD, which a naive grep calls a use" {
+    // `func (s *Server) Listen() error {` — the text before the name is the
+    // receiver, so without stepping over it `refs Listen` answers "no
+    // declaration" for a method that exists.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = "/tmp/opencode/refs-go";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = dir ++ "/server.go",
+        .data =
+        \\func (s *Server) Listen() error {
+        \\    return nil
+        \\}
+        \\func (s *Server) Serve(port int) error {
+        \\    return s.Listen()
+        \\}
+        \\
+        ,
+    });
+
+    const args = try std.fmt.allocPrint(arena, "{{\"symbol\":\"Listen\",\"subdir\":\"{s}\"}}", .{dir});
+    const out = try execute(std.testing.io, "refs", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "definition(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "server.go:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "server.go:5") != null);
+}
+
+test "refs: does not walk zig-pkg or zig-out" {
+    // Both hold thousands of files and none of them is the user's code. A `refs`
+    // that reported the standard library's internals would be worse than useless.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // From the project root, not from inside zig-pkg: walking `subdir:
+    // "zig-pkg"` produces paths RELATIVE to that root, so the check never sees
+    // the string "zig-pkg" and passes for the wrong reason.
+    const out = execute(std.testing.io, "refs", "{\"symbol\":\"Evaluator\"}", arena, null, null) catch |err| return err;
+    try std.testing.expect(std.mem.indexOf(u8, out, "zig-pkg/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zig-out/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".zig-cache/") == null);
+    // And it still found the real ones, or the exclusions proved nothing.
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/") != null);
 }

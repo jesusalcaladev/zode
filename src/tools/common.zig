@@ -91,7 +91,13 @@ pub const Walker = struct {
     }
 };
 
-pub fn walkZig(io: std.Io, arena: std.mem.Allocator, root: []const u8) !Walker {
+/// Walks EVERY file under `root`, of any extension.
+///
+/// The name says "all" because the walker was written for `glob`'s `**/*.zig`
+/// and `refs` needs it for every language: a symbol in a `.py` is as real as one
+/// in a `.zig`, and the tool that is supposed to be language-agnostic must not
+/// stop at the extension.
+pub fn walkAll(io: std.Io, arena: std.mem.Allocator, root: []const u8) !Walker {
     var w = Walker{
         .io = io,
         .arena = arena,
@@ -100,6 +106,10 @@ pub fn walkZig(io: std.Io, arena: std.mem.Allocator, root: []const u8) !Walker {
     const root_copy = try arena.dupe(u8, root);
     try w.stack.append(arena, root_copy);
     return w;
+}
+
+pub fn walkZig(io: std.Io, arena: std.mem.Allocator, root: []const u8) !Walker {
+    return walkAll(io, arena, root);
 }
 
 /// Directory names the walker never descends into.

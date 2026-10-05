@@ -36,6 +36,15 @@ pub fn main(init: std.process.Init) !u8 {
     const g3 = try tools.execute(init.io, "git_log", "{\"limit\":3}", arena, null, null);
     try out.interface.print("GIT_LOG: {s}\n", .{g3[0..@min(g3.len, 300)]});
 
+    // refs, on THIS repository: the only honest check of the definition/use split
+    // is against a codebase that actually has cross-file references.
+    const rf = try tools.execute(init.io, "refs", "{\"symbol\":\"hitRatePct\"}", arena, null, null);
+    try out.interface.print("REFS: {s}\n", .{rf[0..@min(rf.len, 700)]});
+
+    // read with `paths`: three files, ONE call, on this repository.
+    const rp = try tools.execute(init.io, "read", "{\"paths\":[\"src/cache_stats.zig\",\"src/compaction.zig\"]}", arena, null, null);
+    try out.interface.print("READ-PATHS: {d} bytes, {d} file(s)\n", .{ rp.len, std.mem.count(u8, rp, "\n--- ") + 1 });
+
     try out.interface.flush();
     return 0;
 }
