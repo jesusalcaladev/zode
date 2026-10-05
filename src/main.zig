@@ -89,7 +89,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // The `arena`, not the `gpa`: this text lives as long as the conversation
     // does, and the arena dies at the end of the run. With `gpa` it was a leak
     // per process (the DebugAllocator says so on exit, which is how it showed up).
-    try msgs.append(arena, .{ .role = "system", .content = headlessSystemPrompt(arena, env) });
+    try msgs.append(arena, .{ .role = "system", .content = try headlessSystemPrompt(arena, env) });
     // `@file` mentions work in headless too: the TUI expands them in
     // `runOneTurn` (`withMentions`), but this runner sent the raw text, so
     // `zode --chat "explain @src/foo.zig"` made the model answer "I don't have
@@ -300,25 +300,23 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
 /// agent, which is the same decision arriving through a different door.
 /// Returns gpa-owned memory. The caller frees it (the `arena` of the run owns it
 /// for the whole process, which is the simplest correct owner here).
-fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.Map) []u8 {
-    // BORROWED, like everywhere else: `discoverSkills` owns the list, and the headless
-    // runner has no teardown of its own to free it in.
-    const entries = agent.discoverSkills(a, env);
-    var list_buf: [8 * 1024]u8 = undefined;
-    const section = skills.systemPromptSection(entries, &list_buf);
-
-    var loc_buf: [512]u8 = undefined;
-    const location = agent.projectInfoPromptLines(&loc_buf);
-
-    var sp_buf: [16 * 1024]u8 = undefined;
-    const sp = std.fmt.bufPrint(
-        &sp_buf,
-        "{s}\n{s}\n{s}{s}",
-        .{ agent.default_system_prompt, ask.guidance, section, location },
-    ) catch return a.dupe(u8, agent.default_system_prompt) catch "";
-    return a.dupe(u8, sp) catch a.dupe(u8, agent.default_system_prompt) catch "";
+fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.Map) ![]u8 {
+    // `buildSystemPromptFor` and NOT a composition of its own. This function used
+    // to build `base + ask + skills + location` and leave out `tool_routing_prompt`
+    // and `verification_prompt`, which made `--chat` — the runner every pty test
+    // and every measurement in this repo drives — an agent with no routing rules at
+    // all. It reached for `bash zig build` where `check` exists and for
+    // `bash curl` where `web_search` exists, and none of that was visible from the
+    // TUI, where the same rules do work.
+    //
+    // Two prompts for one agent is not a configuration, it is a second definition
+    // of how the harness wants to be used. There is one now.
+    //
+    // `ask.guidance` is inside it, and the runner still refuses `ask`: the guidance
+    // is about WHEN to consider a question, and `task` returns "the user has to
+    // decide X" to the main agent, which is the same decision through another door.
+    return try agent.buildSystemPromptFor(a, env);
 }
-
 /// `tools_mod.execute` plus the background registry.
 ///
 /// A thin wrapper and not a change to the signature of `execute`: the registry

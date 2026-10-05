@@ -243,6 +243,14 @@ fn appendLocked(j: *Job, gpa: std.mem.Allocator, bytes: []const u8) void {
 pub const Output = struct {
     buf: [max_output + 512]u8 = undefined,
     len: usize = 0,
+    /// The job's exit code, when it has finished. null while running or when the
+    /// child could not be reaped.
+    ///
+    /// It is here and not only in the header `read` prints because the callers that
+    /// PARSE the output need it too, and the dangerous shape is "the build failed
+    /// and the tool said it passed": a scan for `file:line: error:` finds nothing in
+    /// a panic, and without the exit status there is nothing left to notice with.
+    exit: ?u8 = null,
 
     pub fn slice(self: *const Output) []const u8 {
         return self.buf[0..self.len];
@@ -332,6 +340,7 @@ pub fn readNoHeader(reg: *Registry, out: *Output, id: u32) ![]const u8 {
                 j.dropped, max_output / 1024,
             }) catch {};
         }
+        out.exit = j.exit;
         if (w.buffered().len == 0) return "";
         out.len = w.buffered().len;
         return out.slice();

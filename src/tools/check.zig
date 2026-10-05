@@ -124,6 +124,26 @@ pub fn report(arena: std.mem.Allocator, reg: *bgproc.Registry, id: u32) ![]const
 
     if (diags.len == 0) {
         if (running) return "the check is still running and has printed no error yet.";
+        // THE FAILED-EXIT CASE, and it is the dangerous direction.
+        //
+        // Measured: a `build.zig` that panics prints a source location and a
+        // `thread N panic:` line — neither of which is `file:line: error:`, so the
+        // diagnostic scan found nothing, and the tool said **"no type errors"** while
+        // the build had exited 2 and produced a stack trace.
+        //
+        // A check that fails and reports success is worse than no check: the model
+        // reads "no type errors" and carries on editing a project whose build does
+        // not even run. So a non-zero exit with no diagnostics is reported as a
+        // failure, with the tail of the output, which is where a panic or a missing
+        // dependency actually is.
+        const failed = !running and out.exit != null and out.exit.? != 0;
+        if (failed) {
+            var m: std.ArrayList(u8) = .empty;
+            try m.print(arena, "the check FAILED (exit {d}) and did not report a type error. That usually means the build itself could not run — a broken build script, a missing dependency, or a panic. The output:", .{out.exit.?});
+            const tail = text[if (text.len > 2000) text.len - 2000 else 0..];
+            try m.print(arena, "\n{s}\nDo NOT treat this as a passing build: fix what the output says first.", .{tail});
+            return m.items;
+        }
         return "no type errors. The code compiles as far as this project's own check can tell.";
     }
 

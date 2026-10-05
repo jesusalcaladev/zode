@@ -81,7 +81,7 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"read","description":"A PNG/JPG/GIF/WEBP arrives as an IMAGE you can look at, never as bytes: do not use bash xxd/hexdump/base64/strings on a picture. Read a file from disk, or SEVERAL at once with `paths` (max 8) — prefer that whenever you are comparing files or opening a handful: one call is one round trip and a round trip is a whole request, so reading three files one by one costs three of them. Each file keeps the same caching. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"description":"read up to 8 files in ONE call; each is cached separately"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":[]}}},
     \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, several HUNKS in one file via edits:[{old_string,new_string},...] (all validated first, then applied in order; if a hunk no longer matches because an earlier one rewrote it, NOTHING is written and you are told which hunk). For several FILES in ONE call use files:[{path,old_string,new_string},...] (max 8) — that is the shape a rename takes, and doing it one file per call is one request per file. old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","description":"several HUNKS in this one file","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"files":{"type":"array","description":"up to 8 {path,old_string,new_string} objects, edited in ONE call","items":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
+    \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr. NOT the tool for TYPECHECKING: `check` does that with the project's own command (build.zig, tsconfig.json, Cargo.toml, go.mod) and brings the errors back with a file and a line, so you never spend a call inventing `zig build` / `npx tsc` / `cargo check` yourself. Use `bash` for running things — a test suite you named, git, a script — and for anything that is not a type check. By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while it runs. and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
     \\{"type":"function","function":{"name":"glob","description":"Find files matching a glob pattern like src/**/*.zig.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
     \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regex. Returns path:line:text matches.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"subdir":{"type":"string"}},"required":["pattern"]}}},
     \\{"type":"function","function":{"name":"git_status","description":"The state of the working tree and the branch: one line per staged, modified or untracked path (XY = staged then worktree, ?? = untracked), plus how many files changed and by how much. Prefer it to `bash git status`, which returns English prose with colour codes that you then have to parse. Returns a clean-tree note when there is nothing to report.","parameters":{"type":"object","properties":{},"required":[]}}},
@@ -1519,4 +1519,50 @@ test "the read description says a picture arrives as an IMAGE, not as bytes" {
         return;
     }
     return error.NoRead;
+}
+
+test "check: a FAILED build is never reported as 'no type errors'" {
+    // Measured, and it is the dangerous direction. A `build.zig` that panics prints
+    // a source location and `thread N panic: object files have no standard
+    // installation procedure` — neither is `file:line: error:`, so the diagnostic
+    // scan found nothing and the tool answered **"no type errors"** while the build
+    // had exited 2 with a stack trace.
+    //
+    // A check that fails and reports success is worse than no check: the model
+    // reads "no type errors" and carries on editing a project whose build does not
+    // even run.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reg = bgproc.Registry{};
+    defer reg.deinit(undefined, std.testing.allocator);
+    reg.slots[0] = .{ .state = .finished, .id = 7, .exit = 2 };
+    try reg.slots[0].buf.appendSlice(
+        std.testing.allocator,
+        "/usr/lib/zig/std/Build/Step/InstallArtifact.zig:64:32: thread 508062 panic: object files have no standard installation procedure\n",
+    );
+
+    const out = try check_tool.report(arena, &reg, 7);
+    try std.testing.expect(std.mem.indexOf(u8, out, "no type errors") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FAILED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "exit 2") != null);
+    // And the panic is in there, because that is what the user has to read.
+    try std.testing.expect(std.mem.indexOf(u8, out, "panic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Do NOT treat this as a passing build") != null);
+}
+
+test "check: a PASSING build with no diagnostics says so, and says nothing scary" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reg = bgproc.Registry{};
+    defer reg.deinit(undefined, std.testing.allocator);
+    reg.slots[0] = .{ .state = .finished, .id = 8, .exit = 0 };
+    try reg.slots[0].buf.appendSlice(std.testing.allocator, "Build finished\\n");
+
+    const out = try check_tool.report(arena, &reg, 8);
+    try std.testing.expect(std.mem.indexOf(u8, out, "no type errors") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FAILED") == null);
 }

@@ -296,6 +296,32 @@ fn freeSkillsCacheLocked() void {
     skills_stamp_len = 0;
 }
 
+/// The system prompt, composed for a run that has no `Model`.
+///
+/// The headless runner used to compose ITS OWN, and it left out the routing table
+/// and the verification prompt. That is the single worst bug this repository has
+/// had in a while, and the reason it survived so long is that every test drives
+/// `--chat`:
+///
+///   - `zode --chat` got NO routing rules, so it reached for `bash zig build`
+///     where `check` exists, and for `bash curl` where `web_search` exists;
+///   - it got no batching rules, so reading three files cost three round trips;
+///   - it got no verification rules, so a task took three times as long;
+///   - it got no `todo` or `refs` guidance, so neither was used.
+///
+/// And it was invisible from the TUI, where all of it works. Two prompts for the
+/// same agent, one of them a subset of the other, is not a configuration: it is a
+/// second definition of how the harness wants to be used.
+///
+/// So there is ONE composition now. The headless runner calls this.
+pub fn buildSystemPromptFor(
+    gpa: std.mem.Allocator,
+    env: ?*const std.process.Environ.Map,
+) ![]u8 {
+    var buf: [16 * 1024]u8 = undefined;
+    return gpa.dupe(u8, buildSystemPrompt(gpa, &buf, env));
+}
+
 fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process.Environ.Map) []const u8 {
     const base = systemPromptBase(gpa);
     const entries = discoverSkills(gpa, env);
@@ -331,6 +357,8 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     //   base (per project) · routing (constant) · ask guidance (constant)
     //   · skills (per session) · location (per project)
     //   · read-only note (EVERY keypress of shift+tab, mid-turn)
+    const blocks_len = routing.len + verification_prompt.len + ask.guidance.len +
+        section.len + location.len + mode_note.len;
     const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}", .{
         base,
         routing,
@@ -339,7 +367,45 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
         section,
         location,
         mode_note,
-    }) catch return base;
+    }) catch blk: {
+        // It did not fit, and the old answer was `catch return base`: the WHOLE
+        // prompt became the project's own text, with no routing table, no
+        // verification rule, no ask guidance, no skills and no location — silently,
+        // for every project whose instruction file is bigger than the buffer.
+        //
+        // That is the exact symptom this table was written for. Asked to find a
+        // games page, the model ran `bash curl`, because there was no rule saying
+        // not to; here it happens to any project with a 30 KB `AGENTS.md`, and it
+        // looks like "the model ignored my instructions" instead of "the harness
+        // dropped its own".
+        //
+        // So the CONSTANT blocks are the ones that survive and the per-project text
+        // is what gets trimmed — and it says so, because a project that cannot see
+        // half of its own instructions should be told rather than left to guess.
+        // The slack has to cover the note AND the separators. With 64 bytes the
+        // retry overflowed too and the answer was `catch routing`, which drops the
+        // verification rules and the ask guidance — the same class of loss as the
+        // bug being fixed, one function deeper.
+        const note = "[the project instructions above were truncated to fit; the rest is in the project's instruction file]";
+        const overhead = note.len + 16;
+        if (out.len <= blocks_len + overhead) break :blk routing;
+        const room = out.len - blocks_len - overhead;
+        const keep = @min(base.len, room);
+        break :blk std.fmt.bufPrint(
+            out,
+            "{s}\n{s}\n{s}\n{s}{s}{s}{s}\n{s}",
+            .{
+                base[0..keep],
+                note,
+                routing,
+                verification_prompt,
+                ask.guidance,
+                section,
+                location,
+                mode_note,
+            },
+        ) catch routing;
+    };
     return composed;
 }
 
@@ -4628,7 +4694,22 @@ pub fn autoCheckResult(m: *tui.Model, arena: std.mem.Allocator) ?[]const u8 {
     m.auto_check = 0;
 
     const diags = typecheck_mod.extractDiagnostics(arena, text, 12) catch return null;
-    if (diags.len == 0) return null;
+    if (diags.len == 0) {
+        // A check that FAILED and produced no `file:line: error:` is a failure, not
+        // a pass. Measured: a `build.zig` that panics prints a source location and a
+        // `thread N panic:` line, the scan finds nothing, and saying nothing here
+        // would leave the model editing a project whose build does not even run.
+        // Silence is right for a check that PASSED and wrong for one that did not.
+        const failed = out.exit != null and out.exit.? != 0;
+        if (!failed) return null;
+        const label = m.auto_check_label[0..m.auto_check_label_len];
+        const tail = text[if (text.len > 1500) text.len - 1500 else 0..];
+        return std.fmt.allocPrint(
+            arena,
+            "[{s} FAILED with exit {d} and reported no type error]\n{s}\nThat usually means the build itself could not run — a broken build script, a missing dependency or a panic. Do not treat this as a passing build.",
+            .{ label, out.exit.?, tail },
+        ) catch null;
+    }
 
     const label = m.auto_check_label[0..m.auto_check_label_len];
     return std.fmt.allocPrint(
@@ -7063,4 +7144,117 @@ test "autoCheckResult: no job, and a job still running, both say nothing" {
     // exists to avoid. The job keeps its slot and the next iteration reads it.
     try std.testing.expect(autoCheckResult(&m, arena) == null);
     try std.testing.expectEqual(@as(u32, 3), m.auto_check);
+}
+
+test "the headless prompt is the SAME prompt as the TUI's, routing included" {
+    // The bug this pins: `zode --chat` composed its own system prompt and left out
+    // `tool_routing_prompt` and `verification_prompt`. So the runner that every pty
+    // test and every measurement in this repo drives was an agent with NO routing
+    // rules at all: it reached for `bash zig build` where `check` exists, for
+    // `bash curl` where `web_search` exists, it read three files in three round
+    // trips, and it wrote its own verification scripts.
+    //
+    // None of it was visible from the TUI, where the same rules do work — which is
+    // why it survived: the TUI looked right.
+    //
+    // One composition now, and this is the test that says so.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // An `Io`, because `systemPromptBase` reads the project's AGENTS.md through
+    // `io_global` and that is `undefined` until startup assigns it. Calling a file
+    // read through it is a GPF, not a zero — the eighth time this family has cost
+    // an afternoon, and the reason every one of those tests attaches one.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    io_global = threaded.io();
+    defer io_global = saved_io;
+
+    // The AGENTS.md cache is a MODULE GLOBAL that outlives this test's arena, and
+    // the next test would read a pointer into memory that has been freed. That is a
+    // use-after-free that shows up as a segfault in whichever test runs second,
+    // which is how it would have been misread.
+    const saved_agents = agents_md_cache;
+    agents_md_cache = null;
+    defer agents_md_cache = saved_agents;
+
+    var buf: [16 * 1024]u8 = undefined;
+    const from_tui = buildSystemPrompt(a, &buf, null);
+    const headless = try buildSystemPromptFor(a, null);
+
+    try std.testing.expectEqualStrings(from_tui, headless);
+
+    // And the specific things that were missing, by name.
+    for ([_][]const u8{
+        tool_routing_prompt,
+        verification_prompt,
+        ask.guidance,
+    }) |block| {
+        if (std.mem.indexOf(u8, headless, block) == null) {
+            std.debug.print("the headless prompt is missing a block of {d} bytes\n", .{block.len});
+            return error.PromptIncomplete;
+        }
+    }
+    // The rules that only exist in the routing table, so a future edit that drops
+    // the block is caught by name and not by byte count.
+    for ([_][]const u8{ "NEVER use bash", "check` TYPECHECKS", "`todo`", "`refs`", "`paths`" }) |needle| {
+        if (std.mem.indexOf(u8, headless, needle) == null) {
+            std.debug.print("the headless prompt lost the rule: {s}\n", .{needle});
+            return error.RuleMissing;
+        }
+    }
+}
+
+test "a project whose AGENTS.md does not fit still gets the ROUTING, not just its own text" {
+    // Found by the previous test, which runs in this repository: its `AGENTS.md` is
+    // ~90 KB, the composition buffer is 16 KB, and the old overflow answer was
+    // `catch return base`. So in this very repository the composed prompt was the
+    // project's own text ALONE: no routing table, no verification rule, no ask
+    // guidance, no skills, no location.
+    //
+    // That is the failure this whole table exists to prevent — asked to find a
+    // games page, the model ran `bash curl`, because there was no rule saying not
+    // to — and it was happening silently to every project with a large instruction
+    // file, and looking like "the model ignored my instructions".
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The same `Io` requirement as the test above, and the same reason.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    io_global = threaded.io();
+    defer io_global = saved_io;
+
+    const saved_agents = agents_md_cache;
+    agents_md_cache = null;
+    defer agents_md_cache = saved_agents;
+
+    var buf: [16 * 1024]u8 = undefined;
+    const composed = buildSystemPrompt(a, &buf, null);
+
+    // The constant blocks are the ones that must survive the trim.
+    for ([_][]const u8{
+        tool_routing_prompt,
+        verification_prompt,
+        ask.guidance,
+        "NEVER use bash",
+        "`check`",
+        "`todo`",
+    }) |needle| {
+        if (std.mem.indexOf(u8, composed, needle) == null) {
+            std.debug.print("the prompt lost a block when the base did not fit: {s}\n", .{needle[0..@min(needle.len, 40)]});
+            return error.PromptIncomplete;
+        }
+    }
+    // And the truncation is ANNOUNCED: a project that cannot see half of its own
+    // instructions should be told, not left to guess.
+    if (std.mem.indexOf(u8, composed, "truncated to fit") == null) {
+        return error.TruncationNotAnnounced;
+    }
+    // It still fits in the buffer it was given, which is the other half.
+    try std.testing.expect(composed.len <= buf.len);
 }

@@ -91,6 +91,14 @@ pub const default_system_prompt =
 pub const tool_routing_prompt =
     \\Choosing the right tool (do not guess — route):
     \\
+    \\ - `check` TYPECHECKS the project for you, in the background, and brings
+    \\   back the errors with a file and a line. Use it instead of
+    \\   `bash zig build` / `bash npx tsc` / `bash cargo check`: you spend no
+    \\   round trip guessing the command, and the input never freezes. After you
+    \\   write code, read what it says before writing more — an error you find now
+    \\   costs one turn and an error you find three turns later costs three.
+    \\   It runs on its own after your edits, so call it with no arguments and
+    \\   keep working, then ask for the result.
     \\ - Anything on the INTERNET (find a site, look up a game, a product, docs,
     \\   prices, news) belongs to web_search / web_fetch. NEVER use bash (curl,
     \\   wget, pip, npm ...) to reach the web: it is slower, un-asked-for and
@@ -129,14 +137,6 @@ pub const tool_routing_prompt =
     \\   `strings` on a picture: that is what you did before, and the answer was a
     \\   PNG signature instead of the picture. If `read` says the current model
     \\   cannot see images, say so and stop; do not work around it with bash.
-    \\ - `check` TYPECHECKS the project for you, in the background, and brings
-    \\   back the errors with a file and a line. Use it instead of
-    \\   `bash zig build` / `bash npx tsc` / `bash cargo check`: you spend no
-    \\   round trip guessing the command, and the input never freezes. After you
-    \\   write code, read what it says before writing more — an error you find now
-    \\   costs one turn and an error you find three turns later costs three.
-    \\   It runs on its own after your edits, so call it with no arguments and
-    \\   keep working, then ask for the result.
     \\ - The repository has tools for git: `git_status`, `git_diff`, `git_log`.
     \\   They return machine formats instead of prose and take no arguments from
     \\   you. Use them instead of `bash git status`, which spends a round trip to
