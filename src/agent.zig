@@ -5957,8 +5957,9 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     }
 
     // 1) The guide must NOT be inside the built-in prompt: that text is what
-    //    `AGENTS.md` replaces. (Note: the built-in DOES name the tools in its
-    //    "Environment" list; what cannot be there is the routing TABLE.)
+    //    `AGENTS.md` replaces. (The built-in does NOT name the tools either: a
+    //    second list of them was there and was already wrong — twelve names
+    //    against twenty in the schema.)
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "NEVER use bash") == null);
     try std.testing.expect(std.mem.indexOf(u8, default_system_prompt, "Choosing the right tool") == null);
 
