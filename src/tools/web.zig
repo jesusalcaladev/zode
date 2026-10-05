@@ -7,6 +7,7 @@ const dispatch = @import("dispatch.zig");
 const common = @import("common.zig");
 const http = @import("../lib/http_client.zig");
 const web = @import("../lib/web.zig");
+const agent = @import("../agent.zig");
 
 /// Hard cap on a web response. 200 KB of text is plenty to read a doc and
 /// keeps an endless page (a listing of 50 000 links) from blowing up the turn's
@@ -24,6 +25,33 @@ pub fn toolWebFetch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocato
     const trimmed = std.mem.trim(u8, url, " \t\r\n");
     if (!isHttpUrl(trimmed)) {
         return std.fmt.allocPrint(arena, "error: only http:// and https:// URLs can be fetched, got: {s}", .{trimmed});
+    }
+
+    // The credential endpoints, before anything else happens.
+    //
+    // `web_fetch` asks for NO permission (see `needsPermission`) while `bash` does, so
+    // this is the one door into the machine that the user never opens. That makes it a
+    // permission question, not a sandbox question: a model can always reach the same
+    // address with `curl` through `bash`, behind a dialog. What this removes is the case
+    // where a page the model READ tells it to fetch an internal address and the answer
+    // lands in the context and on the user's screen with nobody asked.
+    if (web.isCredentialEndpoint(trimmed)) {
+        return std.fmt.allocPrint(
+            arena,
+            "refused: {s} is a cloud instance-metadata endpoint, which serves credentials (AWS, GCP, Azure and DigitalOcean all use link-local for it). " ++
+                "Fetching it would put a key in the transcript. " ++
+                "If you genuinely need a private address, ZODE_WEB_ALLOW_LOCAL=1 allows the private ranges " ++
+                "-- and `bash` with `curl` reaches it behind a permission dialog either way.",
+            .{web.urlHost(trimmed)},
+        );
+    }
+    if (web.isPrivateHost(trimmed) and !allowLocal()) {
+        return std.fmt.allocPrint(
+            arena,
+            "refused: {s} is a loopback or private address, and `web_fetch` asks for no permission, so reaching it would be the one thing on this machine that never got your say. " ++
+                "Set ZODE_WEB_ALLOW_LOCAL=1 if that is what you want (fetching your own dev server is a normal thing to do), or use `bash` with curl, which does ask.",
+            .{web.urlHost(trimmed)},
+        );
     }
 
     var max_bytes: usize = common.max_tool_output;
@@ -249,6 +277,16 @@ pub fn percentEncodeQuery(raw: []const u8, w: *std.Io.Writer) !void {
     }
 }
 
+/// `ZODE_WEB_ALLOW_LOCAL=1` lets `web_fetch` reach loopback and the private ranges.
+///
+/// It is one variable and not a `--allow-local` flag because the thing it is for is a
+/// standing preference ("I fetch my own dev server from here"), not a per-call decision.
+fn allowLocal() bool {
+    const v = agent.environ_global orelse return false;
+    const s = v.get("ZODE_WEB_ALLOW_LOCAL") orelse return false;
+    return s.len > 0 and !std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "false");
+}
+
 pub fn isHttpUrl(url: []const u8) bool {
     if (std.mem.startsWith(u8, url, "http://")) return true;
     if (std.mem.startsWith(u8, url, "https://")) return true;
@@ -436,4 +474,40 @@ test "looksRateLimited never mistakes a real result for a throttle" {
     // And both real throttle messages are caught.
     try std.testing.expect(looksRateLimited("the search engine is refusing requests from this machine right now (HTTP 202 for \"q\"). That is rate limiting"));
     try std.testing.expect(looksRateLimited("the search engine answered HTTP 503 for \"q\". That is a problem on their side"));
+}
+
+test "web_fetch refuses the credential endpoints and says which host it was" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var obj: std.json.ObjectMap = .{};
+    try obj.put(arena, "url", .{ .string = "http://169.254.169.254/latest/meta-data/" });
+    const out = try toolWebFetch(std.testing.io, obj, arena);
+
+    // It has to NAME the host: "refused" alone leaves the model to guess which of a
+    // dozen URLs in the page it cannot use.
+    try std.testing.expect(std.mem.indexOf(u8, out, "169.254.169.254") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "refused") != null);
+    // And to say what to do, because "refused" with no way forward is a dead end the
+    // model will route around with `bash`.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ZODE_WEB_ALLOW_LOCAL") != null);
+}
+
+test "web_fetch refuses loopback, and a public URL is not touched" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var obj: std.json.ObjectMap = .{};
+    try obj.put(arena, "url", .{ .string = "http://127.0.0.1:8080/admin" });
+    const out = try toolWebFetch(std.testing.io, obj, arena);
+    // It must fail BEFORE the network: the refusal text is there and there is no
+    // HTTP status in it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "127.0.0.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "permission") != null);
+
+    // And `isHttpUrl` still accepts a public one, so the guard is not just "refuse all".
+    try std.testing.expect(isHttpUrl("https://example.com/"));
+    try std.testing.expect(!web.isPrivateHost("https://example.com/"));
 }

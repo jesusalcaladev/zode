@@ -1,3 +1,20 @@
+/// 0600, because a session is a transcript of everything you did.
+///
+/// It is not a secret store — nothing in it is encrypted — but it holds file contents
+/// the agent read, command output, and whatever you pasted, and it is written into the
+/// PROJECT DIRECTORY, which on a shared machine or a laptop with several accounts is
+/// world-readable by default. Measured before this: `sessions/*.jsonl` came out
+/// `-rw-r--r--`.
+///
+/// The directory gets 0700 for the same reason: a 0755 directory leaks the NAMES of
+/// every session you have had, and with the files at 0644 those names were enough to
+/// read all of them.
+///
+/// `auth.json` was already written 0600 (`config.zig`), so the principle was already in
+/// the repo and this one file was simply outside it.
+const session_mode: std.Io.File.Permissions = @enumFromInt(0o600);
+const sessions_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
+
 const std = @import("std");
 const chat = @import("chat.zig");
 const zjsonl = @import("lib/zjsonl.zig");
@@ -60,8 +77,12 @@ pub const Session = struct {
 
         var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         defer dir.close(io);
-        try dir.createDirPath(io, "sessions");
+        _ = try dir.createDirPathStatus(io, "sessions", sessions_dir_mode);
         const file = try dir.createFile(io, s.path.?, .{ .truncate = false });
+        // `createFile` takes no mode: POSIX gives 0666 & ~umask, which is 0644 on a
+        // default umask. The mode is set on the open file, so there is no window in
+        // which the transcript exists at 0644 — which a `create` + `chmod` would have.
+        file.setPermissions(io, session_mode) catch {};
         s.file = file;
         s.io = io;
         // Streaming writer: appends at the end of the fd (no 0xFF hole).
@@ -200,6 +221,9 @@ pub const Session = struct {
         var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         defer dir.close(io);
         const file = try dir.createFile(io, path, .{ .truncate = true });
+        // Resuming TRUNCATES and rewrites, so the file is recreated: its mode has to be
+        // set again, or a session that was 0600 goes back to 0644 on the next resume.
+        file.setPermissions(io, session_mode) catch {};
         s.file = file;
         s.fw = std.Io.File.Writer.initStreaming(file, io, &s.write_buf);
         for (s.messages.items) |*m| {
