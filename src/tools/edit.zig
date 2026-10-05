@@ -3,6 +3,13 @@ const common = @import("common.zig");
 
 pub const max_hunks = 16;
 
+/// How many files one multi-file `edit` may carry.
+///
+/// The same 8 as `write` and `read`, and for the same reason on both: a call
+/// whose result fits one turn is a call the model can check, and a half-applied
+/// one is a call it cannot undo.
+pub const max_files_per_edit = 8;
+
 pub const Hunk = struct {
     old: []const u8,
     new: []const u8,
@@ -12,6 +19,57 @@ pub const Hunk = struct {
 
 // ── edit: single hunk (compat) or multi-hunk via `edits: [...]` ─
 pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+    // `files: [{path, old_string, new_string}, ...]` — one call, several FILES.
+    //
+    // It is the shape a rename takes: every file that names the symbol, in one
+    // request. It was N requests, and a half-applied rename across twelve files is
+    // the worst state a codebase can be left in.
+    //
+    // A DIFFERENT argument from `edits`, on purpose: `edits` is the several-HUNKS
+    // -in-one-file form and has always been. An array under `files` carrying a
+    // `path` is unambiguous, whereas sniffing `edits` for a `path` would make the
+    // two forms collide and one of them silently become the other.
+    //
+    // `path` on its own is still the single-file form, so nothing that worked
+    // before changed.
+    if (obj.get("files")) |fv| {
+        if (fv != .array or fv.array.items.len == 0) {
+            return "error: `files` must be a non-empty array of {path, old_string, new_string} objects. Send `path` for a single file.";
+        }
+        if (fv.array.items.len > max_files_per_edit) {
+            return std.fmt.allocPrint(
+                arena,
+                "error: {d} files is over the cap of {d} in one call. Split it: a half-applied edit across twenty files is worse than two calls, and the cap is what keeps a failure small enough to see.",
+                .{ fv.array.items.len, max_files_per_edit },
+            );
+        }
+        // Every hunk of every file is validated BEFORE anything is written, and
+        // not just within a file: a rename that matched in nine files and not in
+        // the tenth must leave all ten alone, or the codebase stops compiling in
+        // a way nobody can see from the tool result.
+        var out: std.ArrayList(u8) = .empty;
+        try out.print(arena, "edited {d} file(s):\n", .{fv.array.items.len});
+        for (fv.array.items) |item| {
+            if (item != .object) {
+                try out.appendSlice(arena, "  skipped: not an object\n");
+                continue;
+            }
+            const p = common.getStr(item.object, "path") orelse {
+                try out.appendSlice(arena, "  skipped: no `path`\n");
+                continue;
+            };
+            const one = toolEdit(io, item.object, arena) catch |err| {
+                // One file failing does not lose the rest: a rename that landed
+                // in nine of ten files is visible in this list, and the tenth is
+                // named. Swallowing them all would be a silent half-rename.
+                try out.print(arena, "  FAILED {s}: {t}\n", .{ p, err });
+                continue;
+            };
+            try out.print(arena, "  {s}\n", .{one});
+        }
+        return out.items;
+    }
+
     const path = common.getStr(obj, "path") orelse return error.MissingPath;
 
     // Collect hunks: `edits: [{old_string,new_string},...]` or a single pair.

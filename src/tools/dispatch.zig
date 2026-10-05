@@ -67,7 +67,7 @@ pub fn toolsJson() []const u8 {
     \\[
     \\{"type":"function","function":{"name":"read","description":"Read a file from disk, or SEVERAL at once with `paths` (max 8) — prefer that whenever you are comparing files or opening a handful: one call is one round trip and a round trip is a whole request, so reading three files one by one costs three of them. Each file keeps the same caching. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"description":"read up to 8 files in ONE call; each is cached separately"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":[]}}},
     \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
-    \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, or several at once via edits:[{old_string,new_string},...] (applied in order, all validated first). old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, several HUNKS in one file via edits:[{old_string,new_string},...] (all validated first, then applied in order; if a hunk no longer matches because an earlier one rewrote it, NOTHING is written and you are told which hunk). For several FILES in ONE call use files:[{path,old_string,new_string},...] (max 8) — that is the shape a rename takes, and doing it one file per call is one request per file. old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","description":"several HUNKS in this one file","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"files":{"type":"array","description":"up to 8 {path,old_string,new_string} objects, edited in ONE call","items":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":[]}}},
     \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
     \\{"type":"function","function":{"name":"glob","description":"Find files matching a glob pattern like src/**/*.zig.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
     \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regex. Returns path:line:text matches.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"subdir":{"type":"string"}},"required":["pattern"]}}},
@@ -1017,4 +1017,107 @@ test "refs: does not walk zig-pkg or zig-out" {
     try std.testing.expect(std.mem.indexOf(u8, out, ".zig-cache/") == null);
     // And it still found the real ones, or the exclusions proved nothing.
     try std.testing.expect(std.mem.indexOf(u8, out, "src/") != null);
+}
+
+test "write {files}: SEVERAL files in ONE call, and one bad one does not lose the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"files":[{{"path":"/tmp/opencode/mw-1.txt","content":"uno\n"}},{{"path":"/tmp/opencode/mw-2.txt","content":"dos\n"}},{{"path":"/tmp/opencode/mw-3.txt"}}]}}
+    , .{});
+    const out = try execute(std.testing.io, "write", args, arena, null, null);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "wrote 3 file(s)") != null);
+    // Both good ones landed, with their sizes.
+    try std.testing.expect(std.mem.indexOf(u8, out, "mw-1.txt (4 bytes, 1 lines)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mw-2.txt") != null);
+    // And the one with no `content` is named instead of silently vanishing.
+    try std.testing.expect(std.mem.indexOf(u8, out, "skipped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mw-3.txt") != null);
+
+    const a = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/opencode/mw-1.txt", arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("uno\n", a);
+}
+
+test "write {files} over the cap is refused with a number, not silently truncated" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var args: std.ArrayList(u8) = .empty;
+    try args.appendSlice(arena, "{\"files\":[");
+    var i: usize = 0;
+    while (i < write_tool.max_files_per_call + 2) : (i += 1) {
+        if (i > 0) try args.appendSlice(arena, ",");
+        try args.print(arena, "{{\"path\":\"/tmp/opencode/of{d}.txt\",\"content\":\"x\"}}", .{i});
+    }
+    try args.appendSlice(arena, "]}");
+
+    const out = try execute(std.testing.io, "write", args.items, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "over the cap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "half applied") != null);
+    // And NOTHING was written: a refused call that wrote the first four anyway is
+    // worse than one that refused.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, "/tmp/opencode/of0.txt", .{}));
+}
+
+test "edit {files}: the shape a rename takes, and the failing file is NAMED" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{ "mf-1.txt", "mf-2.txt", "mf-3.txt" }) |n| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = try std.fmt.allocPrint(arena, "/tmp/opencode/{s}", .{n}),
+            .data = "const oldName = 1;\n",
+        });
+    }
+
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"files":[{{"path":"/tmp/opencode/mf-1.txt","old_string":"oldName","new_string":"newName"}},{{"path":"/tmp/opencode/mf-2.txt","old_string":"oldName","new_string":"newName"}},{{"path":"/tmp/opencode/mf-3.txt","old_string":"nothingMatchesThis","new_string":"x"}}]}}
+    , .{});
+    const out = try execute(std.testing.io, "edit", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "edited 3 file(s)") != null);
+    // Two landed.
+    const a = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/opencode/mf-1.txt", arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("const newName = 1;\n", a);
+    const b = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/opencode/mf-2.txt", arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("const newName = 1;\n", b);
+    // And the third one is named, with the reason and the text that did not
+    // match. It does NOT say "FAILED" — `toolEdit` returns a missing `old_string`
+    // as TEXT, not as an error union, so the batch reports what the single-file
+    // form said, which is the better message anyway.
+    //
+    // A rename that landed in two of three files and did not SAY so is the worst
+    // possible outcome, so this is the assertion that matters most in the test.
+    try std.testing.expect(std.mem.indexOf(u8, out, "mf-3.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "old_string not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "nothingMatchesThis") != null);
+    // And it was left alone.
+    const c = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/opencode/mf-3.txt", arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("const oldName = 1;\n", c);
+}
+
+test "edit: `edits` is still the several-HUNKS-in-one-file form, not the files form" {
+    // The two forms have to stay distinct. Sniffing `edits` for a `path` to tell
+    // them apart makes one of them silently become the other; they use different
+    // arguments instead, and this is the test that says so.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/mf-hunks.txt",
+        .data = "alpha\nbeta\n",
+    });
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"path":"/tmp/opencode/mf-hunks.txt","edits":[{{"old_string":"alpha","new_string":"A"}},{{"old_string":"beta","new_string":"B"}}]}}
+    , .{});
+    const out = try execute(std.testing.io, "edit", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2 hunk(s)") != null);
+
+    const r = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/opencode/mf-hunks.txt", arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("A\nB\n", r);
 }

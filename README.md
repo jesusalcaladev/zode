@@ -29,6 +29,10 @@ $ zode
 - **Parallel subagents**: several independent searches in one message go to
   subagents at the same time (3 by default, `ZODE_TASK_PARALLEL`), each with its
   own throwaway window, and the reports come back in the order you asked for them.
+- **`write` and `edit` take several files at once** — `files: [...]`, max 8.
+  Renaming a symbol is one call, not one per file, and **the file that failed is
+  named with the reason**, because a rename applied to nine files out of ten and
+  not reported is a codebase that does not compile.
 - **`read` takes several paths at once** — one call is one round trip, and a round
   trip is a whole request. On a free tier (`total_credits: 0`, measured) every
   request is also a chance to be rate-limited plus three backoff waits.
