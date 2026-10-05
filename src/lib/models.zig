@@ -105,6 +105,81 @@ pub fn isRouter(id: []const u8) bool {
 /// The test is on the ID, because that is all several providers publish: a
 /// name that says what it does. It is a filter, not a guarantee, and being wrong
 /// here costs one rotation.
+/// Does this model accept an IMAGE?
+///
+/// ## Why it is a name table and not a capability probe
+///
+/// There is no way to ask a provider "do you take images?" without sending one and
+/// reading the error. And the failure mode of getting it wrong is asymmetric:
+/// attaching an image to a model that cannot see it is a 400 and the whole turn
+/// dies, while NOT attaching one to a model that can is a confusing answer with no
+/// explanation. So the table is a whitelist, and a model that is not in it does not
+/// get images.
+///
+/// That is also why the router entries are absent. `openrouter/free` routes each
+/// request to a different upstream model, so whether it accepts an image depends on
+/// what it picked this time — there is no correct answer to give, and the honest
+/// thing is to say the model cannot be asked.
+///
+/// `space-bunny-free` is the same case and it is the model this account actually
+/// uses, which is worth stating plainly: on the free tier there is no vision.
+pub fn isVision(id: []const u8) bool {
+    if (id.len == 0) return false;
+    // Routers first, so a name that happens to contain a vision word does not slip
+    // through: `openrouter/free` is not `gpt-4o`.
+    if (isRouter(id)) return false;
+    const m = id;
+
+    const yes = [_][]const u8{
+        // OpenAI
+        "gpt-4o",               "gpt-4.1",         "gpt-4-turbo",  "gpt-4-vision",  "gpt-5",
+        "chatgpt-4o",
+        // Anthropic
+                  "claude-3",        "claude-4",     "claude-sonnet", "claude-opus",
+        "claude-haiku",
+        // Google
+                "gemini",          "gemma-3",      "gemma3",
+        // Meta
+               "llama-3.2-vision",
+        "llama-3.2-11b-vision", "llama-4",         "llama-vision", "pixtral",       "llava",
+        "bakllava",
+        // Alibaba
+                    "qwen-vl",         "qwen2-vl",     "qwen2.5-vl",    "qwen3-vl",
+        "internvl",
+        // Mistral / others
+                    "mistral-small-3", "ministral",    "devstral",      "pixtral-large",
+        "cogvlm",
+        // Others that ship vision under an obvious name
+                      "vision",          "vl-",          "-vl",           "omni",
+    };
+    for (yes) |needle| {
+        if (containsAtWord(m, needle)) return true;
+    }
+    // And a few that are vision ONLY in a size-specific form; naming the family is
+    // enough because the family's non-vision members do not exist under it.
+    return false;
+}
+
+/// A substring hit at a word boundary: `_`, `-`, `/`, `.` or the ends.
+///
+/// Without it, `gpt-4o` would match inside `gpt-4o-mini-audio` (fine) and, worse,
+/// `vision` would match inside `supervised-visionless-tiny`.
+fn containsAtWord(hay: []const u8, needle: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, from, needle)) |at| {
+        const end = at + needle.len;
+        const before_ok = at == 0 or isBoundary(hay[at - 1]);
+        const after_ok = end >= hay.len or isBoundary(hay[end]);
+        if (before_ok and after_ok) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
+fn isBoundary(c: u8) bool {
+    return c == '-' or c == '_' or c == '/' or c == '.' or c == ':';
+}
+
 pub fn isConversational(id: []const u8) bool {
     const needles = [_][]const u8{
         // embeddings / retrieval
@@ -446,4 +521,53 @@ test "isRouter: the ids that measured 0% cached, and the `:free` models that mea
     }) |m| {
         try std.testing.expect(!isRouter(m));
     }
+}
+
+test "isVision: the models that take images, and the ones that must never be given one" {
+    // The asymmetry is the whole reason this is a whitelist: an image sent to a
+    // model without vision is a 400 and the whole turn dies, while NOT sending one
+    // to a model that has it is a confusing answer. So unknown means no.
+    for ([_][]const u8{
+        "gpt-4o",                        "gpt-4o-mini",       "gpt-4.1",
+        "gpt-4-turbo",                   "claude-sonnet-4-5", "claude-3-5-haiku-20241022",
+        "claude-opus-4-1",               "gemini-2.5-flash",  "gemini-3-pro-preview",
+        "llama-3.2-11b-vision-instruct", "llama-4-scout",     "pixtral-12b",
+        "qwen2.5-vl-7b",                 "mistral-small-3.1", "gemma-3-27b-it",
+    }) |m| {
+        if (!isVision(m)) {
+            std.debug.print("isVision says NO to {s}\n", .{m});
+            return error.MissingVision;
+        }
+    }
+}
+
+test "isVision: text models and ROUTERS get no image, ever" {
+    for ([_][]const u8{
+        "kimi-k2.6",                 "deepseek-chat",    "qwen3-8b",
+        "qwen/qwen3.8-27b:free",     "space-bunny-free", "openrouter/free",
+        "opencode/space-bunny-free", "",                 "some-unknown-model",
+    }) |m| {
+        if (isVision(m)) {
+            std.debug.print("isVision says YES to {s}\n", .{m});
+            return error.FalseVision;
+        }
+    }
+}
+
+test "isVision: the router check runs FIRST, so a name with a vision word is still no" {
+    // `openrouter/free` is the model this account is configured with, and it
+    // routes each request to a different upstream. Whether that upstream takes an
+    // image changes per request, so there is no correct answer to give.
+    try std.testing.expect(isRouter("openrouter/free"));
+    try std.testing.expect(!isVision("openrouter/free"));
+    try std.testing.expect(!isVision("opencode/anything-vision"));
+}
+
+test "isVision: the match is at a word boundary" {
+    // Without the boundary, the bare word `vision` matches inside
+    // `supervised-visionless-tiny` and a text model starts getting images.
+    try std.testing.expect(containsAtWord("llama-3.2-11b-vision-instruct", "vision"));
+    try std.testing.expect(containsAtWord("openai/gpt-4o", "gpt-4o"));
+    try std.testing.expect(!containsAtWord("supervised-visionless-tiny", "vision"));
+    try std.testing.expect(!containsAtWord("mygpt-4o-clone", "gpt-4o"));
 }

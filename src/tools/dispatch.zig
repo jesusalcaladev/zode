@@ -78,7 +78,7 @@ pub fn isParallelSafe(name: []const u8) bool {
 pub fn toolsJson() []const u8 {
     return
     \\[
-    \\{"type":"function","function":{"name":"read","description":"Read a file from disk, or SEVERAL at once with `paths` (max 8) — prefer that whenever you are comparing files or opening a handful: one call is one round trip and a round trip is a whole request, so reading three files one by one costs three of them. Each file keeps the same caching. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"description":"read up to 8 files in ONE call; each is cached separately"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"read","description":"A PNG/JPG/GIF/WEBP arrives as an IMAGE you can look at, never as bytes: do not use bash xxd/hexdump/base64/strings on a picture. Read a file from disk, or SEVERAL at once with `paths` (max 8) — prefer that whenever you are comparing files or opening a handful: one call is one round trip and a round trip is a whole request, so reading three files one by one costs three of them. Each file keeps the same caching. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"description":"read up to 8 files in ONE call; each is cached separately"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":[]}}},
     \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, several HUNKS in one file via edits:[{old_string,new_string},...] (all validated first, then applied in order; if a hunk no longer matches because an earlier one rewrote it, NOTHING is written and you are told which hunk). For several FILES in ONE call use files:[{path,old_string,new_string},...] (max 8) — that is the shape a rename takes, and doing it one file per call is one request per file. old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","description":"several HUNKS in this one file","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"files":{"type":"array","description":"up to 8 {path,old_string,new_string} objects, edited in ONE call","items":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":[]}}},
     \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
@@ -1493,4 +1493,30 @@ test "todo: the schema documents BOTH forms, so the model knows the patch exists
         return;
     }
     return error.NoTodo;
+}
+
+test "the read description says a picture arrives as an IMAGE, not as bytes" {
+    // Measured: asked to look at a PNG, the model ran `bash` with `strings` and
+    // reported "PNG, IHDR, IDAT, IEND" — the magic bytes, not the picture. The
+    // capability existed and was not reached for, which is the failure this whole
+    // feature was at risk of repeating.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), toolsJson(), .{}) catch
+        return error.BadSchema;
+    for (v.array.items) |item| {
+        const fn_obj = item.object.get("function").?.object;
+        if (!std.mem.eql(u8, fn_obj.get("name").?.string, "read")) continue;
+        const desc = fn_obj.get("description").?.string;
+        // "IMAGE" and not "image": the description shouts it on purpose, and a
+        // test that matches the lowercase form fails on the word being right.
+        for ([_][]const u8{ "PNG", "IMAGE", "never as bytes" }) |n| {
+            if (std.mem.indexOf(u8, desc, n) == null) {
+                std.debug.print("the read description does not say {s}\n", .{n});
+                return error.SchemaIncomplete;
+            }
+        }
+        return;
+    }
+    return error.NoRead;
 }

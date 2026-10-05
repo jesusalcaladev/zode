@@ -15,6 +15,7 @@ const free_auto = @import("free_auto.zig");
 const compaction_mod = @import("compaction.zig");
 const mascot = @import("lib/mascot.zig");
 const bgproc = @import("bgproc.zig");
+const images_mod = @import("lib/images.zig");
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
 
@@ -82,6 +83,9 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     const arena = arena_state.allocator();
 
     var msgs: std.ArrayList(chat.ChatMessage) = .empty;
+    // Images a `read` left behind: on the wire for ONE request and then gone, the
+    // same rule as the TUI.
+    var pending_images: images_mod.Pending = .{};
     // The `arena`, not the `gpa`: this text lives as long as the conversation
     // does, and the arena dies at the end of the run. With `gpa` it was a leak
     // per process (the DebugAllocator says so on exit, which is how it showed up).
@@ -199,7 +203,21 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             msgs.clearRetainingCapacity();
             try msgs.appendSlice(arena, cur);
         }
-        const body = chat.buildBodyMessages(body_buf, model_name, msgs.items, effort_pref, tools_mod.toolsJson(), kind) catch return error.BodyTooBig;
+        // The images go on the wire for THIS request and are then gone. Consumed
+        // once: the same screenshot in four consecutive requests is four times the
+        // tokens for information the model already has.
+        var wire = msgs.items;
+        defer pending_images.clear();
+        if (!pending_images.isEmpty()) {
+            const note = images_mod.wireNote(arena, &pending_images) catch "";
+            if (note.len > 0) {
+                const with = arena.alloc(chat.ChatMessage, msgs.items.len + 1) catch msgs.items;
+                @memcpy(with[0..msgs.items.len], msgs.items);
+                with[msgs.items.len] = .{ .role = "user", .content = note, .images = pending_images.images[0..pending_images.len] };
+                wire = with;
+            }
+        }
+        const body = chat.buildBodyMessages(body_buf, model_name, wire, effort_pref, tools_mod.toolsJson(), kind) catch return error.BodyTooBig;
 
         const Cb = struct {
             fn onDelta(_: ?*anyopaque, delta: []const u8) void {
@@ -252,7 +270,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         try msgs.append(arena, .{ .role = "assistant", .content = "", .tool_calls_json = tc_json });
         for (result.ctx.parts.items) |*p| {
             models.dbg("\n[tool {s}] {s}\n", .{ p.name.items, p.args.items });
-            const res = execHeadless(io, &bg, p.name.items, p.args.items, arena) catch |err| {
+            const res = execHeadless(io, &bg, &pending_images, p.name.items, p.args.items, arena) catch |err| {
                 try msgs.append(arena, .{
                     .role = "tool",
                     .content = try std.fmt.allocPrint(arena, "error: {t}", .{err}),
@@ -309,10 +327,20 @@ fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.M
 fn execHeadless(
     io: std.Io,
     bg: *bgproc.Registry,
+    images: *images_mod.Pending,
     name: []const u8,
     args: []const u8,
     arena: std.mem.Allocator,
 ) ![]const u8 {
+    // `read` on a picture goes the same way as in the TUI, through the SAME
+    // function. The first version of the image feature only existed in the TUI's
+    // loop, and `zode --chat` — the runner every pty test drives — happily
+    // returned raw PNG bytes with no error anywhere.
+    if (std.mem.eql(u8, name, "read")) {
+        if (agent.prepareImageFor(arena, io, images, agent.curAnswering(), args)) |res| {
+            return res;
+        }
+    }
     // NO read cache in the headless runner: it is one turn, one context, and the
     // cache would only be able to help within it. The headless agent is also where
     // a "you already have this" answer is most confusing to debug, because there

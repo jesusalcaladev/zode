@@ -124,6 +124,11 @@ pub const tool_routing_prompt =
     \\ - The same rule for searches: ONE `grep` with a good pattern beats three
     \\   with a narrower one. Reach for the second search only when the first did
     \\   not answer the question.
+    \\ - A PNG, JPG, GIF or WEBP goes to `read`, and it arrives as an IMAGE you
+    \\   can look at — not as bytes. Never `xxd`, `hexdump`, `base64` or
+    \\   `strings` on a picture: that is what you did before, and the answer was a
+    \\   PNG signature instead of the picture. If `read` says the current model
+    \\   cannot see images, say so and stop; do not work around it with bash.
     \\ - `check` TYPECHECKS the project for you, in the background, and brings
     \\   back the errors with a file and a line. Use it instead of
     \\   `bash zig build` / `bash npx tsc` / `bash cargo check`: you spend no

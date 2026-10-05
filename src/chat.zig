@@ -362,12 +362,41 @@ fn startsWithAny(haystack: []const u8, prefixes: []const []const u8) bool {
 }
 
 /// Reference to a history message, for the wire format.
+/// An image on the wire, as OpenAI-compatible `image_url` wants it.
+///
+/// `data_b64` is the base64 WITHOUT the `data:` prefix, and the serializer builds
+/// the prefix. It is stored that way so the same buffer is what the encoder
+/// produced, with no second copy of a megabyte of base64.
+pub const Image = struct {
+    mime: []const u8,
+    data_b64: []const u8,
+};
+
+/// An image that has not been encoded yet, which is how `read` leaves it.
+pub const ImageRef = struct {
+    mime: []const u8,
+    /// The bytes as read from disk.
+    bytes: []const u8,
+};
+
 pub const ChatMessage = struct {
     role: []const u8, // "system" | "user" | "assistant" | "tool"
     content: []const u8,
     tool_calls_json: ?[]const u8 = null,
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
+    /// Images that go WITH this message, as content blocks.
+    ///
+    /// Only a `user` message may carry them, and that is a property of the
+    /// protocol, not a choice: a `tool` message's content is a plain string in
+    /// OpenAI's shape, so an image a tool "read" cannot ride along there. That is
+    /// why `read` on a picture leaves the bytes in the harness and the harness puts
+    /// them on the NEXT user message, which is also where the model's attention is.
+    images: []const Image = &.{},
+
+    pub fn isMultimodal(self: ChatMessage) bool {
+        return self.images.len > 0 and !std.mem.eql(u8, self.role, "tool");
+    }
 };
 
 pub const Callbacks = struct {
@@ -1261,11 +1290,29 @@ fn buildBodyOpenAI(
             try w.writeAll("\"tool_call_id\":\"");
             try jsonEscape(&w, m.tool_call_id orelse "");
             try w.writeAll("\",\"content\":\"");
+            try jsonEscape(&w, m.content);
+            try w.writeAll("\"");
+        } else if (m.isMultimodal()) {
+            // The ONE place the content shape changes: an array of blocks, with the
+            // text first and the images after. Everything else in this file writes
+            // a quoted string, so a message that happens to have an image on it is
+            // the single place where a missing brace would be invisible in review.
+            try w.writeAll("\"content\":[{\"type\":\"text\",\"text\":\"");
+            try jsonEscape(&w, m.content);
+            try w.writeAll("\"}");
+            for (m.images) |img| {
+                try w.writeAll(",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                try w.writeAll(img.mime);
+                try w.writeAll(";base64,");
+                try w.writeAll(img.data_b64);
+                try w.writeAll("\"}}");
+            }
+            try w.writeAll("]");
         } else {
             try w.writeAll("\"content\":\"");
+            try jsonEscape(&w, m.content);
+            try w.writeAll("\"");
         }
-        try jsonEscape(&w, m.content);
-        try w.writeAll("\"");
         if (m.tool_calls_json) |tj| {
             if (tj.len > 0) {
                 try w.writeAll(",\"tool_calls\":");
@@ -2374,4 +2421,54 @@ test "buildBodyOpenAI: the tools schema comes BEFORE the messages" {
     const v = try std.json.parseFromSliceLeaky(std.json.Value, a.allocator(), body, .{});
     try std.testing.expect(v.object.get("tools") != null);
     try std.testing.expect(v.object.get("messages") != null);
+}
+
+test "an image turns content into an ARRAY of blocks, and only for a user message" {
+    // The one place the content shape is not a quoted string, which is exactly why
+    // it needs a test: a missing brace here is invisible in review and the whole
+    // request 400s.
+    const with_img = [_]ChatMessage{
+        .{ .role = "user", .content = "look at this" },
+    };
+    var msgs = with_img;
+    msgs[0].images = &[_]Image{
+        .{ .mime = "image/png", .data_b64 = "AAAA" },
+        .{ .mime = "image/jpeg", .data_b64 = "BBBB" },
+    };
+
+    var buf: [8192]u8 = undefined;
+    const body = try buildBodyOpenAI(buf[0..], "m", &msgs, .medium, "");
+    try std.testing.expect(std.mem.indexOf(u8, body,
+        \\{"role":"user","content":[{"type":"text","text":"look at this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,BBBB"}}]}
+    ) != null);
+}
+
+test "a tool message NEVER becomes multimodal, whatever images it is given" {
+    // OpenAI's shape for a tool result is a string. Sending an array there is a
+    // 400, and it would be a 400 the model cannot explain — which is why the
+    // harness attaches images to a user message instead.
+    var msgs = [_]ChatMessage{
+        .{ .role = "tool", .content = "an image", .tool_call_id = "c1" },
+    };
+    msgs[0].images = &[_]Image{.{ .mime = "image/png", .data_b64 = "AAAA" }};
+
+    var buf: [8192]u8 = undefined;
+    const body = try buildBodyOpenAI(buf[0..], "m", &msgs, .medium, "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "an image") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "image_url") == null);
+}
+
+test "a user message with no images is byte-for-byte what it was" {
+    // The array shape must not leak into ordinary messages: it is a different
+    // content type and a provider is within its rights to treat it differently.
+    const msgs = [_]ChatMessage{
+        .{ .role = "user", .content = "plain text" },
+    };
+    var buf: [8192]u8 = undefined;
+    const body = try buildBodyOpenAI(buf[0..], "m", &msgs, .medium, "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "plain text") != null);
+    // The array shape did not leak in.
+    try std.testing.expect(std.mem.indexOf(u8, body, "[{\"type\"") == null);
 }

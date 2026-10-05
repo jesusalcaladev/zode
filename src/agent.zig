@@ -23,6 +23,7 @@ const ask = @import("lib/ask.zig");
 const bgproc = @import("bgproc.zig");
 const typecheck_mod = @import("lib/typecheck.zig");
 const check_tool = @import("tools/check.zig");
+const images_mod = @import("lib/images.zig");
 const bench_mod = @import("lib/bench.zig");
 const skills = @import("lib/skills.zig");
 const skillstore = @import("lib/skillstore.zig");
@@ -2543,7 +2544,12 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // session file would grow 32 KB per mention and `/resume` would bring the
     // files inside the prompts.
     var mentions_in: MentionCount = .{};
-    const msgs0 = withMentions(arena, snapshotMsgs(arena), &mentions_in);
+    const msgs1 = withMentions(arena, snapshotMsgs(arena), &mentions_in);
+    // The images, on the wire and ONLY on the wire, for the same reason the
+    // `@file` contents are not stored: the session file would grow megabytes per
+    // screenshot and `/resume` would bring the pictures back. They are consumed
+    // here — one message, one request — and the base64 dies with this turn's arena.
+    const msgs0 = withPendingImages(m, arena, msgs1);
 
     const comp: compaction.Compacted = compaction.elideTier(
         arena,
@@ -4038,6 +4044,21 @@ fn execOneCall(
     // The `todo` tool has no result to look at: its effect is the PLAN the user
     // sees, and it is applied here (not inside `execute`) because the plan lives
     // in the `Model`, which belongs to the TUI.
+    // `read` on a PICTURE does not return bytes. The bytes are put aside by
+    // `prepareImage` and go on the next user message, because a `tool` message's
+    // content is a plain string in OpenAI's shape and an image cannot ride there.
+    //
+    // It is intercepted HERE and not inside `tools/read.zig` because the tool has
+    // no `Model`, and the pending list, the current model's vision and the message
+    // that carries it are all the `Model`'s.
+    if (std.mem.eql(u8, call.name, "read")) {
+        if (prepareImage(m, call.args_json)) |res| {
+            s.appendToolResult(call.id, call.name, res) catch {};
+            turn_stats.noteTool();
+            return 0;
+        }
+    }
+
     if (std.mem.eql(u8, call.name, "todo")) {
         // Which of the two forms it is: a patch has one of these keys, and a
         // replacement does not. Deciding it by the KEYS and not by "does it have
@@ -4405,6 +4426,104 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
 /// The text sent as "user" so the model sees the tool results. It lives in a
 /// constant (not inlined) so it can be tested.
 pub const syntheticUserText = "Continue with the tool results above.";
+
+/// Appends the pending images as one `user` message, and frees the base64.
+///
+/// It returns a NEW list rather than touching the session's, which is what keeps
+/// the images out of the JSONL. It runs once per turn: the images are consumed
+/// here, and an iteration later there is nothing left to attach — deliberately,
+/// because the same screenshot in four consecutive requests is four times the
+/// tokens for information the model already has.
+///
+/// A `tool` message could not carry them anyway: its content is a plain string in
+/// OpenAI's shape, which is the whole reason they live in the harness instead of
+/// in `read`'s result.
+fn withPendingImages(m: *tui.Model, arena: std.mem.Allocator, msgs: []chat.ChatMessage) []chat.ChatMessage {
+    defer m.pending_images.clear();
+    if (m.pending_images.isEmpty()) return msgs;
+
+    const note = images_mod.wireNote(arena, &m.pending_images) catch return msgs;
+    const imgs = arena.alloc(chat.Image, m.pending_images.len) catch return msgs;
+    for (m.pending_images.images[0..m.pending_images.len], imgs) |src, *dst| {
+        dst.* = src;
+    }
+
+    const out = arena.alloc(chat.ChatMessage, msgs.len + 1) catch return msgs;
+    @memcpy(out[0..msgs.len], msgs);
+    out[msgs.len] = .{ .role = "user", .content = note, .images = imgs };
+    pushInfoFmt(m, "· {d} image(s) sent to {s}", .{ m.pending_images.len, curAnswering() });
+    return out;
+}
+
+/// `read` on an image: put the bytes aside for the next user message and return
+/// the text the model reads instead.
+///
+/// Returns null when this is not an image read, and the normal `read` runs.
+///
+/// It takes the pieces it needs and NOT a `*Model`, because there are two callers
+/// and they do not have one in common: the TUI (`execOneCall`) and the headless
+/// runner (`--chat`, which is what the pty tests and `router_smoke` drive). The
+/// first version took a `*Model` and the consequence was that the whole feature
+/// silently did not exist in the runner that is actually used for testing — the
+/// binary returned raw PNG bytes with no error anywhere.
+///
+/// Four refusals, each one a case where attaching the image would be worse than
+/// not attaching it, and each one says which: no vision on the current model, over
+/// the per-image cap, too many already waiting, or the path is not an image at all.
+/// A model told "here is a picture" and given nothing looks for a file that does
+/// not exist.
+pub fn prepareImageFor(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    pending: *images_mod.Pending,
+    model: []const u8,
+    args_json: []const u8,
+) ?[]const u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
+    if (parsed != .object) return null;
+    const pv = parsed.object.get("path") orelse return null;
+    if (pv != .string) return null;
+    const path = pv.string;
+    const mime = images_mod.mimeForPath(path) orelse return null;
+
+    const vision = models_mod.isVision(model);
+
+    // Read it even when it cannot be attached: the size is information, and a
+    // missing file is an error the model needs to hear about rather than a picture
+    // it cannot see.
+    var dir = std.Io.Dir.cwd();
+    const bytes = dir.readFileAlloc(io, path, gpa, .limited(images_mod.max_bytes * 2)) catch |err| {
+        return std.fmt.allocPrint(
+            gpa,
+            "{s}: could not read the image ({t}). Check the path with glob or list_files.",
+            .{ std.fs.path.basename(path), err },
+        ) catch null;
+    };
+    defer gpa.free(bytes);
+
+    if (vision and pending.len >= images_mod.max_images) pending.refused += 1;
+
+    const p = images_mod.prepare(gpa, path, bytes, mime, vision) catch return null;
+    defer p.deinit(gpa);
+
+    if (p.image_b64) |b64| {
+        const slot = &pending.images[pending.len];
+        slot.* = .{ .mime = mime, .data_b64 = b64 };
+        pending.len += 1;
+    }
+    return p.text;
+}
+
+/// The TUI's half: same function, with the `Model`'s pieces.
+fn prepareImage(m: *tui.Model, args_json: []const u8) ?[]const u8 {
+    // `curAnswering` and not the configured model: with the cheap router on, the
+    // model that gets the request is the one that has to be able to SEE it.
+    return prepareImageFor(m.allocator, io_global, &m.pending_images, curAnswering(), args_json);
+}
 
 /// Does a writing tool in this batch touch a file whose contents a compiler
 /// would care about?

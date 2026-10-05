@@ -12,6 +12,7 @@ const palette = @import("palette.zig");
 const plan_mod = @import("lib/plan.zig");
 const checkpoint = @import("lib/checkpoint.zig");
 const bgproc = @import("bgproc.zig");
+const images_mod = @import("lib/images.zig");
 const readcache = @import("lib/readcache.zig");
 const bench_mod = @import("lib/bench.zig");
 const models_mod = @import("lib/models.zig");
@@ -752,6 +753,14 @@ pub const Model = struct {
     /// Background jobs (see `bgproc.zig`): id, how many were started, whether
     /// ESC has been pressed since the last one.
     bg: bgproc.Registry = .{},
+    /// Images a `read` left behind, waiting to go on the next user message.
+    ///
+    /// Cleared as soon as the message goes out: an image is worth seeing once, and
+    /// keeping the base64 would make this the largest thing in the process after a
+    /// session with a few screenshots. It is NOT cached and NOT persisted for the
+    /// same reason — and because a cached image prefix is a permanently uncacheable
+    /// tail on every subsequent iteration.
+    pending_images: images_mod.Pending = .{},
     /// The automatic typecheck the harness started after a write tool touched
     /// code (`lib/typecheck.zig`), or 0 when there is none.
     ///
