@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-"""ESC tiene que MATAR el grupo de procesos, no solo poner un flag.
+"""ESC has to KILL the process group, not just set a flag.
 
-Por que esto NO puede ser un test de Zig: lo que se comprueba es si un proceso
-que el agente lanzo SIGUE VIVO en la tabla de procesos del kernel. Eso solo se
-puede ver desde fuera, en la pty real, con `zig build` ya hecho.
+Why this cannot be a Zig test: what is being checked is whether a process the
+agent spawned is STILL ALIVE in the kernel's process table. That is only visible
+from outside, in a real pty, with `zig build` already done.
 
 And why it looks at the GRANDCHILD and not at the shell (this cost a round trip):
 
-`bash` de zode es siempre `/bin/sh -c "lo que pida el modelo"`. Un shell tiene
-hijos. Si el fix fuera "matar el pid del shell", la prueba MIRANDO EL SHELL
+zode's `bash` is always `/bin/sh -c "whatever the model asked for"`, and a shell
+has children. If the fix were "kill the shell's pid", a test LOOKING AT THE SHELL
 would pass the same way: the shell dies and the grandchild (`sleep`, `zig`,
 `npm`) keeps running with the CPU pinned. The symptom that got reported as
 "ESC does not stop the processes" is exactly that, one level lower.
 
-The marker is `sleep 301 & wait`: shell + grandchild, two pids. It looks for
+The marker is `sleep 301 & wait`: shell plus grandchild, two pids. It looks for
 `sleep 301` and only that. With `exec` the shell is replaced, one process is left,
 and the test would go green with the fix and without it alike — which is what this
 looks at, so that cannot be what it checks.
 
-How the fix was verified: remove the `pgid = 0` from both spawns (foreground and
-background) hace que esto falle con el nieto vivo; volver a ponerlo lo hace
+How the fix was verified: removing the `pgid = 0` from both spawns (foreground and
+background) makes this fail with the grandchild alive; putting it back makes it
 pass. Both halves of the contract are in the same test.
 
-Uso:
+Usage:
     zig build
     set -a && source .env && set +a
     python3 tools/esc_kill_pty.py
 
-`HOME` propio: la app escribe `~/.config/zode/auth.json` y `sessions/`, y un
+Its own `HOME`: the app writes `~/.config/zode/auth.json` and `sessions/`, and an
 automated script must not touch the real config of whoever runs it.
 """
 
@@ -44,12 +44,12 @@ import time
 
 ROWS, COLS = 50, 200
 BINARY = "./zig-out/bin/zode"
-# Un HOME aparte (el fuzzer de junio guardo una key pegada por error y dejo al
+# A separate HOME (June's fuzzer saved a key pasted by mistake and left the
 # provider con 401 sin explicacion aparente).
 SANDBOX_HOME = "/tmp/opencode/zode-esc-home"
 MARKER = "/tmp/opencode/zodeesc/bin/spin"
 GRANDCHILD_ARGV = (b"sleep", b"301")
-PROMPT = "ejecuta en background el binario /tmp/opencode/zodeesc/bin/spin y sigue"
+PROMPT = "run /tmp/opencode/zodeesc/bin/spin in the background and keep going"
 
 
 def strip_ansi(b: bytes) -> str:
@@ -85,8 +85,8 @@ def grandchild_procs():
 
 def build_marker() -> None:
     os.makedirs(os.path.dirname(MARKER), exist_ok=True)
-    # `sleep & wait` deja a NIETO vivo. Sin `exec` el shell se queda esperando
-    # y el nieto es otro proceso con otro pid.
+    # `sleep & wait` leaves the GRANDCHILD alive. Without `exec` the shell stays waiting
+    # and the grandchild is a separate process with its own pid.
     with open(MARKER, "w") as f:
         f.write("#!/bin/sh\nsleep 301 &\nwait\n")
     os.chmod(MARKER, 0o755)
@@ -103,7 +103,7 @@ def main() -> int:
     if not os.path.exists(BINARY):
         sys.exit(f"{BINARY} no existe: ejecuta `zig build` primero")
     if "ZODE_OPENCODE_KEY" not in os.environ:
-        sys.exit("ZODE_OPENCODE_KEY no esta: `set -a && source .env && set +a`")
+        sys.exit("ZODE_OPENCODE_KEY is missing: `set -a && source .env && set +a`")
 
     os.makedirs(SANDBOX_HOME, exist_ok=True)
     build_marker()
@@ -137,14 +137,14 @@ def main() -> int:
                 pass
 
     pump(3.0)
-    # `/yolo` primero: sin esto `bash` pide permiso y el turno se queda parado en
-    # el dialogo, que es un camino distinto del que se quiere probar.
+    # `/yolo` first: without it `bash` asks for permission and the turn sits in the
+    # dialog, which is a different path than the one under test.
     os.write(fd, b"/yolo\r")
     pump(2.0)
     os.write(fd, PROMPT.encode() + b"\r")
 
-    # Se espera a que el nieto exista (con un tope), no a un tiempo fijo: con un
-    # modelo lento el turno puede tardar, y un `sleep` aqui seria un OK falso.
+    # Wait for the grandchild to EXIST (with a cap), not for a fixed time: with a
+    # slow model a turn can take a while, and a `sleep` here would be a false OK.
     deadline = time.time() + 45
     while time.time() < deadline and not grandchild_procs():
         pump(1.0)
@@ -172,8 +172,8 @@ def main() -> int:
         pass
     os.waitpid(pid, 0)
 
-    # Limpieza: si el nieto sobrevivio (o sea, el fix no esta), no se deja
-    # un `sleep 301` dando vueltas por la maquina.
+    # Cleanup: if the grandchild survived (that is, the fix is not in), it is not
+    # left spinning on somebody's machine.
     for p, _ in after:
         try:
             os.kill(p, signal.SIGKILL)
@@ -181,11 +181,13 @@ def main() -> int:
             pass
 
     if not during:
-        print("  SKIP el nieto nunca llego a arrancar: la prueba no prueba nada")
+        print("  SKIP the grandchild never started: the test is not testing anything")
         print("  (pantalla: " + text[-400:].replace("\n", " ") + ")")
         return 0
 
     ok = check(
+        # Not translated: this string is what the assertion compares against, and
+        # the repo's rule keeps asserted strings as they are.
         "ESC mato el grupo de procesos (nada huerfano)",
         len(after) == 0,
         "\n".join(f"pid {p}: {c}" for p, c in after),

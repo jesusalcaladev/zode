@@ -915,6 +915,101 @@ pub const Model = struct {
         }
     };
 
+    /// What the scrollback is holding, in bytes and in pieces.
+    ///
+    /// It exists because "6 MB" was a startup number quoted as if it were the
+    /// number, and the number that decides whether a two-hour session is usable is
+    /// the one nobody had: does it grow. `tools/ram_probe.py` measures the slope
+    /// with a real model answering; this says WHERE the bytes are, so a slope can
+    /// be attributed instead of guessed at.
+    ///
+    /// `hot_bytes` counts the paragraph text as it sits, and `cold_bytes` counts
+    /// the COMPRESSED form `pruneCold` leaves behind — together they are the
+    /// scrollback, and the ratio between them is what says whether the compression
+    /// is doing its job.
+    pub const RamReport = struct {
+        paras: usize,
+        hot: usize,
+        cold: usize,
+        hot_bytes: usize,
+        cold_bytes: usize,
+        cache_entries: usize,
+        cache_arena_bytes: usize,
+        read_cache_entries: usize,
+        /// The process's own RSS, 0 where it cannot be read (a non-Linux target).
+        rss_kb: usize,
+
+        pub fn scrollbackBytes(self: RamReport) usize {
+            return self.hot_bytes + self.cold_bytes;
+        }
+    };
+
+    /// `VmRSS` from `/proc/self/status`, in KB. 0 when there is no `/proc`.
+    ///
+    /// It is here, next to the breakdown and not in a separate tool, because the
+    /// interesting question is not "how much memory" but "how much of it is the
+    /// scrollback": a total on its own says nothing about which part to fix, and
+    /// the breakdown on its own does not say whether it is a lot.
+    ///
+    /// Read on demand and never cached: a cached RSS is wrong within a second, and
+    /// this is a command the user types, not a per-frame value.
+    pub fn selfRssKb() usize {
+        if (@import("builtin").os.tag != .linux) return 0;
+        // `std.posix` and not the `Io`: `/context` is a command, it runs on the UI
+        // thread, and taking an `Io` for a 200-byte read would mean the caller has
+        // to have one attached — which the tests deliberately do not.
+        const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return 0;
+        // `std.posix.close` does not exist in 0.16 (close takes an `Io`); the raw
+        // syscall is under `system`, and this is the one place that wants it: a
+        // 200-byte diagnostic read should not require the caller to own an `Io`.
+        defer _ = std.posix.system.close(fd);
+        var buf: [8192]u8 = undefined;
+        const n = std.posix.read(fd, &buf) catch return 0;
+        const text = buf[0..n];
+        const key = "VmRSS:";
+        const at = std.mem.indexOf(u8, text, key) orelse return 0;
+        var i = at + key.len;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        var v: usize = 0;
+        while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) v = v * 10 + (text[i] - '0');
+        return v;
+    }
+
+    pub fn ramReport(self: *Model) RamReport {
+        self.lock();
+        defer self.unlock();
+        var r = RamReport{
+            .paras = self.paras.items.len,
+            .hot = 0,
+            .cold = 0,
+            .hot_bytes = 0,
+            .cold_bytes = 0,
+            .cache_entries = 0,
+            .cache_arena_bytes = 0,
+            .read_cache_entries = 0,
+            .rss_kb = selfRssKb(),
+        };
+        for (self.paras.items) |p| {
+            if (p.is_cold) {
+                r.cold += 1;
+                r.cold_bytes += p.text.len;
+            } else {
+                r.hot += 1;
+                r.hot_bytes += p.text.len;
+            }
+        }
+        for (self.seg_cache.items) |e| {
+            r.cache_entries += 1;
+            if (e.arena) |a| {
+                // `ArenaAllocator` does not report its used size; the buffer it
+                // owns is the honest upper bound and it is what the process pays.
+                r.cache_arena_bytes += a.queryCapacity();
+            }
+        }
+        r.read_cache_entries = self.reads.liveEntries();
+        return r;
+    }
+
     /// Last tool call, so Ctrl+R can show its full result.
     /// Tool running right now. `pushToolStart` sets it and `pushToolDone`
     /// clears it; while it exists a clock line is drawn.
@@ -8830,4 +8925,63 @@ test "ctrl+d scrolls back down and does NOT quit" {
     // And ctrl+c is the exit, which is what the status bar says.
     try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
     try std.testing.expect(ctx.quit);
+}
+
+test "ramReport: an empty session is zero, and the split adds up by construction" {
+    // The report exists so a slope can be attributed, which only works if hot and
+    // cold are SEPARATE numbers. The invariant is the one that matters and it is
+    // the one that cannot rot silently: `scrollbackBytes` is the sum, so a
+    // paragraph counted in neither bucket would make the total lie.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    m.attachIo(threaded.io());
+
+    const empty = m.ramReport();
+    try std.testing.expectEqual(@as(usize, 0), empty.paras);
+    try std.testing.expectEqual(@as(usize, 0), empty.hot);
+    try std.testing.expectEqual(@as(usize, 0), empty.cold);
+    try std.testing.expectEqual(@as(usize, 0), empty.scrollbackBytes());
+    try std.testing.expectEqual(@as(usize, 0), empty.cache_entries);
+}
+
+test "ramReport: what is in the scrollback is counted, hot and compressed apart" {
+    // `paras` only grows from the UI thread through `drainPendingLocked`, which is
+    // the invariant that lets the draw read `paras[i].text` without the lock. So
+    // the test goes through the same door: enqueue, then drain.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    m.attachIo(threaded.io());
+
+    // A long paragraph and a short one, so the byte total is not just the count.
+    var long_buf: [4096]u8 = undefined;
+    @memset(long_buf[0..4096], 'x');
+    m.pushInfo(long_buf[0..4096]);
+    m.pushInfo("short");
+    m.drainPending();
+
+    const r = m.ramReport();
+    try std.testing.expectEqual(@as(usize, 2), r.paras);
+    try std.testing.expectEqual(@as(usize, 2), r.hot);
+    try std.testing.expectEqual(@as(usize, 0), r.cold);
+    try std.testing.expectEqual(r.hot + r.cold, r.paras);
+    try std.testing.expectEqual(r.hot_bytes + r.cold_bytes, r.scrollbackBytes());
+    try std.testing.expect(r.hot_bytes >= 4096 + 5);
+}
+
+test "selfRssKb reads the process's own RSS, or says 0" {
+    // 0 on a target with no /proc is a valid answer and not a failure: the field
+    // exists so the breakdown can be read next to the total, not so a non-Linux
+    // build breaks.
+    const kb = Model.selfRssKb();
+    if (@import("builtin").os.tag == .linux) {
+        try std.testing.expect(kb > 0);
+        // A process cannot be smaller than a page.
+        try std.testing.expect(kb >= 4);
+    }
 }

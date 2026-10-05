@@ -170,6 +170,34 @@ pub fn cmdContext(m: *tui.Model) void {
     ) catch "details";
     agent.pushInfoOwned(m, l3);
 
+    // WHERE THE MEMORY IS, in bytes.
+    //
+    // Not decoration: "6 MB" is a startup number, and the one that decides whether
+    // a long session is usable is whether it grows. `tools/ram_probe.py` measures
+    // the slope with a real model answering (measured 2026-10-05: 7.96 MB at
+    // startup, 12.32 MB after 8 turns, +48 KB/turn and flattening); this says
+    // where the bytes are, so a slope can be attributed instead of guessed at.
+    //
+    // The hot/cold split is the interesting part: `pruneCold` compresses the
+    // paragraphs outside the scroll window, so a long session's scrollback is
+    // mostly base64. If `cold` ever stops growing, the compression stopped
+    // running, and that is the bug to look for.
+    const ram = m.ramReport();
+    const lram = std.fmt.allocPrint(
+        m.allocator,
+        "  memory: {d} MB RSS · {d} KB scrollback ({d} hot · {d} compressed) · {d} KB segment cache ({d} entries) · {d} files cached",
+        .{
+            @as(f64, @floatFromInt(ram.rss_kb)) / 1024.0,
+            ram.scrollbackBytes() / 1024,
+            ram.hot_bytes / 1024,
+            ram.cold_bytes / 1024,
+            ram.cache_arena_bytes / 1024,
+            ram.cache_entries,
+            ram.read_cache_entries,
+        },
+    ) catch "details";
+    agent.pushInfoOwned(m, lram);
+
     // The read cache, in tokens saved rather than in hits: "it worked" is a number
     // the user can compare against the size of the files they are working with.
     if (m.reads.stats.hits > 0 or m.reads.stats.misses > 0) {

@@ -57,6 +57,13 @@ $ zode
 - **Providers**: OpenCode, OpenRouter, Anthropic (native API with prompt
   caching), OpenAI, Groq, DeepSeek, and local (Ollama/LM Studio). You connect
   them from the TUI itself, without editing files.
+- **`check`**: typechecks THIS project with the project's own compiler —
+  `build.zig` → `zig build`, `tsconfig.json` → `tsc --noEmit`, `Cargo.toml` →
+  `cargo check` — in the background, and reports the errors with a file and a line.
+  It also runs on its own after an `edit` touches code (`ZODE_AUTO_CHECK=0` turns
+  that off), so a broken build is found before the next request goes out with it.
+  It is the 80 % of an LSP that costs zero bytes of RAM and needs nothing
+  installed.
 - **`rename`**: renames a symbol everywhere it appears as **real code**, in one
   call, and reports every file it touched. A name inside a string, a comment or a
   longer identifier is left alone — measured, not assumed. A rename applied by the
@@ -103,6 +110,9 @@ zig build -Doptimize=Debug   # with symbols, for when something crashes
 | `zig build test` | The tests (`-- <filter>` runs only the ones whose name matches) |
 | `zig build tool-test -- "command"` | The tools headless, to try one without opening the TUI |
 | `zig build roster-probe` | Which providers you have a key for, and how many free models each publishes |
+| `zig build check-probe` | Runs the automatic typecheck against a project with a deliberate error in it |
+| `python3 tools/ram_probe.py` | RAM across turns, with the real model answering |
+| `python3 tools/ram_probe_replay.py` | RAM against session length, with no model at all |
 
 ## First steps
 
@@ -251,6 +261,26 @@ Every turn is written to `sessions/zode-<id>.jsonl` (one line per event, with
 `/undo` gives you back **files**, not messages: the session is append-only and
 rewriting it halfway through a turn has no explanation.
 
+## How the memory behaves
+
+`tools/measure.py` answers the startup number — measured 2026-10-05: **6.09 MB**
+steady RSS, 3.7 ms to the first paint, 1.34 MB binary. It does NOT answer whether
+the memory *grows*, which is what decides whether a long session is usable:
+
+- `tools/ram_probe.py` — the slope **with the real model answering**. Measured over
+  8 turns of `space-bunny-free`: 7.96 MB at startup, 12.32 MB after 8 turns,
+  **+48 KB/turn and flattening** (per-turn deltas +60, −10, +100, +50, +40, +70,
+  +20 KB). It cannot go past a handful of turns on a free account: the daily quota
+  answers six and then stops.
+- `tools/ram_probe_replay.py` — against **session length, with no model at all**. A
+  5-turn and a 3000-turn session (a 1 MB history against a 2 KB one) land on the
+  same RSS step, because `pruneCold` compresses the paragraphs outside the scroll
+  window. RSS moves in ~2 MB steps here, so the report prints the levels it saw
+  rather than a difference between two of them.
+- `/context` shows where the bytes are: total RSS, the scrollback split into hot
+  and compressed, the segment cache and the read cache. A total on its own says
+  nothing about which part to fix.
+
 ## Development
 
 ```bash
@@ -320,6 +350,8 @@ src/lib/                modules that test on their own, no TUI and no network
   verify.zig            which verifications are slow enough to background
   router.zig             which model answers the main turn (cheap, or yours)
   symbols.zig            declarations per language + the string/comment mask
+  typecheck.zig          which command typechecks this project, per marker file
+  images.zig             image attachments: caps, mime, and the no-vision refusal
   regex.zig             a mini regex engine
   mascot.zig            Zo
   theme.zig             colours
