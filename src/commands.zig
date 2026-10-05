@@ -113,6 +113,68 @@ pub fn cmdCache(m: *tui.Model) void {
     }
 }
 
+/// `/compact [off|elide|full|default]`: what automatic compaction is allowed to do.
+///
+/// With no argument it REPORTS, which is the point: a policy nobody can see is a
+/// policy nobody can trust, and "why did it summarize that" has to have an answer
+/// that does not involve reading the source.
+///
+/// `default` clears the override and goes back to `ZODE_COMPACT`, because an
+/// override that cannot be cleared is a value somebody set once and forgot.
+pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
+    if (arg.len == 0) {
+        const eff = compaction.effectiveMode(m.environ, m.compact_mode);
+        const pct = compaction.targetPct(m.environ);
+        const from_env = if (m.compact_mode == null) "from ZODE_COMPACT" else "overridden here";
+        const line = std.fmt.allocPrint(
+            m.allocator,
+            "compaction: {s} · threshold {d}% ({s}) · limit {d} → budget {d} tokens",
+            .{ @tagName(eff), pct, from_env, compaction.contextLimitFor(m.environ, agent.curModelContext()), compaction.budgetFor(m.environ, agent.curModelContext()) },
+        ) catch "compaction";
+        agent.pushInfoOwned(m, line);
+        const detail = std.fmt.allocPrint(
+            m.allocator,
+            // The RANGE, not the value: this printed `ZODE_COMPACT_PCT=10%` next to
+            // "threshold 42%", because 10 is the clamp's floor, and two numbers that
+            // both look like the setting are worse than none.
+            "  {s} · ZODE_COMPACT_PCT accepts {d}..{d} · ZODE_COMPACT=off|elide|full",
+            .{ compaction.describe(eff), compaction.min_target_pct, compaction.max_target_pct },
+        ) catch "compaction";
+        agent.pushInfoOwned(m, detail);
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(arg, "default") or std.ascii.eqlIgnoreCase(arg, "env")) {
+        m.compact_mode = null;
+        const eff = compaction.effectiveMode(m.environ, null);
+        const line = std.fmt.allocPrint(m.allocator, "compaction: following ZODE_COMPACT again ({s})", .{@tagName(eff)}) catch "compaction";
+        agent.pushInfoOwned(m, line);
+        return;
+    }
+
+    // The SAME parser as the env var, so a typo is answered the same way in both
+    // places: with what it does and what it would have to be, not with "unknown".
+    const chosen: compaction.Mode = blk: {
+        if (std.ascii.eqlIgnoreCase(arg, "off") or std.ascii.eqlIgnoreCase(arg, "never")) break :blk .off;
+        if (std.ascii.eqlIgnoreCase(arg, "elide") or std.ascii.eqlIgnoreCase(arg, "tier1")) break :blk .elide;
+        if (std.ascii.eqlIgnoreCase(arg, "full") or std.ascii.eqlIgnoreCase(arg, "on")) break :blk .full;
+        const line = std.fmt.allocPrint(
+            m.allocator,
+            "unknown compaction mode '{s}': use off | elide | full | default (off = never compact, elide = free tier only, full = also summarize)",
+            .{arg},
+        ) catch "unknown compaction mode";
+        agent.pushInfoOwned(m, line);
+        return;
+    };
+    m.compact_mode = chosen;
+    const line = std.fmt.allocPrint(
+        m.allocator,
+        "compaction: {s} ({s})",
+        .{ @tagName(chosen), compaction.describe(chosen) },
+    ) catch "compaction";
+    agent.pushInfoOwned(m, line);
+}
+
 /// `/context`: gauge of context used against the limit and the budget.
 pub fn cmdContext(m: *tui.Model) void {
     _ = agent.ensureSession(m, m.allocator);
@@ -169,6 +231,18 @@ pub fn cmdContext(m: *tui.Model) void {
         }, agent.session_elided, agent.tps_last },
     ) catch "details";
     agent.pushInfoOwned(m, l3);
+    // WHAT WILL HAPPEN at the threshold, which is a different question from how much
+    // is used: "80% of the limit" does not say whether crossing it costs a request.
+    const l3b = std.fmt.allocPrint(
+        m.allocator,
+        "  compaction: {s} at {d}% of the limit ({s})",
+        .{
+            @tagName(compaction.effectiveMode(m.environ, m.compact_mode)),
+            compaction.targetPct(m.environ),
+            if (m.compact_mode == null) "ZODE_COMPACT" else "overridden with /compact",
+        },
+    ) catch "compaction";
+    agent.pushInfoOwned(m, l3b);
 
     // WHERE THE MEMORY IS, in bytes.
     //
@@ -305,7 +379,8 @@ pub const commands = [_]Cmd{
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall" },
     .{ .key = "/new", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
-    .{ .key = "/context", .desc = "tokens used vs budget (compaction at 80%)" },
+    .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
+    .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times" },
     .{ .key = "/session", .desc = "session info" },
     .{ .key = "/cache", .desc = "cache hit-rate for this session" },

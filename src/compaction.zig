@@ -13,7 +13,6 @@ const chat = @import("chat.zig");
 /// IMPORTANT: this is a VIEW for the wire only. The session JSONL keeps the
 /// full history, so resume/replay never loses data.
 pub const default_context_limit: i64 = 128_000;
-pub const target_pct: i64 = 80;
 /// Recent MESSAGES kept verbatim (never elided/summarized).
 ///
 /// It counts messages, not turns, and that is worth knowing: one assistant turn
@@ -94,13 +93,82 @@ pub fn estimateTokens(msgs: []const chat.ChatMessage) i64 {
     return total;
 }
 
-/// The compaction budget: 80% of the limit.
+/// How much of the context window compaction aims to stay under.
+pub const target_pct: i64 = 80;
+
+/// The most aggressive setting that still makes sense, and why it is a clamp.
+///
+/// At 0% every request is over budget, so tier 2 fires on EVERY turn: one extra
+/// request per turn, forever, to summarize a conversation that is not long. That
+/// is the exact waste the "summarize once per session" rule exists to avoid, and a
+/// knob that can reach it is not a knob. At 100% nothing is compacted until the
+/// provider answers 400 for a too-long request, which is the failure the budget
+/// exists to prevent — and the failure you cannot see coming.
+pub const min_target_pct: i64 = 10;
+pub const max_target_pct: i64 = 95;
+
+pub fn targetPct(env: ?*const std.process.Environ.Map) i64 {
+    const m = env orelse return target_pct;
+    const s = m.get("ZODE_COMPACT_PCT") orelse return target_pct;
+    const n = std.fmt.parseInt(i64, s, 10) catch return target_pct;
+    return @max(min_target_pct, @min(n, max_target_pct));
+}
+
+/// What automatic compaction is allowed to do.
+///
+/// The two tiers are not interchangeable and the difference is invisible on screen:
+/// tier 1 replaces OLD tool results with a marker (no network, no tokens, and the
+/// session file still has everything), while tier 2 asks a model to summarize the
+/// old turns (a request, tokens, and a summary that can quietly drop the one detail
+/// the model needed). Between "never" and "always, fully" there are three
+/// defensible positions, and which one is right depends on what the user is doing:
+/// a long read-only session wants `elide`, a coding session wants `full`, and
+/// someone who would rather see the provider complain wants `off`.
+///
+/// `ZODE_COMPACT` = `off` | `elide` | `full` (the default).
+pub const Mode = enum { off, elide, full };
+
+pub fn mode(env: ?*const std.process.Environ.Map) Mode {
+    const m = env orelse return .full;
+    const s = m.get("ZODE_COMPACT") orelse return .full;
+    if (std.ascii.eqlIgnoreCase(s, "off") or std.ascii.eqlIgnoreCase(s, "never") or
+        std.ascii.eqlIgnoreCase(s, "false") or std.ascii.eqlIgnoreCase(s, "0")) return .off;
+    if (std.ascii.eqlIgnoreCase(s, "elide") or std.ascii.eqlIgnoreCase(s, "tier1") or
+        std.ascii.eqlIgnoreCase(s, "free")) return .elide;
+    return .full;
+}
+
+/// The mode that is actually in force: what `/compact` set, else `ZODE_COMPACT`.
+///
+/// The override is a parameter instead of a module global so the decision is
+/// testable with no Model and no environment, and so there is exactly ONE place
+/// that answers "what will compaction do" — with three definitions of it (the env,
+/// the override and the caller's assumption) every one of them drifts.
+pub fn effectiveMode(env: ?*const std.process.Environ.Map, override: ?Mode) Mode {
+    return override orelse mode(env);
+}
+
+/// One line for `/context` and `/help`: what a given mode actually does.
+///
+/// It takes the mode and NOT the environment, because the caller knows which mode
+/// is in force (it may be a `/compact` override) and reading the env again here is
+/// how `/compact off` came to answer "elide, then summarize": the two disagreed and
+/// the more reassuring of the two won. The string is about the MODE.
+pub fn describe(m: Mode) []const u8 {
+    return switch (m) {
+        .off => "never: nothing is elided and nothing is summarized, and the request may be rejected for being too long",
+        .elide => "elide old tool results only: free, no request, no summary",
+        .full => "elide old tool results, then summarize the old turns (one extra request)",
+    };
+}
+
+/// The compaction budget: `ZODE_COMPACT_PCT`% of the limit.
 pub fn budgetTokens(env: ?*const std.process.Environ.Map) i64 {
     return budgetFor(env, 0);
 }
 
 pub fn budgetFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
-    return @divTrunc(contextLimitFor(env, model_ctx) * target_pct, 100);
+    return @divTrunc(contextLimitFor(env, model_ctx) * targetPct(env), 100);
 }
 
 pub const Compacted = struct {
@@ -130,6 +198,7 @@ pub fn elideTier(
     msgs: []const chat.ChatMessage,
     budget: i64,
     env: ?*const std.process.Environ.Map,
+    compaction_mode: Mode,
 ) !Compacted {
     const out = try arena.alloc(chat.ChatMessage, msgs.len);
     @memcpy(out, msgs);
@@ -160,12 +229,27 @@ pub fn elideTier(
     }
 
     var res = Compacted{ .msgs = out, .elided = elided, .elided_at = elided_at.items };
-    if (estimateTokens(out) > budget) {
+    // `needs_summary` is what ASKS for the second tier, so this is where the mode
+    // decides it — and the decision is not the caller's, because the caller has two
+    // call sites that would each have to remember. A mode of `elide` still returns
+    // the elided view (it is free and it is what keeps the prefix cacheable); it
+    // just never spends a request to go further.
+    if (estimateTokens(out) > budget and compaction_mode == .full) {
         res.needs_summary = true;
         // Suggest summarizing everything after system and before the window.
         res.summary_upto = protect_from;
     }
     return res;
+}
+
+/// Tier 1 as a no-op, for `ZODE_COMPACT=off`.
+///
+/// A separate function rather than a branch at the call site because there are two
+/// call sites (the turn and the subagent) and "off" has to mean the same thing in
+/// both: no eliding, no summary, and `needs_summary` false so nothing downstream
+/// asks for one.
+pub fn nothingElided(msgs: []chat.ChatMessage) Compacted {
+    return .{ .msgs = msgs };
 }
 
 /// Builds the summarize prompt for tier 2 (caller sends it to the LLM).
@@ -231,7 +315,7 @@ test "elide shrinks the tool dumps but protects the recent ones" {
     }
 
     const before = estimateTokens(msgs);
-    const res = try elideTier(arena, msgs, @divTrunc(before, 4), null); // very low budget
+    const res = try elideTier(arena, msgs, @divTrunc(before, 4), null, .full); // very low budget
     try std.testing.expect(res.elided > 0);
     try std.testing.expect(estimateTokens(res.msgs) < before);
 
@@ -254,7 +338,7 @@ test "no summary needed when eliding is enough" {
     for (1..12) |i| {
         msgs[i] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c" };
     }
-    const res = try elideTier(arena, msgs, 9000, null);
+    const res = try elideTier(arena, msgs, 9000, null, .full);
     try std.testing.expect(!res.needs_summary);
     try std.testing.expect(res.elided > 0);
 }
@@ -278,7 +362,7 @@ test "elideTier says WHICH messages it took, not only how many" {
         try msgs.append(arena, .{ .role = "tool", .content = "x" ** 4000 });
     }
 
-    const res = try elideTier(arena, msgs.items, 1000, null);
+    const res = try elideTier(arena, msgs.items, 1000, null, .full);
     try std.testing.expect(res.elided > 0);
     try std.testing.expectEqual(res.elided, res.elided_at.len);
 
@@ -298,7 +382,7 @@ test "elideTier reports nothing when it elides nothing" {
         .{ .role = "system", .content = "system" },
         .{ .role = "user", .content = "hola" },
     };
-    const res = try elideTier(arena, &msgs, 1_000_000, null);
+    const res = try elideTier(arena, &msgs, 1_000_000, null, .full);
     try std.testing.expectEqual(@as(usize, 0), res.elided);
     try std.testing.expectEqual(@as(usize, 0), res.elided_at.len);
 }
@@ -341,11 +425,11 @@ test "a wider window protects more of the tail verbatim" {
         });
     }
 
-    const narrow = try elideTier(arena, msgs.items, 1000, null);
+    const narrow = try elideTier(arena, msgs.items, 1000, null, .full);
     var wide_env = std.process.Environ.Map.init(std.testing.allocator);
     defer wide_env.deinit();
     try wide_env.put("ZODE_RECENT_WINDOW", "30");
-    const wide = try elideTier(arena, msgs.items, 1000, &wide_env);
+    const wide = try elideTier(arena, msgs.items, 1000, &wide_env, .full);
 
     // A wider window protects more, so FEWER messages are elided.
     try std.testing.expect(wide.elided < narrow.elided);
@@ -453,4 +537,122 @@ test "limitSource says which of the three it was, because the number is automati
     try env.put("ZODE_CONTEXT_LIMIT", "not a number");
     try std.testing.expectEqual(LimitSource.model, limitSource(&env, 200_000));
     try std.testing.expectEqual(LimitSource.default_, limitSource(&env, 0));
+}
+
+test "ZODE_COMPACT_PCT sets the threshold, and the clamps hold" {
+    const E = std.process.Environ.Map;
+    var e = E.init(std.testing.allocator);
+    defer e.deinit();
+    try e.put("ZODE_CONTEXT_LIMIT", "100000");
+
+    // The default is the constant, not a literal written twice. With the env in
+    // hand, so the 100k above is the limit that is actually read.
+    try std.testing.expectEqual(target_pct, targetPct(null));
+    try std.testing.expectEqual(@divTrunc(100000 * target_pct, 100), budgetFor(&e, 0));
+
+    // 0% would make tier 2 fire on EVERY turn (one wasted request per turn
+    // forever) and 100% would never compact at all: both are clamped, not obeyed.
+    try e.put("ZODE_COMPACT_PCT", "50");
+    try std.testing.expectEqual(@as(i64, 50), targetPct(&e));
+    try std.testing.expectEqual(@as(i64, 50_000), budgetFor(&e, 0));
+
+    try e.put("ZODE_COMPACT_PCT", "0");
+    try std.testing.expectEqual(min_target_pct, targetPct(&e));
+    try e.put("ZODE_COMPACT_PCT", "100");
+    try std.testing.expectEqual(max_target_pct, targetPct(&e));
+    try e.put("ZODE_COMPACT_PCT", "-40");
+    try std.testing.expectEqual(min_target_pct, targetPct(&e));
+    // Junk falls back to the default rather than to 0: a typo must not turn
+    // compaction into something that runs every turn.
+    try e.put("ZODE_COMPACT_PCT", "banana");
+    try std.testing.expectEqual(target_pct, targetPct(&e));
+}
+
+test "ZODE_COMPACT picks the mode, and the default is full" {
+    const E = std.process.Environ.Map;
+    var e = E.init(std.testing.allocator);
+    defer e.deinit();
+
+    try std.testing.expectEqual(Mode.full, mode(null));
+    for ([_][]const u8{ "off", "OFF", "never", "false", "0" }) |v| {
+        try e.put("ZODE_COMPACT", v);
+        try std.testing.expectEqual(Mode.off, mode(&e));
+    }
+    for ([_][]const u8{ "elide", "tier1", "free" }) |v| {
+        try e.put("ZODE_COMPACT", v);
+        try std.testing.expectEqual(Mode.elide, mode(&e));
+    }
+    // Anything else is `full`, on purpose: a typo must not silently DISABLE
+    // compaction, which is the direction that costs tokens until the request 400s.
+    for ([_][]const u8{ "full", "on", "yes", "banana", "" }) |v| {
+        try e.put("ZODE_COMPACT", v);
+        try std.testing.expectEqual(Mode.full, mode(&e));
+    }
+}
+
+test "describe talks about the MODE, so an override cannot be described as the env's" {
+    // The three strings, one per mode: they have to differ, because a caller that
+    // printed the wrong one is what made `/compact off` claim it would still
+    // summarize.
+    const off = describe(.off);
+    const elide = describe(.elide);
+    const full = describe(.full);
+    try std.testing.expect(!std.mem.eql(u8, off, elide));
+    try std.testing.expect(!std.mem.eql(u8, elide, full));
+    try std.testing.expect(!std.mem.eql(u8, off, full));
+    // What each one PROMISES, not which words it uses: `off` says it will not
+    // summarize (it has to say so, so the word is there and the promise is not) and
+    // `full` is the only one that admits to spending a request.
+    try std.testing.expect(std.mem.indexOf(u8, off, "extra request") == null);
+    try std.testing.expect(std.mem.indexOf(u8, elide, "extra request") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "extra request") != null);
+}
+
+test "the /compact override wins over the env, and null goes back to it" {
+    const E = std.process.Environ.Map;
+    var e = E.init(std.testing.allocator);
+    defer e.deinit();
+    try e.put("ZODE_COMPACT", "off");
+
+    try std.testing.expectEqual(Mode.off, effectiveMode(&e, null));
+    // An override is what `/compact` sets, and it has to win: the whole point is to
+    // change the policy of a session whose env said otherwise.
+    try std.testing.expectEqual(Mode.elide, effectiveMode(&e, .elide));
+    try std.testing.expectEqual(Mode.full, effectiveMode(&e, .full));
+    // And clearing it (null) goes back to the env, not to a remembered value.
+    try std.testing.expectEqual(Mode.off, effectiveMode(&e, null));
+}
+
+test "elide mode still elides (it is free) but never asks for a summary" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // MORE than `recent_window` messages, and that is not a detail: `elideTier`
+    // protects the newest `recent_window` and never touches them, so with 4 messages
+    // and a window of 8 `protect_from` is 0 and the loop below it never runs. A test
+    // with a short list does not check that eliding works, it checks that it correctly
+    // does nothing.
+    const fat = "x" ** 4000;
+    var list: [12]chat.ChatMessage = undefined;
+    list[0] = .{ .role = "system", .content = "sys" };
+    for (1..12) |i| {
+        list[i] = if (i <= 3)
+            .{ .role = "tool", .content = fat }
+        else
+            .{ .role = "user", .content = "recent turn" };
+    }
+
+    // A budget LOW enough that eliding alone is not enough: with a budget the elided
+    // markers already fit in, `needs_summary` is false for `full` too and the test
+    // would be comparing two identical results and calling it a pass.
+    const full = try elideTier(arena, &list, 50, null, .full);
+    const elide = try elideTier(arena, &list, 50, null, .elide);
+
+    // Both tiers elide: tier 1 costs no request, so `elide` does not throw it away.
+    try std.testing.expect(full.elided > 0);
+    try std.testing.expectEqual(full.elided, elide.elided);
+    // And the only difference is the request that `elide` refuses to spend.
+    try std.testing.expect(full.needs_summary);
+    try std.testing.expect(!elide.needs_summary);
 }

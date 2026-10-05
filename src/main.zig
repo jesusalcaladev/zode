@@ -181,8 +181,16 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     while (iteration < iter_limit) : (iteration += 1) {
         // Context under budget: elide old tool dumps (a wire view).
         {
-            const comp = compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetFor(env, agent.curModelContext()), env) catch
-                compaction_mod.Compacted{ .msgs = msgs.items };
+            // The same policy as the TUI, through the same two functions. This call
+            // site is the headless runner, and it used to be a third definition of
+            // "what compaction does": `off` here was ignored, so `--chat` compacted
+            // whatever the user had switched off.
+            const cmode = compaction_mod.effectiveMode(env, null);
+            const comp = if (cmode == .off)
+                compaction_mod.nothingElided(msgs.items)
+            else
+                compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetFor(env, agent.curModelContext()), env, cmode) catch
+                    compaction_mod.nothingElided(msgs.items);
             if (comp.elided > 0) elided_total += comp.elided;
             var cur: []chat.ChatMessage = try arena.dupe(chat.ChatMessage, comp.msgs);
 

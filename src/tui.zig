@@ -9,6 +9,7 @@ const theme = @import("lib/theme.zig");
 const ed = @import("lib/editor.zig");
 const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
+const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
 const checkpoint = @import("lib/checkpoint.zig");
 const bgproc = @import("bgproc.zig");
@@ -831,6 +832,17 @@ pub const Model = struct {
     layout_overflow: bool = false,
 
     environ: ?*const std.process.Environ.Map = null,
+    /// What `/compact` set, or null to follow `ZODE_COMPACT`.
+    ///
+    /// It lives in the Model and not in a module global because the env map is what
+    /// the other policies read and this one has to be changeable WHILE a session
+    /// runs: the whole point of `/compact` is to answer "the budget is 40% and I do
+    /// not want that", and an env var cannot be changed from inside the app.
+    ///
+    /// Null means "ask the environment", which is the default and what a fresh
+    /// session does — so there is exactly one answer to "what is compaction doing"
+    /// and it is `compaction.effectiveMode`, not this field on its own.
+    compact_mode: ?compaction.Mode = null,
 
     pub const PermAnswer = enum { none, allow, allow_always, deny };
 

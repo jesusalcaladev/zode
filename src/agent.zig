@@ -1694,6 +1694,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdAllowlist(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
+    } else if (std.mem.eql(u8, cmd, "compact")) {
+        commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "session")) {
         commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {
@@ -2660,12 +2662,20 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // here — one message, one request — and the base64 dies with this turn's arena.
     const msgs0 = withPendingImages(m, arena, msgs1);
 
-    const comp: compaction.Compacted = compaction.elideTier(
-        arena,
-        msgs0,
-        compaction.budgetFor(m.environ, curModelContext()),
-        m.environ,
-    ) catch compaction.Compacted{ .msgs = msgs0 };
+    // `ZODE_COMPACT=off` is a branch HERE, not inside `elideTier`, so it cannot be
+    // half-applied: with it on, nothing is elided and nothing is summarized, and the
+    // wire carries the history whole.
+    const cmode = compaction.effectiveMode(m.environ, m.compact_mode);
+    const comp: compaction.Compacted = if (cmode == .off)
+        compaction.nothingElided(msgs0)
+    else
+        compaction.elideTier(
+            arena,
+            msgs0,
+            compaction.budgetFor(m.environ, curModelContext()),
+            m.environ,
+            cmode,
+        ) catch compaction.nothingElided(msgs0);
     // Which files went in with the prompt. Without this line the user sees the
     // model "knowing" something nobody showed it, and with a 30 KB file that
     // also changes the context spend without any prior notice.
@@ -3865,8 +3875,14 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
         // paying for a grep dump it does not need.
         var cstate = std.heap.ArenaAllocator.init(gpa);
         const carena = cstate.allocator();
-        const comp = compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens, m.environ) catch
-            compaction.Compacted{ .msgs = msgs.items };
+        // The same `off` as the turn above: a policy the user set has to mean the
+        // same thing in the subagent, or `/context` describes a budget nothing obeys.
+        const cmode = compaction.effectiveMode(m.environ, m.compact_mode);
+        const comp = if (cmode == .off)
+            compaction.nothingElided(msgs.items)
+        else
+            compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens, m.environ, cmode) catch
+                compaction.nothingElided(msgs.items);
 
         const body = chat.buildBodyMessages(
             &body_buf,
