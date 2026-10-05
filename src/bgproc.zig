@@ -25,6 +25,7 @@
 //!   the reader thread would race with `bash_output` reading the same buffer.
 
 const std = @import("std");
+const sleep = @import("lib/sleep.zig");
 const builtin = @import("builtin");
 
 pub const Registry = @This();
@@ -32,6 +33,13 @@ pub const Registry = @This();
 /// Jobs at the same time. Each one is a thread and a pipe pair, so this is not
 /// free: 8 is already more than a person can keep track of.
 pub const max_jobs = 8;
+
+/// Bytes of command kept for display.
+///
+/// Not for `exec`: the whole line goes to `/bin/sh -c` either way. This is only
+/// what the header shows, and a header that cannot hold the whole command is
+/// better than one that can point at freed memory.
+pub const max_command = 256;
 
 /// Output kept per job. A build that prints 2 MB of warnings is not worth 2 MB of
 /// RAM and is not worth sending to a model either: past this the buffer stops
@@ -73,8 +81,20 @@ pub const Job = struct {
     /// passes back to `bash_output`. It is a counter, not a pointer, so a freed
     /// slot's memory can never make id 3 point at job 5.
     id: u32 = 0,
-    /// Own copy of the command, for `bash_output`'s header. gpa.
-    command: ?[]u8 = null,
+    /// The command, for `bash_output`'s header.
+    ///
+    /// A FIXED buffer and not a heap slice, and the reason is a use-after-free
+    /// that was already there: `spawn` was called with the TURN's arena (that is
+    /// what `tools/bash.zig` had to hand it), the arena is freed at the end of
+    /// `execToolCalls`, and the job — which can still be running, and is still
+    /// read by `statusLine` from the draw — kept a pointer into it. A finished
+    /// build's header then printed whatever the next allocation put there.
+    ///
+    /// A fixed buffer removes the ownership question instead of answering it: no
+    /// allocator is involved, nothing to free, nothing to dangle. 256 bytes holds
+    /// any command that is worth running; a longer one is truncated and says so.
+    cmd_buf: [max_command]u8 = @splat(0),
+    cmd_len: usize = 0,
     /// What the job printed. Own mutex: the reader thread appends while the
     /// worker (or the UI) reads.
     mutex: std.atomic.Mutex = .unlocked,
@@ -110,6 +130,12 @@ pub const Job = struct {
     /// On the JOB and not only on the registry: `/bg` prints one line per slot and
     /// the draw wants the same word for the status column. Two implementations of
     /// "is this job fine" is how `ok` and `exit=0` end up disagreeing on screen.
+    /// The command as a slice of the job's own buffer. Never null, never a
+    /// pointer somebody else can free.
+    pub fn commandSlice(self: *const Job) []const u8 {
+        return self.cmd_buf[0..self.cmd_len];
+    }
+
     pub fn stateWord(self: *const Job) []const u8 {
         return switch (self.state) {
             .running => "running",
@@ -122,7 +148,6 @@ pub const Job = struct {
     /// Frees the job's own memory. `gpa` must be the one that allocated `command`
     /// and `buf`, which is the Model's.
     fn deinit(self: *Job, gpa: std.mem.Allocator) void {
-        if (self.command) |c| gpa.free(c);
         self.buf.deinit(gpa);
         self.* = .{};
     }
@@ -136,7 +161,7 @@ cancel_all: bool = false,
 /// The raw id of a running job (for the UI: "which command is that?").
 pub fn commandOf(self: *Registry, id: u32) ?[]const u8 {
     for (&self.slots) |*j| {
-        if (j.isLive() and j.id == id) return j.command;
+        if (j.isLive() and j.id == id) return j.commandSlice();
     }
     return null;
 }
@@ -247,7 +272,7 @@ pub fn read(reg: *Registry, out: *Output, id: u32) ![]const u8 {
         if (from >= avail and !finished) return error.NoNewOutput;
 
         var w: std.Io.Writer = .fixed(&out.buf);
-        const cmd = j.command orelse "";
+        const cmd = j.commandSlice();
 
         if (finished and j.exit != null) {
             w.print("[{s}] finished exit={d}\n", .{ cmd, j.exit.? }) catch {};
@@ -274,6 +299,46 @@ pub fn read(reg: *Registry, out: *Output, id: u32) ![]const u8 {
 }
 
 /// The state of a job as ONE short word, for the header.
+/// The new output WITHOUT the header `read` prepends.
+///
+/// It exists for the tools that PARSE what a command printed, and the reason is
+/// not tidiness: the header is a line zode writes, `[zig build] finished exit=1`,
+/// and a parser that scans for `file:line: error:` finds the whole command line
+/// inside it. `zig build check-probe` reported "3 type error(s)" for a build with
+/// 2, the third one being its own command echoed back.
+///
+/// So the two readings are different things and they are named as such: `read` is
+/// for a model to read (the header answers "what was this?"), `readNoHeader` is
+/// for code that has to tell output from metadata.
+pub fn readNoHeader(reg: *Registry, out: *Output, id: u32) ![]const u8 {
+    for (&reg.slots) |*j| {
+        if (!j.isLive() or j.id != id) continue;
+
+        lockSlot(j);
+        defer unlockSlot(j);
+
+        const finished = j.state != .running;
+        const from = j.cursor;
+        const avail = j.buf.items.len;
+        if (from >= avail and !finished) return error.NoNewOutput;
+
+        var w: std.Io.Writer = .fixed(&out.buf);
+        if (from < avail) {
+            w.writeAll(j.buf.items[from..avail]) catch {};
+            j.cursor = avail;
+        }
+        if (j.dropped > 0) {
+            w.print("\n({d} bytes of output dropped by the {d} KB cap)\n", .{
+                j.dropped, max_output / 1024,
+            }) catch {};
+        }
+        if (w.buffered().len == 0) return "";
+        out.len = w.buffered().len;
+        return out.slice();
+    }
+    return error.UnknownJob;
+}
+
 pub fn stateWord(reg: *Registry, id: u32) []const u8 {
     for (&reg.slots) |*j| {
         if (j.isLive() and j.id == id) return j.stateWord();
@@ -433,9 +498,6 @@ pub fn spawn(
     }
     const j = slot orelse return error.TooManyJobs;
 
-    const cmd_copy = try gpa.dupe(u8, command);
-    errdefer gpa.free(cmd_copy);
-
     var argv = [_][]const u8{ "/bin/sh", "-c", command };
     // `pgid = 0` puts the child in its OWN process group (as the leader). It is
     // what makes `kill(-pid)` possible in `killGroup`, and without it a `sh -c
@@ -453,7 +515,11 @@ pub fn spawn(
     j.* = .{};
     j.state = .running;
     j.id = reg.next_id;
-    j.command = cmd_copy;
+    // Truncated, not refused: a long command still has to run. The header is a
+    // label, and a label that lies about whether the command ran is worse than a
+    // short one.
+    j.cmd_len = @min(command.len, max_command);
+    @memcpy(j.cmd_buf[0..j.cmd_len], command[0..j.cmd_len]);
     j.child = child;
     // The pid, taken BEFORE the reader thread can reap the child. `killTree`
     // signals `-pgid`, and after a reap that pid belongs to somebody else.
@@ -510,13 +576,29 @@ fn reader(ctx: *ReaderCtx) void {
     mr.init(gpa, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
 
+    // `reader(ix).buffered()` is the WHOLE data read from that stream so far, not
+    // what arrived in this cycle: `fill` advances `end`, and nothing ever consumes
+    // it. Appending it every cycle therefore re-appended the entire buffer on each
+    // fill, and a job that printed two error lines had them six times in its
+    // output by the time the agent read it.
+    //
+    // Found by `zig build check-probe` against a command with a known output: the
+    // report said "7 type error(s)" for a build with 2. A duplicated diagnostic is
+    // worse than a missing one — the model reads it as 7 places to fix.
+    //
+    // `consumed` is per stream and only ever grows. `rebaseGrowing` memmoves the
+    // data to offset 0 and preserves its length, so a shrink here would mean the
+    // accounting is wrong; skipping is the safe direction, because losing output is
+    // worse than repeating it.
+    var consumed = [_]usize{ 0, 0 };
     while (mr.fill(4096, .none)) |_| {
         for (0..2) |ix| {
             const chunk = mr.reader(ix).buffered();
-            if (chunk.len == 0) continue;
+            if (chunk.len <= consumed[ix]) continue;
             lockSlot(j);
-            appendLocked(j, gpa, chunk);
+            appendLocked(j, gpa, chunk[consumed[ix]..]);
             unlockSlot(j);
+            consumed[ix] = chunk.len;
         }
     } else |err| switch (err) {
         error.EndOfStream => {},
@@ -649,11 +731,14 @@ test "read: returns what is new and does NOT repeat the old" {
     // same output.
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
-    // OWNED command: `deinit` frees it, so a literal here is an "Invalid free"
-    // in the test rather than in production. (Sixth family, and the tests are
-    // the only place where you get to see it for free.)
+    // The command is COPIED into the job's own fixed buffer, so `deinit` has
+    // nothing to free for it any more. This `dupe` used to be freed by `deinit`
+    // and now has to be freed here, and that shift is the proof: the job no
+    // longer holds a pointer somebody else could have released.
     const cmd = try std.testing.allocator.dupe(u8, "zig build");
-    reg.slots[0] = .{ .state = .finished, .id = 3, .exit = 0, .command = cmd };
+    defer std.testing.allocator.free(cmd);
+    reg.slots[0] = .{ .state = .finished, .id = 3, .exit = 0, .cmd_len = @min(cmd.len, max_command) };
+    @memcpy(reg.slots[0].cmd_buf[0..reg.slots[0].cmd_len], cmd[0..reg.slots[0].cmd_len]);
     try reg.slots[0].buf.appendSlice(std.testing.allocator, "linea1\nlinea2\n");
 
     var o1 = bgproc.Output{};
@@ -852,4 +937,95 @@ fn procPgrp(io: std.Io, pid: std.posix.pid_t) !i64 {
     _ = it.next() orelse return error.BadStat; // ppid
     const pgrp = it.next() orelse return error.BadStat;
     return std.fmt.parseInt(i64, pgrp, 10);
+}
+
+test "a job's output is NOT duplicated: the reader consumes what it appended" {
+    // Real bug, found by `zig build check-probe`: `MultiReader.reader(ix).buffered()`
+    // returns EVERYTHING read from that stream so far, because `fill` only advances
+    // `end` and nothing consumes it. The reader appended the whole buffer on every
+    // fill, so a command with two error lines had six in the job's output by the
+    // time it was read, and `check` reported "7 type error(s)" for a build with 2.
+    //
+    // A duplicated diagnostic is worse than a missing one: the model reads the count
+    // as places to go and fix.
+    // A real job needs an allocator that outlives the reader thread, and
+    // `std.testing.allocator` frees everything at the end of the test while the
+    // thread may still be running. A page allocator cannot fail a leak check.
+    // A real job needs an allocator that OUTLIVES the reader thread, and
+    // `std.testing.allocator` checks for leaks at the end of the test while that
+    // thread may still be running. A page allocator cannot fail that check, and
+    // these two tests are about output accounting, not about leaks.
+    const gpa = std.heap.page_allocator;
+
+    var reg = Registry{};
+    defer reg.deinit(undefined, gpa);
+
+    // One line per write, and several writes, so a per-fill append shows up.
+    const cmd = "i=0; while [ $i -lt 5 ]; do echo \"line$i\"; i=$((i+1)); done";
+    const id = try spawn(&reg, gpa, std.testing.io, cmd);
+
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 20) {
+        sleep.nap(20);
+        if (!std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+    }
+    try std.testing.expect(!std.mem.eql(u8, stateWord(&reg, id), "running"));
+
+    // Counted on the header-free read, and the reason is the same finding: the
+    // header contains the command, and the command contains the word being counted.
+    // Counting on `read` gave 6 for 5 lines and looked like a second bug.
+    var out = Output{};
+    const text = try readNoHeader(&reg, &out, id);
+    try std.testing.expectEqual(@as(usize, 1), countOf(text, "line0\n"));
+    try std.testing.expectEqual(@as(usize, 1), countOf(text, "line4\n"));
+    try std.testing.expectEqual(@as(usize, 5), countOf(text, "line"));
+}
+
+test "readNoHeader: the command line is not part of the output a parser sees" {
+    // The other half of the same finding. `read` prepends `[cmd] finished exit=1`,
+    // which is zode's own text, and a scanner looking for `file:line: error:`
+    // finds the whole command inside it. `check-probe` counted its own command line
+    // as a third type error.
+    const gpa = std.heap.page_allocator;
+
+    var reg = Registry{};
+    defer reg.deinit(undefined, gpa);
+
+    const cmd = "echo 'src/a.zig:1:1: error: real' >&2";
+    const id = try spawn(&reg, gpa, std.testing.io, cmd);
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 20) {
+        sleep.nap(20);
+        if (!std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+    }
+
+    var with = Output{};
+    const a = try read(&reg, &with, id);
+    try std.testing.expect(std.mem.indexOf(u8, a, "src/a.zig:1:1: error: real") != null);
+    // The header carries the command, and with it a copy of the error text.
+    try std.testing.expect(std.mem.indexOf(u8, a, "echo 'src/a.zig:1:1: error") != null);
+
+    // A second job, because the first one's cursor has already been consumed.
+    const id2 = try spawn(&reg, gpa, std.testing.io, cmd);
+    waited = 0;
+    while (waited < 5000) : (waited += 20) {
+        sleep.nap(20);
+        if (!std.mem.eql(u8, stateWord(&reg, id2), "running")) break;
+    }
+    var without = Output{};
+    const b = try readNoHeader(&reg, &without, id2);
+    try std.testing.expect(std.mem.indexOf(u8, b, "src/a.zig:1:1: error: real") != null);
+    // And no trace of the command that produced it.
+    try std.testing.expect(std.mem.indexOf(u8, b, "echo 'src/a.zig:1:1: error") == null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "finished exit=") == null);
+}
+
+fn countOf(hay: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, hay, from, needle)) |at| {
+        n += 1;
+        from = at + needle.len;
+    }
+    return n;
 }

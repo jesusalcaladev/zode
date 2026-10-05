@@ -752,6 +752,26 @@ pub const Model = struct {
     /// Background jobs (see `bgproc.zig`): id, how many were started, whether
     /// ESC has been pressed since the last one.
     bg: bgproc.Registry = .{},
+    /// The automatic typecheck the harness started after a write tool touched
+    /// code (`lib/typecheck.zig`), or 0 when there is none.
+    ///
+    /// It is here, and not in the agent, for two reasons that both cost something
+    /// to learn. It is WRITTEN by the worker and READ by the next iteration of
+    /// the same worker, so it could be a plain field — but the tests build a
+    /// `Model` and drive `execToolCalls` directly, and a field on the agent would
+    /// be shared between them. And it LIVES ACROSS the arena that started the job:
+    /// the job's output belongs to a background thread with its own buffer, so it
+    /// cannot be a pointer into a turn's arena. A `u32` id and a re-read of the
+    /// registry is the whole contract.
+    auto_check: u32 = 0,
+    /// The command the automatic check is running, for the message the model
+    /// reads. Owned copy: the plan is a comptime string but the label that goes
+    /// with the job is composed.
+    auto_check_label: [64]u8 = @splat(0),
+    auto_check_label_len: usize = 0,
+    /// How many automatic checks have been started this turn, so a model that
+    /// edits nine files in a row does not start nine builds.
+    auto_check_turn: u32 = 0,
     /// Which files the agent has already read, and which of those are STILL in the
     /// context (see `readcache.zig`).
     ///

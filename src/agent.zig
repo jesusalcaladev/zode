@@ -21,6 +21,8 @@ const config_mod = @import("config.zig");
 
 const ask = @import("lib/ask.zig");
 const bgproc = @import("bgproc.zig");
+const typecheck_mod = @import("lib/typecheck.zig");
+const check_tool = @import("tools/check.zig");
 const bench_mod = @import("lib/bench.zig");
 const skills = @import("lib/skills.zig");
 const skillstore = @import("lib/skillstore.zig");
@@ -553,7 +555,7 @@ fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
         const slot = &m.bg.slots[i];
         if (!slot.isLive()) continue;
         any = true;
-        w.print("  job {d} [{s}] {s}\n", .{ slot.id, slot.stateWord(), slot.command orelse "?" }) catch {};
+        w.print("  job {d} [{s}] {s}\n", .{ slot.id, slot.stateWord(), slot.commandSlice() }) catch {};
     }
     if (!any) {
         pushInfo(m, "no background commands");
@@ -817,6 +819,37 @@ fn readFileTo(arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
 
 // ── environment and history notices ───────────────────────────
 
+/// An env var read as a boolean, with a default.
+///
+/// `ZODE_AUTO_CHECK=0` is for someone who does not want a build started behind
+/// their back. It has to be an escape hatch: "the harness decides to run a
+/// compiler on your machine without being asked" is a policy, and a policy with
+/// no off switch is not a default.
+pub fn envTruthy(key: []const u8, default: bool) bool {
+    return envTruthyIn(environ_global, key, default);
+}
+
+/// An env var read as a boolean, from an explicit map.
+///
+/// One implementation because the check existed in THREE places and they had
+/// already drifted: two compared `"off"` case-insensitively and the third did not,
+/// so `ZODE_X=OFF` turned the feature off in one place and on in another. The
+/// comparison is case-insensitive because `OFF`, `Off` and `off` are the same
+/// answer to anybody who typed them.
+pub fn envTruthyIn(env: ?*const std.process.Environ.Map, key: []const u8, default: bool) bool {
+    const raw = envGet(env, key) orelse return default;
+    // An EMPTY value means "not set". It is what you get from `ZODE_AUTO_BG=` in
+    // a `.env` file, and treating it as false would silently disable a default
+    // because of a trailing `=`.
+    if (raw.len == 0) return default;
+    if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "no") or std.ascii.eqlIgnoreCase(raw, "off"))
+    {
+        return false;
+    }
+    return true;
+}
+
 fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = env orelse return null;
     return m.get(key);
@@ -848,12 +881,8 @@ pub fn initFreeAutoFromEnv(m: *tui.Model) void {
     // `ZODE_AUTO_BG=0` opts out of starting known-slow verifications in the
     // background on their own (see `lib/verify.zig`). Default: on, because the
     // alternative is the user's input freezing for the length of a build.
-    if (envGet(m.environ, "ZODE_AUTO_BG")) |v| {
-        if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off") or
-            std.ascii.eqlIgnoreCase(v, "false"))
-        {
-            tools_mod.setAutoBackground(false);
-        }
+    if (!envTruthyIn(m.environ, "ZODE_AUTO_BG", true)) {
+        tools_mod.setAutoBackground(false);
     }
 }
 
@@ -1825,6 +1854,21 @@ fn chatWorker(job: *ChatJob) void {
     m.beginWorker();
     defer m.endWorker();
 
+    // The automatic typecheck's budget is PER TURN. Resetting it here and not in
+    // `runOneTurn` is the difference between "two builds per turn" and "two
+    // builds per iteration for the rest of the session": the cap exists to stop a
+    // model that edits nine files in a row from starting nine builds, and a cap
+    // that is never reset stops at two for the whole conversation.
+    m.auto_check_turn = 0;
+    // A check left over from a PREVIOUS turn is not this turn's problem: reading
+    // it here would tell the model about errors in code it did not write this
+    // turn. The job is killed rather than orphaned so a build from a turn the user
+    // abandoned does not keep burning a core.
+    if (m.auto_check != 0 and std.mem.eql(u8, bgproc.stateWord(&m.bg, m.auto_check), "running")) {
+        _ = bgproc.kill(&m.bg, io_global, m.auto_check);
+    }
+    m.auto_check = 0;
+
     // The turn stats start here (not in `runOneTurn`): the turn is the whole
     // `chatWorker`, with its 8 iterations.
     turn_stats.reset(m.allocator, std.Io.Timestamp.now(io_global, .real).nanoseconds);
@@ -2464,6 +2508,27 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // The prompt that goes out on the wire can differ from the one in the session
     // (read-only mode, the skill list), so it is synced AFTER the append.
     syncSystemPrompt(s);
+
+    // The automatic typecheck's verdict, IF it has finished.
+    //
+    // Here and not in `execToolCalls` because the timing is the whole point: the
+    // job was started at the end of the previous iteration so the model could
+    // spend this one doing something else, and this is the last moment before the
+    // request goes out. Read any earlier and it would still be running; read any
+    // later and the model has already decided what to write.
+    //
+    // It goes in as a `user` message, after the `tool` results, which is a shape
+    // every provider accepts — the alternative, a `tool_result` with no call id,
+    // is not a thing.
+    if (autoCheckResult(m, gpa)) |note| {
+        const owned = gpa.dupe(u8, note) catch null;
+        if (owned) |text| {
+            s.append(.user, text) catch m.allocator.free(text);
+            pushInfoFmt(m, "· {s} found problems in the code you just wrote", .{
+                m.auto_check_label[0..m.auto_check_label_len],
+            });
+        }
+    }
 
     // Tier 1 compaction before building the body: it is a VIEW of the wire, the
     // session on disk keeps everything.
@@ -4207,6 +4272,16 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         i += 1;
         ran += execOneCall(m, s, call, arena, &denied);
     }
+    // An edit to code is followed by a typecheck WITHOUT the model asking, because
+    // the model finds out it broke something one iteration too late otherwise:
+    // the next request goes out with the broken state in the prompt, those tokens
+    // are billed, and only then does a build say so.
+    //
+    // Started here, in the BACKGROUND, so the model goes on to the next file and
+    // the result is waiting when it looks. The alternative — making the model
+    // call `check` — is the same request with one more round trip in it.
+    autoCheckAfterTools(m, t.calls.items);
+
     s.flush();
     // "tools done" says nothing. With the numbers it does: you know whether it was
     // fast (and therefore whether the model is going to continue or has stopped)
@@ -4235,6 +4310,116 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
 /// The text sent as "user" so the model sees the tool results. It lives in a
 /// constant (not inlined) so it can be tested.
 pub const syntheticUserText = "Continue with the tool results above.";
+
+/// Does a writing tool in this batch touch a file whose contents a compiler
+/// would care about?
+///
+/// Split out from `autoCheckAfterTools` because it is the DECISION and this
+/// function is the effect, and the decision is what a test can pin: an `edit` on
+/// `notes.md` must not start a build, and an `edit` on `src/a.zig` must.
+/// A cheap gate in front of a build: does this tool call name at least one path a
+/// compiler would read?
+///
+/// Deliberately optimistic. `write {files:[...]}` has no `path`, so the multi-file
+/// forms return FALSE here and the automatic check does not fire for them — which
+/// is the wrong direction, and the reason is that guessing by extension means
+/// looking inside the arguments, and an argument the harness cannot parse must not
+/// be the reason a broken build goes unnoticed. So the caller's answer is "no
+/// proof it is code", and the manual `check` tool is there for the other case.
+fn codePathsFromArgs(args_json: []const u8, arena: std.mem.Allocator) bool {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return false;
+    if (parsed != .object) return false;
+    const v = parsed.object.get("path") orelse return false;
+    if (v != .string) return false;
+    return typecheck_mod.worthChecking(v.string);
+}
+
+/// Start the project's typecheck if this batch of tools edited code.
+///
+/// Three guards, and each one is a decision:
+///
+/// - **Only code.** `worthChecking` is the extension table. A `write` on a
+///   `README.md` starts nothing.
+/// - **Once a turn.** Nine edits in one turn is nine builds competing for the same
+///   eight background slots, and the ninth one is the build of the state after
+///   the eighth, which is the only one anybody wanted. The cap is on starts, not
+///   on correctness: the job that IS running gets read either way.
+/// - **Nothing already running.** If the model asked for a check itself, or the
+///   previous iteration's check is still going, starting another one wastes a slot
+///   and makes the results arrive out of order.
+pub fn autoCheckAfterTools(m: *tui.Model, calls: []const TurnCtx.Call) void {
+    if (!envTruthy("ZODE_AUTO_CHECK", true)) return;
+    if (m.auto_check_turn >= auto_check_per_turn) return;
+    if (m.auto_check != 0 and std.mem.eql(u8, bgproc.stateWord(&m.bg, m.auto_check), "running")) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var touched_code = false;
+    for (calls) |c| {
+        if (touchesFile(c.name) and codePathsFromArgs(c.args_json, arena)) touched_code = true;
+    }
+    if (!touched_code) return;
+
+    const plan = check_tool.planAt(io_global, ".") orelse return;
+    const id = bgproc.spawn(&m.bg, m.allocator, io_global, plan.command) catch return;
+    m.auto_check = id;
+    m.auto_check_turn += 1;
+    const l = @min(plan.label.len, m.auto_check_label.len);
+    @memcpy(m.auto_check_label[0..l], plan.label[0..l]);
+    m.auto_check_label_len = l;
+}
+
+/// How many automatic checks one turn may start.
+///
+/// 2, not 1: the shape of a task is "edit, read the errors, fix, edit, read the
+/// errors", and with 1 the second fix is never checked. Not 3, because a turn that
+/// needs three builds is a turn where the model is guessing.
+pub const auto_check_per_turn: u32 = 2;
+
+/// The automatic check's result, if it is ready, as text for the model.
+///
+/// Returns null while it runs: the model is mid-thought and a note that says
+/// "still running" every iteration is the noise this feature exists to avoid. The
+/// job keeps its slot and the next call reads it.
+///
+/// It only reports when there ARE errors. A passing check produces nothing at
+/// all, on purpose: "it compiles" is worth nothing to a model that was not going
+/// to write code anyway, and it is the one message that could be repeated five
+/// times a turn.
+pub fn autoCheckResult(m: *tui.Model, arena: std.mem.Allocator) ?[]const u8 {
+    const id = m.auto_check;
+    if (id == 0) return null;
+    if (std.mem.eql(u8, bgproc.stateWord(&m.bg, id), "running")) return null;
+
+    var out = bgproc.Output{};
+    // No header: it is zode's own `[zig build] finished exit=1` line, and a scan
+    // for `file:line: error:` finds the whole command inside it.
+    const text = bgproc.readNoHeader(&m.bg, &out, id) catch return null;
+    // Consumed either way: a job that has been read is done, and leaving the id
+    // set would make the NEXT edit report the previous turn's errors.
+    m.auto_check = 0;
+
+    const diags = typecheck_mod.extractDiagnostics(arena, text, 12) catch return null;
+    if (diags.len == 0) return null;
+
+    const label = m.auto_check_label[0..m.auto_check_label_len];
+    return std.fmt.allocPrint(
+        arena,
+        "[{s} found {d} problem(s) in the code you just wrote]\n{s}\nThis is the project's own compiler, not a guess. Fix these before writing more.",
+        .{ label, countDiagLines(diags), diags },
+    ) catch null;
+}
+
+fn countDiagLines(s: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |l| if (std.mem.trim(u8, l, " \t\r").len != 0) {
+        n += 1;
+    };
+    return n;
+}
 
 /// Does this tool modify a file on disk?
 fn touchesFile(name: []const u8) bool {
@@ -6538,4 +6723,118 @@ test "a cheap model equal to the active one is not used, because it is not cheap
     var st = router_mod.initFromEnv(&env);
     try std.testing.expectEqual(router_mod.Decision.active, router_mod.decide(&st, "the-same-one", true));
     try std.testing.expectEqual(@as(u32, 0), st.attempts);
+}
+
+test "envTruthy: an unset flag takes the default and an explicit off really is off" {
+    const saved = environ_global;
+    environ_global = null;
+    defer environ_global = saved;
+
+    try std.testing.expect(envTruthy("ZODE_AUTO_CHECK", true));
+    try std.testing.expect(!envTruthy("ZODE_AUTO_CHECK", false));
+    // The harness starting a compiler on the machine unasked is a POLICY, and a
+    // policy with no off switch is not a default.
+    for ([_][]const u8{ "0", "false", "no", "off", "OFF" }) |v| {
+        var map = std.process.Environ.Map.init(std.testing.allocator);
+        defer map.deinit();
+        map.put("ZODE_AUTO_CHECK", v) catch return error.PutFailed;
+        environ_global = &map;
+        const got = envTruthy("ZODE_AUTO_CHECK", true);
+        if (got) {
+            std.debug.print("ZODE_AUTO_CHECK={s} was read as ON\n", .{v});
+            return error.OffNotOff;
+        }
+    }
+}
+
+test "codePathsFromArgs: the gate that decides if a build is worth starting" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expect(codePathsFromArgs("{\"path\":\"src/a.zig\"}", arena));
+    try std.testing.expect(codePathsFromArgs("{\"path\":\"src/app.ts\"}", arena));
+    // A build that proves nothing is a request spent.
+    try std.testing.expect(!codePathsFromArgs("{\"path\":\"README.md\"}", arena));
+    try std.testing.expect(!codePathsFromArgs("{\"path\":\"package-lock.json\"}", arena));
+    // `write {files:[...]}` has no `path`. It is the wrong direction — a
+    // multi-file edit is exactly what breaks a build — and the reason is that
+    // guessing means reading the arguments, and an argument this cannot parse
+    // must not be the reason a broken build goes unnoticed. The manual `check`
+    // tool is there for that case.
+    try std.testing.expect(!codePathsFromArgs("{\"files\":[{\"path\":\"a.zig\"}]}", arena));
+    // Garbage in is not a crash and not a yes.
+    try std.testing.expect(!codePathsFromArgs("not json", arena));
+    try std.testing.expect(!codePathsFromArgs("{\"path\":123}", arena));
+}
+
+test "autoCheck: the cap is per turn and it stops a model that edits nine times" {
+    // Nine edits in one turn is nine builds competing for eight background slots,
+    // and the ninth is a build of the state after the eighth — the only one
+    // anybody wanted.
+    try std.testing.expect(auto_check_per_turn < 4);
+    // Not 1 either: the shape of a task is "edit, read the errors, fix, edit,
+    // read the errors", and with 1 the second fix is never checked.
+    try std.testing.expect(auto_check_per_turn >= 2);
+}
+
+test "autoCheckResult: a job with locations produces the note, and it is consumed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.bg.slots[1] = .{ .state = .finished, .id = 6, .exit = 1 };
+    try m.bg.slots[1].buf.appendSlice(std.testing.allocator, "src/a.zig:3:5: error: unused variable\n");
+    @memcpy(m.auto_check_label[0..9], "zig build");
+    m.auto_check_label_len = 9;
+    m.auto_check = 6;
+
+    const note = autoCheckResult(&m, arena) orelse return error.NoNote;
+    try std.testing.expect(std.mem.indexOf(u8, note, "src/a.zig:3:5: error") != null);
+    // The label, so the model knows this is the compiler and not a guess.
+    try std.testing.expect(std.mem.indexOf(u8, note, "zig build") != null);
+    // And it says what to do about it.
+    try std.testing.expect(std.mem.indexOf(u8, note, "Fix these") != null);
+    // Consumed: the next edit must not report this turn's errors a second time.
+    try std.testing.expectEqual(@as(u32, 0), m.auto_check);
+}
+
+test "autoCheckResult: a PASSING check says nothing at all" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    // Exit 0 and output with no locations: the build was fine.
+    m.bg.slots[0] = .{ .state = .finished, .id = 2, .exit = 0 };
+    try m.bg.slots[0].buf.appendSlice(std.testing.allocator, "Build finished\n");
+    m.auto_check = 2;
+
+    // "it compiles" is worth nothing to a model that was not going to write code
+    // anyway, and it is the one message that could be repeated five times in one
+    // turn. Silence is the design.
+    try std.testing.expect(autoCheckResult(&m, arena) == null);
+    // Consumed even when silent, or the next edit reports it again.
+    try std.testing.expectEqual(@as(u32, 0), m.auto_check);
+}
+
+test "autoCheckResult: no job, and a job still running, both say nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expect(autoCheckResult(&m, arena) == null);
+
+    m.bg.slots[0] = .{ .state = .running, .id = 3 };
+    try m.bg.slots[0].buf.appendSlice(std.testing.allocator, "src/a.zig:1:1: error: early\n");
+    m.auto_check = 3;
+    // Mid-thought, a note that says "still running" is the noise this feature
+    // exists to avoid. The job keeps its slot and the next iteration reads it.
+    try std.testing.expect(autoCheckResult(&m, arena) == null);
+    try std.testing.expectEqual(@as(u32, 3), m.auto_check);
 }

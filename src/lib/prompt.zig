@@ -124,6 +124,14 @@ pub const tool_routing_prompt =
     \\ - The same rule for searches: ONE `grep` with a good pattern beats three
     \\   with a narrower one. Reach for the second search only when the first did
     \\   not answer the question.
+    \\ - `check` TYPECHECKS the project for you, in the background, and brings
+    \\   back the errors with a file and a line. Use it instead of
+    \\   `bash zig build` / `bash npx tsc` / `bash cargo check`: you spend no
+    \\   round trip guessing the command, and the input never freezes. After you
+    \\   write code, read what it says before writing more — an error you find now
+    \\   costs one turn and an error you find three turns later costs three.
+    \\   It runs on its own after your edits, so call it with no arguments and
+    \\   keep working, then ask for the result.
     \\ - The repository has tools for git: `git_status`, `git_diff`, `git_log`.
     \\   They return machine formats instead of prose and take no arguments from
     \\   you. Use them instead of `bash git status`, which spends a round trip to
@@ -236,7 +244,7 @@ test "the built-in prompt says the rules that prevent the bad outcomes" {
 test "the routing table is about ROUND TRIPS, and says so" {
     // Every rule in it is "one call instead of N". If a future rewrite turns it
     // into prose about tools in general it has lost the reason it exists.
-    for ([_][]const u8{ "paths", "files", "refs", "round trip", "task", "git_status" }) |k| {
+    for ([_][]const u8{ "paths", "files", "refs", "round trip", "task", "git_status", "check" }) |k| {
         if (std.mem.indexOf(u8, tool_routing_prompt, k) == null) {
             std.debug.print("the routing table lost: {s}\n", .{k});
             return error.RuleMissing;

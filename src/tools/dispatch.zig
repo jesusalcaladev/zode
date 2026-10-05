@@ -17,6 +17,7 @@ const bash_tool = @import("bash.zig");
 const git_tool = @import("git.zig");
 const refs_tool = @import("refs.zig");
 const rename_tool = @import("rename.zig");
+const check_tool = @import("check.zig");
 const bg_tool = @import("bg.zig");
 const glob_tool = @import("glob.zig");
 const grep_tool = @import("grep.zig");
@@ -88,6 +89,7 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"git_log","description":"The last commits, most recent first, one line each (short hash and subject).","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"how many commits (default 20, max 200)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"refs","description":"Where a symbol is DEFINED and where it is USED, in one call and with the two separated: definitions first, then calls, then plain references. One plain identifier, not a pattern (use `grep` for text). Prefer it over grepping: guessing the declaration shape for the language, running two greps and working out which hit is the definition is three round trips, and a round trip is a whole request. Knows the declaration shapes of zig, rust, go, python, js/ts, c, sh, and steps over Go method receivers, so `refs Listen` finds `func (s *Server) Listen()` instead of calling it a use.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"subdir":{"type":"string","description":"where to look (default: the whole project)"}},"required":["symbol"]}}},
     \\{"type":"function","function":{"name":"rename","description":"Rename a symbol EVERYWHERE it appears as code, in ONE call, and report every file it touched. Prefer it over a series of `edit` calls: a rename applied to nine files out of ten leaves a codebase that does not compile, and only this says which file was skipped. Only whole-word occurrences that are real CODE are changed: the same name inside a string, a comment or a longer identifier is left alone. Two same-named symbols are both renamed — run `refs` first and narrow with `subdir` when that matters.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"to":{"type":"string","description":"the new name; must be a plain identifier"},"subdir":{"type":"string"}},"required":["symbol","to"]}}},
+    \\{"type":"function","function":{"name":"check","description":"Typecheck THIS project, in the background, and report the errors with a file and a line. You do not have to know the command: build.zig means `zig build`, Cargo.toml means `cargo check`, tsconfig.json means `tsc --noEmit`. Call it with no arguments to start one and KEEP WORKING, then call it with id to read the errors. Prefer it over `bash zig build`: it saves the round trip of guessing the command, and it never blocks the input.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the job id a previous call returned"}}}}},
     \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; ask for a deeper offset if the text is cut.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Search the web and get titles, URLs and snippets. Use it when you need something you do not know yet (docs, versions, error messages), then web_fetch the promising URLs.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 8"}},"required":["query"]}}},
@@ -192,6 +194,8 @@ pub fn execute(
         return refs_tool.toolRefs(io, obj, arena);
     } else if (std.mem.eql(u8, name, "rename")) {
         return rename_tool.toolRename(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "check")) {
+        return check_tool.toolCheck(io, obj, arena, bg, arena);
     } else if (std.mem.eql(u8, name, "git_status")) {
         return git_tool.toolGitStatus(io, arena);
     } else if (std.mem.eql(u8, name, "git_diff")) {
@@ -240,6 +244,7 @@ pub const defs = [_]ToolDef{
     .{ .name = "grep", .desc = "Search file contents with regex" },
     .{ .name = "refs", .desc = "Where a symbol is defined and used" },
     .{ .name = "rename", .desc = "Rename a symbol everywhere, in one call" },
+    .{ .name = "check", .desc = "Typecheck this project, in the background" },
     .{ .name = "git_status", .desc = "Working tree state, machine format" },
     .{ .name = "git_diff", .desc = "Unified diff of the working tree" },
     .{ .name = "git_log", .desc = "Last commits, one line each" },
@@ -1350,4 +1355,70 @@ test "rename and refs agree on the COUNT, because they share the scanner" {
     const rename_out = try execute(std.testing.io, "rename", rename_args, arena, null, null);
     // One definition + one use = 2 replacements, matching what refs reported.
     try std.testing.expect(std.mem.indexOf(u8, rename_out, "2 replacement(s)") != null);
+}
+
+test "check: it knows this project's command without being told" {
+    const dir = "/tmp/opencode/check-zig";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dir ++ "/build.zig", .data = "" });
+
+    const plan = check_tool.planAt(std.testing.io, dir);
+    try std.testing.expectEqualStrings("zig build", (plan orelse return error.NoPlan).command);
+}
+
+test "check: a project with no marker file says so instead of guessing a command" {
+    const dir = "/tmp/opencode/check-none";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dir ++ "/notes.txt", .data = "hi" });
+
+    // Guessing here would mean RUNNING something the harness invented. The honest
+    // answer is null, and the model falls back to `bash` exactly as it does today.
+    try std.testing.expect(check_tool.planAt(std.testing.io, dir) == null);
+}
+
+test "check: an unknown project produces a message, not an error" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Its own directory. It relied on another test having created this path, and
+    // test order is not a contract: run alone it was an "unknown job" error.
+    const dir = "/tmp/opencode/check-none2";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dir ++ "/notes.txt", .data = "hi" });
+
+    const args = try jsonArgs(arena, "{{\"subdir\":\"{s}\"}}", .{dir});
+    const out = try execute(std.testing.io, "check", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "no typecheck is known") != null);
+    // And it tells the model what to do instead, which is the useful half.
+    try std.testing.expect(std.mem.indexOf(u8, out, "run_in_background") != null);
+}
+
+test "check asks for permission, because it starts a compiler on the machine" {
+    // The same reason `bash` asks. `zig build` writes `.zig-cache`, runs the
+    // compiler and can execute build steps — which can do anything at all. A
+    // harness that runs a build without asking is not a harness with permissions.
+    try std.testing.expect(needsPermission("check"));
+    try std.testing.expect(!isParallelSafe("check"));
+}
+
+test "the schema of check does not require the model to know the command" {
+    // The whole value is that it does not have to. A required argument for the
+    // command would put back the round trip this tool exists to remove.
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, toolsJson(), i, "\"name\":\"check\"")) |at| {
+        const all = toolsJson();
+        const after = all[at..@min(at + 400, all.len)];
+        try std.testing.expect(std.mem.indexOf(u8, after, "\"required\"") == null);
+        i = at + 1;
+    }
+    // And it is registered, so the model can actually reach it.
+    var found = false;
+    for (defs) |d| if (std.mem.eql(u8, d.name, "check")) {
+        found = true;
+    };
+    try std.testing.expect(found);
 }

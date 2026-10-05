@@ -119,6 +119,22 @@ pub fn build(b: *std.Build) void {
     // (which is why the probe lives in `src/`, not `src/bin/`). Declaring them
     // here clashes too: a file cannot be the root of two modules in the same
     // compilation, and `providers.zig` already is the root of `agent`.
+    // The typecheck probe: it shows what the model would be told after an edit,
+    // with a real compiler's real diagnostics in it. Same placement reason as
+    // `roster_probe` — `tools/check.zig` imports files above `src/tools/`, so a
+    // module rooted in `src/bin/` cannot reach them.
+    const check_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/check_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    check_probe_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const check_probe = b.addExecutable(.{ .name = "check_probe", .root_module = check_probe_mod });
+    const check_probe_run = b.addRunArtifact(check_probe);
+    if (b.args) |args| check_probe_run.addArgs(args);
+    const check_probe_step = b.step("check-probe", "Runs the automatic typecheck against a project with a deliberate error");
+    check_probe_step.dependOn(&check_probe_run.step);
+
     const roster_mod = b.createModule(.{
         .root_source_file = b.path("src/roster_probe.zig"),
         .target = target,
