@@ -5,22 +5,22 @@ Por que esto NO puede ser un test de Zig: lo que se comprueba es si un proceso
 que el agente lanzo SIGUE VIVO en la tabla de procesos del kernel. Eso solo se
 puede ver desde fuera, en la pty real, con `zig build` ya hecho.
 
-Y por que mira al NIETO y no al shell (esto costó una vuelta):
+And why it looks at the GRANDCHILD and not at the shell (this cost a round trip):
 
 `bash` de zode es siempre `/bin/sh -c "lo que pida el modelo"`. Un shell tiene
 hijos. Si el fix fuera "matar el pid del shell", la prueba MIRANDO EL SHELL
-pasaría igual: el shell muere y el nieto (`sleep`, `zig`, `npm`) sigue
-corriendo con el CORE prendido. El síntoma que se报销ó como "ESC no para los
-procesos" es exactamente ese, un nivel más abajo.
+would pass the same way: the shell dies and the grandchild (`sleep`, `zig`,
+`npm`) keeps running with the CPU pinned. The symptom that got reported as
+"ESC does not stop the processes" is exactly that, one level lower.
 
-El marcador es `sleep 301 & wait`: shell + nieto, dos pids. Se mira `sleep 301`
-y solo ese. Con `exec` el shell se reemplaza, queda un proceso, y la prueba
-daría verde tanto con el fix como sin él — que es como se comprueba aquí, por eso
-el comentario.
+The marker is `sleep 301 & wait`: shell + grandchild, two pids. It looks for
+`sleep 301` and only that. With `exec` the shell is replaced, one process is left,
+and the test would go green with the fix and without it alike — which is what this
+looks at, so that cannot be what it checks.
 
-Como se verificó el fix: quitar el `pgid = 0` de los dos spawns (foreground y
+How the fix was verified: remove the `pgid = 0` from both spawns (foreground and
 background) hace que esto falle con el nieto vivo; volver a ponerlo lo hace
-pasar. Las dos mitades del contrato están en el mismo test.
+pass. Both halves of the contract are in the same test.
 
 Uso:
     zig build
@@ -28,7 +28,7 @@ Uso:
     python3 tools/esc_kill_pty.py
 
 `HOME` propio: la app escribe `~/.config/zode/auth.json` y `sessions/`, y un
-script automático no debe tocar la config real de quien lo ejecuta.
+automated script must not touch the real config of whoever runs it.
 """
 
 import fcntl

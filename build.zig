@@ -4,33 +4,34 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // ReleaseSmall POR DEFECTO.
     //
-    // Antes `zig build` producía un binario Debug (10.8 MB, el 79 % secciones de
-    // debug, con el `DebugAllocator` en el camino caliente). Luego se pasó a
-    // ReleaseSafe + strip, y ahora a ReleaseSmall + strip. Medido HOY sobre este
-    // árbol (nm/llvm-size sobre el binario sin strip, y tools/measure.py en pty):
+    // `zig build` used to produce a Debug binary (10.8 MB, 79 % of it debug
+    // sections, with the `DebugAllocator` on the hot path). Then it became
+    // ReleaseSafe + strip, and now ReleaseSmall + strip. Measured on THIS tree
+    // (nm/llvm-size on the unstripped binary, and tools/measure.py in a pty):
     //
     //   ReleaseSafe + strip   2.20 MB   (.text 1.82 MB · .rodata 0.51 MB)
     //   ReleaseSmall + strip  1.34 MB   (.text 0.86 MB · .rodata 0.38 MB)   <--
     //
-    // Y no cuesta velocidad, al menos en lo que se nota al arrancar: measure.py da
-    // 11 ms / 6.22 MB RSS con ReleaseSafe contra 6 ms / 5.79 MB con ReleaseSmall.
-    // La app es I/O-bound (espera red y esperas del usuario), así que el modo de
-    // optimización casi solo decide cómo de grande queda el fichero.
+    // And it costs no speed, at least in what is visible at startup: measure.py
+    // gives 11 ms / 6.22 MB RSS with ReleaseSafe against 6 ms / 5.79 MB with
+    // ReleaseSmall. The app is I/O-bound (it waits on the network and on the
+    // user), so the optimize mode mostly decides how big the file ends up.
     //
-    // EL SUELO, para no volver a medir lo que no depende de nosotros (nm sobre
-    // zode-debug, ReleaseSafe): crypto 509 KB — `std.crypto.tls.Client` manda key
-    // shares de x25519_ml_kem768/secp256r1/secp384r1/x25519 sin opción para
-    // recortarlos, y la verificación de certificados arrastra RSA, P-256, P-384,
-    // ed25519 y SHA-1 — más 185 KB de rodata de las tablas unicode de `uucode` que
-    // entra por `vaxis.gwidth`. Los dos son dependencia (std y vaxis); tocarlos es
-    // un `patch` declarado en build.zig.zon, como 5.7/5.9.
+    // THE FLOOR, so nobody measures again what does not depend on us (nm over
+    // zode-debug, ReleaseSafe): crypto 509 KB — `std.crypto.tls.Client` mandates
+    // key shares of x25519_ml_kem768/secp256r1/secp384r1/x25519 with no option to
+    // trim them, and certificate verification drags in RSA, P-256, P-384, ed25519
+    // and SHA-1 — plus 185 KB of rodata of `uucode`'s unicode tables, which comes
+    // in through `vaxis.gwidth`. Both are dependencies (std and vaxis); changing
+    // them is a `patch` declared in build.zig.zon, like 5.7/5.9.
     //
-    // Para el debug de verdad: `zig build -Doptimize=Debug`, y `-Doptimize=ReleaseSafe`
-    // si alguna vez make falta el binario rápido en vez del pequeño.
+    // For real debugging: `zig build -Doptimize=Debug`, and
+    // `-Doptimize=ReleaseSafe` if you ever need the fast binary instead of the
+    // small one.
     const optimize = b.option(
         std.builtin.OptimizeMode,
         "optimize",
-        "Modo de optimización (default: ReleaseSmall)",
+        "Optimize mode (default: ReleaseSmall)",
     ) orelse .ReleaseSmall;
     // Strip is ON by default because it takes the binary from 10.78 MB to 1.89 MB
     // (measured), and zode is I/O-bound so it costs nothing at runtime.
@@ -40,12 +41,11 @@ pub fn build(b: *std.Build) void {
     // disabled", which is exactly the moment you least want the build to be
     // mute. So `-Dstrip=false` is the documented way to get a debuggable build,
     // and `zig build -Dstrip=false` is what to run when something crashes.
-    const strip = b.option(bool, "strip", "Quita las secciones de debug (default: true)") orelse true;
-    // Los tests van en Debug a propósito (el DebugAllocator y las
-    // comprobaciones de overflow son los que cazan los bugs), pero su binario
-    // no necesita símbolos: sin esto, cada reconstrucción deja otro de 49 MB en
-    // `.zig-cache/o`.
-    const strip_tests = b.option(bool, "strip-tests", "Strip del binario de tests (default: true)") orelse true;
+    const strip = b.option(bool, "strip", "Strip the debug sections (default: true)") orelse true;
+    // The tests go in Debug on purpose (the DebugAllocator and the overflow checks
+    // are what catch bugs), but their binary needs no symbols: without this every
+    // rebuild leaves another 49 MB in `.zig-cache/o`.
+    const strip_tests = b.option(bool, "strip-tests", "Strip the test binary (default: true)") orelse true;
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("vaxis", vaxis.module("vaxis"));
 
-    // El strip va en el MÓDULO (`root_module.strip`), no en el ejecutable.
+    // The strip goes on the MODULE (`root_module.strip`), not on the executable.
     if (strip) exe_mod.strip = true;
     const exe = b.addExecutable(.{
         .name = "zode",
@@ -131,25 +131,25 @@ pub fn build(b: *std.Build) void {
     const roster_probe_step = b.step("roster-probe", "Shows the pool of free models of every provider");
     roster_probe_step.dependOn(&roster_probe_run.step);
 
-    // Tests con acceso a vaxis (markdown/highlight testean estilos).
-    // SIEMPRE en Debug: el binario ya sale ReleaseSafe+strip, pero compilar la
-    // suite en ReleaseSafe cuesta 2 min y no encuentra un fallo más (al revés:
-    // encuentra menos, porque el DebugAllocator y las comprobaciones de
-    // overflow están justo para eso).
+    // Tests that need vaxis (markdown/highlight test styles).
+    // ALWAYS in Debug: the binary already comes out ReleaseSafe+strip, but
+    // compiling the suite in ReleaseSafe takes 2 minutes and finds no MORE bug —
+    // it finds fewer, because the DebugAllocator and the overflow checks are
+    // exactly what catch them.
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_all.zig"),
         .target = target,
         .optimize = .Debug,
-        // El binario de tests en Debug pesa ~49 MB (casi todo secciones de
-        // debug de vaxis) y .zig-cache/o guarda UNO POR CADA RECONSTRUCCION: se
-        // llegaron a acumular 44, o sea 1.4 GB. Los tests no se depuran con gdb,
-        // así que los símbolos no sirven de nada: `strip` los deja en ~10 MB.
+        // The test binary in Debug weighs ~49 MB (almost all vaxis debug
+        // sections) and `.zig-cache/o` keeps ONE PER REBUILD: 44 of them
+        // accumulated once, which is 1.4 GB. The tests are not debugged with gdb,
+        // so the symbols are worth nothing: `strip` brings it to ~10 MB.
         .strip = strip_tests,
     });
     test_mod.addImport("vaxis", vaxis.module("vaxis"));
-    // `zig build test -- <filtro>` corre solo los tests cuyo nombre contiene el
-    // filtro. El runner de Zig 0.16 no trae `--test-filter`, así que el filtro
-    // se aplica al COMPILAR (no entra en los args del binario).
+    // `zig build test -- <filter>` runs only the tests whose name contains the
+    // filter. Zig 0.16's runner has no `--test-filter`, so the filter is applied
+    // AT COMPILE TIME (it does not reach the binary's args).
     const filters: []const []const u8 = if (b.args) |args| args else &.{};
     const tests = b.addTest(.{ .root_module = test_mod, .filters = filters });
     const run_tests = b.addRunArtifact(tests);

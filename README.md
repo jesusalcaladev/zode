@@ -1,7 +1,7 @@
 # zode
 
 A code agent in the terminal, written in **pure Zig** (no libc, no C
-dependencies; the only external one is libvaxis). **1.29 MB** binary, ~6 MB of
+dependencies; the only external one is libvaxis). **1.34 MB** binary, 6 MB of
 RAM, all the code in one directory.
 
 It is not a wrapper around another agent: it speaks HTTP with the provider, runs
@@ -89,7 +89,7 @@ Grab the binary and you are done. There is nothing else to install.
 You need **Zig 0.16.0**.
 
 ```bash
-zig build                    # release stripped, 1.29 MB (ReleaseSmall)
+zig build                    # release stripped, 1.34 MB (ReleaseSmall)
 zig build test               # 500+ unit tests, in Debug
 zig build -Doptimize=Debug   # with symbols, for when something crashes
 ```
