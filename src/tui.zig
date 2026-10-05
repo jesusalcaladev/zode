@@ -13,6 +13,7 @@ const plan_mod = @import("lib/plan.zig");
 const checkpoint = @import("lib/checkpoint.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
+const agent_mod = @import("agent.zig");
 const readcache = @import("lib/readcache.zig");
 const bench_mod = @import("lib/bench.zig");
 const models_mod = @import("lib/models.zig");
@@ -761,26 +762,13 @@ pub const Model = struct {
     /// same reason — and because a cached image prefix is a permanently uncacheable
     /// tail on every subsequent iteration.
     pending_images: images_mod.Pending = .{},
-    /// The automatic typecheck the harness started after a write tool touched
-    /// code (`lib/typecheck.zig`), or 0 when there is none.
+    /// The automatic typecheck the harness starts after a write tool touches code.
     ///
-    /// It is here, and not in the agent, for two reasons that both cost something
-    /// to learn. It is WRITTEN by the worker and READ by the next iteration of
-    /// the same worker, so it could be a plain field — but the tests build a
-    /// `Model` and drive `execToolCalls` directly, and a field on the agent would
-    /// be shared between them. And it LIVES ACROSS the arena that started the job:
-    /// the job's output belongs to a background thread with its own buffer, so it
-    /// cannot be a pointer into a turn's arena. A `u32` id and a re-read of the
-    /// registry is the whole contract.
-    auto_check: u32 = 0,
-    /// The command the automatic check is running, for the message the model
-    /// reads. Owned copy: the plan is a comptime string but the label that goes
-    /// with the job is composed.
-    auto_check_label: [64]u8 = @splat(0),
-    auto_check_label_len: usize = 0,
-    /// How many automatic checks have been started this turn, so a model that
-    /// edits nine files in a row does not start nine builds.
-    auto_check_turn: u32 = 0,
+    /// It is a struct and not three fields because the headless runner keeps one on
+    /// its stack (`agent.AutoCheck`), and the automatic check used to exist only here
+    /// — so `zode --chat`, the runner every pty test and measurement drives, edited
+    /// code and never compiled it. One implementation, two owners.
+    auto_check: agent_mod.AutoCheck = .{},
     /// Which files the agent has already read, and which of those are STILL in the
     /// context (see `readcache.zig`).
     ///

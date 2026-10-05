@@ -86,6 +86,8 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // Images a `read` left behind: on the wire for ONE request and then gone, the
     // same rule as the TUI.
     var pending_images: images_mod.Pending = .{};
+    // The automatic typecheck's state for a run that has no `Model` to keep it in.
+    var auto_check: agent.AutoCheck = .{};
     // The `arena`, not the `gpa`: this text lives as long as the conversation
     // does, and the arena dies at the end of the run. With `gpa` it was a leak
     // per process (the DebugAllocator says so on exit, which is how it showed up).
@@ -157,9 +159,21 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
 
     models.dbg_io = io;
 
+    // `agent.iterationLimit()` and NOT a literal 6.
+    //
+    // The TUI allows 12 and `ZODE_MAX_ITER` moves it; the headless runner had 6
+    // hardcoded, so `--chat` gave up on a real task while the same task in the same
+    // repository finished in the TUI — with no error and no explanation, just
+    // "iteration limit" at the end. Measured on a six-step task: eight tool calls
+    // and the answer never arrived.
+    //
+    // Same root cause as the headless prompt: the headless path is a second, lesser
+    // implementation of the same agent, and every place it diverges is a place
+    // where `--chat` is quietly worse than the TUI.
+    const iter_limit = agent.iterationLimit();
     var iteration: usize = 0;
     var elided_total: usize = 0;
-    while (iteration < 6) : (iteration += 1) {
+    while (iteration < iter_limit) : (iteration += 1) {
         // Context under budget: elide old tool dumps (a wire view).
         {
             const comp = compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetFor(env, agent.curModelContext()), env) catch
@@ -284,9 +298,36 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                 .content = res,
                 .tool_call_id = try arena.dupe(u8, p.id.items),
             });
+            // The AUTOMATIC typecheck, started here for the same reason the TUI
+            // starts it: an edit to code is followed by a compiler run without the
+            // model asking, because the model finds out it broke something one
+            // iteration too late otherwise. It lives in `execToolCalls` for the TUI
+            // and it used to exist ONLY there — so `--chat`, the runner every pty
+            // test and measurement drives, edited code and never compiled it.
+            auto_check.afterTool(&bg, gpa, io, p.name.items, p.args.items);
+        }
+
+        // Whatever the automatic check found, before the next request goes out. It
+        // goes in as a `user` message after the `tool` results, which is a shape
+        // every provider accepts — the alternative, a `tool_result` with no call id,
+        // is not a thing.
+        if (auto_check.autoCheckWait(&bg, arena)) |note| {
+            try msgs.append(arena, .{ .role = "user", .content = note });
+            models.dbg("[auto-check] {s}\n", .{note});
         }
     }
-    models.dbg("\n[iteration limit]\n", .{});
+    // The automatic typecheck, waited for at the END of the run.
+    //
+    // Measured: with the result only read at the start of the next iteration, a run
+    // that ended right after the edit collected nothing — the `zig build` it had
+    // started was still running — so the feature produced nothing on exactly the
+    // turns it exists for. This is the one moment blocking is free: the run is over
+    // and the answer is about to be printed.
+    if (auto_check.autoCheckWait(&bg, arena)) |note| {
+        models.dbg("\n[auto-check] {s}\n", .{note});
+    }
+
+    models.dbg("\n[iteration limit reached after {d} iterations]\n", .{iter_limit});
     return 0;
 }
 
