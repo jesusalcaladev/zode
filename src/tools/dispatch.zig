@@ -474,3 +474,100 @@ test "read: markDroppedAt undoes the cache when compaction takes the result away
     try std.testing.expect(std.mem.indexOf(u8, out, "contenido que se perdio") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "unchanged") == null);
 }
+
+test "edit: two hunks, the second inside the first's new text, and NOTHING is written" {
+    // The bug this pins: every hunk is validated against the ORIGINAL text but
+    // applied to the output of the previous one. `allocReplace` cannot fail on a
+    // missing match, it copies the text through, so hunk 2 silently did nothing
+    // and the file was written without it. The model found out three iterations
+    // later, when it compiled.
+    //
+    // Here hunk 1 rewrites `alpha` into `alpha AND beta`, and hunk 2 wants to
+    // rename `beta`. On the original text `beta` does not exist (so the
+    // validation rejects it)... so the overlap is built the other way round:
+    // hunk 1 introduces the text hunk 2 was looking for.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path = "/tmp/opencode/edit-clobber-test.txt";
+    // `marker` exists once. Hunk 1 renames it to `keep`; hunk 2 renames
+    // `marker` too, which the validation accepts (one occurrence) and which then
+    // finds nothing because hunk 1 already consumed it.
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "before marker after\n" });
+
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"path":"{s}","edits":[{{"old_string":"marker","new_string":"keep"}},{{"old_string":"marker","new_string":"other"}}]}}
+    , .{path});
+
+    const out = execute(std.testing.io, "edit", args, arena, null, null) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return err;
+    };
+
+    // It is refused, and it says WHY in words the model can act on.
+    try std.testing.expect(std.mem.indexOf(u8, out, "nothing was written") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Hunk 2 of 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "earlier hunk") != null);
+
+    // And the file on disk is exactly what it was.
+    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("before marker after\n", after);
+}
+
+test "edit: allow_multiple is honoured inside `edits`, not only on the single form" {
+    // The bug: `allow_multiple` was read only in the single-pair branch, so an
+    // array hunk that needed it was refused with "old_string appears N times"
+    // and the model had no way to tell that the flag it CAN set on the single
+    // form was being ignored on the array form.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path = "/tmp/opencode/edit-am-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "aa b aa\n" });
+
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"path":"{s}","edits":[{{"old_string":"aa","new_string":"cc","allow_multiple":true}}]}}
+    , .{path});
+    const out = try execute(std.testing.io, "edit", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2 replacement") != null);
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("cc b cc\n", after);
+}
+
+test "edit: the count in the answer is the REAL one" {
+    // `allocReplace` used to return only the bytes, so a hunk that applied zero
+    // times and one that applied exactly once both reported "1 replacement".
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path = "/tmp/opencode/edit-count-test.txt";
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "aa bb aa\n" });
+
+    // allow_multiple on `aa`: two occurrences, and the count has to say 2.
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"path":"{s}","old_string":"aa","new_string":"cc","allow_multiple":true}}
+    , .{path});
+    const out = try execute(std.testing.io, "edit", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2 replacement") != null);
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(1 << 20));
+    try std.testing.expectEqualStrings("cc bb cc\n", after);
+}
+
+test "allocReplace: a missing match reports ZERO, it does not claim it happened" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const none = try edit_tool.allocReplace(a, "hello", "zzz", "x");
+    try std.testing.expectEqual(@as(usize, 0), none.count);
+    try std.testing.expectEqualStrings("hello", none.bytes);
+
+    const some = try edit_tool.allocReplace(a, "x x x", "x", "-");
+    try std.testing.expectEqual(@as(usize, 3), some.count);
+    try std.testing.expectEqualStrings("- - -", some.bytes);
+}
