@@ -3550,14 +3550,29 @@ pub fn applyPlanPatchTo(
 /// only by committing: "here is the evidence" is a different claim from "I think it
 /// worked". A harness that guessed would either stop on unfinished work or never stop.
 pub fn applyGoalCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return;
-    if (parsed != .object) return;
+    // NOT a plain `catch return`: a call that cannot be read has to say so. Silently
+    // dropping it is the same failure as the one this function used to have — the model
+    // gets no answer, cannot tell whether the verdict landed, and the turn runs to the
+    // ceiling. The refusal is what lets it try again.
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
+        m.pushInfoFmt("goal: the arguments were not valid JSON — {s}", .{goal_err_text(error.BadArgs)});
+        return;
+    };
+    if (parsed != .object) {
+        m.pushInfoFmt("goal: the arguments were not a JSON object — {s}", .{goal_err_text(error.BadArgs)});
+        return;
+    }
     const v = goal_mod.parseVerdict(parsed.object, arena) catch |err| {
         // The model gets the SAME refusal the parser gives a human, in words, because a
         // bare `error.BadStatus` is not something it can act on. `goal` is the one tool
         // whose error text decides whether the turn can finish.
-        const line = std.fmt.allocPrint(arena, "{s}", .{goal_err_text(err)}) catch return;
-        m.pushInfoOwned(line);
+        //
+        // `pushInfoFmt` and NOT `pushInfoOwned(allocPrint(arena, …))`: `arena` here is
+        // the TURN's arena, and `pushInfoOwned` frees with the model's allocator. That
+        // is an "Invalid free" on every single refusal — which is every time the model
+        // gets the verdict wrong, the one path that most needs to work. The symptom was
+        // a test crashing with `signal ABRT` while the refusal under test was a typo.
+        m.pushInfoFmt("goal: {s}", .{goal_err_text(err)});
         return;
     };
 
@@ -3593,6 +3608,7 @@ fn goal_err_text(err: anyerror) []const u8 {
         error.MissingSummary => "goal needs a `summary`: what you finished and how you know, or why it cannot be done.",
         error.SummaryTooShort => "the `summary` is too short to be one. Say what happened and what proves it.",
         error.MissingUnblock => "`blocked` needs `what_would_unblock`: the one thing that would change the answer. Without it the harness cannot tell a real blocker from giving up.",
+        error.BadArgs => "the arguments could not be read as JSON. Send the two fields as a JSON object.",
         else => "the goal verdict was not understood; send status plus summary.",
     };
 }
@@ -4506,6 +4522,22 @@ fn execOneCall(
         // it have items" is what lets a call do both: replace the list and then
         // patch it.
         applyPlanCall(m, call.args_json, arena);
+    }
+
+    // The `goal` tool is the same shape of thing: it has no effect the harness can see
+    // in the tool's text, only in the Model.
+    //
+    // **It was missing here for one whole release cycle.** `applyGoalCall` was written,
+    // `toolGoal` was written, the schema was there, and the model called it and was told
+    // "recorded: the goal is BLOCKED" — while the harness went on to the hard ceiling
+    // and printed `the goal was never decided`. Two halves of one feature, wired
+    // individually, and nothing that could notice the seam: the tool's test checks the
+    // TEXT, `goal.test` checks the PARSING, and neither of them goes from a tool call
+    // to the Model.
+    //
+    // That is why the test below drives `execOneCall` and not the pure functions.
+    if (std.mem.eql(u8, call.name, "goal")) {
+        applyGoalCall(m, call.args_json, arena);
     }
 
     const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg, &m.reads) catch |err| {
@@ -8114,4 +8146,71 @@ test "the goal note carries the objective and the budget, and the note has a mar
 test "no goal, no note" {
     var g: goal_mod.Goal = .{};
     try std.testing.expectError(error.NoGoal, goalNote(std.testing.allocator, &g, 5, false));
+}
+
+test "a `goal` CALL reaches the Model, which the two pure tests could not see" {
+    // The bug this pins, measured: `applyGoalCall` existed, `toolGoal` existed, the
+    // schema was declared, the model called the tool and the tool answered "recorded:
+    // the goal is BLOCKED" — and the harness never applied it, ran to the hard ceiling
+    // and printed `the goal was never decided`.
+    //
+    // `goal.test` checked the PARSING and `tools.dispatch` checked the TEXT. Neither
+    // went from a tool call to the Model, so the seam between them had nothing watching
+    // it. This goes through `applyGoalCall` exactly as `execOneCall` does, which is the
+    // only level at which the bug was visible.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // No goal set: the call still has to land, because refusing it would leave the turn
+    // with no way to finish and no message about why.
+    try std.testing.expectEqual(goal_mod.Status.none, m.goal.status);
+
+    const blocked =
+        \\{"status":"blocked","summary":"the upstream service is down","what_would_unblock":"a working key"}
+    ;
+    applyGoalCall(&m, blocked, arena);
+
+    try std.testing.expectEqual(goal_mod.Status.blocked, m.goal.status);
+    try std.testing.expectEqualStrings("the upstream service is down", m.goal.say());
+    try std.testing.expectEqualStrings("a working key", m.goal.whatUnblocks());
+
+    const met =
+        \\{"status":"met","summary":"the build passes"}
+    ;
+    applyGoalCall(&m, met, arena);
+    try std.testing.expectEqual(goal_mod.Status.met, m.goal.status);
+    try std.testing.expectEqualStrings("the build passes", m.goal.say());
+}
+
+test "a malformed goal call leaves the goal OPEN and says why, and never closes it" {
+    // The dangerous direction is silent: if a bad call set the status anyway, the turn
+    // would end as "goal met" or "goal blocked" on a call the model never made.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // Four ways of being wrong, including the one that matters most: `blocked`
+    // without `what_would_unblock` must NOT be taken, because a goal that can be
+    // given up without saying what would fix it is a goal that gets given up.
+    //
+    // Multiline literals throughout: a JSON string in a plain Zig literal needs
+    // `\"` everywhere, and a heredoc that writes those doubles them into
+    // `{\\"status...`, which stops compiling three characters later with "expected
+    // ',' after initializer" — pointing at a line with nothing wrong on it.
+    for ([_][]const u8{
+        "{\"status\":\"finishd\",\"summary\":\"typo\"}",
+        "{\"summary\":\"no status\"}",
+        "{\"status\":\"blocked\",\"summary\":\"no unblocker\"}",
+        "not json at all",
+    }) |bad| {
+        applyGoalCall(&m, bad, arena);
+        try std.testing.expectEqual(goal_mod.Status.none, m.goal.status);
+    }
 }

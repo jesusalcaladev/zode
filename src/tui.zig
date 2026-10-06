@@ -9029,3 +9029,78 @@ test "selfRssKb reads the process's own RSS, or says 0" {
         try std.testing.expect(kb >= 4);
     }
 }
+
+test "a long streaming paragraph does not exhaust the frame arena" {
+    // The crash this pins: vaxis writes each grapheme into the frame arena, and the
+    // live paragraph used to copy the WHOLE `stream_buf` into it and parse the whole
+    // of it on EVERY frame. A 533-line code block — which is what a real task produces —
+    // exhausted the ~1.36 MB frame arena and the process died with
+    // `warning(vaxis): couldn't write grapheme: OutOfMemory`, mid-task, with the work
+    // done and no verdict ever declared.
+    //
+    // Measured 2026-10-05 with `space-bunny-free` on a real task: 43 iterations of
+    // goal work, a working implementation, and a dead process at the moment the output
+    // got big. The tests could not see it because they only ever streamed short text.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // What a `write` of a 533-line file looks like as a live stream, plus the syntax
+    // highlighting that makes every token its own allocation.
+    m.streaming = true;
+    var i: usize = 0;
+    while (i < 900) : (i += 1) {
+        m.streamDelta("    if x_ == 42 { return \"y\"; } else { print z_ + 1; }\n");
+    }
+
+    // 100 frames: the live paragraph is re-parsed on every one, so one frame surviving
+    // by luck is not enough.
+    var frame: usize = 0;
+    while (frame < 100) : (frame += 1) {
+        _ = arena_state.reset(.retain_capacity);
+        const s = try drawTest(&m, arena, 200, 50);
+        _ = s;
+    }
+    // The assertion is that we got here: before the fix this frame returned
+    // `error.OutOfMemory` and the test failed on the draw, not on a comparison.
+    try std.testing.expect(m.stream_buf.items.len > 0);
+}
+
+test "a big diff paragraph plus scrolling does not walk the frame arena away" {
+    // The other path that can exhaust the frame arena, and the one the September freeze
+    // was about: `layoutFor` converges by re-parsing paragraphs until their heights stop
+    // moving, and every pass allocates in the FRAME arena. A paragraph whose real height
+    // keeps disagreeing with its estimate makes that loop run its budget — and the
+    // budget was added so it fails a test instead of hanging the app, which means the
+    // frame is still FULL when it gives up.
+    //
+    // This is what a real task produces: one `write` of a 500-line file is ONE diff
+    // paragraph of ~2000 lines, and then the user scrolls through it while the next
+    // iteration streams.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const before = "line\n" ** 900;
+    const after = "changed line\n" ** 900;
+    _ = m.pushDiff(before, after);
+    // Drain it into the history the way the draw does.
+    m.drainPending();
+
+    // Scroll the whole thing, which is what forces `layoutWindow` to keep correcting
+    // heights for paragraphs whose estimate is a placeholder.
+    var step: usize = 0;
+    while (step < 300) : (step += 7) {
+        m.scrollBy(@intCast(step % 40 + 1));
+        _ = arena_state.reset(.retain_capacity);
+        const s = try drawTest(&m, arena, 200, 50);
+        _ = s;
+    }
+    try std.testing.expect(m.paras.items.len > 0);
+}
