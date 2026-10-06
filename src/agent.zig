@@ -2225,6 +2225,24 @@ pub fn goalHardLimit() usize {
 /// because `runToolCall` is only reached with a non-empty name.
 pub const repeat_limit: u8 = 3;
 
+/// Whether the repetition guard is blind to this tool.
+///
+/// ## The criterion, and why it is not a list of conveniences
+///
+/// A guard on "the same call twice" can only be honest about calls that are trying to
+/// DO something. These two are trying to SEE something, and neither has an argument
+/// that could distinguish it from itself: the variable is time, and time is not in the
+/// arguments. That is the whole test — not "is this tool important", which would let
+/// every future tool argue itself an exemption.
+///
+/// `read` is exempt because re-reading what you just edited is correct. `bash_output`
+/// because the `bash` schema instructs the model to poll with it, so a poll is the
+/// harness recommending a repeat — measured stopping a real turn on the third one, with
+/// a test suite still running.
+pub fn isRepeatExempt(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "bash_output");
+}
+
 pub const Repeats = struct {
     last: u64 = 0,
     run: u8 = 0,
@@ -2254,6 +2272,19 @@ pub const Repeats = struct {
         }
         if (self.run >= repeat_limit) return self.tool[0..self.tool_len];
         return null;
+    }
+
+    /// The guard as the loop applies it.
+    ///
+    /// The exemption lives HERE and not at the call site on purpose. It was at the call
+    /// site first (`if (!std.mem.eql(u8, c.name, "read"))`), and the consequence was that
+    /// the only tests for it had to be the ones that went through the whole tool
+    /// executor, while `note` — the thing with the counter in it — could not be asked
+    /// "what happens when you poll?" directly. A rule that lives in one place is a rule
+    /// the tests can call.
+    pub fn noteGuarded(self: *Repeats, name: []const u8, args_json: []const u8) ?[]const u8 {
+        if (isRepeatExempt(name)) return null;
+        return self.note(name, args_json);
     }
 
     pub fn reset(self: *Repeats) void {
@@ -4872,14 +4903,14 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         // seen with its arguments. The loop checks the flag; it cannot count, because it
         // never sees a call.
         //
-        // `read` is exempt and not as a nicety: re-reading a file you just edited is
-        // the correct thing to do, and stopping on it would punish the one habit that
-        // makes an agent correct.
-        if (!std.mem.eql(u8, c.name, "read")) {
-            if (m.repeats.note(c.name, c.args_json)) |which| {
-                if (m.loop_repeated == null) {
-                    m.loop_repeated = which;
-                }
+        // A call whose whole purpose is to LOOK AT SOMETHING AGAIN is exempt, and the
+        // criterion is that it has no argument that could distinguish it from itself:
+        // the only variable is time, and time is not in the arguments. See
+        // `isRepeatExempt` and `Repeats.noteGuarded`, which is where the rule lives so
+        // that this call and its tests cannot disagree.
+        if (m.repeats.noteGuarded(c.name, c.args_json)) |which| {
+            if (m.loop_repeated == null) {
+                m.loop_repeated = which;
             }
         }
     }
@@ -8213,4 +8244,81 @@ test "a malformed goal call leaves the goal OPEN and says why, and never closes 
         applyGoalCall(&m, bad, arena);
         try std.testing.expectEqual(goal_mod.Status.none, m.goal.status);
     }
+}
+
+test "polling a background job is not a loop, and the guard stays blind to it" {
+    // The false positive this pins, measured on a real task: the model started a test
+    // suite with `run_in_background`, then called `bash_output` three times — which the
+    // `bash` schema tells it to do — and the guard ended the turn with "tell me what
+    // to try instead", while the suite was still running and the model was waiting
+    // correctly.
+    //
+    // Twenty polls here, not three: a suite that takes a minute gets polled a lot, and
+    // the ceiling is what bounds that, not a guard that cannot tell waiting from
+    // spinning.
+    var r: Repeats = .{};
+    var i: u8 = 0;
+    while (i < 20) : (i += 1) {
+        try std.testing.expect(isRepeatExempt("bash_output"));
+        try std.testing.expect(r.noteGuarded("bash_output", "{}") == null);
+    }
+    // Interleaved with real work, which is what a turn actually looks like: the run
+    // counter has to reset, not accumulate across the poll.
+    _ = r.noteGuarded("read", "{}");
+    _ = r.noteGuarded("bash_output", "{}");
+    try std.testing.expect(r.noteGuarded("bash_output", "{}") == null);
+
+    // And the counter underneath still works: the exemption is a filter on top, not a
+    // disabled guard. Twenty polls counted and then one `bash` has to be a first call.
+    var counted: Repeats = .{};
+    i = 0;
+    while (i < 20) : (i += 1) _ = counted.note("bash_output", "{}");
+    try std.testing.expect(counted.note("bash",
+        \\{"command":"zig build"}
+    ) == null);
+}
+
+test "the guard still fires on the loops it was built for" {
+    // The exemption is for looking, not for doing. Without this half the fix would read
+    // as "the repetition guard is off".
+    const CMD_BUILD =
+        \\{"command":"zig build"}
+    ;
+    const CMD_TEST =
+        \\{"command":"zig test"}
+    ;
+    const CMD_CARGO =
+        \\{"command":"cargo check"}
+    ;
+
+    var r: Repeats = .{};
+    try std.testing.expect(r.noteGuarded("bash", CMD_BUILD) == null);
+    try std.testing.expect(r.noteGuarded("bash", CMD_BUILD) == null);
+    try std.testing.expectEqualStrings("bash", r.noteGuarded("bash", CMD_BUILD).?);
+
+    // A different command is not a repeat: three DIFFERENT builds is a model working.
+    var r2: Repeats = .{};
+    try std.testing.expect(r2.noteGuarded("bash", CMD_BUILD) == null);
+    try std.testing.expect(r2.noteGuarded("bash", CMD_TEST) == null);
+    try std.testing.expect(r2.noteGuarded("bash", CMD_CARGO) == null);
+}
+
+test "no tool that WRITES can be exempt from the repetition guard" {
+    // A guard with a hole in it is not a guard: if a write tool ever ended up on the
+    // exemption list, an agent could loop on it forever and the ceiling would be the
+    // only thing left. The exemption and the write list have to be disjoint, the same
+    // shape as the parallel-safety test.
+    for (tools_mod.defs) |d| {
+        if (isRepeatExempt(d.name)) {
+            try std.testing.expect(!isWriteTool(d.name));
+        }
+    }
+    // And the two exemptions are the observation tools, named: a third one arriving is a
+    // decision that has to be argued here, not appended quietly.
+    try std.testing.expect(isRepeatExempt("read"));
+    try std.testing.expect(isRepeatExempt("bash_output"));
+    try std.testing.expect(!isRepeatExempt("bash"));
+    try std.testing.expect(!isRepeatExempt("edit"));
+    try std.testing.expect(!isRepeatExempt("write"));
+    try std.testing.expect(!isRepeatExempt("goal"));
 }
