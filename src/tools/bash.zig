@@ -27,7 +27,7 @@ pub fn toolBash(
     if (bg_tool.autoBackgroundRule(obj, command)) |rule| {
         {
             const r = reg orelse return error.NoBackgroundRegistry;
-            const id = try bgproc.spawn(r, arena, io, command);
+            const id = try bgproc.spawn(r, io, command);
             return std.fmt.allocPrint(arena,
                 \\started in the background as job {d}, because `{s}` is a slow verification
                 \\
@@ -43,7 +43,7 @@ pub fn toolBash(
 
     if (common.getBool(obj, "run_in_background")) {
         const r = reg orelse return error.NoBackgroundRegistry;
-        const id = try bgproc.spawn(r, arena, io, command);
+        const id = try bgproc.spawn(r, io, command);
         return std.fmt.allocPrint(arena,
             \\started in the background as job {d}
             \\

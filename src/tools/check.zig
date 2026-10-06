@@ -148,6 +148,7 @@ pub fn toolCheck(
     reg: ?*bgproc.Registry,
     gpa: std.mem.Allocator,
 ) ![]const u8 {
+    _ = &gpa; // the registry owns its allocator now; kept for the dispatcher's shape
     // With an id, this is the second half: read what the job printed.
     if (common.getInt(obj, "id")) |id_i| {
         if (id_i <= 0) return error.MissingId;
@@ -168,7 +169,7 @@ pub fn toolCheck(
 
     const r = reg orelse return error.NoBackgroundRegistry;
 
-    const id = bgproc.spawn(r, gpa, io, plan.command) catch |err| switch (err) {
+    const id = bgproc.spawn(r, io, plan.command) catch |err| switch (err) {
         error.TooManyJobs => return std.fmt.allocPrint(
             arena,
             "there are already {d} background jobs. Wait for one with bash_output before starting a check.",

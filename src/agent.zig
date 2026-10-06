@@ -5253,7 +5253,7 @@ pub const AutoCheck = struct {
         if (self.job != 0 and std.mem.eql(u8, bgproc.stateWord(reg, self.job), "running")) return;
 
         const plan = check_tool.planAt(io, ".") orelse return;
-        const id = bgproc.spawn(reg, gpa, io, plan.command) catch return;
+        const id = bgproc.spawn(reg, io, plan.command) catch return;
         self.job = id;
         self.started_this_turn += 1;
         const l = @min(plan.label.len, self.label.len);

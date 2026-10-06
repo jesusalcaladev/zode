@@ -155,8 +155,49 @@ pub const Job = struct {
 
 slots: [max_jobs]Job = @splat(.{}),
 next_id: u32 = 1,
+/// The allocator every job's memory comes from and goes back to.
+///
+/// ## Why the registry owns it, and not the caller
+///
+/// It used to be a `spawn` parameter, and in every real call site the argument was the
+/// TURN's arena. The reader thread is detached and it outlives the turn: it lives until
+/// the child's pipes reach EOF, which for a test suite or a build is often seconds after
+/// the turn that started it has ended and its arena has been deinited. The thread then
+/// called `gpa.free` on a destroyed arena, and the allocator's own `free` memsets the
+/// block it is releasing — memory the kernel had already given back. That is a write to
+/// unmapped memory, and it killed the process.
+///
+/// Found with a symbolized core, after four wrong theories (memory exhaustion, a garbage
+/// grapheme length, the segment cache, the body buffer). The trace is three frames and
+/// names all of them:
+///
+///     std/mem/Allocator.zig:448  free          @memset(bytes, undefined)
+///     std/Io/File/MultiReader.zig:105  deinit   gpa.free(context.fr.interface.buffer)
+///     src/bgproc.zig:586          reader       defer mr.deinit()
+///
+/// The property belongs in the TYPE rather than in a comment on the call site, which is
+/// the same rule the rest of this repo keeps relearning: a caller cannot be trusted with
+/// a lifetime decision it has no way to check, and a `spawn(reg, arena, …)` signature
+/// invites exactly this every time a tool is written.
+/// Defaults to `page_allocator` and NOT to `undefined`, on purpose.
+///
+/// The first version of this field was `= undefined`, on the reasoning that every real
+/// construction goes through `init`. Two of this file's own tests then built a
+/// `Registry{}` literal, the detached reader thread freed a block through an
+/// uninitialized allocator, and the test binary died with a general protection fault —
+/// which is the very crash this field was added to prevent, reproduced by the fix.
+///
+/// An allocator that is merely WRONG fails loudly and frees nothing; an allocator that
+/// is `undefined` frees through a garbage vtable. So the default is the one that cannot
+/// fail a leak check and cannot fault, and `init` is how you get a real one.
+gpa: std.mem.Allocator = std.heap.page_allocator,
+
 /// Set by ESC. Consumed by `spawn`.
 cancel_all: bool = false,
+
+pub fn init(gpa: std.mem.Allocator) Registry {
+    return .{ .gpa = gpa };
+}
 
 /// The raw id of a running job (for the UI: "which command is that?").
 pub fn commandOf(self: *Registry, id: u32) ?[]const u8 {
@@ -491,10 +532,10 @@ pub fn deinit(reg: *Registry, io: ?std.Io, gpa: std.mem.Allocator) void {
 /// published to the registry before the reader can store the exit status into it.
 pub fn spawn(
     reg: *Registry,
-    gpa: std.mem.Allocator,
     io: std.Io,
     command: []const u8,
 ) !u32 {
+    const gpa = reg.gpa;
     // ESC pressed: refuse to start something the user just asked to stop.
     if (reg.cancel_all) return error.Cancelled;
 
@@ -828,7 +869,7 @@ test "cancel_all: ESC stops the next one from starting" {
     reg.cancel_all = true;
     // Without `io` the spawn cannot even be attempted, and still the refusal has
     // to be ESC's and not a crash: it is the first condition checked.
-    try std.testing.expectError(error.Cancelled, bgproc.spawn(&reg, std.testing.allocator, undefined, "ls"));
+    try std.testing.expectError(error.Cancelled, bgproc.spawn(&reg, undefined, "ls"));
 }
 
 test "reap does not touch a live job" {
@@ -971,7 +1012,7 @@ test "a job's output is NOT duplicated: the reader consumes what it appended" {
 
     // One line per write, and several writes, so a per-fill append shows up.
     const cmd = "i=0; while [ $i -lt 5 ]; do echo \"line$i\"; i=$((i+1)); done";
-    const id = try spawn(&reg, gpa, std.testing.io, cmd);
+    const id = try spawn(&reg, std.testing.io, cmd);
 
     var waited: u32 = 0;
     while (waited < 5000) : (waited += 20) {
@@ -1001,7 +1042,7 @@ test "readNoHeader: the command line is not part of the output a parser sees" {
     defer reg.deinit(undefined, gpa);
 
     const cmd = "echo 'src/a.zig:1:1: error: real' >&2";
-    const id = try spawn(&reg, gpa, std.testing.io, cmd);
+    const id = try spawn(&reg, std.testing.io, cmd);
     var waited: u32 = 0;
     while (waited < 5000) : (waited += 20) {
         sleep.nap(20);
@@ -1015,7 +1056,7 @@ test "readNoHeader: the command line is not part of the output a parser sees" {
     try std.testing.expect(std.mem.indexOf(u8, a, "echo 'src/a.zig:1:1: error") != null);
 
     // A second job, because the first one's cursor has already been consumed.
-    const id2 = try spawn(&reg, gpa, std.testing.io, cmd);
+    const id2 = try spawn(&reg, std.testing.io, cmd);
     waited = 0;
     while (waited < 5000) : (waited += 20) {
         sleep.nap(20);
@@ -1037,4 +1078,70 @@ fn countOf(hay: []const u8, needle: []const u8) usize {
         from = at + needle.len;
     }
     return n;
+}
+
+test "a background job outlives the ARENA it was started from" {
+    // THE crash this pins, found with a symbolized core after four wrong theories. The
+    // reader thread is detached and lives until the child's pipes hit EOF, which for a
+    // test suite is seconds after the turn that started it ended and its arena was
+    // deinited. With `spawn(reg, arena, …)` the thread then called `gpa.free` on a
+    // destroyed arena, and the allocator's free memsets the block it is releasing —
+    // memory the kernel already took back. Write to unmapped memory, SIGSEGV, process
+    // gone, mid-task, with the work done.
+    //
+    //     std/mem/Allocator.zig:448          free         @memset(bytes, undefined)
+    //     std/Io/File/MultiReader.zig:105   deinit      gpa.free(…interface.buffer)
+    //     src/bgproc.zig:586                 reader      defer mr.deinit()
+    //
+    // The test is the shape of the bug, not a shape that could pass by luck: a job is
+    // started from inside an arena scope, the scope is CLOSED, and only then is the
+    // output read. Before the fix this is a use-after-free that `std.testing.allocator`
+    // reports as a leak or a crash inside the reader thread; there is no window in which
+    // it reliably passes.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The registry's allocator is the caller's — the model's, in the product — and the
+    // test's here. That is the whole point: it is NOT the arena below.
+    // `page_allocator`, not the testing one: the reader thread allocates and frees
+    // through the registry's allocator WHILE this thread is running, and
+    // `std.testing.allocator` is neither thread-safe nor willing to be checked for
+    // leaks while that is happening. Two existing tests in this file already work this
+    // way and say why.
+    var reg: Registry = .init(std.heap.page_allocator);
+    defer reg.deinit(io, std.heap.page_allocator);
+
+    var id: u32 = 0;
+    {
+        // A per-turn arena, exactly like `runOneTurn`'s, destroyed at the end of scope.
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const turn_arena = arena_state.allocator();
+
+        // The command and its result text are allocated from the TURN, like every tool's
+        // arguments and messages are. They are copied into the slot, so they survive.
+        id = try spawn(&reg, io, try turn_arena.dupe(u8, "sleep 0.2; echo outlived-the-arena"));
+    }
+    // ── the arena is gone. The reader thread is still running. ──
+
+    var waited_ms: u32 = 0;
+    while (waited_ms < 5000) : (waited_ms += 50) {
+        if (!std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+        sleep.nap(50);
+    }
+    try std.testing.expect(!std.mem.eql(u8, stateWord(&reg, id), "running"));
+
+    var out: Output = .{};
+    const text = try readNoHeader(&reg, &out, id);
+    try std.testing.expect(std.mem.indexOf(u8, text, "outlived-the-arena") != null);
+}
+
+test "the registry's allocator is the one jobs use, not the caller's" {
+    // The property, stated as a test because it is the whole fix: `spawn` has no
+    // allocator parameter to get wrong, and the registry holds the only one a job ever
+    // sees. A tool written tomorrow cannot pass a turn arena here, because there is no
+    // argument to pass it in.
+    const reg: Registry = .init(std.testing.allocator);
+    try std.testing.expect(reg.gpa.ptr == std.testing.allocator.ptr);
 }

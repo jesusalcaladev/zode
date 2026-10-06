@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
         "echo '        unused_variable' >&2; " ++
         "echo 'src/broken.zig:4:5: error: call to undeclared function' >&2; " ++
         "sleep 1; exit 1";
-    const id = try bgproc.spawn(&reg, init.gpa, init.io, cmd);
+    const id = try bgproc.spawn(&reg, init.io, cmd);
     try w.print("JOB {d}\n", .{id});
 
     var waited: u32 = 0;

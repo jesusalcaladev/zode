@@ -1098,6 +1098,11 @@ pub const Model = struct {
     pub fn init(allocator: std.mem.Allocator) Model {
         var m = Model{
             .allocator = allocator,
+            // The job registry gets the MODEL's allocator, never a turn's: a background
+            // job's reader thread is detached and outlives the turn that started it, so a
+            // turn-scoped allocator there is a use-after-free waiting for a slow build.
+            // See `bgproc.Registry.gpa`.
+            .bg = bgproc.Registry.init(allocator),
             .pal = palette.Palette.init(allocator),
             .pal_inited = true,
             .ed = ed.Editor.init(allocator),
