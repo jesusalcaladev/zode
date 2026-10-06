@@ -3012,3 +3012,102 @@ Y el test del lookalike asegura `!= .slow_verify` y no un tipo concreto, porque
 `check` una vez más y reportar. Necesita la salida del auto-check metida en el resumen
 del turno, y vale más que las tablas de arriba sólo si algún modelo declara terminado
 sin estarlo. No se ha observado, así que no está construido.
+
+## The harness was telling the model to stop (2026-10-06)
+
+Five real task runs. The same model that codes well inside another harness finished
+**none** of them. The harness had the evidence the whole time and never asked with it.
+
+**The control was held and nobody noticed.** The model is the same one that finishes
+tasks in opencode. The variable that was actually free is this orchestration, and
+three turns of blaming the model were three turns of not reading the loop.
+
+### 1. The checkpoint said STOP
+
+At iteration 12, with the work half done, the prompt said:
+
+    STOP AND REPORT. You have used the iteration budget for this turn.
+    Do not start new work.
+
+A model that obeys writes a summary instead of finishing. A model that does not obey
+burns the next 48 iterations ignoring an instruction. **Neither finishes the task**,
+and which one happens is not the harness's decision to make with someone's work.
+
+Its escape hatch was "say so in your answer and the harness will give you more
+iterations" — **prose the harness cannot read**. The only machine-readable ending is
+the `goal` call, so the prompt was offering a door made of a material nothing here
+handles.
+
+Now it says keep going, and it says what to keep going ON: the plan's own open steps,
+which the harness counts and the model does not have to report. "Keep going" alone is
+a mood; "keep going on these two steps" is a task.
+
+### 2. A red check could not stop the turn
+
+The harness read the build's exit code and built the model's OWN error message out of
+the diagnostics (`[zig build found 3 problem(s) …] Fix these before writing more`) — and
+then let the turn end anyway. Five times out of five, on a task that was about code
+compiling.
+
+`AutoCheck.last_verdict` remembers what the last verification said, and `turnMayEnd`
+refuses the ending when it was red and the goal is open. Not "usually", and not
+"unless the budget is over": the ceiling's job is to say UNFINISHED, not to allow
+broken code. `blocked` always remains, which is what keeps this from being a dead end.
+
+**Asking the model whether it is finished is what does not work.** A turn that has
+ended in prose is a turn where nobody is grading anything, and the one moment a
+self-assessment would be worth something is the one moment there is nobody left to
+give it. The harness has the evidence; the loop just has to ask with it.
+
+### 3. "say `continue` to go on" at the ceiling
+
+The exact sentence `/goal` was built to delete, still shipping. It now leads with
+UNFINISHED and names what is unresolved.
+
+And the goal note no longer repeats "Budget: 58 iterations left of 60" on every one of
+up to 60 iterations. **A number that has not changed in any way the model can act on is
+not information; it is a deadline the model learns to hurry for**, which is the
+opposite of finishing careful work. The number appears in the last few iterations,
+where it is actionable.
+
+## A test that asserts the OPPOSITE of the fix
+
+The test for the goal note asserted `"18"` was present ("you have 18 left is what makes
+a model finish"). It had to be **rewritten**, not extended, and the rewrite is the
+record: it now asserts the countdown is **absent** in the steady state and present only
+near the ceiling.
+
+A test that pins behaviour you have just decided is wrong has to be deleted on purpose,
+in the open, with the reason. Otherwise the next person reads a green suite as
+endorsement of the thing that was measured to be wrong.
+
+## `tmux` `default-shell` is `/bin/fish`, and `$?` is a COMPILE error there
+
+Two reproduction runs "showed" a dead session, a missing exit code and no stderr. The
+conclusion drawn from them was close to catastrophic and **completely wrong**: that
+zode exits instantly. zode was never launched.
+
+    fish: $? is not the exit status. In fish, use $status.
+
+It is a **parse** error, so the whole command line never runs: rc 127, no files
+created, no app. And the harness reported it as a finding, because a missing file and
+a dead session look exactly like a crash.
+
+- The inner command goes in a **file** that tmux runs with `sh`, not a variable expanded
+  inside nested double quotes. A file has no quoting to get wrong and no shell to
+  disagree about.
+- `sh -n -c "$CMD"` before believing anything about a command line: it is the difference
+  between "zode died" and "fish refused to parse it".
+- **A harness that reports "no evidence" must distinguish it from "no observation".**
+  A missing `exit.txt` is not a zero exit; it is a file that was never created, and the
+  two look identical from the outside.
+
+## The measurement that was wrong twice
+
+`echo "EXIT=$?"` inside a double-quoted `tmux new-session` argument is expanded by the
+OUTER shell when the argument is BUILT. The `exit.txt` it wrote held the status of
+whatever ran before `tmux new-session`. It said `EXIT=1`, was quoted back as fact, and
+was defended twice — on a process whose exit code had never been observed.
+
+`git push` has a variant of the same shape in this repo's history: "Everything
+up-to-date" with three unpushed commits, fixed by `git push origin HEAD:main`.
