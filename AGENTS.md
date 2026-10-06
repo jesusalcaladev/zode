@@ -2817,3 +2817,198 @@ con un id de modelo. Ahora busca en una copia con el gutter y los espacios ELIMI
 `tools.web.test.web_search for real` falla de vez en cuando contra DuckDuckGo. Es un test
 de RED, no tiene que ver con nada de esto, y pasa al re-ejecutarlo. Está porque el
 endpoint es un scrape.
+
+---
+
+# Que el harness termine tareas (2026-10-05, segunda tanda)
+
+La pregunta era «dejando aparte los modelos, ¿el harness está bien hecho?». La
+respuesta honesta fue: la maquinaria sí, y el hueco **no está en las piezas, está en la
+condición de salida del bucle**. Lo que sigue es lo que se hizo con eso.
+
+## `/goal`: el turno no puede quedarse corto
+
+El fallo que se complains: a las 12 iteraciones el turno para con «agent iteration limit
+reached (12): stopping the turn», el plan tiene pasos abiertos, y escribes «continue».
+Esa frase no dice si la tarea está terminada.
+
+    /goal <objetivo>      lo fija para lo que escribas después
+    /goal                 lo reporta y su estado
+    /goal clear           lo quita
+    ZODE_GOAL_MAX          el techo duro (por defecto max(3x el blando, 60))
+
+**Dos números en vez de uno.** El blando (12) pasa a ser un objetivo REPORTADO — contra
+el que se mide `/bench` — y un objetivo se gana un techo duro y generoso (60). El caso
+que llega a 60 nunca iba a terminarse parando en 12; debería haber dicho `blocked` mucho
+antes. `ZODE_GOAL_MAX` nunca puede quedar por debajo del blando: un techo duro bajo el
+objetivo pararía el turno antes del checkpoint.
+
+**Decide el modelo, no el harness.** El harness sabe cuántas iteraciones lleva; no sabe
+si el paquete pesa menos de 10 KB. Un harness que lo adivinara pararía en trabajo
+inacabado o no pararía nunca. El veredicto es una HERRAMIENTA con dos respuestas:
+
+- `met` + `summary` — termina el turno.
+- `blocked` + `summary` + **`what_would_unblock`** — termina el turno, con calma.
+
+`what_would_unblock` es OBLIGATORIO. Sin él, `blocked` es indistinguible de «no me
+apetece» y el harness aceptaría rendirse como un hecho. Ese campo es toda la seguridad
+del invento: un bucle sin techo que además puede PARAR es un bucle que puedes dejar
+corriendo, y sólo significa algo si la parada está justificada.
+
+Un `status` desconocido es ERROR, no un valor por defecto: `met` acabaría el bucle por
+una errata y `none` haría que una llamada malformada pareciera que el modelo sigue
+trabajando.
+
+**El checkpoint.** En el límite blando el harness para al modelo y pide veredicto, en
+su propio vocabulario y con las dos formas escritas, porque «sigo o paro» invita a una
+tercera opción que no está en la lista. Si no declara, el harness dice «no verdict yet:
+continuing» y sigue hasta el techo duro. El presupuesto entra en el prompt como
+NÚMEROS («18 left»): es la palanca más barata del invento, porque a un modelo con
+presupuesto de sobra lo pulimenta y a uno con dos iteraciones lo termina.
+
+En el techo duro el mensaje dice qué queda abierto («N plan steps still open»), porque
+«stopping the turn» es la frase que empezó todo esto.
+
+**Por qué la nota es su propio mensaje de sistema.** `buildSystemPrompt` compone el
+prefijo estable más grande y el caché se indexa por sus bytes literales: meter ahí un
+objetivo que cambia DENTRO de un turno invalidaría los ~16 KB de esquemas de
+herramientas en cada iteración. Va al FINAL, marcado, y `Session.setGoalNote` lo
+encuentra para sustituirlo.
+
+## El detector de repetición
+
+La misma herramienta con los mismos argumentos tres veces seguidas para el turno, y dice
+**qué** se repitió. Se comprueba en el bucle y se alimenta desde `execToolCalls`,
+porque el bucle nunca ve una llamada. `read` está EXENTO: releer un fichero que acabas
+de editar es el hábito correcto, y parar ahí castigaría justo lo que hace bien a un
+agente. Un hash y no los argumentos: comparar bytes significa poseerlos durante el
+turno, y una colisión cuesta una parada temprana en un turno que no iba a ninguna parte.
+
+## El desperdicio que sí se puede medir
+
+`edit` fallaba diciendo «not found in X» más 80 bytes, y la única salida del modelo era
+`read` el fichero otra vez: **una iteración entera** gastada en que le dijeran lo que
+la herramienta podía decirle. Y un edit fallido es el fallo recuperable más común en un
+agente de código, así que esto probablemente pagaba una parte grande de las 12.
+
+`lib/edit_hint.zig` es puro y se testea solo. Busca la línea más cercana por Jaccard
+sobre tokens separados por ESPACIOS y escribe una frase DISTINTA para cada uno de los
+tres fallos reales, porque una frase que vale para los tres no le deja elegir nada:
+
+- texto correcto, ESPACIOS distintos → «here is the real line»
+- texto correcto, LUGAR distinto → «the surroundings are what did not match»
+- texto que NUNCA EXISTIÓ → dilo claro, porque re-leer no lo va a producir
+
+Tres cosas que sólo funcionan por accidente si no se escriben:
+
+- **Tokens por espacio, no palabras ni caracteres.** El tokenizador con puntuación era
+  la primera versión y es incorrecto para código: `+=`, `=>` y `!=` están hechos
+  ENTEROS de separadores, así que un parche cuyos tokens son `x += 1;` volvía sin
+  tokens y toda puntuación era cero. En código, los operadores son palabras.
+- **La prueba verbatim/espacios compara la línea TAL COMO SE ENVIÓ**, sangría
+  incluida. Una línea con sangría de tabulador CONTIENE la versión recortada de un
+  parche que la sangró con cuatro espacios, así que «¿está el texto recortado en el
+  fichero?» dice que sí para los dos fallos y no los separa. Comparar recortes es
+  cierto para toda línea y no prueba nada.
+- **El umbral es 0,50 y es una negativa, no un ajuste**: enseñar una región que no tiene
+  nada que ver cuesta otro edit fallido y otra iteración.
+
+`old_string not found in` sigue siendo el principio de todas las ramas: es el
+vocabulario del esquema y otro test lo fija. Lo que cambió es la frase de después.
+
+## La caché de modelos (1144 ms → 118 ms)
+
+Medido con `capture-pane` de tmux, que lee una pantalla de verdad:
+
+    frío, sin caché:   1144 ms   y   1756 ms   (dos corridas, varianza de red)
+    caliente:           118 ms
+    --models:            594 ms  →  18 / 22 / 28 ms
+
+Un script de pty que concatena el stream **reporta el picker VACÍO con 464 modelos
+cargados**, porque vaxis repinta diferencialmente y una celda que no cambió no se
+reemite. AGENTS.md ya lo decía y me coûtó una hora creyendo la captura de pantalla.
+
+No es por el parseo: `curl` sola tardaba 415-858 ms y zode 475-673 ms, o sea ~90% es la
+ida y vuelta de 772 KB. Es **resiliencia**: un pty que no contesta, un SSH, un mal
+minuto en OpenRouter convierten 772 KB en segundos, y un picker muerto cuatro segundos
+parece una app rota.
+
+**Normalizada, no cruda** — y es una decisión: guardar el cuerpo crudo ahorra los ~60 ms
+de parseo pero los paga en cada lectura, que es el camino que tiene que sentirse
+instantáneo. La lista parseada se lee en ~5 ms y el único riesgo es un cambio de
+esquema, que el `version` convierte en un fallo de caché. La versión es un entero
+escrito a mano y no un hash de la estructura: un hash se mueve cuando se mueve un
+COMENTARIO.
+
+Clave por PROVEEDOR, guardando la URL: una URL que no coincide es un fallo. Un
+proveedor cuyo `models_url` cambió tiene otro catálogo, y enseñar el viejo manda al
+usuario a elegir un modelo que no está.
+
+**El diff suele estar VACÍO.** `describe()` devuelve cadena vacía cuando nada se movió y
+el llamante no reordena: una línea en cada refresco enseña a ignorarla, y reordenar una
+lista bajo el cursor es peor que no reordenarla.
+
+### El SIGSEGV que hay que escribir
+
+La primera versión hacía `gpa.dupe(Model, cached.models)`. `Model` es
+`id: []const u8, owned_by: []const u8` — un struct de SLICES al arena de la caché, así
+que una copia de struct es una lista de punteros a memoria que muere en la llave de
+cierre.
+
+Invisible en `--models`, que usa la lista antes de que muera el arena, y un SIGSEGV
+crudo en el TUI (status 139, sin mensaje de panic, stderr vacío) porque guarda la copia
+un frame. `copyOut` es copia PROFUNDA y su nombre lo dice. La regla: **la propiedad tiene
+que estar en la firma, no en un comentario.** El test que lo prueba destruye el arena a
+propósito y luego lee la copia — y NO debe llevar además un `defer` de ese deinit, que es
+doble free y segfault en la propia lista libre del arena.
+
+## git que escribe, y tablas que saben más idiomas
+
+`git_status`, `git_diff`, `git_log` sólo leían; todo lo que cambiaba el repositorio
+pasaba por `bash`. Ahora hay `git_branch`, `git_add`, `git_commit` y `git_stash`.
+
+**Todo argv es lista fija.** Un nombre de rama, un mensaje y una ruta vienen del modelo
+y los tres acaban en una línea de comandos. `validRefName` rechaza un nombre que empiece
+por `-`: esa es toda la regla, y es la que impide que un nombre se lea como OPCIÓN de
+git. El mensaje de commit va a un FICHERO y `-F` lo nombra, así que nunca es un argv.
+
+`check` pasó de 5 idiomas a 12. Los marcadores son DATOS: añadir un idioma es una fila
+más un brazo de `planFor`. Y un marcador SIN código fuente no es nada: un repo puede
+traer un `Gemfile` de una gema vendorizada sin tener Ruby, y `ruby -c` sobre eso no
+prueba nada. Donde no hay typechecker (Ruby, PHP) el comando es una comprobación de
+sintaxis y la etiqueta LO DICE.
+
+`@field` exige un nombre comptime, así que las tablas llevan un enum y los bucles son
+`inline for`. Un `[]const u8` como nombre de campo no compila, que es de esas cosas que
+el compilador tePbsett.
+
+## Dos reglas de `verify` que se leían bien y no casaban con nada
+
+Las dos por la misma causa, y en direcciones opuestas:
+
+- `at_start = false` necesita un byte NO-palabra DESPUÉS de la needle. La `t` de
+  `just test` es byte de palabra, así que `"just "` no disparaba nunca. Igual que
+  `./scripts/`: la `c` de detrás es byte de palabra.
+- `at_start = true` no tiene esa comprobación, así que un `"just"` a secas disparaba
+  sobre `just-file.md`.
+
+Solución: `at_start` Y un espacio final. El espacio es el límite; `at_start` es lo que
+evita que case dentro de otra palabra. El coste es que un `just` a secas se queda en
+foreground, que es la dirección segura en la que equivocarse.
+
+Y el test del lookalike asegura `!= .slow_verify` y no un tipo concreto, porque
+`cat test.txt` cae en `.quick` por la regla de `cat`, que es la mejor respuesta.
+
+## Dos tests míos que estaban mal, con el código correcto
+
+- `a/b` en la lista de «nombres de rama inválidos»: una barra DENTRO de un nombre de
+  rama es normal (`fix/goal-loop`) y sólo se rechaza una inicial. El test pedía que git
+  rechazara algo que git acepta.
+- `cat test.txt` esperando `.unknown` cuando la regla de `cat` lo hace `.quick`.
+
+## Lo que NO se hizo, y por qué
+
+**La puerta final**: cuando el plan llega al 100% y el modelo dice terminado, ejecutar
+`check` una vez más y reportar. Necesita la salida del auto-check metida en el resumen
+del turno, y vale más que las tablas de arriba sólo si algún modelo declara terminado
+sin estarlo. No se ha observado, así que no está construido.
