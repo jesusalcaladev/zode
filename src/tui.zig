@@ -9162,3 +9162,52 @@ test "no painted cell carries a grapheme with an absurd length" {
         }
     }
 }
+
+test "scrolling past the segment cache cap leaves no cell pointing at a freed arena" {
+    // The gap in the test above: it had five paragraphs and the cache holds 128, so the
+    // eviction path never ran. The crash is intermittent (2 of 4 real task runs) and both
+    // of those turns produced a lot of text, which is what pushes the cache past its cap
+    // WHILE a frame is being painted.
+    //
+    // `drawLines` paints `CellRun`s whose bytes live in the paragraph's own arena, and
+    // the cache evicts LIFO when it goes over 128 — freeing an arena. If an entry that is
+    // in the visible window gets evicted, the cells painted from it point at freed memory
+    // and vaxis reads the LENGTH from it when it renders, after the frame: a garbage
+    // length, `appendSlice` on a one-grapheme append, `OutOfMemory`, process gone. That
+    // is the whole chain, and it explains a 6.5 MB flat RSS better than any leak story.
+    //
+    // 400 paragraphs — three times the cap — walked from the top to the bottom, and every
+    // cell of every frame measured.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        var line: [160]u8 = undefined;
+        const text = std.fmt.bufPrint(&line, "paragraph {d}: the quick brown fox jumps over the lazy dog " ++ "again " ** 8, .{i}) catch "";
+        m.pushKind(if (i % 2 == 0) .assistant else .tool_res, text);
+    }
+    m.drainPending();
+
+    var frame: usize = 0;
+    while (frame < 400) : (frame += 1) {
+        // Down through the whole history, one row at a time, which is what moves the
+        // window across the cache boundary and forces the eviction.
+        m.scrollBy(1);
+        _ = arena_state.reset(.retain_capacity);
+        const s = try drawTest(&m, arena, 200, 50);
+
+        var row: usize = 0;
+        while (row < s.size.height) : (row += 1) {
+            var col: usize = 0;
+            while (col < s.size.width) : (col += 1) {
+                const g = s.readCell(col, row).char.grapheme;
+                try std.testing.expect(g.len <= 8);
+            }
+        }
+    }
+}
