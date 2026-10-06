@@ -1626,3 +1626,55 @@ test "bash: a command that only prints a LOT does not leave a grandchild behind"
     // Nowhere near the 30 s timeout: the point of the cap is that it returns.
     try std.testing.expect(elapsed_ms < 5000);
 }
+
+test "a failed edit says WHICH of the three failures it was, and never says nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A TAB where the patch has four spaces: the most common way a patch written from
+    // memory fails. Absolute paths under `/tmp/opencode`, which is what every other
+    // test in this file does — a relative path is resolved against the cwd of the test
+    // binary and the failure looks like "the tool is broken".
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/edit-hint-1.txt",
+        .data = "pub fn f() void {\n\tx += 1;\n}\n",
+    });
+
+    // Through `allocPrint`, like every other `edit` test here: `{{` is how a format
+    // string spells a literal brace, and a plain `\\`-string would need the braces
+    // single AND would still carry the escaping backslash.
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"files":[{{"path":"/tmp/opencode/edit-hint-1.txt","old_string":"    x += 1;","new_string":"\tx += 2;"}}]}}
+    , .{});
+    const out = try execute(std.testing.io, "edit", args, arena, null, null);
+
+    // The three things the model needs and did not have before: WHAT is wrong, WHERE it
+    // is, and WHAT it sent. Before this the only thing it had was the path and the
+    // first 80 bytes, which cost it a whole iteration to act on.
+    try std.testing.expect(std.mem.indexOf(u8, out, "SPACING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x += 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "You sent:") != null);
+    // The familiar phrase is still the OPENING, because the schema and another test
+    // use it; what is new is the sentence and the text after it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "old_string not found in") != null);
+    // And it is no longer JUST those words: the old message was the path plus 80 bytes.
+    try std.testing.expect(out.len > 200);
+}
+
+test "a patch for text that never existed says so, and does not pretend to be close" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/edit-hint-2.txt",
+        .data = "pub fn f() void {\n    std.debug.print(\"hi\");\n}\n",
+    });
+
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"files":[{{"path":"/tmp/opencode/edit-hint-2.txt","old_string":"struct WidgetFactoryRegistry {{ ... }}","new_string":"x"}}]}}
+    , .{});
+    const out = try execute(std.testing.io, "edit", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "It is not in this file at all") != null);
+}

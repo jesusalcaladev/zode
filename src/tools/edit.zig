@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const hint_lib = @import("../lib/edit_hint.zig");
 
 pub const max_hunks = 16;
 
@@ -112,7 +113,19 @@ pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
             if (count > 1 and !h.allow_multiple) break;
         }
         if (count == 0) {
-            return std.fmt.allocPrint(arena, "error: old_string not found in {s}: \"{s}\"", .{ path, h.old[0..@min(h.old.len, 80)] });
+            // The three words that used to be here — "old_string not found in X" —
+            // cost the model an ENTIRE iteration: the only way to recover was to read
+            // the file again and look for the difference itself, on a turn whose budget
+            // is 12. `hintFor` returns the nearest line and says WHICH of the three
+            // failures this is, so the recovery costs no iteration at all. See
+            // `lib/edit_hint.zig` for why the three have to read differently.
+            const hint = hint_lib.hintFor(arena, data, h.old) catch hint_lib.Hint{ .text = "" };
+            const sent = quoteFirstLine(arena, h.old) catch "(your patch)";
+            return std.fmt.allocPrint(
+                arena,
+                "{s}\\nYou sent: {s}",
+                .{ hint_lib.message(hint, path), sent },
+            );
         }
         if (count > 1 and !h.allow_multiple) {
             return std.fmt.allocPrint(arena, "error: old_string appears {d} times in {s}; be more specific or use allow_multiple", .{ count, path });
@@ -183,6 +196,20 @@ pub const Replaced = struct {
     bytes: []u8,
     count: usize,
 };
+
+/// The first line of the patch, as sent, so the model can compare it with what came
+/// back. Shown AFTER the hint and not before: the hint is the answer and the echo is the
+/// question, and a model that reads the question first tends to answer the question.
+fn quoteFirstLine(arena: std.mem.Allocator, old: []const u8) ![]const u8 {
+    const nl = std.mem.indexOfScalar(u8, old, '\n') orelse old.len;
+    const line = std.mem.trimEnd(u8, old[0..nl], " \t\r");
+    if (line.len == 0) return "(an empty line)";
+    return std.fmt.allocPrint(
+        arena,
+        "\"{s}\"",
+        .{line},
+    );
+}
 
 pub fn allocReplace(a: std.mem.Allocator, data: []const u8, old: []const u8, new: []const u8) !Replaced {
     var out: std.ArrayList(u8) = .empty;
