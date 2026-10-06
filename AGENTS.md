@@ -3291,3 +3291,57 @@ better guess but `ulimit -c unlimited` plus a build that actually has symbols.
 **A loud warning is not evidence, and the absence of one is not either.** What made
 this tractable in the end was a core file and a name; what made it a whole session was
 that the only artifact anyone looked at said `OutOfMemory`.
+
+## `Child.kill` REAPS, so `bash_kill` and the reader were racing for one child (2026-10-06)
+
+The second crash of the same session, found the same way (a symbolized core) and on a
+run that **already had the first fix in its binary**, which is what proved they were two
+bugs and not one:
+
+    thread panic: programmer bug caused syscall error: CHILD
+    std/Io/Threaded.zig:15339  childKillPosix   .CHILD => errnoBug
+    std/process/Child.zig:125  kill
+    src/bgproc.zig              killTree
+    src/tools/bg.zig:48         toolBashKill
+
+`Io.Threaded.childKillPosix` is `kill(pid, TERM)` followed by a **blocking `wait4(pid)`**.
+So `Child.kill` does not only signal: **it reaps**. And the reader thread reaps as well,
+with `child.wait(io)`, on its own copy of the same pid. Two reaps of one child: the loser
+gets ECHILD and `errnoBug` panics, because a double reap is supposed to be impossible.
+
+It was possible because `bash_kill` runs on the **UI thread** and the reader's `wait`
+runs on its own, with nothing serialising them. The comment inside `killTree`
+**acknowledged the race** —
+
+    // `Child.kill` … for its own side effects on the struct (it zeroes `id`,
+    // which the reader's `wait` relies on)
+
+— and then called `c.kill(io)` anyway. `wait` does not read `j.child` at all; it uses
+`ctx.child`. The comment described a mechanism that does not exist and used it to
+justify the call that caused the crash.
+
+**Signalling and reaping are different jobs with different owners.** The signal is the
+urgent half and belongs to whoever was asked to stop something. The reap belongs to the
+reader, which is blocked in `wait` for exactly that purpose and which also collects the
+exit status the model is shown. So `killTree` signals and nothing else.
+
+`kill` now reports `false` for a job the reader has already taken over. Reporting a
+kill that did not happen is how ESC claims to have stopped a build that is still
+running, which is worse than not killing it: at least that one is visible.
+
+### The two bugs were adjacent, and that is the lesson
+
+Fix 1 was the reader freeing through the turn's arena. Fix 2 was the kill path racing
+the reader's reap. **Both are in `bgproc`'s job lifecycle**, both involve the same two
+threads, and one did not appear until the other was out of the way. A crash that
+survives a fix is not evidence that the fix was wrong; it is evidence that the area has
+more than one thing in it, and the cheap response is to go and read the whole lifecycle
+rather than to look for a second theory about the first bug.
+
+### How the tests are written for a race
+
+Sixty rounds of "spawn something that exits immediately, then kill it", with **no
+sleep**: the point is to be inside the window, not to avoid it. Before the fix
+`errnoBug` called `abort`, so a regression takes the whole test binary down rather than
+failing an `expect` — which is the right way round: a race this narrow cannot be made
+deterministic, and a test that flaked would be a test nobody trusted.
