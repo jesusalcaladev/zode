@@ -4,6 +4,7 @@ const vxfw = vaxis.vxfw;
 const tui = @import("tui.zig");
 const http_client = @import("lib/http_client.zig");
 const models = @import("lib/models.zig");
+const modelcache = @import("lib/modelcache.zig");
 const models_mod = models;
 const provider = @import("lib/provider.zig");
 const providers = @import("lib/providers.zig");
@@ -36,11 +37,49 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     const url = cfg.urlModels(&url_buf);
     const key = envGet(env, "ZODE_API_KEY");
 
+    // `--models` is the worst case for a cold network: 772 KB and a 400-800 ms round
+    // trip, for a list that changes once a month. It reads the cache first, prints, and
+    // refreshes only if there is nothing saved (or the save is ancient). A machine with
+    // no network still gets an answer.
+    var astate = std.heap.ArenaAllocator.init(gpa);
+    defer astate.deinit();
+    const arena = astate.allocator();
+
+    var printed = false;
+    // The cache key is the PROVIDER, not the URL: two providers can publish the same
+    // catalogue URL and one of them changing its models must not invalidate the other.
+    const pid = envGet(env, "ZODE_PROVIDER") orelse "default";
+    if (modelcache.read(io, env, arena, pid, url)) |e| {
+        if (e.models.len > 0) {
+            var out_buf: [4096]u8 = undefined;
+            var out = std.Io.File.stdout().writer(io, &out_buf);
+            for (e.models) |m| {
+                try out.interface.print("{s}\t{s}\n", .{ m.id, m.owned_by });
+            }
+            try out.interface.flush();
+            const free = blk: {
+                var n: usize = 0;
+                for (e.models) |m| {
+                    if (m.is_free) n += 1;
+                }
+                break :blk n;
+            };
+            std.debug.print("{d} modelos ({d} free) — lista guardada, {s}\n", .{
+                e.models.len,
+                free,
+                if (ageIsStale(io, e.fetched_at)) "obsoleta, se actualiza" else "actual",
+            });
+            printed = true;
+        }
+    }
+    if (printed) return 0;
+
     var list = models.listModels(gpa, &http, url, key) catch |err| {
         std.debug.print("error: {t}\n", .{err});
         return 1;
     };
     defer list.deinit(gpa);
+    modelcache.write(io, env, pid, url, list.items);
 
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
@@ -50,6 +89,23 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     try out.interface.flush();
     std.debug.print("{d} modelos ({d} free)\n", .{ list.items.len, list.free_count });
     return 0;
+}
+
+/// Is a saved list old enough that a refresh is urgent?
+///
+/// Urgent and not "unusable": `--models` prints it either way, because a month-old
+/// list of ids is far more useful than an error. This only decides whether to say so.
+///
+/// It takes the `io` and does NOT read `agent.io_global`: `--models` runs before
+/// `main` assigns that global, and reading a clock through an `Io` that was never
+/// attached is a jump through a garbage vtable — a segfault, which is exactly what the
+/// first version did. Measured: 203 ms then a core dump, every time.
+fn ageIsStale(io: std.Io, fetched_at: i64) bool {
+    if (fetched_at <= 0) return true;
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    if (now <= fetched_at) return false;
+    const hours = @divTrunc(now - fetched_at, 3600);
+    return hours >= modelcache.max_age_hours;
 }
 
 /// Headless mode: zode --chat "text"

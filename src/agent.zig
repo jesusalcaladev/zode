@@ -12,6 +12,7 @@ const free_auto = @import("free_auto.zig");
 const router_mod = @import("lib/router.zig");
 const plan_mod = @import("lib/plan.zig");
 const goal_mod = @import("lib/goal.zig");
+const modelcache = @import("lib/modelcache.zig");
 const clean_mod = @import("lib/clean.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
@@ -5860,6 +5861,7 @@ pub fn listModelsAsync(m: *tui.Model) !void {
     const job = try m.allocator.create(ModelsJob);
     m.beginWorker();
     job.* = .{ .model = m, .for_picker = false };
+    m.models_for_picker = false;
     const th = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
         m.endWorker();
         m.allocator.destroy(job);
@@ -5878,6 +5880,7 @@ pub fn pickerModelsAsync(m: *tui.Model) !void {
     const job = try m.allocator.create(ModelsJob);
     m.beginWorker();
     job.* = .{ .model = m, .for_picker = true };
+    m.models_for_picker = true;
     const th = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
         m.endWorker();
         m.allocator.destroy(job);
@@ -5907,15 +5910,52 @@ fn modelsWorker(job: *ModelsJob) void {
     m.beginWorker();
     defer m.endWorker();
 
-    setStatusWithZo(m, .tooling, "listing models…");
+    const def = activeProviderDef(m.environ);
+
+    // ── step 1: the CACHE, before anything touches the network ──
+    //
+    // This is the whole feature and it is 5 ms instead of 411-673. The palette gets
+    // painted with what we already knew, and the network happens afterwards, in the
+    // same worker, where the user is already looking at a populated list.
+    //
+    // It goes BEFORE the status line on purpose: "listing models…" on top of a list
+    // that is already there reads as an app that has not noticed it has the answer.
+    var cached: []models_mod.Model = &.{};
+    var from_cache = false;
+    {
+        var astate = std.heap.ArenaAllocator.init(gpa);
+        defer astate.deinit();
+        if (modelcache.read(io_global, m.environ, astate.allocator(), def.id, def.models_url)) |e| {
+            // `copyOut`, NOT `dupe(Model, ...)`. `Model` is a struct of slices into the
+            // cache's arena, so a plain struct copy is a list of pointers into memory
+            // that dies at the closing brace of this block. Measured: SIGSEGV, exit
+            // status 139, no panic message, empty stderr — and only in the TUI, because
+            // `--models` uses its list before the arena goes away.
+            cached = modelcache.copyOut(gpa, e.models) catch &.{};
+            from_cache = cached.len > 0;
+        }
+    }
+    if (from_cache) {
+        publishModels(m, cached, def.id, .cached);
+        setStatusWithZo(m, .done, "models from cache");
+    } else {
+        setStatusWithZo(m, .tooling, "listing models…");
+    }
 
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
 
-    const def = activeProviderDef(m.environ);
     const key = curKey(m);
 
     var list = models_mod.listModels(gpa, &http, def.models_url, key) catch |err| {
+        // With a cache on screen, a failed refresh is a NOTE and not an error: the user
+        // is looking at a usable list, and an error line over it invites them to think
+        // the list is wrong.
+        if (from_cache) {
+            const msg = std.fmt.allocPrint(gpa, "could not refresh the model list ({t}); showing the last one saved", .{err}) catch "could not refresh the model list";
+            pushInfoOwned(m, msg);
+            return;
+        }
         if (err == error.HttpError) {
             m.pushInfoFmt("models: HTTP error at {s}", .{def.models_url});
         } else {
@@ -5928,38 +5968,65 @@ fn modelsWorker(job: *ModelsJob) void {
 
     defer list.deinit(gpa);
 
-    // Order: the "free" ones first, since those are the ones that work without
-    // credits, and alphabetical within each group so the list is stable.
-    const sorted = gpa.dupe(models_mod.Model, list.items) catch return;
+    // ── step 2: what CHANGED ──
+    //
+    // Only when there was a cache. `describe` returns EMPTY when nothing moved, and the
+    // caller must not re-sort in that case: reordering a list under the cursor is worse
+    // than not reordering it, and a line that appears on every refresh trains the user
+    // to ignore it.
+    if (from_cache) {
+        var astate = std.heap.ArenaAllocator.init(gpa);
+        defer astate.deinit();
+        const arena = astate.allocator();
+        const d = modelcache.diff(cached, list.items);
+        const line = modelcache.describe(arena, d);
+        if (line.len > 0) pushInfoOwned(m, gpa.dupe(u8, line) catch line);
+        modelcache.freeOut(gpa, cached);
+    }
+
+    // Written AFTER the diff and not before: a cache that was just refreshed with the
+    // list in hand and still compares as "changed" is a cache that never converges.
+    modelcache.write(io_global, m.environ, def.id, def.models_url, list.items);
+
+    publishModels(m, list.items, def.id, .fresh);
+    setStatusWithZo(m, .done, "models ready");
+}
+
+const ModelSource = enum { cached, fresh };
+
+/// Hands a list of models to whoever is waiting: the picker gets items, the plain
+/// `/models` gets lines.
+///
+/// One function because there were two copies of the "free first, then alphabetical"
+/// ordering and a cache makes it a third call site; three copies of an ordering is how
+/// the picker and `/models` end up disagreeing about which models exist.
+fn publishModels(m: *tui.Model, models: []const models_mod.Model, provider_id: []const u8, source: ModelSource) void {
+    const gpa = m.allocator;
+    const sorted = gpa.dupe(models_mod.Model, models) catch return;
     defer gpa.free(sorted);
+    // The "free" ones first: those are the ones that work without credits, and
+    // alphabetical within each group so the list is stable between runs.
     std.mem.sort(models_mod.Model, sorted, {}, freeFirst);
 
-    if (job.for_picker) {
-        // The palette is NOT touched here: this is the worker's thread and the UI
-        // thread draws it without a lock (modifying both at once was a
-        // segfault).
-        // ITEMS already built with their own strings are handed over: handing
-        // over the `Model`s and freeing the list on exit left the `id`s
-        // dangling, and the drawing blew up with InvalidStartByte.
+    if (m.models_for_picker) {
+        // The palette is NOT touched here: this is the worker's thread and the UI thread
+        // draws it without a lock, and that was a segfault. ITEMS already built with
+        // their own strings are handed over: handing over the `Model`s and freeing the
+        // list on exit left the ids dangling and the drawing blew up.
         const items = buildModelItems(m, sorted);
-        if (items) |it| {
-            m.setPendingItems(it);
-        }
+        if (items) |it| m.setPendingItems(it);
         return;
     }
-    {
-        for (sorted) |info| {
-            const hint = if (isFree(info)) "free" else "";
-            const line = std.fmt.allocPrint(
-                gpa,
-                "{s:<44} {s}",
-                .{ info.id, hint },
-            ) catch continue;
-            pushInfoOwned(m, line);
-        }
-        m.pushInfoFmt("{d} models on {s}", .{ sorted.len, def.id });
+    for (sorted) |info| {
+        const hint = if (isFree(info)) "free" else "";
+        const line = std.fmt.allocPrint(gpa, "{s:<44} {s}", .{ info.id, hint }) catch continue;
+        pushInfoOwned(m, line);
     }
-    setStatusWithZo(m, .done, "models ready");
+    m.pushInfoFmt("{d} models on {s}{s}", .{
+        sorted.len,
+        provider_id,
+        if (source == .cached) " (saved list; refreshing)" else "",
+    });
 }
 
 /// Is this model free?

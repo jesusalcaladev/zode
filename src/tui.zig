@@ -854,6 +854,11 @@ pub const Model = struct {
     goal_checkpoint: bool = false,
     /// Set when the same tool call has now happened three times running.
     loop_repeated: ?[]const u8 = null,
+    /// The last models request was for the picker, not for `/models`.
+    ///
+    /// On the Model and not an argument because the cache publishes from a helper that
+    /// is called from two places and has no business knowing which one asked.
+    models_for_picker: bool = false,
     /// The objective of this turn, when `/goal` set one.
     ///
     /// In the Model and not a module global because the draw reads it every frame and
