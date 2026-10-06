@@ -609,7 +609,18 @@ fn reader(ctx: *ReaderCtx) void {
     defer gpa.destroy(ctx);
     const io = ctx.io;
     var child = &ctx.child;
-    defer child.kill(io);
+    // NOT `defer child.kill(io)`.
+    //
+    // The normal path ends with `child.wait(io)`, which REAPS the child: the `Io` forgets
+    // it. A `defer kill` then runs on that reaped child, `Io.Threaded.childKill` answers
+    // `.CHILD`, and `errnoBug` panics — because double-reaping is supposed to be
+    // impossible, and a `defer` that cannot tell "we are leaving early" from "we already
+    // waited" makes it very possible.
+    //
+    // So the early exits kill explicitly and the wait path does not. Two of the three
+    // places that used to rely on the defer are below, and each says why.
+    var reaped: bool = false;
+    defer if (!reaped) child.kill(io);
 
     var slot: ?*Job = null;
     for (&ctx.reg.slots) |*j| {
@@ -659,7 +670,23 @@ fn reader(ctx: *ReaderCtx) void {
         },
     }
 
+    // The child stops being the `Io`'s to kill at the moment `wait` reaps it, and
+    // `wait` BLOCKS. `j.child` is a different copy from the reader's `ctx.child`, so
+    // nothing else was clearing it: a `bash_kill` arriving in the window between `wait`
+    // returning and the state update below reached into the `Io` with a child it had
+    // already reaped, and `Io.Threaded.childKill` panics on that as a programmer bug.
+    //
+    // Measured, and it killed the process mid-turn: `bash_kill` on the UI thread against
+    // this `wait` on the reader thread, with nothing serialising them. So the handover
+    // happens HERE, under the lock, before the blocking call — and `kill` reports false
+    // for a job in this state rather than claiming a kill that did not happen.
+    lockSlot(j);
+    if (j.isLive() and j.id == job_id) j.child = null;
+    unlockSlot(j);
+
     const term = child.wait(io) catch {
+        // `wait` failed, so the child was NOT reaped and the `defer` still has work to
+        // do. Nothing to set: `reaped` stays false on purpose.
         lockSlot(j);
         j.state = .finished;
         j.exit = null;
@@ -667,6 +694,9 @@ fn reader(ctx: *ReaderCtx) void {
         unlockSlot(j);
         return;
     };
+    // From here the child has been REAPED and is nobody's to kill again — the double reap
+    // that panicked. Set before anything else can return.
+    reaped = true;
 
     lockSlot(j);
     // The slot may have been RELEASED while the job was still running (the model
@@ -704,10 +734,17 @@ pub fn reap(reg: *Registry, gpa: std.mem.Allocator, id: u32) void {
 }
 
 /// Kills one job (by id), if it is running.
+///
+/// Returns false — and says nothing was killed — when the job is already being reaped.
+/// Reporting a kill that did not happen is how ESC ends up claiming to have stopped a
+/// build that is still running.
 pub fn kill(reg: *Registry, io: std.Io, id: u32) bool {
     for (&reg.slots) |*j| {
         if (j.isLive() and j.id == id) {
             if (j.state != .running) return false;
+            // `child == null` means the reader thread has started reaping. Racing it here
+            // is what killed the process: see `killTree`.
+            if (j.child == null) return false;
             j.kill_requested = true;
             killTree(j, io);
             return true;
@@ -729,16 +766,46 @@ pub fn kill(reg: *Registry, io: std.Io, id: u32) bool {
 /// reaches all of it. The plain `c.kill(io)` still runs after, for its own side
 /// effects on the struct (it zeroes `id`, which the reader's `wait` relies on).
 fn killTree(j: *Job, io: std.Io) void {
-    if (j.child) |*c| {
-        // The GROUP first, using the pid captured at spawn (`j.pgid`), not
-        // `c.id`: the reader thread's `wait()` can have zeroed `c.id` already, and
-        // even if it has not, `j.pgid` is the one value the reaper cannot
-        // invalidate under us.
-        if (j.pgid > 0) std.posix.kill(-j.pgid, std.posix.SIG.KILL) catch {};
-        c.kill(io);
+    _ = io;
+    const c = j.child orelse return;
+    const pid = c.id orelse return;
+
+    // SIGNAL ONLY. No `Child.kill`, and that is the whole fix for a crash that killed the
+    // process mid-turn:
+    //
+    //     thread panic: programmer bug caused syscall error: CHILD
+    //     std/Io/Threaded.zig:15339  childKillPosix   .CHILD => errnoBug
+    //     std/process/Child.zig:125  kill
+    //     src/bgproc.zig              killTree
+    //     src/tools/bg.zig:48         toolBashKill
+    //
+    // `Io.Threaded.childKillPosix` is `kill(pid, TERM)` followed by a BLOCKING
+    // `wait4(pid)`. So `Child.kill` does not just signal: IT REAPS. And the reader thread
+    // reaps too, with `child.wait(io)`, on its own copy of the same pid. Two reaps of one
+    // child: the loser gets ECHILD and `errnoBug` panics, because a double reap is
+    // supposed to be impossible.
+    //
+    // It was possible because `bash_kill` runs on the UI thread and the reader's `wait`
+    // runs on its own, with nothing serialising them. The comment here used to
+    // acknowledge the race and then call `c.kill(io)` anyway, on the reasoning that it
+    // "zeroes `id`, which the reader's `wait` relies on" — but `wait` does not read
+    // `j.child` at all, it uses `ctx.child`.
+    //
+    // **Signalling and reaping are different jobs with different owners.** The signal is
+    // the urgent half and belongs here, on the thread that was asked to stop something.
+    // The reap belongs to the reader, which is blocked in `wait` for exactly that purpose
+    // and which also collects the exit status the model is shown.
+    //
+    // The GROUP first, because the child is always `/bin/sh -c "…"`: killing only the
+    // shell leaves its own children compiling. `j.pgid` and not `pid`, because a pid can
+    // be recycled between the spawn and the kill, and `pgid` is the one value the reaper
+    // cannot invalidate under us.
+    if (j.pgid > 0) {
+        std.posix.kill(-j.pgid, std.posix.SIG.KILL) catch {};
+    } else {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
     }
 }
-
 /// A plain `nanosleep`, NOT `Io.sleep`: `Io.sleep` goes through the shared `Io`,
 /// which the TUI's redraw ticks also use. Sleeping on it from a worker freezes
 /// the screen (this is the trap AGENTS.md documents for `Retry.wait` and the
@@ -1144,4 +1211,85 @@ test "the registry's allocator is the one jobs use, not the caller's" {
     // argument to pass it in.
     const reg: Registry = .init(std.testing.allocator);
     try std.testing.expect(reg.gpa.ptr == std.testing.allocator.ptr);
+}
+
+test "killing a job that is exiting at the same moment does not panic" {
+    // The second crash this session found, same method as the first (a symbolized core):
+    //
+    //     thread panic: programmer bug caused syscall error: CHILD
+    //     std/process/Child.zig:125  kill
+    //     src/bgproc.zig             killTree
+    //     src/tools/bg.zig:48        toolBashKill
+    //
+    // `Io.Threaded.childKill` answers `.CHILD` for a child it has already reaped, and
+    // treats that as a programmer bug — which it is, because `bash_kill` runs on the UI
+    // thread and the reader's `wait()` runs on its own, and nothing serialised them.
+    //
+    // This is a stress test and not a deterministic reproduction on purpose: the window
+    // is real but narrow, and a test that hit it every time would be a test that fails
+    // for a reason that is not the bug. Sixty rounds of "spawn something that exits
+    // immediately, then kill it" drives the reader into `wait` while the kill is in
+    // flight, which is the exact interleaving. Before the fix, `errnoBug` aborts the
+    // process — and a test binary that aborts is a red test, not a flaky one.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var reg: Registry = .init(std.heap.page_allocator);
+    defer reg.deinit(io, std.heap.page_allocator);
+
+    var round: usize = 0;
+    while (round < 60) : (round += 1) {
+        const id = spawn(&reg, io, "exit 0") catch break;
+        // No sleep: the point is to be inside the window, not to avoid it.
+        _ = kill(&reg, io, id);
+        var waited: u32 = 0;
+        while (waited < 2000) : (waited += 10) {
+            if (!std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+            sleep.nap(10);
+        }
+        _ = reap(&reg, std.heap.page_allocator, id);
+    }
+    // Reaching here IS the assertion: `errnoBug` calls `abort`, so a regression takes
+    // the whole test binary down rather than failing an expect.
+    try std.testing.expect(true);
+}
+
+test "a job that has already finished reports the kill as NOT done" {
+    // The other half of the same fix, and the part the USER sees. Reporting a kill that
+    // did not happen is how ESC ends up claiming to have stopped a build that is still
+    // running, which is worse than not killing it: at least that one is visible.
+    //
+    // Once the reader has handed the child over — `j.child = null`, under the slot lock,
+    // immediately before its blocking `wait` — there is nothing left to signal, and `kill`
+    // says so instead of claiming a kill.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var reg: Registry = .init(std.heap.page_allocator);
+    defer reg.deinit(io, std.heap.page_allocator);
+
+    const id = try spawn(&reg, io, "echo done");
+    var waited: u32 = 0;
+    while (waited < 3000) : (waited += 10) {
+        if (!std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+        sleep.nap(10);
+    }
+    try std.testing.expect(!std.mem.eql(u8, stateWord(&reg, id), "running"));
+    // And a kill on a finished job is a no-op that reports the truth.
+    try std.testing.expect(!kill(&reg, io, id));
+
+    var out: Output = .{};
+    const text = try readNoHeader(&reg, &out, id);
+    try std.testing.expect(std.mem.indexOf(u8, text, "done") != null);
+}
+
+fn killAllCount(reg: *Registry, io: std.Io, budget_ms: u64) usize {
+    killAll(reg, io, budget_ms);
+    var n: usize = 0;
+    for (&reg.slots) |*j| {
+        if (j.isLive()) n += 1;
+    }
+    return n;
 }
