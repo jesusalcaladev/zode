@@ -2134,6 +2134,39 @@ fn chatWorker(job: *ChatJob) void {
 
         // 1. The goal was decided. The model said so, and it is the only thing that
         //    ends a goal turn early.
+        //
+        //    EXCEPT a `met` WITH OPEN PLAN STEPS, which is the model contradicting
+        //    itself in the same breath: it wrote down four steps, ticked two, and then
+        //    said the work is finished. Measured on the first successful run: exactly
+        //    that — `goal(met)` accepted with steps 3 and 4 still unticked on screen.
+        //
+        //    The turn does not end there. The plan is the model's OWN bookkeeping, so
+        //    the harness can read the contradiction without asking it anything, and the
+        //    model's way out stays machine-readable: close the steps, or declare
+        //    `blocked`. Refusing is not the harness distrusting the verdict — it is two
+        //    of the model's own artefacts disagreeing, and which one is wrong is
+        //    exactly what the model is for.
+        if (!verdictIsFinal(m.goal, m.plan.openCount()) and m.goal.status == goal_mod.Status.met and m.goal.checkpoints == 0) {
+            var g = m.goal;
+            g.checkpoints += 1;
+            m.goal = g;
+            // Back to open, so the ordinary checkpoint and the ordinary ceiling apply
+            // from here: one refusal, and if it argues, the budget is what ends it.
+            m.goal.status = goal_mod.Status.none;
+            pushErrorFmt(
+                m,
+                "you declared the goal MET but {d} of your own plan steps are still open ({d}/{d} done). Close them and declare again, or call `goal` with status blocked.",
+                .{ m.plan.openCount(), m.plan.doneCount(), m.plan.items.len },
+            );
+            const nudge = m.allocator.dupe(
+                u8,
+                "The harness will not accept `met` yet: your plan still has open steps. Finish them, tick them with `todo`, and call `goal` again — or, if they genuinely cannot be finished here, call `goal` with status blocked and what_would_unblock.",
+            ) catch break;
+            if (owned) |o| m.allocator.free(o);
+            owned = nudge;
+            last_user = nudge;
+            continue;
+        }
         if (m.goal.status != goal_mod.Status.none) break;
 
         // 2. The model stopped asking for tools, or it answered in prose while the goal
@@ -8619,4 +8652,56 @@ test "the iteration counter shows the limit that APPLIES, not the soft cap" {
     // would be shown next.
     m.goal.status = goal_mod.Status.met;
     try std.testing.expectEqual(iterationLimit(), statusIterationLimit(&m));
+}
+
+test "`met` with open plan steps is refused once, and the model has to answer" {
+    // Measured on the first run that finished a task: the model wrote four steps, ticked
+    // two, and then declared the goal MET. The harness accepted it and the turn ended
+    // with its own plan contradicting its own verdict on screen.
+    //
+    // Two artefacts from the SAME model, disagreeing, is not something to resolve by
+    // trusting one of them. And the fix does not need to ask anything: the plan's open
+    // count is readable, so the contradiction is machine-detectable.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const obj = "the suite passes";
+    @memcpy(m.goal.text[0..obj.len], obj);
+    m.goal.len = obj.len;
+
+    // Two steps done, one open.
+    var items = [_]plan_mod.Item{.{}} ** 3;
+    const labels = [_][]const u8{ "write it", "run it", "verify the output" };
+    for (&items, labels, 0..) |*it, lbl, i| {
+        @memcpy(it.text[0..lbl.len], lbl);
+        it.status = if (i < 2) .done else .pending;
+    }
+    _ = m.plan.apply(items[0..], 3);
+    try std.testing.expectEqual(@as(usize, 1), m.plan.openCount());
+
+    // The state the loop reacts to: MET with an open step.
+    m.goal.status = goal_mod.Status.met;
+    try std.testing.expect(!verdictIsFinal(m.goal, m.plan.openCount()));
+    m.goal.status = goal_mod.Status.blocked;
+    try std.testing.expect(verdictIsFinal(m.goal, m.plan.openCount()));
+    m.goal.status = goal_mod.Status.met;
+    try std.testing.expect(verdictIsFinal(m.goal, 0));
+
+    // And the refusal is not an infinite one: the second refusal is the ceiling's job,
+    // which is what `checkpoints` counts.
+    try std.testing.expectEqual(@as(u8, 0), m.goal.checkpoints);
+}
+
+/// Whether a verdict ends the turn. Extracted so the rule can be asserted without
+/// standing up a whole turn.
+pub fn verdictIsFinal(g: goal_mod.Goal, open_steps: usize) bool {
+    if (g.status == goal_mod.Status.none) return false;
+    if (g.status == goal_mod.Status.met and open_steps > 0) return false;
+    return true;
 }
