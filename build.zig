@@ -36,11 +36,19 @@ pub fn build(b: *std.Build) void {
     // Strip is ON by default because it takes the binary from 10.78 MB to 1.89 MB
     // (measured), and zode is I/O-bound so it costs nothing at runtime.
     //
-    // But a STRIPPED BINARY HAS NO STACK TRACE: when zode crashed with SIGSEGV
-    // the only thing on screen was "Cannot print stack trace: stack tracing is
-    // disabled", which is exactly the moment you least want the build to be
-    // mute. So `-Dstrip=false` is the documented way to get a debuggable build,
-    // and `zig build -Dstrip=false` is what to run when something crashes.
+    // **But `-Dstrip=false` DOES NOT GIVE YOU A DEBUGGABLE BUILD, and it used to be
+    // documented here as if it did.** Measured 2026-10-06 while chasing a real SIGSEGV:
+    //
+    //     zig build -Dstrip=false  ->  nm: no hay símbolos
+    //     readelf -SW              ->  no .symtab, no .debug_*   (not one section)
+    //
+    // `strip` only removes debug sections that were EMITTED, and ReleaseSafe /
+    // ReleaseSmall do not emit them. There is nothing for it to keep, so "unstripped"
+    // and "with symbols" are two different things and only the first one happens.
+    //
+    // For a crash trace, use the `debug` STEP, which builds in `.Debug` — that is where
+    // the symbols come from. `debug_mod` below fell into this same trap, in a step whose
+    // entire description was the promise it did not keep.
     const strip = b.option(bool, "strip", "Strip the debug sections (default: true)") orelse true;
     // The tests go in Debug on purpose (the DebugAllocator and the overflow checks
     // are what catch bugs), but their binary needs no symbols: without this every
@@ -77,17 +85,39 @@ pub fn build(b: *std.Build) void {
     // out as "Cannot print stack trace: stack tracing is disabled" — which is
     // precisely the moment you least want the build to be mute. (It happened: a
     // SIGSEGV with no way to tell where from.)
+    //
+    // **`.Debug` HERE, not `optimize`, and that one word was the whole bug.** This
+    // step said "has symbols, for crash traces" and produced a binary the same size as
+    // the stripped release one, with `nm` reporting no symbols and `readelf -SW` listing
+    // no `.symtab` and no `.debug_*` section at all. Setting `strip = null` on a
+    // ReleaseSmall module does not create debug info; it only declines to remove debug
+    // info that was never emitted. So the one build whose entire job is to be
+    // symbolizable was the one build with no symbols, and it took a real segfault to
+    // find out.
     const debug_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
     debug_mod.addImport("vaxis", vaxis.module("vaxis"));
     const debug_exe = b.addExecutable(.{ .name = "zode-debug", .root_module = debug_mod });
+    // Kept as well as `.Debug`, and both are needed: `.Debug` is what CREATES the
+    // symbols and `strip = null` is what stops them being taken away again.
     debug_exe.root_module.strip = null;
-    b.installArtifact(debug_exe);
-    b.step("debug", "Build an UNSTRIPPED zode-debug (has symbols, for crash traces)")
-        .dependOn(&debug_exe.step);
+    // `addInstallArtifact` and NOT `installArtifact`, because of what was measured:
+    // `installArtifact` hangs the artifact off the DEFAULT install step, so `zig build
+    // debug` compiled the executable and never put it anywhere — the `zode-debug` that
+    // existed on disk had been copied by some earlier plain `zig build`, and it was
+    // BYTE-IDENTICAL to the stripped release binary (same md5). A step whose whole
+    // promise is "here is your crash-trace binary" was producing no binary at all, and
+    // the one on disk was a lie with a reassuring name.
+    //
+    // An install step that only this one depends on is also what keeps a normal
+    // `zig build` from dropping a ~50 MB Debug binary into `zig-out/bin` every time.
+    const install_debug = b.addInstallArtifact(debug_exe, .{});
+    const debug_step = b.step("debug", "Build and install zode-debug in Debug: WITH SYMBOLS, for crash traces");
+    debug_step.dependOn(&debug_exe.step);
+    debug_step.dependOn(&install_debug.step);
 
     // tool_test binario temporal
     const tt_mod = b.createModule(.{
