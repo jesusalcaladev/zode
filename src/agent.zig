@@ -2061,12 +2061,65 @@ fn chatWorker(job: *ChatJob) void {
             pushTurnSummary(m);
             return;
         };
+        // 0. THE BUILD IS RED AND THE GOAL IS OPEN: nothing below may end this turn.
+        //
+        //    FIRST, before `again orelse break` and before the repetition guard, and that
+        //    order is the whole fix. The first version of this rule sat two checks below,
+        //    which made it DEAD CODE on the common path: the model stops calling tools,
+        //    `again` is null, and the `orelse break` above had already ended the turn.
+        //    A rule about not stopping has to be ABOVE every stop.
+        //
+        //    This is the check that turns "the turn ended" into "the task ended". The
+        //    harness knows the build failed — it read the exit code and built the model's
+        //    own error message out of the diagnostics — and then let the turn end anyway,
+        //    five times out of five, on a task that was about code compiling.
+        //
+        //    Asking the model whether it is finished is what does not work: a turn that
+        //    has ended in prose is a turn where nobody is grading anything, and the one
+        //    moment a self-assessment would be worth something is the one moment there is
+        //    nobody left to give it. The harness has the evidence; the loop just has to
+        //    ask with it.
+        //
+        //    `blocked` is still honoured above all of it, at check 1 below: a real
+        //    blocker has to be declarable or this is a cage.
+        if (!turnMayEnd(&m.auto_check, m.goal.isOpen()) and m.goal.status == goal_mod.Status.none) {
+            var why_buf: [96]u8 = undefined;
+            const why = blk: {
+                if (m.plan.openCount() > 0) {
+                    break :blk std.fmt.bufPrint(&why_buf, "{d} plan steps open", .{m.plan.openCount()}) catch "plan steps open";
+                }
+                break :blk "no open steps";
+            };
+            pushErrorFmt(
+                m,
+                "not done: the last {s} was RED and the objective is not met ({s}). Fix it, or declare `blocked` with what would unblock it.",
+                .{
+                    if (m.auto_check.label_len > 0) m.auto_check.label[0..m.auto_check.label_len] else "check",
+                    why,
+                },
+            );
+            // The nudge is the prompt. `owned`, not a bare assignment: the loop frees the
+            // previous prompt through it, so a `last_user` set without it leaks a turn's
+            // worth of text every time the turn refuses to end.
+            //
+            // A stack buffer and not `allocPrint(m.allocator, …)`: this runs on the
+            // refusing path, which is the path a turn takes when it is going badly.
+            const nudge = m.allocator.dupe(
+                u8,
+                "The harness will not end this turn yet: the last check failed and the objective is not met. Read the errors above, fix them, and re-run the check. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.",
+            ) catch break;
+            if (owned) |o| m.allocator.free(o);
+            owned = nudge;
+            last_user = nudge;
+            continue;
+        }
+
         const text = again orelse break;
         if (owned) |o| m.allocator.free(o);
         owned = text;
         last_user = text;
 
-        // 0. The model ran the same call three times running. Stopped HERE, and not at
+        // 1. The model ran the same call three times running. Stopped HERE, and not at
         //    the limit, because the limit costs twelve iterations first and the user
         //    sees a normal-looking turn that ends for no stated reason.
         if (m.loop_repeated) |which| {
@@ -2083,57 +2136,9 @@ fn chatWorker(job: *ChatJob) void {
         //    ends a goal turn early.
         if (m.goal.status != goal_mod.Status.none) break;
 
-        // 2. The model stopped asking for tools. `again == null` is above; this is the
-        //    case where it answered in prose while the goal is still open, which means
-        //    it thinks it is finished without having declared.
-        //
-        //    UNLESS THE CODE IS RED.
-        //
-        //    This is the check that turns "the turn ended" into "the task ended". The
-        //    harness knows the build failed — it read the exit code and built the model's
-        //    own error message out of the diagnostics — and then it let the turn end
-        //    anyway, five times out of five, on a task that was about code compiling.
-        //
-        //    Not asking the model whether it is finished, because a turn that has ended
-        //    in prose is a turn where nobody is grading anything: the one moment where
-        //    a self-assessment would be worth something is the one moment there is
-        //    nobody left to give it. The harness already has the evidence.
-        if (!turnMayEnd(&m.auto_check, m.goal.isOpen())) {
-            // A stack buffer and not `allocPrint(m.allocator, …)`: this runs on the
-            // refusing path, which is the path a turn takes when it is going badly, and
-            // a leak there is a leak per iteration of every bad turn.
-            var why_buf: [96]u8 = undefined;
-            const why = blk: {
-                if (m.plan.openCount() > 0) {
-                    break :blk std.fmt.bufPrint(&why_buf, "{d} plan steps open", .{m.plan.openCount()}) catch "plan steps open";
-                }
-                break :blk "no open steps";
-            };
-            pushErrorFmt(
-                m,
-                "not done: the last {s} was RED and the goal is still open ({s}). Fix it, or declare `blocked` with what would unblock it.",
-                .{
-                    if (m.auto_check.label_len > 0) m.auto_check.label[0..m.auto_check.label_len] else "check",
-                    why,
-                },
-            );
-            // Re-open the turn with the refusal as the prompt. The model's own message
-            // about the failure is already in the history, so this is not repeating it:
-            // it is making the loop's refusal explicit and imperative, which is the part
-            // a model reads as a task rather than as commentary.
-            //
-            // `owned`, not a bare assignment: the loop frees the previous prompt through
-            // it, so a `last_user` set without it leaks a turn's worth of text per
-            // refusal.
-            const nudge = m.allocator.dupe(
-                u8,
-                "The harness will not end this turn yet: the last check failed and the objective is not met. Read the errors above, fix them, and re-run the check. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.",
-            ) catch break;
-            if (owned) |o| m.allocator.free(o);
-            owned = nudge;
-            last_user = nudge;
-            continue;
-        }
+        // 2. The model stopped asking for tools, or it answered in prose while the goal
+        //    is still open, which means it thinks it is finished without having declared.
+        //    Give it the checkpoint rather than ending the turn on a shrug.
         if (checkpointed) {
             // 3. It had its checkpoint and still did not declare. That is the answer:
             //    it wants more room, so give it, until the hard ceiling.
