@@ -2828,7 +2828,7 @@ condición de salida del bucle**. Lo que sigue es lo que se hizo con eso.
 
 ## `/goal`: el turno no puede quedarse corto
 
-El fallo que se complains: a las 12 iteraciones el turno para con «agent iteration limit
+El fallo que se quejaba: a las 12 iteraciones el turno para con «agent iteration limit
 reached (12): stopping the turn», el plan tiene pasos abiertos, y escribes «continue».
 Esa frase no dice si la tarea está terminada.
 
@@ -2926,7 +2926,7 @@ Medido con `capture-pane` de tmux, que lee una pantalla de verdad:
 
 Un script de pty que concatena el stream **reporta el picker VACÍO con 464 modelos
 cargados**, porque vaxis repinta diferencialmente y una celda que no cambió no se
-reemite. AGENTS.md ya lo decía y me coûtó una hora creyendo la captura de pantalla.
+reemite. AGENTS.md ya lo decía y me costó una hora creyendo la captura de pantalla.
 
 No es por el parseo: `curl` sola tardaba 415-858 ms y zode 475-673 ms, o sea ~90% es la
 ida y vuelta de 772 KB. Es **resiliencia**: un pty que no contesta, un SSH, un mal
@@ -2980,7 +2980,7 @@ sintaxis y la etiqueta LO DICE.
 
 `@field` exige un nombre comptime, así que las tablas llevan un enum y los bucles son
 `inline for`. Un `[]const u8` como nombre de campo no compila, que es de esas cosas que
-el compilador tePbsett.
+el compilador te lo pone bien.
 
 ## Dos reglas de `verify` que se leían bien y no casaban con nada
 
