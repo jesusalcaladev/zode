@@ -252,3 +252,191 @@ fn isNotARepo(r: bg_tool.Foreground) bool {
 fn notARepo() []const u8 {
     return "this directory is not a git repository. Nothing was run. If the project is not under git, `git_status`/`git_diff`/`git_log` do not apply to it and `bash` is the way to ask about files.";
 }
+
+// ── the writing half ─────────────────────────────────────────────────────────────
+//
+// Why it is here at all: `git_status`, `git_diff` and `git_log` only READ, so anything
+// that changes the repository went through `bash` — two permission dialogs and a shell
+// string for "make a branch and commit this", and on a tree with unrelated work in it
+// the model could not isolate its own change at all.
+//
+// ## Why every argv is a FIXED list and never a format string
+//
+// A branch name, a commit message and a path all come from the model, and all three end
+// up in a command line. With `allocPrint("{s}", .{name})` a name of
+// `--upload-pack=touch /tmp/x` is an ARGUMENT to `git checkout` and not a branch. With
+// a fixed argv and no shell, it is simply a branch name git will refuse, which is the
+// failure mode you want.
+//
+// That is the same rule `check` follows, and the reason it is written down here: this
+// is the file where a shortcut would be most tempting.
+
+/// Branches: list, create, switch. `name` is validated, never interpolated into a
+/// shell.
+pub fn toolGitBranch(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    action: []const u8,
+    name: []const u8,
+) ![]const u8 {
+    if (std.mem.eql(u8, action, "list")) {
+        const r = try bg_tool.runForeground(arena, io, "git branch --format='%(refname:short)'", 10, diff_limit);
+        return if (r.stdout.len == 0) "no branches beyond the default yet." else r.stdout;
+    }
+
+    const want = if (std.mem.eql(u8, action, "create")) "checkout" else if (std.mem.eql(u8, action, "switch")) "switch" else return "git_branch needs `action`: list | create | switch";
+
+    if (!validRefName(name)) {
+        return std.fmt.allocPrint(
+            arena,
+            "`{s}` is not a usable branch name. A branch name cannot start with a dash, and it cannot contain a space, a colon, a `~`, a `^`, a `?`, a `*`, a `[`, a backslash or any of the control characters. Pick another name.",
+            .{name},
+        );
+    }
+
+    var argv: [4][]const u8 = .{ "git", want, "-b", "" };
+    const b = switch (want[0]) {
+        'c' => "-b", // checkout -b CREATES
+        else => "",
+    };
+    argv[2] = b;
+    argv[3] = name;
+    const r = runGit(arena, io, &argv) catch |err| return err;
+    if (!ok(r)) return explain(arena, r, name);
+    const verb: []const u8 = if (b.len > 0) "created and switched to" else "switched to";
+    return std.fmt.allocPrint(arena, "{s} `{s}`", .{ verb, name });
+}
+
+/// A branch name that git will accept, checked here so the model gets a sentence
+/// instead of git's.
+///
+/// The dash rule is not cosmetic: it is the one that keeps a name from being read as an
+/// OPTION by git itself, which is the only injection surface in this file.
+pub fn validRefName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 200) return false;
+    if (name[0] == '-' or name[0] == '/') return false;
+    if (std.mem.endsWith(u8, name, ".lock")) return false;
+    for (name) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+        switch (c) {
+            ' ', ':', '~', '^', '?', '*', '[', '\\', '@' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Stage everything, or the paths given, and say what is now staged.
+pub fn toolGitAdd(io: std.Io, arena: std.mem.Allocator, paths: []const []const u8) ![]const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(arena, "git");
+    try argv.append(arena, "add");
+    if (paths.len == 0) {
+        try argv.append(arena, "-A");
+    } else {
+        for (paths) |p| {
+            if (std.mem.eql(u8, p, "-A") or p.len > 0 and p[0] == '-') {
+                return "a path cannot start with a dash: it would be read as an option to git. Use `./name` if the file starts with one.";
+            }
+            try argv.append(arena, p);
+        }
+    }
+    const r = runGit(arena, io, argv.items) catch |err| return err;
+    if (!ok(r)) return explain(arena, r, "add");
+    const st = try bg_tool.runForeground(arena, io, "git diff --cached --shortstat", 10, 4096);
+    const tail = if (st.stdout.len > 0) std.mem.trim(u8, st.stdout, " \t\r\n") else "";
+    return std.fmt.allocPrint(arena, "staged{s}\n", .{
+        if (tail.len > 0) std.fmt.allocPrint(arena, ": {s}", .{tail}) catch "" else " everything",
+    });
+}
+
+/// Commit what is staged. The message goes in a FILE, not on the command line.
+///
+/// `git commit -m "<model's text>"` would be an argv entry and could contain anything;
+/// writing it to a temp file and passing `-F` keeps it out of the argv entirely, and it
+/// is the shape git's own documentation recommends for anything long.
+pub fn toolGitCommit(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    message: []const u8,
+) ![]const u8 {
+    const msg = std.mem.trim(u8, message, " \t\r\n");
+    if (msg.len == 0) return "a commit needs a message. One line of what changed and why is enough.";
+    if (msg.len > 4096) return "the commit message is over 4096 characters; the first paragraph is what git shows.";
+
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/tmp/opencode/zode-commit-{d}.txt", .{std.Io.Timestamp.now(io, .real).toNanoseconds()}) catch
+        return "could not name a temporary file for the commit message";
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = msg }) catch
+        return "could not write the commit message to a temporary file";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var argv: [4][]const u8 = .{ "git", "commit", "-F", path };
+    const r = runGit(arena, io, &argv) catch |err| return err;
+    if (!ok(r)) {
+        if (std.mem.indexOf(u8, r.stderr, "nothing to commit") != null) {
+            return "nothing to commit: the tree has no staged changes. `git_add` first, or edit something.";
+        }
+        return explain(arena, r, "commit");
+    }
+    const head = r.stdout;
+    const line = std.mem.indexOfScalar(u8, head, '\n') orelse head.len;
+    return std.fmt.allocPrint(arena, "committed: {s}", .{std.mem.trim(u8, head[0..line], " \t\r\n")});
+}
+
+/// Put the current changes aside and get them back with `git stash pop`.
+pub fn toolGitStash(io: std.Io, arena: std.mem.Allocator, action: []const u8) ![]const u8 {
+    var argv: [3][]const u8 = undefined;
+    const verb: []const u8 = if (std.mem.eql(u8, action, "pop")) "pop" else if (std.mem.eql(u8, action, "list")) "list" else "push";
+    argv = .{ "git", "stash", verb };
+    const r = runGit(arena, io, &argv) catch |err| return err;
+    if (!ok(r)) return explain(arena, r, verb);
+    return switch (verb[0]) {
+        'p' => "stash pop: the changes are back in the tree.",
+        'l' => if (r.stdout.len == 0) "no stashes." else r.stdout,
+        else => "changes stashed. `git_stash pop` brings them back.",
+    };
+}
+
+fn runGit(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) !bg_tool.Foreground {
+    // `runForeground` only takes a shell string, so the argv is joined with a quoting
+    // that cannot be escaped: each argument is single-quoted and any `'` inside is
+    // closed, escaped and reopened. It is the one place in this file where a model's
+    // text becomes part of a command, and it is quoted rather than trusted.
+    var text = std.Io.Writer.Allocating.init(arena);
+    const w = &text.writer;
+    for (argv, 0..) |a, i| {
+        if (i > 0) w.writeAll(" ") catch {};
+        w.writeByte('\'') catch {};
+        for (a) |c| {
+            // Close the quote, emit an escaped quote, reopen. The only sequence that
+            // cannot be broken from inside single quotes.
+            if (c == '\'') w.writeAll("'\\''") catch {} else w.writeByte(c) catch {};
+        }
+        w.writeByte('\'') catch {};
+    }
+    return bg_tool.runForeground(arena, io, text.written(), 20, diff_limit);
+}
+
+fn ok(r: bg_tool.Foreground) bool {
+    const t = r.term orelse return false;
+    return t.exited == 0;
+}
+
+/// git's stderr, trimmed, with the two cases that are about the MODEL and not the repo.
+fn explain(arena: std.mem.Allocator, r: bg_tool.Foreground, what: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, r.stderr, "not a git repository") != null) {
+        return "this directory is not a git repository, so that was not run. If the project is not under git, `bash` is the way to ask about files.";
+    }
+    if (std.mem.indexOf(u8, r.stderr, "Please tell me who you are") != null) {
+        return "git has no author configured, and it refuses to commit without one. Run `git config user.email` and `git config user.name` yourself — it is a decision about who is committing, not something to guess.";
+    }
+    if (std.mem.indexOf(u8, r.stderr, "would be overwritten") != null) {
+        return "git refused because unstaged changes in the tree would be lost by that switch. `git_stash` first, then switch, then `git_stash pop`.";
+    }
+    const e = std.mem.trim(u8, r.stderr, " \t\r\n");
+    if (e.len == 0) {
+        return std.fmt.allocPrint(arena, "git {s} failed with no message of its own", .{what}) catch "git failed";
+    }
+    return std.fmt.allocPrint(arena, "git {s} said: {s}", .{ what, e[0..@min(e.len, 600)] }) catch "git failed";
+}

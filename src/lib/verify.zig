@@ -71,6 +71,51 @@ const rules = [_]rule{
     .{ .needle = "make check", .kind = .slow_verify },
     .{ .needle = "make build", .kind = .slow_verify },
     .{ .needle = "make", .kind = .slow_verify, .at_start = false },
+    // `just` and `task` are the same idea as make with two words of config, and every
+    // repository that uses one has its whole test suite behind it.
+    //
+    //
+    // The trailing space is LOAD-BEARING and it took two tries to get right, in
+    // opposite directions:
+    //
+    //   - `at_start = false` needs a NON-word byte AFTER the needle, so `"just "` never
+    //     fired at all (the `t` of `test` is a word byte) and `./scripts/` never fired
+    //     for the same reason. A rule that reads right and matches nothing.
+    //   - `at_start = true` has no such check, so a bare `"just"` fired on `just-file.md`
+    //     and on anything else starting with those four letters.
+    //
+    // So: `at_start` AND a trailing space. The space is the word boundary, and
+    // `at_start` is what stops "just" matching inside another word. The cost is that a
+    // bare `just` (no recipe) stays in the foreground, which is the safe direction to
+    // be wrong in.
+    .{ .needle = "just ", .kind = .slow_verify, .at_start = true },
+    .{ .needle = "justfile", .kind = .slow_verify, .at_start = false },
+    .{ .needle = "task ", .kind = .slow_verify, .at_start = true },
+    // ── elixir / ruby / dotnet / bazel ──
+    .{ .needle = "mix test", .kind = .slow_verify },
+    .{ .needle = "mix compile", .kind = .slow_verify },
+    .{ .needle = "mix deps.get", .kind = .unknown },
+    .{ .needle = "bundle exec rspec", .kind = .slow_verify },
+    .{ .needle = "bundle exec rake", .kind = .slow_verify },
+    .{ .needle = "rspec", .kind = .slow_verify },
+    .{ .needle = "dotnet test", .kind = .slow_verify },
+    .{ .needle = "dotnet build", .kind = .slow_verify },
+    .{ .needle = "bazel test", .kind = .slow_verify },
+    .{ .needle = "bazel build", .kind = .slow_verify },
+    // ── a repository's OWN script, which is what most of them use ──
+    //
+    // `./scripts/ci.sh`, `./test.sh`, `bin/test`: no keyword to match, so the rule is
+    // on the SHAPE. It is deliberately narrow — a file that merely starts with "test"
+    // is not a test run — and it is `at_start = false` so `cd x && ./scripts/ci.sh`
+    // still matches through the wrapper handling.
+    // NO trailing slash. `containsAtWord` needs a non-word byte AFTER the needle, and
+    // the `/` in `./scripts/` is followed by `c` — so the rule with the slash never
+    // fires on anything. `.`, `/`, `-` and `_` are boundaries here on purpose (that is
+    // what makes `fuzz` match `fuzz.py`), and a needle has to respect it.
+    .{ .needle = "./scripts", .kind = .slow_verify, .at_start = false },
+    .{ .needle = "./test.sh", .kind = .slow_verify },
+    .{ .needle = "./run-tests", .kind = .slow_verify },
+    .{ .needle = "bin/test", .kind = .slow_verify, .at_start = false },
     // ── python ──
     .{ .needle = "pytest", .kind = .slow_verify },
     .{ .needle = "python -m pytest", .kind = .slow_verify },
@@ -293,4 +338,22 @@ test "classify: the FIRST matching rule wins, so the specific ones come first" {
     // the table order is what decides and it is pinned here.
     try std.testing.expectEqualStrings("zig build", classify("zig build test").matched);
     try std.testing.expectEqualStrings("cargo check", classify("cargo check").matched);
+}
+
+test "the rules the other tests assume, checked one by one" {
+    // Written out rather than in a loop so a failure names WHICH rule is wrong. The
+    // version in a loop said "expected .slow_verify, found .unknown" and pointed at
+    // nothing.
+    try std.testing.expectEqual(Kind.slow_verify, classify("mix test").kind);
+    try std.testing.expectEqual(Kind.slow_verify, classify("dotnet build").kind);
+    try std.testing.expectEqual(Kind.slow_verify, classify("just test").kind);
+    try std.testing.expectEqual(Kind.slow_verify, classify("./test.sh").kind);
+    try std.testing.expectEqual(Kind.slow_verify, classify("bin/test").kind);
+    try std.testing.expectEqual(Kind.slow_verify, classify("./scripts/ci.sh").kind);
+    try std.testing.expectEqual(Kind.slow_verify, classify("cd /tmp/x && ./scripts/ci.sh").kind);
+    // NOT slow_verify, which is the claim: a file that happens to be called `test.txt`
+    // is a read, and sending reads to the background would steal the session on them.
+    // It lands on `.quick` because of the `cat` rule, which is the better answer.
+    try std.testing.expect(classify("cat test.txt").kind != Kind.slow_verify);
+    try std.testing.expect(classify("just-file.md").kind != Kind.slow_verify);
 }

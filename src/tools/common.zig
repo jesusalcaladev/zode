@@ -128,3 +128,18 @@ pub fn isSkippable(name: []const u8) bool {
     }
     return name.len > 0 and name[0] == '.';
 }
+
+/// A string array field, or an empty slice when it is missing or not an array.
+///
+/// Empty means "none given", which for `git_add` means "everything that changed" — a
+/// different meaning from "an empty list", and the two are not the same request. The
+/// caller says which one it treats as what, in its own words.
+pub fn getStrList(obj: std.json.ObjectMap, key: []const u8) []const []const u8 {
+    const v = obj.get(key) orelse return &.{};
+    if (v != .array) return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (v.array.items) |e| {
+        if (e == .string) out.append(std.heap.page_allocator, e.string) catch break;
+    }
+    return out.items;
+}

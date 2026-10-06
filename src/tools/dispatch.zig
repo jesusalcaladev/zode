@@ -26,6 +26,8 @@ const web_tool = @import("web.zig");
 const think_tool = @import("think.zig");
 const todo_tool = @import("todo.zig");
 const goal_tool = @import("goal.zig");
+const verify_mod = @import("../lib/verify.zig");
+const typecheck = @import("../lib/typecheck.zig");
 const errors_tool = @import("errors.zig");
 
 pub const ToolDef = struct {
@@ -88,6 +90,10 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"git_status","description":"The state of the working tree and the branch: one line per staged, modified or untracked path (XY = staged then worktree, ?? = untracked), plus how many files changed and by how much. Prefer it to `bash git status`, which returns English prose with colour codes that you then have to parse. Returns a clean-tree note when there is nothing to report.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"git_diff","description":"The unified diff of the working tree against the index (or of the index against HEAD with staged:true). One block per file, each headed by the path, with +N and −M counted for you at the end. Painted with the same colouriser as a write/edit diff. For anything git does that these do not cover (a commit, a checkout, a stash, a log of one path), use `bash`.","parameters":{"type":"object","properties":{"staged":{"type":"boolean","description":"diff the index against HEAD instead of the working tree"}},"required":[]}}},
     \\{"type":"function","function":{"name":"git_log","description":"The last commits, most recent first, one line each (short hash and subject).","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"how many commits (default 20, max 200)"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"git_branch","description":"Work with branches: list them, create one and switch to it, or switch to an existing one. Use it before committing so your change is not mixed with whatever was already in the tree. `create` and `switch` need a name; a name starting with a dash is refused.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","switch"]},"name":{"type":"string","description":"the branch, required for create and switch"}},"required":["action"]}}},
+    \\{"type":"function","function":{"name":"git_add","description":"Stage changes for the next commit. With no paths it stages everything that changed, which is what you want after you edited files yourself. Reports what is staged.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"stage only these paths; omit to stage everything"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"git_commit","description":"Commit what is staged, with a message. One line of what changed and why is enough; do not put the diff in it. Returns the short hash. Does NOT push and does NOT add: stage first.","parameters":{"type":"object","properties":{"message":{"type":"string","description":"the commit message, one paragraph"}},"required":["message"]}}},
+    \\{"type":"function","function":{"name":"git_stash","description":"Put the current changes aside (push) so you can switch branches or start something clean, and bring them back (pop). `list` shows what is stashed. Use push+pop when the tree has unrelated work in it that you must not touch.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["push","pop","list"]}},"required":[]}}},
     \\{"type":"function","function":{"name":"refs","description":"Where a symbol is DEFINED and where it is USED, in one call and with the two separated: definitions first, then calls, then plain references. One plain identifier, not a pattern (use `grep` for text). Prefer it over grepping: guessing the declaration shape for the language, running two greps and working out which hit is the definition is three round trips, and a round trip is a whole request. Knows the declaration shapes of zig, rust, go, python, js/ts, c, sh, and steps over Go method receivers, so `refs Listen` finds `func (s *Server) Listen()` instead of calling it a use.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"subdir":{"type":"string","description":"where to look (default: the whole project)"}},"required":["symbol"]}}},
     \\{"type":"function","function":{"name":"rename","description":"Rename a symbol EVERYWHERE it appears as code, in ONE call, and report every file it touched. Prefer it over a series of `edit` calls: a rename applied to nine files out of ten leaves a codebase that does not compile, and only this says which file was skipped. Only whole-word occurrences that are real CODE are changed: the same name inside a string, a comment or a longer identifier is left alone. Two same-named symbols are both renamed — run `refs` first and narrow with `subdir` when that matters.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"to":{"type":"string","description":"the new name; must be a plain identifier"},"subdir":{"type":"string"}},"required":["symbol","to"]}}},
     \\{"type":"function","function":{"name":"check","description":"Typecheck THIS project, in the background, and report the errors with a file and a line. You do not have to know the command: build.zig means `zig build`, Cargo.toml means `cargo check`, tsconfig.json means `tsc --noEmit`. Call it with no arguments to start one and KEEP WORKING, then call it with id to read the errors. Prefer it over `bash zig build`: it saves the round trip of guessing the command, and it never blocks the input.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the job id a previous call returned"}}}}},
@@ -208,6 +214,14 @@ pub fn execute(
         return git_tool.toolGitDiff(io, obj, arena);
     } else if (std.mem.eql(u8, name, "git_log")) {
         return git_tool.toolGitLog(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "git_branch")) {
+        return git_tool.toolGitBranch(io, arena, common.getStr(obj, "action") orelse "list", common.getStr(obj, "name") orelse "");
+    } else if (std.mem.eql(u8, name, "git_add")) {
+        return git_tool.toolGitAdd(io, arena, common.getStrList(obj, "paths"));
+    } else if (std.mem.eql(u8, name, "git_commit")) {
+        return git_tool.toolGitCommit(io, arena, common.getStr(obj, "message") orelse "");
+    } else if (std.mem.eql(u8, name, "git_stash")) {
+        return git_tool.toolGitStash(io, arena, common.getStr(obj, "action") orelse "push");
     } else if (std.mem.eql(u8, name, "list_files")) {
         return list_files_tool.toolListFiles(io, obj, arena);
     } else if (std.mem.eql(u8, name, "web_fetch")) {
@@ -256,6 +270,10 @@ pub const defs = [_]ToolDef{
     .{ .name = "git_status", .desc = "Working tree state, machine format" },
     .{ .name = "git_diff", .desc = "Unified diff of the working tree" },
     .{ .name = "git_log", .desc = "Last commits, one line each" },
+    .{ .name = "git_branch", .desc = "list | create | switch: work with branches" },
+    .{ .name = "git_add", .desc = "Stage changes for the next commit" },
+    .{ .name = "git_commit", .desc = "Commit what is staged, with a message" },
+    .{ .name = "git_stash", .desc = "push | pop | list: put changes aside and bring them back" },
     .{ .name = "list_files", .desc = "List a directory (cheap structure overview)" },
     .{ .name = "web_fetch", .desc = "Fetch a URL and return it as readable text (HTML stripped)" },
     .{ .name = "web_search", .desc = "Search the web: titles, URLs and snippets" },
@@ -1730,4 +1748,85 @@ test "goal: an unknown status shows the two shapes that work, braces and all" {
 
 test "goal asks for no permission: it records what the model did, it changes nothing" {
     try std.testing.expect(!needsPermission("goal"));
+}
+
+test "a branch name that starts with a dash is refused, because that is the injection" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // git reads `--foo` as an OPTION. Every argv here is a fixed list and the name is
+    // one entry, so this cannot become an option — but the refusal is still here
+    // because a name that git will not accept should not reach git.
+    // No backslash here: it goes into a JSON string, so it would have to be escaped and
+    // this loop interpolates raw. `validRefName` is checked for it below, where there is
+    // no JSON in the way.
+    // `a/b` is NOT here: a slash inside a branch name is normal (`fix/goal-loop` is in
+    // the good list below) and only a LEADING one is refused. Having it in this list
+    // was a test that demanded git reject something git accepts.
+    for ([_][]const u8{ "--upload-pack=touch /tmp/x", "-x", "a b", "a:b", "a~1", "a^", "a?", "a*", "a[", ".lock", "/leading" }) |bad| {
+        const out = try execute(std.testing.io, "git_branch", try std.fmt.allocPrint(arena,
+            \\{{"action":"create","name":"{s}"}}
+        , .{bad}), arena, null, null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "not a usable branch name") != null);
+    }
+    // And a real one is accepted, so the check is not just refusing everything.
+    for ([_][]const u8{ "main", "fix/goal-loop", "feat-1", "v1.2.3" }) |good| {
+        try std.testing.expect(git_tool.validRefName(good));
+    }
+    // Checked here rather than through JSON: a backslash needs escaping to travel
+    // through a tool call, and a rule that only holds when the caller escapes correctly
+    // is not a rule.
+    try std.testing.expect(!git_tool.validRefName("a\\b"));
+    try std.testing.expect(!git_tool.validRefName("x.lock"));
+    try std.testing.expect(!git_tool.validRefName(""));
+}
+
+test "git: a path that starts with a dash is refused too" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try execute(std.testing.io, "git_add",
+        \\{"paths":["-A"]}
+    , arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "cannot start with a dash") != null);
+}
+
+test "git_commit with no message says so instead of committing something" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A PLAIN string, not allocPrint: there is nothing to interpolate, and a
+    // format string would read every `{` in the JSON as a placeholder.
+    const args: []const u8 = "{\"message\":\"  \"}";
+    const out = try execute(std.testing.io, "git_commit", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "needs a message") != null);
+}
+
+test "git_branch refuses an unknown action with the three that exist" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try execute(std.testing.io, "git_branch",
+        \\{"action":"destroy"}
+    , arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "list | create | switch") != null);
+}
+
+test "the marker table and the plan table agree, which is what makes check honest" {
+    // A marker with no plan arm, or a plan arm with no marker, means `check` silently
+    // does nothing for a whole language. Both directions are checked here by counting.
+    // Python is the reference: it is the one the tests above already pin.
+    try std.testing.expect((typecheck.planFor(.{ .pyproject = true, .py_source = true }) orelse unreachable).label.len > 0);
+    try std.testing.expect((typecheck.planFor(.{ .mix_exs = true, .mix_source = true }) orelse unreachable).label.len > 0);
+    try std.testing.expect((typecheck.planFor(.{ .gemfile = true, .rb_source = true }) orelse unreachable).label.len > 0);
+    try std.testing.expect((typecheck.planFor(.{ .csproj = true, .cs_source = true }) orelse unreachable).label.len > 0);
+    try std.testing.expect((typecheck.planFor(.{ .gradle = true, .java_source = true }) orelse unreachable).label.len > 0);
+    try std.testing.expect((typecheck.planFor(.{ .pom = true, .java_source = true }) orelse unreachable).label.len > 0);
+    try std.testing.expect((typecheck.planFor(.{ .composer = true, .php_source = true }) orelse unreachable).label.len > 0);
+    try std.testing.expect((typecheck.planFor(.{ .dune_project = true, .ocaml_source = true }) orelse unreachable).label.len > 0);
+    // A marker WITHOUT source is still nothing: a vendored Gemfile is not a Ruby
+    // project, and running `ruby -c` on it would prove nothing.
+    try std.testing.expect(typecheck.planFor(.{ .gemfile = true }) == null);
+    try std.testing.expect(typecheck.planFor(.{ .csproj = true }) == null);
 }

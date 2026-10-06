@@ -55,6 +55,22 @@ pub const Markers = struct {
     /// would be a claim the command cannot back.
     pyproject: bool = false,
     py_source: bool = false,
+    // The rest. Every one of these is a MARKER FILE and a fixed command, never
+    // something the model names: a table that asks the model what to run is a table
+    // that runs whatever the model wants.
+    mix_exs: bool = false,
+    mix_source: bool = false,
+    gemfile: bool = false,
+    rb_source: bool = false,
+    csproj: bool = false,
+    cs_source: bool = false,
+    gradle: bool = false,
+    java_source: bool = false,
+    pom: bool = false,
+    composer: bool = false,
+    php_source: bool = false,
+    dune_project: bool = false,
+    ocaml_source: bool = false,
 };
 
 /// The command for this project, or null when nothing here is known.
@@ -93,6 +109,40 @@ pub fn planFor(m: Markers) ?Plan {
     if (m.pyproject and m.py_source) return .{
         .command = "python3 -m compileall -q .",
         .label = "python syntax check",
+    };
+    if (m.mix_exs and m.mix_source) return .{
+        .command = "mix compile",
+        .label = "mix compile",
+    };
+    // `.exs` is Elixir's build AND its test config, and `mix compile` is the cheapest
+    // thing that answers "does this still parse". `mix credo` would be a lint nobody
+    // asked for.
+    if (m.dune_project and m.ocaml_source) return .{
+        .command = "dune build",
+        .label = "dune build",
+    };
+    // Ruby has no typechecker to run and pretending otherwise would mean installing
+    // one. A syntax check is what the language actually offers, and it is labelled as
+    // that.
+    if (m.gemfile and m.rb_source) return .{
+        .command = "ruby -c",
+        .label = "ruby -c (syntax only; ruby has no typechecker)",
+    };
+    if (m.csproj and m.cs_source) return .{
+        .command = "dotnet build --nologo -v q",
+        .label = "dotnet build",
+    };
+    if (m.gradle and m.java_source) return .{
+        .command = "gradle compileJava --quiet",
+        .label = "gradle compileJava",
+    };
+    if (m.pom and m.java_source) return .{
+        .command = "mvn -q -o compile",
+        .label = "mvn compile",
+    };
+    if (m.composer and m.php_source) return .{
+        .command = "php -l",
+        .label = "php -l (syntax only)",
     };
     return null;
 }

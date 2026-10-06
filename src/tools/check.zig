@@ -32,6 +32,73 @@ const tcheck = @import("../lib/typecheck.zig");
 ///
 /// Exposed for the tests and for `agent.autoCheck`, which wants the SAME answer
 /// this tool would give without spawning anything.
+/// Marker FILES, as data.
+///
+/// It is a table and not a dozen `if`s because it is the thing that grows: a language is
+/// one row here plus one in `typecheck.planFor`, and with the `if`s it was a hunt for
+/// the one that had been forgotten.
+/// A `Markers` field, as an enum, because `@field` needs a comptime-known name and a
+/// `[]const u8` is not one. With strings here the table does not compile, which is the
+/// kind of thing a compiler settles for you.
+const MarkerField = enum {
+    zig_build,
+    cargo_toml,
+    tsconfig,
+    go_mod,
+    pyproject,
+    mix_exs,
+    gemfile,
+    csproj,
+    gradle,
+    pom,
+    composer,
+    dune_project,
+};
+
+const markers = [_]struct { field: MarkerField, files: []const []const u8 }{
+    .{ .field = .zig_build, .files = &.{"build.zig"} },
+    .{ .field = .cargo_toml, .files = &.{"Cargo.toml"} },
+    .{ .field = .tsconfig, .files = &.{ "tsconfig.json", "jsconfig.json" } },
+    .{ .field = .go_mod, .files = &.{"go.mod"} },
+    .{ .field = .pyproject, .files = &.{ "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt" } },
+    .{ .field = .mix_exs, .files = &.{"mix.exs"} },
+    .{ .field = .gemfile, .files = &.{"Gemfile"} },
+    .{ .field = .csproj, .files = &.{"global.json"} },
+    .{ .field = .gradle, .files = &.{ "build.gradle", "build.gradle.kts", "settings.gradle" } },
+    .{ .field = .pom, .files = &.{"pom.xml"} },
+    .{ .field = .composer, .files = &.{"composer.json"} },
+    .{ .field = .dune_project, .files = &.{ "dune-project", "dune" } },
+};
+
+/// Source extensions that prove the language is actually USED here.
+///
+/// The marker alone is not enough: a repository can carry a `Gemfile` for a vendored
+/// gem and no Ruby of its own, and running `ruby -c` on it proves nothing. The pair
+/// (marker AND source) is what makes the answer mean something, and it is the same rule
+/// Python already followed.
+const SourceField = enum {
+    py_source,
+    mix_source,
+    rb_source,
+    cs_source,
+    java_source,
+    php_source,
+    ocaml_source,
+};
+
+const sources = [_]struct { field: SourceField, ext: []const u8 }{
+    .{ .field = .py_source, .ext = ".py" },
+    .{ .field = .mix_source, .ext = ".ex" },
+    .{ .field = .mix_source, .ext = ".exs" },
+    .{ .field = .rb_source, .ext = ".rb" },
+    .{ .field = .cs_source, .ext = ".cs" },
+    .{ .field = .java_source, .ext = ".java" },
+    .{ .field = .java_source, .ext = ".kt" },
+    .{ .field = .php_source, .ext = ".php" },
+    .{ .field = .ocaml_source, .ext = ".ml" },
+    .{ .field = .ocaml_source, .ext = ".mli" },
+};
+
 pub fn planAt(io: std.Io, dir: []const u8) ?tcheck.Plan {
     var m = tcheck.Markers{};
 
@@ -45,7 +112,18 @@ pub fn planAt(io: std.Io, dir: []const u8) ?tcheck.Plan {
         m.go_mod = m.go_mod or std.mem.eql(u8, e.name, "go.mod");
         m.pyproject = m.pyproject or std.mem.eql(u8, e.name, "pyproject.toml") or
             std.mem.eql(u8, e.name, "setup.py");
-        if (std.mem.endsWith(u8, e.name, ".py")) m.py_source = true;
+        // One table for the markers and one for the extensions, so adding a language is
+        // two lines and not a hunt through a `if` per ecosystem.
+        // `inline for`: it unrolls at comptime, which is what makes `@field` legal
+        // with a table. A plain `for` over the same table does not compile.
+        inline for (markers) |mk| {
+            for (mk.files) |f| {
+                if (std.mem.eql(u8, e.name, f)) @field(m, @tagName(mk.field)) = true;
+            }
+        }
+        inline for (sources) |src| {
+            if (std.mem.endsWith(u8, e.name, src.ext)) @field(m, @tagName(src.field)) = true;
+        }
     }
     dirh.close(io);
 
@@ -84,7 +162,7 @@ pub fn toolCheck(
     // nothing.
     const plan = planAt(io, subdir) orelse return std.fmt.allocPrint(
         arena,
-        "no typecheck is known for this project (no build.zig, Cargo.toml, tsconfig.json, go.mod or pyproject.toml). Run whatever the project uses with `bash`, in the background: bash with run_in_background true.",
+        "no typecheck is known for this project (no build.zig, Cargo.toml, tsconfig.json, go.mod, pyproject.toml, mix.exs, Gemfile, global.json, build.gradle, pom.xml, composer.json or dune-project). Run whatever the project uses with `bash`, in the background: bash with run_in_background true.",
         .{},
     );
 
