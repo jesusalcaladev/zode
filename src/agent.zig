@@ -2291,6 +2291,13 @@ pub fn iterationLimit() usize {
 /// ceiling, because a user who sets it wants exactly that.
 pub const default_goal_hard: usize = 60;
 
+/// The ceiling that applies to the turn in progress, and the one the status bar has to
+/// print. Extracted because the number in the UI and the number the loop uses were two
+/// reads of the same idea, and only the loop's was right.
+pub fn statusIterationLimit(m: *const tui.Model) usize {
+    return if (m.goal.isOpen()) goalHardLimit() else iterationLimit();
+}
+
 pub fn goalHardLimit() usize {
     const raw = envGet(environ_global, "ZODE_GOAL_MAX") orelse return @max(iterationLimit() * 3, default_goal_hard);
     const n = std.fmt.parseInt(usize, raw, 10) catch return @max(iterationLimit() * 3, default_goal_hard);
@@ -3184,10 +3191,22 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // stopped. The first one has no counter because it is the normal case and
     // the number would be noise.
     if (iteration > 0) {
+        // The limit that ACTUALLY applies, not the soft cap.
+        //
+        // With a goal set the ceiling is `goalHardLimit()` — 60 by default — and this
+        // used to print `iterationLimit()` whatever it was. Measured in a real run: the
+        // status read `thinking · iteration 26/12`, which is a turn that is 34 iterations
+        // from its budget being displayed as 14 over it.
+        //
+        // That is not cosmetic. A user who reads "26/12" concludes the turn is running
+        // away and cuts it short, which is the harness talking the user into aborting
+        // work that has fifty iterations left. A status bar that overstates the budget
+        // gets the user to do the harness's job, wrongly.
+        const limit = statusIterationLimit(m);
         const it = std.fmt.allocPrint(
             gpa,
             "thinking · iteration {d}/{d}",
-            .{ iteration + 1, iterationLimit() },
+            .{ iteration + 1, limit },
         ) catch "thinking";
         setStatusWithZo(m, .thinking, it);
     } else {
@@ -8566,4 +8585,38 @@ test "the verdict is per TURN and resets, so turn two is not judged by turn one"
     try std.testing.expectEqual(@as(u32, 0), ac.started_this_turn);
     // The job id goes too, which is what stops turn two reporting turn one's errors.
     try std.testing.expectEqual(@as(u32, 0), ac.job);
+}
+
+test "the iteration counter shows the limit that APPLIES, not the soft cap" {
+    // Measured in a real run: `thinking · iteration 26/12`. With a goal set the ceiling
+    // is 60, so the turn was 34 from its budget and the status said it was 14 over. A
+    // user who reads that cuts the turn short, which is the status bar talking the user
+    // into aborting work with fifty iterations left.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // No goal: the soft cap is the ceiling and that is what is shown.
+    const plain = statusIterationLimit(&m);
+    try std.testing.expectEqual(iterationLimit(), plain);
+
+    // A goal raises the ceiling, and the number on screen has to follow it or it is
+    // reporting a budget that does not exist.
+    const obj = "ship";
+    @memcpy(m.goal.text[0..obj.len], obj);
+    m.goal.len = obj.len;
+    try std.testing.expect(m.goal.isOpen());
+    const with_goal = statusIterationLimit(&m);
+    try std.testing.expectEqual(goalHardLimit(), with_goal);
+    try std.testing.expect(with_goal > plain);
+
+    // And once the goal is DECIDED the turn is over, so the soft cap is the number that
+    // would be shown next.
+    m.goal.status = goal_mod.Status.met;
+    try std.testing.expectEqual(iterationLimit(), statusIterationLimit(&m));
 }
