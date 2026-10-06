@@ -2419,6 +2419,18 @@ pub const Model = struct {
         return self.busy or self.streaming or self.tool_run != null;
     }
 
+    /// `workingLocked` for callers outside this file, and NOT renamed: the "locked"
+    /// suffix is what says "this one wants the lock and `main`'s exit report must not
+    /// block on a turn in flight to find out why the app is leaving".
+    ///
+    /// Reading `busy`/`streaming`/`tool_run` without the lock is a torn read, and a torn
+    /// read in a DIAGNOSTIC is worse than a wrong one: it would print a state that never
+    /// existed. This one is a three-word `or` over words, and the alternative is a report
+    /// that lies about the moment it exists to explain.
+    pub fn workingPublic(self: *const Model) bool {
+        return self.workingLocked();
+    }
+
     pub fn queuedCount(self: *Model) usize {
         self.lock();
         defer self.unlock();

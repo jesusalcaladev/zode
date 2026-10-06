@@ -544,7 +544,50 @@ fn runTui(init: std.process.Init) !u8 {
     agent.initCheapRouterFromEnv(model.environ);
 
     agent.bootMark("app.run start");
-    try app.run(model.widget(), .{});
+
+    // WHY WE ARE LEAVING, ALWAYS, ON STDERR.
+    //
+    // Measured over five real task runs: the process ended, mid-turn, with the work
+    // done and no verdict declared — and the log said NOTHING. No panic, no error, no
+    // message. `tmux` reports the session gone, `capture-pane` says the server is not
+    // running, and stderr has one `info(vaxis)` line in it. Five runs produced zero
+    // information about why, and the first four hours of diagnosis went on hypotheses
+    // (frame arena, segment cache, a garbage grapheme length, memory growth) because
+    // there was nothing to read.
+    //
+    // A program that vanishes without a word is a bug in the program, not only in
+    // whatever made it vanish. The cost is two lines and it is paid only at exit.
+    //
+    // `ZODE_EXIT_TRACE=1` to see it; without it, only when something went wrong, which
+    // is the case that needs it. A clean exit has always been silent and must stay so:
+    // a message on every ctrl+c would be noise the user learns to ignore, and the one
+    // time they need to read it is the time it is missing.
+    const exit_trace = envGet(init.environ_map, "ZODE_EXIT_TRACE") != null;
+
+    app.run(model.widget(), .{}) catch |err| {
+        // This is the branch that matters most and it used to be `try`, which printed
+        // the error and nothing else: no clue about which turn, which tool, how much was
+        // in flight, or how much memory the process was holding at the moment it gave
+        // up. Every one of those is a question the next bug will ask.
+        std.debug.print(
+            \\zode: the TUI stopped with `{t}`.
+            \\  busy: {s} · streaming: {s} · queue: {d}
+            \\  history: {d} paragraphs · plan: {d}/{d} done
+            \\  workers in flight: {d}
+            \\
+        , .{
+            err,
+            if (model.workingPublic()) "yes" else "no",
+            if (model.streaming) "yes" else "no",
+            model.queuedCount(),
+            model.paras.items.len,
+            model.plan.doneCount(),
+            model.plan.items.len,
+            model.workers.load(.monotonic),
+        });
+        return err;
+    };
+    if (exit_trace) std.debug.print("zode: the TUI returned normally; quitting.\n", .{});
 
     // Out through `quitFast`, not through the defers.
     //
