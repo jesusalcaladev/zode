@@ -3180,3 +3180,47 @@ ones is this one.
    reading `stderr.log` and the tmux pane and never the script's stderr.
 3. **`ulimit -c unlimited` is the difference between "it died" and "here is what
    died".** Two runs produced zero artifacts and therefore zero answers.
+
+## A build step whose description was the promise it did not keep (2026-10-06)
+
+`zig build debug` is documented in its own `b.step` line as:
+
+    Build zode-debug (has symbols, for crash traces)
+
+It could not do either half of that. Two independent defects, and the reason a real
+SIGSEGV stayed un diagnosed for a whole session:
+
+**1. It compiled in ReleaseSmall.** `.optimize = optimize` where it needed `.Debug`,
+with `strip = null` beside it "keeping" the debug sections. `strip` only removes
+sections that were EMITTED, and ReleaseSafe/ReleaseSmall emit none:
+
+    zig build -Dstrip=false   ->  nm: no hay símbolos
+    readelf -SW               ->  no .symtab, no .debug_*   (not one)
+
+**2. It never installed anything.** `b.installArtifact` attaches to the DEFAULT
+install step, so `zig build debug` compiled the executable into the cache and stopped.
+The `zig-out/bin/zode-debug` that existed had been copied by some earlier plain
+`zig build`, and it was **byte-identical to the stripped release binary — same md5**.
+
+So the file answering to "the one with symbols, for crash traces" was a copy of the
+one with none. And `-Dstrip=false`, which the comment in `build.zig` recommended as
+"the documented way to get a debuggable build", has the same defect: it is the same
+confusion — **unstripped is not the same thing as symbolized** — written down twice.
+
+Fixed both. Measured after:
+
+    zig-out/bin/zode-debug   59,370,296 bytes
+    .symtab present, .debug_info present, nm lists symbols
+
+`b.addInstallArtifact` with the install step depended on by `debug` only, which also
+stops a normal `zig build` from dropping 59 MB into `zig-out/bin` every time.
+
+**The general lesson, and it is the one worth keeping**: a build step's DESCRIPTION is
+part of the interface, and a description that is wrong is worse than no step at all.
+Here it was not merely incomplete, it was confidently false, and it was consulted as
+evidence — "the debug step exists, so the crash is hard to diagnose" — when in fact
+the step was the reason.
+
+**And the test that would have caught it is one line**: `nm zig-out/bin/zode-debug`
+after `zig build debug`. There is no reason a build step cannot be asserted, and a
+step whose whole purpose is "trustworthy artifacts" is the last place to skip it.
