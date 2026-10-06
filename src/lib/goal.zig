@@ -183,15 +183,72 @@ pub fn reminder(g: *const Goal, soft_cap: usize, hard_cap: usize, left: usize) [
 /// It says what it wants in the model's own terms — done, or blocked and why — because
 /// "continue or stop" invites the model to keep going for a third option that is not
 /// on the list.
-pub fn checkpointPrompt(soft_cap: usize, left: usize) []const u8 {
+/// What the harness says when the soft budget runs out.
+///
+/// ## Why this does not say STOP
+///
+/// The first version opened with "STOP AND REPORT. You have used the iteration budget
+/// for this turn. Do not start new work." and closed with "If you are neither, say so in
+/// your answer and the harness will give you more iterations."
+///
+/// Both halves were wrong, and measurably so. Over five real task runs the same model
+/// that does this work well under a different harness finished zero of them, and this
+/// prompt is the reason:
+///
+/// - It told the model to STOP at iteration 12 with the work half done. A model that
+///   obeys writes a summary instead of finishing; a model that does not obey burns the
+///   next 48 iterations ignoring an instruction. Neither finishes the task. That is a
+///   coin flip the harness is flipping with the user's work.
+/// - The escape was "say so in your answer", which requires the harness to READ PROSE.
+///   It does not and it cannot: the only machine-readable ending is the `goal` call. So
+///   the prompt offered a door made of a material the harness cannot handle.
+///
+/// The harness does not need the model to tell it whether the work is finished. It has
+/// the plan, with its open steps counted, and the verification that failed. So this
+/// names what is still open and keeps going. The verdict stays available, but as what it
+/// actually is: the way out when the work really cannot be finished here, not the price
+/// of admission for continuing.
+///
+/// The numbers are in it because they are the cheapest lever there is: a model with room
+/// to spare polishes the objective, and a model with four iterations left finishes.
+pub fn checkpointPrompt(
+    gpa: std.mem.Allocator,
+    soft_cap: usize,
+    left: usize,
+    open_steps: usize,
+) ![]const u8 {
     _ = soft_cap;
-    _ = left;
-    return "STOP AND REPORT. You have used the iteration budget for this turn. Do not start new work.\n" ++
-        "In your answer, say what is DONE, what is still MISSING, and then call `goal` with one of:\n" ++
-        "  {\"status\":\"met\",     \"summary\":\"what you finished, and the evidence\"}\n" ++
-        "  {\"status\":\"blocked\", \"summary\":\"why it cannot be done here\", \"what_would_unblock\":\"the one thing that would change the answer\"}\n" ++
-        "Use `met` ONLY if you are certain. Do not use `blocked` because something is hard. If you are neither, " ++
-        "say so in your answer and the harness will give you more iterations.\n";
+    const steps = try openStepsLine(gpa, open_steps);
+    defer gpa.free(steps);
+    return std.fmt.allocPrint(gpa,
+        \\Keep going. This is a speed bump, not the end of the turn, and there are {d} more
+        \\iterations after this one.
+        \\
+        \\Still open in your plan: {s}
+        \\
+        \\That is the work: finish it now. Do not write a summary of what you did, because an
+        \\unfinished task does not become a finished one by being described.
+        \\
+        \\If a test or a build is failing, fix that before anything else. Unverified work is
+        \\not work.
+        \\
+        \\Only when the objective is genuinely reached, or genuinely cannot be reached here,
+        \\call `goal`:
+        \\  {{"status":"met",     "summary":"what you finished, and the evidence"}}
+        \\  {{"status":"blocked", "summary":"why it cannot be done here", "what_would_unblock":"the one thing that would change the answer"}}
+    , .{ left, steps });
+}
+
+/// "Keep going" only works if it says what to keep going ON, and the harness already
+/// knows: the plan counts its own open steps. Asking the model would be asking it for
+/// something this process can read off its own state, which is the whole point of the
+/// change — the harness stops asking the model to grade its own homework.
+fn openStepsLine(gpa: std.mem.Allocator, open_steps: usize) ![]const u8 {
+    return switch (open_steps) {
+        0 => gpa.dupe(u8, "none, which means the objective is not met or not verified: find out which before you declare it."),
+        1 => gpa.dupe(u8, "1 step. Finish that one before anything else."),
+        else => std.fmt.allocPrint(gpa, "{d} steps. Work down them in order.", .{open_steps}),
+    };
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────────

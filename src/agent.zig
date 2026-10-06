@@ -455,21 +455,50 @@ pub fn syncSystemPrompt(s: *session_mod.Session) void {
 /// The objective, verbatim, plus the budget as NUMBERS. "You have 18 iterations left"
 /// is the cheapest lever in the whole feature: a model told it has plenty polishes, and
 /// one told it has two left finishes.
-pub fn goalNote(gpa: std.mem.Allocator, g: *const goal_mod.Goal, left: usize, checkpoint: bool) ![]const u8 {
+pub fn goalNote(
+    gpa: std.mem.Allocator,
+    g: *const goal_mod.Goal,
+    left: usize,
+    checkpoint: bool,
+    open_steps: usize,
+) ![]const u8 {
     if (!g.isSet()) return error.NoGoal;
     if (checkpoint) {
         return std.fmt.allocPrint(
             gpa,
             "{s}{s}\n\n{s}",
-            .{ session_mod.goal_note_marker, g.objective(), goal_mod.checkpointPrompt(0, left) },
+            .{ session_mod.goal_note_marker, g.objective(), try goal_mod.checkpointPrompt(gpa, 0, left, open_steps) },
         );
     }
+    // The countdown only appears when it is TRUE information, that is near the ceiling.
+    //
+    // It used to be on every iteration, and that is 60 sentences in the model's context
+    // all saying the same thing: "Budget: 58 iterations left of 60". A number that has
+    // not changed in any way the model can act on is not information, it is a deadline
+    // the model learns to hurry for — which is the opposite of finishing careful work.
+    // What the model needs instead, every time, is the one sentence that keeps the shape
+    // of the turn clear: it ends when the objective is decided, not when the model stops
+    // talking.
+    //
+    // `urgent` is the last few iterations. There the number IS actionable, and a model
+    // with four iterations left should be told to land the plane.
+    const urgent = left <= 4;
     return std.fmt.allocPrint(
         gpa,
-        "{s}{s}\nBudget: {d} iterations left of {d}. Do not spend them polishing: the turn does not " ++
-            "end until the objective is met or you have declared it blocked, and a summary of what you did " ++
-            "is not a verdict. Call `goal` only when it is true.",
-        .{ session_mod.goal_note_marker, g.objective(), left, g.iterations + left },
+        "{s}{s}\n{s}",
+        .{
+            session_mod.goal_note_marker,
+            g.objective(),
+            if (urgent)
+                std.fmt.allocPrint(
+                    gpa,
+                    "{d} iterations left. Land it: finish what is open, and call `goal` with what is true.",
+                    .{left},
+                ) catch "iterations are running out: land it."
+            else
+                "This turn ends when the objective is met or you declare it blocked — not when you stop talking. " ++
+                    "A summary is not a verdict. Call `goal` only when it is true.",
+        },
     );
 }
 
@@ -2056,8 +2085,55 @@ fn chatWorker(job: *ChatJob) void {
 
         // 2. The model stopped asking for tools. `again == null` is above; this is the
         //    case where it answered in prose while the goal is still open, which means
-        //    it thinks it is finished without having declared. Give it the checkpoint
-        //    rather than ending the turn on a shrug.
+        //    it thinks it is finished without having declared.
+        //
+        //    UNLESS THE CODE IS RED.
+        //
+        //    This is the check that turns "the turn ended" into "the task ended". The
+        //    harness knows the build failed — it read the exit code and built the model's
+        //    own error message out of the diagnostics — and then it let the turn end
+        //    anyway, five times out of five, on a task that was about code compiling.
+        //
+        //    Not asking the model whether it is finished, because a turn that has ended
+        //    in prose is a turn where nobody is grading anything: the one moment where
+        //    a self-assessment would be worth something is the one moment there is
+        //    nobody left to give it. The harness already has the evidence.
+        if (!turnMayEnd(&m.auto_check, m.goal.isOpen())) {
+            // A stack buffer and not `allocPrint(m.allocator, …)`: this runs on the
+            // refusing path, which is the path a turn takes when it is going badly, and
+            // a leak there is a leak per iteration of every bad turn.
+            var why_buf: [96]u8 = undefined;
+            const why = blk: {
+                if (m.plan.openCount() > 0) {
+                    break :blk std.fmt.bufPrint(&why_buf, "{d} plan steps open", .{m.plan.openCount()}) catch "plan steps open";
+                }
+                break :blk "no open steps";
+            };
+            pushErrorFmt(
+                m,
+                "not done: the last {s} was RED and the goal is still open ({s}). Fix it, or declare `blocked` with what would unblock it.",
+                .{
+                    if (m.auto_check.label_len > 0) m.auto_check.label[0..m.auto_check.label_len] else "check",
+                    why,
+                },
+            );
+            // Re-open the turn with the refusal as the prompt. The model's own message
+            // about the failure is already in the history, so this is not repeating it:
+            // it is making the loop's refusal explicit and imperative, which is the part
+            // a model reads as a task rather than as commentary.
+            //
+            // `owned`, not a bare assignment: the loop frees the previous prompt through
+            // it, so a `last_user` set without it leaks a turn's worth of text per
+            // refusal.
+            const nudge = m.allocator.dupe(
+                u8,
+                "The harness will not end this turn yet: the last check failed and the objective is not met. Read the errors above, fix them, and re-run the check. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.",
+            ) catch break;
+            if (owned) |o| m.allocator.free(o);
+            owned = nudge;
+            last_user = nudge;
+            continue;
+        }
         if (checkpointed) {
             // 3. It had its checkpoint and still did not declare. That is the answer:
             //    it wants more room, so give it, until the hard ceiling.
@@ -2092,22 +2168,30 @@ fn chatWorker(job: *ChatJob) void {
     if (owned) |o| m.allocator.free(o);
     const capped = iterations >= hard and m.goal.isOpen();
     if (capped) {
-        // The message has to say what is unresolved, because "stopping the turn" is the
-        // sentence that started this: the user cannot tell a finished task from a cut
-        // one, and the plan on screen is the only evidence they had.
+        // UNFINISHED, first word. The old text was "goal not declared after N
+        // iterations. Stopping here; say `continue` to go on." and it had two problems:
+        // it led with the harness's bookkeeping instead of the state of the work, and it
+        // ended by handing the user a chore — which is the sentence that started this
+        // whole feature. Reaching the ceiling means the turn ran out of room, not that
+        // the task is done, and the one thing the user must not be left guessing is which
+        // of the two it is.
         const open_steps = m.plan.openCount();
-        if (open_steps > 0) {
+        const unresolved = if (open_steps > 0)
+            std.fmt.allocPrint(m.allocator, "{d} plan steps still open", .{open_steps}) catch "plan steps still open"
+        else
+            m.allocator.dupe(u8, "no open plan steps, so the objective is simply unverified") catch
+                "the objective is unverified";
+        defer m.allocator.free(unresolved);
+
+        if (had_goal and m.goal.status == goal_mod.Status.none) {
             pushErrorFmt(
                 m,
-                "goal not declared after {d} iterations ({d} plan steps still open). Stopping here; say `continue` to go on.",
-                .{ hard, open_steps },
+                "UNFINISHED after {d} iterations ({s}). The goal was never declared: {s}",
+                .{ hard, unresolved, m.goal.objective() },
             );
         } else {
-            pushErrorFmt(m, "goal not declared after {d} iterations. Stopping here; say `continue` to go on.", .{hard});
+            pushErrorFmt(m, "UNFINISHED after {d} iterations ({s}).", .{ hard, unresolved });
         }
-    }
-    if (had_goal and m.goal.status == goal_mod.Status.none) {
-        pushErrorFmt(m, "the goal was never decided: {s}", .{m.goal.objective()});
     }
     m.streamEnd();
     // The bench sample is taken HERE, once per turn, and not per iteration: a
@@ -2910,7 +2994,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     if (session) |ss| {
         const left = if (m.goal.isOpen()) @max(goalHardLimit() - iteration, 0) else 0;
         const note = if (m.goal.isSet())
-            (goalNote(arena, &m.goal, left, m.goal_checkpoint) catch null)
+            (goalNote(arena, &m.goal, left, m.goal_checkpoint, m.plan.openCount()) catch null)
         else
             null;
         ss.setGoalNote(note) catch {};
@@ -5073,6 +5157,27 @@ pub const AutoCheck = struct {
     /// the whole contract: the output belongs to a background thread's buffer, so it
     /// cannot be a pointer into a turn's arena.
     job: u32 = 0,
+    /// The last verdict this turn: 0 = nothing has been checked, 1 = the last check
+    /// passed, 2 = it failed.
+    ///
+    /// ## Why the harness needs to remember this
+    ///
+    /// Measured over five real task runs: the same model that codes well in another
+    /// harness finished none of them, and in every case the turn ended with the code
+    /// never compiling. Not because the model refused to check — it started the checks
+    /// — but because nothing in the loop connected "the build is red" to "you may not
+    /// finish yet".
+    ///
+    /// The harness can see that the code is broken. It has the exit code and the
+    /// diagnostics; it already builds the model's own message out of them. So the
+    /// information was there and the LOOP did not ask, and the turn ended the way turns
+    /// end: the model stopped calling tools. Asking the model to notice is exactly the
+    /// thing that does not work — a turn that ends in prose is a turn where nobody is
+    /// grading anything any more.
+    ///
+    /// An integer and not a bool because "never checked" and "checked and passed" are
+    /// different, and only the first one is allowed to end a turn.
+    last_verdict: Verdict = .unchecked,
     /// The command it is running, for the message the model reads. A fixed buffer,
     /// because it outlives the arena that composed it.
     label: [64]u8 = @splat(0),
@@ -5087,6 +5192,7 @@ pub const AutoCheck = struct {
     pub fn resetTurn(self: *AutoCheck, reg: *bgproc.Registry, io: std.Io) void {
         _ = io;
         self.started_this_turn = 0;
+        self.last_verdict = .unchecked;
         // The running job is NOT killed.
         //
         // It was, and that made the whole feature useless most of the time. A
@@ -5176,6 +5282,7 @@ pub const AutoCheck = struct {
 
         const diags = typecheck_mod.extractDiagnostics(arena, text, 12) catch return null;
         if (diags.len == 0) {
+            self.last_verdict = .passed;
             // A check that FAILED and produced no `file:line: error:` is a failure,
             // not a pass. Measured: a `build.zig` that panics prints a source
             // location and a `thread N panic:` line, the scan finds nothing, and
@@ -5183,6 +5290,7 @@ pub const AutoCheck = struct {
             // not even run.
             const failed = out.exit != null and out.exit.? != 0;
             if (!failed) return null;
+            self.last_verdict = .failed;
             const tail = text[if (text.len > 1500) text.len - 1500 else 0..];
             return std.fmt.allocPrint(
                 arena,
@@ -5191,6 +5299,7 @@ pub const AutoCheck = struct {
             ) catch null;
         }
 
+        self.last_verdict = .failed;
         return std.fmt.allocPrint(
             arena,
             "[{s} found {d} problem(s) in the code you just wrote]\n{s}\nThis is the project's own compiler, not a guess. Fix these before writing more.",
@@ -5198,6 +5307,36 @@ pub const AutoCheck = struct {
         ) catch null;
     }
 };
+
+/// What the last verification of this turn said. See `AutoCheck.last_verdict` for why
+/// the loop needs it.
+pub const Verdict = enum { unchecked, passed, failed };
+
+/// May the turn end right now?
+///
+/// This is the function that makes "finish the task" mean something. A turn ends when
+/// the model stops asking for tools, and that used to be the end of it, whatever the
+/// state of the code: five real runs, five turns that ended with a build nobody had
+/// run or a build that was red, and a model that had no way to be told.
+///
+/// The rules, in order:
+///
+/// - A RED verification is the one hard block. Not "usually", not "unless the budget is
+///   over": the code does not work, and a turn that ends here produces a summary of
+///   code that does not compile. The budget does not get a vote — that is the ceiling's
+///   job and it says UNFINISHED.
+/// - A turn with NOTHING verified can end, because that is a turn of prose, of
+///   questions, of a task that needs no build. Demanding a compile there would make the
+///   harness nag about a README.
+/// - The model may always leave by declaring `blocked`, which is the honest exit and the
+///   reason the ceiling is not a dead end.
+///
+/// The check is the AUTO one and not "did the model run a test": the harness cannot
+/// read the model's intentions, but it can read its own compiler's exit code.
+pub fn turnMayEnd(ac: *const AutoCheck, goal_open: bool) bool {
+    if (goal_open and ac.last_verdict == .failed) return false;
+    return true;
+}
 
 /// Does a writing tool in this batch touch a file whose contents a compiler
 /// would care about?
@@ -8153,30 +8292,84 @@ test "the goal note carries the objective and the budget, and the note has a mar
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
-    w.print("{s}", .{try goalNote(a, &g, 18, false)}) catch unreachable;
+    w.print("{s}", .{try goalNote(a, &g, 18, false, 2)}) catch unreachable;
     const steady = w.buffered();
     // The objective verbatim: a paraphrase of a measurable target is not the target.
     try std.testing.expect(std.mem.indexOf(u8, steady, t) != null);
-    // The numbers, because "you have 18 left" is what makes a model finish.
-    try std.testing.expect(std.mem.indexOf(u8, steady, "18") != null);
     // And the marker, which is how the note is found again to be replaced.
     try std.testing.expect(std.mem.startsWith(u8, steady, session_mod.goal_note_marker));
 
+    // NO COUNTDOWN in the steady state, which is the change this test exists for.
+    //
+    // It used to assert the opposite ("you have 18 left is what makes a model finish").
+    // It was wrong, and it was wrong in the same direction as the crash it was written
+    // next to: a number that has not changed in any way the model can act on, repeated
+    // on every one of up to 60 iterations, is not information. It is a deadline the
+    // model learns to hurry for, which is the opposite of finishing careful work.
+    //
+    // The number still appears when it is actionable — near the ceiling — and that is
+    // the half that is worth keeping.
+    try std.testing.expect(std.mem.indexOf(u8, steady, "18 iterations left") == null);
+    // The shape of the turn, which IS worth saying every time: it ends when the
+    // objective is decided, not when the model stops talking.
+    try std.testing.expect(std.mem.indexOf(u8, steady, "A summary is not a verdict") != null);
+
+    var buf3: [512]u8 = undefined;
+    var w3: std.Io.Writer = .fixed(&buf3);
+    w3.print("{s}", .{try goalNote(a, &g, 3, false, 2)}) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, w3.buffered(), "3 iterations left") != null);
+
     var buf2: [2048]u8 = undefined;
     var w2: std.Io.Writer = .fixed(&buf2);
-    w2.print("{s}", .{try goalNote(a, &g, 0, true)}) catch unreachable;
+    w2.print("{s}", .{try goalNote(a, &g, 48, true, 3)}) catch unreachable;
     const cp = w2.buffered();
     try std.testing.expect(std.mem.indexOf(u8, cp, t) != null);
-    try std.testing.expect(std.mem.indexOf(u8, cp, "STOP AND REPORT") != null);
-    // And a checkpoint asks for the verdict in the model's own vocabulary, with both
-    // shapes spelled out, because "continue or stop" invites a third option.
+
+    // The checkpoint does NOT tell the model to stop. This is the second half of the
+    // change and the more important one: "STOP AND REPORT ... Do not start new work" at
+    // iteration 12, with the task half done, is a coin flip — a model that obeys writes
+    // a summary instead of finishing, and a model that does not obey burns the next 48
+    // iterations ignoring an instruction. Neither finishes the task, and which one
+    // happens is not the harness's decision to make with someone's work.
+    try std.testing.expect(std.mem.indexOf(u8, cp, "STOP AND REPORT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "Do not start new work") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "Keep going") != null);
+    // "Keep going" is only useful if it says what to keep going ON, and the harness
+    // already knows: it is the plan's own count. Three open steps, named as three.
+    try std.testing.expect(std.mem.indexOf(u8, cp, "3 steps") != null);
+    // The verdict is still reachable, with both shapes spelled out, because a real
+    // blocker has to be declarable.
     try std.testing.expect(std.mem.indexOf(u8, cp, "what_would_unblock") != null);
     try std.testing.expect(std.mem.indexOf(u8, cp, "met") != null);
 }
 
+test "a checkpoint with NO open plan steps says so, instead of implying there is work" {
+    // "Keep going" with nothing to go on is how a model talks itself into a summary. A
+    // plan with zero open steps and an undeclared goal means the objective is not met or
+    // not verified, and the prompt has to say WHICH question is open — because that is
+    // the one the model has to answer before it is allowed to declare anything.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var g: goal_mod.Goal = .{};
+    const t = "the build is green";
+    @memcpy(g.text[0..t.len], t);
+    g.len = t.len;
+    g.iterations = 10;
+
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{s}", .{try goalNote(a, &g, 40, true, 0)}) catch unreachable;
+    const cp = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, cp, "Keep going") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "none") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "0 steps") == null);
+}
+
 test "no goal, no note" {
     var g: goal_mod.Goal = .{};
-    try std.testing.expectError(error.NoGoal, goalNote(std.testing.allocator, &g, 5, false));
+    try std.testing.expectError(error.NoGoal, goalNote(std.testing.allocator, &g, 5, false, 0));
 }
 
 test "a `goal` CALL reaches the Model, which the two pure tests could not see" {
@@ -8321,4 +8514,51 @@ test "no tool that WRITES can be exempt from the repetition guard" {
     try std.testing.expect(!isRepeatExempt("edit"));
     try std.testing.expect(!isRepeatExempt("write"));
     try std.testing.expect(!isRepeatExempt("goal"));
+}
+
+test "a RED check is the one thing that cannot end a goal turn" {
+    // The rule the whole loop was missing, measured over five real task runs: five turns
+    // ended with the code not compiling, and the harness had read the exit code and built
+    // the model's own error message out of the diagnostics before letting it happen.
+    var ac: AutoCheck = .{};
+
+    // Nothing checked: a turn of prose, of questions, of a task with no build in it.
+    // Demanding a compile here would be the harness nagging about a README.
+    ac.last_verdict = .unchecked;
+    try std.testing.expect(turnMayEnd(&ac, true));
+    try std.testing.expect(turnMayEnd(&ac, false));
+
+    // Green: the code works, so ending is a decision the model is entitled to make.
+    ac.last_verdict = .passed;
+    try std.testing.expect(turnMayEnd(&ac, true));
+    try std.testing.expect(turnMayEnd(&ac, false));
+
+    // Red WITH an open goal: this is the block. The code does not work and the objective
+    // is not met, so a turn that ends here hands the user a summary of broken code.
+    ac.last_verdict = .failed;
+    try std.testing.expect(!turnMayEnd(&ac, true));
+
+    // Red with NO goal: there is nothing to hold open, and a `bash` that failed on a
+    // project with no typechecker is not a reason to forbid the turn from ending. The
+    // rule is scoped to a goal because that is the only thing that makes "unfinished"
+    // mean something.
+    try std.testing.expect(turnMayEnd(&ac, false));
+}
+
+test "the verdict is per TURN and resets, so turn two is not judged by turn one" {
+    // A stale red is a worse bug than no red: it would refuse to let any later turn end,
+    // forever, with an error message about a build from a previous task.
+    var ac: AutoCheck = .{};
+    ac.job = 7;
+    ac.started_this_turn = 2;
+    ac.last_verdict = .failed;
+
+    var reg: bgproc.Registry = undefined;
+    _ = &reg;
+    ac.resetTurn(&reg, undefined);
+
+    try std.testing.expectEqual(Verdict.unchecked, ac.last_verdict);
+    try std.testing.expectEqual(@as(u32, 0), ac.started_this_turn);
+    // The job id goes too, which is what stops turn two reporting turn one's errors.
+    try std.testing.expectEqual(@as(u32, 0), ac.job);
 }
