@@ -11,6 +11,7 @@ const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
+const goal_mod = @import("lib/goal.zig");
 const checkpoint = @import("lib/checkpoint.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
@@ -845,6 +846,24 @@ pub const Model = struct {
     compact_mode: ?compaction.Mode = null,
     /// Set after the first frame so the startup probe can mark it once.
     boot_painted: bool = false,
+    /// Set for the one iteration where the harness asks for a verdict.
+    ///
+    /// A flag and not an argument because `runOneTurn` builds the prompt from four
+    /// places and threading a `bool` through all of them is how one of them gets
+    /// missed. The draw does not read it.
+    goal_checkpoint: bool = false,
+    /// Set when the same tool call has now happened three times running.
+    loop_repeated: ?[]const u8 = null,
+    /// The objective of this turn, when `/goal` set one.
+    ///
+    /// In the Model and not a module global because the draw reads it every frame and
+    /// the loop writes it from a worker; a global would need the same lock the plan
+    /// already has and would be one more thing to get wrong.
+    goal: goal_mod.Goal = .{},
+    /// The repetition guard for this turn. Lives here and not in the worker because
+    /// `runToolCall` is where a call is seen, and that is the only place that can see
+    /// a call repeated.
+    repeats: agent.Repeats = .{},
 
     pub const PermAnswer = enum { none, allow, allow_always, deny };
 

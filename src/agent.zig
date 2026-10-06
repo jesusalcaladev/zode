@@ -11,6 +11,7 @@ const roster_mod = @import("roster.zig");
 const free_auto = @import("free_auto.zig");
 const router_mod = @import("lib/router.zig");
 const plan_mod = @import("lib/plan.zig");
+const goal_mod = @import("lib/goal.zig");
 const clean_mod = @import("lib/clean.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
@@ -433,6 +434,44 @@ pub fn syncSystemPrompt(s: *session_mod.Session) void {
     _ = s.replaceSystem(want) catch {};
 }
 
+/// The note that carries a `/goal` into the request, as a SECOND system message at the
+/// end.
+///
+/// ## Why it is not folded into the system prompt
+///
+/// `buildSystemPrompt` composes the biggest stable prefix in every request, and the
+/// provider's cache is indexed by the literal prefix: changing any byte of it
+/// invalidates the ~16 KB of tool schemas that follow. A goal changes WITHIN a turn,
+/// every iteration, and it is four lines.
+///
+/// So it goes at the END, as its own system message, with a marker that
+/// `Session.setGoalNote` finds to replace it. Same reason as the read-only notice and
+/// the skill list: order the system prompt by how OFTEN each part changes, and put the
+/// volatile parts last.
+///
+/// ## What is actually in it
+///
+/// The objective, verbatim, plus the budget as NUMBERS. "You have 18 iterations left"
+/// is the cheapest lever in the whole feature: a model told it has plenty polishes, and
+/// one told it has two left finishes.
+pub fn goalNote(gpa: std.mem.Allocator, g: *const goal_mod.Goal, left: usize, checkpoint: bool) ![]const u8 {
+    if (!g.isSet()) return error.NoGoal;
+    if (checkpoint) {
+        return std.fmt.allocPrint(
+            gpa,
+            "{s}{s}\n\n{s}",
+            .{ session_mod.goal_note_marker, g.objective(), goal_mod.checkpointPrompt(0, left) },
+        );
+    }
+    return std.fmt.allocPrint(
+        gpa,
+        "{s}{s}\nBudget: {d} iterations left of {d}. Do not spend them polishing: the turn does not " ++
+            "end until the objective is met or you have declared it blocked, and a summary of what you did " ++
+            "is not a verdict. Call `goal` only when it is true.",
+        .{ session_mod.goal_note_marker, g.objective(), left, g.iterations + left },
+    );
+}
+
 /// The user-facing half of the system prompt: their `AGENTS.md` if they have one,
 /// the built-in one if not.
 ///
@@ -698,7 +737,7 @@ var cur_model: []const u8 = "";
 /// Active session (`null` until the first message). The worker creates it, not
 /// startup: opening a session file just because the program started would
 /// create junk files if the user never chats.
-var session: ?*session_mod.Session = null;
+pub var session: ?*session_mod.Session = null;
 
 /// Reopen the last session at startup? Set by `ZODE_RESUME=1` or `--resume`.
 pub var resume_on_start: bool = false;
@@ -1698,6 +1737,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "compact")) {
         commands_mod.cmdCompact(m, rest);
+    } else if (std.mem.eql(u8, cmd, "goal")) {
+        commands_mod.cmdGoal(m, rest);
     } else if (std.mem.eql(u8, cmd, "session")) {
         commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {
@@ -1957,8 +1998,28 @@ fn chatWorker(job: *ChatJob) void {
     // budget above: the state of one turn must not poison the next one.
     m.bg.cancel_all = false;
 
-    const limit = iterationLimit();
-    while (iterations < limit) : (iterations += 1) {
+    // ── the loop, and the three things that decide when it stops ──
+    //
+    // `soft` is the reported target. `hard` only exists when a goal is set: it is what
+    // a `/goal` earns, and it is generous on purpose, because a task that reaches 60
+    // iterations was never going to be finished by stopping at 12 — it should have said
+    // `blocked` long before.
+    //
+    // The goal is cleared HERE and not at the end of the turn: a second prompt in the
+    // queue must not inherit the previous turn's objective, or "and now make it 5 KB"
+    // silently becomes a different goal than the one that was answered.
+    const had_goal = m.goal.isSet();
+    if (had_goal) {
+        m.goal.status = goal_mod.Status.none;
+        m.goal.checkpoints = 0;
+    }
+    const soft = iterationLimit();
+    const hard = if (had_goal) goalHardLimit() else soft;
+
+    m.repeats.reset();
+    var checkpointed = false;
+
+    while (iterations < hard) : (iterations += 1) {
         turn_stats.iterations = iterations + 1;
         const again = runOneTurn(m, last_user, iterations) catch |err| {
             reportErr(m, err);
@@ -1974,10 +2035,79 @@ fn chatWorker(job: *ChatJob) void {
         if (owned) |o| m.allocator.free(o);
         owned = text;
         last_user = text;
+
+        // 0. The model ran the same call three times running. Stopped HERE, and not at
+        //    the limit, because the limit costs twelve iterations first and the user
+        //    sees a normal-looking turn that ends for no stated reason.
+        if (m.loop_repeated) |which| {
+            m.loop_repeated = null;
+            pushErrorFmt(
+                m,
+                "stopped: `{s}` ran with the same arguments three times in a row. Something is not moving; tell me what to try instead.",
+                .{which},
+            );
+            break;
+        }
+
+        // 1. The goal was decided. The model said so, and it is the only thing that
+        //    ends a goal turn early.
+        if (m.goal.status != goal_mod.Status.none) break;
+
+        // 2. The model stopped asking for tools. `again == null` is above; this is the
+        //    case where it answered in prose while the goal is still open, which means
+        //    it thinks it is finished without having declared. Give it the checkpoint
+        //    rather than ending the turn on a shrug.
+        if (checkpointed) {
+            // 3. It had its checkpoint and still did not declare. That is the answer:
+            //    it wants more room, so give it, until the hard ceiling.
+        } else if (iterations + 1 >= soft and m.goal.isOpen()) {
+            checkpointed = true;
+            var g2 = m.goal;
+            g2.checkpoints += 1;
+            m.goal = g2;
+            pushInfoFmt(
+                m,
+                "{d}/{d} iterations: stopping to ask whether the goal is reached. {d} more available.",
+                .{ iterations + 1, soft, hard - (iterations + 1) },
+            );
+            m.goal_checkpoint = true;
+            defer m.goal_checkpoint = false;
+            const again2 = runOneTurn(m, last_user, iterations) catch |err| {
+                reportErr(m, err);
+                m.streamEnd();
+                pushTurnSummary(m);
+                return;
+            };
+            if (again2) |t2| {
+                if (owned) |o| m.allocator.free(o);
+                owned = t2;
+                last_user = t2;
+            }
+            m.repeats.reset();
+            if (m.goal.status != goal_mod.Status.none) break;
+            pushInfoFmt(m, "no verdict yet: continuing.", .{});
+        }
     }
     if (owned) |o| m.allocator.free(o);
-    const capped = iterations >= iterationLimit();
-    if (capped) pushErrorFmt(m, "agent iteration limit reached ({d}): stopping the turn", .{iterationLimit()});
+    const capped = iterations >= hard and m.goal.isOpen();
+    if (capped) {
+        // The message has to say what is unresolved, because "stopping the turn" is the
+        // sentence that started this: the user cannot tell a finished task from a cut
+        // one, and the plan on screen is the only evidence they had.
+        const open_steps = m.plan.openCount();
+        if (open_steps > 0) {
+            pushErrorFmt(
+                m,
+                "goal not declared after {d} iterations ({d} plan steps still open). Stopping here; say `continue` to go on.",
+                .{ hard, open_steps },
+            );
+        } else {
+            pushErrorFmt(m, "goal not declared after {d} iterations. Stopping here; say `continue` to go on.", .{hard});
+        }
+    }
+    if (had_goal and m.goal.status == goal_mod.Status.none) {
+        pushErrorFmt(m, "the goal was never decided: {s}", .{m.goal.objective()});
+    }
     m.streamEnd();
     // The bench sample is taken HERE, once per turn, and not per iteration: a
     // turn is the unit the user thinks in ("that took 40 s"), and a per-iteration
@@ -2053,6 +2183,82 @@ pub fn iterationLimit() usize {
     if (n > 200) return 200;
     return n;
 }
+
+/// The CEILING, which only a `/goal` ever reaches.
+///
+/// ## Why there are two numbers
+///
+/// The soft limit (12) exists to stop a runaway loop. It was also, by accident, the
+/// only limit: a task that needed 14 got cut at 12 and the user typed "continue", which
+/// is the failure this whole feature exists to remove.
+///
+/// Two numbers separates the two jobs. The soft one is what `/bench` measures against
+/// — it is a REPORTED target, not a wall. The hard one is the wall, and it is generous
+/// on purpose: the cases that hit it are tasks that cannot be finished here, and those
+/// should end by saying `blocked`, not by being silently truncated.
+///
+/// `ZODE_GOAL_MAX` overrides it. It is not clamped to anything sensible beyond a
+/// ceiling, because a user who sets it wants exactly that.
+pub const default_goal_hard: usize = 60;
+
+pub fn goalHardLimit() usize {
+    const raw = envGet(environ_global, "ZODE_GOAL_MAX") orelse return @max(iterationLimit() * 3, default_goal_hard);
+    const n = std.fmt.parseInt(usize, raw, 10) catch return @max(iterationLimit() * 3, default_goal_hard);
+    return @max(n, iterationLimit());
+}
+
+/// The same tool with the same arguments, three times running.
+///
+/// ## Why this is separate from the limit
+///
+/// A loop with a limit is stopped by the limit, which costs the whole budget first: the
+/// model can burn twelve iterations re-reading the same file looking for something it
+/// already has, and the user sees a normal-looking turn that ends for no stated reason.
+///
+/// This catches the shape itself, and it says WHAT was repeated, so the stop is
+/// informative instead of mysterious. A hash and not the arguments: comparing the bytes
+/// means owning them for the turn, and a collision here costs an early stop on a turn
+/// that was going nowhere anyway.
+///
+/// `u64` FNV-1a over the tool name and the arguments. `0` is never a legal hash here
+/// because `runToolCall` is only reached with a non-empty name.
+pub const repeat_limit: u8 = 3;
+
+pub const Repeats = struct {
+    last: u64 = 0,
+    run: u8 = 0,
+    tool: [64]u8 = undefined,
+    tool_len: usize = 0,
+
+    /// Feeds one call. Returns the tool name when this is the third identical one.
+    pub fn note(self: *Repeats, name: []const u8, args_json: []const u8) ?[]const u8 {
+        var h: u64 = 14695981039346656037;
+        for (name) |c| {
+            h ^= c;
+            h *%= 1099511628211;
+        }
+        h ^= 0xff;
+        h *%= 1099511628211;
+        for (args_json) |c| {
+            h ^= c;
+            h *%= 1099511628211;
+        }
+        if (h == self.last and self.run > 0) {
+            self.run += 1;
+        } else {
+            self.last = h;
+            self.run = 1;
+            self.tool_len = @min(name.len, self.tool.len);
+            @memcpy(self.tool[0..self.tool_len], name[0..self.tool_len]);
+        }
+        if (self.run >= repeat_limit) return self.tool[0..self.tool_len];
+        return null;
+    }
+
+    pub fn reset(self: *Repeats) void {
+        self.* = .{};
+    }
+};
 
 /// The moment the turn started, for the bench sample. Taken here because the
 /// worker's start is not the same as the model's first token.
@@ -2667,6 +2873,17 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // `ZODE_COMPACT=off` is a branch HERE, not inside `elideTier`, so it cannot be
     // half-applied: with it on, nothing is elided and nothing is summarized, and the
     // wire carries the history whole.
+    // The goal note goes into the wire view HERE, once per iteration, after the
+    // messages are assembled and before the body is built.
+    if (session) |ss| {
+        const left = if (m.goal.isOpen()) @max(goalHardLimit() - iteration, 0) else 0;
+        const note = if (m.goal.isSet())
+            (goalNote(arena, &m.goal, left, m.goal_checkpoint) catch null)
+        else
+            null;
+        ss.setGoalNote(note) catch {};
+    }
+
     const cmode = compaction.effectiveMode(m.environ, m.compact_mode);
     const comp: compaction.Compacted = if (cmode == .off)
         compaction.nothingElided(msgs0)
@@ -3313,6 +3530,70 @@ pub fn applyPlanPatchTo(
         ) catch null;
     }
     return plan.summary(arena);
+}
+
+/// Applies a `goal` tool call to the session's goal, and returns the line the model
+/// reads.
+///
+/// ## Why it lives here and not in the tool
+///
+/// The same reason `applyPlanCall` does: the goal lives in the `Model`, which is the
+/// TUI's, and the tool has no `Model`. Intercepted in the agent loop, after the tool
+/// returns, so BOTH runners (the TUI and `--chat`) get it by going through the same
+/// place — the recurring bug of this repo is a second, lesser implementation of the
+/// agent, and this is the piece that would drift first.
+///
+/// ## Why the verdict is a TOOL and not the harness asking
+///
+/// The harness cannot tell whether an objective was reached. Only the model can, and
+/// only by committing: "here is the evidence" is a different claim from "I think it
+/// worked". A harness that guessed would either stop on unfinished work or never stop.
+pub fn applyGoalCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return;
+    if (parsed != .object) return;
+    const v = goal_mod.parseVerdict(parsed.object, arena) catch |err| {
+        // The model gets the SAME refusal the parser gives a human, in words, because a
+        // bare `error.BadStatus` is not something it can act on. `goal` is the one tool
+        // whose error text decides whether the turn can finish.
+        const line = std.fmt.allocPrint(arena, "{s}", .{goal_err_text(err)}) catch return;
+        m.pushInfoOwned(line);
+        return;
+    };
+
+    var g = m.goal;
+    g.status = v.status;
+    @memcpy(g.summary[0..v.summary.len], v.summary);
+    g.summary_len = v.summary.len;
+    const ub = if (v.unblock.len > 0) v.unblock else "";
+    @memcpy(g.unblock[0..ub.len], ub);
+    g.unblock_len = ub.len;
+    m.goal = g;
+
+    switch (v.status) {
+        .met => {
+            m.pushInfoFmt("goal met: {s}", .{v.summary});
+            setStatusWithZo(m, .done, "goal met");
+        },
+        .blocked => {
+            // Said the way the user needs it: what is wrong, and what would change it.
+            // A blocker without the second half is a shrug and reads as one.
+            m.pushInfoFmt("goal blocked: {s}", .{v.summary});
+            if (ub.len > 0) m.pushInfoFmt("  would unblock it: {s}", .{ub});
+            setStatusWithZo(m, .warn, "goal blocked");
+        },
+        .none => {},
+    }
+}
+
+fn goal_err_text(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingStatus => "goal needs a `status`: \"met\" if the objective is reached (with the evidence), or \"blocked\" if it cannot be done here (with `what_would_unblock`).",
+        error.BadStatus => "`status` must be `met` or `blocked`. Nothing else ends the turn, so do not invent a third one.",
+        error.MissingSummary => "goal needs a `summary`: what you finished and how you know, or why it cannot be done.",
+        error.SummaryTooShort => "the `summary` is too short to be one. Say what happened and what proves it.",
+        error.MissingUnblock => "`blocked` needs `what_would_unblock`: the one thing that would change the answer. Without it the harness cannot tell a real blocker from giving up.",
+        else => "the goal verdict was not understood; send status plus summary.",
+    };
 }
 
 /// The TUI's half: same functions, plus the status line and the screen.
@@ -4554,6 +4835,20 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     // call `check` — is the same request with one more round trip in it.
     for (t.calls.items) |c| {
         m.auto_check.afterTool(&m.bg, m.allocator, io_global, c.name, c.args_json);
+        // The repetition guard, fed HERE because this is the only place a tool call is
+        // seen with its arguments. The loop checks the flag; it cannot count, because it
+        // never sees a call.
+        //
+        // `read` is exempt and not as a nicety: re-reading a file you just edited is
+        // the correct thing to do, and stopping on it would punish the one habit that
+        // makes an agent correct.
+        if (!std.mem.eql(u8, c.name, "read")) {
+            if (m.repeats.note(c.name, c.args_json)) |which| {
+                if (m.loop_repeated == null) {
+                    m.loop_repeated = which;
+                }
+            }
+        }
     }
 
     s.flush();
@@ -7664,4 +7959,92 @@ test "a cleared plan is a change, and an empty one is not" {
     // And a list that HAD items, emptied, IS a change: it is the signal it is over.
     _ = applyPlanTo(&plan, "{\"items\":[{\"content\":\"one\"}]}", a);
     try std.testing.expectEqualStrings("plan cleared", applyPlanTo(&plan, "{\"items\":[]}", a).?);
+}
+
+// ── the goal, and the loop that refuses to stop short of it ─────────────────────
+
+test "the repetition guard fires on the third identical call, and names the tool" {
+    var r: Repeats = .{};
+    const args = "{\"command\":\"ls\"}";
+
+    // Two is a coincidence; three is a loop. Below the threshold nothing is returned,
+    // which is the property that matters: a guard that fires early stops real work.
+    try std.testing.expect(r.note("bash", args) == null);
+    try std.testing.expect(r.note("bash", args) == null);
+    try std.testing.expectEqualStrings("bash", r.note("bash", args).?);
+
+    // A different tool resets the run, not the counter's lifetime.
+    var r2: Repeats = .{};
+    try std.testing.expect(r2.note("bash", args) == null);
+    try std.testing.expect(r2.note("bash", args) == null);
+    try std.testing.expect(r2.note("grep", args) == null);
+    try std.testing.expect(r2.note("bash", args) == null);
+    try std.testing.expect(r2.note("bash", args) == null);
+    try std.testing.expectEqualStrings("bash", r2.note("bash", args).?);
+}
+
+test "different arguments are different work, even with the same tool" {
+    // This is the false positive that would matter: a model grepping for three
+    // different patterns is making progress and must not be stopped.
+    var r: Repeats = .{};
+    try std.testing.expect(r.note("grep", "{\"pattern\":\"alpha\"}") == null);
+    try std.testing.expect(r.note("grep", "{\"pattern\":\"beta\"}") == null);
+    try std.testing.expect(r.note("grep", "{\"pattern\":\"gamma\"}") == null);
+    try std.testing.expect(r.note("grep", "{\"pattern\":\"alpha\"}") == null);
+}
+
+test "a goal earns a hard ceiling well above the soft one" {
+    // The whole point: 12 was the only number and it cut real tasks. `ZODE_GOAL_MAX`
+    // overrides it and can never come out BELOW the soft limit, because a hard ceiling
+    // under the target would stop a goal turn before the checkpoint even runs.
+    try std.testing.expect(goalHardLimit() > iterationLimit());
+    const prev = environ_global;
+    defer environ_global = prev;
+    var e = std.process.Environ.Map.init(std.testing.allocator);
+    defer e.deinit();
+    environ_global = &e;
+    try std.testing.expectEqual(goalHardLimit(), goalHardLimit());
+    try e.put("ZODE_GOAL_MAX", "2");
+    // 2 is below the floor of 4 in `iterationLimit`, and below the goal floor too.
+    try std.testing.expectEqual(iterationLimit(), goalHardLimit());
+    try e.put("ZODE_GOAL_MAX", "500");
+    try std.testing.expectEqual(@as(usize, 500), goalHardLimit());
+}
+
+test "the goal note carries the objective and the budget, and the note has a marker" {
+    var g: goal_mod.Goal = .{};
+    const t = "make the package weigh under 10 KB";
+    @memcpy(g.text[0..t.len], t);
+    g.len = t.len;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    w.print("{s}", .{try goalNote(a, &g, 18, false)}) catch unreachable;
+    const steady = w.buffered();
+    // The objective verbatim: a paraphrase of a measurable target is not the target.
+    try std.testing.expect(std.mem.indexOf(u8, steady, t) != null);
+    // The numbers, because "you have 18 left" is what makes a model finish.
+    try std.testing.expect(std.mem.indexOf(u8, steady, "18") != null);
+    // And the marker, which is how the note is found again to be replaced.
+    try std.testing.expect(std.mem.startsWith(u8, steady, session_mod.goal_note_marker));
+
+    var buf2: [2048]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    w2.print("{s}", .{try goalNote(a, &g, 0, true)}) catch unreachable;
+    const cp = w2.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, cp, t) != null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "STOP AND REPORT") != null);
+    // And a checkpoint asks for the verdict in the model's own vocabulary, with both
+    // shapes spelled out, because "continue or stop" invites a third option.
+    try std.testing.expect(std.mem.indexOf(u8, cp, "what_would_unblock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "met") != null);
+}
+
+test "no goal, no note" {
+    var g: goal_mod.Goal = .{};
+    try std.testing.expectError(error.NoGoal, goalNote(std.testing.allocator, &g, 5, false));
 }

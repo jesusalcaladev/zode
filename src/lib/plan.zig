@@ -106,6 +106,13 @@ pub const Plan = struct {
         return null;
     }
 
+    /// Steps not done. The counterpart of `doneCount`, and it is what the goal's final
+    /// message reports: "the goal was not declared, N steps still open" is the sentence
+    /// that tells the user whether this was a cut-off task or a finished one.
+    pub fn openCount(self: *const Plan) u8 {
+        return @intCast(self.len - self.doneCount());
+    }
+
     pub fn allDone(self: *const Plan) bool {
         if (self.len == 0) return false;
         return self.doneCount() == self.len;

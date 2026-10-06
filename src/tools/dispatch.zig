@@ -25,6 +25,7 @@ const list_files_tool = @import("list_files.zig");
 const web_tool = @import("web.zig");
 const think_tool = @import("think.zig");
 const todo_tool = @import("todo.zig");
+const goal_tool = @import("goal.zig");
 const errors_tool = @import("errors.zig");
 
 pub const ToolDef = struct {
@@ -99,7 +100,8 @@ pub fn toolsJson() []const u8 {
     \\{"type":"function","function":{"name":"skill","description":"Load a skill: a folder of instructions written for a specific kind of task. Your prompt lists only the name and when to use it (the body is not in your prompt, so it costs nothing until you ask). Load one when its description matches what you are about to do, and load none when none of them do.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"the skill's name, exactly as listed"}},"required":["name"]}}},
     \\{"type":"function","function":{"name":"task","description":"Send a read-only investigation to a SUBAGENT that has its own context window, and get back a short report (a few lines with paths and line numbers). Use it when the search is big: grepping across a large tree, tracing where something is used, reading many files to answer one question. Everything the subagent reads is paid for ONCE in a window that is then thrown away, instead of staying in your context and being resent on every remaining step — so for a wide search this is much cheaper than doing it yourself. It cannot write anything and cannot ask the user anything; if it needs a decision only the user can make, it says so in the report and you decide whether to ask. Use it for search; do it yourself when you already know the file to change. You can send SEVERAL task calls in one message when the searches are independent (a different area each one): they run at the same time instead of one after the other, and the reports come back in the order you asked. Do not send two tasks that need the answer of the other, and do not send one task per file when a single grep covers it.","parameters":{"type":"object","properties":{"description":{"type":"string","description":"one line: what to find out"},"prompt":{"type":"string","description":"the full question, including where to look and what to report back"}},"required":["description"]}}},
     \\{"type":"function","function":{"name":"bash_output","description":"Read the NEW output of a command you started with run_in_background, plus whether it is still running or what it exited with. Incremental: you get what appeared since your last call, not the whole buffer, so polling is cheap. Poll once per step, and do not poll in a tight loop — do something else in between.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"bash_kill","description":"Kill a backgrounded command. Use it when you no longer need the result, or when it is clearly going the wrong way.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}}
+    \\{"type":"function","function":{"name":"bash_kill","description":"Kill a backgrounded command. Use it when you no longer need the result, or when it is clearly going the wrong way.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}},
+    \\{"type":"function","function":{"name":"goal","description":"Say whether the OBJECTIVE of this turn was reached. Only meaningful when the user set one with /goal; without it there is nothing to decide and you should not call this. Two answers, and both end the turn: `met` with a summary of what you finished AND the evidence (a command you ran, a number you measured), or `blocked` with the reason AND `what_would_unblock`, which is required. Call `met` only when you are certain: a confident summary is not the same claim as having checked, and a goal declared met that is not met is the one failure the harness cannot recover from. Do not use `blocked` because something is hard or slow. If neither is true, keep working and do not call this.","parameters":{"type":"object","properties":{"status":{"type":"string","enum":["met","blocked"],"description":"met = reached, blocked = cannot be done here"},"summary":{"type":"string","description":"what you finished and how you know, or why it cannot be done"},"what_would_unblock":{"type":"string","description":"REQUIRED when blocked: the one thing that would change the answer (a credential, a service that is up, a decision only the user can make)"}},"required":["status","summary"]}}}
     \\]
     ;
 }
@@ -148,7 +150,11 @@ pub fn needsPermission(name: []const u8) bool {
         std.mem.eql(u8, name, "ask") or
         std.mem.eql(u8, name, "skill") or
         std.mem.eql(u8, name, "bash_output") or
-        std.mem.eql(u8, name, "bash_kill"));
+        std.mem.eql(u8, name, "bash_kill") or
+        // `goal` decides nothing about the machine: it records what the model already
+        // did. Asking permission for it would put a dialog in front of the answer the
+        // user most wants to read.
+        std.mem.eql(u8, name, "goal"));
 }
 
 /// Runs a tool with JSON args. Returns the (truncated) result —
@@ -212,6 +218,8 @@ pub fn execute(
         return think_tool.toolThink(obj, arena);
     } else if (std.mem.eql(u8, name, "todo")) {
         return todo_tool.toolTodo(obj, arena);
+    } else if (std.mem.eql(u8, name, "goal")) {
+        return goal_tool.toolGoal(obj, arena);
     } else if (std.mem.eql(u8, name, "bash_output")) {
         return bg_tool.toolBashOutput(obj, arena, bg);
     } else if (std.mem.eql(u8, name, "bash_kill")) {
@@ -256,6 +264,7 @@ pub const defs = [_]ToolDef{
     .{ .name = "ask", .desc = "Ask the user one question when the answer changes what you do" },
     .{ .name = "skill", .desc = "Load a skill's full instructions on demand (cheap: only its name is in your prompt)" },
     .{ .name = "task", .desc = "Send a read-only search to a subagent with its own context, get back a short report" },
+    .{ .name = "goal", .desc = "Declare the /goal objective met or blocked, with the evidence (ends the turn)" },
     .{ .name = "bash_output", .desc = "New output of a backgrounded command (incremental) plus its exit status" },
     .{ .name = "bash_kill", .desc = "Kill a backgrounded command" },
 };
@@ -1677,4 +1686,48 @@ test "a patch for text that never existed says so, and does not pretend to be cl
     , .{});
     const out = try execute(std.testing.io, "edit", args, arena, null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "It is not in this file at all") != null);
+}
+
+test "goal: met records it and says the turn ends, with the evidence echoed back" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"status":"met","summary":"the build passes and the binary is 8.9 KB"}}
+    , .{});
+    const out = try execute(std.testing.io, "goal", args, arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "8.9 KB") != null);
+}
+
+test "goal: blocked is refused without what_would_unblock, IN WORDS" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"status":"blocked","summary":"the service is down"}}
+    , .{});
+    const out = try execute(std.testing.io, "goal", args, arena, null, null);
+    // Not an error union: the model must READ this and be able to fix it in the next
+    // call. A bare `error.MissingUnblock` is a thing it cannot act on.
+    try std.testing.expect(std.mem.indexOf(u8, out, "what_would_unblock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "giving up") != null);
+}
+
+test "goal: an unknown status shows the two shapes that work, braces and all" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try std.fmt.allocPrint(arena,
+        \\{{"status":"finishd","summary":"a typo"}}
+    , .{});
+    const out = try execute(std.testing.io, "goal", args, arena, null, null);
+    // The message carries JSON examples, so it is a PLAIN string and not a format:
+    // every `{` in it would otherwise be a placeholder.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"met\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"blocked\"") != null);
+}
+
+test "goal asks for no permission: it records what the model did, it changes nothing" {
+    try std.testing.expect(!needsPermission("goal"));
 }

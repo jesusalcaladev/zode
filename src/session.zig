@@ -16,6 +16,9 @@ const session_mode: std.Io.File.Permissions = @enumFromInt(0o600);
 const sessions_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
 
 const std = @import("std");
+
+/// The first bytes of the goal note, so it can be found again and replaced.
+pub const goal_note_marker = "\u{1}ZODE-GOAL\u{1}";
 const chat = @import("chat.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 
@@ -136,6 +139,36 @@ pub const Session = struct {
         }
         try self.append(.system, content);
         return true;
+    }
+
+    /// Appends a SECOND system message, at the end, and removes the previous one.
+    ///
+    /// Separate from `replaceSystem` because the two have opposite cache behaviour.
+    /// `replaceSystem` rewrites message 0, which is the FIRST thing on the wire and
+    /// therefore invalidates the whole prefix after it — every tool schema, every
+    /// message, every turn. That is the right trade for a prompt that changes once at
+    /// startup.
+    ///
+    /// The goal changes WITHIN a turn, and it is small, so it goes at the END: the
+    /// cache is read up to the first byte that differs, so the tools+system+history
+    /// prefix keeps hitting across every iteration of the run and only this last
+    /// message is new. It also replaces any previous goal note, because a turn that
+    /// declares `met` must not leave "keep working towards it" in the next request.
+    pub fn setGoalNote(self: *Session, note: ?[]const u8) !void {
+        // Drop a previous one. Found by MARKER, not by index: the list is append-only
+        // and the note may not be the last message.
+        var i: usize = 0;
+        while (i < self.messages.items.len) : (i += 1) {
+            const m = self.messages.items[i];
+            if (m.role != .system) continue;
+            if (!std.mem.startsWith(u8, m.content, goal_note_marker)) continue;
+            const owned = m.content;
+            _ = self.messages.orderedRemove(i);
+            self.allocator.free(owned);
+            i -= 1;
+        }
+        const n = note orelse return;
+        try self.append(.system, n);
     }
 
     /// Adds a message with tool_calls metadata (assistant).

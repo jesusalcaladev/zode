@@ -3,6 +3,7 @@ const tui = @import("tui.zig");
 const agent = @import("agent.zig");
 const cache_stats = @import("cache_stats.zig");
 const compaction = @import("compaction.zig");
+const goal_mod = @import("lib/goal.zig");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 const mascot = @import("lib/mascot.zig");
@@ -172,6 +173,82 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
         "compaction: {s} ({s})",
         .{ @tagName(chosen), compaction.describe(chosen) },
     ) catch "compaction";
+    agent.pushInfoOwned(m, line);
+}
+
+/// `/goal [text|clear]`: the objective of this turn, which the turn may not stop
+/// short of.
+///
+/// With text it sets the objective and sends nothing: the next thing you type is the
+/// task, and it is worked with the objective attached. That ordering is deliberate.
+/// `/goal` on its own would have to invent a task, and a prompt like "make the package
+/// weigh under 10 KB" alone is not yet a task — it is a goal.
+///
+/// With `clear` it drops one.
+///
+/// With NO argument it reports, because a goal you cannot see is a goal you cannot
+/// tell the model apart from: "why did it stop" is unanswerable unless the objective is
+/// on screen with its state.
+pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
+    const trimmed = std.mem.trim(u8, arg, " \t\r\n");
+
+    if (trimmed.len == 0) {
+        if (!m.goal.isSet()) {
+            agent.pushInfoOwned(m, "no goal set. /goal <objective> gives the next turn something it may not stop short of.");
+            return;
+        }
+        const state = switch (m.goal.status) {
+            .none => "open",
+            .met => "MET",
+            .blocked => "BLOCKED",
+        };
+        const l1 = std.fmt.allocPrint(m.allocator, "goal ({s}): {s}", .{ state, m.goal.objective() }) catch "goal";
+        agent.pushInfoOwned(m, l1);
+        if (m.goal.summary_len > 0) {
+            const l2 = std.fmt.allocPrint(m.allocator, "  {s}", .{m.goal.say()}) catch "goal";
+            agent.pushInfoOwned(m, l2);
+        }
+        if (m.goal.unblock_len > 0) {
+            const l3 = std.fmt.allocPrint(m.allocator, "  would unblock it: {s}", .{m.goal.whatUnblocks()}) catch "goal";
+            agent.pushInfoOwned(m, l3);
+        }
+        const l4 = std.fmt.allocPrint(
+            m.allocator,
+            "  budget: {d} soft, {d} hard ({d} checkpoints asked) · /goal clear to drop it",
+            .{ agent.iterationLimit(), agent.goalHardLimit(), m.goal.checkpoints },
+        ) catch "goal";
+        agent.pushInfoOwned(m, l4);
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "clear") or std.ascii.eqlIgnoreCase(trimmed, "off")) {
+        const was = m.goal.objective();
+        m.goal.clear();
+        m.goal_checkpoint = false;
+        m.loop_repeated = null;
+        // The note is removed from the wire too, or the next request still carries
+        // "keep working towards it" with nothing behind it.
+        if (agent.session) |ss| ss.setGoalNote(null) catch {};
+        if (was.len > 0) {
+            const line = std.fmt.allocPrint(m.allocator, "goal cleared ({d} checkpoints, {d} iterations)", .{ m.goal.checkpoints, m.goal.iterations }) catch "goal cleared";
+            agent.pushInfoOwned(m, line);
+        } else {
+            agent.pushInfoOwned(m, "no goal was set");
+        }
+        return;
+    }
+
+    var g = goal_mod.Goal{};
+    const n = @min(trimmed.len, g.text.len);
+    @memcpy(g.text[0..n], trimmed[0..n]);
+    g.len = n;
+    m.goal = g;
+    m.goal.status = goal_mod.Status.none;
+    const line = std.fmt.allocPrint(
+        m.allocator,
+        "goal set: {s}\n  the turn may use {d} iterations instead of {d}, and will be asked at {d} whether it is met or blocked. Now type the task.",
+        .{ trimmed, agent.goalHardLimit(), agent.iterationLimit(), agent.iterationLimit() },
+    ) catch "goal";
     agent.pushInfoOwned(m, line);
 }
 
@@ -372,6 +449,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
     .{ .key = "/plan", .desc = "clear the visible task list" },
+    .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)" },
     .{ .key = "/agent.yolo", .desc = "toggle auto permissions" },
