@@ -3224,3 +3224,70 @@ the step was the reason.
 **And the test that would have caught it is one line**: `nm zig-out/bin/zode-debug`
 after `zig build debug`. There is no reason a build step cannot be asserted, and a
 step whose whole purpose is "trustworthy artifacts" is the last place to skip it.
+
+## The crash: the background reader freed through the TURN's arena (2026-10-06)
+
+Killed the process in **2 of 3** real task runs — mid-turn, work done, no verdict, no
+message. Three frames, and every one of them says what happened:
+
+    Segmentation fault at address 0x7f812c8e815c
+    /usr/lib/zig/std/mem/Allocator.zig:448          free        @memset(bytes, undefined)
+    /usr/lib/zig/std/Io/File/MultiReader.zig:105   deinit     gpa.free(context.fr.interface.buffer)
+    src/bgproc.zig:586                              reader     defer mr.deinit()
+
+`bgproc.spawn` took the **caller's** allocator, and every real call site passed the
+turn's arena: `toolBash` receives `arena` as a parameter and handed it straight
+through. The reader thread is `detach`ed and outlives the turn — it lives until the
+child's pipes hit EOF, which for a test suite is seconds after the turn ended and its
+arena was deinited. The thread then called `gpa.free` on a destroyed arena, and **an
+allocator's `free` memsets the block it is releasing**: memory the kernel had already
+taken back. A write to unmapped memory.
+
+**This is why RSS was flat at 6.5 MB.** Nothing was missing. Memory was being given
+back, and the crash was in the giving-back.
+
+### The fix, and the shape it takes
+
+Ownership in the TYPE, which is the rule this repo keeps relearning:
+
+- `bgproc.Registry` owns `gpa`. It is the model's allocator, set in `Model.init`.
+- `spawn(reg, io, command)` has **no allocator parameter at all**. A tool written
+  tomorrow cannot pass a turn arena, because there is no argument to pass it in.
+
+### `= undefined` as a default was the same bug wearing a different hat
+
+The new field was first `gpa: std.mem.Allocator = undefined`, on the reasoning that
+every real construction goes through `init`. Two of `bgproc.zig`'s own tests then build
+a `Registry{}` literal, the detached reader freed a block through an uninitialized
+allocator, and the test binary died with a general protection fault.
+
+**The very crash, reproduced by the very fix.** The default is now `page_allocator`:
+an allocator that is merely WRONG frees nothing and cannot fault a leak check, and one
+that is `undefined` frees through a garbage vtable. When in doubt about a default,
+pick the failure that is loud over the one that is silent.
+
+### What it took to GET the three frames
+
+The `debug` step, which was itself broken in two ways (previous section). With a
+symbolized build the first core was the answer, in one run, with no guessing:
+
+- release build: six frames, `0x108a9f0 in ?? ()`, `si_addr` a wild stack-range
+  pointer, and **no way to name any of it**
+- `zig build debug`, one run: three frames, all named, at the moment the fix needed
+
+Four wrong theories came before it — memory exhaustion, a garbage grapheme length, the
+segment cache, the body buffer — and each was falsified with a test rather than an
+argument. That was not wasted: it is what ruled out "memory", which is what the
+vaxis warning kept insisting.
+
+### The lesson worth more than the bug
+
+**The vaxis warning said `OutOfMemory` and the whole session chased memory.** It was
+an unrelated warning about a one-grapheme append in a 6 MB process. The crash was a
+SIGSEGV, which prints nothing by default. So the one signal that was loud was about a
+different thing, and the real failure was silent — and the fix for that was not a
+better guess but `ulimit -c unlimited` plus a build that actually has symbols.
+
+**A loud warning is not evidence, and the absence of one is not either.** What made
+this tractable in the end was a core file and a name; what made it a whole session was
+that the only artifact anyone looked at said `OutOfMemory`.
