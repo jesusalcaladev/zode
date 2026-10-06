@@ -9104,3 +9104,61 @@ test "a big diff paragraph plus scrolling does not walk the frame arena away" {
     }
     try std.testing.expect(m.paras.items.len > 0);
 }
+
+test "no painted cell carries a grapheme with an absurd length" {
+    // The crash this pins, measured twice on real tasks (runs 1 and 4 of 4, with the
+    // work DONE and no verdict declared):
+    //
+    //     warning(vaxis): couldn't write grapheme: OutOfMemory
+    //
+    // with the process at **6.5 MB RSS**, flat from the first sample to the last. Flat
+    // RSS is the whole diagnosis: it is not memory that grows, and not memory that runs
+    // out. vaxis's `InternalScreen.writeCell` does
+    // `buf[i].char.appendSlice(arena, cell.char.grapheme)`, so an `OutOfMemory` on a
+    // ONE-GRAPHEME append in a 6 MB process means the slice's LENGTH was garbage — the
+    // `&[_]u8{c}` family AGENTS.md keeps paying for: a `Cell` stored by value with a
+    // pointer to bytes that died before `Vaxis.render()` read them, so the length comes
+    // from freed memory.
+    //
+    // Two hypotheses were tested and both were FALSE (the frame arena and the segment
+    // cache), which is why this does not look for an allocation failure at all: a
+    // garbage length of 40 bytes paints fine and only shows up as corruption. It walks
+    // the painted surface instead and looks at the one thing that is always wrong.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // One of everything a real turn produces at once, at the sizes a real turn
+    // produces them: a 500-line write (the diff), its tool result, the tool header, a
+    // long assistant paragraph and a live stream on top.
+    const many = "    if x_ == 42 { return \"y\"; } else { print z_ + 1; }\n" ** 480;
+    _ = m.pushDiff("old\n" ** 480, many);
+    m.pushToolStart("write", "minilang.py");
+    m.pushToolDone("write", "minilang.py", 120, many);
+    m.pushKind(.assistant, many);
+    m.pushKind(.tool_res, many);
+    m.streaming = true;
+    m.streamDelta(many);
+
+    var frame: usize = 0;
+    while (frame < 12) : (frame += 1) {
+        m.scrollBy(3);
+        _ = arena_state.reset(.retain_capacity);
+        const s = try drawTest(&m, arena, 200, 50);
+
+        var row: usize = 0;
+        while (row < s.size.height) : (row += 1) {
+            var col: usize = 0;
+            while (col < s.size.width) : (col += 1) {
+                const g = s.readCell(col, row).char.grapheme;
+                // A grapheme is at most a handful of bytes. `+` as the bound is the
+                // point: a real one is 1..4 and a joined emoji is 4, so nothing real
+                // comes near it and a freed slice reads as thousands.
+                try std.testing.expect(g.len <= 8);
+            }
+        }
+    }
+}
