@@ -4386,6 +4386,14 @@ fn taskBatchEnd(calls: []const TurnCtx.Call, from: usize) usize {
 /// `ZODE_TASK_PARALLEL` overrides it, and `1` restores the serial behaviour.
 pub const default_task_parallel: usize = 3;
 
+/// How many times a subagent retries a retryable error before giving up.
+///
+/// Fewer than the main turn's three, and on purpose: the main turn has a user's
+/// attention to spend on a slow answer and a report to make; a subagent that is one
+/// of three in parallel should get out of the way quickly rather than hold its slot
+/// through three backoffs that the other two are also sitting in.
+pub const subagent_retry_attempts: usize = 2;
+
 fn taskParallelLimit(env: ?*const std.process.Environ.Map) usize {
     const v = envGet(env, "ZODE_TASK_PARALLEL") orelse return default_task_parallel;
     const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return default_task_parallel;
@@ -4559,13 +4567,17 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
 /// leave the turn able to continue, and the main agent needs to know it has to do
 /// the search itself.
 fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report) []const u8 {
+    // `gpa` is the MODEL's allocator and it is only for the things that outlive this
+    // call — the `Report` belongs to the caller. Everything that belongs to the subagent
+    // and nobody else goes through `sarena` below, which is why that arena exists.
+    const gpa = m.allocator;
+
     // Permission: a subagent spends the user's tokens and reads the whole repo.
     // `task` IS in `needsPermission`, so the dialog has already been shown by
     // `execToolCalls`'s gate before this is reached.
     const pick = pickTarget(m);
     const key = pick.key orelse return subagent_mod.refused("no api key for this provider", rep);
 
-    var gpa = m.allocator;
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
 
@@ -4590,23 +4602,41 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
     // The subagent's OWN history. It does not inherit anything from the main
     // conversation: inheriting it would inherit the tokens, which is the thing
     // this whole feature exists to avoid.
+    //
+    // ## The ARENA, and the leak that made it necessary
+    //
+    // `msgs` was allocated from `gpa` — the MODEL's allocator — and never freed. Not
+    // the ArrayList, which is a few bytes on the stack: every message's `content`, the
+    // prompt, and the tool results, which is a `grep` dump of up to 4 KB per call over
+    // eight iterations. One subagent leaked tens of KB and the leak was in the process
+    // allocator's hands, so it showed up as RSS that never came down and a DebugAllocator
+    // complaint nobody could attribute.
+    //
+    // An arena is the right shape here and not only because it frees: the subagent's
+    // history is a THROWAWAY window by definition, so having one owner whose death
+    // reclaims all of it is the same argument that keeps the subagent out of the main
+    // context. What crosses the boundary is the REPORT, and `formatReport` already
+    // copies it into the caller's fixed buffer.
+    var sstate = std.heap.ArenaAllocator.init(gpa);
+    defer sstate.deinit();
+    const sarena = sstate.allocator();
+
     var msgs: std.ArrayList(chat.ChatMessage) = .empty;
     var tstate = SubTurn{ .m = m };
     defer tstate.deinit(gpa);
 
     const user_msg = if (task.prompt.len > 0)
         std.fmt.allocPrint(
-            gpa,
+            sarena,
             "{s}\n\n{s}",
             .{ task.description, task.prompt },
         ) catch return subagent_mod.refused("no memory for the prompt", rep)
     else
-        gpa.dupe(u8, task.description) catch return subagent_mod.refused("no memory for the prompt", rep);
-    defer gpa.free(user_msg);
+        sarena.dupe(u8, task.description) catch return subagent_mod.refused("no memory for the prompt", rep);
 
-    msgs.append(gpa, .{ .role = "system", .content = subagent_mod.system_prompt }) catch
+    msgs.append(sarena, .{ .role = "system", .content = subagent_mod.system_prompt }) catch
         return subagent_mod.refused("no memory for the system prompt", rep);
-    msgs.append(gpa, .{ .role = "user", .content = user_msg }) catch
+    msgs.append(sarena, .{ .role = "user", .content = user_msg }) catch
         return subagent_mod.refused("no memory for the prompt", rep);
 
     var url_buf: [1024]u8 = undefined;
@@ -4617,6 +4647,10 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
 
     var body_buf: [256 * 1024]u8 = undefined;
     var iteration: usize = 0;
+    // Retry bookkeeping, LOCAL to this subagent and not a global: three run at once and
+    // a shared counter would be one subagent's 429 resetting another's budget.
+    var sub_attempt: usize = 0;
+    var sub_retries: usize = 0;
     while (iteration < subagent_mod.max_iterations) : (iteration += 1) {
         // Budget enforcement on the SUBCOMPACTED view: the subagent's window is
         // small by design, and letting it grow past `budget_tokens` would mean
@@ -4682,9 +4716,43 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
                 const partial = subagent_mod.formatReport(tstate.text.items, rep);
                 return partial;
             }
+            // THE RETRY, and it is the whole difference between a subagent that works
+            // and one that does not.
+            //
+            // The main turn retries a 429 three times with backoff. The subagent used
+            // to give up on the first one, and that is worse here than in the main turn
+            // for one specific reason: **three subagents run in parallel by default**,
+            // which is three requests inside a second, which is exactly what gets a 429
+            // in the first place. The parallelism was building the rate limit that then
+            // killed the very searches it had started, and the model was told "refused"
+            // for something that was a number in a header.
+            //
+            // It retries SILENTLY: a subagent's intermediate steps must not appear in
+            // the user's history, and three "rate limited, retrying" lines from three
+            // threads is a history full of noise about something invisible. The attempts
+            // are counted and reported in the result if they all fail.
+            if (isRetryable(err) and sub_attempt < subagent_retry_attempts) {
+                sub_attempt += 1;
+                Retry.wait(sub_attempt) catch {
+                    // ESC cut the wait short: that is the user stopping it, so it is a
+                    // cancellation and not a failure.
+                    return subagent_mod.refused("cancelled while waiting to retry", rep);
+                };
+                sub_retries += 1;
+                continue;
+            }
+            if (sub_retries > 0) {
+                return std.fmt.allocPrint(
+                    sarena,
+                    "This search failed after {d} attempt(s): {t}. It was a rate limit, not the task. The main agent can run the search itself, or try again in a moment.",
+                    .{ sub_attempt + 1, err },
+                ) catch return subagent_mod.refused(@errorName(err), rep);
+            }
             return subagent_mod.refused(@errorName(err), rep);
         };
         cstate.deinit();
+        // The request worked, so the next one's retry budget is whole again.
+        sub_attempt = 0;
 
         if (tstate.calls.items.len == 0) {
             // Done: the text IS the report.
@@ -4695,10 +4763,10 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
         // Tool round. The assistant message carries its `tool_calls` or the next
         // request is a 400 (the bug the TUI agent loop had).
         const tc_json = if (tstate.calls.items.len > 0)
-            toolCallsJsonFromCalls(gpa, tstate.calls.items)
+            toolCallsJsonFromCalls(sarena, tstate.calls.items)
         else
             null;
-        msgs.append(gpa, .{ .role = "assistant", .content = tstate.text.items, .tool_calls_json = tc_json }) catch
+        msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items, .tool_calls_json = tc_json }) catch
             return subagent_mod.refused("out of memory during the subagent loop", rep);
 
         for (tstate.calls.items) |call| {
@@ -4706,15 +4774,19 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             // result, NOT as a crash: the model asked for something out of scope
             // and it should find out by being told, in the same turn.
             if (!subagent_mod.allowsTool(call.name)) {
-                const denied = std.fmt.allocPrint(gpa, "the subagent may not use `{s}`. It can only search and read.", .{call.name}) catch "not allowed";
-                msgs.append(gpa, .{ .role = "tool", .content = denied, .tool_call_id = call.id }) catch break;
+                const denied = std.fmt.allocPrint(sarena, "the subagent may not use `{s}`. It can only search and read.", .{call.name}) catch "not allowed";
+                msgs.append(sarena, .{ .role = "tool", .content = denied, .tool_call_id = call.id }) catch break;
                 continue;
             }
             const res_text = tools_mod.execute(
                 io_global,
                 call.name,
                 call.args_json,
-                gpa,
+                // The subagent's throwaway arena, NOT the model allocator: a `grep`
+                // result here is up to 4 KB of memory nobody will ever read again, and
+                // one owner that dies with the subagent is the only way to be sure it
+                // goes back.
+                sarena,
                 // NO background registry: a subagent must not leave processes
                 // behind that nobody is tracking, and `run_in_background` on a
                 // read-only tool is not a thing.
@@ -4726,8 +4798,8 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
                 // window that is thrown away a second later.
                 null,
             ) catch |err| {
-                const emsg = gpa.dupe(u8, @errorName(err)) catch continue;
-                msgs.append(gpa, .{ .role = "tool", .content = emsg, .tool_call_id = call.id }) catch break;
+                const emsg = sarena.dupe(u8, @errorName(err)) catch continue;
+                msgs.append(sarena, .{ .role = "tool", .content = emsg, .tool_call_id = call.id }) catch break;
                 continue;
             };
             // The per-result cap is the subagent's own, tighter one: 16 KB of grep
@@ -4736,7 +4808,7 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
                 res_text[0..subagent_mod.max_tool_output]
             else
                 res_text;
-            msgs.append(gpa, .{ .role = "tool", .content = capped, .tool_call_id = call.id }) catch break;
+            msgs.append(sarena, .{ .role = "tool", .content = capped, .tool_call_id = call.id }) catch break;
         }
         tstate.clearCalls(gpa);
         tstate.text.clearRetainingCapacity();

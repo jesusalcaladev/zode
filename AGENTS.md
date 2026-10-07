@@ -3757,3 +3757,61 @@ It is now a refusal that names the job and says to poll it with `bash_output`. T
 still does not block — the cap stays a cap, because a slow compile must not freeze the
 user's session — but now it is the MODEL that decides whether to wait, which is the one
 thing it is good at, and the iteration budget carries the turn.
+
+---
+
+# Two real bugs in the subagent, found by reading it (2026-10-07)
+
+Neither showed up in a test. Both are the kind that only show up when you actually
+run a long session, which is why they were still here.
+
+## 1. The subagent leaked its whole window on every call
+
+```zig
+var msgs: std.ArrayList(chat.ChatMessage) = .empty;   // from gpa
+// ... no deinit, anywhere
+```
+
+Not the ArrayList — that is a few bytes on the stack. Everything it pointed at: the
+prompt, every assistant message, every `tool_calls` JSON, and **every tool result**.
+A subagent is eight iterations of `grep` results at up to 4 KB each, so one call leaked
+tens of KB from the MODEL's allocator, and the leak went into the process heap where it
+showed up as RSS that never came down and a DebugAllocator complaint with nothing to
+attribute it to.
+
+Now an arena (`sarena`) owns the entire throwaway window and dies with the subagent.
+That is not only about the leak: a subagent's context is a **disposable window by
+definition**, so having one owner whose death reclaims all of it is the same argument
+that keeps it out of the main context in the first place. `gpa` is now only for the
+things that genuinely outlive the call, which is the `Report` the caller owns.
+
+The tool results went with it — `tools.execute` is handed `sarena`, because a 4 KB grep
+result in a window nobody will read again is exactly what an arena is for.
+
+## 2. Three parallel subagents killed themselves with their own parallelism
+
+`task` runs up to **three at once** by default (`default_task_parallel = 3`). Three
+requests inside a second is a good way to earn a 429. And the subagent — unlike the
+main turn — had **no retry at all**: one `error.RateLimited` and it returned "refused".
+
+So the parallelism was building the rate limit that then destroyed the searches it had
+started, and the model was told `refused` for something that was a number in a header.
+The worse half of that is that it is *self-inflicted*, which makes it both easy to
+trigger and invisible in any test that runs one subagent at a time.
+
+It now retries, **silently**:
+
+- **Silently**, because a subagent's intermediate steps must not appear in the user's
+  history at all — three "rate limited, retrying" lines from three threads is a history
+  full of noise about something invisible.
+- **Two attempts, not three**, because a subagent that is one of three in parallel should
+  get out of the way rather than hold its slot through three backoffs the other two are
+  also sitting in.
+- **Per subagent, not a global counter**, because three threads sharing one retry budget
+  means one subagent's 429 resets another's — the same lost-update class as
+  `bench.subagents` before it was fixed.
+- **Reported if they all fail**, saying it was a rate limit and not the task, because
+  "refused" is an instruction to do something and a 429 is not.
+
+ESC during the backoff is a cancellation, not a failure: `Retry.wait` returns the ESC and
+the report is "cancelled while waiting to retry", not an error about the search.
