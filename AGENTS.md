@@ -3481,3 +3481,77 @@ with it.
   a suite after every edit is the thing `verification_prompt` exists to prevent.
 - It does not raise the ceiling. A task that cannot be verified in 60 iterations should
   have said `blocked`; the gate tells the model that, it does not extend the budget.
+
+---
+
+# Prompt polish: rules that decide, not rules that decorate (2026-10-07)
+
+The exit gate made the harness hold the evidence. The prompt is what tells the model
+what the harness does with it, and a careful pass over it found the same class of bug
+the gate had: **the harness had the rule, and the model had not been told.**
+
+## Four rules added, and the failure each one prevents
+
+**"A green build is not a fixed bug."** This is the most expensive outcome an agent can
+hand back: code that compiles while the reported bug is still there. It is invisible
+from outside — the diff is clean, the build is green, the tests nobody wrote did not
+run — and it is the failure most likely to be reported to you as success. It went in
+the RULES block rather than in `verification_prompt`, because that block is about how
+much wall clock verification costs and a rule that decides whether the work is
+finished does not belong in a block about time.
+
+**"Finish the whole task, not the easy part of it… check every clause of it."** The
+other silent failure: half a request delivered confidently. Both silent failures have
+the same shape — nothing looks wrong, and something is missing.
+
+**"Do NOT use `ask` to report progress, or to hand back work you could have
+finished."** The ask guidance said what `ask` was FOR and nothing about what it must
+not be used for, so a model could use it to sign off on its own work. A user asked to
+confirm learns to press enter without reading, and the question then means nothing
+while still costing a turn. Plus the level below it: never ask a question whose answer
+is "whatever you think is right" — that is the model's own decision, and asking it
+hands the decision back instead of taking it.
+
+**"If a tool call is denied or errors, do not retry it as it was."** It said "if it is
+denied" and said nothing about a call that FAILED, which is the common case: a model
+that re-sends the same `edit` whose `old_string` did not match gets three identical
+errors and calls it a loop.
+
+## A test that no rule is stated twice
+
+Duplicated prompt text is not redundancy, it is a rule paid for on every request plus
+the copy that drifts: someone tightens one of them and the loose one keeps the old
+wording alive forever.
+
+Checking it on a list of fragments would be the thing that goes stale — the next rule
+added would not be in the list. So the test is on the SHAPE: no trimmed line of 24+
+characters in one block may appear in another block. I verified it fails by putting a
+verbatim rule from `default_system_prompt` into `tool_routing_prompt` and watching it
+go red, then removing it. It immediately found one real duplicate — the "ambiguous
+request → `ask`" rule was in all three blocks — and the one in the routing table is
+gone, because a routing table is for choosing between tools and `ask` is not that.
+
+## What it cost, because the prompt is the cached prefix
+
+The prompt is the biggest stable prefix in every request, so growth is not free:
+
+```
+before   10687 chars  ~2671 tokens
+after    12516 chars  ~3129 tokens   (+458)
+```
+
+`tool_routing_prompt` is 1341 of those tokens and it earned them by removing real
+duplication: the internet bullet stated "search first, fetch after" twice, and the
+"local code questions start with glob/grep/refs" rule restated the end of the `bash`
+bullet in full. Both were merged rather than cut, because both carry a rule.
+
+## The `\\` wrap trap, again, in a NEW test
+
+`"you could have finished"` is not in the `ask` guidance string. The `\\` continuation
+joins the lines but KEEPS the next line's indentation, so the text is
+`hand back work\n   you could have finished`. And `"do NOT use it to report progress"`
+failed too — the string starts with a capital `Do`. A rule-pinning test that searches
+for a phrase across a wrap is a test that fails on a rule that is present, and the
+fix is to search for the half that is really in the string, with a comment saying why.
+That trap is now documented in the test itself, so the next person does not spend the
+same twenty minutes.

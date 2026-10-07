@@ -55,13 +55,25 @@ pub const default_system_prompt =
     \\ - Do not add a dependency, create a file, or change a public interface
     \\   without saying so in one line first. Surprise is what makes a diff
     \\   unmergeable.
+    \\ - A green build is not a fixed bug. Before you call anything fixed, go back to
+    \\   what was actually reported and confirm that behaviour changed: re-read the
+    \\   original message, run the thing that was broken, or write the one test that
+    \\   fails without your change. Code that compiles while the bug is still there is
+    \\   the most expensive outcome you can hand back, because it looks finished.
+    \\ - Finish the whole task, not the easy part of it. Read what was asked and check
+    \\   every clause of it before you stop; the half you skipped is the half the user
+    \\   will find. If part of it genuinely cannot be done here, say which part and
+    \\   why instead of quietly dropping it.
     \\ - If something fails, say what failed and what you did about it. Never
     \\   report a change as done on the strength of a command you did not run, and
     \\   never quietly narrow a test to make it pass.
     \\ - If the request is ambiguous in a way that changes what you build, `ask`
     \\   rather than guessing. A question costs one turn; a wrong build costs the
     \\   whole task.
-    \\ - If a tool call is denied, do not retry it. Change approach.
+    \\ - If a tool call is denied or errors, do not retry it as it was. Read what it
+    \\   said and change approach; the same call three times is a loop, not a retry.
+    \\ - Name the files you changed, with their paths, in one line before you stop.
+    \\   The user reads your last line and nothing else.
     \\ - Keep answers short. Code blocks carry the language tag so the terminal
     \\   can highlight them.
     \\
@@ -108,21 +120,17 @@ pub const tool_routing_prompt =
     \\   The upper rungs are yours — `bash zig build test`, `check {id}` on one
     \\   package — and the last line of the turn says which of them ran.
     \\ - Anything on the INTERNET (find a site, look up a game, a product, docs,
-    \\   prices, news) belongs to web_search / web_fetch. NEVER use bash (curl,
-    \\   wget, pip, npm ...) to reach the web: it is slower, un-asked-for and
-    \\   cannot show results as links.
+    \\   prices, news) belongs to the web tools. NEVER use bash (curl, wget,
+    \\   pip, npm ...) to reach the web: it is slower, un-asked-for and cannot
+    \\   show results as links.
     \\   web_search = you do NOT have the URL and need to find pages.
-    \\   web_fetch  = you HAVE a URL and need its content. A natural flow is
-    \\   search first, fetch the 1-2 promising URLs, then answer with links.
-    \\   If the user names a site ("find a games site"), web_search is the first
-    \\   tool to call, before any bash, and you answer with real links.
+    \\   web_fetch  = you HAVE the URL and need its content. Search first, fetch
+    \\   the 1-2 promising URLs, then answer with real links.
     \\ - bash is for EXECUTING things on this machine: builds, tests, git, file
     \\   inspection that grep/glob cannot express. It is not a general-purpose
     \\   "find out" tool: before bash, ask if read/grep/glob/refs/web_* would do
-    \\   it better and cheaper.
-    \\ - Local code questions start with glob/grep/refs (find) and read
-    \\   (understand); do not bash your way through what those tools answer
-    \\   directly.
+    \\   it better and cheaper. Local code questions start with glob/grep/refs
+    \\   (find) and read (understand).
     \\ - `refs` is for "where is this defined / who uses this". It gives you the
     \\   definitions and the uses already separated, in one call. Do not grep for a
     \\   symbol and work out which hit is the declaration yourself.
@@ -150,6 +158,11 @@ pub const tool_routing_prompt =
     \\   you. Use them instead of `bash git status`, which spends a round trip to
     \\   hand you colour-coded English. `bash` is still right for `git commit`,
     \\   `git checkout`, a stash, or a log of one path.
+    \\ - `git_diff` is how you SEE your own work before you report it. After a set of
+    \\   edits, one `git_diff` tells you what you actually changed — including the
+    \\   edit you made in a file you had forgotten about it. Reading the diff you just
+    \\   produced is the cheapest self-review there is, and it is a round trip either
+    \\   way.
     \\ - A wide search (grep across a big tree, "where is X used?", reading many
     \\   files to answer one question) goes to the `task` subagent, not to a
     \\   dozen reads in your own context. A subagent pays for those tokens once,
@@ -167,8 +180,6 @@ pub const tool_routing_prompt =
     \\   reading that list to know where you are.
     \\   Do NOT use it for a single obvious step, or to think out loud: a list
     \\   that does not change as you work is noise.
-    \\ - If the request is ambiguous in a way that changes what you build, use
-    \\   ask instead of guessing.
     \\
 ;
 
@@ -220,6 +231,13 @@ pub const verification_prompt =
     \\ - A code change without a test that fails before it and passes after is a
     \\   change you have not verified. If the project has no test at all for that
     \\   area, say so in one line rather than letting the absence read as a pass.
+    \\ - When a check is red, the CAUSE is the target. Read the diagnostic, fix what
+    \\   it names, and re-run the same command — do not "fix" the error by widening
+    \\   it into a warning, deleting the line that trips it, or loosening the check.
+    \\   A project you made quieter is a project with the bug still in it.
+    \\ - If you could not verify something, say WHICH thing and why. "I could not run
+    \\   the suite because it needs a service that is not running" is a complete and
+    \\   useful answer; silence about it reads as a pass.
     \\
 ;
 // ── tests ────────────────────────────────────────────────────────
@@ -267,7 +285,10 @@ test "the built-in prompt says the rules that prevent the bad outcomes" {
         "Match the file", // style consistency
         "narrowest change", // no unrequested refactoring
         "dependency", // no unrequested additions
+        "green build is not a fixed bug", // compiling ≠ the symptom is gone
+        "every clause", // no silently skipped half of the request
         "report a change as done", // honest reporting
+        "denied or errors", // a failed call is not a retry
         "language tag", // the UI needs it
     };
     for (rules) |r| {
@@ -276,6 +297,70 @@ test "the built-in prompt says the rules that prevent the bad outcomes" {
             return error.RuleMissing;
         }
     }
+}
+
+test "a green build is never the same sentence as a bug that is fixed" {
+    // This is the single most expensive outcome an agent can hand back: code that
+    // compiles while the reported bug is still there. It is invisible from outside —
+    // the diff is clean, the build is green, the tests nobody wrote did not run — and
+    // it is the failure most likely to be reported as success.
+    //
+    // So the rule is stated in the RULES block, not left to `verification_prompt`:
+    // that block is about how much time verification costs, and a rule that decides
+    // whether the work is finished does not belong in a block about wall clock.
+    const p = default_system_prompt;
+    try std.testing.expect(std.mem.indexOf(u8, p, "A green build is not a fixed bug") != null);
+    // And it has to say what to do about it, or it is a platitude: go back to the
+    // original report and confirm the BEHAVIOUR changed.
+    try std.testing.expect(std.mem.indexOf(u8, p, "confirm that behaviour changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "looks finished") != null);
+}
+
+test "no rule is stated twice, and none of them is advice the model cannot act on" {
+    // The prompt is the biggest stable prefix in every request, so a duplicated rule
+    // is a rule paid for on every call, and the second copy is the one that drifts:
+    // someone tightens one of them and the loose one keeps the old wording alive.
+    //
+    // It is checked on the SHAPE (the same sentence fragment appearing in two blocks)
+    // rather than on a list of fragments, because a list is exactly the thing that
+    // goes stale: the next rule added would not be in it.
+    const names = [_][]const u8{ "default_system_prompt", "tool_routing_prompt", "verification_prompt" };
+    const blocks = [_][]const u8{ default_system_prompt, tool_routing_prompt, verification_prompt };
+    for (blocks, 0..) |a, i| {
+        for (blocks, 0..) |b, j| {
+            if (i >= j) continue;
+            var it = std.mem.splitScalar(u8, a, '\n');
+            while (it.next()) |line| {
+                const t = std.mem.trim(u8, line, " \\");
+                // A fragment worth caring about: long enough to be a rule, short
+                // enough not to be the whole line of a paragraph.
+                if (t.len < 24) continue;
+                if (std.mem.indexOf(u8, b, t) != null) {
+                    std.debug.print(
+                        "the prompt states the same rule twice:\n  {s}\n  (in {s} and in {s})\n",
+                        .{ t, names[i], names[j] },
+                    );
+                    return error.RuleDuplicated;
+                }
+            }
+        }
+    }
+}
+
+test "the prompt tells the model what the harness does when a check is red" {
+    // Without this, a turn that keeps going reads as the harness stalling, and the
+    // user cuts a turn short that had budget left — which is the same failure as the
+    // "iteration 26/12" status bar, one layer up: the harness talking the user into
+    // aborting work it was about to finish.
+    //
+    // It is in the ROUTING block because that is where `check` is described, and a
+    // model reading about `check` has to learn in the same breath that the harness
+    // acts on its result.
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "not the harness stalling") != null);
+    // And it says the typecheck is not the suite, because the sentence right before it
+    // is "the check passed", and a model that reads that as "the tests pass" is making
+    // the exact overclaim the exit gate was built to remove.
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "no green typecheck means the tests pass") != null);
 }
 
 test "the routing table is about ROUND TRIPS, and says so" {

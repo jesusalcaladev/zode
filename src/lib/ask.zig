@@ -190,6 +190,10 @@ pub const guidance =
     \\ - At most ONE question per step, and no more than three in a whole turn.
     \\   A model that asks everything is as useless as one that assumes
     \\   everything.
+    \\ - Do NOT use it to report progress, to say you are done, or to hand back work
+    \\   you could have finished. It is for a decision only YOU cannot make; anything
+    \\   else is your job, and a user who gets asked to confirm your work learns to
+    \\   press enter without reading.
     \\
     \\How to ask:
     \\ - Put your recommendation FIRST and say why in the question text, so the
@@ -197,6 +201,8 @@ pub const guidance =
     \\ - Use `options` when the choices are enumerable (2 to 5). Use no options
     \\   when the answer is free text (a name, a path, a yes/no with a nuance).
     \\ - `header` is a 2-3 word label for the dialog, not the question.
+    \\ - Never ask a question whose answer is "whatever you think is right". That is
+    \\   the model's own call; asking it hands back the decision it was given.
     \\
     \\After the answer: keep going. Do not ask a follow-up that restates the same
     \\decision, and do not ask anything you have already been told.
@@ -351,4 +357,30 @@ test "guidance: forbids asking what can be read" {
     // It is the rule that gives the most value and the easiest to lose in a rewrite.
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "do NOT ask what you can read") != null);
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "three in a whole turn") != null);
+}
+
+test "guidance: `ask` is for decisions, not for progress reports or sign-off" {
+    // The two failure modes that turn `ask` from useful into a nuisance, and both are
+    // invisible to a model that has only been told what `ask` is FOR.
+    //
+    // The second one is the worse of the two and it took a rule to say out loud: a
+    // model that asks "does this look right?" before finishing hands the work back to
+    // the user, and a user who gets asked to confirm learns to press enter without
+    // reading. The question then means nothing and costs a turn to mean nothing.
+    //
+    // The third rule is the same idea one level in: "whatever you think is right" is
+    // the model's own decision, and asking it gives the decision away instead of
+    // taking it.
+    //
+    // Each needle is a fragment that does NOT cross a `\\` line break, which is the
+    // trap this file has already documented: the continuation joins the lines but KEEPS
+    // the next line's indentation, so a phrase written across two lines is not in the
+    // string at all — it is "hand back\n   work". The first version of this test
+    // searched for "you could have finished" and failed on a rule that was present.
+    try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "Do NOT use it to report progress") != null);
+    // "anything else is your job" is split across the wrap above ("…; anything" /
+    // "else is your job…"), so the needle is the half that is really in the string.
+    try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "else is your job") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "press enter without reading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "whatever you think is right") != null);
 }
