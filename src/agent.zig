@@ -709,16 +709,60 @@ pub var session_elided: usize = 0;
 
 /// Has the TUI already summarized the old turns in this session?
 ///
-/// Once, and only once. Retrying it every turn is one wasted request per turn
-/// forever, and the state it would recover from (a context too full to send) is
-/// exactly the one it cannot recover from without help. A `/new` resets it.
-var summarized_this_session: bool = false;
-
-/// Has the TUI already summarized the old turns in this session?
+/// Tier 2 compaction: the LLM request that summarizes the old stretch.
 ///
-/// Once, and only once. Retrying it every turn is one wasted request per turn
-/// forever, and the state it would recover from (a context too full to send) is
-/// exactly the one it cannot recover from without help. A `/new` resets it.
+/// ## Why "once per session" was wrong
+///
+/// It used to be a bool, and the reasoning behind it was sound — retrying it every
+/// turn is one wasted request per turn forever — but the conclusion was one step too
+/// far. "Not every turn" is not "only ever once", and a bool can only say the second
+/// thing. So in a long session the context grew again with no brake, and the turn died
+/// with a writer error when the body outgrew the 1 MiB buffer: from the outside, "the
+/// agent went quiet". The flag was the cause and nothing said so.
+///
+/// ## Why it is now a budget with a gap, and not just a budget
+///
+/// Two guards, because they answer different questions:
+///
+/// - **A gap of `summary_gap` iterations.** Without it, a long turn where every
+///   iteration needs a summary spends a request per iteration — the exact waste the
+///   bool was there to prevent. With it, summarizing is at most once every six
+///   iterations, which on a 60-iteration goal turn is ten summaries instead of sixty.
+/// - **A cap of `summary_max` per session.** Without it, a session that keeps filling
+///   the context keeps paying for summaries forever, and each one is a request whose
+///   result is thrown away by the next one. Three is enough to carry a long session;
+///   past that the user is better served by `/new` or a bigger window.
+pub const summary_gap: usize = 6;
+pub const summary_max: usize = 3;
+
+/// How many summaries this session has done, and the iteration of the last one.
+var summaries_done: usize = 0;
+var summarized_at_iteration: usize = 0;
+
+/// May tier 2 run right now, at `iteration`?
+///
+/// It returns true on the first trigger of a session and then at most once every
+/// `summary_gap` iterations, up to `summary_max` times.
+pub fn maySummarize(iteration: usize) bool {
+    if (summaries_done >= summary_max) return false;
+    if (summaries_done == 0) return true;
+    return iteration >= summarized_at_iteration + summary_gap;
+}
+
+/// Records that a summary was just made. Separate from `maySummarize` so the call is
+/// visible at the one place that spends a request.
+fn noteSummarized(iteration: usize) void {
+    summaries_done += 1;
+    summarized_at_iteration = iteration;
+}
+
+/// A new session gets the whole budget back. `/new`, `/resume` and the bootstrap all
+/// come through here.
+fn resetSummaries() void {
+    summaries_done = 0;
+    summarized_at_iteration = 0;
+}
+
 /// Tok/s of the in-flight stream (status bar) and of the last finished stream.
 pub var tps_live: f64 = 0;
 pub var tps_last: f64 = 0;
@@ -1335,7 +1379,7 @@ pub fn newSession(m: *tui.Model) void {
     const s = ensureSession(m, m.allocator);
     m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
-    summarized_this_session = false;
+    resetSummaries();
 }
 
 // ── turn stats (ROADMAP phase 3) ──────────────────────────────
@@ -1556,7 +1600,7 @@ pub fn resetSession(m: *tui.Model) void {
         s.flush();
     }
     session_elided = 0;
-    summarized_this_session = false;
+    resetSummaries();
     m.pushInfoFmt("session reset", .{});
 }
 
@@ -1923,7 +1967,7 @@ fn resumeLatest(m: *tui.Model) void {
     };
     session = s;
     session_elided = 0;
-    summarized_this_session = false;
+    resetSummaries();
     const msg = std.fmt.allocPrint(
         m.allocator,
         "session resumed: {s} · {d} messages",
@@ -2176,6 +2220,31 @@ fn chatWorker(job: *ChatJob) void {
             last_user = nudge;
             continue;
         }
+
+        // 1b. `blocked` with nothing behind it.
+        //
+        //     `what_would_unblock` is a field the model FILLS IN, and a field is as easy
+        //     to invent as a fact: "the network is down" costs the same to write as "here
+        //     is the key", and the harness accepted both with the same confidence. So the
+        //     second half of the justification is something it can read off its own state
+        //     — did the turn actually TRY? A `blocked` on the first response with no tool
+        //     ever run is a shrug with a JSON body: nothing was read, nothing executed,
+        //     so there is no evidence for a claim about what is impossible.
+        //
+        //     Refused ONCE. A second `blocked` after the model has run tools is accepted,
+        //     and it has to be: a task that genuinely cannot be done here is exactly what
+        //     `blocked` is for, and a rule with no exit is a cage.
+        if (!goal_mod.verdictCredible(&m.goal, turn_stats.tools)) {
+            m.goal.blocked_refusals += 1;
+            m.goal.status = goal_mod.Status.none;
+            const why = goal_mod.blockedRetryText(m.allocator) catch break;
+            pushErrorOwned(m, why);
+            if (owned) |o| m.allocator.free(o);
+            owned = why;
+            last_user = why;
+            continue;
+        }
+
         if (m.goal.status != goal_mod.Status.none) break;
 
         // 2. The model stopped asking for tools, or it answered in prose while the goal
@@ -3144,7 +3213,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // turn, before the request, so the turn that triggered it is already the one
     // that fits.
     var msgs_wire: []chat.ChatMessage = comp.msgs;
-    if (comp.needs_summary and comp.summary_upto > 1 and !summarized_this_session) {
+    if (comp.needs_summary and comp.summary_upto > 1 and maySummarize(iteration)) {
         const sum_from: usize = 1; // never the system message
         const upto = @min(comp.summary_upto, comp.msgs.len);
         if (upto > sum_from + 1) {
@@ -3176,7 +3245,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
                 comp.msgs[sum_from..upto],
                 arena,
             )) |summary| {
-                summarized_this_session = true;
+                noteSummarized(iteration);
                 pushInfoFmt(m, "\u{b7} older turns summarized ({d} chars, was {d} messages)", .{
                     summary.len,
                     upto - sum_from,
@@ -3196,7 +3265,13 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             } else {
                 // It failed: say so instead of pretending, and do not retry it every
                 // single turn (that would be one wasted request per turn forever).
-                summarized_this_session = true;
+                // A failure counts against the budget, which is the other half of the
+                // old rule: retrying it every turn is one wasted request per turn
+                // forever. But it is no longer PERMANENT — `maySummarize` allows a new
+                // attempt after `summary_gap` iterations, and up to `summary_max` times
+                // in the session, so a session that outgrows the first summary still has
+                // a brake instead of dying on a writer error.
+                noteSummarized(iteration);
                 pushInfo(m, "\u{b7} the summary failed; carrying on with the messages as they are");
             }
         }
@@ -9159,7 +9234,11 @@ test "the gate's own check does not consult the turn's quota, and the quota does
     var reg: bgproc.Registry = .init(std.testing.allocator);
     defer reg.deinit(threaded.io(), std.testing.allocator);
 
-    // Two quota checks go through and count against `started_this_turn`.
+    // Two quota checks go through and count against `started_this_turn`. This one builds
+    // its own registry instead of using `checkFor`, and it is right: `spawn` writes the
+    // job into the registry it is GIVEN, so the registry that is deinit'ed has to be the
+    // same one. See `releaseChecked` for what the first version of these tests got
+    // wrong.
     for (0..auto_check_per_turn) |_| {
         try std.testing.expect(ac.maybeStart(&reg, threaded.io(), false));
         try std.testing.expectEqual(@as(u32, 0), ac.gate.forced);
@@ -9203,6 +9282,245 @@ fn waitJob(reg: *bgproc.Registry, id: u32) !void {
         sleep_mod.nap(10);
     }
     return error.JobNeverFinished;
+}
+
+/// An `AutoCheck` wired to a command that answers as told, with a real registry.
+///
+/// The seam every test of the gate needs and none of the others have: a REAL process,
+/// a REAL exit code and the REAL `file:line: error:` scan, so the wrapper — not just
+/// the pure rule — is exercised end to end. `planAt` is bypassed on purpose (it wants a
+/// project on disk with a `build.zig` in it); everything downstream of the spawn is the
+/// production path.
+fn checkFor(comptime cmd: []const u8) CheckFixture {
+    const threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    const reg: bgproc.Registry = .init(std.testing.allocator);
+    var ac: AutoCheck = .{};
+    ac.command_len = @min(cmd.len, ac.command.len);
+    @memcpy(ac.command[0..ac.command_len], cmd[0..ac.command_len]);
+    const label = "the check";
+    ac.label_len = label.len;
+    @memcpy(ac.label[0..label.len], label);
+    ac.gate.checkable = true;
+    return .{ .ac = ac, .threaded = threaded, .reg = reg };
+}
+
+/// What `checkFor` hands back, with the field types it needs.
+///
+/// Named and not anonymous because two of the three have to be `var` at the call site
+/// (`reg` is spawned into and `threaded` owns a self-pointer that moves with it) and an
+/// anonymous struct returned by value cannot be copied without invalidating that.
+const CheckFixture = struct {
+    ac: AutoCheck,
+    threaded: std.Io.Threaded,
+    reg: bgproc.Registry,
+};
+
+/// Tears the fixture down.
+///
+/// ## The copy trap that made this leak, and cost an hour of a plausible wrong theory
+///
+/// The first version of these tests did `var ac = h.ac; var reg = h.reg;` and used the
+/// copies. `bgproc.Registry` is a plain struct with an `ArrayList` inside each slot, so
+/// a copy of it is perfectly legal and looks identical — but `spawn` writes the job into
+/// the registry it was GIVEN, and the job's `buf` is allocated there. Deinit'ing
+/// `h.reg` freed a registry that had never held a job, while the one the test actually
+/// spawned into was dropped on the floor.
+///
+/// The theory that came first was much more interesting and completely wrong: "the
+/// detached reader sets `state = finished` before its last append, so the teardown
+/// frees the buffer underneath it". That has a real ring to it, it names a real
+/// ordering in `bgproc.reader`, and adding a drain loop for it changed nothing at all.
+///
+/// So there is no drain loop here. The tests use `&h.reg` and `&h.ac` directly and the
+/// leak is gone, and the lesson is the one this repo keeps re-learning: a mechanism that
+/// explains the symptom is not evidence that it IS the symptom.
+fn releaseChecked(h: *CheckFixture) void {
+    h.reg.deinit(h.threaded.io(), std.testing.allocator);
+    h.threaded.deinit();
+}
+
+test "the gate refuses a turn over a REAL failing build, through the real wrapper" {
+    // ## Why this test exists and what it is NOT
+    //
+    // Every other test of the exit gate drives `Gate.decide()`, which is pure: it proves
+    // the RULE and it proves nothing about the code that RUNS it. That gap is the same
+    // shape as one this repo already paid for, where `applyGoalCall` existed, `toolGoal`
+    // existed and the schema was declared — and the model called the tool and the
+    // harness went on to the ceiling, because `execOneCall` had never been wired to it.
+    // Three halves, each tested, and nothing watching the seam.
+    //
+    // So this one drives `exitGate` itself: a real child, a real exit code 1, the real
+    // diagnostic scan, the real wait. It is still not the whole loop — `chatWorker`
+    // needs a `Model` and a network — but it is the half where a bug would be SILENT,
+    // because the rule's own tests cannot see it.
+    // `exit 1` with a real diagnostic on stderr: the exact shape the scan looks for, so
+    // the refusal is built out of a message that came from a process.
+    var h: CheckFixture = checkFor("printf 'src/a.zig:3:5: error: unused variable\\n' >&2; exit 1");
+    defer releaseChecked(&h);
+    const ac = &h.ac;
+    const reg = &h.reg;
+
+    _ = ac.noteWrite("write", "{\"path\":\"src/a.zig\"}");
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.writes);
+
+    const refusal = ac.exitGate(reg, std.testing.allocator, h.threaded.io()) orelse
+        return error.GateLetARedBuildThrough;
+    defer std.testing.allocator.free(refusal);
+    // "would end on it": the gate has to say what it is refusing, not just refuse.
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "would end on it") != null);
+    // And it names the count, which is what tells the model how much is left to do.
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "1 problem") != null);
+    // The verdict went into the GATE, not just into the message: a refusal that does
+    // not move the state would be refused again for the wrong reason next time.
+    try std.testing.expectEqual(exitgate.Verdict.failed, ac.gate.verdict);
+    // And the diagnostics reached the buffer the next iteration reads them from.
+    try std.testing.expect(ac.noteSlice().len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ac.noteSlice(), "unused variable") != null);
+}
+
+test "the gate lets a turn end once a REAL build has passed over the files it wrote" {
+    var h: CheckFixture = checkFor("exit 0");
+    defer releaseChecked(&h);
+    const ac = &h.ac;
+    const reg = &h.reg;
+
+    _ = ac.noteWrite("write", "{\"path\":\"src/a.zig\"}");
+    // The FIRST gate call has nothing behind that write, so it spends one of its own
+    // checks: that is the gate doing its job, not the gate being impatient.
+    try std.testing.expect(ac.exitGate(reg, std.testing.allocator, h.threaded.io()) == null);
+    try std.testing.expectEqual(exitgate.Verdict.passed, ac.gate.verdict);
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.forced);
+    try std.testing.expectEqual(@as(u32, 0), ac.gate.unverified());
+
+    // And the SECOND call, with nothing changed, spends NOTHING. This is the half worth
+    // pinning: the gate runs on EVERY iteration of the turn, so a gate that re-checked
+    // whenever it was asked would spawn a build per iteration for the rest of the
+    // session. What stops it is the files being covered — not the fact that it already
+    // ran once, which is a different rule and a worse one.
+    try std.testing.expect(ac.exitGate(reg, std.testing.allocator, h.threaded.io()) == null);
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.forced);
+}
+
+test "a green build followed by another edit makes the gate check AGAIN, for real" {
+    // The staleness rule, through the wrapper: the model fixes the build, edits a second
+    // file, and the first green is not evidence about the second file's contents.
+    var h: CheckFixture = checkFor("exit 0");
+    defer releaseChecked(&h);
+    const ac = &h.ac;
+    const reg = &h.reg;
+
+    _ = ac.noteWrite("write", "{\"path\":\"src/a.zig\"}");
+    try std.testing.expect(ac.exitGate(reg, std.testing.allocator, h.threaded.io()) == null);
+    try std.testing.expectEqual(exitgate.Verdict.passed, ac.gate.verdict);
+
+    // The next edit is not covered by that check.
+    _ = ac.noteWrite("edit", "{\"path\":\"src/b.zig\"}");
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.unverified());
+
+    // A re-check covers it, and it is FORCED: without the forced re-check this turn
+    // would have ended on evidence about files that no longer exist in that form.
+    try std.testing.expect(ac.maybeStart(reg, h.threaded.io(), true));
+    try waitJob(reg, ac.job);
+    _ = ac.collect(reg);
+    // TWO, not one: the first gate call above already spent one of its own checks
+    // (there was a write with nothing behind it), so this is the second. The count is
+    // asserted rather than glossed because "one re-check per turn" and "one re-check per
+    // uncovered write" are different rules and only the numbers tell them apart.
+    try std.testing.expectEqual(@as(u32, 2), ac.gate.forced);
+    try std.testing.expectEqual(@as(u32, 0), ac.gate.unverified());
+}
+
+test "tier 2 compaction is a BUDGET with a gap, not a switch that turns off forever" {
+    // This is the bug that made a long session die with a writer error and look, from
+    // the outside, like "the agent went quiet". The flag was `summarized_this_session:
+    // bool`, and the reasoning behind it — retrying every turn is one wasted request per
+    // turn forever — was sound. The conclusion was one step too far: "not every turn" is
+    // not "only ever once", and a bool can only say the second thing.
+    //
+    // So the flag is gone and there are two numbers instead, and they answer different
+    // questions: how OFTEN (the gap, so a long turn does not pay per iteration) and how
+    // MANY (the cap, so a session that keeps filling the context does not pay forever).
+    const saved = .{ summaries_done, summarized_at_iteration };
+    defer {
+        summaries_done = saved[0];
+        summarized_at_iteration = saved[1];
+    }
+    resetSummaries();
+
+    // The first trigger of a session is immediate: the turn that filled the context is
+    // the one that does not fit any more, so it is the one that must be summarized.
+    try std.testing.expect(maySummarize(0));
+
+    // And the next five iterations it does NOT: that is the waste the bool was invented
+    // to stop, and it is the half that matters on a 60-iteration goal turn.
+    noteSummarized(0);
+    var i: usize = 1;
+    while (i < summary_gap) : (i += 1) {
+        try std.testing.expect(!maySummarize(i));
+    }
+    // At the gap it goes back.
+    try std.testing.expect(maySummarize(summary_gap));
+
+    // Up to the cap, and then never again: past this the user is better served by
+    // `/new` or a bigger window than by zode quietly spending a request per summary
+    // forever, each one thrown away by the next.
+    var it: usize = summary_gap;
+    while (summaries_done < summary_max) {
+        try std.testing.expect(maySummarize(it));
+        noteSummarized(it);
+        it += summary_gap;
+    }
+    try std.testing.expect(!maySummarize(it));
+    try std.testing.expect(!maySummarize(it + 100));
+
+    // A new session gets the whole budget back, which is the only thing that made the
+    // old flag's reset make sense.
+    resetSummaries();
+    try std.testing.expect(maySummarize(0));
+}
+
+test "the gate stops re-checking after its budget, and says the code is not verified" {
+    // Bounded on purpose: an unbounded "just check again" is how a turn that cannot be
+    // verified becomes a turn that never returns. Once the budget is spent the gate
+    // stops, and the turn ends WITH THE TRUTH rather than looping or claiming green.
+    var h: CheckFixture = checkFor("exit 0");
+    defer releaseChecked(&h);
+    const ac = &h.ac;
+    const reg = &h.reg;
+
+    // Spend the budget for real: one write, one forced check, one more write, and the
+    // gate wants another each time.
+    //
+    // `canForce` counts checks the gate STARTED, not writes, so the budget has to be
+    // spent by starting them — a test that only wrote files would have asserted nothing
+    // about the cap.
+    for (0..exitgate.Gate.max_forced) |_| {
+        _ = ac.noteWrite("write", "{\"path\":\"src/a.zig\"}");
+        // Null is the expected answer here: the command exits 0, so each of these
+        // checks passes and the turn is free to end. What is being spent is the gate's
+        // OWN budget, not a refusal.
+        if (ac.exitGate(reg, std.testing.allocator, h.threaded.io())) |r| std.testing.allocator.free(r);
+        try std.testing.expectEqual(@as(u32, 0), ac.gate.unverified());
+        try std.testing.expectEqual(exitgate.Verdict.passed, ac.gate.verdict);
+    }
+    try std.testing.expect(!ac.gate.canForce());
+
+    // Now the budget is gone and the files are edited again with nothing covering them.
+    // The gate must stop, and the turn must end WITH THE TRUTH: never looping, and
+    // never claiming a green it could not produce.
+    _ = ac.noteWrite("write", "{\"path\":\"src/a.zig\"}");
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.unverified());
+
+    const refusal = ac.exitGate(reg, std.testing.allocator, h.threaded.io()) orelse
+        return error.GateClaimedGreenItCouldNotCheck;
+    defer std.testing.allocator.free(refusal);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "NOT verified") != null);
+    // And no extra child: `forced` did not move, because the gate was not allowed to
+    // start one.
+    try std.testing.expectEqual(@as(u32, exitgate.Gate.max_forced), ac.gate.forced);
+    // And it is spoken once per turn: a line repeated five times is a line the user
+    // learns to ignore, and the whole point of saying it is that it is read.
+    try std.testing.expect(ac.spoke);
 }
 
 test "the verdict is per TURN and resets, so turn two is not judged by turn one" {

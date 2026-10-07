@@ -3555,3 +3555,111 @@ for a phrase across a wrap is a test that fails on a rule that is present, and t
 fix is to search for the half that is really in the string, with a comment saying why.
 That trap is now documented in the test itself, so the next person does not spend the
 same twenty minutes.
+
+---
+
+# The four holes left after the exit gate (2026-10-07)
+
+Four things were listed as still missing. All four are done, and the first one turned
+out to be the interesting one.
+
+## 1. The RULE was tested; the code that RUNS it was not
+
+Seven tests on `Gate.decide()` and one on the budget — all pure. `exitGate`, the
+function that actually waits for a process and reads its exit code, had **no test at
+all**. So the gate was verified as a rule and unverified as a program.
+
+That is the shape of a bug this repo has already paid for twice. `applyGoalCall`
+existed, `toolGoal` existed, the schema was declared — and the model called the tool
+and the harness went on to the ceiling, because `execOneCall` had never been wired to
+it. Three halves, each with its own test, and nothing watching the seam.
+
+Four new tests drive `exitGate` itself with a **real child**: `exit 1` with a real
+`file:line: error:` on stderr, `exit 0`, a green-then-edit-again sequence, and the
+budget running out. `planAt` is bypassed on purpose (it wants a project on disk);
+everything downstream of the spawn is the production path.
+
+It is still not the whole loop — `chatWorker` needs a `Model` and a network — so this
+is a real remaining limit and not a solved one. But it is the half where a bug would
+be **silent**, because the rule's own tests cannot see it.
+
+### The leak that was not where the theory said
+
+Writing those tests leaked one allocation, and the first theory was a good one: "the
+detached reader sets `state = finished` BEFORE its last append to `buf`, so a teardown
+that runs the instant the state flips frees the buffer underneath the thread". That
+names a real ordering in `bgproc.reader`, it is the kind of race this repo has found
+three times, and adding a drain loop for it changed **nothing**.
+
+The real cause was in the test: `var reg = h.reg`. `bgproc.Registry` is a plain struct
+with an `ArrayList` per slot, so copying it is legal and looks identical — but `spawn`
+writes the job into the registry it was **given**, and deinit'ing `h.reg` freed a
+registry that had never held a job while the one the test actually spawned into was
+dropped on the floor. The tests use `&h.reg` and `&h.ac` directly now.
+
+Worth writing down for its own sake: a mechanism that explains the symptom is not
+evidence that it **is** the symptom. The drain loop is gone because it was never the
+problem, not because it was suppressed.
+
+## 2. `blocked` had a field and no evidence
+
+`what_would_unblock` is mandatory, and it is a field the model FILLS IN — "the network
+is down" costs exactly as much to write as "here is the key", and the harness accepted
+both with the same confidence. A model could declare `blocked` on iteration one and
+get the calm, honest exit that the whole goal feature was built to be safe.
+
+The second half of the justification is something the harness can read off its own
+state: **did the turn actually try?** `verdictCredible(g, tools_run)` refuses a
+`blocked` with zero tools run.
+
+Three decisions in it, each of which is the safe direction:
+
+- **The bar is `tools > 0`, and nothing else.** Not "several tools", not "a
+  verification". The claim being tested is "did you look before you said it is
+  impossible", and one read answers that. A stricter bar punishes exactly the careful
+  model that read twelve files before concluding it needed a credential.
+- **Refused ONCE.** An absolute rule turns every genuinely impossible task into a turn
+  that runs to the ceiling, and that task is exactly what `blocked` exists for. After
+  the refusal the same verdict is accepted: the model was told, it had its chance, and
+  arguing is how a loop stops being a loop.
+- **`met` is never subject to it.** The asymmetry is the point: the check catches a
+  false BLOCKER, a claim about the world. "There was nothing to do here" is not a claim
+  the harness can check, and grading how many tools a model used before saying a task
+  needed none is not a thing it knows.
+
+`blocked_refusals` is a separate counter from `checkpoints` on purpose: that one counts
+"you did not declare", this one counts "you declared giving up without trying". With
+one shared counter a turn that caught a shrug would look like a turn that had to be
+nagged about declaring at all.
+
+## 3. Tier 2 compaction could only ever run once per session
+
+`var summarized_this_session: bool`, and the comment said why: retrying it every turn
+is one wasted request per turn forever. The reasoning is sound and the conclusion is one
+step too far. **"Not every turn" is not "only ever once"**, and a bool can only say the
+second thing.
+
+So a long session grew again with no brake and the turn died with a writer error when
+the body outgrew the 1 MiB buffer. From the outside that is "the agent went quiet", and
+nothing said otherwise — the flag was the cause.
+
+Two numbers now, answering two different questions:
+
+| | value | question |
+|---|---|---|
+| `summary_gap` | 6 iterations | how OFTEN, so a 60-iteration turn does not pay per iteration |
+| `summary_max` | 3 per session | how MANY, so a session that keeps filling the context does not pay forever |
+
+The first trigger of a session is still immediate, because the turn that filled the
+context is the one that does not fit any more. And a **failure** counts against the
+budget too — that was the other half of the old rule — but it is no longer permanent,
+which is the whole fix.
+
+## 4. A check that outruns the 4 s cap
+
+Still a hole, and deliberately so: the gate says "still running", names the job, and
+lets the turn end. Blocking there would be the harness deciding that a slow compile
+matters more than the user's session, and `finishAutoCheck`'s job keeps running for
+the next turn to read. What was added is only that the **end-of-turn report** says which
+of the rungs ran (`AutoCheck.proofLine`), so "the check is still going" cannot be read
+as "the check passed".

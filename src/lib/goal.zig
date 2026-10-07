@@ -65,6 +65,13 @@ pub const Goal = struct {
     /// How many times the harness had to stop the model and ask for a verdict. More
     /// than one means the model is not declaring, and that is worth seeing.
     checkpoints: usize = 0,
+    /// How many times a `blocked` was sent back for want of evidence.
+    ///
+    /// Separate from `checkpoints` because it answers a different question: that one
+    /// counts "you did not declare", this one counts "you declared giving up without
+    /// having tried". A shared counter would make a turn that refused a shrug look
+    /// like a turn that had to be nagged, which are opposite problems.
+    blocked_refusals: u8 = 0,
 
     pub fn isSet(self: Goal) bool {
         return self.len > 0;
@@ -249,6 +256,141 @@ fn openStepsLine(gpa: std.mem.Allocator, open_steps: usize) ![]const u8 {
         1 => gpa.dupe(u8, "1 step. Finish that one before anything else."),
         else => std.fmt.allocPrint(gpa, "{d} steps. Work down them in order.", .{open_steps}),
     };
+}
+
+/// May the harness accept this verdict, given what the turn actually did?
+///
+/// ## Why `blocked` needs this and `met` does not
+///
+/// `blocked` is the exit hatch that makes the whole goal feature safe: an unbounded
+/// loop that can also STOP is a loop you can leave running, and it only means
+/// something if the stop is justified. `what_would_unblock` was the first half of that
+/// justification and it is not enough, because a field is something the model FILLS
+/// IN — "the network is down" is as easy to invent as "here is the key", and both are
+/// accepted with the same confidence.
+///
+/// So the second half is something the harness can read off its own state: **did the
+/// turn actually try?** A verdict of `blocked` on the very first response, with no tool
+/// ever run, is not a blocker — it is a shrug with a JSON body. Nothing was read, no
+/// command was run, no file was looked at, so there is no evidence for any claim about
+/// what is impossible.
+///
+/// ## Why only ONCE, and why only with zero tools
+///
+/// Two failure modes on the other side, both real:
+///
+/// - **Infinite.** If the refusal were absolute, a turn on a genuinely impossible task
+///   would run to the ceiling every time, and a task that cannot be done here is
+///   exactly the case `blocked` exists for. So it is refused once and then honoured:
+///   the model has been told, it has had its chance to go and do something, and a
+///   second `blocked` after it has run tools is a real one.
+/// - **Punishing a careful model.** The bar is deliberately `tools == 0`, not "few
+///   tools". A model that read twelve files before concluding it needs a credential
+///   has earned its `blocked`; a model that asked on iteration one has not. Anything
+///   stricter punishes exactly the careful behaviour we want.
+///
+/// And `met` is never subject to it: "there was nothing to do here" is a real answer,
+/// and the harness has no evidence to weigh against it either way. That asymmetry is
+/// the point — the check exists to stop a false BLOCKER, not to grade the model.
+pub fn verdictCredible(g: *const Goal, tools_run: usize) bool {
+    if (g.status != .blocked) return true;
+    if (g.blocked_refusals > 0) return true;
+    return tools_run > 0;
+}
+
+/// The sentence the harness sends back when a `blocked` has no evidence behind it.
+///
+/// It is written as an instruction and not as a refusal, because the model's way out
+/// has to stay open: it can go and try, and then the same verdict is accepted.
+pub fn blockedRetryText(gpa: std.mem.Allocator) ![]u8 {
+    return gpa.dupe(u8,
+        \\Your `blocked` was not accepted: this turn has not run a single tool, so
+        \\there is no evidence for the claim. Nothing was read, nothing was executed,
+        \\nothing was looked at. Go and do the obvious first thing — read the file,
+        \\run the command, search for the answer — and if it is still impossible,
+        \\call `goal` with status blocked again and it will be accepted.
+    );
+}
+
+test "a `blocked` with nothing behind it is sent back once, then accepted" {
+    // The failure this pins: `what_would_unblock` is a field the model FILLS IN, so
+    // "the network is down" was as acceptable as "here is the key", and a model that
+    // gave up on iteration one got the same calm exit as one that spent a turn proving
+    // it. The exit hatch has to be earned by SOMETHING the harness can read itself.
+    //
+    // The harness can read exactly one thing here — whether any tool ran — and that is
+    // deliberately the whole bar. Anything stricter would punish the careful model that
+    // read twelve files before concluding it needed a credential, which is the
+    // behaviour we want, and would let a model that read one file declare anything.
+    var g: Goal = .{};
+    g.status = .blocked;
+
+    // Nothing was tried. A shrug.
+    try std_test.expect(!verdictCredible(&g, 0));
+
+    // One tool is enough. Not "three tools", not "a verification": the claim being
+    // tested is "did you look before you said it is impossible", and one read answers
+    // that.
+    try std_test.expect(verdictCredible(&g, 1));
+}
+
+test "the refusal happens ONCE, because a blocked that cannot be declared is a cage" {
+    // The other failure mode, and the one that matters more: an absolute rule here
+    // turns every genuinely impossible task into a turn that runs to the ceiling. That
+    // is the exact task `blocked` exists for.
+    var g: Goal = .{};
+    g.status = .blocked;
+
+    try std_test.expect(!verdictCredible(&g, 0));
+    g.blocked_refusals = 1;
+    // Same state, same zero tools: accepted now. The model was told, it had its chance
+    // to go and do something, and arguing about it is how a loop stops being a loop.
+    try std_test.expect(verdictCredible(&g, 0));
+}
+
+test "`met` is never sent back for want of evidence" {
+    // The asymmetry is the point, and it is deliberate. The check exists to catch a
+    // FALSE BLOCKER — a claim of impossibility with nothing behind it. "There was
+    // nothing to do here" is not a claim about the world that can be checked, and the
+    // harness has no evidence to weigh against it either way.
+    //
+    // Making `met` subject to the same rule would mean grading how many tools a model
+    // used before saying a task needed none, which is not a thing the harness knows.
+    var g: Goal = .{};
+    g.status = .met;
+    try std_test.expect(verdictCredible(&g, 0));
+
+    g.status = .none;
+    try std_test.expect(verdictCredible(&g, 0));
+}
+
+test "the retry text gives an instruction, not a dead end" {
+    // A refusal that does not say what to do instead is a dead end with extra steps: the
+    // model's only remaining move is to give up, which is the opposite of what the
+    // refusal is for.
+    const text = try blockedRetryText(std_test.allocator);
+    defer std_test.allocator.free(text);
+    try std_test.expect(std.mem.indexOf(u8, text, "read the file") != null);
+    try std_test.expect(std.mem.indexOf(u8, text, "call `goal` with status blocked again") != null);
+    // And it promises the second one lands, so the model can trust the way out.
+    try std_test.expect(std.mem.indexOf(u8, text, "it will be accepted") != null);
+}
+
+test "the refusal counter is not the checkpoint counter" {
+    // They answer opposite questions. `checkpoints` counts "you did not declare";
+    // `blocked_refusals` counts "you declared giving up without trying". With one shared
+    // counter a turn that caught a shrug would look like a turn that had to be nagged
+    // about declaring at all, and `Goal{}.* = .{}` in `clear()` would be the only thing
+    // keeping the two apart.
+    var g: Goal = .{};
+    try std_test.expectEqual(@as(usize, 0), g.checkpoints);
+    try std_test.expectEqual(@as(u8, 0), g.blocked_refusals);
+
+    g.blocked_refusals = 1;
+    try std_test.expectEqual(@as(usize, 0), g.checkpoints);
+
+    g.clear();
+    try std_test.expectEqual(@as(u8, 0), g.blocked_refusals);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────────
