@@ -58,6 +58,13 @@ pub const Decision = enum {
     /// check is still running, and let the turn go — the job stays alive and the next
     /// turn reads it.
     still_running,
+    /// Code was written, it compiles, and nobody has LOOKED at the change since.
+    ///
+    /// This is the one that catches what a compiler cannot: an edit to the wrong file, a
+    /// duplicated block, a debug print left behind, a test deleted instead of fixed, a
+    /// function whose body no longer matches its name. The rest of this file answers
+    /// "does the machine accept it"; this one answers "is it what you meant to build".
+    refused_review,
 };
 
 /// The state of the code as far as the harness knows it.
@@ -94,6 +101,17 @@ pub const Gate = struct {
     running: bool = false,
     /// Checks the GATE started, past the per-turn quota.
     forced: u32 = 0,
+    /// Writes a completed review was looking at.
+    ///
+    /// The same staleness arithmetic as `verified_writes`, and for the same reason: a
+    /// review of the diff BEFORE the last edit is not a review of the current diff. If
+    /// this were a bool the model would review once at the start of the turn and the
+    /// harness would call the last three files "reviewed" for the rest of it.
+    reviewed_writes: u32 = 0,
+    /// A review is possible here: the project is a git repository, so there is a diff
+    /// to read. Without it the gate says so and does not hold the turn — the same
+    /// direction as `cannot_verify`, and for the same reason.
+    reviewable: bool = false,
 
     pub fn reset(self: *Gate) void {
         self.* = .{};
@@ -121,9 +139,23 @@ pub const Gate = struct {
         self.verified_writes = covers;
     }
 
+    /// A review of the diff as it is right now finished.
+    ///
+    /// It records `writes` and not a number the caller supplies, because the only
+    /// question is whether the review covers the files as they are NOW, and a caller
+    /// that could pass its own number would eventually pass a stale one.
+    pub fn noteReview(self: *Gate) void {
+        self.reviewed_writes = self.writes;
+    }
+
     /// Writes no completed check covers.
     pub fn unverified(self: Gate) u32 {
         return if (self.writes > self.verified_writes) self.writes - self.verified_writes else 0;
+    }
+
+    /// Writes no completed review covers.
+    pub fn unreviewed(self: Gate) u32 {
+        return if (self.writes > self.reviewed_writes) self.writes - self.reviewed_writes else 0;
     }
 
     pub fn wroteCode(self: Gate) bool {
@@ -160,6 +192,11 @@ pub const Gate = struct {
         if (!self.checkable) return .cannot_verify;
         if (self.verdict == .failed) return .refused_failed;
         if (self.unverified() > 0) return .refused_unverified;
+        // The review comes LAST, and the order is a decision rather than an accident:
+        // a red build is worth more than an unread diff. Making the model read its own
+        // diff before it has fixed a compile error is a worse turn than either problem
+        // alone, and it costs an iteration on top of the one the build already cost.
+        if (self.reviewable and self.unreviewed() > 0) return .refused_review;
         return .end;
     }
 };
@@ -271,4 +308,123 @@ test "reset: the next turn is judged by its own code" {
     try t.expectEqual(Verdict.unchecked, g.verdict);
     try t.expectEqual(Decision.end, g.decide());
     try t.expectEqual(@as(u32, 0), g.forced);
+}
+
+test "code that compiles but was never LOOKED AT does not let a turn end" {
+    // The rule that catches what a compiler cannot: an edit to the wrong file, a print
+    // left behind, a test weakened instead of fixed. Everything else in this file is the
+    // machine's opinion of the code; this is the model's.
+    var g: Gate = .{};
+    g.checkable = true;
+    g.reviewable = true;
+    g.noteWrite();
+    g.noteStarted(false);
+    g.noteCompleted(.passed, 1);
+    // Green, and still not reviewed.
+    try t.expectEqual(Decision.refused_review, g.decide());
+
+    g.noteReview();
+    try t.expectEqual(Decision.end, g.decide());
+}
+
+test "a review goes stale exactly like a check, and for the same reason" {
+    // The same arithmetic as `verified_writes`, and it has to be the same arithmetic:
+    // a review of the diff BEFORE the last edit is not a review of the current diff, and
+    // a bool would have called the last three files "reviewed" for the rest of the turn.
+    //
+    // The sequence below is the REAL one, and writing it down is what showed the two
+    // rules compose: after the second edit BOTH are stale, and the verification is
+    // reported first. The test version of "the review is now missing" is not "edit and
+    // assert refused_review" — it is "edit, let the build catch up, and only THEN assert
+    // refused_review". Skipping the middle step would have asserted a decision the gate
+    // never makes.
+    var g: Gate = .{};
+    g.checkable = true;
+    g.reviewable = true;
+    g.noteWrite();
+    g.noteStarted(false);
+    g.noteCompleted(.passed, 1);
+    g.noteReview();
+    try t.expectEqual(Decision.end, g.decide());
+
+    g.noteWrite(); // another edit, after the review AND after the check
+    // Both stale, and the build is what the model has to deal with first.
+    try t.expectEqual(@as(u32, 1), g.unverified());
+    try t.expectEqual(@as(u32, 1), g.unreviewed());
+    try t.expectEqual(Decision.refused_unverified, g.decide());
+
+    // The build catches up. Now, and only now, the review is what is missing.
+    g.noteStarted(true);
+    g.noteCompleted(.passed, 2);
+    try t.expectEqual(Decision.refused_review, g.decide());
+
+    g.noteReview();
+    try t.expectEqual(@as(u32, 0), g.unreviewed());
+    try t.expectEqual(Decision.end, g.decide());
+}
+
+test "a RED build outranks an unread diff" {
+    // The ORDER is the decision and it is not obvious. Reading your own diff while the
+    // code does not compile is a worse turn than either problem alone: the model spends
+    // an iteration reading a diff it is about to invalidate by fixing the build.
+    //
+    // So the red build is reported first, and the review only becomes the model's next
+    // problem once the code compiles.
+    var g: Gate = .{};
+    g.checkable = true;
+    g.reviewable = true;
+    g.noteWrite();
+    g.noteStarted(false);
+    g.noteCompleted(.failed, 1);
+    try t.expectEqual(Decision.refused_failed, g.decide());
+}
+
+test "no git means the review is not required, and the turn is not held forever" {
+    // The direction that is safe to be wrong in, and the same one as `cannot_verify`: a
+    // harness that waits for a review it can never obtain never ends a turn in a project
+    // that is not a repository, which is a lot of projects.
+    var g: Gate = .{};
+    g.checkable = true;
+    g.reviewable = false; // no repository here
+    g.noteWrite();
+    g.noteStarted(false);
+    g.noteCompleted(.passed, 1);
+    try t.expectEqual(Decision.end, g.decide());
+
+    // And a turn of prose never needs one either.
+    var prose: Gate = .{};
+    prose.reviewable = true;
+    try t.expectEqual(Decision.end, prose.decide());
+}
+
+test "reset: the review does not survive into the next turn" {
+    // Same shape as every other per-turn counter: a review of the PREVIOUS turn's diff
+    // is not a review of this turn's, and inheriting it would let turn two end without
+    // reading anything it wrote.
+    //
+    // `reviewable` resets too, which is not a detail — it is the git probe's answer,
+    // and a `git init` in the middle of a session has to be picked up. The gate asks
+    // again rather than trusting the previous turn.
+    var g: Gate = .{};
+    g.checkable = true;
+    g.reviewable = true;
+    g.noteWrite();
+    g.noteStarted(false);
+    g.noteCompleted(.passed, 1);
+    g.noteReview();
+    try t.expectEqual(Decision.end, g.decide());
+
+    g.reset();
+    try t.expectEqual(@as(u32, 0), g.reviewed_writes);
+    try t.expectEqual(@as(u32, 0), g.writes);
+    try t.expect(!g.reviewable);
+
+    // Turn two, same directory: the probe says yes again, the model edits, and the
+    // review is required from scratch.
+    g.checkable = true;
+    g.reviewable = true;
+    g.noteWrite();
+    g.noteStarted(false);
+    g.noteCompleted(.passed, 1);
+    try t.expectEqual(Decision.refused_review, g.decide());
 }

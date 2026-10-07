@@ -158,11 +158,13 @@ pub const tool_routing_prompt =
     \\   you. Use them instead of `bash git status`, which spends a round trip to
     \\   hand you colour-coded English. `bash` is still right for `git commit`,
     \\   `git checkout`, a stash, or a log of one path.
-    \\ - `git_diff` is how you SEE your own work before you report it. After a set of
-    \\   edits, one `git_diff` tells you what you actually changed — including the
-    \\   edit you made in a file you had forgotten about it. Reading the diff you just
-    \\   produced is the cheapest self-review there is, and it is a round trip either
-    \\   way.
+    \\ - `review` is how you SEE your own work, and the harness WILL NOT end your turn
+    \\   without it once you have edited a file. It hands back the diff of the files
+    \\   YOU changed this turn plus a checklist, and the build is already known good, so
+    \\   it costs no wall clock. Call it once after a set of edits, not once per edit.
+    \\   Read what it gives you and act on it: a file you did not mean to touch, a print
+    \\   you left behind, a test you weakened. Fixing those is cheaper than being told
+    \\   about them by the user.
     \\ - A wide search (grep across a big tree, "where is X used?", reading many
     \\   files to answer one question) goes to the `task` subagent, not to a
     \\   dozen reads in your own context. A subagent pays for those tokens once,
@@ -366,7 +368,10 @@ test "the prompt tells the model what the harness does when a check is red" {
 test "the routing table is about ROUND TRIPS, and says so" {
     // Every rule in it is "one call instead of N". If a future rewrite turns it
     // into prose about tools in general it has lost the reason it exists.
-    for ([_][]const u8{ "paths", "files", "refs", "round trip", "task", "git_status", "check", "todo" }) |k| {
+    // `review` is in the ROUTING table and not only in the exit gate's message: the
+    // model has to know it exists before it is refused, and a refusal naming a tool
+    // that was never mentioned reads as a bug in the harness.
+    for ([_][]const u8{ "paths", "files", "refs", "round trip", "task", "git_status", "check", "todo", "review" }) |k| {
         if (std.mem.indexOf(u8, tool_routing_prompt, k) == null) {
             std.debug.print("the routing table lost: {s}\n", .{k});
             return error.RuleMissing;

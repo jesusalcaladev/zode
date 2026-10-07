@@ -28,6 +28,7 @@ const bgproc = @import("bgproc.zig");
 const sleep_mod = @import("lib/sleep.zig");
 const typecheck_mod = @import("lib/typecheck.zig");
 const check_tool = @import("tools/check.zig");
+const bg_tool = @import("tools/bg.zig");
 const images_mod = @import("lib/images.zig");
 const bench_mod = @import("lib/bench.zig");
 const skills = @import("lib/skills.zig");
@@ -38,6 +39,7 @@ const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
 const commands_mod = @import("commands.zig");
 const exitgate = @import("lib/exitgate.zig");
+const review_mod = @import("lib/review.zig");
 
 // The `/help` tables live with the commands they document. Re-exported because
 // the palette builds its items from `commands`, and that is not a commands
@@ -1035,6 +1037,39 @@ pub fn envTruthyIn(env: ?*const std.process.Environ.Map, key: []const u8, defaul
 }
 
 /// The floor of the iteration limit, as a function so the test can name it.
+/// Is this directory inside a git repository?
+///
+/// One `git rev-parse` per turn, and the answer is cached in the gate for the turn
+/// because it cannot change from here: a repository is a property of the directory, not
+/// of the code in it. The alternative — asking git at every gate call — is a subprocess
+/// per iteration of a 60-iteration turn to learn the same thing.
+fn isGitRepo(io: std.Io) bool {
+    const r = bg_tool.runForeground(std.heap.page_allocator, io, "git rev-parse --is-inside-work-tree", 5, 64) catch return false;
+    return r.term != null and std.mem.indexOf(u8, r.stdout, "true") != null;
+}
+
+/// `isGitRepo`, asked once and remembered.
+///
+/// `null` is "not asked yet", which is different from `false` ("asked, and there is no
+/// repository here") and that difference is the whole point of the optional: a gate
+/// that re-asked on every iteration of a 60-iteration turn would spawn sixty processes
+/// to learn one bit about the directory.
+var git_repo_probe: ?bool = null;
+
+fn gitRepoCached(io: std.Io) bool {
+    if (git_repo_probe) |known| return known;
+    const answer = isGitRepo(io);
+    git_repo_probe = answer;
+    return answer;
+}
+
+/// Forgets the probe, so a `git init` in the middle of a session is picked up.
+///
+/// `/new` and `--resume` call it. Nothing else can change the answer.
+pub fn forgetGitRepoProbe() void {
+    git_repo_probe = null;
+}
+
 fn agent_default_iterations() usize {
     return default_max_iterations;
 }
@@ -1380,6 +1415,10 @@ pub fn newSession(m: *tui.Model) void {
     m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
     resetSummaries();
+    // The git probe's answer is about the DIRECTORY, and a `git init` in the middle of a
+    // session changes it. These are the only two moments that can: everything else in a
+    // session happens inside the same tree.
+    forgetGitRepoProbe();
 }
 
 // ── turn stats (ROADMAP phase 3) ──────────────────────────────
@@ -1396,6 +1435,12 @@ pub const TurnStats = struct {
     iterations: usize = 0,
     tools: usize = 0,
     denied: usize = 0,
+    /// How many times the model reviewed its own diff this turn.
+    ///
+    /// It is on the summary line because a turn that ends having reviewed nothing is
+    /// worth seeing as a number rather than as an absence: "0 reviews" reads as a fact
+    /// and a missing line reads as something nobody looked for.
+    reviews: usize = 0,
     /// Files touched, in order of appearance, without repeats.
     files: std.ArrayList([]const u8) = .empty,
     lines_added: usize = 0,
@@ -1968,6 +2013,7 @@ fn resumeLatest(m: *tui.Model) void {
     session = s;
     session_elided = 0;
     resetSummaries();
+    forgetGitRepoProbe();
     const msg = std.fmt.allocPrint(
         m.allocator,
         "session resumed: {s} · {d} messages",
@@ -3944,6 +3990,110 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
 /// model that asks fifteen is an interrogation that costs a full round trip each
 /// time. At the cap the question is refused with the DECLINE text, which tells
 /// the agent to decide and carry on — so the cap degrades into "you decide", not
+/// `review`: hand the model its own diff, with a checklist, and RECORD that it did.
+///
+/// ## Why it is intercepted here and not a normal tool
+///
+/// A normal tool runs inside `tools.execute` with no access to the Model. What a review
+/// needs is the list of files THIS turn touched — which is `turn_stats.files` — because
+/// the right diff is the model's own change and not the working tree, which in a working
+/// repository is somebody else's half-finished work too.
+///
+/// ## Why the recording is here and not in the tool
+///
+/// The gate needs to know that a review happened and that it covered the files as they
+/// are NOW. That is state, and state belongs next to the state it is about: the same
+/// reason `applyGoalCall` sits in the loop rather than in the tool. A tool that only
+/// returned text would make "reviewed" a thing the model claims rather than a thing the
+/// harness observed, which is the whole difference.
+///
+/// ## And why it is `noteReview` and not a boolean
+///
+/// A boolean would be satisfied by one review at the start of the turn and would call
+/// the last three files "reviewed" for the rest of it. `reviewed_writes` is the value of
+/// `writes` at the moment of the review, so an edit afterwards makes the diff unreviewed
+/// again — the same staleness arithmetic the verification uses, for the same reason.
+fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+
+    m.pushToolStart("review", "your own diff");
+
+    if (turn_stats.files.items.len == 0) {
+        const none =
+            "Nothing to review: you have not changed a file this turn, so there is no " ++
+            "diff of yours to read.";
+        m.pushToolDone("review", "nothing to review", 0, none);
+        s.appendToolResult(call.id, "review", none) catch {};
+        return 1;
+    }
+
+    // The diff of the turn's own files, and ONLY those. `git diff -- <paths>` with the
+    // paths this turn produced; without them a review in a dirty tree is a review of
+    // the whole repository, which is not a review of anything.
+    var argv: std.ArrayList(u8) = .empty;
+    argv.appendSlice(arena, "git diff --") catch {};
+    for (turn_stats.files.items) |f| {
+        argv.append(arena, ' ') catch {};
+        argv.appendSlice(arena, f) catch {};
+    }
+
+    const r = bg_tool.runForeground(arena, io_global, argv.items, 20, 64 * 1024) catch |err| {
+        const msg = std.fmt.allocPrint(
+            arena,
+            "could not read the diff ({t}). If this is not a git repository there is nothing to review with, and the harness cannot require it.",
+            .{err},
+        ) catch "could not read the diff";
+        m.pushToolDone("review", "no diff", 0, msg);
+        s.appendToolResult(call.id, "review", msg) catch {};
+        return 1;
+    };
+
+    if (std.mem.startsWith(u8, r.stdout, "fatal:") or std.mem.startsWith(u8, r.stderr, "fatal:")) {
+        // Not a repository, or no git. The same direction as `cannot_verify`: the
+        // reviewable flag is cleared so the gate stops asking for something that cannot
+        // be produced, and the model is told why in one sentence.
+        m.auto_check.gate.reviewable = false;
+        const msg = review_mod.notARepoText;
+        m.pushToolDone("review", "not a git repository", 0, msg);
+        s.appendToolResult(call.id, "review", msg) catch {};
+        return 1;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    if (r.stdout.len == 0) {
+        // An empty diff with files touched happens: the model wrote a file identical to
+        // what was already there, or committed it. Either way there is nothing to read,
+        // and a review step that says so is more useful than a diff of zero bytes with
+        // eight checklist items above it.
+        out.appendSlice(arena, "The diff of the files you changed this turn is EMPTY: they match what is already in the repository. Nothing to review.") catch {};
+    } else {
+        out.appendSlice(arena, r.stdout) catch {};
+        if (r.stdout[r.stdout.len - 1] != '\n') out.append(arena, '\n') catch {};
+        if (r.truncated) out.appendSlice(arena, bg_tool.foreground_truncation_notice) catch {};
+    }
+
+    const body = review_mod.checklist(arena, turn_stats.files.items, r.stdout.len) catch
+        "Read the diff above and look at it.";
+    out.appendSlice(arena, "\n") catch {};
+    out.appendSlice(arena, body) catch {};
+
+    // The record. AFTER the diff is in hand, never before: a review that produced
+    // nothing must not count, or the model satisfies the gate by calling `review` in a
+    // project where git cannot see the change.
+    m.auto_check.gate.noteReview();
+    turn_stats.reviews += 1;
+
+    const text = out.items;
+    m.pushToolDone("review", std.fmt.allocPrint(arena, "{d} file(s), ~{d} KB", .{
+        turn_stats.files.items.len,
+        r.stdout.len / 1024,
+    }) catch "your own diff", 0, text);
+    s.appendToolResult(call.id, "review", text) catch {};
+    return 1;
+}
+
 /// into a broken turn.
 fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
     var astate = std.heap.ArenaAllocator.init(m.allocator);
@@ -5122,6 +5272,15 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
             ran += skillCall(m, s, call);
             continue;
         }
+        if (std.mem.eql(u8, call.name, "review")) {
+            // Intercepted here for the same reason as `ask` and `todo`: what it needs
+            // is the TURN's list of touched files, which lives in `turn_stats` and not
+            // in anything a tool can reach. A `review` tool that got the whole working
+            // tree would hand back 400 files of someone else's change.
+            i += 1;
+            ran += reviewCall(m, s, call);
+            continue;
+        }
         if (std.mem.eql(u8, call.name, "task")) {
             // Consecutive `task` calls go together: they are independent
             // read-only searches, and in series each one is a full round trip of
@@ -5447,6 +5606,15 @@ pub const AutoCheck = struct {
     /// nothing: a harness that cannot say what it proved must not say "typechecked"
     /// either. See `typecheck.Plan.kind` for why the distinction is carried at all.
     proof: typecheck_mod.Kind = .nothing,
+    /// Whether the REVIEWABLE question has already been answered this turn.
+    ///
+    /// Separate from `gate.reviewable` because that one is a bool that starts false, and
+    /// false means two different things there: "asked, and there is no repository here"
+    /// and "not asked yet". A caller that wants to PIN the answer — the tests, which
+    /// must not change meaning with the directory they run in — has no way to say which
+    /// of the two it means, and a test that gets a different answer inside a git
+    /// repository than outside it is a trap with a green light.
+    review_known: bool = false,
     /// The gate already said out loud that the code is not verified this turn.
     ///
     /// Once, because a line repeated five times a turn is a line the user learns to
@@ -5458,10 +5626,23 @@ pub const AutoCheck = struct {
     /// session".
     pub fn resetTurn(self: *AutoCheck, reg: *bgproc.Registry, io: std.Io) void {
         _ = io;
+        // `reviewable` is NOT probed here.
+        //
+        // It was, and it was wrong twice. A `git rev-parse` per TURN is a subprocess to
+        // learn a fact about the DIRECTORY, which cannot change from inside a turn; and
+        // putting it in `resetTurn` made the probe run against whatever `Io` the caller
+        // had — including `undefined`, which is what the tests pass, so the test crashed
+        // with a general protection fault instead of failing an assertion.
+        //
+        // So the probe is LAZY and CACHED, in `gitRepoCached`: the first gate call that
+        // needs the answer pays for it and every later one reads the cached bool. The
+        // cache is reset by `/new` and by `--resume`, which are the only two moments the
+        // directory can have become a repository while zode was running.
         self.started_this_turn = 0;
         self.gate.reset();
         self.problems = 0;
         self.spoke = false;
+        self.review_known = false;
         self.note_len = 0;
         self.job_covers = 0;
         self.label_len = 0;
@@ -5761,10 +5942,25 @@ pub const AutoCheck = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
     ) ?[]u8 {
+        // The one probe of the session, here and not in `resetTurn`: see the note on
+        // `gitRepoCached`. It only runs when the turn has actually written something,
+        // which is the first moment the question is worth a subprocess.
+        if (!self.review_known and self.gate.wroteCode()) {
+            self.review_known = true;
+            self.gate.reviewable = gitRepoCached(io);
+        }
         switch (self.decideNow(reg, io)) {
             .end => return null,
             .cannot_verify => return self.sayUnverified(gpa, "no check is known for this project"),
-            .still_running => return self.sayUnverified(gpa, "the check is still running"),
+            .still_running => return std.fmt.allocPrint(
+                gpa,
+                "Your turn cannot end yet: {s} is STILL RUNNING as job {d} and its verdict is unknown. Poll it with `bash_output` (that is what it is for) and carry on working while it goes. Do not end the turn on an unknown verdict.",
+                .{ self.labelSlice(), self.job },
+            ) catch null,
+            // The code compiles and nobody has read the diff. It is the LAST refusal on
+            // purpose: a red build is worth more than an unread diff, so by the time the
+            // gate gets here the build is already accounted for.
+            .refused_review => return review_mod.missingText(gpa, self.gate.unreviewed()) catch null,
             .refused_failed => return std.fmt.allocPrint(
                 gpa,
                 "not done: the last {s} was RED and this turn would end on code that does not build. Fix the problems, or declare `blocked` with what would unblock it.",
@@ -5779,7 +5975,12 @@ pub const AutoCheck = struct {
                 switch (self.decideNow(reg, io)) {
                     .end => return null,
                     .cannot_verify => return self.sayUnverified(gpa, "no check is known for this project"),
-                    .still_running => return self.sayUnverified(gpa, "the check is still running"),
+                    .still_running => return std.fmt.allocPrint(
+                        gpa,
+                        "Your turn cannot end yet: {s} is STILL RUNNING as job {d} and its verdict is unknown. Poll it with `bash_output` and carry on working while it goes.",
+                        .{ self.labelSlice(), self.job },
+                    ) catch null,
+                    .refused_review => return review_mod.missingText(gpa, self.gate.unreviewed()) catch null,
                     .refused_failed => return std.fmt.allocPrint(
                         gpa,
                         "not done: {s} found {d} problem(s) in the code you just wrote and this turn would end on it. Fix them, or declare `blocked`.",
@@ -5807,8 +6008,20 @@ pub const AutoCheck = struct {
             _ = self.collect(reg);
         }
         const d = self.gate.decide();
-        // A check still in flight at the cap is neither red nor green: it is unknown,
-        // and the honest word for unknown here is "still running", not "refused".
+        // A check still in flight at the cap is neither red nor green: it is unknown.
+        //
+        // It used to end the turn on that, with one line saying so, and that was the hole
+        // this whole feature has had since the beginning: a project whose build takes
+        // 45 s NEVER gets verified, because every turn gives up at 4 s. The turn ends
+        // with "not verified" on code that was 41 seconds from being green, and the
+        // model has learned that the gate is a formality it can wait out.
+        //
+        // Now it is a REFUSAL instead, and the model does the waiting: `bash_output` on
+        // the job, which is the one thing it is good at, while the iteration budget
+        // carries the turn. What this deliberately does NOT do is block the thread —
+        // the cap is still a cap, because a slow compile must not freeze the user's
+        // session, and it is the MODEL that has to decide whether to wait or to say the
+        // turn is unverified.
         if (self.job != 0 and self.gate.running and d == .refused_unverified) return .still_running;
         return d;
     }
@@ -9314,6 +9527,15 @@ fn checkFor(comptime cmd: []const u8) CheckFixture {
     ac.label_len = label.len;
     @memcpy(ac.label[0..label.len], label);
     ac.gate.checkable = true;
+    // The REVIEW is pinned OFF here, and it has to be.
+    //
+    // `exitGate` probes the directory for a git repository, so without this the answer
+    // depends on WHERE THE TEST RUNS: in this repository every one of these tests would
+    // get `refused_review` instead of testing verification, and outside it they would
+    // pass. A test whose result changes with the working directory is a trap with a
+    // green light, and these are about the build, not about the diff.
+    ac.gate.reviewable = false;
+    ac.review_known = true;
     return .{ .ac = ac, .threaded = threaded, .reg = reg };
 }
 

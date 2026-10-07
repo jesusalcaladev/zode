@@ -3663,3 +3663,97 @@ matters more than the user's session, and `finishAutoCheck`'s job keeps running 
 the next turn to read. What was added is only that the **end-of-turn report** says which
 of the rungs ran (`AutoCheck.proofLine`), so "the check is still going" cannot be read
 as "the check passed".
+
+---
+
+# The review step: the only rule about the diff, and not about the machine (2026-10-07)
+
+The exit gate answers "does the compiler accept this". It cannot answer "is this the
+change you meant to make", and the gap between those two is where an agent hands back
+something that compiles and is wrong.
+
+## What it is, and what it is not
+
+**Not** a judgement. Nothing can read a diff and say "this is bad". So the harness does
+not try, and anything claiming to would be a rubric in disguise.
+
+**It is** handing the model its own work back with a checklist of the things that
+actually go wrong in a diff, and refusing to end the turn until it has been read. Which
+means **the checklist is the product**: "review your work" produces a rubber stamp,
+because there is nothing to fail at. Eight entries in `lib/review.zig`, each one
+something that has really gone wrong here — a change in a file the task did not mention,
+a leftover print, a name that no longer matches the body, a test weakened instead of
+fixed, the same logic twice, an error swallowed, a change wider than the task, and the
+original report.
+
+Each entry carries a `why`, and it goes into the text the model reads. "No debug prints"
+is a rule to obey; "these are in nearly every diff that was never re-read" is a reason
+to go looking. A test fails an entry whose `why` is shorter than 20 characters or that
+just restates the `what`.
+
+## It reuses the staleness arithmetic, because the rule is the same rule
+
+`reviewed_writes` sits next to `verified_writes` and works identically: it is the value
+of `writes` at the moment of the review, so an edit afterwards makes the diff unreviewed
+again. A bool would be satisfied by one review at the start of the turn and would call
+the last three files "reviewed" for the rest of it.
+
+### The test that showed the two rules compose
+
+The first version of the staleness test did "edit, assert `refused_review`" and it went
+red. After a second edit BOTH the check and the review are stale, and the gate reports
+the **build** first — which is correct, because reading a diff you are about to
+invalidate by fixing the build is a wasted iteration.
+
+So the test now walks the real sequence: edit → `refused_unverified` → the build catches
+up → `refused_review`. The order is pinned deliberately: the red build outranks the
+unread diff.
+
+## Where it is intercepted, and why there
+
+Not in `tools.execute`: that has no access to the Model, and what a review needs is
+`turn_stats.files` — the files **this turn** touched. A review of the whole working tree
+in a dirty repository is a review of somebody else's half-finished work.
+
+And the RECORD is there too, next to the state it is about, for the same reason
+`applyGoalCall` is in the loop and not in the tool: a tool that only returned text would
+make "reviewed" something the model *claims* rather than something the harness
+*observes*, and that is the whole difference.
+
+It is recorded **after** the diff is in hand, never before: a review that produced
+nothing must not count, or the model satisfies the gate by calling `review` in a
+project where git cannot see the change.
+
+## Three things that bit, and what they say
+
+**The git probe was in `resetTurn` and it was wrong twice.** A `git rev-parse` per turn
+is a subprocess to learn a fact about the DIRECTORY, which cannot change from inside a
+turn — and putting it in `resetTurn` made it run against whatever `Io` the caller had,
+including the `undefined` the tests pass. The test died with a GPF instead of failing an
+assertion. It is now lazy and cached in `gitRepoCached(io)`, paid for by the first gate
+call that has written something, and forgotten by `/new` and `--resume` — the only two
+moments the directory can have become a repository while zode was running.
+
+**A test that changes meaning with the working directory is a trap with a green light.**
+`exitGate` probes for git, so the four tests that drive it with a real child started
+failing *inside this repository* and would have passed outside it. They are about the
+build, not about the diff, so `CheckFixture` now pins `reviewable = false` and
+`review_known = true` — and `review_known` exists as a separate field precisely because
+`reviewable` starts `false`, where `false` means two different things: "asked, and there
+is no repository" and "not asked yet".
+
+**The tool schema had a brace too many.** `"properties":{}}` where `git_status` has
+`"properties":{},`. The JSON test caught it, which is the argument for generating nothing
+by hand but definitely for parsing what is generated.
+
+## And the 4 s hole is closed by making the MODEL wait
+
+`still_running` used to end the turn with one line saying so, which meant a project
+whose build takes 45 s **never got verified**: every turn gave up at 4 seconds, ended
+with "not verified" on code that was 41 seconds from green, and taught the model that
+the gate is a formality.
+
+It is now a refusal that names the job and says to poll it with `bash_output`. The thread
+still does not block — the cap stays a cap, because a slow compile must not freeze the
+user's session — but now it is the MODEL that decides whether to wait, which is the one
+thing it is good at, and the iteration budget carries the turn.
