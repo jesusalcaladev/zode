@@ -3345,3 +3345,139 @@ sleep**: the point is to be inside the window, not to avoid it. Before the fix
 `errnoBug` called `abort`, so a regression takes the whole test binary down rather than
 failing an `expect` — which is the right way round: a race this narrow cannot be made
 deterministic, and a test that flaked would be a test nobody trusted.
+
+---
+
+# The exit gate: a turn may not end on code nobody checked (2026-10-07)
+
+The harness already had a loop, a `check` tool, an automatic typecheck and `/goal`.
+What it did not have was **one rule that decides whether the turn may end**, and the
+missing rule is the whole difference between finishing tasks and stopping at the first
+plausible answer.
+
+## The bug was an ORDERING, not a missing feature
+
+The red-check rule existed and read:
+
+```zig
+if (goal_open and ac.last_verdict == .failed) return false;   // the old rule
+```
+
+Five real task runs, the same model that codes well under another harness, finished
+**none** of them. Every time the code was left not compiling, and the harness had the
+evidence the whole time: it read the exit code, it built the model's own error message
+out of the diagnostics, it put them in the history. Then it let the turn end.
+
+Four separate things were wrong, and only the first is the one anybody would guess:
+
+1. **The check was collected AFTER the loop decided to end.** `finishAutoCheck` waited
+   for the job, read the diagnostics and appended them to the session — from
+   `chatWorker`'s tail, below the `break`. A check that only runs when the turn is over
+   is a check that arrives after the decision. It is now `AutoCheck.exitGate`, called at
+   the TOP of every iteration, above `again orelse break`, so the model is told while it
+   still has budget to act on it.
+2. **Red only blocked a `/goal` turn.** The condition was `goal_open and … failed`. A
+   plain "fix this bug" is a task about code like any other; the only thing that made it
+   different was that the user had not typed `/goal` first. The rule now has no goal in
+   it at all.
+3. **A green from BEFORE the last edit counted as evidence.** The model fixed the build,
+   edited a second file, and the harness believed the first green. Now `Gate` counts
+   `writes` against `verified_writes`, where `verified_writes` is the value of `writes`
+   when the check STARTED. A check that started before the last edit leaves the difference
+   non-zero, and the evidence is stale — which is exactly what it is.
+4. **The write counter counted CALLS, not writes.** `afterTool` ran once per tool call
+   from the batch loop, which cannot tell a call that ran from one that did not: a denied
+   `edit`, a `write` to an unopenable path and an `edit` whose old string was not found
+   all counted. Each made the gate wait for a check of files that still had their OLD
+   contents — green, and about the wrong thing, which reads as evidence and is not. The
+   counting moved to the SUCCESS path in `execOneCall`.
+
+## `lib/exitgate.zig`: the rule is pure, and that is the point
+
+The decision is a struct with four numbers and no I/O, so it can be asserted with no
+TUI, no network and no terminal. Two runners exist (`zode` and `zode --chat`) and every
+rule living in one of them drifts from the other: the headless prompt used to miss the
+routing table, and the automatic typecheck used to exist only in the TUI — the runner
+every test in this repo drives. `--chat` also ended its run on a final answer with the
+check in flight, then printed the errors as a footnote of a run it had already called
+finished.
+
+`decide()` in order, and each branch answers a different question:
+
+| state | decision | why |
+|---|---|---|
+| no code written | `end` | a turn of prose has no code to check; nagging here is nagging about a README |
+| code written, no check possible | `cannot_verify` | **not a cage**: it says so and lets the turn go |
+| last check RED | `refused_failed` | the code does not work, whatever the budget says |
+| no finished check covers the current files | `refused_unverified` | a green from before the last edit is not evidence |
+| otherwise | `end` | the model is entitled to decide it is done |
+
+The direction of `cannot_verify` is deliberate and it is the one that is safe to be
+wrong in: a turn that ends with an honest "NOT verified" costs one line, and a turn
+that never returns costs the user the whole task.
+
+## Two budgets, not one
+
+`auto_check_per_turn` (2) exists so a model that edits nine files does not start nine
+builds WHILE it works — that is the check that gives the model its errors early.
+`Gate.max_forced` (2) exists so the check that DECIDES whether the turn ends always
+happens. Conflating them was how either one would have broken: a turn that spent its two
+builds editing would reach the gate unable to check at all, the one moment it must be
+able to.
+
+## The proof is reported at the precision it was earned
+
+`typecheck.Plan.kind` is `.types` / `.syntax` / `.tests` / `.nothing`, and
+`proofWord` maps it to **typechecked / syntax-checked / tested / not checked**. The word
+"verified" is deliberately not one of them: no command in the table justifies it alone.
+
+This is the same class of error as the one the gate exists to remove, in the opposite
+direction. `zig build` proves the files typecheck and says nothing about whether the
+code works; a turn that ends "verified" over a typecheck claims a test run nobody did,
+and the user reads that and stops looking at the diff. The upper rungs are the model's
+(`bash zig build test`, `check {id}` on one package) — the harness supplies the floor
+that costs nothing, and a floor reported as a ceiling is how a turn gets trusted that
+should not be.
+
+## Three tests that were rewritten, and why
+
+Rewriting a test on purpose, in the open, is the record of the decision; leaving it green
+would be a suite endorsing the behaviour that was measured to be wrong.
+
+- **`turnMayEnd` is GONE.** Its test asserted that red with no goal open was allowed to
+  end — pinning the bug. The replacement asserts the opposite, and says so in the test.
+- **`codePathsFromArgs` multi-file.** It asserted `!…("{\"files\":[{\"path\":\"a.zig\"}]}")`,
+  that the multi-file form was invisible to the gate. The prompt tells the model to send
+  ONE `edit {files:[…]}` for a rename across nine files, so **the form the harness
+  recommends was the one form that never started a check**. The old comment called this
+  "the wrong direction" and left it wrong.
+- **`codePathsFromArgs` unparseable args.** Now counts them. "An argument we failed to
+  parse must not be the reason a broken build goes unnoticed": not counting them ends
+  the turn and announces finished work over code nobody compiled (the failure being
+  removed), and counting them costs one honest "not verified" line on a project with no
+  check — which is literally true. The tie does not go both ways.
+
+## `proofWord(.nothing)` is `not checked`, not `typechecked`
+
+A default-constructed `AutoCheck` claims **nothing**. Falling back to the weakest thing
+that is still a claim is how "verified" ends up in a status bar that never ran
+anything.
+
+## `envTruthy` inside `noteWrite`, and the arena it owns
+
+`noteWrite` takes no allocator and builds its own `ArenaAllocator` over `page_allocator`:
+the only allocation is one parsed JSON tree of a few hundred bytes, and it is the
+difference between a function that cannot leak and one where the next caller passes
+`std.testing.allocator` and 42 allocations show up in a test with nothing else wrong
+with it.
+
+## What this does NOT do
+
+- It does not judge quality. The harness knows whether a compiler accepted the files and
+  nothing else; whether a change is well named and worth reviewing is the model's
+  judgement with the user's eyes on it.
+- It does not run the test suite. The gate runs the project's compiler, in the
+  background, with the model's own `check`/`bash` covering the rest. A harness that ran
+  a suite after every edit is the thing `verification_prompt` exists to prevent.
+- It does not raise the ceiling. A task that cannot be verified in 60 iterations should
+  have said `blocked`; the gate tells the model that, it does not extend the budget.

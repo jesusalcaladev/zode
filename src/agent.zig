@@ -37,6 +37,7 @@ const subagent_mod = @import("lib/subagent.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
 const commands_mod = @import("commands.zig");
+const exitgate = @import("lib/exitgate.zig");
 
 // The `/help` tables live with the commands they document. Re-exported because
 // the palette builds its items from `commands`, and that is not a commands
@@ -2061,7 +2062,7 @@ fn chatWorker(job: *ChatJob) void {
             pushTurnSummary(m);
             return;
         };
-        // 0. THE BUILD IS RED AND THE GOAL IS OPEN: nothing below may end this turn.
+        // 0. THE EXIT GATE: may this turn end on the code as it is right now?
         //
         //    FIRST, before `again orelse break` and before the repetition guard, and that
         //    order is the whole fix. The first version of this rule sat two checks below,
@@ -2080,38 +2081,46 @@ fn chatWorker(job: *ChatJob) void {
         //    nobody left to give it. The harness has the evidence; the loop just has to
         //    ask with it.
         //
-        //    `blocked` is still honoured above all of it, at check 1 below: a real
+        //    It waits for a check that is in flight, and starts one more of its own if
+        //    the code has been written since the last finished check. That is the whole
+        //    difference from the old rule, which only looked at the verdict of a check
+        //    that happened to have finished.
+        //
+        //    `blocked` is honoured ABOVE all of it, and never inside the gate: a real
         //    blocker has to be declarable or this is a cage.
-        if (!turnMayEnd(&m.auto_check, m.goal.isOpen()) and m.goal.status == goal_mod.Status.none) {
-            var why_buf: [96]u8 = undefined;
-            const why = blk: {
-                if (m.plan.openCount() > 0) {
-                    break :blk std.fmt.bufPrint(&why_buf, "{d} plan steps open", .{m.plan.openCount()}) catch "plan steps open";
-                }
-                break :blk "no open steps";
-            };
-            pushErrorFmt(
-                m,
-                "not done: the last {s} was RED and the objective is not met ({s}). Fix it, or declare `blocked` with what would unblock it.",
-                .{
-                    if (m.auto_check.label_len > 0) m.auto_check.label[0..m.auto_check.label_len] else "check",
-                    why,
-                },
-            );
-            // The nudge is the prompt. `owned`, not a bare assignment: the loop frees the
-            // previous prompt through it, so a `last_user` set without it leaks a turn's
-            // worth of text every time the turn refuses to end.
-            //
-            // A stack buffer and not `allocPrint(m.allocator, …)`: this runs on the
-            // refusing path, which is the path a turn takes when it is going badly.
-            const nudge = m.allocator.dupe(
-                u8,
-                "The harness will not end this turn yet: the last check failed and the objective is not met. Read the errors above, fix them, and re-run the check. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.",
-            ) catch break;
-            if (owned) |o| m.allocator.free(o);
-            owned = nudge;
-            last_user = nudge;
-            continue;
+        //
+        //    ## It runs on EVERY iteration, which is what makes it a gate
+        //
+        //    The first version of the gate ran once, at the end of the turn, after the
+        //    loop had already decided to stop — so the diagnostics were collected, put
+        //    in the history and read by nobody. A check that only runs when the turn is
+        //    over is a check that arrives after the decision.
+        //
+        //    Running it at the TOP of every iteration is what makes it a gate rather
+        //    than a report: the model is told the build is red while it still has budget
+        //    to fix it, and the turn does not end until the code it wrote is either
+        //    green or declared `blocked`.
+        if (m.goal.status != goal_mod.Status.blocked) {
+            if (m.auto_check.exitGate(&m.bg, m.allocator, io_global)) |refusal| {
+                // A `met` that the code contradicts goes back to open, so the ordinary
+                // checkpoint and the ordinary ceiling apply from here. Two artefacts from
+                // the SAME model disagreeing — "I am finished" over a build that says
+                // otherwise — is not something to resolve by trusting one of them.
+                if (m.goal.status == goal_mod.Status.met) m.goal.status = goal_mod.Status.none;
+                pushErrorOwned(m, refusal);
+
+                // The nudge is the prompt. `owned`, not a bare assignment: the loop frees
+                // the previous prompt through it, so a `last_user` set without it leaks a
+                // turn's worth of text every time the turn refuses to end.
+                const nudge = m.allocator.dupe(
+                    u8,
+                    "The harness will not end this turn yet: the code you wrote does not have a passing check behind it. Read the problems above, fix them, and let the check run again. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.",
+                ) catch break;
+                if (owned) |o| m.allocator.free(o);
+                owned = nudge;
+                last_user = nudge;
+                continue;
+            }
         }
 
         const text = again orelse break;
@@ -2254,37 +2263,66 @@ fn chatWorker(job: *ChatJob) void {
     pushTurnSummary(m);
 }
 
-/// Waits (briefly) for the automatic typecheck and reports it.
+/// Reports whatever the automatic typecheck found, at the end of a turn.
 ///
-/// The cap is 4 s and it is not a guess about how long a build takes: a build that
-/// takes longer than that is a build the user is watching, and the job keeps running
-/// for the next turn to read. What must not happen is answering "done" about code
-/// whose only compile check is still in flight.
+/// ## It is the REPORT, not the gate
+///
+/// The gate is `AutoCheck.exitGate`, and it runs INSIDE the loop, before the turn is
+/// allowed to end. This is only what is left to say once the turn's fate is decided,
+/// and it exists because the gate consumes the diagnostics: they go back to the model
+/// as a nudge, and if nothing else kept a copy they would be gone from the history by
+/// the time the user scrolled back to read them.
+///
+/// ## And the case that used to be silent
+///
+/// A turn that ends with code nobody compiled, because the project has no check the
+/// harness knows, used to print nothing at all — it read as "done". Now it says the
+/// code is NOT verified, once, with the reason. A turn that ends without that line is
+/// a turn where something was checked and passed.
 pub fn finishAutoCheck(m: *tui.Model) void {
     const gpa = m.allocator;
-    if (m.auto_check.job == 0) return;
-
-    var waited_ms: u32 = 0;
-    while (waited_ms < auto_check_wait_ms) {
-        if (!std.mem.eql(u8, bgproc.stateWord(&m.bg, m.auto_check.job), "running")) break;
-        sleep_mod.nap(50);
-        waited_ms += 50;
+    if (m.auto_check.job != 0) {
+        var waited_ms: u32 = 0;
+        while (waited_ms < auto_check_wait_ms) {
+            if (!std.mem.eql(u8, bgproc.stateWord(&m.bg, m.auto_check.job), "running")) break;
+            sleep_mod.nap(50);
+            waited_ms += 50;
+        }
+        if (m.auto_check.collect(&m.bg)) |note| {
+            const owned = gpa.dupe(u8, note) catch return;
+            // Into the history, owned: the session keeps it and this is not the turn's
+            // arena. And to the screen, because a compile error nobody was shown is the
+            // thing this whole feature exists to prevent.
+            const sess = ensureSession(m, gpa);
+            sess.append(.user, owned) catch gpa.free(owned);
+            sess.flush();
+            pushInfoFmt(m, "· {s} reported problems in the code you just wrote — see the history", .{
+                m.auto_check.labelSlice(),
+            });
+            return;
+        }
     }
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const note = m.auto_check.collect(&m.bg, arena_state.allocator()) orelse return;
+    // Nothing red. Is that because everything passed, or because nothing was ever
+    // checked? The two used to look identical on screen, and only the second one is a
+    // lie the user has to be told about.
+    if (m.auto_check.gate.decide() == .cannot_verify and !m.auto_check.spoke) {
+        m.auto_check.spoke = true;
+        pushInfoFmt(
+            m,
+            "· the code you wrote is NOT verified: this project has no check the harness knows how to run",
+            .{},
+        );
+    }
 
-    const owned = gpa.dupe(u8, note) catch return;
-    // Into the history, owned: the session keeps it and this is not the turn's
-    // arena. And to the screen, because a compile error nobody was shown is the
-    // thing this whole feature exists to prevent.
-    const sess = ensureSession(m, gpa);
-    sess.append(.user, owned) catch gpa.free(owned);
-    sess.flush();
-    pushInfoFmt(m, "· {s} reported problems in the code you just wrote — see the history", .{
-        m.auto_check.label[0..m.auto_check.label_len],
-    });
+    // And what WAS proved, in the word that is true of it. This is the last line of the
+    // turn and it is the one a user reads before deciding whether to open the diff.
+    if (m.auto_check.gate.wroteCode()) {
+        if (m.auto_check.proofLine(gpa)) |line| {
+            defer gpa.free(line);
+            pushInfo(m, line);
+        }
+    }
 }
 
 /// How long the end of a turn waits for the automatic typecheck.
@@ -3001,7 +3039,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // It goes in as a `user` message, after the `tool` results, which is a shape
     // every provider accepts — the alternative, a `tool_result` with no call id,
     // is not a thing.
-    if (m.auto_check.collect(&m.bg, gpa)) |note| {
+    if (m.auto_check.collect(&m.bg)) |note| {
         const owned = gpa.dupe(u8, note) catch null;
         if (owned) |text| {
             s.append(.user, text) catch m.allocator.free(text);
@@ -4720,6 +4758,17 @@ fn execOneCall(
         s.appendToolResult(call.id, call.name, emsg) catch {};
         return 0;
     };
+    // The automatic typecheck, and the exit gate's write counter, fed from HERE.
+    //
+    // The success path and not the list of calls, and that is the whole reason this is
+    // four lines below the `execute`: a denied `edit`, a `write` to a path that could not
+    // be opened and an `edit` whose old string was not found ALL return above, and none
+    // of them changed a byte. Counting them made the gate wait for a check of files
+    // that still had their old contents — a check that comes back green and is about
+    // the wrong thing, which is worse than no check because it reads as evidence.
+    const wrote = m.auto_check.noteWrite(call.name, call.args_json);
+    m.auto_check.afterTool(&m.bg, io_global, wrote);
+
     const ms = elapsedMs(call_t0);
     turn_stats.noteTool();
     if (std.mem.eql(u8, call.name, "bash") and startedBackground(res)) m.bench.bg_jobs += 1;
@@ -5030,31 +5079,40 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         i += 1;
         ran += execOneCall(m, s, call, arena, &denied);
     }
-    // An edit to code is followed by a typecheck WITHOUT the model asking, because
-    // the model finds out it broke something one iteration too late otherwise:
-    // the next request goes out with the broken state in the prompt, those tokens
-    // are billed, and only then does a build say so.
+    // The repetition guard, fed HERE because this is the only place a tool call is
+    // seen with its arguments. The loop checks the flag; it cannot count, because it
+    // never sees a call.
     //
-    // Started here, in the BACKGROUND, so the model goes on to the next file and
-    // the result is waiting when it looks. The alternative — making the model
-    // call `check` — is the same request with one more round trip in it.
+    // It stays here even though the automatic check moved: this is about the CALL and
+    // not about its effect, so three denied attempts to run the same command are still
+    // three attempts and still a loop worth stopping.
+    //
+    // A call whose whole purpose is to LOOK AT SOMETHING AGAIN is exempt, and the
+    // criterion is that it has no argument that could distinguish it from itself:
+    // the only variable is time, and time is not in the arguments. See
+    // `isRepeatExempt` and `Repeats.noteGuarded`, which is where the rule lives so
+    // that this call and its tests cannot disagree.
     for (t.calls.items) |c| {
-        m.auto_check.afterTool(&m.bg, m.allocator, io_global, c.name, c.args_json);
-        // The repetition guard, fed HERE because this is the only place a tool call is
-        // seen with its arguments. The loop checks the flag; it cannot count, because it
-        // never sees a call.
-        //
-        // A call whose whole purpose is to LOOK AT SOMETHING AGAIN is exempt, and the
-        // criterion is that it has no argument that could distinguish it from itself:
-        // the only variable is time, and time is not in the arguments. See
-        // `isRepeatExempt` and `Repeats.noteGuarded`, which is where the rule lives so
-        // that this call and its tests cannot disagree.
         if (m.repeats.noteGuarded(c.name, c.args_json)) |which| {
             if (m.loop_repeated == null) {
                 m.loop_repeated = which;
             }
         }
     }
+    // The automatic typecheck is started from the SUCCESS path of each call
+    // (`execOneCall`), not from this list. This loop cannot tell a call that ran from
+    // one that did not, and both of the mistakes that produced came from asking it to:
+    //
+    // 1. It started a check for a DENIED edit, and for one that failed to apply, so the
+    //    build it waited for was a build of files that still had their old contents:
+    //    green, and about the wrong thing.
+    // 2. It counted them as writes, so the exit gate would refuse to let the turn end
+    //    on the strength of a check covering code that was never written.
+    //
+    // An edit is still followed by a typecheck without the model asking — the model
+    // finds out it broke something one iteration too late otherwise — and it is still
+    // started in the BACKGROUND, so the model goes on to the next file and the result
+    // is waiting when it looks.
 
     s.flush();
     // "tools done" says nothing. With the numbers it does: you know whether it was
@@ -5194,19 +5252,64 @@ fn prepareImage(m: *tui.Model, args_json: []const u8) ?[]const u8 {
 ///
 /// One implementation, two owners. The TUI keeps it on the `Model`; the headless
 /// runner keeps it on the stack.
-/// The gate that decides whether an edit is worth a build at all.
+/// The gate that decides whether an edit is worth a build at all: does any path in
+/// these arguments belong to a file a compiler would care about?
 ///
-/// Deliberately optimistic. `write {files:[...]}` has no `path`, so the multi-file
-/// forms answer false here — and that is the wrong direction. Guessing by extension
-/// means looking inside the arguments, and an argument the harness cannot parse must
-/// not be the reason a broken build goes unnoticed. The `check` tool is there for
-/// that case, and the model has it.
-fn codePathsFromArgs(args_json: []const u8, arena: std.mem.Allocator) bool {
+/// ## Why it walks the multi-file forms
+///
+/// It used to read a single `path` key, and `write {files:[...]}` / `edit
+/// {files:[...]}` have none — so the multi-file calls, which are the ones the prompt
+/// pushes the model towards ("ONE call for nine files, not nine calls"), were exactly
+/// the ones that never started a check. The comment on the old version said this was
+/// "the wrong direction" and left it wrong.
+///
+/// It is the wrong direction because an argument the harness cannot read must not be
+/// the reason a broken build goes unnoticed. Now every path in either form counts, and
+/// ONE of them being code is enough: the check runs on the PROJECT, not on the file.
+///
+/// ## Deliberately optimistic
+///
+/// An unknown extension still triggers a check (`worthChecking` says what it says),
+/// because "we do not know what this file is" is not "this changed no code".
+pub fn codePathsFromArgs(args_json: []const u8, arena: std.mem.Allocator) bool {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return false;
     if (parsed != .object) return false;
-    const v = parsed.object.get("path") orelse return false;
-    if (v != .string) return false;
-    return typecheck_mod.worthChecking(v.string);
+    return pathsWorthChecking(parsed.object);
+}
+
+/// Is this edit worth a build at all? The optimistic reading.
+///
+/// `codePathsFromArgs` is the strict one and answers false for arguments it cannot
+/// read; this one answers true for them, and the difference is the whole asymmetry
+/// argument in `noteWrite`'s doc: not knowing what the file is is not the same as the
+/// file not being code, and the price of guessing wrong is one honest "not verified"
+/// line against the price of the other guess, which is a turn that announces finished
+/// work over code nobody compiled.
+///
+/// It only ever says MORE yes than the strict one, never less: it delegates, so a path
+/// the strict reader proved was a README is still not worth a build here.
+fn worthATurn(args_json: []const u8, arena: std.mem.Allocator) bool {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return true;
+    if (parsed != .object) return true;
+    return pathsWorthChecking(parsed.object);
+}
+
+fn pathsWorthChecking(obj: std.json.ObjectMap) bool {
+    if (obj.get("path")) |v| {
+        if (v == .string and typecheck_mod.worthChecking(v.string)) return true;
+    }
+    // `files` is an array of objects, each with its own `path`.
+    if (obj.get("files")) |fv| {
+        if (fv == .array) {
+            for (fv.array.items) |entry| {
+                if (entry != .object) continue;
+                if (entry.object.get("path")) |v| {
+                    if (v == .string and typecheck_mod.worthChecking(v.string)) return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 pub const AutoCheck = struct {
@@ -5214,34 +5317,53 @@ pub const AutoCheck = struct {
     /// the whole contract: the output belongs to a background thread's buffer, so it
     /// cannot be a pointer into a turn's arena.
     job: u32 = 0,
-    /// The last verdict this turn: 0 = nothing has been checked, 1 = the last check
-    /// passed, 2 = it failed.
+    /// THE RULE, as data. Pure and in `lib/exitgate.zig` so it can be asserted with no
+    /// TUI and no network; this struct is only the machinery that feeds it.
     ///
-    /// ## Why the harness needs to remember this
-    ///
-    /// Measured over five real task runs: the same model that codes well in another
-    /// harness finished none of them, and in every case the turn ended with the code
-    /// never compiling. Not because the model refused to check — it started the checks
-    /// — but because nothing in the loop connected "the build is red" to "you may not
-    /// finish yet".
-    ///
-    /// The harness can see that the code is broken. It has the exit code and the
-    /// diagnostics; it already builds the model's own message out of them. So the
-    /// information was there and the LOOP did not ask, and the turn ended the way turns
-    /// end: the model stopped calling tools. Asking the model to notice is exactly the
-    /// thing that does not work — a turn that ends in prose is a turn where nobody is
-    /// grading anything any more.
-    ///
-    /// An integer and not a bool because "never checked" and "checked and passed" are
-    /// different, and only the first one is allowed to end a turn.
-    last_verdict: Verdict = .unchecked,
+    /// It replaced a field here called `last_verdict` that the loop read as
+    /// `goal_open and last_verdict == .failed`. That rule was right about red and
+    /// wrong about three other things, and each of them was a measured failure:
+    /// a red check could not end a turn that had no `/goal` set (which is a plain
+    /// "fix this bug", a task about code like any other); a green check from BEFORE the
+    /// last edit counted as evidence about the current files; and a check that could not
+    /// be run was indistinguishable from a check that had not been started.
+    gate: exitgate.Gate = .{},
     /// The command it is running, for the message the model reads. A fixed buffer,
     /// because it outlives the arena that composed it.
     label: [64]u8 = @splat(0),
     label_len: usize = 0,
+    /// The command to run, kept so the gate can check at the END of a turn without
+    /// walking the project directory again. Fixed buffer, same reason as `label`.
+    command: [160]u8 = @splat(0),
+    command_len: usize = 0,
     /// How many have been started this turn, so a model that edits nine files in a
     /// row does not start nine builds.
     started_this_turn: u32 = 0,
+    /// `gate.writes` when the running job was started: what that check is actually
+    /// looking at. Everything written after this is uncovered, and that is what makes a
+    /// green stale instead of current.
+    job_covers: u32 = 0,
+    /// The result of the last completed check, as text for the model.
+    ///
+    /// A fixed buffer and not an arena slice, because it is read AFTER the arena that
+    /// composed it is gone: the gate reads it at the end of the turn, `runOneTurn`
+    /// reads it at the start of the next iteration, and `finishAutoCheck` reads it after
+    /// both. Ownership in the struct is what makes all three of those safe.
+    note: [4096]u8 = @splat(0),
+    note_len: usize = 0,
+    /// How many problems that check found, for the one-line report.
+    problems: usize = 0,
+    /// What the finished check actually PROVED.
+    ///
+    /// `nothing` and not `types`, so that a default-constructed `AutoCheck` claims
+    /// nothing: a harness that cannot say what it proved must not say "typechecked"
+    /// either. See `typecheck.Plan.kind` for why the distinction is carried at all.
+    proof: typecheck_mod.Kind = .nothing,
+    /// The gate already said out loud that the code is not verified this turn.
+    ///
+    /// Once, because a line repeated five times a turn is a line the user learns to
+    /// ignore, and the whole point of saying it is that it is read.
+    spoke: bool = false,
 
     /// Per turn. Resetting it here and not per iteration is the difference between
     /// "two builds per turn" and "two builds per iteration for the rest of the
@@ -5249,7 +5371,17 @@ pub const AutoCheck = struct {
     pub fn resetTurn(self: *AutoCheck, reg: *bgproc.Registry, io: std.Io) void {
         _ = io;
         self.started_this_turn = 0;
-        self.last_verdict = .unchecked;
+        self.gate.reset();
+        self.problems = 0;
+        self.spoke = false;
+        self.note_len = 0;
+        self.job_covers = 0;
+        self.label_len = 0;
+        self.command_len = 0;
+        // `proof` too. It is the claim the end-of-turn report makes about code THIS turn
+        // wrote, and a turn that inherits the previous turn's green is reporting a
+        // build that finished before the first edit of this one.
+        self.proof = .nothing;
         // The running job is NOT killed.
         //
         // It was, and that made the whole feature useless most of the time. A
@@ -5266,32 +5398,92 @@ pub const AutoCheck = struct {
         self.job = 0;
     }
 
-    /// Start the project's typecheck if this tool call edited code.
+    /// A writing tool SUCCEEDED on code a compiler would care about.
+    ///
+    /// The counter is the input to the exit gate, so what counts and what does not is
+    /// the whole question. Two decisions here, both of them deliberate:
+    ///
+    /// - Only files `worthChecking` counts. `zig fmt`, a README, a lockfile: a build
+    ///   after any of them proves nothing and costs the model an iteration of waiting.
+    /// - It is called from the SUCCESS path of the tool, not from the list of calls.
+    ///   Before, every call was counted, including a denied one and one that failed to
+    ///   apply: both wrote nothing, so both made the gate wait for a check of files
+    ///   that still have their old contents — a check that would be green and mean
+    ///   nothing at all.
+    pub fn noteWrite(self: *AutoCheck, name: []const u8, args_json: []const u8) bool {
+        if (!envTruthy("ZODE_AUTO_CHECK", true)) return false;
+        if (!touchesFile(name)) return false;
+
+        // Its own arena, and NOT the caller's. The only thing allocated is one parsed
+        // JSON tree of a few hundred bytes, and it is the difference between a function
+        // that cannot leak and one where the next caller passes `std.testing.allocator`
+        // and 42 allocations show up in a test that has nothing else wrong with it.
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        if (!worthATurn(args_json, a)) return false;
+
+        self.gate.noteWrite();
+        return true;
+    }
+
+    /// Start the project's typecheck, unless one is already running or the turn has
+    /// spent its quota. Returns whether a job was started.
+    ///
+    /// `forced` is the gate's own check at the end of a turn and does NOT consult
+    /// `auto_check_per_turn`: that quota exists so a model that edits nine files does
+    /// not start nine builds during the turn, and the gate's whole job is to be sure
+    /// before it lets the turn end. Conflating them was how the quota would have
+    /// blocked the one check that decides the turn.
+    pub fn maybeStart(
+        self: *AutoCheck,
+        reg: *bgproc.Registry,
+        io: std.Io,
+        forced: bool,
+    ) bool {
+        if (!envTruthy("ZODE_AUTO_CHECK", true)) return false;
+        if (self.job != 0 and std.mem.eql(u8, bgproc.stateWord(reg, self.job), "running")) return false;
+        if (forced) {
+            if (!self.gate.canForce()) return false;
+        } else if (self.started_this_turn >= auto_check_per_turn) return false;
+
+        if (self.command_len == 0) {
+            const plan = check_tool.planAt(io, ".") orelse return false;
+            const c = @min(plan.command.len, self.command.len);
+            @memcpy(self.command[0..c], plan.command[0..c]);
+            self.command_len = c;
+            const l = @min(plan.label.len, self.label.len);
+            @memcpy(self.label[0..l], plan.label[0..l]);
+            self.label_len = l;
+            // What this command will have PROVED when it finishes. Recorded with the
+            // command so the end-of-turn report cannot claim more than ran.
+            self.proof = plan.kind;
+        }
+        self.gate.checkable = true;
+
+        const id = bgproc.spawn(reg, io, self.command[0..self.command_len]) catch return false;
+        self.job = id;
+        self.started_this_turn += 1;
+        // What this check will be looking at. Writes after this are NOT covered by it,
+        // which is the whole point of recording the number here.
+        self.job_covers = self.gate.writes;
+        self.gate.noteStarted(forced);
+        return true;
+    }
+
+    /// A writing tool succeeded: count it and, if the turn has budget, start a check.
+    ///
+    /// `afterTool` used to do both jobs from the list of calls, which is why it also
+    /// counted the ones that wrote nothing. Now the counting is `noteWrite`, called
+    /// from the success path, and this is only the "maybe start" half.
     pub fn afterTool(
         self: *AutoCheck,
         reg: *bgproc.Registry,
-        gpa: std.mem.Allocator,
         io: std.Io,
-        name: []const u8,
-        args_json: []const u8,
+        counted: bool,
     ) void {
-        if (!envTruthy("ZODE_AUTO_CHECK", true)) return;
-        if (self.started_this_turn >= auto_check_per_turn) return;
-        if (!touchesFile(name)) return;
-
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        if (!codePathsFromArgs(args_json, arena_state.allocator())) return;
-
-        if (self.job != 0 and std.mem.eql(u8, bgproc.stateWord(reg, self.job), "running")) return;
-
-        const plan = check_tool.planAt(io, ".") orelse return;
-        const id = bgproc.spawn(reg, io, plan.command) catch return;
-        self.job = id;
-        self.started_this_turn += 1;
-        const l = @min(plan.label.len, self.label.len);
-        @memcpy(self.label[0..l], plan.label[0..l]);
-        self.label_len = l;
+        if (!counted) return;
+        _ = self.maybeStart(reg, io, false);
     }
 
     /// Waits (briefly) for the check and then collects it, for a caller that is
@@ -5307,7 +5499,7 @@ pub const AutoCheck = struct {
     /// is a build the user is watching, the job keeps running, and the next turn
     /// reads it. What must not happen is answering about code whose only compile
     /// check is still in flight.
-    pub fn autoCheckWait(self: *AutoCheck, reg: *bgproc.Registry, arena: std.mem.Allocator) ?[]const u8 {
+    pub fn autoCheckWait(self: *AutoCheck, reg: *bgproc.Registry) ?[]const u8 {
         if (self.job == 0) return null;
         var waited_ms: u32 = 0;
         while (waited_ms < auto_check_wait_ms) {
@@ -5315,7 +5507,7 @@ pub const AutoCheck = struct {
             sleep_mod.nap(50);
             waited_ms += 50;
         }
-        return self.collect(reg, arena);
+        return self.collect(reg);
     }
 
     /// The result, if it is ready, as text for the model. Null while it runs.
@@ -5324,7 +5516,13 @@ pub const AutoCheck = struct {
     /// nothing at all, on purpose: "it compiles" is worth nothing to a model that
     /// was not going to write code anyway, and it is the one message that could be
     /// repeated five times a turn.
-    pub fn collect(self: *AutoCheck, reg: *bgproc.Registry, arena: std.mem.Allocator) ?[]const u8 {
+    ///
+    /// ## What it does to the GATE, and that is the point
+    ///
+    /// Every exit updates `gate` with the verdict AND with how many writes the check
+    /// was looking at. Without the second number a green is a green forever, and a
+    /// model that fixed the build and then edited a second file gets believed.
+    pub fn collect(self: *AutoCheck, reg: *bgproc.Registry) ?[]const u8 {
         const id = self.job;
         if (id == 0) return null;
         if (std.mem.eql(u8, bgproc.stateWord(reg, id), "running")) return null;
@@ -5336,64 +5534,222 @@ pub const AutoCheck = struct {
         // Consumed either way: a job that has been read is done, and leaving the id
         // set would make the NEXT edit report the previous turn's errors.
         self.job = 0;
+        const covers = self.job_covers;
 
-        const diags = typecheck_mod.extractDiagnostics(arena, text, 12) catch return null;
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const diags = typecheck_mod.extractDiagnostics(arena_state.allocator(), text, 12) catch "";
         if (diags.len == 0) {
-            self.last_verdict = .passed;
             // A check that FAILED and produced no `file:line: error:` is a failure,
             // not a pass. Measured: a `build.zig` that panics prints a source
             // location and a `thread N panic:` line, the scan finds nothing, and
             // silence here would leave the model editing a project whose build does
             // not even run.
             const failed = out.exit != null and out.exit.? != 0;
-            if (!failed) return null;
-            self.last_verdict = .failed;
+            if (!failed) {
+                self.gate.noteCompleted(.passed, covers);
+                self.problems = 0;
+                return null;
+            }
+            self.gate.noteCompleted(.failed, covers);
+            self.problems = 1;
             const tail = text[if (text.len > 1500) text.len - 1500 else 0..];
-            return std.fmt.allocPrint(
-                arena,
+            return self.remember(std.fmt.allocPrint(
+                std.heap.page_allocator,
                 "[{s} FAILED with exit {d} and reported no type error]\n{s}\nThat usually means the build itself could not run \u{2014} a broken build script, a missing dependency or a panic. Do not treat this as a passing build.",
                 .{ self.label[0..self.label_len], out.exit.?, tail },
-            ) catch null;
+            ) catch return null);
         }
 
-        self.last_verdict = .failed;
-        return std.fmt.allocPrint(
-            arena,
+        self.gate.noteCompleted(.failed, covers);
+        self.problems = countDiagLines(diags);
+        return self.remember(std.fmt.allocPrint(
+            std.heap.page_allocator,
             "[{s} found {d} problem(s) in the code you just wrote]\n{s}\nThis is the project's own compiler, not a guess. Fix these before writing more.",
-            .{ self.label[0..self.label_len], countDiagLines(diags), diags },
+            .{ self.label[0..self.label_len], self.problems, diags },
+        ) catch return null);
+    }
+
+    /// Copies a composed note into the struct and returns a slice of IT.
+    ///
+    /// The copy is what makes the return value safe to read late: the caller that
+    /// wants to put the note in the history is not the function that has the arena.
+    fn remember(self: *AutoCheck, owned: []const u8) []const u8 {
+        const n = @min(owned.len, self.note.len);
+        @memcpy(self.note[0..n], owned[0..n]);
+        self.note_len = n;
+        std.heap.page_allocator.free(owned);
+        return self.note[0..n];
+    }
+
+    /// The one-line reason, for a message that goes on screen.
+    pub fn labelSlice(self: *const AutoCheck) []const u8 {
+        return self.label[0..self.label_len];
+    }
+
+    /// What the last finished check proved, in the word that is actually true of it.
+    pub fn proofPhrase(self: *const AutoCheck) ?[]const u8 {
+        return switch (self.proof) {
+            .nothing => null,
+            else => typecheck_mod.proofWord(self.proof),
+        };
+    }
+
+    /// The end-of-turn line: what the harness ran, and what it did not.
+    ///
+    /// ## Why it exists, given the gate already said something
+    ///
+    /// The gate's refusal is a sentence for the MODEL ("fix these, or declare
+    /// `blocked`"). This one is for the USER, and it lands when the turn ends, which is
+    /// the last thing on screen before the next prompt. That is the moment a user decides
+    /// whether to go and read the diff — so it has to say what was actually proven.
+    ///
+    /// The wrong version of this line is the one that says "done" or "verified". The
+    /// harness ran a typecheck; the tests are the model's to run and it may or may not
+    /// have. Claiming the suite on its behalf is the same class of error as announcing
+    /// finished work over a red build, and it is easier to miss because it is the
+    /// cheerful one.
+    pub fn proofLine(self: *const AutoCheck, gpa: std.mem.Allocator) ?[]u8 {
+        return switch (self.proof) {
+            // The word that matters is "NOT", and it comes first. A user who reads
+            // "nothing was checked" as a footnote and "code is NOT verified" as a
+            // headline is reading two different reports, and the headline is the one
+            // they act on.
+            .nothing => std.fmt.allocPrint(
+                gpa,
+                "· NOT verified: this turn's code has no check behind it ({s}) — this project has no typecheck the harness knows how to run",
+                .{typecheck_mod.proofWord(.nothing)},
+            ) catch null,
+            .types => std.fmt.allocPrint(
+                gpa,
+                "· {s} {s} the code you just wrote. That is the compiler, not the tests — the project's test suite is the model's to run.",
+                .{ typecheck_mod.proofWord(.types), self.labelSlice() },
+            ) catch null,
+            .syntax => std.fmt.allocPrint(
+                gpa,
+                "· {s} {s}: the files parse. That is all this language's default check can tell you, and it is not a typecheck.",
+                .{ typecheck_mod.proofWord(.syntax), self.labelSlice() },
+            ) catch null,
+            .tests => std.fmt.allocPrint(
+                gpa,
+                "· {s} {s} and its tests passed.",
+                .{ typecheck_mod.proofWord(.tests), self.labelSlice() },
+            ) catch null,
+        };
+    }
+
+    pub fn noteSlice(self: *const AutoCheck) []const u8 {
+        return self.note[0..self.note_len];
+    }
+
+    /// THE EXIT GATE, as a wrapper over the pure rule.
+    ///
+    /// `lib/exitgate.zig` says WHAT may end a turn; this says how the harness goes and
+    /// finds out: it waits for a check that is in flight, collects it, and — if the
+    /// code is still unverified — starts ONE more check of its own and waits again.
+    ///
+    /// It returns null when the turn may end, or a `gpa`-owned message saying why it
+    /// may not. One message, built once, used by both runners: `--chat` and the TUI
+    /// were two lesser copies of this decision and every place they differed was a
+    /// place where the headless agent quietly finished a task with a red build.
+    ///
+    /// Why it waits HERE and not at the end of the turn
+    ///
+    /// `finishAutoCheck` did wait, and it did it after the loop had already decided to
+    /// end. That ordering is the bug this function replaces: the diagnostics were
+    /// collected, put in the history and read by nobody. The model was told "done"
+    /// about code that did not compile, and the one iteration that could have fixed it
+    /// had already been spent.
+    ///
+    /// ## Why a check that outruns the cap does not hold the turn
+    ///
+    /// A build longer than the cap is a build the user is watching, and it keeps
+    /// running for the next turn to read. Blocking here would be the harness deciding
+    /// that a slow compile is worth more than the user's session. So the verdict is
+    /// "still running", it says so out loud, and the turn goes.
+    pub fn exitGate(
+        self: *AutoCheck,
+        reg: *bgproc.Registry,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+    ) ?[]u8 {
+        switch (self.decideNow(reg, io)) {
+            .end => return null,
+            .cannot_verify => return self.sayUnverified(gpa, "no check is known for this project"),
+            .still_running => return self.sayUnverified(gpa, "the check is still running"),
+            .refused_failed => return std.fmt.allocPrint(
+                gpa,
+                "not done: the last {s} was RED and this turn would end on code that does not build. Fix the problems, or declare `blocked` with what would unblock it.",
+                .{self.labelSlice()},
+            ) catch null,
+            .refused_unverified => {
+                // One more check of the CURRENT files, because the only way to turn an
+                // unchecked green into a checked one is to look at what is there now.
+                if (!self.maybeStart(reg, io, true)) {
+                    return self.sayUnverified(gpa, "no check is known for this project");
+                }
+                switch (self.decideNow(reg, io)) {
+                    .end => return null,
+                    .cannot_verify => return self.sayUnverified(gpa, "no check is known for this project"),
+                    .still_running => return self.sayUnverified(gpa, "the check is still running"),
+                    .refused_failed => return std.fmt.allocPrint(
+                        gpa,
+                        "not done: {s} found {d} problem(s) in the code you just wrote and this turn would end on it. Fix them, or declare `blocked`.",
+                        .{ self.labelSlice(), self.problems },
+                    ) catch null,
+                    .refused_unverified => return self.sayUnverified(
+                        gpa,
+                        "the code you wrote is still not covered by a finished check",
+                    ),
+                }
+            },
+        }
+    }
+
+    /// Wait for what is in flight, collect it, and ask the pure rule.
+    fn decideNow(self: *AutoCheck, reg: *bgproc.Registry, io: std.Io) exitgate.Decision {
+        _ = io;
+        if (self.job != 0) {
+            var waited_ms: u32 = 0;
+            while (waited_ms < auto_check_wait_ms) {
+                if (!std.mem.eql(u8, bgproc.stateWord(reg, self.job), "running")) break;
+                sleep_mod.nap(50);
+                waited_ms += 50;
+            }
+            _ = self.collect(reg);
+        }
+        const d = self.gate.decide();
+        // A check still in flight at the cap is neither red nor green: it is unknown,
+        // and the honest word for unknown here is "still running", not "refused".
+        if (self.job != 0 and self.gate.running and d == .refused_unverified) return .still_running;
+        return d;
+    }
+
+    /// The "this is NOT verified" line, ONCE per turn.
+    ///
+    /// Returns null only if the allocation failed, and the caller treats that as "the
+    /// turn may end": the alternative to a line is not a crash, it is a turn that ends
+    /// without the warning, which is exactly where this function was already.
+    fn sayUnverified(self: *AutoCheck, gpa: std.mem.Allocator, why: []const u8) ?[]u8 {
+        if (self.spoke) {
+            return std.fmt.allocPrint(
+                gpa,
+                "the code you wrote is still NOT verified ({s}). Say so when you report.",
+                .{why},
+            ) catch null;
+        }
+        self.spoke = true;
+        return std.fmt.allocPrint(
+            gpa,
+            "the code you wrote is NOT verified: {s}. Say that in your answer instead of implying it works.",
+            .{why},
         ) catch null;
     }
 };
 
-/// What the last verification of this turn said. See `AutoCheck.last_verdict` for why
-/// the loop needs it.
-pub const Verdict = enum { unchecked, passed, failed };
-
-/// May the turn end right now?
-///
-/// This is the function that makes "finish the task" mean something. A turn ends when
-/// the model stops asking for tools, and that used to be the end of it, whatever the
-/// state of the code: five real runs, five turns that ended with a build nobody had
-/// run or a build that was red, and a model that had no way to be told.
-///
-/// The rules, in order:
-///
-/// - A RED verification is the one hard block. Not "usually", not "unless the budget is
-///   over": the code does not work, and a turn that ends here produces a summary of
-///   code that does not compile. The budget does not get a vote — that is the ceiling's
-///   job and it says UNFINISHED.
-/// - A turn with NOTHING verified can end, because that is a turn of prose, of
-///   questions, of a task that needs no build. Demanding a compile there would make the
-///   harness nag about a README.
-/// - The model may always leave by declaring `blocked`, which is the honest exit and the
-///   reason the ceiling is not a dead end.
-///
-/// The check is the AUTO one and not "did the model run a test": the harness cannot
-/// read the model's intentions, but it can read its own compiler's exit code.
-pub fn turnMayEnd(ac: *const AutoCheck, goal_open: bool) bool {
-    if (goal_open and ac.last_verdict == .failed) return false;
-    return true;
-}
+/// What the last verification of this turn said. Kept as a name because it is read
+/// from the status line and from `/bench`; the rule itself is `exitgate.Decision`.
+pub const Verdict = exitgate.Verdict;
 
 /// Does a writing tool in this batch touch a file whose contents a compiler
 /// would care about?
@@ -7396,8 +7752,13 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     defer std.testing.allocator.free(fake_agents);
     agents_md_cache = fake_agents;
 
-    var out: [8192]u8 = undefined;
+    // 16 KB and not 8, because `bufPrint` TRUNCATES silently and the last block is the
+    // one that goes missing: a routing table that stops mid-sentence looks like a
+    // shorter prompt, not like a broken test. The prompt is the biggest stable prefix
+    // in every request, so its length is worth pinning generously.
+    var out: [16 * 1024]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null);
+    try std.testing.expect(composed.len < out.len); // it FIT: nothing was truncated
     try std.testing.expect(std.mem.indexOf(u8, composed, "No hagas esto.") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "web_search = you do NOT have the URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
@@ -7992,12 +8353,18 @@ test "codePathsFromArgs: the gate that decides if a build is worth starting" {
     // A build that proves nothing is a request spent.
     try std.testing.expect(!codePathsFromArgs("{\"path\":\"README.md\"}", arena));
     try std.testing.expect(!codePathsFromArgs("{\"path\":\"package-lock.json\"}", arena));
-    // `write {files:[...]}` has no `path`. It is the wrong direction — a
-    // multi-file edit is exactly what breaks a build — and the reason is that
-    // guessing means reading the arguments, and an argument this cannot parse
-    // must not be the reason a broken build goes unnoticed. The manual `check`
-    // tool is there for that case.
-    try std.testing.expect(!codePathsFromArgs("{\"files\":[{\"path\":\"a.zig\"}]}", arena));
+    // **`write {files:[...]}` has no `path`, and this assertion used to say so.**
+    //
+    // It is the one line that was wrong twice: the first version of the reader returned
+    // false for the multi-file forms, the comment called that "the wrong direction", and
+    // the comment was more convinced than the code. The prompt tells the model to send
+    // ONE `edit {files:[...]}` for a rename across nine files instead of nine calls —
+    // so the form the harness recommends was the one form that never started a check.
+    try std.testing.expect(codePathsFromArgs("{\"files\":[{\"path\":\"a.zig\"}]}", arena));
+    // One code file among the rest is enough: the check runs on the PROJECT.
+    try std.testing.expect(codePathsFromArgs("{\"files\":[{\"path\":\"r.md\"},{\"path\":\"s/b.zig\"}]}", arena));
+    // And a multi-file call that is entirely non-code is still not worth a build.
+    try std.testing.expect(!codePathsFromArgs("{\"files\":[{\"path\":\"r.md\"}]}", arena));
     // Garbage in is not a crash and not a yes.
     try std.testing.expect(!codePathsFromArgs("not json", arena));
     try std.testing.expect(!codePathsFromArgs("{\"path\":123}", arena));
@@ -8014,10 +8381,6 @@ test "autoCheck: the cap is per turn and it stops a model that edits nine times"
 }
 
 test "autoCheckResult: a job with locations produces the note, and it is consumed" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     m.bg.slots[1] = .{ .state = .finished, .id = 6, .exit = 1 };
@@ -8026,7 +8389,7 @@ test "autoCheckResult: a job with locations produces the note, and it is consume
     m.auto_check.label_len = 9;
     m.auto_check.job = 6;
 
-    const note = m.auto_check.collect(&m.bg, arena) orelse return error.NoNote;
+    const note = m.auto_check.collect(&m.bg) orelse return error.NoNote;
     try std.testing.expect(std.mem.indexOf(u8, note, "src/a.zig:3:5: error") != null);
     // The label, so the model knows this is the compiler and not a guess.
     try std.testing.expect(std.mem.indexOf(u8, note, "zig build") != null);
@@ -8037,10 +8400,6 @@ test "autoCheckResult: a job with locations produces the note, and it is consume
 }
 
 test "autoCheckResult: a PASSING check says nothing at all" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     // Exit 0 and output with no locations: the build was fine.
@@ -8051,26 +8410,22 @@ test "autoCheckResult: a PASSING check says nothing at all" {
     // "it compiles" is worth nothing to a model that was not going to write code
     // anyway, and it is the one message that could be repeated five times in one
     // turn. Silence is the design.
-    try std.testing.expect(m.auto_check.collect(&m.bg, arena) == null);
+    try std.testing.expect(m.auto_check.collect(&m.bg) == null);
     // Consumed even when silent, or the next edit reports it again.
     try std.testing.expectEqual(@as(u32, 0), m.auto_check.job);
 }
 
 test "autoCheckResult: no job, and a job still running, both say nothing" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
-    try std.testing.expect(m.auto_check.collect(&m.bg, arena) == null);
+    try std.testing.expect(m.auto_check.collect(&m.bg) == null);
 
     m.bg.slots[0] = .{ .state = .running, .id = 3 };
     try m.bg.slots[0].buf.appendSlice(std.testing.allocator, "src/a.zig:1:1: error: early\n");
     m.auto_check.job = 3;
     // Mid-thought, a note that says "still running" is the noise this feature
     // exists to avoid. The job keeps its slot and the next iteration reads it.
-    try std.testing.expect(m.auto_check.collect(&m.bg, arena) == null);
+    try std.testing.expect(m.auto_check.collect(&m.bg) == null);
     try std.testing.expectEqual(@as(u32, 3), m.auto_check.job);
 }
 
@@ -8203,12 +8558,17 @@ test "the headless runner and the TUI share ONE automatic typecheck" {
 
     // The gate both callers share: an edit to code is worth a build, an edit to
     // markdown is not, and an argument this cannot parse is not proof either way.
+    //
+    // The multi-file line USED to be `!…`, asserting that `files` was invisible to it.
+    // That is the second half of the same bug as above, in a test that claimed to be
+    // about two runners sharing one implementation: it was asserting that the shared
+    // implementation was blind.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try std.testing.expect(codePathsFromArgs("{\"path\":\"src/a.zig\"}", a));
     try std.testing.expect(!codePathsFromArgs("{\"path\":\"README.md\"}", a));
-    try std.testing.expect(!codePathsFromArgs("{\"files\":[{\"path\":\"a.zig\"}]}", a));
+    try std.testing.expect(codePathsFromArgs("{\"files\":[{\"path\":\"a.zig\"}]}", a));
 }
 
 test "iterationLimit is the SAME for both runners, and ZODE_MAX_ITER moves it" {
@@ -8470,10 +8830,6 @@ test "a `goal` CALL reaches the Model, which the two pure tests could not see" {
 test "a malformed goal call leaves the goal OPEN and says why, and never closes it" {
     // The dangerous direction is silent: if a bad call set the status anyway, the turn
     // would end as "goal met" or "goal blocked" on a call the model never made.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -8485,6 +8841,10 @@ test "a malformed goal call leaves the goal OPEN and says why, and never closes 
     // `\"` everywhere, and a heredoc that writes those doubles them into
     // `{\\"status...`, which stops compiling three characters later with "expected
     // ',' after initializer" — pointing at a line with nothing wrong on it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
     for ([_][]const u8{
         "{\"status\":\"finishd\",\"summary\":\"typo\"}",
         "{\"summary\":\"no status\"}",
@@ -8573,33 +8933,276 @@ test "no tool that WRITES can be exempt from the repetition guard" {
     try std.testing.expect(!isRepeatExempt("goal"));
 }
 
-test "a RED check is the one thing that cannot end a goal turn" {
+test "a RED check is the one thing that cannot end a turn" {
     // The rule the whole loop was missing, measured over five real task runs: five turns
     // ended with the code not compiling, and the harness had read the exit code and built
     // the model's own error message out of the diagnostics before letting it happen.
+    //
+    // **This test REPLACED one, on purpose, and the replacement is the record.** It used
+    // to read `turnMayEnd(&ac, goal_open)` and assert that red with NO goal open was
+    // allowed to end. That assertion was pinning behaviour that has now been measured to
+    // be wrong: "fix this bug" with no `/goal` is a task about code like any other, and
+    // the only thing that made it different was that the user had not typed four words
+    // first. So `turnMayEnd` is gone, and the rule is `exitgate.Gate.decide` — pure, in
+    // `lib/exitgate.zig`, with no goal in it at all.
     var ac: AutoCheck = .{};
 
-    // Nothing checked: a turn of prose, of questions, of a task with no build in it.
+    // Nothing written: a turn of prose, of questions, of a task with no build in it.
     // Demanding a compile here would be the harness nagging about a README.
-    ac.last_verdict = .unchecked;
-    try std.testing.expect(turnMayEnd(&ac, true));
-    try std.testing.expect(turnMayEnd(&ac, false));
+    try std.testing.expectEqual(exitgate.Decision.end, ac.gate.decide());
 
-    // Green: the code works, so ending is a decision the model is entitled to make.
-    ac.last_verdict = .passed;
-    try std.testing.expect(turnMayEnd(&ac, true));
-    try std.testing.expect(turnMayEnd(&ac, false));
+    // Green and covering the current files: ending is the model's decision to make.
+    ac.gate.checkable = true;
+    _ = ac.noteWrite("write", "{\"path\":\"src/a.zig\"}");
+    ac.gate.noteStarted(false);
+    ac.gate.noteCompleted(.passed, 1);
+    try std.testing.expectEqual(exitgate.Decision.end, ac.gate.decide());
 
-    // Red WITH an open goal: this is the block. The code does not work and the objective
-    // is not met, so a turn that ends here hands the user a summary of broken code.
-    ac.last_verdict = .failed;
-    try std.testing.expect(!turnMayEnd(&ac, true));
+    // Red: the block. The code does not work, so a turn that ends here hands the user a
+    // summary of code that does not compile. No goal is involved anywhere in that.
+    ac.gate.noteCompleted(.failed, 1);
+    try std.testing.expectEqual(exitgate.Decision.refused_failed, ac.gate.decide());
 
-    // Red with NO goal: there is nothing to hold open, and a `bash` that failed on a
-    // project with no typechecker is not a reason to forbid the turn from ending. The
-    // rule is scoped to a goal because that is the only thing that makes "unfinished"
-    // mean something.
-    try std.testing.expect(turnMayEnd(&ac, false));
+    // And it stays refused after another edit, because a red is a red.
+    _ = ac.noteWrite("write", "{\"path\":\"src/b.zig\"}");
+    try std.testing.expectEqual(exitgate.Decision.refused_failed, ac.gate.decide());
+}
+
+test "the gate counts what was WRITTEN, not what was asked for" {
+    // The bug this pins: `afterTool` used to be called once per tool CALL, from the
+    // batch loop, which cannot tell a call that ran from a call that did not. A denied
+    // `edit`, a `write` to a path that could not be opened and an `edit` whose old
+    // string was not found all counted, and each of them made the gate wait for a check
+    // of files that still had their OLD contents: a check that comes back green and is
+    // about the wrong thing, which reads as evidence and is not.
+    var ac: AutoCheck = .{};
+
+    // Not a writing tool.
+    try std.testing.expect(!ac.noteWrite("read", "{\"path\":\"src/a.zig\"}"));
+    // A writing tool, but not a file a compiler would care about.
+    try std.testing.expect(!ac.noteWrite("write", "{\"path\":\"README.md\"}"));
+    try std.testing.expect(!ac.noteWrite("write", "{\"path\":\"build.lock\"}"));
+
+    // Valid JSON with NO path in it: no file, so no build. This is `write` being called
+    // with something the tool would itself reject, and it is not worth a build because
+    // nothing was written.
+    try std.testing.expect(!ac.noteWrite("write", "{}"));
+
+    // Arguments the harness CANNOT read at all still count, and that is deliberate in
+    // this direction.
+    //
+    // The reasoning is the one in `codePathsFromArgs`: an argument we failed to parse
+    // must not be the reason a broken build goes unnoticed. The risk of getting it wrong
+    // is asymmetric and both ways were considered:
+    //
+    // - NOT counting it means the gate sees nothing written, ends the turn, and the user
+    //   is told the work is done about code nobody compiled. That is the exact failure
+    //   this feature exists to remove.
+    // - Counting it means the gate waits for a check it cannot attribute to a file. It
+    //   still runs the PROJECT's check, so the check is right anyway; the only cost is
+    //   that a turn on a project with no check says "not verified" once, which is
+    //   literally true.
+    //
+    // So the cost of being wrong is one honest sentence, and the cost of being wrong the
+    // other way is a lie about the work. The tie does not really go both ways.
+    try std.testing.expect(ac.noteWrite("write", "not json"));
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.writes);
+
+    // And a real write counts on top of that one, once.
+    try std.testing.expect(ac.noteWrite("write", "{\"path\":\"src/a.zig\"}"));
+    try std.testing.expectEqual(@as(u32, 2), ac.gate.writes);
+    try std.testing.expect(ac.gate.wroteCode());
+}
+
+test "a multi-file write starts a check, which the single-path reader never did" {
+    // The prompt pushes the model towards `write {files:[...]}` and `edit
+    // {files:[...]}` — ONE call for nine files instead of nine calls — and the gate read
+    // a single `path` key. So the exact form the harness recommends was the one form
+    // that never started a check, and the comment on the old reader said this was "the
+    // wrong direction" and left it wrong.
+    var ac: AutoCheck = .{};
+
+    try std.testing.expect(ac.noteWrite("write", "{\"files\":[{\"path\":\"src/one.zig\"}]}"));
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.writes);
+
+    var ac2: AutoCheck = .{};
+    try std.testing.expect(ac2.noteWrite("edit", "{\"files\":[{\"path\":\"README.md\"},{\"path\":\"src/two.zig\"}]}"));
+    try std.testing.expectEqual(@as(u32, 1), ac2.gate.writes);
+
+    // And one that is entirely non-code still does not.
+    var ac3: AutoCheck = .{};
+    try std.testing.expect(!ac3.noteWrite("write", "{\"files\":[{\"path\":\"README.md\"}]}"));
+    try std.testing.expectEqual(@as(u32, 0), ac3.gate.writes);
+}
+
+test "a green from BEFORE the last edit does not let the turn end" {
+    // This is the staleness rule, end to end through the gate's own counters: the model
+    // fixed the build, edited a second file, and the harness believed the first green.
+    // One number of writes against one number of covered writes is the whole difference.
+    var ac: AutoCheck = .{};
+    ac.gate.checkable = true;
+
+    try std.testing.expect(ac.noteWrite("write", "{\"path\":\"src/a.zig\"}"));
+    ac.gate.noteStarted(false);
+    ac.job_covers = ac.gate.writes; // what `maybeStart` records when it spawns
+    ac.gate.noteCompleted(.passed, ac.job_covers);
+    try std.testing.expectEqual(exitgate.Decision.end, ac.gate.decide());
+
+    // The next edit is not covered by that check.
+    try std.testing.expect(ac.noteWrite("edit", "{\"path\":\"src/b.zig\"}"));
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.unverified());
+    try std.testing.expectEqual(exitgate.Decision.refused_unverified, ac.gate.decide());
+
+    // Re-checking the CURRENT files closes it, and only that does.
+    ac.gate.noteStarted(true);
+    ac.job_covers = ac.gate.writes;
+    ac.gate.noteCompleted(.passed, ac.job_covers);
+    try std.testing.expectEqual(exitgate.Decision.end, ac.gate.decide());
+}
+
+test "the gate ends a turn on code it CANNOT check, and says so" {
+    // The direction that is safe to be wrong in. A project with no `build.zig`, no
+    // `Cargo.toml`, nothing the harness knows how to run must not produce a turn that
+    // never returns: the user would have to ctrl+c a task that was already answered.
+    // The turn ends, and it ends with the truth in it.
+    const a = std.testing.allocator;
+    var ac: AutoCheck = .{};
+    try std.testing.expect(ac.noteWrite("write", "{\"path\":\"main.c\"}"));
+    // `checkable` is false: `planAt` found nothing, which is the default and the
+    // real state of any project whose build the harness does not know.
+    try std.testing.expectEqual(exitgate.Decision.cannot_verify, ac.gate.decide());
+
+    const msg = ac.sayUnverified(a, "no check is known for this project") orelse return error.NoMessage;
+    defer a.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "NOT verified") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "no check is known for this project") != null);
+
+    // Once. A line repeated five times a turn is a line the user learns to ignore, and
+    // the whole point of saying it is that it is read.
+    try std.testing.expect(ac.spoke);
+}
+
+test "what the harness proved is reported as what it proved, not as 'verified'" {
+    // The exit gate's claim is "there is a passing check behind this code", and a claim
+    // is only as good as its precision. `zig build` answers ONE question — does it
+    // typecheck — and says nothing at all about whether the code works.
+    //
+    // The failure this pins is the SAME class as the one the gate exists to remove, in
+    // the opposite direction: a turn that ended with `kind == .types`, reported as
+    // "verified", claims a test run nobody did, and the user reads that and stops
+    // looking at the diff.
+    try std.testing.expectEqualStrings("typechecked", typecheck_mod.proofWord(.types));
+    try std.testing.expectEqualStrings("syntax-checked", typecheck_mod.proofWord(.syntax));
+    try std.testing.expectEqualStrings("tested", typecheck_mod.proofWord(.tests));
+    // And "verified" is deliberately NOT one of those words: no command in the table
+    // justifies it on its own.
+    for ([_]typecheck_mod.Kind{ .types, .syntax, .tests }) |k| {
+        try std.testing.expect(!std.mem.eql(u8, typecheck_mod.proofWord(k), "verified"));
+    }
+
+    // The report reaches the user carrying the precise word.
+    var ac: AutoCheck = .{};
+    ac.proof = .types;
+    const msg = ac.proofPhrase() orelse return error.NoMessage;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "typechecked") != null);
+}
+
+test "the end of a turn reports the narrowest thing that was actually proved" {
+    // The gate closing is not the same as the work being finished, and the last line
+    // before the next prompt is what decides whether the user goes and looks at the diff.
+    // It has to be honest in the specific direction: name what ran, and name what did
+    // not.
+    //
+    // The upper rungs are the model's — `bash` with the project's test command,
+    // `check {id}` for one package. The harness supplies the floor that costs nothing,
+    // and a floor reported as a ceiling is how a turn gets trusted that should not be.
+    const a = std.testing.allocator;
+    var ac: AutoCheck = .{};
+    ac.proof = .types;
+
+    const line = ac.proofLine(a) orelse return error.NoLine;
+    defer a.free(line);
+    // It says what it ran, in the past tense, about this turn.
+    try std.testing.expect(std.mem.indexOf(u8, line, "typechecked") != null);
+    // And it points at the tests as the model's to run, so nobody reads a green
+    // typecheck as a green suite.
+    try std.testing.expect(std.mem.indexOf(u8, line, "tests") != null);
+
+    // No check at all: the line says so instead of claiming anything.
+    var none: AutoCheck = .{};
+    const nol = none.proofLine(a) orelse return error.NoLine;
+    defer a.free(nol);
+    try std.testing.expect(std.mem.indexOf(u8, nol, "NOT") != null);
+}
+
+test "the gate's own check does not consult the turn's quota, and the quota does not consume the gate's" {
+    // Two different budgets for two different jobs, and conflating them was how either
+    // one would have broken:
+    //
+    // - `auto_check_per_turn` (2) exists so a model that edits nine files does not start
+    //   nine builds WHILE it works. The model gets the errors early; that is all it is
+    //   for.
+    // - The gate's budget exists so the check that decides whether the turn ends always
+    //   happens. With the quota shared, a turn that spent its two builds editing would
+    //   reach the gate unable to check at all — the one moment it must be able to.
+    var ac: AutoCheck = .{};
+    ac.gate.checkable = true;
+    const cmd = "exit 0";
+    @memcpy(ac.command[0..cmd.len], cmd);
+    ac.command_len = cmd.len;
+    const label = "fake";
+    @memcpy(ac.label[0..label.len], label);
+    ac.label_len = label.len;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var reg: bgproc.Registry = .init(std.testing.allocator);
+    defer reg.deinit(threaded.io(), std.testing.allocator);
+
+    // Two quota checks go through and count against `started_this_turn`.
+    for (0..auto_check_per_turn) |_| {
+        try std.testing.expect(ac.maybeStart(&reg, threaded.io(), false));
+        try std.testing.expectEqual(@as(u32, 0), ac.gate.forced);
+        try waitJob(&reg, ac.job);
+    }
+    try std.testing.expectEqual(auto_check_per_turn, ac.started_this_turn);
+
+    // The third one is REFUSED, and that is the whole point of the first half: a model
+    // that keeps editing does not start a build per edit.
+    try std.testing.expect(!ac.maybeStart(&reg, threaded.io(), false));
+
+    // And the gate still can, because the check that decides whether the turn ends is
+    // not the check that gives the model its early errors. With the budgets shared, a
+    // turn that spent its two builds editing would arrive here unable to check at all —
+    // the one moment it must be able to.
+    try std.testing.expect(ac.maybeStart(&reg, threaded.io(), true));
+    try std.testing.expectEqual(@as(u32, 1), ac.gate.forced);
+    try waitJob(&reg, ac.job);
+
+    // And the gate's budget is its own, bounded: two of its own checks, then it stops
+    // and the iteration ceiling takes over. An unbounded "just check again" is how a
+    // turn that cannot be verified becomes a turn that never returns.
+    for (0..exitgate.Gate.max_forced - 1) |_| {
+        try std.testing.expect(ac.maybeStart(&reg, threaded.io(), true));
+        try waitJob(&reg, ac.job);
+    }
+    try std.testing.expect(!ac.gate.canForce());
+    try std.testing.expect(!ac.maybeStart(&reg, threaded.io(), true));
+}
+
+/// Waits for one job to leave "running", with a cap.
+///
+/// Without the cap a job that never starts (or never finishes) turns a unit test into a
+/// hung test binary, which is the failure mode this repo cannot afford in CI — and the
+/// cap is on the WAIT, not on the assertion, so a job that misbehaves fails the
+/// `expect` after it instead of hanging.
+fn waitJob(reg: *bgproc.Registry, id: u32) !void {
+    var waited: u32 = 0;
+    while (waited < 5000) : (waited += 10) {
+        if (!std.mem.eql(u8, bgproc.stateWord(reg, id), "running")) return;
+        sleep_mod.nap(10);
+    }
+    return error.JobNeverFinished;
 }
 
 test "the verdict is per TURN and resets, so turn two is not judged by turn one" {
@@ -8608,16 +9211,23 @@ test "the verdict is per TURN and resets, so turn two is not judged by turn one"
     var ac: AutoCheck = .{};
     ac.job = 7;
     ac.started_this_turn = 2;
-    ac.last_verdict = .failed;
+    ac.gate.checkable = true;
+    ac.gate.noteWrite();
+    ac.gate.noteCompleted(.failed, 1);
 
     var reg: bgproc.Registry = undefined;
     _ = &reg;
     ac.resetTurn(&reg, undefined);
 
-    try std.testing.expectEqual(Verdict.unchecked, ac.last_verdict);
+    try std.testing.expectEqual(Verdict.unchecked, ac.gate.verdict);
     try std.testing.expectEqual(@as(u32, 0), ac.started_this_turn);
     // The job id goes too, which is what stops turn two reporting turn one's errors.
     try std.testing.expectEqual(@as(u32, 0), ac.job);
+    // And the whole gate, because "reset the verdict" is not the same as "reset what
+    // the verdict was about": a turn that kept `writes` from turn one would refuse to
+    // end on turn two's first build for the rest of the session.
+    try std.testing.expectEqual(@as(u32, 0), ac.gate.writes);
+    try std.testing.expectEqual(exitgate.Decision.end, ac.gate.decide());
 }
 
 test "the iteration counter shows the limit that APPLIES, not the soft cap" {

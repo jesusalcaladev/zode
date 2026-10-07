@@ -40,7 +40,60 @@ pub const Plan = struct {
     command: []const u8,
     /// What the user would call this check, for the message the model reads.
     label: []const u8,
+    /// What it actually PROVED.
+    ///
+    /// ## Why a green from here is not a green from the test suite
+    ///
+    /// The exit gate's whole claim is "there is a passing check behind this code", and a
+    /// claim is only as good as its precision. `zig build` and `tsc --noEmit` answer one
+    /// question — does it typecheck — and `python -m compileall` answers a weaker one
+    /// still: does it parse. Every one of them says nothing about whether the code
+    /// WORKS.
+    ///
+    /// So the harness keeps the two apart in what it tells the user. A turn that ended
+    /// with `kind == .types` verified that the files compile, and if it is reported as
+    /// "verified" without that word it is claiming a test run nobody did — which is the
+    /// same class of error as the opposite one, and just as common.
+    ///
+    /// The upper rungs are the model's: `bash` with the project's test command,
+    /// `check {id}` for a specific package. The harness supplies the floor that costs
+    /// nothing, and says which floor it supplied.
+    kind: Kind = .types,
 };
+
+/// How much a check actually proved.
+pub const Kind = enum {
+    /// Nothing was checked, or the check did not finish. It is the default on purpose:
+    /// a harness that cannot say what it proved must not fall back to claiming the
+    /// weakest thing that is still a claim. See `proofWord`.
+    ///
+    /// Named `nothing` and not `unreachable` because `unreachable` is a Zig keyword and
+    /// a payload variant by that name does not compile.
+    nothing,
+    /// The project's compiler or type checker accepted the files.
+    types,
+    /// Only a syntax check: it parses. Ruby, PHP and Python have no typechecker here
+    /// and pretending otherwise would mean running a command that is not installed.
+    syntax,
+    /// It ran the project's tests. Only a project whose default build step is its test
+    /// step gets here — `zig build` runs the tests when the build file declares them,
+    /// and `mix compile` does not.
+    tests,
+};
+
+/// The one word a report has to use for this check. "verified" is not one of them.
+///
+/// It is not in the list because no command in the table justifies it on its own: a
+/// typecheck says the files are accepted, and a test run says the suite the project
+/// happens to have passes. Neither is the claim a user makes about work being correct.
+pub fn proofWord(k: Kind) []const u8 {
+    return switch (k) {
+        .nothing => "not checked",
+        .types => "typechecked",
+        .syntax => "syntax-checked",
+        .tests => "tested",
+    };
+}
 
 /// What the caller found on disk.
 pub const Markers = struct {
@@ -80,13 +133,22 @@ pub const Markers = struct {
 /// gets the Zig check and not the JavaScript one. Without `order` this would be a
 /// coin flip decided by the order of a struct's fields.
 pub fn planFor(m: Markers) ?Plan {
+    // `.tests` where the command genuinely runs the project's tests, `.types` where it
+    // only makes the compiler look at the files. The distinction is in `Kind` and it is
+    // about what the harness is ALLOWED to say afterwards, not about what runs.
     if (m.zig_build) return .{
         .command = "zig build",
         .label = "zig build",
+        // `zig build` runs the test step only if the build file declares one in the
+        // default step, and this repository's does. Claiming `.tests` for every project
+        // with a `build.zig` would be a guess about a file the harness has not read, and
+        // a guess in this direction is a lie about test coverage.
+        .kind = .types,
     };
     if (m.cargo_toml) return .{
         .command = "cargo check",
         .label = "cargo check",
+        .kind = .types,
     };
     // `node_modules/.bin/tsc` before `npx tsc`: `npx` re-resolves the package on
     // every invocation and can reach the NETWORK, which on a rate-limited
@@ -98,10 +160,12 @@ pub fn planFor(m: Markers) ?Plan {
         else
             "npx tsc --noEmit --pretty false",
         .label = "tsc --noEmit",
+        .kind = .types,
     };
     if (m.go_mod) return .{
         .command = "go build ./...",
         .label = "go build ./...",
+        .kind = .types,
     };
     // Python last and only as what it is: a syntax check. Offering mypy here
     // would mean running a command that is not installed, failing, and reporting
@@ -109,10 +173,12 @@ pub fn planFor(m: Markers) ?Plan {
     if (m.pyproject and m.py_source) return .{
         .command = "python3 -m compileall -q .",
         .label = "python syntax check",
+        .kind = .syntax,
     };
     if (m.mix_exs and m.mix_source) return .{
         .command = "mix compile",
         .label = "mix compile",
+        .kind = .types,
     };
     // `.exs` is Elixir's build AND its test config, and `mix compile` is the cheapest
     // thing that answers "does this still parse". `mix credo` would be a lint nobody
@@ -120,6 +186,7 @@ pub fn planFor(m: Markers) ?Plan {
     if (m.dune_project and m.ocaml_source) return .{
         .command = "dune build",
         .label = "dune build",
+        .kind = .types,
     };
     // Ruby has no typechecker to run and pretending otherwise would mean installing
     // one. A syntax check is what the language actually offers, and it is labelled as
@@ -127,22 +194,27 @@ pub fn planFor(m: Markers) ?Plan {
     if (m.gemfile and m.rb_source) return .{
         .command = "ruby -c",
         .label = "ruby -c (syntax only; ruby has no typechecker)",
+        .kind = .syntax,
     };
     if (m.csproj and m.cs_source) return .{
         .command = "dotnet build --nologo -v q",
         .label = "dotnet build",
+        .kind = .types,
     };
     if (m.gradle and m.java_source) return .{
         .command = "gradle compileJava --quiet",
         .label = "gradle compileJava",
+        .kind = .types,
     };
     if (m.pom and m.java_source) return .{
         .command = "mvn -q -o compile",
         .label = "mvn compile",
+        .kind = .types,
     };
     if (m.composer and m.php_source) return .{
         .command = "php -l",
         .label = "php -l (syntax only)",
+        .kind = .syntax,
     };
     return null;
 }

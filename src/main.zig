@@ -323,6 +323,31 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         cache_stats.session.record(chat.last_usage);
 
         if (result.ctx.parts.items.len == 0) {
+            // THE EXIT GATE, and it is here rather than after the loop for the same
+            // reason it is there in the TUI: a run that has produced its final answer is
+            // exactly the moment a red build has to stop it, and after the loop the
+            // answer has already been printed.
+            //
+            // `--chat` used to end the run on a final answer with the automatic check
+            // still in flight, and then wait for it at the very bottom and PRINT the
+            // errors as a footnote of a run it had already called finished. A user
+            // scripting this saw a clean exit and a red build.
+            if (auto_check.exitGate(&bg, gpa, io)) |refusal| {
+                defer gpa.free(refusal);
+                models.dbg("\n[not done] {s}\n", .{refusal});
+                // The model needs the diagnostics, not just the refusal: it is the only
+                // thing that can act on them, and the nudge is what makes it act.
+                if (auto_check.noteSlice().len > 0) {
+                    try msgs.append(arena, .{ .role = "user", .content = auto_check.noteSlice() });
+                }
+                try msgs.append(arena, .{
+                    .role = "user",
+                    .content = "The harness will not end this run yet: the code you wrote does not have a passing check behind it. Fix the problems above and carry on.",
+                });
+                // The iterations left are counted by the `while` above, so this costs a
+                // turn and says so.
+                continue;
+            }
             const s = &cache_stats.session;
             models.dbg("\n[cache] {d:.1}% hit-rate · {d} prompt / {d} cached tokens", .{ s.hitRatePct(), s.prompt_tokens, s.cached_tokens });
             // WHY, because a rate with no cause is not actionable, and this is
@@ -345,6 +370,11 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             }
             if (elided_total > 0) models.dbg(" · {d} tool results elided", .{elided_total});
             models.dbg("\n", .{});
+            // What the harness actually proved about the code this run wrote, in the
+            // word that is true of it — "typechecked", never "verified". A script that
+            // prints "done" over a typecheck claims a test run nobody did, and the person
+            // reading the CI log is the one who stops looking.
+            printProofLine(&auto_check, gpa);
             return 0; // final answer
         }
 
@@ -373,7 +403,14 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             // iteration too late otherwise. It lives in `execToolCalls` for the TUI
             // and it used to exist ONLY there — so `--chat`, the runner every pty
             // test and measurement drives, edited code and never compiled it.
-            auto_check.afterTool(&bg, gpa, io, p.name.items, p.args.items);
+            //
+            // `noteWrite` then `afterTool`, not `afterTool` with the arguments, because
+            // the gate's write counter has to count calls that WROTE. The line above
+            // this one is the `catch` for a failed call, so anything that gets here
+            // succeeded; before, a failed `write` still started a check of the old
+            // contents and counted towards the exit gate.
+            const wrote = auto_check.noteWrite(p.name.items, p.args.items);
+            auto_check.afterTool(&bg, io, wrote);
 
             // The plan, applied. It used to be a `Model` field and `applyPlanCall`
             // only ran in the TUI's path, so a `todo` call here answered **"plan
@@ -391,7 +428,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // goes in as a `user` message after the `tool` results, which is a shape
         // every provider accepts — the alternative, a `tool_result` with no call id,
         // is not a thing.
-        if (auto_check.autoCheckWait(&bg, arena)) |note| {
+        if (auto_check.autoCheckWait(&bg)) |note| {
             try msgs.append(arena, .{ .role = "user", .content = note });
             models.dbg("[auto-check] {s}\n", .{note});
         }
@@ -403,12 +440,37 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // started was still running — so the feature produced nothing on exactly the
     // turns it exists for. This is the one moment blocking is free: the run is over
     // and the answer is about to be printed.
-    if (auto_check.autoCheckWait(&bg, arena)) |note| {
+    if (auto_check.autoCheckWait(&bg)) |note| {
         models.dbg("\n[auto-check] {s}\n", .{note});
     }
+    printProofLine(&auto_check, gpa);
 
+    // UNFINISHED, and the first word, for the same reason the TUI says it that way:
+    // a run that reached its ceiling ran out of room, which is not the same thing as
+    // the task being finished, and the one thing a user of a script must not be left
+    // guessing is which of the two it is. The exit code is 0 because nothing crashed;
+    // the sentence is what tells the truth.
+    if (auto_check.gate.wroteCode()) {
+        models.dbg(
+            "\nUNFINISHED: {d} iterations and the code has no passing check behind it. {d} file write(s) with nothing green covering them.\n",
+            .{ iter_limit, auto_check.gate.unverified() },
+        );
+    }
     models.dbg("\n[iteration limit reached after {d} iterations]\n", .{iter_limit});
     return 0;
+}
+
+/// The end-of-turn proof line, printed for the headless runner.
+///
+/// The same sentence the TUI pushes into its history, from the same function, because
+/// a script's output and a terminal's history are the same report with two different
+/// renderers — and the first version of the gate made them disagree: `--chat` printed
+/// "finished" and put the errors underneath as a footnote.
+fn printProofLine(ac: *const agent.AutoCheck, gpa: std.mem.Allocator) void {
+    if (!ac.gate.wroteCode()) return;
+    const line = ac.proofLine(gpa) orelse return;
+    defer gpa.free(line);
+    models.dbg("\n{s}\n", .{line});
 }
 
 /// The headless system prompt: the default one plus the ask guidance, and the

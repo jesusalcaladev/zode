@@ -99,6 +99,14 @@ pub const tool_routing_prompt =
     \\   costs one turn and an error you find three turns later costs three.
     \\   It runs on its own after your edits, so call it with no arguments and
     \\   keep working, then ask for the result.
+    \\   It also runs by ITSELF after every edit you make, and the harness will not
+    \\   end your turn while the code you wrote has a red check behind it — so if
+    \\   you are still working when the turn seems to keep going, that is the check
+    \\   coming back, not the harness stalling. What the harness runs is the
+    \\   project's COMPILER, which is not the same as the tests: nothing here runs
+    \\   your test suite for you, and no green typecheck means the tests pass.
+    \\   The upper rungs are yours — `bash zig build test`, `check {id}` on one
+    \\   package — and the last line of the turn says which of them ran.
     \\ - Anything on the INTERNET (find a site, look up a game, a product, docs,
     \\   prices, news) belongs to web_search / web_fetch. NEVER use bash (curl,
     \\   wget, pip, npm ...) to reach the web: it is slower, un-asked-for and
@@ -198,6 +206,20 @@ pub const verification_prompt =
     \\   pass.
     \\ - Finish by saying, in one line, what you verified and what you did not. A
     \\   claim you cannot back with a command is not a verification.
+    \\ - Say the PRECISE word, not the generous one. `zig build` proves the code
+    \\   typechecks; `zig build test` proves the suite passes; reading the diff
+    \\   proves nothing about behaviour. "It compiles" and "the tests pass" are
+    \\   different claims and only one of them is true after a typecheck. Claiming
+    \\   the tests when you only compiled is the same error as claiming the work is
+    \\   done when the build is red: a true-sounding sentence about work nobody did.
+    \\ - Narrow to the thing you changed: one module's tests, the function you
+    \\   touched, the parser you edited. A suite that passes says less about your
+    \\   change than the three tests that cover it, and it takes ten times as long.
+    \\   Then, once at the end, the whole suite — and that is the ONE place it is
+    \\   worth the wall clock.
+    \\ - A code change without a test that fails before it and passes after is a
+    \\   change you have not verified. If the project has no test at all for that
+    \\   area, say so in one line rather than letting the absence read as a pass.
     \\
 ;
 // ── tests ────────────────────────────────────────────────────────
