@@ -2087,6 +2087,19 @@ fn chatWorker(job: *ChatJob) void {
     if (had_goal) {
         m.goal.status = goal_mod.Status.none;
         m.goal.checkpoints = 0;
+        // `blocked_refusals` goes here too, and it was MISSING when the field was added,
+        // which made the evidence check a one-shot for the whole SESSION instead of one
+        // per turn.
+        //
+        // The consequence is small on the surface and bad underneath: a model that
+        // declared `blocked` on the first iteration of turn one had its refusal spent,
+        // and on turn two a shrug with no tools behind it was accepted immediately —
+        // which is the entire failure the field was added for, resurrected after one
+        // turn. The state is per turn because the evidence is per turn: "did THIS turn
+        // look before it said it is impossible" is a different question every time, and
+        // answering it with the previous turn's answer is the "a stale red is worse than
+        // no red" bug in a new place.
+        m.goal.blocked_refusals = 0;
     }
     const soft = iterationLimit();
     const hard = if (had_goal) goalHardLimit() else soft;

@@ -393,6 +393,35 @@ test "the refusal counter is not the checkpoint counter" {
     try std_test.expectEqual(@as(u8, 0), g.blocked_refusals);
 }
 
+test "the state the refusal reads is PER TURN, and the turn resets it" {
+    // The bug this pins, and it is one I wrote the same day: `blocked_refusals` was added
+    // to `Goal`, wired into the loop, and then never reset — while `checkpoints` right
+    // next to it WAS. So the evidence check was a one-shot for the whole SESSION.
+    //
+    // Small on the surface, bad underneath: a model that declared `blocked` on the first
+    // iteration of turn one had its single refusal spent, and on turn two a shrug with no
+    // tools behind it was accepted immediately. The whole failure the field was added for
+    // came back after one turn.
+    //
+    // The reason it is per turn is the same reason a stale red is worse than no red: the
+    // evidence is per turn ("did THIS turn look before it said it is impossible") and
+    // answering it with the previous turn's answer is answering a different question.
+    var g: Goal = .{};
+    g.status = .blocked;
+    g.blocked_refusals = 1;
+    // Turn one, already refused: accepted (that is the "only once" rule).
+    try std_test.expect(verdictCredible(&g, 0));
+
+    // The new turn's reset — the two lines `chatWorker` runs before the loop.
+    g.status = .none;
+    g.checkpoints = 0;
+    g.blocked_refusals = 0;
+
+    // And now the very same shrug is refused again, because it is a new turn's shrug.
+    g.status = .blocked;
+    try std_test.expect(!verdictCredible(&g, 0));
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────────
 
 const std_test = std.testing;
