@@ -145,6 +145,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     var pending_images: images_mod.Pending = .{};
     // The automatic typecheck's state for a run that has no `Model` to keep it in.
     var auto_check: agent.AutoCheck = .{};
+    agent.attachAutoCheckEnv(&auto_check, env);
     // The plan, on the stack. There is no `Model` here and no screen, so this is
     // where the steps go: printed, so a run in a script shows the same progress a
     // TUI session would.
@@ -578,6 +579,10 @@ fn runTui(init: std.process.Init) !u8 {
     agent.api_key_global = envGet(init.environ_map, "ZODE_API_KEY");
     agent.environ_global = init.environ_map;
     agent.gpa_global = init.gpa;
+    // The automatic typecheck reads `ZODE_AUTO_CHECK` off its OWN environment field,
+    // not off the module global, so this is not optional: without it the flag silently
+    // reads as "no environment" and every setting takes its default.
+    agent.attachAutoCheckEnv(&model.auto_check, init.environ_map);
     // Before `bootstrapSession` and before anything composes a prompt: the AGENTS.md
     // and the skills roots are both derived from it.
     agent.initProjectInfo(io, init.environ_map);

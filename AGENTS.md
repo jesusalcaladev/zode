@@ -3815,3 +3815,54 @@ It now retries, **silently**:
 
 ESC during the backoff is a cancellation, not a failure: `Retry.wait` returns the ESC and
 the report is "cancelled while waiting to retry", not an error about the search.
+
+---
+
+# Splitting `agent.zig`: only the seams that were already there (2026-10-07)
+
+The file was 9 648 lines. This took out three things and it is worth being exact about
+**why those three and not the twenty that also look movable.**
+
+## The rule: a module cannot import outward
+
+`src/lib/*` is rooted at `src/lib/`, so a file there cannot reach `src/tui.zig`,
+`src/chat.zig` or anything else above it. That single rule is the whole partition, and
+it is why this split is small instead of impressive:
+
+| moved | to | why it could move |
+|---|---|---|
+| `AutoCheck` + `exitGate` + the wait + the git probe | `src/autochk.zig` | it was **already Model-free** — that was in its own doc comment from the day it was written |
+| `Repeats`, the repetition guard | `src/lib/repeats.zig` | pure: a hash and a counter |
+| `envTruthy` / `envGet` | `src/lib/env.zig` | pure, and `autochk` now reads `ZODE_AUTO_CHECK` too |
+
+**What did NOT move, and why it is not laziness.** The model palette (700 lines of
+`agent.zig`), the subagent loop, the tool dispatcher and the session bootstrap all read
+or write module globals that live in `agent.zig`. Moving any of them means `agent.zig`
+imports it AND it imports `agent.zig`, which is a cycle — or it means threading a dozen
+parameters through call sites, which is the file getting worse with extra steps.
+
+So the honest summary: **`agent.zig` is big because it is a hub of shared mutable state,
+and a file that owns the state cannot be decomposed without first reducing the state.**
+The three that moved are the three that did not need it. A "split the big file" that
+produced forty files full of `*_params` structs would have been worse code with the same
+line count.
+
+## `AutoCheck` was already the seam — and moving it exposed a bug nobody had seen
+
+It had a doc comment saying "a struct with no `Model` in it" and lived in a 6 000-line
+file. The moment it moved out, the reason became concrete: it called
+`envTruthy("ZODE_AUTO_CHECK", …)`, which reads the **module global** in `agent.zig`.
+That call IS an import cycle.
+
+It became an `env` field, and a field nobody assigns is the worst kind of change:
+`null` means "no environment", and `null` means the **default** for every flag — so
+`ZODE_AUTO_CHECK=0` would have kept working perfectly while nobody could turn it ON,
+with no error and a green suite.
+
+Caught by writing the test **after** wiring both construction sites, not before, which
+is the order that would have missed it: the assertion is that the flag is read from the
+`AutoCheck`'s OWN map, and it is in `autochk.zig` rather than at the two `main.zig` call
+sites — because a test at a construction site only proves somebody remembered to run it.
+
+`attachEnv` exists as a function for the same reason. Two call sites, each an assignment
+that can be forgotten, is how a flag ends up read-only-off.
