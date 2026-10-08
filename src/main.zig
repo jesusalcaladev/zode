@@ -29,13 +29,52 @@ fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
 /// Headless mode: zode --models
 fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) !u8 {
     models.dbg_io = io; // for diagnostics
+    // The configuration FIRST, and this is the bug this call fixes.
+    //
+    // `--models` used to be dispatched BEFORE `loadUserConfig`, which is why it always
+    // described opencode: `activeProviderDef` reads `cur_provider_id`, a module global
+    // that `loadUserConfig` is what sets, and nothing had set it yet. Measured with
+    // `ZODE_PROVIDER=openrouter` and a real key: it printed opencode's catalogue, from
+    // its own cache, and said nothing about openrouter at all.
+    //
+    // `--models` is the command you run when a provider is not working. A diagnostic
+    // that cannot name the provider you configured is not a diagnostic, and the two bugs
+    // stacked: it read the wrong provider AND only `ZODE_API_KEY` for the key.
+    //
+    // It needs the `Io` and the environment assigned first, because `loadUserConfig`
+    // reads config.json through both. The marks are not there because `--models` is a
+    // diagnostic command and its startup time is not what anybody is measuring.
+    agent.io_global = io;
+    agent.environ_global = env;
+    agent.gpa_global = gpa;
+    agent.loadUserConfig();
+    defer agent.shutdownUserConfig();
+
     var http = http_client.Http.init(gpa, io);
     defer http.deinit();
 
-    const cfg = provider.Config.load(env);
-    var url_buf: [1024]u8 = undefined;
-    const url = cfg.urlModels(&url_buf);
-    const key = envGet(env, "ZODE_API_KEY");
+    // THE ACTIVE PROVIDER, and not `provider.Config.load(env)`.
+    //
+    // This used to read the opencode URLs straight out of the environment and the key
+    // out of `ZODE_API_KEY`, so `--models` could only ever describe the opencode
+    // catalogue. Measured while testing a fresh OpenRouter key: with
+    // `ZODE_PROVIDER=openrouter` and `ZODE_OPENROUTER_KEY` set, it printed opencode's
+    // models and said nothing about why the real provider was failing.
+    //
+    // Which is the worst possible place for the bug: `--models` is the command you run
+    // WHEN a provider is not working, and it was structurally incapable of reporting
+    // anything about a provider other than one. It is the same class as the headless
+    // prompt missing the routing table and the automatic typecheck existing only in the
+    // TUI — a second, lesser implementation of a thing the TUI already gets right.
+    //
+    // So it goes through the same two functions the TUI and `--chat` use, which is what
+    // makes it right by construction rather than by remembering to add the next provider.
+    const def = agent.activeProviderDef(env);
+    // `def.models_url` and not `cfg.urlModels(buf)`: the provider table owns its own URL
+    // and the buffer was only ever there because the opencode defaults came from a
+    // helper that needed somewhere to put them.
+    const url = def.models_url;
+    const key = providers.keyFor(def, env);
 
     // `--models` is the worst case for a cold network: 772 KB and a 400-800 ms round
     // trip, for a list that changes once a month. It reads the cache first, prints, and
@@ -48,7 +87,11 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     var printed = false;
     // The cache key is the PROVIDER, not the URL: two providers can publish the same
     // catalogue URL and one of them changing its models must not invalidate the other.
-    const pid = envGet(env, "ZODE_PROVIDER") orelse "default";
+    // The cache key is the provider's REAL id now, not whatever the environment says.
+    // They were the same when both meant opencode and they diverge the moment a user
+    // sets `ZODE_PROVIDER` without a config.json: the fetch went to opencode and the
+    // cache entry was filed under the other name, so the next run could not find it.
+    const pid = def.id;
     if (modelcache.read(io, env, arena, pid, url)) |e| {
         if (e.models.len > 0) {
             var out_buf: [4096]u8 = undefined;

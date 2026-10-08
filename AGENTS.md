@@ -3866,3 +3866,63 @@ sites — because a test at a construction site only proves somebody remembered 
 
 `attachEnv` exists as a function for the same reason. Two call sites, each an assignment
 that can be forgotten, is how a flag ends up read-only-off.
+
+---
+
+# `--models` could only ever describe opencode (2026-10-08)
+
+Found by giving zode a brand new OpenRouter key and running the obvious diagnostic.
+It printed opencode's catalogue.
+
+## Two bugs stacked, and the second one hid the first
+
+```zig
+const cfg = provider.Config.load(env);      // opencode's URLs, from the environment
+const key = envGet(env, "ZODE_API_KEY");    // the GENERIC key, never the provider's
+```
+
+`provider.Config.load` reads `ZODE_BASE_URL`/`ZODE_MODELS_URL`, whose defaults **are**
+opencode's. So with `ZODE_PROVIDER=openrouter` and `ZODE_OPENROUTER_KEY` set, `--models`
+asked opencode's catalogue with a key that opencode had never heard of, printed a stale
+cached answer, and said nothing at all about the provider the user had configured.
+
+Fixing the key alone would not have helped, and that is what makes it worth writing
+down: the SECOND bug was masking the first. There is a stage in this repo where
+`--models` with a working OpenRouter key still would have printed opencode's models, and
+the person testing it would have concluded the key was bad.
+
+## And the one underneath: it ran before the config was loaded
+
+`runModels` was dispatched at `main()` line ~707 and `loadUserConfig` at ~618 — in a
+different branch, so `--models` never reached it. `activeProviderDef` reads
+`cur_provider_id`, a module global that `loadUserConfig` is what sets, so at that point
+it was still `"opencode"` no matter what the environment said.
+
+**The lesson is the ordering, not the code.** The first fix (route through
+`activeProviderDef` + `providers.keyFor`, the same two functions the TUI and `--chat`
+use) changed nothing at all on its own, because the state those functions read had never
+been populated. A "use the right helper" fix that compiles, passes tests, and has no
+effect is worse than no fix: it reads as done.
+
+## Why this mattered more than a broken `--models`
+
+`--models` is the command you run **when a provider is not working**. A diagnostic that
+cannot name the provider you configured is not a diagnostic — it sends you to debug the
+key when the key is fine, and it does that silently and confidently, because the output
+is 468 lines of plausible-looking model names.
+
+It is the same class as the two this repo has already paid for: the headless prompt
+without the routing table, and the automatic typecheck existing only in the TUI. A second,
+lesser implementation of a thing the main path already gets right. Every time one shows
+up, the fix is the same shape: **make it go through the same function the main path uses**,
+so the next provider is right by construction rather than by remembering.
+
+## Verified against a real key, after the fix
+
+```
+--models              → 468 modelos (20 free), fetched live from OpenRouter
+--chat (texto)        →answered, 8091 prompt tokens
+--chat (con `read`)   → tool call, read, answer "244"; cache hit 36% → 72% on the
+                        second run, i.e. the tools prefix is being cached as designed
+roster-probe          → 8 free candidates, sorted, contexts and gate status per model
+```
