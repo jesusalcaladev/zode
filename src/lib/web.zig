@@ -534,24 +534,50 @@ pub fn excerpt(arena: std.mem.Allocator, text: []const u8, offset: usize, max_by
     }
     const rest = text[offset..];
     var out: std.ArrayList(u8) = .empty;
-    // Where this page starts, so a mid-document page cannot be mistaken for a
-    // document that begins mid-sentence.
-    if (offset > 0) {
-        out.print(arena, "[continuing at byte {d} of {d}]\n\n", .{ offset, text.len }) catch return "out of memory building the answer";
+
+    // Where this window ends, and whether it ends short. Computed BEFORE the
+    // header, because the header carries the continuation — see below.
+    const truncated = rest.len > max_bytes;
+    // The position the NEXT call should pass, absolute in the document: the model
+    // never has to do arithmetic on two different coordinate systems.
+    var at: usize = 0;
+    var cut: usize = 0;
+    if (truncated) {
+        // Cut at a line boundary: cutting in the middle of a word leaves garbage
+        // that the model keeps thinking is the end of the document.
+        cut = max_bytes;
+        while (cut > 0 and rest[cut] != '\n') cut -= 1;
+        if (cut < max_bytes / 2) cut = max_bytes; // page with no line breaks: hard cut
+        at = offset + cut;
     }
-    if (rest.len <= max_bytes) {
+
+    // The header, and it is written FIRST on purpose: it says where this window
+    // starts (so a mid-document page cannot be mistaken for a document that
+    // begins mid-sentence) and, when the window is short, which `offset` continues
+    // it.
+    //
+    // The continuation is in BOTH ends of the answer, and that is not redundancy
+    // for its own sake. The note at the end is where the eye lands at the cut;
+    // this line is the one that SURVIVES everything that trims a tool result
+    // afterwards — the subagent's 4 KB cap keeps the head, so with the promise
+    // only at the tail it was cut away and the model re-fetched the same first
+    // window forever. Every truncation scheme keeps the head.
+    if (offset > 0) {
+        if (truncated)
+            out.print(arena, "[continuing at byte {d} of {d}; pass offset={d} to continue]\n\n", .{ offset, text.len, at }) catch return "out of memory building the answer"
+        else
+            out.print(arena, "[continuing at byte {d} of {d}]\n\n", .{ offset, text.len }) catch return "out of memory building the answer";
+    } else if (truncated) {
+        // The leading 0 is where the window starts: the same coordinate system
+        // as the `offset` the model passes, so there is nothing to infer.
+        out.print(arena, "[page {d}-{d} of {d} bytes; pass offset={d} to continue]\n\n", .{ @as(usize, 0), at, text.len, at }) catch return "out of memory building the answer";
+    }
+
+    if (!truncated) {
         out.appendSlice(arena, rest) catch return "out of memory building the answer";
         return out.items;
     }
-    // Cut at a line boundary: cutting in the middle of a word leaves garbage
-    // that the model keeps thinking is the end of the document.
-    var cut = max_bytes;
-    while (cut > 0 and rest[cut] != '\n') cut -= 1;
-    if (cut < max_bytes / 2) cut = max_bytes; // page with no line breaks: hard cut
     out.appendSlice(arena, rest[0..cut]) catch return "out of memory building the answer";
-    // The position the NEXT call should pass, absolute in the document: the model
-    // never has to do arithmetic on two different coordinate systems.
-    const at = offset + cut;
     out.print(arena, "\n\n… (truncated at {d} of {d} bytes; pass offset={d} to continue)", .{ at, text.len, at }) catch {};
     return out.items;
 }
@@ -872,11 +898,42 @@ test "excerpt: the truncation note names the exact offset to continue" {
     // Cut at the line boundary: 10 bytes would end mid-word ("line o|ne" would
     // actually land inside "line two"), so the note's number is the byte the
     // page really stopped at — 8, right after "line one".
-    try std.testing.expect(std.mem.startsWith(u8, got, "line one"));
+    //
+    // This used to assert `startsWith(got, "line one")`. The window now opens
+    // with a header line carrying the continuation (see `excerpt`), so the
+    // assertion moved from "the text is first" to "the text is there, right
+    // after the header, in order" — which is what it was really about: nothing
+    // lost at the front.
+    try std.testing.expect(std.mem.indexOf(u8, got, "]\n\nline one") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "truncated at 8 of 29 bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "pass offset=8 to continue") != null);
     // The old note promised "a deeper request", a parameter that did not exist.
     try std.testing.expect(std.mem.indexOf(u8, got, "deeper request") == null);
+}
+
+test "excerpt: the continuation is at the TOP as well, where a cap cannot cut it" {
+    // The subagent caps every tool result at 4 KB and keeps the HEAD. With the
+    // promise only at the tail it was cut away, and the model re-fetched the same
+    // first window forever — a note nobody can read is not a note.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = "line one\nline two\nline three\n";
+    const got = excerpt(arena, text, 0, 10);
+    // The header is the FIRST line, before the content.
+    try std.testing.expect(std.mem.startsWith(u8, got, "[page 0-8 of 29 bytes; pass offset=8 to continue]"));
+    // And it survives any head-preserving cap: 512 bytes of it still carry the
+    // instruction, which is the whole point of putting it at the front.
+    const head = got[0..@min(got.len, 512)];
+    try std.testing.expect(std.mem.indexOf(u8, head, "pass offset=8 to continue") != null);
+    // A mid-document window says where it starts AND how to go on.
+    const mid = excerpt(arena, text, 8, 10);
+    try std.testing.expect(std.mem.startsWith(u8, mid, "[continuing at byte 8 of 29; pass offset=17 to continue]"));
+    // A window that reaches the end carries no promise it cannot keep.
+    const whole = excerpt(arena, text, 8, 100);
+    try std.testing.expect(std.mem.indexOf(u8, whole, "pass offset") == null);
+    try std.testing.expect(std.mem.startsWith(u8, whole, "[continuing at byte 8 of 29]"));
 }
 
 test "excerpt: a mid-document page says where it starts and continues without a gap" {
@@ -912,7 +969,10 @@ test "excerpt: a page with no line breaks is hard-cut, still at a whole offset" 
     const arena = arena_state.allocator();
 
     const got = excerpt(arena, "0123456789abcdef", 0, 8);
-    try std.testing.expect(std.mem.startsWith(u8, got, "01234567"));
+    // Same move as the test above: the window opens with its header now, so
+    // "the text is there" replaces "the text is first". What this test is about
+    // is the cut being at a WHOLE offset — 8, not 7 or 9 — and the note saying it.
+    try std.testing.expect(std.mem.indexOf(u8, got, "]\n\n01234567") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "pass offset=8 to continue") != null);
 }
 

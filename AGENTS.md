@@ -4186,3 +4186,91 @@ perfectly unit-tested and still do nothing when typed — that is how
 **Roadmap state**: priority 1 (selective permissions), 2 (web_fetch offset +
 Brave behind `ZODE_BRAVE_KEY`) and 3 (this section) are done. **Priority 4 is
 next: the ecosystem — custom slash commands and hooks.**
+
+---
+
+# The three "not done yet" items, and the cap that was eating the promise (2026-10-08)
+
+Asked for as three features: skills, `@file` mentions, and `web_fetch` paging.
+Two of the three were **already implemented and tested** — the roadmap sections
+earlier in this file still list them as pending, which is why they looked undone.
+Reading the code first is what kept this session from rebuilding them.
+
+| asked | state found | what was actually missing |
+|---|---|---|
+| skills (frontmatter, on-demand body) | done: `skills.zig` + `skillstore.zig`, the `skill` tool, the list in the prompt | nothing in the code; only a test that the BODY stays out of the composed prompt |
+| `@file` mentions in the user prompt | done: `withMentions` (TUI, on the wire view) and `main.zig` (headless) | nothing |
+| `web_fetch` range budget / offset | mechanism done (schema + `excerpt`) | the MODEL was never told, and the promise was cut off inside `task` |
+
+## 1. The routing table now says a fetch is a WINDOW
+
+`offset` existed and the truncation note named it, but both live in the tool's
+own output — read AFTER the first call. A rule about how to read a long page has
+to be read BEFORE it, so `tool_routing_prompt` carries it: window, `offset`,
+next window, "2-3 calls at ONE url", and never answering from the first window
+as if it were the page. Pinned by a test on the four needles (a rule with no
+test is a rule the next rewrite loses).
+
+## 2. The continuation moved to the TOP of the window
+
+`web.excerpt` now writes the header BEFORE the content, and when the window
+falls short it carries the instruction:
+
+```
+[page 0-16384 of 90112 bytes; pass offset=16384 to continue]
+```
+
+The note at the end stays (that is where the eye lands at the cut). The header
+is the one that **survives everything that trims a tool result afterwards**:
+every cap keeps the head, and `task` caps at 4 KB. With the promise only at the
+tail of a 16 KB result it was *always* cut, so a subagent re-fetched the same
+first window and reported the page as read when it had seen 4 KB of it.
+
+Cost of the header: ~60 bytes, and only when the window is actually short.
+
+## 3. `capResult`: the subagent's cut was a raw slice
+
+`res_text[0..4096]`, and three defects in one line:
+
+1. **Mid-line**, so a fragment was indistinguishable from a complete answer —
+   the exact failure every other cut in this repo reserves a notice for.
+2. **Mid-UTF-8**: a byte cut can land on a continuation byte, and the message
+   then carries invalid UTF-8 onto the wire.
+3. **It ate the tail of every "continue with X" note**, `pass offset=N` among
+   them (fixed from both sides: the note's twin now rides at the top).
+
+`subagent.capResult` cuts at a line boundary (falling back to a hard cut when a
+single line is the whole result), then walks back to a UTF-8 boundary, and appends
+`cut_notice` INSIDE the budget. Under the cap it returns the same slice — no
+copy, no allocation. Four tests, including the composition: an `excerpt` window
+capped by `capResult` still carries `pass offset=`.
+
+## 4. A test for what the skills design promises
+
+The design is "only name + description go into the prompt", and discovery tests
+proved discovery. The composition could still have been wrong (dropping the
+section, or inlining bodies), so the existing mtime test now also asserts, on
+`buildSystemPrompt` itself: the description is in, and a body token written into
+the `SKILL.md` is **not**. Asserting on the composed prompt and on the discovery
+are two different bugs.
+
+## Verification, honestly
+
+- `zig build test` → **803 tests: 802 pass, 0 fail, 1 skip** — and the skip was
+  read off the run's own output rather than assumed: `braveSearch for real`,
+  which skips by design with no `ZODE_BRAVE_KEY`. The other three live web tests
+  (`web_fetch for real`, `web_search for real`, and "the offset in the note is
+  the offset the next call takes") are all `OK`, so the paging round trip really
+  ran against example.com with the header change in place.
+- `tools/pty_smoke.py` → 22 checks OK. `tools/submodel_smoke.py` → OK.
+- **The live LLM E2E did NOT run**: the free-model daily quota on the key is
+  exhausted (`RateLimited` on two different `:free` models, retried). The
+  catalog still fetches (`--models` works), so it is the chat quota and not the
+  network. Skills and `@file` are therefore verified at the unit level (real
+  disk, real fixtures) and not through a real answer — which is the part that
+  cannot be faked, and it is a LIMITATION, not a pass.
+
+The lesson is the one this file already states twice: a test whose red state is
+"the provider said no" is a test people learn to ignore, so the suite does not
+assert on model output — and a session that cannot reach the model reports the
+gap instead of calling it verified.
