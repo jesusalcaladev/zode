@@ -134,17 +134,29 @@ think, web_fetch, web_search.
 
 ## The web tools: `web_fetch` and `web_search`
 
-- `web_fetch {url, max_bytes?}`: a GET with a browser `user-agent` and
+- `web_fetch {url, max_bytes?, offset?}`: a GET with a browser `user-agent` and
   `accept-encoding: identity`. The HTML is turned into text with `web.zig`; JSON
   or plain text pass through untouched. A 4xx/5xx returns status + body (which is
-  where the real reason is).
-- `web_search {query, max_results?}`: DuckDuckGo's `html/` endpoint (no key). It
-  is a scrape: `web.searchResults` gets the title, URL and snippet by the position
-  of its classes. When the HTML changes it returns a message saying so, NEVER an
-  empty list (which the model would read as "there are no results").
+  where the real reason is). **`offset` is a byte position into the EXTRACTED
+  text** (after HTML is stripped), and the truncation note names the exact number
+  to pass (`pass offset=16000 to continue`). The old note promised "a deeper
+  request" over a parameter that did not exist: the model re-asked, got the same
+  first page and took it for the whole document. The window is `web.excerpt`
+  (pure: header + line-boundary cut + note + past-the-end guard), tested with no
+  network.
+- `web_search {query, max_results?}`: **two engines, one contract.** The default
+  is DuckDuckGo's `html/` → `lite/` chain (no key; a scrape: `web.searchResults`
+  gets the title, URL and snippet by the position of its classes). With
+  `ZODE_BRAVE_KEY` set, Brave's real index answers first
+  (`GET /res/v1/web/search?q=…&count=…` + `X-Subscription-Token`) and the free
+  chain is the fallback — whichever answers, the model gets the same numbered
+  list and never has to know which engine it was. When the key cannot be used,
+  `[search note: …]` rides in FRONT of whatever the free chain returns, so a
+  wrong key is visible exactly while it is wrong and never once it works, and a
+  broken key degrades the search instead of stopping it.
 - `max_tool_output` (16 KB) is the default budget; hard cap 200 KB.
 
-Four things that cost something and have to be known:
+Six things that cost something and have to be known:
 
 1. **Explicit `accept-encoding: identity`.** `openRequest` sets
    `accept_encoding = .omit`, which is "do not send the header", and without it
@@ -162,9 +174,30 @@ Four things that cost something and have to be known:
    network tests (which are skipped without internet) are the ones that catch it.
 4. **The art cannot use `*` or `~`** (same reason as the banner:
    `markedSegments` eats them as style marks). The iris is `=` and the pupil `o`.
+5. **The Brave shape was verified against Brave's own artifacts before a line
+   was written**: their official agent skill (`brave/brave-search-skills` —
+   `web.results[]`), their reference Python client's models (`title: str`,
+   `url: str`, `description: str | None`, `count: int 1..20`, GET with query
+   params) and that client's 56 KB mock response, which IS the test fixture. A
+   test comparing zode's JSON against zode's own idea of the JSON proves
+   nothing; the live shape is checked by `braveSearch for real`, which fails on
+   a shape mismatch and skips without a key. `description` carries `<strong>`
+   marks and `&quot;`/`&#x27;` entities: `cleanText` strips and decodes them,
+   the same path the DDG list goes through. Only `q` and `count` are sent —
+   every optional parameter whose type was not verified costs a 422 per search.
+6. **The `lite/` fallback used to be unreachable in the cases it exists for.**
+   The chain returned on ANY non-2xx from `html/`, so a 403/500 there ended the
+   search without ever asking `lite/`: the fallback only worked when the first
+   endpoint answered 200 with an unknown layout. Now only a rate limit (202/429)
+   short-circuits — asking a rate-limiting engine twice in a row is what the
+   message tells the model not to do — and the results are parsed ONCE instead
+   of twice (`if (f(…).len > 0) return f(…)` walked the page twice per answer).
+   The explicit `freeBody` between the two requests is gone: the `defer` owns
+   it, and both together would be a double free the day `Http` stops using an
+   arena.
 
-`web.zig` is PURE (no network) on purpose: what always fails is parsing the HTML,
-and that is tested with fixtures.
+`web.zig` is PURE (no network) on purpose: what always fails is parsing the HTML
+or the JSON, and that is tested with fixtures.
 
 ## Context compaction (80% of the limit)
 

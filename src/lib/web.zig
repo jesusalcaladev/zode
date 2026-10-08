@@ -513,6 +513,130 @@ fn cleanText(arena: std.mem.Allocator, raw: []const u8) []const u8 {
     return std.mem.trim(u8, out.items, " \t\r\n");
 }
 
+// ── one page of a document ───────────────────────────────────────────
+
+/// One window of a document, with everything the model needs to page through it.
+///
+/// `web_fetch` always returned the BEGINNING of the text, and its truncation
+/// note promised "ask for the rest with a deeper request" — a parameter that did
+/// not exist anywhere in the schema. That is a promise the model cannot keep:
+/// it re-asks, gets the same first 16 KB, and reads that as the whole document.
+/// This is the parameter: `offset` is a byte position into THIS text, and the
+/// note names the exact `offset` to pass next, so continuing is one copy
+/// instead of a guess that usually lands mid-word.
+pub fn excerpt(arena: std.mem.Allocator, text: []const u8, offset: usize, max_bytes: usize) []const u8 {
+    if (offset >= text.len) {
+        return std.fmt.allocPrint(
+            arena,
+            "offset {d} is past the end: the extracted text is {d} bytes long. Start again with offset 0 (or omit it).",
+            .{ offset, text.len },
+        ) catch "offset is past the end of the document";
+    }
+    const rest = text[offset..];
+    var out: std.ArrayList(u8) = .empty;
+    // Where this page starts, so a mid-document page cannot be mistaken for a
+    // document that begins mid-sentence.
+    if (offset > 0) {
+        out.print(arena, "[continuing at byte {d} of {d}]\n\n", .{ offset, text.len }) catch return "out of memory building the answer";
+    }
+    if (rest.len <= max_bytes) {
+        out.appendSlice(arena, rest) catch return "out of memory building the answer";
+        return out.items;
+    }
+    // Cut at a line boundary: cutting in the middle of a word leaves garbage
+    // that the model keeps thinking is the end of the document.
+    var cut = max_bytes;
+    while (cut > 0 and rest[cut] != '\n') cut -= 1;
+    if (cut < max_bytes / 2) cut = max_bytes; // page with no line breaks: hard cut
+    out.appendSlice(arena, rest[0..cut]) catch return "out of memory building the answer";
+    // The position the NEXT call should pass, absolute in the document: the model
+    // never has to do arithmetic on two different coordinate systems.
+    const at = offset + cut;
+    out.print(arena, "\n\n… (truncated at {d} of {d} bytes; pass offset={d} to continue)", .{ at, text.len, at }) catch {};
+    return out.items;
+}
+
+// ── Brave (the configured engine) ────────────────────────────────────
+
+/// What a Brave answer body says, in the three things it can say.
+///
+/// The shape is verified against Brave's own artifacts and not from memory:
+/// their official agent skill documents `web.results[]`, their reference Python
+/// client models `title: str`, `url: str`, `description: str | None`, and its
+/// mock data — a real response, 56 KB — is what the tests below parse.
+pub const BraveAnswer = union(enum) {
+    /// The numbered list, rendered exactly like the free chain's. Non-empty.
+    results: []const u8,
+    /// Parsed fine and there was nothing there: an answer from a real index,
+    /// not a failure, and it must not be reported as one.
+    empty: void,
+    /// Not a body this build can act on: not JSON, an `{"error": …}` envelope,
+    /// or a shape without `web.results`. The server's own words when it had any —
+    /// "SUBSCRIPTION_TOKEN_INVALID: The provided subscription token is invalid."
+    /// is what the user needs to read, and "HTTP 422" alone says nothing.
+    unusable: ?[]const u8,
+};
+
+pub fn braveResults(arena: std.mem.Allocator, body: []const u8, max: usize) BraveAnswer {
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch
+        return .{ .unusable = null }; // an HTML challenge page, a proxy error, a truncated body
+    if (parsed.value != .object) return .{ .unusable = null };
+    const root = parsed.value.object;
+
+    if (root.get("error")) |e| {
+        const code = strField(e, "code");
+        const detail = strField(e, "detail");
+        var msg: ?[]const u8 = null;
+        if (code != null and detail != null) {
+            msg = std.fmt.allocPrint(arena, "{s}: {s}", .{ code.?, detail.? }) catch null;
+        } else if (detail != null) {
+            msg = detail;
+        } else if (code != null) {
+            msg = code;
+        }
+        return .{ .unusable = msg orelse "the server sent an error envelope without a message" };
+    }
+
+    const webv = root.get("web") orelse return .{ .unusable = "the answer has no `web` field this build knows" };
+    if (webv != .object) return .{ .unusable = "the answer's `web` field is not an object" };
+    const arrv = webv.object.get("results") orelse return .{ .unusable = "the answer has no `web.results` this build knows" };
+    if (arrv != .array) return .{ .unusable = "`web.results` is not an array" };
+    if (arrv.array.items.len == 0) return .{ .empty = {} };
+
+    var out: std.ArrayList(u8) = .empty;
+    var n: usize = 0;
+    for (arrv.array.items) |item| {
+        if (n >= max) break;
+        if (item != .object) continue;
+        const title = strField(item, "title") orelse continue;
+        const url = strField(item, "url") orelse continue;
+        const desc = strField(item, "description"); // `str | None` in Brave's own model
+        if (url.len == 0) continue;
+        const t = cleanText(arena, title);
+        if (t.len == 0) continue;
+        n += 1;
+        out.print(arena, "{d}. {s}\n   {s}\n", .{ n, t, url }) catch return .{ .unusable = "out of memory rendering the results" };
+        if (desc) |d| {
+            // `<strong>` highlight marks and `&quot;`/`&#x27;` entities: the same
+            // `cleanText` the DuckDuckGo list goes through, so both engines render
+            // the same list and the model never has to know which one answered.
+            const c = cleanText(arena, d);
+            if (c.len > 0) out.print(arena, "   {s}\n", .{c[0..@min(c.len, 400)]}) catch {};
+        }
+        out.append(arena, '\n') catch {};
+    }
+    if (n == 0) return .{ .empty = {} };
+    return .{ .results = out.items };
+}
+
+/// A string field of a JSON object value, or null when it is absent or not a string.
+fn strField(v: std.json.Value, key: []const u8) ?[]const u8 {
+    if (v != .object) return null;
+    const f = v.object.get(key) orelse return null;
+    if (f != .string) return null;
+    return f.string;
+}
+
 // ── tests ─────────────────────────────────────────────────────
 
 test "htmlToText removes script, style and tags" {
@@ -729,4 +853,175 @@ test "loopback is private but is NOT a credential endpoint" {
     try std.testing.expect(!isCredentialEndpoint("http://127.0.0.1:3000/"));
     try std.testing.expect(!isCredentialEndpoint("http://localhost:8080/"));
     try std.testing.expect(!isCredentialEndpoint("http://192.168.1.1/"));
+}
+
+test "excerpt: a page that fits is the text itself, verbatim" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("hello world", excerpt(arena, "hello world", 0, 100));
+}
+
+test "excerpt: the truncation note names the exact offset to continue" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = "line one\nline two\nline three\n"; // 29 bytes
+    const got = excerpt(arena, text, 0, 10);
+    // Cut at the line boundary: 10 bytes would end mid-word ("line o|ne" would
+    // actually land inside "line two"), so the note's number is the byte the
+    // page really stopped at — 8, right after "line one".
+    try std.testing.expect(std.mem.startsWith(u8, got, "line one"));
+    try std.testing.expect(std.mem.indexOf(u8, got, "truncated at 8 of 29 bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "pass offset=8 to continue") != null);
+    // The old note promised "a deeper request", a parameter that did not exist.
+    try std.testing.expect(std.mem.indexOf(u8, got, "deeper request") == null);
+}
+
+test "excerpt: a mid-document page says where it starts and continues without a gap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = "line one\nline two\nline three\n";
+    const got = excerpt(arena, text, 8, 100);
+    // A page starting mid-document must not read like a document that begins
+    // mid-sentence.
+    try std.testing.expect(std.mem.indexOf(u8, got, "[continuing at byte 8 of 29]") != null);
+    // Byte 8 is the newline that closed "line one": nothing lost, nothing repeated.
+    try std.testing.expect(std.mem.indexOf(u8, got, "\nline two\nline three\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "line one") == null);
+}
+
+test "excerpt: an offset past the end says so instead of panicking" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const got = excerpt(arena, "abc", 99, 10);
+    try std.testing.expect(std.mem.indexOf(u8, got, "offset 99 is past the end") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "3 bytes long") != null);
+    // And what to do about it, or the model retries the same number.
+    try std.testing.expect(std.mem.indexOf(u8, got, "offset 0") != null);
+}
+
+test "excerpt: a page with no line breaks is hard-cut, still at a whole offset" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const got = excerpt(arena, "0123456789abcdef", 0, 8);
+    try std.testing.expect(std.mem.startsWith(u8, got, "01234567"));
+    try std.testing.expect(std.mem.indexOf(u8, got, "pass offset=8 to continue") != null);
+}
+
+// The Brave fixtures below are TRIMMED FROM A REAL RESPONSE: the reference
+// client's `mock_data/web.json` (56 KB, 20 results), fetched 2026-10-08. The
+// shape was verified three ways before a line of this was written — Brave's
+// official agent skill (`web.results[]`), their reference Python client's
+// models (`title: str`, `url: str`, `description: str | None`), and that
+// response itself.
+
+test "braveResults: the real shape renders exactly like the free chain's list" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        \\{"type":"search","query":"hello world","web":{"type":"search","family_friendly":true,"results":[
+        \\{"title":"\"Hello, World!\" program - Wikipedia",
+        \\ "url":"https://en.wikipedia.org/wiki/%22Hello,_World!%22_program",
+        \\ "description":"A &quot;Hello, World!&quot; program is <strong>usually a simple computer program that emits a message.</strong> It illustrates a language&#x27;s basic syntax.",
+        \\ "page_age":"2024-12-27T15:49:55","profile":{"name":"Wikipedia"},"is_live":false,
+        \\ "deep_results":{"buttons":[{"type":"button_result","title":"History","url":"https://example.com/h"}]}},
+        \\{"title":"Hello World Computer Science","url":"https://www.helloworldcs.org/",
+        \\ "description":null,"thumbnail":{"src":"https://cdn.example.com/x.png"}}
+        \\]}}
+    ;
+    const got = braveResults(arena, body, 8);
+    try std.testing.expect(got == .results);
+    const out = got.results;
+
+    // The same numbered list the DuckDuckGo chain produces: the model must not
+    // have to know which engine answered.
+    try std.testing.expect(std.mem.indexOf(u8, out, "1. \"Hello, World!\" program - Wikipedia\n   https://en.wikipedia.org/wiki/%22Hello,_World!%22_program") != null);
+    // `<strong>` marks stripped and the entities decoded — the two things the
+    // live description is full of.
+    try std.testing.expect(std.mem.indexOf(u8, out, "<strong>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "&quot;") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "usually a simple computer program") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "language's basic syntax") != null);
+    // `description: null` loses the snippet line, not the result.
+    try std.testing.expect(std.mem.indexOf(u8, out, "2. Hello World Computer Science\n   https://www.helloworldcs.org/") != null);
+    // Exactly two URLs: no phantom entries out of the ignored fields.
+    var urls: usize = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "   https://")) urls += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), urls);
+}
+
+test "braveResults: zero results is an answer from a real index, not a failure" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = braveResults(arena, "{\"type\":\"search\",\"web\":{\"type\":\"search\",\"family_friendly\":true,\"results\":[]}}", 8);
+    try std.testing.expect(got == .empty);
+}
+
+test "braveResults: the error envelope keeps the server's own words" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The real 422 body, captured from api.search.brave.com on 2026-10-08.
+    const body =
+        \\{"error":{"code":"SUBSCRIPTION_TOKEN_INVALID","detail":"The provided subscription token is invalid.","meta":{"component":"authentication"},"status":422},"type":"ErrorResponse"}
+    ;
+    const got = braveResults(arena, body, 8);
+    try std.testing.expect(got == .unusable);
+    const msg = got.unusable orelse return error.ExpectedMessage;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "SUBSCRIPTION_TOKEN_INVALID") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "The provided subscription token is invalid.") != null);
+}
+
+test "braveResults: an HTML challenge page is unusable, never results" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const got = braveResults(arena, "<!doctype html><html><body>Just a moment…</body></html>", 8);
+    try std.testing.expect(got == .unusable);
+    try std.testing.expect(got.unusable == null);
+    // No message means "this is not JSON", which is all we can honestly say.
+}
+
+test "braveResults: a shape without web.results says which field is missing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const got = braveResults(arena, "{\"type\":\"search\",\"web\":{\"type\":\"search\"}}", 8);
+    try std.testing.expect(got == .unusable);
+    const msg = got.unusable orelse return error.ExpectedMessage;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "web.results") != null);
+}
+
+test "braveResults: max caps the list at whole results" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body =
+        \\{"web":{"results":[
+        \\{"title":"one","url":"https://a.example/","description":"d1"},
+        \\{"title":"two","url":"https://b.example/","description":"d2"},
+        \\{"title":"three","url":"https://c.example/","description":"d3"}]}}
+    ;
+    const got = braveResults(arena, body, 2);
+    try std.testing.expect(got == .results);
+    try std.testing.expect(std.mem.indexOf(u8, got.results, "2. two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.results, "three") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got.results, "3.") == null);
 }

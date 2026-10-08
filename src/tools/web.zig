@@ -58,6 +58,13 @@ pub fn toolWebFetch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocato
     if (common.getInt(obj, "max_bytes")) |mb| {
         if (mb > 0) max_bytes = @min(@as(usize, @intCast(mb)), web_hard_cap);
     }
+    // Where this window starts, in bytes of the EXTRACTED text (after HTML is
+    // stripped): the model sees the note's byte positions, so the offset it is
+    // told to pass and the offset it passes are counted from the same string.
+    var offset: usize = 0;
+    if (common.getInt(obj, "offset")) |o| {
+        if (o > 0) offset = @intCast(o);
+    }
 
     var h = http.Http.init(arena, io);
     defer h.deinit();
@@ -93,28 +100,21 @@ pub fn toolWebFetch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocato
     // releases it when this function returns, and the ArenaAllocator REUSES
     // that memory in the next allocation (the one from `client.deinit`'s pool, the
     // buffer's own growth…). The caller read `0xAA` where the JSON
-    // should have been. It goes through the truncation and the short path, and only with
-    // an arena: that is why it never showed up in the network tests.
-    var out: std.ArrayList(u8) = .empty;
-    if (text.len <= max_bytes) {
-        out.appendSlice(arena, text) catch return "out of memory building the answer";
-    } else {
-        // Cut at a line boundary: cutting in the middle of a word leaves
-        // garbage that the model keeps thinking is the end of the
-        // document.
-        var cut = max_bytes;
-        while (cut > 0 and text[cut] != '\n') cut -= 1;
-        if (cut < max_bytes / 2) cut = max_bytes; // page with no line breaks: hard cut
-        out.appendSlice(arena, text[0..cut]) catch return "out of memory building the answer";
-        out.print(arena, "\n\n… (truncated at {d} of {d} bytes; ask for the rest with a deeper request)", .{ cut, text.len }) catch {};
-    }
-    return out.items;
+    // should have been. `web.excerpt` appends into its own list, so the copy
+    // (and the offset window and the truncation note) all happen in one place,
+    // and only with an arena: that is why it never showed up in the network tests.
+    return web.excerpt(arena, text, offset, max_bytes);
 }
 
-/// `web_search`: DuckDuckGo results (`html/` endpoint, no API key).
+/// `web_search`: real search results, with two engines behind one contract.
 ///
-/// It is a scrape, and it will break the day they change one of the HTML classes.
-/// When that happens, the error says so (with the alternative) instead of returning an
+/// The default is DuckDuckGo (`html/` → `lite/`, a scrape, no key). With
+/// `ZODE_BRAVE_KEY` set the real index answers first and the free chain is the
+/// fallback. Whichever answers, the model gets the same numbered list — it does
+/// not have to know which engine it was.
+///
+/// The scrape will break the day they change one of the HTML classes. When that
+/// happens, the error says so (with the alternative) instead of returning an
 /// empty list, which the model would interpret as "there are no results".
 pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const query = common.getStr(obj, "query") orelse
@@ -127,6 +127,126 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
         if (mr > 0) max_results = @min(@as(usize, @intCast(mr)), 20);
     }
 
+    // A real index when the user has one: `ZODE_BRAVE_KEY` turns it on, and the
+    // free DuckDuckGo chain stays both the default (a tool that needs a signup to
+    // work at all does not work) and the fallback (a configured-but-broken key
+    // must not break a tool that otherwise works). When Brave fails its reason
+    // rides in front of whatever the free chain answers, so a wrong key is
+    // visible exactly while it is wrong and never once it works.
+    var engine_note: []const u8 = "";
+    if (braveKey()) |key| {
+        switch (braveSearch(io, arena, key, q, max_results)) {
+            .done => |r| return r,
+            .fell_back => |why| engine_note = why,
+        }
+    }
+    return withNote(arena, engine_note, freeChain(io, arena, q, max_results));
+}
+
+/// The key that turns on Brave's real index, when the user has one.
+fn braveKey() ?[]const u8 {
+    const v = agent.environ_global orelse return null;
+    const k = v.get("ZODE_BRAVE_KEY") orelse return null;
+    return if (k.len == 0) null else k;
+}
+
+/// One Brave attempt, and what it means for the rest of the search.
+const BraveOutcome = union(enum) {
+    /// Brave answered: the search is over (the list, or an honest "nothing
+    /// there" from a real index).
+    done: []const u8,
+    /// Brave could not answer, and this is why. The free chain runs; if THAT
+    /// fails too, the message carries both reasons.
+    fell_back: []const u8,
+};
+
+/// `GET https://api.search.brave.com/res/v1/web/search?q=…&count=…`, the same
+/// call Brave's reference clients make (their Python client sends these two as
+/// query params with the `X-Subscription-Token` header).
+///
+/// Only `q` and `count` are sent: every optional parameter whose type has not
+/// been verified costs a 422 on every search, and `description` comes back with
+/// `<strong>` highlight marks either way — the parser strips them, so no
+/// parameter is needed for cleanliness either.
+fn braveSearch(io: std.Io, arena: std.mem.Allocator, key: []const u8, q: []const u8, max_results: usize) BraveOutcome {
+    var url_buf: [1024]u8 = undefined;
+    var uw: std.Io.Writer = .fixed(&url_buf);
+    uw.writeAll("https://api.search.brave.com/res/v1/web/search?q=") catch return .{ .fell_back = "the search API (ZODE_BRAVE_KEY): query too long" };
+    percentEncodeQuery(q, &uw) catch return .{ .fell_back = "the search API (ZODE_BRAVE_KEY): query too long" };
+    // `count` is an integer 1..20 in Brave's own request model.
+    uw.print("&count={d}", .{@min(@max(max_results, 1), 20)}) catch return .{ .fell_back = "the search API (ZODE_BRAVE_KEY): query too long" };
+    const url = uw.buffered();
+
+    var h = http.Http.init(arena, io);
+    defer h.deinit();
+
+    const res = h.getWithHeaders(url, &braveHeaders(key)) catch |err| {
+        return .{ .fell_back = std.fmt.allocPrint(
+            arena,
+            "the search API (ZODE_BRAVE_KEY) could not be reached: {t}",
+            .{err},
+        ) catch "the search API (ZODE_BRAVE_KEY) could not be reached" };
+    };
+    defer h.freeBody(res.body);
+
+    if (res.status < 200 or res.status >= 300) {
+        // The error envelope carries the real reason
+        // ("SUBSCRIPTION_TOKEN_INVALID: The provided subscription token is
+        // invalid."); a bare HTTP 422 sends the user to debug the wrong thing.
+        var detail: []const u8 = "";
+        switch (web.braveResults(arena, res.body, 1)) {
+            .unusable => |m| {
+                if (m) |mm| detail = mm;
+            },
+            else => {},
+        }
+        const note = if (detail.len > 0)
+            std.fmt.allocPrint(arena, "the search API (ZODE_BRAVE_KEY) answered HTTP {d}: {s}", .{ res.status, detail }) catch "the search API answered with an error"
+        else
+            std.fmt.allocPrint(arena, "the search API (ZODE_BRAVE_KEY) answered HTTP {d}", .{res.status}) catch "the search API answered with an error";
+        return .{ .fell_back = note };
+    }
+
+    return switch (web.braveResults(arena, res.body, max_results)) {
+        .results => |r| .{ .done = r },
+        // A real index saying "nothing" is a real answer. Falling through to the
+        // scrape would trade an authoritative answer for a guess, and reporting
+        // it as "the HTML did not match" would send the model off to rephrase a
+        // query that was answered fine.
+        .empty => .{ .done = std.fmt.allocPrint(
+            arena,
+            "no results for \"{s}\": the search index (ZODE_BRAVE_KEY) answered with none. That is not \"nothing exists on the internet\" — rephrase the query, or fetch a URL you already know with web_fetch.",
+            .{q},
+        ) catch "no results; rephrase the query or fetch a URL you know" },
+        .unusable => |m| .{ .fell_back = if (m) |mm|
+            std.fmt.allocPrint(arena, "the search API (ZODE_BRAVE_KEY) answered with something this build cannot read: {s}", .{mm}) catch "the search API answered with something unreadable"
+        else
+            "the search API (ZODE_BRAVE_KEY) answered with something this build cannot read (not JSON, or a shape it does not know)" },
+    };
+}
+
+/// Brave's headers: the token, JSON, and the same `identity` encoding everything
+/// here asks for (std does not decompress; see `browserHeaders`).
+pub fn braveHeaders(key: []const u8) [4]http.Http.ExtraHeader {
+    return .{
+        .{ .name = "user-agent", .value = web.user_agent },
+        .{ .name = "accept", .value = "application/json" },
+        .{ .name = "accept-encoding", .value = "identity" },
+        .{ .name = "x-subscription-token", .value = key },
+    };
+}
+
+/// The Brave failure, in front of whatever the free chain produced (its results
+/// or its own failure), so "search worked while silently ignoring my key" cannot
+/// happen. It is only ever non-empty while a configured key is being bypassed —
+/// exactly while the user needs to see it, and never once the key works.
+fn withNote(arena: std.mem.Allocator, note: []const u8, body: []const u8) []const u8 {
+    if (note.len == 0) return body;
+    return std.fmt.allocPrint(arena, "[search note: {s}]\n\n{s}", .{ note, body }) catch body;
+}
+
+/// The free chain: DuckDuckGo's `html/`, then its `lite/`. No key required.
+fn freeChain(io: std.Io, arena: std.mem.Allocator, q: []const u8, max_results: usize) []const u8 {
     // DDG's `html/` endpoint is the one that asks for neither JS nor a key. The query goes
     // percent-encoded with `std.Uri`'s encoder (by hand people forget the `&` and
     // the `+`, and the search reaches the server in pieces).
@@ -143,18 +263,27 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
     defer h.deinit();
 
     const res = h.getWithHeaders(url, &browserHeaders()) catch |err| {
-        return std.fmt.allocPrint(arena, "error searching \"{s}\": {t}", .{ q, err });
+        return std.fmt.allocPrint(arena, "error searching \"{s}\": {t}", .{ q, err }) catch "error: the search could not be reached";
     };
+    // Freed once, at the end: an explicit `freeBody` here AND this defer would
+    // be a double free the day Http stops using an arena.
     defer h.freeBody(res.body);
 
-    if (res.status < 200 or res.status >= 300) {
-        return engineRefused(arena, q, res.status);
-    }
+    // A RATE LIMIT is the only refusal that ends the chain here: `lite/` is the
+    // same engine, and asking it a second time in a row is what the message
+    // tells the model not to do. Every OTHER refusal (403, 500…) says nothing
+    // about `lite/`, which is a different page — before this, a 403 from `html/`
+    // ended the search without ever asking `lite/`, so the fallback only worked
+    // when the first endpoint answered 200 with a layout this build did not know,
+    // which is the case it was written for.
+    if (res.status == 202 or res.status == 429) return engineRefused(arena, q, res.status);
 
-    if (web.searchResults(arena, res.body, max_results).len > 0) {
-        return web.searchResults(arena, res.body, max_results);
+    if (res.status >= 200 and res.status < 300) {
+        // Parse ONCE: the old `if (searchResults(…).len > 0) return searchResults(…)`
+        // walked the same page twice to produce one list.
+        const found = web.searchResults(arena, res.body, max_results);
+        if (found.len > 0) return found;
     }
-    h.freeBody(res.body);
 
     // SECOND ENDPOINT, and this is the whole improvement: `html/` answering 200
     // with a layout we do not know used to be the end of the road, and the model
@@ -168,7 +297,7 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
     const url2 = lite_w.buffered();
 
     const res2 = h.getWithHeaders(url2, &browserHeaders()) catch |err| {
-        return std.fmt.allocPrint(arena, "error searching \"{s}\": {t} (and the fallback endpoint could not be reached either)", .{ q, err });
+        return std.fmt.allocPrint(arena, "error searching \"{s}\": {t} (and the fallback endpoint could not be reached either)", .{ q, err }) catch "error: neither search endpoint could be reached";
     };
     defer h.freeBody(res2.body);
     // The status is carried into the message instead of being dropped. Before, a
@@ -178,9 +307,8 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
     // date.
     if (res2.status < 200 or res2.status >= 300) return engineRefused(arena, q, res2.status);
 
-    if (web.liteSearchResults(arena, res2.body, max_results).len > 0) {
-        return web.liteSearchResults(arena, res2.body, max_results);
-    }
+    const found2 = web.liteSearchResults(arena, res2.body, max_results);
+    if (found2.len > 0) return found2;
     return searchFailed(arena, q);
 }
 
@@ -510,4 +638,136 @@ test "web_fetch refuses loopback, and a public URL is not touched" {
     // And `isHttpUrl` still accepts a public one, so the guard is not just "refuse all".
     try std.testing.expect(isHttpUrl("https://example.com/"));
     try std.testing.expect(!web.isPrivateHost("https://example.com/"));
+}
+
+test "web_fetch's schema carries the paging parameter the truncation note promises" {
+    // The note says "pass offset=N" — if the parameter is not in the schema the
+    // model cannot pass it, and the promise is a lie it will believe: it re-asks,
+    // gets the same first page, and reads that as the whole document.
+    const js = dispatch.toolsJson();
+    const at = std.mem.indexOf(u8, js, "\"web_fetch\"").?;
+    const end = std.mem.indexOfPos(u8, js, at, "\"web_search\"").?;
+    const this_tool = js[at..end];
+    try std.testing.expect(std.mem.indexOf(u8, this_tool, "\"offset\":{\"type\":\"integer\"") != null);
+    // The old wording that promised a "deeper request" is gone.
+    try std.testing.expect(std.mem.indexOf(u8, this_tool, "deeper request") == null);
+    // And the note's own vocabulary is the schema's vocabulary.
+    try std.testing.expect(std.mem.indexOf(u8, this_tool, "pass the value the truncation note names") != null);
+}
+
+test "braveKey: one variable picks the engine, and an empty value is no key" {
+    const saved = agent.environ_global;
+    defer agent.environ_global = saved;
+
+    agent.environ_global = null;
+    try std.testing.expect(braveKey() == null);
+
+    {
+        var map = std.process.Environ.Map.init(std.testing.allocator);
+        defer map.deinit();
+        try map.put("ZODE_BRAVE_KEY", "");
+        agent.environ_global = &map;
+        // An empty value must not open the code path: it would send an empty
+        // token header and fall back with a confusing note on EVERY search.
+        try std.testing.expect(braveKey() == null);
+    }
+    agent.environ_global = null;
+
+    {
+        var map = std.process.Environ.Map.init(std.testing.allocator);
+        defer map.deinit();
+        try map.put("ZODE_BRAVE_KEY", "BSA-test-key");
+        agent.environ_global = &map;
+        try std.testing.expectEqualStrings("BSA-test-key", braveKey().?);
+    }
+    agent.environ_global = null;
+}
+
+test "braveSearch for real: the parser matches the live response shape" {
+    // Only for machines with a key configured; without one there is nothing to
+    // verify, and a test that always skips says nothing.
+    const key = braveKey() orelse return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    switch (braveSearch(std.testing.io, arena, key, "zig programming language", 5)) {
+        .done => |r| {
+            // A live answer is a list or the honest empty message — never
+            // "something this build cannot read", which would mean the verified
+            // shape is wrong and every configured search would say so.
+            try std.testing.expect(r.len > 0);
+            try std.testing.expect(std.mem.indexOf(u8, r, "cannot read") == null);
+        },
+        .fell_back => |why| {
+            // A SHAPE failure is a bug and must fail here. Transport and auth
+            // (offline, spent key) are the machine's state, not the code's.
+            if (std.mem.indexOf(u8, why, "cannot read") != null) {
+                std.debug.print("brave response shape mismatch: {s}\n", .{why});
+                return error.ShapeMismatch;
+            }
+            return error.SkipZigTest;
+        },
+    }
+}
+
+test "web_fetch for real: the offset in the note is the offset the next call takes" {
+    // The whole point of the parameter: the note hands the model a number and the
+    // next call has to accept exactly that number. A note whose number the schema
+    // cannot accept is the false promise this feature was built to remove.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out1 = dispatch.execute(std.testing.io, "web_fetch", "{\"url\":\"https://example.com/\",\"max_bytes\":60}", arena, null, null) catch |err| {
+        if (isNetError(err)) return error.SkipZigTest;
+        return err;
+    };
+    const marker = "pass offset=";
+    const at = std.mem.indexOf(u8, out1, marker) orelse
+        // No note means example.com's text fit in 60 bytes (it has not for years)
+        // — nothing to page, nothing proven: skip rather than fail on a fixture.
+        return error.SkipZigTest;
+    var end = at + marker.len;
+    while (end < out1.len and std.ascii.isDigit(out1[end])) end += 1;
+    const n = try std.fmt.parseInt(usize, out1[at + marker.len .. end], 10);
+
+    const args = try std.fmt.allocPrint(arena, "{{\"url\":\"https://example.com/\",\"max_bytes\":60,\"offset\":{d}}}", .{n});
+    const out2 = dispatch.execute(std.testing.io, "web_fetch", args, arena, null, null) catch |err| {
+        if (isNetError(err)) return error.SkipZigTest;
+        return err;
+    };
+    const header = try std.fmt.allocPrint(arena, "[continuing at byte {d} of ", .{n});
+    try std.testing.expect(std.mem.indexOf(u8, out2, header) != null);
+    // The second window is the second window, not the first page again.
+    try std.testing.expect(!std.mem.startsWith(u8, out2, out1[0..@min(20, out1.len)]));
+}
+
+test "a configured key that cannot be used never breaks the search, and says so" {
+    const saved = agent.environ_global;
+    defer agent.environ_global = saved;
+
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZODE_BRAVE_KEY", "BSA-this-key-is-not-real");
+    agent.environ_global = &map;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var obj: std.json.ObjectMap = .{};
+    try obj.put(arena, "query", .{ .string = "zig programming language" });
+    const out = try toolWebSearch(std.testing.io, obj, arena);
+
+    // Whatever happened to the network — a 422 from the API or a dead cable —
+    // the note is in front and the free chain's answer follows it. The tool
+    // produces output in every case: a broken key degrades the search, it does
+    // not stop it.
+    try std.testing.expect(std.mem.startsWith(u8, out, "[search note: "));
+    // And the reason names the variable the user has to go fix, or they debug
+    // the engine instead of the key.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ZODE_BRAVE_KEY") != null);
+    // This one is reachable offline too (the note becomes "could not be
+    // reached"), so it never skips and never lies.
 }
