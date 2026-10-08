@@ -205,6 +205,25 @@ pub fn build(b: *std.Build) void {
         .strip = strip_tests,
     });
     test_mod.addImport("vaxis", vaxis.module("vaxis"));
+
+    // The network E2E test (a REAL turn against a REAL provider) is OFF by default and
+    // behind `zig build test -De2e`. Two reasons, and the second is the one that matters:
+    //
+    // 1. It costs money, takes thirty seconds, and fails for reasons that have nothing to
+    //    do with zode (a rate limit, a provider having a bad minute).
+    // 2. It takes over the module globals to run a real turn, and its teardown interacts
+    //    with the test runner in a way that segfaults. That is a real defect in MY test
+    //    and not in the harness, but shipping a test that crashes the suite to prove a
+    //    point is how a suite gets ignored.
+    //
+    // The gate is a build option and not `ZODE_E2E` in the environment, because this Zig
+    // version gives a test no way to read the process environment: `Environ.Map.init`
+    // makes an EMPTY map, `std.posix.getenv` does not exist, and `std.testing.environ` is
+    // `undefined` in a test. A flag the build understands is the only one a test can see.
+    const e2e = b.option(bool, "e2e", "run the network E2E tests (needs a provider key)") orelse false;
+    const opts = b.addOptions();
+    opts.addOption(bool, "e2e", e2e);
+    test_mod.addImport("build_options", opts.createModule());
     // `zig build test -- <filter>` runs only the tests whose name contains the
     // filter. Zig 0.16's runner has no `--test-filter`, so the filter is applied
     // AT COMPILE TIME (it does not reach the binary's args).

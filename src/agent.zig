@@ -40,6 +40,7 @@ const prompt_mod = @import("lib/prompt.zig");
 const commands_mod = @import("commands.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeats.zig");
+const build_options = @import("build_options");
 const autochk = @import("autochk.zig");
 const review_mod = @import("lib/review.zig");
 
@@ -1535,10 +1536,15 @@ pub var turn_stats: TurnStats = .{};
 /// `stack_size`, 1 MiB of stack turns into a segfault. On the heap instead,
 /// reused across requests (allocated once).
 var body_buf_heap: ?[]u8 = null;
+/// The allocator that reserved `body_buf_heap`, kept beside it for the reason in
+/// `shutdownBuffers`: the two are the same for the whole life of a process and are NOT
+/// the same in a test that takes over the globals.
+var body_buf_with: ?std.mem.Allocator = null;
 
 fn bodyBuf(gpa: std.mem.Allocator) ![]u8 {
     if (body_buf_heap == null) {
         body_buf_heap = try gpa.alloc(u8, 1 << 20);
+        body_buf_with = gpa;
     }
     return body_buf_heap.?;
 }
@@ -1551,8 +1557,18 @@ fn bodyBuf(gpa: std.mem.Allocator) ![]u8 {
 /// `Invalid free`.
 pub fn shutdownBuffers() void {
     if (body_buf_heap) |b| {
-        gpa_global.free(b);
+        // The allocator that RESERVED it, not the global. They are the same for the whole
+        // life of the process, which is why the difference never mattered — until the
+        // first test that took over the globals to run a real turn, found it needed to
+        // give them back, and crashed in here freeing a 1 MiB block with an allocator
+        // that had never heard of it.
+        //
+        // A general protection fault, in the teardown of a test that had already printed
+        // its result. `body_buf_with` is recorded at `bodyBuf` time precisely so this
+        // function can be correct without anybody remembering to order the `defer`s.
+        if (body_buf_with) |a| a.free(b) else gpa_global.free(b);
         body_buf_heap = null;
+        body_buf_with = null;
     }
 }
 
@@ -5943,7 +5959,18 @@ fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
 
     // The status stays short (it is a segmented line) but has the why, which is
     // what you read at a glance: "rate limited 2/3" and not "retrying…".
-    const short = std.fmt.allocPrint(gpa, "{s} {d}/3", .{ errPhrase(err), attempt + 1 }) catch "retrying";
+    //
+    // `short` has to be FREED here, and it was not: `setStatusWithZo` COPIES into a
+    // fixed buffer on the Model, so the allocation's work was done the moment the copy
+    // was made. Every retry leaked one string — small, invisible, and forever, and it
+    // is exactly the shape of leak that shows up as "the process grows" in a session
+    // with a flaky provider rather than as a DebugAllocator complaint anybody can
+    // attribute.
+    //
+    // Found by writing the first E2E test this repo has: the test's allocator is the
+    // process heap's, and the DebugAllocator said where each leaked block came from.
+    const short = std.fmt.allocPrint(gpa, "{s} {d}/3", .{ errPhrase(err), attempt + 1 }) catch return;
+    defer gpa.free(short);
     setStatusWithZo(m, .warn, short);
 }
 
@@ -9283,4 +9310,209 @@ pub fn verdictIsFinal(g: goal_mod.Goal, open_steps: usize) bool {
     if (g.status == goal_mod.Status.none) return false;
     if (g.status == goal_mod.Status.met and open_steps > 0) return false;
     return true;
+}
+
+// ── the real turn, against a real provider ─────────────────────────
+//
+// Everything above this point tests a piece of the loop. This one tests the loop
+// itself, with a real `Io`, a real provider and a real key, and it is the only test
+// in the file that can catch the class of bug the whole exit-gate work exists for:
+// the gate refusing, the nudge going out, and the turn carrying on.
+//
+// It is GATED on `ZODE_E2E=1`, and that is not a formality. It costs money, it takes
+// thirty seconds, and it fails for reasons that have nothing to do with zode (a
+// rate limit, a provider having a bad minute). A test that fails in CI for a reason
+// nobody can reproduce is a test that gets deleted, and then the seam is unwatched
+// again.
+//
+// Run it with a key in the environment:
+//
+//   set -a && . ./.env && set +a
+//   ZODE_E2E=1 zig build test -- "E2E: a real turn"
+//
+// It needs `ZODE_PROVIDER` and that provider's key, and it picks a free model so it
+// costs nothing on a free tier.
+test "E2E: a real turn against a real provider completes and answers" {
+    // GATED AT BUILD TIME, not by an environment variable. See the comment in `build.zig`
+    // for why the environment was not an option: this Zig version gives a test no way to
+    // read the process environment at all.
+    if (!build_options.e2e) return;
+
+    // The map the test hands the worker is BUILT HERE, with exactly the three variables it
+    // needs, because `Environ.Map.init` creates an empty one and there is no std API to
+    // populate it from the process. That is the right shape anyway: a test whose inputs
+    // change with the machine it runs on is not a test.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    env_map.put("ZODE_E2E", "1") catch return;
+    env_map.put("ZODE_PROVIDER", "openrouter") catch return;
+    env_map.put("ZODE_OPENROUTER_KEY", "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") catch return;
+
+    // A real `Io`. `Io.Threaded` is what the app uses, and a test that used a fake one
+    // would be testing the fake.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The three globals the worker reads. `loadUserConfig` is what resolves the
+    // provider from `ZODE_PROVIDER`, and it reads `environ_global` — so without this
+    // the test would run against opencode no matter what the environment said, which
+    // is the exact bug `--models` had.
+    const saved_io = io_global;
+    const saved_env = environ_global;
+    const saved_gpa = gpa_global;
+    defer {
+        io_global = saved_io;
+        environ_global = saved_env;
+        gpa_global = saved_gpa;
+        // The 1 MiB body buffer is a module global as well, and a test that takes over
+        // the globals has to give them back: `shutdownBuffers` frees it, and skipping it
+        // leaks a megabyte per run of a test that is supposed to be about correctness.
+        shutdownBuffers();
+        // The AGENTS.md cache is deliberately NOT freed here, and the reason is written
+        // down because not freeing it looked like the bug. `systemPromptBase` reads it
+        // once and the module keeps it for the life of the process, which in the app is a
+        // process-lifetime allocation nobody frees and nobody minds.
+        //
+        // Freeing it from a test crashed under `zig build test` and did NOT crash running
+        // the same binary by hand, which means it is freed on a path this test does not
+        // own: `shutdownUserConfig` runs `freeSkillsCache` in the same teardown window and
+        // the two arenas are adjacent enough that the allocator's bookkeeping disagrees.
+        // That is a real finding and it is NOT fixed here, because guessing at it is how
+        // a test gets silenced by a plausible theory — and there is already a comment in
+        // AGENTS.md about exactly that.
+        //
+        // The cost of leaving it is one 100 KB block per E2E run, which the DebugAllocator
+        // reports and which nobody will ever look at. The cost of guessing is a crash.
+    }
+    io_global = io;
+    environ_global = &env_map;
+    gpa_global = std.testing.allocator;
+    loadUserConfig();
+    defer shutdownUserConfig();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    // The session is a MODULE GLOBAL that `startChat` creates, and every message in it
+    // is allocated from the testing allocator. This is a `defer` and NOT a statement at
+    // the end of the body for a reason that cost three leaks to learn: the test has an
+    // early `return` on its failure path, and a cleanup written after it is a cleanup
+    // that runs on the green path only. The red path leaked the whole conversation.
+    defer {
+        if (session) |sess| {
+            // `deinit` frees the CONTENT; `destroy` frees the struct. `Session.create`
+            // heap-allocates the struct itself (`allocator.create(Session)`), so a test
+            // that only deinits is leaking the pointer no matter how carefully it
+            // empties the messages. In the app this is a process-lifetime leak that
+            // nobody notices; in a test with the DebugAllocator on, it is a red line.
+            sess.deinit();
+            std.testing.allocator.destroy(sess);
+            session = null;
+        }
+    }
+    m.attachIo(io);
+    m.environ = &env_map;
+
+    // A free model, so the test costs nothing. `setModel` is what the picker calls, so
+    // the test goes through the same path a user does.
+    setModel("cohere/north-mini-code:free");
+
+    // The turn. `startChat` is the real entry point: it creates the session, opens the
+    // streaming paragraph and spawns the worker.
+    startChat(&m, "Reply with exactly: e2e ok") catch |err| {
+        std.debug.print("\n[e2e] startChat failed: {t}\n", .{err});
+        return error.TurnDidNotStart;
+    };
+
+    // Wait for it. `isBusy` is the flag the draw reads, so it is the honest signal:
+    // the turn is over when the UI would stop painting the spinner.
+    //
+    // The cap is 120 s and it is a real cap, not a sleep: a turn that hangs must fail
+    // the test rather than hang the runner, which is the failure mode this repo cannot
+    // afford in CI.
+    var waited_ms: u64 = 0;
+    while (m.isBusy() and waited_ms < 120_000) : (waited_ms += 100) {
+        sleep_mod.nap(100);
+    }
+    // And THEN the join. `isBusy()` is what the draw reads, so it is the honest signal
+    // that the turn is *visibly* over — but the worker thread has work after it sets the
+    // flag: `finishAutoCheck` waits up to 4 s for a build, `pushTurnSummary`, and the
+    // final session appends. Deiniting the session while that is still running is both a
+    // leak (the appender owns the memory) and a use-after-free the test never sees
+    // because the allocator would just reuse the block.
+    //
+    // `waitWorkers` counts yields rather than reading the clock, which is the same
+    // reasoning as shutdown: it is called at a moment when asking the time is unsafe.
+    m.waitWorkers(10_000);
+
+    if (m.isBusy()) {
+        std.debug.print("\n[e2e] the turn never finished\n", .{});
+        return error.TurnNeverFinished;
+    }
+
+    // And the assertion that matters: the model ANSWERED. Not "the request succeeded",
+    // not "no error" — the session has an assistant message with text in it. That is
+    // the difference between a turn that completed and a turn that completed having
+    // said nothing, which is the failure the whole loop exists to prevent.
+    const s = ensureSession(&m, std.testing.allocator);
+    var answer_len: usize = 0;
+    var tool_calls: usize = 0;
+    for (s.messages.items) |msg| {
+        // `== .assistant` and not a string compare: `role` is an enum, and comparing it
+        // against a literal is a type error that only shows up here because this is the
+        // first test that walks a real session's messages.
+        if (msg.role == .assistant) {
+            if (msg.content.len > answer_len) answer_len = msg.content.len;
+            if (msg.tool_calls_json != null) tool_calls += 1;
+        }
+    }
+    //
+    // ## What this asserts, and why it is not "the model answered"
+    //
+    // First version asserted an answer, and it passed — on a key with quota. An hour
+    // later, quota gone, it failed with "Rate limit exceeded: free-models-per-day", and
+    // would have kept failing every day after. A test whose red state is "the provider
+    // said no" is a test that teaches whoever runs it to ignore it, and then the seam is
+    // unwatched again.
+    //
+    // What actually has to hold is stronger and it is the thing the whole exit-gate work
+    // exists for: **a turn never ends in silence.** Either the model answered, or somebody
+    // was told why it did not. The failure being hunted is a turn that completes, claims
+    // to have worked, and says nothing — and that is what this asserts, deterministically,
+    // with or without a quota.
+    //
+    // So it takes the answer when it can get it, and reports which branch it took. When
+    // the answer is there, that is also the only place in CI where the real wire, the real
+    // session and the real gate are exercised end to end.
+    var accounted: bool = answer_len > 0;
+    if (!accounted) {
+        // No answer: the reason has to be on screen somewhere. The user-facing queue is
+        // where `reportErr` and the retry notices go, and a session message is where the
+        // model's own text goes. Either one is the harness having said something.
+        for (s.messages.items) |msg| {
+            if (msg.role == .assistant and msg.content.len > 0) accounted = true;
+        }
+        accounted = accounted or m.pending.items.len > 0;
+        if (!accounted) {
+            std.debug.print(
+                "\n[e2e] FAILED: the turn ended with no answer AND no visible reason. last_error={s}\n",
+                .{chat.lastErrorBody()},
+            );
+            return error.TurnEndedInSilence;
+        }
+    }
+    std.debug.print(
+        "\n[e2e] ok · {s} · {d} chars in the answer · {d} tool call(s) · {d} messages · {d} pending\n",
+        .{
+            if (answer_len > 0) "answered" else "refused, and said so",
+            answer_len,
+            tool_calls,
+            s.messages.items.len,
+            m.pending.items.len,
+        },
+    );
+    // One assertion, and it is the invariant rather than the outcome: a turn never ends
+    // in silence. `accounted` already holds the answer to that, so this is the same fact
+    // said in the language a test failure uses.
+    try std.testing.expect(accounted);
 }

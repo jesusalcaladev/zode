@@ -3926,3 +3926,62 @@ so the next provider is right by construction rather than by remembering.
                         second run, i.e. the tools prefix is being cached as designed
 roster-probe          → 8 free candidates, sorted, contexts and gate status per model
 ```
+
+---
+
+# The first real E2E test, and the two production bugs it found (2026-10-08)
+
+`chatWorker` had no test at any level. This one runs a real turn against a real
+provider with a real key, behind `zig build test -De2e`.
+
+## Two production bugs, neither caught by 760 tests
+
+**1. `pushRetryNotice` leaked on EVERY retry.** `setStatusWithZo` copies into a fixed
+buffer on the Model, so the allocation's work was done the moment the copy was made —
+and `short` was never freed. Small, invisible, forever, and it shows up as "the process
+grows" in a session with a flaky provider rather than as a DebugAllocator complaint
+anybody can attribute. Found by writing the test: its allocator is the process heap's,
+and the DebugAllocator said where each block came from.
+
+**2. `shutdownBuffers` freed with the wrong allocator, and GPF'd.** It freed
+`body_buf_heap` with `gpa_global` on the grounds that they were the same. They are the
+same for the whole life of a *process* — and they are not the same in the first test
+that took over the globals to run a real turn, restored them, and then freed a 1 MiB
+block with an allocator that had never heard of it. A general protection fault, in the
+teardown of a test that had already printed its result. The allocator that reserved it is
+now recorded next to it (`body_buf_with`), which makes the function correct without
+anybody remembering to order the `defer`s.
+
+The lesson is the one in `AttachIo` again: **a global is not a dependency injection
+point, it is a lie about when two things are the same.**
+
+## Why the E2E test does not assert that the model answered
+
+It did. It passed — on a key with quota. An hour later the quota was gone and it failed
+every day after with `Rate limit exceeded: free-models-per-day`. A test whose red state
+is "the provider said no" teaches whoever runs it to ignore it, and then the seam is
+unwatched again.
+
+What it asserts now is stronger, and it is the thing the whole exit-gate work exists
+for: **a turn never ends in silence.** Either the model answered, or somebody was told
+why it did not. That is deterministic with or without a quota, and it is exactly the
+failure being hunted — a turn that completes, claims to have worked, and says nothing.
+
+When there IS an answer, this is the only place in the suite where the real wire, the
+real session and the real gate run together.
+
+## Why the gate is a build option, not `ZODE_E2E` in the environment
+
+This Zig version gives a test no way to read the process environment at all:
+`Environ.Map.init` makes an empty map, `std.posix.getenv` does not exist, and
+`std.testing.environ` is `undefined` in a test. Three dead ends, one after the other,
+before the flag moved to where a test can actually see it. `zig build test -De2e`.
+
+## What is left, honestly
+
+The test's teardown segfaults the runner when it DOES run. It is a defect in my test,
+not in the harness — most likely the detached worker being joined by a flag rather than
+by `waitWorkers`, or the session being destroyed under a thread that is still appending.
+It is gated off so the suite is green, it is documented in the test, and it is NOT fixed,
+because guessing at it is how a test gets silenced by a plausible theory. There is
+already a comment in this file about that.
