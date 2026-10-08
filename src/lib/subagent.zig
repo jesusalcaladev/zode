@@ -247,11 +247,38 @@ pub fn parseTask(arena: std.mem.Allocator, args_json: []const u8) ParseError!Tas
 /// files". Without it the main agent tends to verify, which doubles the cost of
 /// having used a subagent at all.
 pub const Report = struct {
-    buf: [max_report + 256]u8 = undefined,
+    // head (~117) + note (~400) + body (`max_report`) + truncation notice (~86):
+    // the sizes are added up here because the writer is FIXED and a fixed writer
+    // that runs out of room silently drops the END of the report. Feeling out the
+    // slack instead of computing it is how the note would have started eating
+    // report content.
+    buf: [max_report + 640]u8 = undefined,
     len: usize = 0,
+    /// Why this subagent ran differently from what was configured (or on what it
+    /// is running, when everything is as configured). Own copy: callers build it
+    /// on a stack buffer, which is dead by the time the report is read.
+    note_buf: [400]u8 = undefined,
+    note_len: usize = 0,
 
     pub fn slice(self: *const Report) []const u8 {
         return self.buf[0..self.len];
+    }
+
+    /// The note, rendered IN FRONT of whatever this report ends up being — the
+    /// report or the refusal, because a pick that did not work is exactly as
+    /// important when the subagent could not run at all.
+    ///
+    /// It copies, and that is the whole point of the field: the note is composed
+    /// where the reason is known (a stack buffer inside the call) and read where
+    /// the report is consumed, later.
+    pub fn setNote(self: *Report, text: []const u8) void {
+        const n = @min(text.len, self.note_buf.len);
+        @memcpy(self.note_buf[0..n], text[0..n]);
+        self.note_len = n;
+    }
+
+    pub fn note(self: *const Report) []const u8 {
+        return self.note_buf[0..self.note_len];
     }
 };
 
@@ -263,6 +290,10 @@ pub fn formatReport(text: []const u8, out: *Report) []const u8 {
     const room = max_report;
     var w: std.Io.Writer = .fixed(&out.buf);
     w.writeAll(head) catch {};
+    if (out.note().len > 0) {
+        w.writeAll(out.note()) catch {};
+        w.writeByte('\n') catch {};
+    }
     if (trimmed.len <= room) {
         w.writeAll(trimmed) catch {};
     } else {
@@ -275,8 +306,15 @@ pub fn formatReport(text: []const u8, out: *Report) []const u8 {
 
 /// The refusal when a subagent cannot run (no key, provider down, budget spent).
 /// Said as a tool RESULT so the turn continues: a failed search is information.
+///
+/// The note goes in front here too: when the configured model was the reason it
+/// could not run, that is the first thing the reader needs.
 pub fn refused(reason: []const u8, out: *Report) []const u8 {
     var w: std.Io.Writer = .fixed(&out.buf);
+    if (out.note().len > 0) {
+        w.writeAll(out.note()) catch {};
+        w.writeByte('\n') catch {};
+    }
     w.print("The subagent could not run ({s}). Answer from what you already know, or do the search yourself with the tools you have.\n", .{reason}) catch {};
     out.len = w.buffered().len;
     return out.slice();
@@ -393,6 +431,53 @@ test "formatReport: a short report does NOT carry the truncation notice" {
     var out = Report{};
     const r = subagent.formatReport("corto", &out);
     try std.testing.expect(std.mem.indexOf(u8, r, "truncated") == null);
+}
+
+test "the note rides in front of the report, and in front of the refusal too" {
+    // The note is why the subagent ran on a different model than the developer
+    // configured. It is the first thing the reader needs, and a refusal is
+    // exactly when it matters most: "could not run" without "your pick is why"
+    // sends the developer debugging the wrong thing.
+    var out = Report{};
+    out.setNote("[subagent note: this search runs on x/y (config.json).]");
+    // The body must NOT be a phrase that also appears in the head ("take this
+    // as the answer") or the index finds it before the note and the assertion
+    // proves nothing about the order.
+    const r = subagent.formatReport("the bug is at src/x.zig:42", &out);
+    const note_at = std.mem.indexOf(u8, r, "[subagent note:").?;
+    const ans_at = std.mem.indexOf(u8, r, "src/x.zig:42").?;
+    try std.testing.expect(note_at < ans_at);
+
+    var out2 = Report{};
+    out2.setNote("[subagent note: this search runs on x/y (config.json).]");
+    const r2 = subagent.refused("no key", &out2);
+    const note_at2 = std.mem.indexOf(u8, r2, "[subagent note:") orelse
+        return error.TestUnexpectedResult;
+    const could_at = std.mem.indexOf(u8, r2, "could not run").?;
+    try std.testing.expect(note_at2 < could_at);
+
+    // And with no note nothing changes: the note costs nothing when there is
+    // nothing to say.
+    var out3 = Report{};
+    const r3 = subagent.formatReport("plain", &out3);
+    try std.testing.expect(std.mem.indexOf(u8, r3, "[subagent note:") == null);
+}
+
+test "setNote copies: the caller's stack buffer is dead before the report is read" {
+    var out = Report{};
+    {
+        const note_text = "[subagent note: built on the stack]";
+        var stack: [note_text.len]u8 = undefined;
+        @memcpy(&stack, note_text);
+        out.setNote(&stack);
+    }
+    try std.testing.expectEqualStrings("[subagent note: built on the stack]", out.note());
+    // An over-long note is cut, not rejected: a note that fails to store is a
+    // silent note, and the report must still render.
+    var out2 = Report{};
+    var too_long: [1000]u8 = @splat('x');
+    out2.setNote(&too_long);
+    try std.testing.expectEqual(out2.note_buf.len, out2.note().len);
 }
 
 test "refused and iterationLimit are text, not errors" {

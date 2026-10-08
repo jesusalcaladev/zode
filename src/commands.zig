@@ -459,6 +459,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
+    .{ .key = "/submodel", .desc = "which model the SUBAGENTS use (no args: report | <model> | <provider> <model> | off)" },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
     .{ .key = "/plan", .desc = "clear the visible task list" },
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },

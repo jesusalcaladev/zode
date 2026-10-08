@@ -1564,6 +1564,10 @@ pub fn reloadUserConfig() void {
     if (cfg_arena_state) |*st| st.deinit();
     cfg_arena_state = null;
     user_config = .{};
+    // The subagent's pick may have changed with the config: a give-up recorded
+    // against the OLD `subagent_model` must not outlive it, or fixing
+    // config.json would do nothing until restart.
+    sub_fail_len = 0;
     loadUserConfig();
 }
 
@@ -2103,6 +2107,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         openModelPaletteAsync(m);
     } else if (std.mem.eql(u8, cmd, "effort")) {
         cmdEffort(m, arg);
+    } else if (std.mem.eql(u8, cmd, "submodel")) {
+        cmdSubmodel(m, arg);
     } else if (std.mem.eql(u8, cmd, "use")) {
         commands_mod.cmdUse(m, arg);
     } else if (std.mem.eql(u8, cmd, "plan")) {
@@ -2998,6 +3004,18 @@ const Target = struct {
     from_roster: ?roster_mod.Candidate = null,
 };
 
+/// The endpoint for a target.
+///
+/// It is a function and not three inline copies because the subagent's model
+/// fallback re-derives it after switching models: a `url` computed once outside
+/// the loop would keep pointing at the provider that just said no.
+fn targetUrl(buf: []u8, t: Target) []const u8 {
+    return if (t.kind == .anthropic)
+        std.fmt.bufPrint(buf, "{s}/messages", .{t.base_url}) catch t.base_url
+    else
+        std.fmt.bufPrint(buf, "{s}/chat/completions", .{t.base_url}) catch t.base_url;
+}
+
 /// This turn's target: the pool if free-auto is on and already has its list,
 /// the active provider/model otherwise.
 ///
@@ -3010,6 +3028,285 @@ fn pickTarget(m: *tui.Model) Target {
     if (free_auto.poolSize() == 0) return active;
     const cand = free_auto.rosterGet(m.allocator).active(free_auto.nowMs()) orelse return active;
     return targetForCandidate(m, cand) orelse active;
+}
+
+// ── /submodel: which model the SUBAGENTS run on ──────────────
+//
+// Three ways to say it, in this order — the same shape as the active model's
+// own (`/use` beats config.json beats the environment):
+//
+//   1. `/submodel` in this session: unset (inherit), set, or `off` (force none)
+//   2. `subagent_provider` / `subagent_model` in config.json
+//   3. `ZODE_SUBAGENT_PROVIDER` / `ZODE_SUBAGENT_MODEL`
+//
+// Nothing set = what always happened: the subagent runs on the same target as
+// the main turn (free-auto rotation included), at effort `low`.
+//
+// A pick that cannot be used does NOT fail the search: the reason rides in
+// front of the report and the search runs on the normal target. A broken
+// override that killed every `task` would push the searches back into the main
+// context, which is the exact cost the subagent exists to avoid.
+
+/// What the developer asked for, wherever it came from.
+const SubPick = struct {
+    provider: []const u8,
+    model: []const u8,
+    /// Which of the three said it. It rides in the report's note so a pick that
+    /// is working and one that was never set can be told apart without going
+    /// to look — a mode you cannot see is a mode you cannot diagnose.
+    source: []const u8,
+};
+
+/// The session's own override. Three states and not two: `off` has to SURVIVE
+/// a config.json that sets the field, or `/submodel off` would do nothing for
+/// exactly the user who needs it most.
+///
+/// The buffers are static for the same reason as `cur_model_buf`: the string
+/// `/submodel` is fed comes from the input line and dies with the next redraw.
+/// The UI thread writes them and the worker reads them, which is the same
+/// accepted race as the model name itself: a ≤128-byte copy with a single
+/// writer.
+var sub_session: enum { unset, set, off } = .unset;
+var sub_provider_buf: [64]u8 = undefined;
+var sub_provider_len: usize = 0;
+var sub_model_buf: [128]u8 = undefined;
+var sub_model_len: usize = 0;
+
+/// Why the pick was given up for the rest of the session ("" = it was not).
+/// Session-long like `router.State.given_up`: a model the provider will not
+/// serve is one it will not serve on the next `task` either, and every attempt
+/// costs a failed request plus a fallback before the search can start.
+var sub_fail_buf: [256]u8 = undefined;
+var sub_fail_len: usize = 0;
+
+fn submodelFail(text: []const u8) void {
+    const n = @min(text.len, sub_fail_buf.len);
+    @memcpy(sub_fail_buf[0..n], text[0..n]);
+    sub_fail_len = n;
+}
+
+/// Formats a reason into `buf` and returns what fit.
+///
+/// A fixed writer and not `bufPrint` because `bufPrint` on overflow gives an
+/// ERROR and no text at all — and a reason that vanishes leaves the note
+/// saying "was not used ()". Truncated is still a reason.
+fn reasonFmt(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print(fmt, args) catch {};
+    return w.buffered();
+}
+
+/// The developer's pick, or null when subagents follow the main turn.
+fn submodelPick(m: *tui.Model) ?SubPick {
+    switch (sub_session) {
+        // The session's `off` beats everything: config.json and the environment
+        // come back on the next launch, and saying "off" has to mean off NOW.
+        .off => return null,
+        .set => return .{
+            .provider = sub_provider_buf[0..sub_provider_len],
+            .model = sub_model_buf[0..sub_model_len],
+            .source = "/submodel",
+        },
+        .unset => {},
+    }
+    if (user_config.subagent_provider.len > 0 or user_config.subagent_model.len > 0) {
+        return .{
+            .provider = user_config.subagent_provider,
+            .model = user_config.subagent_model,
+            .source = "config.json",
+        };
+    }
+    const p = envGet(m.environ, "ZODE_SUBAGENT_PROVIDER") orelse "";
+    const mo = envGet(m.environ, "ZODE_SUBAGENT_MODEL") orelse "";
+    if (p.len == 0 and mo.len == 0) return null;
+    return .{
+        .provider = p,
+        .model = mo,
+        .source = if (mo.len > 0) "ZODE_SUBAGENT_MODEL" else "ZODE_SUBAGENT_PROVIDER",
+    };
+}
+
+/// Where a pick resolves to, or why it does not.
+const SubResolve = union(enum) {
+    ok: Target,
+    /// A slice INTO the caller's reason buffer, already written for a human.
+    why: []const u8,
+};
+
+/// Resolves the pick into a target: the named provider (or the active one when
+/// the pick names only a model), the named model (or the provider's
+/// `default_model`), and the key OF THAT PROVIDER.
+fn submodelTarget(m: *tui.Model, pick: SubPick, reason: []u8) SubResolve {
+    const def: *const providers.ProviderDef = blk: {
+        if (pick.provider.len == 0) break :blk activeProviderDef(m.environ);
+        if (config_mod.find(user_config, pick.provider)) |d| break :blk d;
+        if (providers.byId(pick.provider)) |d| break :blk d;
+        return .{ .why = reasonFmt(reason, "zode does not know the provider \"{s}\" (see /providers)", .{pick.provider}) };
+    };
+    const model: []const u8 = if (pick.model.len > 0) pick.model else def.default_model;
+    if (model.len == 0) {
+        return .{ .why = reasonFmt(reason, "\"{s}\" has no default model; name one: /submodel {s} <model>", .{ def.id, def.id }) };
+    }
+    // The key for THIS provider, and `curKey` only when it IS the active one:
+    // `curKey` falls back to the generic `ZODE_API_KEY`, and handing that to
+    // another provider is the one-key-to-the-wrong-endpoint bug all over again.
+    //
+    // `key_env.len == 0` is a provider that needs NO key (ollama and friends):
+    // null there is a configuration, not a missing credential.
+    const key = if (std.mem.eql(u8, def.id, activeProviderDef(m.environ).id))
+        curKey(m)
+    else
+        providers.keyFor(def, m.environ);
+    if (key == null and def.key_env.len > 0) {
+        return .{ .why = reasonFmt(reason, "there is no API key for \"{s}\" (connect it with ctrl+a, or set its ZODE_*_KEY)", .{def.id}) };
+    }
+    return .{ .ok = .{
+        .def = def,
+        .model = model,
+        .kind = chat.kindForProvider(def.id),
+        .base_url = def.base_url,
+        .key = key,
+        .from_roster = null,
+    } };
+}
+
+/// The note for a RUNTIME fallback: the measured clause (`router.phraseHead`)
+/// plus the two names plus the subagent's own command. Split out so the
+/// wording is testable without a dead model and a network.
+fn submodelFallbackNote(
+    buf: []u8,
+    from_provider: []const u8,
+    from_model: []const u8,
+    w: router_mod.Why,
+    to_provider: []const u8,
+    to_model: []const u8,
+) []const u8 {
+    return reasonFmt(
+        buf,
+        "[subagent note: {s}/{s} {s}, so this search went to {s}/{s}. Set another with /submodel, or /submodel off.]",
+        .{ from_provider, from_model, router_mod.phraseHead(w), to_provider, to_model },
+    );
+}
+
+/// The pick, applied to `base`. False = the subagent runs on `base` as always.
+/// When the pick existed but could not be used, the NOTE explaining why is
+/// already in the Report — silence here would be a setting that looks like it
+/// works.
+fn applySubmodel(m: *tui.Model, base: *Target, rep: *subagent_mod.Report) bool {
+    // Given up for this session: silent, like the cheap router after its first
+    // 403. The developer has already seen the reason — in the first report and
+    // in `/submodel`, which says it too.
+    if (sub_fail_len > 0) return false;
+    const pick = submodelPick(m) orelse return false;
+
+    var reason_buf: [400]u8 = undefined;
+    switch (submodelTarget(m, pick, &reason_buf)) {
+        .why => |why_not| {
+            var nbuf: [640]u8 = undefined;
+            const prov: []const u8 = if (pick.provider.len > 0)
+                pick.provider
+            else
+                activeProviderDef(m.environ).id;
+            rep.setNote(reasonFmt(
+                &nbuf,
+                "[subagent note: the subagent model {s}/{s} was not used ({s}). Fix it with /submodel, or /submodel off.]",
+                .{ prov, pick.model, why_not },
+            ));
+            return false;
+        },
+        .ok => |target| {
+            base.* = target;
+            // The success note too, not only the failure one: the router reports
+            // a cheap turn that simply WORKED for the same reason — a pick you
+            // cannot see is a pick where "my config did nothing" cannot be told
+            // apart from "my config is not needed here".
+            var nbuf: [320]u8 = undefined;
+            rep.setNote(reasonFmt(
+                &nbuf,
+                "[subagent note: this search runs on {s}/{s} ({s}).]",
+                .{ target.def.id, target.model, pick.source },
+            ));
+            return true;
+        },
+    }
+}
+
+/// `/submodel [off | <model> | <provider> <model>]`; no args: report.
+///
+/// It lives here and not in `commands.zig` because it writes THIS module's
+/// state — the same reason `/effort` and `/yolo` stayed in agent.zig.
+fn cmdSubmodel(m: *tui.Model, arg: ?[]const u8) void {
+    const a = arg orelse return submodelReport(m);
+    if (std.mem.eql(u8, a, "off") or std.mem.eql(u8, a, "none")) {
+        sub_session = .off;
+        sub_fail_len = 0;
+        m.pushInfoFmt("subagents: the same model as the main turn (`/submodel off`; config.json and the environment are ignored this session). Set: /submodel <model> | <provider> <model>", .{});
+        return;
+    }
+    var it = std.mem.tokenizeScalar(u8, a, ' ');
+    const t1 = it.next() orelse return submodelReport(m);
+    const t2 = it.next();
+    // ONE token is a model on the active provider, unless it happens to be a
+    // known provider id — then it is `/submodel <provider>` with that
+    // provider's default model. Both readings are what people type: `/submodel
+    // kimi-k2.6` and `/submodel groq` are equally plausible, and always
+    // treating it as a model would send a provider id into the model field.
+    if (t2 == null and (config_mod.find(user_config, t1) != null or providers.byId(t1) != null)) {
+        setSubmodel(t1, "");
+    } else if (t2) |mo| {
+        setSubmodel(t1, mo);
+    } else {
+        setSubmodel("", t1);
+    }
+    // A fresh pick deserves a fresh chance: the give-up was about the OLD one.
+    sub_fail_len = 0;
+    submodelReport(m);
+}
+
+/// Copies the pick into the session's static buffers. It COPIES, and that is
+/// the point: the string comes from the input line and dies with the next
+/// redraw — a global pointing at it is the `cur_model_buf` bug again.
+fn setSubmodel(provider: []const u8, model: []const u8) void {
+    const p = @min(provider.len, sub_provider_buf.len);
+    std.mem.copyForwards(u8, sub_provider_buf[0..p], provider[0..p]);
+    sub_provider_len = p;
+    const mm = @min(model.len, sub_model_buf.len);
+    std.mem.copyForwards(u8, sub_model_buf[0..mm], model[0..mm]);
+    sub_model_len = mm;
+    sub_session = .set;
+}
+
+/// `/submodel` with no arguments, and also the closing line of every set: it
+/// resolves the pick LIVE, because reporting what is STORED when what matters
+/// is whether it would be USED is how a broken setting keeps looking fine.
+fn submodelReport(m: *tui.Model) void {
+    if (sub_session == .off) {
+        m.pushInfoFmt("subagents: the same model as the main turn (/submodel off). Set: /submodel <model> | /submodel <provider> <model>", .{});
+        return;
+    }
+    const pick = submodelPick(m) orelse {
+        m.pushInfoFmt("subagents: the same model as the main turn (no override). Set: /submodel <model> | /submodel <provider> <model>", .{});
+        return;
+    };
+    const prov: []const u8 = if (pick.provider.len > 0)
+        pick.provider
+    else
+        activeProviderDef(m.environ).id;
+    var reason_buf: [400]u8 = undefined;
+    switch (submodelTarget(m, pick, &reason_buf)) {
+        .ok => |t| {
+            if (sub_fail_len > 0) {
+                m.pushInfoFmt("subagents: {s}/{s} ({s}) — NOT in use: {s}. Change it with /submodel, or /submodel off", .{
+                    t.def.id, t.model, pick.source, sub_fail_buf[0..sub_fail_len],
+                });
+            } else {
+                m.pushInfoFmt("subagents: {s}/{s} ({s}). Off with /submodel off.", .{ t.def.id, t.model, pick.source });
+            }
+        },
+        .why => |why_not| m.pushInfoFmt("subagents: {s}/{s} ({s}) — CANNOT be used: {s}", .{
+            prov, pick.model, pick.source, why_not,
+        }),
+    }
 }
 
 /// Says, once, that the chosen model is a router and that this costs money.
@@ -3180,8 +3477,14 @@ fn activeTarget(m: *tui.Model) Target {
         .model = cur_model,
         .kind = kind,
         .base_url = def.base_url,
-        // Anthropic carries the key in headers, not in Bearer: null here.
-        .key = if (kind == .anthropic) null else providers.keyFor(def, m.environ) orelse curKey(m),
+        // The KEY is always the key, Anthropic included: `streamRaw` decides
+        // where it goes (x-api-key for Anthropic, Bearer for the rest) and it
+        // takes it from this very field — `if (kind == .anthropic) null` here
+        // meant the TUI's Anthropic requests went out carrying only
+        // `anthropic-version`, with nothing to authenticate with. The headless
+        // runner always passed the key, which is why the wire format looked
+        // tested and the TUI would have 401'd on the first request.
+        .key = providers.keyFor(def, m.environ) orelse curKey(m),
     };
 }
 
@@ -3196,7 +3499,9 @@ fn targetForCandidate(m: *tui.Model, cand: roster_mod.Candidate) ?Target {
         .model = cand.model_id,
         .kind = kind,
         .base_url = def.base_url,
-        .key = if (kind == .anthropic) null else providers.keyFor(def, m.environ),
+        // Same as `activeTarget`: the key for THIS provider, Anthropic included
+        // (see the note there — `streamRaw` is what routes it into x-api-key).
+        .key = providers.keyFor(def, m.environ),
         .from_roster = cand,
     };
 }
@@ -3507,15 +3812,14 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             // a quota error.
             const sp = pickTarget(m);
             var surl_buf: [1024]u8 = undefined;
-            const surl = if (sp.kind == .anthropic)
-                std.fmt.bufPrint(&surl_buf, "{s}/messages", .{sp.base_url}) catch sp.base_url
-            else
-                std.fmt.bufPrint(&surl_buf, "{s}/chat/completions", .{sp.base_url}) catch sp.base_url;
+            const surl = targetUrl(&surl_buf, sp);
             if (summarizeTurns(
                 gpa,
                 &sum_http,
                 surl,
-                if (sp.kind == .anthropic) null else sp.key,
+                // The key for Anthropic too: `streamRaw` turns it into
+                // x-api-key (see `activeTarget`).
+                sp.key,
                 sp.kind,
                 sp.model,
                 chat.effectiveEffort(sp.model, current_effort),
@@ -3678,16 +3982,15 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         // (the headless runner in main.zig does add the path, which is why it
         // worked there).
         var url_buf: [1024]u8 = undefined;
-        const url = if (pick.kind == .anthropic)
-            std.fmt.bufPrint(&url_buf, "{s}/messages", .{pick.base_url}) catch pick.base_url
-        else
-            std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{pick.base_url}) catch pick.base_url;
+        const url = targetUrl(&url_buf, pick);
 
-        // For Anthropic the auth goes in headers (x-api-key), not in Bearer: null
-        // is passed and `streamRaw` sets it. For the rest, Bearer with the key
-        // OF THAT PROVIDER (not the active one's: sending one provider's key to
-        // another endpoint is the `ZODE_PROVIDER` bug, once fixed).
-        const bearer: ?[]const u8 = if (pick.kind == .anthropic) null else pick.key;
+        // The key OF THAT PROVIDER (not the active one's: sending one provider's
+        // key to another endpoint is the `ZODE_PROVIDER` bug, once fixed), passed
+        // as the bearer for BOTH kinds: `streamRaw` is what routes it — Bearer
+        // for OpenAI, x-api-key for Anthropic. Passing null for Anthropic (what
+        // this did) left the request with no credentials at all: streamRaw can
+        // only set x-api-key `if (bearer) |k|`, and there was no k.
+        const bearer: ?[]const u8 = pick.key;
 
         chat.streamChat(
             gpa,
@@ -4793,8 +5096,11 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
     // Permission: a subagent spends the user's tokens and reads the whole repo.
     // `task` IS in `needsPermission`, so the dialog has already been shown by
     // `execToolCalls`'s gate before this is reached.
-    const pick = pickTarget(m);
-    const key = pick.key orelse return subagent_mod.refused("no api key for this provider", rep);
+    var pick = pickTarget(m);
+    // The developer's pick for subagents, if they made one. The NOTE — what it
+    // will run on, or why the pick was not usable — goes into the Report HERE,
+    // because this is the last moment that knows before the first request.
+    var on_submodel = applySubmodel(m, &pick, rep);
 
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
@@ -4858,10 +5164,17 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
         return subagent_mod.refused("no memory for the prompt", rep);
 
     var url_buf: [1024]u8 = undefined;
-    const url = if (pick.kind == .anthropic)
-        std.fmt.bufPrint(&url_buf, "{s}/messages", .{pick.base_url}) catch pick.base_url
-    else
-        std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{pick.base_url}) catch pick.base_url;
+    var url = targetUrl(&url_buf, pick);
+
+    // The server's OWN error text for the last failed request. The model
+    // fallback in the error path reads it (`router.disqualifies` needs the body
+    // for a 400: OpenRouter answers a bad model id with a 400, and the status
+    // alone does not say whether the MODEL or the REQUEST was rejected). It is a
+    // local buffer and not `lastErrorBody()` on purpose: three subagents run in
+    // parallel and the globals belong to the turn the user is watching — each
+    // one failing would overwrite the others' reason, which is the exact hazard
+    // `mirror_globals` exists for.
+    var err_detail: chat.ErrBuf = .{};
 
     var body_buf: [256 * 1024]u8 = undefined;
     var iteration: usize = 0;
@@ -4904,11 +5217,24 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
         // would erase the ESC the user pressed while another was mid-flight, so
         // the turn they were watching carried on. ESC is the user's signal, it
         // stays set, and every request obeys it (see `streamRaw`).
-        const bearer: ?[]const u8 = if (pick.kind == .anthropic) null else key;
-        // `streamChat` returns `void`: it owns the StreamCtx and destroys it.
+        // The key FOLLOWS `pick`, computed here and not before the loop: the
+        // model fallback can swap the target mid-subagent, and a `key` captured
+        // once would send the dead provider's credential to the new endpoint —
+        // the `ZODE_PROVIDER` bug with the provider already rotated under it.
+        //
+        // `key_env.len == 0` is a provider that needs NO key (ollama and
+        // friends): null there is a configuration, not a missing credential.
+        // For everyone else a null key would go out with no Authorization at
+        // all, which is the Anthropic bug caught one step earlier.
+        if (pick.key == null and pick.def.key_env.len > 0)
+            return subagent_mod.refused("no api key for this provider", rep);
+        const bearer: ?[]const u8 = pick.key;
+        // `streamChatDetail` returns `void`: it owns the StreamCtx and destroys
+        // it, and hands back the server's error text in `err_detail` on the way
+        // out (the model fallback below needs the body, not just the status).
         // (`streamChatCtx` is the other one, and it hands the ctx over — mixing
         // them up is how a subagent leaks 8 KB per iteration.)
-        chat.streamChat(
+        chat.streamChatDetail(
             gpa,
             &http,
             url,
@@ -4926,6 +5252,7 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             // resets `/cache`, and a subagent starting would clear the cancel flag
             // the user set with ESC.
             false,
+            &err_detail,
         ) catch |err| {
             cstate.deinit();
             // A cancelled subagent returns what it found, if anything. Treating
@@ -4933,6 +5260,48 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             if (err == error.Cancelled and tstate.text.items.len > 0) {
                 const partial = subagent_mod.formatReport(tstate.text.items, rep);
                 return partial;
+            }
+            // THE MODEL FALLBACK, and it comes BEFORE the retry on purpose: an
+            // error that says this MODEL will not answer must not be retried
+            // twice more with backoff — the backoff would only slow down the
+            // admission. Same order as the main turn's cheap router: disqualify
+            // first, retry after.
+            if (on_submodel and router_mod.disqualifies(err, err_detail.slice())) {
+                const why_now = router_mod.why(err, err_detail.slice());
+                // Session-long, like `router.State.given_up`: the next `task`
+                // must not pay a failed request to learn what this one just
+                // found out.
+                var fbuf: [256]u8 = undefined;
+                submodelFail(reasonFmt(&fbuf, "{s}/{s} {s} ({t})", .{
+                    pick.def.id, pick.model, router_mod.phraseHead(why_now), err,
+                }));
+                const doomed = pickTarget(m);
+                const nowhere = std.mem.eql(u8, doomed.model, pick.model) and
+                    std.mem.eql(u8, doomed.def.id, pick.def.id);
+                if (!nowhere) {
+                    // The note rides in FRONT of the report: the model that was
+                    // configured was not the one that answered, and that is the
+                    // developer's first question when they read it.
+                    var nbuf: [440]u8 = undefined;
+                    rep.setNote(submodelFallbackNote(
+                        &nbuf,
+                        pick.def.id,
+                        pick.model,
+                        why_now,
+                        doomed.def.id,
+                        doomed.model,
+                    ));
+                    pick = doomed;
+                    url = targetUrl(&url_buf, pick);
+                    tstate.clearCalls(gpa);
+                    tstate.text.clearRetainingCapacity();
+                    sub_attempt = 0;
+                    on_submodel = false;
+                    continue;
+                }
+                // The pick IS the normal target: there is nowhere to fall back
+                // to. The give-up above stops the next `task` from paying this
+                // again, and the refusal below reports it.
             }
             // THE RETRY, and it is the whole difference between a subagent that works
             // and one that does not.
@@ -6892,7 +7261,8 @@ fn cmdGroup(key: []const u8) u8 {
     if (std.mem.eql(u8, k, "free-auto") or std.mem.eql(u8, k, "free")) return 3;
     if (std.mem.eql(u8, k, "model") or std.mem.eql(u8, k, "models") or
         std.mem.eql(u8, k, "provider") or std.mem.eql(u8, k, "providers") or
-        std.mem.eql(u8, k, "use") or std.mem.eql(u8, k, "effort")) return 4;
+        std.mem.eql(u8, k, "use") or std.mem.eql(u8, k, "effort") or
+        std.mem.eql(u8, k, "submodel")) return 4;
     return 5;
 }
 
@@ -7332,6 +7702,277 @@ test "targetForCandidate: an unknown provider returns null (not a half-built tar
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     try std.testing.expect(targetForCandidate(&m, cand) == null);
+}
+
+// ── /submodel ────────────────────────────────────────────────
+
+/// The globals `/submodel` writes. Zig runs the tests in ONE process, so a
+/// test that sets a pick and does not put it back poisons the next one.
+const SubGlobals = struct {
+    session: @TypeOf(sub_session),
+    provider_len: usize,
+    model_len: usize,
+    fail_len: usize,
+    config: config_mod.Config,
+
+    fn take() SubGlobals {
+        return .{
+            .session = sub_session,
+            .provider_len = sub_provider_len,
+            .model_len = sub_model_len,
+            .fail_len = sub_fail_len,
+            .config = user_config,
+        };
+    }
+
+    fn putBack(s: SubGlobals) void {
+        sub_session = s.session;
+        sub_provider_len = s.provider_len;
+        sub_model_len = s.model_len;
+        sub_fail_len = s.fail_len;
+        user_config = s.config;
+    }
+};
+
+test "submodel: the session beats config.json, config beats the environment, off beats all" {
+    const saved = SubGlobals.take();
+    defer saved.putBack();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_SUBAGENT_PROVIDER", "env-prov");
+    try env.put("ZODE_SUBAGENT_MODEL", "env-model");
+    m.environ = &env;
+
+    sub_session = .unset;
+    sub_fail_len = 0;
+    user_config = .{ .subagent_provider = "cfg-prov", .subagent_model = "cfg-model" };
+
+    {
+        const p = submodelPick(&m).?;
+        try std.testing.expectEqualStrings("cfg-model", p.model);
+        try std.testing.expectEqualStrings("cfg-prov", p.provider);
+        try std.testing.expectEqualStrings("config.json", p.source);
+    }
+
+    setSubmodel("sess-prov", "sess-model");
+    {
+        const p = submodelPick(&m).?;
+        try std.testing.expectEqualStrings("sess-model", p.model);
+        try std.testing.expectEqualStrings("sess-prov", p.provider);
+        try std.testing.expectEqualStrings("/submodel", p.source);
+    }
+
+    // `off` over the session AND over config.json — or it would do nothing for
+    // exactly the user who has the field set and wants it out of the way.
+    sub_session = .off;
+    try std.testing.expect(submodelPick(&m) == null);
+
+    // No config → the environment.
+    sub_session = .unset;
+    user_config = .{};
+    {
+        const p = submodelPick(&m).?;
+        try std.testing.expectEqualStrings("env-model", p.model);
+        try std.testing.expectEqualStrings("env-prov", p.provider);
+        try std.testing.expectEqualStrings("ZODE_SUBAGENT_MODEL", p.source);
+    }
+
+    // Nothing anywhere → subagents follow the main turn, which is what always
+    // happened and has to stay the default.
+    var bare_env = std.process.Environ.Map.init(std.testing.allocator);
+    defer bare_env.deinit();
+    m.environ = &bare_env;
+    try std.testing.expect(submodelPick(&m) == null);
+}
+
+test "/submodel parses the three spellings, and off means none of them" {
+    const saved = SubGlobals.take();
+    defer saved.putBack();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    user_config = .{};
+    sub_session = .unset;
+    sub_fail_len = 0;
+
+    // A known provider id → provider-only (its default model).
+    cmdSubmodel(&m, "groq");
+    {
+        const p = submodelPick(&m).?;
+        try std.testing.expectEqualStrings("groq", p.provider);
+        try std.testing.expectEqualStrings("", p.model);
+    }
+    // Anything else → a model on the active provider.
+    cmdSubmodel(&m, "kimi-k2.6");
+    {
+        const p = submodelPick(&m).?;
+        try std.testing.expectEqualStrings("", p.provider);
+        try std.testing.expectEqualStrings("kimi-k2.6", p.model);
+    }
+    // provider + model.
+    cmdSubmodel(&m, "groq llama-x");
+    {
+        const p = submodelPick(&m).?;
+        try std.testing.expectEqualStrings("groq", p.provider);
+        try std.testing.expectEqualStrings("llama-x", p.model);
+    }
+    // off.
+    cmdSubmodel(&m, "off");
+    try std.testing.expect(submodelPick(&m) == null);
+}
+
+test "submodel: an unknown provider does not kill the search: a note, and the normal target" {
+    const saved = SubGlobals.take();
+    defer saved.putBack();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    user_config = .{};
+    sub_session = .unset;
+    sub_fail_len = 0;
+    setSubmodel("provider-que-no-existe", "some-model");
+
+    var base = activeTarget(&m);
+    const before_model = base.model;
+    const before_def = base.def;
+    var rep = subagent_mod.Report{};
+    try std.testing.expect(!applySubmodel(&m, &base, &rep));
+    // The target is untouched: a pick may not be applied by half.
+    try std.testing.expect(base.def == before_def);
+    try std.testing.expectEqualStrings(before_model, base.model);
+    // And the note names WHICH pick and WHY. A refusal without a name sends the
+    // developer to config.json to look for a field that is fine.
+    try std.testing.expect(std.mem.indexOf(u8, rep.note(), "provider-que-no-existe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rep.note(), "does not know") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rep.note(), "/submodel off") != null);
+}
+
+test "submodel: a provider with no key does not kill the search either" {
+    const saved = SubGlobals.take();
+    defer saved.putBack();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    user_config = .{};
+    sub_session = .unset;
+    sub_fail_len = 0;
+    // With `m.environ` null and no saved keys, `keyFor(groq)` is null whatever
+    // the real process environment holds — the test does not depend on whether
+    // the person running it happens to have GROQ_API_KEY exported.
+    m.environ = null;
+    providers.setSavedKeys(null);
+    defer providers.setSavedKeys(null);
+    setSubmodel("groq", "llama-3.3-70b-versatile");
+
+    var base = activeTarget(&m);
+    const before_def = base.def;
+    var rep = subagent_mod.Report{};
+    try std.testing.expect(!applySubmodel(&m, &base, &rep));
+    try std.testing.expect(base.def == before_def);
+    try std.testing.expect(std.mem.indexOf(u8, rep.note(), "API key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rep.note(), "groq") != null);
+}
+
+test "submodel: the pick replaces the target, and the note says which model is running" {
+    const saved = SubGlobals.take();
+    defer saved.putBack();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_GROQ_KEY", "gsk-test");
+    m.environ = &env;
+    user_config = .{};
+    sub_session = .unset;
+    sub_fail_len = 0;
+    setSubmodel("groq", "llama-3.3-70b-versatile");
+
+    var base = activeTarget(&m);
+    var rep = subagent_mod.Report{};
+    try std.testing.expect(applySubmodel(&m, &base, &rep));
+    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", base.model);
+    try std.testing.expectEqualStrings("groq", base.def.id);
+    // The key is the PICKED provider's, not the active one's.
+    try std.testing.expect(base.key != null);
+    try std.testing.expectEqualStrings("gsk-test", base.key.?);
+    // The success note: a pick you cannot see is a pick where "my config did
+    // nothing" cannot be told apart from "my config is not needed here".
+    try std.testing.expect(std.mem.indexOf(u8, rep.note(), "this search runs on groq/llama-3.3-70b-versatile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rep.note(), "/submodel") != null);
+}
+
+test "submodel: a pick given up for the session does not try again, and says nothing" {
+    const saved = SubGlobals.take();
+    defer saved.putBack();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    user_config = .{};
+    sub_session = .unset;
+    setSubmodel("groq", "llama-3.3-70b-versatile");
+    submodelFail("groq/llama-3.3-70b-versatile is not available on this account (Forbidden)");
+
+    var base = activeTarget(&m);
+    const before_def = base.def;
+    var rep = subagent_mod.Report{};
+    try std.testing.expect(!applySubmodel(&m, &base, &rep));
+    try std.testing.expect(base.def == before_def);
+    // SILENT, like the cheap router after its first 403: the developer already
+    // saw the reason in the first report, and `/submodel` still says it. A note
+    // on every subsequent search is noise about something already decided.
+    try std.testing.expectEqual(@as(usize, 0), rep.note().len);
+}
+
+test "the fallback note: the measured clause, both names, and the subagent's own command" {
+    var buf: [440]u8 = undefined;
+    const gated_note = submodelFallbackNote(&buf, "groq", "llama-4-scout", .gated, "openrouter", "kimi-k2.6");
+    try std.testing.expect(std.mem.indexOf(u8, gated_note, "groq/llama-4-scout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated_note, "is not available on this account") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gated_note, "so this search went to openrouter/kimi-k2.6") != null);
+    // The remedy names the SUBAGENT's command: pointing at /model would send
+    // the developer to change the model they are already watching.
+    try std.testing.expect(std.mem.indexOf(u8, gated_note, "/submodel off") != null);
+    // And no tail smuggled in from the main turn's sentence: "this turn" inside
+    // a subagent's report reads as if the MAIN turn had changed models.
+    try std.testing.expect(std.mem.indexOf(u8, gated_note, "this turn") == null);
+
+    var buf2: [440]u8 = undefined;
+    const typo_note = submodelFallbackNote(&buf2, "groq", "x", .unknown_model, "openrouter", "y");
+    try std.testing.expect(std.mem.indexOf(u8, typo_note, "does not know") != null);
+}
+
+test "an anthropic target carries its key: streamRaw turns the bearer into x-api-key" {
+    // `cur_provider_id` points INTO `cur_provider_buf`, so saving the slice and
+    // then calling setProviderId would overwrite the very bytes it points at,
+    // and the restore would write back what was just set. Copy the BYTES first.
+    var prov_buf: [64]u8 = undefined;
+    const prov_len = @min(cur_provider_id.len, prov_buf.len);
+    @memcpy(prov_buf[0..prov_len], cur_provider_id[0..prov_len]);
+    defer setProviderId(prov_buf[0..prov_len]);
+
+    setProviderId("anthropic");
+    providers.setSavedKeys(null);
+    defer providers.setSavedKeys(null);
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_ANTHROPIC_KEY", "sk-ant-test");
+    m.environ = &env;
+
+    const t = activeTarget(&m);
+    try std.testing.expectEqual(chat.ProviderKind.anthropic, t.kind);
+    // The regression this pins: the key used to be forced to null for
+    // `.anthropic` on the theory that streamRaw "sets it" — but streamRaw does
+    // `if (bearer) |k|` and there was no k, so the TUI's Anthropic requests went
+    // out carrying only `anthropic-version` and no credentials at all.
+    try std.testing.expect(t.key != null);
+    try std.testing.expectEqualStrings("sk-ant-test", t.key.?);
 }
 
 test "noteTurnFailure: a 401 and ESC do NOT drop the pair" {

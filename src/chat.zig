@@ -1235,6 +1235,37 @@ pub fn streamChat(
     try streamRaw(gpa, http, url, bearer, body, ctx);
 }
 
+/// `streamChat`, but the server's own error text comes back in a buffer the
+/// CALLER owns instead of dying with the ctx.
+///
+/// The subagent's model fallback needs it: `router.disqualifies` reads the body
+/// because OpenRouter answers a bad model id with HTTP 400 and the status alone
+/// does not say whether the MODEL or the REQUEST was rejected. The main turn
+/// reads the same text from `lastErrorBody()` — it publishes to the globals — and
+/// a subagent must not publish: three run in parallel and each failure would
+/// overwrite the others' reason, which is the exact hazard `mirror_globals`
+/// exists for. So the reason travels out in a caller-owned `ErrBuf`, a value
+/// copy of `ctx.err` made while the ctx is still alive.
+pub fn streamChatDetail(
+    gpa: std.mem.Allocator,
+    http: *http_client.Http,
+    url: []const u8,
+    bearer: ?[]const u8,
+    body: []u8,
+    cb: Callbacks,
+    kind: ProviderKind,
+    mirror_globals: bool,
+    err_out: *ErrBuf,
+) !void {
+    const ctx = try gpa.create(StreamCtx);
+    ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind, .mirror_globals = mirror_globals };
+    defer ctx.destroy();
+    streamRaw(gpa, http, url, bearer, body, ctx) catch |err| {
+        err_out.* = ctx.err; // ErrBuf is a fixed-size struct: nothing to free here
+        return err;
+    };
+}
+
 // ── body builders ────────────────────────────────────────────
 
 /// Body with the full history (multi-turn + tools), depending on the provider.

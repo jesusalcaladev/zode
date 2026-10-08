@@ -181,6 +181,20 @@ pub fn phrase(w: Why) []const u8 {
     };
 }
 
+/// The measured clause WITHOUT the tail.
+///
+/// `phrase` is a full sentence whose end names the MAIN turn ("this turn went
+/// to"). A subagent's fallback is composed by its caller instead, because the
+/// tail has to name the caller's own target and the caller's own command — the
+/// subagent's is `/submodel`, not `/model`. The head is the half that was
+/// measured against what the providers really answer, and it is the same.
+pub fn phraseHead(w: Why) []const u8 {
+    return switch (w) {
+        .gated => "is not available on this account",
+        .unknown_model => "is a model this provider does not know",
+    };
+}
+
 /// What to do about it, and the two need DIFFERENT actions: a gated model is fixed
 /// by picking another one, and a name the provider does not know is fixed by
 /// fixing the name. Sending somebody to `/model` because of a typo is the kind of
@@ -510,6 +524,22 @@ test "the phrase carries no model name: the caller substitutes both of them" {
     // one caller ended up saying "on this account" about a 404.
     try std.testing.expect(std.mem.indexOf(u8, phrase(Why.gated), "{s}") == null);
     try std.testing.expect(std.mem.indexOf(u8, phrase(Why.unknown_model), "{s}") == null);
+}
+
+test "phraseHead is the measured half of phrase: same clause, caller's tail" {
+    // The subagent composes its own tail (it names its own target and its own
+    // command, `/submodel`), so the HEAD it shows has to be the very clause the
+    // main turn shows — or the two callers describe the same 403 with different
+    // words and start to look like two different diagnoses.
+    const kinds = [_]Why{ .gated, .unknown_model };
+    for (kinds) |w| {
+        const head = phraseHead(w);
+        const full = phrase(w);
+        try std.testing.expect(std.mem.startsWith(u8, full, head));
+        // And the head has no tail in it: a "so ..." inside it would smuggle the
+        // main turn's slot into a sentence the subagent finishes itself.
+        try std.testing.expect(std.mem.indexOf(u8, head, ", so") == null);
+    }
 }
 
 test "disqualifies: a 400 that names the model IS a model problem" {

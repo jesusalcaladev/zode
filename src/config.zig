@@ -28,6 +28,14 @@ pub const Config = struct {
     provider: []const u8 = "",
     /// Global default model (empty = the provider's).
     model: []const u8 = "",
+    /// Where SUBAGENTS run, as an override of the main turn's target. Either
+    /// may be empty on its own: a provider alone uses its `default_model`, a
+    /// model alone runs on the active provider. Both empty = subagents follow
+    /// the main turn, which is what has always happened.
+    /// (`ZODE_SUBAGENT_PROVIDER` / `ZODE_SUBAGENT_MODEL` are the environment's
+    /// spelling of the same two, and config.json beats them.)
+    subagent_provider: []const u8 = "",
+    subagent_model: []const u8 = "",
     /// User-defined providers (appended to the compiled ones).
     extra: []const providers.ProviderDef = &.{},
     /// Wire format of each extra provider: "openai" (default) or "anthropic".
@@ -87,6 +95,14 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
     }
     if (root.get("model")) |v| {
         if (v == .string) cfg.model = try arena.dupe(u8, v.string);
+    }
+    // The subagent's model, parsed where the active one is: an unparsed field
+    // is a setting that reads back as "not configured" forever.
+    if (root.get("subagent_provider")) |v| {
+        if (v == .string) cfg.subagent_provider = try arena.dupe(u8, v.string);
+    }
+    if (root.get("subagent_model")) |v| {
+        if (v == .string) cfg.subagent_model = try arena.dupe(u8, v.string);
     }
 
     const pv = root.get("providers") orelse return cfg;
@@ -261,6 +277,31 @@ test "parse: a built-in provider cannot be shadowed" {
     try std.testing.expectEqual(@as(usize, 0), cfg.extra.len);
     // And the lookup still resolves to the compiled one.
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", find(cfg, "openrouter").?.base_url);
+}
+
+test "parse: the subagent's model is parsed where the active one is" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"subagent_provider":"groq","subagent_model":"llama-3.3-70b-versatile"}
+    ;
+    const cfg = try parse(arena, json, "/tmp/cfg.json");
+    try std.testing.expectEqualStrings("groq", cfg.subagent_provider);
+    try std.testing.expectEqualStrings("llama-3.3-70b-versatile", cfg.subagent_model);
+
+    // Absent means "subagents follow the main turn", which is the default and
+    // has to stay it: a field that parsed to something else would silently move
+    // every subagent off the model the user picked.
+    const bare = try parse(arena, "{}", "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 0), bare.subagent_provider.len);
+    try std.testing.expectEqual(@as(usize, 0), bare.subagent_model.len);
+
+    // A non-string is ignored like every other malformed field, not an error:
+    // one bad value must not take the whole config down.
+    const weird = try parse(arena, "{\"subagent_model\":42}", "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 0), weird.subagent_model.len);
 }
 
 test "parse: corrupt JSON returns an error, not a panic" {

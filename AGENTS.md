@@ -4043,3 +4043,146 @@ just freed.
 
 So: **761/761 with `-De2e`, the E2E included, no crash and no leak.** The suite is
 green both ways — with and without the network tests.
+
+---
+
+# The subagent's model, and the Anthropic key that was never sent (2026-10-08)
+
+Priority 3 of the roadmap: let the developer pick **which model the subagents
+run on** — fewer tokens, better results, faster — without touching the main
+turn. One command, three sources, and a fallback so a wrong pick cannot kill
+every `task`.
+
+## `/submodel`, and why the precedence looks like `/use`
+
+```
+/submodel                    report (and it RESOLVES live: stored is not "usable")
+/submodel <model>            that model on the ACTIVE provider
+/submodel <provider>         that provider's default_model
+/submodel <provider> <model> exactly that pair
+/submodel off                this session: subagents follow the main turn
+```
+
+The precedence is the active model's own, deliberately:
+**session `/submodel` > `subagent_provider`/`subagent_model` in config.json >
+`ZODE_SUBAGENT_PROVIDER`/`ZODE_SUBAGENT_MODEL`** > nothing (= today's behavior,
+free-auto rotation included).
+
+- **`off` is a THIRD state, not "unset".** A bool cannot express "ignore the
+  config.json that sets it", and `/submodel off` would do nothing for exactly
+  the user who has the field set and wants it out of the way.
+- **One token is a model, unless it is a known provider id** — `/submodel
+  kimi-k2.6` and `/submodel groq` are both what people type, and always reading
+  it as a model would send a provider id into the model field.
+- **The buffers are static** (`sub_provider_buf` / `sub_model_buf`), the
+  `cur_model_buf` rule again: the string comes from the input line and dies with
+  the next redraw.
+- config.json is user-authored and zode never WRITES it, so `/submodel` is
+  session state only; persistence is by hand in config.json or the environment.
+- **No built-in provider ships with a `default_model`**, so `/submodel groq`
+  on its own answers "groq has no default model; name one" — and the report says
+  that instead of pretending the pick is armed.
+
+## The note: every deviation rides IN FRONT of the report
+
+`Report.setNote` copies into the Report's own buffer and `formatReport` AND
+`refused` both render it first. Three words the note can say, and each is a
+different question answered:
+
+| note | when | tells the developer |
+|---|---|---|
+| `this search runs on <p>/<m> (<source>).` | the pick worked | it is LIVE, and which source won |
+| `the subagent model <p>/<m> was not used (<why>).` | could not resolve | their config is wrong, and where |
+| `<p>/<m> <clause>, so this search went to <p>/<m>.` | runtime fallback | the pick is dead for this session |
+
+- **The success note exists too**, for the router's reason: a pick you cannot
+  see is a pick where "my config did nothing" cannot be told apart from "my
+  config is not needed here".
+- **`refused` renders it as well**: "could not run" without "your pick is why"
+  sends the developer debugging the wrong thing.
+- The clause head is `router.phraseHead` — the measured half of `phrase`,
+  shared so the two callers cannot describe the same 403 with different words.
+  The TAIL is the subagent's own (`/submodel off`, not `/model`), which is why
+  it is not `phrase` itself: `phrase` ends in "so this turn went to", and
+  "this turn" inside a subagent's report reads as if the MAIN turn had changed
+  models.
+
+## The fallback runs BEFORE the retry, like the cheap router
+
+In `runSubagent`'s catch, before `isRetryable`:
+
+1. `router_mod.disqualifies(err, err_detail.slice())` — needs the BODY, because
+   OpenRouter answers a bad model id with a 400 and the status alone does not
+   say whether the MODEL or the REQUEST was rejected.
+2. `submodelFail(...)` records the reason for the rest of the SESSION
+   (`router.State.given_up` semantics): the next `task` must not pay a failed
+   request to learn what this one just found out. `reloadUserConfig` clears it
+   — a give-up must not outlive the config it was about.
+3. `pickTarget(m)` again, `url = targetUrl(&url_buf, pick)` (the URL is
+   re-derived: computed once it would keep pointing at the provider that just
+   said no), the text and tool calls are cleared, `sub_attempt = 0`, and the
+   loop continues.
+4. If the fallback IS the pick (rotation drifted into the same pair), there is
+   nowhere to go: give up, do not continue, let the refusal below report it.
+
+Three things that were bugs in the making:
+
+- **The key follows `pick`.** `const key = pick.key` before the loop would
+  still hold the DEAD provider's credential after the fallback swapped the
+  target — the `ZODE_PROVIDER` bug with the provider already rotated under it.
+  The null-key check lives inside the loop for the same reason.
+- **A provider with `key_env = &.{}` needs NO key** (ollama): null there is a
+  configuration, not a missing credential, so the check is
+  `key == null and def.key_env.len > 0`.
+- **`chat.streamChatDetail(..., err_out)`**, a new entry next to `streamChat`
+  that copies `ctx.err` into a caller-owned `ErrBuf` before `ctx.destroy()`.
+  The main turn reads `lastErrorBody()` — it publishes to the globals — and a
+  subagent MUST NOT: three run in parallel and each failure would overwrite the
+  others' reason. Same hazard `mirror_globals` exists for.
+
+## The Anthropic fix: `bearer = null` meant NO credentials at all
+
+Five places set `.key = null` / `bearer = null` for `.anthropic` on the theory
+that "streamRaw sets x-api-key". It does — **from the bearer**:
+
+```zig
+if (ctx.kind == .anthropic) {
+    if (bearer) |k| { … x-api-key … }   // <- there was no k
+    auth = null;
+}
+```
+
+So every Anthropic request from the TUI carried only `anthropic-version` and
+authenticated as nobody: a 401 on the first call, never seen because Anthropic
+has never been run live from here. The headless runner passed
+`providers.keyFor(def, env)` unconditionally and worked — it was the reference
+all along.
+
+Fixed at the source: **`Target.key` always holds the key**, and every caller
+passes `bearer = pick.key`. `streamRaw` is the only place that decides where it
+goes (x-api-key for Anthropic, Bearer for the rest). Pinned by a test that runs
+`setProviderId("anthropic")` with `ZODE_ANTHROPIC_KEY` in the environ map and
+demands `t.key != null` — plus the `setProviderId` buffer trap in its own
+comment (`cur_provider_id` points INTO `cur_provider_buf`, so saving the slice
+and then calling `setProviderId` overwrites the very bytes you meant to restore:
+copy the BYTES first).
+
+`summarizeTurns` and `runOneTurn` got `targetUrl` while they were there — the
+URL is derived from a Target or it is derived three times.
+
+## Tests
+
+12 new (797 total, 796 pass, 1 skip): precedence (session > config > env > off beats all),
+the three spellings, unknown provider, no key, success + its note, give-up is
+silent, the fallback note's wording, the anthropic key, config parse, `phraseHead`
+⊆ `phrase`, and the note riding in front of both `formatReport` and `refused`.
+
+`tools/submodel_smoke.py` is the wiring test the units cannot do: the submit
+chain, `cmdGroup` and the painted report, in a real pty with no network and no
+key (unlike `router_smoke.py`, which needs an account). A command can be
+perfectly unit-tested and still do nothing when typed — that is how
+`/free-auto` went unnoticed.
+
+**Roadmap state**: priority 1 (selective permissions), 2 (web_fetch offset +
+Brave behind `ZODE_BRAVE_KEY`) and 3 (this section) are done. **Priority 4 is
+next: the ecosystem — custom slash commands and hooks.**
