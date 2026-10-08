@@ -375,7 +375,9 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     // model has to know before it decides what to call, or it plans a `write`
     // and then gets an error, which it reads as a bug and works around.
     const mode_note: []const u8 = if (read_only)
-        "READ-ONLY MODE is on (shift+tab to turn it off). You cannot write, edit or run bash: those calls come back with an error saying so. Investigate, then use `ask` to tell the user what you found and ask how to proceed.\n\n"
+        "READ-ONLY MODE is on (shift+tab to cycle). You cannot write, edit or run bash: those calls come back with an error saying so. Investigate, then use `ask` to tell the user what you found and ask how to proceed.\n\n"
+    else if (accept_edits)
+        "ACCEPT-EDITS MODE is on (shift+tab to cycle): file edits (write, edit, rename) run without asking, but bash still asks for permission. Ask the user with `ask` before running anything destructive.\n\n"
     else
         "";
 
@@ -596,38 +598,89 @@ pub const default_max_iterations: usize = 12;
 /// race here and it would only ever delay the change by one iteration.
 pub var read_only: bool = false;
 
-/// Turns read-only mode on or off and says so.
-pub fn toggleReadOnly(m: *tui.Model) void {
-    read_only = !read_only;
-    m.read_only = read_only;
-    if (read_only) {
-        setStatusWithZo(m, .warn, "read-only · the agent investigates and asks");
-        pushInfo(m, "read-only mode ON (shift+tab to turn it off): write, edit and bash will come back with an error instead of running. The agent investigates and asks you with `ask`.");
-    } else {
-        setStatusWithZo(m, .done, "read-only off");
-        pushInfo(m, "read-only mode OFF");
-    }
+/// Accept-edits mode: file edits (`write`, `edit`, `rename`) run
+/// without a dialog; `bash` and everything else still asks. The
+/// middle ground between the default (a dialog per edit) and
+/// `/yolo` (allow all) — the selective part of selective permissions.
+///
+/// Mutually exclusive with `read_only` and `yolo`: every mode setter
+/// (`cyclePermMode`, `setPermMode`) clears the other two, and
+/// `permModesConsistent` pins that in a test.
+pub var accept_edits: bool = false;
+
+/// The four permission modes. `default` asks for anything that writes
+/// or runs a command; `accept_edits` auto-allows file edits;
+/// `read_only` blocks them; `bypass` (`/yolo`) allows everything.
+pub const PermMode = enum { default, accept_edits, read_only, bypass };
+
+/// The mode that applies right now, read off the three flags.
+pub fn currentPermMode() PermMode {
+    if (yolo) return .bypass;
+    if (read_only) return .read_only;
+    if (accept_edits) return .accept_edits;
+    return .default;
 }
 
-/// `/ask [on|off]`.
+/// The mode as one word, for the status bar and `/mode`.
+pub fn permModeName() []const u8 {
+    return switch (currentPermMode()) {
+        .default => "default",
+        .accept_edits => "accept-edits",
+        .read_only => "read-only",
+        .bypass => "bypass",
+    };
+}
+
+/// Sets the mode. The three flags are mutually exclusive BY
+/// CONSTRUCTION, not by convention: a caller that set one and forgot
+/// the others would leave the status bar advertising a mode that does
+/// not apply, which is worse than no mode at all.
+pub fn setPermMode(m: *tui.Model, mode: PermMode) void {
+    read_only = (mode == .read_only);
+    accept_edits = (mode == .accept_edits);
+    yolo = (mode == .bypass);
+    m.read_only = read_only;
+    m.accept_edits = accept_edits;
+}
+
+/// shift+tab: cycles the modes that ASK.
+/// default → accept-edits → plan → default.
+///
+/// Bypass (`/yolo`) is deliberately not in the cycle: it is the "stop
+/// asking me anything" switch, and cycling out of it lands on default,
+/// so the mode the status bar shows is always the mode that applies.
+pub fn cyclePermMode(m: *tui.Model) void {
+    const next = switch (currentPermMode()) {
+        .default => PermMode.accept_edits,
+        .accept_edits => PermMode.read_only,
+        .read_only => PermMode.default,
+        .bypass => PermMode.default,
+    };
+    setPermMode(m, next);
+    setStatusWithZoFmt(m, if (next == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
+    pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
+}
+
+/// `/ask [on|off]`: read-only (plan) mode, by its old name.
 fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
     if (arg) |a| {
         const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
         const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
-        if (on and !read_only) {
-            toggleReadOnly(m);
+        if (on) {
+            setPermMode(m, .read_only);
+            pushInfo(m, "read-only (plan) mode ON: the agent investigates and asks you with `ask`.");
             return;
         }
-        if (off and read_only) {
-            toggleReadOnly(m);
+        if (off) {
+            setPermMode(m, .default);
+            pushInfo(m, "read-only mode OFF");
             return;
         }
-        if (!on and !off) {
-            pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (read_only) "on" else "off"});
-            return;
-        }
+        pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (read_only) "on" else "off"});
+        return;
     }
-    toggleReadOnly(m);
+    // No argument: toggle, as it always did.
+    setPermMode(m, if (read_only) .default else .read_only);
 }
 
 /// `/bench`: the numbers that decide whether to tune anything.
@@ -965,11 +1018,114 @@ const max_always = 8;
 pub var always_names: [max_always][48]u8 = undefined;
 pub var always_lens: [max_always]usize = @splat(0);
 
+/// The `bash` command prefixes the user has allowed without a dialog,
+/// from `permissions.json`'s `"bash"` array. Fixed buffers, like
+/// `always_names`: the slices `loadAllowlist` reads them from live in
+/// an arena that dies at the end of the load.
+const max_bash_patterns = 16;
+const bash_pattern_max = 160;
+pub var bash_pattern_bufs: [max_bash_patterns][bash_pattern_max]u8 = undefined;
+pub var bash_pattern_lens: [max_bash_patterns]usize = @splat(0);
+
+fn isBashPattern(pat: []const u8) bool {
+    for (bash_pattern_lens, 0..) |l, i| {
+        if (l > 0 and std.mem.eql(u8, bash_pattern_bufs[i][0..l], pat)) return true;
+    }
+    return false;
+}
+
+/// Like `setAlwaysAllowedNoSave` but for a `bash` command prefix.
+fn addBashPatternNoSave(pat: []const u8) bool {
+    if (isBashPattern(pat)) return true;
+    // An over-long command is REFUSED, never cut. A pattern truncated at an
+    // arbitrary byte is a broader permission than the one the user approved:
+    // the first 96 bytes of `python -c "one specific thing"` would allow any
+    // other `python -c` there is. What was approved is what is stored.
+    if (pat.len == 0 or pat.len > bash_pattern_max) return false;
+    for (bash_pattern_lens, 0..) |l, i| {
+        if (l == 0) {
+            @memcpy(bash_pattern_bufs[i][0..pat.len], pat);
+            bash_pattern_lens[i] = pat.len;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a `bash` call's command matches one of the persisted
+/// command prefixes.
+///
+/// A prefix ending at a TOKEN BOUNDARY, not a substring: the pattern
+/// `git status` matches `git status --short` but never `git statusx`,
+/// and `git` matches `git push` — which is what the user asked for the
+/// moment they wrote `git`, so the specificity is theirs to choose.
+/// Whether the call runs without a dialog under the current
+/// mode: accept-edits auto-allows file edits, and a `bash`
+/// command matching a persisted prefix is allowed.
+///
+/// The selective part of selective permissions — the user's
+/// standing "I trust this", as against `/yolo`'s "I trust
+/// everything". Plan (read-only) and bypass are handled BEFORE
+/// this is consulted: plan blocks writes outright and bypass
+/// skips the dialog, so neither reaches here.
+fn permAutoAllowed(name: []const u8, arg: []const u8) bool {
+    return (accept_edits and isEditTool(name)) or bashPatternAllowed(name, arg);
+}
+
+fn bashPatternAllowed(name: []const u8, arg: []const u8) bool {
+    if (!std.mem.eql(u8, name, "bash")) return false;
+    const cmd = std.mem.trim(u8, arg, " \t\r\n");
+    for (bash_pattern_lens, 0..) |l, i| {
+        if (l == 0 or l > cmd.len) continue;
+        if (!std.mem.eql(u8, cmd[0..l], bash_pattern_bufs[i][0..l])) continue;
+        if (l != cmd.len and cmd[l] != ' ' and cmd[l] != '\t') continue;
+
+        // The remainder must not start ANOTHER command or redirect
+        // anywhere. `git status` allowed must not become
+        // `git status && rm -rf /`: the pattern names ONE command, and
+        // whatever chains after it is a different command however the
+        // prefix is read. `<` and `>` are in here because a redirect
+        // writes files, and `$` because it expands (a command
+        // substitution more so than a variable). A pattern that covers
+        // the whole line has an empty remainder and is unaffected.
+        const rest = cmd[l..];
+        if (rest.len > 0 and std.mem.indexOfAny(u8, rest, ";|&<>`$\n") != null) continue;
+        return true;
+    }
+    return false;
+}
+
 fn isAlwaysAllowed(name: []const u8) bool {
     for (always_lens, 0..) |l, i| {
         if (l > 0 and std.mem.eql(u8, always_names[i][0..l], name)) return true;
     }
     return false;
+}
+
+/// The `a` key on the permission dialog.
+///
+/// For every tool but `bash` it saves the TOOL NAME, as it always did. For
+/// `bash` it saves the COMMAND, because "bash may always run" is `/yolo`
+/// with extra steps: what the user actually approved, having just read the
+/// dialog, is this one command. Scoped approval is the whole point of
+/// selective permissions, and this is where the user is standing when they
+/// decide.
+fn allowAlwaysFor(m: *tui.Model, name: []const u8, arg: []const u8) void {
+    if (!std.mem.eql(u8, name, "bash")) {
+        setAlwaysAllowed(m, name);
+        return;
+    }
+    const cmd = std.mem.trim(u8, arg, " \t\r\n");
+    if (cmd.len == 0) return;
+    if (addBashPatternNoSave(cmd)) {
+        saveAllowlist();
+        const msg = std.fmt.allocPrint(m.allocator, "bash allowed: {s}", .{cmd}) catch return;
+        pushInfoOwned(m, msg);
+    } else {
+        // Too long for the 160-byte budget, or the list is full. Saying
+        // nothing here would look like the key had been ignored.
+        pushInfoFmt(m, "not saved: the command is longer than {d} bytes or the list of {d} is full", .{ bash_pattern_max, max_bash_patterns });
+    }
 }
 
 fn setAlwaysAllowed(m: *tui.Model, name: []const u8) void {
@@ -1009,16 +1165,37 @@ fn loadAllowlist() void {
 
     const data = readFileTo(a, path) orelse return;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, data, .{}) catch return;
-    if (parsed != .array) return;
-    for (parsed.array.items) |v| {
-        if (v != .string) continue;
-        _ = setAlwaysAllowedNoSave(v.string);
+    // Two shapes, because the file is hand-edited and it predates the
+    // `bash` patterns: a bare array is the tool allowlist (the old
+    // format), and an object carries the same list under `tools` plus
+    // the command prefixes under `bash`.
+    switch (parsed) {
+        .array => |arr| for (arr.items) |v| {
+            if (v == .string) _ = setAlwaysAllowedNoSave(v.string);
+        },
+        .object => |obj| {
+            if (obj.get("tools")) |tv| {
+                if (tv == .array) for (tv.array.items) |v| {
+                    if (v == .string) _ = setAlwaysAllowedNoSave(v.string);
+                };
+            }
+            if (obj.get("bash")) |bv| {
+                if (bv == .array) for (bv.array.items) |v| {
+                    if (v == .string) _ = addBashPatternNoSave(v.string);
+                };
+            }
+        },
+        else => {},
     }
 }
 
 // ── persisted allowlist: ~/.config/zode/permissions.json ─────
 fn permissionsFilePath(buf: []u8) ?[]const u8 {
-    const home = environ_global.?.get("HOME") orelse return null;
+    // `environ_global.?` panicked when the global was null, which is its
+    // normal state in every test that did not set it: a missing environment
+    // is "there is nowhere to persist", not a crash.
+    const env = environ_global orelse return null;
+    const home = env.get("HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.config/zode/permissions.json", .{home}) catch null;
 }
 
@@ -1038,9 +1215,24 @@ fn saveAllowlist() void {
         n += 1;
     }
 
-    var buf: [2048]u8 = undefined;
+    var pats: [max_bash_patterns][]const u8 = undefined;
+    var np: usize = 0;
+    for (bash_pattern_lens, 0..) |l, i| {
+        if (l == 0) continue;
+        pats[np] = bash_pattern_bufs[i][0..l];
+        np += 1;
+    }
+
+    var buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
+    // By hand (not with a writer over a map) because it is two short
+    // arrays and this way it reads at a glance:
+    //   {"tools":["edit"],"bash":["git status"]}
+    w.print("{{\"tools\":", .{}) catch return;
     config_mod.writeStringArray(&w, gpa_global, names[0..n]) catch return;
+    w.print(",\"bash\":", .{}) catch return;
+    config_mod.writeStringArray(&w, gpa_global, pats[0..np]) catch return;
+    w.print("}}", .{}) catch return;
     std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = w.buffered() }) catch {};
 }
 
@@ -1795,12 +1987,49 @@ pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
 // agent state (`current_effort`, the yolo flag) and `commands.zig` importing
 // back for a write is the edge that would make the two files a cycle.
 
-/// `/agent.yolo`: toggle for automatic permissions.
+/// `/yolo`: toggle bypass mode, the "stop asking me anything"
+/// switch. Turning it on clears the other modes so the status bar
+/// shows the mode that applies; turning it off returns to default.
 fn cmdYolo(m: *tui.Model) void {
-    yolo = !yolo;
+    setPermMode(m, if (yolo) .default else .bypass);
     const msg = if (yolo) "yolo ON: no confirmations" else "yolo OFF: asks for permission";
     pushInfo(m, msg);
     setStatusWithZo(m, if (yolo) .warn else .idle, msg);
+}
+
+/// `/mode [default|accept-edits|plan|bypass]`, or the current
+/// mode with no argument.
+///
+/// Selective permissions: the user picks how much the agent asks,
+/// per CLASS of action, without the all-or-nothing `/yolo`.
+fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        const mode = parsePermMode(a);
+        if (mode) |mm| {
+            setPermMode(m, mm);
+            setStatusWithZoFmt(m, if (mm == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
+            pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
+            return;
+        }
+        pushInfo(m, "/mode: default|accept-edits|read-only|bypass");
+        return;
+    }
+    pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
+}
+
+/// The mode a `/mode` argument names, or null when it names none.
+/// Case-insensitive, and tolerant of the spellings people type.
+fn parsePermMode(a: []const u8) ?PermMode {
+    if (std.ascii.eqlIgnoreCase(a, "default")) return .default;
+    if (std.ascii.eqlIgnoreCase(a, "accept-edits") or
+        std.ascii.eqlIgnoreCase(a, "accept_edits") or
+        std.ascii.eqlIgnoreCase(a, "edits")) return .accept_edits;
+    if (std.ascii.eqlIgnoreCase(a, "read-only") or
+        std.ascii.eqlIgnoreCase(a, "readonly") or
+        std.ascii.eqlIgnoreCase(a, "ro")) return .read_only;
+    if (std.ascii.eqlIgnoreCase(a, "bypass") or
+        std.ascii.eqlIgnoreCase(a, "yolo")) return .bypass;
+    return null;
 }
 
 /// `/effort low|medium|high`, or the picker if it comes without arguments.
@@ -1892,6 +2121,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdBg(m, arg);
     } else if (std.mem.eql(u8, cmd, "yolo")) {
         cmdYolo(m);
+    } else if (std.mem.eql(u8, cmd, "mode")) {
+        cmdMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
         commands_mod.cmdAllowlist(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
@@ -4963,12 +5194,19 @@ fn execOneCall(
     }
 
     // ── permission ──
-    if (!yolo and tools_mod.needsPermission(call.name) and !isAlwaysAllowed(call.name)) {
+    //
+    // Accept-edits auto-allows file edits, and a `bash` command
+    // that matches a persisted prefix is allowed without a dialog.
+    // Both are the user's standing "I trust this" — the selective
+    // part of selective permissions — and everything else that
+    // needs permission still asks, unless `/yolo` said not to.
+    const auto_allowed = permAutoAllowed(call.name, arg);
+    if (!yolo and !auto_allowed and tools_mod.needsPermission(call.name) and !isAlwaysAllowed(call.name)) {
         var dbuf: [384]u8 = undefined;
         const detail = std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
         switch (m.requestPermission(call.name, detail)) {
             .allow => {},
-            .allow_always => setAlwaysAllowed(m, call.name),
+            .allow_always => allowAlwaysFor(m, call.name, arg),
             .deny, .none => {
                 // The denial is handed back to the model as a result
                 // so it changes strategy instead of retrying.
@@ -5750,6 +5988,17 @@ pub fn isWriteTool(name: []const u8) bool {
     return std.mem.eql(u8, name, "write") or
         std.mem.eql(u8, name, "edit") or
         std.mem.eql(u8, name, "bash");
+}
+
+/// The tools that change files but run no command: the ones
+/// accept-edits mode auto-allows. `bash` is deliberately NOT here —
+/// accepting edits is not accepting arbitrary commands — and neither
+/// is `task`, because a subagent is exactly the thing that should
+/// stay behind a dialog.
+pub fn isEditTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "edit") or
+        std.mem.eql(u8, name, "rename");
 }
 
 /// Path of the file a writing tool touches (or null if it does not say).
@@ -9378,6 +9627,293 @@ pub fn verdictIsFinal(g: goal_mod.Goal, open_steps: usize) bool {
     if (g.status == goal_mod.Status.none) return false;
     if (g.status == goal_mod.Status.met and open_steps > 0) return false;
     return true;
+}
+
+// ── selective permissions: modes, edit tools, bash patterns ──
+
+test "perm modes: the three flags are mutually exclusive, always" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = read_only, .ae = accept_edits, .y = yolo };
+    defer {
+        read_only = saved.ro;
+        accept_edits = saved.ae;
+        yolo = saved.y;
+    }
+
+    // Every mode sets exactly the flags that name it, so the
+    // status bar never advertises a mode that does not apply.
+    inline for (.{ PermMode.default, PermMode.accept_edits, PermMode.read_only, PermMode.bypass }) |mode| {
+        setPermMode(&m, mode);
+        try std.testing.expectEqual(mode == .read_only, read_only);
+        try std.testing.expectEqual(mode == .accept_edits, accept_edits);
+        try std.testing.expectEqual(mode == .bypass, yolo);
+        try std.testing.expectEqual(mode, currentPermMode());
+    }
+}
+
+test "permModeName: one word per mode" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = read_only, .ae = accept_edits, .y = yolo };
+    defer {
+        read_only = saved.ro;
+        accept_edits = saved.ae;
+        yolo = saved.y;
+    }
+
+    setPermMode(&m, .default);
+    try std.testing.expectEqualStrings("default", permModeName());
+    setPermMode(&m, .accept_edits);
+    try std.testing.expectEqualStrings("accept-edits", permModeName());
+    setPermMode(&m, .read_only);
+    try std.testing.expectEqualStrings("read-only", permModeName());
+    setPermMode(&m, .bypass);
+    try std.testing.expectEqualStrings("bypass", permModeName());
+}
+
+test "shift+tab cycles default -> accept-edits -> plan -> default" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = read_only, .ae = accept_edits, .y = yolo };
+    defer {
+        read_only = saved.ro;
+        accept_edits = saved.ae;
+        yolo = saved.y;
+    }
+
+    setPermMode(&m, .default);
+    cyclePermMode(&m);
+    try std.testing.expectEqual(PermMode.accept_edits, currentPermMode());
+    cyclePermMode(&m);
+    try std.testing.expectEqual(PermMode.read_only, currentPermMode());
+    cyclePermMode(&m);
+    try std.testing.expectEqual(PermMode.default, currentPermMode());
+
+    // Bypass is deliberately not in the cycle: it is the "stop
+    // asking me anything" switch, and cycling out of it lands on
+    // default so the shown mode is always the mode that applies.
+    setPermMode(&m, .bypass);
+    cyclePermMode(&m);
+    try std.testing.expectEqual(PermMode.default, currentPermMode());
+}
+
+test "isEditTool: the file edits, and not bash or a subagent" {
+    try std.testing.expect(isEditTool("write"));
+    try std.testing.expect(isEditTool("edit"));
+    try std.testing.expect(isEditTool("rename"));
+    // Accepting edits is NOT accepting arbitrary commands, and a
+    // subagent is exactly the thing that stays behind a dialog.
+    try std.testing.expect(!isEditTool("bash"));
+    try std.testing.expect(!isEditTool("task"));
+    try std.testing.expect(!isEditTool("read"));
+}
+
+test "bashPatternAllowed: a prefix at a token boundary, and only for bash" {
+    const saved_lens = bash_pattern_lens;
+    const saved_bufs = bash_pattern_bufs;
+    defer {
+        bash_pattern_lens = saved_lens;
+        bash_pattern_bufs = saved_bufs;
+    }
+    for (&bash_pattern_lens) |*l| l.* = 0;
+    bash_pattern_lens[0] = "git status".len;
+    @memcpy(bash_pattern_bufs[0][0.."git status".len], "git status");
+
+    // The pattern itself, anything that extends it with a flag,
+    // and the command with surrounding whitespace.
+    try std.testing.expect(bashPatternAllowed("bash", "git status"));
+    try std.testing.expect(bashPatternAllowed("bash", "git status --short"));
+    try std.testing.expect(bashPatternAllowed("bash", "  git status  "));
+
+    // A longer token that merely starts the same way is NOT a match.
+    try std.testing.expect(!bashPatternAllowed("bash", "git statusx"));
+    // A different command entirely.
+    try std.testing.expect(!bashPatternAllowed("bash", "git push --force"));
+
+    // Chaining, pipes, redirects and expansion are a DIFFERENT command
+    // however the prefix is read: `git status` allowed must never become
+    // `git status && rm -rf /`.
+    try std.testing.expect(!bashPatternAllowed("bash", "git status && rm -rf /"));
+    try std.testing.expect(!bashPatternAllowed("bash", "git status; echo pwned"));
+    try std.testing.expect(!bashPatternAllowed("bash", "git status | wc -l"));
+    try std.testing.expect(!bashPatternAllowed("bash", "git status > /etc/passwd"));
+    try std.testing.expect(!bashPatternAllowed("bash", "git status $(echo hi)"));
+    // The pattern is for `bash`; a tool that merely runs a command
+    // in its arguments is not a bash command.
+    try std.testing.expect(!bashPatternAllowed("edit", "git status"));
+}
+
+test "permAutoAllowed: accept-edits allows edits, a bash prefix allows that bash" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = read_only, .ae = accept_edits, .y = yolo };
+    const saved_lens = bash_pattern_lens;
+    const saved_bufs = bash_pattern_bufs;
+    defer {
+        read_only = saved.ro;
+        accept_edits = saved.ae;
+        yolo = saved.y;
+        bash_pattern_lens = saved_lens;
+        bash_pattern_bufs = saved_bufs;
+    }
+    for (&bash_pattern_lens) |*l| l.* = 0;
+    bash_pattern_lens[0] = "git status".len;
+    @memcpy(bash_pattern_bufs[0][0.."git status".len], "git status");
+
+    // Default: nothing is auto-allowed, so everything asks. The
+    // `git status` pattern is set below and allowed in EVERY mode,
+    // so the command that must ask here is one it does not name.
+    setPermMode(&m, .default);
+    try std.testing.expect(!permAutoAllowed("write", "{}"));
+    try std.testing.expect(!permAutoAllowed("bash", "zig build test"));
+
+    // Accept-edits: file edits run, but bash still asks.
+    setPermMode(&m, .accept_edits);
+    try std.testing.expect(permAutoAllowed("write", "{}"));
+    try std.testing.expect(permAutoAllowed("edit", "{}"));
+    try std.testing.expect(permAutoAllowed("rename", "{}"));
+    // A bash command with no allowed prefix still asks, even here:
+    // accepting edits is not accepting commands.
+    try std.testing.expect(!permAutoAllowed("bash", "zig build test"));
+
+    // A bash prefix allows that command in ANY mode: it is the
+    // user's standing "I trust this", independent of the mode.
+    setPermMode(&m, .default);
+    try std.testing.expect(permAutoAllowed("bash", "git status"));
+    try std.testing.expect(permAutoAllowed("bash", "git status --short"));
+    try std.testing.expect(!permAutoAllowed("bash", "rm -rf /"));
+}
+
+test "the `a` key on a bash dialog saves the COMMAND, not the whole tool" {
+    const saved = .{
+        .env = environ_global,
+        .al = always_lens,
+        .bl = bash_pattern_lens,
+        .bb = bash_pattern_bufs,
+    };
+    defer {
+        environ_global = saved.env;
+        always_lens = saved.al;
+        bash_pattern_lens = saved.bl;
+        bash_pattern_bufs = saved.bb;
+    }
+    // No HOME: `saveAllowlist` has nowhere to write and says so quietly.
+    environ_global = null;
+    for (&always_lens) |*l| l.* = 0;
+    for (&bash_pattern_lens) |*l| l.* = 0;
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // `bash`: the command is what gets stored. Saving the tool name here
+    // would be "every command, forever" — /yolo with an extra step, and
+    // persisted on top.
+    allowAlwaysFor(&m, "bash", "  git status --short  ");
+    try std.testing.expect(!isAlwaysAllowed("bash"));
+    try std.testing.expect(bashPatternAllowed("bash", "git status --short"));
+    // A second command the user never approved still asks.
+    try std.testing.expect(!bashPatternAllowed("bash", "git push --force"));
+
+    // Every other tool behaves exactly as it always did.
+    allowAlwaysFor(&m, "edit", "{}");
+    try std.testing.expect(isAlwaysAllowed("edit"));
+    try std.testing.expect(!isAlwaysAllowed("write"));
+
+    // An over-long command is REFUSED, not cut: a pattern truncated at an
+    // arbitrary byte is a broader permission than the one approved.
+    var long_cmd: [200]u8 = undefined;
+    @memset(&long_cmd, 'a');
+    try std.testing.expect(!addBashPatternNoSave(&long_cmd));
+    for (bash_pattern_lens) |l| try std.testing.expect(l != long_cmd.len);
+}
+
+test "permissions.json: the old shape and the new one both load, and saving round-trips" {
+    const saved = .{
+        .env = environ_global,
+        .io = io_global,
+        .gpa = gpa_global,
+        .al = always_lens,
+        .bl = bash_pattern_lens,
+        .bb = bash_pattern_bufs,
+    };
+    defer {
+        environ_global = saved.env;
+        io_global = saved.io;
+        gpa_global = saved.gpa;
+        always_lens = saved.al;
+        bash_pattern_lens = saved.bl;
+        bash_pattern_bufs = saved.bb;
+    }
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+
+    // Its own HOME: this test must never read or write the reader's real
+    // permissions.json.
+    const home = "/tmp/zode-perm-test";
+    std.Io.Dir.cwd().deleteTree(io_global, home) catch {};
+    defer {
+        std.Io.Dir.cwd().deleteTree(io_global, home) catch {};
+    }
+    try std.Io.Dir.cwd().createDirPath(io_global, "/tmp/zode-perm-test/.config/zode");
+
+    var emap = std.process.Environ.Map.init(std.testing.allocator);
+    defer emap.deinit();
+    try emap.put("HOME", home);
+    environ_global = &emap;
+
+    var pbuf: [512]u8 = undefined;
+    const path = permissionsFilePath(&pbuf) orelse return error.NoPath;
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const a = astate.allocator();
+
+    // ── the OLD shape: a bare array of tool names, which is what every
+    //    permissions.json written before the bash patterns looked like. ──
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = "[\"edit\",\"write\"]" });
+    for (&always_lens) |*l| l.* = 0;
+    for (&bash_pattern_lens) |*l| l.* = 0;
+    loadAllowlist();
+    try std.testing.expect(isAlwaysAllowed("edit"));
+    try std.testing.expect(isAlwaysAllowed("write"));
+    var any_pattern = false;
+    for (bash_pattern_lens) |l| {
+        if (l > 0) any_pattern = true;
+    }
+    try std.testing.expect(!any_pattern);
+
+    // ── the NEW shape: tools plus the commands that were approved. ──
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = "{\"tools\":[\"edit\"],\"bash\":[\"git status\",\"zig build test\"]}" });
+    for (&always_lens) |*l| l.* = 0;
+    for (&bash_pattern_lens) |*l| l.* = 0;
+    loadAllowlist();
+    try std.testing.expect(isAlwaysAllowed("edit"));
+    try std.testing.expect(!isAlwaysAllowed("write"));
+    try std.testing.expect(bashPatternAllowed("bash", "git status"));
+    try std.testing.expect(bashPatternAllowed("bash", "zig build test --summary all"));
+    try std.testing.expect(!bashPatternAllowed("bash", "git push --force"));
+
+    // ── saving writes the NEW shape (a bare array cannot carry `bash`),
+    //    and loading that file back gives the very same answer. ──
+    saveAllowlist();
+    for (&always_lens) |*l| l.* = 0;
+    for (&bash_pattern_lens) |*l| l.* = 0;
+    loadAllowlist();
+    try std.testing.expect(isAlwaysAllowed("edit"));
+    try std.testing.expect(!isAlwaysAllowed("write"));
+    try std.testing.expect(bashPatternAllowed("bash", "git status"));
+    try std.testing.expect(bashPatternAllowed("bash", "zig build test"));
+
+    const data = readFileTo(a, path) orelse return error.NoFile;
+    try std.testing.expect(std.mem.startsWith(u8, data, "{\"tools\":["));
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"bash\":") != null);
 }
 
 // ── the real turn, against a real provider ─────────────────────────

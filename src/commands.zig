@@ -53,9 +53,11 @@ pub fn cmdHelp(m: *tui.Model) void {
 /// way was to open the file by hand. It also says whether `/agent.yolo` is on, which
 /// is the other way of "don't ask me".
 pub fn cmdAllowlist(m: *tui.Model) void {
-    var line_buf: [256]u8 = undefined;
+    var line_buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&line_buf);
-    w.writeAll("always allowed: ") catch {};
+    w.writeAll("mode: ") catch {};
+    w.writeAll(agent.permModeName()) catch {};
+    w.writeAll("  \u{b7} always allowed: ") catch {};
     var n: usize = 0;
     for (agent.always_lens, 0..) |l, i| {
         if (l == 0) continue;
@@ -64,7 +66,17 @@ pub fn cmdAllowlist(m: *tui.Model) void {
         n += 1;
     }
     if (n == 0) w.writeAll("(none)") catch {};
-    if (agent.yolo) w.writeAll("  \u{b7} agent.yolo ON: everything is auto-allowed") catch {};
+    // The bash command prefixes: the other half of selective
+    // permissions, the commands that run without a dialog.
+    var np: usize = 0;
+    w.writeAll("  \u{b7} bash: ") catch {};
+    for (agent.bash_pattern_lens, 0..) |l, i| {
+        if (l == 0) continue;
+        if (np > 0) w.writeAll(" \u{b7} ") catch {};
+        w.writeAll(agent.bash_pattern_bufs[i][0..l]) catch {};
+        np += 1;
+    }
+    if (np == 0) w.writeAll("(none)") catch {};
     const msg = std.fmt.allocPrint(
         m.allocator,
         "{s}",
@@ -452,8 +464,9 @@ pub const commands = [_]Cmd{
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)" },
-    .{ .key = "/agent.yolo", .desc = "toggle auto permissions" },
-    .{ .key = "/allowlist", .desc = "tools always allowed (persisted)" },
+    .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing" },
+    .{ .key = "/mode", .desc = "permission mode: default | accept-edits | read-only | bypass" },
+    .{ .key = "/allowlist", .desc = "always-allowed tools + bash (persisted)" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall" },
     .{ .key = "/new", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },

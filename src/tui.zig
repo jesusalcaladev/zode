@@ -753,6 +753,10 @@ pub const Model = struct {
     /// Read-only mode: write/edit/bash come back as tool_results instead of
     /// running. See `/ask`.
     read_only: bool = false,
+    /// Accept-edits: write/edit/rename run without a dialog, bash still
+    /// asks. See `/mode`; `agent.currentPermMode()` is what the status
+    /// bar reads, these two fields only mirror it for the draw.
+    accept_edits: bool = false,
     /// Background jobs (see `bgproc.zig`): id, how many were started, whether
     /// ESC has been pressed since the last one.
     bg: bgproc.Registry = .{},
@@ -4149,7 +4153,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // switch AFTER typing the prompt ("actually, look first"), and a mode
             // you can only enter with an empty box is a mode you use once.
             if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
-                agent.toggleReadOnly(self);
+                agent.cyclePermMode(self);
                 ctx.redraw = true;
                 try self.armTick(ctx);
                 return;
@@ -5527,13 +5531,19 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
         out.append(arena, .{ .text = et, .style = theme.brand_faint }) catch return null;
     }
 
-    // Read-only mode. It has to be VISIBLE at all times and not just in the
-    // history, because it changes what a write tool call will do: a mode you
-    // cannot see is a mode where "the model ignored my edit" is indistinguishable
-    // from "the model did not try".
-    if (agent.read_only) {
+    // The permission mode. It has to be VISIBLE at all times and not just
+    // in the history, because it changes what a write tool call will do: a
+    // mode you cannot see is a mode where "the model ignored my edit" is
+    // indistinguishable from "the model did not try". All the non-default
+    // modes show, not only read-only: accept-edits and bypass are exactly
+    // the modes where "did it ask?" is the question the answer matters to.
+    const pm = agent.currentPermMode();
+    if (pm != .default) {
         if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
-        out.append(arena, .{ .text = "read-only", .style = theme.warn_bold }) catch return null;
+        out.append(arena, .{
+            .text = agent.permModeName(),
+            .style = if (pm == .accept_edits) theme.tool else theme.warn_bold,
+        }) catch return null;
     }
 
     // Context tokens ALWAYS visible, not only when they are > 0.
@@ -6064,19 +6074,22 @@ test "autocomplete: filters by prefix and accepts with tab" {
     m.ed.insert("/mo") catch {};
     syncAutocomplete(&m);
     try std.testing.expect(m.ac.active);
-    // /model, /models and /mode... no: /model, /models, and /memory does not
-    // exist, but /models does. Checked against the real list.
+    // /model, /models and /mode, all three against the real list
+    // (/memory does not exist). A prefix filter, not an exact one.
     const n_mo = matchCount(&m);
-    try std.testing.expect(n_mo >= 2);
+    try std.testing.expect(n_mo >= 3);
     var has_model = false;
     var has_models = false;
+    var has_mode = false;
     for (0..n_mo) |i| {
         const k = matchLabel(&m, i).?;
         if (std.mem.eql(u8, k, "/model")) has_model = true;
         if (std.mem.eql(u8, k, "/models")) has_models = true;
+        if (std.mem.eql(u8, k, "/mode")) has_mode = true;
     }
     try std.testing.expect(has_model);
     try std.testing.expect(has_models);
+    try std.testing.expect(has_mode);
 
     // "/models" leaves only /models (the longer prefix wins)
     m.ed.clear();
@@ -6085,11 +6098,13 @@ test "autocomplete: filters by prefix and accepts with tab" {
     try std.testing.expectEqual(@as(usize, 1), matchCount(&m));
     try std.testing.expectEqualStrings("/models", matchLabel(&m, 0).?);
 
-    // "/mod" leaves /model and /models
+    // "/mod" leaves /models, /model and /mode, in table order:
+    // /models precedes /model in the command table, which is why
+    // index 0 below is /models and not the alphabetically-first one.
     m.ed.clear();
     m.ed.insert("/mod") catch {};
     syncAutocomplete(&m);
-    try std.testing.expectEqual(@as(usize, 2), matchCount(&m));
+    try std.testing.expectEqual(@as(usize, 3), matchCount(&m));
     m.ac.sel = 0;
     try std.testing.expectEqualStrings("/models", matchLabel(&m, 0).?);
 
