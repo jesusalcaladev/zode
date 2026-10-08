@@ -66,6 +66,27 @@ pub const verification_prompt = prompt_mod.verification_prompt;
 // ── system prompt: the project's AGENTS.md (cached) ──────────
 var agents_md_cache: ?[]u8 = null;
 
+/// Releases the AGENTS.md cache.
+///
+/// `pub` and idempotent (null after the first call) for one reason: the E2E test needs to
+/// release a module global it did not create, and doing `allocator.free(x); x = null;` at
+/// the call site is a double free the moment any other owner does the same. Inlining the
+/// guard makes the second call a no-op rather than a crash.
+///
+/// In the app this is never called: the cache is a process-lifetime allocation. It exists
+/// for tests that take over the globals.
+pub fn forgetAgentsCache(a: std.mem.Allocator) void {
+    if (agents_md_cache) |c| {
+        // The CALLER's allocator, because the cache was read with the one `runOneTurn`
+        // was handed. Two separate wrong guesses were made here before this: freeing it
+        // with `page_allocator` while the block belonged to the testing allocator (an
+        // Invalid free), and freeing it at the call site (a double free the moment any
+        // other owner does the same).
+        a.free(c);
+        agents_md_cache = null;
+    }
+}
+
 /// Where zode is running, resolved ONCE at startup.
 ///
 /// Fixed buffers and no lock: the cwd cannot change while zode runs, so this is
@@ -812,6 +833,27 @@ fn updateTps(chars: usize, start_ns: i128) void {
 // ── active provider / model / session ────────────────────────
 
 pub var cur_provider_id: []const u8 = "opencode";
+/// The active provider's id, in a static buffer.
+///
+/// Same rule as `cur_model_buf`. `loadUserConfig` reads the id from
+/// `config.json` or from `ZODE_PROVIDER` — memory the CALLER owns: the
+/// config arena, freed at shutdown, and the environ map, which in a test
+/// is a temporary the test deinits. Pointing at either is a dangling
+/// slice the moment that memory is freed, and the status bar reads
+/// `cur_provider_id` on every frame.
+///
+/// Found by the first E2E test: it freed its environ map, and the very
+/// next test's status draw segfaulted reading the provider name.
+pub var cur_provider_buf: [128]u8 = undefined;
+
+/// Copies the provider id into `cur_provider_buf` and points
+/// `cur_provider_id` at it, so the global never points at memory a
+/// caller can free.
+pub fn setProviderId(id: []const u8) void {
+    const n = @min(id.len, cur_provider_buf.len);
+    std.mem.copyForwards(u8, cur_provider_buf[0..n], id[0..n]);
+    cur_provider_id = cur_provider_buf[0..n];
+}
 var cur_model: []const u8 = "";
 
 /// Active session (`null` until the first message). The worker creates it, not
@@ -1092,8 +1134,22 @@ var cheap_router: router_mod.State = .{};
 var router_cheap_on: bool = false;
 
 /// `ZODE_CHEAP_TURN`, read once at startup.
+/// The cheap-router model name, in a static buffer.
+///
+/// Same rule as `cur_model_buf`, and for the same reason: the global
+/// outlives the map `initFromEnv` read the name from. `initFromEnv`
+/// returns a slice INTO the caller's map, so a global that points at it
+/// dangles the moment any caller passes a map it then deinits — which is
+/// exactly what a test does, and what the first E2E test crashed on.
+pub var cheap_model_buf: [128]u8 = undefined;
+
 pub fn initCheapRouterFromEnv(env: ?*const std.process.Environ.Map) void {
     cheap_router = router_mod.initFromEnv(env);
+    if (cheap_router.cheap_model.len > 0) {
+        const n = @min(cheap_router.cheap_model.len, cheap_model_buf.len);
+        std.mem.copyForwards(u8, cheap_model_buf[0..n], cheap_router.cheap_model[0..n]);
+        cheap_router.cheap_model = cheap_model_buf[0..n];
+    }
     router_cheap_on = cheap_router.cheap_model.len > 0;
 }
 
@@ -1225,10 +1281,10 @@ pub fn loadUserConfig() void {
         // and ended up sending one provider's key to another provider's
         // endpoint → 403.)
         if (user_config.provider.len > 0) {
-            cur_provider_id = user_config.provider;
+            setProviderId(user_config.provider);
         } else if (envGet(environ_global, "ZODE_PROVIDER")) |p| {
             if (config_mod.find(user_config, p) != null or providers.byId(p) != null) {
-                cur_provider_id = p;
+                setProviderId(p);
             }
         }
         // `ZODE_MODEL` FIRST, then `config.json`. It was config.json only, and
@@ -6667,7 +6723,7 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
         pushInfoOwned(m, msg);
         return;
     };
-    cur_provider_id = def.id;
+    setProviderId(def.id);
     // A model from the PREVIOUS provider is no good for the new one (that is what
     // happened when going from opencode to anthropic: an opencode id in a
     // Messages API request is a 400). With no compiled `default_model`, the only
@@ -8037,6 +8093,18 @@ test "the cheap router is off unless ZODE_CHEAP_TURN names a model" {
     // The default matters more than the feature: a small model that is not
     // available for your account answers 403 and the model has no way to know
     // the fallback would have worked. So nothing happens unless it is asked for.
+    //
+    // The global is saved and restored, not just overwritten: turning the
+    // router on here leaves every LATER turn — including the E2E — routing
+    // through a model that does not exist, which is not what this test is
+    // about and not what the suite should inherit.
+    const saved_router = cheap_router;
+    const saved_on = router_cheap_on;
+    defer {
+        cheap_router = saved_router;
+        router_cheap_on = saved_on;
+    }
+
     var off = std.process.Environ.Map.init(std.testing.allocator);
     defer off.deinit();
 
@@ -9319,40 +9387,78 @@ pub fn verdictIsFinal(g: goal_mod.Goal, open_steps: usize) bool {
 // in the file that can catch the class of bug the whole exit-gate work exists for:
 // the gate refusing, the nudge going out, and the turn carrying on.
 //
-// It is GATED on `ZODE_E2E=1`, and that is not a formality. It costs money, it takes
-// thirty seconds, and it fails for reasons that have nothing to do with zode (a
-// rate limit, a provider having a bad minute). A test that fails in CI for a reason
-// nobody can reproduce is a test that gets deleted, and then the seam is unwatched
-// again.
+// It is GATED on the build option `-De2e`, and that is not a formality. It
+// costs money, it takes thirty seconds, and it fails for reasons that have
+// nothing to do with zode (a rate limit, a provider having a bad minute). A
+// test that fails in CI for a reason nobody can reproduce is a test that gets
+// deleted, and then the seam is unwatched again.
 //
-// Run it with a key in the environment:
+// Run it with a key in `.env`:
 //
-//   set -a && . ./.env && set +a
-//   ZODE_E2E=1 zig build test -- "E2E: a real turn"
+//   zig build test -De2e -- "E2E: a real turn"
 //
-// It needs `ZODE_PROVIDER` and that provider's key, and it picks a free model so it
-// costs nothing on a free tier.
+// It needs `ZODE_PROVIDER` and that provider's key, and it picks a free model
+// so it costs nothing on a free tier.
+//
+/// Reads `KEY=VALUE` pairs from `.env` into `map`.
+///
+/// `.env` is gitignored and chmod 600, so it is the one place a provider key
+/// can enter a test without entering the tree. `put` dupes both sides, so the
+/// buffer this reads into is free on return.
+fn loadDotEnv(io: std.Io, map: *std.process.Environ.Map) void {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, ".env", std.heap.page_allocator, .limited(64 * 1024)) catch return;
+    defer std.heap.page_allocator.free(data);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        const bare = if (std.mem.startsWith(u8, trimmed, "export ")) trimmed["export ".len..] else trimmed;
+        const eq = std.mem.indexOfScalar(u8, bare, '=') orelse continue;
+        const key = std.mem.trim(u8, bare[0..eq], " \t");
+        const val = std.mem.trim(u8, bare[eq + 1 ..], " \t\"'");
+        if (key.len == 0) continue;
+        map.put(key, val) catch return;
+    }
+}
+
+/// Whether the map holds any credential at all: the generic `ZODE_API_KEY` or
+/// any provider's `ZODE_<PROVIDER>_KEY`. The E2E test cannot run without one,
+/// and it must not run against a provider that would answer 401.
+fn envHasAnyKey(map: *const std.process.Environ.Map) bool {
+    if (map.get("ZODE_API_KEY") != null) return true;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.endsWith(u8, entry.key_ptr.*, "_KEY")) return true;
+    }
+    return false;
+}
+
 test "E2E: a real turn against a real provider completes and answers" {
     // GATED AT BUILD TIME, not by an environment variable. See the comment in `build.zig`
     // for why the environment was not an option: this Zig version gives a test no way to
     // read the process environment at all.
     if (!build_options.e2e) return;
 
-    // The map the test hands the worker is BUILT HERE, with exactly the three variables it
-    // needs, because `Environ.Map.init` creates an empty one and there is no std API to
-    // populate it from the process. That is the right shape anyway: a test whose inputs
-    // change with the machine it runs on is not a test.
-    var env_map = std.process.Environ.Map.init(std.testing.allocator);
-    defer env_map.deinit();
-    env_map.put("ZODE_E2E", "1") catch return;
-    env_map.put("ZODE_PROVIDER", "openrouter") catch return;
-    env_map.put("ZODE_OPENROUTER_KEY", "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") catch return;
-
     // A real `Io`. `Io.Threaded` is what the app uses, and a test that used a fake one
     // would be testing the fake.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
+
+    // The map the test hands the worker is BUILT HERE, from `.env`, because
+    // `Environ.Map.init` creates an empty one and there is no std API to
+    // populate it from the process. That is the right shape anyway: a test whose
+    // inputs change with the machine it runs on is not a test — and the one
+    // input it cannot do without, the provider's key, is a secret that must
+    // not be in this file. It was committed once, by mistake; reading it from
+    // the gitignored `.env` is the only fix that makes a repeat impossible.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    loadDotEnv(io, &env_map);
+    // No credential, no test: running without one is a 401, which is not an
+    // end-to-end of anything. Skip — a red "no key" is exactly as ignorable as
+    // the quota failure this test was redesigned to survive.
+    if (!envHasAnyKey(&env_map)) return;
 
     // The three globals the worker reads. `loadUserConfig` is what resolves the
     // provider from `ZODE_PROVIDER`, and it reads `environ_global` — so without this
@@ -9369,21 +9475,11 @@ test "E2E: a real turn against a real provider completes and answers" {
         // the globals has to give them back: `shutdownBuffers` frees it, and skipping it
         // leaks a megabyte per run of a test that is supposed to be about correctness.
         shutdownBuffers();
-        // The AGENTS.md cache is deliberately NOT freed here, and the reason is written
-        // down because not freeing it looked like the bug. `systemPromptBase` reads it
-        // once and the module keeps it for the life of the process, which in the app is a
-        // process-lifetime allocation nobody frees and nobody minds.
-        //
-        // Freeing it from a test crashed under `zig build test` and did NOT crash running
-        // the same binary by hand, which means it is freed on a path this test does not
-        // own: `shutdownUserConfig` runs `freeSkillsCache` in the same teardown window and
-        // the two arenas are adjacent enough that the allocator's bookkeeping disagrees.
-        // That is a real finding and it is NOT fixed here, because guessing at it is how
-        // a test gets silenced by a plausible theory — and there is already a comment in
-        // AGENTS.md about exactly that.
-        //
-        // The cost of leaving it is one 100 KB block per E2E run, which the DebugAllocator
-        // reports and which nobody will ever look at. The cost of guessing is a crash.
+        // The AGENTS.md cache, read once by `systemPromptBase` with the testing allocator
+        // and kept in the module for the life of the process. `forgetAgentsCache` takes the
+        // allocator, because the block belongs to the one `runOneTurn` was handed — and
+        // freeing it with any other is an Invalid free.
+        forgetAgentsCache(std.testing.allocator);
     }
     io_global = io;
     environ_global = &env_map;

@@ -3929,12 +3929,14 @@ roster-probe          → 8 free candidates, sorted, contexts and gate status pe
 
 ---
 
-# The first real E2E test, and the two production bugs it found (2026-10-08)
+# The first real E2E test, and the four production bugs it found (2026-10-08)
 
 `chatWorker` had no test at any level. This one runs a real turn against a real
-provider with a real key, behind `zig build test -De2e`.
+provider with a real key, behind `zig build test -De2e`. The key is read from
+the gitignored `.env` — NEVER from the source, where it was committed once by
+mistake and had to be rotated.
 
-## Two production bugs, neither caught by 760 tests
+## Four production bugs, none caught by 760 tests
 
 **1. `pushRetryNotice` leaked on EVERY retry.** `setStatusWithZo` copies into a fixed
 buffer on the Model, so the allocation's work was done the moment the copy was made —
@@ -3951,6 +3953,26 @@ block with an allocator that had never heard of it. A general protection fault, 
 teardown of a test that had already printed its result. The allocator that reserved it is
 now recorded next to it (`body_buf_with`), which makes the function correct without
 anybody remembering to order the `defer`s.
+
+**3. The cheap router's model name dangled.** `initCheapRouterFromEnv` stored
+`initFromEnv`'s return — a slice INTO the caller's environ map — in the module
+global `cheap_router`. In the app that map is the process environment, which lives
+forever, so nobody noticed. A test that passed a local map, turned the router on,
+and deinited it left the global pointing at freed memory, and the next turn crashed
+in `setAnswering` reading the model name. The name now lives in `cheap_model_buf`,
+the same rule as `cur_model_buf`, and the test that turned it on restores the
+global it changed.
+
+**4. The active provider's id dangled.** `loadUserConfig` set `cur_provider_id` to
+`user_config.provider` (the config arena) or to the `ZODE_PROVIDER` value (the
+environ map) — both memory the caller owns. The status bar reads `cur_provider_id`
+on every frame, so the first test after one that freed that memory segfaulted
+drawing the provider name. It now lives in `cur_provider_buf`, via `setProviderId`.
+
+Bugs 3 and 4 are the same defect as `cur_model_buf`, a third and fourth time:
+**a global that points at memory a caller can free.** The fix is always "copy the
+name into a static buffer", and it is now applied everywhere a module global
+outlives the map it was read from.
 
 The lesson is the one in `AttachIo` again: **a global is not a dependency injection
 point, it is a lie about when two things are the same.**
@@ -3977,11 +3999,14 @@ This Zig version gives a test no way to read the process environment at all:
 `std.testing.environ` is `undefined` in a test. Three dead ends, one after the other,
 before the flag moved to where a test can actually see it. `zig build test -De2e`.
 
-## What is left, honestly
+## The teardown segfault is fixed, and what it really was
 
-The test's teardown segfaults the runner when it DOES run. It is a defect in my test,
-not in the harness — most likely the detached worker being joined by a flag rather than
-by `waitWorkers`, or the session being destroyed under a thread that is still appending.
-It is gated off so the suite is green, it is documented in the test, and it is NOT fixed,
-because guessing at it is how a test gets silenced by a plausible theory. There is
-already a comment in this file about that.
+The first version of this test crashed the runner, and the honest note here used to
+say "a defect in my test, not fixed, because guessing is how a test gets silenced."
+That was the right instinct — but the guess was wrong, and the real cause was bugs 3
+and 4 above. The crash was not in the test's cleanup at all: it was the NEXT test's
+status draw, reading a provider name that pointed at the environ map the E2E test had
+just freed.
+
+So: **761/761 with `-De2e`, the E2E included, no crash and no leak.** The suite is
+green both ways — with and without the network tests.
