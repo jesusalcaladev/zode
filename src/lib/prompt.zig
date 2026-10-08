@@ -126,6 +126,12 @@ pub const tool_routing_prompt =
     \\   web_search = you do NOT have the URL and need to find pages.
     \\   web_fetch  = you HAVE the URL and need its content. Search first, fetch
     \\   the 1-2 promising URLs, then answer with real links.
+    \\   web_fetch hands back a WINDOW of the page, not the whole page. Its first
+    \\   line says which bytes of how many you got and which `offset` continues
+    \\   them; pass that offset and you get the NEXT window of the same text.
+    \\   Read on with it until you have what you need — a long document is 2-3
+    \\   calls at ONE url, and answering from the first window as if it were the
+    \\   whole document is how a page gets misread.
     \\ - bash is for EXECUTING things on this machine: builds, tests, git, file
     \\   inspection that grep/glob cannot express. It is not a general-purpose
     \\   "find out" tool: before bash, ask if read/grep/glob/refs/web_* would do
@@ -374,6 +380,20 @@ test "the routing table is about ROUND TRIPS, and says so" {
     for ([_][]const u8{ "paths", "files", "refs", "round trip", "task", "git_status", "check", "todo", "review" }) |k| {
         if (std.mem.indexOf(u8, tool_routing_prompt, k) == null) {
             std.debug.print("the routing table lost: {s}\n", .{k});
+            return error.RuleMissing;
+        }
+    }
+}
+
+test "the routing table says a fetch is a WINDOW the model can page with offset" {
+    // The truncation note at the end of a `web_fetch` result names the exact
+    // `offset` to continue — and it is at the END of a result the model may not
+    // finish reading. The rule has to be read BEFORE the first call, or the
+    // window is taken for the whole document (the documented failure: re-ask,
+    // same first 16 KB, answered as if it were the page).
+    for ([_][]const u8{ "WINDOW of the page", "`offset` continues", "NEXT window", "whole document" }) |k| {
+        if (std.mem.indexOf(u8, tool_routing_prompt, k) == null) {
+            std.debug.print("the routing table lost the paging rule: {s}\n", .{k});
             return error.RuleMissing;
         }
     }

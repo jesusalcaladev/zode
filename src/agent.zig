@@ -5391,10 +5391,10 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             };
             // The per-result cap is the subagent's own, tighter one: 16 KB of grep
             // in a 24k budget is two thirds of the window in a single call.
-            const capped = if (res_text.len > subagent_mod.max_tool_output)
-                res_text[0..subagent_mod.max_tool_output]
-            else
-                res_text;
+            // `capResult` and not a raw slice: it cuts at a line and UTF-8
+            // boundary and says that it cut, so a fragment cannot be mistaken
+            // for the whole output.
+            const capped = subagent_mod.capResult(sarena, res_text);
             msgs.append(sarena, .{ .role = "tool", .content = capped, .tool_call_id = call.id }) catch break;
         }
         tstate.clearCalls(gpa);
@@ -8622,6 +8622,32 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     const again = discoverSkills(std.testing.allocator, null);
     try std.testing.expectEqual(@as(usize, 1), again.len);
     try std.testing.expectEqualStrings("nuevo", again[0].name);
+
+    // 4) And the PROMPT carries name + description ONLY. The body is what the
+    //    `skill` tool reads on demand — inlining it here would be a tax on every
+    //    request of every session, forever, whether the task needs it or not.
+    //    Asserted against the COMPOSED prompt and not only against
+    //    `discoverSkills`, because a discovery that is right and a composition
+    //    that drops (or inlines) the section are two different bugs.
+    const saved_agents = agents_md_cache;
+    defer agents_md_cache = saved_agents;
+    const fake_agents = try std.testing.allocator.dupe(u8, "# proyecto\ninstrucciones.");
+    defer std.testing.allocator.free(fake_agents);
+    agents_md_cache = fake_agents;
+
+    try std.Io.Dir.cwd().writeFile(io_global, .{
+        .sub_path = skill_path,
+        .data = "---\ndescription: recien creado\n---\nSKILL-BODY-MUST-NOT-ENTER-THE-PROMPT\n",
+    });
+    // `skills_cache` is NOT nulled here on purpose: the file's size changed, so
+    // the mtime+size stamp is what has to invalidate the cache — the mechanism
+    // this test exists for.
+    var pbuf: [16 * 1024]u8 = undefined;
+    const prompt = buildSystemPrompt(std.testing.allocator, &pbuf, null);
+    try std.testing.expect(prompt.len < pbuf.len); // it FIT: nothing was truncated
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "nuevo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "recien creado") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "SKILL-BODY-MUST-NOT-ENTER-THE-PROMPT") == null);
 
     // The global state is left as it was for the next test, and the list is really
     // FREED: it is memory from `std.testing.allocator` and the process teardown
