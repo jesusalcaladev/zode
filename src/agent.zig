@@ -14,6 +14,7 @@ const plan_mod = @import("lib/plan.zig");
 const goal_mod = @import("lib/goal.zig");
 const modelcache = @import("lib/modelcache.zig");
 const clean_mod = @import("lib/clean.zig");
+const usercmds_mod = @import("lib/usercmds.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
@@ -2192,10 +2193,192 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "resume")) {
         resumeLatest(m);
     } else {
-        const msg = std.fmt.allocPrint(m.allocator, "unknown command: {s} (/help)", .{cmd}) catch
-            "unknown command";
-        pushInfoOwned(m, msg);
+        // An unknown token is where a USER command lives: refresh first, so a
+        // file created while zode was open runs without a restart.
+        refreshUserCommandsModel(m);
+        if (findUserCmd(cmd)) |idx| {
+            try runUserCommand(m, idx, arg);
+        } else {
+            // `pushInfoFmt` and not `allocPrint … catch "literal"`: on OOM that
+            // pattern hands a .rodata pointer to `pushInfoOwned` and the process
+            // dies on exit with an Invalid free (the documented trap).
+            m.pushInfoFmt("unknown command: {s} (/help)", .{cmd});
+        }
     }
+}
+
+// ── user slash commands (.zode/commands, ~/.config/zode/commands) ────
+//
+// The LIST is static (fixed buffers, no allocation) because the `/`
+// completion reads it on every keystroke and the palette reads it on open: a
+// heap list would need an owner, a lock and a refresh story for something that
+// is a few dozen small strings. The BODIES are not here at all — they are read
+// from disk at run time (`lib/usercmds.zig`), so editing a command takes
+// effect without a restart.
+
+var uc_entries: [usercmds_mod.max_cmds]usercmds_mod.Entry = undefined;
+var uc_cmds: [usercmds_mod.max_cmds]commands_mod.Cmd = undefined;
+var uc_len: usize = 0;
+
+/// The roots, in shadowing order: the project's, then the user's.
+///
+/// The HOME path goes into the CALLER's buffer: every path has to survive the
+/// function, and one shared scratch leaves the earlier roots pointing at the
+/// last one written (the `sb.path` trap).
+fn userCmdRoots(
+    buf: *[std.fs.max_path_bytes]u8,
+    out: *[2][]const u8,
+    env: ?*const std.process.Environ.Map,
+) usize {
+    var n: usize = 0;
+    out[n] = usercmds_mod.project_dir; // a literal: static, no buffer needed
+    n += 1;
+    if (env) |e| {
+        if (e.get("HOME")) |home| {
+            if (home.len > 0) {
+                if (std.fmt.bufPrint(buf, "{s}/.config/{s}", .{ home, usercmds_mod.user_subdir })) |p| {
+                    out[n] = p;
+                    n += 1;
+                } else |_| {}
+            }
+        }
+    }
+    return n;
+}
+
+/// Scans `roots` into the static list. Its own function so a test can point it
+/// at a temp directory; `refreshUserCommands` builds the real roots.
+pub fn refreshUserCommandsFrom(gpa: std.mem.Allocator, io: std.Io, roots: []const []const u8) void {
+    const found = usercmds_mod.scan(gpa, io, roots, &uc_entries);
+    uc_len = found.len;
+    // Sort for stable, predictable order in help/palette
+    std.mem.sort(usercmds_mod.Entry, uc_entries[0..uc_len], {}, struct {
+        fn less(_: void, a: usercmds_mod.Entry, b: usercmds_mod.Entry) bool {
+            return std.mem.lessThan(u8, a.name(), b.name());
+        }
+    }.less);
+    for (uc_entries[0..uc_len], 0..) |*e, i| {
+        // The Cmd slices point INTO the entry's static buffers. Rescan
+        // overwrites those buffers in place and rebuilds the slices right
+        // after, so nothing outlives what it points at.
+        uc_cmds[i] = .{ .key = e.key(), .desc = e.desc() };
+    }
+}
+
+/// Scan the real roots (project + `~/.config/zode/commands`).
+pub fn refreshUserCommands(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var roots: [2][]const u8 = undefined;
+    const n = userCmdRoots(&buf, &roots, env);
+    refreshUserCommandsFrom(gpa, io, roots[0..n]);
+}
+
+/// Refresh through the Model's OWN `io`, guarded by `io_ready` — the same rule
+/// as the activity strip's clock: the tests build a Model without an app, and
+/// reading an uninitialized `Io` is a jump through a garbage vtable.
+pub fn refreshUserCommandsModel(m: *tui.Model) void {
+    if (!m.io_ready) return;
+    refreshUserCommands(m.allocator, m.io, m.environ);
+}
+
+/// The cached list, without touching the disk: the `/` completion and the draw
+/// read this on every keystroke. The SCAN happens at startup (`main.zig`) and
+/// on `/help`, the palette, and an unknown `/name` — the moments that are
+/// already doing I/O or are about to report something to the user.
+pub fn userCommands() []const commands_mod.Cmd {
+    return uc_cmds[0..uc_len];
+}
+
+/// Command `i`: the builtins first, then the user's. ONE iterator for the four
+/// places that used to walk `commands` alone — a second list walked separately
+/// in each is four lists to keep in sync.
+pub fn commandAt(i: usize) ?commands_mod.Cmd {
+    if (i < commands.len) return commands[i];
+    const u = userCommands();
+    const j = i - commands.len;
+    if (j < u.len) return u[j];
+    return null;
+}
+
+/// The user command this token names (`review` → its index), or null.
+///
+/// Builtins are NOT here on purpose: `submit` only reaches this in its final
+/// else, so `/help` can never be shadowed by a file named `help.md`.
+fn findUserCmd(token: []const u8) ?usize {
+    for (uc_entries[0..uc_len], 0..) |*e, i| {
+        if (std.mem.eql(u8, e.name(), token)) return i;
+    }
+    return null;
+}
+
+/// `/name args`: the file's body becomes the prompt (with the args where the
+/// template says) and `startChat` takes it from there — it dupes the input, so
+/// the expansion is freed on return.
+///
+/// Runs on the UI thread like every other local command: the read is one small
+/// file and `startChat` only spawns the worker.
+fn runUserCommand(m: *tui.Model, idx: usize, arg: ?[]const u8) !void {
+    if (!m.io_ready) return;
+    const e = &uc_entries[idx];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var roots: [2][]const u8 = undefined;
+    const n = userCmdRoots(&root_buf, &roots, m.environ);
+    if (e.root >= n) {
+        m.pushInfoFmt("{s}: its folder is not reachable from here (no HOME?)", .{e.key()});
+        return;
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.md", .{ roots[e.root], e.name() }) catch {
+        m.pushInfoFmt("{s}: path too long", .{e.key()});
+        return;
+    };
+    const expanded = usercmds_mod.render(m.allocator, m.io, path, arg orelse "") orelse {
+        m.pushInfoFmt("{s}: could not read {s} (removed, or over 64 KB)", .{ e.key(), path });
+        return;
+    };
+    defer m.allocator.free(expanded);
+    try startChat(m, expanded);
+}
+
+test "user commands: commandAt walks builtins AND the disk list, and a rescan replaces it" {
+    // The dispatch (`submit`'s final else) and the `/` completion read the SAME
+    // list through `commandAt`; this pins that a scanned command really lands
+    // there (builtins first) and that a rescan REPLACES rather than appends —
+    // an append-only list would grow a phantom entry for every file rename.
+    const root = "/tmp/zode-usercmds-agent-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/zode-usercmds-agent-test/hola.md",
+        .data = "---\ndescription: says hola\n---\nSay hola to $ARGUMENTS.",
+    });
+
+    var roots = [_][]const u8{root};
+    refreshUserCommandsFrom(std.testing.allocator, std.testing.io, &roots);
+    // Leftovers in a static would leak into every later test that walks the
+    // list: clear it whatever happens below.
+    defer refreshUserCommandsFrom(std.testing.allocator, std.testing.io, &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), userCommands().len);
+    try std.testing.expectEqualStrings("/hola", userCommands()[0].key);
+    try std.testing.expectEqualStrings("says hola", userCommands()[0].desc);
+
+    // Builtins first, then the user's — and then nothing.
+    try std.testing.expectEqualStrings("/help", commandAt(0).?.key);
+    const found = commandAt(commands.len).?;
+    try std.testing.expectEqualStrings("/hola", found.key);
+    try std.testing.expect(commandAt(commands.len + 1) == null);
+
+    // The dispatch token arrives WITHOUT the slash, and a builtin is never a
+    // user command (builtins win in `submit` because it checks them first).
+    try std.testing.expect(findUserCmd("hola") != null);
+    try std.testing.expect(findUserCmd("/hola") == null);
+    try std.testing.expect(findUserCmd("help") == null);
+
+    // A rescan with no roots empties the list (a renamed file disappears).
+    refreshUserCommandsFrom(std.testing.allocator, std.testing.io, &.{});
+    try std.testing.expectEqual(@as(usize, 0), userCommands().len);
 }
 
 // ── /clean: purge zode's own leftovers, nothing else ──────────
@@ -7309,6 +7492,10 @@ pub const cmd_groups = [_]palette.Group{
     .{ .name = "Free models" },
     .{ .name = "Model" },
     .{ .name = "Session" },
+    // The user's OWN commands, appended: `cmdGroup`'s numbers are positions in
+    // this array, and renumbering five of them to move Yours up would be five
+    // constants changed to save one scroll — the filter finds them anyway.
+    .{ .name = "Yours" },
 };
 
 /// Wrapper of `cmdGroup` for the tests (see the `key[1..]` note).
@@ -7367,9 +7554,13 @@ pub fn openConnectPalette(m: *tui.Model) void {
 /// would dangle when the streamer redraws.
 pub fn openCommandPalette(m: *tui.Model) void {
     const gpa = m.allocator;
+    // A file added a minute ago has to be here: this is where a user looks
+    // for "what can I type".
+    refreshUserCommandsModel(m);
+    const uc = userCommands();
     // +1 for the header's "Connect" item: it is the shortcut to connect a
     // provider without leaving the command palette.
-    const items = gpa.alloc(palette.Item, commands.len + 1) catch return;
+    const items = gpa.alloc(palette.Item, commands.len + 1 + uc.len) catch return;
     items[0] = .{
         .kind = .command,
         .group = 1,
@@ -7388,6 +7579,16 @@ pub fn openCommandPalette(m: *tui.Model) void {
             .group = cmdGroup(c.key),
             .label = gpa.dupe(u8, c.key) catch return,
             .hint = gpa.dupe(u8, hint) catch "",
+        };
+    }
+    // The user's own commands, in "Yours" (the group AFTER `cmd_groups`'s
+    // builtins, 1-based: index 5 → id 6 = `cmd_groups.len`).
+    for (uc, 0..) |c, i| {
+        items[commands.len + 1 + i] = .{
+            .kind = .command,
+            .group = @intCast(cmd_groups.len),
+            .label = gpa.dupe(u8, c.key) catch return,
+            .hint = gpa.dupe(u8, c.desc) catch "",
         };
     }
     // Stable order by group: otherwise the headers repeat and the list jumps from

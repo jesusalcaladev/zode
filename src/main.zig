@@ -651,6 +651,11 @@ fn runTui(init: std.process.Init) !u8 {
     // the user's config the pool would not see their providers.
     agent.initFreeAutoFromEnv(&model);
     agent.bootMark("initFreeAutoFromEnv");
+    // User slash commands: scanned once here so the `/` completion knows them
+    // from the first keystroke (later refreshes: /help, the palette, an
+    // unknown /name — the moments that already do I/O).
+    agent.refreshUserCommandsModel(&model);
+    agent.bootMark("userCommands");
     agent.initCheapRouterFromEnv(model.environ);
 
     agent.bootMark("app.run start");

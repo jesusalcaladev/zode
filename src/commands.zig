@@ -40,6 +40,19 @@ pub fn cmdHelp(m: *tui.Model) void {
         agent.pushInfoOwned(m, line);
     }
 
+    // The user's own commands, refreshed so a file written a minute ago shows
+    // up. They get their own block because they answer a different question:
+    // not "what does zode do" but "what did I add".
+    agent.refreshUserCommandsModel(m);
+    const uc = agent.userCommands();
+    if (uc.len > 0) {
+        agent.pushInfoOwned(m, gpa.dupe(u8, "your commands (.zode/commands, ~/.config/zode/commands)") catch return);
+        for (uc) |c| {
+            const line = std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
+            agent.pushInfoOwned(m, line);
+        }
+    }
+
     agent.pushInfoOwned(m, gpa.dupe(u8, "shortcuts") catch return);
     for (shortcuts) |s| {
         const line = std.fmt.allocPrint(gpa, "{s: <18} {s}", .{ s.key, s.desc }) catch continue;
