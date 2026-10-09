@@ -256,6 +256,7 @@ pub fn scan(
             const dot = std.mem.lastIndexOf(u8, ent.name, ".md") orelse continue;
             if (dot == 0 or dot + 3 != ent.name.len) continue;
             const base = ent.name[0..dot];
+            if (base.len == 0 or base[0] == '.') continue; // skip dotfiles
             if (!validName(base)) continue;
             // README is documentation, not a runnable command.
             if (std.ascii.eqlIgnoreCase(base, "README")) continue;
