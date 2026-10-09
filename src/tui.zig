@@ -84,7 +84,7 @@ pub const Painter = struct {
     /// Writes an ALREADY stable grapheme (literal or arena that outlives the
     /// frame). Allocates no memory.
     pub fn putStable(self: *Painter, col: u16, row: u16, g: []const u8, w: u8, style: vaxis.Style) void {
-        if (col >= self.width or row >= self.height) return;
+        if (col >= self.width or row >= self.height or col + w > self.width) return;
         self.surface.writeCell(col, row, .{
             .char = .{ .grapheme = g, .width = w },
             .style = style,
@@ -237,7 +237,7 @@ fn wrapCells(
     width: u16,
     indent: u16,
 ) !void {
-    return wrapCellsGutter(pa, lines, cells, width, indent, null);
+    return wrapCellsGutter(pa, lines, cells, width, indent, null, false);
 }
 
 /// `wrapCells` with a visible GUTTER on the continuation rows.
@@ -254,6 +254,7 @@ fn wrapCellsGutter(
     width: u16,
     indent: u16,
     gutter: ?vaxis.Style,
+    word_wrap: bool,
 ) !void {
     if (cells.len == 0) {
         try lines.append(pa, .{ .cells = &.{}, .w = 0 });
@@ -263,18 +264,45 @@ fn wrapCellsGutter(
     var start: usize = 0;
     var used: u16 = 0; // columns USED by real cells
     var first = true;
+    var break_after: ?usize = null;
+    var break_width: u16 = 0;
     for (cells, 0..) |c, i| {
         // The limit of a continuation is the width MINUS the indent, because
         // the indent occupies real columns.
         const limit: u16 = if (first) @max(width, 1) else @max(width - ind_w, 1);
         const cw: u16 = @min(c.w, @max(limit, 1));
         if (used > 0 and used + cw > limit) {
-            try appendContinuation(pa, lines, cells[start..i], used, if (first) 0 else ind_w, if (first) null else gutter);
-            start = i;
-            used = 0;
+            var split = i;
+            var line_used = used;
+            if (word_wrap) {
+                if (break_after) |b| {
+                    if (b > start and b <= i) {
+                        split = b;
+                        line_used = break_width;
+                    }
+                }
+            }
+            try appendContinuation(pa, lines, cells[start..split], line_used, if (first) 0 else ind_w, if (first) null else gutter);
+            start = split;
             first = false;
+            used = 0;
+            const next_limit = @max(width - ind_w, 1);
+            for (cells[split..i]) |tail| used += @min(tail.w, next_limit);
+            break_after = null;
+
+            // A long word can fit on the unindented first row but not on a
+            // continuation row. Keep the same hard-wrap guarantee in that case.
+            if (used > 0 and used + @min(c.w, next_limit) > next_limit) {
+                try appendContinuation(pa, lines, cells[start..i], used, ind_w, gutter);
+                start = i;
+                used = 0;
+            }
         }
         used += cw;
+        if (word_wrap and (std.mem.eql(u8, c.text, " ") or std.mem.eql(u8, c.text, "\t"))) {
+            break_after = i + 1;
+            break_width = used;
+        }
     }
     try appendContinuation(pa, lines, cells[start..], used, if (first) 0 else ind_w, if (first) null else gutter);
 }
@@ -387,7 +415,7 @@ fn buildLinesBase(
             // `applyCodeGutter`) and a diff already prefixes every line with a
             // sign, so a second bar there would be noise.
             const gutter: ?vaxis.Style = if (is_code or blk.kind == .diff) null else theme.gutter;
-            try wrapCellsGutter(pa, &lines, cells.items, avail, if (is_code) 0 else 2, gutter);
+            try wrapCellsGutter(pa, &lines, cells.items, avail, if (is_code) 0 else 2, gutter, !is_code and blk.kind != .diff);
             if (is_code) {
                 applyCodeGutter(pa, lines.items[before..], width);
             }
@@ -550,6 +578,10 @@ pub const Model = struct {
     /// It is not an `ArrayList`: the list is a fixed-size array (see `plan.zig`),
     /// so the draw paints it without allocating.
     plan: plan_mod.Plan = .{},
+    /// Worker-only plan-mode state, reset for each user turn.
+    plan_touched_this_turn: bool = false,
+    plan_write_blocked_this_turn: bool = false,
+    plan_missing_nudges_this_turn: u8 = 0,
 
     /// The file snapshots per turn, for `/undo`. It is the only thing that
     /// survives from one turn to the next (the worker's arena does not), which
@@ -1119,8 +1151,6 @@ pub const Model = struct {
         lang: []const u8 = "",
     };
 
-    const spinner_chars = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-
     pub fn hasInput(self: *const Model) bool {
         return !self.ed.isEmpty();
     }
@@ -1382,11 +1412,8 @@ pub const Model = struct {
         self.redraw_requested.store(true, .seq_cst);
     }
 
-    /// Text + mood. The mood is stored apart so that the status row can paint
-    /// THE FACE in its color: before, the text carried the face embedded and
-    /// it came out the same gray as the rest, and duplicated too (the one in
-    /// the strip and the one in the text). Now the TUI draws the face exactly
-    /// once, in the mood's color.
+    /// Text + mood. The activity strip uses this mood for its single animated
+    /// face; the persistent status row no longer repeats activity feedback.
     pub fn setStatusWithMood(self: *Model, new_mood: mascot.Mood, text: []const u8) void {
         self.lock();
         defer self.unlock();
@@ -4216,6 +4243,37 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     }
                 }
             }
+
+            // With an empty editor, the arrows belong to the history rather
+            // than to an invisible cursor. Ask choices and open pickers have
+            // already consumed their own arrows above.
+            if (!self.hasInput() and !self.permActive()) {
+                if (key.matches(vaxis.Key.up, .{})) {
+                    self.scrollBy(1);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                if (key.matches(vaxis.Key.down, .{})) {
+                    self.scrollBy(-1);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                if (key.matches(vaxis.Key.home, .{})) {
+                    self.scrollBy(1_000_000);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                if (key.matches(vaxis.Key.end, .{})) {
+                    self.scrollBy(-1_000_000);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
+
             // ESC. Three things it can mean, and the ORDER is the whole design:
             //
             // 1. an open QUESTION -> "I am not answering that", the agent decides
@@ -4617,11 +4675,9 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // scrolling re-parses on demand, which is what the old comment claimed and
     // was not true) and returns the visible range already stabilized.
     //
-    // The wrap width is `width - hist_margin`: `drawLines` paints with 2
-    // margin columns, and if the layout does not account for it the last
-    // column goes off screen.
+    // Keep matching margins on both sides of the history text.
     const hist_margin: u16 = historyMargin(width);
-    const wrap_width: u16 = if (width > hist_margin) width - hist_margin else width;
+    const wrap_width: u16 = if (width > hist_margin * 2) width - hist_margin * 2 else width;
     self.wrap_w = wrap_width;
     const vis = try self.layoutFor(
         ctx,
@@ -4667,54 +4723,14 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         drawLines(&p, live_lines, line_cursor, first_visible, history_h);
     }
 
-    // ── status: spinner + text + session info ──
-    // The status row goes out in SEGMENTS, not as one string: the face and the
-    // text have to be in different colors. With a single string everything came
-    // out in the dim blue and the face was NOT visible at all (which is exactly
-    // the complaint: "you can't tell by the color"). The mood is the only thing
-    // that tells you whether it is thinking, waiting for permission or stuck.
-    var status_segs: std.ArrayList(InfoSeg) = .empty;
-    const mood: mascot.Mood = self.mood();
-    {
-        self.lock();
-        defer self.unlock();
-        if (self.busy) {
-            status_segs.append(ctx.arena, .{
-                .text = Model.spinner_chars[self.spinner_frame % Model.spinner_chars.len],
-                .style = theme.ctxColor(100),
-            }) catch {};
-            status_segs.append(ctx.arena, .{ .text = " ", .style = theme.brand_faint }) catch {};
-        }
-    }
-    // The face goes FIRST and in the mood's color: it is the indicator.
-    {
-        const face = mascot.faceFrames(mood, self.spinner_frame / 6);
-        status_segs.append(ctx.arena, .{
-            .text = face,
-            .style = .{ .bold = true, .fg = .{ .index = mood.color() } },
-        }) catch {};
-        status_segs.append(ctx.arena, .{ .text = "  ", .style = theme.brand_faint }) catch {};
-    }
-    status_segs.append(ctx.arena, .{ .text = self.status(), .style = theme.brand_soft }) catch {};
-
-    // Scroll indicator: if the history is not anchored at the bottom, it has to
-    // be said. Without this you lose the context of "why doesn't it scroll
-    // down by itself".
-    //
-    // It prints `max_offset - first_visible`, the lines that are actually
-    // hidden below, NOT the raw scroll offset. With the debt that used to be
-    // possible, the number on screen could be 336 while nothing was hidden at
-    // all, because it is a count of what you cannot see.
-    if (self.max_offset > self.first_visible) {
-        const below = self.max_offset - self.first_visible;
-        const s = std.fmt.allocPrint(ctx.arena, "  ↓ {d}", .{below}) catch "";
-        if (s.len > 0) status_segs.append(ctx.arena, .{ .text = s, .style = theme.warn }) catch {};
-    }
-
-    // The session info (model · provider · effort · ctx% · tok/s) is painted
+    // The session info (model · provider · effort · ctx%) is painted
     // segmented further below, right-aligned; here it is only prepared.
-    const act_now = self.activity();
-    const info: []const InfoSeg = sessionInfo(ctx.arena, act_now.streaming) orelse &.{};
+    const info: []const InfoSeg = sessionInfo(ctx.arena) orelse &.{};
+    const usage = usageInfo(ctx.arena);
+    const info_width = sessionInfoWidth(info);
+    const usage_width: u16 = if (usage) |segments| segsWidth(segments) else 0;
+    const usage_fits = usage != null and usage_width + info_width + 5 < width;
+    const info_right = if (usage_fits) width - usage_width - 3 else width;
 
     // ── `ask`: the model asked something ──
     //
@@ -4736,20 +4752,34 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         if (input_top > 0) p.fillRow(input_top - 1, "─", theme.rule);
     }
 
-    // ── status: text on the left + session info on the right ──
+    // ── status: session info on the right; activity lives in ONE place ──
+    //
+    // The mascot, spinner and phase used to appear here AND in the activity
+    // strip. That duplicated the same state and made the bottom two rows look
+    // like two competing "working" indicators. During work the strip is the
+    // single source of activity; the status row is reserved for session
+    // metadata. When idle, it can show a quiet status or a scroll hint.
     {
-        var col: u16 = 0;
-        for (status_segs.items) |sg| {
-            col = p.putText(col, status_row, sg.text, sg.style);
+        const current = self.activity();
+        const label: []const u8 = if (!self.follow_bottom and !self.hasInput())
+            "↑↓ history · PgUp/PgDn · End latest"
+        else if (!current.busy and !current.ask and !current.perm and self.queuedCount() == 0)
+            self.status()
+        else
+            "";
+        if (label.len > 0) {
+            const reserved = info_width + (if (usage_fits) usage_width + 3 else 0);
+            const left_width = if (width > reserved + 3) width - reserved - 3 else 0;
+            _ = p.putClipped(1, status_row, label, left_width, theme.brand_soft);
         }
     }
-    if (info.len > 0) drawSessionInfo(&p, status_row, width, info, self.activity().busy);
+    if (info.len > 0) drawSessionInfo(&p, status_row, info_right, info);
 
     // Second column, at the right edge: what the session has cost. Painted
     // AFTER the session column so it wins any overlap, and only if the session
     // column left room (`reserved`).
-    if (usageInfo(ctx.arena)) |usage| {
-        drawUsageColumn(&p, status_row, width, usage, sessionInfoWidth(info));
+    if (usage_fits) {
+        if (usage) |segments| drawUsageColumn(&p, status_row, width, segments, info_width);
     }
 
     // ── `/` autocompletion (right above the input) ──
@@ -4758,11 +4788,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     }
 
     // ── multiline input with border ──
-    // Activity strip: the MASCOT is the "it is working" indicator. Before the
-    // only feedback was the tiny status bar spinner, which with a slow model
-    // says nothing: you couldn't tell whether it was thinking, waiting or hung.
-    // Here it is the face + the state + the elapsed SECONDS, which is what
-    // really answers "is it working or is it stuck?".
+    // The activity strip is the one "is it working?" indicator: face, phase
+    // and elapsed time live together instead of being repeated in the status.
     if (plan_rows > 0) {
         drawPlanBlock(&p, input_top - plan_rows, width, plan_rows, pl_now);
     }
@@ -4792,7 +4819,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // over a question — you pressed ctrl+p while waiting — and then the palette
     // must win, because it is what you are typing into.
     if (self.askSnapshot(ctx.arena)) |snap| {
-        if (!self.pal.active) drawAskPanel(&p, width, height, snap, self.askMillis());
+        if (!self.pal.active) drawAskPanel(&p, width, history_h, snap, self.askMillis());
     }
 
     // ── modal palette (Ctrl+P): last, on top of everything ──
@@ -5002,12 +5029,9 @@ fn lineStartOffset(lines: [][]const u8, line: usize) usize {
 
 /// Paints a paragraph's lines, clipped to the visible window
 /// [first_visible, last_visible) mapped to rows [0, history_h).
-/// Left margin of the history, in columns.
+/// Side margin of the history, in columns.
 ///
-/// It lives in a function because TWO places use it and they have to agree: the
-/// layout (which wraps to `width - margin`) and the painting (which starts at
-/// the margin's column). If they diverged, the last column would go off
-/// screen.
+/// Layout reserves it on both sides; painting uses it as the left edge.
 fn historyMargin(width: u16) u16 {
     return if (width > 8) 2 else 0;
 }
@@ -5020,10 +5044,7 @@ fn drawLines(
     history_h: u16,
 ) void {
     const hh: usize = history_h;
-    // History's left margin (4.9 of the ROADMAP): 2 columns of air, like the
-    // ones the input box already has. Before the text stuck to the terminal
-    // edge and the code blocks' gutter ended up at column 2, which is where a
-    // margin belongs. With the margin the whole history lines up and breathes.
+    // The history has matching air on both sides, like the input box.
     const margin: u16 = historyMargin(p.width);
     for (lines, 0..) |ln, li| {
         const abs = line_offset + li;
@@ -5117,9 +5138,7 @@ fn drawPermissionModal(
 /// The "it is working" strip, right above the input box.
 ///
 /// It answers "is it stuck or is it thinking?": Zo's face animated with the
-/// state, the elapsed SECONDS (the only thing that distinguishes "thinking"
-/// from "hung") and what is in the queue. Without this the only feedback was
-/// an 8px spinner in the status bar.
+/// state, the elapsed seconds and what is in the queue.
 ///
 /// The LABEL is the phase, not a generic "working". "Working" for 40 seconds
 /// does not say whether the model is thinking, is already writing or whether
@@ -5229,7 +5248,7 @@ fn drawAskPanel(
     snap: AskSnapshot,
     waited_ms: u64,
 ) void {
-    if (width < 24 or height < 8) return;
+    if (width < 24 or height == 0) return;
 
     // The panel is ONE widget: the question and the options are in the same box,
     // which is what makes it impossible for one to erase the other. It used to be
@@ -5249,29 +5268,45 @@ fn drawAskPanel(
     // interleaved with the panel text.
     const q_all = wrapTextToRows(p, snap.question, inner_w, p.arena);
     const q_cap: usize = 8;
-    var q_n = q_all.len;
-    var q_more: usize = 0;
-    if (q_n > q_cap) {
-        q_more = q_n - q_cap;
-        q_n = q_cap;
-    }
 
     // Rows: border + header + question + one blank + options + blank + hint + clock
     const has_header = snap.header.len > 0;
     const opts = snap.options.len;
     const choice_rows: usize = if (opts > 0 and !snap.typing) opts + 1 else 0;
     const hdr_rows: usize = if (has_header) 1 else 0;
-    const more_rows: usize = if (q_more > 0) 1 else 0;
     const menu_rows: usize = if (choice_rows > 0) choice_rows + 1 else 0;
-    const rows_content: usize = hdr_rows + q_n + more_rows + menu_rows + 2;
-    const want_h: u16 = @intCast(rows_content + 2);
-    // Clamped to the screen. Unclamped, a 600-char question on a 40-column
-    // terminal made a 24-row box that covered the status bar AND the input box,
-    // and the input box is the ONLY way to answer a free-text question: the app
-    // looked frozen with a yellow box full of text and no way out.
-    const max_h: u16 = if (height > 6) height - 4 else height;
-    const box_h: u16 = @min(want_h, max_h);
-    const top: u16 = if (height > box_h + 2) (height - box_h) / 2 else 0;
+    const fixed_rows = hdr_rows + menu_rows + 2;
+    const wanted_q = @min(q_all.len, q_cap);
+    const wanted_more: usize = if (q_all.len > wanted_q) 1 else 0;
+    const want_h: u16 = @intCast(fixed_rows + wanted_q + wanted_more + 2);
+    // `height` is the history area, not the terminal: the answer editor and
+    // status bar remain visible below the panel while the user types.
+    const box_h: u16 = @min(want_h, height);
+    if (height < 8) {
+        _ = p.putClipped(1, 0, snap.question, width - 2, theme.warn_bold);
+        if (height > 1 and choice_rows > 0) {
+            var selected: [256]u8 = undefined;
+            const idx = @min(snap.sel, snap.options.len);
+            const label = if (idx == snap.options.len) ask_other_label else snap.options[idx];
+            const line = std.fmt.bufPrint(&selected, "▸ {d} {s}", .{ idx + 1, label }) catch "▸ choice";
+            _ = p.putClipped(1, 1, line, width - 2, theme.selected);
+        }
+        if (height > 2) {
+            const hint = if (choice_rows > 0) "↑↓ choose · enter · esc" else "answer below · esc to decide";
+            _ = p.putClipped(1, 2, hint, width - 2, theme.hint);
+        }
+        return;
+    }
+    const top: u16 = (height - box_h) / 2;
+    // Keep the answer choices and help visible before spending rows on a long
+    // question. If it is shortened, reserve one row to say so.
+    const q_room = @as(usize, box_h - 2) -| fixed_rows;
+    var q_n = @min(wanted_q, q_room);
+    var q_more: usize = 0;
+    if (q_n < q_all.len and q_room > 1) {
+        q_n -= 1;
+        q_more = q_all.len - q_n;
+    }
 
     { // opaque background: the history behind is dense text and a box with the
         // history showing through reads as a rendering bug.
@@ -5346,18 +5381,17 @@ fn drawAskPanel(
                 std.fmt.bufPrint(&marker, "  {d} ", .{i + 1}) catch "  ";
             const used = p.putClipped(inner_col, row, mk, inner_w, style);
             const label = if (is_other) ask_other_label else snap.options[i];
-            const after = p.putClipped(used, row, label, inner_w - (used - inner_col), style);
+            const marker_cols = used - inner_col;
+            const tag_text = if (i == 0 and !is_other) " · recommended" else "";
+            const tag_cols: u16 = @intCast(columnsOf(p, tag_text));
+            const keep_tag = tag_text.len > 0 and inner_w > marker_cols + tag_cols + 8;
+            const label_cols = inner_w - marker_cols - (if (keep_tag) tag_cols else 0);
+            const after = p.putClipped(used, row, label, label_cols, style);
             // The recommendation is STATED, not implied by being first: the
             // guidance tells the model to put its own pick first, so row 1 is
             // what Enter takes. It used to be printed INSTEAD of the option (as
             // the picker's `desc`, which also made it read like a longer label).
-            if (i == 0 and !is_other) {
-                const tag: vaxis.Style = if (is_sel)
-                    .{ .fg = .{ .rgb = .{ 0x9e, 0xce, 0x6a } }, .bg = theme.sel_bg.bg }
-                else
-                    theme.ok;
-                _ = p.putClipped(after + 2, row, "← recommended", inner_w - (after + 2 - inner_col), tag);
-            }
+            if (keep_tag) _ = p.putClipped(after, row, tag_text, tag_cols, if (is_sel) theme.ok else theme.hint);
             row += 1;
         }
         // The recommendation is stated, not implied: the guidance tells the model
@@ -5444,17 +5478,37 @@ fn wrapOneLine(
     var start: usize = 0;
     var col: u16 = 0;
     var pos: usize = 0;
+    var break_pos: usize = 0;
+    var break_col: u16 = 0;
     var it = vaxis.unicode.graphemeIterator(line);
     while (it.next()) |g| {
         const gb = g.bytes(line);
+        const before = pos;
         pos += gb.len;
         const w: u16 = p.measure(gb);
         if (col + w > width and col > 0) {
-            rows.append(arena, line[start .. pos - gb.len]) catch return;
-            start = pos - gb.len;
-            col = 0;
+            if (break_pos > start) {
+                rows.append(arena, line[start..break_pos]) catch return;
+                start = break_pos;
+                col -= break_col;
+            } else {
+                rows.append(arena, line[start..before]) catch return;
+                start = before;
+                col = 0;
+            }
+            break_pos = 0;
+            break_col = 0;
+            if (col + w > width and col > 0) {
+                rows.append(arena, line[start..before]) catch return;
+                start = before;
+                col = 0;
+            }
         }
         col += w;
+        if (std.mem.eql(u8, gb, " ") or std.mem.eql(u8, gb, "\t")) {
+            break_pos = pos;
+            break_col = col;
+        }
     }
     if (start < line.len) rows.append(arena, line[start..]) catch {};
 }
@@ -5496,7 +5550,7 @@ fn drawActivityStrip(
     // during a question reads as "it is working on it", and then the user waits
     // for an answer that never gets asked.
     const waiting = act.perm or act.ask;
-    const mood_kind: mascot.Mood = if (waiting) .warn else if (act.busy) .thinking else .idle;
+    const mood_kind: mascot.Mood = if (waiting) .warn else if (act.busy) self.mood() else .idle;
     const face = mascot.faceFrames(mood_kind, self.spinner_frame / 6);
     const mood: vaxis.Style = if (waiting) theme.warn else if (act.busy) theme.brand else theme.brand_soft;
 
@@ -5582,22 +5636,15 @@ fn drawActivityStrip(
         }
     }
 
-    // Speed while the text arrives. It is the second piece of data you need to
-    // distinguish "the model is slow" from "the stream hung": 2 tok/s with
-    // the clock running is a slow answer; the clock stopped and this at zero
-    // is not.
-    //
-    // CAREFUL: `agent.tps_live` is read WITHOUT a lock on purpose. It is an
-    // `f64` that the worker writes once per stream and the status bar reads
-    // every frame, and has for months: it is atomic in practice (one word),
-    // and putting a lock in the drawing path for a number that goes from 0 to
-    // 200 does not pay off.
+    // Live throughput belongs with the activity phase, not duplicated in the
+    // persistent model/context metadata on the status row.
     if (act.streaming and agent.tps_live > 1) {
         var tbuf: [32]u8 = undefined;
-        const ts2 = std.fmt.bufPrint(&tbuf, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch "";
-        if (ts2.len > 0 and col + ts2.len + 2 < width) {
-            _ = p.putText(col, row, ts2, theme.brand_soft);
-            col += @as(u16, @intCast(ts2.len)) + 1;
+        const speed = std.fmt.bufPrint(&tbuf, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch "";
+        const speed_cols: u16 = @intCast(columnsOf(p, speed));
+        if (speed.len > 0 and col + speed_cols + 2 < width) {
+            _ = p.putText(col, row, speed, theme.tool);
+            col += speed_cols + 1;
         }
     }
 
@@ -5620,18 +5667,15 @@ fn drawActivityStrip(
 /// A piece of the status row with its style.
 const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 
-/// Status bar session info: model · provider (effort) · ctx% · tok/s.
+/// Status bar session info: model · provider (effort) · context usage.
 ///
 /// It is an array of segments (text + style) instead of a string, because each
-/// part goes in its own color: the model in bright blue, the rest dim, the
-/// ctx% green/yellow/red depending on how full it is and the tok/s in cyan.
+/// part goes in its own color: the model in bright blue, the rest dim and the
+/// ctx% green/yellow/red depending on how full it is.
 /// With a single string everything came out the same gray.
 ///
-/// `streaming` (not `busy`) is what decides whether the tok/s are painted:
-/// `tps_live` is the LAST stream's and is not cleared when the turn ends, so
-/// with a 30s `bash` the row kept announcing "⚡ 42 tok/s" while not a single
-/// token arrived. It is a number that does not match what is next to it.
-fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
+/// Live speed belongs beside the activity phase, not duplicated here.
+fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     var out: std.ArrayList(InfoSeg) = .empty;
 
     const model = agent.curAnswering();
@@ -5700,12 +5744,6 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     }
     const ct = std.fmt.allocPrint(arena, "ctx {d}%", .{agent.ctx_pct}) catch return null;
     out.append(arena, .{ .text = ct, .style = theme.ctxColor(agent.ctx_pct) }) catch return null;
-
-    if (streaming and agent.tps_live > 1) {
-        out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
-        const tt = std.fmt.allocPrint(arena, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch return null;
-        out.append(arena, .{ .text = tt, .style = theme.tool }) catch return null;
-    }
 
     if (out.items.len == 0) return null;
     return out.items;
@@ -5817,8 +5855,7 @@ const sessionInfoWidth = segsWidth;
 /// Draws the session info right-aligned, measuring the total width with the
 /// REAL cell width (not `len`): emojis and `·` take 1, but if a 2-column
 /// grapheme ever shows up, aligning by `len` misaligns the whole row.
-fn drawSessionInfo(p: *Painter, row: u16, width: u16, segs: []const InfoSeg, busy: bool) void {
-    _ = busy;
+fn drawSessionInfo(p: *Painter, row: u16, right_edge: u16, segs: []const InfoSeg) void {
     var total: u16 = 0;
     for (segs) |sg| {
         var it = vaxis.unicode.graphemeIterator(sg.text);
@@ -5827,15 +5864,15 @@ fn drawSessionInfo(p: *Painter, row: u16, width: u16, segs: []const InfoSeg, bus
             total += 1;
         }
     }
-    if (total + 2 >= width) return; // doesn't fit: skipped before invading the text
+    if (right_edge < total + 2) return; // doesn't fit: skipped before invading the text
 
-    var col: u16 = width - total;
+    var col: u16 = right_edge - total;
     for (segs) |sg| {
         var it = vaxis.unicode.graphemeIterator(sg.text);
         while (it.next()) |g| {
             const b = g.bytes(sg.text);
             const w = theme.graphemeWidth(p.ctx, b);
-            if (col + w <= width) _ = p.putStable(col, row, b, w, sg.style);
+            if (col + w <= right_edge) _ = p.putStable(col, row, b, w, sg.style);
             col += w;
         }
     }
@@ -6511,7 +6548,7 @@ test "status: the segments are live, whole text" {
     // parenthesis.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const segs = sessionInfo(arena_state.allocator(), false) orelse return;
+    const segs = sessionInfo(arena_state.allocator()) orelse return;
 
     for (segs) |sg| {
         try std.testing.expect(sg.text.len > 0);
@@ -6917,6 +6954,10 @@ test "activity strip: with work and with a queue" {
     try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "1 queued") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "en cola") != null);
+    var status_buf: [256]u8 = undefined;
+    const status_row = rowText(s, s.size.height - 2, &status_buf);
+    try std.testing.expect(std.mem.indexOf(u8, status_row, "streaming") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_row, "⠋") == null);
 }
 
 test "activity strip: the label is the phase" {
@@ -6982,7 +7023,7 @@ test "status: tokens and context are always visible" {
     // exist.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const segs = sessionInfo(arena_state.allocator(), false) orelse return;
+    const segs = sessionInfo(arena_state.allocator()) orelse return;
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(std.testing.allocator);
     for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
@@ -7070,11 +7111,10 @@ test "permissions: the modal is centered and shows the 4 options" {
     m.perm_active = false;
 }
 
-test "the status face is in its mood's color, not in the status gray" {
-    // The complaint was literal: "you can't tell by the color". The status row
-    // goes out in SEGMENTS precisely for that: the face in the mood's color and
-    // the text in the dim blue. With a single string everything came out the
-    // same gray.
+test "the activity strip is the only working indicator" {
+    // The status row used to repeat the mascot, spinner and phase already shown
+    // in the activity strip. Keep the animated face and phase together there;
+    // the bottom status row is only for stable session metadata.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -7085,12 +7125,11 @@ test "the status face is in its mood's color, not in the status gray" {
 
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
     const status_row = s.size.height - 2;
+    const activity_row = findRow(s, "streaming") orelse return error.TestUnexpectedResult;
     const face = mascot.faceFrames(.thinking, 0);
 
-    // The face is SEVERAL graphemes spread across different cells, so they are
-    // walked with the same iterator the painter uses: comparing the whole string
-    // against a cell NEVER matches and the test would pass by luck or fail
-    // without saying anything.
+    // The face is several graphemes spread across cells, so inspect each cell
+    // individually rather than comparing the whole face to one cell.
     var it = vaxis.unicode.graphemeIterator(face);
     var found: usize = 0;
     while (it.next()) |g| {
@@ -7098,7 +7137,7 @@ test "the status face is in its mood's color, not in the status gray" {
         var col: u16 = 0;
         var hit = false;
         while (col < s.size.width) {
-            const cell = s.readCell(col, status_row);
+            const cell = s.readCell(col, activity_row);
             if (std.mem.eql(u8, cell.char.grapheme, bytes)) {
                 hit = true;
                 break;
@@ -7106,18 +7145,15 @@ test "the status face is in its mood's color, not in the status gray" {
             col += @max(1, cell.char.width);
         }
         try std.testing.expect(hit);
-        const cell = s.readCell(col, status_row);
-        try std.testing.expectEqual(mascot.Mood.thinking.vaxisColor(), cell.style.fg);
-        try std.testing.expect(cell.style.bold);
+        const cell = s.readCell(col, activity_row);
+        try std.testing.expectEqual(theme.brand.fg, cell.style.fg);
+        try std.testing.expectEqual(theme.brand.bold, cell.style.bold);
         found += 1;
     }
     try std.testing.expect(found > 0);
-
-    // And the text that accompanies it does NOT carry the face inside: before
-    // it was painted twice (the one in the strip and the one in the text) and
-    // the one in the text came out gray.
     var rb: [256]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, status_row, &rb), "thinking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, status_row, &rb), "streaming") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, status_row, &rb), "⠋") == null);
 }
 
 /// A banner line's columns, without the `*…*` marks.
@@ -8140,12 +8176,14 @@ test "the history has a left margin and nothing goes off screen" {
     var buf2: [128]u8 = undefined;
     const cont = rowText(s, 1, &buf2);
     try std.testing.expect(std.mem.startsWith(u8, cont, "  \u{2502} "));
-    // And it does not reach the end. In COLUMNS, not in bytes: `rowText` returns
+    // The right margin stays clear too. In COLUMNS, not in bytes: `rowText` returns
     // bytes and the gutter bar is 3 bytes for 1 column, so counting bytes made
     // this row look longer than the terminal is wide.
     const cols = try plainColumns(std.testing.allocator, std.mem.trimEnd(u8, cont, " "));
     defer std.testing.allocator.free(cols);
-    try std.testing.expect(cols.len < 38);
+    try std.testing.expect(cols.len <= 38);
+    try std.testing.expectEqualStrings(" ", s.readCell(38, 1).char.grapheme);
+    try std.testing.expectEqualStrings(" ", s.readCell(39, 1).char.grapheme);
 }
 
 test "prune: what leaves the window is compressed and comes back byte-for-byte IDENTICAL" {
@@ -8335,6 +8373,18 @@ test "usage column: with data, the cache pct and the session tokens" {
     try std.testing.expect(std.mem.indexOf(u8, all, "45% cached") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "2k prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "out") != null);
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const surface = try drawTest(&m, arena, 140, 20);
+    var row_buf: [512]u8 = undefined;
+    const row = rowText(surface, surface.size.height - 2, &row_buf);
+    // The two right-aligned groups used to start at the same edge and overwrite
+    // one another. Both must be visible together at a width where they fit.
+    try std.testing.expect(std.mem.indexOf(u8, row, "opencode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "ctx ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "45% cached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "2k prompt") != null);
 }
 
 test "both status columns measure the width the same (else they overlap)" {
@@ -9024,14 +9074,14 @@ test "read-only shows up in the status bar" {
 
     const before = try drawTest(&m, arena, 100, 30);
     const before_row = rowText(before, status_row, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, before_row, "read-only") == null);
+    try std.testing.expect(std.mem.indexOf(u8, before_row, "plan") == null);
 
     agent.read_only = true;
     defer agent.read_only = false;
 
     const after = try drawTest(&m, arena, 100, 30);
     const after_row = rowText(after, status_row, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, after_row, "read-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_row, "plan") != null);
 }
 
 test "@ mention: the popup lists files AND is painted, and does not hide the ones that do not fit" {
@@ -9301,7 +9351,26 @@ test "ctrl+d scrolls back down and does NOT quit" {
     // Empty input: that is the state the bug needed.
     try std.testing.expect(m.ed.isEmpty());
 
-    // Up, then down, with the empty input the whole way.
+    // The arrow keys scroll one line when the editor is empty.
+    const bottom = m.anchorLine();
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
+    const arrow_up = m.anchorLine();
+    try std.testing.expect(arrow_up < bottom);
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
+    try std.testing.expectEqual(bottom, m.anchorLine());
+
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.home } });
+    try std.testing.expectEqual(@as(usize, 0), m.anchorLine());
+    const scrolled = try drawTest(&m, arena_state.allocator(), 60, 20);
+    var status_buf: [256]u8 = undefined;
+    const status = rowText(scrolled, scrolled.size.height - 2, &status_buf);
+    try std.testing.expect(std.mem.indexOf(u8, status, "history") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "↓ 1") == null);
+    const latest = m.currentMaxOffset();
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.end } });
+    try std.testing.expectEqual(latest, m.anchorLine());
+
+    // Page shortcuts still work with the empty input the whole way.
     try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
     try std.testing.expect(!ctx.quit);
     const up = m.anchorLine();
@@ -9313,6 +9382,34 @@ test "ctrl+d scrolls back down and does NOT quit" {
     // And ctrl+c is the exit, which is what the status bar says.
     try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
     try std.testing.expect(ctx.quit);
+}
+
+test "ask panel wraps by words, stays in history, and leaves the answer input visible" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try openAskForTest(
+        &m,
+        "Choose alpha beta exceptionallylongword and explain the tradeoff.",
+        "Decision",
+        &.{ "Use adapter", "Add adapter" },
+    );
+    const s = try drawTest(&m, arena, 40, 24);
+
+    // The complete word remains on one row instead of being split at the box
+    // edge, and the question's choices remain inside the bordered panel.
+    try std.testing.expect(findRow(s, "exceptionallylongword") != null);
+    try std.testing.expect(findRow(s, "recommended") != null);
+    try std.testing.expect(findRow(s, "Use adapter") != null);
+
+    // The panel is confined to the history viewport; the input box and status
+    // strip are still painted and usable underneath it.
+    const input_top = s.size.height - 4 - 1 - 1;
+    try std.testing.expectEqualStrings("╭", s.readCell(0, input_top).char.grapheme);
+    try std.testing.expect(findRow(s, "enter answers") != null);
 }
 
 test "ramReport: an empty session is zero, and the split adds up by construction" {

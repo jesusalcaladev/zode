@@ -2,21 +2,45 @@ const std = @import("std");
 const common = @import("common.zig");
 const list_files_tool = @import("list_files.zig");
 
-// ── grep: native rg > native grep > internal fallback ────────
+// ── grep: rg > git grep (in a repo) > grep -rn > internal fallback ──────
+//
+// There is NO "which binary exists?" probe: `nativeGrep` already returns
+// null for a binary that cannot run, which is exactly what the chain needs to
+// move on to the next step. A probe would be a first subprocess paid to avoid
+// a fallback that is itself one, plus a process-wide cache — and grep is one
+// of the PARALLEL-SAFE tools, so that cache would be written from several
+// threads at once, and its `run` result was never freed.
+//
+// Every argv ends with `--` before the pattern: the pattern comes from the
+// model, and a pattern starting with "-" is otherwise read as an option. rg,
+// git grep and GNU grep were each checked to accept the separator.
 pub fn toolGrep(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const pattern = common.getStr(obj, "pattern") orelse return error.MissingPattern;
     const subdir = common.getStr(obj, "subdir") orelse ".";
 
-    // 1) ripgrep (the best: fast, respects .gitignore)
-    // Smart case: case-insensitive if all lowercase, sensitive if has uppercase
-    const rg_argv = [_][]const u8{ "rg", "--no-heading", "-n", "-S", "--hidden", "--max-count", "10", "--max-columns", "400", pattern, subdir };
+    // 1) ripgrep: fast, respects .gitignore, `--hidden` for dotfiles and
+    //    `--follow` for symlinked directories. Exit 1 means "no matches" and
+    //    ENDS the chain: rg is authoritative when it is there, and falling
+    //    through to a dumber tool would resurface the ignored files it just
+    //    refused to show.
+    const rg_argv = [_][]const u8{ "rg", "--no-heading", "-n", "-S", "--hidden", "--follow", "--max-count", "12", "--max-columns", "500", "--", pattern, subdir };
     if (nativeGrep(arena, io, &rg_argv)) |out| return out;
 
-    // 2) the system's grep -rn
-    const grep_argv = [_][]const u8{ "grep", "-rn", "--include=*", "-m", "5", pattern, subdir };
+    // 2) git grep: the next best inside a repository, and it ignores the same
+    //    ignored files. No `rev-parse` to ask whether this IS a repository:
+    //    outside one git grep exits 128, `nativeGrep` returns null and the
+    //    chain continues — the same cost as the check, one subprocess instead
+    //    of two. `--untracked` keeps untracked files visible (that is what rg
+    //    searches too); gitignored files stay out of both.
+    const gg_argv = [_][]const u8{ "git", "grep", "-n", "-I", "--max-count", "40", "--untracked", "--", pattern, subdir };
+    if (nativeGrep(arena, io, &gg_argv)) |out| return out;
+
+    // 3) the system's grep -rn. No .gitignore here, which is why it is third
+    //    and not first: it is the one that would walk .zig-cache.
+    const grep_argv = [_][]const u8{ "grep", "-rn", "--include=*", "-m", "5", "--", pattern, subdir };
     if (nativeGrep(arena, io, &grep_argv)) |out| return out;
 
-    // 3) fallback: internal regex engine
+    // 4) our own engine: the only one that cannot be missing.
     return fallbackGrep(io, pattern, subdir, arena);
 }
 
