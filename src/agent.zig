@@ -2254,7 +2254,7 @@ pub fn refreshUserCommandsFrom(gpa: std.mem.Allocator, io: std.Io, roots: []cons
     // Sort for stable, predictable order in help/palette
     std.mem.sort(usercmds_mod.Entry, uc_entries[0..uc_len], {}, struct {
         fn less(_: void, a: usercmds_mod.Entry, b: usercmds_mod.Entry) bool {
-            return std.mem.lessThan(u8, a.name(), b.name());
+            return std.ascii.lessThanIgnoreCase(a.name(), b.name());
         }
     }.less);
     for (uc_entries[0..uc_len], 0..) |*e, i| {
