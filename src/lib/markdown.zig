@@ -397,7 +397,7 @@ fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![
 pub const max_diff_lines = 2000;
 
 /// Context lines kept around each change.
-pub const diff_context_lines = 3;
+pub const diff_context_lines = 4;
 
 /// One line of the raw diff, before hunking.
 const DiffLine = struct {
@@ -949,11 +949,14 @@ test "unifiedDiff: a small change in a large file does NOT dump the whole file" 
     }
 
     const d = try unifiedDiff(arena, before.items, after.items);
-    // A single hunk: header + 3 context lines + 1 '-' change + 1 '+' + 3 context lines.
-    try std.testing.expectEqual(@as(usize, 9), d.len);
-    try std.testing.expectEqualStrings("@@ -28,7 +28,7 @@", d[0]);
-    try std.testing.expectEqualStrings("-linea 30", d[4]);
-    try std.testing.expectEqualStrings("+linea 999", d[5]);
+    // A single hunk: header + 4 context lines + 1 '-' change + 1 '+' + 4 context lines.
+    // The 4 is `diff_context_lines`: the test follows the constant, because a
+    // hunk's size is exactly that number and pinning "9" would pin a value
+    // that only ever described one setting.
+    try std.testing.expectEqual(@as(usize, 1 + 4 + 1 + 1 + 4), d.len);
+    try std.testing.expectEqualStrings("@@ -27,9 +27,9 @@", d[0]);
+    try std.testing.expectEqualStrings("-linea 30", d[5]);
+    try std.testing.expectEqualStrings("+linea 999", d[6]);
     // And the rest of the file does NOT come out.
     for (d) |l| {
         try std.testing.expect(std.mem.indexOf(u8, l, "linea 0") == null or

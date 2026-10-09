@@ -370,6 +370,33 @@ test "native grep finds the pattern" {
     try std.testing.expect(std.mem.indexOf(u8, out, "toolGrep") != null);
 }
 
+test "a pattern that starts with a dash is a pattern, not an option" {
+    // Every argv of the chain ends with `--` before the pattern, because the
+    // pattern comes from the model: rg, git grep and GNU grep were each
+    // verified to accept the separator, and without it a "-foo" is read as a
+    // flag by whichever binary runs first.
+    //
+    // The assertion is the exact string "no matches": that is what
+    // `nativeGrep` answers on exit 1, i.e. a native tool parsed the pattern
+    // and reported no hit. The internal fallback's answer has a different
+    // shape ("no matches: <pattern>"), so a chain that lets the dash pattern
+    // error all the way down to the fallback FAILS here.
+    //
+    // The pattern is CONCATENATED: this test lives in `src`, which is the
+    // directory it greps, so the full literal in the source would match the
+    // test's own line and prove nothing (it did, on the first run).
+    const pattern = "--zode-no" ++ "-such-pattern";
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const args = try std.fmt.allocPrint(arena, "{{\"pattern\":\"{s}\",\"subdir\":\"src\"}}", .{pattern});
+    const out = execute(std.testing.io, "grep", args, arena, null, null) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest; // no rg/grep in PATH
+        return err;
+    };
+    try std.testing.expectEqualStrings("no matches", out);
+}
+
 test "write returns a PREVIEW of the file, not an opaque OK" {
     // A tool result that only says "ok" forces opening the file to find out
     // whether the model wrote what it was asked to write, and in an agentic loop

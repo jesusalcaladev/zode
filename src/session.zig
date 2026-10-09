@@ -268,7 +268,22 @@ pub const Session = struct {
 
     /// Path of the most recent session (by mtime); null if there is none.
     pub fn latestSessionPath(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
-        var dir = std.Io.Dir.cwd().openDir(io, "sessions", .{}) catch return null;
+        return latestSessionPathIn(arena, io, "sessions");
+    }
+
+    /// The most recent `.jsonl` inside `dir_path`, as a path relative to the
+    /// cwd. Split from `latestSessionPath` so a test can point it at a temp
+    /// directory instead of the real `sessions/` (hijacking the repo's sessions
+    /// would redirect whoever resumes next to a fixture).
+    ///
+    /// `.iterate = true` is MANDATORY here: without it the directory opens
+    /// fine but its cursor cannot be read, `next()` fails on the first call,
+    /// the loop ends with nothing and the function reports "no sessions" —
+    /// which is how `--resume`, `ZODE_RESUME=1` and `/resume` all answered
+    /// "nothing to resume" over a sessions/ full of files, in every release
+    /// build (a missing flag only panics in debug, so nothing else saw it).
+    pub fn latestSessionPathIn(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) !?[]const u8 {
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
         defer dir.close(io);
 
         var it = dir.iterate();
@@ -277,7 +292,7 @@ pub const Session = struct {
         while (it.next(io) catch null) |e| {
             if (e.kind != .file) continue;
             if (!std.mem.endsWith(u8, e.name, ".jsonl")) continue;
-            const full = try std.fmt.allocPrint(arena, "sessions/{s}", .{e.name});
+            const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, e.name });
             const st = dir.statFile(io, e.name, .{}) catch continue;
             const mtime_s = st.mtime.toSeconds();
             if (mtime_s > best_mtime) {
@@ -424,4 +439,40 @@ test "round trip: session compressed on disk" {
     var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer dir.close(io);
     dir.deleteFile(io, used_path) catch {};
+}
+
+test "latestSessionPath: finds a .jsonl in the directory (the iterate flag)" {
+    // The regression this pins: the directory was opened WITHOUT
+    // `.iterate = true`, so `next()` failed on the first call, the loop ended
+    // empty and the function answered "no sessions" — which is how `--resume`,
+    // `ZODE_RESUME=1` and `/resume` all said "nothing to resume" over a
+    // sessions/ full of files in every release build. Here it answers with the
+    // file, or the bug is back.
+    const io = std.testing.io;
+    const root = "/tmp/zode-latest-session-test";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/zode-latest-session-test/zode-fixture.jsonl",
+        .data = "{\"role\":\"user\",\"content\":\"x\"}\n",
+    });
+    // Not a session file: ignored rather than resumed.
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/zode-latest-session-test/notes.txt",
+        .data = "x",
+    });
+
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const found = try Session.latestSessionPathIn(astate.allocator(), io, root);
+    try std.testing.expect(found != null);
+    try std.testing.expect(std.mem.endsWith(u8, found.?, "/zode-fixture.jsonl"));
+
+    // An empty directory is null, not a panic and not the first name it saw.
+    const empty = "/tmp/zode-latest-session-test-empty";
+    std.Io.Dir.cwd().deleteTree(io, empty) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, empty) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, empty);
+    try std.testing.expect(try Session.latestSessionPathIn(astate.allocator(), io, empty) == null);
 }

@@ -96,6 +96,26 @@ def drive(keys, budget: float = 8.0):
         except OSError:
             break
 
+    # The LAST key is always sent at the very end of the budget, so its
+    # response lands AFTER the last read: for every "type + Enter" case the
+    # window closed before the answer existed. Measured: the response arrives
+    # ~10 ms after the Enter, and the /clean checks were passing on the
+    # autocomplete hint instead (the desc literally contains "dry run" and
+    # "/clean yes"), i.e. they did not need the command to answer at all.
+    # This drain is what makes "<cmd> answers" check the ANSWER.
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if not r:
+            continue
+        try:
+            chunk = os.read(fd, 1 << 16)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            break
+        out += chunk
+
     os.write(fd, b"\x03")  # ctrl+c: the prompt's own exit path
     time.sleep(0.3)
     try:
@@ -168,13 +188,27 @@ def main() -> int:
     #    untested here, which is how the scroll bug (page up past the top, then
     #    nothing moved on page down) shipped with a green smoke test.
     #
-    #    The keys that DO scroll the history: PageUp `\x1b[5~`, PageDown
-    #    `\x1b[6~`, Ctrl+U `\x15` (half a page up), Ctrl+D `\x04` (half a page
-    #    down) and the wheel (`\x1b[<64;…M` / `\x1b[<65;…M`).
+    #    The keys that scroll the history: Up/Down when the input is empty,
+    #    Home/End for oldest/latest, PageUp `\x1b[5~`, PageDown `\x1b[6~`,
+    #    Ctrl+U `\x15` (half a page up), Ctrl+D `\x04` (half a page down) and
+    #    the wheel (`\x1b[<64;…M` / `\x1b[<65;…M`).
     out3, t3 = drive(
-        [b"hola", b"\r", b"\x0c", b"\x1b[5~", b"\x1b[5~", b"\x1b[6~", b"\x15", b"\x04"]
+        [
+            b"hola",
+            b"\r",
+            b"\x0c",
+            b"\x1b[A",
+            b"\x1b[B",
+            b"\x1b[H",
+            b"\x1b[F",
+            b"\x1b[5~",
+            b"\x1b[5~",
+            b"\x1b[6~",
+            b"\x15",
+            b"\x04",
+        ]
     )
-    ok &= check("ctrl+l + real scroll keys do not break anything", "panic" not in t3.lower(), t3)
+    ok &= check("arrows, Home/End and page keys scroll without breaking", "panic" not in t3.lower(), t3)
     ok &= check("no 'Invalid free' after scrolling", "invalid free" not in t3.lower(), t3)
 
     # 4) `/clean`: a cleanup command that runs in the TUI without asking anything
@@ -183,8 +217,18 @@ def main() -> int:
     #    hold no empty session at all, and a test that depends on there being junk
     #    to delete only ever verifies the happy path.
     out4, t4 = drive([b"/clean", b"\r"])
-    ok &= check("/clean answers (dry run)", "/clean" in t4 and "dry run" in t4, t4)
-    ok &= check("/clean offers the 'yes'", "/clean yes" in t4, t4)
+    # Both needles are RESPONSE-only: "dry run" and "/clean yes" also live in
+    # the command's desc, which the autocomplete popup shows while the text is
+    # being typed — the first version of these checks passed on the popup and
+    # would have kept passing if /clean never answered. "…: dry run" is the
+    # header only cmdClean prints, and the tail has one of three endings
+    # (the junk may or may not exist in the sandbox).
+    ok &= check("/clean answers (dry run)", "/clean: dry run" in t4, t4)
+    ok &= check(
+        "/clean offers the 'yes' (or says there is nothing)",
+        "run /clean yes to delete" in t4 or "nothing to delete" in t4 or "nothing to clean" in t4,
+        t4,
+    )
     ok &= check("/clean does not break anything", "panic" not in t4.lower(), t4)
 
     # 5) `/context` says WHERE the work is happening. It is the line that answers
@@ -240,6 +284,20 @@ def main() -> int:
     # would make the next Enter re-run it.
     out8b, t8b = drive([b"hola", b"\x15"], budget=8.0)
     ok &= check("the input is usable after `!`", "panic" not in t8b.lower(), t8b)
+
+    # 9) The user-command commands, TYPED. Both live in `submit`'s big if/else
+    #    chain: the unit tests check the branches, and this checks that they
+    #    are reachable from a keystroke and that their answer reaches the
+    #    screen (the `/free-auto` lesson: a command can be perfectly
+    #    unit-tested and still do nothing when typed).
+    out9, t9 = drive(
+        [b"/reload-cmds", b"\r", b"/which-cmd help", b"\r", b"/which-cmd zode-no-such", b"\r"],
+        budget=15.0,
+    )
+    ok &= check("/reload-cmds answers with the count", "reloaded user commands:" in t9, t9)
+    ok &= check("/which-cmd names a builtin as a builtin", "/help is a builtin" in t9, t9)
+    ok &= check("/which-cmd says not found for a file that is not there", "not found: /zode-no-such" in t9, t9)
+    ok &= check("the new commands do not break anything", "panic" not in t9.lower(), t9)
 
     if not ok:
         print("\n--- plain text (truncated) ---")

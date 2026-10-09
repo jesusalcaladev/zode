@@ -46,10 +46,18 @@ pub fn cmdHelp(m: *tui.Model) void {
     agent.refreshUserCommandsModel(m);
     const uc = agent.userCommands();
     if (uc.len > 0) {
-        agent.pushInfoOwned(m, gpa.dupe(u8, "your commands (.zode/commands, ~/.config/zode/commands)") catch return);
-        for (uc) |c| {
-            const line = std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
-            agent.pushInfoOwned(m, line);
+        agent.pushInfoOwned(m, gpa.dupe(u8, "your commands (.zode/commands · ~/.config/zode/commands)") catch return);
+        var i: usize = 0;
+        while (i < uc.len) : (i += 1) {
+            if (agent.userCommandInfo(i)) |info| {
+                const origin = if (info.root == 0) "proj" else "user";
+                const line = std.fmt.allocPrint(gpa, "{s: <14} {s: <10} {s}", .{ info.key, origin, info.desc }) catch continue;
+                agent.pushInfoOwned(m, line);
+            } else {
+                const c = uc[i];
+                const line = std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
+                agent.pushInfoOwned(m, line);
+            }
         }
     }
 
@@ -489,6 +497,8 @@ pub const commands = [_]Cmd{
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
     .{ .key = "/submodel", .desc = "which model the SUBAGENTS use (no args: report | <model> | <provider> <model> | off)" },
+    .{ .key = "/reload-cmds", .desc = "reload user commands from disk" },
+    .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name" },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
     .{ .key = "/plan", .desc = "clear the visible task list" },
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },

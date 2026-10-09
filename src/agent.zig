@@ -376,7 +376,7 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     // model has to know before it decides what to call, or it plans a `write`
     // and then gets an error, which it reads as a bug and works around.
     const mode_note: []const u8 = if (read_only)
-        "READ-ONLY MODE is on (shift+tab to cycle). You cannot write, edit or run bash: those calls come back with an error saying so. Investigate, then use `ask` to tell the user what you found and ask how to proceed.\n\n"
+        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line — and end your turn: the user will be asked to approve it. On approval zode switches itself to default mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
     else if (accept_edits)
         "ACCEPT-EDITS MODE is on (shift+tab to cycle): file edits (write, edit, rename) run without asking, but bash still asks for permission. Ask the user with `ask` before running anything destructive.\n\n"
     else
@@ -627,7 +627,11 @@ pub fn permModeName() []const u8 {
     return switch (currentPermMode()) {
         .default => "default",
         .accept_edits => "accept-edits",
-        .read_only => "read-only",
+        // "plan" and not "read-only": it is what the mode IS for (investigate,
+        // write the plan, get it approved) and what the cycle and `/mode` have
+        // always called it in their own docs. The mechanics are unchanged —
+        // every write is still refused.
+        .read_only => "plan",
         .bypass => "bypass",
     };
 }
@@ -682,6 +686,106 @@ fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
     }
     // No argument: toggle, as it always did.
     setPermMode(m, if (read_only) .default else .read_only);
+}
+
+// ── plan approval: the developer says yes or no ────────────
+
+/// The option labels of the approval dialog. They are the API of the flow:
+/// `planGateDecision` matches the FIRST one by prefix, so changing a label
+/// here without changing the matcher silently turns every approval into a
+/// revision.
+pub const approve_option = "Approve — implement it now";
+pub const revise_option = "Revise — change the plan first";
+
+/// What the model is told after the developer approved. Owned by the caller.
+pub const plan_gate_approved_text =
+    "The user APPROVED the plan, and zode has already switched itself out of plan mode " ++
+    "(you are in default mode: edits and commands are allowed). Implement the plan now: " ++
+    "work through the steps, verify as you go, and report what changed when done. Do not " ++
+    "ask for approval again — it has been given.";
+
+/// The revision nudge's shape. `{s}` is the user's own words: a rejection with
+/// no reason is the one thing the model cannot act on.
+pub const plan_gate_revise_fmt =
+    "The user did NOT approve the plan yet. They said: \"{s}\"\n" ++
+    "Revise the plan with the `todo` tool (say what changed in the steps), then end your " ++
+    "turn to present it again. You are still in PLAN MODE: do not edit anything until " ++
+    "it is approved.";
+
+/// What an approval answer means, decided WITHOUT a TUI so it can be tested.
+///
+/// - no answer at all (ESC or timeout) → `skip`: end the turn with no nudge.
+///   A user who walked away must not come back to a loop that kept asking —
+///   that is how a plan gate turns into a wall.
+/// - the approve option (prefix match) or an obvious typed yes → `approve`.
+/// - EVERYTHING else — the revise option or the user's own typed words →
+///   `revise`, and those words travel with the nudge as the reason.
+pub const PlanGate = enum { approve, revise, skip };
+
+pub fn planGateDecision(answer: ?[]const u8) PlanGate {
+    const a = answer orelse return .skip;
+    const t = std.mem.trim(u8, a, " \t\r\n");
+    if (t.len == 0) return .skip;
+    if (std.mem.startsWith(u8, t, "Approve")) return .approve;
+    if (std.ascii.eqlIgnoreCase(t, "approve") or
+        std.ascii.eqlIgnoreCase(t, "yes") or
+        std.ascii.eqlIgnoreCase(t, "y")) return .approve;
+    return .revise;
+}
+
+/// The approval dialog, run on the WORKER at the moment the model tries to end
+/// a plan-mode turn. Returns the prompt for the next iteration, or null to end
+/// the turn without a nudge (nobody answered, or the answer was not usable).
+fn planApprovalNudge(m: *tui.Model) ?[]u8 {
+    // The final answer is CLOSED before the dialog: the developer reads the
+    // plan block and the explanation together, and text that can still move
+    // under a modal is text they cannot rely on.
+    m.streamEnd();
+    var q_buf: [240]u8 = undefined;
+    const q = std.fmt.bufPrint(
+        &q_buf,
+        "Plan ready: {d} step(s) shown above. Approve it so zode can start implementing?",
+        .{m.plan.len},
+    ) catch "Plan ready. Approve it so zode can start implementing?";
+    const opts = [_][]const u8{ approve_option, revise_option };
+    setStatusWithZo(m, .warn, "the plan needs your approval");
+    const answer = m.requestAsk(q, "plan", &opts);
+    defer if (answer) |a| m.allocator.free(a);
+
+    switch (planGateDecision(answer)) {
+        .approve => {
+            // The plan-mode verdict describes planning, not the implementation
+            // that begins after approval. Carrying it forward would end the
+            // newly approved implementation turn on its first response.
+            m.goal.status = goal_mod.Status.none;
+            setPermMode(m, .default);
+            pushInfo(m, "plan approved — plan mode off: implementing");
+            return m.allocator.dupe(u8, plan_gate_approved_text) catch null;
+        },
+        .revise => {
+            // A rejected draft is not a final verdict either. The revised plan
+            // must be presented before the developer can decide what happens.
+            m.goal.status = goal_mod.Status.none;
+            // The user's own words, cut to a sane length: the answer comes from
+            // a free-text field with no cap, and a nudge that repeats a pasted
+            // novel is a nudge nobody reads. `fb_buf` is fine because
+            // `allocPrint` copies it into the returned string before returning.
+            var fb_buf: [300]u8 = undefined;
+            const fb: []const u8 = if (answer) |a| blk: {
+                const t = std.mem.trim(u8, a, " \t\r\n");
+                const cut = t[0..@min(t.len, fb_buf.len - 1)];
+                @memcpy(fb_buf[0..cut.len], cut);
+                break :blk fb_buf[0..cut.len];
+            } else revise_option;
+            const nudge = std.fmt.allocPrint(m.allocator, plan_gate_revise_fmt, .{fb}) catch return null;
+            pushInfo(m, "plan not approved: revising");
+            return nudge;
+        },
+        .skip => {
+            pushInfo(m, "plan approval skipped — shift+tab leaves plan mode whenever you want");
+            return null;
+        },
+    }
 }
 
 /// `/bench`: the numbers that decide whether to tune anything.
@@ -2056,7 +2160,7 @@ fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
             pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
             return;
         }
-        pushInfo(m, "/mode: default|accept-edits|read-only|bypass");
+        pushInfo(m, "/mode: default|accept-edits|plan|bypass");
         return;
     }
     pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
@@ -2069,7 +2173,8 @@ fn parsePermMode(a: []const u8) ?PermMode {
     if (std.ascii.eqlIgnoreCase(a, "accept-edits") or
         std.ascii.eqlIgnoreCase(a, "accept_edits") or
         std.ascii.eqlIgnoreCase(a, "edits")) return .accept_edits;
-    if (std.ascii.eqlIgnoreCase(a, "read-only") or
+    if (std.ascii.eqlIgnoreCase(a, "plan") or
+        std.ascii.eqlIgnoreCase(a, "read-only") or
         std.ascii.eqlIgnoreCase(a, "readonly") or
         std.ascii.eqlIgnoreCase(a, "ro")) return .read_only;
     if (std.ascii.eqlIgnoreCase(a, "bypass") or
@@ -2188,6 +2293,53 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdAskMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "skills")) {
         cmdSkills(m);
+    } else if (std.mem.eql(u8, cmd, "reload-cmds") or std.mem.eql(u8, cmd, "reloadcmds") or std.mem.eql(u8, cmd, "reloadcmd")) {
+        if (m.io_ready) {
+            refreshUserCommandsForce(m.allocator, m.io, m.environ, true);
+            const uc = userCommands();
+            m.pushInfoFmt("reloaded user commands: {d} found (.zode/commands + ~/.config/zode/commands)", .{uc.len});
+        } else {
+            m.pushInfo("cannot reload: io not ready");
+        }
+    } else if (std.mem.eql(u8, cmd, "which-cmd") or std.mem.eql(u8, cmd, "whichcmd")) {
+        if (arg) |a| {
+            var token = std.mem.trim(u8, a, " \t\r\n");
+            // "which-cmd /hola" has to work like "which-cmd hola": the dispatch
+            // token arrives WITHOUT the slash, and a user who just typed the
+            // command's name in full should not get "not found" for it.
+            if (token.len > 0 and token[0] == '/') token = token[1..];
+            // Refresh first: "not found" has to mean "there is no such file",
+            // not "there was no such file at startup". The mtime cache makes
+            // this two stats when nothing moved.
+            refreshUserCommandsModel(m);
+            if (findUserCmd(token)) |idx| {
+                if (userCommandInfo(idx)) |info| {
+                    const origin = if (info.root == 0) ".zode/commands" else "~/.config/zode/commands";
+                    const name = if (info.key.len > 0) info.key[1..] else info.key;
+                    m.pushInfoFmt("{s} -> {s}/{s}.md", .{ info.key, origin, name });
+                    return;
+                }
+            }
+            // The token may name a BUILTIN: saying "not found" about /help
+            // would be a lie, and this command's whole job is to say where a
+            // name comes from.
+            var is_builtin = false;
+            for (commands) |c| {
+                if (c.key.len == token.len + 1 and c.key[0] == '/' and
+                    std.mem.eql(u8, c.key[1..], token))
+                {
+                    is_builtin = true;
+                    break;
+                }
+            }
+            if (is_builtin) {
+                m.pushInfoFmt("/{s} is a builtin, not a file (.zode/commands holds only the user's)", .{token});
+            } else {
+                m.pushInfoFmt("not found: /{s} (no builtin and no file)", .{token});
+            }
+        } else {
+            m.pushInfo("usage: /which-cmd <name>");
+        }
     } else if (std.mem.eql(u8, cmd, "new")) {
         newSession(m);
     } else if (std.mem.eql(u8, cmd, "resume")) {
@@ -2219,6 +2371,17 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
 var uc_entries: [usercmds_mod.max_cmds]usercmds_mod.Entry = undefined;
 var uc_cmds: [usercmds_mod.max_cmds]commands_mod.Cmd = undefined;
 var uc_len: usize = 0;
+var uc_roots_buf: [std.fs.max_path_bytes * 2]u8 = undefined;
+var uc_roots: [2][]const u8 = undefined;
+var uc_roots_n: usize = 0;
+/// Last mtime (ns) of each root directory at scan time; 0 = the directory did
+/// not exist. A missing directory stores 0, so CREATING it later is a non-zero
+/// mtime and invalidates the cache exactly like a new file would.
+var uc_root_mtime_ns: [2]i128 = .{0, 0};
+/// A scan has happened at least once. Without it the very first call would
+/// compare against uninitialised roots and could decide "unchanged" over
+/// garbage: an empty list, forever, with no error anywhere.
+var uc_scanned: bool = false;
 
 /// The roots, in shadowing order: the project's, then the user's.
 ///
@@ -2249,6 +2412,50 @@ fn userCmdRoots(
 /// Scans `roots` into the static list. Its own function so a test can point it
 /// at a temp directory; `refreshUserCommands` builds the real roots.
 pub fn refreshUserCommandsFrom(gpa: std.mem.Allocator, io: std.Io, roots: []const []const u8) void {
+    refreshUserCommandsFromForce(gpa, io, roots, false);
+}
+
+pub fn refreshUserCommandsFromForce(gpa: std.mem.Allocator, io: std.Io, roots: []const []const u8, force: bool) void {
+    // The cache: two stat calls instead of a directory walk per keystroke. The
+    // scan only happens when the ROOTS differ or a root's mtime says something
+    // moved (a file created, removed or renamed inside it). Editing a file in
+    // place does NOT move the directory's mtime — that is the cache's one blind
+    // spot and the reason `/reload-cmds` takes `force`.
+    //
+    // `force` bypasses every check. And `uc_scanned` guards the first call:
+    // without it, `roots.len == uc_roots_n` over uninitialised state could
+    // "confirm" a scan that never ran and the list would stay empty forever.
+    if (!force and uc_scanned and roots.len == uc_roots_n) {
+        var fresh = true;
+        for (roots, 0..) |r, i| {
+            if (!std.mem.eql(u8, r, uc_roots[i]) or rootMtimeNs(io, r) != uc_root_mtime_ns[i]) {
+                fresh = false;
+                break;
+            }
+        }
+        if (fresh) return;
+    }
+
+    // Remember the roots and their mtimes for the next call. Each root that
+    // does not fit the buffer is remembered as `""`, which never compares equal
+    // to a real root: the next call rescans. A bounds check instead of a
+    // panic — a path the cache cannot hold is a cache miss, not a crash.
+    uc_roots_n = @min(roots.len, uc_roots.len);
+    uc_scanned = true;
+    var buf_off: usize = 0;
+    for (roots[0..uc_roots_n], 0..) |r, i| {
+        uc_root_mtime_ns[i] = 0;
+        if (buf_off + r.len <= uc_roots_buf.len) {
+            const copy = uc_roots_buf[buf_off .. buf_off + r.len];
+            @memcpy(copy, r);
+            uc_roots[i] = copy;
+            buf_off += r.len;
+        } else {
+            uc_roots[i] = "";
+        }
+        uc_root_mtime_ns[i] = rootMtimeNs(io, uc_roots[i]);
+    }
+
     const found = usercmds_mod.scan(gpa, io, roots, &uc_entries);
     uc_len = found.len;
     // Sort for stable, predictable order in help/palette
@@ -2258,19 +2465,30 @@ pub fn refreshUserCommandsFrom(gpa: std.mem.Allocator, io: std.Io, roots: []cons
         }
     }.less);
     for (uc_entries[0..uc_len], 0..) |*e, i| {
-        // The Cmd slices point INTO the entry's static buffers. Rescan
-        // overwrites those buffers in place and rebuilds the slices right
-        // after, so nothing outlives what it points at.
         uc_cmds[i] = .{ .key = e.key(), .desc = e.desc() };
     }
 }
 
+/// A root directory's mtime in nanoseconds, or 0 when it cannot be read —
+/// which is also what a directory that does not exist records, so "missing"
+/// and "missing since the last scan" compare equal and do not rescan.
+fn rootMtimeNs(io: std.Io, path: []const u8) i128 {
+    const d = std.Io.Dir.cwd().openDir(io, path, .{}) catch return 0;
+    defer d.close(io);
+    const st = d.stat(io) catch return 0;
+    return st.mtime.toNanoseconds();
+}
+
 /// Scan the real roots (project + `~/.config/zode/commands`).
 pub fn refreshUserCommands(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) void {
+    refreshUserCommandsForce(gpa, io, env, false);
+}
+
+pub fn refreshUserCommandsForce(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, force: bool) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var roots: [2][]const u8 = undefined;
     const n = userCmdRoots(&buf, &roots, env);
-    refreshUserCommandsFrom(gpa, io, roots[0..n]);
+    refreshUserCommandsFromForce(gpa, io, roots[0..n], force);
 }
 
 /// Refresh through the Model's OWN `io`, guarded by `io_ready` — the same rule
@@ -2287,6 +2505,21 @@ pub fn refreshUserCommandsModel(m: *tui.Model) void {
 /// already doing I/O or are about to report something to the user.
 pub fn userCommands() []const commands_mod.Cmd {
     return uc_cmds[0..uc_len];
+}
+
+pub const UserCmdInfo = struct {
+    key: []const u8,
+    desc: []const u8,
+    root: u8, // 0 = project .zode/commands, 1 = user ~/.config/zode/commands
+};
+
+pub fn userCommandInfo(i: usize) ?UserCmdInfo {
+    if (i >= uc_len) return null;
+    return UserCmdInfo{
+        .key = uc_cmds[i].key,
+        .desc = uc_cmds[i].desc,
+        .root = uc_entries[i].root,
+    };
 }
 
 /// Command `i`: the builtins first, then the user's. ONE iterator for the four
@@ -2376,9 +2609,118 @@ test "user commands: commandAt walks builtins AND the disk list, and a rescan re
     try std.testing.expect(findUserCmd("/hola") == null);
     try std.testing.expect(findUserCmd("help") == null);
 
+    // Where it came from: this is what `/which-cmd` prints, and the index is
+    // the SAME one `findUserCmd` returns — two lists with different orders is
+    // how a command would be reported as coming from the wrong folder.
+    const info = userCommandInfo(0).?;
+    try std.testing.expectEqual(@as(u8, 0), info.root);
+    try std.testing.expectEqualStrings("/hola", info.key);
+    try std.testing.expect(userCommandInfo(userCommands().len) == null);
+
     // A rescan with no roots empties the list (a renamed file disappears).
     refreshUserCommandsFrom(std.testing.allocator, std.testing.io, &.{});
     try std.testing.expectEqual(@as(usize, 0), userCommands().len);
+}
+
+test "the user command cache: an in-place edit needs /reload-cmds, a new file does not" {
+    // The cache keys on each root directory's mtime: creating, removing or
+    // renaming a file inside it bumps the directory, but REWRITING an existing
+    // file does not (only the file's own mtime moves). That blind spot is the
+    // trade the cache makes and `/reload-cmds` (force) is its way out, so both
+    // halves are pinned here: a cache that skipped everything would fail step
+    // 1, one that never cached would fail nothing but is covered by the roots
+    // comparison it shares with this path.
+    const root = "/tmp/zode-usercmds-cache-test";
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/zode-usercmds-cache-test/one.md",
+        .data = "---\ndescription: old\n---\nbody",
+    });
+
+    var roots = [_][]const u8{root};
+    refreshUserCommandsFrom(a, io, &roots);
+    // Clean the statics whatever happens below: they outlive this test.
+    defer refreshUserCommandsFrom(a, io, &.{});
+    try std.testing.expectEqual(@as(usize, 1), userCommands().len);
+
+    // 1. Rewritten in place: the directory's mtime does not move, so the
+    //    ordinary refresh keeps the old description.
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/zode-usercmds-cache-test/one.md",
+        .data = "---\ndescription: NEW\n---\nbody",
+    });
+    refreshUserCommandsFrom(a, io, &roots);
+    try std.testing.expectEqualStrings("old", userCommands()[0].desc);
+
+    // 2. `force` — exactly what `/reload-cmds` passes — reads the disk.
+    refreshUserCommandsFromForce(a, io, &roots, true);
+    try std.testing.expectEqualStrings("NEW", userCommands()[0].desc);
+
+    // 3. A NEW file bumps the directory, so it is picked up WITHOUT force.
+    //    The nap is the filesystem's timestamp clock, not the cache: mtimes
+    //    come from the coarse (per-tick) clock, so two operations inside one
+    //    tick record the SAME mtime and the cache would then be right to keep
+    //    the old list. No real user creates two files within a tick.
+    sleep_mod.nap(50);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = "/tmp/zode-usercmds-cache-test/two.md",
+        .data = "---\ndescription: second\n---\nbody",
+    });
+    refreshUserCommandsFrom(a, io, &roots);
+    try std.testing.expectEqual(@as(usize, 2), userCommands().len);
+}
+
+/// Does any queued info/error line contain this text? A `submit` branch can
+/// only be checked through what it pushed: there is no return value, which is
+/// exactly how an alias typo or a dead branch stays invisible to every other
+/// test.
+fn pendingContains(m: *tui.Model, needle: []const u8) bool {
+    for (m.pending.items) |p| {
+        if (std.mem.indexOf(u8, p.text, needle) != null) return true;
+    }
+    return false;
+}
+
+test "which-cmd and reload-cmds reach submit, and each says something checkable" {
+    // Both commands live in one long if/else chain, so nothing else in the
+    // suite would notice an alias that was never wired or a branch that never
+    // runs (the "three halves, nothing watching the seam" pattern).
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    // A test Model has no app behind it: without an explicit `io` every
+    // refresh would jump through an uninitialized vtable (the `attachIo`
+    // trap), which is why the flag and the handle are set together.
+    m.io = std.testing.io;
+    m.io_ready = true;
+    m.environ = null; // no HOME: only the project root is scanned
+    defer refreshUserCommandsFrom(std.testing.allocator, std.testing.io, &.{});
+
+    // A BUILTIN is answered truthfully instead of "not found": the whole job
+    // of this command is to say where a name comes from.
+    try submit(&m, "/which-cmd help");
+    try std.testing.expect(pendingContains(&m, "/help is a builtin"));
+
+    // With or without the leading slash — the dispatch token arrives without
+    // it, and a user who just typed the command's own name should not be told
+    // it does not exist.
+    try submit(&m, "/which-cmd /definitely-not-a-command");
+    try std.testing.expect(pendingContains(&m, "not found: /definitely-not-a-command"));
+    try submit(&m, "/which-cmd definitely-not-a-command");
+    try std.testing.expect(pendingContains(&m, "not found: /definitely-not-a-command"));
+
+    try submit(&m, "/which-cmd");
+    try std.testing.expect(pendingContains(&m, "usage: /which-cmd"));
+
+    try submit(&m, "/reload-cmds");
+    try std.testing.expect(pendingContains(&m, "reloaded user commands:"));
+
+    // The alias is what a human types by muscle memory.
+    try submit(&m, "/reloadcmds");
+    try std.testing.expect(pendingContains(&m, "reloaded user commands:"));
 }
 
 // ── /clean: purge zode's own leftovers, nothing else ──────────
@@ -2612,6 +2954,9 @@ fn chatWorker(job: *ChatJob) void {
     // long session would stop being able to ask anything after three questions
     // EVER, which is a bug that only shows up an hour in.
     m.asks_this_turn = 0;
+    m.plan_touched_this_turn = false;
+    m.plan_write_blocked_this_turn = false;
+    m.plan_missing_nudges_this_turn = 0;
 
     // A NEW turn clears the ESC flag: ESC blocked spawns so that the turn in
     // flight could not start anything else after the user said "stop", but if it
@@ -2653,6 +2998,10 @@ fn chatWorker(job: *ChatJob) void {
 
     m.repeats.reset();
     var checkpointed = false;
+    // How many times this turn has shown the plan-approval dialog. Bounded so
+    // "reject → revise → re-present" can cycle once but a turn that keeps being
+    // rejected ends on the ordinary ceiling instead of asking forever.
+    var plan_gate_asks: u8 = 0;
 
     while (iterations < hard) : (iterations += 1) {
         turn_stats.iterations = iterations + 1;
@@ -2727,7 +3076,49 @@ fn chatWorker(job: *ChatJob) void {
             }
         }
 
-        const text = again orelse break;
+        const text = again orelse {
+            // ── PLAN APPROVAL: the turn may not end with a plan nobody answered on ──
+            //
+            // Plan mode's whole point is investigate → plan → the developer says
+            // yes or no. This loop is the only place that knows the model just
+            // tried to end its turn, so the gate lives HERE: the plan block is
+            // already on screen and the final answer is already painted, which
+            // is exactly what the user needs to read before answering. The
+            // worker blocks on the dialog like it does on every `ask`, and the
+            // activity strip keeps showing that zode is waiting.
+            //
+            // A goal verdict cannot bypass this gate. In plan mode, even a
+            // declared `met` or `blocked` is not approval to implement.
+            if (currentPermMode() == .read_only) {
+                if (m.plan_write_blocked_this_turn and !m.plan_touched_this_turn and m.plan_missing_nudges_this_turn < 2) {
+                    m.plan_missing_nudges_this_turn += 1;
+                    const nudge = m.allocator.dupe(
+                        u8,
+                        "Plan mode blocked a write because no implementation plan has been recorded yet. Use `todo` to show the complete, concrete plan to the user, then end your turn so they can approve or revise it. Do not retry the blocked write.",
+                    ) catch null;
+                    if (nudge) |next| {
+                        if (owned) |o| m.allocator.free(o);
+                        owned = next;
+                        last_user = next;
+                        continue;
+                    }
+                }
+                if (m.plan_write_blocked_this_turn and !m.plan_touched_this_turn) {
+                    pushError(m, "plan mode is still active: no implementation plan was recorded, so no approval was requested and no write was allowed");
+                    break;
+                }
+                if (m.plan_touched_this_turn and !m.plan.isEmpty() and plan_gate_asks < 2) {
+                plan_gate_asks += 1;
+                if (planApprovalNudge(m)) |nudge| {
+                    if (owned) |o| m.allocator.free(o);
+                    owned = nudge;
+                    last_user = nudge;
+                    continue;
+                }
+                }
+            }
+            break;
+        };
         if (owned) |o| m.allocator.free(o);
         owned = text;
         last_user = text;
@@ -4734,6 +5125,7 @@ fn goal_err_text(err: anyerror) []const u8 {
 fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator) void {
     var snapshot = m.planCopy();
     const line = applyPlanTo(&snapshot, args_json, arena) orelse return;
+    m.plan_touched_this_turn = true;
     m.replacePlan(snapshot);
     m.pushInfoFmt("{s}", .{line});
     if (snapshot.allDone()) setStatusWithZo(m, .done, "all plan steps done");
@@ -5772,10 +6164,11 @@ pub const max_asks_per_turn = 3;
 /// changes plan instead of retrying (a retry of the same call is an immediate
 /// loop, and the cap is what saves you from it).
 pub const read_only_text =
-    "read-only mode is on: the user asked zode to look before it touches anything, " ++
-    "so write/edit/bash did not run. Do NOT retry it. Either use `ask` to tell the " ++
-    "user what you found and what you would change, or (if you are already sure) say " ++
-    "so in one line — the user can turn read-only off with shift+tab.";
+    "plan (read-only) mode is on: the user asked zode to look before it touches anything, " ++
+    "so write/edit/bash did not run. Do NOT retry it. Read what you need and write the " ++
+    "IMPLEMENTATION PLAN with the `todo` tool, then end your turn — the user will be asked " ++
+    "to approve it and zode will switch itself out of plan mode. For anything you need to " ++
+    "know first, use `ask` — or say so in one line — the user can turn plan mode off with shift+tab.";
 
 /// ESC: kills the foreground command if there is one. Returns how many were
 /// killed. See `bgproc.killForeground` for why this is not a no-op.
@@ -5809,7 +6202,8 @@ fn execOneCall(
     // saying no is a dialog that lies. The user asked for "look, don't touch", and
     // a permission prompt for a write in that mode is a bug in the UI.
     if (read_only and isWriteTool(call.name)) {
-        m.pushToolDone(call.name, "read-only", 0, read_only_text);
+        m.plan_write_blocked_this_turn = true;
+        m.pushToolDone(call.name, "blocked by plan mode", 0, read_only_text);
         s.appendToolResult(call.id, call.name, read_only_text) catch {};
         return 0;
     }
@@ -6605,10 +6999,21 @@ fn touchesFile(name: []const u8) bool {
 /// also be `rm`: the mode has to be decided from the tool, not from parsing the
 /// command string, or every read-only mode would be bypassable by writing
 /// `bash ls` first to learn what the model "really" wants to run.
+/// The tools that CHANGE the world: every write-ish tool, `bash` among them.
+///
+/// Plan (read-only) mode refuses exactly these, so the list has to be complete:
+/// `rename` and the git mutations (`git_add`/`git_commit`/`git_stash`/
+/// `git_branch`) were missing, and `needsPermission` EXEMPTS the git tools from
+/// the dialog — together they were a hole through which plan mode could rewrite
+/// files and commit them while saying it touched nothing. Read-only git tools
+/// (status/diff/log) are deliberately NOT here.
 pub fn isWriteTool(name: []const u8) bool {
-    return std.mem.eql(u8, name, "write") or
-        std.mem.eql(u8, name, "edit") or
-        std.mem.eql(u8, name, "bash");
+    return isEditTool(name) or // write, edit, rename
+        std.mem.eql(u8, name, "bash") or
+        std.mem.eql(u8, name, "git_add") or
+        std.mem.eql(u8, name, "git_commit") or
+        std.mem.eql(u8, name, "git_stash") or
+        std.mem.eql(u8, name, "git_branch");
 }
 
 /// The tools that change files but run no command: the ones
@@ -8644,6 +9049,48 @@ test "read-only: `bash` is blocked even when it is just an ls" {
     try std.testing.expect(!isWriteTool("ask"));
 }
 
+test "plan mode refuses EVERY tool that changes the repository, git included" {
+    // The hole this pins: `rename` and the git mutations were missing from the
+    // write list while `needsPermission` EXEMPTS the git tools from the dialog,
+    // so in plan mode a model could stage, commit and rename files while the
+    // mode said nothing was being touched. One of these failing is a way back
+    // into that hole.
+    try std.testing.expect(isWriteTool("rename"));
+    try std.testing.expect(isWriteTool("git_add"));
+    try std.testing.expect(isWriteTool("git_commit"));
+    try std.testing.expect(isWriteTool("git_stash"));
+    try std.testing.expect(isWriteTool("git_branch"));
+    // The read-only git tools still work: refusing `git status` would make the
+    // mode useless for the one thing it exists for (looking).
+    try std.testing.expect(!isWriteTool("git_status"));
+    try std.testing.expect(!isWriteTool("git_diff"));
+    try std.testing.expect(!isWriteTool("git_log"));
+}
+
+test "plan gate: approve, revise, and nobody there to answer" {
+    // The mapping from "what the user picked" to "what the turn does". The
+    // dialog itself cannot be tested without a TUI, this is the half where a
+    // mistake would be silent: a misread answer either implements an unapproved
+    // plan or nags forever.
+    //
+    // No answer (ESC / timeout) ends the turn WITHOUT a nudge: a user who
+    // walked away must not come back to a loop that kept asking.
+    try std.testing.expectEqual(PlanGate.skip, planGateDecision(null));
+    try std.testing.expectEqual(PlanGate.skip, planGateDecision(""));
+    try std.testing.expectEqual(PlanGate.skip, planGateDecision("   "));
+    // The option labels themselves, by PREFIX (that is how the picker returns
+    // them), plus the spellings a human types.
+    try std.testing.expectEqual(PlanGate.approve, planGateDecision(approve_option));
+    try std.testing.expectEqual(PlanGate.approve, planGateDecision("approve"));
+    try std.testing.expectEqual(PlanGate.approve, planGateDecision("yes"));
+    try std.testing.expectEqual(PlanGate.approve, planGateDecision("YES"));
+    // The revise option and any words of their own are BOTH revisions: free
+    // text is feedback, not silence.
+    try std.testing.expectEqual(PlanGate.revise, planGateDecision(revise_option));
+    try std.testing.expectEqual(PlanGate.revise, planGateDecision("no"));
+    try std.testing.expectEqual(PlanGate.revise, planGateDecision("make step 3 optional"));
+}
+
 test "read-only: the text that goes back to the model says NOT to retry" {
     // Without the "do NOT retry", the model repeats the call and the loop eats the
     // remaining iterations. And without "ask", the mode offers no way out.
@@ -10632,7 +11079,7 @@ test "permModeName: one word per mode" {
     setPermMode(&m, .accept_edits);
     try std.testing.expectEqualStrings("accept-edits", permModeName());
     setPermMode(&m, .read_only);
-    try std.testing.expectEqualStrings("read-only", permModeName());
+    try std.testing.expectEqualStrings("plan", permModeName());
     setPermMode(&m, .bypass);
     try std.testing.expectEqualStrings("bypass", permModeName());
 }
