@@ -853,6 +853,22 @@ pub var tps_last: f64 = 0;
 /// when each turn closes.
 pub var ctx_used: i64 = 0;
 pub var ctx_pct: u8 = 0;
+/// `true` when `ctx_used` is the PROVIDER's own count for the last request and
+/// not our 4-chars-per-token estimate. The status bar prints `~` only for the
+/// estimate: a number the provider itself counted does not need the squiggle,
+/// and the two look identical otherwise.
+pub var ctx_real: bool = false;
+
+/// Which number means "how much context": the provider's own count when there
+/// is one, the estimate when there is not (before the first request).
+///
+/// It is the same question measured with the real tokenizer. `prev_prompt` is
+/// the prompt count of the LAST request, which IS the context — system, tools,
+/// history and all — so showing our estimate next to it is showing a shadow of
+/// a number we already have.
+pub fn ctxTokens(real: i64, estimate: i64) i64 {
+    return if (real > 0) real else estimate;
+}
 
 /// Recomputes `ctx_used`/`ctx_pct`. Cheap to call, but not needed per frame:
 /// tokens only change when a message is added.
@@ -860,27 +876,51 @@ pub fn refreshContextUsage(m: *tui.Model) void {
     if (session == null) {
         ctx_used = 0;
         ctx_pct = 0;
+        ctx_real = false;
         return;
     }
     var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();
     const msgs = snapshotMsgs(astate.allocator());
-    ctx_used = compaction.estimateTokens(msgs);
+    const estimate = compaction.estimateTokens(msgs);
+    const real = cache_stats.session.prev_prompt;
+    ctx_used = ctxTokens(real, estimate);
+    ctx_real = real > 0;
     const limit = @max(1, compaction.contextLimitFor(m.environ, curModelContext()));
     const pct = (@as(f64, @floatFromInt(ctx_used)) / @as(f64, @floatFromInt(limit))) * 100.0;
     ctx_pct = @intFromFloat(std.math.clamp(pct, 0, 999));
 }
 
-fn updateTps(chars: usize, start_ns: i128) void {
-    if (start_ns == 0 or chars < 32) return;
+/// Tokens per second of a stream that produced `tokens` in `dt_ns`.
+///
+/// Returns 0 when the window cannot support a number: no time, no tokens, or a
+/// rate so absurd it can only be a bad clock read (a 0-length window and a
+/// 1-millisecond one are both `dt_ns > 0`, and the second would print 900000
+/// tok/s for a single character).
+pub fn tpsOf(tokens: f64, dt_ns: i128) f64 {
+    if (dt_ns <= 0 or tokens <= 0) return 0;
+    const tps = tokens / (@as(f64, @floatFromInt(dt_ns)) / 1e9);
+    if (tps <= 0.5 or tps >= 100_000) return 0;
+    return tps;
+}
+
+/// Our own count when the provider sent none: ~4 chars per token.
+fn estTokens(chars: usize) f64 {
+    return @as(f64, @floatFromInt(chars)) / 4.0;
+}
+
+/// The tok/s of a FINISHED stream, for `/context` and the next session's memory.
+///
+/// `completion` is the provider's own count when it sent one: the same span of
+/// time measured with the real tokenizer instead of with chars/4, which is off
+/// by whatever the tokenizer disagrees with us about (code and CJK both sit far
+/// from 4 chars).
+fn finishTps(chars: usize, start_ns: i128, completion: i64) void {
+    if (start_ns == 0) return;
     const now_ns = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-    const dt = now_ns - start_ns;
-    if (dt <= 0) return;
-    const tps = (@as(f64, @floatFromInt(chars)) / 4.0) / (@as(f64, @floatFromInt(dt)) / 1e9);
-    if (tps > 0.5 and tps < 100_000) {
-        tps_live = tps;
-        tps_last = tps;
-    }
+    const tokens: f64 = if (completion > 0) @floatFromInt(completion) else estTokens(chars);
+    const tps = tpsOf(tokens, now_ns - start_ns);
+    if (tps > 0) tps_last = tps;
 }
 
 // ── active provider / model / session ────────────────────────
@@ -2889,6 +2929,12 @@ const TurnCtx = struct {
     chars: usize = 0,
     /// Moment of the first token (ns). 0 = nothing has arrived yet.
     stream_start_ns: i128 = 0,
+    /// Rolling window for the LIVE tok/s: the moment and the char count of the
+    /// last sample. The rate is computed over the window, not over the whole
+    /// stream, so it tracks the model instead of averaging the first slow
+    /// seconds into every reading after them.
+    tps_win_ns: i128 = 0,
+    tps_win_chars: usize = 0,
     /// Finish reason of the request.
     finish: [32]u8 = undefined,
     finish_len: usize = 0,
@@ -2915,11 +2961,32 @@ fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
     const t: *TurnCtx = @ptrCast(@alignCast(ud.?));
     t.text.appendSlice(t.m.allocator, delta) catch {};
     t.chars += delta.len;
+    const now_ns = std.Io.Timestamp.now(io_global, .real).nanoseconds;
     if (t.stream_start_ns == 0) {
-        t.stream_start_ns = std.Io.Timestamp.now(io_global, .real).nanoseconds;
+        t.stream_start_ns = now_ns;
+        t.tps_win_ns = now_ns;
+        t.tps_win_chars = t.chars;
+        // A fresh stream starts at zero instead of showing the PREVIOUS
+        // stream's number: before, `tps_live` was only written at the END of
+        // each iteration, so the status bar painted iteration N-1's rate (or
+        // the last turn's) while iteration N was streaming.
+        tps_live = 0;
+    } else if (now_ns - t.tps_win_ns >= tps_sample_ns) {
+        const win = tpsOf(estTokens(t.chars - t.tps_win_chars), now_ns - t.tps_win_ns);
+        if (win > 0) {
+            tps_live = win;
+            tps_last = win;
+        }
+        t.tps_win_ns = now_ns;
+        t.tps_win_chars = t.chars;
     }
     t.m.streamDelta(delta);
 }
+
+/// How often the live tok/s is recomputed while tokens arrive. 250 ms: fine
+/// enough that the number feels live, coarse enough that one clock read per
+/// quarter second instead of one per delta.
+const tps_sample_ns: i128 = 250 * 1_000_000;
 
 fn onToolCall(ud: ?*anyopaque, id: []const u8, name: []const u8, args_json: []const u8) void {
     const t: *TurnCtx = @ptrCast(@alignCast(ud.?));
@@ -4078,7 +4145,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         };
         break;
     }
-    updateTps(tstate.chars, tstate.stream_start_ns);
+    // The provider's own completion count when it sent one: the same window of
+    // time, the real tokenizer (see `finishTps`).
+    finishTps(tstate.chars, tstate.stream_start_ns, chat.last_usage.completion);
     cache_stats.session.record(chat.last_usage);
 
     // Closes the streaming paragraph: what arrived stays in the history.
@@ -9003,6 +9072,32 @@ test "the status bar names the model that is ANSWERING, not the one that is conf
     // Back to empty: the override is per turn, not sticky.
     setAnswering("");
     try std.testing.expectEqualStrings("the-picked-one", curAnswering());
+}
+
+test "tpsOf: the rate itself, and the two windows that must not produce one" {
+    // The live counter is a rate over a 250 ms window: with a window that tiny,
+    // a bad clock read (dt = 0) or a single delta (dt = 1 ms) would print
+    // 400000 tok/s in the status bar. The floor and the ceiling are what keep
+    // the number believable.
+    try std.testing.expectApproxEqAbs(@as(f64, 400), tpsOf(400, 1_000_000_000), 0.001);
+    // 2000 tokens in a quarter second = 8000 tok/s.
+    try std.testing.expectApproxEqAbs(@as(f64, 8000), tpsOf(2000, 250_000_000), 0.001);
+    try std.testing.expectEqual(@as(f64, 0), tpsOf(400, 0));
+    try std.testing.expectEqual(@as(f64, 0), tpsOf(400, -1));
+    try std.testing.expectEqual(@as(f64, 0), tpsOf(0, 1_000_000_000));
+    // A µs window: one token in one microsecond is a million tok/s, which can
+    // only be a clock artifact.
+    try std.testing.expectEqual(@as(f64, 0), tpsOf(1, 1_000));
+}
+
+test "ctxTokens: the provider's own count wins, the estimate covers the first request" {
+    // Two instruments for the same question: our ~4 chars/token and the
+    // tokenizer that will actually bill the context. The real one is exact and
+    // does not get the `~`; before the first request there is no real one and
+    // the estimate is what there is.
+    try std.testing.expectEqual(@as(i64, 12_480), ctxTokens(12_480, 9_999));
+    try std.testing.expectEqual(@as(i64, 9_999), ctxTokens(0, 9_999));
+    try std.testing.expectEqual(@as(i64, 0), ctxTokens(0, 0));
 }
 
 test "the cheap router is off unless ZODE_CHEAP_TURN names a model" {

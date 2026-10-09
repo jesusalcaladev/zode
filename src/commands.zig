@@ -310,6 +310,14 @@ pub fn cmdContext(m: *tui.Model) void {
     // 128k for a 1M model" from "the catalogue was never downloaded", and all
     // three look the same on the same line.
     const src = compaction.limitSource(m.environ, agent.curModelContext());
+    // What the PROVIDER counted on the last request, next to our estimate.
+    // They answer the same question with different instruments: `used` above is
+    // ~4 chars per token, `prev_prompt` is the tokenizer that will actually bill
+    // this context. When they disagree by more than a few percent, the estimate
+    // is what the compaction budget is about to be judged against, and saying so
+    // is the difference between "the number is wrong" and "the number is an
+    // estimate".
+    const provider_count = agent.cacheSessionStats().prev_prompt;
     const l3 = std.fmt.allocPrint(
         m.allocator,
         "  limit from: {s} · elided this session: {d} tool results · last stream: {d:.0} tok/s",
@@ -320,6 +328,14 @@ pub fn cmdContext(m: *tui.Model) void {
         }, agent.session_elided, agent.tps_last },
     ) catch "details";
     agent.pushInfoOwned(m, l3);
+    if (provider_count > 0) {
+        const l3c = std.fmt.allocPrint(
+            m.allocator,
+            "  last request: {d} tokens counted by the provider (our estimate: {d})",
+            .{ provider_count, used },
+        ) catch "details";
+        agent.pushInfoOwned(m, l3c);
+    }
     // WHAT WILL HAPPEN at the threshold, which is a different question from how much
     // is used: "80% of the limit" does not say whether crossing it costs a request.
     const l3b = std.fmt.allocPrint(
@@ -438,7 +454,7 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "ctrl+t", .desc = "model palette (providers | models)" },
     .{ .key = "ctrl+a", .desc = "connect a provider (paste its key)" },
     .{ .key = "ctrl+l", .desc = "clear the view (the session file is untouched)" },
-    .{ .key = "ctrl+r", .desc = "expand / collapse the last tool result" },
+    .{ .key = "ctrl+r", .desc = "expand / collapse the last tool result or diff" },
     .{ .key = "ctrl+c", .desc = "quit" },
     .{ .key = "ctrl+u / ctrl+d", .desc = "scroll half a page" },
     .{ .key = "page up / down", .desc = "scroll a page" },

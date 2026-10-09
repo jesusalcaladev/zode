@@ -156,7 +156,11 @@ def main():
             "ZODE_CHEAP_TURN": CHEAP,
             "ZODE_AUTO_BG": "0",
         }
-        key = json.load(open(os.path.expanduser("~/.config/zode/auth.json"))).get("opencode")
+        # The key is read BELOW, from ROUTER_TEST_KEY or auth.json. Reading it
+        # here crashed the whole test on a machine without auth.json, before the
+        # ROUTER_TEST_KEY branch was ever reached — and this value was dead
+        # anyway: the block below starts with an unconditional `key = None`.
+        key = None
     else:
         env = {
             "ZODE_PROVIDER": "openrouter",
@@ -167,10 +171,6 @@ def main():
             "ZODE_AUTO_BG": "0",
         }
         key = None
-        try:
-            key = json.load(open(os.path.expanduser("~/.config/zode/auth.json"))).get("openrouter")
-        except Exception:
-            key = None
     # The key comes from `~/.config/zode/auth.json`, NOT from the environment.
     #
     # Measured 2026-10-04 on this machine: the key in `.env` answers 401

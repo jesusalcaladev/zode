@@ -4274,3 +4274,121 @@ The lesson is the one this file already states twice: a test whose red state is
 "the provider said no" is a test people learn to ignore, so the suite does not
 assert on model output — and a session that cannot reach the model reports the
 gap instead of calling it verified.
+
+---
+
+# Token counter, a timeline that does not fill, and the router verified live (2026-10-08)
+
+Three asks in one turn: make the token counter really trustworthy, make the
+agent's own output (tool results, diffs) compact and modern in the timeline, and
+verify that the model router actually sends calm tasks to small models.
+
+## The token counter: two numbers, and which one is the truth
+
+The status bar and `/context` used to show a **4-chars-per-token estimate** with
+a `~`, forever. The provider already counts the prompt exactly (it arrives over
+SSE with `stream_options:{include_usage:true}`), and showing an estimate next to
+a real number is how a counter loses credibility.
+
+- `ctxTokens(real, estimate)` decides: the provider's own
+  `cache_stats.session.prev_prompt` **wins** when it exists, the estimate covers
+  the first request (before any usage has arrived). The result sets
+  `agent.ctx_real`.
+- The status bar prints `{d} tok` with **no `~`** when `ctx_real`, `~{d} tok`
+  otherwise. The tilde is not decoration: it says whether the number was counted
+  or guessed.
+- `/context` gains a line naming both: `last request: N tokens counted by the
+  provider (our estimate: M)` — so drift between the two is visible instead of
+  hidden.
+
+**tok/s had three defects, all user-visible:**
+
+1. `updateTps` used `chars/4` even when the provider had just told us the exact
+   `completion` tokens. `finishTps(chars, start_ns, completion)` prefers the
+   provider's count when `> 0`.
+2. `tpsOf(tokens, dt_ns)` guards the arithmetic: `dt <= 0 -> 0` (a stream faster
+   than the clock resolution produced garbage), floor 0.5, ceiling 100k.
+3. **The number was stale.** `tps_live` kept the last stream's value while a
+   30 s `bash` ran, so the bar announced "tok/s" without a token arriving — the
+   bug AGENTS.md already recorded for the status bar, still live in the
+   counter. Now the stream START resets `tps_live = 0`, and `onDelta` samples a
+   **rolling 250 ms window** (`tps_win_ns`/`tps_win_chars` in `TurnCtx`) instead
+   of painting one number per turn-end: the figure moves while the model writes
+   and goes quiet when it stops.
+
+`fmtTokCount` renders compactly (`1.1M` / `2k` / `940`) into a **caller's stack
+buffer** — a segment that points at a temporary is the `bufPrint`-into-stack bug
+this file already lists.
+
+## The timeline: diffs collapse to a preview, Ctrl+R swaps them
+
+A `write` over a 600-line file used to paint **every diff line into the
+history** — the timeline filled with the agent's own doing and the answer got
+pushed off screen. Now:
+
+- `diff_preview_lines = 12`: above that, `pushDiffLang` builds a preview (first
+  12 lines) and appends the marker
+  `… +{added} −{removed} · {N} more lines · ctrl+r to expand`.
+- The full text is memoized on the tool's `ToolMemo`
+  (`diff_full`/`diff_short`/`diff_para_idx`/`diff_expanded`), and `toggleLastTool`
+  swaps the paragraph in place — same paragraph index, so the scroll anchor does
+  not move. A **short** diff is shown whole, and Ctrl+R then opens the tool
+  result as before.
+- `toggleParagraph` calls `textLive()` FIRST: a paragraph outside the scroll
+  window is `is_cold` (zjsonl-compressed base64) and overwriting its raw text
+  without rehydrating corrupts it on the next read. Test included.
+- `pushDiffKind` now **borrows** both slices (it copies its own); the previous
+  version owned them and would have double-freed on OOM.
+
+`ctrl+r`'s palette description says what it now does: "expand / collapse the
+last tool result **or diff**".
+
+## The router, verified — cheap models for calm work
+
+The claim to check: small/specific models get the calm tasks, in subagents and
+in the main turn. What was verified, layer by layer:
+
+- **Subagents always run effort `low`** — hardcoded in `runSubagent`'s
+  `buildBodyMessages` call, not read from `/effort`: a subagent is a bounded
+  search and this is where the money is saved. Read-only tool list, 24k budget,
+  depth 1.
+- **`/submodel` precedence** (session > config.json > env > off) has 6 tests
+  (7806-7977) in the green suite, and `tools/submodel_smoke.py` exercises the
+  typed command in a real pty: 5/5 ok, including "off is reported as no
+  override" and "an unknown provider is reported as unusable, not fatal".
+- **Cheap-turn router** (`ZODE_CHEAP_TURN`): the main turn decides with
+  `router_mod.decide` before the request, and `onFailure` falls back to the
+  user's model **before** the retry loop — an error that says this MODEL will
+  not answer must not be retried twice with backoff. 16 tests in
+  `lib/router.zig` + 2 in `agent.zig`.
+- **Subagent model fallback**: `router_mod.disqualifies` (needs the BODY, a 400
+  does not say whether the model or the request was rejected) runs before the
+  subagent's own retry, records the give-up for the session, and the note rides
+  in front of the report.
+- **LIVE**: `ROUTER_TEST_KEY=… python3 tools/router_smoke.py` -> **4/4 ok**
+  against the real OpenRouter gateway with a gated cheap model
+  (`thinkingmachines/inkling-small:free` answers 403 "is only available on
+  agentic harnesses"): the turn is not lost, the history says which model was
+  skipped and why, the notice says how to turn it off, and the status bar names
+  `qwen/qwen3.8-27b:free` — the model that actually answered.
+
+**The smoke test itself had a bug worth keeping**: in `ROUTER_SMOKE_FORCE` mode
+it read `~/.config/zode/auth.json` at line 159 **before** its own
+`ROUTER_TEST_KEY` branch — an unguarded `json.load` that crashed the whole test
+on any machine without that file, and whose value was dead anyway (the block
+below starts with an unconditional `key = None`). Two dead reads removed. A test
+script that cannot start proves nothing about what it was written to prove.
+
+## Verification, honestly
+
+- `zig build test --summary all` -> **808 tests: 807 pass, 1 skip** (the skip is
+  `braveSearch for real`, by design without `ZODE_BRAVE_KEY`).
+- `tools/pty_smoke.py` -> OK (all checks, including scroll, palette and `!cmd`).
+- `tools/submodel_smoke.py` -> OK. `tools/router_smoke.py` -> OK, live.
+- The two language greps (test names / comments in English) come out empty.
+- **A general live chat still hits the free-model daily quota** (`RateLimited`
+  on `apodex/apodex-1.1-mini:free`), the same limitation as the last session.
+  The router smoke did complete a real turn, so the wire works; what is
+  exhausted is the free quota, and the token counter's "provider count" path is
+  therefore verified by unit test and by the `/context` line rather than by a
+  fresh live answer.
