@@ -245,70 +245,136 @@ fn withNote(arena: std.mem.Allocator, note: []const u8, body: []const u8) []cons
     return std.fmt.allocPrint(arena, "[search note: {s}]\n\n{s}", .{ note, body }) catch body;
 }
 
-/// The free chain: DuckDuckGo's `html/`, then its `lite/`. No key required.
-fn freeChain(io: std.Io, arena: std.mem.Allocator, q: []const u8, max_results: usize) []const u8 {
-    // DDG's `html/` endpoint is the one that asks for neither JS nor a key. The query goes
-    // percent-encoded with `std.Uri`'s encoder (by hand people forget the `&` and
-    // the `+`, and the search reaches the server in pieces).
-    var url_buf: [1024]u8 = undefined;
-    var uw: std.Io.Writer = .fixed(&url_buf);
-    uw.writeAll("https://html.duckduckgo.com/html/?q=") catch return "error: query too long";
-    // CAREFUL: `std.Uri.Writer` is NOT `pub` in 0.16, so the query component
-    // encoder cannot be used from here. We percent-encode by
-    // hand, which for a query is four characters.
-    percentEncodeQuery(q, &uw) catch return "error: query too long";
-    const url = uw.buffered();
+/// One engine attempt of the free chain, and everything it can say.
+const Stage = struct {
+    /// The numbered list. Non-empty means the search is over.
+    results: []const u8 = "",
+    /// The HTTP status when the engine refused (not 2xx). First one wins.
+    refusal: ?u16 = null,
+    /// The status when the refusal was a RATE LIMIT (202/429) — the one kind
+    /// that is worth naming apart, because it says "wait", not "rephrase".
+    limited: ?u16 = null,
+    /// A 2xx whose HTML we could not parse: the engines answered and OUR
+    /// scraper does not know their page. This is the one case that is our bug.
+    bad_layout: bool = false,
+    /// The request itself failed (DNS, refused, timeout).
+    net_error: bool = false,
+};
 
+/// GET `url` and interpret it through `parse`, once. The three engines differ
+/// in exactly those five facts and share everything else, so the facts are
+/// collected here instead of being re-derived at three call sites with three
+/// slightly different conditions.
+fn ask(
+    h: *http.Http,
+    arena: std.mem.Allocator,
+    url: []const u8,
+    parse: *const fn (std.mem.Allocator, []const u8, usize) []const u8,
+    max_results: usize,
+) Stage {
+    var st = Stage{};
+    const res = h.getWithHeaders(url, &browserHeaders()) catch {
+        st.net_error = true;
+        return st;
+    };
+    // Parsed results live in the arena, so the body is free to go now — before
+    // the next request of the chain reuses this one's buffers.
+    defer h.freeBody(res.body);
+    if (res.status == 202 or res.status == 429) {
+        st.limited = res.status;
+        st.refusal = res.status;
+        return st;
+    }
+    if (res.status < 200 or res.status >= 300) {
+        st.refusal = res.status;
+        return st;
+    }
+    // Parse ONCE: the old `if (parse(…).len > 0) return parse(…)` walked the
+    // same page twice to produce one list.
+    const found = parse(arena, res.body, max_results);
+    if (found.len > 0)
+        st.results = found
+    else
+        st.bad_layout = true;
+    return st;
+}
+
+/// The free chain: DuckDuckGo's `html/` and `lite/`, then Bing. No key required.
+///
+/// The order and the skip are MEASUREMENTS, not preferences (2026-10-08, one
+/// machine): `html/` answered 200 on the first request and 202 from the second
+/// on; `lite/` shares that bucket and answered 202 at the same moment (so after
+/// a rate limit it is SKIPPED: a guaranteed second refusal costing 1.1 s — it is
+/// still asked after a 200-with-an-unknown-layout, where the other page of the
+/// same engine IS the right next ask); Bing answered 200 in 0.76 s through the
+/// whole DDG window, which is why it is the third engine and not decoration.
+///
+/// Before, a 202 from `html/` ENDED the search — the failure this whole chain
+/// exists to avoid happened on the one error it was built for.
+fn freeChain(io: std.Io, arena: std.mem.Allocator, q: []const u8, max_results: usize) []const u8 {
     var h = http.Http.init(arena, io);
     defer h.deinit();
 
-    const res = h.getWithHeaders(url, &browserHeaders()) catch |err| {
-        return std.fmt.allocPrint(arena, "error searching \"{s}\": {t}", .{ q, err }) catch "error: the search could not be reached";
-    };
-    // Freed once, at the end: an explicit `freeBody` here AND this defer would
-    // be a double free the day Http stops using an arena.
-    defer h.freeBody(res.body);
+    // DDG's `html/`: asks for neither JS nor a key. The query is percent-encoded
+    // by hand (`std.Uri.Writer` is not `pub` in 0.16) — and by hand people
+    // forget the `&` and the `+`, and the search reaches the server in pieces.
+    var url_buf: [1024]u8 = undefined;
+    var uw: std.Io.Writer = .fixed(&url_buf);
+    uw.writeAll("https://html.duckduckgo.com/html/?q=") catch return "error: query too long";
+    percentEncodeQuery(q, &uw) catch return "error: query too long";
 
-    // A RATE LIMIT is the only refusal that ends the chain here: `lite/` is the
-    // same engine, and asking it a second time in a row is what the message
-    // tells the model not to do. Every OTHER refusal (403, 500…) says nothing
-    // about `lite/`, which is a different page — before this, a 403 from `html/`
-    // ended the search without ever asking `lite/`, so the fallback only worked
-    // when the first endpoint answered 200 with a layout this build did not know,
-    // which is the case it was written for.
-    if (res.status == 202 or res.status == 429) return engineRefused(arena, q, res.status);
-
-    if (res.status >= 200 and res.status < 300) {
-        // Parse ONCE: the old `if (searchResults(…).len > 0) return searchResults(…)`
-        // walked the same page twice to produce one list.
-        const found = web.searchResults(arena, res.body, max_results);
-        if (found.len > 0) return found;
-    }
-
-    // SECOND ENDPOINT, and this is the whole improvement: `html/` answering 200
-    // with a layout we do not know used to be the end of the road, and the model
-    // was told the engine had no results for a query it HAD answered. `lite/` is
-    // a different page of the same engine with different classes (`lib/web.zig`
-    // parses both), so a layout change on one is a retry, not a failure.
     var url2_buf: [1024]u8 = undefined;
     var lite_w: std.Io.Writer = .fixed(&url2_buf);
-    lite_w.writeAll("https://lite.duckduckgo.com/lite/?q=") catch return searchFailed(arena, q);
-    percentEncodeQuery(q, &lite_w) catch return searchFailed(arena, q);
-    const url2 = lite_w.buffered();
+    lite_w.writeAll("https://lite.duckduckgo.com/lite/?q=") catch return "error: query too long";
+    percentEncodeQuery(q, &lite_w) catch return "error: query too long";
 
-    const res2 = h.getWithHeaders(url2, &browserHeaders()) catch |err| {
-        return std.fmt.allocPrint(arena, "error searching \"{s}\": {t} (and the fallback endpoint could not be reached either)", .{ q, err }) catch "error: neither search endpoint could be reached";
-    };
-    defer h.freeBody(res2.body);
-    // The status is carried into the message instead of being dropped. Before, a
-    // 202 here and a 200 with an unreadable page both arrived as the same "no
-    // results could be parsed", and those are two completely different things: one
-    // is the engine refusing this client, the other is our scraper being out of
-    // date.
-    if (res2.status < 200 or res2.status >= 300) return engineRefused(arena, q, res2.status);
+    var url3_buf: [1024]u8 = undefined;
+    var bing_w: std.Io.Writer = .fixed(&url3_buf);
+    bing_w.writeAll("https://www.bing.com/search?q=") catch return "error: query too long";
+    percentEncodeQuery(q, &bing_w) catch return "error: query too long";
 
-    const found2 = web.liteSearchResults(arena, res2.body, max_results);
-    if (found2.len > 0) return found2;
+    var st = ask(&h, arena, uw.buffered(), web.searchResults, max_results);
+    if (st.results.len > 0) return st.results;
+    var limited = st.limited;
+    var refusal = st.refusal;
+    var stale = st.bad_layout;
+    var all_unreachable = st.net_error;
+
+    // A rate-limited `html/` SKIPS `lite/`: measured, same bucket (see above).
+    if (st.limited == null) {
+        st = ask(&h, arena, lite_w.buffered(), web.liteSearchResults, max_results);
+        if (st.results.len > 0) return st.results;
+        if (limited == null) limited = st.limited;
+        if (refusal == null) refusal = st.refusal;
+        stale = stale or st.bad_layout;
+        all_unreachable = all_unreachable and st.net_error;
+    }
+
+    st = ask(&h, arena, bing_w.buffered(), web.bingResults, max_results);
+    if (st.results.len > 0) return st.results;
+    if (limited == null) limited = st.limited;
+    if (refusal == null) refusal = st.refusal;
+    stale = stale or st.bad_layout;
+    all_unreachable = all_unreachable and st.net_error;
+
+    // Nothing answered. The three ways that happens, in the order of what the
+    // reader should DO about it:
+    //
+    // 1. A 200 we could not parse is OUR scraper — the message has to say
+    //    "rephrase" would be useless, because the query was answered fine.
+    // 2. A rate limit says WAIT, and the test for a live scrape keys on this
+    //    message to skip instead of going red for a reason outside the code.
+    // 3. Any other refusal is the engine's problem.
+    if (stale) return searchFailed(arena, q);
+    if (limited) |s| return engineRefused(arena, q, s);
+    if (refusal) |s| return engineRefused(arena, q, s);
+    if (all_unreachable) {
+        return std.fmt.allocPrint(
+            arena,
+            "error searching \"{s}\": none of the search engines could be reached (network). Check the connection and try again.",
+            .{q},
+        ) catch "error: no search engine could be reached";
+    }
     return searchFailed(arena, q);
 }
 
@@ -381,7 +447,7 @@ pub fn engineRefused(arena: std.mem.Allocator, q: []const u8, status: u16) []con
 pub fn searchFailed(arena: std.mem.Allocator, q: []const u8) []const u8 {
     return std.fmt.allocPrint(
         arena,
-        "no results could be parsed for \"{s}\". Both search endpoints answered, and their HTML did not match what this build knows how to read. Do NOT read that as \"there is nothing about this\": rephrase the query, or fetch a URL you already know with web_fetch.",
+        "no results could be parsed for \"{s}\". The search engines answered, but their HTML did not match what this build knows how to read. Do NOT read that as \"there is nothing about this\": rephrase the query, or fetch a URL you already know with web_fetch.",
         .{q},
     ) catch "the search could not be read; rephrase the query or fetch a URL you know";
 }

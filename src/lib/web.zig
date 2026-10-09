@@ -499,6 +499,206 @@ fn realUrl(arena: std.mem.Allocator, href: []const u8) []const u8 {
     return href;
 }
 
+// ── Bing, the third free engine ────────────────────────────────────
+
+/// Search results from Bing's HTML — the third engine of the free chain.
+///
+/// It exists because DuckDuckGo rate-limits by machine and BOTH of its
+/// endpoints share the same bucket: measured on 2026-10-08 from one machine,
+/// `html/` answered 200 on the first request and 202 from the second on,
+/// `lite/` answered 202 at the same moment, and Bing answered 200 in 0.76 s
+/// through the whole window. A chain of two endpoints of one engine has one
+/// failure mode and no way out.
+///
+/// The markup is from a live page fetched the same day, not from memory:
+/// `<li class="b_algo" …><h2 class=""><a target="_blank" href="…">Title</a></h2>
+/// …<div class="b_caption"><p class="…">Snippet</p></div>…`. The heading is
+/// matched in its two spellings (`<h2 class=""><a` and `<h2><a`) because the
+/// class attribute is exactly the kind of thing a template changes.
+///
+/// Returns "" for a page that is not a result page (a captcha, an error), which
+/// is what tells the chain "the scraper is out of date" instead of "there is
+/// nothing on the internet about this".
+pub fn bingResults(arena: std.mem.Allocator, html: []const u8, max: usize) []const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var n: usize = 0;
+    var pos: usize = 0;
+    var seen = std.StringHashMap(void).init(arena);
+    defer seen.deinit();
+
+    while (n < max) {
+        // The earlier of the two heading spellings from `pos`.
+        const m1 = std.mem.indexOfPos(u8, html, pos, "<h2 class=\"\"><a");
+        const m2 = std.mem.indexOfPos(u8, html, pos, "<h2><a");
+        const marker: usize = if (m1) |a|
+            (if (m2) |b| @min(a, b) else a)
+        else
+            (m2 orelse break);
+
+        // `pos` advances BEFORE anything can `continue`: a marker with no usable
+        // href below must not be found again on the next pass, or the loop spins.
+        pos = marker + 4;
+
+        // The anchor opens the heading, so its href is a few columns away. A href
+        // much further out belongs to some other link inside the heading, and
+        // taking it would make the result title point at something else.
+        const href_at = std.mem.indexOfPos(u8, html, pos, "href=\"") orelse continue;
+        if (href_at - marker > 120) continue;
+        const href_start = href_at + 6;
+        const href_end = std.mem.indexOfScalarPos(u8, html, href_start, '"') orelse continue;
+        const title_start = (std.mem.indexOfScalarPos(u8, html, href_end, '>') orelse continue) + 1;
+        const title_end = std.mem.indexOfPos(u8, html, title_start, "</a>") orelse continue;
+
+        const url = bingUrl(arena, html[href_start..href_end]);
+        const title = cleanText(arena, html[title_start..title_end]);
+        if (url.len == 0 or title.len == 0) continue;
+        // The same URL twice is one result — and Bing's own redirect means two
+        // blocks can carry different hrefs for the SAME page, which is why the
+        // dedupe runs on the DECODED url below the redirect.
+        if (seen.contains(url)) continue;
+        seen.put(url, {}) catch {};
+        pos = title_end;
+
+        n += 1;
+        out.print(arena, "{d}. ", .{n}) catch return "";
+        out.appendSlice(arena, title) catch return "";
+        out.append(arena, '\n') catch return "";
+        out.print(arena, "   {s}\n", .{url}) catch return "";
+
+        // The snippet, bounded by THIS block: the next heading ends it, same rule
+        // as `renderResults` (a snippet that runs past its result hands the model
+        // the next one's description).
+        const nm1 = std.mem.indexOfPos(u8, html, title_end, "<h2 class=\"\"><a");
+        const nm2 = std.mem.indexOfPos(u8, html, title_end, "<h2><a");
+        const block_end: usize = blk: {
+            if (nm1) |a| {
+                if (nm2) |b| break :blk @min(a, b);
+                break :blk a;
+            }
+            break :blk nm2 orelse html.len;
+        };
+        if (indexOfIn(html, title_end, block_end, "class=\"b_caption\"")) |cap| {
+            const p_at = std.mem.indexOfPos(u8, html, cap, "<p") orelse 0;
+            const s_start = (std.mem.indexOfScalarPos(u8, html, p_at, '>') orelse block_end) + 1;
+            const s_end = indexOfIn(html, s_start, block_end, "</p>") orelse block_end;
+            const snip = cleanText(arena, html[s_start..@min(s_end, s_start + 400)]);
+            if (snip.len > 0) out.print(arena, "   {s}\n", .{snip}) catch return "";
+        }
+        out.append(arena, '\n') catch return "";
+    }
+    if (n == 0) return "";
+    return out.items;
+}
+
+/// The real URL behind Bing's redirect (`…/ck/a?…&u=a1<base64 of the URL>`).
+///
+/// The payload is standard base64 of the absolute URL with the `a1` prefix
+/// stripped. It arrives WITHOUT `=` padding and can use the URL-safe alphabet,
+/// so both are normalized before decoding; in the page the href is HTML-escaped
+/// (`&amp;`), which is what cuts the payload from the right side — the first
+/// `&` after `u=a1` starts the next parameter.
+///
+/// Returning the redirect instead would give the model a `bing.com/ck/a?…` URL:
+/// it works in a browser for a while, it is unreadable in a transcript, and it
+/// dies with Bing's own state. Anything that is not this redirect passes
+/// through untouched.
+fn bingUrl(arena: std.mem.Allocator, href: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, href, "bing.com/ck/a") == null) return href;
+    const u_at = std.mem.indexOf(u8, href, "u=a1") orelse return href;
+    var b64 = href[u_at + 4 ..];
+    if (std.mem.indexOfScalar(u8, b64, '&')) |amp| b64 = b64[0..amp];
+    if (b64.len < 4) return href;
+
+    var normalized = arena.alloc(u8, b64.len + 3) catch return href;
+    var m: usize = 0;
+    for (b64) |c| {
+        normalized[m] = switch (c) {
+            '-' => '+',
+            '_' => '/',
+            else => c,
+        };
+        m += 1;
+    }
+    while (m % 4 != 0) {
+        normalized[m] = '=';
+        m += 1;
+    }
+    const slice = normalized[0..m];
+    const dec = std.base64.standard.Decoder;
+    const bin_len = dec.calcSizeForSlice(slice) catch return href;
+    const buf = arena.alloc(u8, bin_len) catch return href;
+    // `decode` fills the buffer and returns void in 0.16 (it writes exactly
+    // `calcSizeForSlice` bytes), so the length is the one already computed.
+    dec.decode(buf, slice) catch return href;
+    const real = std.mem.trim(u8, buf, " \t\r\n");
+    // What comes out of the base64 has to be a URL: the payload can be
+    // anything, and a decoded blob that is not one would be handed to the model
+    // as "the result". (`isHttpUrl` lives in the tools layer, which lib cannot
+    // import — the check is two `startsWith`.)
+    if (!std.mem.startsWith(u8, real, "http://") and
+        !std.mem.startsWith(u8, real, "https://")) return href;
+    return real;
+}
+
+const bing_html_fixture =
+    \\<html><head><title>zig language - Búsqueda</title></head><body>
+    \\<ol id="b_results" class="">
+    \\<li class="b_algo" data-id iid=SERP.5287><link rel="stylesheet" href="/rp/noise.css" type="text/css"/>
+    \\<div class="b_tpcn"><a class="tilk" href="https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9zaXRl">example.com</a></div>
+    \\<h2 class=""><a target="_blank" href="https://www.bing.com/ck/a?!&amp;&amp;p=79939e7e&amp;ptn=3&amp;u=a1aHR0cHM6Ly96aWdsYW5nLm9yZy8&amp;ntb=1" h="ID=SERP,5090.2">Zig &amp; Programming Language</a></h2>
+    \\<div class="b_caption"><p class="b_lineclamp2">A system language focused on correctness.</p></div>
+    \\</li>
+    \\<li class="b_algo"><h2 class=""><a target="_blank" href="https://ziglang.org/documentation/">Docs</a></h2><div class="b_caption"><p>The manual.</p></div></li>
+    \\<li class="b_algo"><h2 class=""><a target="_blank" href="https://www.bing.com/ck/a?u=a1aHR0cHM6Ly96aWdsYW5nLm9yZy8">Zig again</a></h2><div class="b_caption"><p>Different redirect, same page.</p></div></li>
+    \\<li class="b_algo"><h2><a href="https://plain.example/no-class">No class attribute</a></h2><div class="b_caption"><p>The other spelling of the heading.</p></div></li>
+    \\</ol></body></html>
+;
+
+test "bingResults pulls title, real URL and snippet out of the live shape" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const out = bingResults(a, bing_html_fixture, 8);
+    // The heading marker starts at the RESULT anchor, not at the <link> noise
+    // that sits between the <li> and the <h2>: the first URL has to be the
+    // decoded ziglang.org, not /rp/noise.css.
+    try std.testing.expect(std.mem.indexOf(u8, out, "1. Zig & Programming Language") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://ziglang.org/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bing.com/ck/a") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "A system language focused on correctness.") != null);
+}
+
+test "bingResults: a direct href passes through, and a duplicate is one result" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const out = bingResults(a, bing_html_fixture, 8);
+    // Block 2: no redirect at all.
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://ziglang.org/documentation/") != null);
+    // Block 3 decodes to https://ziglang.org/, already seen in block 1 -> dropped.
+    // Block 4 is the `<h2><a` spelling and survives, so there are exactly 3.
+    try std.testing.expect(std.mem.indexOf(u8, out, "3. No class attribute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "4.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Different redirect, same page.") == null);
+}
+
+test "bingResults: a page that is not a results page is empty, never garbage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const captcha = "<html><body><h1>Checking your browser</h1></body></html>";
+    try std.testing.expectEqual(@as(usize, 0), bingResults(a, captcha, 8).len);
+}
+
+test "bingResults: max caps the list at whole results" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const out = bingResults(a, bing_html_fixture, 2);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2. Docs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "3.") == null);
+}
+
 /// Text of a chunk of HTML: strips tags and decodes entities.
 fn cleanText(arena: std.mem.Allocator, raw: []const u8) []const u8 {
     var out: std.ArrayList(u8) = .empty;

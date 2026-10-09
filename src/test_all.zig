@@ -28,6 +28,7 @@ pub const clean = @import("lib/clean.zig");
 pub const ask = @import("lib/ask.zig");
 pub const subagent = @import("lib/subagent.zig");
 pub const skills = @import("lib/skills.zig");
+pub const usercmds = @import("lib/usercmds.zig");
 pub const project = @import("lib/project.zig");
 pub const readcache = @import("lib/readcache.zig");
 pub const verify = @import("lib/verify.zig");

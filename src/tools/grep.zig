@@ -8,7 +8,8 @@ pub fn toolGrep(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     const subdir = common.getStr(obj, "subdir") orelse ".";
 
     // 1) ripgrep (the best: fast, respects .gitignore)
-    const rg_argv = [_][]const u8{ "rg", "--no-heading", "-n", "--max-count", "5", "--max-columns", "300", pattern, subdir };
+    // Smart case: case-insensitive if all lowercase, sensitive if has uppercase
+    const rg_argv = [_][]const u8{ "rg", "--no-heading", "-n", "-S", "--max-count", "10", "--max-columns", "400", pattern, subdir };
     if (nativeGrep(arena, io, &rg_argv)) |out| return out;
 
     // 2) the system's grep -rn

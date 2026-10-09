@@ -3951,7 +3951,8 @@ fn matchCount(self: *const Model) usize {
         .command => blk: {
             const prefix = acPrefix(self) orelse break :blk 0;
             var n: usize = 0;
-            for (agent.commands) |c| {
+            var i: usize = 0;
+            while (agent.commandAt(i)) |c| : (i += 1) {
                 if (startsWithIgnoreCase(commandToken(c.key), prefix)) n += 1;
             }
             break :blk n;
@@ -3969,7 +3970,8 @@ fn matchLabel(self: *const Model, n: usize) ?[]const u8 {
         .command => blk: {
             const prefix = acPrefix(self) orelse break :blk null;
             var seen: usize = 0;
-            for (agent.commands) |c| {
+            var i: usize = 0;
+            while (agent.commandAt(i)) |c| : (i += 1) {
                 if (!startsWithIgnoreCase(commandToken(c.key), prefix)) continue;
                 if (seen == n) break :blk c.key;
                 seen += 1;
@@ -3996,13 +3998,16 @@ fn isExactMatch(self: *Model) bool {
     if (!self.ac.active or self.ac.mode != .command) return false;
     const typed = std.mem.trim(u8, self.ed.text(), " \t\r\n");
     if (typed.len == 0) return false;
-    // Compared against ALL the commands, not just the highlighted one.
+    // Compared against ALL the commands, not just the highlighted one —
+    // builtins AND the user's own (`commandAt` walks both), so Enter on a
+    // completed `/review` submits instead of re-completing.
     //
     // Comparing only with the highlighted one broke "/model": the popup sorted
     // "/models" first, so it was not an exact match and Enter completed to
     // "/models". Now: if what is typed IS a command it is sent as-is; if it is
     // partial ("mod"), it is completed.
-    for (agent.commands) |c| {
+    var ac_i: usize = 0;
+    while (agent.commandAt(ac_i)) |c| : (ac_i += 1) {
         if (std.mem.eql(u8, typed, c.key)) return true;
     }
     return false;
@@ -4969,10 +4974,12 @@ fn drawAutocomplete(
 }
 
 /// The description of a command by its full key (`/model` → "switch model").
-/// One lookup, shared by the draw: `agent.commands` is a tiny table, a linear
-/// scan is cheaper than threading `agent.Cmd` through the match functions.
+/// One lookup, shared by the draw: `commandAt` is a tiny walk over two static
+/// lists, a linear scan is cheaper than threading `agent.Cmd` through the
+/// match functions.
 fn agentCommandDesc(key: []const u8) []const u8 {
-    for (agent.commands) |c| {
+    var i: usize = 0;
+    while (agent.commandAt(i)) |c| : (i += 1) {
         if (std.mem.eql(u8, c.key, key)) return c.desc;
     }
     return "";
