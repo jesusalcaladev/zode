@@ -213,6 +213,14 @@ fn bannerRuleLine(pa: std.mem.Allocator, width: u16) PLine {
     return .{ .cells = runs.items, .w = made };
 }
 
+/// Lines of a diff shown before it collapses into a preview.
+///
+/// Twelve is where a diff stops being "what just happened" and starts being the
+/// file. The counts and the rest of the lines are one Ctrl+R away, and the
+/// marker says so — a collapsed view that does not say it is collapsed is the
+/// bug this exists to avoid.
+pub const diff_preview_lines = 12;
+
 /// Lines added and removed by a diff (what is shown as `+N −M`).
 pub const DiffCounts = struct { added: usize = 0, removed: usize = 0 };
 
@@ -1064,9 +1072,28 @@ pub const Model = struct {
         /// Already expanded.
         expanded: bool = false,
 
+        /// The diff this tool produced, when it was COLLAPSED into a preview.
+        ///
+        /// Both forms live here because the paragraph can only hold one of them
+        /// at a time and Ctrl+R swaps between them. `null` = no diff of its own
+        /// (a `read`, a `grep`), so Ctrl+R keeps doing what it always did.
+        diff_para_idx: ?usize = null,
+        diff_full: []u8 = &.{},
+        diff_short: []u8 = &.{},
+        diff_expanded: bool = false,
+
+        fn hasDiff(self: *const ToolMemo) bool {
+            return self.diff_para_idx != null and self.diff_full.len > 0 and self.diff_short.len > 0;
+        }
+
         fn deinit(self: *ToolMemo, gpa: std.mem.Allocator) void {
             if (self.result.len > 0) gpa.free(self.result);
             if (self.summary.len > 0) gpa.free(self.summary);
+            if (self.diff_full.len > 0) gpa.free(self.diff_full);
+            if (self.diff_short.len > 0) gpa.free(self.diff_short);
+            self.diff_full = &.{};
+            self.diff_short = &.{};
+            self.diff_para_idx = null;
         }
     };
 
@@ -2875,75 +2902,175 @@ pub const Model = struct {
             if (joined.items.len > 0) joined.append(self.allocator, '\n') catch return .{};
             joined.appendSlice(self.allocator, l) catch return .{};
         }
-        // `pushKind` copies, so this buffer is temporary.
-        const copy = self.allocator.dupe(u8, joined.items) catch return .{};
-        defer self.allocator.free(copy);
-        self.pushDiffKind(copy, lang);
+
+        // A long diff COLLAPSES into a preview: a `write` of a 500-line file is
+        // 500 rows of history, and the timeline is where the user is trying to
+        // follow what the agent is doing. What is hidden is not lost — Ctrl+R
+        // swaps the paragraph for the full text — and the counts are in the
+        // marker, so nothing about the change is invisible.
+        var short: ?[]const u8 = null;
+        if (lines.len > diff_preview_lines) {
+            var s: std.ArrayList(u8) = .empty;
+            for (lines[0..diff_preview_lines], 0..) |l, i| {
+                if (i > 0) s.append(arena, '\n') catch break;
+                s.appendSlice(arena, l) catch break;
+            }
+            s.print(
+                arena,
+                "\n… +{d} −{d} · {d} more lines · ctrl+r to expand",
+                .{ added, removed, lines.len - diff_preview_lines },
+            ) catch {};
+            if (s.items.len > 0) short = s.items;
+        }
+
+        self.pushDiffKind(joined.items, short, lang);
         return .{ .added = added, .removed = removed };
     }
 
     /// Enqueues a diff paragraph WITH its language (`agent.langFromPath` gets
-    /// it from the path's extension).
+    /// it from the path's extension), collapsing it into `short` when the
+    /// caller built one.
+    ///
+    /// Both slices are BORROWED: everything that outlives this call is copied
+    /// here, and the caller frees its own buffers. (The old version took
+    /// ownership of `text` in two of its three paths and the caller freed it
+    /// anyway — a double free that only ever ran on out-of-memory.)
     ///
     /// The language is not stored as its own string but as the SAME slice
     /// `pushToolStart` already copied from the path: otherwise the paragraph
     /// would point at the worker's arena, which is freed at the end of the
     /// turn.
-    fn pushDiffKind(self: *Model, text: []const u8, lang: []const u8) void {
-        const lang_copy = self.allocator.dupe(u8, lang) catch {
-            self.pushKind(.diff, text);
+    fn pushDiffKind(self: *Model, text: []const u8, short: ?[]const u8, lang: []const u8) void {
+        const gpa = self.allocator;
+
+        // What the paragraph shows, and what is kept for Ctrl+R. When either
+        // copy fails the diff is shown WHOLE instead: a collapsed view nothing
+        // can open is worse than a long one.
+        var para_src: []const u8 = text;
+        var keep_full: []u8 = &.{};
+        var keep_short: []u8 = &.{};
+        if (short) |s| {
+            const f = gpa.dupe(u8, text) catch null;
+            const sh = gpa.dupe(u8, s) catch null;
+            if (f != null and sh != null) {
+                keep_full = f.?;
+                keep_short = sh.?;
+                para_src = s;
+            } else {
+                if (f) |x| gpa.free(x);
+                if (sh) |x| gpa.free(x);
+            }
+        }
+        const collapsed = keep_short.len > 0;
+
+        const text_copy = gpa.dupe(u8, para_src) catch {
+            freeDiffMemoParts(gpa, keep_full, keep_short);
             return;
         };
+        const lang_copy = gpa.dupe(u8, lang) catch {
+            gpa.free(text_copy);
+            freeDiffMemoParts(gpa, keep_full, keep_short);
+            self.pushKind(.diff, para_src);
+            return;
+        };
+
         self.lock();
         defer self.unlock();
+        const idx = self.paras.items.len + self.pending.items.len;
         self.pending.append(self.allocator, .{
             .kind = .diff,
-            .text = self.allocator.dupe(u8, text) catch {
-                self.allocator.free(lang_copy);
-                self.allocator.free(text);
-                return;
-            },
+            .text = text_copy,
             .lang = lang_copy,
         }) catch {
-            self.allocator.free(lang_copy);
-            self.allocator.free(text);
+            gpa.free(text_copy);
+            gpa.free(lang_copy);
+            freeDiffMemoParts(gpa, keep_full, keep_short);
+            return;
         };
+        if (collapsed) {
+            // Attached to the tool result that produced it: Ctrl+R toggles the
+            // last thing that was collapsed, which for a write/edit IS the diff.
+            if (self.last_tool) |*lt| {
+                if (lt.diff_full.len > 0) gpa.free(lt.diff_full);
+                if (lt.diff_short.len > 0) gpa.free(lt.diff_short);
+                lt.diff_full = keep_full;
+                lt.diff_short = keep_short;
+                lt.diff_para_idx = idx;
+                lt.diff_expanded = false;
+                keep_full = &.{};
+                keep_short = &.{};
+            }
+        }
+        freeDiffMemoParts(gpa, keep_full, keep_short);
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
     }
 
+    fn freeDiffMemoParts(gpa: std.mem.Allocator, full: []u8, short: []u8) void {
+        if (full.len > 0) gpa.free(full);
+        if (short.len > 0) gpa.free(short);
+    }
+
     /// Ctrl+R: expands or collapses the last tool's result.
+    ///
+    /// When the last tool produced a COLLAPSED diff, the diff is what it
+    /// toggles: that is the thing that was hidden, and the tool result under a
+    /// `write` is a preview of the same file. With no diff (a `read`, a `grep`)
+    /// it behaves as it always has.
     pub fn toggleLastTool(self: *Model) bool {
         self.lock();
         var lt = self.last_tool orelse {
             self.unlock();
             return false;
         };
-        const idx = lt.para_idx;
-        if (idx >= self.paras.items.len or lt.result.len == 0) {
+        if (lt.hasDiff()) {
+            const ok = toggleParagraph(self, lt.diff_para_idx.?, lt.diff_expanded, lt.diff_full, lt.diff_short);
+            if (ok) {
+                lt.diff_expanded = !lt.diff_expanded;
+                self.last_tool = lt;
+            }
             self.unlock();
-            return false;
+            return ok;
         }
-        // `result` and `summary` are the source of truth; the paragraph's text
-        // is a view of one of the two (that is why they are not freed here).
-        const want = if (lt.expanded) lt.summary else lt.result;
-        const copy = self.allocator.dupe(u8, want) catch {
-            self.unlock();
-            return false;
-        };
-        self.allocator.free(self.paras.items[idx].text);
-        self.paras.items[idx].text = copy;
-        lt.expanded = !lt.expanded;
-        self.last_tool = lt;
+        const idx = lt.para_idx;
+        const ok = toggleParagraph(self, idx, lt.expanded, lt.result, lt.summary);
+        if (ok) {
+            lt.expanded = !lt.expanded;
+            self.last_tool = lt;
+        }
+        self.unlock();
+        return ok;
+    }
+
+    /// Swaps paragraph `idx` between the two texts (`expanded` says which one
+    /// it is showing). Returns false when there is nothing to swap.
+    ///
+    /// `textLive` runs FIRST: a paragraph outside the scroll window is stored
+    /// COMPRESSED (`is_cold`), and overwriting that with raw text while the
+    /// flag stays set makes the next rehydrate call `decompressInto` on text
+    /// that was never compressed — an assert in debug and a garbage paragraph
+    /// in release. Toggling a tool result you scrolled away from is exactly
+    /// when this happens.
+    fn toggleParagraph(
+        self: *Model,
+        idx: usize,
+        expanded: bool,
+        full: []const u8,
+        short: []const u8,
+    ) bool {
+        if (idx >= self.paras.items.len) return false;
+        const want = if (expanded) short else full;
+        if (want.len == 0) return false;
+        const p = &self.paras.items[idx];
+        _ = p.textLive(self.allocator);
+        const copy = self.allocator.dupe(u8, want) catch return false;
+        self.allocator.free(p.text);
+        p.text = copy;
+        p.is_cold = false;
         // The layout of this and the following paragraphs changes: re-cache.
         if (self.cache_from == null or idx < self.cache_from.?) self.cache_from = idx;
-        // The anchor is NOT touched, and that is a fix: Ctrl+R used to set
-        // `scroll = 0`, which yanked the view to the bottom while you were
-        // reading something else. The anchor is absolute, so expanding a tool
-        // only moves what comes after it: if you were at the bottom you stay at
-        // the bottom (the follow flag), and if you were reading above, you stay
-        // exactly where you were.
-        self.unlock();
+        // The anchor is NOT touched: Ctrl+R used to set `scroll = 0`, which
+        // yanked the view to the bottom while you were reading something else.
         return true;
     }
 
@@ -5554,7 +5681,13 @@ fn sessionInfo(arena: std.mem.Allocator, streaming: bool) ?[]const InfoSeg {
     // also what warns you that you are approaching the compaction limit.
     if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
     if (agent.ctx_used > 0) {
-        const tk = std.fmt.allocPrint(arena, "~{d} tok", .{agent.ctx_used}) catch return null;
+        // `~` only for OUR estimate: when the provider has already counted the
+        // prompt itself, the number is exact and the squiggle would be false
+        // modesty (see `agent.ctx_real`).
+        const tk = if (agent.ctx_real)
+            std.fmt.allocPrint(arena, "{d} tok", .{agent.ctx_used}) catch return null
+        else
+            std.fmt.allocPrint(arena, "~{d} tok", .{agent.ctx_used}) catch return null;
         out.append(arena, .{ .text = tk, .style = theme.brand_soft }) catch return null;
         out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
     }
@@ -5592,22 +5725,39 @@ fn usageInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     const tag = std.fmt.allocPrint(arena, " {d:.0}% cached", .{st.hitRatePct()}) catch return null;
     out.append(arena, .{ .text = tag, .style = theme.ctxColor(pct) }) catch return null;
 
+    // Compact counts: `1103k prompt` was a cumulative number in a unit nobody
+    // reads at a glance. The same figure as `1.1M`.
+    var pb: [24]u8 = undefined;
     const tok = std.fmt.allocPrint(
         arena,
-        " \u{b7} {d}k prompt",
-        .{@divTrunc(st.prompt_tokens + 500, 1000)},
+        " \u{b7} {s} prompt",
+        .{fmtTokCount(&pb, st.prompt_tokens)},
     ) catch return null;
     out.append(arena, .{ .text = tok, .style = theme.brand_faint }) catch return null;
 
     if (st.completion_tokens > 0) {
+        var cb: [24]u8 = undefined;
         const comp = std.fmt.allocPrint(
             arena,
-            " \u{b7} {d}k out",
-            .{@divTrunc(st.completion_tokens + 500, 1000)},
+            " \u{b7} {s} out",
+            .{fmtTokCount(&cb, st.completion_tokens)},
         ) catch return null;
         out.append(arena, .{ .text = comp, .style = theme.brand_faint }) catch return null;
     }
     return out.items;
+}
+
+/// A token count the way a human reads one: `940`, `2k`, `1.1M`.
+///
+/// `buf` has to be the CALLER's: the segment stores the slice and the painter
+/// reads it after this function's frame is gone, which is the `bufPrint` trap
+/// documented in `sessionInfo`.
+fn fmtTokCount(buf: []u8, n: i64) []const u8 {
+    if (n >= 1_000_000) {
+        return std.fmt.bufPrint(buf, "{d:.1}M", .{@as(f64, @floatFromInt(n)) / 1_000_000.0}) catch "";
+    }
+    if (n >= 1000) return std.fmt.bufPrint(buf, "{d}k", .{@divTrunc(n + 500, 1000)}) catch "";
+    return std.fmt.bufPrint(buf, "{d}", .{n}) catch "";
 }
 
 /// Paints the usage column glued to the right, with a `│` separating it from
@@ -7530,6 +7680,161 @@ test "a 300-line diff does not hang and is still ONE paragraph" {
         if (p.kind == .diff) diffs += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), diffs);
+}
+
+test "a long diff collapses into a preview, and Ctrl+R swaps it for the whole thing" {
+    // The complaint this answers: a `write` of a 300-line file was 300 rows of
+    // history in the place the user is watching to see what the agent is doing.
+    // The preview keeps the shape of the change (first lines + the counts) and
+    // the whole diff is one key away — a collapse with no way back would be
+    // worse than no collapse at all.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var before: [16 * 1024]u8 = undefined;
+    var after: [16 * 1024]u8 = undefined;
+    var nb: usize = 0;
+    var na: usize = 0;
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        nb += (std.fmt.bufPrint(before[nb..], "linea {d}\n", .{i}) catch break).len;
+        na += (std.fmt.bufPrint(after[na..], "linea {d}!\n", .{i}) catch break).len;
+    }
+
+    m.pushToolStart("write", "src/demo.txt");
+    m.pushToolDone("write", "wrote 60 lines", 7, "wrote 60 lines");
+    const counts = m.pushDiff(before[0..nb], after[0..na]);
+    try std.testing.expect(counts.added == 60 and counts.removed == 60);
+    m.drainPending();
+
+    // Still ONE paragraph (the contract that keeps the layout loop alive), and
+    // it is the short one.
+    var diff_idx: ?usize = null;
+    var diffs: usize = 0;
+    for (m.paras.items, 0..) |p, n| {
+        if (p.kind != .diff) continue;
+        diffs += 1;
+        diff_idx = n;
+    }
+    try std.testing.expectEqual(@as(usize, 1), diffs);
+    const short_text = m.paras.items[diff_idx.?].text;
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "ctrl+r to expand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "+60 −60") != null);
+    // The preview is the FIRST lines, and the far end of the file is not there.
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "linea 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "linea 59") == null);
+
+    // Ctrl+R opens the WHOLE diff…
+    try std.testing.expect(m.toggleLastTool());
+    const full_text = m.paras.items[diff_idx.?].text;
+    try std.testing.expect(std.mem.indexOf(u8, full_text, "linea 59") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text, "ctrl+r to expand") == null);
+
+    // …and Ctrl+R closes it again (the same key, the same paragraph).
+    try std.testing.expect(m.toggleLastTool());
+    const again = m.paras.items[diff_idx.?].text;
+    try std.testing.expect(std.mem.indexOf(u8, again, "ctrl+r to expand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "linea 59") == null);
+
+    // And the whole thing survives a draw at a realistic size.
+    _ = try drawTest(&m, arena, 100, 30);
+}
+
+test "a short diff is shown WHOLE, and Ctrl+R then opens the tool result" {
+    // The collapse must not fire on the everyday case: a two-line fix is the
+    // thing you WANT to read inline, and hiding it behind a key would be a
+    // slower way to see less.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushToolStart("edit", "src/demo.txt");
+    m.pushToolDone("edit", "Edited 1 line", 2, "the full result of the edit");
+    _ = m.pushDiff("uno\ndos\n", "uno\nDOS\n");
+    m.drainPending();
+
+    for (m.paras.items) |p| {
+        if (p.kind != .diff) continue;
+        // Whole, no marker, nothing hidden.
+        try std.testing.expect(std.mem.indexOf(u8, p.text, "ctrl+r") == null);
+        try std.testing.expect(std.mem.indexOf(u8, p.text, "+DOS") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p.text, "-dos") != null);
+    }
+    // No diff to expand, so the key does what it always did: the RESULT.
+    try std.testing.expect(m.last_tool != null and !m.last_tool.?.hasDiff());
+    try std.testing.expect(m.toggleLastTool());
+    var found = false;
+    for (m.paras.items) |p| {
+        if (p.kind == .tool_res and std.mem.indexOf(u8, p.text, "the full result of the edit") != null) found = true;
+    }
+    try std.testing.expect(found);
+    _ = try drawTest(&m, arena, 80, 20);
+}
+
+test "Ctrl+R on a paragraph that went COLD rehydrates it instead of corrupting it" {
+    // A paragraph outside the scroll window is stored COMPRESSED with
+    // `is_cold = true`. Overwriting that text with raw bytes while the flag
+    // stays set makes the next `textLive` call `decompressInto` on text that
+    // was never compressed: an assert in debug, a garbage paragraph in
+    // release.
+    //
+    // The paragraph this happens to is the DIFF, and it is the only one that
+    // can: `pruneCold` skips anything under `min_compress_len`, and a tool
+    // result's paragraph is a single summary line (~18 bytes) — which is also
+    // why the first version of this test, written against the result, failed to
+    // compress at all. A diff of a few hundred lines is exactly what you
+    // scrolled away from and then come back to open.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var before: [16 * 1024]u8 = undefined;
+    var after: [16 * 1024]u8 = undefined;
+    var nb: usize = 0;
+    var na: usize = 0;
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        nb += (std.fmt.bufPrint(before[nb..], "line {d} with enough text for a realistic preview width\n", .{i}) catch break).len;
+        na += (std.fmt.bufPrint(after[na..], "line {d}! with enough text for a realistic preview width\n", .{i}) catch break).len;
+    }
+
+    m.pushToolStart("write", "src/demo.txt");
+    m.pushToolDone("write", "wrote 80 lines", 5, "wrote 80 lines");
+    _ = m.pushDiff(before[0..nb], after[0..na]);
+    m.drainPending();
+
+    const idx = m.last_tool.?.diff_para_idx.?;
+    const text_len = m.paras.items[idx].text.len;
+    try std.testing.expect(std.mem.indexOf(u8, m.paras.items[idx].text, "ctrl+r to expand") != null);
+
+    // Cold, the way `pruneCold` leaves it when you scroll away.
+    const buf = try std.testing.allocator.alloc(u8, text_len + 1);
+    defer std.testing.allocator.free(buf);
+    const packed_z = zjsonl.compressLine(buf, m.paras.items[idx].text) orelse return error.TestUnexpectedResult;
+    const copy = try std.testing.allocator.dupe(u8, packed_z);
+    std.testing.allocator.free(m.paras.items[idx].text);
+    m.paras.items[idx].text = copy;
+    m.paras.items[idx].is_cold = true;
+    try std.testing.expect(m.paras.items[idx].is_cold);
+
+    // The toggle still works, and what it leaves behind is RAW text whose flag
+    // says so — not base64 under `is_cold = false`.
+    try std.testing.expect(m.toggleLastTool());
+    const p = &m.paras.items[idx];
+    try std.testing.expect(!p.is_cold);
+    try std.testing.expect(std.mem.indexOf(u8, p.text, "line 79!") != null); // the whole diff
+    try std.testing.expect(std.mem.indexOf(u8, p.text, "ctrl+r to expand") == null);
+    // And it is really the text: a decompression of raw bytes would be garbage
+    // or an assert, never a clean diff.
+    try std.testing.expect(std.mem.indexOf(u8, p.text, "with enough text for a realistic preview") != null);
+    _ = try drawTest(&m, arena, 80, 24);
 }
 
 test "streamEnd sets dirty: a state change asks for a frame" {
