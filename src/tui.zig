@@ -1795,11 +1795,7 @@ pub const Model = struct {
             // IN FRONT, not behind: the blank row separates this paragraph
             // from the previous one. Placed at the end, the gap showed up
             // after "second" and the history was still a wall of text.
-            if (after_banner) {
-                grown[0] = bannerRuleLine(para_arena.allocator(), width);
-            } else {
-                grown[0] = .{ .cells = &.{}, .w = 0 };
-            }
+            grown[0] = .{ .cells = &.{}, .w = 0 };
             @memcpy(grown[1..], lines);
             lines = grown;
         }
@@ -5299,22 +5295,15 @@ fn drawInput(
     if (top >= p.height or width < 6) return;
 
     const box_h: u16 = input_h + 2; // top border + contents + bottom border
-    p.putStable(0, top, "╭", 1, theme.input_border);
-    p.fillRange(1, width - 1, top, "─", theme.input_border);
-    p.putStable(width - 1, top, "╮", 1, theme.input_border);
-    p.putStable(0, top + box_h - 1, "╰", 1, theme.input_border);
-    p.fillRange(1, width - 1, top + box_h - 1, "─", theme.input_border);
-    p.putStable(width - 1, top + box_h - 1, "╯", 1, theme.input_border);
+    // Clean minimal input border
+    const border_style = if (self.focused()) theme.input_border_active else theme.input_border;
+    p.fillRange(0, width, top, "─", border_style);
+    p.fillRange(0, width, top + box_h - 1, "─", border_style);
 
-    var r: u16 = 1;
-    while (r < box_h - 1) : (r += 1) {
-        // Fill interior with subtle background
-        var c: u16 = 1;
-        while (c < width - 1) : (c += 1) {
-            p.putStable(c, top + r, " ", 1, .{ .bg = .{ .rgb = .{ 0x14, 0x14, 0x24 } } });
-        }
-        p.putStable(0, top + r, "│", 1, theme.input_border);
-        p.putStable(width - 1, top + r, "│", 1, theme.input_border);
+    // Subtle background for input area
+    var bg_row: u16 = 1;
+    while (bg_row < box_h - 1) : (bg_row += 1) {
+        p.fillRange(0, width, top + bg_row, " ", .{ .bg = .{ .rgb = .{ 0x14, 0x14, 0x20 } } });
     }
 
     // Prompt `❯ ` only on the first line.
@@ -5487,10 +5476,11 @@ fn lineStartOffset(lines: [][]const u8, line: usize) usize {
 ///
 /// Layout reserves it on both sides; painting uses it as the left edge.
 fn historyMargin(width: u16) u16 {
-    if (width > 120) return 4;
-    if (width > 80) return 3;
-    if (width > 8) return 2;
-    return 0;
+    if (width > 160) return 8;
+    if (width > 120) return 6;
+    if (width > 80) return 5;
+    if (width > 8) return 4;
+    return 1;
 }
 
 fn scrollbarThumb(track_rows: usize, max_offset: usize) struct { size: usize, travel: usize } {

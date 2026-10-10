@@ -70,7 +70,7 @@ const styles = struct {
     // because this module does not depend on the TUI (markdown's tests use it
     // on its own).
     const banner: Style = .{ .fg = .{ .rgb = .{ 0xb4, 0x5d, 0xff } } }; // brand violet
-    const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x22, 0xd3, 0xee } } }; // brand_hi cyan
+    const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xe0, 0xb4, 0xff } } }; // brand_hi bright
     // A heading was `fg(4)` bold: the SAME blue as the `›` user prefix and as
     // `theme.accent`, and the same style the diff used for `@@ -1,4 +1,6 @@`. A
     // heading had to shout over the prose, so it gets the lightest blue in the
