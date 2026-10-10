@@ -701,6 +701,7 @@ pub const Model = struct {
     /// PAGE (the whole window) instead of a fixed number: with 5 fixed, in a
     /// tall terminal PageUp barely moved anything.
     hist_rows: usize = 10,
+    scrollbar_dragging: bool = false,
 
     /// Paragraph cache: 1 arena per closed paragraph, with the lines ALREADY
     /// wrapped at the current width. Invalidated on width change; frees the
@@ -2927,10 +2928,9 @@ pub const Model = struct {
         //
         // It was inside, which meant that any turn that ended with an EMPTY
         // stream buffer left the model "streaming" forever. `workingLocked()`
-        // counts it, so the placeholder was painted on EVERY frame from then on
-        // — a `thinking · 4321.3s` line with a clock that never stops, a spinner
-        // that never stops, and a status bar that says the app is busy long
-        // after the turn is over. That is the "junk that never cleans up".
+        // counts it, so the activity strip kept reporting a live turn forever:
+        // a clock that never stops, a spinner that never stops, and a status bar
+        // that says the app is busy long after the turn is over.
         //
         // The empty-buffer paths are not exotic: every turn error before the
         // first token (401, 403, 429 given up, 5xx after 3 retries), ESC, and
@@ -3608,9 +3608,6 @@ pub const Model = struct {
     /// scroll is what there is to scroll.
     pub fn scrollBy(self: *Model, n: isize) void {
         if (n == 0) return;
-        self.selection_start = null;
-        self.selection_end = null;
-        self.selecting_text = false;
         const mo = self.currentMaxOffset();
         var first = if (self.follow_bottom) mo else @min(self.anchor, mo);
         // DIRECTION, spelled out because getting it backwards is invisible in
@@ -3624,6 +3621,15 @@ pub const Model = struct {
             const down: usize = @intCast(-n);
             first = @min(first + down, mo);
         }
+        self.scrollTo(first);
+    }
+
+    fn scrollTo(self: *Model, first_line: usize) void {
+        self.selection_start = null;
+        self.selection_end = null;
+        self.selecting_text = false;
+        const mo = self.currentMaxOffset();
+        const first = @min(first_line, mo);
         self.setAnchorLine(first);
         self.anchor = first;
         // Reaching the bottom re-arms the follow, so the next line that arrives
@@ -4781,6 +4787,34 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             ctx.redraw = true;
         },
         .mouse => |m| {
+            if (self.scrollbar_dragging) {
+                switch (m.type) {
+                    .drag => {
+                        if (m.row >= 0 and @as(usize, @intCast(m.row)) < self.hist_rows) {
+                            self.scrollTo(scrollbarOffset(
+                                @intCast(m.row),
+                                self.hist_rows,
+                                self.max_offset,
+                            ));
+                        }
+                        ctx.redraw = true;
+                        return;
+                    },
+                    .release => {
+                        if (m.row >= 0 and @as(usize, @intCast(m.row)) < self.hist_rows) {
+                            self.scrollTo(scrollbarOffset(
+                                @intCast(m.row),
+                                self.hist_rows,
+                                self.max_offset,
+                            ));
+                        }
+                        self.scrollbar_dragging = false;
+                        ctx.redraw = true;
+                        return;
+                    },
+                    else => {},
+                }
+            }
             if (self.selecting_text) {
                 switch (m.type) {
                     .drag => {
@@ -4801,6 +4835,19 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             if (m.type == .press and m.button == .left and
                 !self.pal.active and !self.askActive() and !self.permActive())
             {
+                if (self.max_offset > 0 and m.col >= 0 and m.row >= 0 and
+                    @as(usize, @intCast(m.col)) == self.selectable_width -| 1 and
+                    @as(usize, @intCast(m.row)) < self.hist_rows)
+                {
+                    self.scrollbar_dragging = true;
+                    self.scrollTo(scrollbarOffset(
+                        @intCast(m.row),
+                        self.hist_rows,
+                        self.max_offset,
+                    ));
+                    ctx.redraw = true;
+                    return;
+                }
                 if (self.selectionPoint(m)) |point| {
                     self.selection_start = point;
                     self.selection_end = point;
@@ -4895,8 +4942,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // why the app had stopped.
     const act_rows: u16 = if (act.busy or queued > 0 or act.ask) 1 else 0;
 
-    // The plan is a one-line summary. Its full checklist is already in the
-    // conversation; repeating it here crowds out both history and the input.
+    // Keep a compact live summary near the input; the complete checklist is
+    // emitted into the scrollable history when the model updates the plan.
     const pl_now = self.planCopy();
     const plan_rows: u16 = if (pl_now.isEmpty()) 0 else 1;
 
@@ -4991,16 +5038,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         // tool runs with the stream closed), so the clock line REPLACES the
         // live paragraph instead of adding to it.
         if (self.tool_run) |tr| {
-            const ms = self.toolRunMillisLocked();
             // The ARGUMENT goes with the name: `bash(sleep 30) · 12.3s` says
             // far more than `bash · 12.3s` when there are several tools in the
-            // turn and you are looking at the strip to see which one is stuck.
-            // `ToolRun.arg` had been stored for months and nobody read it.
-            const line = std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{
+            // turn. The strip owns the only elapsed-time counter.
+            const line = std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running", .{
                 tr.name,
                 tr.arg,
-                ms / 1000,
-                (ms % 1000) / 100,
             }) catch "";
             // Copied here, while `tool_buf` is certainly alive and `tr.name` /
             // `tr.arg` cannot be freed under us: `toolRunEnd` frees them from
@@ -5015,38 +5058,23 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         if (self.workingLocked()) self.spinner_frame +%= 1;
     }
 
-    // Placeholder while the turn is alive but no text has arrived yet.
-    //
-    // The gap between "you pressed Enter" and the first token is seconds, and
-    // in that gap the history had NOTHING live: the last dot was your prompt.
-    // The one-row strip already says something, but it is glued to the input
-    // and with the input open it reads as part of the box. A line in that spot
-    // (`thinking · 3.2s`) with the clock inside is what says "I'm here".
-    var live_kind: md.Kind = if (live_is_tool) .tool_res else .assistant;
+    // The activity strip is the single owner of phase and elapsed time. Do not
+    // repeat its clock in the history while waiting for the first token.
+    const live_kind: md.Kind = if (live_is_tool) .tool_res else .assistant;
     var live_active = false;
-    // Only if there IS a turn: at idle the history does not invent a line.
-    if (live_src.len == 0 and self.workingLocked()) {
-        // `ph_buf` is block-local AND the copy happens INSIDE this block. It
-        // used to be block-local with the copy ten lines further down, past the
-        // end of its scope: reading a dead stack buffer, which is the same bug
-        // as `&[_]u8{c}` and just as undefined. Local buffer + immediate copy
-        // into the frame arena is the pattern that cannot get it wrong.
-        var ph_buf: [64]u8 = undefined;
-        const ms = self.busyMillis();
-        const ph = std.fmt.bufPrint(&ph_buf, "thinking · {d}.{d}s", .{
-            ms / 1000,
-            (ms % 1000) / 100,
-        }) catch "thinking";
-        live_src = ctx.arena.dupe(u8, ph) catch "thinking";
-        live_kind = .info;
-        live_active = true;
-    }
+    const hist_margin: u16 = historyMargin(width);
+    const wrap_width: u16 = if (width > hist_margin * 2 + 1)
+        width - hist_margin * 2 - 1
+    else if (width > 1)
+        width - 1
+    else
+        width;
 
     var live_lines: []const PLine = &.{};
     if (live_src.len > 0) {
         // `live_src` is already frame-arena owned (see the invariant above), so
         // there is nothing to copy here any more.
-        live_lines = buildLines(ctx.arena, ctx, live_kind, live_src, width) catch &.{};
+        live_lines = buildLines(ctx.arena, ctx, live_kind, live_src, wrap_width) catch &.{};
         live_active = live_lines.len > 0;
     }
 
@@ -5056,13 +5084,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // scrolling re-parses on demand, which is what the old comment claimed and
     // was not true) and returns the visible range already stabilized.
     //
-    // Keep matching margins on both sides of the history text.
-    const hist_margin: u16 = historyMargin(width);
-    const wrap_width: u16 = if (width > hist_margin * 2) width - hist_margin * 2 else width;
+    // Reserve one column for the scrollbar, even while it is inactive, so text
+    // never jumps when the history first becomes scrollable.
     self.wrap_w = wrap_width;
     const vis = try self.layoutFor(
         ctx,
-        if (width > hist_margin) width - hist_margin else width,
+        wrap_width,
         if (live_active) live_lines.len else 0,
         history_h,
     );
@@ -5102,6 +5129,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     if (live_active) {
         drawLines(&p, live_lines, line_cursor, first_visible, history_h);
     }
+    drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
     try self.snapshotSelectableHistory(surface, history_h);
     self.paintTextSelection(surface);
 
@@ -5428,6 +5456,43 @@ fn historyMargin(width: u16) u16 {
     return if (width > 8) 2 else 0;
 }
 
+fn scrollbarThumb(track_rows: usize, max_offset: usize) struct { size: usize, travel: usize } {
+    if (track_rows == 0 or max_offset == 0) return .{ .size = track_rows, .travel = 0 };
+    const total = track_rows + max_offset;
+    const size = @max(1, track_rows * track_rows / total);
+    return .{ .size = @min(size, track_rows), .travel = track_rows -| size };
+}
+
+fn scrollbarOffset(row: usize, track_rows: usize, max_offset: usize) usize {
+    const thumb = scrollbarThumb(track_rows, max_offset);
+    if (thumb.travel == 0 or max_offset == 0) return 0;
+    const centered = row -| (thumb.size / 2);
+    const track_pos = @min(centered, thumb.travel);
+    const scaled = @as(u128, @intCast(track_pos)) * @as(u128, @intCast(max_offset));
+    return @intCast(scaled / thumb.travel);
+}
+
+fn drawHistoryScrollbar(
+    p: *Painter,
+    width: u16,
+    track_rows: u16,
+    first_visible: usize,
+    max_offset: usize,
+) void {
+    if (width == 0 or track_rows == 0 or max_offset == 0) return;
+    const metrics = scrollbarThumb(@intCast(track_rows), max_offset);
+    const thumb_top = if (metrics.travel == 0)
+        0
+    else
+        metrics.travel * first_visible / max_offset;
+    const col = width - 1;
+    var row: usize = 0;
+    while (row < track_rows) : (row += 1) {
+        const in_thumb = row >= thumb_top and row < thumb_top + metrics.size;
+        p.putStable(col, @intCast(row), if (in_thumb) "█" else "│", 1, if (in_thumb) theme.brand else theme.rule);
+    }
+}
+
 fn drawLines(
     p: *Painter,
     lines: []const PLine,
@@ -5540,8 +5605,7 @@ fn drawPermissionModal(
 ///
 /// When there is a queue the queued prompts are shown too, so you know what is
 /// coming next instead of having to remember it.
-/// A compact plan summary: progress and the active step, without repeating the
-/// full checklist already present in the conversation.
+/// A compact plan summary; the complete checklist is kept in the history.
 fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
     p.fillRow(top, " ", .{});
     if (pl.allDone()) {
@@ -6018,9 +6082,8 @@ fn drawActivityStrip(
     col += 1;
 
     // What it is doing, when it is a tool. A bare "thinking" with a 30s `bash`
-    // does not say whether it is working or hung; the tool's NAME and its clock
-    // do. It is the same information as the history's `⎿ running` line, here in
-    // the strip so you can read it without scrolling.
+    // does not say whether it is working or hung; the tool's NAME identifies it,
+    // and the strip's clock shows its duration.
     if (running_tool_name) |name| {
         if (col + name.len + 2 < width) {
             _ = p.putText(col, row, name, theme.brand_soft);
@@ -6029,9 +6092,9 @@ fn drawActivityStrip(
     }
 
     // Clock. Without it, a slow turn looks hung.
-    if (act.busy) {
+    if (act.busy or running_tool) {
         var cbuf: [24]u8 = undefined;
-        const ms = self.busyMillis();
+        const ms = if (running_tool) self.toolRunMillis() else self.busyMillis();
         const ts = std.fmt.bufPrint(&cbuf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
         if (ts.len > 0) {
             _ = p.putText(col, row, ts, theme.brand_soft);
@@ -7127,6 +7190,61 @@ test "scrollBy: the wheel cannot underflow at the top" {
     try std.testing.expect(m.anchor <= m.max_offset);
 }
 
+test "scrollbar click and drag navigate absolute history positions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    for (0..80) |i| {
+        var text: [32]u8 = undefined;
+        m.pushInfo(try std.fmt.bufPrint(&text, "history row {d}", .{i}));
+    }
+    const surface = try drawTest(&m, arena_state.allocator(), 80, 24);
+    const bottom = m.max_offset;
+    try std.testing.expect(bottom > 0);
+
+    var ctx = testCtx();
+    defer ctx.cmds.deinit(ctx.alloc);
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(surface.size.width - 1),
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expect(m.scrollbar_dragging);
+    try std.testing.expectEqual(@as(usize, 0), m.first_visible);
+
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(surface.size.width - 1),
+        .row = @intCast(m.hist_rows - 1),
+        .button = .left,
+        .mods = .{},
+        .type = .drag,
+    } });
+    try std.testing.expectEqual(bottom, m.first_visible);
+
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(surface.size.width - 1),
+        .row = @intCast(m.hist_rows - 1),
+        .button = .none,
+        .mods = .{},
+        .type = .release,
+    } });
+    try std.testing.expect(!m.scrollbar_dragging);
+    try std.testing.expect(m.follow_bottom);
+}
+
+test "scrollbar thumb maps track endpoints to history endpoints" {
+    const track: usize = 20;
+    const max_offset: usize = 180;
+    const thumb = scrollbarThumb(track, max_offset);
+    try std.testing.expect(thumb.size > 0);
+    try std.testing.expect(thumb.size < track);
+    try std.testing.expectEqual(@as(usize, 0), scrollbarOffset(0, track, max_offset));
+    try std.testing.expectEqual(max_offset, scrollbarOffset(track - 1, track, max_offset));
+}
+
 test "scroll: overscrolling up leaves no debt, so one PageDown really scrolls down" {
     // THE bug, with its numbers.
     //
@@ -8144,7 +8262,7 @@ test "a tool header marks the name so the parser highlights it" {
     try std.testing.expect(std.mem.indexOfScalar(u8, all, '*') == null);
 }
 
-test "a running tool paints its clock, and it disappears when it ends" {
+test "a running tool clock appears only in the activity strip" {
     // Without this, a 30s `bash` leaves the last row frozen at
     // `⏺ bash(...)`: there is no way to tell if the process is still alive or
     // if the app has hung. The clock is the only thing that answers "is it
@@ -8155,18 +8273,13 @@ test "a running tool paints its clock, and it disappears when it ends" {
     defer m.deinit();
     m.pushToolStart("bash", "sleep 30");
 
-    // While it runs: the clock line has to be there.
+    // The tool line identifies the command; the strip owns its only clock.
     {
         const s = try drawTest(&m, arena_state.allocator(), 92, 26);
         const all = allText(s);
-        // With the ARGUMENT: `bash(sleep 30) running · 0.0s`. `ToolRun.arg` was
-        // stored and nobody read it; with several tools in the turn, the
-        // argument is what says which one is stuck.
         try std.testing.expect(std.mem.indexOf(u8, all, "sleep 30") != null);
         try std.testing.expect(std.mem.indexOf(u8, all, "running") != null);
-        // And the activity strip names the tool, with the "running" phase label
-        // (not the generic "thinking": what runs here is a command).
-        try std.testing.expect(std.mem.indexOf(u8, all, "running") != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, all, "0.0s"));
         try std.testing.expect(m.isBusy());
     }
 
@@ -8192,9 +8305,10 @@ test "the strip names the phase: thinking, streaming or running a tool" {
         m.streamStart(); // turn open, no text yet
         const s = try drawTest(&m, arena, 90, 20);
         const all = allText(s);
-        // With no deltas yet there is no streaming: it is "thinking", and on top
-        // of that there is a live line with the clock (the Phase 2 placeholder).
-        try std.testing.expect(std.mem.indexOf(u8, all, "thinking") != null);
+        // Once the request is opened, the strip reports streaming while the
+        // history stays clear until actual text arrives.
+        try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
+        try std.testing.expect(std.mem.indexOf(u8, all, "thinking ·") == null);
     }
     {
         var m = Model.init(std.testing.allocator);
@@ -8228,9 +8342,7 @@ test "the permission strip shows with the turn open" {
     m.perm_active = false;
 }
 
-test "with the turn open but no text there is a live line with the clock" {
-    // The gap between "Enter" and the first token is seconds, and before the
-    // history had NOTHING live there: the last dot was your prompt.
+test "the activity strip is the only clock before the first token" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -8239,16 +8351,12 @@ test "with the turn open but no text there is a live line with the clock" {
     m.streamStart();
     const s = try drawTest(&m, arena_state.allocator(), 80, 20);
     const all = allText(s);
-    try std.testing.expect(std.mem.indexOf(u8, all, "thinking") != null);
-    // With the clock inside ("thinking · 0.0s"), which is what says "I'm still
-    // here".
-    try std.testing.expect(std.mem.indexOf(u8, all, "· 0.0s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, all, "0.0s"));
+    try std.testing.expect(std.mem.indexOf(u8, all, "thinking ·") == null);
 }
 
-test "at idle the history does not invent a live line" {
-    // The placeholder only shows if there is a turn: otherwise, the last
-    // paragraph of a fresh session would be "thinking · 0.0s" without having
-    // written anything.
+test "at idle there is no activity clock" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -8789,6 +8897,7 @@ test "a line wrapped to the width carries a continuation indent" {
     const msg = "la primera parte de la frase es larga " ** 3;
     m.streamStart();
     m.streamDelta(msg);
+    m.streamEnd();
     const s = try drawTest(&m, arena_state.allocator(), 30, 12);
     const all = allText(s);
     // There is more than one row with the sentence's text.
@@ -9295,10 +9404,9 @@ test "streamEnd with no text also clears `streaming`, so nothing counts forever"
     //
     // `self.streaming = false` used to live INSIDE `if (has_text and ...)`, so a
     // turn that ended with an empty buffer left the model "streaming" forever.
-    // `workingLocked()` counts `streaming`, so from then on EVERY frame painted
-    // the placeholder: a `thinking · 4321.3s` line whose clock never stopped, a
-    // spinner that never stopped, and a status bar claiming the app was busy
-    // long after the turn was over. That is the junk that never cleaned up.
+    // `workingLocked()` counts `streaming`, so from then on EVERY frame kept
+    // showing an activity clock, spinner and busy status long after the turn
+    // was over.
     //
     // The test above asserted `!busy` and the paragraph count and never
     // `!streaming`, which is exactly why it stayed hidden.

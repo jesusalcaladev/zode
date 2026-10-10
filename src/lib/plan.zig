@@ -176,6 +176,18 @@ pub const Plan = struct {
             if (self.currentIndex()) |i| self.items[i].textOf() else "",
         }) catch "plan updated";
     }
+
+    /// The complete plan for tool results and conversation history.
+    pub fn details(self: *const Plan, arena: std.mem.Allocator) []const u8 {
+        if (self.len == 0) return "plan cleared";
+        var text = std.Io.Writer.Allocating.init(arena);
+        const w = &text.writer;
+        w.print("Implementation plan ({d}/{d} done):", .{ self.doneCount(), self.len }) catch return "plan updated";
+        for (self.items[0..self.len], 0..) |step, i| {
+            w.print("\n{s} {d}. {s}", .{ step.status.glyph(), i + 1, step.textOf() }) catch return "plan updated";
+        }
+        return text.written();
+    }
 };
 
 /// What the parse returns: the list and how many steps there are.
@@ -583,6 +595,21 @@ test "the summary says what is missing, not a percentage" {
 
     p.clear();
     try std.testing.expectEqualStrings("plan cleared", p.summary(arena));
+}
+
+test "details lists every plan step with its status" {
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    var p = Plan.init();
+    const items = try three("inspect files", "implement change", "run tests", .done, .in_progress, .pending);
+    _ = p.apply(&items, 3);
+
+    const details = p.details(arena);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Implementation plan (1/3 done)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "☑ 1. inspect files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "◐ 2. implement change") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "☐ 3. run tests") != null);
 }
 
 // ── test helpers ──────────────────────────────────────────────
