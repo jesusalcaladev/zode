@@ -587,6 +587,9 @@ Decisions that are not obvious:
 - PageUp/PageDown move a **page** (the window, minus one line), not a fixed 5.
   `hist_rows` is published from the draw (the only place that knows the height).
 - **Ctrl+U / Ctrl+D** = half a page, like in less and in Claude Code.
+- The rightmost history column is an interactive scrollbar: click/drag maps to
+  the absolute history range; wheel events, including touchpad scrolling, use
+  the same clamped anchor as the keyboard.
 - A `↓ N` indicator in the status when the history is not anchored at the bottom:
   without it you lose the notion of "why is it not scrolling down".
 - `ctx_used`/`ctx_pct` are **cached in the agent** and refreshed at the end of
@@ -1554,8 +1557,8 @@ A COMPLETE list on every call (it replaces the previous one); it accepts
 `items`/`todos` and `content`/`text`/`task`; an unknown `status` falls into
 `pending` (the step is not wrong, it is mislabelled); more than 20 steps is an
 ERROR and not a silent truncation. The on-screen plan is a one-line summary of
-progress and the current step; the full checklist remains in the conversation.
-`/plan` clears it.
+progress and the current step; each update also writes the complete numbered
+checklist into the scrollable history for review before approval. `/plan` clears it.
 
 A bug of its own that the tests caught: in `Plan.apply` the loop wrote
 `self.items[self.len] = it` and `self.len` was only updated at the end, so **every**

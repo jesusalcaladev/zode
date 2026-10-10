@@ -376,7 +376,7 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     // model has to know before it decides what to call, or it plans a `write`
     // and then gets an error, which it reads as a bug and works around.
     const mode_note: []const u8 = if (read_only)
-        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line — and end your turn: the user will be asked to approve it. On approval zode switches itself to Build mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
+        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line. Zode displays the complete numbered checklist in the scrollable history; end your turn so the user can review and approve it. On approval zode switches itself to Build mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
     else if (accept_edits)
         "ACCEPT-EDITS MODE is on (shift+tab to cycle): file edits (write, edit, rename) run without asking, but bash still asks for permission. Ask the user with `ask` before running anything destructive.\n\n"
     else
@@ -5163,7 +5163,11 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
     const line = applyPlanTo(&snapshot, args_json, arena) orelse return;
     m.plan_touched_this_turn = true;
     m.replacePlan(snapshot);
-    m.pushInfoFmt("{s}", .{line});
+    if (snapshot.isEmpty()) {
+        m.pushInfoFmt("{s}", .{line});
+    } else {
+        m.pushInfoFmt("{s}\n{s}", .{ line, snapshot.details(arena) });
+    }
     if (snapshot.allDone()) setStatusWithZo(m, .done, "all plan steps done");
 }
 
@@ -10350,6 +10354,26 @@ test "applyPlanTo works with NO Model, which is what --chat has" {
         return error.NoBadIndexLine;
     };
     try std.testing.expect(std.mem.indexOf(u8, bad, "do not exist") != null);
+}
+
+test "the TUI records the complete plan for the user to review" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var model = tui.Model.init(std.testing.allocator);
+    defer model.deinit();
+
+    applyPlanCall(&model,
+        \\{"items":[{"content":"inspect the code","status":"done"},{"content":"implement the fix","status":"in_progress"},{"content":"run tests"}]}
+    , arena_state.allocator());
+
+    try std.testing.expectEqual(@as(u8, 3), model.plan.len);
+    try std.testing.expect(model.plan_touched_this_turn);
+    try std.testing.expectEqual(@as(usize, 1), model.pending.items.len);
+    const output = model.pending.items[0].text;
+    try std.testing.expect(std.mem.indexOf(u8, output, "1/3 done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "1. inspect the code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "2. implement the fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "3. run tests") != null);
 }
 
 test "a cleared plan is a change, and an empty one is not" {
