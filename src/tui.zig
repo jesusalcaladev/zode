@@ -5195,8 +5195,23 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     }
     if (info.len > 0) drawSessionInfo(&p, status_row, info_right, info);
 
+    // ── status bar frame ──
+    //
+    // The status bar is a single row; a thin frame makes it read as a distinct
+    // row at the bottom of the screen, visually separated from the history
+    // above and the input below. The left edge is drawn whenever there is
+    // content on the left; the right edge is drawn when there is no usage
+    // column glued to the far right (the usage column is painted after this
+    // block, and it would overwrite the right edge anyway).
+    {
+        const has_left = self.status().len > 0 or !self.follow_bottom;
+        const has_right = info.len > 0 or !usage_fits;
+        if (has_left) _ = p.putStable(0, status_row, "│", 1, theme.rule);
+        if (has_right) _ = p.putStable(width - 1, status_row, "│", 1, theme.rule);
+    }
+
     // Second column, at the right edge: what the session has cost. Painted
-    // AFTER the session column so it wins any overlap, and only if the session
+    // AFTER the frame so it wins any overlap, and only if the session
     // column left room (`reserved`).
     if (usage_fits) {
         if (usage) |segments| drawUsageColumn(&p, status_row, width, segments, info_width);
@@ -5608,6 +5623,10 @@ fn drawPermissionModal(
 /// A compact plan summary; the complete checklist is kept in the history.
 fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
     p.fillRow(top, " ", .{});
+    // Frame the plan as a distinct block above the input, so it is easy to
+    // spot that there is a todo list and to see which step is active.
+    const frame = if (pl.allDone()) "┌─" else "├─";
+    _ = p.putStable(0, top, frame, 2, theme.rule);
     if (pl.allDone()) {
         var buf: [64]u8 = undefined;
         const txt = std.fmt.bufPrint(&buf, "☑ plan {d}/{d} · complete", .{ pl.len, pl.len }) catch "☑ plan complete";
