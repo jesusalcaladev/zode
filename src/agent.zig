@@ -2406,7 +2406,7 @@ var uc_roots_n: usize = 0;
 /// Last mtime (ns) of each root directory at scan time; 0 = the directory did
 /// not exist. A missing directory stores 0, so CREATING it later is a non-zero
 /// mtime and invalidates the cache exactly like a new file would.
-var uc_root_mtime_ns: [2]i128 = .{0, 0};
+var uc_root_mtime_ns: [2]i128 = .{ 0, 0 };
 /// A scan has happened at least once. Without it the very first call would
 /// compare against uninitialised roots and could decide "unchanged" over
 /// garbage: an empty list, forever, with no error anywhere.
@@ -3137,13 +3137,13 @@ fn chatWorker(job: *ChatJob) void {
                     break;
                 }
                 if (m.plan_touched_this_turn and !m.plan.isEmpty() and plan_gate_asks < 2) {
-                plan_gate_asks += 1;
-                if (planApprovalNudge(m)) |nudge| {
-                    if (owned) |o| m.allocator.free(o);
-                    owned = nudge;
-                    last_user = nudge;
-                    continue;
-                }
+                    plan_gate_asks += 1;
+                    if (planApprovalNudge(m)) |nudge| {
+                        if (owned) |o| m.allocator.free(o);
+                        owned = nudge;
+                        last_user = nudge;
+                        continue;
+                    }
                 }
             }
             break;
@@ -7589,20 +7589,20 @@ const ModelsJob = struct {
     model: *tui.Model,
     /// false = list in the history (`/models`); otherwise open the picker.
     for_picker: bool = false,
+    request_id: usize = 0,
+    provider_id: []u8,
+    models_url: []u8,
+    key: ?[]u8,
 };
 
 /// `/models`: lists the active provider's models in the history.
 pub fn listModelsAsync(m: *tui.Model) !void {
-    const job = try m.allocator.create(ModelsJob);
-    m.beginWorker();
-    job.* = .{ .model = m, .for_picker = false };
-    m.models_for_picker = false;
-    const th = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
+    const job = try createModelsJob(m, false);
+    spawnModelsJob(m, job) catch |err| {
         m.endWorker();
-        m.allocator.destroy(job);
-        return error.ThreadSpawnFailed;
+        destroyModelsJob(m.allocator, job);
+        return err;
     };
-    th.detach();
 }
 
 /// `/model` and Ctrl+T: the two-column model palette.
@@ -7612,16 +7612,53 @@ pub fn listModelsAsync(m: *tui.Model) !void {
 /// network), and the worker fills it in when it finishes. So there is no blank
 /// wait.
 pub fn pickerModelsAsync(m: *tui.Model) !void {
-    const job = try m.allocator.create(ModelsJob);
-    m.beginWorker();
-    job.* = .{ .model = m, .for_picker = true };
-    m.models_for_picker = true;
-    const th = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
-        m.endWorker();
-        m.allocator.destroy(job);
-        return error.ThreadSpawnFailed;
+    const job = createModelsJob(m, true) catch |err| {
+        const def = activeProviderDef(m.environ);
+        const request_id = m.beginCatalogRequest(def.id);
+        m.setCatalogNotice(request_id, "Could not start model refresh");
+        return err;
     };
-    th.detach();
+    spawnModelsJob(m, job) catch |err| {
+        m.endWorker();
+        m.setCatalogNotice(job.request_id, "Could not start model refresh");
+        destroyModelsJob(m.allocator, job);
+        return err;
+    };
+}
+
+fn createModelsJob(m: *tui.Model, for_picker: bool) !*ModelsJob {
+    const gpa = m.allocator;
+    const def = activeProviderDef(m.environ);
+    const provider_id = try gpa.dupe(u8, def.id);
+    errdefer gpa.free(provider_id);
+    const models_url = try gpa.dupe(u8, def.models_url);
+    errdefer gpa.free(models_url);
+    const key = if (curKey(m)) |value| try gpa.dupe(u8, value) else null;
+    errdefer if (key) |value| gpa.free(value);
+    const job = try gpa.create(ModelsJob);
+    errdefer gpa.destroy(job);
+    job.* = .{
+        .model = m,
+        .for_picker = for_picker,
+        .request_id = if (for_picker) m.beginCatalogRequest(def.id) else 0,
+        .provider_id = provider_id,
+        .models_url = models_url,
+        .key = key,
+    };
+    return job;
+}
+
+fn spawnModelsJob(m: *tui.Model, job: *ModelsJob) !void {
+    m.beginWorker();
+    const thread = std.Thread.spawn(.{}, modelsWorker, .{job}) catch return error.ThreadSpawnFailed;
+    thread.detach();
+}
+
+fn destroyModelsJob(gpa: std.mem.Allocator, job: *ModelsJob) void {
+    gpa.free(job.provider_id);
+    gpa.free(job.models_url);
+    if (job.key) |key| gpa.free(key);
+    gpa.destroy(job);
 }
 
 /// Like `pickerModelsAsync` but with the Ctrl+T key.
@@ -7639,13 +7676,16 @@ pub fn openModelPaletteAsync(m: *tui.Model) void {
 }
 
 fn modelsWorker(job: *ModelsJob) void {
-    defer job.model.allocator.destroy(job);
+    defer destroyModelsJob(job.model.allocator, job);
     const m = job.model;
     const gpa = m.allocator;
     m.beginWorker();
     defer m.endWorker();
-
-    const def = activeProviderDef(m.environ);
+    const is_current = struct {
+        fn check(model: *tui.Model, request: *const ModelsJob) bool {
+            return !request.for_picker or model.catalogRequestCurrent(request.request_id);
+        }
+    }.check;
 
     // ── step 1: the CACHE, before anything touches the network ──
     //
@@ -7660,7 +7700,7 @@ fn modelsWorker(job: *ModelsJob) void {
     {
         var astate = std.heap.ArenaAllocator.init(gpa);
         defer astate.deinit();
-        if (modelcache.read(io_global, m.environ, astate.allocator(), def.id, def.models_url)) |e| {
+        if (modelcache.read(io_global, m.environ, astate.allocator(), job.provider_id, job.models_url)) |e| {
             // `copyOut`, NOT `dupe(Model, ...)`. `Model` is a struct of slices into the
             // cache's arena, so a plain struct copy is a list of pointers into memory
             // that dies at the closing brace of this block. Measured: SIGSEGV, exit
@@ -7670,39 +7710,72 @@ fn modelsWorker(job: *ModelsJob) void {
             from_cache = cached.len > 0;
         }
     }
+    defer if (cached.len > 0) modelcache.freeOut(gpa, cached);
     if (from_cache) {
-        publishModels(m, cached, def.id, .cached);
-        setStatusWithZo(m, .done, "models from cache");
+        publishModels(m, cached, job.provider_id, .cached, job.request_id, job.for_picker);
+        if (is_current(m, job)) {
+            m.setCatalogNotice(job.request_id, "Saved catalog · checking for updates...");
+            if (!job.for_picker) setStatusWithZo(m, .tooling, "refreshing model catalog");
+        }
     } else {
-        setStatusWithZo(m, .tooling, "listing models…");
+        if (is_current(m, job) and !job.for_picker) setStatusWithZo(m, .tooling, "loading model catalog");
     }
 
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
 
-    const key = curKey(m);
-
-    var list = models_mod.listModels(gpa, &http, def.models_url, key) catch |err| {
+    var list = models_mod.listModels(gpa, &http, job.models_url, job.key) catch |err| {
         // With a cache on screen, a failed refresh is a NOTE and not an error: the user
         // is looking at a usable list, and an error line over it invites them to think
         // the list is wrong.
         if (from_cache) {
-            const msg = std.fmt.allocPrint(gpa, "could not refresh the model list ({t}); showing the last one saved", .{err}) catch "could not refresh the model list";
-            pushInfoOwned(m, msg);
+            if (is_current(m, job)) {
+                m.setCatalogNotice(job.request_id, "Offline · showing saved catalog");
+                if (!job.for_picker) setStatusWithZo(m, .warn, "saved model catalog available");
+                if (!job.for_picker) {
+                    m.pushInfoFmt("could not refresh {s}'s model catalog ({t}); keeping saved models", .{ job.provider_id, err });
+                }
+            }
             return;
         }
+        if (!is_current(m, job)) return;
         if (err == error.HttpError) {
-            m.pushInfoFmt("models: HTTP error at {s}", .{def.models_url});
+            if (!job.for_picker) m.pushInfoFmt("models: HTTP error at {s}", .{job.models_url});
         } else {
-            const msg = std.fmt.allocPrint(gpa, "models: {t}", .{err}) catch "models error";
-            pushInfoOwned(m, msg);
+            if (!job.for_picker) {
+                const msg = std.fmt.allocPrint(gpa, "models: {t}", .{err}) catch "models error";
+                pushInfoOwned(m, msg);
+            }
         }
-        setStatusWithZo(m, .warn, "no models");
+        if (is_current(m, job)) {
+            m.setCatalogNotice(job.request_id, "Could not load models · retry with /model");
+            if (!job.for_picker) setStatusWithZo(m, .warn, "model catalog unavailable");
+        }
         return;
     };
 
     defer list.deinit(gpa);
 
+    if (list.items.len == 0) {
+        if (is_current(m, job)) {
+            const note: []const u8 = if (from_cache)
+                "Provider returned no models · kept saved catalog"
+            else
+                "Provider returned no models";
+            m.setCatalogNotice(job.request_id, note);
+            if (!job.for_picker) {
+                setStatusWithZo(m, .warn, "provider returned no models");
+                if (from_cache) {
+                    m.pushInfoFmt("{s} returned an empty model catalog; keeping the saved list", .{job.provider_id});
+                } else {
+                    m.pushInfoFmt("{s} returned an empty model catalog", .{job.provider_id});
+                }
+            }
+        }
+        return;
+    }
+
+    var catalog_changed = !from_cache;
     // ── step 2: what CHANGED ──
     //
     // Only when there was a cache. `describe` returns EMPTY when nothing moved, and the
@@ -7714,17 +7787,27 @@ fn modelsWorker(job: *ModelsJob) void {
         defer astate.deinit();
         const arena = astate.allocator();
         const d = modelcache.diff(cached, list.items);
+        catalog_changed = d.added > 0 or d.removed > 0 or d.changed > 0;
         const line = modelcache.describe(arena, d);
-        if (line.len > 0) pushInfoOwned(m, gpa.dupe(u8, line) catch line);
-        modelcache.freeOut(gpa, cached);
+        if (line.len > 0 and is_current(m, job)) pushInfoOwned(m, gpa.dupe(u8, line) catch line);
     }
 
     // Written AFTER the diff and not before: a cache that was just refreshed with the
     // list in hand and still compares as "changed" is a cache that never converges.
-    modelcache.write(io_global, m.environ, def.id, def.models_url, list.items);
+    modelcache.write(io_global, m.environ, job.provider_id, job.models_url, list.items);
 
-    publishModels(m, list.items, def.id, .fresh);
-    setStatusWithZo(m, .done, "models ready");
+    publishModels(m, list.items, job.provider_id, .fresh, job.request_id, job.for_picker);
+    if (is_current(m, job)) {
+        const notice = std.fmt.allocPrint(
+            gpa,
+            "{s} · {d} models",
+            .{ if (catalog_changed) "Catalog updated" else "Catalog up to date", list.items.len },
+        ) catch "Model catalog refreshed";
+        m.setCatalogNotice(job.request_id, notice);
+        if (!job.for_picker) {
+            setStatusWithZo(m, .done, if (catalog_changed) "model catalog updated" else "model catalog current");
+        }
+    }
 }
 
 const ModelSource = enum { cached, fresh };
@@ -7735,7 +7818,14 @@ const ModelSource = enum { cached, fresh };
 /// One function because there were two copies of the "free first, then alphabetical"
 /// ordering and a cache makes it a third call site; three copies of an ordering is how
 /// the picker and `/models` end up disagreeing about which models exist.
-fn publishModels(m: *tui.Model, models: []const models_mod.Model, provider_id: []const u8, source: ModelSource) void {
+fn publishModels(
+    m: *tui.Model,
+    models: []const models_mod.Model,
+    provider_id: []const u8,
+    source: ModelSource,
+    request_id: usize,
+    for_picker: bool,
+) void {
     const gpa = m.allocator;
     const sorted = gpa.dupe(models_mod.Model, models) catch return;
     defer gpa.free(sorted);
@@ -7743,13 +7833,13 @@ fn publishModels(m: *tui.Model, models: []const models_mod.Model, provider_id: [
     // alphabetical within each group so the list is stable between runs.
     std.mem.sort(models_mod.Model, sorted, {}, freeFirst);
 
-    if (m.models_for_picker) {
+    if (for_picker) {
         // The palette is NOT touched here: this is the worker's thread and the UI thread
         // draws it without a lock, and that was a segfault. ITEMS already built with
         // their own strings are handed over: handing over the `Model`s and freeing the
         // list on exit left the ids dangling and the drawing blew up.
         const items = buildModelItems(m, sorted);
-        if (items) |it| m.setPendingItems(it);
+        if (items) |it| m.setPendingCatalogItems(request_id, it);
         return;
     }
     for (sorted) |info| {
@@ -7793,7 +7883,9 @@ fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
 /// are own copies from the model's allocator.
 fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
     const gpa = m.allocator;
-    const defs = allProviders(gpa);
+    var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer defs_arena_state.deinit();
+    const defs = allProviders(defs_arena_state.allocator());
     const n = defs.len + 1 + list.len; // +1 = "+ connect"
     const items = gpa.alloc(palette.Item, n) catch return null;
     var i: usize = 0;
@@ -7841,6 +7933,7 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     // that as soon as one of them is not updated, loose literals show up (which
     // `freeItems` cannot free) and the app crashes on exit.
     const items = buildModelItems(m, list) orelse return;
+    if (m.pal.mode == .models) m.invalidateCatalogRequest();
     // The mode goes BEFORE `setItemsOwned`: `resetSelection` computes the active
     // column from the mode. With the old mode, opening the model palette left
     // the PROVIDERS column active, the arrows did not move the model list and
@@ -7861,7 +7954,9 @@ pub const model_groups = [_]palette.Group{
 /// `/provider`: picker with all the providers and their key state.
 fn openProviderPicker(m: *tui.Model) void {
     const gpa = m.allocator;
-    const defs = allProviders(gpa);
+    var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer defs_arena_state.deinit();
+    const defs = allProviders(defs_arena_state.allocator());
     const items = gpa.alloc(tui.PickerItem, defs.len) catch return;
     for (defs, 0..) |*d, i| {
         const has_key = providers.hasKey(d, m.environ);
@@ -7979,7 +8074,9 @@ fn cmdGroup(key: []const u8) u8 {
 /// without having to go through the left column of the model palette.
 pub fn openConnectPalette(m: *tui.Model) void {
     const gpa = m.allocator;
-    const defs = allProviders(gpa);
+    var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer defs_arena_state.deinit();
+    const defs = allProviders(defs_arena_state.allocator());
     const items = gpa.alloc(palette.Item, defs.len) catch return;
     for (defs, 0..) |*d, i| {
         const active = std.mem.eql(u8, d.id, cur_provider_id);
@@ -7991,6 +8088,7 @@ pub fn openConnectPalette(m: *tui.Model) void {
             .hint = gpa.dupe(u8, if (active) "active" else if (has_key) "key ok" else "no key") catch "",
         };
     }
+    if (m.pal.mode == .models) m.invalidateCatalogRequest();
     m.pal.mode = .connect;
     m.pal.active = true;
     m.pal.query_len = 0;
@@ -8044,6 +8142,7 @@ pub fn openCommandPalette(m: *tui.Model) void {
     // Stable order by group: otherwise the headers repeat and the list jumps from
     // "Model" to "Session" and back to "Suggested".
     std.mem.sort(palette.Item, items, {}, byGroupThenName);
+    if (m.pal.mode == .models) m.invalidateCatalogRequest();
     m.pal.mode = .commands;
     m.pal.active = true;
     m.pal.query_len = 0;
