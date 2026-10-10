@@ -497,6 +497,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
     .{ .key = "/submodel", .desc = "which model the SUBAGENTS use (no args: report | <model> | <provider> <model> | off)" },
+    .{ .key = "/task-parallel", .desc = "simultaneous subagent limit: 1..8 | auto", .key_hint = "1..8 | auto" },
     .{ .key = "/reload-cmds", .desc = "reload user commands from disk" },
     .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name" },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },

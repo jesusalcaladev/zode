@@ -175,6 +175,10 @@ pub const tool_routing_prompt =
     \\   files to answer one question) goes to the `task` subagent, not to a
     \\   dozen reads in your own context. A subagent pays for those tokens once,
     \\   in a window that is thrown away, and hands you back a paragraph.
+    \\   For a substantial request with several independent unknowns, send 2–4
+    \\   distinct, consecutive `task` calls in the SAME response so they run
+    \\   together; use
+    \\   one for a focused question, never duplicate tracks or split only by file.
     \\ - A skill exists for something non-obvious and you have been told about it:
     \\   load it with `skill` before improvising. The body is not in your context
     \\   on purpose — that is the whole point of loading it on demand.

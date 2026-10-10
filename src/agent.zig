@@ -818,6 +818,33 @@ fn cmdBench(m: *tui.Model) void {
     }
 }
 
+/// `/task-parallel [1..8|auto]`: tune simultaneous subagent requests for this
+/// session. `auto` returns to the environment/default value.
+fn cmdTaskParallel(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |raw| {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(value, "auto")) {
+            m.setTaskParallelLimit(0);
+        } else {
+            const parsed = std.fmt.parseInt(u8, value, 10) catch {
+                m.pushInfo("usage: /task-parallel [1..8|auto]");
+                return;
+            };
+            if (parsed < 1 or parsed > 8) {
+                m.pushInfo("usage: /task-parallel [1..8|auto]");
+                return;
+            }
+            m.setTaskParallelLimit(parsed);
+        }
+    }
+    const override = m.taskParallelLimit();
+    const effective = if (override > 0) override else taskParallelLimit(m);
+    m.pushInfoFmt(
+        "subagent parallelism: {d} at a time{s}",
+        .{ effective, if (override > 0) " (session override)" else " (auto: ZODE_TASK_PARALLEL or default)" },
+    );
+}
+
 /// `/skills`: what is loadable, and from where.
 fn cmdSkills(m: *tui.Model) void {
     const entries = discoverSkills(m.allocator, m.environ);
@@ -2255,6 +2282,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdEffort(m, arg);
     } else if (std.mem.eql(u8, cmd, "submodel")) {
         cmdSubmodel(m, arg);
+    } else if (std.mem.eql(u8, cmd, "task-parallel")) {
+        cmdTaskParallel(m, arg);
     } else if (std.mem.eql(u8, cmd, "use")) {
         commands_mod.cmdUse(m, arg);
     } else if (std.mem.eql(u8, cmd, "plan")) {
@@ -5559,7 +5588,10 @@ pub const default_task_parallel: usize = 3;
 /// through three backoffs that the other two are also sitting in.
 pub const subagent_retry_attempts: usize = 2;
 
-fn taskParallelLimit(env: ?*const std.process.Environ.Map) usize {
+fn taskParallelLimit(m: *tui.Model) usize {
+    const override = m.taskParallelLimit();
+    if (override > 0) return override;
+    const env = m.environ;
     const v = envGet(env, "ZODE_TASK_PARALLEL") orelse return default_task_parallel;
     const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return default_task_parallel;
     return @max(1, @min(n, 8));
@@ -5585,12 +5617,7 @@ fn runTaskBatch(
     arena: std.mem.Allocator,
 ) struct { ok: usize, denied: usize } {
     const n = to - from;
-    const limit = taskParallelLimit(m.environ);
-
-    for (t.calls.items[from..to]) |call| {
-        const arg = toolArgSummary(call.name, call.args_json, arena);
-        m.pushToolStart(call.name, arg);
-    }
+    const limit = taskParallelLimit(m);
     var lbl: [96]u8 = undefined;
     const label = if (n == 1)
         std.fmt.bufPrint(&lbl, "1 search in a subagent", .{}) catch "searching"
@@ -5604,7 +5631,7 @@ fn runTaskBatch(
         text: []const u8 = "",
         err: bool = false,
     };
-    var results = arena.alloc(Job, n) catch {
+    const results = arena.alloc(Job, n) catch {
         // No memory for the slots: serial, which is slow but correct.
         var ok: usize = 0;
         for (t.calls.items[from..to]) |call| ok += taskCall(m, s, call, arena);
@@ -5616,24 +5643,31 @@ fn runTaskBatch(
         call: TurnCtx.Call,
         out: *Job,
         m: *tui.Model,
-        pending: *std.atomic.Value(usize),
         task: subagent_mod.Task,
-        ok_slot: *std.atomic.Value(usize),
+        wave_running: ?*std.atomic.Value(usize) = null,
     };
-    var ctxs = arena.alloc(Ctx, n) catch return .{ .ok = 0, .denied = 0 };
-    var pending = std.atomic.Value(usize).init(0);
-    var done_count = std.atomic.Value(usize).init(0);
+    const ctxs = arena.alloc(Ctx, n) catch {
+        var ok: usize = 0;
+        for (t.calls.items[from..to]) |call| ok += taskCall(m, s, call, arena);
+        return .{ .ok = ok, .denied = 0 };
+    };
     var malformed: usize = 0;
+    for (t.calls.items[from..to]) |call| {
+        const arg = toolArgSummary(call.name, call.args_json, arena);
+        m.pushToolStart(call.name, arg);
+    }
+    m.beginTaskBatch(n);
+    defer m.endTaskBatch();
     for (t.calls.items[from..to], 0..) |call, k| {
         // Parsed HERE, on the turn thread, so a malformed task does not need a
         // thread and its message is not reordered by the race below.
         const parsed = subagent_mod.parseTask(arena, call.args_json) catch {
             malformed += 1;
-            ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending, .task = .{ .description = "" }, .ok_slot = &done_count };
+            ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .task = .{ .description = "" } };
+            m.taskBatchFinished();
             continue;
         };
-        ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending, .task = parsed, .ok_slot = &done_count };
-        _ = pending.fetchAdd(1, .seq_cst);
+        ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .task = parsed };
     }
 
     const Runner = struct {
@@ -5642,12 +5676,17 @@ fn runTaskBatch(
             // the `Io` they are using (the detached-worker trap).
             ctx.m.beginWorker();
             defer ctx.m.endWorker();
-            defer _ = ctx.pending.fetchSub(1, .seq_cst);
+            const wave_running = ctx.wave_running;
+            defer if (wave_running) |running| {
+                _ = running.fetchSub(1, .seq_cst);
+            };
+            ctx.m.taskBatchStarted();
+            defer ctx.m.taskBatchFinished();
             if (ctx.task.description.len == 0) {
                 ctx.out.err = true;
                 return;
             }
-            _ = ctx.ok_slot.fetchAdd(1, .seq_cst);
+            _ = ctx.m.bench.subagents.fetchAdd(1, .seq_cst);
             // Each one has its OWN Report (a fixed 8 KB buffer) and its own
             // arena: sharing either between two threads is a silent data race.
             var rep = subagent_mod.Report{};
@@ -5658,8 +5697,8 @@ fn runTaskBatch(
         }
     };
 
-    // `limit` at a time: the semaphore is the pending counter itself, and the
-    // threads are spawned in waves so at most `limit` are ever in flight.
+    // Spawn fixed-size waves so at most `limit` threads are in flight. Each wave
+    // has a local completion counter; no global worker count is used as a semaphore.
     var spawned: usize = 0;
     while (spawned < n) {
         const wave = @min(limit, n - spawned);
@@ -5668,6 +5707,7 @@ fn runTaskBatch(
         while (k < wave) : (k += 1) {
             const idx = spawned + k;
             if (ctxs[idx].task.description.len == 0) continue; // malformed: no thread
+            ctxs[idx].wave_running = &running;
             _ = running.fetchAdd(1, .seq_cst);
             const th = std.Thread.spawn(.{}, Runner.run, .{&ctxs[idx]}) catch {
                 Runner.run(&ctxs[idx]);
@@ -5701,7 +5741,12 @@ fn runTaskBatch(
         m.pushToolDone(call.name, "report", 0, r.text);
         s.appendToolResult(call.id, call.name, r.text) catch {};
     }
-    m.pushInfoFmt("{d} subagent{s} in parallel", .{ ok, if (ok == 1) "" else "s" });
+    m.pushInfoFmt("{d}/{d} subagent{s} completed (parallel limit {d})", .{
+        ok,
+        n - malformed,
+        if (ok == 1) "" else "s",
+        limit,
+    });
     return .{ .ok = ok, .denied = 0 };
 }
 
@@ -7923,7 +7968,7 @@ fn cmdGroup(key: []const u8) u8 {
     if (std.mem.eql(u8, k, "model") or std.mem.eql(u8, k, "models") or
         std.mem.eql(u8, k, "provider") or std.mem.eql(u8, k, "providers") or
         std.mem.eql(u8, k, "use") or std.mem.eql(u8, k, "effort") or
-        std.mem.eql(u8, k, "submodel")) return 4;
+        std.mem.eql(u8, k, "submodel") or std.mem.eql(u8, k, "task-parallel")) return 4;
     return 5;
 }
 
@@ -9667,11 +9712,44 @@ test "subagents: consecutive task calls form ONE batch (that is what parallelize
     try std.testing.expect(default_task_parallel >= 1 and default_task_parallel <= 8);
 }
 
+test "subagents: session parallel limit overrides auto and can return to auto" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), m.taskParallelLimit());
+    try std.testing.expectEqual(@as(usize, default_task_parallel), taskParallelLimit(&m));
+    m.setTaskParallelLimit(6);
+    try std.testing.expectEqual(@as(u8, 6), m.taskParallelLimit());
+    try std.testing.expectEqual(@as(usize, 6), taskParallelLimit(&m));
+    m.setTaskParallelLimit(0);
+    try std.testing.expectEqual(@as(usize, default_task_parallel), taskParallelLimit(&m));
+}
+
+test "/task-parallel is wired through submit and rejects invalid limits" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try submit(&m, "/task-parallel 6");
+    try std.testing.expectEqual(@as(u8, 6), m.taskParallelLimit());
+    try std.testing.expect(pendingContains(&m, "6 at a time"));
+
+    try submit(&m, "/task-parallel 9");
+    try std.testing.expectEqual(@as(u8, 6), m.taskParallelLimit());
+    try std.testing.expect(pendingContains(&m, "usage: /task-parallel"));
+
+    try submit(&m, "/task-parallel auto");
+    try std.testing.expectEqual(@as(u8, 0), m.taskParallelLimit());
+    try std.testing.expectEqual(@as(u8, 4), cmdGroupPublic("/task-parallel"));
+}
+
 test "subagents: the model is told it can send several at once" {
     // If the description does not say it, the model keeps sending one per
     // message and the parallelism never happens: the capability has to be
     // visible in the schema to be used.
-    try std.testing.expect(std.mem.indexOf(u8, tools_mod.toolsJson(), "run at the same time") != null);
+    const schema = tools_mod.toolsJson();
+    try std.testing.expect(std.mem.indexOf(u8, schema, "SAME message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "live completion progress") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "/task-parallel") != null);
 }
 
 test "setModelCtx RESETS the window when a change carries none" {

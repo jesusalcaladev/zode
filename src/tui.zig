@@ -583,6 +583,15 @@ pub const Model = struct {
     plan_write_blocked_this_turn: bool = false,
     plan_missing_nudges_this_turn: u8 = 0,
 
+    /// Parallel subagent limit for this session. Zero follows ZODE_TASK_PARALLEL
+    /// or the compiled default.
+    task_parallel_override: u8 = 0,
+
+    /// Live progress for one `task` batch. All fields are protected by `lock`.
+    task_batch_total: usize = 0,
+    task_batch_completed: usize = 0,
+    task_batch_running: usize = 0,
+
     /// The file snapshots per turn, for `/undo`. It is the only thing that
     /// survives from one turn to the next (the worker's arena does not), which
     /// is why the stack carries its own allocator.
@@ -2479,7 +2488,60 @@ pub const Model = struct {
     /// half-minute `bash` was left with no spinner, no clock and the strip
     /// saying "queued" — which is exactly the feeling of a hung app.
     fn workingLocked(self: *const Model) bool {
-        return self.busy or self.streaming or self.tool_run != null;
+        return self.busy or self.streaming or self.tool_run != null or self.task_batch_total > 0;
+    }
+
+    pub fn taskParallelLimit(self: *Model) u8 {
+        self.lock();
+        defer self.unlock();
+        return self.task_parallel_override;
+    }
+
+    pub fn setTaskParallelLimit(self: *Model, limit: u8) void {
+        self.lock();
+        self.task_parallel_override = if (limit == 0) 0 else @min(limit, 8);
+        self.dirty = true;
+        self.unlock();
+        self.requestRedraw();
+    }
+
+    pub fn beginTaskBatch(self: *Model, total: usize) void {
+        self.lock();
+        self.task_batch_total = total;
+        self.task_batch_completed = 0;
+        self.task_batch_running = 0;
+        self.dirty = true;
+        self.unlock();
+        self.requestRedraw();
+    }
+
+    pub fn taskBatchStarted(self: *Model) void {
+        self.lock();
+        if (self.task_batch_total > 0) self.task_batch_running += 1;
+        self.dirty = true;
+        self.unlock();
+        self.requestRedraw();
+    }
+
+    pub fn taskBatchFinished(self: *Model) void {
+        self.lock();
+        if (self.task_batch_total > 0) {
+            self.task_batch_running -|= 1;
+            self.task_batch_completed = @min(self.task_batch_completed + 1, self.task_batch_total);
+        }
+        self.dirty = true;
+        self.unlock();
+        self.requestRedraw();
+    }
+
+    pub fn endTaskBatch(self: *Model) void {
+        self.lock();
+        self.task_batch_total = 0;
+        self.task_batch_completed = 0;
+        self.task_batch_running = 0;
+        self.dirty = true;
+        self.unlock();
+        self.requestRedraw();
     }
 
     /// `workingLocked` for callers outside this file, and NOT renamed: the "locked"
@@ -3308,7 +3370,17 @@ pub const Model = struct {
     /// `streaming` lives here and is not read bare in draw: the worker writes
     /// it from another thread, and a `bool` read unsynchronized on every frame
     /// is a data race (benign, but for free hard to debug).
-    pub const Activity = struct { busy: bool, dirty: bool, perm: bool, ask: bool, picker: bool, streaming: bool };
+    pub const Activity = struct {
+        busy: bool,
+        dirty: bool,
+        perm: bool,
+        ask: bool,
+        picker: bool,
+        streaming: bool,
+        subagent_total: usize,
+        subagent_completed: usize,
+        subagent_running: usize,
+    };
 
     fn activity(self: *Model) Activity {
         self.lock();
@@ -3328,6 +3400,9 @@ pub const Model = struct {
             },
             .picker = self.picker_active,
             .streaming = self.streaming,
+            .subagent_total = self.task_batch_total,
+            .subagent_completed = self.task_batch_completed,
+            .subagent_running = self.task_batch_running,
         };
     }
 
@@ -5248,7 +5323,7 @@ fn drawAskPanel(
     snap: AskSnapshot,
     waited_ms: u64,
 ) void {
-    if (width < 24 or height == 0) return;
+    if (width < 6 or height == 0) return;
 
     // The panel is ONE widget: the question and the options are in the same box,
     // which is what makes it impossible for one to erase the other. It used to be
@@ -5282,18 +5357,56 @@ fn drawAskPanel(
     // `height` is the history area, not the terminal: the answer editor and
     // status bar remain visible below the panel while the user types.
     const box_h: u16 = @min(want_h, height);
-    if (height < 8) {
-        _ = p.putClipped(1, 0, snap.question, width - 2, theme.warn_bold);
-        if (height > 1 and choice_rows > 0) {
-            var selected: [256]u8 = undefined;
-            const idx = @min(snap.sel, snap.options.len);
-            const label = if (idx == snap.options.len) ask_other_label else snap.options[idx];
-            const line = std.fmt.bufPrint(&selected, "▸ {d} {s}", .{ idx + 1, label }) catch "▸ choice";
-            _ = p.putClipped(1, 1, line, width - 2, theme.selected);
+    if (height < 8 or width < 24) {
+        const compact_rows = @min(height, 7);
+        var fill_row: u16 = 0;
+        while (fill_row < compact_rows) : (fill_row += 1) {
+            p.fillRange(0, width, fill_row, " ", theme.code_bg);
         }
-        if (height > 2) {
-            const hint = if (choice_rows > 0) "↑↓ choose · enter · esc" else "answer below · esc to decide";
-            _ = p.putClipped(1, 2, hint, width - 2, theme.hint);
+        var compact_row: u16 = 0;
+        const compact_w = width - 2;
+        if (has_header and compact_row < compact_rows) {
+            _ = p.putClipped(1, compact_row, askLineForWidth(p, snap.header, compact_w, p.arena), compact_w, theme.hint);
+            compact_row += 1;
+        }
+
+        const compact_question = wrapTextToRows(p, snap.question, compact_w, p.arena);
+        const reserved: u16 = if (compact_rows > 1) (if (choice_rows > 0) 2 else 1) else 0;
+        const question_room = compact_rows -| compact_row -| reserved;
+        const needs_more = compact_question.len > question_room;
+        const q_count = if (needs_more and question_room > 0)
+            @min(compact_question.len, question_room - 1)
+        else
+            @min(compact_question.len, question_room);
+        var q_i: usize = 0;
+        while (q_i < q_count and compact_row < compact_rows) : (q_i += 1) {
+            _ = p.putClipped(1, compact_row, compact_question[q_i], compact_w, theme.warn_bold);
+            compact_row += 1;
+        }
+        if (needs_more and compact_row < compact_rows and question_room > 0) {
+            _ = p.putClipped(1, compact_row, "…", compact_w, theme.hint);
+            compact_row += 1;
+        }
+        if (choice_rows > 0 and compact_row < compact_rows) {
+            const idx = @min(snap.sel, snap.options.len);
+            const raw_label = if (idx == snap.options.len) ask_other_label else snap.options[idx];
+            const option = normalizeAskOption(p.arena, raw_label);
+            var marker: [16]u8 = undefined;
+            const prefix = std.fmt.bufPrint(&marker, "▸ {d} ", .{idx + 1}) catch "▸ ";
+            const used = p.putClipped(1, compact_row, prefix, compact_w, theme.selected);
+            const marker_cols = used - 1;
+            const label = askLineForWidth(p, option, compact_w -| marker_cols, p.arena);
+            _ = p.putClipped(used, compact_row, label, compact_w -| marker_cols, theme.selected);
+            compact_row += 1;
+        }
+        if (compact_row < compact_rows) {
+            const hint: []const u8 = if (choice_rows > 0)
+                "↑↓ choose · enter · esc"
+            else if (snap.typing)
+                "enter sends · esc: decide"
+            else
+                "answer below · esc: decide";
+            _ = p.putClipped(1, compact_row, askLineForWidth(p, hint, compact_w, p.arena), compact_w, theme.hint);
         }
         return;
     }
@@ -5380,12 +5493,13 @@ fn drawAskPanel(
             else
                 std.fmt.bufPrint(&marker, "  {d} ", .{i + 1}) catch "  ";
             const used = p.putClipped(inner_col, row, mk, inner_w, style);
-            const label = if (is_other) ask_other_label else snap.options[i];
             const marker_cols = used - inner_col;
             const tag_text = if (i == 0 and !is_other) " · recommended" else "";
             const tag_cols: u16 = @intCast(columnsOf(p, tag_text));
             const keep_tag = tag_text.len > 0 and inner_w > marker_cols + tag_cols + 8;
             const label_cols = inner_w - marker_cols - (if (keep_tag) tag_cols else 0);
+            const raw_label = if (is_other) ask_other_label else snap.options[i];
+            const label = askLineForWidth(p, normalizeAskOption(p.arena, raw_label), label_cols, p.arena);
             const after = p.putClipped(used, row, label, label_cols, style);
             // The recommendation is STATED, not implied by being first: the
             // guidance tells the model to put its own pick first, so row 1 is
@@ -5436,6 +5550,47 @@ fn columnsOf(p: *const Painter, text: []const u8) usize {
     var it = vaxis.unicode.graphemeIterator(text);
     while (it.next()) |g| n += p.measure(g.bytes(text));
     return n;
+}
+
+fn normalizeAskOption(arena: std.mem.Allocator, text: []const u8) []const u8 {
+    const out = arena.alloc(u8, text.len) catch return text;
+    var n: usize = 0;
+    var pending_space = false;
+    for (text) |byte| {
+        if (byte < 0x20 or byte == 0x7f) {
+            pending_space = n > 0;
+            continue;
+        }
+        if (pending_space) {
+            out[n] = ' ';
+            n += 1;
+            pending_space = false;
+        }
+        out[n] = byte;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// Keeps a menu choice on one visual row and makes truncation explicit.
+fn askLineForWidth(p: *const Painter, text: []const u8, width: u16, arena: std.mem.Allocator) []const u8 {
+    if (columnsOf(p, text) <= width or width == 0) return text;
+    const ellipsis = "…";
+    const ellipsis_width = p.measure(ellipsis);
+    if (ellipsis_width > width) return "";
+    const max_text_width = width - ellipsis_width;
+    var out: std.ArrayList(u8) = .empty;
+    var used: u16 = 0;
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| {
+        const bytes = g.bytes(text);
+        const w = p.measure(bytes);
+        if (w > max_text_width -| used) break;
+        out.appendSlice(arena, bytes) catch return text;
+        used += w;
+    }
+    out.appendSlice(arena, ellipsis) catch return text;
+    return out.items;
 }
 
 /// Rows a text takes at `width` columns, as slices into `text`.
@@ -5569,10 +5724,21 @@ fn drawActivityStrip(
     var tr_name_buf: [64]u8 = undefined;
     const running_tool_name = self.toolRunName(&tr_name_buf);
     const running_tool = running_tool_name != null;
+    var task_label_buf: [96]u8 = undefined;
+    const task_label = if (act.subagent_total > 0)
+        std.fmt.bufPrint(
+            &task_label_buf,
+            "subagents {d}/{d} done · {d} active",
+            .{ act.subagent_completed, act.subagent_total, act.subagent_running },
+        ) catch "subagents working"
+    else
+        "";
     const label: []const u8 = if (act.ask)
         "waiting for your answer"
     else if (act.perm)
         "waiting for your permission"
+    else if (act.subagent_total > 0)
+        task_label
     else if (running_tool)
         "running"
     else if (act.streaming)
@@ -5581,8 +5747,8 @@ fn drawActivityStrip(
         "thinking"
     else
         "queued";
-    _ = p.putText(col, row, label, theme.brand_bold);
-    col += @as(u16, @intCast(label.len)) + 1;
+    col = p.putClipped(col, row, label, width -| col, theme.brand_bold);
+    col += 1;
 
     // What it is doing, when it is a tool. A bare "thinking" with a 30s `bash`
     // does not say whether it is working or hung; the tool's NAME and its clock
@@ -6975,6 +7141,7 @@ test "activity strip: the label is the phase" {
         const s = try drawTest(&m, arena_state.allocator(), 90, 24);
         try std.testing.expect(std.mem.indexOf(u8, allText(s), "thinking") != null);
     }
+
     // 2) writing: stream open.
     {
         var m = Model.init(std.testing.allocator);
@@ -7002,6 +7169,25 @@ test "activity strip: the label is the phase" {
         const s = try drawTest(&m, arena_state.allocator(), 90, 24);
         try std.testing.expect(std.mem.indexOf(u8, allText(s), "waiting for your permission") != null);
     }
+}
+
+test "activity strip: parallel subagents show live completion and active counts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.beginTaskBatch(7);
+    m.taskBatchStarted();
+    m.taskBatchStarted();
+    m.taskBatchFinished();
+    const s = try drawTest(&m, arena_state.allocator(), 100, 24);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "subagents 1/7 done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "1 active") != null);
+
+    m.endTaskBatch();
+    try std.testing.expectEqual(@as(usize, 0), m.activity().subagent_total);
 }
 
 test "activity strip: asks for permission when it is due" {
@@ -8824,6 +9010,49 @@ test "ask: the options are painted INSIDE the panel, numbered, and the selection
     try std.testing.expect(findRow(s, "recommended") != null);
     // ...and the highlighted row says so with a marker, not only with a colour.
     try std.testing.expect(findRow(s, "▸ 1 postgres") != null);
+}
+
+test "ask: option text stays on one row and clipped choices show an ellipsis" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const long_option = "this option is intentionally much longer than the width available inside the ask panel and must be visibly shortened";
+    const options = [_][]const u8{ "first choice\nsecond line", long_option };
+    try openAskForTest(&m, "Choose one approach", "design", &options);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const s = try drawTest(&m, arena_state.allocator(), 90, 26);
+
+    const normalized_row = findRow(s, "first choice second line") orelse return error.TestUnexpectedResult;
+    var line_buf: [256]u8 = undefined;
+    const normalized_line = rowText(s, normalized_row, &line_buf);
+    try std.testing.expect(std.mem.indexOf(u8, normalized_line, "│") != null);
+
+    const clipped_row = findRow(s, "this option is intentionally") orelse return error.TestUnexpectedResult;
+    const clipped_line = rowText(s, clipped_row, &line_buf);
+    const left_bar = std.mem.indexOf(u8, clipped_line, "│") orelse return error.TestUnexpectedResult;
+    const right_bar = std.mem.lastIndexOf(u8, clipped_line, "│") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(right_bar > left_bar);
+    try std.testing.expect(std.mem.indexOf(u8, clipped_line[left_bar..right_bar], "…") != null);
+}
+
+test "ask: narrow and short layouts keep the question visible in the compact panel" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const options = [_][]const u8{"recommended option"};
+    try openAskForTest(&m, "Which approach should we take?", "design", &options);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const narrow = try drawTest(&m, arena_state.allocator(), 20, 18);
+    try std.testing.expect(std.mem.indexOf(u8, allText(narrow), "Which approach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allText(narrow), "▸ 1") != null);
+
+    var small_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer small_arena.deinit();
+    const short = try drawTest(&m, small_arena.allocator(), 80, 13);
+    try std.testing.expect(std.mem.indexOf(u8, allText(short), "Which approach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allText(short), "▸ 1 recommended") != null);
 }
 
 test "ask: the option list lives in the panel box, so it cannot be painted over it" {
