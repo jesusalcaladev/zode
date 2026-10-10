@@ -4895,21 +4895,10 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // why the app had stopped.
     const act_rows: u16 = if (act.busy or queued > 0 or act.ask) 1 else 0;
 
-    // The plan (the `todo` tool): one checkbox per step, above the activity
-    // strip. It only takes rows if there is a plan, and at most
-    // `plan_max_rows`: a 20-step plan cannot eat the history.
+    // The plan is a one-line summary. Its full checklist is already in the
+    // conversation; repeating it here crowds out both history and the input.
     const pl_now = self.planCopy();
-    // A FINISHED plan takes ONE row, not one per step. `drawPlanBlock` returns
-    // after a single `☑ all N steps done` line, so reserving N rows left the
-    // ghosts of the checkbox rows underneath it, forever: they sit below
-    // `history_h`, so the history clear loop never touched them, and they stayed
-    // until the plan was cleared or replaced.
-    const plan_rows: u16 = if (pl_now.isEmpty())
-        0
-    else if (pl_now.allDone())
-        1
-    else
-        @min(@as(u16, pl_now.len), plan_max_rows);
+    const plan_rows: u16 = if (pl_now.isEmpty()) 0 else 1;
 
     // Autocompletion popup: only if there are matches.
     const ac_rows: u16 = if (self.ac.active and matchCount(self) > 0)
@@ -5194,7 +5183,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // The activity strip is the one "is it working?" indicator: face, phase
     // and elapsed time live together instead of being repeated in the status.
     if (plan_rows > 0) {
-        drawPlanBlock(&p, input_top - plan_rows, width, plan_rows, pl_now);
+        drawPlanBlock(&p, input_top - plan_rows, width, pl_now);
     }
     if (act_rows == 1 and input_top > act_rows + plan_rows) {
         drawActivityStrip(&p, input_top - act_rows - plan_rows - 1, width, self, act, queued);
@@ -5323,7 +5312,7 @@ fn drawInput(
         const ph: []const u8 = if (self.askActive())
             "your answer\u{2026} \u{b7} enter sends it \u{b7} esc: you decide"
         else
-            "Ask anything\u{2026} \u{b7} / for commands \u{b7} ctrl+c to exit";
+            "Ask anything\u{2026} \u{b7} / commands";
         _ = p.putClipped(4, top + 1, ph, ed_w - 2, theme.placeholder);
     }
 
@@ -5551,79 +5540,29 @@ fn drawPermissionModal(
 ///
 /// When there is a queue the queued prompts are shown too, so you know what is
 /// coming next instead of having to remember it.
-/// How many plan steps are painted at most.
-///
-/// With 20 rows the plan eats the whole history, which is exactly what a plan
-/// must NOT do (the history is the conversation). Six is a number thought for a
-/// normal terminal: you see the beginning and the state, and the rest follows
-/// from the "2/8" of the status bar.
-pub const plan_max_rows: u16 = 6;
-
-/// The plan block: one checkbox per step, with the step in progress highlighted.
-///
-/// Why it is ON SCREEN and not only in the history: the question "how much is
-/// left?" has to be answerable without Ask Mode, and the history means
-/// scrolling. And the step in progress goes in the brand color because it is the
-/// only information that changes from frame to frame.
-///
-/// When everything is done it draws ONE line ("all N steps done") instead of N
-/// checkboxes: a finished plan does not need to be on screen, and leaving it
-/// there pushes the input up for no reason.
-fn drawPlanBlock(
-    p: *Painter,
-    top: u16,
-    width: u16,
-    rows: u16,
-    pl: plan_mod.Plan,
-) void {
+/// A compact plan summary: progress and the active step, without repeating the
+/// full checklist already present in the conversation.
+fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
+    p.fillRow(top, " ", .{});
     if (pl.allDone()) {
-        p.fillRow(top, " ", .{});
         var buf: [64]u8 = undefined;
-        const txt = std.fmt.bufPrint(&buf, "☑ all {d} steps done", .{pl.len}) catch "☑ done";
-        _ = p.putText(1, top, txt, theme.ok);
+        const txt = std.fmt.bufPrint(&buf, "☑ plan {d}/{d} · complete", .{ pl.len, pl.len }) catch "☑ plan complete";
+        _ = p.putClipped(1, top, txt, width -| 1, theme.ok);
         return;
     }
 
-    const cur = pl.currentIndex();
-    for (0..rows) |i| {
-        const row: u16 = top + @as(u16, @intCast(i));
-        p.fillRow(row, " ", .{});
-        const it = pl.items[i];
-        const is_cur = cur != null and @as(u8, @intCast(i)) == cur.?;
-        // The step in progress: brand color in BOLD. The other styles are
-        // already complete Styles from the theme, and mixing a literal with a
-        // theme value is exactly the type error that reads as "expected Color,
-        // found Style".
-        const style: vaxis.Style = if (is_cur) theme.brand_bold else if (it.status == .done) theme.brand_faint else theme.brand_soft;
-
-        var col: u16 = 1;
-        col = p.putText(col, row, it.status.glyph(), style);
-        // The number is what lets you say "the 3" out loud, and it takes 3
-        // columns: `☐ 12. ` against `☐ 1. `.
-        col = p.putText(col + 1, row, tryNum(p.arena, @as(u8, @intCast(i)) + 1), theme.brand_faint);
-        col = p.putText(col + 1, row, it.textOf(), style);
-        if (col >= width) return;
-    }
-
-    // If the plan is longer than the rows, the last row says so. Without this
-    // the user sees 6 of 20 and cannot tell whether the list ended or was cut.
-    if (pl.len > rows) {
-        const row: u16 = top + rows - 1;
-        var buf: [64]u8 = undefined;
-        const txt = std.fmt.bufPrint(
-            &buf,
-            "  +{d} more · {d}/{d} done",
-            .{ pl.len - rows, pl.doneCount(), pl.len },
-        ) catch "";
-        _ = p.putText(1, row, txt, theme.brand_faint);
-    }
-}
-
-/// "3" as memory owned by the frame.
-fn tryNum(arena: std.mem.Allocator, n: u8) []const u8 {
-    var buf: [4]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}.", .{n}) catch return "";
-    return arena.dupe(u8, s) catch "";
+    const i = pl.currentIndex() orelse return;
+    const item = pl.items[i];
+    var buf: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&buf, "{s} plan {d}/{d} · {d} open · ", .{
+        item.status.glyph(),
+        pl.doneCount(),
+        pl.len,
+        pl.openCount(),
+    }) catch return;
+    const style: vaxis.Style = if (item.status == .in_progress) theme.brand_bold else theme.brand_soft;
+    const col = p.putText(1, top, prefix, style);
+    _ = p.putClipped(col, top, item.textOf(), width -| col, style);
 }
 
 /// Picker callback for an `ask` menu.
@@ -6643,6 +6582,7 @@ test "input: box with border, prompt and placeholder" {
     const mid = rowText(s, h - 4, &buf2);
     try std.testing.expect(std.mem.indexOf(u8, mid, "\u{276f}") != null);
     try std.testing.expect(std.mem.indexOf(u8, mid, "Ask anything") != null);
+    try std.testing.expectEqual(theme.hint.fg, s.readCell(4, h - 4).style.fg);
     // bottom border
     var buf3: [128]u8 = undefined;
     const bot = rowText(s, h - 3, &buf3);
@@ -9135,11 +9075,7 @@ fn countAssistant(m: *Model) usize {
     return n;
 }
 
-test "plan block: one checkbox per step, and the running step highlighted" {
-    // What is checked here is what the user SEES (the plan's own logic is already
-    // tested in plan.zig): that there is one checkbox per step and that the step
-    // in progress is the only one in the brand color. That difference between
-    // "where it is at" and "a list" is exactly what makes the block useful.
+test "plan summary: progress and current step are visible without repeating the list" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -9160,38 +9096,20 @@ test "plan block: one checkbox per step, and the running step highlighted" {
     try std.testing.expect(m.activity().dirty);
 
     const s = try drawTest(&m, arena, 100, 30);
-    const r_done = findRow(s, "leer el roadmap") orelse return error.TestUnexpectedResult;
-    const r_cur = findRow(s, "implementar la tool") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(findRow(s, "escribir los tests") != null);
-    // In the order of the list, top to bottom.
-    try std.testing.expect(r_done < r_cur);
+    const r_cur = findRow(s, "plan 1/3 · 2 open · implementar la tool") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(findRow(s, "leer el roadmap") == null);
+    try std.testing.expect(findRow(s, "escribir los tests") == null);
 
     var buf: [256]u8 = undefined;
-    // The done step carries its check (not an arrow) and the dimmed color.
-    const done_row = rowText(s, r_done, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, done_row, "☑") != null);
-    const done_cell = s.readCell(1, r_done);
-    try std.testing.expectEqual(theme.brand_faint.fg, done_cell.style.fg);
-    try std.testing.expect(!done_cell.style.bold);
-
-    // The running step: SAME text, brand color, and in bold.
+    const plan_row = rowText(s, r_cur, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, plan_row, "◐") != null);
     const cur_cell = s.readCell(1, r_cur);
     try std.testing.expectEqual(theme.brand_bold.fg, cur_cell.style.fg);
     try std.testing.expect(cur_cell.style.bold);
-    const cur_row = rowText(s, r_cur, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, cur_row, "◐") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cur_row, "2.") != null);
-
-    // And the pending one goes in soft, no bold: the three states are told apart
-    // at a glance.
-    const r_next = findRow(s, "escribir los tests") orelse return error.TestUnexpectedResult;
-    const next_cell = s.readCell(1, r_next);
-    try std.testing.expectEqual(theme.brand_soft.fg, next_cell.style.fg);
-    try std.testing.expect(!next_cell.style.bold);
 }
 
-test "the plan is drawn ABOVE the input and pushes it, without eating the history" {
-    // The order of the rows from the bottom up is status · strip · PLAN · input.
+test "the plan summary sits above the input and uses one row" {
+    // The order of the rows from the bottom up is status · strip · plan · input.
     // If the plan were drawn anywhere else it would cover the history, which is
     // exactly what a plan must not do.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -9219,11 +9137,9 @@ test "the plan is drawn ABOVE the input and pushes it, without eating the histor
     // The plan's first step: enough to know WHERE the block is.
     const r_plan = findRow(s_con, "primero") orelse return error.TestUnexpectedResult;
 
-    // The plan sits ABOVE the input (the input is always at the very bottom),
-    // and the input goes UP 3 rows: the plan's rows are taken off it, and it is
-    // not the history that loses them.
+    // The plan sits ABOVE the input, taking one row instead of one row per step.
     try std.testing.expect(r_plan < input_con);
-    try std.testing.expectEqual(input_sin - 3, input_con);
+    try std.testing.expectEqual(input_sin - 1, input_con);
     // And the history is still up there (with 30 rows there is plenty of room).
     try std.testing.expect(findRow(s_con, "hola") != null);
     try std.testing.expect(findRow(s_con, "hola").? < r_plan);
@@ -9254,22 +9170,13 @@ test "a finished plan is drawn in ONE line" {
     _ = m.applyPlan(&items, 8);
 
     const s = try drawTest(&m, arena, 100, 30);
-    _ = findRow(s, "all 8 steps done") orelse return error.TestUnexpectedResult;
+    _ = findRow(s, "plan 8/8 · complete") orelse return error.TestUnexpectedResult;
     // CAREFUL: the summary's check is "☑ all...", so searching for "☑ a" would
     // match the summary itself. What is searched for is each step's NUMBER,
     // which only shows up when the list is painted whole.
     try std.testing.expect(findRow(s, "1. a") == null);
     try std.testing.expect(findRow(s, "4. d") == null);
 
-    // And what was really broken: the LAYOUT reserved one row per step
-    // (`plan_rows = min(len, plan_max_rows)`) while the drawing paints just one
-    // ("☑ all 8 steps done"). `input_top` is computed with `plan_rows`, so a
-    // finished plan pushed the input box SEVEN rows down for no reason, and
-    // stole those seven rows from the history.
-    //
-    // (They were not "ghost rows": the surface's buffer is `@memset` to
-    // `.default` on every frame, so an unpainted row comes out blank. The
-    // damage was of space, not of stale pixels.)
     const with_done_plan = m.hist_rows;
 
     // The same history, no plan: the history has to get those rows back.
@@ -9278,9 +9185,7 @@ test "a finished plan is drawn in ONE line" {
     try std.testing.expect(m.hist_rows > with_done_plan);
 }
 
-test "a long plan says how many steps were left unpainted" {
-    // Without the "+N more", seeing 6 of 20 looks like a whole plan. And the cut has
-    // a cap (`plan_max_rows`) because a 20-step plan cannot eat the history.
+test "a long plan summary keeps the open count visible" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -9298,11 +9203,10 @@ test "a long plan says how many steps were left unpainted" {
     _ = m.applyPlan(&items, 20);
 
     const s = try drawTest(&m, arena, 120, 44);
-    const r = findRow(s, "+14 more") orelse return error.TestUnexpectedResult;
+    const r = findRow(s, "plan 1/20 · 19 open") orelse return error.TestUnexpectedResult;
     var buf: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, r, &buf), "1/20 done") != null);
-    // And only `plan_max_rows` steps are painted: not one more.
-    try std.testing.expectEqual(plan_max_rows, r - findRow(s, "a").? + 1);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, r, &buf), "· b") != null);
+    try std.testing.expect(findRow(s, "1. a") == null);
 }
 
 test "the checkpoint opens per TURN and the undo consumes the last one" {
