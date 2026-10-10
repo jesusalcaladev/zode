@@ -134,9 +134,11 @@ pub const tool_routing_prompt =
     \\   whole document is how a page gets misread.
     \\   Keep web research narrow: one specific query, the default five results, and
     \\   fetch only the best primary sources needed to verify the answer. Search
-    \\   snippets are enough for discovery; do not fetch every result. For long
-    \\   pages, request only the next offset needed, then stop when the evidence is
-    \\   sufficient. Final web claims must link to the source that supports them.
+    \\   snippets are enough for discovery; do not fetch every result. Do not repeat
+    \\   an equivalent query when useful sources are already listed; if none fit,
+    \\   refine the query instead. For long pages, request only the next offset
+    \\   needed, then stop when the evidence is sufficient. Final web claims must
+    \\   link to the source that supports them.
     \\ - bash is for EXECUTING things on this machine: builds, tests, git, file
     \\   inspection that grep/glob cannot express. It is not a general-purpose
     \\   "find out" tool: before bash, ask if read/grep/glob/refs/web_* would do
@@ -412,7 +414,7 @@ test "the routing table says a fetch is a WINDOW the model can page with offset"
 }
 
 test "web research stays focused and user-facing output stays compact" {
-    for ([_][]const u8{ "one specific query", "default five results", "primary sources", "do not fetch every result", "link to the source" }) |needle| {
+    for ([_][]const u8{ "one specific query", "default five results", "primary sources", "do not fetch every result", "do not repeat", "refine the query instead", "link to the source" }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, needle) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "do not repeat tool output") != null);

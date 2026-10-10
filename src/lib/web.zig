@@ -595,7 +595,7 @@ pub fn bingResults(arena: std.mem.Allocator, html: []const u8, max: usize) []con
             const p_at = std.mem.indexOfPos(u8, html, cap, "<p") orelse 0;
             const s_start = (std.mem.indexOfScalarPos(u8, html, p_at, '>') orelse block_end) + 1;
             const s_end = indexOfIn(html, s_start, block_end, "</p>") orelse block_end;
-            const snip = cleanText(arena, html[s_start..@min(s_end, s_start + 400)]);
+            const snip = compactSnippet(arena, cleanText(arena, html[s_start..@min(s_end, s_start + 400)]));
             if (snip.len > 0) out.print(arena, "   {s}\n", .{snip}) catch return "";
         }
         out.append(arena, '\n') catch return "";
@@ -860,8 +860,8 @@ pub fn braveResults(arena: std.mem.Allocator, body: []const u8, max: usize) Brav
             // `<strong>` highlight marks and `&quot;`/`&#x27;` entities: the same
             // `cleanText` the DuckDuckGo list goes through, so both engines render
             // the same list and the model never has to know which one answered.
-            const c = cleanText(arena, d);
-            if (c.len > 0) out.print(arena, "   {s}\n", .{c[0..@min(c.len, 400)]}) catch {};
+            const c = compactSnippet(arena, cleanText(arena, d));
+            if (c.len > 0) out.print(arena, "   {s}\n", .{c}) catch {};
         }
         out.append(arena, '\n') catch {};
     }
@@ -1309,4 +1309,22 @@ test "braveResults: max caps the list at whole results" {
     try std.testing.expect(std.mem.indexOf(u8, got.results, "2. two") != null);
     try std.testing.expect(std.mem.indexOf(u8, got.results, "three") == null);
     try std.testing.expect(std.mem.indexOf(u8, got.results, "3.") == null);
+}
+
+test "braveResults compacts long snippets without splitting UTF-8" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const description = "résumé " ** 80;
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"web\":{{\"results\":[{{\"title\":\"Result\",\"url\":\"https://example.com/\",\"description\":\"{s}\"}}]}}}}",
+        .{description},
+    );
+    const answer = braveResults(arena, body, 5);
+    try std.testing.expect(answer == .results);
+    const result = answer.results;
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+    try std.testing.expect(result.len < 400);
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, result, "\n"), "…"));
 }
