@@ -1056,12 +1056,13 @@ change. Now they use `findRow` / `hasBlankRowBetween`, which search by
   list with the state already updated (to "key ok"), which is where you see that
   it worked. Dumping the user into the models palette leaves them with an empty
   column and no idea why.
-- **Ctrl+T** or **/model** -> "Switch model" in two columns (providers | models).
+- **Ctrl+T** or **/model** -> "Choose a model" in two columns (providers | models).
   It **opens right away** with the providers column (which is local) and the
   models are filled in when they arrive from the network: before, nothing opened
   until the provider answered, and with a slow one it looked like the command did
   nothing.
-- **Ctrl+A** opens the connect modal directly.
+- **Ctrl+A** opens the provider connection flow. Escape from key entry returns to
+  the same provider list, and `+ connect` in the model picker opens that flow.
 - The activity strip goes above the input, and the history blocks are separated
   with a blank row. The tokens and the ctx% ALWAYS appear in the status bar
   (before the ctx% only appeared after a whole turn, and at the start you saw
@@ -1552,8 +1553,9 @@ The model writes the list and the user sees it above the input, without Ask Mode
 A COMPLETE list on every call (it replaces the previous one); it accepts
 `items`/`todos` and `content`/`text`/`task`; an unknown `status` falls into
 `pending` (the step is not wrong, it is mislabelled); more than 20 steps is an
-ERROR and not a silent truncation. Done is drawn on one line. Cap of 6 rows
-(`plan_max_rows`) and, if it does not fit, `+N more · 1/20 done`. `/plan` clears it.
+ERROR and not a silent truncation. The on-screen plan is a one-line summary of
+progress and the current step; the full checklist remains in the conversation.
+`/plan` clears it.
 
 A bug of its own that the tests caught: in `Plan.apply` the loop wrote
 `self.items[self.len] = it` and `self.len` was only updated at the end, so **every**

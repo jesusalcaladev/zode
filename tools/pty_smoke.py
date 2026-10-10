@@ -175,11 +175,18 @@ def main() -> int:
 
     # 2) Ctrl+P: the modal palette has to open AND close. This is the path that
     #    broke most often (dangling items, double free of the allocator).
-    out2, t2 = drive([b"\x10", b"esc"])
-    ok &= check("ctrl+p opens the palette", "Switch model" in t2 or "Connect" in t2, t2)
-    ok &= check("esc closes the palette", "Switch model" not in t2, t2)
+    out2, t2 = drive([b"\x10", b"esc", b"after palette", b"\r"])
+    ok &= check("ctrl+p opens the command palette", "Commands" in t2, t2)
+    ok &= check("esc closes the palette and restores input", "after palette" in t2, t2)
 
-    # 3) Ctrl+L (clear) and the REAL scroll keys: they must not take the app
+    # 3) Connecting is a guided flow: choose a provider, back out of the key
+    #    field to the provider list, then close. Escape must not change the modal
+    #    into the unrelated model picker.
+    out_connect, t_connect = drive([b"\x01", b"\r", b"\x1b", b"\x1b"])
+    ok &= check("connect opens the provider list and key prompt", "Connect a provider" in t_connect and "Add API key" in t_connect, t_connect)
+    ok &= check("back from key entry stays in Connect", "Choose a model" not in t_connect, t_connect)
+
+    # 4) Ctrl+L (clear) and the REAL scroll keys: they must not take the app
     #    down.
     #
     #    This used to send `\x1b[B` twice and call it "scroll". That is the DOWN
@@ -211,7 +218,7 @@ def main() -> int:
     ok &= check("arrows, Home/End and page keys scroll without breaking", "panic" not in t3.lower(), t3)
     ok &= check("no 'Invalid free' after scrolling", "invalid free" not in t3.lower(), t3)
 
-    # 4) `/clean`: a cleanup command that runs in the TUI without asking anything
+    # 5) `/clean`: a cleanup command that runs in the TUI without asking anything
     #    has to work ALWAYS, and without `yes` it must not delete. What is checked
     #    is the dry-run TEXT, not that something got deleted: the smoke HOME may
     #    hold no empty session at all, and a test that depends on there being junk
@@ -231,7 +238,7 @@ def main() -> int:
     )
     ok &= check("/clean does not break anything", "panic" not in t4.lower(), t4)
 
-    # 5) `/context` says WHERE the work is happening. It is the line that answers
+    # 6) `/context` says WHERE the work is happening. It is the line that answers
     #    "is it really reading the files from here?", and it appears nowhere else
     #    on screen.
     # TWO enters: the first is taken by the autocompletion (which is open because

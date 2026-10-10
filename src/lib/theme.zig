@@ -65,7 +65,7 @@ pub const rule: vaxis.Style = brand_faint;
 pub const input_border: vaxis.Style = brand_faint;
 pub const input_prompt: vaxis.Style = brand_bold;
 pub const input_text: vaxis.Style = .{};
-pub const placeholder: vaxis.Style = brand_soft;
+pub const placeholder: vaxis.Style = hint;
 
 /// Color of the context gauge depending on how full it is: comfortable green,
 /// yellow as it approaches the compaction budget, red above that.
