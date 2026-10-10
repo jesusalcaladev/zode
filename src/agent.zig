@@ -7946,7 +7946,7 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
             .kind = .provider,
             .group = 1,
             .label = gpa.dupe(u8, d.id) catch return null,
-            .hint = gpa.dupe(u8, if (active) "active" else if (has_key) "key ok" else "no key") catch "",
+            .hint = providerKeyHint(gpa, d, active, has_key) orelse return null,
         };
         i += 1;
     }
@@ -7975,6 +7975,17 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
         i += 1;
     }
     return items;
+}
+
+fn providerKeyHint(gpa: std.mem.Allocator, def: *const providers.ProviderDef, active: bool, has_key: bool) ?[]u8 {
+    const state: []const u8 = if (def.key_env.len == 0)
+        "no key needed"
+    else if (has_key)
+        "connected"
+    else
+        "key needed";
+    if (active) return std.fmt.allocPrint(gpa, "active · {s}", .{state}) catch null;
+    return gpa.dupe(u8, state) catch null;
 }
 
 fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
@@ -8135,7 +8146,7 @@ pub fn openConnectPalette(m: *tui.Model) void {
             .kind = .provider,
             .group = 0,
             .label = gpa.dupe(u8, d.id) catch return,
-            .hint = gpa.dupe(u8, if (active) "active" else if (has_key) "key ok" else "no key") catch "",
+            .hint = providerKeyHint(gpa, d, active, has_key) orelse return,
         };
     }
     if (m.pal.mode == .models) m.invalidateCatalogRequest();
@@ -8273,6 +8284,7 @@ pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
         openConnectPalette(m);
         return;
     }
+    m.pal.key_return_mode = if (m.pal.mode == .models) .models else .connect;
     if (provider_idx) |idx| {
         if (idx >= m.pal.items.len) return;
         if (m.pal.items[idx].kind != .provider) return;
