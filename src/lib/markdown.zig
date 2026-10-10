@@ -69,8 +69,8 @@ const styles = struct {
     // These are the three blues from `theme.zig`; they are repeated here
     // because this module does not depend on the TUI (markdown's tests use it
     // on its own).
-    const banner: Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // brand
-    const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } }; // brand_hi
+    const banner: Style = .{ .fg = .{ .rgb = .{ 0xb4, 0x5d, 0xff } } }; // brand violet
+    const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x22, 0xd3, 0xee } } }; // brand_hi cyan
     // A heading was `fg(4)` bold: the SAME blue as the `›` user prefix and as
     // `theme.accent`, and the same style the diff used for `@@ -1,4 +1,6 @@`. A
     // heading had to shout over the prose, so it gets the lightest blue in the

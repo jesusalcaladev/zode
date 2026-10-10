@@ -4,7 +4,7 @@ const vxfw = vaxis.vxfw;
 
 /// Semantic palette for the TUI. One single place for the colors: the ANSI
 /// index is the terminal's business, we only ask for "accent", "warn", etc.
-pub const accent: vaxis.Style = .{ .fg = .{ .index = 4 } }; // blue
+pub const accent: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xb4, 0x5d, 0xff } } }; // vibrant violet
 pub const accent_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 } };
 
 // ── brand blue ───────────────────────────────────────────────
@@ -18,15 +18,15 @@ pub const accent_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 } };
 // terminals that don't support it.
 
 /// Bright blue: `zode` wordmark, `❯` prompt, active model, commands.
-pub const brand: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
-pub const brand_bold: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
-/// Light blue: the `zode` wordmark. It sits one tone above `brand` so that
-/// the logo reads as "lit up" against the owl art, which is `brand`.
-pub const brand_hi: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } };
-/// Dim blue: Zo's text, hints, provider, effort.
-pub const brand_soft: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } } };
-/// Almost grey blue: horizontal separators and the input box borders.
-pub const brand_faint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x3b, 0x42, 0x61 } } };
+/// Vibrant electric violet/cyan for modern look
+pub const brand: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xb4, 0x5d, 0xff } } };
+pub const brand_bold: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xe9, 0x7c, 0xff } } };
+/// Bright neon cyan for highlights
+pub const brand_hi: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x22, 0xd3, 0xee } } };
+/// Softer violet for secondary text
+pub const brand_soft: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x94, 0x7a, 0xd6 } } };
+/// Subtle border color
+pub const brand_faint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x4c, 0x3e, 0x8d } } };
 pub const assistant: vaxis.Style = .{ .fg = .{ .index = 5 } }; // magenta
 pub const assistant_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 5 } };
 pub const tool: vaxis.Style = .{ .fg = .{ .index = 6 } }; // cyan
@@ -49,7 +49,7 @@ pub const hint_faint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x65, 0x6d, 0x82 } } }
 /// Background of the selected row in a list. It has to be a BACKGROUND: with
 /// only a foreground change, a selected item is distinguishable only by bold,
 /// which is a difference most people do not see across a 60-column row.
-pub const sel_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x2a, 0x2f, 0x45 } } };
+pub const sel_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x3d, 0x2f, 0x6b } } };
 pub const ok: vaxis.Style = .{ .fg = .{ .index = 2 } }; // green
 pub const warn: vaxis.Style = .{ .fg = .{ .index = 3 } }; // yellow
 pub const warn_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 3 } };
@@ -102,14 +102,14 @@ pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 }, .bg = 
 pub const code_text: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xa9, 0xb1, 0xd6 } } };
 pub const code_kw: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } } }; // lilac
 pub const code_kw2: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } }, .italic = true };
-pub const code_builtin: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // blue
+pub const code_builtin: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x22, 0xd3, 0xee } } }; // cyan
 pub const code_type: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x2a, 0xc7, 0xb9 } } }; // cyan
 pub const code_str: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x9e, 0xce, 0x6a } } }; // dim green
 pub const code_comment: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } }, .italic = true };
 pub const code_num: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xe0, 0xaf, 0x68 } } }; // amber
 /// Function call: now with COLOR, not just `bold` (which is indistinguishable
 /// from normal bold text).
-pub const code_fn: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } }, .bold = true };
+pub const code_fn: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xb4, 0x5d, 0xff } }, .bold = true };
 pub const code_deco: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xe0, 0xaf, 0x68 } }, .italic = true };
 
 // ── diff ───────────────────────────────────────────────────────

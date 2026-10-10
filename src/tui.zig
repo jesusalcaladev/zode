@@ -4720,20 +4720,34 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             const half: usize = @max(2, self.hist_rows / 2);
             if (k.matches(vaxis.Key.page_up, .{}) or k.codepoint == 5 or
                 (k.codepoint == 'k' and k.mods.shift) or
-                (k.matches('u', .{ .ctrl = true })))
+                (k.matches('u', .{ .ctrl = true })) or
+                k.matches(vaxis.Key.up, .{}) or
+                k.matches(vaxis.Key.home, .{}) or
+                k.codepoint == 'g')
             {
-                const step = if (k.matches('u', .{ .ctrl = true })) half else page;
-                self.scrollBy(@intCast(step));
+                if (k.matches(vaxis.Key.home, .{}) or k.codepoint == 'g') {
+                    self.scrollTo(0);
+                } else {
+                    const step = if (k.matches('u', .{ .ctrl = true })) half else if (k.matches(vaxis.Key.up, .{})) 1 else page;
+                    self.scrollBy(@intCast(step));
+                }
                 ctx.redraw = true;
                 try self.armTick(ctx);
                 return;
             }
             if (k.matches(vaxis.Key.page_down, .{}) or k.codepoint == 6 or
                 (k.codepoint == 'j' and k.mods.shift) or
-                (k.matches('d', .{ .ctrl = true })))
+                (k.matches('d', .{ .ctrl = true })) or
+                k.matches(vaxis.Key.down, .{}) or
+                k.matches(vaxis.Key.end, .{}) or
+                k.codepoint == 'G')
             {
-                const step = if (k.matches('d', .{ .ctrl = true })) half else page;
-                self.scrollBy(-@as(isize, @intCast(step)));
+                if (k.matches(vaxis.Key.end, .{}) or k.codepoint == 'G') {
+                    self.scrollTo(self.max_offset > 0 ? self.max_offset : 0);
+                } else {
+                    const step = if (k.matches('d', .{ .ctrl = true })) half else if (k.matches(vaxis.Key.down, .{})) 1 else page;
+                    self.scrollBy(-@as(isize, @intCast(step)));
+                }
                 ctx.redraw = true;
                 try self.armTick(ctx);
                 return;
@@ -5176,7 +5190,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         self.scroll_bottom_row = status_row;
         const scrolled = !self.follow_bottom;
         const label: []const u8 = if (scrolled)
-            "↓ latest"
+            "↓ Jump to bottom"
         else if (!current.busy and !current.ask and !current.perm and self.queuedCount() == 0)
             self.status()
         else
@@ -5294,6 +5308,11 @@ fn drawInput(
 
     var r: u16 = 1;
     while (r < box_h - 1) : (r += 1) {
+        // Fill interior with subtle background
+        var c: u16 = 1;
+        while (c < width - 1) : (c += 1) {
+            p.putStable(c, top + r, " ", 1, .{ .bg = .{ .rgb = .{ 0x14, 0x14, 0x24 } } });
+        }
         p.putStable(0, top + r, "│", 1, theme.input_border);
         p.putStable(width - 1, top + r, "│", 1, theme.input_border);
     }
@@ -5468,7 +5487,10 @@ fn lineStartOffset(lines: [][]const u8, line: usize) usize {
 ///
 /// Layout reserves it on both sides; painting uses it as the left edge.
 fn historyMargin(width: u16) u16 {
-    return if (width > 8) 2 else 0;
+    if (width > 120) return 4;
+    if (width > 80) return 3;
+    if (width > 8) return 2;
+    return 0;
 }
 
 fn scrollbarThumb(track_rows: usize, max_offset: usize) struct { size: usize, travel: usize } {
