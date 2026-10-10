@@ -29,16 +29,24 @@ const mascot = @import("lib/mascot.zig");
 /// and "what can I press". Before this there was only the first one, and only
 /// without the shortcut column, so half the keybindings were written down
 /// nowhere — you find them by hitting Ctrl+P and hoping.
-pub fn cmdHelp(m: *tui.Model) void {
+fn pushCommandList(m: *tui.Model, palette_visible: bool) void {
     const gpa = m.allocator;
-    agent.pushInfoOwned(m, gpa.dupe(u8, "commands") catch return);
     for (commands) |c| {
+        if (c.palette_visible != palette_visible) continue;
         const line = if (c.key_hint) |h|
             std.fmt.allocPrint(gpa, "{s: <14} {s}  ({s})", .{ c.key, c.desc, h }) catch continue
         else
             std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
         agent.pushInfoOwned(m, line);
     }
+}
+
+pub fn cmdHelp(m: *tui.Model) void {
+    const gpa = m.allocator;
+    agent.pushInfoOwned(m, gpa.dupe(u8, "commands") catch return);
+    pushCommandList(m, true);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "advanced · type these commands directly") catch return);
+    pushCommandList(m, false);
 
     // The user's own commands, refreshed so a file written a minute ago shows
     // up. They get their own block because they answer a different question:
@@ -109,15 +117,14 @@ pub fn cmdAllowlist(m: *tui.Model) void {
 /// `/cache`: prompt cache hit-rate of the session.
 pub fn cmdCache(m: *tui.Model) void {
     const st = &cache_stats.session;
-    const line = std.fmt.allocPrint(
-        m.allocator,
+    agent.pushInfoFmt(
+        m,
         // WRITES are in the line because they are the expensive half: a high
         // hit-rate with a write on EVERY request means the prefix is being
         // rebuilt each turn, and no hit-rate alone can reveal that.
-        "cache [{s}] {d:.1}% hit-rate · {d} reqs with hit · {d} prompt / {d} cached / {d} written · {d} completion",
-        .{ agent.cur_provider_id, st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
-    ) catch "cache";
-    agent.pushInfoOwned(m, line);
+        "session cache · {d:.1}% hit-rate · {d} requests with hits · {d} input / {d} cached / {d} written · {d} output tokens",
+        .{ st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
+    );
 
     // WHY, because a rate with no cause is not actionable. The number alone was
     // 0.0% on a perfectly healthy setup for weeks.
@@ -145,6 +152,98 @@ pub fn cmdCache(m: *tui.Model) void {
             .{st.prompt_shrinks},
         ),
     }
+}
+
+/// `/usage`: provider-reported token totals for the active session.
+pub fn cmdUsage(m: *tui.Model) void {
+    const st = agent.cacheSessionStats();
+    if (st.requests == 0) {
+        agent.pushInfo(
+            m,
+            "Usage · no provider-reported token data yet. `/context` shows the current estimate.",
+        );
+        return;
+    }
+
+    const input = @max(st.prompt_tokens, 0);
+    const output = @max(st.completion_tokens, 0);
+    const total = input +| output;
+    const cached = @min(@max(st.cached_tokens, 0), input);
+    const uncached = input - cached;
+    const requests: i64 = @intCast(st.requests);
+    var input_buf: [32]u8 = undefined;
+    var output_buf: [32]u8 = undefined;
+    var total_buf: [32]u8 = undefined;
+    var cached_buf: [32]u8 = undefined;
+    var uncached_buf: [32]u8 = undefined;
+    var writes_buf: [32]u8 = undefined;
+    var avg_in_buf: [32]u8 = undefined;
+    var avg_out_buf: [32]u8 = undefined;
+    const msg = std.fmt.allocPrint(
+        m.allocator,
+        "Usage · {d} metered requests · {s} total tokens\n" ++
+            "  Input {s} · output {s} · average/request {s} in / {s} out\n" ++
+            "  Cache reads {s} ({d:.1}%) · cache writes {s} · uncached input {s}",
+        .{
+            st.requests,
+            formatTokenCount(&total_buf, total),
+            formatTokenCount(&input_buf, input),
+            formatTokenCount(&output_buf, output),
+            formatTokenCount(&avg_in_buf, @divTrunc(input, requests)),
+            formatTokenCount(&avg_out_buf, @divTrunc(output, requests)),
+            formatTokenCount(&cached_buf, cached),
+            st.hitRatePct(),
+            formatTokenCount(&writes_buf, @max(st.cache_write_tokens, 0)),
+            formatTokenCount(&uncached_buf, uncached),
+        },
+    ) catch return;
+    agent.pushInfoOwned(m, msg);
+}
+
+fn formatTokenCount(buf: []u8, value: i64) []const u8 {
+    const n: u64 = @intCast(@max(value, 0));
+    var len: usize = 1;
+    var divisor: u64 = 1;
+    while (divisor <= n / 10) : (divisor *= 10) {
+        len += 1;
+    }
+    var out: usize = 0;
+    for (0..len) |i| {
+        buf[out] = '0' + @as(u8, @intCast((n / divisor) % 10));
+        out += 1;
+        if (i + 1 < len and (len - i - 1) % 3 == 0) {
+            buf[out] = ',';
+            out += 1;
+        }
+        divisor /= 10;
+    }
+    return buf[0..out];
+}
+
+test "formatTokenCount groups digits from the right" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("0", formatTokenCount(&buf, 0));
+    try std.testing.expectEqualStrings("999", formatTokenCount(&buf, 999));
+    try std.testing.expectEqualStrings("1,000", formatTokenCount(&buf, 1_000));
+    try std.testing.expectEqualStrings("12,345", formatTokenCount(&buf, 12_345));
+    try std.testing.expectEqualStrings("1,234,567", formatTokenCount(&buf, 1_234_567));
+}
+
+test "usage command reports provider totals and distinguishes estimates" {
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 12_345, .cached = 10_000, .completion = 678 });
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    cmdUsage(&m);
+
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(std.testing.allocator);
+    for (m.pending.items) |item| try all.appendSlice(std.testing.allocator, item.text);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "Usage · 1 metered requests · 13,023 total tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "Input 12,345 · output 678") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "Cache reads 10,000") != null);
 }
 
 /// `/compact [off|elide|full|default]`: what automatic compaction is allowed to do.
@@ -482,7 +581,7 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "ctrl+u / ctrl+d", .desc = "scroll half a page" },
     .{ .key = "page up / down", .desc = "scroll a page" },
     .{ .key = "shift+enter", .desc = "newline (enter sends)" },
-    .{ .key = "shift+tab", .desc = "read-only mode: no writes, the agent asks you" },
+    .{ .key = "shift+tab", .desc = "cycle Build → accept-edits → Plan modes" },
     .{ .key = "esc", .desc = "stop the turn, kill a running command, or answer a question with \"you decide\"" },
     .{ .key = "tab", .desc = "complete a `/` command" },
     .{ .key = "↑ / ↓", .desc = "command history (empty line keeps the draft)" },
@@ -492,33 +591,33 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
 /// `/help`.
 pub const commands = [_]Cmd{
     .{ .key = "/help", .desc = "show commands", .key_hint = "ctrl+p" },
-    .{ .key = "/models", .desc = "list the active provider models" },
+    .{ .key = "/models", .desc = "show catalog counts; use /model to browse" },
     .{ .key = "/model", .desc = "pick a model in a modal", .key_hint = "ctrl+p" },
     .{ .key = "/provider", .desc = "pick a provider in a modal" },
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
     .{ .key = "/submodel", .desc = "which model the SUBAGENTS use (no args: report | <model> | <provider> <model> | off)" },
-    .{ .key = "/task-parallel", .desc = "simultaneous subagent limit: 1..8 | auto", .key_hint = "1..8 | auto" },
-    .{ .key = "/reload-cmds", .desc = "reload user commands from disk" },
-    .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name" },
+    .{ .key = "/task-parallel", .desc = "simultaneous subagent limit: 1..8 | auto", .key_hint = "1..8 | auto", .palette_visible = false },
+    .{ .key = "/reload-cmds", .desc = "reload user commands from disk", .palette_visible = false },
+    .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name", .palette_visible = false },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
-    .{ .key = "/plan", .desc = "clear the visible task list" },
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
-    .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)" },
+    .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
     .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing" },
-    .{ .key = "/mode", .desc = "permission mode: default | accept-edits | read-only | bypass" },
+    .{ .key = "/mode", .desc = "set work mode: build | accept-edits | plan | bypass" },
     .{ .key = "/allowlist", .desc = "always-allowed tools + bash (persisted)" },
-    .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall" },
+    .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
     .{ .key = "/new", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
+    .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
-    .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times" },
-    .{ .key = "/session", .desc = "session info" },
-    .{ .key = "/cache", .desc = "cache hit-rate for this session" },
-    .{ .key = "/ask", .desc = "on|off: read-only mode (shift+tab); the agent investigates and asks" },
+    .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
+    .{ .key = "/session", .desc = "session info", .palette_visible = false },
+    .{ .key = "/cache", .desc = "cache hit-rate for this session", .palette_visible = false },
+    .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
 };
@@ -530,4 +629,7 @@ pub const Cmd = struct {
     /// Only ones that really exist are listed: putting a fake one would be worse
     /// than putting none.
     key_hint: ?[]const u8 = null,
+    /// Keep advanced maintenance and harness controls out of the default
+    /// command palette while preserving direct commands and `/help`.
+    palette_visible: bool = true,
 };

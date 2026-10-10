@@ -22,7 +22,7 @@ $ zode
 
 - **An agent with tools**: it reads, writes, edits, compiles, searches, and uses
   git. The agent loop decides on its own (with `ask` when the answer changes what
-  it does, and in read-only mode it investigates and asks you).
+  it does, and in Plan mode it investigates and asks you).
 - **Tools in parallel** for the read-only ones, **bash in the background** with
   incremental output, and **ESC kills the whole process group** (the grandchild
   too).
@@ -82,6 +82,9 @@ $ zode
 - **`/free-auto`**: spreads the turns across the free models each provider
   publishes, and when one runs out of quota it **carries on by itself** with the
   next one.
+- **Web research**: one focused search returns five concise results by default;
+  only the best primary sources are fetched, long pages are paged by offset, and
+  final claims link to their sources instead of repeating raw tool output.
 
 ## Install
 
@@ -159,24 +162,31 @@ palette that **runs** the one you pick.
 | `/model` | model picker (modal, two columns: providers \| models) |
 | `/provider` | provider picker |
 | `/providers` | list the providers and whether they have a key |
-| `/models` | models of the active provider |
+| `/models` | catalog counts for the active provider |
 | `/use <provider> [model]` | change provider and model at once |
 | `/effort [low\|medium\|high\|…]` | reasoning effort (no argument: opens the picker) |
 | `/free-auto [on\|off\|status]` | rotate across free models when one runs out of quota |
-| `/plan` | clear the visible task list |
 | `/undo` | put the files back the way they were before a turn |
 | `/clean [yes]` | purge zode's leftovers (simulates by default) |
 | `/yolo` | automatic permissions |
 | `/allowlist` | tools that are always allowed (persisted) |
-| `/ask [on\|off]` | read-only mode (also **Shift+Tab**) |
+| `/mode [build\|accept-edits\|plan\|bypass]` | choose the work/permission mode |
+| `/ask [on\|off]` | enable or disable Plan mode |
 | `/skills` | which skills there are and where they come from |
 | `/bg [list\|kill <id>\|killall]` | background commands |
 | `/new` · `/resume` | new session / reopen the last one |
 | `/context` | tokens used against the budget |
+| `/usage` | provider-reported token totals for this session |
 | `/bench` | session numbers: turns, iterations, first token |
-| `/cache` | the provider's cache hit rate |
-| `/session` | id, file and messages of the session |
 | `/quit` | exit |
+
+`/models` stays compact; use `/model` (or Ctrl+T) to browse the catalog without
+filling the conversation timeline. `/usage` reports provider-counted input and
+output tokens, cache reads/writes, and per-request averages. It is session-scoped
+and restored by `/resume`; `/context` remains the current prompt estimate/budget.
+Maintenance and diagnostics such as `/cache`, `/session`, `/bench`, `/bg`,
+`/clean`, and `/task-parallel` remain available by typing them directly, but are
+kept out of the default Ctrl+P palette.
 
 ### Shortcuts
 
@@ -186,12 +196,12 @@ palette that **runs** the one you pick.
 | `Ctrl+T` | model palette |
 | `Ctrl+A` | connect a provider |
 | `Ctrl+L` | clear the view (the session file is untouched) |
-| `Ctrl+R` | fold/unfold the last result |
+| `Ctrl+R` | expand/collapse the last tool result or diff |
 | `Ctrl+U` / `Ctrl+D` | half a page of scroll |
 | `PageUp` / `PageDown` | a page |
 | mouse drag over history | select and copy text to the clipboard on release |
 | `Shift+Enter` | newline (Enter sends) |
-| `Shift+Tab` | read-only mode |
+| `Shift+Tab` | cycle Build → accept-edits → Plan (shown in the status bar) |
 | `Esc` | stop the turn, kill the command, or answer "you decide" |
 | `Tab` | complete a `/` command |
 | `↑` / `↓` | prompt history |

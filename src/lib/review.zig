@@ -58,6 +58,14 @@ pub const items = [_]Item{
         .why = "this is how a red build gets made to look green, and it is invisible to the compiler",
     },
     .{
+        .what = "Type-safety escapes: `any`, `anyopaque`, unchecked casts, or erased types",
+        .why = "they move failures from compile time to runtime; keep them at a narrow, justified boundary",
+    },
+    .{
+        .what = "New layers or abstractions that duplicate an existing seam",
+        .why = "extra indirection costs every reader; follow the local architecture unless the change needs a new boundary",
+    },
+    .{
         .what = "A change wider than the task asked for",
         .why = "unrelated edits inside a fix are how a review turns into an archaeology dig",
     },
@@ -178,6 +186,8 @@ test "the checklist tells the model what the harness already did, so it does not
     // And it refuses the cheap answer, which is the whole failure mode of a step the
     // model can satisfy by saying "looks good".
     try t.expect(std.mem.indexOf(u8, out, "without reading") != null);
+    try t.expect(std.mem.indexOf(u8, out, "unchecked casts") != null);
+    try t.expect(std.mem.indexOf(u8, out, "existing seam") != null);
     // And the counts are real numbers, not placeholders.
     try t.expect(std.mem.indexOf(u8, out, "2 file(s)") != null);
     try t.expect(std.mem.indexOf(u8, out, "4096 bytes") != null);

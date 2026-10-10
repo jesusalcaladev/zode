@@ -122,7 +122,7 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
     const q = std.mem.trim(u8, query, " \t\r\n");
     if (q.len == 0) return "error: empty query";
 
-    var max_results: usize = 8;
+    var max_results: usize = 5;
     if (common.getInt(obj, "max_results")) |mr| {
         if (mr > 0) max_results = @min(@as(usize, @intCast(mr)), 20);
     }
@@ -535,9 +535,12 @@ test "the web tools ask for no permissions (they are reads)" {
 }
 
 test "web_fetch and web_search appear in the JSON with their description" {
-    try std.testing.expect(std.mem.indexOf(u8, dispatch.toolsJson(), "\"web_fetch\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dispatch.toolsJson(), "\"web_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dispatch.toolsJson(), "html.duckduckgo.com") == null); // the endpoint lives in the code, not in the prompt
+    const json = dispatch.toolsJson();
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"web_fetch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "default 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "fetch only the best primary source") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "html.duckduckgo.com") == null); // the endpoint lives in the code, not in the prompt
 }
 
 test "web_fetch rejects non-http(s) without touching the network" {

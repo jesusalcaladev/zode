@@ -3161,20 +3161,20 @@ pub const Model = struct {
 
         // A long diff COLLAPSES into a preview: a `write` of a 500-line file is
         // 500 rows of history, and the timeline is where the user is trying to
-        // follow what the agent is doing. What is hidden is not lost — Ctrl+R
-        // swaps the paragraph for the full text — and the counts are in the
-        // marker, so nothing about the change is invisible.
+        // follow what the agent is doing. Put the summary before the excerpt so
+        // the scale and the way to expand it are visible immediately.
         var short: ?[]const u8 = null;
         if (lines.len > diff_preview_lines) {
             var s: std.ArrayList(u8) = .empty;
+            s.print(arena, "diff preview · +{d} −{d}\n", .{ added, removed }) catch {};
             for (lines[0..diff_preview_lines], 0..) |l, i| {
-                if (i > 0) s.append(arena, '\n') catch break;
+                if (i > 0 or s.items.len > 0) s.append(arena, '\n') catch break;
                 s.appendSlice(arena, l) catch break;
             }
             s.print(
                 arena,
-                "\n… +{d} −{d} · {d} more lines · ctrl+r to expand",
-                .{ added, removed, lines.len - diff_preview_lines },
+                "\n… {d} more lines · ctrl+r to expand",
+                .{lines.len - diff_preview_lines},
             ) catch {};
             if (s.items.len > 0) short = s.items;
         }
@@ -4683,7 +4683,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 try self.armTick(ctx);
                 return;
             }
-            // Shift+Tab: read-only mode.
+            // Shift+Tab cycles the visible Build / accept-edits / Plan modes.
             //
             // Chosen because it is the key nothing else in a terminal uses, and
             // because every other coding agent already uses it for this, so it
@@ -4899,7 +4899,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // after a single `☑ all N steps done` line, so reserving N rows left the
     // ghosts of the checkbox rows underneath it, forever: they sit below
     // `history_h`, so the history clear loop never touched them, and they stayed
-    // until `/plan` or a new plan came along.
+    // until the plan was cleared or replaced.
     const plan_rows: u16 = if (pl_now.isEmpty())
         0
     else if (pl_now.allDone())
@@ -6157,7 +6157,7 @@ fn drawActivityStrip(
 /// A piece of the status row with its style.
 const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 
-/// Status bar session info: model · provider (effort) · context usage.
+/// Status bar session info: model · provider (effort) · mode · context usage.
 ///
 /// It is an array of segments (text + style) instead of a string, because each
 /// part goes in its own color: the model in bright blue, the rest dim and the
@@ -6170,7 +6170,6 @@ fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
 
     const model = agent.curAnswering();
     const provider = agent.curProvider();
-    if (model.len == 0 and provider.len == 0) return null;
 
     if (model.len > 0) {
         out.append(arena, .{ .text = model, .style = theme.brand_bold }) catch return null;
@@ -6199,20 +6198,18 @@ fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
         out.append(arena, .{ .text = et, .style = theme.brand_faint }) catch return null;
     }
 
-    // The permission mode. It has to be VISIBLE at all times and not just
-    // in the history, because it changes what a write tool call will do: a
-    // mode you cannot see is a mode where "the model ignored my edit" is
-    // indistinguishable from "the model did not try". All the non-default
-    // modes show, not only read-only: accept-edits and bypass are exactly
-    // the modes where "did it ask?" is the question the answer matters to.
+    // Always show the mode, including Build: the default is still a mode and
+    // should not look like missing state while the provider is loading.
     const pm = agent.currentPermMode();
-    if (pm != .default) {
-        if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
-        out.append(arena, .{
-            .text = agent.permModeName(),
-            .style = if (pm == .accept_edits) theme.tool else theme.warn_bold,
-        }) catch return null;
-    }
+    if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
+    out.append(arena, .{
+        .text = agent.permModeName(),
+        .style = switch (pm) {
+            .default => theme.brand_soft,
+            .accept_edits => theme.tool,
+            .read_only, .bypass => theme.warn_bold,
+        },
+    }) catch return null;
 
     // Context tokens ALWAYS visible, not only when they are > 0.
     //
@@ -7054,6 +7051,36 @@ test "status: the segments are live, whole text" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "status: Build mode is always visible" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = agent.read_only, .ae = agent.accept_edits, .y = agent.yolo };
+    defer {
+        agent.setPermMode(
+            &m,
+            if (saved.y)
+                .bypass
+            else if (saved.ro)
+                .read_only
+            else if (saved.ae)
+                .accept_edits
+            else
+                .default,
+        );
+    }
+    agent.setPermMode(&m, .default);
+
+    const segs = sessionInfo(arena_state.allocator()) orelse return error.TestUnexpectedResult;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "ctx ") != null);
 }
 
 test "status: the status row fits and is not cut" {
@@ -7950,16 +7977,30 @@ test "picking a command in the palette EXECUTES it (not puts it in the input)" {
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
 
     agent.openCommandPalette(&m);
     var ctx = testCtx();
 
-    // Filtering by "cache" leaves only /cache, and Enter fires it.
+    var has_usage = false;
+    var has_cache = false;
+    var has_background = false;
+    for (m.pal.items) |item| {
+        if (std.mem.eql(u8, item.label, "/usage")) has_usage = true;
+        if (std.mem.eql(u8, item.label, "/cache")) has_cache = true;
+        if (std.mem.eql(u8, item.label, "/bg")) has_background = true;
+    }
+    try std.testing.expect(has_usage);
+    try std.testing.expect(!has_cache);
+    try std.testing.expect(!has_background);
+
+    // Filtering by "usage" leaves the session summary; Enter runs it.
     for ([_]vaxis.Key{
-        .{ .codepoint = 'c', .text = "c" },
+        .{ .codepoint = 'u', .text = "u" },
+        .{ .codepoint = 's', .text = "s" },
         .{ .codepoint = 'a', .text = "a" },
-        .{ .codepoint = 'c', .text = "c" },
-        .{ .codepoint = 'h', .text = "h" },
+        .{ .codepoint = 'g', .text = "g" },
         .{ .codepoint = 'e', .text = "e" },
     }) |k| {
         _ = try m.paletteKey(&ctx, k);
@@ -7970,13 +8011,12 @@ test "picking a command in the palette EXECUTES it (not puts it in the input)" {
     try std.testing.expect(!m.pal.active);
     try std.testing.expectEqualStrings("", std.mem.trim(u8, m.ed.text(), " "));
 
-    // And the command really ran: `/cache` writes its hit-rate line into the
-    // history.
+    // And the command really ran: `/usage` reports missing provider data.
     const s = try drawTest(&m, arena_state.allocator(), 92, 20);
     var found = false;
     for (0..s.size.height) |row| {
         var rb: [512]u8 = undefined;
-        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "hit-rate") != null) found = true;
+        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "no provider-reported token data") != null) found = true;
     }
     try std.testing.expect(found);
 }
@@ -8443,8 +8483,9 @@ test "a long diff collapses into a preview, and Ctrl+R swaps it for the whole th
     }
     try std.testing.expectEqual(@as(usize, 1), diffs);
     const short_text = m.paras.items[diff_idx.?].text;
+    try std.testing.expect(std.mem.startsWith(u8, short_text, "diff preview · +60 −60\n"));
     try std.testing.expect(std.mem.indexOf(u8, short_text, "ctrl+r to expand") != null);
-    try std.testing.expect(std.mem.indexOf(u8, short_text, "+60 −60") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "more lines") != null);
     // The preview is the FIRST lines, and the far end of the file is not there.
     try std.testing.expect(std.mem.indexOf(u8, short_text, "linea 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, short_text, "linea 59") == null);

@@ -376,7 +376,7 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     // model has to know before it decides what to call, or it plans a `write`
     // and then gets an error, which it reads as a bug and works around.
     const mode_note: []const u8 = if (read_only)
-        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line — and end your turn: the user will be asked to approve it. On approval zode switches itself to default mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
+        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line — and end your turn: the user will be asked to approve it. On approval zode switches itself to Build mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
     else if (accept_edits)
         "ACCEPT-EDITS MODE is on (shift+tab to cycle): file edits (write, edit, rename) run without asking, but bash still asks for permission. Ask the user with `ask` before running anything destructive.\n\n"
     else
@@ -625,7 +625,7 @@ pub fn currentPermMode() PermMode {
 /// The mode as one word, for the status bar and `/mode`.
 pub fn permModeName() []const u8 {
     return switch (currentPermMode()) {
-        .default => "default",
+        .default => "build",
         .accept_edits => "accept-edits",
         // "plan" and not "read-only": it is what the mode IS for (investigate,
         // write the plan, get it approved) and what the cycle and `/mode` have
@@ -648,8 +648,7 @@ pub fn setPermMode(m: *tui.Model, mode: PermMode) void {
     m.accept_edits = accept_edits;
 }
 
-/// shift+tab: cycles the modes that ASK.
-/// default → accept-edits → plan → default.
+/// shift+tab: cycle Build → accept-edits → Plan → Build.
 ///
 /// Bypass (`/yolo`) is deliberately not in the cycle: it is the "stop
 /// asking me anything" switch, and cycling out of it lands on default,
@@ -663,29 +662,34 @@ pub fn cyclePermMode(m: *tui.Model) void {
     };
     setPermMode(m, next);
     setStatusWithZoFmt(m, if (next == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
-    pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
 }
 
-/// `/ask [on|off]`: read-only (plan) mode, by its old name.
+/// `/ask [on|off]`: Plan mode, retained as a command alias.
 fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
     if (arg) |a| {
         const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
         const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
         if (on) {
             setPermMode(m, .read_only);
-            pushInfo(m, "read-only (plan) mode ON: the agent investigates and asks you with `ask`.");
+            const msg = "Plan mode ON: investigate first; writes are blocked pending approval.";
+            setStatusWithZo(m, .warn, msg);
+            pushInfo(m, msg);
             return;
         }
         if (off) {
             setPermMode(m, .default);
-            pushInfo(m, "read-only mode OFF");
+            const msg = "Build mode ON";
+            setStatusWithZo(m, .idle, msg);
+            pushInfo(m, msg);
             return;
         }
         pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (read_only) "on" else "off"});
         return;
     }
     // No argument: toggle, as it always did.
-    setPermMode(m, if (read_only) .default else .read_only);
+    const next: PermMode = if (read_only) .default else .read_only;
+    setPermMode(m, next);
+    setStatusWithZoFmt(m, if (next == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
 }
 
 // ── plan approval: the developer says yes or no ────────────
@@ -700,7 +704,7 @@ pub const revise_option = "Revise — change the plan first";
 /// What the model is told after the developer approved. Owned by the caller.
 pub const plan_gate_approved_text =
     "The user APPROVED the plan, and zode has already switched itself out of plan mode " ++
-    "(you are in default mode: edits and commands are allowed). Implement the plan now: " ++
+    "(you are in Build mode: edits and commands are allowed). Implement the plan now: " ++
     "work through the steps, verify as you go, and report what changed when done. Do not " ++
     "ask for approval again — it has been given.";
 
@@ -1779,9 +1783,11 @@ pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Sessi
         const s = m.allocator.create(session_mod.Session) catch @panic("out of memory for the session");
         s.* = session_mod.Session.init(m.allocator);
         session = s;
+        cache_stats.session = .{};
         return s;
     };
     session = fresh;
+    cache_stats.session = .{};
     return fresh;
 }
 
@@ -1805,6 +1811,7 @@ pub fn newSession(m: *tui.Model) void {
         m.allocator.destroy(old);
         session = null;
     }
+    cache_stats.session.reset();
     const s = ensureSession(m, m.allocator);
     m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
@@ -2049,13 +2056,26 @@ test "TurnStats: a 0-line diff invents no files" {
 
 /// Empties the current session's history without creating a new one.
 pub fn resetSession(m: *tui.Model) void {
+    cache_stats.session.reset();
     if (session) |s| {
         s.messages.clearRetainingCapacity();
+        s.appendUsageSnapshot(cache_stats.session) catch |err| {
+            m.pushErrorFmt("could not reset session usage: {t}", .{err});
+        };
         s.flush();
     }
     session_elided = 0;
     resetSummaries();
     m.pushInfoFmt("session reset", .{});
+}
+
+fn recordSessionUsage(m: *tui.Model, usage: chat.Usage, kind: chat.ProviderKind) void {
+    cache_stats.session.recordFor(usage, kind);
+    if (session) |s| {
+        s.appendUsageSnapshot(cache_stats.session) catch |err| {
+            m.pushErrorFmt("could not save session usage: {t}", .{err});
+        };
+    }
 }
 
 /// Opens the session at startup: the most recent one if it was asked for
@@ -2071,6 +2091,7 @@ pub fn bootstrapSession(m: *tui.Model) void {
         if (latest) |path| {
             if (session_mod.Session.resumePath(m.allocator, io_global, path)) |s| {
                 session = s;
+                cache_stats.session = s.usage_stats;
                 const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
                     "session resumed";
                 pushInfoOwned(m, msg);
@@ -2173,7 +2194,7 @@ fn cmdYolo(m: *tui.Model) void {
     setStatusWithZo(m, if (yolo) .warn else .idle, msg);
 }
 
-/// `/mode [default|accept-edits|plan|bypass]`, or the current
+/// `/mode [build|accept-edits|plan|bypass]`, or the current
 /// mode with no argument.
 ///
 /// Selective permissions: the user picks how much the agent asks,
@@ -2187,7 +2208,7 @@ fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
             pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
             return;
         }
-        pushInfo(m, "/mode: default|accept-edits|plan|bypass");
+        pushInfo(m, "/mode: build|accept-edits|plan|bypass");
         return;
     }
     pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
@@ -2196,7 +2217,7 @@ fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
 /// The mode a `/mode` argument names, or null when it names none.
 /// Case-insensitive, and tolerant of the spellings people type.
 fn parsePermMode(a: []const u8) ?PermMode {
-    if (std.ascii.eqlIgnoreCase(a, "default")) return .default;
+    if (std.ascii.eqlIgnoreCase(a, "build") or std.ascii.eqlIgnoreCase(a, "default")) return .default;
     if (std.ascii.eqlIgnoreCase(a, "accept-edits") or
         std.ascii.eqlIgnoreCase(a, "accept_edits") or
         std.ascii.eqlIgnoreCase(a, "edits")) return .accept_edits;
@@ -2286,8 +2307,6 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdTaskParallel(m, arg);
     } else if (std.mem.eql(u8, cmd, "use")) {
         commands_mod.cmdUse(m, arg);
-    } else if (std.mem.eql(u8, cmd, "plan")) {
-        cmdPlan(m);
     } else if (std.mem.eql(u8, cmd, "undo")) {
         cmdUndo(m);
     } else if (std.mem.eql(u8, cmd, "clean")) {
@@ -2308,6 +2327,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdAllowlist(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
+    } else if (std.mem.eql(u8, cmd, "usage")) {
+        commands_mod.cmdUsage(m);
     } else if (std.mem.eql(u8, cmd, "compact")) {
         commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "goal")) {
@@ -2883,6 +2904,7 @@ fn resumeLatest(m: *tui.Model) void {
         return;
     };
     session = s;
+    cache_stats.session = s.usage_stats;
     session_elided = 0;
     resetSummaries();
     forgetGitRepoProbe();
@@ -4751,7 +4773,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // The provider's own completion count when it sent one: the same window of
     // time, the real tokenizer (see `finishTps`).
     finishTps(tstate.chars, tstate.stream_start_ns, chat.last_usage.completion);
-    cache_stats.session.record(chat.last_usage);
+    recordSessionUsage(m, chat.last_usage, pick.kind);
 
     // Closes the streaming paragraph: what arrived stays in the history.
     m.streamEnd();
@@ -4824,21 +4846,6 @@ fn maybeAnnounceCompaction(m: *tui.Model, comp_needs_summary: bool) void {
         .{},
     ) catch return;
     pushInfoOwned(m, msg);
-}
-
-/// `/plan`: clears the visible task list.
-///
-/// It exists because the plan belongs to the TURN and sometimes gets stuck
-/// half-done (the model ran out of steps, or the user wants to start over
-/// without a new session). Without it, the only way to empty it is the model
-/// sending an empty list, which is never going to happen on its own.
-fn cmdPlan(m: *tui.Model) void {
-    if (m.planCopy().isEmpty()) {
-        pushInfo(m, "the plan is already empty");
-        return;
-    }
-    m.clearPlan();
-    pushInfo(m, "plan cleared");
 }
 
 /// `/undo`: puts the files back the way they were before the last turn.
@@ -7117,6 +7124,49 @@ fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator
     if (res.len == 0) return "";
     var it = std.mem.splitScalar(u8, res, '\n');
     const first = it.next() orelse return "";
+    if (std.mem.eql(u8, name, "bash")) {
+        const status = if (std.mem.indexOf(u8, first, "exit=")) |at|
+            first[at + "exit=".len ..]
+        else
+            first;
+        var summary: std.ArrayList(u8) = .empty;
+        summary.appendSlice(arena, "exit ") catch return first;
+        summary.appendSlice(arena, status) catch return first;
+
+        var section: enum { none, stdout, stderr } = .none;
+        var stdout_lines: usize = 0;
+        var stderr_lines: usize = 0;
+        var capped = false;
+        var lines = std.mem.splitScalar(u8, res, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, line, "--- stdout ---")) {
+                section = .stdout;
+                continue;
+            }
+            if (std.mem.eql(u8, line, "--- stderr ---")) {
+                section = .stderr;
+                continue;
+            }
+            if (std.mem.indexOf(u8, line, "output cut at the tool's cap") != null) {
+                capped = true;
+                continue;
+            }
+            if (std.mem.trim(u8, line, " \t\r").len == 0 or std.mem.startsWith(u8, line, "exit=")) continue;
+            switch (section) {
+                .stdout => stdout_lines += 1,
+                .stderr => stderr_lines += 1,
+                .none => {},
+            }
+        }
+        if (stdout_lines > 0) {
+            summary.print(arena, " · stdout {d} line{s}", .{ stdout_lines, if (stdout_lines == 1) "" else "s" }) catch return first;
+        }
+        if (stderr_lines > 0) {
+            summary.print(arena, " · stderr {d} line{s}", .{ stderr_lines, if (stderr_lines == 1) "" else "s" }) catch return first;
+        }
+        if (capped) summary.appendSlice(arena, " · output capped") catch return first;
+        return summary.items;
+    }
     // `write` says "wrote X (N bytes, M lines)" and then a preview. The one-line
     // summary is that first line: the preview is the tool result (what the
     // model sees) and shows up in the history under it.
@@ -7584,7 +7634,7 @@ fn onEffortPick(m: *tui.Model, _: u32, label: []const u8) void {
     cmdEffort(m, label);
 }
 
-/// Job of the `/models` worker (list in the history) and of the picker.
+/// Job of the `/models` catalog summary and the model picker.
 const ModelsJob = struct {
     model: *tui.Model,
     /// false = list in the history (`/models`); otherwise open the picker.
@@ -7595,7 +7645,7 @@ const ModelsJob = struct {
     key: ?[]u8,
 };
 
-/// `/models`: lists the active provider's models in the history.
+/// `/models` shows catalog counts; `/model` is the detailed browser.
 pub fn listModelsAsync(m: *tui.Model) !void {
     const job = try createModelsJob(m, false);
     spawnModelsJob(m, job) catch |err| {
@@ -7842,15 +7892,15 @@ fn publishModels(
         if (items) |it| m.setPendingCatalogItems(request_id, it);
         return;
     }
+    var free_count: usize = 0;
     for (sorted) |info| {
-        const hint = if (isFree(info)) "free" else "";
-        const line = std.fmt.allocPrint(gpa, "{s:<44} {s}", .{ info.id, hint }) catch continue;
-        pushInfoOwned(m, line);
+        if (isFree(info)) free_count += 1;
     }
-    m.pushInfoFmt("{d} models on {s}{s}", .{
+    m.pushInfoFmt("{d} models · {d} free · {s}{s} · use /model to browse", .{
         sorted.len,
+        free_count,
         provider_id,
-        if (source == .cached) " (saved list; refreshing)" else "",
+        if (source == .cached) " · saved list; refreshing" else "",
     });
 }
 
@@ -8108,31 +8158,38 @@ pub fn openCommandPalette(m: *tui.Model) void {
     const uc = userCommands();
     // +1 for the header's "Connect" item: it is the shortcut to connect a
     // provider without leaving the command palette.
-    const items = gpa.alloc(palette.Item, commands.len + 1 + uc.len) catch return;
+    var visible_count: usize = 0;
+    for (commands) |c| if (c.palette_visible) {
+        visible_count += 1;
+    };
+    const items = gpa.alloc(palette.Item, visible_count + 1 + uc.len) catch return;
     items[0] = .{
         .kind = .command,
         .group = 1,
         .label = gpa.dupe(u8, "Connect") catch return,
         .hint = gpa.dupe(u8, "add a provider API key") catch "",
     };
-    for (commands, 0..) |c, i| {
+    var item_idx: usize = 1;
+    for (commands) |c| {
+        if (!c.palette_visible) continue;
         // `/free-auto` carries its STATE in the hint: seeing "on · 3/8" next to it
         // in the palette is what tells you the rotation is running, without
         // having to go and ask for the status.
         const hint: []const u8 = if (std.mem.eql(u8, c.key, "/free-auto"))
             (if (freeAutoOn()) freeAutoLabel(gpa) else "rotate free models of every provider · off")
         else if (c.key_hint) |h| h else "";
-        items[i + 1] = .{
+        items[item_idx] = .{
             .kind = .command,
             .group = cmdGroup(c.key),
             .label = gpa.dupe(u8, c.key) catch return,
             .hint = gpa.dupe(u8, hint) catch "",
         };
+        item_idx += 1;
     }
     // The user's own commands, in "Yours" (the group AFTER `cmd_groups`'s
     // builtins, 1-based: index 5 → id 6 = `cmd_groups.len`).
     for (uc, 0..) |c, i| {
-        items[commands.len + 1 + i] = .{
+        items[visible_count + 1 + i] = .{
             .kind = .command,
             .group = @intCast(cmd_groups.len),
             .label = gpa.dupe(u8, c.key) catch return,
@@ -9066,6 +9123,11 @@ test "toolArgSummary and toolResultSummary know the web tools" {
     try std.testing.expect(std.mem.indexOf(u8, res, "3 lines") != null);
     const hits = toolResultSummary("web_search", "1. One\n   https://a.example\n   snip\n\n2. Two\n   https://b.example\n   snip\n", arena);
     try std.testing.expectEqualStrings("2 results", hits);
+
+    const bash = toolResultSummary("bash", "exit=0\n--- stdout ---\nfirst\nsecond\n--- stderr ---\nwarning\n", arena);
+    try std.testing.expectEqualStrings("exit 0 · stdout 2 lines · stderr 1 line", bash);
+    const capped = toolResultSummary("bash", "exit=(stopped at the tool's output cap)\n--- stdout ---\npartial\n… (output cut at the tool's cap and the command was stopped)\n", arena);
+    try std.testing.expectEqualStrings("exit (stopped at the tool's output cap) · stdout 1 line · output capped", capped);
 }
 
 test "cmdAllowlist lists what is there and warns if it is empty" {
@@ -11240,7 +11302,7 @@ test "perm modes: the three flags are mutually exclusive, always" {
     }
 }
 
-test "permModeName: one word per mode" {
+test "permModeName: clear label for every mode" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -11252,7 +11314,7 @@ test "permModeName: one word per mode" {
     }
 
     setPermMode(&m, .default);
-    try std.testing.expectEqualStrings("default", permModeName());
+    try std.testing.expectEqualStrings("build", permModeName());
     setPermMode(&m, .accept_edits);
     try std.testing.expectEqualStrings("accept-edits", permModeName());
     setPermMode(&m, .read_only);
@@ -11261,7 +11323,7 @@ test "permModeName: one word per mode" {
     try std.testing.expectEqualStrings("bypass", permModeName());
 }
 
-test "shift+tab cycles default -> accept-edits -> plan -> default" {
+test "shift+tab cycles Build -> accept-edits -> Plan -> Build" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -11286,6 +11348,19 @@ test "shift+tab cycles default -> accept-edits -> plan -> default" {
     setPermMode(&m, .bypass);
     cyclePermMode(&m);
     try std.testing.expectEqual(PermMode.default, currentPermMode());
+}
+
+test "mode commands use Build as the visible name and keep default as an alias" {
+    try std.testing.expectEqual(PermMode.default, parsePermMode("build").?);
+    try std.testing.expectEqual(PermMode.default, parsePermMode("default").?);
+    try std.testing.expectEqual(PermMode.accept_edits, parsePermMode("accept-edits").?);
+    try std.testing.expectEqual(PermMode.read_only, parsePermMode("plan").?);
+    try std.testing.expectEqual(PermMode.bypass, parsePermMode("bypass").?);
+    try std.testing.expect(parsePermMode("unknown") == null);
+
+    for (commands) |command| {
+        try std.testing.expect(!std.mem.eql(u8, command.key, "/plan"));
+    }
 }
 
 test "isEditTool: the file edits, and not bash or a subagent" {

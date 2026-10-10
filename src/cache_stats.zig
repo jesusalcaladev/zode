@@ -65,14 +65,19 @@ pub const CacheStats = struct {
     }
 
     pub fn record(self: *CacheStats, usage: chat.Usage) void {
+        self.recordFor(usage, .openai);
+    }
+
+    pub fn recordFor(self: *CacheStats, usage: chat.Usage, kind: chat.ProviderKind) void {
         if (usage.prompt == 0 and usage.completion == 0) return;
+        const prompt = totalInputTokens(usage, kind);
         // Captured BEFORE the increment: this is how many requests had already
         // happened, and "did compaction run since the last one" is exactly
         // `compacted_at >= before`. Getting this wrong counted every legitimate
         // post-compaction shrink as a router.
         const before = self.requests;
         self.requests += 1;
-        self.prompt_tokens += usage.prompt;
+        self.prompt_tokens += prompt;
         self.completion_tokens += usage.completion;
         if (usage.cached > 0) {
             self.cache_hits += 1;
@@ -82,7 +87,7 @@ pub const CacheStats = struct {
             self.cache_writes += 1;
             self.cache_write_tokens += usage.cache_write;
         }
-        const p: i64 = @intCast(usage.prompt);
+        const p = prompt;
         if (self.prev_prompt != 0 and p < self.prev_prompt) {
             self.prompt_shrinks += 1;
             // Compaction rewrites the history BEFORE the next body is composed, so
@@ -122,7 +127,7 @@ pub const CacheStats = struct {
     /// Percentage of prompt tokens served from cache (0-100).
     pub fn hitRatePct(self: *const CacheStats) f64 {
         if (self.prompt_tokens == 0) return 0;
-        return 100.0 * @as(f64, @floatFromInt(self.cached_tokens)) /
+        return 100.0 * @as(f64, @floatFromInt(@min(self.cached_tokens, self.prompt_tokens))) /
             @as(f64, @floatFromInt(self.prompt_tokens));
     }
 
@@ -142,6 +147,17 @@ pub const CacheStats = struct {
 
 const chat = @import("chat.zig");
 
+/// The prompt count is total input on OpenAI-compatible APIs. Anthropic reports
+/// cache reads and writes in separate fields, so add those to input for a
+/// provider-independent session total.
+pub fn totalInputTokens(usage: chat.Usage, kind: chat.ProviderKind) i64 {
+    const prompt = @max(usage.prompt, 0);
+    return if (kind == .anthropic)
+        prompt + @max(usage.cached, 0) + @max(usage.cache_write, 0)
+    else
+        prompt;
+}
+
 /// Global session stats.
 pub var session: CacheStats = .{};
 
@@ -152,6 +168,16 @@ test "hit rate math" {
     try std.testing.expectEqual(@as(usize, 2), s.requests);
     try std.testing.expectEqual(@as(usize, 1), s.cache_hits);
     try std.testing.expectApproxEqAbs(@as(f64, 45.0), s.hitRatePct(), 0.01);
+}
+
+test "Anthropic cache tokens are included in total input and hit-rate math" {
+    var s = CacheStats{};
+    s.recordFor(.{ .prompt = 200, .cached = 700, .cache_write = 100, .completion = 40 }, .anthropic);
+    try std.testing.expectEqual(@as(i64, 1000), s.prompt_tokens);
+    try std.testing.expectEqual(@as(i64, 700), s.cached_tokens);
+    try std.testing.expectEqual(@as(i64, 100), s.cache_write_tokens);
+    try std.testing.expectApproxEqAbs(@as(f64, 70.0), s.hitRatePct(), 0.01);
+    try std.testing.expectEqual(@as(i64, 1000), s.prev_prompt);
 }
 
 test "cache writes are counted apart from reads" {

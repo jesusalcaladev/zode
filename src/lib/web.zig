@@ -474,7 +474,7 @@ fn renderResults(
         if (indexOfIn(html, title_end, block_end, snippet_class)) |sn| {
             const s_start = (std.mem.indexOfScalarPos(u8, html, sn, '>') orelse sn) + 1;
             const s_end = indexOfIn(html, s_start, block_end, "</a>") orelse block_end;
-            const snip = cleanText(arena, html[s_start..@min(s_end, s_start + 400)]);
+            const snip = compactSnippet(arena, cleanText(arena, html[s_start..@min(s_end, s_start + 400)]));
             if (snip.len > 0) {
                 out.print(arena, "   {s}\n", .{snip}) catch return "";
             }
@@ -483,6 +483,20 @@ fn renderResults(
     }
     if (n == 0) return "";
     return out.items;
+}
+
+/// Search snippets help choose a source; they should not consume the budget of
+/// the page that will verify it. Keep a readable prefix and never split UTF-8.
+fn compactSnippet(arena: std.mem.Allocator, text: []const u8) []const u8 {
+    const max_bytes: usize = 240;
+    if (text.len <= max_bytes) return text;
+
+    var end = max_bytes;
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    if (std.mem.lastIndexOfAny(u8, text[0..end], " \t\r\n")) |space| {
+        if (space >= max_bytes / 2) end = space;
+    }
+    return std.fmt.allocPrint(arena, "{s}…", .{text[0..end]}) catch text[0..end];
 }
 
 /// The real URL behind the DuckDuckGo link (`//duckduckgo.com/l/?uddg=…`).
@@ -929,6 +943,17 @@ test "searchResults pulls out title, URL and snippet" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Fast and readable") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "2. Second") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "https://example.com/x") != null);
+}
+
+test "search snippets are concise and remain valid UTF-8" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const long = "documentation résumé " ** 20;
+    const snippet = compactSnippet(arena, long);
+    try std.testing.expect(snippet.len <= 243);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(snippet));
+    try std.testing.expect(std.mem.endsWith(u8, snippet, "…"));
 }
 
 test "searchResults with no results returns empty (no garbage text)" {
