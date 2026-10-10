@@ -188,6 +188,10 @@ Maintenance and diagnostics such as `/cache`, `/session`, `/bench`, `/bg`,
 `/clean`, and `/task-parallel` remain available by typing them directly, but are
 kept out of the default Ctrl+P palette.
 
+## License
+
+zode is distributed under the [MIT License](LICENSE).
+
 ### Shortcuts
 
 | | |
