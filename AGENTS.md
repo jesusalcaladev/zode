@@ -153,7 +153,9 @@ think, web_fetch, web_search.
   list and never has to know which engine it was. When the key cannot be used,
   `[search note: …]` rides in FRONT of whatever the free chain returns, so a
   wrong key is visible exactly while it is wrong and never once it works, and a
-  broken key degrades the search instead of stopping it.
+  broken key degrades the search instead of stopping it. Snippets from every
+  engine share the same 240-byte, UTF-8-safe cap: they are for discovery, not
+  another copy of the page.
 - `max_tool_output` (16 KB) is the default budget; hard cap 200 KB.
 
 Six things that cost something and have to be known:
@@ -216,7 +218,11 @@ or the JSON, and that is tested with fixtures.
   `agent.summarizeTurns()` makes ONE LLM call with `summaryPrompt()` and replaces
   `msgs[after system..summary_upto]` with a user note `[earlier conversation
   summarized to fit the context budget]`. Best-effort: if it fails, it carries on
-  without a summary. It counts towards cache_stats.
+  without a summary. The input is capped at 16 KB, keeps the start and newest
+  messages, and includes tool-call JSON; this bounds the extra request even for
+  very long histories. It counts towards cache_stats.
+- Tier 1 tracks its running token estimate while eliding, so a long history is
+  scanned once instead of re-estimating the entire message list after each result.
 - Real E2E test (with `ZODE_CONTEXT_LIMIT=6000` and 8 reads): it fires
   `summarizing old turns…` on successive iterations and the agent repairs itself
   by re-reading what was summarized when it needs it. Caveat: with very small
