@@ -435,7 +435,9 @@ pub fn cmdSession(m: *tui.Model) void {
 
 /// `/providers`: lists the providers with their key state.
 pub fn cmdProviders(m: *tui.Model) void {
-    for (agent.allProviders(m.allocator)) |*d| {
+    var defs_arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer defs_arena_state.deinit();
+    for (agent.allProviders(defs_arena_state.allocator())) |*d| {
         const key_state: []const u8 =
             if (d.key_env.len == 0) "sin key" else if (providers.keyFor(d, m.environ) != null) "key ok" else "SIN KEY";
         const active: []const u8 = if (std.mem.eql(u8, d.id, agent.cur_provider_id)) " ←" else "";

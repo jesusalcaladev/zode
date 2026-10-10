@@ -122,6 +122,12 @@ zig build -Doptimize=Debug   # with symbols, for when something crashes
 2. The environment works too, which is what the scripts will use:
    `ZODE_OPENCODE_KEY=… ./zode`.
 
+The model picker shows a saved catalog immediately while refreshing that
+provider in the background. Its footer reports whether the catalog is loading,
+current, updated, or being kept because the provider is unavailable. Choosing a
+different provider switches the picker to that provider's own catalog; late
+responses from the previous provider are discarded.
+
 No-TUI mode, to try it without a terminal and for scripts:
 
 ```bash
@@ -183,6 +189,7 @@ palette that **runs** the one you pick.
 | `Ctrl+R` | fold/unfold the last result |
 | `Ctrl+U` / `Ctrl+D` | half a page of scroll |
 | `PageUp` / `PageDown` | a page |
+| mouse drag over history | select and copy text to the clipboard on release |
 | `Shift+Enter` | newline (Enter sends) |
 | `Shift+Tab` | read-only mode |
 | `Esc` | stop the turn, kill the command, or answer "you decide" |

@@ -640,6 +640,9 @@ pub const Model = struct {
     /// there is no race.
     pending_items: ?[]palette.Item = null,
     pal_inited: bool = false,
+    catalog_request_id: usize = 0,
+    catalog_notice_buf: [160]u8 = undefined,
+    catalog_notice_len: usize = 0,
 
     /// Streaming state: the assistant's last paragraph is still open.
     streaming: bool = false,
@@ -712,6 +715,10 @@ pub const Model = struct {
     /// an estimate (see `ensureParaHeights`), replaced by the exact one when
     /// it is parsed.
     para_heights: std.ArrayList(usize) = .empty,
+    /// Segment tree over paragraph heights: long-history scroll queries are
+    /// logarithmic instead of scanning every paragraph on every frame.
+    height_tree: std.ArrayList(usize) = .empty,
+    height_tree_capacity: usize = 0,
     cache_width: u16 = 0,
     /// Index of the first paragraph whose layout is invalidated (Ctrl+R
     /// expands a tool in-place). `null` = cache is up to date.
@@ -723,6 +730,16 @@ pub const Model = struct {
     /// Fixed status bar.
     status_buf: [160]u8 = undefined,
     status_len: usize = 0,
+    scroll_bottom_row: u16 = 0,
+    scroll_bottom_start: u16 = 0,
+    scroll_bottom_end: u16 = 0,
+    selectable_text: std.ArrayList(u8) = .empty,
+    selectable_map: std.ArrayList(usize) = .empty,
+    selectable_rows: u16 = 0,
+    selectable_width: u16 = 0,
+    selection_start: ?SelectionPoint = null,
+    selection_end: ?SelectionPoint = null,
+    selecting_text: bool = false,
     /// Mood the status was composed with (to color the face).
     status_mood: mascot.Mood = .idle,
     status_mood_set: bool = false,
@@ -907,11 +924,6 @@ pub const Model = struct {
     goal_checkpoint: bool = false,
     /// Set when the same tool call has now happened three times running.
     loop_repeated: ?[]const u8 = null,
-    /// The last models request was for the picker, not for `/models`.
-    ///
-    /// On the Model and not an argument because the cache publishes from a helper that
-    /// is called from two places and has no business knowing which one asked.
-    models_for_picker: bool = false,
     /// The objective of this turn, when `/goal` set one.
     ///
     /// In the Model and not a module global because the draw reads it every frame and
@@ -942,6 +954,8 @@ pub const Model = struct {
     /// Max paragraphs with cells in memory at once (the ones outside the
     /// window are re-parsed when you look at them again).
     const max_cached_paras = 128;
+
+    const SelectionPoint = struct { row: u16, col: u16 };
 
     const Para = struct {
         kind: md.Kind,
@@ -1216,6 +1230,9 @@ pub const Model = struct {
         self.stream_buf.deinit(self.allocator);
         self.clearSegCache(); // empties `para_heights`
         self.para_heights.deinit(self.allocator);
+        self.height_tree.deinit(self.allocator);
+        self.selectable_text.deinit(self.allocator);
+        self.selectable_map.deinit(self.allocator);
         self.closePicker();
         self.picker_items.deinit(self.allocator);
         self.picker_filtered.deinit(self.allocator);
@@ -1554,6 +1571,9 @@ pub const Model = struct {
         // to overwrite here: the heights get estimated as whole numbers
         // again).
         self.para_heights.items.len = 0;
+        if (self.height_tree.items.len > 0) {
+            @memset(self.height_tree.items, 0);
+        }
     }
 
     /// Frees cache entry `i` and removes it (keeping order).
@@ -1587,10 +1607,15 @@ pub const Model = struct {
     fn ensureParaHeights(self: *Model) void {
         const n = self.paras.items.len;
         while (self.para_heights.items.len > n) {
+            const idx = self.para_heights.items.len - 1;
+            self.setHeightTreeValue(idx, 0);
             _ = self.para_heights.pop();
         }
+        self.ensureHeightTree(n);
+        self.para_heights.ensureTotalCapacity(self.allocator, n) catch return;
         while (self.para_heights.items.len < n) {
             const p = self.paras.items[self.para_heights.items.len];
+            const idx = self.para_heights.items.len;
             const est: usize = if (p.known_lines > 0)
                 p.known_lines
             else
@@ -1599,9 +1624,109 @@ pub const Model = struct {
             // those of `paras` and draw walks them assuming they measure the
             // same thing, so an OOM here cannot leave the list short (that
             // would be an out-of-range index in the next frame).
-            self.para_heights.ensureTotalCapacity(self.allocator, n) catch return;
             self.para_heights.appendAssumeCapacity(est);
+            self.setHeightTreeValue(idx, est);
         }
+    }
+
+    /// Grows geometrically and rebuilds only when the indexed history outgrows
+    /// its current leaf capacity. A failed allocation leaves the linear
+    /// fallback available and never publishes a partial tree.
+    fn ensureHeightTree(self: *Model, n: usize) void {
+        if (n <= self.height_tree_capacity) return;
+        var cap: usize = @max(self.height_tree_capacity, 1);
+        while (cap < n) {
+            const doubled = std.math.mul(usize, cap, 2) catch return;
+            cap = doubled;
+        }
+        const tree_len = std.math.mul(usize, cap, 2) catch return;
+        self.height_tree.ensureTotalCapacity(self.allocator, tree_len) catch return;
+        self.height_tree.items.len = tree_len;
+        @memset(self.height_tree.items, 0);
+        self.height_tree_capacity = cap;
+        for (self.para_heights.items, 0..) |h, i| {
+            self.height_tree.items[cap + i] = h;
+        }
+        var node = cap - 1;
+        while (node > 0) : (node -= 1) {
+            self.height_tree.items[node] =
+                self.height_tree.items[node * 2] + self.height_tree.items[node * 2 + 1];
+        }
+    }
+
+    fn setHeightTreeValue(self: *Model, index: usize, value: usize) void {
+        const cap = self.height_tree_capacity;
+        if (cap == 0 or index >= cap or self.height_tree.items.len < cap * 2) return;
+        var node = cap + index;
+        self.height_tree.items[node] = value;
+        node /= 2;
+        while (node > 0) : (node /= 2) {
+            self.height_tree.items[node] =
+                self.height_tree.items[node * 2] + self.height_tree.items[node * 2 + 1];
+        }
+    }
+
+    /// Sum of the first `end` paragraph heights. Falls back to a direct scan if
+    /// allocating a larger tree failed.
+    fn heightPrefix(self: *const Model, end: usize) usize {
+        const stop = @min(end, self.para_heights.items.len);
+        const cap = self.height_tree_capacity;
+        if (cap == 0 or stop > cap or self.height_tree.items.len < cap * 2) {
+            var sum: usize = 0;
+            for (self.para_heights.items[0..stop]) |h| sum += h;
+            return sum;
+        }
+        var left = cap;
+        var right = cap + stop;
+        var sum: usize = 0;
+        while (left < right) {
+            if ((left & 1) != 0) {
+                sum += self.height_tree.items[left];
+                left += 1;
+            }
+            if ((right & 1) != 0) {
+                right -= 1;
+                sum += self.height_tree.items[right];
+            }
+            left /= 2;
+            right /= 2;
+        }
+        return sum;
+    }
+
+    /// Paragraph index containing an absolute history line; total height maps
+    /// to `len`, the position just after the final paragraph.
+    fn heightIndexAt(self: *const Model, line: usize) usize {
+        const n = self.para_heights.items.len;
+        const total = self.heightPrefix(n);
+        if (line >= total) return n;
+        const cap = self.height_tree_capacity;
+        if (cap == 0 or n > cap or self.height_tree.items.len < cap * 2) {
+            var sum: usize = 0;
+            for (self.para_heights.items, 0..) |h, i| {
+                if (line < sum + h) return i;
+                sum += h;
+            }
+            return n;
+        }
+        var node: usize = 1;
+        var offset = line;
+        while (node < cap) {
+            const left = node * 2;
+            const left_sum = self.height_tree.items[left];
+            if (offset < left_sum) {
+                node = left;
+            } else {
+                offset -= left_sum;
+                node = left + 1;
+            }
+        }
+        return @min(node - cap, n);
+    }
+
+    /// First paragraph count whose cumulative height reaches `line`.
+    fn heightLowerBound(self: *const Model, line: usize) usize {
+        return self.heightIndexAt(line);
     }
 
     /// Cheap height estimate for a paragraph that has never been parsed.
@@ -1686,7 +1811,10 @@ pub const Model = struct {
         });
         // The exact height replaces the estimate, in the list AND in the paragraph:
         // the paragraph copy is what survives a resize (`ensureParaHeights`).
-        if (idx < self.para_heights.items.len) self.para_heights.items[idx] = lines.len;
+        if (idx < self.para_heights.items.len) {
+            self.para_heights.items[idx] = lines.len;
+            self.setHeightTreeValue(idx, lines.len);
+        }
         self.paras.items[idx].known_lines = lines.len;
     }
 
@@ -1701,8 +1829,7 @@ pub const Model = struct {
     /// clamp the anchor) and they cannot know how tall the live paragraph is:
     /// they use the last frame's value, through `currentMaxOffset`.
     fn totalsFor(self: *Model, live_lines: usize, history_h: usize) struct { total: usize, max_offset: usize } {
-        var closed: usize = 0;
-        for (self.para_heights.items) |h| closed += h;
+        const closed = self.heightPrefix(self.para_heights.items.len);
         const total: usize = closed + live_lines;
         const hh = @max(history_h, 1);
         return .{
@@ -1754,10 +1881,8 @@ pub const Model = struct {
 
     /// The absolute line of the top of the view, from (paragraph, offset).
     fn anchorLine(self: *const Model) usize {
-        var acc: usize = 0;
         const upto = @min(self.anchor_para, self.para_heights.items.len);
-        for (self.para_heights.items[0..upto]) |h| acc += h;
-        return acc + self.anchor_off;
+        return self.heightPrefix(upto) + self.anchor_off;
     }
 
     /// The other direction: turn an absolute line into (paragraph, offset).
@@ -1765,14 +1890,11 @@ pub const Model = struct {
     /// The offset is clamped to the paragraph's CURRENT height, which is what
     /// keeps a shrink from leaving the anchor pointing past its own paragraph.
     fn setAnchorLine(self: *Model, line: usize) void {
-        var acc: usize = 0;
-        for (self.para_heights.items, 0..) |h, i| {
-            if (line < acc + h) {
-                self.anchor_para = i;
-                self.anchor_off = line - acc;
-                return;
-            }
-            acc += h;
+        const i = self.heightIndexAt(line);
+        if (i < self.para_heights.items.len) {
+            self.anchor_para = i;
+            self.anchor_off = line - self.heightPrefix(i);
+            return;
         }
         // Past the last paragraph: the top of the view is below all of them.
         self.anchor_para = self.para_heights.items.len;
@@ -1838,17 +1960,9 @@ pub const Model = struct {
         if (self.paras.items.len == 0) return;
 
         // ── target window: the paragraphs covering [first, last] ──
-        var acc: usize = 0;
-        var lo: usize = 0;
-        while (lo < self.para_heights.items.len) : (lo += 1) {
-            if (acc + self.para_heights.items[lo] > first_visible) break;
-            acc += self.para_heights.items[lo];
-        }
-        var hi = lo;
-        var seen = acc;
-        while (hi < self.para_heights.items.len and seen < last_visible) : (hi += 1) {
-            seen += self.para_heights.items[hi];
-        }
+        var lo = self.heightIndexAt(first_visible);
+        var hi = self.heightLowerBound(last_visible);
+        if (hi < lo) hi = lo;
         // If the visible window is wider than the cap, the tail is kept (that
         // is what you are reading: the very bottom).
         if (hi - lo > Model.max_cached_paras) lo = hi - Model.max_cached_paras;
@@ -2387,18 +2501,71 @@ pub const Model = struct {
         }
     }
 
-    /// The worker leaves the already-built items here (thread-safe).
-    ///
-    /// ITEMS are handed over, not `models_mod.Model`: a Model's `id` points
-    /// into the list it came from, and if the worker frees that list when it
-    /// finishes (which it does) those pointers dangle. The items carry their
-    /// own strings and the palette frees them when they are replaced.
-    pub fn setPendingItems(self: *Model, items: []palette.Item) void {
+    pub fn beginCatalogRequest(self: *Model, provider_id: []const u8) usize {
+        self.lock();
+        self.catalog_request_id +%= 1;
+        if (self.catalog_request_id == 0) self.catalog_request_id = 1;
+        const request_id = self.catalog_request_id;
+        if (self.pending_items) |items| {
+            palette.freeItems(self.allocator, items);
+            self.pending_items = null;
+        }
+        const notice = std.fmt.bufPrint(&self.catalog_notice_buf, "Loading {s} model catalog…", .{provider_id}) catch "";
+        self.catalog_notice_len = notice.len;
+        self.dirty = true;
+        self.unlock();
+        self.requestRedraw();
+        return request_id;
+    }
+
+    pub fn catalogRequestCurrent(self: *Model, request_id: usize) bool {
         self.lock();
         defer self.unlock();
+        return self.catalog_request_id == request_id;
+    }
+
+    pub fn setCatalogNotice(self: *Model, request_id: usize, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        if (self.catalog_request_id != request_id) return;
+        const n = @min(text.len, self.catalog_notice_buf.len);
+        @memcpy(self.catalog_notice_buf[0..n], text[0..n]);
+        self.catalog_notice_len = n;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    pub fn catalogNotice(self: *Model, arena: std.mem.Allocator) []const u8 {
+        self.lock();
+        defer self.unlock();
+        return arena.dupe(u8, self.catalog_notice_buf[0..self.catalog_notice_len]) catch "";
+    }
+
+    pub fn invalidateCatalogRequest(self: *Model) void {
+        self.lock();
+        self.catalog_request_id +%= 1;
+        if (self.catalog_request_id == 0) self.catalog_request_id = 1;
+        self.catalog_notice_len = 0;
+        if (self.pending_items) |items| {
+            palette.freeItems(self.allocator, items);
+            self.pending_items = null;
+        }
+        self.dirty = true;
+        self.unlock();
+        self.requestRedraw();
+    }
+
+    pub fn setPendingCatalogItems(self: *Model, request_id: usize, items: []palette.Item) void {
+        self.lock();
+        defer self.unlock();
+        if (self.catalog_request_id != request_id) {
+            palette.freeItems(self.allocator, items);
+            return;
+        }
         if (self.pending_items) |old| palette.freeItems(self.allocator, old);
         self.pending_items = items;
         self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// The UI thread picks up the items and returns ownership.
@@ -3441,6 +3608,9 @@ pub const Model = struct {
     /// scroll is what there is to scroll.
     pub fn scrollBy(self: *Model, n: isize) void {
         if (n == 0) return;
+        self.selection_start = null;
+        self.selection_end = null;
+        self.selecting_text = false;
         const mo = self.currentMaxOffset();
         var first = if (self.follow_bottom) mo else @min(self.anchor, mo);
         // DIRECTION, spelled out because getting it backwards is invisible in
@@ -3467,12 +3637,113 @@ pub const Model = struct {
         self.max_offset = mo;
     }
 
+    fn snapshotSelectableHistory(self: *Model, surface: vxfw.Surface, rows: u16) !void {
+        const height = @min(rows, surface.size.height);
+        const width = surface.size.width;
+        self.selectable_text.clearRetainingCapacity();
+        self.selectable_map.clearRetainingCapacity();
+        self.selectable_rows = height;
+        self.selectable_width = width;
+
+        const map_len = std.math.mul(usize, @as(usize, height), @as(usize, width) + 1) catch return error.OutOfMemory;
+        try self.selectable_map.ensureTotalCapacity(self.allocator, map_len);
+        for (0..height) |row| {
+            if (row > 0) try self.selectable_text.append(self.allocator, '\n');
+            try self.selectable_map.append(self.allocator, self.selectable_text.items.len);
+            var col: u16 = 0;
+            while (col < width) {
+                const cell = surface.readCell(col, row);
+                const text = cell.char.grapheme;
+                try self.selectable_text.appendSlice(self.allocator, text);
+                const cell_width: u16 = @max(@as(u16, cell.char.width), 1);
+                var step: u16 = 0;
+                while (step < cell_width and col + step < width) : (step += 1) {
+                    try self.selectable_map.append(self.allocator, self.selectable_text.items.len);
+                }
+                col += cell_width;
+            }
+        }
+    }
+
+    fn selectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
+        if (mouse.row < 0 or mouse.col < 0) return null;
+        const row = @as(u16, @intCast(mouse.row));
+        const col = @as(u16, @intCast(mouse.col));
+        if (row >= self.selectable_rows or self.selectable_width == 0) return null;
+        return .{ .row = row, .col = @min(col, self.selectable_width - 1) };
+    }
+
+    fn clampedSelectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
+        if (mouse.row < 0 or mouse.col < 0 or self.selectable_rows == 0 or self.selectable_width == 0) return null;
+        return .{
+            .row = @min(@as(u16, @intCast(mouse.row)), self.selectable_rows - 1),
+            .col = @min(@as(u16, @intCast(mouse.col)), self.selectable_width - 1),
+        };
+    }
+
+    fn selectedText(self: *const Model, allocator: std.mem.Allocator) !?[]u8 {
+        const start = self.selection_start orelse return null;
+        const end = self.selection_end orelse return null;
+        const first = if (selectionPointLess(end, start)) end else start;
+        const last = if (selectionPointLess(end, start)) start else end;
+        if (first.row >= self.selectable_rows or last.row >= self.selectable_rows) return null;
+        const stride = @as(usize, self.selectable_width) + 1;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var row = first.row;
+        while (row <= last.row) : (row += 1) {
+            const from_col: u16 = if (row == first.row) first.col else 0;
+            const to_col: u16 = if (row == last.row) @min(last.col + 1, self.selectable_width) else self.selectable_width;
+            const map_base = @as(usize, row) * stride;
+            if (map_base + to_col >= self.selectable_map.items.len) return null;
+            const from = self.selectable_map.items[map_base + from_col];
+            const to = self.selectable_map.items[map_base + to_col];
+            if (from > to or to > self.selectable_text.items.len) return null;
+            const part = std.mem.trimEnd(u8, self.selectable_text.items[from..to], " \t");
+            try out.appendSlice(allocator, part);
+            if (row < last.row) try out.append(allocator, '\n');
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    fn paintTextSelection(self: *const Model, surface: vxfw.Surface) void {
+        const start = self.selection_start orelse return;
+        const end = self.selection_end orelse return;
+        const first = if (selectionPointLess(end, start)) end else start;
+        const last = if (selectionPointLess(end, start)) start else end;
+        if (first.row >= self.selectable_rows or last.row >= self.selectable_rows) return;
+        var row = first.row;
+        while (row <= last.row) : (row += 1) {
+            const from = if (row == first.row) first.col else 0;
+            const to = if (row == last.row) @min(last.col + 1, self.selectable_width) else self.selectable_width;
+            var col = from;
+            while (col < to and col < surface.size.width) : (col += 1) {
+                var cell = surface.readCell(col, row);
+                cell.style.bg = theme.selected.bg;
+                cell.style.bold = true;
+                surface.writeCell(col, row, cell);
+            }
+        }
+    }
+
+    fn copySelectedText(self: *const Model, ctx: *vxfw.EventContext) !void {
+        const text = (try self.selectedText(ctx.alloc)) orelse return;
+        defer ctx.alloc.free(text);
+        if (text.len == 0) return;
+        try ctx.copyToClipboard(text);
+    }
+
+    fn selectionPointLess(a: SelectionPoint, b: SelectionPoint) bool {
+        return a.row < b.row or (a.row == b.row and a.col < b.col);
+    }
+
     // ── modal palette (Ctrl+P) ─────────────────────────────
 
     /// Opens the palette in the given mode. `items` and `groups` are filled by
     /// the caller (the agent) and must stay alive while it is open; in
     /// practice they live in the model's allocator.
     pub fn openPaletteWith(self: *Model, mode: palette.Mode, items: []const palette.Item, groups: []const palette.Group) void {
+        if (self.pal.mode == .models) self.invalidateCatalogRequest();
         self.pal.mode = mode;
         self.pal.active = true;
         self.pal.query_len = 0;
@@ -3481,6 +3752,7 @@ pub const Model = struct {
     }
 
     pub fn closePalette(self: *Model) void {
+        if (self.pal.mode == .models) self.invalidateCatalogRequest();
         self.pal.close();
     }
 
@@ -3495,6 +3767,7 @@ pub const Model = struct {
     /// AGENT's job, not the TUI's: here we only pass along what was selected
     /// and wait for an "I consumed it" bool.
     pub fn paletteKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+        const closing_model_palette = self.pal.mode == .models and key.matches(vaxis.Key.escape, .{});
         const act = palette.handleKey(&self.pal, key);
         // CAREFUL: redraw must be requested ALWAYS. The palette mutates its
         // state (query, selection) and without `ctx.redraw` the screen stays
@@ -3504,6 +3777,7 @@ pub const Model = struct {
         switch (act) {
             .none => {},
             .close => {
+                if (closing_model_palette) self.invalidateCatalogRequest();
                 self.closePalette();
                 return true;
             },
@@ -3546,6 +3820,7 @@ pub const Model = struct {
             .set_provider => |p| {
                 self.closePalette();
                 try agent.applyProvider(self, p);
+                agent.openModelPaletteAsync(self);
                 return true;
             },
             .set_model => |mo| {
@@ -4502,8 +4777,46 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             ctx.redraw = true;
         },
         .mouse => |m| {
+            if (self.selecting_text) {
+                switch (m.type) {
+                    .drag => {
+                        if (self.clampedSelectionPoint(m)) |point| self.selection_end = point;
+                        ctx.redraw = true;
+                        return;
+                    },
+                    .release => {
+                        if (self.clampedSelectionPoint(m)) |point| self.selection_end = point;
+                        self.selecting_text = false;
+                        try self.copySelectedText(ctx);
+                        ctx.redraw = true;
+                        return;
+                    },
+                    else => {},
+                }
+            }
+            if (m.type == .press and m.button == .left and
+                !self.pal.active and !self.askActive() and !self.permActive())
+            {
+                if (self.selectionPoint(m)) |point| {
+                    self.selection_start = point;
+                    self.selection_end = point;
+                    self.selecting_text = true;
+                    ctx.redraw = true;
+                    return;
+                }
+            }
             // The wheel arrives as button 64/65 with type=press.
             if (m.type != .press) return;
+            if (m.button == .left and
+                m.row >= 0 and @as(u16, @intCast(m.row)) == self.scroll_bottom_row and
+                m.col >= 0 and @as(u16, @intCast(m.col)) >= self.scroll_bottom_start and
+                @as(u16, @intCast(m.col)) < self.scroll_bottom_end)
+            {
+                self.scrollBy(-1_000_000);
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
             switch (m.button) {
                 // CAREFUL: `self.scroll` is a usize. `self.scroll -= 3` with
                 // the scroll at 0 underflows and brings the app down (integer
@@ -4786,8 +5099,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     //
     // `line_cursor` is the ABSOLUTE position of the first line: the window's
     // `.offset` (`cache_lo`) plus what the cached paragraphs before it carry.
-    var line_cursor: usize = 0;
-    for (self.para_heights.items[0..self.cache_lo]) |h| line_cursor += h;
+    var line_cursor = self.heightPrefix(self.cache_lo);
     for (self.seg_cache.items) |c| {
         defer line_cursor += c.height;
         if (line_cursor >= last_visible) break;
@@ -4797,6 +5109,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     if (live_active) {
         drawLines(&p, live_lines, line_cursor, first_visible, history_h);
     }
+    try self.snapshotSelectableHistory(surface, history_h);
+    self.paintTextSelection(surface);
 
     // The session info (model · provider · effort · ctx%) is painted
     // segmented further below, right-aligned; here it is only prepared.
@@ -4836,8 +5150,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // metadata. When idle, it can show a quiet status or a scroll hint.
     {
         const current = self.activity();
-        const label: []const u8 = if (!self.follow_bottom and !self.hasInput())
-            "↑↓ history · PgUp/PgDn · End latest"
+        self.scroll_bottom_start = 0;
+        self.scroll_bottom_end = 0;
+        self.scroll_bottom_row = status_row;
+        const scrolled = !self.follow_bottom;
+        const label: []const u8 = if (scrolled)
+            "↓ latest"
         else if (!current.busy and !current.ask and !current.perm and self.queuedCount() == 0)
             self.status()
         else
@@ -4845,7 +5163,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         if (label.len > 0) {
             const reserved = info_width + (if (usage_fits) usage_width + 3 else 0);
             const left_width = if (width > reserved + 3) width - reserved - 3 else 0;
-            _ = p.putClipped(1, status_row, label, left_width, theme.brand_soft);
+            if (scrolled and left_width >= 8) {
+                _ = p.putClipped(1, status_row, label, 8, theme.brand);
+                self.scroll_bottom_start = 1;
+                self.scroll_bottom_end = 9;
+            } else {
+                _ = p.putClipped(1, status_row, label, left_width, theme.brand_soft);
+            }
         }
     }
     if (info.len > 0) drawSessionInfo(&p, status_row, info_right, info);
@@ -4906,7 +5230,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         self.pal.setItemsOwned(items, &agent.model_groups);
     }
     if (self.pal.active) {
-        palette.draw(&p, &surface, &self.pal, width, height);
+        palette.draw(&p, &surface, &self.pal, width, height, self.catalogNotice(ctx.arena));
     }
 
     return surface;
@@ -6868,6 +7192,104 @@ test "scroll: overscrolling up leaves no debt, so one PageDown really scrolls do
     try std.testing.expectEqual(m.max_offset - 10, m.max_offset - m.first_visible);
 }
 
+test "history height index tracks estimates, corrections, and cache resets" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    for (0..257) |i| {
+        var buf: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "history paragraph {d}", .{i});
+        m.pushInfo(text);
+    }
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expect(m.height_tree_capacity >= m.para_heights.items.len);
+
+    var total: usize = 0;
+    for (0..m.para_heights.items.len + 1) |end| {
+        try std.testing.expectEqual(total, m.heightPrefix(end));
+        if (end < m.para_heights.items.len) total += m.para_heights.items[end];
+    }
+    for (0..total) |line| {
+        var expected: usize = 0;
+        while (expected < m.para_heights.items.len and
+            line >= m.heightPrefix(expected + 1)) : (expected += 1)
+        {}
+        try std.testing.expectEqual(expected, m.heightIndexAt(line));
+    }
+
+    const changed = m.para_heights.items.len / 2;
+    m.para_heights.items[changed] += 3;
+    m.paras.items[changed].known_lines = m.para_heights.items[changed];
+    m.setHeightTreeValue(changed, m.para_heights.items[changed]);
+    try std.testing.expectEqual(
+        m.heightPrefix(changed) + m.para_heights.items[changed],
+        m.heightPrefix(changed + 1),
+    );
+
+    m.clearSegCache();
+    m.ensureParaHeights();
+    try std.testing.expectEqual(m.paras.items[changed].known_lines, m.para_heights.items[changed]);
+    total = 0;
+    for (0..m.para_heights.items.len + 1) |end| {
+        try std.testing.expectEqual(total, m.heightPrefix(end));
+        if (end < m.para_heights.items.len) total += m.para_heights.items[end];
+    }
+}
+
+test "dragging across timeline text copies the selected output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushInfo("copied phrase from the assistant output");
+    m.pushInfo("second assistant line");
+    const surface = try drawTest(&m, arena_state.allocator(), 80, 24);
+
+    var ctx = testCtx();
+    defer {
+        for (ctx.cmds.items) |cmd| {
+            switch (cmd) {
+                .copy_to_clipboard => |text| ctx.alloc.free(text),
+                .set_title => |text| ctx.alloc.free(text),
+                else => {},
+            }
+        }
+        ctx.cmds.deinit(ctx.alloc);
+    }
+
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = 0,
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(surface.size.width - 1),
+        .row = 2,
+        .button = .left,
+        .mods = .{},
+        .type = .drag,
+    } });
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(surface.size.width - 1),
+        .row = 2,
+        .button = .none,
+        .mods = .{},
+        .type = .release,
+    } });
+
+    var copied: ?[]const u8 = null;
+    for (ctx.cmds.items) |cmd| {
+        if (cmd == .copy_to_clipboard) copied = cmd.copy_to_clipboard;
+    }
+    try std.testing.expect(copied != null);
+    try std.testing.expect(std.mem.indexOf(u8, copied.?, "copied phrase from the assistant output") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copied.?, "second assistant line") != null);
+}
+
 test "scroll: reading is not dragged away by the text that arrives" {
     // `first` used to be `max_offset - scroll`: also relative to the bottom, so
     // every new line moved `max_offset` and therefore the window, while `scroll`
@@ -7589,6 +8011,77 @@ test "a command that needs arguments goes back to the input (not run blindly)" {
 
     try std.testing.expect(!m.pal.active);
     try std.testing.expectEqualStrings("/use ", m.ed.text());
+}
+
+test "model catalog requests discard stale results and keep the latest status" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const stale_request = m.beginCatalogRequest("first-provider");
+    const stale_items = try std.testing.allocator.alloc(palette.Item, 1);
+    stale_items[0] = .{
+        .kind = .model,
+        .label = try std.testing.allocator.dupe(u8, "stale-model"),
+    };
+
+    const current_request = m.beginCatalogRequest("second-provider");
+    m.setPendingCatalogItems(stale_request, stale_items);
+    try std.testing.expect(m.catalogRequestCurrent(current_request));
+    try std.testing.expect(m.pending_items == null);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const notice = m.catalogNotice(arena_state.allocator());
+    try std.testing.expect(std.mem.indexOf(u8, notice, "second-provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, notice, "first-provider") == null);
+}
+
+test "model catalog refresh status is visible in the open picker" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const groups = [_]palette.Group{ .{ .name = "Providers" }, .{ .name = "" }, .{ .name = "Models" } };
+    const items = [_]palette.Item{
+        .{ .kind = .provider, .group = 1, .label = "example-provider" },
+        .{ .kind = .connect, .group = 2, .label = "+ connect" },
+    };
+    m.pal.mode = .models;
+    m.pal.active = true;
+    m.pal.setItems(&items, &groups);
+    const request_id = m.beginCatalogRequest("example-provider");
+    m.setCatalogNotice(request_id, "Offline · showing saved catalog");
+
+    const surface = try drawTest(&m, arena_state.allocator(), 90, 24);
+    try std.testing.expect(std.mem.indexOf(u8, allText(surface), "Offline") != null);
+}
+
+test "closing the model palette invalidates its pending catalog request" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pal.mode = .models;
+    m.pal.active = true;
+    const request_id = m.beginCatalogRequest("example-provider");
+
+    var ctx = testCtx();
+    _ = try m.paletteKey(&ctx, .{ .codepoint = 27 });
+
+    try std.testing.expect(!m.pal.active);
+    try std.testing.expect(!m.catalogRequestCurrent(request_id));
+}
+
+test "replacing the model palette invalidates its pending catalog request" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pal.mode = .models;
+    m.pal.active = true;
+    const request_id = m.beginCatalogRequest("example-provider");
+
+    agent.openConnectPalette(&m);
+
+    try std.testing.expectEqual(palette.Mode.connect, m.pal.mode);
+    try std.testing.expect(!m.catalogRequestCurrent(request_id));
 }
 
 test "streamEnd empties pending BEFORE setting the paragraph (else the text lands on top of the tool)" {
@@ -9593,9 +10086,17 @@ test "ctrl+d scrolls back down and does NOT quit" {
     const scrolled = try drawTest(&m, arena_state.allocator(), 60, 20);
     var status_buf: [256]u8 = undefined;
     const status = rowText(scrolled, scrolled.size.height - 2, &status_buf);
-    try std.testing.expect(std.mem.indexOf(u8, status, "history") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "latest") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "↓ 1") == null);
     const latest = m.currentMaxOffset();
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = 2,
+        .row = @intCast(scrolled.size.height - 2),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expectEqual(latest, m.anchorLine());
     try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.end } });
     try std.testing.expectEqual(latest, m.anchorLine());
 

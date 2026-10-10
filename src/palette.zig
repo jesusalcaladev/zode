@@ -587,6 +587,7 @@ pub fn draw(
     pal: *Palette,
     width: u16,
     height: u16,
+    notice: []const u8,
 ) void {
     const box = boxFor(pal, width, height);
     if (box.w < 24 or box.h < 8) return;
@@ -622,7 +623,7 @@ pub fn draw(
 
     if (pal.mode == .key_prompt) {
         drawKeyPrompt(p, pal, box);
-        drawFooter(p, pal, box);
+        drawFooter(p, pal, box, notice);
         surface.cursor = .{
             .row = box.y + 4,
             .col = box.x + 3 + @as(u16, @intCast(pal.key_len)),
@@ -648,22 +649,27 @@ pub fn draw(
         while (ry < box.h - 2) : (ry += 1) {
             p.putStable(box.x + box.col_w, box.y + ry, "│", 1, theme.brand_faint);
         }
-        drawColumn(p, pal, box, 0, box.x + 1, box.col_w - 1);
-        drawColumn(p, pal, box, 1, box.x + box.col_w + 1, box.w - box.col_w - 2);
+        drawColumn(p, pal, box, 0, box.x + 1, box.col_w - 1, "");
+        drawColumn(p, pal, box, 1, box.x + box.col_w + 1, box.w - box.col_w - 2, notice);
     } else {
-        drawColumn(p, pal, box, 0, box.x + 1, box.w - 2);
+        drawColumn(p, pal, box, 0, box.x + 1, box.w - 2, "");
     }
 
     // ── footer ──
-    drawFooter(p, pal, box);
+    drawFooter(p, pal, box, notice);
 }
 
 /// A column of items, with group header, scroll and highlight.
-fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16) void {
+fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, notice: []const u8) void {
     const filtered = pal.filtered[c].items;
     if (filtered.len == 0) {
-        const msg: []const u8 = if (pal.mode == .connect) "no providers" else "no matches";
-        _ = p.putText(x0 + 2, box.y + 3, msg, theme.brand_faint);
+        const msg: []const u8 = if (pal.mode == .connect)
+            "no providers"
+        else if (pal.mode == .models and c == 1 and notice.len > 0 and pal.queryText().len == 0)
+            notice
+        else
+            "no matches";
+        _ = p.putClipped(x0 + 2, box.y + 3, msg, w -| 4, theme.hint);
         return;
     }
     pal.clampScroll(c, box.list_rows);
@@ -730,7 +736,7 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16) v
     }
 }
 
-fn drawFooter(p: *Painter, pal: *const Palette, box: Box) void {
+fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) void {
     const fy = box.y + box.h - 2;
     const hint: []const u8 = switch (pal.mode) {
         .commands => "↑↓ move · enter run · esc close",
@@ -738,14 +744,20 @@ fn drawFooter(p: *Painter, pal: *const Palette, box: Box) void {
         .connect => "↑↓ move · enter choose · esc back",
         .key_prompt => "",
     };
-    if (hint.len > 0 and hint.len + 4 < box.w) {
-        _ = p.putText(box.x + box.w - 2 - @as(u16, @intCast(hint.len)), fy, hint, theme.brand_soft);
+    const hint_width: u16 = @intCast(displayWidth(hint));
+    const hint_x = box.x + box.w - 2 -| hint_width;
+    if (hint.len > 0 and hint_width + 4 < box.w) {
+        _ = p.putText(hint_x, fy, hint, theme.brand_soft);
     }
     if (pal.mode == .models) {
         // Shortcut to connect without having to reach the item at the bottom.
         const left = "ctrl+a connect";
         if (left.len + 4 < box.w) {
             _ = p.putText(box.x + 2, fy, left, theme.brand);
+            const notice_x = box.x + 2 + @as(u16, @intCast(displayWidth(left))) + 2;
+            if (notice.len > 0 and hint_x > notice_x + 1) {
+                _ = p.putClipped(notice_x, fy, notice, hint_x - notice_x - 1, theme.hint);
+            }
         }
     }
 }
