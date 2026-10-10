@@ -94,6 +94,7 @@ pub const Palette = struct {
 
     /// `.key_prompt` mode.
     key_item: u32 = 0,
+    key_return_mode: Mode = .connect,
     key_input: [max_key]u8 = undefined,
     key_len: usize = 0,
     key_msg: [96]u8 = undefined,
@@ -104,6 +105,40 @@ pub const Palette = struct {
 
     pub fn init(gpa: std.mem.Allocator) Palette {
         return .{ .gpa = gpa };
+    }
+
+    test "key prompt escape returns to the palette it came from" {
+        var pal = Palette.init(t.allocator);
+        defer pal.deinit();
+        const items = [_]Item{
+            .{ .kind = .provider, .label = "openrouter" },
+        };
+        pal.mode = .connect;
+        pal.active = true;
+        pal.setItems(&items, &.{});
+
+        _ = handleKey(&pal, .{ .codepoint = 13 });
+        try t.expectEqual(Mode.key_prompt, pal.mode);
+        _ = handleKey(&pal, .{ .codepoint = 27 });
+        try t.expectEqual(Mode.connect, pal.mode);
+
+        pal.mode = .models;
+        pal.key_return_mode = .models;
+        pal.mode = .key_prompt;
+        _ = handleKey(&pal, .{ .codepoint = 27 });
+        try t.expectEqual(Mode.models, pal.mode);
+    }
+
+    test "model palette connect item opens the provider connection flow" {
+        var pal = Palette.init(t.allocator);
+        defer pal.deinit();
+        const items = [_]Item{
+            .{ .kind = .connect, .label = "+ connect" },
+        };
+        pal.mode = .models;
+        pal.setItems(&items, &.{});
+        pal.col = 0;
+        try t.expect(std.meta.activeTag(handleKey(&pal, .{ .codepoint = 13 })) == .open_connect);
     }
 
     pub fn deinit(self: *Palette) void {
@@ -612,9 +647,9 @@ pub fn draw(
     // ── title (left) and "esc" (right) ──
     const title = switch (pal.mode) {
         .commands => "Commands",
-        .models => "Switch model",
-        .connect => "Connect",
-        .key_prompt => "Connect",
+        .models => "Choose a model",
+        .connect => "Connect a provider",
+        .key_prompt => "Add API key",
     };
     var tb: [32]u8 = undefined;
     const t1 = std.fmt.bufPrint(&tb, " {s}", .{title}) catch " ";
@@ -635,10 +670,16 @@ pub fn draw(
     const sy = box.y + 2;
     _ = p.putText(box.x + 2, sy, "▌", theme.brand_bold);
     const q = pal.queryText();
+    const placeholder: []const u8 = switch (pal.mode) {
+        .commands => "search commands",
+        .models => if (pal.column() == 0) "filter providers" else "filter models",
+        .connect => "filter providers",
+        .key_prompt => "",
+    };
     if (q.len > 0) {
         _ = p.putText(box.x + 3, sy, q, theme.brand);
     } else {
-        _ = p.putText(box.x + 3, sy, "search", theme.brand_faint);
+        _ = p.putText(box.x + 3, sy, placeholder, theme.brand_faint);
     }
     surface.cursor = .{ .row = sy, .col = box.x + 3 + @as(u16, @intCast(q.len)) };
 
@@ -740,8 +781,8 @@ fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) vo
     const fy = box.y + box.h - 2;
     const hint: []const u8 = switch (pal.mode) {
         .commands => "↑↓ move · enter run · esc close",
-        .models => "↑↓ move · tab switch column · enter use",
-        .connect => "↑↓ move · enter choose · esc back",
+        .models => "↑↓ move · tab switch · enter select",
+        .connect => "↑↓ move · enter add / replace key",
         .key_prompt => "",
     };
     const hint_width: u16 = @intCast(displayWidth(hint));
@@ -844,6 +885,8 @@ pub const Action = union(enum) {
     run_command: []const u8,
     /// Switch to this provider.
     set_provider: []const u8,
+    /// Open the guided provider connection list.
+    open_connect,
     /// Switch to this model, with its context window in tokens.
     ///
     /// A struct, not a bare `[]const u8`, because the window is what makes the
@@ -868,7 +911,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
     // ── key prompt ──
     if (pal.mode == .key_prompt) {
         if (key.matches(vaxis.Key.escape, .{})) {
-            pal.mode = .models;
+            pal.mode = pal.key_return_mode;
             pal.key_len = 0;
             pal.key_msg_len = 0;
             return .{ .none = {} };
@@ -977,6 +1020,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
             .provider => blk: {
                 if (pal.mode == .connect) {
                     pal.key_item = filtered_index;
+                    pal.key_return_mode = .connect;
                     pal.mode = .key_prompt;
                     pal.key_len = 0;
                     pal.key_msg_len = 0;
@@ -986,13 +1030,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
                 break :blk Action{ .set_provider = it.label };
             },
             .model => .{ .set_model = .{ .id = it.label, .ctx_tokens = it.ctx_tokens } },
-            .connect => blk: {
-                pal.mode = .key_prompt;
-                pal.key_len = 0;
-                pal.key_msg_len = 0;
-                pal.setKeyMessage("choose a provider first", false);
-                break :blk Action{ .none = {} };
-            },
+            .connect => .open_connect,
         };
     }
     return .{ .none = {} };
@@ -1211,7 +1249,7 @@ test "draw: models mode paints both columns and the footer" {
 
     const s = try tui.drawTest(&m, arena_state.allocator(), 90, 26);
     const all = tui.allText(s);
-    try t.expect(std.mem.indexOf(u8, all, "Switch model") != null);
+    try t.expect(std.mem.indexOf(u8, all, "Choose a model") != null);
     try t.expect(std.mem.indexOf(u8, all, "openrouter") != null);
     try t.expect(std.mem.indexOf(u8, all, "deepseek-chat") != null);
     try t.expect(std.mem.indexOf(u8, all, "free") != null);

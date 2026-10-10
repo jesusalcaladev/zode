@@ -3823,6 +3823,10 @@ pub const Model = struct {
                 agent.openModelPaletteAsync(self);
                 return true;
             },
+            .open_connect => {
+                agent.openConnectPalette(self);
+                return true;
+            },
             .set_model => |mo| {
                 self.closePalette();
                 // The window goes with the model: it is what the compaction
