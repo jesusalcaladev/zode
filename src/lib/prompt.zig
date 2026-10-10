@@ -132,6 +132,11 @@ pub const tool_routing_prompt =
     \\   Read on with it until you have what you need — a long document is 2-3
     \\   calls at ONE url, and answering from the first window as if it were the
     \\   whole document is how a page gets misread.
+    \\   Keep web research narrow: one specific query, the default five results, and
+    \\   fetch only the best primary sources needed to verify the answer. Search
+    \\   snippets are enough for discovery; do not fetch every result. For long
+    \\   pages, request only the next offset needed, then stop when the evidence is
+    \\   sufficient. Final web claims must link to the source that supports them.
     \\ - bash is for EXECUTING things on this machine: builds, tests, git, file
     \\   inspection that grep/glob cannot express. It is not a general-purpose
     \\   "find out" tool: before bash, ask if read/grep/glob/refs/web_* would do
@@ -192,6 +197,9 @@ pub const tool_routing_prompt =
     \\   reading that list to know where you are.
     \\   Do NOT use it for a single obvious step, or to think out loud: a list
     \\   that does not change as you work is noise.
+    \\ - Keep user-facing output clean: lead with the result, include only relevant
+    \\   files and checks, state uncertainty plainly, and do not repeat tool output
+    \\   or narrate routine progress.
     \\
 ;
 
@@ -401,6 +409,13 @@ test "the routing table says a fetch is a WINDOW the model can page with offset"
             return error.RuleMissing;
         }
     }
+}
+
+test "web research stays focused and user-facing output stays compact" {
+    for ([_][]const u8{ "one specific query", "default five results", "primary sources", "do not fetch every result", "link to the source" }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, needle) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "do not repeat tool output") != null);
 }
 
 test "verification asks for a regression test, but NOT for a test rig" {

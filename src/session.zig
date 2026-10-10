@@ -20,6 +20,7 @@ const std = @import("std");
 /// The first bytes of the goal note, so it can be found again and replaced.
 pub const goal_note_marker = "\u{1}ZODE-GOAL\u{1}";
 const chat = @import("chat.zig");
+const cache_stats = @import("cache_stats.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 
 /// A conversation message. Efficient design:
@@ -49,6 +50,9 @@ pub const Session = struct {
     /// Session path (owned, to show in the TUI).
     path: ?[]const u8 = null,
     fw: ?std.Io.File.Writer = null,
+    /// Provider-reported usage for this session, persisted as metadata records
+    /// in the JSONL and never sent back to the model.
+    usage_stats: cache_stats.CacheStats = .{},
 
     pub fn init(allocator: std.mem.Allocator) Session {
         return .{
@@ -262,6 +266,7 @@ pub const Session = struct {
         for (s.messages.items) |*m| {
             try s.persist(m);
         }
+        if (s.usage_stats.requests > 0) try s.persistUsageSnapshot();
         try s.fw.?.interface.flush();
         return s;
     }
@@ -306,6 +311,26 @@ pub const Session = struct {
     pub fn flush(self: *Session) void {
         if (self.fw != null) self.fw.?.interface.flush() catch {};
     }
+
+    /// Save a compact cumulative snapshot outside the conversation messages.
+    /// Rewriting a session on resume keeps only the latest snapshot.
+    pub fn appendUsageSnapshot(self: *Session, stats: cache_stats.CacheStats) !void {
+        self.usage_stats = stats;
+        try self.persistUsageSnapshot();
+    }
+
+    fn persistUsageSnapshot(self: *Session) !void {
+        const file_writer = &(self.fw orelse return).interface;
+        const json = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            .{ .event = "usage", .stats = self.usage_stats },
+            .{},
+        );
+        defer self.allocator.free(json);
+        try file_writer.writeAll(json);
+        try file_writer.writeByte('\n');
+        try file_writer.flush();
+    }
 };
 
 fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
@@ -345,10 +370,50 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
+        if (parseUsageSnapshot(allocator, line)) |stats| {
+            s.usage_stats = stats;
+            continue;
+        }
         const m = parseLine(allocator, line) catch continue;
         try s.messages.append(allocator, m);
     }
     return s;
+}
+
+fn parseUsageSnapshot(gpa: std.mem.Allocator, line: []const u8) ?cache_stats.CacheStats {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return null;
+    if (parsed != .object) return null;
+    const event = parsed.object.get("event") orelse return null;
+    const stats_value = parsed.object.get("stats") orelse return null;
+    if (event != .string or !std.mem.eql(u8, event.string, "usage") or stats_value != .object) return null;
+    const obj = stats_value.object;
+    return .{
+        .prompt_tokens = getI64(obj, "prompt_tokens") orelse return null,
+        .cached_tokens = getI64(obj, "cached_tokens") orelse return null,
+        .completion_tokens = getI64(obj, "completion_tokens") orelse return null,
+        .requests = getUsize(obj, "requests") orelse return null,
+        .cache_hits = getUsize(obj, "cache_hits") orelse return null,
+        .cache_write_tokens = getI64(obj, "cache_write_tokens") orelse return null,
+        .cache_writes = getUsize(obj, "cache_writes") orelse return null,
+        .prev_prompt = getI64(obj, "prev_prompt") orelse return null,
+        .prompt_shrinks = getUsize(obj, "prompt_shrinks") orelse return null,
+        .compacted_at = getUsize(obj, "compacted_at") orelse return null,
+        .unexplained_shrinks = getUsize(obj, "unexplained_shrinks") orelse return null,
+    };
+}
+
+fn getI64(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = obj.get(key) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
+fn getUsize(obj: std.json.ObjectMap, key: []const u8) ?usize {
+    const value = getI64(obj, key) orelse return null;
+    if (value < 0) return null;
+    return std.math.cast(usize, value);
 }
 
 fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Message {
@@ -414,9 +479,13 @@ test "round trip: session compressed on disk" {
         const big = "const std = @import(\"std\");\n" ** 100; // ~2.8KB
         try s.appendToolResult("call_1", "read", big);
         try s.append(.user, "hola");
+        var stats: cache_stats.CacheStats = .{};
+        stats.record(.{ .prompt = 1200, .cached = 800, .completion = 250 });
+        try s.appendUsageSnapshot(stats);
         s.flush();
     }
     defer alloc.free(used_path);
+    defer std.Io.Dir.cwd().deleteFile(io, used_path) catch {};
 
     // Verify the line came out compressed: content starts with the "z" marker.
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, used_path, alloc, .limited(1 << 20));
@@ -435,10 +504,10 @@ test "round trip: session compressed on disk" {
     const expected = "const std = @import(\"std\");\n" ** 100;
     try std.testing.expectEqualStrings(expected, s2.messages.items[0].content);
     try std.testing.expectEqualStrings("hola", s2.messages.items[1].content);
-
-    var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
-    defer dir.close(io);
-    dir.deleteFile(io, used_path) catch {};
+    try std.testing.expectEqual(@as(usize, 2), s2.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 1), s2.usage_stats.requests);
+    try std.testing.expectEqual(@as(i64, 1200), s2.usage_stats.prompt_tokens);
+    try std.testing.expectEqual(@as(i64, 800), s2.usage_stats.cached_tokens);
 }
 
 test "latestSessionPath: finds a .jsonl in the directory (the iterate flag)" {

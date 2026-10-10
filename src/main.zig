@@ -364,7 +364,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             return 1;
         };
         defer result.ctx.destroy();
-        cache_stats.session.record(chat.last_usage);
+        cache_stats.session.recordFor(chat.last_usage, kind);
 
         if (result.ctx.parts.items.len == 0) {
             // THE EXIT GATE, and it is here rather than after the loop for the same
