@@ -510,10 +510,8 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// TUI in the Claude Code style:
-///  ┌ history (markdown + syntax highlighting, tool blocks, scroll)
-///  ├ status: provider · model │ effort │ ⚠yolo │ ctx%
-///  └ multiline input with border and `/` autocompletion
+/// Compact terminal workspace: scrollable history, contextual work indicators,
+/// a borderless multiline prompt, and a quiet session status row.
 /// Per-frame copy of an open question. Everything in it is in the FRAME arena,
 /// which is the only memory whose lifetime matches "being painted right now".
 pub const AskSnapshot = struct {
@@ -4922,15 +4920,14 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     };
 
     // ── bottom-up layout ──
-    //   row height-2            status
-    //   row height-3            bottom border of the input box
-    //   rows height-4-input_h   input contents (input_h rows)
-    //   row height-4-input_h    top border of the box
-    //   row height-5-input_h    separator (or autocompletion popup)
-    //   rows 0..history_h       history
+    //   row height-2                         session status
+    //   rows height-2-input_h .. height-3   prompt
+    //   autocomplete / plan / activity      only when relevant
+    //   one rule                             workspace boundary
+    //   rows 0..history_h                    conversation
     const status_row: u16 = height - 2;
     const max_input_lines: u16 = 8;
-    const text_w: u16 = if (width > 3) width - 3 else 1; // same region drawInput paints
+    const text_w: u16 = if (width > 4) width - 4 else 1;
 
     // Activity strip (mascot + state + clock): 1 row, but ONLY if there is
     // something to report. At idle it takes no space, as it should.
@@ -4953,17 +4950,15 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     else
         0;
 
-    // The input grows with the text but never eats the history: if both do not
-    // fit, the input is clipped (and its view anchors to the bottom).
-    const chrome: u16 = 4 + ac_rows + act_rows + plan_rows; // status + borders + popup + strip + plan
+    // The prompt is fixed against the status row; optional workspace rows take
+    // space from history rather than pushing the cursor away from the bottom.
+    const chrome: u16 = 3 + ac_rows + act_rows + plan_rows; // status, boundary, bottom margin, context rows
     const avail: u16 = if (height > chrome + 2) height - chrome - 2 else 1;
     const ed_w: u16 = if (text_w > 0) text_w else 1;
     const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(ed_w, editorMeasurer(&p)), max_input_lines))), avail), 1);
-    // The order from the bottom up is: status · strip · PLAN · input box. The
-    // plan goes between the strip and the input (and not over the status)
-    // because it is what you look at while the model works, next to the clock.
-    const input_top: u16 = height - 4 - act_rows - plan_rows - input_h;
-    const history_h: u16 = if (input_top > 1) input_top - 1 else 1;
+    const input_top: u16 = height - 2 - input_h;
+    const workspace_top = input_top -| ac_rows -| plan_rows -| act_rows;
+    const history_h: u16 = if (workspace_top > 1) workspace_top - 1 else 1;
     // The key handler needs the height to jump a whole page.
     self.hist_rows = history_h;
 
@@ -5157,10 +5152,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // ── permission dialog (modal over the history, at the bottom) ──
     var perm_tool: []const u8 = "";
     var perm_detail: []const u8 = "";
-    if (!self.permActive() and ac_rows == 0) {
-        // The separator only when there is no popup (otherwise they overlap).
-        if (input_top > 0) p.fillRow(input_top - 1, "─", theme.rule);
-    }
+    if (!self.permActive() and workspace_top > 0) p.fillRow(workspace_top - 1, "─", theme.rule);
 
     // ── status: session info on the right; activity lives in ONE place ──
     //
@@ -5217,22 +5209,20 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         if (usage) |segments| drawUsageColumn(&p, status_row, width, segments, info_width);
     }
 
-    // ── `/` autocompletion (right above the input) ──
+    // ── contextual rows, present only when useful ──
+    if (act_rows == 1) {
+        drawActivityStrip(&p, workspace_top, width, self, act, queued);
+    }
+    if (plan_rows > 0) {
+        drawPlanBlock(&p, workspace_top + act_rows, width, pl_now);
+    }
+
+    // ── `/` autocompletion (directly above the prompt) ──
     if (ac_rows > 0) {
         drawAutocomplete(&p, self, input_top - ac_rows, width, ac_rows);
     }
 
-    // ── multiline input with border ──
-    // The activity strip is the one "is it working?" indicator: face, phase
-    // and elapsed time live together instead of being repeated in the status.
-    if (plan_rows > 0) {
-        drawPlanBlock(&p, input_top - plan_rows, width, pl_now);
-    }
-    if (act_rows == 1 and input_top > act_rows + plan_rows) {
-        drawActivityStrip(&p, input_top - act_rows - plan_rows - 1, width, self, act, queued);
-    }
-
-    drawInput(&p, &surface, self, input_top, width, input_h);
+    drawInput(&p, &surface, self, input_top, width, input_h, workspace_top -| 1);
 
     // ── permission dialog: centered MODAL ──
     //
@@ -5272,8 +5262,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     return surface;
 }
 
-/// The input box: rounded border, `❯` prompt and up to `max_input_lines`
-/// lines. The terminal cursor is anchored at the real cursor position.
+/// Borderless prompt: the conversation is the workspace, not a stack of boxes.
+/// The terminal cursor is anchored at the real editor position.
 fn drawInput(
     p: *Painter,
     surface: *vxfw.Surface,
@@ -5281,31 +5271,14 @@ fn drawInput(
     top: u16,
     width: u16,
     input_h: u16,
+    hint_row: u16,
 ) void {
     if (top >= p.height or width < 6) return;
 
-    const box_h: u16 = input_h + 2; // top border + contents + bottom border
-    p.putStable(0, top, "╭", 1, theme.input_border);
-    p.fillRange(1, width - 1, top, "─", theme.input_border);
-    p.putStable(width - 1, top, "╮", 1, theme.input_border);
-    p.putStable(0, top + box_h - 1, "╰", 1, theme.input_border);
-    p.fillRange(1, width - 1, top + box_h - 1, "─", theme.input_border);
-    p.putStable(width - 1, top + box_h - 1, "╯", 1, theme.input_border);
-
-    var r: u16 = 1;
-    while (r < box_h - 1) : (r += 1) {
-        p.putStable(0, top + r, "│", 1, theme.input_border);
-        p.putStable(width - 1, top + r, "│", 1, theme.input_border);
-    }
-
-    // Prompt `❯ ` only on the first line.
-    _ = p.putText(2, top + 1, "❯ ", theme.input_prompt);
-
-    // The text region is columns [2, width-1): the left border is 0, the right
-    // border is `width - 1`. `width - 3`, not `width - 4`: the layout used to
-    // reserve one column less than the paint area, which is the kind of off-by-one
-    // that only shows up as "the last character of a wrapped line is missing".
-    const ed_w: u16 = if (width > 3) width - 3 else 1;
+    // Prompt and text start at columns 1 and 3 respectively; keeping the same
+    // width in layout and paint prevents clipping a final grapheme.
+    _ = p.putText(1, top, "❯ ", theme.input_prompt);
+    const ed_w: u16 = if (width > 4) width - 4 else 1;
     const meas = editorMeasurer(p);
 
     // Rows, not lines: the text is wrapped HERE, with the same wrap the box was
@@ -5319,10 +5292,10 @@ fn drawInput(
     const first = if (total_rows > input_h) total_rows - input_h else 0;
     const shown = self.ed.rowsInWindow(first, input_h, ed_w, meas, p.arena);
     for (shown, 0..) |piece, i| {
-        const row = top + 1 + @as(u16, @intCast(i));
-        if (row >= top + box_h - 1) break;
+        const row = top + @as(u16, @intCast(i));
+        if (i >= input_h) break;
         if (piece.bytes.len == 0) continue;
-        _ = p.putClipped(2, row, piece.bytes, ed_w, theme.input_text);
+        _ = p.putClipped(3, row, piece.bytes, ed_w, theme.input_text);
     }
 
     // The terminal cursor, at its VISUAL row and column. `cursorLine` gave a
@@ -5330,21 +5303,20 @@ fn drawInput(
     // `2 + everything before it`: outside the surface, so the caret vanished.
     const cc = self.ed.cursorRowCol(ed_w, meas);
     if (cc.row >= first and cc.row < first + shown.len) {
-        const col = 2 + @min(cc.col, ed_w - 1);
+        const col = 3 + @min(cc.col, ed_w - 1);
         surface.cursor = .{
-            .row = top + 1 + @as(u16, @intCast(cc.row - first)),
+            .row = top + @as(u16, @intCast(cc.row - first)),
             .col = col,
         };
     }
 
-    // Rows scrolled out above: on the border, the way the picker's title sits on
-    // its border. Without it, a box full of the middle of your prompt looks
-    // exactly like a box with all of it.
-    if (first > 0 and width > 16) {
+    // Show the clipped prompt's hidden-row count on the workspace rule, not in
+    // the prompt text itself.
+    if (first > 0 and width > 16 and hint_row < top and !self.ac.active) {
         var ib: [32]u8 = undefined;
         const lab = std.fmt.bufPrint(&ib, "\u{2191} {d} more", .{first}) catch "";
         if (lab.len > 0 and lab.len + 4 < width) {
-            _ = p.putClipped(width - 2 - @as(u16, @intCast(lab.len)), top, lab, @as(u16, @intCast(lab.len)), theme.hint_faint);
+            _ = p.putClipped(width - 2 - @as(u16, @intCast(lab.len)), hint_row, lab, @as(u16, @intCast(lab.len)), theme.hint_faint);
         }
     }
 
@@ -5356,19 +5328,7 @@ fn drawInput(
             "your answer\u{2026} \u{b7} enter sends it \u{b7} esc: you decide"
         else
             "Ask anything\u{2026} \u{b7} / commands";
-        _ = p.putClipped(4, top + 1, ph, ed_w - 2, theme.placeholder);
-    }
-
-    if (self.ac.active) {
-        var hb: [64]u8 = undefined;
-        const n = matchCount(self);
-        const h = std.fmt.bufPrint(&hb, "{d} {s} \u{b7} tab complete", .{
-            n,
-            if (n == 1) @as([]const u8, "match") else "matches",
-        }) catch "";
-        if (h.len + 4 < width) {
-            _ = p.putText(width - 2 - @as(u16, @intCast(h.len)), top + box_h - 1, h, theme.dim);
-        }
+        _ = p.putClipped(3, top, ph, ed_w, theme.placeholder);
     }
 }
 
@@ -6060,8 +6020,7 @@ fn drawActivityStrip(
     const mood: vaxis.Style = if (waiting) theme.warn else if (act.busy) theme.brand else theme.brand_soft;
 
     var col: u16 = 1;
-    _ = p.putText(col, row, face, mood);
-    col += @as(u16, @intCast(face.len));
+    col = p.putText(col, row, face, mood);
 
     // State: the first thing you have to be able to read at a glance, and now
     // it is the PHASE.
@@ -6571,7 +6530,7 @@ test "render: long text wraps without losing characters" {
     try std.testing.expectEqualStrings(msg, acc.items);
 }
 
-test "render: the status and the separator take the bottom rows" {
+test "render: the status and workspace rule anchor the compact prompt" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6584,13 +6543,12 @@ test "render: the status and the separator take the bottom rows" {
     const s = try drawTest(&m, arena, 40, height);
 
     var buf: [128]u8 = undefined;
-    // separator: one row above the top border of the input box
-    const sep = rowText(s, height - 6, &buf);
+    // The rule separates the conversation from the prompt workspace.
+    const sep = rowText(s, height - 4, &buf);
     try std.testing.expectEqualStrings("\u{2500}", sep[0..3]);
-    // top border of the input box
     var buf3: [128]u8 = undefined;
-    const box = rowText(s, height - 5, &buf3);
-    try std.testing.expectEqualStrings("\u{256d}", std.mem.trim(u8, box, " ")[0..3]);
+    const prompt = rowText(s, height - 3, &buf3);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\u{276f}") != null);
     // status
     var buf2: [128]u8 = undefined;
     const st = rowText(s, height - 2, &buf2);
@@ -6646,7 +6604,7 @@ test "toggleLastTool with no previous tool does nothing" {
     try std.testing.expect(!m.toggleLastTool());
 }
 
-test "input: box with border, prompt and placeholder" {
+test "input: compact prompt, prompt glyph and placeholder" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -6655,20 +6613,11 @@ test "input: box with border, prompt and placeholder" {
     const h: u16 = 14;
     const s = try drawTest(&m, arena_state.allocator(), 40, h);
 
-    var buf: [128]u8 = undefined;
-    // rounded top border
-    const top = rowText(s, h - 5, &buf);
-    try std.testing.expectEqualStrings("\u{256d}\u{2500}", std.mem.trim(u8, top, " ")[0..6]);
-    // contents: prompt + placeholder
     var buf2: [128]u8 = undefined;
-    const mid = rowText(s, h - 4, &buf2);
+    const mid = rowText(s, h - 3, &buf2);
     try std.testing.expect(std.mem.indexOf(u8, mid, "\u{276f}") != null);
     try std.testing.expect(std.mem.indexOf(u8, mid, "Ask anything") != null);
-    try std.testing.expectEqual(theme.hint.fg, s.readCell(4, h - 4).style.fg);
-    // bottom border
-    var buf3: [128]u8 = undefined;
-    const bot = rowText(s, h - 3, &buf3);
-    try std.testing.expectEqualStrings("\u{2570}\u{2500}", std.mem.trim(u8, bot, " ")[0..6]);
+    try std.testing.expectEqual(theme.hint.fg, s.readCell(3, h - 3).style.fg);
 }
 
 test "input: multiline grows the box and shows both lines" {
@@ -6678,28 +6627,28 @@ test "input: multiline grows the box and shows both lines" {
     defer m.deinit();
 
     const h: u16 = 16;
-    // Three lines: the box must grow to 3 rows of content.
+    // Three lines: the prompt grows to three rows.
     m.ed.insert("primera\nsegunda\ntercera") catch {};
 
     const s = try drawTest(&m, arena_state.allocator(), 40, h);
     var buf: [128]u8 = undefined;
-    const top = rowText(s, h - 7, &buf); // input_h=3 → top = h-4-3
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.trim(u8, top, " "), "\u{256d}") != null);
+    const top = rowText(s, h - 5, &buf); // input_h=3 → top = h-2-3
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.trim(u8, top, " "), "❯") != null);
 
     var b1: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 6, &b1), "primera") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 5, &b1), "primera") != null);
     var b2: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 5, &b2), "segunda") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 4, &b2), "segunda") != null);
     var b3: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 4, &b3), "tercera") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 3, &b3), "tercera") != null);
 }
 
-test "input: a long line WRAPS inside the box and no character is lost" {
-    // THE bug: the box was sized from `displayLines` (which counts soft wraps)
+test "input: a long line wraps within the prompt and no character is lost" {
+    // THE bug: the prompt was sized from `displayLines` (which counts soft wraps)
     // and the paint split on `\n` only, handing one very long line to `putText`,
     // which clips at the TERMINAL edge. So the box grew to eight rows, the text
     // stayed in the first one running off the right, and everything past the
-    // border was dropped with no ellipsis and no word: the user could not see
+    // right edge was clipped with no ellipsis and no word: the user could not see
     // what they had typed.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -6715,16 +6664,16 @@ test "input: a long line WRAPS inside the box and no character is lost" {
     const r1 = findRow(s, "el cielo gris") orelse return error.TestUnexpectedResult;
     const r2 = findRow(s, "puerto viejo") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u16, 1), r2 - r1);
-    // And nothing spilled past the right border of the box.
+    // The prompt is borderless; wrapped text stays inside the screen instead.
     var buf: [128]u8 = undefined;
     for ([_]u16{ r1, r2 }) |row| {
         const t = rowText(s, row, &buf);
         try std.testing.expect(std.mem.lastIndexOfScalar(u8, t, ' ') != null);
-        try std.testing.expect(std.mem.indexOf(u8, t, "│") != null);
+        try std.testing.expect(std.mem.indexOf(u8, t, "│") == null);
     }
 }
 
-test "input: a wrapped line fills several rows and the cursor stays INSIDE the box" {
+test "input: a wrapped line fills several rows and the cursor stays on screen" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -6736,27 +6685,26 @@ test "input: a wrapped line fills several rows and the cursor stays INSIDE the b
     const h: u16 = 20;
     const s = try drawTest(&m, arena_state.allocator(), w, h);
 
-    const rows = m.ed.displayLines(w - 3, testEditorMeasurer());
+    const rows = m.ed.displayLines(w - 4, testEditorMeasurer());
     try std.testing.expect(rows >= 4);
     const input_h: u16 = @min(rows, 8);
-    const top = h - 4 - input_h;
+    const top = h - 2 - input_h;
 
-    // Several rows of the box carry text, not just the first one.
+    // Several prompt rows carry text, not just the first one.
     var filled: usize = 0;
-    var row: u16 = top + 1;
-    while (row < top + 1 + input_h) : (row += 1) {
+    var row: u16 = top;
+    while (row < top + input_h) : (row += 1) {
         var buf: [128]u8 = undefined;
         if (std.mem.indexOf(u8, rowText(s, row, &buf), "aaaa") != null) filled += 1;
     }
     try std.testing.expect(filled >= 4);
 
-    // And the caret is a real cell inside the box. It used to be anchored at
-    // `2 + width of everything before it`, i.e. column 74 of a 40-wide terminal,
-    // so it simply disappeared.
+    // The caret is a real cell on screen. It used to be anchored at the width
+    // of everything before it, so it simply disappeared.
     const cur = s.cursor orelse return error.TestUnexpectedResult;
     try std.testing.expect(cur.col < w - 1);
-    try std.testing.expect(cur.row >= top + 1);
-    try std.testing.expect(cur.row < h - 3);
+    try std.testing.expect(cur.row >= top);
+    try std.testing.expect(cur.row < h - 2);
 }
 
 test "input: rows scrolled out above are announced instead of silently hidden" {
@@ -6769,8 +6717,7 @@ test "input: rows scrolled out above are announced instead of silently hidden" {
     while (i < 60) : (i += 1) m.ed.insert("linea ") catch {};
 
     const s = try drawTest(&m, arena_state.allocator(), 40, 14);
-    // A box full of the middle of what you typed looks exactly like a box with
-    // all of it, so the count of what is hidden has to be on the border.
+    // A clipped prompt reports how many visual rows are above the cursor.
     try std.testing.expect(findRow(s, "more") != null);
 }
 
@@ -6914,14 +6861,14 @@ test "input: the cursor is anchored at the real position" {
     m.ed.insert("abc") catch {};
     m.ed.moveHome();
     const s = try drawTest(&m, arena_state.allocator(), 40, 14);
-    // Cursor at the start of the line: right after the "❯ " prompt (col 2).
-    try std.testing.expectEqual(@as(u16, 2), s.cursor.?.col);
-    try std.testing.expectEqual(@as(u16, 14 - 4), s.cursor.?.row);
+    // Cursor at the start of the line: right after the "❯ " prompt (col 3).
+    try std.testing.expectEqual(@as(u16, 3), s.cursor.?.col);
+    try std.testing.expectEqual(@as(u16, 14 - 3), s.cursor.?.row);
 
     // With the cursor at the end, it advances 3 columns (the 3 characters).
     m.ed.moveToEnd();
     const s2 = try drawTest(&m, arena_state.allocator(), 40, 14);
-    try std.testing.expectEqual(@as(u16, 5), s2.cursor.?.col);
+    try std.testing.expectEqual(@as(u16, 6), s2.cursor.?.col);
 }
 
 test "diff: pushDiff paints -/+ lines after the tool result" {
@@ -9267,7 +9214,7 @@ test "the plan summary sits above the input and uses one row" {
 
     // The plan sits ABOVE the input, taking one row instead of one row per step.
     try std.testing.expect(r_plan < input_con);
-    try std.testing.expectEqual(input_sin - 1, input_con);
+    try std.testing.expectEqual(input_sin, input_con);
     // And the history is still up there (with 30 rows there is plenty of room).
     try std.testing.expect(findRow(s_con, "hola") != null);
     try std.testing.expect(findRow(s_con, "hola").? < r_plan);
@@ -10211,10 +10158,10 @@ test "ask panel wraps by words, stays in history, and leaves the answer input vi
     try std.testing.expect(findRow(s, "recommended") != null);
     try std.testing.expect(findRow(s, "Use adapter") != null);
 
-    // The panel is confined to the history viewport; the input box and status
-    // strip are still painted and usable underneath it.
-    const input_top = s.size.height - 4 - 1 - 1;
-    try std.testing.expectEqualStrings("╭", s.readCell(0, input_top).char.grapheme);
+    // The panel is confined to the history viewport; the borderless prompt and
+    // status strip remain painted and usable underneath it.
+    const input_top = s.size.height - 3;
+    try std.testing.expectEqualStrings("❯", s.readCell(1, input_top).char.grapheme);
     try std.testing.expect(findRow(s, "enter answers") != null);
 }
 

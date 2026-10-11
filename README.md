@@ -22,7 +22,8 @@ $ zode
 
 - **An agent with tools**: it reads, writes, edits, compiles, searches, and uses
   git. The agent loop decides on its own (with `ask` when the answer changes what
-  it does, and in Plan mode it investigates and asks you).
+  it does, and in Plan mode it investigates and asks you). Repeated identical
+  calls get one bounded corrective nudge before stopping with a clear reason.
 - **Tools in parallel** for the read-only ones, **bash in the background** with
   incremental output, and **ESC kills the whole process group** (the grandchild
   too).

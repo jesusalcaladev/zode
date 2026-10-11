@@ -1532,6 +1532,7 @@ pub fn resetCheapRouter(m: *tui.Model) void {
     cheap_router.given_up = false;
     cheap_router.attempts = 0;
     cheap_router.fallbacks = 0;
+    cheap_router.last_why = null;
 }
 
 /// What the cheap router has been doing, for `/bench`.
@@ -3048,6 +3049,7 @@ fn chatWorker(job: *ChatJob) void {
     const hard = if (had_goal) goalHardLimit() else soft;
 
     m.repeats.reset();
+    var repeat_recovery: repeats_mod.Recovery = .{};
     var checkpointed = false;
     // How many times this turn has shown the plan-approval dialog. Bounded so
     // "reject → revise → re-present" can cycle once but a turn that keeps being
@@ -3127,6 +3129,37 @@ fn chatWorker(job: *ChatJob) void {
             }
         }
 
+        if (m.loop_repeated) |which| {
+            m.loop_repeated = null;
+            if (again) |answer| m.allocator.free(answer);
+            switch (repeat_recovery.onRepeat()) {
+                .nudge => {
+                    pushErrorFmt(
+                        m,
+                        "repeated `{s}` with the same arguments {d} times. I have not run it again. Change the approach or arguments, inspect the result, or explain why another action is needed.",
+                        .{ which, repeats_mod.repeat_limit },
+                    );
+                    m.repeats.reset();
+                    const nudge = m.allocator.dupe(
+                        u8,
+                        "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.",
+                    ) catch break;
+                    if (owned) |o| m.allocator.free(o);
+                    owned = nudge;
+                    last_user = nudge;
+                    continue;
+                },
+                .stop => {
+                    pushErrorFmt(
+                        m,
+                        "stopped: `{s}` repeated with the same arguments after the harness already asked for a different approach. No automatic retry was performed.",
+                        .{which},
+                    );
+                    break;
+                },
+            }
+        }
+
         const text = again orelse {
             // ── PLAN APPROVAL: the turn may not end with a plan nobody answered on ──
             //
@@ -3173,19 +3206,6 @@ fn chatWorker(job: *ChatJob) void {
         if (owned) |o| m.allocator.free(o);
         owned = text;
         last_user = text;
-
-        // 1. The model ran the same call three times running. Stopped HERE, and not at
-        //    the limit, because the limit costs twelve iterations first and the user
-        //    sees a normal-looking turn that ends for no stated reason.
-        if (m.loop_repeated) |which| {
-            m.loop_repeated = null;
-            pushErrorFmt(
-                m,
-                "stopped: `{s}` ran with the same arguments three times in a row. Something is not moving; tell me what to try instead.",
-                .{which},
-            );
-            break;
-        }
 
         // 1. The goal was decided. The model said so, and it is the only thing that
         //    ends a goal turn early.
