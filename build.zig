@@ -233,6 +233,31 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // ── the design harness ────────────────────────────────────────────
+    //
+    // Renders scripted scenes of the TUI and prints them as ANSI text:
+    // `zig build ui-frame -- turn 100 34`, `-- --flat all` for plain text.
+    //
+    // It exists because neither existing check can judge a DESIGN. The
+    // `drawTest` unit tests compare a row against a string, so they prove a word
+    // is there and say nothing about whether the frame is composed. The pty
+    // smoke sees the truth about vaxis, but it needs a terminal, a timing
+    // budget and (for a real turn) a key.
+    //
+    // Same placement reason as `check_probe`: a module rooted in `src/bin/`
+    // cannot import files above it, and this needs `tui.zig`.
+    const ui_frame_mod = b.createModule(.{
+        .root_source_file = b.path("src/ui_frame.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_frame_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const ui_frame = b.addExecutable(.{ .name = "ui_frame", .root_module = ui_frame_mod });
+    const ui_frame_run = b.addRunArtifact(ui_frame);
+    if (b.args) |args| ui_frame_run.addArgs(args);
+    const ui_frame_step = b.step("ui-frame", "Render scripted TUI scenes as ANSI text (design review)");
+    ui_frame_step.dependOn(&ui_frame_run.step);
+
     // ── pty checks: the only verification that sees what vaxis renders ──
     //
     // vaxis renders DIFFERENTIALLY and queries the terminal (colors,
