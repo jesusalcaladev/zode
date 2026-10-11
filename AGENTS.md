@@ -4403,3 +4403,83 @@ script that cannot start proves nothing about what it was written to prove.
   exhausted is the free quota, and the token counter's "provider count" path is
   therefore verified by unit test and by the `/context` line rather than by a
   fresh live answer.
+
+---
+
+# `zig build ui-frame`: the design harness, and the bug it found on day one (2026-10-11)
+
+A full redesign of the TUI, and the first thing it needed was a way to SEE.
+
+## The three checks, and what each one cannot see
+
+| check | sees | cannot see |
+|---|---|---|
+| `tui.drawTest` unit tests | a row contains a word | whether the frame is composed, whether two rows collide, whether the whole thing looks designed |
+| `tools/pty_smoke.py` | what vaxis REALLY renders | needs a pty, a timing budget, a key; can only look at ONE moment |
+| **`zig build ui-frame`** | the real `drawFn` on the real `Model` with real content, as ANSI | needs nothing: no TTY, no network, no key |
+
+The third one is not a replacement, it is the only one a DESIGN can be judged
+against. `src/ui_frame.zig` (in `src/`, not `src/bin/`, for the same reason as
+`check_probe`: a module rooted in `src/bin/` cannot import files above it) fills a
+`Model` through the SAME public API the agent uses — `pushToolStart`,
+`streamStart`, `requestAsk`, `openPaletteWith` — and renders ten scenes:
+
+```
+zig build ui-frame -- turn 96 30      # one scene, with color
+zig build ui-frame -- --flat all      # plain text: diffable, greppable
+zig build ui-frame -- --layout turn   # ALSO dump the layout numbers
+```
+
+**A scene that reached into `paras` directly would be worthless**: it would
+render a frame the app can never produce, and it would keep rendering fine the
+day the real path broke. That is why every scene is a list of public calls.
+
+## It found a real bug in three minutes: the history painted out of order
+
+The `turn` scene showed **the ZODE banner twice**, once at the top and once in
+the middle of the conversation. Not a rendering artifact: a layout bug, and one
+of the four tests that were ALREADY RED before this work started.
+
+`--layout` printed the cache:
+
+```
+cache[0] para=3 … cache[5] para=8 … cache[6] para=0 … cache[8] para=2
+paras: 0:banner 1:banner 2:banner 3:banner 4:banner 5:user …
+```
+
+**`seg_cache` was not sorted.** The painter walks it accumulating `line_cursor`,
+so it needs paragraph order — and it got that order for free while the layout
+window only ever moved FORWARDS (`for (lo..hi)` appends ascending, and
+everything below `lo` is evicted).
+
+But the window also moves BACKWARDS: a height correction, a resize, anything
+that lowers `first_visible`. Then those paragraphs are re-parsed and **appended
+at the end**, after the ones with a higher index. Paragraphs 0-2 (the banner)
+were painted at the line where paragraph 8 ended.
+
+The fix is in `layoutWindow`, not in `layoutOne`: **the invariant belongs to the
+function that can break it**. `layoutOne` is called in ascending order and does
+not know what else is in the list, so "append" was never the wrong answer on its
+own.
+
+```zig
+if (!self.cacheSorted()) {
+    std.mem.sort(CachedPara, self.seg_cache.items, {}, cachedLessThan);
+}
+```
+
+`cacheSorted` is one pass over at most `max_cached_paras` entries and the sort
+only happens on the frames where the order actually broke. The red test it fixed
+("correcting a paragraph's height does not move the text under the reader") had
+been failing since the window became a window, and AGENTS.md had been describing
+the window's behaviour in the past tense for months.
+
+**Three failures before, three after.** The lesson is not the bug.
+
+**The lesson is the gap.** 855 tests, 144 of them in `tui.zig`, a pty smoke, a
+scroll reproduction, and a `drawTest` that reads the real surface cell by cell —
+and the frame was painting a header in the middle of a paragraph. Every existing
+check answers a QUESTION: does the text arrive, does it not crash, does the word
+appear on row N. **None of them ever asks "is this composed?"**, and a design
+rewrite is the one task where that is the only question there is. The harness was
+not an optimisation; it was the missing assertion.
