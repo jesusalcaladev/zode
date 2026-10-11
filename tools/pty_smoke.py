@@ -165,9 +165,18 @@ def main() -> int:
     out, t = drive([b"hola mundo", b"\r"])
     ok = True
     print(f"smoke: {len(out)} bytes through the pty")
-    ok &= check("banner: first row of the wordmark", "######  ####  ####   ######" in t, t)
-    ok &= check("banner: third row", "   ##  ##  ## ##   # ###" in t, t)
-    ok &= check("input box (╭ ╰ borders)", "╭" in t and "╰" in t, t)
+    # The ASCII is gone. What replaced it is type: a wordmark, a tagline, and
+    # the four commands worth knowing in the first thirty seconds. A pty check
+    # for "␣ ######" would now fail on a REDESIGN, which is what a check pinned
+    # to pixels does — it stops watching the thing it watched.
+    ok &= check("hero: the wordmark is on screen", "zode" in t, t)
+    ok &= check("hero: the tagline is on screen", "a code agent in your terminal" in t, t)
+    ok &= check("hero: the command grid is on screen", "choose a model" in t, t)
+    # No box around the input: a hairline above it and an accent bar on the
+    # left. Four keys that no longer appear are asserted ABSENT, because the
+    # frame is the claim and "no ╭" is the part that can regress silently.
+    ok &= check("input: no box borders", "╭" not in t and "╰" not in t, t)
+    ok &= check("input: the accent bar is there", "▌" in t, t)
     ok &= check("status bar", "esc interrupts" in t, t)
     ok &= check("the user prompt echoes", "hola mundo" in t, t)
     ok &= check("no panic", "panic" not in t.lower(), t)
