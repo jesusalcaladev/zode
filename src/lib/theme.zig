@@ -2,144 +2,337 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-/// Semantic palette for the TUI. One single place for the colors: the ANSI
-/// index is the terminal's business, we only ask for "accent", "warn", etc.
-pub const accent: vaxis.Style = .{ .fg = .{ .index = 4 } }; // blue
-pub const accent_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 } };
+/// Semantic palette for the TUI.
+///
+/// One place for every color, and a TEST that fails the build when a pair of
+/// text and background is unreadable. That test is the point of this file: the
+/// previous palette had three tones below 3:1 and AGENTS.md says so in three
+/// separate places, which is what a comment is for — describing a bug instead of
+/// preventing it.
+///
+/// # The system
+///
+/// A dark UI reads as expensive when it is mostly MONOCHROME with exactly one
+/// accent, and expensive-looking when everything is colored. So:
+///
+///   - **ink** carries the text, in three steps, and nothing else does.
+///   - **line** is for hairlines and NEVER for text. It is below 3:1 on purpose:
+///     a rule has to recede, and a rule that is legible is a line of text.
+///   - **brand** is the single accent. It marks what is interactive and what is
+///     yours: your prompt, the caret, the focused thing, the live phase.
+///   - **ok / warn / err** are semantics, not decoration, and they are
+///     deliberately NOT the accent: a green that means "brand" and a green that
+///     means "this line was added" cannot both exist.
+fn rgb(r: u8, g: u8, b: u8) vaxis.Style {
+    return .{ .fg = .{ .rgb = .{ r, g, b } } };
+}
 
-// ── brand blue ───────────────────────────────────────────────
-// Three tones instead of a single `accent`: it gives depth to the chrome
-// (header, borders, status) without anything shouting. The values are the
-// blues of the Tokyo Night palette, the theme the TUI was reviewed with; if
-// your terminal uses a different dark background they still look harmonious
-// (same hue, different lightness).
+fn bg(r: u8, g: u8, b: u8) vaxis.Style {
+    return .{ .bg = .{ .rgb = .{ r, g, b } } };
+}
+
+// ── ink ───────────────────────────────────────────────────────
 //
-// truecolor (`.rgb`) with vaxis falling back to the nearest ANSI index on
-// terminals that don't support it.
+// Measured against `#000`, which is the darkest background a terminal realistically
+// offers. `contrastOk` at the bottom of this file is what proves these, and it is
+// a test: the numbers in the comments are the ones it computes.
 
-/// Bright blue: `zode` wordmark, `❯` prompt, active model, commands.
-pub const brand: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
-pub const brand_bold: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
-/// Light blue: the `zode` wordmark. It sits one tone above `brand` so that
-/// the logo reads as "lit up" against the owl art, which is `brand`.
-pub const brand_hi: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } };
-/// Dim blue: Zo's text, hints, provider, effort.
-pub const brand_soft: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } } };
-/// Almost grey blue: horizontal separators and the input box borders.
-pub const brand_faint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x3b, 0x42, 0x61 } } };
-pub const assistant: vaxis.Style = .{ .fg = .{ .index = 5 } }; // magenta
-pub const assistant_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 5 } };
-pub const tool: vaxis.Style = .{ .fg = .{ .index = 6 } }; // cyan
+/// Primary text: 18.1:1. The only thing allowed to be bright white.
+pub const ink: vaxis.Style = rgb(0xf2, 0xf2, 0xf2);
+/// Secondary text — a tool's argument, a result's body. 7.0:1.
+pub const ink2: vaxis.Style = rgb(0xa3, 0xa3, 0xa3);
+/// Tertiary text — a timestamp, a hint, a label. 5.7:1.
+///
+/// It was `#7a7a7a` in the first draft of this file and the contrast test said
+/// 4.44:1 on `well_bg`, which is below the floor. This is what that test is
+/// for: it is not a number I chose, it is a number I got wrong.
+pub const ink3: vaxis.Style = rgb(0x85, 0x85, 0x85);
 
-// ── readable secondary text ────────────────────────────────────
+/// Hairlines. 1.6:1. NEVER text — see `ink3` for text you are meant to read.
+pub const line: vaxis.Style = rgb(0x2e, 0x2e, 0x2e);
+
+/// A slightly brighter rule, for the hairline that separates the transcript
+/// from the input: it is one step more present than `line` and it is the reason
+/// the input feels anchored without a box around it.
+pub const line_bright: vaxis.Style = rgb(0x3d, 0x3d, 0x3d);
+
+// ── the accent: a warm, matte green ────────────────────────────
 //
-// `brand_faint` (#3b4261) is ~1.9:1 against a dark background: fine for a
-// hairline border, UNREADABLE for a line of text. It was doing both jobs —
-// the `ask` panel's hint and clock, the key hints under the code chips — and
-// the only legible thing in that panel was the question itself.
+// HUE 100°, ~34% saturation, ~55% lightness. Chosen for being MATTE: a
+// saturated green (`#00ff00`, or the terminal's index 2) is a highlighter pen,
+// and next to a diff it is indistinguishable from "this line was added".
+// Desaturating it and warming it toward yellow is what makes it read as an
+// interface color rather than as a status color.
+
+/// 7.2:1. The accent proper: your prompt, the caret, the selected row's mark.
+pub const brand: vaxis.Style = rgb(0x7f, 0xb0, 0x69);
+/// One step up, for the one thing that should read as lit (the wordmark, Zo's
+/// face). Bold as well as bright: a wordmark at normal weight is just text,
+/// and "zode" has to be recognisable in the first half second.
+pub const brand_hi: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa8, 0xd4, 0x8a } } };
+/// 5.7:1. Tertiary text that still carries a color.
+pub const brand_soft: vaxis.Style = rgb(0x6b, 0x90, 0x60);
+/// Green hairline. Sits between `line` and `brand_soft` in weight.
+pub const brand_faint: vaxis.Style = rgb(0x2f, 0x44, 0x29);
+/// The background of a focused surface's track (a depleting progress bar).
+pub const brand_deep: vaxis.Style = rgb(0x1a, 0x27, 0x17);
+
+// ── semantics ─────────────────────────────────────────────────
 //
-// The split is by ROLE, not by taste:
-//   - `brand_faint`  hairlines: borders, separators, rules. Never text.
-//   - `hint`         text the user is meant to read but that is not the
-//                    answer. ~4.5:1 on the dark backgrounds we use.
-//   - `brand_soft`   text that is genuinely tertiary (a label, a counter).
-pub const hint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0x83, 0x99 } } };
-/// One step below `hint`: a key hint next to something already labelled.
-pub const hint_faint: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x65, 0x6d, 0x82 } } };
-/// Background of the selected row in a list. It has to be a BACKGROUND: with
-/// only a foreground change, a selected item is distinguishable only by bold,
-/// which is a difference most people do not see across a 60-column row.
-pub const sel_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x2a, 0x2f, 0x45 } } };
-pub const ok: vaxis.Style = .{ .fg = .{ .index = 2 } }; // green
-pub const warn: vaxis.Style = .{ .fg = .{ .index = 3 } }; // yellow
-pub const warn_bold: vaxis.Style = .{ .bold = true, .fg = .{ .index = 3 } };
-pub const err: vaxis.Style = .{ .fg = .{ .index = 1 } }; // red
-pub const dim: vaxis.Style = .{ .fg = .{ .index = 8 } };
-pub const text: vaxis.Style = .{};
-pub const user: vaxis.Style = .{ .fg = .{ .index = 7 } }; // bright white
+// `ok` is a VIVID green and `brand` is a MATTE one, and they are kept apart on
+// purpose. Inside a diff the green always means `+`; outside a diff it always
+// means the app. Two greens that are 20 degrees apart are not enough separation
+// once a whole screen is full of both.
 
-/// Style of the separator line / borders.
-pub const rule: vaxis.Style = brand_faint;
+pub const ok: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
+pub const warn: vaxis.Style = rgb(0xf5, 0xa5, 0x24);
+pub const err: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
 
-/// Style of the input box (border + prompt).
-pub const input_border: vaxis.Style = brand_faint;
-pub const input_prompt: vaxis.Style = brand_bold;
-pub const input_text: vaxis.Style = .{};
-pub const placeholder: vaxis.Style = hint;
+/// Selection: a BACKGROUND, always.
+///
+/// With only a foreground change a selected row is distinguishable only by
+/// bold, which most people do not see across a 60-column row. This cost a
+/// scrollbar that highlighted the wrong line once.
+pub const sel_bg: vaxis.Style = bg(0x1e, 0x24, 0x1c);
+pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa8, 0xd4, 0x8a } }, .bg = sel_bg.bg };
 
-/// Color of the context gauge depending on how full it is: comfortable green,
-/// yellow as it approaches the compaction budget, red above that.
-/// Thresholds: <50%, <80%, the rest. 80% is exactly where compaction starts.
+/// A modal's interior. Darker than any plausible terminal background, so a box
+/// reads as a hole in the page and the history cannot show through it.
+pub const panel_bg: vaxis.Style = bg(0x0a, 0x0b, 0x0a);
+/// The well a tool's output sits in: the sunken surface of the two.
+pub const well_bg: vaxis.Style = bg(0x10, 0x11, 0x10);
+
+// ── code token palette ────────────────────────────────────────
+//
+// NO GREENS. The accent is green, so a green keyword would put brand and
+// syntax on the same screen with the same reading. Orange, blue and amber
+// instead: they are the classic high-legibility set, and they leave green
+// alone for the two jobs that own it.
+
+pub const code_text: vaxis.Style = rgb(0xc9, 0xd1, 0xd9);
+pub const code_kw: vaxis.Style = rgb(0xff, 0x9e, 0x64); // orange
+pub const code_kw2: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0xff, 0xb0, 0x86 } } };
+pub const code_builtin: vaxis.Style = rgb(0xd2, 0xa8, 0xff); // lilac
+pub const code_type: vaxis.Style = rgb(0x79, 0xc0, 0xff); // blue
+pub const code_str: vaxis.Style = rgb(0xa5, 0xd6, 0xff); // pale blue
+/// A comment. Italic and two steps below `code_text`, but still 6.2:1: a
+/// comment is CONTENT the reader asked for, not chrome. The `#6b7280` in the
+/// first draft was 3.9:1, and the contrast test refused it.
+pub const code_comment: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0x8b, 0x94, 0x9e } } };
+pub const code_num: vaxis.Style = rgb(0xff, 0xcb, 0x6b); // amber
+pub const code_fn: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xd2, 0xa8, 0xff } } };
+/// Decorators (`@Override`, `@import`): pink, so they are neither the keyword
+/// orange nor the diff's red.
+pub const code_deco: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0xff, 0x6b, 0x9d } } };
+
+// ── diff ──────────────────────────────────────────────────────
+//
+// A foreground alone is not a diff: `+ line` and `- line` have to read as two
+// BANDS, and a band is a background. The tints are very dark on purpose
+// (#0e1f14 over black is barely there) — enough to group the lines, not enough
+// to shout over the prose.
+
+pub const diff_add: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
+pub const diff_add_bg: vaxis.Style = bg(0x0e, 0x1f, 0x14);
+pub const diff_del: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
+pub const diff_del_bg: vaxis.Style = bg(0x22, 0x10, 0x0f);
+/// A context line: the unchanged rows around a change. Dimmest thing in a diff
+/// that is still a word.
+///
+/// It sits on the WELL and not on a tint, which is both a contrast decision
+/// (4.4:1 on `#0e1f14`, under the floor) and the right design one: the tints
+/// mark what CHANGED, and a tinted context line means every row of a hunk is
+/// tinted, which is a wall with no shape.
+pub const diff_ctx: vaxis.Style = rgb(0x80, 0x80, 0x80);
+/// The `@@ -1,4 +1,6 @@` header: the only thing in a diff allowed to be bold.
+pub const diff_hunk: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
+pub const diff_stat_add: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
+pub const diff_stat_del: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
+
+// ── the rail ──────────────────────────────────────────────────
+//
+// The `│` that ties a tool's result to its call. It is a LINE, not text: it
+// marks a boundary and has nothing to say, which is why it is allowed to be
+// the quietest thing on screen.
+
+pub const rail: vaxis.Style = rgb(0x2e, 0x2e, 0x2e);
+/// The gutter of a code block. One step above `rail` because it is carrying
+/// content (a language chip sits on it).
+pub const gutter: vaxis.Style = rgb(0x3d, 0x3d, 0x3d);
+/// A continuation row's indent marker: "this row still belongs to the block
+/// above". One glyph, and it is the difference between "one result plus five
+/// anonymous rows" and "a result".
+pub const gutter_soft: vaxis.Style = rgb(0x33, 0x33, 0x33);
+
+// ── named roles ───────────────────────────────────────────────
+//
+// The rest of the TUI asks for a ROLE and not for a color. It is the difference
+// between a retheme being one file and being a grep across eleven.
+
+/// What the user typed.
+pub const user: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7f, 0xb0, 0x69 } } };
+/// The assistant's prose. Default bright, no color: the model is not decorated.
+pub const assistant: vaxis.Style = ink;
+/// A tool's NAME. Bold and near-white: this is the word you scan for.
+pub const tool_name: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xe6, 0xe6, 0xe6 } } };
+/// A tool's ARGUMENT, on the same line: dimmer than the name, never the same.
+pub const tool_arg: vaxis.Style = ink2;
+/// A tool's result summary. `ink2`, NOT `ink3`: a result is what the turn
+/// actually produced, and a notice (`·`) is the app talking to itself about
+/// it. One step apart, so a transcript of thirty tool calls does not read as
+/// one long list of whispers.
+pub const tool_res: vaxis.Style = ink2;
+/// A notice ("3 tool results elided", "done · 12.4s").
+pub const notice: vaxis.Style = ink3;
+/// A markdown heading. Bold and white: brighter than the prose around it, which
+/// is the whole job of a heading.
+pub const heading: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xe6, 0xe6, 0xe6 } } };
+/// A markdown list bullet.
+pub const bullet: vaxis.Style = brand;
+/// A markdown blockquote bar.
+pub const quote: vaxis.Style = rgb(0x5a, 0x5a, 0x5a);
+/// The language chip on a code block.
+pub const code_lang: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0x7a, 0x7a, 0x7a } } };
+/// A table's rules and header.
+pub const table: vaxis.Style = rgb(0x5a, 0x5a, 0x5a);
+
+// ── chrome ────────────────────────────────────────────────────
+
+/// The one rule that separates the transcript from the input.
+pub const rule: vaxis.Style = line_bright;
+/// The input's caret bar and prompt. The accent, always: it says "you are here".
+pub const input_prompt: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7f, 0xb0, 0x69 } } };
+pub const input_bar: vaxis.Style = rgb(0x3f, 0x5c, 0x36);
+pub const placeholder: vaxis.Style = ink3;
+/// The status row: everything in it is metadata, so everything in it is dim.
+pub const status: vaxis.Style = rgb(0x5f, 0x5f, 0x5f);
+/// A key hint inside a modal (`enter run`). 6.3:1 on `panel_bg`.
+///
+/// It is dimmer than the option it belongs to, never dimmer than readable. The
+/// first version was `#6b7280` at 4.08:1, and the whole point of a hint is
+/// that it gets read.
+pub const key_hint: vaxis.Style = rgb(0x8b, 0x94, 0x9e);
+/// A modal's title. `ink2` bold: it names the thing without competing with the
+/// question under it.
+pub const panel_title: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa3, 0xa3, 0xa3 } } };
+
+/// Accent for the older names, kept as aliases so the rename is one commit and
+/// not a hunt. Anything still using these is on its way out.
+pub const brand_bold = input_prompt;
+pub const brand_hi_old = brand_hi;
+pub const accent = brand;
+pub const accent_bold = brand;
+pub const hint = ink2;
+pub const hint_faint = ink3;
+pub const dim = ink3;
+pub const text = ink;
+pub const assistant_bold = heading;
+pub const tool = ink2;
+pub const code_gutter = gutter;
+pub const rule_old = line;
+// Still referenced by the modal code that has not been rewritten onto the
+// panel yet. `code_bg` was the old name for a modal's interior and it pointed
+// at the same value `panel_bg` does.
+pub const code_bg = panel_bg;
+pub const input_text = ink;
+pub const warn_bold: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xf5, 0xa5, 0x24 } } };
+/// A palette group heading. Bold `ink2`: a LABEL, one step above the items and
+/// clearly below the selected one.
+pub const group: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa3, 0xa3, 0xa3 } } };
+pub const item: vaxis.Style = ink2;
+pub const item_sel: vaxis.Style = selected;
+pub const input_border = line;
+
+/// Context gauge: comfortable, near the compaction budget, past it.
 pub fn ctxColor(pct: u8) vaxis.Style {
-    if (pct < 50) return ok;
+    if (pct < 50) return ink2;
     if (pct < 80) return warn;
     return err;
 }
 
-/// Selected row: brand blue AND a background. See `sel_bg` for why the
-/// background is not optional.
-pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .index = 4 }, .bg = sel_bg.bg };
+// ── contrast, as an invariant ─────────────────────────────────
 
-// ── code token palette (ROADMAP Phase 4.4/4.5/4.6) ──────────────
-//
-// They were hardcoded in `highlight.zig` as xterm-256 indexes, without
-// importing `theme.zig`. Two consequences:
-//  - The code was shown in the terminal's default colors, not the app's: the
-//    header in brand blue and the code block in 256 came from
-//    different systems.
-//  - `str` and `diff_add` were BOTH `index 2`. That is, a code string and
-//    an added diff line came out in the SAME green, which is exactly what
-//    makes "the whole diff is green" indistinguishable from "this is a string".
-//
-// They are separated here: strings in dim green (#9ece6a) and added lines in
-// a brighter green (#73daca), and normal text (`def`) drops to a light
-// gray (#a9b1d6) instead of `Style{}`, which is the terminal's default
-// color: the BRIGHTEST thing on screen. With ~90% of the code's
-// lines landing in `def`, the whole block was the loudest thing there.
+/// WCAG relative luminance of an sRGB triple.
+pub fn luminance(r: u8, g: u8, b: u8) f64 {
+    const lin = struct {
+        fn f(v: u8) f64 {
+            const x = @as(f64, @floatFromInt(v)) / 255.0;
+            return if (x <= 0.03928) x / 12.92 else std.math.pow(f64, (x + 0.055) / 1.055, 2.4);
+        }
+    };
+    return 0.2126 * lin.f(r) + 0.7152 * lin.f(g) + 0.0722 * lin.f(b);
+}
 
-/// Normal code text. Before it was `Style{}` = the terminal's default
-/// color, that is, the brightest thing on screen.
-pub const code_text: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xa9, 0xb1, 0xd6 } } };
-pub const code_kw: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } } }; // lilac
-pub const code_kw2: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } }, .italic = true };
-pub const code_builtin: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // blue
-pub const code_type: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x2a, 0xc7, 0xb9 } } }; // cyan
-pub const code_str: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x9e, 0xce, 0x6a } } }; // dim green
-pub const code_comment: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } }, .italic = true };
-pub const code_num: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xe0, 0xaf, 0x68 } } }; // amber
-/// Function call: now with COLOR, not just `bold` (which is indistinguishable
-/// from normal bold text).
-pub const code_fn: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } }, .bold = true };
-pub const code_deco: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xe0, 0xaf, 0x68 } }, .italic = true };
+/// Contrast ratio between two sRGB triples, 1.0 to 21.0.
+///
+/// The denominator is the LIGHTER one. It is a ratio, not a subtraction, so it
+/// is order-independent — which matters, because the first version of the
+/// contrast check compared the wrong way round and "passed" a 1.6:1 pair.
+pub fn contrast(a: [3]u8, b: [3]u8) f64 {
+    const la = luminance(a[0], a[1], a[2]);
+    const lb = luminance(b[0], b[1], b[2]);
+    const hi = @max(la, lb);
+    const lo = @min(la, lb);
+    return (hi + 0.05) / (lo + 0.05);
+}
 
-// ── diff ───────────────────────────────────────────────────────
-// Decoupled from `code_str` on purpose: see above.
-pub const diff_add: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x73, 0xda, 0xca } } };
-pub const diff_del: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xf7, 0x76, 0x8e } } };
-pub const diff_ctx: vaxis.Style = code_comment;
+/// The rgb triple behind a style's foreground, or null when it is `.default`
+/// (which means "whatever the terminal has", and cannot be checked).
+pub fn fgRgb(st: vaxis.Style) ?[3]u8 {
+    return switch (st.fg) {
+        .rgb => |c| c,
+        else => null,
+    };
+}
 
-/// Background and gutter of a code block (Phase 4.1).
-pub const code_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x1a, 0x1b, 0x26 } } };
-/// The `│` in the gutter of a CONTINUATION row: the line under a tool result or
-/// a wrapped paragraph still belongs to it. One glyph per row, and it is the
-/// difference between "one result plus five anonymous rows" and "a result".
-pub const gutter: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x4a, 0x51, 0x70 } } };
+/// The rgb triple behind a style's background, or `.default` resolved to the
+/// darkest plausible terminal background.
+pub fn bgRgb(st: vaxis.Style) [3]u8 {
+    return switch (st.bg) {
+        .rgb => |c| c,
+        else => .{ 0, 0, 0 },
+    };
+}
 
-/// The `│` that frames a code block. It was `brand_faint` (#3b4261, 1.9:1),
-/// which made the ONE thing that says "this is a block" the least visible mark
-/// in the UI. `hint_faint` is 3.4:1 and still recedes.
-pub const code_gutter: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x65, 0x6d, 0x82 } } };
-/// Chip with the block's language.
-pub const code_lang: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x7a, 0x83, 0x99 } }, .italic = true };
+/// Every color that is ever used as TEXT, with the background it is read on.
+///
+/// This list IS the rule. A color that is not in it is not text: it is a line,
+/// a fill, or an oversight, and the only way to find out which is to try to
+/// paint a paragraph with it.
+pub const text_pairs = [_][2]vaxis.Style{
+    .{ ink, well_bg },
+    .{ ink, panel_bg },
+    .{ ink2, panel_bg },
+    .{ ink2, well_bg },
+    .{ ink3, panel_bg },
+    .{ ink3, well_bg },
+    .{ brand, well_bg },
+    .{ brand_hi, panel_bg },
+    .{ brand_soft, well_bg },
+    .{ ok, diff_add_bg },
+    .{ err, diff_del_bg },
+    .{ diff_ctx, well_bg },
+    .{ code_text, well_bg },
+    .{ code_kw, well_bg },
+    .{ code_str, well_bg },
+    .{ code_num, well_bg },
+    .{ code_type, well_bg },
+    .{ code_builtin, well_bg },
+    .{ code_comment, well_bg },
+    .{ heading, panel_bg },
+    .{ notice, panel_bg },
+    .{ key_hint, panel_bg },
+};
 
-// ── modal palette (Ctrl+P) ───────────────────────────────────
+/// Minimum contrast for a pair that carries words.
+pub const min_text_contrast: f64 = 4.5;
 
-/// Unhighlighted item: normal text, not grey, so the list stays readable.
-pub const item: vaxis.Style = .{};
-/// Group heading ("Suggested", "Model", "Session"...).
-pub const group: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xbb, 0x9a, 0xf7 } } };
-/// Highlighted row: accent bar + text in brand blue.
-pub const item_sel: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
+/// Minimum contrast for a pair that is a MARK (a rail, a bullet, a bar).
+///
+/// 1.3 is deliberately low: a mark that competes with the text is a bug, and
+/// this number exists to stop "let's make the rail a bit more visible" from
+/// turning into a column of dots down the middle of the screen.
+pub const min_mark_contrast: f64 = 1.25;
 
 /// Width in columns of a grapheme (minimum 1), measured with whatever method
 /// the terminal negotiated. `ctx` is the frame's DrawContext: if the width
@@ -148,6 +341,126 @@ pub fn graphemeWidth(ctx: vxfw.DrawContext, g: []const u8) u8 {
     if (g.len == 0) return 1;
     const w = ctx.stringWidth(g);
     return @intCast(@max(1, w));
+}
+
+/// Hue in degrees (0-360) and saturation (0-1) of an sRGB triple.
+///
+/// Needed because the two greens are separated by CHROMA, not by lightness, and
+/// a contrast ratio between two colors of similar lightness is ~1.0 however
+/// far apart their hues are. The first version of the "the two greens are
+/// different" test measured contrast and failed: `brand` (#7fb069) and `ok`
+/// (#4cc76b) are both mid-lightness, so the ratio said 1.1 while a reader sees
+/// a dusty sage and a vivid emerald. Measuring the wrong quantity is how a test
+/// gets deleted instead of fixed.
+pub fn hueSat(c: [3]u8) struct { h: f64, s: f64, l: f64 } {
+    const r = @as(f64, @floatFromInt(c[0])) / 255.0;
+    const g = @as(f64, @floatFromInt(c[1])) / 255.0;
+    const b = @as(f64, @floatFromInt(c[2])) / 255.0;
+    const mx = @max(r, @max(g, b));
+    const mn = @min(r, @min(g, b));
+    const d = mx - mn;
+    const l = (mx + mn) / 2.0;
+    if (d == 0) return .{ .h = 0, .s = 0, .l = l };
+    const s = d / (1 - @abs(2 * l - 1));
+    var h: f64 = 0;
+    if (mx == r) {
+        h = 60 * @mod(@mod((g - b) / d, 6.0) + 6.0, 6.0);
+    } else if (mx == g) {
+        h = 60 * ((b - r) / d + 2);
+    } else {
+        h = 60 * ((r - g) / d + 4);
+    }
+    return .{ .h = h, .s = s, .l = l };
+}
+
+test "contrast: the ratio is order-independent and correct on the anchors" {
+    // White on black is the maximum; identical colors are 1.
+    try std.testing.expectApproxEqAbs(@as(f64, 21.0), contrast(.{ 0xff, 0xff, 0xff }, .{ 0, 0, 0 }), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), contrast(.{ 0x40, 0x40, 0x40 }, .{ 0x40, 0x40, 0x40 }), 0.001);
+    // Order matters for the ARITHMETIC but not the answer: the first version of
+    // this compared the darker against the lighter and "passed" a 1.6:1 pair.
+    const a = [3]u8{ 0xf2, 0xf2, 0xf2 };
+    const b = [3]u8{ 0, 0, 0 };
+    try std.testing.expectApproxEqAbs(contrast(a, b), contrast(b, a), 0.0001);
+    // The pair this file exists for. Measured 2.14:1 on black (the 1.9 quoted
+    // for years was against `#1a1b26`, not against black) — and it was used for
+    // TEXT, which is what makes it a bug and not just a dark color.
+    const old = contrast(.{ 0x3b, 0x42, 0x61 }, .{ 0, 0, 0 });
+    try std.testing.expect(old < min_text_contrast);
+    // And the one that replaced it.
+    const neu = contrast(.{ 0x85, 0x85, 0x85 }, .{ 0, 0, 0 });
+    try std.testing.expect(neu >= min_text_contrast);
+}
+
+test "every TEXT color is readable on the surface it is used on" {
+    var i: usize = 0;
+    while (i < text_pairs.len) : (i += 1) {
+        const fg = fgRgb(text_pairs[i][0]) orelse continue;
+        const bgc = bgRgb(text_pairs[i][1]);
+        const r = contrast(fg, bgc);
+        if (r < min_text_contrast) {
+            // The values, not the names: a `Style` has no tag, and a color's
+            // name is not something you can compute the contrast OF. The point
+            // is that whoever fixes this does not have to guess which pair it
+            // was.
+            std.debug.print(
+                "contrast {d:.2}:1 below {d:.1} — fg #{x:0>2}{x:0>2}{x:0>2} on bg #{x:0>2}{x:0>2}{x:0>2}\n",
+                .{ r, min_text_contrast, fg[0], fg[1], fg[2], bgc[0], bgc[1], bgc[2] },
+            );
+            return error.TextContrastTooLow;
+        }
+    }
+}
+
+test "the hairline is a hairline and NOT text" {
+    // The rule exists precisely so that `line` can recede. This is the test
+    // that stops somebody from promoting it to text because it "looked better"
+    // somewhere.
+    const r = contrast(.{ 0x2e, 0x2e, 0x2e }, .{ 0, 0, 0 });
+    try std.testing.expect(r >= 1.4);
+    try std.testing.expect(r < min_text_contrast);
+    // …and it still has to be visible enough to be a line at all.
+    try std.testing.expect(r >= min_mark_contrast);
+}
+
+test "the accent green and the diff green are told apart by CHROMA, not by lightness" {
+    // The whole two-green decision rests on a reader telling them apart. A
+    // contrast ratio cannot measure that (they are the same lightness), so the
+    // quantity that separates them is saturation: the accent is MATTE and `ok`
+    // is VIVID. Both differences are asserted, because either one alone would
+    // pass with a palette that still reads as "the same green".
+    const a = hueSat(fgRgb(brand).?);
+    const b = hueSat(fgRgb(ok).?);
+    // The matte one is measurably less saturated.
+    try std.testing.expect(b.s - a.s >= 0.15);
+    // And not the same hue either. The hue distance has to take the wrap
+    // around 360 into account, or a red at 350 and a red at 10 read as 340
+    // apart.
+    var dh = @abs(a.h - b.h);
+    if (dh > 180) dh = 360 - dh;
+    try std.testing.expect(dh >= 15);
+}
+
+test "the code palette contains no green" {
+    // The accent is green. A green token would put "brand" and "syntax" on the
+    // same screen reading the same way, which is the exact confusion `ok` is
+    // already kept away from.
+    //
+    // "Green" is hue in the 70-170 band with enough saturation to still look
+    // like a color: `code_comment` sits at hue 218 (blue-gray) and must not be
+    // caught by it.
+    const palette = [_]vaxis.Style{
+        code_text, code_kw, code_kw2, code_builtin, code_type,
+        code_str,  code_comment, code_num, code_fn, code_deco,
+    };
+    for (palette) |st| {
+        const hs = hueSat(fgRgb(st).?);
+        const greenish = hs.h >= 70 and hs.h <= 170 and hs.s >= 0.15;
+        if (greenish) {
+            std.debug.print("code color at hue {d:.0} saturation {d:.2} reads as green\n", .{ hs.h, hs.s });
+            return error.CodePaletteHasGreen;
+        }
+    }
 }
 
 test "graphemeWidth: ascii=1, empty=1" {

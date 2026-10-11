@@ -42,52 +42,59 @@ const styles = struct {
     fn fg(idx: u8) Style {
         return .{ .fg = .{ .index = idx } };
     }
-    const user_prefix = fg(4); // blue
-    const user_text = Style{};
-    const asst_prefix = fg(5); // magenta
-    const asst_text = Style{};
-    // Notices ("3 tool results elided", "done · 12.4s", "@file: 2 inlined") used
-    // to be `fg(8)`, the same gray as a tool RESULT, and at ~2.8:1 on a dark
-    // background they were invisible in a long history. A notice is secondary
-    // information the user still has to be able to read, so it gets a readable
-    // tone and the tool result keeps the dim one.
-    const info: Style = .{ .fg = .{ .rgb = .{ 0x7a, 0x83, 0x99 } } };
-    const tool = fg(6); // cyan
-    const tool_bold: Style = .{ .bold = true, .fg = .{ .index = 6 } };
-    const tool_res = fg(8); // the result goes dimmed
-    // The tool summary goes in REAL BOLD. Before it was identical to
-    // `tool_res` (same index, no `.bold`), so the "two tones" described in
-    // AGENTS.md was a no-op: `*write*(hola.js) · *3ms*` came out entirely in
-    // the same gray.
-    const tool_res_bold: Style = .{ .bold = true, .fg = .{ .index = 8 } };
-    const diff_add = fg(2); // green
-    const diff_del = fg(1); // red
-    const diff_ctx = fg(8); // gray
-    const err = fg(1); // red
-    // Header: the owl goes in the brand color and the wordmark one tone
-    // above, so the logo reads lit against the art.
-    // These are the three blues from `theme.zig`; they are repeated here
-    // because this module does not depend on the TUI (markdown's tests use it
-    // on its own).
-    const banner: Style = .{ .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } }; // brand
-    const banner_bold: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } }; // brand_hi
-    // A heading was `fg(4)` bold: the SAME blue as the `›` user prefix and as
-    // `theme.accent`, and the same style the diff used for `@@ -1,4 +1,6 @@`. A
-    // heading had to shout over the prose, so it gets the lightest blue in the
-    // palette (`#c0caf5`, one tone above the wordmark) and the hunk header gets
-    // its own style: two different things that used to be indistinguishable.
-    const heading: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xc0, 0xca, 0xf5 } } };
-    /// The `@@ -a,b +c,d @@` line of a diff. Dimmer than a heading, because it is
-    /// part of a block and not the title of one.
-    const hunk: Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7a, 0xa2, 0xf7 } } };
-    /// A list bullet, so the list reads as a list. Same tone as the `⏺` of a tool.
-    const bullet: Style = .{ .fg = .{ .index = 6 } };
-    /// The `>` bar of a quote.
-    const quote_bar: Style = .{ .fg = .{ .rgb = .{ 0x56, 0x5f, 0x89 } } };
-    /// A horizontal rule drawn from `---`.
-    const rule: Style = .{ .fg = .{ .rgb = .{ 0x3b, 0x42, 0x61 } } };
+
+    // Everything below comes from `theme.zig` and this module used to keep its
+    // OWN COPY of the palette, hardcoded, with a comment saying that was on
+    // purpose so the tests would run on their own. It is not on purpose: both
+    // files live in `src/lib/`, `theme.zig` imports nothing but vaxis, and
+    // `highlight.zig` has been importing it all along.
+    //
+    // The cost of the copy was a UI with two color systems: the banner, the
+    // prose, the bullets and the diff came out of one palette and the chrome
+    // out of another, and retheming meant grepping. The palette is the ONE
+    // place now, and `theme.zig`'s contrast test is what guards the half that
+    // lives here.
+
+    const user_prefix = theme.user;
+    const user_text = theme.ink;
+    // The assistant's prose is DEFAULT BRIGHT with no color at all. It used to
+    // be `.{}` and the `◆` prefix was magenta: the model's own words were
+    // decorated in the loudest color on the screen, which made every answer
+    // look like chrome.
+    const asst_prefix = Style{};
+    const asst_text = theme.ink;
+    /// A notice ("3 tool results elided", "done · 12.4s"). It has to be READ,
+    /// so it is `ink3` and not the terminal's gray.
+    const info: Style = theme.notice;
+    const tool = theme.tool_name;
+    const tool_bold = theme.tool_name;
+    const tool_res = theme.tool_res;
+    /// BOLD, and the SAME tone: the two-tone effect is weight, not color. The
+    /// first draft of the new palette pointed both at `theme.tool_res`, which
+    /// silently made `tool_res_bold` an alias and the `*3ms*` span came out
+    /// indistinguishable from the line it was on — the exact no-op this test
+    /// was written to prevent, reintroduced through the refactor.
+    const tool_res_bold: Style = .{ .bold = true, .fg = theme.tool_res.fg };
+    const diff_add = theme.diff_add;
+    const diff_del = theme.diff_del;
+    const diff_ctx = theme.diff_ctx;
+    const err = theme.err;
+    const banner: Style = theme.brand;
+    const banner_bold = theme.brand_hi;
+    /// A heading is WHITE BOLD, brighter than the prose around it, which is the
+    /// entire job of a heading. It was `#c0caf5` and the diff hunk was a blue
+    /// bold: two different things that used to be the same color.
+    const heading = theme.heading;
+    /// The `@@ -a,b +c,d @@` line. Amber bold: it is a label for the block
+    /// below it, not a title.
+    const hunk: Style = theme.diff_hunk;
+    const bullet: Style = theme.bullet;
+    const quote_bar: Style = theme.quote;
+    const rule: Style = theme.line;
     const bold = Style{ .bold = true };
-    const inline_code = Style{ .fg = .{ .index = 3 } }; // yellow
+    /// Inline `code`. Amber, to match the number tokens: an inline code span and
+    /// a numeric literal are the same kind of thing you look up.
+    const inline_code = Style{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
     const sep = fg(8);
 };
 
@@ -702,15 +709,37 @@ fn constClose(line: []const u8, from: usize, needle: []const u8) ?usize {
 }
 
 /// Prompt prefixes per kind (they are drawn on the first line of the block).
+///
+/// # The vocabulary
+///
+/// There are FIVE marks in this UI and every one of them is in this function.
+/// That is the whole rule: a reader learns the screen by learning five glyphs,
+/// and a sixth one added "because this case is different" is a sixth thing to
+/// learn for no gain.
+///
+/// | mark | meaning | why this glyph |
+/// |---|---|---|
+/// | `›` | you | the only thing in the accent color, so it is always findable |
+/// | `●` | a tool ran | a filled dot reads as "something happened here" |
+/// | `│` | its output | a rail ties a body to the call above it |
+/// | `└` | the body's end | the elbow: this is the bottom of it |
+/// | `✗` | it failed | the one glyph nobody misreads |
+/// | `·` | a notice | the smallest thing on screen, and the smallest thing it says |
+///
+/// The one that is GONE is `◆`, the assistant's bullet. It was the loudest
+/// mark in the transcript and it marked the least remarkable thing in it:
+/// prose. The model's own words are not chrome, and removing the glyph is
+/// what let the accent mean exactly one thing — "this is yours".
 pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
     return switch (kind) {
         .user => .{ .text = "› ", .style = styles.user_prefix },
-        .assistant => .{ .text = "◆ ", .style = styles.asst_prefix },
+        // No mark at all. The prose starts at the margin and its first word is
+        // in `ink`, which is the loudest thing a paragraph should be.
+        .assistant => .{ .text = "", .style = styles.asst_prefix },
         .info => .{ .text = "· ", .style = styles.info },
-        .tool => .{ .text = "⚙ ", .style = styles.tool },
-        // Claude Code style tool calls: header and result with dashes.
-        .tool_run => .{ .text = "⏺ ", .style = styles.tool_bold },
-        .tool_res => .{ .text = "⎿  ", .style = styles.tool_res },
+        .tool => .{ .text = "● ", .style = styles.tool_bold },
+        .tool_run => .{ .text = "● ", .style = styles.tool_bold },
+        .tool_res => .{ .text = "│ ", .style = styles.tool_res },
         .diff => .{ .text = "", .style = styles.diff_ctx },
         .error_msg => .{ .text = "✗ ", .style = styles.err },
         .banner => .{ .text = "", .style = styles.banner },
@@ -1101,17 +1130,76 @@ test "a heading gets an empty row in front of it (unless it opens the paragraph)
 
 test "the notice style is readable and NOT the tool-result gray" {
     // They were both `fg(8)` at ~2.8:1, so a notice and a tool result were the
-    // same thing in a long history.
-    // The notice is a truecolor tone chosen for contrast; the tool result stays
-    // on the ANSI dim gray.
+    // same thing in a long history. Both now come from `theme.zig` and both are
+    // above the contrast floor; the test is that they are still DIFFERENT, and
+    // that "different" means different, not "one is a color and the other is
+    // an index".
     try std.testing.expect(std.meta.activeTag(styles.info.fg) == .rgb);
-    try std.testing.expect(std.meta.activeTag(styles.tool_res.fg) == .index);
-    try std.testing.expect(styles.tool_res.fg.index == 8);
+    try std.testing.expect(std.meta.activeTag(styles.tool_res.fg) == .rgb);
+    try std.testing.expect(!std.meta.eql(styles.info.fg.rgb, styles.tool_res.fg.rgb));
+
+    // The floor itself, checked here and not only in `theme.zig`, because this
+    // is the module that decides which style a NOTICE gets. A retheme that
+    // forgot this file would pass the theme test and fail this one.
+    const bg = [3]u8{ 0, 0, 0 };
+    for ([_]Style{ styles.info, styles.tool_res }) |st| {
+        const c = theme.contrast(theme.fgRgb(st).?, bg);
+        if (c < 4.5) {
+            std.debug.print("markdown style at {d:.2}:1 is unreadable\n", .{c});
+            return error.MarkdownStyleUnreadable;
+        }
+    }
 }
 
 test "a markdown heading is not the diff hunk header" {
     // They shared one style, so `@@ -1,4 +1,6 @@` looked exactly like a
     // markdown heading: bold blue, same as the `›` of a user prompt.
     try std.testing.expect(std.meta.activeTag(styles.heading.fg) == .rgb);
-    try std.testing.expect(std.mem.eql(u8, &styles.heading.fg.rgb, &styles.hunk.fg.rgb) == false);
+    try std.testing.expect(std.meta.activeTag(styles.hunk.fg) == .rgb);
+    try std.testing.expect(!std.meta.eql(styles.heading.fg.rgb, styles.hunk.fg.rgb));
+}
+
+test "the assistant's prose carries NO mark, and its color is ink and not the accent" {
+    // The `◆` was the loudest glyph in the transcript and it marked the least
+    // remarkable thing in it. Two separate decisions, asserted separately:
+    // the MARK is gone, and the prose is not wearing the accent.
+    //
+    // The prose is `ink`, not the terminal's default color. `Style{}` used to
+    // mean "whatever the terminal has", which on a light-background terminal is
+    // black-on-white and on a dark one is "the brightest thing on screen" —
+    // the reason `code_text` had to be pulled DOWN to `#a9b1d6`. Saying `ink`
+    // makes the paragraph's color ours and stops it depending on the terminal's
+    // idea of what normal text is.
+    const p = prefix(.assistant);
+    try std.testing.expectEqualStrings("", p.text);
+    try std.testing.expectEqual(Style{}, p.style);
+    try std.testing.expectEqual(theme.ink.fg, styles.asst_text.fg);
+    // …and specifically NOT the accent: the green means "yours" and "live",
+    // and if the model's prose were green too the accent would mean nothing.
+    try std.testing.expect(!std.meta.eql(styles.asst_text.fg, theme.brand.fg));
+    try std.testing.expect(!std.meta.eql(styles.asst_text.fg, theme.ink3.fg));
+}
+
+test "the transcript has five marks and not six" {
+    // Every prefix the transcript can draw, collected. A new kind with a new
+    // glyph has to be added to this list on purpose, which is the whole point:
+    // the vocabulary is the interface, and it is the thing most likely to grow
+    // by accident.
+    const seen = [_]Kind{
+        .user, .assistant, .info, .tool, .tool_run,
+        .tool_res, .diff, .error_msg, .banner,
+    };
+    for (seen) |k| {
+        const p = prefix(k);
+        if (p.text.len > 0) {
+            // Only the marks below are allowed. Anything else is a sixth glyph.
+            const allowed = std.mem.eql(u8, p.text, "› ") or
+                std.mem.eql(u8, p.text, "● ") or
+                std.mem.eql(u8, p.text, "│ ") or
+                std.mem.eql(u8, p.text, "✗ ") or
+                std.mem.eql(u8, p.text, "· ") or
+                std.mem.eql(u8, p.text, "  ");
+            try std.testing.expect(allowed);
+        }
+    }
 }

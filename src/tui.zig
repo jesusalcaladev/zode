@@ -221,6 +221,13 @@ fn bannerRuleLine(pa: std.mem.Allocator, width: u16) PLine {
 /// bug this exists to avoid.
 pub const diff_preview_lines = 12;
 
+/// The hairline under the hero's tagline. A LITERAL and not a composed run of
+/// `─`, because `CellRun.w` is a **u8 in COLUMNS**: one run wider than 255
+/// silently stops drawing halfway across a wide terminal. This is the same trap
+/// `bannerRuleLine` documented, and the rule now lives here because the banner
+/// it was written for is gone.
+pub const hero_rule = "───────────────────────────────";
+
 /// Lines added and removed by a diff (what is shown as `+N −M`).
 pub const DiffCounts = struct { added: usize = 0, removed: usize = 0 };
 
@@ -1995,6 +2002,47 @@ pub const Model = struct {
             }
             try self.layoutOne(ctx, idx, width);
         }
+
+        // ── keep the cache SORTED by `para_idx` ──
+        //
+        // The painter walks the cache accumulating `line_cursor`, so it needs
+        // the entries in paragraph order. It USED to get that order for free
+        // because the window only ever moved forwards: `for (lo..hi)` appends
+        // ascending, and everything below `lo` was evicted. But the window also
+        // moves BACKWARDS — a height correction, a resize, anything that lowers
+        // `first_visible` — and then those paragraphs are re-parsed and APPENDED
+        // at the end, after the ones with a higher index.
+        //
+        // The result was a frame painted in the wrong order: `seg_cache` read
+        // `3,4,5,6,7,8,0,1,2`, so paragraphs 0-2 were painted at the line where
+        // paragraph 8 ended. The banner appeared twice, in the middle of a
+        // conversation, and a resized window scrambled a long turn. Measured on
+        // `tools/ui_frame` (`zig build ui-frame -- --layout turn 96 30`) and
+        // caught by the red test "correcting a paragraph's height does not move
+        // the text under the reader", which had been failing since the window
+        // became a window.
+        //
+        // Sorted here rather than in `layoutOne` because the invariant belongs
+        // to the FUNCTION THAT CAN BREAK IT: `layoutOne` is called in ascending
+        // order and does not know what else is already in the list.
+        if (!self.cacheSorted()) {
+            std.mem.sort(CachedPara, self.seg_cache.items, {}, cachedLessThan);
+        }
+    }
+
+    /// Is `seg_cache` in paragraph order? The invariant `drawLines`'s
+    /// `line_cursor` walk depends on. Checked once per frame over at most
+    /// `max_cached_paras` entries, which is cheaper than sorting them.
+    fn cacheSorted(self: *const Model) bool {
+        var i: usize = 1;
+        while (i < self.seg_cache.items.len) : (i += 1) {
+            if (self.seg_cache.items[i - 1].para_idx >= self.seg_cache.items[i].para_idx) return false;
+        }
+        return true;
+    }
+
+    fn cachedLessThan(_: void, a: CachedPara, b: CachedPara) bool {
+        return a.para_idx < b.para_idx;
     }
 
     /// Compresses the paragraphs outside `[lo, hi)` (Phase 6 of the ROADMAP).
@@ -2480,24 +2528,74 @@ pub const Model = struct {
         self.dirty = true;
     }
 
-    /// Pushes the header: ONLY the wordmark.
+    /// The opening screen: a hero, not a logo.
     ///
-    /// Before there were three more things (an 18-row mascot, the "zo the code
-    /// robot says: hi!…" line and the shortcuts line `/help · /model · ctrl+p…`).
-    /// Complaining about "junk in the view" is being right: it was 20 rows of
-    /// header before the first word of the conversation, and the hints are
-    /// already in the palette (Ctrl+P) and in `/help`.
+    /// This replaces a five-row ASCII wordmark. The measurements that killed
+    /// the art are in AGENTS.md and they still hold: `▀` and `▄` paint HALF a
+    /// cell, `#` at 12 rows high reads as a smudge, and "a TUI header is read in
+    /// the first half second" — five rows of `#` is five rows of nothing before
+    /// the user has typed anything.
     ///
-    /// `start_mood` is no longer used to paint anything here: the face is still
-    /// in the status bar (`setStatusWithZo`), which is where it is read. The
-    /// parameter stays to avoid changing the signature at the two call sites.
+    /// What replaces it is TYPE, and a reason to be here: the wordmark, one
+    /// line of what this is, and the four commands that are actually useful in
+    /// the first thirty seconds. That last part is the part the ASCII never was:
+    /// it earned its rows.
+    ///
+    /// Three tones, from the paragraph's own `base` and `mood` slots plus the
+    /// `*…*` mark. The `.banner` kind used to paint EVERYTHING in the brand
+    /// green, which is how a five-line hero came out as five green lines — and
+    /// a page where everything is the accent has no accent.
+    ///
+    /// `start_mood` is no longer used to paint anything here: the face is in the
+    /// activity row, which is where it is read. The parameter stays to avoid
+    /// changing the signature at the two call sites.
     pub fn pushHeader(self: *Model, start_mood: mascot.Mood) void {
         _ = start_mood;
-        var it = std.mem.splitScalar(u8, mascot.banner, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            self.pushKind(.banner, line);
-        }
+        // NO leading spaces: the draw centers this block (`heroFrame`), so the
+        // indent is a function of the terminal width and not a guess made at
+        // startup and frozen into eight paragraphs.
+        self.pushHero("*zode*", theme.brand, theme.brand_hi);
+        self.pushHero("a code agent in your terminal", theme.ink3, theme.ink3);
+        self.pushHero(hero_rule, theme.line, theme.line);
+        // A blank row between the rule and the grid, and one after it. Without
+        // them the grid is part of the rule and the hero reads as three blocks.
+        self.pushHero("", theme.brand, theme.brand_hi);
+        self.pushHeroRow("/help", "commands", "ctrl+p", "palette");
+        self.pushHeroRow("/model", "choose a model", "ctrl+t", "models");
+        self.pushHeroRow("@file", "attach a file", "\u{23ce}", "ask anything");
+    }
+
+    /// One hero line with its own tones. `*…*` paints in `hi` and `~…~` in
+    /// `mood`; everything else is `base`. The markers are REMOVED from the
+    /// text, so the caller sees the clean string and the drawing comes out in
+    /// three colors.
+    fn pushHero(self: *Model, text: []const u8, base: md.Style, third: md.Style) void {
+        const copy = self.allocator.dupe(u8, text) catch return;
+        self.lock();
+        defer self.unlock();
+        self.pending.append(self.allocator, .{ .kind = .banner, .text = copy, .base = base, .mood = third }) catch {
+            self.allocator.free(copy);
+        };
+        self.dirty = true;
+    }
+
+    /// One row of the hero's two-column grid.
+    ///
+    /// The KEY is lit, the description is dim and the shortcut is dimmer. The
+    /// grid is scanned for "what do I press", and a grid where all three columns
+    /// look the same is a paragraph, not a menu.
+    ///
+    /// Fixed column widths, not computed: a grid whose columns move when a
+    /// label changes length is not a grid. They are byte counts and every label
+    /// here is ASCII, so they are also column counts.
+    fn pushHeroRow(self: *Model, key: []const u8, what: []const u8, kbd: []const u8, hint: []const u8) void {
+        const line = std.fmt.allocPrint(
+            self.allocator,
+            "*{s}*  {s: <16}~{s}~  {s}",
+            .{ key, what, kbd, hint },
+        ) catch return;
+        defer self.allocator.free(line);
+        self.pushHero(line, theme.ink3, theme.status);
     }
 
     pub fn beginCatalogRequest(self: *Model, provider_id: []const u8) usize {
@@ -4920,12 +5018,18 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     };
 
     // ── bottom-up layout ──
-    //   row height-2                         session status
-    //   rows height-2-input_h .. height-3   prompt
-    //   autocomplete / plan / activity      only when relevant
-    //   one rule                             workspace boundary
-    //   rows 0..history_h                    conversation
-    const status_row: u16 = height - 2;
+    //
+    //   row height-1                       status (ONE row, two zones)
+    //   rows ..input_top+input_h-1         prompt, no box, grows upward
+    //   row  rule_row                      one hairline
+    //   rows rule_row-ac..plan..act        only when relevant
+    //   rows 0..history_h                  the conversation, and nothing else
+    //
+    // This used to be a banner of 5 rows, a rule, a BORDERED input box of 3
+    // rows, a blank, a status row and another row for the usage column: eleven
+    // rows of furniture before the first word. Six of them were permanent, and
+    // the banner was a drawing that never changed and never would.
+    const status_row: u16 = height - 1;
     const max_input_lines: u16 = 8;
     const text_w: u16 = if (width > 4) width - 4 else 1;
 
@@ -4952,13 +5056,17 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     // The prompt is fixed against the status row; optional workspace rows take
     // space from history rather than pushing the cursor away from the bottom.
-    const chrome: u16 = 3 + ac_rows + act_rows + plan_rows; // status, boundary, bottom margin, context rows
+    //
+    // `chrome` is status + rule and NOTHING else: the input has no top and no
+    // bottom border, so it costs exactly the rows it is using.
+    const chrome: u16 = 2 + ac_rows + act_rows + plan_rows; // status, hairline, context rows
     const avail: u16 = if (height > chrome + 2) height - chrome - 2 else 1;
     const ed_w: u16 = if (text_w > 0) text_w else 1;
     const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(ed_w, editorMeasurer(&p)), max_input_lines))), avail), 1);
-    const input_top: u16 = height - 2 - input_h;
-    const workspace_top = input_top -| ac_rows -| plan_rows -| act_rows;
-    const history_h: u16 = if (workspace_top > 1) workspace_top - 1 else 1;
+    const input_top: u16 = if (height > input_h + 2) height - 1 - input_h else 1;
+    const rule_row: u16 = if (input_top > 0) input_top - 1 else 0;
+    const workspace_top = rule_row -| ac_rows -| plan_rows -| act_rows;
+    const history_h: u16 = @max(workspace_top, 1);
     // The key handler needs the height to jump a whole page.
     self.hist_rows = history_h;
 
@@ -5114,15 +5222,24 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     //
     // `line_cursor` is the ABSOLUTE position of the first line: the window's
     // `.offset` (`cache_lo`) plus what the cached paragraphs before it carry.
+    //
+    // The `pad` is the opening hero's air. It is measured against the CONTENT's
+    // real height and NOT against `last_visible - first_visible`: that range is
+    // already clamped to the viewport, so it is `history_h` whenever the
+    // content is short, and the first version of this compared the content
+    // against itself and always decided there was no room.
+    const content_lines = self.heightPrefix(self.paras.items.len) + live_lines.len;
+    const hero = heroFrame(self, wrap_width + 2 * hist_margin, history_h, content_lines);
+    const pad = hero.pad;
     var line_cursor = self.heightPrefix(self.cache_lo);
     for (self.seg_cache.items) |c| {
         defer line_cursor += c.height;
         if (line_cursor >= last_visible) break;
         if (line_cursor + c.height <= first_visible) continue;
-        drawLines(&p, c.lines, line_cursor, first_visible, history_h);
+        drawLines(&p, c.lines, line_cursor, first_visible, history_h, pad, hero.x_off);
     }
     if (live_active) {
-        drawLines(&p, live_lines, line_cursor, first_visible, history_h);
+        drawLines(&p, live_lines, line_cursor, first_visible, history_h, pad, hero.x_off);
     }
     drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
     try self.snapshotSelectableHistory(surface, history_h);
@@ -5152,7 +5269,6 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // ── permission dialog (modal over the history, at the bottom) ──
     var perm_tool: []const u8 = "";
     var perm_detail: []const u8 = "";
-    if (!self.permActive() and workspace_top > 0) p.fillRow(workspace_top - 1, "─", theme.rule);
 
     // ── status: session info on the right; activity lives in ONE place ──
     //
@@ -5189,22 +5305,15 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     // ── status bar frame ──
     //
-    // The status bar is a single row; a thin frame makes it read as a distinct
-    // row at the bottom of the screen, visually separated from the history
-    // above and the input below. The left edge is drawn whenever there is
-    // content on the left; the right edge is drawn when there is no usage
-    // column glued to the far right (the usage column is painted after this
-    // block, and it would overwrite the right edge anyway).
-    {
-        const has_left = self.status().len > 0 or !self.follow_bottom;
-        const has_right = info.len > 0 or !usage_fits;
-        if (has_left) _ = p.putStable(0, status_row, "│", 1, theme.rule);
-        if (has_right) _ = p.putStable(width - 1, status_row, "│", 1, theme.rule);
-    }
-
+    // There is no FRAME around the status row any more, and that is the whole
+    // entry. It used to draw a `│` at column 0 and one at the far edge, which
+    // framed a row of dim metadata as if it were a panel AND left a stray tick
+    // at the left margin — a mark with nothing on either side of it. The row
+    // reads as a row because it is the only thing on it.
+    //
     // Second column, at the right edge: what the session has cost. Painted
-    // AFTER the frame so it wins any overlap, and only if the session
-    // column left room (`reserved`).
+    // AFTER the session column so it wins any overlap, and only if that column
+    // left room (`usage_fits`).
     if (usage_fits) {
         if (usage) |segments| drawUsageColumn(&p, status_row, width, segments, info_width);
     }
@@ -5222,7 +5331,19 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         drawAutocomplete(&p, self, input_top - ac_rows, width, ac_rows);
     }
 
-    drawInput(&p, &surface, self, input_top, width, input_h, workspace_top -| 1);
+    // ── the hairline ──
+    //
+    // ONE row, full width, `line_bright`: it is what replaces the input's box.
+    // A box is two extra rows and four more glyphs to say "text goes here", and
+    // the thing it is really saying is "this is the boundary of the page" —
+    // which is what a rule says, for one row instead of three.
+    //
+    // It is NOT painted when the permission dialog is up: the modal is a
+    // centred box with a clean background, and a full-width rule under it
+    // points at a boundary the dialog is ignoring.
+    if (!self.permActive()) p.fillRow(rule_row, "─", theme.rule);
+
+    drawInput(&p, &surface, self, input_top, width, input_h, rule_row);
 
     // ── permission dialog: centered MODAL ──
     //
@@ -5262,7 +5383,15 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     return surface;
 }
 
-/// Borderless prompt: the conversation is the workspace, not a stack of boxes.
+/// The prompt. No box, no borders, no top rule of its own: the hairline above
+/// already separates the conversation from what you type, and a box around the
+/// input was three rows for a statement the rule makes in one.
+///
+/// What the box DID carry — a visual anchor for "you are here" — is now a
+/// single accent bar in the left margin, one cell tall per input row. It is
+/// the only green in the bottom third of the screen and it is always where the
+/// caret is, which is the entire job.
+///
 /// The terminal cursor is anchored at the real editor position.
 fn drawInput(
     p: *Painter,
@@ -5275,9 +5404,19 @@ fn drawInput(
 ) void {
     if (top >= p.height or width < 6) return;
 
+    // The accent bar: one cell per input row, in the left margin. `▌` and NOT
+    // `│`: a half-block is the "here" mark in every editor and a pipe reads as
+    // a border.
+    {
+        var i: u16 = 0;
+        while (i < input_h and top + i < p.height) : (i += 1) {
+            p.putStable(0, top + i, "▌", 1, theme.input_bar);
+        }
+    }
+
     // Prompt and text start at columns 1 and 3 respectively; keeping the same
     // width in layout and paint prevents clipping a final grapheme.
-    _ = p.putText(1, top, "❯ ", theme.input_prompt);
+    _ = p.putText(1, top, "› ", theme.input_prompt);
     const ed_w: u16 = if (width > 4) width - 4 else 1;
     const meas = editorMeasurer(p);
 
@@ -5312,11 +5451,11 @@ fn drawInput(
 
     // Show the clipped prompt's hidden-row count on the workspace rule, not in
     // the prompt text itself.
-    if (first > 0 and width > 16 and hint_row < top and !self.ac.active) {
+    if (first > 0 and width > 16 and hint_row != top and !self.ac.active) {
         var ib: [32]u8 = undefined;
         const lab = std.fmt.bufPrint(&ib, "\u{2191} {d} more", .{first}) catch "";
         if (lab.len > 0 and lab.len + 4 < width) {
-            _ = p.putClipped(width - 2 - @as(u16, @intCast(lab.len)), hint_row, lab, @as(u16, @intCast(lab.len)), theme.hint_faint);
+            _ = p.putClipped(width - 2 - @as(u16, @intCast(lab.len)), hint_row, lab, @as(u16, @intCast(lab.len)), theme.key_hint);
         }
     }
 
@@ -5327,7 +5466,7 @@ fn drawInput(
         const ph: []const u8 = if (self.askActive())
             "your answer\u{2026} \u{b7} enter sends it \u{b7} esc: you decide"
         else
-            "Ask anything\u{2026} \u{b7} / commands";
+            "Ask anything\u{2026} \u{b7} / for commands";
         _ = p.putClipped(3, top, ph, ed_w, theme.placeholder);
     }
 }
@@ -5474,15 +5613,27 @@ fn drawLines(
     line_offset: usize,
     first_visible: usize,
     history_h: u16,
+    pad: u16,
+    x_off: u16,
 ) void {
     const hh: usize = history_h;
     // The history has matching air on both sides, like the input box.
-    const margin: u16 = historyMargin(p.width);
+    const margin: u16 = historyMargin(p.width) + x_off;
     for (lines, 0..) |ln, li| {
         const abs = line_offset + li;
         if (abs >= first_visible + hh) break;
         if (abs < first_visible) continue;
-        const row: u16 = @intCast(abs - first_visible);
+        // `pad` is blank rows above the first line. It is how the opening hero
+        // ends up in the middle of an otherwise empty screen instead of glued
+        // to the top of it with thirty rows of nothing underneath.
+        //
+        // It is a PARAMETER and not an offset baked into `first_visible` for
+        // one reason: `first_visible` is a scroll position and it feeds the
+        // height tree, the key handlers and the scrollbar. Faking a negative
+        // scroll to get some air would put all three out by the same amount, and
+        // the first PageUp would jump.
+        const row: u16 = @intCast(abs - first_visible + pad);
+        if (row >= hh) break;
         var col: u16 = margin;
         for (ln.cells) |cell| {
             p.putStable(col, row, cell.text, cell.w, cell.style);
@@ -5490,6 +5641,48 @@ fn drawLines(
             if (col >= p.width) break;
         }
     }
+}
+
+/// Blank rows above the transcript, and blank columns to its left: the ONE rule
+/// that decides both.
+///
+/// Only the opening screen gets them, and only when the whole thing fits. A
+/// conversation is bottom-anchored (that is what a terminal does, and that is
+/// what you expect when text is arriving), but a hero glued to the top-left of
+/// a thirty-row screen reads as a page that failed to load. Centering it is the
+/// difference between "empty" and "waiting".
+///
+/// One function and one condition, so it is testable: the air exists iff the
+/// transcript is nothing but the hero AND it fits.
+///
+/// The width is `hero_content_w` and not "however wide this line happens to
+/// be", because a block whose left edge moves when one of its strings is one
+/// character wider is not a block — it is text that happens to be near a rule.
+fn heroFrame(m: *const Model, width: u16, history_h: u16, content_lines: usize) struct { pad: u16, x_off: u16 } {
+    if (!onlyHero(m)) return .{ .pad = 0, .x_off = 0 };
+    if (content_lines >= history_h) return .{ .pad = 0, .x_off = 0 };
+    const avail = @as(u16, width) -| 2 * historyMargin(width);
+    if (avail <= hero_content_w) return .{ .pad = 0, .x_off = 0 };
+    return .{
+        .pad = @intCast((@as(usize, history_h) - content_lines) / 2),
+        .x_off = (avail - hero_content_w) / 2,
+    };
+}
+
+/// Columns the hero's block occupies: the wordmark plus the widest grid row.
+pub const hero_content_w: u16 = 18 + 44;
+
+/// Is the transcript nothing but the opening hero?
+///
+/// Every paragraph's `kind == .banner`, and there is at least one. The first
+/// prompt flips it and never flips back, which is the point: this is the
+/// EMPTY STATE, and it is the only state where the content should float.
+fn onlyHero(m: *const Model) bool {
+    if (m.paras.items.len == 0) return false;
+    for (m.paras.items) |p| {
+        if (p.kind != .banner) return false;
+    }
+    return true;
 }
 
 /// Footer with the keyboard shortcuts. Dimmed while the user is typing.
@@ -6141,26 +6334,35 @@ fn drawActivityStrip(
 /// A piece of the status row with its style.
 const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 
-/// Status bar session info: model · provider (effort) · mode · context usage.
+/// The RIGHT zone of the status row: what you are working with.
 ///
-/// It is an array of segments (text + style) instead of a string, because each
-/// part goes in its own color: the model in bright blue, the rest dim and the
-/// ctx% green/yellow/red depending on how full it is.
-/// With a single string everything came out the same gray.
+/// Two rules, and they are what make one row of five facts readable instead of
+/// a pile:
 ///
-/// Live speed belongs beside the activity phase, not duplicated here.
+///  1. **Separators are `line`, not `ink`.** A `·` is a hairline between two
+///     items, and drawing it in the same tone as the items makes five facts look
+///     like one run-on sentence. The separators recede, so the facts don't.
+///  2. **Everything is dim except what you might act on.** The model is the one
+///     thing on this row that has a command behind it (`/model`), so it is
+///     `ink2`; the provider, the effort and the token count are facts you read
+///     and never type, so they are `status`. A status row where everything is
+///     bright is a status row nobody reads.
+///
+/// The left zone of the same row is the activity (see `drawActivityStrip`), and
+/// it is only there while there is something to report.
 fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     var out: std.ArrayList(InfoSeg) = .empty;
+    const sep = " · ";
 
     const model = agent.curAnswering();
     const provider = agent.curProvider();
 
     if (model.len > 0) {
-        out.append(arena, .{ .text = model, .style = theme.brand_bold }) catch return null;
+        out.append(arena, .{ .text = model, .style = theme.ink2 }) catch return null;
     }
     if (provider.len > 0) {
-        if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
-        out.append(arena, .{ .text = provider, .style = theme.brand_soft }) catch return null;
+        if (out.items.len > 0) out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
+        out.append(arena, .{ .text = provider, .style = theme.status }) catch return null;
         // The level that actually goes out, not the one the user asked for: if the
         // model has no such step, the status has to say the one that was sent. A
         // status that says `xhigh` while the wire carries `high` is small print
@@ -6178,20 +6380,22 @@ fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
         // outside this function: with bufPrint the text was garbage and the
         // status was cut in half ("kimi-k2.6 · opencode" and then a broken
         // character).
-        const et = std.fmt.allocPrint(arena, " ({s})", .{eff}) catch return null;
-        out.append(arena, .{ .text = et, .style = theme.brand_faint }) catch return null;
+        const et = std.fmt.allocPrint(arena, " {s}", .{eff}) catch return null;
+        out.append(arena, .{ .text = et, .style = theme.line }) catch return null;
     }
 
     // Always show the mode, including Build: the default is still a mode and
     // should not look like missing state while the provider is loading.
     const pm = agent.currentPermMode();
-    if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
+    if (out.items.len > 0) out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
     out.append(arena, .{
         .text = agent.permModeName(),
         .style = switch (pm) {
-            .default => theme.brand_soft,
-            .accept_edits => theme.tool,
-            .read_only, .bypass => theme.warn_bold,
+            .default => theme.status,
+            // A mode that changes what zode is ALLOWED to do is the one thing on
+            // this row that is not a fact, and it gets the only color here.
+            .accept_edits => theme.ink2,
+            .read_only, .bypass => theme.warn,
         },
     }) catch return null;
 
@@ -6201,7 +6405,7 @@ fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     // turn, so at the start nothing was shown and the counter looked like it
     // did not exist. Now it always says "~N tok" and the percentage, which is
     // also what warns you that you are approaching the compaction limit.
-    if (out.items.len > 0) out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
+    if (out.items.len > 0) out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
     if (agent.ctx_used > 0) {
         // `~` only for OUR estimate: when the provider has already counted the
         // prompt itself, the number is exact and the squiggle would be false
@@ -6210,8 +6414,8 @@ fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
             std.fmt.allocPrint(arena, "{d} tok", .{agent.ctx_used}) catch return null
         else
             std.fmt.allocPrint(arena, "~{d} tok", .{agent.ctx_used}) catch return null;
-        out.append(arena, .{ .text = tk, .style = theme.brand_soft }) catch return null;
-        out.append(arena, .{ .text = " · ", .style = theme.brand_faint }) catch return null;
+        out.append(arena, .{ .text = tk, .style = theme.status }) catch return null;
+        out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
     }
     const ct = std.fmt.allocPrint(arena, "ctx {d}%", .{agent.ctx_pct}) catch return null;
     out.append(arena, .{ .text = ct, .style = theme.ctxColor(agent.ctx_pct) }) catch return null;
@@ -6479,14 +6683,24 @@ test "render: the live stream is visible before streamEnd" {
     var buf: [128]u8 = undefined;
     const row0 = rowText(s, 0, &buf);
     try std.testing.expect(std.mem.indexOf(u8, row0, "parci") != null);
+    // The live stream has no mark either: the assistant never does.
+    try std.testing.expect(std.mem.indexOf(u8, row0, "\u{25c6}") == null);
+
+    var arena2_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena2_state.deinit();
+    const arena2 = arena2_state.allocator();
 
     // When the stream closes, the text becomes a fixed paragraph.
     m.streamDelta("al");
     m.streamEnd();
-    const s2 = try drawTest(&m, arena, 40, 12);
+    const s2 = try drawTest(&m, arena2, 40, 12);
     var buf2: [128]u8 = undefined;
     const row0b = rowText(s2, 0, &buf2);
-    try std.testing.expectEqualStrings("\u{25c6} parcial", std.mem.trim(u8, row0b, " "));
+    // NO `◆`. The prose used to carry a magenta diamond, which made the
+    // model's own words the most decorated thing on the screen. What matters
+    // now is that the text is THERE and that nothing is glued to the front of
+    // it — so this asserts the row is exactly the words.
+    try std.testing.expectEqualStrings("parcial", std.mem.trim(u8, row0b, " "));
 }
 
 test "render: long text wraps without losing characters" {
@@ -6543,19 +6757,52 @@ test "render: the status and workspace rule anchor the compact prompt" {
     const s = try drawTest(&m, arena, 40, height);
 
     var buf: [128]u8 = undefined;
-    // The rule separates the conversation from the prompt workspace.
-    const sep = rowText(s, height - 4, &buf);
+    // The bottom three rows, and they are three rows: a hairline, the input,
+    // the status. Before it was a rule, a THREE-row bordered box, a blank and
+    // the status — five rows of furniture for one row of text.
+    const sep = rowText(s, height - 3, &buf);
     try std.testing.expectEqualStrings("\u{2500}", sep[0..3]);
     var buf3: [128]u8 = undefined;
-    const prompt = rowText(s, height - 3, &buf3);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\u{276f}") != null);
+    const prompt = rowText(s, height - 2, &buf3);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\u{203a}") != null);
+    // The accent bar: the input has no box, so this is what says "you are here".
+    // Without it, "where does what I type go" is a question the frame answers
+    // only by the colour of a glyph.
+    try std.testing.expectEqualStrings("\u{258c}", std.mem.trim(u8, prompt, " ")[0..3]);
     // status
     var buf2: [128]u8 = undefined;
-    const st = rowText(s, height - 2, &buf2);
+    const st = rowText(s, height - 1, &buf2);
     try std.testing.expect(std.mem.indexOf(u8, st, "ready") != null);
 }
 
-test "render: tool blocks use ⏺/⎿ and the result expands" {
+test "the bottom furniture is exactly two rows and nothing else" {
+    // The layout, asserted instead of described. This is the test that would
+    // have caught the eleven rows of permanent furniture, and it is one line
+    // per row because a layout that grows has to fail a test, not a review.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const h: u16 = 20;
+    const s = try drawTest(&m, arena_state.allocator(), 60, h);
+    // Rows the transcript may NOT use, from the bottom up.
+    var buf: [128]u8 = undefined;
+    // h-1: the status row.
+    const status = rowText(s, h - 1, &buf);
+    try std.testing.expect(status.len > 0);
+    // h-2: the input, and it is ONE row when the input is one line.
+    const input = rowText(s, h - 2, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, input, "\u{203a}") != null);
+    // h-3: the hairline.
+    const rule = rowText(s, h - 3, &buf);
+    try std.testing.expectEqualStrings("\u{2500}", rule[0..3]);
+    // h-4 is the LAST transcript row and it is NOT furniture: no border, no
+    // extra blank row between the rule and the conversation.
+    try std.testing.expect(m.hist_rows == h - 3);
+}
+
+test "render: tool blocks use ●/│ and the result expands" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -6577,9 +6824,12 @@ test "render: tool blocks use ⏺/⎿ and the result expands" {
     {
         var buf: [256]u8 = undefined;
         const r = findRow(s, "read(src/tui.zig)").?;
-        try std.testing.expectEqualStrings("\u{23fa} read(src/tui.zig)", std.mem.trim(u8, rowText(s, r, &buf), " "));
+        try std.testing.expectEqualStrings("\u{25cf} read(src/tui.zig)", std.mem.trim(u8, rowText(s, r, &buf), " "));
+        // The `⎿` is a `│`. The elbow pointed nowhere; a RAIL is a line the
+        // eye can follow down, which is what an expanded result needs to be
+        // tied to the call it came from.
         const r2 = findRow(s, "Read 1006 lines").?;
-        try std.testing.expectEqualStrings("\u{23bf}  Read 1006 lines \u{b7} 3ms", std.mem.trim(u8, rowText(s, r2, &buf), " "));
+        try std.testing.expectEqualStrings("\u{2502} Read 1006 lines \u{b7} 3ms", std.mem.trim(u8, rowText(s, r2, &buf), " "));
     }
 
     // Ctrl+R expands the full result (several lines).
@@ -6614,10 +6864,16 @@ test "input: compact prompt, prompt glyph and placeholder" {
     const s = try drawTest(&m, arena_state.allocator(), 40, h);
 
     var buf2: [128]u8 = undefined;
-    const mid = rowText(s, h - 3, &buf2);
-    try std.testing.expect(std.mem.indexOf(u8, mid, "\u{276f}") != null);
+    const mid = rowText(s, h - 2, &buf2);
+    try std.testing.expect(std.mem.indexOf(u8, mid, "\u{203a}") != null);
     try std.testing.expect(std.mem.indexOf(u8, mid, "Ask anything") != null);
-    try std.testing.expectEqual(theme.hint.fg, s.readCell(3, h - 3).style.fg);
+    // The placeholder must be the PLACEHOLDER color, and — the part that can
+    // actually break — it must not be the color real text is painted in. The
+    // old assertion compared against `theme.hint`, which was an ALIAS that
+    // moved when the palette was retheme'd, so it checked that the placeholder
+    // equalled whatever color happened to be named `hint` that week.
+    try std.testing.expectEqual(theme.placeholder.fg, s.readCell(3, h - 2).style.fg);
+    try std.testing.expect(!theme.placeholder.fg.eql(theme.input_text.fg));
 }
 
 test "input: multiline grows the box and shows both lines" {
@@ -6627,20 +6883,28 @@ test "input: multiline grows the box and shows both lines" {
     defer m.deinit();
 
     const h: u16 = 16;
-    // Three lines: the prompt grows to three rows.
+    // Three lines: the prompt grows to three rows, upward from the status.
     m.ed.insert("primera\nsegunda\ntercera") catch {};
 
     const s = try drawTest(&m, arena_state.allocator(), 40, h);
     var buf: [128]u8 = undefined;
-    const top = rowText(s, h - 5, &buf); // input_h=3 → top = h-2-3
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.trim(u8, top, " "), "❯") != null);
+    // input_h=3, and the input is pinned above the status row: top = h-1-3.
+    const top = rowText(s, h - 4, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.trim(u8, top, " "), "\u{203a}") != null);
 
     var b1: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 5, &b1), "primera") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 4, &b1), "primera") != null);
     var b2: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 4, &b2), "segunda") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 3, &b2), "segunda") != null);
     var b3: [128]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 3, &b3), "tercera") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rowText(s, h - 2, &b3), "tercera") != null);
+
+    // The accent bar grows WITH the input: one cell per row, and it is the only
+    // green down here. A bar that stayed one row tall while the text used three
+    // would say "one line" and be wrong.
+    try std.testing.expectEqualStrings("\u{258c}", std.mem.trim(u8, rowText(s, h - 4, &buf), " ")[0..3]);
+    try std.testing.expectEqualStrings("\u{258c}", std.mem.trim(u8, rowText(s, h - 3, &buf), " ")[0..3]);
+    try std.testing.expectEqualStrings("\u{258c}", std.mem.trim(u8, rowText(s, h - 2, &buf), " ")[0..3]);
 }
 
 test "input: a long line wraps within the prompt and no character is lost" {
@@ -6688,7 +6952,9 @@ test "input: a wrapped line fills several rows and the cursor stays on screen" {
     const rows = m.ed.displayLines(w - 4, testEditorMeasurer());
     try std.testing.expect(rows >= 4);
     const input_h: u16 = @min(rows, 8);
-    const top = h - 2 - input_h;
+    // `h - 1 - input_h`: the input is pinned directly above the status row, and
+    // the hairline below it took the row the box's bottom border used to be.
+    const top = h - 1 - input_h;
 
     // Several prompt rows carry text, not just the first one.
     var filled: usize = 0;
@@ -6704,7 +6970,9 @@ test "input: a wrapped line fills several rows and the cursor stays on screen" {
     const cur = s.cursor orelse return error.TestUnexpectedResult;
     try std.testing.expect(cur.col < w - 1);
     try std.testing.expect(cur.row >= top);
-    try std.testing.expect(cur.row < h - 2);
+    // The LAST input row is `h - 2` itself: the status moved to `h - 1` and the
+    // box's bottom border is gone, so the prompt now owns that row.
+    try std.testing.expect(cur.row <= h - 2);
 }
 
 test "input: rows scrolled out above are announced instead of silently hidden" {
@@ -6861,9 +7129,12 @@ test "input: the cursor is anchored at the real position" {
     m.ed.insert("abc") catch {};
     m.ed.moveHome();
     const s = try drawTest(&m, arena_state.allocator(), 40, 14);
-    // Cursor at the start of the line: right after the "❯ " prompt (col 3).
+    // Cursor at the start of the line: right after the "› " prompt (col 3).
     try std.testing.expectEqual(@as(u16, 3), s.cursor.?.col);
-    try std.testing.expectEqual(@as(u16, 14 - 3), s.cursor.?.row);
+    // The input is the SECOND row from the bottom now: the hairline took the
+    // row the box's bottom border used to be, and there is no blank row after
+    // it either.
+    try std.testing.expectEqual(@as(u16, 14 - 2), s.cursor.?.row);
 
     // With the cursor at the end, it advances 3 columns (the 3 characters).
     m.ed.moveToEnd();
@@ -6929,19 +7200,52 @@ test "diff: no changes adds no paragraphs" {
     try std.testing.expect(std.mem.indexOf(u8, row0, "+") == null);
 }
 
-test "header: the wordmark and the commands are in the bright blue" {
-    // The brightness falls INSIDE the art (`*zode*`), not on a whole line: that
-    // is what makes the ASCII art look like a logo and not a block of text.
+test "hero: the wordmark is lit and the grid is three tones" {
+    // The brightness falls INSIDE the line (`*zode*`), not on a whole row: that
+    // is what makes a wordmark read as a wordmark and not as a block of text.
+    // And it is a wordmark now — the five rows of ASCII are gone, and what
+    // replaced them is type plus the four commands that are worth knowing in
+    // the first thirty seconds.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const segs = try md.inlineSegments(arena, "  *zode*  \\:\\", .banner);
-    try std.testing.expectEqual(@as(usize, 3), segs.len);
-    try std.testing.expectEqualStrings("  ", segs[0].text);
-    try std.testing.expectEqualStrings("zode", segs[1].text);
-    try std.testing.expect(segs[1].style.bold); // the brightness
-    try std.testing.expectEqualStrings("  \\:\\", segs[2].text);
+    const segs = try md.inlineSegments(arena, "*zode*", .banner);
+    try std.testing.expectEqual(@as(usize, 1), segs.len);
+    try std.testing.expectEqualStrings("zode", segs[0].text);
+    try std.testing.expect(segs[0].style.bold); // the brightness
+
+    // FOUR segments: the marked key, the base between them, the marked
+    // shortcut, and the base after it.
+    //
+    // The texts are matched by CONTENT and the padding is not counted: how many
+    // spaces sit between the columns is a layout decision, and a test that
+    // pins it is a test that fails when somebody nudges a column. What matters
+    // is that the marked parts came out LIT and the unmarked ones did not.
+    // `inlineSegmentsBase` with BOTH tones, NOT `inlineSegments`: the three-arg
+    // helper has no `mood_style`, so the `~…~` mark falls back to `styles.banner`
+    // and comes out the SAME color as the base — which is how this test would
+    // have "proved" the hero has three tones while the third tone does not
+    // exist. The draw passes `Para.mood`, and a test that does not is a test of
+    // a different code path.
+    const row = try md.inlineSegmentsBase(
+        arena,
+        "*zode*  commands        ~ctrl+p~  palette",
+        .banner,
+        theme.ink3,
+        theme.status,
+    );
+    try std.testing.expectEqual(@as(usize, 4), row.len);
+    try std.testing.expectEqualStrings("zode", row[0].text); // the mark
+    try std.testing.expectEqualStrings("ctrl+p", row[2].text); // the other mark
+    try std.testing.expect(std.mem.startsWith(u8, row[1].text, "  commands"));
+    try std.testing.expect(std.mem.startsWith(u8, row[3].text, "  palette"));
+    // Three DIFFERENT tones, which is the whole assertion: a hero painted in
+    // one color has no accent and reads as a wall of text.
+    try std.testing.expect(!std.meta.eql(row[0].style.fg, row[1].style.fg));
+    try std.testing.expect(!std.meta.eql(row[1].style.fg, row[2].style.fg));
+    try std.testing.expect(row[0].style.bold);
+    try std.testing.expect(!row[1].style.bold);
 }
 
 test "header: asterisks are marks, no characters are lost" {
@@ -7016,11 +7320,20 @@ test "status: the segments are live, whole text" {
             try std.testing.expect(c == ' ' or c >= 0x21);
         }
     }
+    // The effort used to be `(med)`, a parenthesised word, and the test closed
+    // the parenthesis. It is ` med` now — the separator carries the structure —
+    // so the assertion is that there is no half-parenthesis anywhere, which is
+    // the ACTUAL failure this test was written for.
+    for (segs) |sg| {
+        try std.testing.expect(std.mem.indexOf(u8, sg.text, ")") == null);
+    }
+    // The effort IS still on the row, just without the parentheses. It carries a
+    // leading space (" med", not "med"), which is what the separator used to do,
+    // so the comparison is against the SPACE-PREFIXED form.
     var found = false;
     for (segs) |sg| {
-        if (std.mem.indexOf(u8, sg.text, "(") != null) {
-            found = true;
-            try std.testing.expectEqual(@as(u8, ')'), sg.text[sg.text.len - 1]);
+        for ([_][]const u8{ " min", " low", " med", " high", " xhigh", " off" }) |e| {
+            if (std.mem.eql(u8, sg.text, e)) found = true;
         }
     }
     try std.testing.expect(found);
@@ -7067,24 +7380,45 @@ test "status: the status row fits and is not cut" {
     const w: u16 = 96;
     const s = try drawTest(&m, arena_state.allocator(), w, 16);
     var buf: [512]u8 = undefined;
-    const row = rowText(s, 16 - 2, &buf); // status_row
+    const row = rowText(s, 16 - 1, &buf); // status_row
     // No U+FFFD (the replacement character shows up when a UTF-8 is split).
     try std.testing.expect(std.mem.indexOf(u8, row, "\u{fffd}") == null);
-    // And the session info is whole: the effort closes with ")" at the end.
-    // (CAREFUL: `rowText` returns BYTES, not columns, so it cannot be compared
-    // against the width: a "·" is 2 bytes in a single cell.)
-    try std.testing.expect(std.mem.indexOf(u8, row, ")") != null);
+    // And the session info is whole: no half-parenthesis, and both fields are
+    // there. (CAREFUL: `rowText` returns BYTES, not columns, so it cannot be
+    // compared against the width: a "·" is 2 bytes in a single cell.)
+    try std.testing.expect(std.mem.indexOf(u8, row, ")") == null);
     try std.testing.expect(std.mem.indexOf(u8, row, "opencode") != null);
 }
 
 test "status: ctxColor changes at the compaction thresholds" {
+    // The intent, not the palette: below the budget a gauge should NOT shout,
+    // near it it warns, past it it is an error. The old version pinned "green"
+    // for the comfortable state, which is how a 3% context gauge ended up the
+    // brightest green thing on the screen.
+    //
+    // What is asserted is the part that can break: the thresholds are the
+    // compaction ones (50 / 80), the three states are DISTINCT, and all three
+    // are readable. A refactor that made all three the same color would still
+    // be a working gauge and a useless one.
+    //
     // 80% is exactly where compaction starts (budget = 80% of the limit).
-    try std.testing.expectEqual(theme.ok.fg, theme.ctxColor(0).fg);
-    try std.testing.expectEqual(theme.ok.fg, theme.ctxColor(49).fg);
+    try std.testing.expectEqual(theme.ink2.fg, theme.ctxColor(0).fg);
+    try std.testing.expectEqual(theme.ink2.fg, theme.ctxColor(49).fg);
     try std.testing.expectEqual(theme.warn.fg, theme.ctxColor(50).fg);
     try std.testing.expectEqual(theme.warn.fg, theme.ctxColor(79).fg);
     try std.testing.expectEqual(theme.err.fg, theme.ctxColor(80).fg);
     try std.testing.expectEqual(theme.err.fg, theme.ctxColor(100).fg);
+    try std.testing.expect(!theme.ctxColor(0).fg.eql(theme.ctxColor(50).fg));
+    try std.testing.expect(!theme.ctxColor(50).fg.eql(theme.ctxColor(80).fg));
+
+    const bg = [3]u8{ 0, 0, 0 };
+    for ([_]u8{ 0, 50, 80 }) |pct| {
+        const c = theme.contrast(theme.fgRgb(theme.ctxColor(pct)).?, bg);
+        if (c < 4.5) {
+            std.debug.print("ctx gauge at {d}% is {d:.2}:1\n", .{ pct, c });
+            return error.GaugeUnreadable;
+        }
+    }
 }
 
 test "header: Zo's line carries the face in the mood's color" {
@@ -7598,7 +7932,7 @@ test "activity strip: with work and with a queue" {
     try std.testing.expect(std.mem.indexOf(u8, all, "1 queued") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "en cola") != null);
     var status_buf: [256]u8 = undefined;
-    const status_row = rowText(s, s.size.height - 2, &status_buf);
+    const status_row = rowText(s, s.size.height - 1, &status_buf);
     try std.testing.expect(std.mem.indexOf(u8, status_row, "streaming") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_row, "⠋") == null);
 }
@@ -7840,11 +8174,15 @@ fn plainColumns(gpa: std.mem.Allocator, line: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-test "banner: a RULE separates it from the first prompt (not a blank row)" {
-    // Bug 4: the logo and the user's first prompt read as a single block.
-    // A blank row does not fix it when there is a 5-row drawing above and the
-    // user's words below: the prompt looks like the last line of the logo.
-    // A rule says so without spending two more rows on blank.
+test "the hairline separates the hero from the first prompt" {
+    // Bug 4, in its new shape: the logo and the user's first prompt read as a
+    // single block. A blank row does not fix it when what is above is a wordmark
+    // and what is below is the user's words.
+    //
+    // This used to be a rule UNDER the five rows of ASCII. The hero is shorter,
+    // but the rule is not about the art being tall: it is the statement "the
+    // header ends here", and it is the same mark the input's hairline uses. This
+    // test form the rule's OWN rule (nothing but `─`, and it spans the width).
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -7855,53 +8193,42 @@ test "banner: a RULE separates it from the first prompt (not a blank row)" {
     const surf = try drawTest(&m, arena_state.allocator(), 72, 20);
     var rb: [256]u8 = undefined;
 
-    // The rule goes right below the art (which is `banner_art_height` rows).
-    const rule_row = rowText(surf, mascot.banner_art_height, &rb);
+    // The prompt row is found by CONTENT, not by number: the hero is above it
+    // and the hero's height is a decision of a different file. The rule is the
+    // row right below it — the separator row is prepended to the prompt's own
+    // paragraph (`grown[0]`), so it sits BELOW the words.
+    const prompt_at = findRow(surf, "hola, quiero una pagina") orelse
+        return error.PromptNotFound;
+
+    // The rule sits ABOVE the prompt, and it is the row of the paragraph's
+    // separator (`grown[0]` comes first, then the prompt's own lines). Below
+    // would be the workspace's own hairline, which is a different rule.
+    const rule_at = prompt_at - 1;
+    const rule_row = rowText(surf, rule_at, &rb);
     const trimmed = std.mem.trim(u8, rule_row, " ");
     try std.testing.expect(trimmed.len > 0);
     // Only `─`: a row with the rule plus anything else would be a layout error,
-    // not a separator (and that is what would happen if the run's `w` got
-    // truncated to 255 columns on a wide terminal).
-    //
-    // `rowText` returns BYTES, and `─` is 3, so the row is several of those
-    // triplets and nothing else.
+    // not a separator. And it really spans the width: a three-column separator
+    // is as bad as none.
     const rule_bytes = "\xe2\x94\x80";
     try std.testing.expect(trimmed.len % 3 == 0);
-    try std.testing.expect(trimmed.len > 0);
     var at: usize = 0;
     while (at < trimmed.len) : (at += 3) {
         try std.testing.expectEqualStrings(rule_bytes, trimmed[at..][0..3]);
     }
-    // And it really spans the width of the history: a three-column rule separates
-    // just as badly as a blank row. The exact width is decided by `drawLines`
-    // (which crops to the history's width), so a floor is set here and not an
-    // exact number.
     const rule_cols = trimmed.len / 3;
     try std.testing.expect(rule_cols >= 60);
     try std.testing.expect(rule_cols <= 72);
-
-    // And the prompt goes BELOW, not stuck to the logo.
-    const prompt_row = rowText(surf, mascot.banner_art_height + 1, &rb);
-    try std.testing.expect(std.mem.indexOf(u8, prompt_row, "hola, quiero una pagina") != null);
 }
 
-test "the banner is ONLY the ZODE wordmark, with no blank rows between lines" {
-    // ASCII art split into paragraphs put a blank row between the letters and
-    // the logo was read in pieces. The header goes without a separator.
+test "the hero is ONLY the wordmark and its grid, with nothing hung below it" {
+    // Complaining about "junk in the view" is being right, and this test is what
+    // pins it down: if someone hangs a line under the hero again, it fails.
     //
-    // And the header is ONLY this: no mascot, no "zo says: hi!", no shortcuts
-    // line. Complaining about "junk in the view" is being right, and this test
-    // is what pins it down: if someone hangs a line below the art again, it
-    // fails.
-    //
-    // The fill is `#`, and that clashes with markdown: a line starting with
-    // `##` is a HEADING and the parser eats the `#`. There are two tests for
-    // this: this one (that the art reaches the screen whole) and the markdown
-    // one below (that `.banner` is not interpreted as prose).
-    //
-    // The rows are compared COMPLETE against the art written by hand here, not
-    // against `mascot.banner`: if the test compared the banner with itself, it
-    // would pass with any broken art.
+    // What it asserts is the hero's SHAPE, and the shape is what survived the
+    // five rows of `#`: a wordmark, one line of what this is, a rule, and a
+    // two-column grid. The art itself is gone (see AGENTS.md on why), so the
+    // test does not compare pixels — it compares the CONTENT that must be there.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -7909,56 +8236,78 @@ test "the banner is ONLY the ZODE wordmark, with no blank rows between lines" {
     m.pushHeader(.idle);
 
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
-    // The `D` has its right stroke one column further out (`##   #`) and the `E`
-    // has its crossbar (`###`). It is what makes `O` and `D` different letters at
-    // a glance instead of the same box twice, which is the whole point of the
-    // wordmark. These rows are what the glyph table in `mascot.zig` composes.
-    const art = [_][]const u8{
-        "######  ####  ####   ######",
-        "##  ## ##  ## ##   # ##",
-        "   ##  ##  ## ##   # ###",
-        "  ##   ##  ## ##   # ##",
-        "######  ####  ####   ######",
-    };
-    var rb: [512]u8 = undefined;
-    // The history has 2 margin columns (4.9 of the ROADMAP), so the art starts
-    // at column 2. The margin is trimmed from both sides: what is checked is
-    // the ART, not its position on screen.
-    const margin = historyMargin(92);
-    for (art, 0..) |want, i| {
-        const got = rowText(s, @intCast(i), &rb);
-        // Both are trimmed: the rows of the `E` carry padding on the right.
-        // The invariants loop below pins the exact width.
-        const got_t = std.mem.trim(u8, got[margin..], " ");
-        const want_t = std.mem.trim(u8, want, " ");
-        try std.testing.expectEqualStrings(want_t, got_t);
+
+    // Every line of the hero, on the rows it actually occupies.
+    var found: usize = 0;
+    // ONLY the history: the status row and the input also say "zode" and
+    // "commands", and a hero that counted them was counting the furniture as
+    // content.
+    var row: u16 = 0;
+    while (row < m.hist_rows and row < s.size.height) : (row += 1) {
+        var rb: [512]u8 = undefined;
+        const r = std.mem.trim(u8, rowText(s, row, &rb), " ");
+        if (std.mem.indexOf(u8, r, "zode") != null and std.mem.indexOf(u8, r, "code agent") == null) found += 1;
+        if (std.mem.indexOf(u8, r, "a code agent in your terminal") != null) found += 1;
+        if (std.mem.indexOf(u8, r, "commands") != null) found += 1;
+        if (std.mem.indexOf(u8, r, "choose a model") != null) found += 1;
+        if (std.mem.indexOf(u8, r, "attach a file") != null) found += 1;
     }
+    // 1 wordmark + 1 tagline + 3 grid rows. Nothing else.
+    try std.testing.expectEqual(@as(usize, 5), found);
+}
 
-    // Below the art there is NOTHING. Not one extra line.
-    const after = rowText(s, mascot.banner_art_height, &rb);
-    try std.testing.expectEqualStrings("", std.mem.trim(u8, after, " "));
-
-    // Art invariant: ALL rows must measure the same, and all the letters must
-    // start at the same columns. Without this the logo reads as noise (it
-    // happened: the `E` was one column early and it came out as "diec FERE").
-    // It is measured with the `*…*` marks removed.
+test "the hero has no blank rows between its lines and nothing hung below them" {
+    // ASCII art split into paragraphs put a blank row between the letters and
+    // the logo was read in pieces. The hero is type, so there are no rows to
+    // glue — but the separator between PARAGRAPHS still has to leave it alone,
+    // and that is what this pins down: not one blank row inside the hero.
     //
-    // CAREFUL: it is measured in COLUMNS, not bytes. An art with `█` (3 bytes
-    // per character) gave 101 columns on row 0 and the test passed without
-    // checking anything.
-    var wit = std.mem.splitScalar(u8, mascot.banner, '\n');
-    var rows: usize = 0;
-    while (wit.next()) |line| {
-        // The banner is `banner_art_height` rows, not one more.
-        try std.testing.expect(rows < mascot.banner_art_height);
-        const cols = plainColumns(std.testing.allocator, line) catch unreachable;
-        defer std.testing.allocator.free(cols);
-        // ALL rows must measure exactly the art's width: the padding on the
-        // right is what makes the letters' strokes line up.
-        try std.testing.expectEqual(mascot.banner_art_width, cols.len);
-        rows += 1;
+    // And the header is ONLY this: no mascot, no "zo says: hi!", no shortcuts
+    // line. Complaining about "junk in the view" is being right, and this test
+    // is what fails if someone hangs a line below it again.
+    //
+    // The rows are compared by CONTENT, not against pixels of the ASCII that
+    // used to be here: if the test compared the hero with a hand-written copy
+    // of the hero, it would pass with any broken hero. What is asserted is the
+    // SHAPE — six lines, contiguous, in order.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushHeader(.idle);
+
+    const s = try drawTest(&m, arena_state.allocator(), 92, 26);
+    var rb: [512]u8 = undefined;
+
+    // The seven lines of the hero, in order. A row that is empty where a line
+    // should be means the separator landed inside the header.
+    const expect_txt = [_]?[]const u8{
+        "zode",
+        "a code agent in your terminal",
+        null, // the rule is `─` only, so it is checked as all-dashes below
+        null, // the blank row between the rule and the grid
+        "commands",
+        "choose a model",
+        "attach a file",
+    };
+    var row: u16 = 0;
+    // Start at the first non-empty history row: the hero is CENTERED
+    // (`heroFrame`), so row 0 can be blank on a tall terminal.
+    while (row < m.hist_rows and std.mem.trim(u8, rowText(s, row, &rb), " ").len == 0) : (row += 1) {}
+    for (expect_txt) |want| {
+        const got = std.mem.trim(u8, rowText(s, row, &rb), " ");
+        if (want) |txt| {
+            if (std.mem.indexOf(u8, got, txt) == null) {
+                std.debug.print("hero row {d}: expected '{s}', got '{s}'\n", .{ row, txt, got });
+                return error.HeroBroken;
+            }
+        }
+        row += 1;
     }
-    try std.testing.expectEqual(mascot.banner_art_height, rows);
+
+    // Below the hero there is NOTHING: not one extra line, and no mascot.
+    const after = rowText(s, row, &rb);
+    try std.testing.expectEqualStrings("", std.mem.trim(u8, after, " "));
 }
 
 /// A `DrawContext` that measures graphemes with the compiled tables, for the
@@ -9117,7 +9466,7 @@ test "usage column: with data, the cache pct and the session tokens" {
     defer m.deinit();
     const surface = try drawTest(&m, arena, 140, 20);
     var row_buf: [512]u8 = undefined;
-    const row = rowText(surface, surface.size.height - 2, &row_buf);
+    const row = rowText(surface, surface.size.height - 1, &row_buf);
     // The two right-aligned groups used to start at the same edge and overwrite
     // one another. Both must be visible together at a width where they fit.
     try std.testing.expect(std.mem.indexOf(u8, row, "opencode") != null);
@@ -9177,10 +9526,21 @@ test "plan summary: progress and current step are visible without repeating the 
 
     var buf: [256]u8 = undefined;
     const plan_row = rowText(s, r_cur, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, plan_row, "◐") != null);
+    // The glyph is read from the CELL and not from `rowText`, and that is not a
+    // style choice: `rowText` collects the graphemes of the row and the plan's
+    // left edge is a TWO-column literal (`├─`), so the run it produces and the
+    // one the cell holds do not line up — the glyph is in the surface and does
+    // not come back out of the text. Checking the text for it was a test that
+    // asserted a rendering quirk instead of the thing it meant.
+    //
+    // The ACTIVE step is the accent, and it is the only thing on this row with
+    // a color: a plan row where nothing is colored is a plan that reads as a
+    // notice, and "which step am I on" stops being answerable.
     const cur_cell = s.readCell(1, r_cur);
-    try std.testing.expectEqual(theme.brand_bold.fg, cur_cell.style.fg);
+    try std.testing.expectEqualStrings("\u{25d0}", cur_cell.char.grapheme);
+    try std.testing.expect(cur_cell.style.fg.eql(theme.brand.fg) or cur_cell.style.fg.eql(theme.brand_hi.fg));
     try std.testing.expect(cur_cell.style.bold);
+    _ = plan_row;
 }
 
 test "the plan summary sits above the input and uses one row" {
@@ -9814,7 +10174,7 @@ test "read-only shows up in the status bar" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    const status_row: u16 = 30 - 2;
+    const status_row: u16 = 30 - 1;
     var buf: [400]u8 = undefined;
 
     const before = try drawTest(&m, arena, 100, 30);
@@ -10108,13 +10468,17 @@ test "ctrl+d scrolls back down and does NOT quit" {
     try std.testing.expectEqual(@as(usize, 0), m.anchorLine());
     const scrolled = try drawTest(&m, arena_state.allocator(), 60, 20);
     var status_buf: [256]u8 = undefined;
-    const status = rowText(scrolled, scrolled.size.height - 2, &status_buf);
+    const status = rowText(scrolled, scrolled.size.height - 1, &status_buf);
     try std.testing.expect(std.mem.indexOf(u8, status, "latest") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "↓ 1") == null);
     const latest = m.currentMaxOffset();
+    // The clickable `↓ latest` zone lives on the status row, and the status row
+    // is now the LAST one: the input lost its box and took the row the box's
+    // bottom border used to be. A click that used to land on the scroll-to-bottom
+    // affordance would now land on the prompt and type nothing.
     try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
         .col = 2,
-        .row = @intCast(scrolled.size.height - 2),
+        .row = @intCast(scrolled.size.height - 1),
         .button = .left,
         .mods = .{},
         .type = .press,
@@ -10160,8 +10524,12 @@ test "ask panel wraps by words, stays in history, and leaves the answer input vi
 
     // The panel is confined to the history viewport; the borderless prompt and
     // status strip remain painted and usable underneath it.
-    const input_top = s.size.height - 3;
-    try std.testing.expectEqualStrings("❯", s.readCell(1, input_top).char.grapheme);
+    //
+    // The prompt is `›` now, and it is one row LOWER than the box used to put
+    // it: nothing in between, and the hairline below it took the box's bottom
+    // border.
+    const input_top = s.size.height - 2;
+    try std.testing.expectEqualStrings("\u{203a}", s.readCell(1, input_top).char.grapheme);
     try std.testing.expect(findRow(s, "enter answers") != null);
 }
 
@@ -10405,3 +10773,4 @@ test "scrolling past the segment cache cap leaves no cell pointing at a freed ar
         }
     }
 }
+
