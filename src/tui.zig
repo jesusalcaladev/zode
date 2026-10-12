@@ -5279,14 +5279,24 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     try self.snapshotSelectableHistory(surface, history_h);
     self.paintTextSelection(surface);
 
-    // The session info (model · provider · effort · ctx%) is painted
-    // segmented further below, right-aligned; here it is only prepared.
-    const info: []const InfoSeg = sessionInfo(ctx.arena) orelse &.{};
-    const usage = usageInfo(ctx.arena);
+    // The session info is ONE thing now — `provider/model` — and it is painted
+    // right-aligned on the status row. There is no second column any more: the
+    // cache hit rate and the token counts used to sit glued to the right edge,
+    // and the row answered seven questions when its job is to answer one.
+    //
+    // They are not deleted, they are a command: `/context` for the tokens and
+    // the compaction gauge, `/cache` for the hit rate, `/bench` for the
+    // iterations. A status row is for what you read without thinking, and those
+    // are for when something is wrong.
+    const info: []const InfoSeg = sessionInfo(self, ctx.arena) orelse &.{};
     const info_width = sessionInfoWidth(info);
-    const usage_width: u16 = if (usage) |segments| segsWidth(segments) else 0;
-    const usage_fits = usage != null and usage_width + info_width + 5 < width;
-    const info_right = if (usage_fits) width - usage_width - 3 else width;
+    // `drawSessionInfo`'s third argument is the RIGHT EDGE the row ends at, not
+    // the column it starts at: passing `width - info_width - 2` put the edge
+    // two columns to the LEFT of where the text is, so the row was painted over
+    // the left label — measured as `ctrl+c exitsopencode/…`, with the two
+    // groups touching. The edge is the screen's, and the margin is the only
+    // thing subtracted from it.
+    const info_right = if (width > 2) width - 2 else width;
 
     // ── `ask`: the model asked something ──
     //
@@ -5324,8 +5334,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         else
             "";
         if (label.len > 0) {
-            const reserved = info_width + (if (usage_fits) usage_width + 3 else 0);
-            const left_width = if (width > reserved + 3) width - reserved - 3 else 0;
+            // Only the session column is reserved now: it is the one thing on
+            // this row that can grow, and the left label has to stop before it.
+            // Reserves the session column AND a real gap: the label is clipped
+            // here, and clipping it flush against the model's name is how the two
+            // read as one sentence.
+            const left_width = if (width > info_width + 7) width - info_width - 7 else 0;
             if (scrolled and left_width >= 8) {
                 _ = p.putClipped(1, status_row, label, 8, theme.brand);
                 self.scroll_bottom_start = 1;
@@ -5337,20 +5351,11 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     }
     if (info.len > 0) drawSessionInfo(&p, status_row, info_right, info);
 
-    // ── status bar frame ──
-    //
-    // There is no FRAME around the status row any more, and that is the whole
-    // entry. It used to draw a `│` at column 0 and one at the far edge, which
-    // framed a row of dim metadata as if it were a panel AND left a stray tick
-    // at the left margin — a mark with nothing on either side of it. The row
-    // reads as a row because it is the only thing on it.
-    //
-    // Second column, at the right edge: what the session has cost. Painted
-    // AFTER the session column so it wins any overlap, and only if that column
-    // left room (`usage_fits`).
-    if (usage_fits) {
-        if (usage) |segments| drawUsageColumn(&p, status_row, width, segments, info_width);
-    }
+    // There is no FRAME around the status row, and that is the whole entry. It
+    // used to draw a `│` at column 0 and one at the far edge, which framed a row
+    // of dim metadata as if it were a panel AND left a stray tick at the left
+    // margin — a mark with nothing on either side of it. The row reads as a row
+    // because it is the only thing on it.
 
     // ── contextual rows, present only when useful ──
     if (act_rows == 1) {
@@ -6407,178 +6412,94 @@ fn drawActivityStrip(
 /// A piece of the status row with its style.
 const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 
-/// The RIGHT zone of the status row: what you are working with.
+/// The RIGHT zone of the status row, and it is ONE thing: `provider/model`.
 ///
-/// Two rules, and they are what make one row of five facts readable instead of
-/// a pile:
+/// This used to carry five facts — model, provider with effort in parentheses,
+/// mode, tokens, ctx% — plus a second column for the cache and the token counts.
+/// Seven pieces of information on a row whose whole job is to answer "what am I
+/// talking to", and the answer to that question was buried in the middle of it.
 ///
-///  1. **Separators are `line`, not `ink`.** A `·` is a hairline between two
-///     items, and drawing it in the same tone as the items makes five facts look
-///     like one run-on sentence. The separators recede, so the facts don't.
-///  2. **Everything is dim except what you might act on.** The model is the one
-///     thing on this row that has a command behind it (`/model`), so it is
-///     `ink2`; the provider, the effort and the token count are facts you read
-///     and never type, so they are `status`. A status row where everything is
-///     bright is a status row nobody reads.
+/// Now the row is `opencode/kimi-k2.6`, in one tone, right-aligned, and nothing
+/// else. The separator is `line` and not `ink`: the `/` is a hairline between
+/// two parts of one name, and drawing it in the tone of the name makes the name
+/// look like two names.
 ///
-/// The left zone of the same row is the activity (see `drawActivityStrip`), and
-/// it is only there while there is something to report.
-fn sessionInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
+/// What moved out did not get deleted, it got a command. `ctx%` and the token
+/// counts are `/context`; the cache hit rate is `/cache`; the iteration stats
+/// are `/bench`. A status row is for the thing you read without thinking, and
+/// those four are things you read when something is wrong.
+fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     var out: std.ArrayList(InfoSeg) = .empty;
-    const sep = " · ";
 
+    // The model that will answer, and not only the one that IS answering.
+    //
+    // `curAnswering()` is empty until the first turn, and the compiled
+    // providers carry no `default_model` on purpose (a name in the code stops
+    // existing the day the provider withdraws it). So the row used to say
+    // `opencode` and nothing else for the whole of a session's first minute,
+    // which is the one moment you are deciding whether to trust the app.
+    //
+    // Three fallbacks, in order of how much they can be trusted: the model a
+    // turn is using, the one `resolveStatusModel` picked out of the provider's
+    // CACHED catalogue (the same rule `resolveModelHeadless` uses, so the row
+    // says what the first turn would actually pick), and the provider's own
+    // `default_model`, which is empty only when the provider really has none.
+    //
+    // The resolve is LAZY and it is the reason this is in the draw and not in
+    // `loadUserConfig`: the catalogue is on disk and reading it at startup would
+    // block the first frame on a file the user may never look at. It runs once
+    // (`status_model_len` is the flag) and only when there is nothing better to
+    // show, so the steady state is one integer compare per frame.
+    if (m.status_model_len == 0 and !m.status_model_tried) resolveStatusModel(m);
     const model = agent.curAnswering();
     const provider = agent.curProvider();
+    const shown_model = if (model.len > 0)
+        model
+    else if (m.status_model_len > 0)
+        m.status_model_buf[0..m.status_model_len]
+    else if (agent.activeProviderDef(m.environ orelse agent.environ_global).default_model.len > 0)
+        agent.activeProviderDef(m.environ orelse agent.environ_global).default_model
+    else
+        "";
 
-    if (model.len > 0) {
-        out.append(arena, .{ .text = model, .style = theme.ink2 }) catch return null;
-    }
     if (provider.len > 0) {
-        if (out.items.len > 0) out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
         out.append(arena, .{ .text = provider, .style = theme.status }) catch return null;
-        // The level that actually goes out, not the one the user asked for: if the
-        // model has no such step, the status has to say the one that was sent. A
-        // status that says `xhigh` while the wire carries `high` is small print
-        // that lies, and there is no way to notice the 400 when it does happen.
-        const eff = switch (agent.effectiveEffort()) {
-            .none => "off",
-            .minimal => "min",
-            .low => "low",
-            .medium => "med",
-            .high => "high",
-            .xhigh => "xhigh",
-        };
-        // CAREFUL: `allocPrint` and NOT `bufPrint` over a stack buffer. The
-        // slice is stored in the segment and read at paint time, already
-        // outside this function: with bufPrint the text was garbage and the
-        // status was cut in half ("kimi-k2.6 · opencode" and then a broken
-        // character).
-        const et = std.fmt.allocPrint(arena, " {s}", .{eff}) catch return null;
-        out.append(arena, .{ .text = et, .style = theme.line }) catch return null;
+    }
+    if (shown_model.len > 0) {
+        if (out.items.len > 0) {
+            out.append(arena, .{ .text = "/", .style = theme.line }) catch return null;
+        }
+        out.append(arena, .{ .text = shown_model, .style = theme.ink2 }) catch return null;
     }
 
-    // Always show the mode, including Build: the default is still a mode and
-    // should not look like missing state while the provider is loading.
-    const pm = agent.currentPermMode();
-    if (out.items.len > 0) out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
-    out.append(arena, .{
-        .text = agent.permModeName(),
-        .style = switch (pm) {
-            .default => theme.status,
-            // A mode that changes what zode is ALLOWED to do is the one thing on
-            // this row that is not a fact, and it gets the only color here.
-            .accept_edits => theme.ink2,
-            .read_only, .bypass => theme.warn,
-        },
-    }) catch return null;
-
-    // Context tokens ALWAYS visible, not only when they are > 0.
+    // The permission mode, and only when it is a DEVIATION.
     //
-    // It was conditioned on `ctx_pct > 0`, which only happens after a complete
-    // turn, so at the start nothing was shown and the counter looked like it
-    // did not exist. Now it always says "~N tok" and the percentage, which is
-    // also what warns you that you are approaching the compaction limit.
-    if (out.items.len > 0) out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
-    if (agent.ctx_used > 0) {
-        // `~` only for OUR estimate: when the provider has already counted the
-        // prompt itself, the number is exact and the squiggle would be false
-        // modesty (see `agent.ctx_real`).
-        const tk = if (agent.ctx_real)
-            std.fmt.allocPrint(arena, "{d} tok", .{agent.ctx_used}) catch return null
-        else
-            std.fmt.allocPrint(arena, "~{d} tok", .{agent.ctx_used}) catch return null;
-        out.append(arena, .{ .text = tk, .style = theme.status }) catch return null;
-        out.append(arena, .{ .text = sep, .style = theme.line }) catch return null;
+    // The row is `provider/model` and nothing else in the normal case, because
+    // that is the one fact the row exists to answer and everything else was
+    // making it unreadable. But a mode is not a fact, it is a promise about what
+    // the agent is allowed to do, and two of the four break the promise in ways
+    // that explain a whole session:
+    //
+    //   read-only  — every `write`/`edit`/`bash` comes back refused, and without
+    //                the mark the answer to "why did it ignore my edit?" is a
+    //                coin toss between "it did not try" and "it could not".
+    //   bypass     — nothing asks, ever, including the `rm`.
+    //
+    // `default` and `accept_edits` are what a coding session looks like, so they
+    // cost zero columns. That is the trade the row is making: space in the
+    // normal case, and no silence ever about the abnormal one.
+    switch (agent.currentPermMode()) {
+        .read_only, .bypass => {
+            if (out.items.len > 0) {
+                out.append(arena, .{ .text = " \u{b7} ", .style = theme.line }) catch return null;
+            }
+            out.append(arena, .{ .text = agent.permModeName(), .style = theme.warn }) catch return null;
+        },
+        .default, .accept_edits => {},
     }
-    const ct = std.fmt.allocPrint(arena, "ctx {d}%", .{agent.ctx_pct}) catch return null;
-    out.append(arena, .{ .text = ct, .style = theme.ctxColor(agent.ctx_pct) }) catch return null;
 
     if (out.items.len == 0) return null;
     return out.items;
-}
-
-/// The SECOND column of the status: what the session costs.
-///
-/// It sits glued to the right and separated from the session column by a `│`,
-/// because they are different things and do not fit in the same sentence: the
-/// left one says WHAT you are working with, and the right one what it has cost
-/// you.
-///
-/// These numbers used to show only with `/cache` and when opening `/context`,
-/// which is exactly when they are no use: the number you want to see is the
-/// current one, without having to open anything.
-fn usageInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
-    var out: std.ArrayList(InfoSeg) = .empty;
-
-    const st = &agent.cacheSessionStats();
-    // No data yet: it would print a `0%` that lies.
-    if (st.requests == 0) return null;
-
-    const pct: u8 = @intFromFloat(std.math.clamp(st.hitRatePct(), 0, 100));
-    const tag = std.fmt.allocPrint(arena, " {d:.0}% cached", .{st.hitRatePct()}) catch return null;
-    out.append(arena, .{ .text = tag, .style = theme.ctxColor(pct) }) catch return null;
-
-    // Compact counts: `1103k prompt` was a cumulative number in a unit nobody
-    // reads at a glance. The same figure as `1.1M`.
-    var pb: [24]u8 = undefined;
-    const tok = std.fmt.allocPrint(
-        arena,
-        " \u{b7} {s} prompt",
-        .{fmtTokCount(&pb, st.prompt_tokens)},
-    ) catch return null;
-    out.append(arena, .{ .text = tok, .style = theme.brand_faint }) catch return null;
-
-    if (st.completion_tokens > 0) {
-        var cb: [24]u8 = undefined;
-        const comp = std.fmt.allocPrint(
-            arena,
-            " \u{b7} {s} out",
-            .{fmtTokCount(&cb, st.completion_tokens)},
-        ) catch return null;
-        out.append(arena, .{ .text = comp, .style = theme.brand_faint }) catch return null;
-    }
-    return out.items;
-}
-
-/// A token count the way a human reads one: `940`, `2k`, `1.1M`.
-///
-/// `buf` has to be the CALLER's: the segment stores the slice and the painter
-/// reads it after this function's frame is gone, which is the `bufPrint` trap
-/// documented in `sessionInfo`.
-fn fmtTokCount(buf: []u8, n: i64) []const u8 {
-    if (n >= 1_000_000) {
-        return std.fmt.bufPrint(buf, "{d:.1}M", .{@as(f64, @floatFromInt(n)) / 1_000_000.0}) catch "";
-    }
-    if (n >= 1000) return std.fmt.bufPrint(buf, "{d}k", .{@divTrunc(n + 500, 1000)}) catch "";
-    return std.fmt.bufPrint(buf, "{d}", .{n}) catch "";
-}
-
-/// Paints the usage column glued to the right, with a `│` separating it from
-/// the session column.
-///
-/// It degrades by dropping pieces BEFORE ever intruding on the other column's
-/// text: if it does not fit whole, nothing is painted. A half-written
-/// `62% cached`, or one sitting on top of the model, reads worse than not
-/// having it at all.
-fn drawUsageColumn(p: *Painter, row: u16, width: u16, segs: []const InfoSeg, reserved: u16) void {
-    const sep_w: u16 = 3; // " │ "
-    const total: u16 = segsWidth(segs);
-    const needed = total + sep_w;
-    if (needed + reserved + 2 >= width) return;
-    if (total == 0) return;
-
-    var col: u16 = width - total;
-    // The separator, three columns to the left of the column's first glyph.
-    _ = p.putStable(col - sep_w, row, "\u{2502}", 1, theme.brand_faint);
-    for (segs) |sg| {
-        var it = vaxis.unicode.graphemeIterator(sg.text);
-        while (it.next()) |g| {
-            const b = g.bytes(sg.text);
-            const w = theme.graphemeWidth(p.ctx, b);
-            if (col + w <= width) _ = p.putStable(col, row, b, w, sg.style);
-            col += w;
-        }
-    }
 }
 
 /// Width in COLUMNS of a group of status segments.
@@ -7385,7 +7306,11 @@ test "status: the segments are live, whole text" {
     // parenthesis.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const segs = sessionInfo(arena_state.allocator()) orelse return;
+    // `sessionInfo` reads the Model's resolved status model, so the test needs one
+    // even though it only cares about the segments' SHAPE.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const segs = sessionInfo(&m, arena_state.allocator()) orelse return;
 
     for (segs) |sg| {
         try std.testing.expect(sg.text.len > 0);
@@ -7393,31 +7318,66 @@ test "status: the segments are live, whole text" {
             try std.testing.expect(c == ' ' or c >= 0x21);
         }
     }
-    // The effort used to be `(med)`, a parenthesised word, and the test closed
-    // the parenthesis. It is ` med` now — the separator carries the structure —
-    // so the assertion is that there is no half-parenthesis anywhere, which is
-    // the ACTUAL failure this test was written for.
-    for (segs) |sg| {
-        try std.testing.expect(std.mem.indexOf(u8, sg.text, ")") == null);
+    // The row is `provider/model` and the separator is its OWN segment, so a
+    // dangling `/` (or one glued to the model) would paint the name as if it
+    // were two names. The resolved model is forced here because this test runs
+    // with no catalogue on disk and no network: without it there would be no
+    // model to separate and the assertion would be vacuous.
+    m.status_model_buf[0..4].* = "test".*;
+    m.status_model_len = 4;
+    m.status_model_tried = true;
+
+    const with_model = sessionInfo(&m, arena_state.allocator()) orelse return;
+    var saw_sep = false;
+    var saw_provider = false;
+    var saw_model = false;
+    for (with_model) |sg| {
+        if (std.mem.eql(u8, sg.text, "/")) saw_sep = true;
+        if (std.mem.eql(u8, sg.text, "opencode")) saw_provider = true;
+        if (std.mem.eql(u8, sg.text, "test")) saw_model = true;
     }
-    // The effort IS still on the row, just without the parentheses. It carries a
-    // leading space (" med", not "med"), which is what the separator used to do,
-    // so the comparison is against the SPACE-PREFIXED form.
-    var found = false;
-    for (segs) |sg| {
-        for ([_][]const u8{ " min", " low", " med", " high", " xhigh", " off" }) |e| {
-            if (std.mem.eql(u8, sg.text, e)) found = true;
-        }
-    }
-    try std.testing.expect(found);
+    try std.testing.expect(saw_sep);
+    try std.testing.expect(saw_provider);
+    try std.testing.expect(saw_model);
 }
 
-test "status: Build mode is always visible" {
+test "status: the row is provider/model and nothing else in the normal case" {
+    // This is the whole point of the change: the row used to carry model,
+    // provider, effort, mode, tokens and ctx% — six facts on a row whose job is
+    // to answer "what am I talking to". Everything that moved out got a command
+    // (`/context`, `/cache`, `/bench`) instead of being deleted.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
+    const segs = sessionInfo(&m, arena_state.allocator()) orelse return error.TestUnexpectedResult;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+    const all = joined.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, all, "opencode") != null);
+    // None of the six, and a row that mentions the context budget again is a
+    // regression of this exact change.
+    for ([_][]const u8{ "ctx ", " cached", " prompt", " tok", " min", " med", " xhigh" }) |gone| {
+        try std.testing.expect(std.mem.indexOf(u8, all, gone) == null);
+    }
+}
+
+test "status: the normal permission modes cost NOTHING on the row" {
+    // The mark for a permission mode only appears when it is a deviation
+    // (`read-only`, `yolo`): `default` and `accept-edits` are what a coding
+    // session looks like, and spending columns on them is what made the old row
+    // unreadable. A test for the ABSENCE of a mark is the only thing that keeps
+    // a future "just add the mode back" from silently undoing the change.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // Restored on the way out: the mode is a process-wide global and the next
+    // test reads it.
     const saved = .{ .ro = agent.read_only, .ae = agent.accept_edits, .y = agent.yolo };
     defer {
         agent.setPermMode(
@@ -7432,14 +7392,16 @@ test "status: Build mode is always visible" {
                 .default,
         );
     }
-    agent.setPermMode(&m, .default);
 
-    const segs = sessionInfo(arena_state.allocator()) orelse return error.TestUnexpectedResult;
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(std.testing.allocator);
-    for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
-    try std.testing.expect(std.mem.indexOf(u8, joined.items, "build") != null);
-    try std.testing.expect(std.mem.indexOf(u8, joined.items, "ctx ") != null);
+    for ([_]agent.PermMode{ .default, .accept_edits }) |pm| {
+        agent.setPermMode(&m, pm);
+        const segs = sessionInfo(&m, arena_state.allocator()) orelse return error.TestUnexpectedResult;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(std.testing.allocator);
+        for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+        // Nothing but the name: the provider, the `/` and the model.
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, " ") == null);
+    }
 }
 
 test "status: the status row fits and is not cut" {
@@ -8087,18 +8049,28 @@ test "activity strip: asks for permission when it is due" {
     m.perm_active = false;
 }
 
-test "status: tokens and context are always visible" {
-    // Before, the ctx% only showed if it was > 0, that is, after a whole turn,
-    // and at the start nothing was visible: it looked like the counter did not
-    // exist.
+test "status: the token counters moved to /context and are off the row" {
+    // The old version of this test asserted the opposite: that `ctx ` and `~N
+    // tok` were ALWAYS on the row. They were, and the row was six facts wide
+    // because of it. The counters are `/context` now, and what is asserted is
+    // the absence — the same shape of test as the permission mark above,
+    // because a presence test cannot catch somebody adding them back.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const segs = sessionInfo(arena_state.allocator()) orelse return;
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    agent.cacheSessionStatsForTest().* = .{};
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 1000, .cached = 900, .completion = 100 });
+    defer agent.cacheSessionStatsForTest().* = .{};
+
+    const segs = sessionInfo(&m, arena_state.allocator()) orelse return;
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(std.testing.allocator);
     for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
-    try std.testing.expect(std.mem.indexOf(u8, joined.items, "ctx ") != null);
     try std.testing.expect(std.mem.indexOf(u8, joined.items, "opencode") != null);
+    for ([_][]const u8{ "ctx ", "cached", "prompt", " tok" }) |gone| {
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, gone) == null);
+    }
 }
 
 /// First row whose text contains `needle` (render tests).
@@ -9504,48 +9476,6 @@ test "prune: the saving is real (not just a boolean)" {
         const live = p.textLive(std.testing.allocator);
         try std.testing.expectEqual(big.len, live.len);
     }
-}
-
-test "usage column: with no data it is not painted (a 0% lies)" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    // With an empty cache session there is nothing to say. These numbers used
-    // to show up only with `/cache`, which is exactly when they stop being
-    // useful.
-    try std.testing.expect(usageInfo(arena_state.allocator()) == null);
-}
-
-test "usage column: with data, the cache pct and the session tokens" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    agent.cacheSessionStatsForTest().* = .{};
-    agent.cacheSessionStatsForTest().record(.{ .prompt = 1000, .cached = 900, .completion = 100 });
-    agent.cacheSessionStatsForTest().record(.{ .prompt = 1000, .cached = 0, .completion = 50 });
-    defer agent.cacheSessionStatsForTest().* = .{};
-
-    const segs = usageInfo(arena) orelse return error.TestUnexpectedResult;
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(std.testing.allocator);
-    for (segs) |s| try joined.appendSlice(std.testing.allocator, s.text);
-    const all = joined.items;
-
-    try std.testing.expect(std.mem.indexOf(u8, all, "45% cached") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "2k prompt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "out") != null);
-
-    var m = Model.init(std.testing.allocator);
-    defer m.deinit();
-    const surface = try drawTest(&m, arena, 140, 20);
-    var row_buf: [512]u8 = undefined;
-    const row = rowText(surface, surface.size.height - 1, &row_buf);
-    // The two right-aligned groups used to start at the same edge and overwrite
-    // one another. Both must be visible together at a width where they fit.
-    try std.testing.expect(std.mem.indexOf(u8, row, "opencode") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "ctx ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "45% cached") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "2k prompt") != null);
 }
 
 test "both status columns measure the width the same (else they overlap)" {
