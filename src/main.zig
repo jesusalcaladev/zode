@@ -358,8 +358,17 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             .userdata = null,
             .onDelta = Cb.onDelta,
         }, kind, true) catch |err| {
-            if (err == error.ServerError) {
-                models.dbg("\n[error server] {s}\n", .{chat.lastErrorBody()});
+            // The server's reason, for EVERY error and not only for a 5xx.
+            //
+            // A 401 is the case this matters most in and the one that used to
+            // print only `AuthFailed`: OpenRouter answers a dead key with
+            // `{"error":{"message":"User not found."}}` and an expired one with
+            // `API key expired`, and those two send you to different places
+            // (rotate the key / get a new one) while `AuthFailed` sends you to
+            // neither. The TUI has shown it since June; this runner did not.
+            const why = chat.lastErrorBody();
+            if (why.len > 0) {
+                models.dbg("\n[error] {t}: {s}\n", .{ err, why });
             } else {
                 models.dbg("\n[error] {t}\n", .{err});
             }
