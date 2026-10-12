@@ -1687,8 +1687,21 @@ pub fn loadUserConfig() void {
         }
         loadAllowlist();
         loadAuthKeys(cfg_arena_state.?.allocator());
+
+        // The status bar's `provider/model`, resolved now that the provider is
+        // known. It reads the CACHED catalogue and never the network, so this is
+        // safe to do on the startup path.
+        if (status_model_target) |m| tui.resolveStatusModel(m);
     }
 }
+
+/// The Model whose status bar row `loadUserConfig` refreshes.
+///
+/// It is a global and not a parameter for the reason every other startup hook
+/// here is: `loadUserConfig` is called from four places, two of them before the
+/// Model exists, and threading a pointer through all four is how the call ends
+/// up missing from the one that matters.
+pub var status_model_target: ?*tui.Model = null;
 
 /// Reads `~/.config/zode/auth.json` and hands it to `providers` so `keyFor`
 /// uses it. Without this, connecting a provider from the palette saved the key
@@ -7694,6 +7707,61 @@ pub fn listModelsAsync(m: *tui.Model) !void {
         destroyModelsJob(m.allocator, job);
         return err;
     };
+}
+
+/// Warms the status bar's `provider/model` from the network, SILENTLY.
+///
+/// The row is `opencode/space-bunny-free` and not just `opencode`, and the only
+/// place a model name exists before the first turn is the provider's catalogue.
+/// A cached catalogue is read by `resolveStatusModel` in a millisecond; an
+/// uncached one is not on disk until somebody asks the provider, and the only
+/// thing that asks at startup used to be `/model` — which is the moment the
+/// status was already being read.
+///
+/// Silent is the whole point: this runs before the first frame, and the models
+/// worker's own path writes `Catalog updated · N models` into the history and
+/// changes the status line, both of which would land on top of the opening hero.
+/// Nothing here is reported, because nothing here is news — the catalogue is
+/// written to disk exactly as the other worker writes it, and the next
+/// `resolveStatusModel` reads it.
+///
+/// It resets `status_model_tried`, which is the flag the draw uses to avoid
+/// re-reading a file that was not there: without the reset the row would keep
+/// saying `opencode` for the whole session, because the lazy resolve had already
+/// run once and found nothing.
+pub fn catalogWarmupAsync(m: *tui.Model) !void {
+    const gpa = m.allocator;
+    const job = try gpa.create(WarmupJob);
+    errdefer gpa.destroy(job);
+    job.* = .{ .model = m };
+    m.beginWorker();
+    const thread = std.Thread.spawn(.{}, warmupWorker, .{job}) catch {
+        m.endWorker();
+        gpa.destroy(job);
+        return error.ThreadSpawnFailed;
+    };
+    thread.detach();
+}
+
+const WarmupJob = struct { model: *tui.Model };
+
+fn warmupWorker(job: *WarmupJob) void {
+    defer job.model.endWorker();
+    defer job.model.allocator.destroy(job);
+    const m = job.model;
+    const gpa = m.allocator;
+    const def = activeProviderDef(m.environ);
+    if (def.models_url.len == 0) return;
+
+    var http = http_client.Http.init(gpa, io_global);
+    defer http.deinit();
+    var list = models_mod.listModels(gpa, &http, def.models_url, providers.keyFor(def, m.environ)) catch return;
+    defer list.deinit(gpa);
+    if (list.items.len == 0) return;
+
+    modelcache.write(io_global, m.environ, def.id, def.models_url, list.items);
+    // The catalogue is on disk now; the draw may look again.
+    m.status_model_tried = false;
 }
 
 /// `/model` and Ctrl+T: the two-column model palette.

@@ -19,6 +19,7 @@ const agent_mod = @import("agent.zig");
 const readcache = @import("lib/readcache.zig");
 const bench_mod = @import("lib/bench.zig");
 const models_mod = @import("lib/models.zig");
+const modelcache = @import("lib/modelcache.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 
 /// Item of the modal picker (opencode style). Labels/descs are gpa-owned
@@ -909,6 +910,28 @@ pub const Model = struct {
     layout_overflow: bool = false,
 
     environ: ?*const std.process.Environ.Map = null,
+    /// The model the status bar shows, resolved ONCE and cached here.
+    ///
+    /// The row is `provider/model`, and it used to show nothing but the
+    /// provider at the start of a session: `curAnswering()` is empty until the
+    /// first turn, and the compiled providers carry no `default_model` on
+    /// purpose (a name in the code stops existing the day the provider
+    /// withdraws it). So for the first minute — the moment you are deciding
+    /// whether to trust the app — the row answered "what am I talking to" with
+    /// only half the answer.
+    ///
+    /// It is resolved from the provider's CACHED catalogue (never from the
+    /// network: the draw runs at 60 fps and must not block on a socket), and
+    /// re-resolved on `/use`, `/provider` and `/model`. `0` means "not yet", not
+    /// "empty", because "not yet" is the one that should look up again.
+    status_model_len: usize = 0,
+    status_model_buf: [128]u8 = undefined,
+    /// The lazy resolve ran once already. Without it, every frame of a session
+    /// with no catalogue on disk would open, parse and free a JSON file that is
+    /// not there — a stat and two open attempts per frame, forever, for a value
+    /// that can only change when the catalogue worker finishes (which resets
+    /// this flag).
+    status_model_tried: bool = false,
     /// What `/compact` set, or null to follow `ZODE_COMPACT`.
     ///
     /// It lives in the Model and not in a module global because the env map is what
@@ -5682,6 +5705,45 @@ fn heroFrame(m: *const Model, width: u16, history_h: u16, content_lines: usize) 
 
 /// Columns the hero's block occupies: the wordmark plus the widest grid row.
 pub const hero_content_w: u16 = 18 + 44;
+
+/// Resolves `status_model_buf` from the provider's CACHED catalogue.
+///
+/// The cache is on disk because it is the only place a model list exists before
+/// the network has answered: the worker fetches the catalogue in the background
+/// and the draw cannot wait for it. `modelcache.read` validates the version and
+/// the URL, so a stale or foreign cache is treated as no cache at all.
+///
+/// It takes the FIRST free model, which is the same rule `resolveModelHeadless`
+/// uses — the status bar is showing what the first turn would pick, not
+/// advertising the whole list.
+pub fn resolveStatusModel(self: *Model) void {
+    self.lock();
+    defer self.unlock();
+    if (self.status_model_len > 0) return;
+    // The clock's own guard, `io_ready`, and not `io == undefined`: `Io` is not
+    // comparable and reading an uninitialised one is a jump through a garbage
+    // vtable, which is the `attachIo` trap this repo has already paid for.
+    if (!self.io_ready) return;
+    self.status_model_tried = true;
+    const io = self.io;
+    const def = agent.activeProviderDef(self.environ orelse agent.environ_global);
+    if (def.id.len == 0) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // `modelcache.read` locates, opens and parses the file itself, and it
+    // validates the version and the URL — a stale or foreign cache is "no
+    // cache", which is the only safe answer to give a status row.
+    const entry = modelcache.read(io, self.environ orelse agent.environ_global, a, def.id, def.models_url) orelse return;
+    for (entry.models) |m| {
+        if (!m.is_free) continue;
+        const n = @min(m.id.len, self.status_model_buf.len);
+        @memcpy(self.status_model_buf[0..n], m.id[0..n]);
+        self.status_model_len = n;
+        return;
+    }
+}
 
 /// Is the transcript nothing but the opening hero?
 ///

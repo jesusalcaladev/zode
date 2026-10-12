@@ -625,6 +625,7 @@ fn runTui(init: std.process.Init) !u8 {
     var model = tui.Model.init(gpa);
     defer model.deinit();
     model.environ = init.environ_map;
+    agent.status_model_target = &model;
     model.attachIo(io); // for the activity strip clock
     model.attach();
 
@@ -671,6 +672,16 @@ fn runTui(init: std.process.Init) !u8 {
     agent.refreshUserCommandsModel(&model);
     agent.bootMark("userCommands");
     agent.initCheapRouterFromEnv(model.environ);
+    // The status row is `provider/model`, and the model's name only exists in
+    // the provider's catalogue: without this, the row says `opencode` for the
+    // whole of a session's first minute — the moment the user is deciding
+    // whether the app knows what it is doing. Silently warms the catalogue into
+    // the cache (`resolveStatusModel` reads it from there); no history line, no
+    // status change, so the hero is not interrupted.
+    tui.resolveStatusModel(&model);
+    if (model.status_model_len == 0) {
+        agent.catalogWarmupAsync(&model) catch {};
+    }
 
     agent.bootMark("app.run start");
 
