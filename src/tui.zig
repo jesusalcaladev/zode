@@ -4113,7 +4113,18 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     const k = key;
 
     // Enter submits; Shift+Enter / Alt+Enter insert a line break.
-    if (k.matches(vaxis.Key.enter, .{})) {
+    //
+    // The codepoint is checked DIRECTLY and not through `key.matches(enter, .{})`,
+    // and that is not a style choice. `matches` requires the modifiers to be
+    // EXACTLY the ones asked for, so `enter + shift` does NOT match
+    // `matches(enter, .{})` — the whole branch was skipped and Shift+Enter did
+    // nothing at all. The modifier was checked AGAIN on the next line, which is
+    // the only reason the bug survived the reading: both lines look right
+    // together.
+    //
+    // Every other key here is matched by codepoint and then filtered by its own
+    // mods, which is the order that works for a key that means two things.
+    if (k.codepoint == vaxis.Key.enter) {
         if (k.mods.shift or k.mods.alt) {
             try self.ed.insertChar('\n');
             syncAutocomplete(self);
@@ -10774,3 +10785,86 @@ test "scrolling past the segment cache cap leaves no cell pointing at a freed ar
     }
 }
 
+
+// ── the wire path for the keys the terminals report differently ──
+//
+// `editorKey` has always had "shift+enter / alt+enter inserts a newline", and
+// for the whole of its life it was code that could not be reached: no terminal
+// reports a modified Enter unless it is ASKED to (`CSI > 1 u`), and zode never
+// asked. What the user saw was Enter, which submits, and there was nothing to
+// fix in the handler.
+//
+// So the test goes through the PARSER and not around it. A `Key` built by hand
+// with `.shift = true` proves the handler works and proves nothing about
+// whether the bytes on the wire ever become that `Key`, which is the half that
+// was broken.
+test "wire: CSI 13;2u arrives as enter+shift and inserts a newline" {
+    // ONE arena owns everything that outlives a single step, in the order the
+    // repo's own tests use. `m` gets its OWN allocator on purpose and it is
+    // NOT the arena: the leak this test was reporting is `std.testing.allocator`
+    // being handed a pointer that only `testing.allocator` knows about, and
+    // with both allocators the DebugAllocator has no way to say which.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(arena);
+    defer m.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = testCtx();
+    ctx.io = threaded.io();
+    // `testCtx` returns `cmds = .empty` with NO allocator, and the key handler
+    // appends to it. An `ArrayList` with no allocator is a leak the moment
+    // anything is pushed, which is what this test was reporting — and it is
+    // also a latent bug in every other test that pushes to `ctx.cmds`.
+    ctx.alloc = arena;
+    ctx.cmds = .empty;
+    _ = std.testing.allocator;
+
+    // The exact bytes a kitty-disambiguate terminal sends for Shift+Enter.
+    // One character typed BEFORE the key, so the assertion that the input grew
+    // is about the newline and not about an editor that started empty.
+
+    var parser: vaxis.Parser = .{};
+    // The `Key`s go into the ARENA, not into `testing.allocator`: `m.ed` is
+    // freed by `defer m.deinit()` and this list is not, and a leak reported
+    // against the DebugAllocator would fail this test for a reason that has
+    // nothing to do with Shift+Enter.
+    var keys: std.ArrayList(vaxis.Key) = .empty;
+    const res = try parser.parse("\x1b[13;2u", arena);
+    if (res.event) |ev| {
+        switch (ev) {
+            .key_press => |k| try keys.append(arena, k),
+            else => {},
+        }
+    }
+    // The whole sequence was consumed, and nothing was left for the next read.
+    try std.testing.expectEqual(@as(usize, "\x1b[13;2u".len), res.n);
+    // The parse produced a modified Enter, not a bare one.
+    try std.testing.expectEqual(@as(usize, 1), keys.items.len);
+    try std.testing.expectEqual(vaxis.Key.enter, keys.items[0].codepoint);
+    try std.testing.expect(keys.items[0].mods.shift);
+
+    // And the handler inserts the newline instead of submitting.
+    const before_len = m.ed.text().len;
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = keys.items[0] });
+    try std.testing.expectEqual(before_len + 1, m.ed.text().len);
+    // A newline means the input is now two ROWS and still open.
+    //
+    // Measured through `drawTest` and not through `ed.displayLines`: the
+    // repo's `test_draw_ctx` has no `stringWidth` fn pointer, so a measurer
+    // built on it returns garbage and the wrap count is meaningless. The
+    // layout is what decides how many rows the box gets, and it is the thing
+    // that has to be right — a two-row box for a one-row prompt is a bug the
+    // editor's own counter cannot see.
+    const s = try drawTest(&m, arena, 60, 20);
+    try std.testing.expectEqual(@as(u16, 2), s.size.height - 1 - m.hist_rows - 1);
+    // And the input is still OPEN with the text in it: a submit clears it, so this
+    // is the observable difference between "inserted a newline" and "sent the
+    // turn". The queue is not checked on purpose — `agent.submit` hands off to a
+    // worker and, with no provider configured, refuses before it enqueues
+    // anything, so an empty queue proves nothing.
+    try std.testing.expect(!m.ed.isEmpty());
+    try std.testing.expectEqualStrings("\n", m.ed.text());
+}

@@ -18,6 +18,8 @@ const mascot = @import("lib/mascot.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");
+const kittyKeyboardPush = @import("lib/termseq.zig").kittyKeyboardPush;
+const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
 
@@ -606,6 +608,18 @@ fn runTui(init: std.process.Init) !u8 {
     // still be counting.
     agent.startTermQueryCap(&app.vx, init.environ_map);
     defer agent.stopTermQueryCap();
+    // ── the keyboard mode ──
+    //
+    // `CSI > 1 u` (kitty "disambiguate") is what makes the terminal SEND
+    // `CSI 13;2u` for Shift+Enter. Without it, no terminal reports a modified
+    // Enter at all: every one of them sends a bare `\r`, so "Shift+Enter inserts
+    // a newline" — which `tui.editorKey` has always implemented — was code that
+    // could never be reached. The key was never woken up.
+    //
+    // `CSI < u` restores it, and it is registered AFTER so it runs BEFORE the
+    // `defer`s that free the writer underneath it.
+    kittyKeyboardPush(app.tty.writer());
+    defer kittyKeyboardPop(app.tty.writer());
     agent.bootMark("vxfw.App.init");
 
     var model = tui.Model.init(gpa);
