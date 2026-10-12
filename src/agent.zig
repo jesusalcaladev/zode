@@ -35,6 +35,7 @@ const bench_mod = @import("lib/bench.zig");
 const skills = @import("lib/skills.zig");
 const skillstore = @import("lib/skillstore.zig");
 const project = @import("lib/project.zig");
+const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
@@ -6942,6 +6943,22 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
 
     // 3. The session. One write, and it is the only reason any of this exists.
     if (session) |s| s.flush();
+
+    // 4. The terminal. `std.process.exit` runs NO defer, and vaxis leaves the
+    // screen in the alternate buffer (`CSI ? 1049 h`) with the mouse captured
+    // and the cursor hidden. So the defers that would undo it never run, and
+    // ctrl+c left the app ON SCREEN: the last frame still there, the cursor
+    // hidden, the shell prompt nowhere. The user's "it closed but zode is still
+    // visible" is exactly this, and not a leaked process.
+    //
+    // `termseq.restoreAll` and not the sequences inline: the same four have to
+    // be written on the normal exit path too, and a copy of them in two places
+    // is one that goes stale the day a third is added.
+    {
+        var out_buf: [256]u8 = undefined;
+        var fw = std.Io.File.stdout().writer(io, &out_buf);
+        termseq.restoreAll(&fw.interface);
+    }
 
     std.process.exit(0);
 }
