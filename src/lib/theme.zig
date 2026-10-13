@@ -39,43 +39,54 @@ fn bg(r: u8, g: u8, b: u8) vaxis.Style {
 
 /// Primary text: 18.1:1. The only thing allowed to be bright white.
 pub const ink: vaxis.Style = rgb(0xf2, 0xf2, 0xf2);
-/// Secondary text — a tool's argument, a result's body. 7.0:1.
-pub const ink2: vaxis.Style = rgb(0xa3, 0xa3, 0xa3);
-/// Tertiary text — a timestamp, a hint, a label. 5.7:1.
+/// Secondary text — a tool's argument, a result's body. 6.9:1 on `well_bg`.
+pub const ink2: vaxis.Style = rgb(0xa3, 0xa1, 0x9e);
+/// Tertiary text — a timestamp, a hint, a label. 5.6:1 on `well_bg`.
 ///
 /// It was `#7a7a7a` in the first draft of this file and the contrast test said
 /// 4.44:1 on `well_bg`, which is below the floor. This is what that test is
 /// for: it is not a number I chose, it is a number I got wrong.
-pub const ink3: vaxis.Style = rgb(0x85, 0x85, 0x85);
+pub const ink3: vaxis.Style = rgb(0x85, 0x83, 0x80);
 
 /// Hairlines. 1.6:1. NEVER text — see `ink3` for text you are meant to read.
-pub const line: vaxis.Style = rgb(0x2e, 0x2e, 0x2e);
+pub const line: vaxis.Style = rgb(0x2e, 0x2c, 0x2a);
 
 /// A slightly brighter rule, for the hairline that separates the transcript
 /// from the input: it is one step more present than `line` and it is the reason
 /// the input feels anchored without a box around it.
-pub const line_bright: vaxis.Style = rgb(0x3d, 0x3d, 0x3d);
+pub const line_bright: vaxis.Style = rgb(0x3d, 0x3a, 0x37);
 
-// ── the accent: a warm, matte green ────────────────────────────
+// ── the accent: a matte teal ──────────────────────────────────
 //
-// HUE 100°, ~34% saturation, ~55% lightness. Chosen for being MATTE: a
-// saturated green (`#00ff00`, or the terminal's index 2) is a highlighter pen,
-// and next to a diff it is indistinguishable from "this line was added".
-// Desaturating it and warming it toward yellow is what makes it read as an
-// interface color rather than as a status color.
+// HUE 186°, ~40% saturation, ~56% lightness. It replaced a matte green, and
+// the reason is worth keeping because the next retheme will face it too.
+//
+// The accent is the one color that appears in CHROME — your prompt, the caret,
+// the wordmark, the selected row, the live phase — so it has to clear
+// everything else on screen. It used to be green, which meant the syntax
+// palette had to contain NO green (see the `code palette` test) to avoid two
+// readings of one color. Teal moves that constraint: it is far from the diff's
+// green AND far from the orange/amber/lilac/pink of the tokens, so the code
+// palette only has to keep out ONE hue band instead of the two the green
+// needed.
+//
+// MATTE is not decoration. A fully saturated cyan is a highlighter pen, and
+// next to a diff it would read as a status color. Desaturating it is what
+// makes it read as an interface color.
 
-/// 7.2:1. The accent proper: your prompt, the caret, the selected row's mark.
-pub const brand: vaxis.Style = rgb(0x7f, 0xb0, 0x69);
+/// 8.5:1 on black, 7.6:1 on `well_bg`. The accent proper: your prompt, the
+/// caret, the selected row's mark.
+pub const brand: vaxis.Style = rgb(0x74, 0xae, 0xb4);
 /// One step up, for the one thing that should read as lit (the wordmark, Zo's
 /// face). Bold as well as bright: a wordmark at normal weight is just text,
 /// and "zode" has to be recognisable in the first half second.
-pub const brand_hi: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa8, 0xd4, 0x8a } } };
-/// 5.7:1. Tertiary text that still carries a color.
-pub const brand_soft: vaxis.Style = rgb(0x6b, 0x90, 0x60);
-/// Green hairline. Sits between `line` and `brand_soft` in weight.
-pub const brand_faint: vaxis.Style = rgb(0x2f, 0x44, 0x29);
+pub const brand_hi: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa4, 0xd5, 0xda } } };
+/// 5.2:1 on `well_bg`. Tertiary text that still carries a color.
+pub const brand_soft: vaxis.Style = rgb(0x5b, 0x8f, 0x95);
+/// Teal hairline. Sits between `line` and `brand_soft` in weight.
+pub const brand_faint: vaxis.Style = rgb(0x28, 0x3c, 0x3e);
 /// The background of a focused surface's track (a depleting progress bar).
-pub const brand_deep: vaxis.Style = rgb(0x1a, 0x27, 0x17);
+pub const brand_deep: vaxis.Style = rgb(0x14, 0x23, 0x24);
 
 // ── semantics ─────────────────────────────────────────────────
 //
@@ -93,28 +104,30 @@ pub const err: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
 /// With only a foreground change a selected row is distinguishable only by
 /// bold, which most people do not see across a 60-column row. This cost a
 /// scrollbar that highlighted the wrong line once.
-pub const sel_bg: vaxis.Style = bg(0x1e, 0x24, 0x1c);
-pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa8, 0xd4, 0x8a } }, .bg = sel_bg.bg };
+pub const sel_bg: vaxis.Style = bg(0x11, 0x24, 0x28);
+pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa4, 0xd5, 0xda } }, .bg = sel_bg.bg };
 
 /// A modal's interior. Darker than any plausible terminal background, so a box
 /// reads as a hole in the page and the history cannot show through it.
-pub const panel_bg: vaxis.Style = bg(0x0a, 0x0b, 0x0a);
+pub const panel_bg: vaxis.Style = bg(0x0b, 0x0a, 0x09);
 /// The well a tool's output sits in: the sunken surface of the two.
-pub const well_bg: vaxis.Style = bg(0x10, 0x11, 0x10);
+pub const well_bg: vaxis.Style = bg(0x12, 0x11, 0x10);
 
 // ── code token palette ────────────────────────────────────────
 //
-// NO GREENS. The accent is green, so a green keyword would put brand and
-// syntax on the same screen with the same reading. Orange, blue and amber
-// instead: they are the classic high-legibility set, and they leave green
-// alone for the two jobs that own it.
+// NOT in the accent's hue band. The accent is teal (186°), so a token in
+// 165-210° would put brand and syntax on the same screen reading the same way —
+// which is what the green accent forced on the green band, and what
+// `codePaletteClearsAccent` below now enforces for the teal one. Orange, amber,
+// lilac, pink and a BLUE PUSHED PAST 213° instead: the classic high-legibility
+// set, with the two blues deliberately moved off the cyan they used to be.
 
 pub const code_text: vaxis.Style = rgb(0xc9, 0xd1, 0xd9);
 pub const code_kw: vaxis.Style = rgb(0xff, 0x9e, 0x64); // orange
 pub const code_kw2: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0xff, 0xb0, 0x86 } } };
 pub const code_builtin: vaxis.Style = rgb(0xd2, 0xa8, 0xff); // lilac
-pub const code_type: vaxis.Style = rgb(0x79, 0xc0, 0xff); // blue
-pub const code_str: vaxis.Style = rgb(0xa5, 0xd6, 0xff); // pale blue
+pub const code_type: vaxis.Style = rgb(0x7b, 0xb0, 0xf4); // indigo, 214°
+pub const code_str: vaxis.Style = rgb(0xa6, 0xbd, 0xf2); // periwinkle, 222°
 /// A comment. Italic and two steps below `code_text`, but still 6.2:1: a
 /// comment is CONTENT the reader asked for, not chrome. The `#6b7280` in the
 /// first draft was 3.9:1, and the contrast test refused it.
@@ -155,14 +168,14 @@ pub const diff_stat_del: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
 // marks a boundary and has nothing to say, which is why it is allowed to be
 // the quietest thing on screen.
 
-pub const rail: vaxis.Style = rgb(0x2e, 0x2e, 0x2e);
+pub const rail: vaxis.Style = rgb(0x2e, 0x2c, 0x2a);
 /// The gutter of a code block. One step above `rail` because it is carrying
 /// content (a language chip sits on it).
-pub const gutter: vaxis.Style = rgb(0x3d, 0x3d, 0x3d);
+pub const gutter: vaxis.Style = rgb(0x3d, 0x3a, 0x37);
 /// A continuation row's indent marker: "this row still belongs to the block
 /// above". One glyph, and it is the difference between "one result plus five
 /// anonymous rows" and "a result".
-pub const gutter_soft: vaxis.Style = rgb(0x33, 0x33, 0x33);
+pub const gutter_soft: vaxis.Style = rgb(0x33, 0x31, 0x2e);
 
 // ── named roles ───────────────────────────────────────────────
 //
@@ -170,7 +183,7 @@ pub const gutter_soft: vaxis.Style = rgb(0x33, 0x33, 0x33);
 // between a retheme being one file and being a grep across eleven.
 
 /// What the user typed.
-pub const user: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7f, 0xb0, 0x69 } } };
+pub const user: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x74, 0xae, 0xb4 } } };
 /// The assistant's prose. Default bright, no color: the model is not decorated.
 pub const assistant: vaxis.Style = ink;
 /// A tool's NAME. Bold and near-white: this is the word you scan for.
@@ -190,22 +203,22 @@ pub const heading: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xe6, 0xe6,
 /// A markdown list bullet.
 pub const bullet: vaxis.Style = brand;
 /// A markdown blockquote bar.
-pub const quote: vaxis.Style = rgb(0x5a, 0x5a, 0x5a);
+pub const quote: vaxis.Style = rgb(0x5a, 0x58, 0x55);
 /// The language chip on a code block.
-pub const code_lang: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0x7a, 0x7a, 0x7a } } };
+pub const code_lang: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0x7a, 0x78, 0x75 } } };
 /// A table's rules and header.
-pub const table: vaxis.Style = rgb(0x5a, 0x5a, 0x5a);
+pub const table: vaxis.Style = rgb(0x5a, 0x58, 0x55);
 
 // ── chrome ────────────────────────────────────────────────────
 
 /// The one rule that separates the transcript from the input.
 pub const rule: vaxis.Style = line_bright;
 /// The input's caret bar and prompt. The accent, always: it says "you are here".
-pub const input_prompt: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x7f, 0xb0, 0x69 } } };
-pub const input_bar: vaxis.Style = rgb(0x3f, 0x5c, 0x36);
+pub const input_prompt: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x74, 0xae, 0xb4 } } };
+pub const input_bar: vaxis.Style = rgb(0x2a, 0x44, 0x47);
 pub const placeholder: vaxis.Style = ink3;
 /// The status row: everything in it is metadata, so everything in it is dim.
-pub const status: vaxis.Style = rgb(0x5f, 0x5f, 0x5f);
+pub const status: vaxis.Style = rgb(0x5f, 0x5d, 0x5a);
 /// A key hint inside a modal (`enter run`). 6.3:1 on `panel_bg`.
 ///
 /// It is dimmer than the option it belongs to, never dimmer than readable. The
@@ -423,7 +436,7 @@ test "the hairline is a hairline and NOT text" {
     try std.testing.expect(r >= min_mark_contrast);
 }
 
-test "the accent green and the diff green are told apart by CHROMA, not by lightness" {
+test "the accent and the diff green are told apart by CHROMA, not by lightness" {
     // The whole two-green decision rests on a reader telling them apart. A
     // contrast ratio cannot measure that (they are the same lightness), so the
     // quantity that separates them is saturation: the accent is MATTE and `ok`
@@ -441,24 +454,33 @@ test "the accent green and the diff green are told apart by CHROMA, not by light
     try std.testing.expect(dh >= 15);
 }
 
-test "the code palette contains no green" {
-    // The accent is green. A green token would put "brand" and "syntax" on the
-    // same screen reading the same way, which is the exact confusion `ok` is
-    // already kept away from.
+test "the code palette clears the accent's hue band" {
+    // The accent is the only color in CHROME, and a token in its hue band would
+    // put "brand" and "syntax" on the same screen reading the same way. With a
+    // green accent that meant "no green in the code palette"; with a teal one
+    // it means "nothing in 165-210°".
     //
-    // "Green" is hue in the 70-170 band with enough saturation to still look
-    // like a color: `code_comment` sits at hue 218 (blue-gray) and must not be
-    // caught by it.
+    // The band is ±21° around the accent, and the test is on SATURATION as
+    // well as hue: `code_text` and `code_comment` are near-neutral, and a
+    // near-neutral color has no hue a reader can see, so its computed hue is
+    // noise. Requiring `s >= 0.15` is what keeps them out of the band instead
+    // of failing the test.
+    const accent_h = hueSat(fgRgb(brand).?).h;
     const palette = [_]vaxis.Style{
         code_text, code_kw, code_kw2, code_builtin, code_type,
         code_str,  code_comment, code_num, code_fn, code_deco,
     };
     for (palette) |st| {
         const hs = hueSat(fgRgb(st).?);
-        const greenish = hs.h >= 70 and hs.h <= 170 and hs.s >= 0.15;
-        if (greenish) {
-            std.debug.print("code color at hue {d:.0} saturation {d:.2} reads as green\n", .{ hs.h, hs.s });
-            return error.CodePaletteHasGreen;
+        if (hs.s < 0.15) continue;
+        var dh = @abs(hs.h - accent_h);
+        if (dh > 180) dh = 360 - dh;
+        if (dh < 21) {
+            std.debug.print(
+                "code color at hue {d:.0} saturation {d:.2} is {d:.0} deg from the accent\n",
+                .{ hs.h, hs.s, dh },
+            );
+            return error.CodePaletteCollidesWithAccent;
         }
     }
 }
