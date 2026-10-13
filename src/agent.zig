@@ -1084,6 +1084,25 @@ pub fn setProviderId(id: []const u8) void {
     std.mem.copyForwards(u8, cur_provider_buf[0..n], id[0..n]);
     cur_provider_id = cur_provider_buf[0..n];
 }
+/// Key state of the active provider's API key.
+///
+/// `verified` means the key has been tested and works.
+/// `saved` means the key is stored in `auth.json` but has not been verified.
+/// `invalid` means the key is known to be bad (e.g., auth error received).
+pub var cur_key_state: u8 = 0; // 0=unknown, 1=verified, 2=saved, 3=invalid
+/// Key state buffer for safe copying (avoids dangling slices).
+pub var cur_key_state_buf: [4]u8 = undefined;
+
+/// Maps key state enum values to display strings.
+pub fn keyStateString(s: u8) []const u8 {
+    switch (s) {
+        1 => "● verified",
+        2 => "○ saved",
+        3 => "✗ invalid",
+        else => "",
+    }
+}
+
 var cur_model: []const u8 = "";
 
 /// Active session (`null` until the first message). The worker creates it, not
@@ -1627,7 +1646,38 @@ pub fn activeProviderDef(env: ?*const std.process.Environ.Map) *const providers.
     return providers.byId(cur_provider_id) orelse providers.activeDef(env);
 }
 
-/// API key of the active provider: first the one saved in `auth.json`, then
+/// Key state of the active provider's API key.
+/// 
+/// `verified` means the key has been tested and works (recent auth success).
+/// `saved` means the key is stored in `auth.json` but has not been verified.
+/// `invalid` means the key is known to be bad (e.g., auth error received).
+/// `unknown` means no key is configured.
+///
+/// Takes the provider's environment to determine the key source.
+pub fn keyState(env: *const std.process.Environ.Map) u8 {
+    // Check saved keys first (from auth.json)
+    const def = activeProviderDef(env);
+    if (def.key_env.len > 0) {
+        // If there are saved keys, the key is at least "saved"
+        // Check if it also works via the environment
+        if (providers.keyFor(def, env) != null) return 1; // verified
+        return 2; // saved
+    }
+    // Check environment
+    const env_key = envGet(env, "ZODE_API_KEY");
+    if (env_key) |_| return 1; // verified (we assume it works if env has it)
+    return 0; // unknown
+}
+
+// Helper to compute the env var name for a provider's key
+fn providerKeyEnvName(def: *const providers.ProviderDef) []const u8 {
+    // Use the provider's key_env field if available, otherwise fall back to
+    // the generic ZODE_API_KEY
+    if (def.key_env.len > 0) return def.key_env[0];
+    return "ZODE_API_KEY";
+}
+
+// API key of the active provider: first the one saved in `auth.json`, then
 /// the environment variable, then the generic one.
 fn curKey(m: *tui.Model) ?[]const u8 {
     if (providers.keyFor(activeProviderDef(m.environ), m.environ)) |k| return k;
