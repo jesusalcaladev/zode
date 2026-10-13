@@ -2941,12 +2941,17 @@ fn cmdClean(m: *tui.Model, aplicar: bool) void {
     // The failure count goes in the output on purpose: `apply` swallows the
     // per-file error so one unreadable file does not abort the rest, and
     // without this line "deleted 23" would be a lie when 24 were candidates.
-    const tail: []const u8 = if (rep.failed == 0)
-        std.fmt.allocPrint(gpa, "  deleted {d} files", .{deleted}) catch "  done"
-    else
-        std.fmt.allocPrint(gpa, "  deleted {d}, {d} could NOT be removed", .{ deleted, rep.failed }) catch
-            "  done (with failures)";
-    pushInfoOwned(m, tail);
+    // `pushInfoFmt` and not `allocPrint … catch "literal"`: on OOM the literal
+    // fallback is a pointer into `.rodata`, and `pushInfoOwned` takes ownership
+    // of it — `Model.deinit` then frees static memory. That is the "Invalid
+    // free" this repo has paid for repeatedly, and it only shows up when the
+    // allocator is already failing, which is exactly when you cannot diagnose
+    // it. `pushInfoFmt` composes AND owns, so the mistake cannot be written.
+    if (rep.failed == 0) {
+        m.pushInfoFmt("  deleted {d} files", .{ deleted });
+    } else {
+        m.pushInfoFmt("  deleted {d}, {d} could NOT be removed", .{ deleted, rep.failed });
+    }
 }
 
 /// `/resume`: reopens the most recent session by mtime.
@@ -2973,12 +2978,7 @@ fn resumeLatest(m: *tui.Model) void {
     session_elided = 0;
     resetSummaries();
     forgetGitRepoProbe();
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "session resumed: {s} · {d} messages",
-        .{ path, s.messages.items.len },
-    ) catch "session resumed";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("session resumed: {s} · {d} messages", .{ path, s.messages.items.len });
     refreshContextUsage(m);
 }
 
@@ -4168,12 +4168,10 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     setStatusWithZo(m, .thinking, "no model chosen · asking the provider");
 
     var list = models_mod.listModels(gpa, http, def.models_url, providers.keyFor(def, m.environ) orelse curKey(m)) catch |err| {
-        const msg = std.fmt.allocPrint(
-            gpa,
+        m.pushInfoFmt(
             "no model chosen, and {s}'s catalog could not be read ({t}). Open /model to pick one.",
             .{ def.id, err },
-        ) catch "no model chosen: the catalog could not be read";
-        pushInfoOwned(m, msg);
+        );
         setStatusWithZo(m, .warn, "no model · /model");
         return null;
     };
@@ -4300,20 +4298,15 @@ fn targetForCandidate(m: *tui.Model, cand: roster_mod.Candidate) ?Target {
 fn pushSwitchNotice(m: *tui.Model, sw: free_auto.Switch, to: Target) void {
     const to_c = to.from_roster orelse return;
     const reason = if (sw.prev_reason.len > 0) sw.prev_reason else "quota gone";
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "quota gone on {s}/{s} ({s}) → {s}/{s} (free-auto {d}/{d})",
-        .{
-            sw.prev_provider,
-            sw.prev_model,
-            reason,
-            to_c.provider_id,
-            to_c.model_id,
-            free_auto.rosterGet(m.allocator).idx + 1,
-            free_auto.poolSize(),
-        },
-    ) catch "free-auto: switched model";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("quota gone on {s}/{s} ({s}) → {s}/{s} (free-auto {d}/{d})", .{
+        sw.prev_provider,
+        sw.prev_model,
+        reason,
+        to_c.provider_id,
+        to_c.model_id,
+        free_auto.rosterGet(m.allocator).idx + 1,
+        free_auto.poolSize(),
+    });
     // The status stays short: it is a segmented line and it already carries the
     // model and the provider. The detail (the why) is in the line above, which
     // does not get cropped.
@@ -4356,12 +4349,13 @@ fn noteTurnFailure(m: *tui.Model, err: anyerror, pick: Target) void {
     if (err == error.AuthFailed or err == error.Cancelled) return;
     const sw = free_auto.switchTo(m.allocator, .failed, chat.lastErrorBody()) orelse return;
     const c = sw.cand;
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "{s}/{s} failed: {s} → next turn starts with {s}/{s}",
-        .{ sw.prev_provider, sw.prev_model, errPhrase(err), c.provider_id, c.model_id },
-    ) catch "free-auto: the pair failed";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("{s}/{s} failed: {s} → next turn starts with {s}/{s}", .{
+        sw.prev_provider,
+        sw.prev_model,
+        errPhrase(err),
+        c.provider_id,
+        c.model_id,
+    });
 }
 
 /// How many files went in with the prompt, and how many of the mentioned ones
@@ -5009,6 +5003,9 @@ fn cmdUndo(m: *tui.Model) void {
             undone,
             if (undone == 1) "" else "s",
         }) catch "undo: done";
+    // `pushInfoFmt` COPIES, so a literal fallback is safe here — which is the
+    // whole difference from `pushInfoOwned`, where the same literal is an
+    // "Invalid free" at teardown.
 
     m.pushInfoFmt("{s} · from: {s}", .{ head_buf, cp.labelOf() });
     if (w.buffered().len > 0) {
@@ -5017,11 +5014,10 @@ fn cmdUndo(m: *tui.Model) void {
         m.pushInfoFmt("{s}", .{w.buffered()});
     }
     if (skipped > 0 or failed > 0) {
-        const warn = std.fmt.allocPrint(m.allocator, "{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
+        m.pushInfoFmt("{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
             skipped,
             failed,
-        }) catch "some files were skipped";
-        pushInfoOwned(m, warn);
+        });
     }
     if (undone > 0) setStatusWithZo(m, .done, "undone");
 }
@@ -7508,12 +7504,13 @@ fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
     const wait_ms = Retry.backoffMs(attempt);
 
     const detail: []const u8 = if (reason.len > 0) reason else "no details from the server";
-    const msg = std.fmt.allocPrint(
-        gpa,
-        "{s}: {s} · retrying in {d}.{d}s (attempt {d}/3)",
-        .{ errPhrase(err), detail, wait_ms / 1000, (wait_ms % 1000) / 100, attempt + 1 },
-    ) catch "retrying";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("{s}: {s} · retrying in {d}.{d}s (attempt {d}/3)", .{
+        errPhrase(err),
+        detail,
+        wait_ms / 1000,
+        (wait_ms % 1000) / 100,
+        attempt + 1,
+    });
 
     // The status stays short (it is a segmented line) but has the why, which is
     // what you read at a glance: "rate limited 2/3" and not "retrying…".
@@ -7583,75 +7580,69 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             // is the ACCOUNT and not the key, and saying "key rejected" sends the user
             // off to rotate a key that is perfectly fine. `reason` is empty when the
             // server said nothing, and then the old wording is all there is.
-            const msg = if (reason.len > 0)
-                std.fmt.allocPrint(gpa, "auth failed on {s}: {s}\n  check {s} (/provider shows the state)", .{
-                    cur_provider_id, reason, names,
-                }) catch "auth failed"
-            else
-                std.fmt.allocPrint(gpa, "key rejected by {s}. check {s} (/provider shows the state)", .{
-                    cur_provider_id, names,
-                }) catch "key rejected";
-            pushErrorOwned(m, msg);
+            if (reason.len > 0) {
+                m.pushErrorFmt("auth failed on {s}: {s}\n  check {s} (/provider shows the state)", .{
+                    cur_provider_id,
+                    reason,
+                    names,
+                });
+            } else {
+                m.pushErrorFmt("key rejected by {s}. check {s} (/provider shows the state)", .{
+                    cur_provider_id,
+                    names,
+                });
+            }
         },
         // 402: the account has no balance. It is not a zode bug nor the key.
         error.NoCredits => {
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "out of credits on {s}: {s}\n  pick a `-free` model or switch with /provider",
-                .{ cur_provider_id, reason },
-            ) catch "out of credits";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("out of credits on {s}: {s}\n  pick a `-free` model or switch with /provider", .{
+                cur_provider_id,
+                reason,
+            });
         },
         // 404: the model does not exist on that provider. Almost always it is an old
         // HARDCODED id left over (which is why the default is changed when the
         // provider retires it) or a typo in /use.
         error.ModelNotFound => {
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "model `{s}` does not exist on {s}: {s}\n  /model for the ones you have",
-                .{ cur_model, cur_provider_id, reason },
-            ) catch "model does not exist";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("model `{s}` does not exist on {s}: {s}\n  /model for the ones you have", .{
+                cur_model,
+                cur_provider_id,
+                reason,
+            });
         },
         // 403: in practice it is almost always the MODEL that is not available for
         // this account, not the key. Saying that plainly saves hours of
         // debugging.
         error.Forbidden => {
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "`{s}` is not available on your {s} account: {s}\n  /model for your models, /provider to switch",
-                .{ cur_model, cur_provider_id, reason },
-            ) catch "access denied";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("`{s}` is not available on your {s} account: {s}\n  /model for your models, /provider to switch", .{
+                cur_model,
+                cur_provider_id,
+                reason,
+            });
         },
         error.BadRequest => {
             // 400: the server did not accept the request. With free-auto on, this pair is
             // already set aside for the next turn (`noteTurnFailure`), so all
             // that is left to say here is what it asked for and what it replied.
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "{s} rejected the request for `{s}`: {s}",
-                .{ cur_provider_id, cur_model, reason },
-            ) catch "request rejected";
-            pushInfoOwned(m, msg);
+            m.pushInfoFmt("{s} rejected the request for `{s}`: {s}", .{
+                cur_provider_id,
+                cur_model,
+                reason,
+            });
         },
         error.RateLimited, error.Overloaded => {
             // `errPhrase`, not `@errorName`: a person reads this line and
             // "RateLimited" tells nobody anything. It is the same rule the retry
             // notices already follow, and they do it right.
-            const msg = std.fmt.allocPrint(gpa, "{s} after several attempts: {s}", .{ errPhrase(err), reason }) catch
-                "service saturated";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("{s} after several attempts: {s}", .{ errPhrase(err), reason });
         },
         else => {
             // `errPhrase` and not `@errorName`: this line is read by a person and
             // "ServerError" tells nobody anything. And it goes out as an ERROR
             // (red) because that is what it is.
-            const msg = std.fmt.allocPrint(gpa, "{s}: {s}", .{ errPhrase(err), reason }) catch "error";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("{s}: {s}", .{ errPhrase(err), reason });
         },
     }
-    setStatusWithZo(m, .warn, errPhrase(err));
 }
 
 /// The environment variables that can hold the active provider's key, as a
@@ -7980,8 +7971,7 @@ fn modelsWorker(job: *ModelsJob) void {
             if (!job.for_picker) m.pushInfoFmt("models: HTTP error at {s}", .{job.models_url});
         } else {
             if (!job.for_picker) {
-                const msg = std.fmt.allocPrint(gpa, "models: {t}", .{err}) catch "models error";
-                pushInfoOwned(m, msg);
+                m.pushInfoFmt("models: {t}", .{ err });
             }
         }
         if (is_current(m, job)) {
@@ -8427,12 +8417,10 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
     // And ONLY if the provider declares one of its own (the user's config.json)
     // is it used.
     if (def.default_model.len > 0) setModel(def.default_model);
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "provider → {s} · model {s}",
-        .{ def.id, if (cur_model.len > 0) cur_model else "(auto: picked from the catalog)" },
-    ) catch "provider";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("provider → {s} · model {s}", .{
+        def.id,
+        if (cur_model.len > 0) cur_model else "(auto: picked from the catalog)",
+    });
     if (had_model and def.default_model.len == 0) {
         // The model of the PREVIOUS provider is not valid here, and staying
         // silent about it means the next turn spends itself on a 400 that says
