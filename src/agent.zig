@@ -3323,11 +3323,19 @@ fn chatWorker(job: *ChatJob) void {
         if (!goal_mod.verdictCredible(&m.goal, turn_stats.tools)) {
             m.goal.blocked_refusals += 1;
             m.goal.status = goal_mod.Status.none;
-            const why = goal_mod.blockedRetryText(m.allocator) catch break;
-            pushErrorOwned(m, why);
+            // The refusal and the prompt are TWO buffers. `pushErrorOwned` takes
+            // ownership (the drain moves the pointer into `paras` and
+            // `Model.deinit` frees it), so handing the same slice to `owned`
+            // made it a second owner: a use-after-free while the UI painted the
+            // paragraph, and a double free at teardown. It was `owned = why`
+            // right after `pushErrorOwned(m, why)`. `exitGate`'s refusal 150
+            // lines up has the right shape: the error gets its buffer, the
+            // prompt gets its own.
+            pushErrorOwned(m, goal_mod.blockedRetryText(m.allocator) catch break);
+            const nudge = m.allocator.dupe(u8, goal_mod.blockedRetryPrompt()) catch break;
             if (owned) |o| m.allocator.free(o);
-            owned = why;
-            last_user = why;
+            owned = nudge;
+            last_user = nudge;
             continue;
         }
 
