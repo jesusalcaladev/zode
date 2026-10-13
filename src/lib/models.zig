@@ -1,13 +1,48 @@
 const std = @import("std");
 const http_client = @import("http_client.zig");
 
+/// Diagnostics for the model catalog, OFF unless asked for.
+///
+/// This used to write up to 300 raw bytes of the server's response to stderr
+/// UNCONDITIONALLY, and `main.zig` set `dbg_io` on the TUI path — where stderr
+/// is the same terminal as the alternate screen. So an HTML error page from a
+/// `/models` fetch landed mid-frame with its ESC bytes intact, which the
+/// renderer then redrew over: the report was "moving the mouse makes weird
+/// things appear in the terminal". It fired at startup (`catalogWarmupAsync`)
+/// and on every Ctrl+T.
+///
+/// Two fixes, and the second is the one that matters: a gate like
+/// `chat.zig`'s `ZODE_DBG_ERR`, and **no raw bytes** — an escape sequence from
+/// a server is not diagnostics, it is a command to the terminal.
 pub var dbg_io: ?std.Io = null;
+pub var dbg_flag: bool = false;
+
+pub fn dbgInitEnv(env: ?*const std.process.Environ.Map) void {
+    const v = if (env) |e| e.get("ZODE_DBG_MODELS") else null;
+    dbg_flag = if (v) |x| x.len > 0 and x[0] != '0' else false;
+}
+
+/// Every byte below 0x20 (and 0x7f) becomes `.`. An ESC in here is the whole
+/// problem; the text around it is still useful.
+fn sanitizeForTerminal(text: []const u8, out: []u8) []const u8 {
+    var n: usize = 0;
+    for (text) |c| {
+        if (n == out.len) break;
+        out[n] = if (c < 0x20 or c == 0x7f) '.' else c;
+        n += 1;
+    }
+    return out[0..n];
+}
 
 pub fn dbg(comptime fmt: []const u8, args: anytype) void {
+    if (!dbg_flag) return;
     const io = dbg_io orelse return;
     var buf: [1024]u8 = undefined;
+    var line: [512]u8 = undefined;
+    const raw = std.fmt.bufPrint(&line, fmt, args) catch return;
+    const safe = sanitizeForTerminal(raw, &buf);
     var w = std.Io.File.stderr().writer(io, &buf);
-    w.interface.print(fmt, args) catch {};
+    w.interface.writeAll(safe) catch {};
     w.interface.flush() catch {};
 }
 
