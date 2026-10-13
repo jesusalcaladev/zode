@@ -6610,9 +6610,15 @@ fn runParallelBatch(
                 ctx.out.ms = elapsedMs(call_t0);
                 return;
             };
-            // COPIED into the turn arena: `a` dies with this thread's defer and the
-            // text is read by the caller afterwards.
-            ctx.out.text = a.dupe(u8, text) catch "";
+            // COPIED OUT OF `a`: the arena dies with this thread's `defer`, and
+            // `waitForBatch` returns only when every `defer` has run, so a
+            // `results[k].text` pointing into `a` is a dangling pointer for
+            // EVERY call, not a race. It was `a.dupe` — allocating the copy in
+            // the same arena that is about to be freed — with a comment
+            // asserting the opposite. `ctx.m.allocator` is the model's
+            // allocator, which outlives the batch, exactly as `runTaskBatch`'s
+            // runner does it.
+            ctx.out.text = ctx.m.allocator.dupe(u8, text) catch "";
             ctx.out.ms = elapsedMs(call_t0);
         }
     };
@@ -6640,6 +6646,20 @@ fn runParallelBatch(
         const summary = toolResultSummary(t.calls.items[from + k].name, r.text, arena);
         m.pushToolDone(t.calls.items[from + k].name, summary, r.ms, r.text);
         s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, r.text) catch {};
+        // `r.text` is the caller's and both consumers above COPIED it
+        // (`pushToolDone` dupes for the paragraph and the Ctrl+R memo,
+        // `appendToolResult` dupes into the session), so this is ours to free.
+        //
+        // It was not, and the leak was invisible: the block is the size of one
+        // tool result, so a long session leaked in proportion to how much the
+        // model reads. It only became visible when the copy had to move out of
+        // the per-call arena (it used to be allocated there, so the arena freed
+        // it — while the pointer itself dangled).
+        //
+        // `err` marks a slot holding an `@errorName` LITERAL, which is not ours
+        // to free: `gpa.free` on `.rodata` is an "Invalid free", which is how a
+        // whole session used to die at quit.
+        if (!r.err) m.allocator.free(r.text);
     }
 
     // The batch's own clock: it is the number the user can compare against a
@@ -11820,6 +11840,126 @@ fn envHasAnyKey(map: *const std.process.Environ.Map) bool {
         if (std.mem.endsWith(u8, entry.key_ptr.*, "_KEY")) return true;
     }
     return false;
+}
+
+test "the parallel batch's tool results outlive the per-call arenas" {
+    // THE crash of "I ask for a plan, it starts doing things, and then it stops
+    // working". Three read-only calls in one assistant message is the most
+    // common shape of a real task, and `runParallelBatch` ran them on threads
+    // that each had their OWN arena:
+    //
+    //     var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
+    //     defer astate.deinit();
+    //     const a = astate.allocator();
+    //     const text = tools_mod.execute(..., a, ...) catch ...;
+    //     ctx.out.text = a.dupe(u8, text) catch "";   // <-- allocated in the
+    //                                                      arena about to die
+    //
+    // and the comment above that line claimed the copy went to the turn arena.
+    // It did not. Defer order is LIFO, so `astate.deinit()` runs BEFORE the
+    // `pending` decrement, and `waitForBatch` waits on `pending`: by the time it
+    // returns every per-call arena is guaranteed dead. That makes the dangling
+    // pointer deterministic rather than a race — for EVERY parallel batch, not
+    // occasionally.
+    //
+    // A `read` of a real source file makes the arena request a multi-MB chunk,
+    // which `gpa` returns to the page allocator, so the caller's `dupe` reads
+    // an unmapped page: SIGSEGV with no panic message. Small results fail
+    // quieter and just corrupt the history and the session file.
+    //
+    // `std.testing.allocator` is what makes this a test and not a hope: it
+    // poisons and unmaps on `free`, so reading a freed result trips the leak
+    // detector instead of returning plausible garbage.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // A scratch directory, so the reads are of files that exist and are big
+    // enough to make the arena take a real chunk.
+    const tmp_path = "/tmp/opencode/zode-test-parallel-batch";
+    try std.Io.Dir.cwd().createDirPath(io_global, tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(io_global, tmp_path) catch {};
+    var tmp = try std.Io.Dir.cwd().openDir(io_global, tmp_path, .{});
+    defer tmp.close(io_global);
+
+    const bodies = [_][]const u8{
+        "fn alpha() void {}\n" ** 200,
+        "fn beta() void {}\n" ** 200,
+        "fn gamma() void {}\n" ** 200,
+    };
+    const paths: [3][]const u8 = .{ "a.zig", "b.zig", "c.zig" };
+    for (paths, bodies) |p, body| {
+        try tmp.writeFile(io_global, .{ .sub_path = p, .data = body });
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var t: TurnCtx = .{ .m = &m };
+    defer t.deinit();
+    // With the TEST allocator, not the turn arena: `TurnCtx.deinit` frees every
+    // id and args_json through the MODEL's allocator, and a block that came out
+    // of an arena is an "Invalid free" — a rule that is easier to get wrong in
+    // the test than in production, which is why it is written down here.
+    for (paths, 0..) |p, i| {
+        const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}/{s}\"}}", .{ tmp_path, p });
+        errdefer std.testing.allocator.free(args);
+        const id = try std.fmt.allocPrint(std.testing.allocator, "call_{d}", .{i});
+        errdefer std.testing.allocator.free(id);
+        // The name too: `TurnCtx.deinit` frees it, and freeing a literal is an
+        // "Invalid free" (the palette bug, the `/free-auto status` bug).
+        const name = try std.testing.allocator.dupe(u8, "read");
+        try t.calls.append(std.testing.allocator, .{
+            .id = id,
+            .name = name,
+            .args_json = args,
+        });
+    }
+
+    var sess = session_mod.Session.init(std.testing.allocator);
+    defer sess.deinit();
+
+    const r = runParallelBatch(&m, &sess, &t, 0, t.calls.items.len, arena);
+
+    // The batch really ran all three.
+    try std.testing.expectEqual(@as(usize, 3), r.ok);
+
+    // The batch's threads are DETACHED, and each one that touched the shared
+    // `Io` owns a buffer inside it. `threaded.deinit()` must not run while a
+    // worker is still inside `io`, so the workers are waited for BEFORE the
+    // defers unwind — the same order `runTui` uses, and the same reason
+    // (AGENTS.md, "Detached workers + destroyed io = use-after-free").
+    m.waitWorkers(2000);
+    try std.testing.expectEqual(@as(usize, 0), m.workers.load(.seq_cst));
+
+    // And every result is still readable AFTER the threads and their arenas are
+    // gone. `pushToolDone` and `appendToolResult` both `dupe` from it, so the
+    // session is where the freed bytes would land — and under
+    // `std.testing.allocator` a freed arena is POISONED, not merely reused, so
+    // a dangling result cannot accidentally look like the right text.
+    var seen_fn: usize = 0;
+    for (sess.messages.items) |msg| {
+        if (!std.mem.eql(u8, @tagName(msg.role), "tool")) continue;
+        try std.testing.expect(msg.content.len > 0);
+        // The actual file contents came back, byte for byte.
+        const want = if (std.mem.indexOf(u8, msg.content, "fn alpha") != null)
+            "fn alpha"
+        else if (std.mem.indexOf(u8, msg.content, "fn beta") != null)
+            "fn beta"
+        else if (std.mem.indexOf(u8, msg.content, "fn gamma") != null)
+            "fn gamma"
+        else
+            return error.TestUnexpectedResult;
+        seen_fn += 1;
+        std.mem.doNotOptimizeAway(want);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen_fn);
 }
 
 test "E2E: a real turn against a real provider completes and answers" {
