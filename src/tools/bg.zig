@@ -7,12 +7,27 @@ const common = @import("common.zig");
 const bgproc = @import("../bgproc.zig");
 const verify_mod = @import("../lib/verify.zig");
 
+/// The job id, as a `u32` — which is what the registry's slots are indexed by.
+///
+/// `getInt` returns `?i64`, and the NEGATIVE half was the only thing checked. An id
+/// above `maxInt(u32)` — a hallucinated `{"id": 99999999999}` — hit
+/// `thread panic: integer cast truncated bits`, and a panic on a worker thread
+/// calls `std.process.abort()`: the whole app died with SIGABRT and no error
+/// message, from the tool the model was told to use for exactly this.
+fn backgroundId(obj: std.json.ObjectMap) !u32 {
+    const id_i = common.getInt(obj, "id") orelse return error.MissingId;
+    if (id_i <= 0) return error.MissingId;
+    // Clamped, not cast: a bad id is a mistake to report, not a way to kill the
+    // process. The registry has a bounded number of slots, so the range it can
+    // actually address is far narrower than u32 anyway.
+    if (id_i > std.math.maxInt(u32)) return error.IdOutOfRange;
+    return @intCast(id_i);
+}
+
 /// `bash_output`: the new output plus the status.
 pub fn toolBashOutput(obj: std.json.ObjectMap, arena: std.mem.Allocator, reg: ?*bgproc.Registry) ![]const u8 {
     const r = reg orelse return error.NoBackgroundRegistry;
-    const id_i = common.getInt(obj, "id") orelse return error.MissingId;
-    if (id_i <= 0) return error.MissingId;
-    const id: u32 = @intCast(id_i);
+    const id = backgroundId(obj) catch return error.BadArgs;
 
     var out = bgproc.Output{};
     const text = bgproc.read(r, &out, id) catch |err| switch (err) {
@@ -42,9 +57,7 @@ pub fn toolBashKill(
     io: std.Io,
 ) ![]const u8 {
     const r = reg orelse return error.NoBackgroundRegistry;
-    const id_i = common.getInt(obj, "id") orelse return error.MissingId;
-    if (id_i <= 0) return error.MissingId;
-    const id: u32 = @intCast(id_i);
+    const id = backgroundId(obj) catch return error.BadArgs;
     if (bgproc.kill(r, io, id)) {
         return std.fmt.allocPrint(arena, "killed job {d}. You can still read what it printed with bash_output.", .{id});
     }
