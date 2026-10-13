@@ -3790,6 +3790,22 @@ pub const Model = struct {
         }
     }
 
+    /// A gesture that must not survive losing the pointer or the focus.
+    ///
+    /// Every mouse mode flag here has exactly one natural exit — the `.release`
+    /// that ends it — and the terminal is under no obligation to deliver that
+    /// release to US: alt-tabbing mid-drag, a notification stealing focus, or a
+    /// release that lands outside the last drawn surface all lose it. A flag
+    /// with no other exit is a flag that can be stranded for the rest of the
+    /// session, and a stranded drag flag turns every later mouse event into a
+    /// scroll jump.
+    fn cancelMouseGestures(self: *Model) void {
+        self.scrollbar_dragging = false;
+        self.selecting_text = false;
+        self.selection_start = null;
+        self.selection_end = null;
+    }
+
     fn selectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
         if (mouse.row < 0 or mouse.col < 0) return null;
         const row = @as(u16, @intCast(mouse.row));
@@ -3852,6 +3868,21 @@ pub const Model = struct {
     }
 
     fn copySelectedText(self: *const Model, ctx: *vxfw.EventContext) !void {
+        // A PRESS followed by a RELEASE at the same point is a CLICK, not a
+        // selection, and it used to fire OSC 52 anyway: `selectedText` on one
+        // cell yields that one trimmed grapheme, which is non-empty, so every
+        // plain click in the transcript emitted
+        // `ESC ]52;c;<base64> ESC \` — written and flushed by vaxis OUTSIDE
+        // `vx.render`, so the renderer never knew about it and the next frame
+        // drew over it. On a terminal that does not implement OSC 52 that is a
+        // wall of visible `^[]52;c;…` text, and it appeared exactly when the
+        // user clicked or dragged across the history.
+        //
+        // A selection is more than one cell. A click is not a selection and
+        // there is nothing anyone wants copied from it.
+        const start = self.selection_start orelse return;
+        const end = self.selection_end orelse return;
+        if (start.row == end.row and start.col == end.col) return;
         const text = (try self.selectedText(ctx.alloc)) orelse return;
         defer ctx.alloc.free(text);
         if (text.len == 0) return;
@@ -4906,6 +4937,25 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
         .focus_in => {
             ctx.redraw = true;
             try self.armTick(ctx);
+        },
+        // Losing focus ends any gesture. Both flags had exactly ONE exit, a
+        // `.release` that reaches this handler, and three ways to not get one:
+        // the window losing focus (the release goes to the window you clicked),
+        // the pointer leaving the surface (vaxis's `mouse_leave` carries no
+        // coordinates), and a release that vxfw drops before it reaches us
+        // because it landed outside the PREVIOUS frame's surface.
+        //
+        // A stranded `scrollbar_dragging` is the loud one: the flag makes every
+        // later `.drag` in the history `return` early after a `scrollTo`, so a
+        // text drag could never start a selection again and the first drag
+        // anywhere jumped the scroll to wherever the pointer happened to be.
+        .focus_out => {
+            self.cancelMouseGestures();
+            ctx.redraw = true;
+        },
+        .mouse_leave => {
+            self.cancelMouseGestures();
+            ctx.redraw = true;
         },
         .paste => |data| {
             // Our own editor has no paste callback: we insert by hand. A paste
@@ -7568,6 +7618,179 @@ test "scrollbar click and drag navigate absolute history positions" {
     } });
     try std.testing.expect(!m.scrollbar_dragging);
     try std.testing.expect(m.follow_bottom);
+}
+
+test "losing focus or the pointer cancels the mouse gesture instead of stranding it" {
+    // The reported symptom: "moving the mouse makes the terminal do strange
+    // things". This is the mechanism behind the half of it that is zode's own.
+    //
+    // `scrollbar_dragging` had exactly ONE exit — the `.release` that reaches
+    // the handler — and three ways to never get one: the window loses focus
+    // (the release goes to whatever you clicked), the pointer leaves the
+    // surface (vaxis's `mouse_leave` carries no coordinates), and a release
+    // that lands outside the PREVIOUS frame's surface, which vxfw drops before
+    // it reaches us.
+    //
+    // A stranded flag is not cosmetic: `scrollbar_dragging` is checked FIRST in
+    // the mouse branch and every `.drag` returns early after a `scrollTo`, so a
+    // stranded one turns every later drag in the transcript into a scroll jump
+    // AND makes a text selection impossible to start for the rest of the
+    // session.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    for (0..80) |i| {
+        var text: [32]u8 = undefined;
+        m.pushInfo(try std.fmt.bufPrint(&text, "history row {d}", .{i}));
+    }
+    const surface = try drawTest(&m, arena_state.allocator(), 80, 24);
+    try std.testing.expect(m.max_offset > 0);
+
+    var ctx = testCtx();
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    // Start a scrollbar drag.
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(surface.size.width - 1),
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expect(m.scrollbar_dragging);
+
+    // The window loses focus (alt-tab, a notification). No release arrives.
+    try typeErasedEventHandler(&m, &ctx, .focus_out);
+    try std.testing.expect(!m.scrollbar_dragging);
+
+    // Same for the pointer leaving the surface: press the SCROLLBAR again,
+    // because a press anywhere else starts a text selection instead.
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(surface.size.width - 1),
+        .row = 0,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expect(m.scrollbar_dragging);
+    try typeErasedEventHandler(&m, &ctx, .mouse_leave);
+    try std.testing.expect(!m.scrollbar_dragging);
+
+    // And a stranded SELECTION is a highlight nobody can dismiss until they
+    // scroll: it painted `theme.selected.bg` over live rows.
+    m.selection_start = .{ .row = 1, .col = 2 };
+    m.selection_end = .{ .row = 3, .col = 8 };
+    m.selecting_text = true;
+    try typeErasedEventHandler(&m, &ctx, .focus_out);
+    try std.testing.expect(!m.selecting_text);
+    try std.testing.expect(m.selection_start == null);
+    try std.testing.expect(m.selection_end == null);
+}
+
+test "a plain click does not fire the clipboard escape sequence" {
+    // OSC 52 is written and flushed by vaxis OUTSIDE `vx.render`, so the
+    // renderer never knows about it and the next frame draws over it. On a
+    // terminal that does not implement it that is a wall of visible
+    // `^[]52;c;<base64>^[\` text — and it fired on EVERY left press in the
+    // transcript, because `selectedText` on a single cell returns that one
+    // trimmed grapheme, which is usually non-empty.
+    //
+    // A click is not a selection. There is nothing anyone wants copied from
+    // it, so it must not produce a clipboard write at all.
+    //
+    // Both halves use the SAME starting cell, so the only difference between
+    // them is the drag. The first version clicked somewhere that happened to
+    // be a space, `trimEnd` emptied it, and the test passed WITH the bug.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    for (0..40) |i| {
+        var text: [32]u8 = undefined;
+        m.pushInfo(try std.fmt.bufPrint(&text, "history row {d}", .{i}));
+    }
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+
+    var ctx = testCtx();
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    // A REAL DRAG first, so the feature is pinned as still working and so the
+    // cell is known to hold non-blank text.
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = 4,
+        .row = 3,
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = 20,
+        .row = 6,
+        .button = .left,
+        .mods = .{},
+        .type = .drag,
+    } });
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = 20,
+        .row = 6,
+        .button = .none,
+        .mods = .{},
+        .type = .release,
+    } });
+    try std.testing.expect(ctx.cmds.items.len > 0);
+    for (ctx.cmds.items) |cmd| ctx.alloc.free(cmd.copy_to_clipboard);
+    ctx.cmds.clearRetainingCapacity();
+
+    // Now the CLICK: press and release with no movement, on a cell that really
+    // holds text. The point is READ OUT of the selection map rather than
+    // guessed, because a click on a blank cell trims to nothing and the test
+    // would then pass WITH the bug — which is exactly what the first version of
+    // this test did.
+    const stride: usize = @as(usize, m.selectable_width) + 1;
+    var click_row: ?usize = null;
+    var click_col: usize = 0;
+    outer: for (0..m.selectable_rows) |row| {
+        for (0..m.selectable_width) |col| {
+            const base = row * stride;
+            if (base + col + 1 >= m.selectable_map.items.len) break;
+            const from = m.selectable_map.items[base + col];
+            const to = m.selectable_map.items[base + col + 1];
+            if (to <= from or to > m.selectable_text.items.len) continue;
+            const cell = m.selectable_text.items[from..to];
+            if (std.mem.trim(u8, cell, " \t").len > 0) {
+                click_row = row;
+                click_col = col;
+                break :outer;
+            }
+        }
+    }
+    const row_i = click_row orelse return error.TestUnexpectedResult;
+
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(click_col),
+        .row = @intCast(row_i),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expectEqual(@as(u16, @intCast(row_i)), m.selection_start.?.row);
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = @intCast(click_col),
+        .row = @intCast(row_i),
+        .button = .none,
+        .mods = .{},
+        .type = .release,
+    } });
+    // It really was a click: one cell, start == end.
+    try std.testing.expectEqual(m.selection_start.?.col, m.selection_end.?.col);
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.cmds.items.len);
+
+    // `copyToClipboard` dupes the text into the context and the App frees it
+    // when it writes the OSC 52; in a test there is no App, so the test is the
+    // owner. (Ownership has to be in the signature, and whoever holds it has
+    // to be the one who frees.)
 }
 
 test "scrollbar thumb maps track endpoints to history endpoints" {
