@@ -29,6 +29,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("tui.zig");
+const sleepz = @import("lib/sleep.zig");
 const plan_mod = @import("lib/plan.zig");
 const palette = @import("palette.zig");
 
@@ -73,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "welcome", .fill = sceneWelcome },
         .{ .name = "turn", .fill = sceneTurn },
         .{ .name = "tools", .fill = sceneTools },
+        .{ .name = "running", .fill = sceneRunning },
         .{ .name = "bash", .fill = sceneBash },
         .{ .name = "diff", .fill = sceneDiff },
         .{ .name = "ask", .fill = sceneAsk },
@@ -87,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
     for (scenes) |sc| {
         if (!all and !std.mem.eql(u8, scene_name, sc.name)) continue;
         ran += 1;
-        try render(wtr, gpa, sc, w, h);
+        try render(wtr, gpa, io, sc, w, h);
     }
     if (ran == 0) {
         try wtr.print("no scene named '{s}'. Try: ", .{scene_name});
@@ -101,9 +103,14 @@ pub fn main(init: std.process.Init) !void {
 
 // ── the printer ────────────────────────────────────────────────
 
-fn render(wtr: *std.Io.Writer, gpa: std.mem.Allocator, sc: Scene, width: u16, height: u16) !void {
+fn render(wtr: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, sc: Scene, width: u16, height: u16) !void {
     var m = tui.Model.init(gpa);
     defer m.deinit();
+    // `attachIo` first: without it `io_ready` is false and every elapsed clock
+    // on screen reads 0. The `running` scene exists precisely to see that
+    // number move, and a scene that rendered it as 0.0s proved nothing about
+    // whether the clock advances.
+    m.attachIo(io);
     sc.fill(&m);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -248,6 +255,21 @@ fn sceneTurn(m: *tui.Model) void {
     m.streamDelta("\nEs el unico cambio que hace falta:\n\n");
     m.streamDelta("```zig\npub const ink = fg(0xf2f2f2); // 18:1\npub const line = fg(0x2e2e2e); // 1.6:1\n```\n");
     m.streamEnd();
+}
+
+fn sceneRunning(m: *tui.Model) void {
+    // A tool that is STILL RUNNING: no `toolRunEnd`, so the draw takes the
+    // live-paragraph branch and the strip's clock path. This is the state the
+    // user was reporting as indistinguishable from a freeze.
+    m.pushHeader(.idle);
+    m.pushKind(.user, "corre los tests");
+    m.pushToolStart("Bash", "zig build test --summary all && ls -la src/lib");
+    m.streamEnd();
+    // Hold it open long enough for the clock to read something. `sleepMs` is
+    // the bare `nanosleep`: going through the shared `Io` from here would take
+    // its event loop with it, and a design harness that hangs is worse than no
+    // design harness.
+    sleepz.nap(1200);
 }
 
 fn sceneTools(m: *tui.Model) void {
