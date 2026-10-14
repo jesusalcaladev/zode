@@ -27,6 +27,7 @@ pub const mentions = @import("lib/mentions.zig");
 pub const clean = @import("lib/clean.zig");
 pub const ask = @import("lib/ask.zig");
 pub const subagent = @import("lib/subagent.zig");
+pub const textcap = @import("lib/textcap.zig");
 pub const skills = @import("lib/skills.zig");
 pub const usercmds = @import("lib/usercmds.zig");
 pub const project = @import("lib/project.zig");
