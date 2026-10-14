@@ -37,6 +37,7 @@ const skillstore = @import("lib/skillstore.zig");
 const project = @import("lib/project.zig");
 const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
+const textcap = @import("lib/textcap.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
 const commands_mod = @import("commands.zig");
@@ -7234,18 +7235,44 @@ fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
         "query"
     else
         "";
-    if (wanted.len > 0) {
+    const raw: []const u8 = if (wanted.len > 0) blk: {
         if (parsed.object.get(wanted)) |v| {
-            if (v == .string) return v.string;
+            if (v == .string) break :blk v.string;
         }
-    }
+        break :blk "";
+    } else "";
     // Without the expected field, the first string there is will do.
-    var it = parsed.object.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.* == .string) return kv.value_ptr.*.string;
-    }
-    return "";
+    const fallback: []const u8 = if (raw.len > 0) raw else blk: {
+        var it = parsed.object.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* == .string) break :blk kv.value_ptr.*.string;
+        }
+        break :blk "";
+    };
+    // CLIPPED, and this is the fix for the timeline filling with garbage. A
+    // `bash` argument is whatever the model wrote, and a real one is a
+    // three-pipeline command of several hundred columns. Returned as is, it
+    // goes into the header `*bash*(<command>)` and into the status bar, and
+    // the header is a PARAGRAPH: it wraps. One long command was worth eight
+    // rows of the history and pushed the answer off screen.
+    //
+    // `arg_max_cols` is what one row can show before it stops being a header,
+    // and the clip is in COLUMNS (`textcap`), so a command with CJK or an emoji
+    // counts correctly rather than by bytes. The full command stays in the
+    // session and in Ctrl+R; this is what the human reads.
+    var buf: [textcap.scratchFor(arg_max_cols)]u8 = undefined;
+    const clipped = textcap.clipInto(fallback, arg_max_cols, &buf);
+    if (clipped.len == 0) return "";
+    return arena.dupe(u8, clipped) catch fallback;
 }
+
+/// Columns a tool argument gets in the header and the status row.
+///
+/// Chosen from the row, not from taste: a header is one visual row wide on the
+/// widest text the user can read, and past that it wraps and stops being a
+/// header. The command is what the model SENT, and the full text stays in the
+/// session and in Ctrl+R; this is what the human reads.
+pub const arg_max_cols: usize = 60;
 
 /// One-line summary of a tool's result (`⎿ Read 12 lines`).
 fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator) []const u8 {
@@ -7822,15 +7849,39 @@ fn warmupWorker(job: *WarmupJob) void {
     const def = activeProviderDef(m.environ);
     if (def.models_url.len == 0) return;
 
-    var http = http_client.Http.init(gpa, io_global);
+    // ITS OWN `Io`, and this is the fix for a fresh install dying at startup.
+    //
+    // The whole app used ONE `Io` for everything: the UI's event loop, vaxis's
+    // pty reader, and every worker's HTTP. A detached worker doing a blocking
+    // TLS request through the shared `Io` takes its thread pool with it, so the
+    // frame loop's own `io.sleep` never runs again. Symptom, measured on a fresh
+    // sandbox: the banner paints, and then NO key, no ESC, no ctrl+c and no
+    // SIGWINCH is ever answered — the process sits in S with 0% CPU. With a
+    // models cache on disk the warmup never starts and the same binary answers
+    // everything, which is why a machine that has been used before never shows
+    // it.
+    //
+    // It also segfaults intermittently 1-2 seconds in, with no message at all:
+    // that is the same race seen from the other side.
+    //
+    // BOTH the request and the cache write run on `worker_io`. Nothing here
+    // touches `io_global` any more.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const worker_io = threaded.io();
+
+    var http = http_client.Http.init(gpa, worker_io);
     defer http.deinit();
     var list = models_mod.listModels(gpa, &http, def.models_url, providers.keyFor(def, m.environ)) catch return;
     defer list.deinit(gpa);
     if (list.items.len == 0) return;
 
-    modelcache.write(io_global, m.environ, def.id, def.models_url, list.items);
+    // The cache write too, and for the same reason as the request above: it is
+    // 772 KB through a DEFLATE-9 and it goes on the SHARED `Io` otherwise, which
+    // is exactly the block that takes the frame loop's `io.sleep` with it.
+    modelcache.write(worker_io, m.environ, def.id, def.models_url, list.items);
     // The catalogue is on disk now; the draw may look again.
-    m.status_model_tried = false;
+    tui.allowStatusModelRetry(m);
 }
 
 /// `/model` and Ctrl+T: the two-column model palette.
@@ -9292,6 +9343,43 @@ test "toolCallsJsonFromCalls: the assistant message carries the tool_calls" {
     // With no calls there is no JSON (and not a "[]" the API does not know what to
     // do with).
     try std.testing.expect(toolCallsJsonFromCalls(astate.allocator(), &[_]TurnCtx.Call{}) == null);
+}
+
+test "a tool argument is clipped so one row cannot fill the timeline" {
+    // The timeline-filling garbage. A `bash` argument is whatever the model
+    // wrote, and a real one is a three-pipeline command of several hundred
+    // columns. It went into the header `*bash*(<command>)`, and a header is a
+    // PARAGRAPH: it wraps. One long command was worth eight rows of history and
+    // pushed the answer off screen.
+    //
+    // The clip is measured in COLUMNS, not bytes: a command with CJK or an emoji
+    // counts correctly, and a byte-sized clip would come out mid-character.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const long_bash =
+        \\{"command":"zig build test --summary all && zig build -p /tmp/opencode/x && cat /very/long/path/to/some/directory/that/goes/on/and/on/forever/and/ever/file.zig"}
+    ;
+    const arg = toolArgSummary("bash", long_bash, arena);
+    try std.testing.expect(textcap.fits(arg, arg_max_cols));
+    // And it ends with the ellipsis, so a clipped command is visibly clipped
+    // rather than silently truncated to another command.
+    try std.testing.expect(std.mem.endsWith(u8, arg, textcap.ellipsis));
+
+    // A short one is returned whole, which is the common case.
+    const short = toolArgSummary("bash", "{\"command\":\"ls -la\"}", arena);
+    try std.testing.expectEqualStrings("ls -la", short);
+
+    // A path is clipped by the same rule.
+    const deep = toolArgSummary("read", "{\"path\":\"src/some/very/deep/nested/directory/structure/that/never/ends/file.zig\"}", arena);
+    try std.testing.expect(textcap.fits(deep, arg_max_cols));
+
+    // A multi-byte command is not cut mid-character: invalid UTF-8 would reach
+    // the markdown parser, the renderer and the session file.
+    const wide = toolArgSummary("bash", "{\"command\":\"日本語のとても長いコマンドをここに書きます。これはテストです。\"}", arena);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(wide));
+    try std.testing.expect(textcap.fits(wide, arg_max_cols));
 }
 
 test "toolArgSummary and toolResultSummary know the web tools" {
