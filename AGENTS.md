@@ -4550,6 +4550,26 @@ free") still pass. **The same 17 fail identically on the parent commit**, so a
 red smoke run must be compared against `tools/ab_probe.py` before it is read as
 "this change broke something". That comparison is the reason this section exists.
 
+## The thinking strip: a face twitching reads as a rendering bug
+
+The user asked for the thinking to come out "normal, simple". It was Zo's face
+alternating between two squints on a six-frame cycle next to the word, and a
+face twitching inside a status strip reads as rendering noise rather than as an
+indicator — the opposite of its intent.
+
+It is now one word and a moving ellipsis: `thinking`, `thinking.`, `thinking..`,
+`thinking...`, one step every ~250 ms. That is the universal convention for
+"still working", and it answers the only question worth answering here — is it
+alive? — with the least possible ink.
+
+**The face is not deleted.** It survives for the two states where the app has
+stopped and is waiting on the human (`ask` and the permission dialog), which is
+the only place a mascot earns its rows: a state that waits for the human must be
+unmissable, and an animated ellipsis would read as "working on it". The test that
+pinned the old behaviour was REWRITTEN on purpose, in the open, with the reason
+in the comment — and a second test now asserts the face is still there for
+`ask`, so the first one cannot be read as "the face is gone".
+
 ## What WAS fixed in the same session, and it is not nothing
 
 `warmupWorker` and the cache write now run on their own `std.Io.Threaded` instead
