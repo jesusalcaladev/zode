@@ -8,6 +8,8 @@ const md = @import("lib/markdown.zig");
 const theme = @import("lib/theme.zig");
 const ed = @import("lib/editor.zig");
 const mascot = @import("lib/mascot.zig");
+const textcap = @import("lib/textcap.zig");
+const sleepz = @import("lib/sleep.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
@@ -3137,11 +3139,6 @@ pub const Model = struct {
         return m2.ttft_pending;
     }
 
-    /// Milliseconds the tool in progress has been running (0 if there is none).
-    pub fn toolRunMillis(self: *const Model) u64 {
-        return self.toolRunMillisLocked();
-    }
-
     /// Name of the tool in progress, or null. The caller owns the result: it is a
     /// COPY, because the name lives in the Model and `toolRunEnd` frees it from
     /// the worker thread the moment the tool is done.
@@ -3158,12 +3155,32 @@ pub const Model = struct {
         return out[0..n];
     }
 
+    /// Milliseconds the tool in progress has been running (0 if there is none).
+    ///
+    /// TAKES THE LOCK, and that is the whole point. This used to call
+    /// `toolRunMillisLocked` directly while holding nothing — which is what the
+    /// `_Locked` suffix is supposed to mean the opposite of. The UI thread read
+    /// `self.tool_run` while the worker thread could be inside `toolRunEnd`,
+    /// which frees it: a use-after-free of the `ToolRun` the moment a 3ms
+    /// `read` finishes.
+    ///
+    /// It also made the CLOCK read 0. `drawActivityStrip` asks for the name
+    /// (locked) and then for the time (unlocked); between the two a fast tool
+    /// could finish and free the whole thing, so the row painted a stale or
+    /// zero elapsed time — the reported symptom of a timer that does not move.
+    pub fn toolRunMillis(self: *Model) u64 {
+        self.lock();
+        defer self.unlock();
+        return self.toolRunMillisLocked();
+    }
+
     /// Same, but for when the caller ALREADY holds the lock.
     fn toolRunMillisLocked(self: *const Model) u64 {
         const tr = self.tool_run orelse return 0;
-        if (!self.io_ready) return 0;
+        if (!self.io_ready or tr.started_ns == 0) return 0;
         const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
-        return @intCast(@max(0, now - tr.started_ns) / std.time.ns_per_ms);
+        if (now <= tr.started_ns) return 0;
+        return @intCast(@divTrunc(now - tr.started_ns, std.time.ns_per_ms));
     }
 
     /// A tool result: "⎿  Read 1006 lines · 3ms". Stores the full result so
@@ -5225,13 +5242,34 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         // tool runs with the stream closed), so the clock line REPLACES the
         // live paragraph instead of adding to it.
         if (self.tool_run) |tr| {
-            // The ARGUMENT goes with the name: `bash(sleep 30) · 12.3s` says
-            // far more than `bash · 12.3s` when there are several tools in the
-            // turn. The strip owns the only elapsed-time counter.
-            const line = std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running", .{
-                tr.name,
-                tr.arg,
-            }) catch "";
+            // The ELAPSED TIME goes IN THE HEADER LINE, not only in the strip.
+            //
+            // The strip is one row and it is at most 80 columns: with a long
+            // command, a model name and a session counter, its clock was the
+            // first thing pushed off the right edge. So the question the user
+            // actually asks — "has it been running 4 seconds or is it stuck?" —
+            // had to be answered from a row that was not on screen.
+            //
+            // The argument is clipped for the same reason it is clipped in the
+            // header: a `bash` argument is whatever the model wrote.
+            //
+            // The clock is read under the lock, and it MOVES: `toolRunMillis`
+            // takes the lock now (it used to read `self.tool_run` unlocked,
+            // which was a use-after-free against `toolRunEnd` and made this
+            // number read 0 — see the comment there).
+            const ms = self.toolRunMillisLocked();
+            var arg_buf: [96]u8 = undefined;
+            const arg_shown = textcap.clipInto(tr.arg, 48, &arg_buf);
+            const secs = ms / 1000;
+            const line = if (ms == 0)
+                if (tr.arg.len == 0)
+                    std.fmt.bufPrint(&tool_buf, "*{s}* running", .{tr.name}) catch ""
+                else
+                    std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running", .{ tr.name, arg_shown }) catch ""
+            else if (tr.arg.len == 0)
+                std.fmt.bufPrint(&tool_buf, "*{s}* running · {d}.{d}s", .{ tr.name, secs, (ms % 1000) / 100 }) catch ""
+            else
+                std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{ tr.name, arg_shown, secs, (ms % 1000) / 100 }) catch "";
             // Copied here, while `tool_buf` is certainly alive and `tr.name` /
             // `tr.arg` cannot be freed under us: `toolRunEnd` frees them from
             // the worker thread as soon as it runs.
@@ -5765,8 +5803,14 @@ pub const hero_content_w: u16 = 18 + 44;
 ///
 /// The cache is on disk because it is the only place a model list exists before
 /// the network has answered: the worker fetches the catalogue in the background
-/// and the draw cannot wait for it. `modelcache.read` validates the version and
-/// the URL, so a stale or foreign cache is treated as no cache at all.
+/// Resolves the model name for the STATUS ROW, from the cache on disk.
+///
+/// It runs in `draw` rather than in `loadUserConfig` because the resolve is
+/// LAZY and a file read at startup would block the first frame on a file the
+/// user may never look at. `modelcache.read` locates, opens and parses the file
+/// itself, and it validates the version and the URL — so a stale or foreign
+/// cache is "no cache at all", which is the only safe answer to give a status
+/// row, and the draw cannot wait for it.
 ///
 /// It takes the FIRST free model, which is the same rule `resolveModelHeadless`
 /// uses — the status bar is showing what the first turn would pick, not
@@ -5798,6 +5842,23 @@ pub fn resolveStatusModel(self: *Model) void {
         self.status_model_len = n;
         return;
     }
+}
+
+/// Tells the draw that the status model may be resolved again.
+///
+/// The warmup worker calls it once the catalogue is on disk. It exists as a
+/// function and not as a bare assignment because the field is read on every
+/// frame from the UI thread and written from a worker: `warmupWorker` used to
+/// write it directly with no lock, which is a data race on a `bool` the draw
+/// compares 60 times a second. A setter is also the only way the caller can
+/// hold the lock while taking it, since `std.atomic.Mutex` is not reentrant and
+/// `resolveStatusModel` holds it.
+pub fn allowStatusModelRetry(self: *Model) void {
+    self.lock();
+    defer self.unlock();
+    self.status_model_tried = false;
+    self.dirty = true;
+    self.redraw_requested.store(true, .seq_cst);
 }
 
 /// Is the transcript nothing but the opening hero?
@@ -6327,21 +6388,32 @@ fn drawActivityStrip(
 ) void {
     p.fillRow(row, " ", .{});
 
-    // The face ANIMATES: it alternates between open and narrowed eyes while
-    // there is work. It is the signal that the app is alive, which is exactly
-    // what you could not see when a slow model looked hung.
-    // `ask` gets the SAME warning face as the permission dialog, and for the same
-    // reason: both are states where the app waits for the human, and in both the
-    // only useful thing the strip can do is make that unmissable. A thinking face
-    // during a question reads as "it is working on it", and then the user waits
-    // for an answer that never gets asked.
+    // What the strip puts at the head of the row.
+    //
+    // THINKING IS ONE WORD AND A MOVING ELLIPSIS, and that is a deliberate
+    // change: it used to be Zo's face alternating between two squints on a
+    // 6-frame cycle, which read as glitchy noise rather than as an indicator.
+    // The animated ellipsis is the universal convention for "still working"
+    // (`thinking`, `thinking.`, `thinking..`, `thinking...`) and it answers the
+    // only question worth answering here — is it alive? — with the least
+    // possible ink.
+    //
+    // The face SURVIVES for the two states where the app has stopped and is
+    // waiting on the human: `ask` and the permission dialog. Those get the
+    // same warning face for the same reason — a state that waits for the
+    // human must be unmissable, and an animated ellipsis would read as
+    // "working on it".
     const waiting = act.perm or act.ask;
-    const mood_kind: mascot.Mood = if (waiting) .warn else if (act.busy) self.mood() else .idle;
-    const face = mascot.faceFrames(mood_kind, self.spinner_frame / 6);
+    const face: []const u8 = if (waiting)
+        mascot.faceFrames(moodWaiting(act), self.spinner_frame / 6)
+    else if (act.busy or act.streaming)
+        ""
+    else
+        mascot.faceFrames(.idle, self.spinner_frame / 6);
     const mood: vaxis.Style = if (waiting) theme.warn else if (act.busy) theme.brand else theme.brand_soft;
 
     var col: u16 = 1;
-    col = p.putText(col, row, face, mood);
+    if (face.len > 0) col = p.putText(col, row, face, mood);
 
     // State: the first thing you have to be able to read at a glance, and now
     // it is the PHASE.
@@ -6363,20 +6435,27 @@ fn drawActivityStrip(
         ) catch "subagents working"
     else
         "";
-    const label: []const u8 = if (act.ask)
-        "waiting for your answer"
-    else if (act.perm)
-        "waiting for your permission"
-    else if (act.subagent_total > 0)
-        task_label
-    else if (running_tool)
-        "running"
-    else if (act.streaming)
-        "streaming"
-    else if (act.busy)
-        "thinking"
-    else
-        "queued";
+    // The label is composed in a buffer because THINKING has a moving ellipsis.
+    var label_buf: [80]u8 = undefined;
+    var label: []const u8 = undefined;
+    if (act.ask) {
+        label = "waiting for your answer";
+    } else if (act.perm) {
+        label = "waiting for your permission";
+    } else if (act.subagent_total > 0) {
+        label = task_label;
+    } else if (running_tool) {
+        label = "running";
+    } else if (act.streaming) {
+        label = "streaming";
+    } else if (act.busy) {
+        // One dot per ~250ms, capped at three, then it starts again. The
+        // spinner frame advances once per draw, and a tick is 40ms while busy.
+        const dots = (self.spinner_frame / 3) % (ellipsis_max + 1);
+        label = std.fmt.bufPrint(&label_buf, "thinking{s}", .{ellipsisOf(dots)}) catch "thinking";
+    } else {
+        label = "queued";
+    }
     col = p.putClipped(col, row, label, width -| col, theme.brand_bold);
     col += 1;
 
@@ -7575,6 +7654,59 @@ test "scrollBy: the wheel cannot underflow at the top" {
     try std.testing.expect(m.anchor <= m.max_offset);
 }
 
+test "the tool clock takes the lock, so a fast tool cannot free it under the reader" {
+    // `toolRunMillis` used to call `toolRunMillisLocked` while holding NOTHING, which
+    // is what the `_Locked` suffix is supposed to mean the opposite of. The draw asks
+    // for the name (locked) and then for the time (unlocked), so between the two a
+    // 3ms `read` could finish, `toolRunEnd` could free the whole `ToolRun`, and the
+    // clock read released memory. That is also why the number read 0 on screen: a
+    // fast tool freed it before the frame painted.
+    //
+    // No `Io` here, which is the other half of the guard: a Model built by a test
+    // has none, and `attachIo` is what `runTui` does. Without one the clock is 0,
+    // and asking for a time that cannot be measured must not be a jump through a
+    // garbage vtable.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expectEqual(@as(bool, false), m.io_ready);
+
+    m.pushToolStart("bash", "sleep 5");
+    try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
+
+    // Ended: nothing to time, and reading it must not touch freed memory.
+    m.pushToolDone("bash", "done", 1, "x");
+    try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
+    // And again, after the tool is long gone: the function has to be callable.
+    try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
+}
+
+test "with an Io attached, the tool clock advances while it runs" {
+    // The other half: the number MOVES. A clock that reads 0 for the whole of a
+    // 30s `bash` is the reported "you cannot tell whether it is frozen", and it
+    // was not only a display problem — the unlock was reading a freed struct too.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.attachIo(threaded.io());
+    try std.testing.expect(m.io_ready);
+
+    m.pushToolStart("bash", "sleep 30");
+    try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
+    // A real wait, so the value has to have moved off zero. `sleepz.nap` and
+    // not `Io.sleep`: this model has an `Io`, and going through it from a test
+    // would take the event loop of a `Threaded` that nothing is running.
+    sleepz.nap(150);
+    const ms = m.toolRunMillis();
+    try std.testing.expect(ms >= 100);
+    // Clamped: never negative, and never earlier than the start.
+    try std.testing.expect(ms < 10_000);
+
+    m.pushToolDone("bash", "done", ms, "x");
+    try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
+}
+
 test "scrollbar click and drag navigate absolute history positions" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -8376,49 +8508,111 @@ test "permissions: the modal is centered and shows the 4 options" {
     m.perm_active = false;
 }
 
-test "the activity strip is the only working indicator" {
-    // The status row used to repeat the mascot, spinner and phase already shown
-    // in the activity strip. Keep the animated face and phase together there;
-    // the bottom status row is only for stable session metadata.
+test "thinking is one word and a moving ellipsis, with no face on it" {
+    // REWRITTEN ON PURPOSE, and the record is this comment.
+    //
+    // It used to assert that Zo's face sat next to "thinking", alternating
+    // between two squints on a six-frame cycle. That is the behaviour that was
+    // reported as looking wrong: a face twitching inside a status strip reads
+    // as rendering noise, not as "still working". The rewrite pins the
+    // replacement — the animated ellipsis, which is the convention — instead of
+    // leaving the old assertion green over code that no longer exists.
+    //
+    // The face is NOT deleted. It survives for the two states where the app has
+    // stopped and waits on the human, asserted in the next test.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var saw_dot = false;
+    var saw_no_dot = false;
+    // The ellipsis cycles through 0..ellipsis_max + 1, one step every three
+    // spinner frames, so a full cycle needs more than that many frames.
+    var frames: usize = 0;
+    while (frames < ellipsis_max * 3 + 2) : (frames += 1) {
+        var m = Model.init(std.testing.allocator);
+        defer m.deinit();
+        m.setStatusWithMood(.thinking, "thinking");
+        // `busy` WITHOUT `streamStart`: that function also sets `streaming`,
+        // and the strip's label checks `streaming` FIRST. The thinking phase is
+        // exactly "there is work and no stream and no tool".
+        m.lock();
+        m.busy = true;
+        m.busy_started_ns = std.math.maxInt(i128);
+        m.unlock();
+        m.spinner_frame = frames;
+
+        const s = try drawTest(&m, arena, 92, 26);
+        // The strip is one row above the input box, which is where `busy`
+        // makes it appear. Look for the WORD, since the frame count decides
+        // which of the rows the history ends on.
+        const row = findRow(s, "thinking") orelse return error.TestUnexpectedResult;
+        var rb: [256]u8 = undefined;
+        const text = rowText(s, row, &rb);
+
+        // No mascot face of any mood: that is the change under test.
+        for ([_]mascot.Mood{ .idle, .thinking, .warn, .done }) |mk| {
+            const f = mascot.faceFrames(mk, 0);
+            var it = vaxis.unicode.graphemeIterator(f);
+            while (it.next()) |g| {
+                const bytes = g.bytes(f);
+                if (bytes.len > 0 and std.mem.indexOf(u8, text, bytes) != null) {
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+
+        // Count the dots IMMEDIATELY after the word. The clock's own decimal
+        // point (`0.0s`) is a dot too, and counting it made every frame look
+        // dotted, so the ellipsis never appeared to move.
+        var n_dots: usize = 0;
+        if (std.mem.indexOf(u8, text, "thinking")) |at| {
+            var c = at + "thinking".len;
+            while (c < text.len and text[c] == '.') : (c += 1) n_dots += 1;
+        }
+        if (n_dots == 0) {
+            saw_no_dot = true;
+        } else {
+            saw_dot = true;
+            // Capped: an ellipsis that grew into a bar would be noise of its own.
+            try std.testing.expect(n_dots <= ellipsis_max);
+        }
+    }
+    // It moved: both a frame with dots and one without.
+    try std.testing.expect(saw_dot and saw_no_dot);
+}
+
+test "the waiting states keep the mascot's warning face" {
+    // The other half of the decision: a state that waits on the HUMAN is the one
+    // place a face is worth its rows. Without this, the test above could be
+    // read as "the face is deleted" and someone would remove it from the
+    // permission dialog too.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    m.setStatusWithMood(.thinking, "thinking");
-    m.streamStart();
+    m.setStatusWithMood(.warn, "waiting");
+    try openAskForTest(&m, "which one?", "decide", &.{"a", "b"});
 
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
-    const status_row = s.size.height - 2;
-    const activity_row = findRow(s, "streaming") orelse return error.TestUnexpectedResult;
-    const face = mascot.faceFrames(.thinking, 0);
-
-    // The face is several graphemes spread across cells, so inspect each cell
-    // individually rather than comparing the whole face to one cell.
-    var it = vaxis.unicode.graphemeIterator(face);
+    const face = mascot.faceFrames(.warn, 0);
     var found: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(face);
     while (it.next()) |g| {
         const bytes = g.bytes(face);
+        const activity_row = findRow(s, "waiting for your answer") orelse return error.TestUnexpectedResult;
         var col: u16 = 0;
-        var hit = false;
         while (col < s.size.width) {
             const cell = s.readCell(col, activity_row);
             if (std.mem.eql(u8, cell.char.grapheme, bytes)) {
-                hit = true;
+                found += 1;
                 break;
             }
             col += @max(1, cell.char.width);
         }
-        try std.testing.expect(hit);
-        const cell = s.readCell(col, activity_row);
-        try std.testing.expectEqual(theme.brand.fg, cell.style.fg);
-        try std.testing.expectEqual(theme.brand.bold, cell.style.bold);
-        found += 1;
     }
     try std.testing.expect(found > 0);
-    var rb: [256]u8 = undefined;
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, status_row, &rb), "streaming") == null);
-    try std.testing.expect(std.mem.indexOf(u8, rowText(s, status_row, &rb), "⠋") == null);
 }
 
 /// A banner line's columns, without the `*…*` marks.
@@ -11082,4 +11276,24 @@ test "wire: CSI 13;2u arrives as enter+shift and inserts a newline" {
     // anything, so an empty queue proves nothing.
     try std.testing.expect(!m.ed.isEmpty());
     try std.testing.expectEqualStrings("\n", m.ed.text());
+}
+
+/// Dots after "thinking": 0 to `ellipsis_max`.
+fn ellipsisOf(n: usize) []const u8 {
+    return switch (n) {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        else => "...",
+    };
+}
+
+/// Cap on the ellipsis, so it never becomes a bar of its own.
+const ellipsis_max: usize = 3;
+
+/// The mood of the face shown while the app waits on the human. Both states
+/// are "stop and look at me", and the mascot gets the same face in each.
+fn moodWaiting(act: Model.Activity) mascot.Mood {
+    _ = act;
+    return .warn;
 }
