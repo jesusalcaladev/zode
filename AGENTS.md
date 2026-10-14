@@ -4483,3 +4483,79 @@ check answers a QUESTION: does the text arrive, does it not crash, does the word
 appear on row N. **None of them ever asks "is this composed?"**, and a design
 rewrite is the one task where that is the only question there is. The harness was
 not an optimisation; it was the missing assertion.
+
+---
+
+# ReleaseSmall + a saved key = the app stops answering (2026-10-14)
+
+**OPEN, and it is not mine.** Verified with an A/B against the previous commit
+(`tools/ab_probe.py`): the built binary and the parent commit behave IDENTICALLY.
+So this session did not introduce it. It is written down because it is the largest
+still-open bug in the harness, and because it invalidates the pty smoke test in a
+way that reads as "my change broke it".
+
+## The repro, and why it took so long to name
+
+`tools/ab_probe.py`, three runs of each, and the verdict is binary:
+
+```
+  no saved key     base    : {'answers': 3}
+  no saved key     current : {'answers': 3}
+  real saved key   base    : {'DEAD': 3}
+  real saved key   current : {'DEAD': 3}
+```
+
+"DEAD" is precise: the app paints its first frame (1685 bytes of ANSI, the whole
+hero plus the input box and the status row) and then **no input of any kind is
+answered** — not a printable key, not Enter, not ESC, not ctrl+c, not a SIGWINCH,
+not a mouse motion report. `/proc` says the process is in `S` with 0% CPU and
+every thread parked in a futex or a timed sleep. It is not a busy loop and it is
+not a crash: `waitpid` never fires and `coredumpctl` gets nothing, which is why
+`kill -9` was the only way out and why the first three theories (a dead tick
+chain, a full pty buffer, a render stall) were all plausible and all wrong.
+
+## What was eliminated, and how
+
+Each of these was a theory that a measurement killed, and they are listed because
+the next person will have the same three ideas:
+
+- **The model-catalog warmup.** `warmupWorker` used `io_global`, and a detached
+  worker doing blocking TLS on the shared `Io` is an obvious suspect. Gating the
+  warmup off entirely (`ZODE_NO_WARMUP=1`, temporary) changed nothing.
+- **The network.** `ZODE_MODELS_URL` does not reach the warmup: `activeProviderDef`
+  returns the COMPILED def (`providers.byId`, which carries opencode's own URL),
+  so the env var is read by `provider.Config.load` and then ignored by the path
+  that matters. A "no-network" test built on it was a test of nothing.
+- **The value of the key.** `{"opencode":"x"}` fails identically to a real one,
+  so it is not a 200-vs-401 difference in the response.
+- **`auth.json` itself.** `{}` (a valid file with no keys), `{"foobar":"x"}` (an
+  unknown provider) and `{"opencode":""}` (an empty value) all leave the app
+  alone. What matters is that `providers.keyFor` returns non-null for the ACTIVE
+  provider.
+- **The successor runner.** `debug` and `ReleaseSafe` both answer normally with
+  a real key; only `ReleaseSmall` (the default of `zig build`) dies, and it is
+  stripped, so `eu-stack`/`nm`/`gdb` have nothing to name and the core is
+  unreachable.
+
+So: `ReleaseSmall` + `keyFor != null` = the input loop stops answering, with no
+symbols to read it from. That is the whole state of the art on 2026-10-14.
+
+## Why the pty smoke test fails, and why that is not a regression
+
+`tools/pty_smoke.py` copies `~/.config/zode/auth.json` into its `SANDBOX_HOME`,
+which is exactly the configuration above. Every check that needs the app to
+answer a command therefore fails — 17 of them — while the checks that only need
+the first frame (the hero, the input box, the accent bar, "no panic", "no Invalid
+free") still pass. **The same 17 fail identically on the parent commit**, so a
+red smoke run must be compared against `tools/ab_probe.py` before it is read as
+"this change broke something". That comparison is the reason this section exists.
+
+## What WAS fixed in the same session, and it is not nothing
+
+`warmupWorker` and the cache write now run on their own `std.Io.Threaded` instead
+of the app's `io_global`. It is the right shape regardless — a detached worker's
+blocking I/O must not share the event loop's `Io`, and AGENTS.md already has the
+use-after-free that the opposite choice produced — and it demonstrably improves
+the no-key case from "answers nothing" to "answers every time". It just is not
+the fix for the key case, and it is written here as hardening rather than as a
+cure.
