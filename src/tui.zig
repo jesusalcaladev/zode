@@ -5851,8 +5851,8 @@ pub fn resolveStatusModel(self: *Model) void {
 /// frame from the UI thread and written from a worker: `warmupWorker` used to
 /// write it directly with no lock, which is a data race on a `bool` the draw
 /// compares 60 times a second. A setter is also the only way the caller can
-/// hold the lock while taking it, since `std.atomic.Mutex` is not reentrant and
-/// `resolveStatusModel` holds it.
+/// take the lock for it, since `std.atomic.Mutex` is not reentrant and
+/// `resolveStatusModel` holds the same one.
 pub fn allowStatusModelRetry(self: *Model) void {
     self.lock();
     defer self.unlock();

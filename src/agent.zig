@@ -7849,23 +7849,18 @@ fn warmupWorker(job: *WarmupJob) void {
     const def = activeProviderDef(m.environ);
     if (def.models_url.len == 0) return;
 
-    // ITS OWN `Io`, and this is the fix for a fresh install dying at startup.
+    // ITS OWN `Io`, and this is HARDENING, not a cure.
     //
     // The whole app used ONE `Io` for everything: the UI's event loop, vaxis's
-    // pty reader, and every worker's HTTP. A detached worker doing a blocking
-    // TLS request through the shared `Io` takes its thread pool with it, so the
-    // frame loop's own `io.sleep` never runs again. Symptom, measured on a fresh
-    // sandbox: the banner paints, and then NO key, no ESC, no ctrl+c and no
-    // SIGWINCH is ever answered — the process sits in S with 0% CPU. With a
-    // models cache on disk the warmup never starts and the same binary answers
-    // everything, which is why a machine that has been used before never shows
-    // it.
+    // pty reader, and every worker's HTTP. A detached worker doing blocking TLS
+    // on the shared `Io` is exactly the shape AGENTS.md already has a
+    // use-after-free for, and isolating it is the right thing regardless of what
+    // it fixes today.
     //
-    // It also segfaults intermittently 1-2 seconds in, with no message at all:
-    // that is the same race seen from the other side.
-    //
-    // BOTH the request and the cache write run on `worker_io`. Nothing here
-    // touches `io_global` any more.
+    // Measured: it takes the no-key case from "answers nothing" to "answers every
+    // time". It is NOT the fix for the saved-key case — gating the warmup off
+    // entirely changes nothing there, which is why that bug is written up as OPEN
+    // in AGENTS.md with the A/B that proves it predates this session.
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const worker_io = threaded.io();
@@ -7876,9 +7871,8 @@ fn warmupWorker(job: *WarmupJob) void {
     defer list.deinit(gpa);
     if (list.items.len == 0) return;
 
-    // The cache write too, and for the same reason as the request above: it is
-    // 772 KB through a DEFLATE-9 and it goes on the SHARED `Io` otherwise, which
-    // is exactly the block that takes the frame loop's `io.sleep` with it.
+    // The cache write too: it is 772 KB through a DEFLATE-9, and on the shared
+    // `Io` it would be the same block the request was.
     modelcache.write(worker_io, m.environ, def.id, def.models_url, list.items);
     // The catalogue is on disk now; the draw may look again.
     tui.allowStatusModelRetry(m);
