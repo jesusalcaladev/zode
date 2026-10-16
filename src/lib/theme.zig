@@ -75,18 +75,18 @@ pub const line_bright: vaxis.Style = rgb(0x3d, 0x3a, 0x37);
 // makes it read as an interface color.
 
 /// 8.5:1 on black, 7.6:1 on `well_bg`. The accent proper: your prompt, the
-/// caret, the selected row's mark.
-pub const brand: vaxis.Style = rgb(0x74, 0xae, 0xb4);
+/// caret, the selected row's mark. MATTE TERRACOTTA.
+pub const brand: vaxis.Style = rgb(0xb8, 0x7e, 0x68);
 /// One step up, for the one thing that should read as lit (the wordmark, Zo's
 /// face). Bold as well as bright: a wordmark at normal weight is just text,
 /// and "zode" has to be recognisable in the first half second.
-pub const brand_hi: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa4, 0xd5, 0xda } } };
-/// 5.2:1 on `well_bg`. Tertiary text that still carries a color.
-pub const brand_soft: vaxis.Style = rgb(0x5b, 0x8f, 0x95);
-/// Teal hairline. Sits between `line` and `brand_soft` in weight.
-pub const brand_faint: vaxis.Style = rgb(0x28, 0x3c, 0x3e);
+pub const brand_hi: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xd9, 0x9a, 0x80 } } };
+/// 4.7:1 on `well_bg`. Tertiary text that still carries a color.
+pub const brand_soft: vaxis.Style = rgb(0xa8, 0x72, 0x5c);
+/// Warm hairline. Sits between `line` and `brand_soft` in weight.
+pub const brand_faint: vaxis.Style = rgb(0x3a, 0x2a, 0x24);
 /// The background of a focused surface's track (a depleting progress bar).
-pub const brand_deep: vaxis.Style = rgb(0x14, 0x23, 0x24);
+pub const brand_deep: vaxis.Style = rgb(0x24, 0x16, 0x12);
 
 // ── semantics ─────────────────────────────────────────────────
 //
@@ -123,8 +123,8 @@ pub const well_bg: vaxis.Style = bg(0x12, 0x11, 0x10);
 // set, with the two blues deliberately moved off the cyan they used to be.
 
 pub const code_text: vaxis.Style = rgb(0xc9, 0xd1, 0xd9);
-pub const code_kw: vaxis.Style = rgb(0xff, 0x9e, 0x64); // orange
-pub const code_kw2: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0xff, 0xb0, 0x86 } } };
+pub const code_kw: vaxis.Style = rgb(0xc7, 0x7d, 0xb8); // orchid
+pub const code_kw2: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0xd9, 0x9a, 0xcc } } };
 pub const code_builtin: vaxis.Style = rgb(0xd2, 0xa8, 0xff); // lilac
 pub const code_type: vaxis.Style = rgb(0x7b, 0xb0, 0xf4); // indigo, 214°
 pub const code_str: vaxis.Style = rgb(0xa6, 0xbd, 0xf2); // periwinkle, 222°
@@ -214,7 +214,7 @@ pub const table: vaxis.Style = rgb(0x5a, 0x58, 0x55);
 /// The one rule that separates the transcript from the input.
 pub const rule: vaxis.Style = line_bright;
 /// The input's caret bar and prompt. The accent, always: it says "you are here".
-pub const input_prompt: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x74, 0xae, 0xb4 } } };
+pub const input_prompt: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xb8, 0x7e, 0x68 } } };
 pub const input_bar: vaxis.Style = rgb(0x2a, 0x44, 0x47);
 pub const placeholder: vaxis.Style = ink3;
 /// The status row: everything in it is metadata, so everything in it is dim.
