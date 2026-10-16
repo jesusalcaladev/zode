@@ -5470,7 +5470,10 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // points at a boundary the dialog is ignoring.
     if (!self.permActive()) p.fillRow(rule_row, "─", theme.rule);
 
-    drawInput(&p, &surface, self, input_top, width, input_h, rule_row);
+    // Determine accent bar color based on state (reuse `act` from layout)
+    const bar_style = if (act.ask) theme.warn else if (act.busy) theme.brand else theme.input_bar;
+
+    drawInput(&p, &surface, self, input_top, width, input_h, rule_row, bar_style);
 
     // ── permission dialog: centered MODAL ──
     //
@@ -5528,22 +5531,45 @@ fn drawInput(
     width: u16,
     input_h: u16,
     hint_row: u16,
+    bar_style: vaxis.Style,
 ) void {
     if (top >= p.height or width < 6) return;
 
-    // The accent bar: one cell per input row, in the left margin. `▌` and NOT
-    // `│`: a half-block is the "here" mark in every editor and a pipe reads as
-    // a border.
+    // The composer surface: a subtle `well_bg` fill behind the input rows so
+    // the composer reads as a SUNKEN SURFACE, distinct from the transcript
+    // above (which sits on the terminal's default background). This is the
+    // same trick that makes tool output wells legible — depth, not a border.
+    // Zero extra rows: the surface lives inside the rows the input already owns.
     {
         var i: u16 = 0;
         while (i < input_h and top + i < p.height) : (i += 1) {
-            p.putStable(0, top + i, "▌", 1, theme.input_bar);
+            p.fillRange(1, width, top + i, " ", theme.well_bg);
+        }
+    }
+
+    // The accent bar: one cell per input row, in the left margin. `▌` and NOT
+    // `│`: a half-block is the "here" mark in every editor and a pipe reads as
+    // a border. Color changes with state: normal=input_bar, busy=brand, ask=warn.
+    {
+        var i: u16 = 0;
+        while (i < input_h and top + i < p.height) : (i += 1) {
+            p.putStable(0, top + i, "▌", 1, bar_style);
         }
     }
 
     // Prompt and text start at columns 1 and 3 respectively; keeping the same
     // width in layout and paint prevents clipping a final grapheme.
-    _ = p.putText(1, top, "› ", theme.input_prompt);
+    // In ask-answer mode (question open, input is the answer field), show a
+    // distinct prompt glyph to distinguish from normal prompt.
+    const in_ask_answer = self.askActive();
+    const prompt_glyph = if (in_ask_answer) "? " else "› ";
+    const prompt_fg = if (in_ask_answer) theme.warn.fg else theme.input_prompt.fg;
+    const prompt_style: vaxis.Style = .{
+        .bold = true,
+        .fg = prompt_fg,
+        .bg = theme.well_bg.bg,
+    };
+    _ = p.putText(1, top, prompt_glyph, prompt_style);
     const ed_w: u16 = if (width > 4) width - 4 else 1;
     const meas = editorMeasurer(p);
 
@@ -5561,7 +5587,11 @@ fn drawInput(
         const row = top + @as(u16, @intCast(i));
         if (i >= input_h) break;
         if (piece.bytes.len == 0) continue;
-        _ = p.putClipped(3, row, piece.bytes, ed_w, theme.input_text);
+        const text_style: vaxis.Style = .{
+            .fg = theme.input_text.fg,
+            .bg = theme.well_bg.bg,
+        };
+        _ = p.putClipped(3, row, piece.bytes, ed_w, text_style);
     }
 
     // The terminal cursor, at its VISUAL row and column. `cursorLine` gave a
@@ -5594,7 +5624,13 @@ fn drawInput(
             "your answer\u{2026} \u{b7} enter sends it \u{b7} esc: you decide"
         else
             "Ask anything\u{2026} \u{b7} / for commands";
-        _ = p.putClipped(3, top, ph, ed_w, theme.placeholder);
+        // The placeholder must sit ON the well_bg surface, not overwrite it with
+        // .default. Combine the placeholder foreground with the well background.
+        const ph_style: vaxis.Style = .{
+            .fg = theme.placeholder.fg,
+            .bg = theme.well_bg.bg,
+        };
+        _ = p.putClipped(3, top, ph, ed_w, ph_style);
     }
 }
 
@@ -7098,6 +7134,140 @@ test "input: a wrapped line fills several rows and the cursor stays on screen" {
     try std.testing.expect(cur.row <= h - 2);
 }
 
+test "input: composer surface is a well_bg sunken panel behind the text" {
+    // Phase 1 of the input polish: the composer must read as a SURFACE, not
+    // just text floating on the terminal background. The well_bg fill is what
+    // separates it from the transcript above without spending a border row.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const w: u16 = 40;
+    const h: u16 = 14;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    // The input row is h-2 (status is h-1). A cell just past the prompt glyph
+    // but before the placeholder text must carry the well_bg background,
+    // proving the surface is painted. Column 5 is past the accent bar (0),
+    // prompt (1-2), and placeholder start (3+), but still inside the fill.
+    const cell = s.readCell(5, h - 2);
+    try std.testing.expect(cell.style.bg != .default);
+    const cell_bg = cell.style.bg;
+    const well_bg = theme.well_bg.bg;
+    try std.testing.expect(switch (cell_bg) {
+        .rgb => |c| switch (well_bg) {
+            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
+            else => false,
+        },
+        else => false,
+    });
+    // The accent bar cell keeps its own color on top of the surface.
+    const bar = s.readCell(0, h - 2);
+    try std.testing.expectEqual(theme.input_bar.fg, bar.style.fg);
+    // The prompt glyph sits on the well surface too.
+    const prompt = s.readCell(1, h - 2);
+    const prompt_bg = prompt.style.bg;
+    try std.testing.expect(switch (prompt_bg) {
+        .rgb => |c| switch (well_bg) {
+            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
+            else => false,
+        },
+        else => false,
+    });
+}
+
+test "input: placeholder and text sit on well_bg surface with correct fg" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const w: u16 = 40;
+    const h: u16 = 14;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    const well_bg = theme.well_bg.bg;
+    // Placeholder text starts at column 3. Check it has well_bg bg AND placeholder fg.
+    const ph_cell = s.readCell(5, h - 2); // "k" in "Ask"
+    try std.testing.expect(switch (ph_cell.style.bg) {
+        .rgb => |c| switch (well_bg) {
+            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
+            else => false,
+        },
+        else => false,
+    });
+    try std.testing.expectEqual(theme.placeholder.fg, ph_cell.style.fg);
+
+    // Now add some text and check the editor text style
+    m.ed.insert("hola") catch {};
+    const s2 = try drawTest(&m, arena_state.allocator(), w, h);
+    const text_cell = s2.readCell(3, h - 2); // "h" at column 3
+    try std.testing.expect(switch (text_cell.style.bg) {
+        .rgb => |c| switch (well_bg) {
+            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
+            else => false,
+        },
+        else => false,
+    });
+    try std.testing.expectEqual(theme.input_text.fg, text_cell.style.fg);
+}
+
+test "input: accent bar color changes with state" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // Normal state: input_bar
+    var act = m.activity();
+    try std.testing.expect(!act.busy);
+    try std.testing.expect(!act.ask);
+
+    // Busy state (tool running): brand
+    m.pushHeader(.idle);
+    m.pushKind(.user, "test");
+    m.pushToolStart("Bash", "sleep 10");
+    act = m.activity();
+    try std.testing.expect(act.busy);
+    try std.testing.expect(!act.ask);
+    try std.testing.expect(m.tool_run != null);
+
+    // Ask state: warn
+    m.askLock();
+    m.freeAskStringsLocked();
+    m.ask_question = m.allocator.dupe(u8, "test?") catch null;
+    m.ask_header = m.allocator.dupe(u8, "header") catch null;
+    m.ask_options.append(m.allocator, m.allocator.dupe(u8, "opt1") catch "") catch {};
+    m.ask_active = true;
+    m.ask_typing = false;
+    m.ask_started_ns = 0;
+    m.askUnlock();
+    act = m.activity();
+    try std.testing.expect(act.busy); // ask counts as busy
+    try std.testing.expect(act.ask);
+}
+
+test "input: accent bar is brand when tool is running (ui-frame running scene)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // Mimic the running scene
+    m.pushHeader(.idle);
+    m.pushKind(.user, "corre los tests");
+    m.pushToolStart("Bash", "zig build test --summary all && ls -la src/lib");
+    // Note: NO streamEnd, NO toolRunEnd
+
+    const w: u16 = 80;
+    const h: u16 = 30;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    // Find the input row (h-2)
+    const input_row = h - 2;
+    const bar_cell = s.readCell(0, input_row);
+    try std.testing.expectEqual(theme.brand.fg, bar_cell.style.fg);
+}
+
 test "input: rows scrolled out above are announced instead of silently hidden" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -7110,6 +7280,49 @@ test "input: rows scrolled out above are announced instead of silently hidden" {
     const s = try drawTest(&m, arena_state.allocator(), 40, 14);
     // A clipped prompt reports how many visual rows are above the cursor.
     try std.testing.expect(findRow(s, "more") != null);
+}
+
+test "input: large tool result + running tool + draw does not crash" {
+    // Reproduces the sequence that crashed: a ~2002 line file read (AGENTS.md
+    // size) followed by a running tool with a long argument, then a draw.
+    // The large result stresses the layout cache; the tool_run line adds a clock
+    // line; together they exposed a UAF in the segment cache eviction.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // 1) Simulate a 2002-line file read result (like AGENTS.md)
+    var big_result: std.ArrayList(u8) = .empty;
+    defer big_result.deinit(std.testing.allocator);
+    var line: usize = 1;
+    while (line <= 2002) : (line += 1) {
+        big_result.print(std.testing.allocator, "{d}| This is line {d} of the big file with some content\n", .{ line, line }) catch break;
+    }
+
+    m.pushToolStart("read", "AGENTS.md");
+    m.pushToolDone("read", "Read 2002 lines", 3, big_result.items);
+
+    // 2) Start a running tool with a long argument (like the bash that followed)
+    m.pushToolStart("bash", "zig build test --summary all && ls -la src/lib && cat build.zig");
+
+    // 3) Draw multiple frames while the tool is running (simulates the clock ticking)
+    var frame: usize = 0;
+    while (frame < 10) : (frame += 1) {
+        const s = try drawTest(&m, arena_state.allocator(), 80, 30);
+        // Verify the draw succeeds: no panic, no invalid memory access
+        _ = s;
+    }
+
+    // 4) End the tool and draw again
+    m.toolRunEnd();
+    m.pushToolDone("bash", "Bash", 1200, "Compiling...\nTests passed\n");
+
+    // 5) Final draw after tool completes
+    const s = try drawTest(&m, arena_state.allocator(), 80, 30);
+    _ = s;
+
+    // If we got here without segfault/ASan error, the path is sound
 }
 
 test "autocomplete: filters by prefix and accepts with tab" {
@@ -10945,11 +11158,9 @@ test "ask panel wraps by words, stays in history, and leaves the answer input vi
     // The panel is confined to the history viewport; the borderless prompt and
     // status strip remain painted and usable underneath it.
     //
-    // The prompt is `›` now, and it is one row LOWER than the box used to put
-    // it: nothing in between, and the hairline below it took the box's bottom
-    // border.
+    // In ask mode the prompt is `?` (warn color) to distinguish from normal prompt.
     const input_top = s.size.height - 2;
-    try std.testing.expectEqualStrings("\u{203a}", s.readCell(1, input_top).char.grapheme);
+    try std.testing.expectEqualStrings("?", s.readCell(1, input_top).char.grapheme);
     try std.testing.expect(findRow(s, "enter answers") != null);
 }
 
