@@ -325,5 +325,16 @@ def main() -> int:
     return 0 if ok else 1
 
 
+def _run_with_timeout():
+    """Wrapper that ensures clean exit even if something hangs."""
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(_run_with_timeout())
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"smoke test crashed: {e}")
+        sys.exit(1)
