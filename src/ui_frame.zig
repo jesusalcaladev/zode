@@ -258,13 +258,12 @@ fn sceneTurn(m: *tui.Model) void {
 }
 
 fn sceneRunning(m: *tui.Model) void {
-    // A tool that is STILL RUNNING: no `toolRunEnd`, so the draw takes the
-    // live-paragraph branch and the strip's clock path. This is the state the
-    // user was reporting as indistinguishable from a freeze.
+    // A tool that is STILL RUNNING: no `toolRunEnd`, no `streamEnd`, so the draw
+    // takes the live-paragraph branch and the strip's clock path. This is the
+    // state the user was reporting as indistinguishable from a freeze.
     m.pushHeader(.idle);
     m.pushKind(.user, "corre los tests");
     m.pushToolStart("Bash", "zig build test --summary all && ls -la src/lib");
-    m.streamEnd();
     // Hold it open long enough for the clock to read something. `sleepMs` is
     // the bare `nanosleep`: going through the shared `Io` from here would take
     // its event loop with it, and a design harness that hangs is worse than no
@@ -328,16 +327,34 @@ fn sceneAsk(m: *tui.Model) void {
     m.streamStart();
     m.streamDelta("Necesito tu decision antes de seguir.\n");
     m.streamEnd();
-    _ = m.requestAsk(
-        "Arranco los tests con tu API key, o un build que no la necesita?",
-        "zode necesita tu decision",
-        &.{
-            "Arrancar los tests con la key del entorno",
-            "Solo el build, sin key",
-            "Los dos en paralelo",
-            "escribir mi propia respuesta",
-        },
-    );
+    // Set ask state directly (like scenePerm) to avoid blocking on waitAskAnswer
+    // Inline freeAskStringsLocked:
+    if (m.ask_question) |q| m.allocator.free(q);
+    if (m.ask_header) |h| m.allocator.free(h);
+    for (m.ask_options.items) |o| m.allocator.free(o);
+    m.ask_options.clearRetainingCapacity();
+    m.ask_question = null;
+    m.ask_header = null;
+    const q = "Arranco los tests con tu API key, o un build que no la necesita?";
+    const h = "zode necesita tu decision";
+    m.ask_question = m.allocator.dupe(u8, q) catch null;
+    m.ask_header = m.allocator.dupe(u8, h) catch null;
+    const opts = [_][]const u8{
+        "Arrancar los tests con la key del entorno",
+        "Solo el build, sin key",
+        "Los dos en paralelo",
+        "escribir mi propia respuesta",
+    };
+    for (opts) |o| {
+        m.ask_options.append(m.allocator, m.allocator.dupe(u8, o) catch "") catch {};
+    }
+    m.ask_answer = null;
+    m.ask_typing = false;
+    m.ask_active = true;
+    m.ask_started_ns = 0;
+    m.ask_sel = 0;
+    m.requestRedraw();
+    m.dirty = true;
 }
 
 fn scenePerm(m: *tui.Model) void {
