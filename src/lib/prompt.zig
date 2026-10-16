@@ -80,7 +80,6 @@ pub const default_system_prompt =
     \\   finished. Never ask a question whose answer is "whatever you think is right".
     \\ - Finish by saying, in one line, what you verified and what you did not.
     \\
-
 ;
 /// Which tool to reach for. NEVER dropped, even when the project has an
 /// `AGENTS.md` — see `buildSystemPrompt`.
@@ -120,7 +119,6 @@ pub const tool_routing_prompt =
     \\ - Finish a step with another open? Say so with `todo`. User reads last line to know if working or stuck. Send whole list once with `items`, then `update` ({index,status}) — 1-BASED — or `remove`/`add`. Don't resend list to change one entry: can lose a step. Exactly one in_progress. Not for single obvious step or thinking out loud: static list = noise.
     \\ - Output: lead with result, only relevant files/checks, state uncertainty, do not repeat tool output or narrate routine progress.
     \\
-
 ;
 /// How to verify, and what NOT to verify.
 ///
@@ -148,8 +146,87 @@ pub const verification_prompt =
     \\ - Red check: CAUSE is the target. Read diagnostic, fix what it names, re-run same command — don't "fix" by widening to warning, deleting the line, or loosening. Quieter project = bug still in it.
     \\ - Couldn't verify? Say WHICH thing and why. "Can't run suite, service down" is complete; silence reads as pass.
     \\
-
 ;
+
+/// The longest prefix of `text` that fits in `room` bytes, cut on a UTF-8
+/// codepoint boundary and — when the line boundary is close enough — after a
+/// `\n`.
+///
+/// This is what trims a project's `AGENTS.md` when the composed system prompt
+/// would overflow the buffer. The previous cut was `base[0..keep]`, a raw byte
+/// index, and it had neither of the two properties that matter:
+///
+///  * **Valid UTF-8.** A cut at an arbitrary byte can split a codepoint and put
+///    invalid bytes into the system message. The walk-back is the same one
+///    `compaction.safePrefixLen` does, for the same reason.
+///  * **A whole instruction.** A cut that lands mid-line reads as a corrupted
+///    file; a cut after `\n` reads as a shorter one. The bullet just before the
+///    cap is often the one carrying a "never do X" rule, so ending its sentence
+///    is the difference between a trimmed file and a misleading one.
+///
+/// The line boundary is only taken when it does not throw away most of the room
+/// (at least half of it). A file whose early newline is at byte 3 and whose next
+/// is far past the cap still gets the codepoint-safe cut, because "cut on a
+/// line" must not become "cut 90% of the file".
+pub fn fitPrefix(text: []const u8, room: usize) []const u8 {
+    if (text.len <= room) return text;
+    if (room == 0) return text[0..0];
+    var end = room;
+    // `end <= room < text.len`, so `text[end]` is always in bounds.
+    while (end > 0 and (text[end] & 0xC0) == 0x80) end -= 1;
+    if (end == 0) return text[0..0];
+    if (std.mem.lastIndexOfScalar(u8, text[0..end], '\n')) |nl| {
+        const line_end = nl + 1;
+        if (line_end * 2 >= room) return text[0..line_end];
+    }
+    return text[0..end];
+}
+
+test "fitPrefix cuts on a line and never splits a UTF-8 codepoint" {
+    // The old cut was `base[0..keep]`: a multibyte char at the boundary went out
+    // as invalid UTF-8 and the last visible instruction was half a sentence.
+    const text = "line one\nline two — with an em dash\nline three\n";
+
+    // `room` lands inside the two-byte em dash and a newline sits close enough
+    // behind it, so the cut takes the line: what the model reads ends at a whole
+    // instruction and is valid UTF-8.
+    const on_line = fitPrefix(text, 16);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(on_line));
+    try std.testing.expectEqualStrings("line one\n", on_line);
+
+    // When the line boundary is too far back to justify it, the raw cut is taken
+    // instead — and it still never splits the em dash.
+    const guarded = fitPrefix(text, 20);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(guarded));
+    try std.testing.expectEqualStrings("line one\nline two ", guarded);
+
+    // Under the cap: the WHOLE text, no cut, no copy.
+    try std.testing.expectEqualStrings(text, fitPrefix(text, text.len));
+    try std.testing.expectEqualStrings(text, fitPrefix(text, text.len + 100));
+}
+
+test "fitPrefix keeps valid UTF-8 even with no newline to cut on" {
+    // A single long line with no `\n` before the cap: the line rule cannot help,
+    // so the codepoint walk-back is the only thing between the model and a broken
+    // byte. 42 bytes, no newline, and `room` lands inside the two-byte `é`.
+    const text = ("a" ** 20) ++ "\u{e9}" ++ ("b" ** 20);
+    const cut = fitPrefix(text, 21);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try std.testing.expectEqualStrings("a" ** 20, cut);
+}
+
+test "fitPrefix does not throw away most of the room for one early newline" {
+    // "cut on a line" must not become "cut at almost nothing": a file whose only
+    // early newline is way before the cap still gets the codepoint-safe cut.
+    const text = "hi\n" ++ ("x" ** 200);
+    const cut = fitPrefix(text, 100);
+    try std.testing.expectEqualStrings(("hi\n" ++ ("x" ** 97)), cut);
+}
+
+test "fitPrefix on zero room returns empty, not a panic" {
+    try std.testing.expectEqual(@as(usize, 0), fitPrefix("anything", 0).len);
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 test "the built-in prompt does NOT carry a second list of the tools" {
