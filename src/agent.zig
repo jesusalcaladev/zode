@@ -423,17 +423,29 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
         // retry overflowed too and the answer was `catch routing`, which drops the
         // verification rules and the ask guidance — the same class of loss as the
         // bug being fixed, one function deeper.
-        const note = "[the project instructions above were truncated to fit; the rest is in the project's instruction file]";
-        const overhead = note.len + 16;
+        const note_lead = "[the project instructions above were truncated to fit";
+        const note_tail = "; the rest is in the project's instruction file]";
+        // The two counters are `{d}` of at most 20 digits each; the slack covers
+        // them plus the separator. It has to cover the note AND the separators:
+        // with too little, the retry overflows too and the answer becomes `catch
+        // routing`, which drops the verification rules and the ask guidance — the
+        // same class of loss as the bug being fixed, one function deeper.
+        const overhead = note_lead.len + note_tail.len + 48;
         if (out.len <= blocks_len + overhead) break :blk routing;
         const room = out.len - blocks_len - overhead;
-        const keep = @min(base.len, room);
+        // The cut is on a line and a UTF-8 boundary, and it names how much of the
+        // project's file survived: a project that cannot see half of its own
+        // instructions is told so, with a number, instead of being left to guess.
+        const fit = prompt_mod.fitPrefix(base, room);
         break :blk std.fmt.bufPrint(
             out,
-            "{s}\n{s}\n{s}\n{s}{s}{s}{s}\n{s}",
+            "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}\n{s}",
             .{
-                base[0..keep],
-                note,
+                fit,
+                note_lead,
+                fit.len,
+                base.len,
+                note_tail,
                 routing,
                 verification_prompt,
                 ask.guidance,
