@@ -4752,7 +4752,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             // moved to a smaller one. It is the same `Target` the rest of the
             // rotation path talks about.
             chat.effectiveEffort(pick.model, current_effort),
-            tools_mod.toolsJson(),
+            if (read_only) tools_mod.toolsJsonReadOnly() else tools_mod.toolsJson(),
             pick.kind,
         );
 
