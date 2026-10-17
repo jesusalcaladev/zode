@@ -537,7 +537,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 ## 🔧 Tool upgrades (independent, one registry row each, no permission changes)
 
 - [ ] **`grep`** + context lines (`-A/-B/-C`), a `glob`/`type` filter, an output mode (`content` / `files_with_matches` / `count`), and a `head_limit` — today the model compensates with more calls
-- [ ] **`bash`** + a `description` field: one line for the timeline ("running the test suite") so the user reads what a command is FOR
+- [x] **`bash`** + a `description` field: one line for the timeline ("running the test suite") so the user reads what a command is FOR — shipped 2026-10-16 (the timeline and the status bar show the description; the permission dialog and the allowlist keep matching the COMMAND, so prose can never ride an allowed prefix)
 - [ ] **`read`** + PDF page ranges (the image path already exists), so a spec handed to the agent is readable without shelling out to a converter
 - [x] **`glob`** + a `subdir` and a `limit`, so "the 20 newest `.zig` under `src/`" is one call (plus `sort: newest|oldest|name`, which is what makes "newest" true — shipped 2026-10-16)
 - [ ] One pure test per row on the argument parsing

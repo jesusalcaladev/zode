@@ -6346,12 +6346,15 @@ fn execOneCall(
     denied: *usize,
 ) usize {
     const arg = toolArgSummary(call.name, call.args_json, arena);
-    m.pushToolStart(call.name, arg);
+    // The timeline may lead with WHAT IT IS FOR (`bash`'s description); the
+    // permission paths below keep `arg`, the command itself.
+    const label = toolTimelineLabel(call.name, call.args_json, arg, arena);
+    m.pushToolStart(call.name, label);
     // The status says WHAT is running, not a generic "working": with a slow `bash`
     // that is the difference between "working" and "hung". The text is
-    // copied to a fixed buffer, so the arg from the worker's arena can die
+    // copied to a fixed buffer, so the label from the worker's arena can die
     // without a problem.
-    setStatusWithZo(m, .tooling, arg);
+    setStatusWithZo(m, .tooling, label);
 
     // ── read-only mode ──
     //
@@ -7314,6 +7317,46 @@ fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
     const clipped = textcap.clipInto(fallback, arg_max_cols, &buf);
     if (clipped.len == 0) return "";
     return arena.dupe(u8, clipped) catch fallback;
+}
+
+/// What the TIMELINE shows for a tool call: the model's own one-line
+/// `description` when it sent one, else the argument summary.
+///
+/// `bash` gained an optional `description` (what the command is FOR), and the
+/// timeline leads with it: `⏺ bash(running the test suite)` is what the human
+/// reads at a glance, where a clipped three-pipeline command was noise. Only
+/// the FIRST line is used and control bytes become spaces — the timeline row
+/// is one line, and an interior newline painted raw is a bug this repo has
+/// already paid for (the ask panel).
+///
+/// **The two consumers of a call's text stay apart on purpose.** The
+/// permission dialog and the allowlist matching keep receiving `arg` (the
+/// COMMAND, from `toolArgSummary`): a permission matched against the model's
+/// own prose would be no permission at all — `description: "git status"` over
+/// `command: "rm -rf /"` must never ride the `git status` allowlist. The
+/// timeline reads intent; the machine reads the command.
+fn toolTimelineLabel(name: []const u8, args_json: []const u8, arg: []const u8, arena: std.mem.Allocator) []const u8 {
+    if (!std.mem.eql(u8, name, "bash")) return arg;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return arg;
+    if (parsed != .object) return arg;
+    const dv = parsed.object.get("description") orelse return arg;
+    if (dv != .string) return arg;
+    const line_end = std.mem.indexOfScalar(u8, dv.string, '\n') orelse dv.string.len;
+    var clean_buf: [textcap.scratchFor(arg_max_cols)]u8 = undefined;
+    var clen: usize = 0;
+    for (dv.string[0..line_end]) |c| {
+        // Over the scratch is clipped later anyway, and a cut mid-character is
+        // healed by `clipInto`'s walk back to a char start.
+        if (clen >= clean_buf.len) break;
+        clean_buf[clen] = if (c < 0x20) ' ' else c;
+        clen += 1;
+    }
+    const clean = std.mem.trim(u8, clean_buf[0..clen], " \t\r");
+    if (clean.len == 0) return arg;
+    var clip_buf: [textcap.scratchFor(arg_max_cols)]u8 = undefined;
+    const clipped = textcap.clipInto(clean, arg_max_cols, &clip_buf);
+    if (clipped.len == 0) return arg;
+    return arena.dupe(u8, clipped) catch arg;
 }
 
 /// Columns a tool argument gets in the header and the status row.
@@ -9424,6 +9467,60 @@ test "a tool argument is clipped so one row cannot fill the timeline" {
     const wide = toolArgSummary("bash", "{\"command\":\"日本語のとても長いコマンドをここに書きます。これはテストです。\"}", arena);
     try std.testing.expect(std.unicode.utf8ValidateSlice(wide));
     try std.testing.expect(textcap.fits(wide, arg_max_cols));
+}
+
+
+test "toolTimelineLabel: the timeline reads the description, the permission reads the command" {
+    // The `bash` `description` field is a HUMAN label ("running the test
+    // suite"), and the timeline shows it instead of a clipped pipeline. The
+    // half that matters is what it must NOT reach: `permAutoAllowed` and the
+    // dialog keep receiving the COMMAND (`toolArgSummary`), because a prefix
+    // allowlist matched against model-written prose would let
+    // `description: "git status"` ride `rm -rf /` unattended.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const with_desc = "{\"command\":\"zig build test --summary all\",\"description\":\"running the test suite\"}";
+    const arg = toolArgSummary("bash", with_desc, arena);
+    // The permission path keeps seeing the command, description or no
+    // description: this is the whole safety argument of the feature.
+    try std.testing.expectEqualStrings("zig build test --summary all", arg);
+    const label = toolTimelineLabel("bash", with_desc, arg, arena);
+    try std.testing.expectEqualStrings("running the test suite", label);
+
+    // No description: the timeline falls back to the command, exactly as
+    // before the field existed.
+    const bare = "{\"command\":\"ls -la\"}";
+    const bare_arg = toolArgSummary("bash", bare, arena);
+    try std.testing.expectEqualStrings("ls -la", toolTimelineLabel("bash", bare, bare_arg, arena));
+
+    // A call the parser cannot read degrades to the command, never to nothing.
+    try std.testing.expectEqualStrings("ls -la", toolTimelineLabel("bash", "not json", bare_arg, arena));
+
+    // Only the FIRST line: the timeline row is one row, and an interior
+    // newline painted raw has already been a bug in this repo (the ask panel).
+    const multiline = "{\"command\":\"make\",\"description\":\"build the release\\nand then some\"}";
+    try std.testing.expectEqualStrings("build the release", toolTimelineLabel("bash", multiline, "make", arena));
+
+    // An empty (or whitespace-only) description is no description: it falls
+    // back to the command instead of painting an empty argument.
+    const blank = "{\"command\":\"make\",\"description\":\"   \"}";
+    try std.testing.expectEqualStrings("make", toolTimelineLabel("bash", blank, "make", arena));
+
+    // A description longer than the row is clipped with the ellipsis, in
+    // columns, and stays valid UTF-8 — the same rules as any argument.
+    const long_desc = "{\"command\":\"make\",\"description\":\"this description is far longer than any timeline row should ever be and keeps going and going\"}";
+    const long_label = toolTimelineLabel("bash", long_desc, "make", arena);
+    try std.testing.expect(textcap.fits(long_label, arg_max_cols));
+    try std.testing.expect(std.mem.endsWith(u8, long_label, textcap.ellipsis));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long_label));
+
+    // A tool other than bash ignores a stray description: `read` shows its
+    // path, because the field belongs to bash alone.
+    const read_args = "{\"path\":\"src/x.zig\",\"description\":\"whatever\"}";
+    try std.testing.expectEqualStrings("src/x.zig", toolArgSummary("read", read_args, arena));
+    try std.testing.expectEqualStrings("src/x.zig", toolTimelineLabel("read", read_args, "src/x.zig", arena));
 }
 
 test "toolArgSummary and toolResultSummary know the web tools" {

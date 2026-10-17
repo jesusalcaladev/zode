@@ -1651,7 +1651,11 @@ Independent of the phases above, four small upgrades to existing tools:
    mode (`content` / `files_with_matches` / `count`), and a `head_limit`. Today it
    is "pattern + subdir" and the model compensates with more calls.
 2. **`bash`** gains a `description` field: one line for the timeline ("running the
-   test suite"), so the user reads what a command is FOR and not only what it is.
+   test suite"), so the user reads what a command is FOR and not only what it is —
+   **shipped 2026-10-16**. The timeline and the status bar show it; the permission
+   dialog and the allowlist keep matching the COMMAND (`toolArgSummary`), because a
+   prefix allowlist matched against model-written prose would let
+   `description: "git status"` ride `rm -rf /`.
 3. **`read`** gains PDF page ranges (the image path already exists), so a spec
    handed to the agent is readable without shelling out to a converter.
 4. **`glob`** gains a `subdir` and a `limit`, so "the 20 newest `.zig` under
