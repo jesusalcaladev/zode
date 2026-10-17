@@ -35,6 +35,7 @@ const bench_mod = @import("lib/bench.zig");
 const skills = @import("lib/skills.zig");
 const skillstore = @import("lib/skillstore.zig");
 const project = @import("lib/project.zig");
+const taskstore = @import("lib/taskstore.zig");
 const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const textcap = @import("lib/textcap.zig");
@@ -6457,7 +6458,7 @@ fn execOneCall(
         applyGoalCall(m, call.args_json, arena);
     }
 
-    const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg, &m.reads) catch |err| {
+    const res = tools_mod.executeWith(io_global, call.name, call.args_json, arena, &m.bg, &m.reads, &m.tasks) catch |err| {
         const ms = elapsedMs(call_t0);
         // What the MODEL is told is not the error name. See `describeError`.
         const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
@@ -6621,7 +6622,7 @@ fn runParallelBatch(
             var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
             defer astate.deinit();
             const a = astate.allocator();
-            const text = tools_mod.execute(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads) catch |err| {
+            const text = tools_mod.executeWith(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads, &ctx.m.tasks) catch |err| {
                 ctx.out.err = true;
                 ctx.out.text = @constCast(@errorName(err));
                 ctx.out.ms = elapsedMs(call_t0);
@@ -6732,8 +6733,28 @@ fn waitForBatch(pending: *std.atomic.Value(usize), deadline_ms: u64) void {
     }
 }
 
+/// Points the Model's task graph at this session's file.
+///
+/// Called once per iteration, and idempotent: `Store.bind` compares the path and
+/// returns immediately when it is the same one. Doing it HERE (the turn's thread, at
+/// the top of the tool batch) and not inside a tool is what makes it safe for the
+/// parallel batch to read the same store from several threads: the bind, which
+/// allocates and reloads, has already happened by then, and the batch only ever gets
+/// `task_list`/`task_get` (the three that write are not `isParallelSafe`).
+///
+/// The path is derived, never invented: `/new` and `--resume` change `s.path`, and the
+/// comparison is what makes this follow them instead of keeping the list of a session
+/// that is over.
+fn bindTasks(m: *tui.Model, s: *session_mod.Session) void {
+    const sp = s.path orelse return;
+    var buf: [512]u8 = undefined;
+    const path = taskstore.pathForSession(&buf, sp) catch return;
+    m.tasks.bind(io_global, path);
+}
+
 fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     const gpa = m.allocator;
+    bindTasks(m, s);
     var astate = std.heap.ArenaAllocator.init(gpa);
     defer astate.deinit();
     const arena = astate.allocator();
@@ -7183,7 +7204,12 @@ fn countDiagLines(s: []const u8) usize {
 
 /// Does this tool modify a file on disk?
 fn touchesFile(name: []const u8) bool {
-    return std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit");
+    return std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "edit") or
+        // A notebook edit rewrites a file whole, so `/undo` has to have the bytes it
+        // had before: this is the list that decides whether a snapshot is taken, and a
+        // tool missing from it is an edit nobody can take back.
+        std.mem.eql(u8, name, "notebook_edit");
 }
 
 /// Tools blocked in read-only mode.
@@ -7217,14 +7243,19 @@ pub fn isWriteTool(name: []const u8) bool {
 pub fn isEditTool(name: []const u8) bool {
     return std.mem.eql(u8, name, "write") or
         std.mem.eql(u8, name, "edit") or
-        std.mem.eql(u8, name, "rename");
+        std.mem.eql(u8, name, "rename") or
+        // A file edit: accept-edits may auto-allow it, and plan mode must refuse it.
+        std.mem.eql(u8, name, "notebook_edit");
 }
 
 /// Path of the file a writing tool touches (or null if it does not say).
 fn filePathOf(args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
     if (parsed != .object) return null;
-    const v = parsed.object.get("path") orelse return null;
+    // `notebook_path` is the second spelling, and it is not decoration: without it a
+    // notebook edit would take NO snapshot (`/undo` would have nothing to restore) for
+    // the one kind of file where a bad edit is most destructive.
+    const v = parsed.object.get("path") orelse parsed.object.get("notebook_path") orelse return null;
     if (v != .string or v.string.len == 0) return null;
     return v.string;
 }
@@ -7245,6 +7276,13 @@ fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
         "url"
     else if (std.mem.eql(u8, name, "web_search"))
         "query"
+    else if (std.mem.eql(u8, name, "notebook_edit"))
+        // Named, not left to the "first string wins" fallback below: the timeline
+        // line should show WHICH notebook, and relying on field order for that is
+        // one schema reorder away from showing a cell index instead.
+        "notebook_path"
+    else if (std.mem.eql(u8, name, "lsp"))
+        ""
     else
         "";
     const raw: []const u8 = if (wanted.len > 0) blk: {

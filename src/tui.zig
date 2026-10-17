@@ -10,6 +10,7 @@ const ed = @import("lib/editor.zig");
 const mascot = @import("lib/mascot.zig");
 const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
+const taskstore = @import("lib/taskstore.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
@@ -858,6 +859,15 @@ pub const Model = struct {
     /// says "you already have this file". Fixed buffers inside, so there is
     /// nothing to deinit.
     reads: readcache.Cache = .{},
+    /// The session's task graph (`task_create`/`task_get`/`task_list`/
+    /// `task_update`/`task_stop`).
+    ///
+    /// In the `Model` for the same reason as `bg` and `reads`, and bound to the
+    /// session's file by `agent.bindTasks` (which compares the path, so `/new` and
+    /// `--resume` rebind by themselves). The `gpa` is set from the model's allocator
+    /// in `init`: the default is `page_allocator`, which is merely WRONG rather than
+    /// a garbage vtable — see `taskstore.Store.gpa`.
+    tasks: taskstore.Store = .{},
     /// Bench counters for `/bench`.
     bench: bench_mod.Stats = .{},
 
@@ -1230,11 +1240,14 @@ pub const Model = struct {
             // `snapshotFile` without it reads garbage.
             .checkpoints = .init(allocator),
         };
+        m.tasks.gpa = allocator;
         m.setStatusText("zode v0.3 \u{b7} esc interrupts \u{b7} ctrl+c exits");
         return m;
     }
 
     pub fn deinit(self: *Model) void {
+        // The task graph holds its own strings and its file path.
+        self.tasks.deinit();
         // The checkpoint snapshots are memory of the model's allocator and
         // nobody else frees them: without this, every turn with tools leaves the
         // whole repo in memory until exit.

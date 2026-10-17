@@ -870,6 +870,411 @@ pub fn braveResults(arena: std.mem.Allocator, body: []const u8, max: usize) Brav
 }
 
 /// A string field of a JSON object value, or null when it is absent or not a string.
+// ── URLs: the redirect policy and the domain filters ───────────────────────
+
+/// Longest URL accepted. A URL this long is not a page anyone meant to read;
+/// the longest legitimate ones are signed cloud URLs with a JWT in the query.
+pub const max_url_len = 2000;
+
+/// Redirect hops followed on our own account before the answer is reported.
+pub const max_redirects = 5;
+
+pub const UrlError = error{
+    /// No scheme, or a scheme that is not http(s).
+    NotHttp,
+    /// `http://user:pw@host` — credentials in a URL belong in a header and
+    /// this tool has nowhere safe to put them.
+    HasUserinfo,
+    /// `http://intranet/` — a single-label host is a machine on somebody's
+    /// network, which is exactly the thing this tool is not for.
+    SingleLabelHost,
+    /// A host with a space, a control byte or an empty label.
+    BadHost,
+    TooLong,
+};
+
+/// Parse an `http(s)` URL into the parts the policy needs.
+///
+/// Hand-written on purpose, and not `std.Uri.parse`: this runs on whatever the
+/// MODEL typed, and a parser that fails must not turn a refused host into an
+/// allowed one. Every failure below is a refusal, and the fallbacks are all
+/// "there is no valid URL here", never "assume it was fine".
+///
+/// The slices point INTO `url`. They are not trimmed and not decoded: the
+/// comparison that matters (the host) is case-insensitive and the tool only
+/// ever re-joins them.
+pub const ParsedUrl = struct {
+    scheme: []const u8,
+    /// Host without the brackets of an IPv6 literal and without the port.
+    host: []const u8,
+    /// "" when the URL did not name one.
+    port: []const u8,
+    /// Everything from the first `/` of the path, including the query and the
+    /// fragment. "" when the URL stopped at the authority.
+    tail: []const u8,
+};
+
+pub fn parseHttpUrl(url: []const u8) UrlError!ParsedUrl {
+    if (url.len == 0 or url.len > max_url_len) return error.TooLong;
+
+    const sep = std.mem.indexOf(u8, url, "://") orelse return error.NotHttp;
+    const scheme = url[0..sep];
+    const is_http = std.mem.eql(u8, scheme, "http");
+    const is_https = std.mem.eql(u8, scheme, "https");
+    if (!is_http and !is_https) return error.NotHttp;
+
+    var rest = url[sep + 3 ..];
+    // The authority ends at the first delimiter, and the fragment is not part
+    // of what we would request.
+    var tail: []const u8 = "";
+    if (std.mem.indexOfAny(u8, rest, "/?#")) |i| {
+        rest = rest[0..i];
+        const after = url[sep + 3 + i ..];
+        tail = after[0 .. (std.mem.indexOfScalar(u8, after, '#') orelse after.len)];
+    } else rest.len = 0;
+
+    if (rest.len == 0) return error.BadHost;
+    // userinfo: anything before an `@` in the authority. RFC 3986 puts it
+    // there and a page a model was told to read can contain one.
+    if (std.mem.lastIndexOfScalar(u8, rest, '@')) |i| {
+        _ = i;
+        return error.HasUserinfo;
+    }
+
+    var host = rest;
+    var port: []const u8 = "";
+    var bracketed = false;
+    if (rest[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return error.BadHost;
+        bracketed = true;
+        host = rest[1..close];
+        if (rest.len > close + 1) {
+            if (rest[close + 1] != ':') return error.BadHost;
+            port = rest[close + 2 ..];
+        }
+    } else if (std.mem.indexOfScalar(u8, rest, ':')) |i| {
+        host = rest[0..i];
+        port = rest[i + 1 ..];
+    }
+
+    if (host.len == 0) return error.BadHost;
+    if (!bracketed) {
+        for (host) |c| {
+            // Anything outside this set is a URL we would be guessing at, and a
+            // guess in a security check is a hole.
+            const ok = std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_' or c == '~' or c == '%' or c >= 0x80;
+            if (!ok) return error.BadHost;
+        }
+        if (host[0] == '.' or host[host.len - 1] == '.') return error.BadHost;
+        if (std.mem.indexOf(u8, host, "..") != null) return error.BadHost;
+    }
+
+    // A literal IPv4 or an IPv6 literal is fine; a single LABEL is a machine on
+    // a local network.
+    const looks_literal = bracketed or std.mem.count(u8, host, ".") == 3 or std.ascii.isDigit(host[0]);
+    if (!looks_literal and std.mem.indexOfScalar(u8, host, '.') == null) return error.SingleLabelHost;
+
+    return .{ .scheme = scheme, .host = host, .port = port, .tail = tail };
+}
+
+/// `http://` rewritten to `https://`, into the caller's buffer.
+///
+/// Returns null when the URL is already https or does not fit. It is not an
+/// error: an https URL is the normal case.
+pub fn upgradeHttps(url: []const u8, buf: []u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, url, "http://")) return null;
+    // The result is ONE BYTE LONGER, not the same length: "http://x" becomes
+    // "https://x". Writing an 's' over the ':' instead would produce
+    // "https//x", which looks like a URL and is not one.
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("https://") catch return null;
+    w.writeAll(url[7..]) catch return null;
+    return w.buffered();
+}
+
+/// Two hosts are "the same site" when they are equal ignoring `www.` and the
+/// default port.
+///
+/// `www.` because that redirect is a redirect everybody follows and stopping it
+/// turns half the internet into a dead end. The port because `:443` on an https
+/// URL is the same server as no port at all, and a `Location` that spells it
+/// out is not a different site.
+pub fn sameSite(a: []const u8, b: []const u8) bool {
+    const pa = parseHttpUrl(a) catch return false;
+    const pb = parseHttpUrl(b) catch return false;
+    if (!std.ascii.eqlIgnoreCase(pa.scheme, pb.scheme)) return false;
+
+    const ha = withoutWww(pa.host);
+    const hb = withoutWww(pb.host);
+    if (!std.ascii.eqlIgnoreCase(ha, hb)) return false;
+
+    // An explicit port has to agree, modulo the scheme's default.
+    const da = defaultPort(pa.scheme);
+    const db = defaultPort(pb.scheme);
+    const ea = if (pa.port.len == 0) da else pa.port;
+    const eb = if (pb.port.len == 0) db else pb.port;
+    return std.mem.eql(u8, ea, eb);
+}
+
+fn withoutWww(host: []const u8) []const u8 {
+    if (host.len > 4 and std.ascii.eqlIgnoreCase(host[0..4], "www.")) return host[4..];
+    return host;
+}
+
+fn defaultPort(scheme: []const u8) []const u8 {
+    return if (std.mem.eql(u8, scheme, "https")) "443" else "80";
+}
+
+/// Turns a `Location` header into a URL, resolving it against the one that
+/// answered. Null when it does not fit `buf`.
+///
+/// RFC 3986's own algorithm, reduced to the four cases a server actually sends:
+/// absolute (`https://x/`), protocol-relative (`//x/`), absolute path (`/x`),
+/// and relative (`x`, `../x`). Anything else — a `mailto:`, a `javascript:` —
+/// is null, because a fetch of those is not a fetch.
+pub fn resolveLocation(base: []const u8, location: []const u8, buf: []u8) ?[]const u8 {
+    const loc = std.mem.trim(u8, location, " \t\r\n");
+    if (loc.len == 0) return null;
+    // A scheme that is not http(s) is not a page. The check is on the SCHEME, not
+    // on "://": `mailto:a@b.c` and `javascript:alert(1)` have no "//" and would
+    // otherwise be joined onto the path, producing a URL that fetches
+    // something the server never offered.
+    if (hasScheme(loc) and !std.mem.startsWith(u8, loc, "http://") and
+        !std.mem.startsWith(u8, loc, "https://")) return null;
+
+    const pb = parseHttpUrl(base) catch return null;
+
+    var w: std.Io.Writer = .fixed(buf);
+
+    if (std.mem.startsWith(u8, loc, "//")) {
+        w.print("{s}:{s}", .{ pb.scheme, loc }) catch return null;
+        return w.buffered();
+    }
+    if (std.mem.startsWith(u8, loc, "http://") or std.mem.startsWith(u8, loc, "https://")) {
+        if (loc.len > buf.len) return null;
+        @memcpy(buf[0..loc.len], loc);
+        return buf[0..loc.len];
+    }
+
+    // Everything below composes the answer out of slices of `base` and `loc`
+    // only. The obvious version builds the `scheme://host:port` prefix first
+    // into `buf` and then prints it into `buf`, and that is an aliased
+    // `@memcpy` inside the writer: the source and the destination are the same
+    // bytes. `origin` as a separate value is the bug.
+    if (std.mem.startsWith(u8, loc, "/")) {
+        w.print("{s}://{s}", .{ pb.scheme, pb.host }) catch return null;
+        if (pb.port.len > 0) w.print(":{s}", .{pb.port}) catch return null;
+        w.writeAll(loc) catch return null;
+        return w.buffered();
+    }
+
+    // Relative to the directory of the current path: everything up to and
+    // including its last `/`, and the `.`/`..` segments resolved.
+    const cut = std.mem.lastIndexOfScalar(u8, pb.tail, '/') orelse return null;
+    w.print("{s}://{s}", .{ pb.scheme, pb.host }) catch return null;
+    if (pb.port.len > 0) w.print(":{s}", .{pb.port}) catch return null;
+    w.writeAll(pb.tail[0..cut]) catch return null;
+    w.writeByte('/') catch return null;
+    w.writeAll(loc) catch return null;
+    return collapseDotSegments(w.buffered(), buf);
+}
+
+/// Removes `.` and `..` segments, into `buf`.
+///
+/// Handled here because it is the one part of RFC 3986 that a `Location` uses
+/// constantly and a plain concatenation gets wrong: `example.com/a/b` +
+/// `../c` is `example.com/a/c`, not `example.com/a/b/../c`. Leaving the dot
+/// segments in the path is not fatal (the server normalises) but it makes the
+/// cache key wrong, and the cache key is what decides whether a page is served
+/// from memory.
+///
+/// Written with index arithmetic and no allocator on purpose: it rewrites a
+/// buffer it is handed, and `Writer.fixed` cannot shrink. `..` pops by finding
+/// the last `/` already written.
+fn collapseDotSegments(url: []const u8, buf: []u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, url, "/./") == null and std.mem.indexOf(u8, url, "/../") == null and
+        !std.mem.endsWith(u8, url, "/.") and !std.mem.endsWith(u8, url, "/..")) return url;
+
+    var wpos: usize = 0;
+    var i: usize = 0;
+    while (i < url.len) {
+        const seg_start = i;
+        while (i < url.len and url[i] != '/') i += 1;
+        const seg = url[seg_start..i];
+        const ends_here = i >= url.len;
+        if (i < url.len) i += 1; // the '/'
+
+        if (std.mem.eql(u8, seg, ".")) {
+            if (ends_here and pushSlash(buf, &wpos)) return null;
+            continue;
+        }
+        if (std.mem.eql(u8, seg, "..")) {
+            // Pop the last segment AND the slash that introduced it. Landing on
+            // the trailing '/' instead gives "/a/b/../c" → "/a/b/c", which is
+            // the bug this function exists to remove.
+            if (std.mem.lastIndexOfScalar(u8, buf[0..wpos], '/')) |last| {
+                wpos = (std.mem.lastIndexOfScalar(u8, buf[0..last], '/') orelse return buf[0..0]) + 1;
+            } else wpos = 0;
+            if (ends_here and pushSlash(buf, &wpos)) return null;
+            continue;
+        }
+        // An EMPTY segment still writes its separator: it is the second '/' of
+        // "https://", and skipping it yields "https:/host", which resolves
+        // nowhere and reads as a typo rather than as a bug.
+        if (wpos + seg.len > buf.len) return null;
+        // A byte loop and not `@memcpy`: `url` and `buf` are the SAME buffer
+        // (the caller passes `w.buffered()` as the source) and the copy only
+        // ever moves bytes towards the front. `@memcpy` refuses to reason
+        // about the overlap and aborts; a forward loop over an overlapping
+        // range is exactly the case it is safe for.
+        for (seg, 0..) |c, k| buf[wpos + k] = c;
+        wpos += seg.len;
+        if (!ends_here) {
+            if (pushSlash(buf, &wpos)) return null;
+        }
+    }
+    return buf[0..wpos];
+}
+
+/// Does `text` begin with a URI scheme (`ALPHA *( ALPHA / DIGIT / + - . ) ":"`)?
+///
+/// Only valid before the first `/`, `?` or `#`: `a/b:c` is a path with a colon
+/// in it, and `//host/x` is a protocol-relative reference.
+fn hasScheme(text: []const u8) bool {
+    if (text.len == 0 or !std.ascii.isAlphabetic(text[0])) return false;
+    var i: usize = 1;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == ':') return i > 0;
+        const ok = std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '.';
+        if (!ok) return false;
+    }
+    return false;
+}
+
+/// Appends one `/`. True when it did not fit.
+fn pushSlash(buf: []u8, wpos: *usize) bool {
+    if (wpos.* + 1 > buf.len) return true;
+    buf[wpos.*] = '/';
+    wpos.* += 1;
+    return false;
+}
+
+/// Does `url` belong to `domain`?
+///
+/// The match is on a LABEL boundary: `docs.example.com` matches
+/// `example.com` and `notexample.com` does not. A `endsWith` without the dot
+/// is the bug that makes a domain allowlist useless.
+pub fn hostInDomain(url: []const u8, domain: []const u8) bool {
+    const p = parseHttpUrl(url) catch return false;
+    const h = withoutWww(p.host);
+    var d = domain;
+    if (std.mem.startsWith(u8, d, "*.")) d = d[2..];
+    if (d.len == 0) return false;
+    d = withoutWww(d);
+    if (std.ascii.eqlIgnoreCase(h, d)) return true;
+    return h.len > d.len + 1 and
+        std.ascii.endsWithIgnoreCase(h, d) and
+        h[h.len - d.len - 1] == '.';
+}
+
+/// Keeps only the results whose host passes `allowed` and not `blocked`.
+///
+/// Filtering happens HERE, on the rendered list, rather than by rewriting the
+/// query into `site:` operators, because `site:` is a per-engine dialect and
+/// the one thing this tool promises is that the model never has to know which
+/// engine answered. A `blocked` domain wins over an `allowed` one: the user
+/// who asked to never see a domain is right about that even if they also
+/// allowed the parent.
+///
+/// Renumbered, because the numbers are positions in a list and a list with
+/// gaps in it reads as "something is missing here" to a model.
+pub fn filterByDomain(
+    arena: std.mem.Allocator,
+    results: []const u8,
+    allowed: []const []const u8,
+    blocked: []const []const u8,
+) []const u8 {
+    if (allowed.len == 0 and blocked.len == 0) return results;
+
+    var out: std.ArrayList(u8) = .empty;
+    var n: usize = 0;
+
+    var it = ResultList.iterator(results);
+    while (it.next()) |block| {
+        if (!passes(block.url, allowed, blocked)) continue;
+        n += 1;
+        out.print(arena, "{d}. {s}\n", .{ n, block.title }) catch return "";
+        out.print(arena, "   {s}\n", .{block.url}) catch return "";
+        if (block.snippet.len > 0) out.print(arena, "   {s}\n", .{block.snippet}) catch return "";
+        out.append(arena, '\n') catch return "";
+    }
+    if (n == 0) return "";
+    return out.items;
+}
+
+fn passes(url: []const u8, allowed: []const []const u8, blocked: []const []const u8) bool {
+    for (blocked) |d| {
+        if (hostInDomain(url, d)) return false;
+    }
+    if (allowed.len == 0) return true;
+    for (allowed) |d| {
+        if (hostInDomain(url, d)) return true;
+    }
+    return false;
+}
+
+/// One entry of the rendered search list.
+///
+/// The shape is a contract with `renderResults` and `braveResults`, both of
+/// which write `N. title`, `   url`, `   snippet` and a blank line. Parsing it
+/// back is cheaper than threading a struct through three parsers and a
+/// fallback chain, and the fallback chain is exactly where a second
+/// representation of "a search result" would drift.
+const ResultBlock = struct {
+    title: []const u8,
+    url: []const u8,
+    snippet: []const u8 = "",
+};
+
+const ResultList = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+
+    fn iterator(text: []const u8) ResultList {
+        return .{ .lines = std.mem.splitScalar(u8, text, '\n') };
+    }
+
+    fn next(self: *ResultList) ?ResultBlock {
+        const first = self.lines.next() orelse return null;
+        // A title line is `N. something`.
+        if (first.len == 0 or !std.ascii.isDigit(first[0])) return null;
+        const sep = std.mem.indexOf(u8, first, ". ") orelse return null;
+        if (sep == 0) return null;
+
+        var block = ResultBlock{ .title = first[sep + 2 ..], .url = "" };
+
+        const url_line = self.lines.next() orelse return block;
+        if (isUrlLine(url_line)) {
+            block.url = std.mem.trim(u8, url_line, " \t\r");
+            const snip = self.lines.next() orelse return block;
+            if (snip.len > 0 and !isUrlLine(snip) and snip[0] == ' ') {
+                block.snippet = std.mem.trim(u8, snip, " \t\r");
+            }
+        }
+        // The blank line that separates blocks. Consuming it here is what makes
+        // the iterator's contract simple; the caller never sees it.
+        if (self.lines.peek()) |next_line| {
+            if (next_line.len == 0) _ = self.lines.next();
+        }
+        return block;
+    }
+};
+
+fn isUrlLine(line: []const u8) bool {
+    return line.len > 4 and std.mem.startsWith(u8, line, "   ") and
+        std.mem.indexOf(u8, line, "://") != null;
+}
+
 fn strField(v: std.json.Value, key: []const u8) ?[]const u8 {
     if (v != .object) return null;
     const f = v.object.get(key) orelse return null;
@@ -1327,4 +1732,169 @@ test "braveResults compacts long snippets without splitting UTF-8" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(result));
     try std.testing.expect(result.len < 400);
     try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, result, "\n"), "…"));
+}
+
+// ── tests: the URL policy ─────────────────────────────────────────────────
+
+test "parseHttpUrl takes the parts apart and refuses what it cannot vouch for" {
+    const p = try parseHttpUrl("https://docs.example.com:8443/guide?x=1#frag");
+    try std.testing.expectEqualStrings("https", p.scheme);
+    try std.testing.expectEqualStrings("docs.example.com", p.host);
+    try std.testing.expectEqualStrings("8443", p.port);
+    // The fragment is not part of what we would request.
+    try std.testing.expectEqualStrings("/guide?x=1", p.tail);
+
+    // Not a scheme we fetch.
+    try std.testing.expectError(error.NotHttp, parseHttpUrl("file:///etc/passwd"));
+    try std.testing.expectError(error.NotHttp, parseHttpUrl("example.com"));
+    // Credentials in a URL have nowhere safe to go in this tool.
+    try std.testing.expectError(error.HasUserinfo, parseHttpUrl("http://user:pw@example.com/"));
+    // A single label is a machine on somebody's LAN.
+    try std.testing.expectError(error.SingleLabelHost, parseHttpUrl("http://intranet/x"));
+    try std.testing.expectError(error.BadHost, parseHttpUrl("https://exa mple.com/"));
+    try std.testing.expectError(error.BadHost, parseHttpUrl("https://example..com/"));
+    try std.testing.expectError(error.TooLong, parseHttpUrl("https://example.com/" ++ "a" ** max_url_len));
+}
+
+test "parseHttpUrl takes an IPv6 literal apart without losing the host" {
+    const p = try parseHttpUrl("http://[fd00::1]:8080/x");
+    try std.testing.expectEqualStrings("fd00::1", p.host);
+    try std.testing.expectEqualStrings("8080", p.port);
+    try std.testing.expectEqualStrings("/x", p.tail);
+    // And it is not mistaken for a single-label host on the way.
+    try std.testing.expect(!web_private("http://[fd00::1]/"));
+}
+
+fn web_private(url: []const u8) bool {
+    return isPrivateHost(url);
+}
+
+test "upgradeHttps rewrites the scheme and leaves an https URL alone" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "https://example.com/a",
+        upgradeHttps("http://example.com/a", &buf).?,
+    );
+    // Not an error: it is the normal case.
+    try std.testing.expect(upgradeHttps("https://example.com/a", &buf) == null);
+    var small: [4]u8 = undefined;
+    try std.testing.expect(upgradeHttps("http://example.com/a", &small) == null);
+}
+
+test "sameSite follows www and the default port, and nothing else" {
+    // The redirects that are most of the internet.
+    try std.testing.expect(sameSite("https://example.com/a", "https://www.example.com/b"));
+    try std.testing.expect(sameSite("http://example.com/a", "http://example.com:80/b"));
+    try std.testing.expect(sameSite("https://example.com/a", "https://example.com:443/b"));
+    try std.testing.expect(sameSite("https://EXAMPLE.com/a", "https://example.com/b"));
+
+    // And the ones it must not.
+    try std.testing.expect(!sameSite("https://example.com/a", "https://evil.com/b"));
+    try std.testing.expect(!sameSite("https://example.com/a", "https://notexample.com/b"));
+    try std.testing.expect(!sameSite("https://example.com/a", "http://example.com/b"));
+    try std.testing.expect(!sameSite("https://example.com/a", "https://example.com:8443/b"));
+}
+
+test "resolveLocation understands the four shapes a server sends" {
+    var buf: [256]u8 = undefined;
+    const base = "https://example.com/docs/guide/index.html";
+
+    try std.testing.expectEqualStrings(
+        "https://other.example/x",
+        resolveLocation(base, "https://other.example/x", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://other.example/x",
+        resolveLocation(base, "//other.example/x", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://example.com/top",
+        resolveLocation(base, "/top", &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://example.com/docs/guide/next",
+        resolveLocation(base, "next", &buf).?,
+    );
+    // `..` resolved against the DIRECTORY, not appended.
+    try std.testing.expectEqualStrings(
+        "https://example.com/docs/next",
+        resolveLocation(base, "../next", &buf).?,
+    );
+
+    // Not pages.
+    try std.testing.expect(resolveLocation(base, "mailto:a@b.c", &buf) == null);
+    try std.testing.expect(resolveLocation(base, "javascript:alert(1)", &buf) == null);
+    try std.testing.expect(resolveLocation(base, "  ", &buf) == null);
+}
+
+test "hostInDomain matches on a label boundary" {
+    try std.testing.expect(hostInDomain("https://docs.example.com/x", "example.com"));
+    try std.testing.expect(hostInDomain("https://example.com/x", "example.com"));
+    try std.testing.expect(hostInDomain("https://EXAMPLE.com/x", "example.com"));
+    try std.testing.expect(hostInDomain("https://www.example.com/x", "example.com"));
+
+    // The whole point of the label boundary.
+    try std.testing.expect(!hostInDomain("https://notexample.com/x", "example.com"));
+    try std.testing.expect(!hostInDomain("https://example.com.evil.net/x", "example.com"));
+    try std.testing.expect(!hostInDomain("https://example.com/x", ""));
+    // A `*.` prefix in the caller's own words is the same domain.
+    try std.testing.expect(hostInDomain("https://a.example.com/x", "*.example.com"));
+}
+
+// ── tests: the domain filter over a rendered list ─────────────────────────
+
+const three_results =
+    \\1. Zig 0.16 release notes
+    \\   https://ziglang.org/download/0.16.0/
+    \\   The release that changed ArrayList.
+    \\
+    \\2. A mirror of the same notes
+    \\   https://blog.example-mirror.com/zig/0.16
+    \\   Someone's copy.
+    \\
+    \\3. The manual
+    \\   https://ziglang.org/documentation/master/
+    \\   Reference.
+    \\
+;
+
+test "filterByDomain keeps the matching results and RENUMBERS them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const kept = filterByDomain(arena, three_results, &.{"ziglang.org"}, &.{});
+    // Two of the three survive (1 and 3), and the mirror is gone.
+    try std.testing.expect(std.mem.indexOf(u8, kept, "release notes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "documentation/master") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "example-mirror") == null);
+    // Renumbered: the numbers are positions, and 1..2 with a gap at 3 reads as
+    // "something is missing" to a model.
+    try std.testing.expect(std.mem.indexOf(u8, kept, "1. Zig 0.16 release notes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "3. ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "2. The manual") != null);
+    // And the snippets travel with their own result.
+    try std.testing.expect(std.mem.indexOf(u8, kept, "changed ArrayList") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "Someone's copy.") == null);
+}
+
+test "a blocked domain wins over an allowed parent" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const kept = filterByDomain(arena, three_results, &.{"example.com"}, &.{"blog.example.com"});
+    try std.testing.expect(std.mem.indexOf(u8, kept, "example-mirror") == null);
+    // Nothing matched, and "no results" is the honest answer — an empty string
+    // makes the tool say the engine found nothing.
+    try std.testing.expectEqualStrings("", filterByDomain(arena, three_results, &.{"nowhere.test"}, &.{}));
+}
+
+test "an empty filter returns the list untouched, not a copy" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings(
+        three_results,
+        filterByDomain(arena_state.allocator(), three_results, &.{}, &.{}),
+    );
 }

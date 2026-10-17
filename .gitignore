@@ -8,3 +8,6 @@ sessions/
 # .pyc files are per-interpreter-version binaries that do not belong in git.
 __pycache__/
 *.pyc
+
+# Ignored code base
+code-base

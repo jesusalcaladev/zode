@@ -22,6 +22,7 @@ pub const free_auto = @import("free_auto.zig");
 pub const router = @import("lib/router.zig");
 pub const symbols = @import("lib/symbols.zig");
 pub const plan = @import("lib/plan.zig");
+pub const taskstore = @import("lib/taskstore.zig");
 pub const checkpoint = @import("lib/checkpoint.zig");
 pub const mentions = @import("lib/mentions.zig");
 pub const clean = @import("lib/clean.zig");

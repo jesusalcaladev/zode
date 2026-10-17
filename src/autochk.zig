@@ -61,8 +61,19 @@ fn countDiagLines(s: []const u8) usize {
 }
 
 /// Does this tool modify a file on disk?
+/// Which tools change files on disk. It mirrors `agent.isEditTool` (write, edit,
+/// rename, notebook_edit) and it CANNOT import it: `autochk` is Model-free and
+/// `agent` imports THIS file, so the list has a second home. It had drifted —
+/// it knew only write and edit — which meant a `rename` (that rewrites code in
+/// files its args never name) and a `notebook_edit` never asked the gate for a
+/// check, and a turn could end right after either one with nothing verified.
+/// This is the "one tool's facts in four places" problem Phase 0 exists to
+/// solve; the test below pins the four names until the registry lands.
 fn touchesFile(name: []const u8) bool {
-    return std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit");
+    return std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "edit") or
+        std.mem.eql(u8, name, "rename") or
+        std.mem.eql(u8, name, "notebook_edit");
 }
 
 /// The one probe of the session, for whether there is a diff to review.
@@ -156,6 +167,13 @@ fn worthATurn(args_json: []const u8, arena: std.mem.Allocator) bool {
 
 fn pathsWorthChecking(obj: std.json.ObjectMap) bool {
     if (obj.get("path")) |v| {
+        if (v == .string and typecheck_mod.worthChecking(v.string)) return true;
+    }
+    // `notebook_path` is `notebook_edit`'s spelling of the same thing. A notebook
+    // is code in the projects that have them, and without this the gate saw a
+    // notebook edit as "a file nobody compiles" — a turn could end after one
+    // with no check ever run.
+    if (obj.get("notebook_path")) |v| {
         if (v == .string and typecheck_mod.worthChecking(v.string)) return true;
     }
     // `files` is an array of objects, each with its own `path`.
@@ -307,6 +325,16 @@ pub const AutoCheck = struct {
         // JSON tree of a few hundred bytes, and it is the difference between a function
         // that cannot leak and one where the next caller passes `std.testing.allocator`
         // and 42 allocations show up in a test that has nothing else wrong with it.
+        // A RENAME always counts, whatever its arguments look like: it rewrites
+        // code in files its args never name (the args are two identifiers), so
+        // there is no path to inspect and "not worth a build" is the wrong guess.
+        // Its own description already tells the model to build after renaming;
+        // the gate makes sure the turn cannot end until one has happened.
+        if (std.mem.eql(u8, name, "rename")) {
+            self.gate.noteWrite();
+            return true;
+        }
+
         var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const a = arena_state.allocator();
@@ -678,6 +706,27 @@ pub const Verdict = exitgate.Verdict;
 // ── tests ────────────────────────────────────────────────────────
 
 const t = std.testing;
+
+test "the gate counts every tool that writes files, and only those" {
+    // `touchesFile` had drifted from `agent.isEditTool` down to two names: a
+    // `rename` and a `notebook_edit` never asked the gate for a check, so a turn
+    // could end after either one with nothing verified. The four names are
+    // pinned HERE because this file cannot import `agent.isEditTool` — `agent`
+    // imports this file, and a cycle is not a way to share a list.
+    var ac: AutoCheck = .{};
+    try t.expect(ac.noteWrite("write", "{\"path\":\"a.zig\",\"content\":\"x\"}"));
+    try t.expect(ac.noteWrite("edit", "{\"path\":\"a.zig\",\"old\":\"x\",\"new\":\"y\"}"));
+    try t.expect(ac.noteWrite("rename", "{\"symbol\":\"old\",\"new_name\":\"fresh\"}"));
+    try t.expect(ac.noteWrite("notebook_edit", "{\"notebook_path\":\"nb.ipynb\",\"cell_number\":0}"));
+    try t.expectEqual(@as(u32, 4), ac.gate.writes);
+
+    // And the session's own bookkeeping is NOT a file write: a task-graph update
+    // starts no build, however often the model calls it.
+    try t.expect(!ac.noteWrite("task_update", "{\"id\":1,\"status\":\"completed\"}"));
+    try t.expect(!ac.noteWrite("task_create", "{\"subject\":\"Do the thing\"}"));
+    try t.expect(!ac.noteWrite("read", "{\"path\":\"a.zig\"}"));
+    try t.expectEqual(@as(u32, 4), ac.gate.writes);
+}
 
 test "ZODE_AUTO_CHECK is read from the AutoCheck's OWN environment" {
     // The bug this pins is one this file was born with. `AutoCheck` used to call

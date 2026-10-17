@@ -13,6 +13,7 @@ const common = @import("common.zig");
 const read_tool = @import("read.zig");
 const write_tool = @import("write.zig");
 const edit_tool = @import("edit.zig");
+const notebook_tool = @import("notebook.zig");
 const bash_tool = @import("bash.zig");
 const git_tool = @import("git.zig");
 const refs_tool = @import("refs.zig");
@@ -29,6 +30,51 @@ const goal_tool = @import("goal.zig");
 const verify_mod = @import("../lib/verify.zig");
 const typecheck = @import("../lib/typecheck.zig");
 const errors_tool = @import("errors.zig");
+const tasks_tool = @import("tasks.zig");
+const sleep_tool = @import("sleep.zig");
+const taskstore = @import("../lib/taskstore.zig");
+
+// The per-tool prompt modules: the TEXT the model reads about a tool lives with that
+// tool, as `prompts/<name>.zig`. This file decides the ORDER and nothing else, so a
+// rule can be written, changed and tested inside a file that is about one tool, and
+// no tool's prose can be broken by an edit to the array. `prompts/validate.zig` holds
+// the invariants every entry has to satisfy.
+const read_prompt = @import("prompts/read.zig");
+const write_prompt = @import("prompts/write.zig");
+const edit_prompt = @import("prompts/edit.zig");
+const notebook_edit_prompt = @import("prompts/notebook_edit.zig");
+const bash_prompt = @import("prompts/bash.zig");
+const glob_prompt = @import("prompts/glob.zig");
+const grep_prompt = @import("prompts/grep.zig");
+const refs_prompt = @import("prompts/refs.zig");
+const rename_prompt = @import("prompts/rename.zig");
+const check_prompt = @import("prompts/check.zig");
+const git_status_prompt = @import("prompts/git_status.zig");
+const git_diff_prompt = @import("prompts/git_diff.zig");
+const git_log_prompt = @import("prompts/git_log.zig");
+const git_branch_prompt = @import("prompts/git_branch.zig");
+const git_add_prompt = @import("prompts/git_add.zig");
+const git_commit_prompt = @import("prompts/git_commit.zig");
+const git_stash_prompt = @import("prompts/git_stash.zig");
+const list_files_prompt = @import("prompts/list_files.zig");
+const web_fetch_prompt = @import("prompts/web_fetch.zig");
+const web_search_prompt = @import("prompts/web_search.zig");
+const think_prompt = @import("prompts/think.zig");
+const todo_prompt = @import("prompts/todo.zig");
+const task_create_prompt = @import("prompts/task_create.zig");
+const task_get_prompt = @import("prompts/task_get.zig");
+const task_list_prompt = @import("prompts/task_list.zig");
+const task_update_prompt = @import("prompts/task_update.zig");
+const task_stop_prompt = @import("prompts/task_stop.zig");
+const ask_prompt = @import("prompts/ask.zig");
+const lsp_prompt = @import("prompts/lsp.zig");
+const skill_prompt = @import("prompts/skill.zig");
+const task_prompt = @import("prompts/task.zig");
+const review_prompt = @import("prompts/review.zig");
+const goal_prompt = @import("prompts/goal.zig");
+const bash_output_prompt = @import("prompts/bash_output.zig");
+const bash_kill_prompt = @import("prompts/bash_kill.zig");
+const sleep_prompt = @import("prompts/sleep.zig");
 
 pub const ToolDef = struct {
     name: []const u8,
@@ -74,71 +120,125 @@ pub fn isParallelSafe(name: []const u8) bool {
         std.mem.eql(u8, name, "glob") or
         std.mem.eql(u8, name, "list_files") or
         std.mem.eql(u8, name, "web_fetch") or
-        std.mem.eql(u8, name, "web_search");
+        std.mem.eql(u8, name, "web_search") or
+        // The two task READERS. There is nothing to wait for: they take the store's
+        // list apart and return text.
+        std.mem.eql(u8, name, "task_list") or
+        std.mem.eql(u8, name, "task_get");
+    // `task_create`, `task_update` and `task_stop` are deliberately NOT here even
+    // though they only read and write a task list: a batch runs its calls in
+    // PARALLEL THREADS, and the store is one `ArrayList` with no lock. Two creates
+    // side by side is the arena-per-call race this repo has already paid for, and the
+    // criterion for this list is "cannot observe another", which "appends to the
+    // thing another call is appending to" fails.
 }
 
 /// Declares the tools to the LLM (OpenAI format). Static: 0 allocs per request.
+///
+/// Composed from the per-tool prompt modules, in `defs` order: the tool TABLE and the
+/// tool SCHEMA are the same list written twice, and the test below fails the day one of
+/// them gains a tool the other has not. Each module owns its own prose and parameters,
+/// so adding a rule is a one-file edit that cannot break another tool's text.
 pub fn toolsJson() []const u8 {
-    return
-    \\[
-    \\{"type":"function","function":{"name":"read","description":"A PNG/JPG/GIF/WEBP arrives as an IMAGE you can look at, never as bytes: do not use bash xxd/hexdump/base64/strings on a picture. Read a file from disk, or SEVERAL at once with `paths` (max 8) — prefer that whenever you are comparing files or opening a handful: one call is one round trip and a round trip is a whole request, so reading three files one by one costs three of them. Each file keeps the same caching. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"description":"read up to 8 files in ONE call; each is cached separately"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"write","description":"Create or overwrite a file with the given content.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},
-    \\{"type":"function","function":{"name":"edit","description":"Exact string replacement in a file. Single hunk via old_string/new_string, several HUNKS in one file via edits:[{old_string,new_string},...] (all validated first, then applied in order; if a hunk no longer matches because an earlier one rewrote it, NOTHING is written and you are told which hunk). For several FILES in ONE call use files:[{path,old_string,new_string},...] (max 8) — that is the shape a rename takes, and doing it one file per call is one request per file. old_string must appear exactly once unless allow_multiple is true.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"edits":{"type":"array","description":"several HUNKS in this one file","items":{"type":"object","properties":{"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["old_string","new_string"]}},"files":{"type":"array","description":"up to 8 {path,old_string,new_string} objects, edited in ONE call","items":{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"]}},"allow_multiple":{"type":"boolean"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"bash","description":"Run a shell command and get combined stdout+stderr. NOT the tool for TYPECHECKING: `check` does that with the project's own command (build.zig, tsconfig.json, Cargo.toml, go.mod) and brings the errors back with a file and a line, so you never spend a call inventing `zig build` / `npx tsc` / `cargo check` yourself. Use `bash` for running things — a test suite you named, git, a script — and for anything that is not a type check. By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while it runs. and get combined stdout+stderr (truncated). By default this BLOCKS until the command finishes, which for anything slow (a build, a test suite, an install) leaves you unable to do anything else while you wait. For those, pass run_in_background: true: it returns a job id immediately and you keep working. Then poll with bash_output when you actually need the result, and bash_kill if you change your mind.","parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","description":"foreground only; default 30"},"run_in_background":{"type":"boolean","description":"return a job id at once instead of waiting"}},"required":["command"]}}},
-    \\{"type":"function","function":{"name":"glob","description":"Find files matching a glob pattern like src/**/*.zig.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
-    \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regex. Returns path:line:text matches.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"subdir":{"type":"string"}},"required":["pattern"]}}},
-    \\{"type":"function","function":{"name":"git_status","description":"The state of the working tree and the branch: one line per staged, modified or untracked path (XY = staged then worktree, ?? = untracked), plus how many files changed and by how much. Prefer it to `bash git status`, which returns English prose with colour codes that you then have to parse. Returns a clean-tree note when there is nothing to report.","parameters":{"type":"object","properties":{},"required":[]}}},
-    \\{"type":"function","function":{"name":"git_diff","description":"The unified diff of the working tree against the index (or of the index against HEAD with staged:true). One block per file, each headed by the path, with +N and −M counted for you at the end. Painted with the same colouriser as a write/edit diff. For anything git does that these do not cover (a commit, a checkout, a stash, a log of one path), use `bash`.","parameters":{"type":"object","properties":{"staged":{"type":"boolean","description":"diff the index against HEAD instead of the working tree"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"git_log","description":"The last commits, most recent first, one line each (short hash and subject).","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"how many commits (default 20, max 200)"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"git_branch","description":"Work with branches: list them, create one and switch to it, or switch to an existing one. Use it before committing so your change is not mixed with whatever was already in the tree. `create` and `switch` need a name; a name starting with a dash is refused.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["list","create","switch"]},"name":{"type":"string","description":"the branch, required for create and switch"}},"required":["action"]}}},
-    \\{"type":"function","function":{"name":"git_add","description":"Stage changes for the next commit. With no paths it stages everything that changed, which is what you want after you edited files yourself. Reports what is staged.","parameters":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"stage only these paths; omit to stage everything"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"git_commit","description":"Commit what is staged, with a message. One line of what changed and why is enough; do not put the diff in it. Returns the short hash. Does NOT push and does NOT add: stage first.","parameters":{"type":"object","properties":{"message":{"type":"string","description":"the commit message, one paragraph"}},"required":["message"]}}},
-    \\{"type":"function","function":{"name":"git_stash","description":"Put the current changes aside (push) so you can switch branches or start something clean, and bring them back (pop). `list` shows what is stashed. Use push+pop when the tree has unrelated work in it that you must not touch.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["push","pop","list"]}},"required":[]}}},
-    \\{"type":"function","function":{"name":"refs","description":"Where a symbol is DEFINED and where it is USED, in one call and with the two separated: definitions first, then calls, then plain references. One plain identifier, not a pattern (use `grep` for text). Prefer it over grepping: guessing the declaration shape for the language, running two greps and working out which hit is the definition is three round trips, and a round trip is a whole request. Knows the declaration shapes of zig, rust, go, python, js/ts, c, sh, and steps over Go method receivers, so `refs Listen` finds `func (s *Server) Listen()` instead of calling it a use.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"subdir":{"type":"string","description":"where to look (default: the whole project)"}},"required":["symbol"]}}},
-    \\{"type":"function","function":{"name":"rename","description":"Rename a symbol EVERYWHERE it appears as code, in ONE call, and report every file it touched. Prefer it over a series of `edit` calls: a rename applied to nine files out of ten leaves a codebase that does not compile, and only this says which file was skipped. Only whole-word occurrences that are real CODE are changed: the same name inside a string, a comment or a longer identifier is left alone. Two same-named symbols are both renamed — run `refs` first and narrow with `subdir` when that matters.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"to":{"type":"string","description":"the new name; must be a plain identifier"},"subdir":{"type":"string"}},"required":["symbol","to"]}}},
-    \\{"type":"function","function":{"name":"check","description":"Typecheck THIS project, in the background, and report the errors with a file and a line. You do not have to know the command: build.zig means `zig build`, Cargo.toml means `cargo check`, tsconfig.json means `tsc --noEmit`. Call it with no arguments to start one and KEEP WORKING, then call it with id to read the errors. Prefer it over `bash zig build`: it saves the round trip of guessing the command, and it never blocks the input.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the job id a previous call returned"}}}}},
-    \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; the truncation note names the exact `offset` to pass to continue where it stopped.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"},"offset":{"type":"integer","description":"byte offset into the extracted text (0 = start); pass the value the truncation note names to continue reading deeper"}},"required":["url"]}}},
-    \\{"type":"function","function":{"name":"web_search","description":"Search the web and return titles, URLs and short snippets. Use one focused query; the default is 5 results. Snippets are for discovery: fetch only the best primary source(s) when you need to verify details, and cite the supporting URL.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 5"}},"required":["query"]}}},
-    \\{"type":"function","function":{"name":"think","description":"Think privately step by step before acting. Use for planning and complex reasoning. No side effects.","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}},
-    \\{"type":"function","function":{"name":"todo","description":"Write the task list the USER SEES on screen. Call it when you FINISH a step and another is still open \u2014 that is when it earns its call, because the user is reading your last line to know whether you are still working. Two forms: send the WHOLE list in `items` when you make the plan or it changes shape, and afterwards change single steps with `update` ({index, status} or {index, text}), `remove` ([3]) or `add` ([{content}]); indexes are 1-BASED. Prefer `update` over resending the list to mark a step done: a twelve-step plan resent to change one can lose a step on the way. Mark exactly one step in_progress while you work on it, and never more than one. Call it again when a step finishes, and clear it when everything is done. Do not use it for a single obvious step or to think out loud: a list that never changes as you work is noise.","parameters":{"type":"object","properties":{"items":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string","description":"imperative, short: what this step does"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content"]},"description":"the WHOLE list, which REPLACES the previous one."},"update":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"index":{"type":"integer","description":"1-based position of the step"},"status":{"type":"string","enum":["pending","in_progress","done"]},"text":{"type":"string","description":"new wording for the step"}},"required":["index"]},"description":"change ONE step in place: {index,status} to mark it, {index,text} to reword it."},"remove":{"type":"array","maxItems":20,"items":{"type":"integer"},"description":"drop steps by 1-based position."},"add":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content"]},"description":"append a step discovered while working."}}}}},
-    \\{"type":"function","function":{"name":"ask","description":"Ask the USER one question, and wait for the answer. Use it when the answer changes what you do next: a choice between approaches, an ambiguous request with two real readings, a 'which one'. Do NOT ask what you can find out yourself — read the file, grep, run the command first, and only ask if it is still unclear after that. One question per step, at most three in a whole turn. Put your recommendation first in the question text so the user can just press enter. With 2 to 5 `options` it becomes a menu; with no options the user types free text. If the user does not answer (esc) you must decide on your own, say which option you picked and why, and carry on: do not ask again. `header` is a 2-3 word label for the dialog, not the question.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"the question, with your recommendation and its reason up front"},"header":{"type":"string","description":"2-3 word label for the dialog"},"options":{"type":"array","minItems":2,"maxItems":5,"items":{"type":"string","description":"one choice, on a single line"}}},"required":["question"]}}},
-    \\{"type":"function","function":{"name":"skill","description":"Load a skill: a folder of instructions written for a specific kind of task. Your prompt lists only the name and when to use it (the body is not in your prompt, so it costs nothing until you ask). Load one when its description matches what you are about to do, and load none when none of them do.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"the skill's name, exactly as listed"}},"required":["name"]}}},
-    \\{"type":"function","function":{"name":"task","description":"Send a read-only investigation to a SUBAGENT that has its own context window, and get back a short report (a few lines with paths and line numbers). Use it when the search is big: grepping across a large tree, tracing where something is used, reading many files to answer one question. Everything the subagent reads is paid for ONCE in a window that is then thrown away, instead of staying in your context and being resent on every remaining step — so for a wide search this is much cheaper than doing it yourself. It cannot write anything and cannot ask the user anything; if it needs a decision only the user can make, it says so in the report and you decide whether to ask. Use it for search; do it yourself when you already know the file to change. For a substantial task with several independent unknowns, split the investigation into distinct scoped questions and send consecutive task calls in the SAME message; the UI shows each assignment and live completion progress. Usually 2–4 useful tracks are enough; keep one focused question as one task, never duplicate work, and never split merely by file. They run concurrently up to the configured limit (/task-parallel), and reports return in request order. Do not send two tasks that depend on each other.","parameters":{"type":"object","properties":{"description":{"type":"string","description":"one line: what to find out"},"prompt":{"type":"string","description":"the full question, including where to look and what to report back"}},"required":["description"]}}},
-    \\{"type":"function","function":{"name":"bash_output","description":"Read the NEW output of a command you started with run_in_background, plus whether it is still running or what it exited with. Incremental: you get what appeared since your last call, not the whole buffer, so polling is cheap. Poll once per step, and do not poll in a tight loop — do something else in between.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"bash_kill","description":"Kill a backgrounded command. Use it when you no longer need the result, or when it is clearly going the wrong way.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"review","description":"Review YOUR OWN change: returns the diff of the files you changed this turn plus a checklist of what to look for in it. The harness has already checked that the code compiles, so this is NOT about running the build — it is about whether the change is the one you meant to make. The harness will not end your turn while an edit of yours is unreviewed, so call it once after a set of edits, before you report what you did. It costs no wall clock.","parameters":{"type":"object","properties":{},"required":[]}}},
-    \\{"type":"function","function":{"name":"goal","description":"Say whether the OBJECTIVE of this turn was reached. Only meaningful when the user set one with /goal; without it there is nothing to decide and you should not call this. Two answers, and both end the turn: `met` with a summary of what you finished AND the evidence (a command you ran, a number you measured), or `blocked` with the reason AND `what_would_unblock`, which is required. Call `met` only when you are certain: a confident summary is not the same claim as having checked, and a goal declared met that is not met is the one failure the harness cannot recover from. Do not use `blocked` because something is hard or slow. If neither is true, keep working and do not call this.","parameters":{"type":"object","properties":{"status":{"type":"string","enum":["met","blocked"],"description":"met = reached, blocked = cannot be done here"},"summary":{"type":"string","description":"what you finished and how you know, or why it cannot be done"},"what_would_unblock":{"type":"string","description":"REQUIRED when blocked: the one thing that would change the answer (a credential, a service that is up, a decision only the user can make)"}},"required":["status","summary"]}}}
-    \\]
-    ;
+    return "[" ++
+        read_prompt.json ++ "," ++
+        write_prompt.json ++ "," ++
+        edit_prompt.json ++ "," ++
+        notebook_edit_prompt.json ++ "," ++
+        bash_prompt.json ++ "," ++
+        glob_prompt.json ++ "," ++
+        grep_prompt.json ++ "," ++
+        refs_prompt.json ++ "," ++
+        rename_prompt.json ++ "," ++
+        check_prompt.json ++ "," ++
+        git_status_prompt.json ++ "," ++
+        git_diff_prompt.json ++ "," ++
+        git_log_prompt.json ++ "," ++
+        git_branch_prompt.json ++ "," ++
+        git_add_prompt.json ++ "," ++
+        git_commit_prompt.json ++ "," ++
+        git_stash_prompt.json ++ "," ++
+        list_files_prompt.json ++ "," ++
+        web_fetch_prompt.json ++ "," ++
+        web_search_prompt.json ++ "," ++
+        think_prompt.json ++ "," ++
+        todo_prompt.json ++ "," ++
+        task_create_prompt.json ++ "," ++
+        task_get_prompt.json ++ "," ++
+        task_list_prompt.json ++ "," ++
+        task_update_prompt.json ++ "," ++
+        task_stop_prompt.json ++ "," ++
+        ask_prompt.json ++ "," ++
+        lsp_prompt.json ++ "," ++
+        skill_prompt.json ++ "," ++
+        task_prompt.json ++ "," ++
+        review_prompt.json ++ "," ++
+        goal_prompt.json ++ "," ++
+        bash_output_prompt.json ++ "," ++
+        bash_kill_prompt.json ++ "," ++
+        sleep_prompt.json ++ "]";
 }
 
-/// Read-only mode tools (no write/modify tools).
-/// This is a static subset of `toolsJson()` for use in plan/read-only mode.
-/// It contains only tools that do not need permission: reads, searches, queries.
+/// Read-only mode (`shift+tab`): the toolset that cannot change the machine.
+///
+/// It is EXACTLY the tools that do not ask for permission — the same policy stated
+/// once as the permission table (`needsPermission`) and once as a schema, with a test
+/// below that fails when the two disagree.
+///
+/// It used to be a second, hand-maintained copy of eighteen entries of `toolsJson()`.
+/// Those copies are gone: a description improved in one array and not in the other was
+/// a tool that read differently depending on the mode it was offered in.
 pub fn toolsJsonReadOnly() []const u8 {
-    return
-    \\[
-    \\{"type":"function","function":{"name":"read","description":"A PNG/JPG/GIF/WEBP arrives as an IMAGE you can look at, never as bytes: do not use bash xxd/hexdump/base64/strings on a picture. Read a file from disk, or SEVERAL at once with `paths` (max 8) \u2014 prefer that whenever you are comparing files or opening a handful: one call is one round trip and a round trip is a whole request, so reading three files one by one costs three of them. Each file keeps the same caching. Optionally read a specific line range with offset/limit. If you already read that exact range and the file has not changed, this returns a one-line note instead of the text: the content is still in your context, so quote it from there, or pass force:true when you really need the text again (for example after it was elided from the context).","parameters":{"type":"object","properties":{"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"},"description":"read up to 8 files in ONE call; each is cached separately"},"offset":{"type":"integer","description":"1-indexed start line"},"limit":{"type":"integer"},"force":{"type":"boolean","description":"send the text again even if it is unchanged"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"glob","description":"Find files matching a glob pattern like src/**/*.zig.","parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
-    \\{"type":"function","function":{"name":"grep","description":"Search file contents with a regex. Returns path:line:text matches.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"subdir":{"type":"string"}},"required":["pattern"]}}},
-    \\{"type":"function","function":{"name":"git_status","description":"The state of the working tree and the branch: one line per staged, modified or untracked path (XY = staged then worktree, ?? = untracked), plus how many files changed and by how much. Prefer it to `bash git status`, which returns English prose with colour codes that you then have to parse. Returns a clean-tree note when there is nothing to report.","parameters":{"type":"object","properties":{},"required":[]}}},
-    \\{"type":"function","function":{"name":"git_diff","description":"The unified diff of the working tree against the index (or of the index against HEAD with staged:true). One block per file, each headed by the path, with +N and \u2212M counted for you at the end. Painted with the same colouriser as a write/edit diff. For anything git does that these do not cover (a commit, a checkout, a stash, a log of one path), use `bash`.","parameters":{"type":"object","properties":{"staged":{"type":"boolean","description":"diff the index against HEAD instead of the working tree"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"git_log","description":"The last commits, most recent first, one line each (short hash and subject).","parameters":{"type":"object","properties":{"limit":{"type":"integer","description":"how many commits (default 20, max 200)"}},"required":[]}}},
-    \\{"type":"function","function":{"name":"refs","description":"Where a symbol is DEFINED and where it is USED, in one call and with the two separated: definitions first, then calls, then plain references. One plain identifier, not a pattern (use `grep` for text). Prefer it over grepping: guessing the declaration shape for the language, running two greps and working out which hit is the definition is three round trips, and a round trip is a whole request. Knows the declaration shapes of zig, rust, go, python, js/ts, c, sh, and steps over Go method receivers, so `refs Listen` finds `func (s *Server) Listen()` instead of calling it a use.","parameters":{"type":"object","properties":{"symbol":{"type":"string"},"subdir":{"type":"string","description":"where to look (default: the whole project)"}},"required":["symbol"]}}},
-    \\{"type":"function","function":{"name":"list_files","description":"List files and directories directly inside a path (non-recursive, cheap).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch an http(s) URL and return the content as readable text (HTML tags, scripts and styles are stripped, entities decoded). Use it to read documentation, a release page or any URL the user mentions. A non-2xx answer returns the status plus the body, so you can see what the site said. Truncated to a byte budget; the truncation note names the exact `offset` to pass to continue where it stopped.","parameters":{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer","description":"bytes of text to keep (default 16000, max 200000)"},"offset":{"type":"integer","description":"byte offset into the extracted text (0 = start); pass the value the truncation note names to continue reading deeper"}},"required":["url"]}}},
-    \\{"type":"function","function":{"name":"web_search","description":"Search the web and return titles, URLs and short snippets. Use one focused query; the default is 5 results. Snippets are for discovery: fetch only the best primary source(s) when you need to verify details, and cite the supporting URL.","parameters":{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"1..20, default 5"}},"required":["query"]}}},
-    \\{"type":"function","function":{"name":"think","description":"Think privately step by step before acting. Use for planning and complex reasoning. No side effects.","parameters":{"type":"object","properties":{"thought":{"type":"string"}},"required":["thought"]}}},
-    \\{"type":"function","function":{"name":"todo","description":"Write the task list the USER SEES on screen. Call it when you FINISH a step and another is still open \u2014 that is when it earns its call, because the user is reading your last line to know whether you are still working. Two forms: send the WHOLE list in `items` when you make the plan or it changes shape, and afterwards change single steps with `update` ({index, status} or {index, text}), `remove` ([3]) or `add` ([{content}]); indexes are 1-BASED. Prefer `update` over resending the list to mark a step done: a twelve-step plan resent to change one can lose a step on the way. Mark exactly one step in_progress while you work on it, and never more than one. Call it again when a step finishes, and clear it when everything is done. Do not use it for a single obvious step or to think out loud: a list that never changes as you work is noise.","parameters":{"type":"object","properties":{"items":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string","description":"imperative, short: what this step does"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content"]},"description":"the WHOLE list, which REPLACES the previous one."},"update":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"index":{"type":"integer","description":"1-based position of the step"},"status":{"type":"string","enum":["pending","in_progress","done"]},"text":{"type":"string","description":"new wording for the step"}},"required":["index"]},"description":"change ONE step in place: {index,status} to mark it, {index,text} to reword it."},"remove":{"type":"array","maxItems":20,"items":{"type":"integer"},"description":"drop steps by 1-based position."},"add":{"type":"array","maxItems":20,"items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content"]},"description":"append steps to the list."}},"required":[]}}},
-    \\{"type":"function","function":{"name":"ask","description":"Ask the USER one question, and wait for the answer. Use it when the answer changes what you do next: a choice between approaches, an ambiguous request with two real readings, a 'which one'. Do NOT ask what you can find out yourself \u2014 read the file, grep, run the command first, and only ask if it is still unclear after that. One question per step, at most three in a whole turn. Put your recommendation first in the question text so the user can just press enter. With 2 to 5 `options` it becomes a menu; with no options the user types free text. If the user does not answer (esc) you must decide on your own, say which option you picked and why, and carry on: do not ask again. `header` is a 2-3 word label for the dialog, not the question.","parameters":{"type":"object","properties":{"question":{"type":"string","description":"the question, with your recommendation and its reason up front"},"header":{"type":"string","description":"2-3 word label for the dialog"},"options":{"type":"array","minItems":2,"maxItems":5,"items":{"type":"string","description":"one choice, on a single line"}}},"required":["question"]}}},
-    \\{"type":"function","function":{"name":"skill","description":"Load a skill: a folder of instructions written for a specific kind of task. Your prompt lists only the name and when to use it (the body is not in your prompt, so it costs nothing until you ask). Load one when its description matches what you are about to do, and load none when none of them do.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"the skill's name, exactly as listed"}},"required":["name"]}}},
-    \\{"type":"function","function":{"name":"bash_output","description":"Read the NEW output of a command you started with run_in_background, plus whether it is still running or what it exited with. Incremental: you get what appeared since your last call, not the whole buffer, so polling is cheap. Poll once per step, and do not poll in a tight loop \u2014 do something else in between.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"bash_kill","description":"Kill a backgrounded command. Use it when you no longer need the result, or when it is clearly going the wrong way.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"the id bash gave you"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"review","description":"Review YOUR OWN change: returns the diff of the files you changed this turn plus a checklist of what to look for in it. The harness has already checked that the code compiles, so this is NOT about running the build \u2014 it is about whether the change is the one you meant to make. The harness will not end your turn while an edit of yours is unreviewed, so call it once after a set of edits, before you report what you did. It costs no wall clock.","parameters":{"type":"object","properties":{},"required":[]}}},
-    \\{"type":"function","function":{"name":"goal","description":"Say whether the OBJECTIVE of this turn was reached. Only meaningful when the user set one with /goal; without it there is nothing to decide and you should not call this. Two answers, and both end the turn: `met` with a summary of what you finished AND the evidence (a command you ran, a number you measured), or `blocked` with the reason AND `what_would_unblock`, which is required. Call `met` only when you are certain: a confident summary is not the same claim as having checked, and a goal declared met that is not met is the one failure the harness cannot recover from. Do not use `blocked` because something is hard or slow. If neither is true, keep working and do not call this.","parameters":{"type":"object","properties":{"status":{"type":"string","enum":["met","blocked"],"description":"met = reached, blocked = cannot be done here"},"summary":{"type":"string","description":"what you finished and how you know, or why it cannot be done"},"what_would_unblock":{"type":"string","description":"REQUIRED when blocked: the one thing that would change the answer (a credential, a service that is up, a decision only the user can make)"}},"required":["status","summary"]}}}
-    \\]
-    ;
+    return "[" ++
+        read_prompt.json ++ "," ++
+        glob_prompt.json ++ "," ++
+        grep_prompt.json ++ "," ++
+        refs_prompt.json ++ "," ++
+        list_files_prompt.json ++ "," ++
+        git_status_prompt.json ++ "," ++
+        git_diff_prompt.json ++ "," ++
+        git_log_prompt.json ++ "," ++
+        web_fetch_prompt.json ++ "," ++
+        web_search_prompt.json ++ "," ++
+        think_prompt.json ++ "," ++
+        todo_prompt.json ++ "," ++
+        task_create_prompt.json ++ "," ++
+        task_get_prompt.json ++ "," ++
+        task_list_prompt.json ++ "," ++
+        task_update_prompt.json ++ "," ++
+        task_stop_prompt.json ++ "," ++
+        ask_prompt.json ++ "," ++
+        skill_prompt.json ++ "," ++
+        bash_output_prompt.json ++ "," ++
+        bash_kill_prompt.json ++ "," ++
+        sleep_prompt.json ++ "," ++
+        review_prompt.json ++ "," ++
+        goal_prompt.json ++ "]";
+}
+
+test "the read-only schema is exactly the tools that do not ask for permission" {
+    // The day these two disagree, the model is either offered a tool in read-only mode
+    // that stops at a permission dialog (the mode exists so that nothing can happen)
+    // or denied one that could not have done anything anyway.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const ro = std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), toolsJsonReadOnly(), .{}) catch
+        return error.BadSchema;
+    if (ro != .array) return error.BadSchema;
+    for (defs) |d| {
+        var in_readonly = false;
+        for (ro.array.items) |item| {
+            const n = item.object.get("function").?.object.get("name").?.string;
+            if (std.mem.eql(u8, n, d.name)) in_readonly = true;
+        }
+        if (in_readonly == needsPermission(d.name)) {
+            std.debug.print(
+                "{s}: the read-only schema and the permission table disagree (in the schema: {}, asks permission: {})\n",
+                .{ d.name, in_readonly, needsPermission(d.name) },
+            );
+            return error.ReadOnlySchemaDrift;
+        }
+    }
 }
 
 /// Does this tool need to ask the user before running it?
@@ -182,10 +282,24 @@ pub fn needsPermission(name: []const u8) bool {
         std.mem.eql(u8, name, "web_search") or
         std.mem.eql(u8, name, "think") or
         std.mem.eql(u8, name, "todo") or
+        // The whole task graph asks nothing, and the reason is the same as `todo`'s:
+        // it changes a list that belongs to the session, not the machine. It also has
+        // to be this way for plan mode, which is exactly when a task list is worth
+        // having — a read-only mode that refuses to let the agent write down its own
+        // plan is a mode that makes the plan live in the prose, where compaction eats
+        // it.
+        std.mem.eql(u8, name, "task_create") or
+        std.mem.eql(u8, name, "task_get") or
+        std.mem.eql(u8, name, "task_list") or
+        std.mem.eql(u8, name, "task_update") or
+        std.mem.eql(u8, name, "task_stop") or
         std.mem.eql(u8, name, "ask") or
         std.mem.eql(u8, name, "skill") or
         std.mem.eql(u8, name, "bash_output") or
         std.mem.eql(u8, name, "bash_kill") or
+        // `sleep` writes nothing and reads nothing: it waits. There is no question
+        // for a dialog to ask.
+        std.mem.eql(u8, name, "sleep") or
         std.mem.eql(u8, name, "review") or
         // `goal` decides nothing about the machine: it records what the model already
         // did. Asking permission for it would put a dialog in front of the answer the
@@ -216,6 +330,31 @@ pub fn execute(
     bg: ?*bgproc.Registry,
     cache: ?*readcache.Cache,
 ) ![]const u8 {
+    return executeWith(io, name, args_json, arena, bg, cache, null);
+}
+
+/// `execute` plus the session's task graph.
+///
+/// A second entry point rather than a seventh parameter on `execute`, for the same
+/// reason `chat.streamChatDetail` sits next to `streamChat`: the callers that have no
+/// session state at all (every test, `zig build tool-test`, the probes) should not
+/// have to say `null` three times to call a tool, and the two runners that DO have a
+/// session say what they mean explicitly. The parameter is the honest shape — the
+/// store belongs to a session, and a module global would be a lie about when two
+/// things are the same.
+///
+/// `null` means "this caller has no task list", which the five task tools answer with
+/// `error.NoTaskStore` and a sentence, never with an empty list that looks like a
+/// real one.
+pub fn executeWith(
+    io: std.Io,
+    name: []const u8,
+    args_json: []const u8,
+    arena: std.mem.Allocator,
+    bg: ?*bgproc.Registry,
+    cache: ?*readcache.Cache,
+    tasks: ?*taskstore.Store,
+) ![]const u8 {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
     if (parsed != .object) return error.BadArgs;
     const obj = parsed.object;
@@ -226,6 +365,8 @@ pub fn execute(
         return write_tool.toolWrite(io, obj, arena);
     } else if (std.mem.eql(u8, name, "edit")) {
         return edit_tool.toolEdit(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "notebook_edit")) {
+        return notebook_tool.toolNotebookEdit(io, obj, arena);
     } else if (std.mem.eql(u8, name, "bash")) {
         return bash_tool.toolBash(io, obj, arena, bg);
     } else if (std.mem.eql(u8, name, "glob")) {
@@ -262,12 +403,24 @@ pub fn execute(
         return think_tool.toolThink(obj, arena);
     } else if (std.mem.eql(u8, name, "todo")) {
         return todo_tool.toolTodo(obj, arena);
+    } else if (std.mem.eql(u8, name, "task_create")) {
+        return tasks_tool.toolTaskCreate(io, tasks, obj, arena);
+    } else if (std.mem.eql(u8, name, "task_get")) {
+        return tasks_tool.toolTaskGet(tasks, obj, arena);
+    } else if (std.mem.eql(u8, name, "task_list")) {
+        return tasks_tool.toolTaskList(tasks, arena);
+    } else if (std.mem.eql(u8, name, "task_update")) {
+        return tasks_tool.toolTaskUpdate(io, tasks, obj, arena);
+    } else if (std.mem.eql(u8, name, "task_stop")) {
+        return tasks_tool.toolTaskStop(io, tasks, obj, arena);
     } else if (std.mem.eql(u8, name, "goal")) {
         return goal_tool.toolGoal(obj, arena);
     } else if (std.mem.eql(u8, name, "bash_output")) {
         return bg_tool.toolBashOutput(obj, arena, bg);
     } else if (std.mem.eql(u8, name, "bash_kill")) {
         return bg_tool.toolBashKill(obj, arena, bg, io);
+    } else if (std.mem.eql(u8, name, "sleep")) {
+        return sleep_tool.toolSleep(io, obj, arena);
     }
     // `ask`, `task` and `skill` are NOT here on purpose: they need the `Model`
     // (the dialog, the worker loop, the loaded skills), which `tools.zig` cannot
@@ -291,6 +444,7 @@ pub const defs = [_]ToolDef{
     .{ .name = "read", .desc = "Read a file with line offsets and smart truncation" },
     .{ .name = "write", .desc = "Create or overwrite a file" },
     .{ .name = "edit", .desc = "Exact str_replace editing, single or multi-hunk" },
+    .{ .name = "notebook_edit", .desc = "Edit a Jupyter cell by index, keeping outputs and metadata" },
     .{ .name = "bash", .desc = "Run a shell command with timeout" },
     .{ .name = "glob", .desc = "Find files matching a glob pattern" },
     .{ .name = "grep", .desc = "Search file contents with regex" },
@@ -309,13 +463,20 @@ pub const defs = [_]ToolDef{
     .{ .name = "web_search", .desc = "Search the web: titles, URLs and snippets" },
     .{ .name = "think", .desc = "Private scratchpad to reason before acting (no side effects)" },
     .{ .name = "todo", .desc = "Write the visible task list the user watches (full list, not a diff)" },
+    .{ .name = "task_create", .desc = "Create a task: an id, a status, an owner and dependencies" },
+    .{ .name = "task_get", .desc = "The full record of one task, with both directions of its dependencies" },
+    .{ .name = "task_list", .desc = "Every task in one line: status, owner and what it is waiting on" },
+    .{ .name = "task_update", .desc = "Change a task: start it, finish it, or wire a dependency" },
+    .{ .name = "task_stop", .desc = "Remove a task that is not going to happen, clearing its edges" },
     .{ .name = "ask", .desc = "Ask the user one question when the answer changes what you do" },
+    .{ .name = "lsp", .desc = "Ask a language server goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls" },
     .{ .name = "skill", .desc = "Load a skill's full instructions on demand (cheap: only its name is in your prompt)" },
     .{ .name = "task", .desc = "Send a read-only search to a subagent with its own context, get back a short report" },
     .{ .name = "review", .desc = "Read your own diff back with a checklist (the harness requires it before the turn ends)" },
     .{ .name = "goal", .desc = "Declare the /goal objective met or blocked, with the evidence (ends the turn)" },
     .{ .name = "bash_output", .desc = "New output of a backgrounded command (incremental) plus its exit status" },
     .{ .name = "bash_kill", .desc = "Kill a backgrounded command" },
+    .{ .name = "sleep", .desc = "Wait N seconds without holding a shell (ESC cuts it short)" },
 };
 
 // ── the two names that belong to no single tool ───────────────
@@ -355,6 +516,23 @@ test "toolsJson is valid JSON and has one entry per tool" {
     }
 }
 
+test "the unknown-tool message names every tool in defs, not a hand-kept subset" {
+    // The message is the one place the model is handed the whole vocabulary, and it is
+    // hand-written. It was already wrong: it named sixteen of the twenty-nine tools and
+    // silently omitted the git ones, `refs`, `rename`, `check`, `lsp`, `review` and
+    // `goal`, so a model that reached for a tool that exists could be told it does not.
+    // `defs` is the table; this test makes the message a view of it instead.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const msg = errors_tool.describeError(arena_state.allocator(), error.UnknownTool, "serch", "{}");
+    for (defs) |d| {
+        if (std.mem.indexOf(u8, msg, d.name) == null) {
+            std.debug.print("the unknown-tool message never names {s}\n", .{d.name});
+            return error.ToolNotListed;
+        }
+    }
+}
+
 test "list_files lists this src" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -386,6 +564,54 @@ test "glob finds the zigs" {
     defer arena_state.deinit();
     const out = try execute(std.testing.io, "glob", "{\"pattern\":\"src/*.zig\"}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "src/main.zig") != null);
+}
+
+test "glob with subdir and limit stays under the directory and stops at the limit" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // src/lib has more than three .zig files, so the walk MUST be cut — and
+    // every printed path has to live under subdir, which is the argument that
+    // used not to exist for this tool.
+    const out = try execute(
+        std.testing.io,
+        "glob",
+        "{\"pattern\":\"**/*.zig\",\"subdir\":\"src/lib\",\"limit\":3}",
+        arena_state.allocator(),
+        null,
+        null,
+    );
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    var paths: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "more results omitted") != null) continue;
+        try std.testing.expect(std.mem.startsWith(u8, line, "src/lib/"));
+        paths += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), paths);
+    try std.testing.expect(std.mem.indexOf(u8, out, "more results omitted") != null);
+
+    // The same call with sort=newest: same cap, and the mtime path (statFile +
+    // sort) actually runs against the real tree — which is the half the pure
+    // comparator test cannot exercise.
+    const sorted = try execute(
+        std.testing.io,
+        "glob",
+        "{\"pattern\":\"**/*.zig\",\"subdir\":\"src/lib\",\"limit\":3,\"sort\":\"newest\"}",
+        arena_state.allocator(),
+        null,
+        null,
+    );
+    var slines = std.mem.splitScalar(u8, sorted, '\n');
+    var spaths: usize = 0;
+    while (slines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "more results omitted") != null) continue;
+        try std.testing.expect(std.mem.startsWith(u8, line, "src/lib/"));
+        spaths += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), spaths);
+    try std.testing.expect(std.mem.indexOf(u8, sorted, "more results omitted") != null);
 }
 
 test "native grep finds the pattern" {
@@ -1710,6 +1936,33 @@ test "bash: a command that only prints a LOT does not leave a grandchild behind"
     try std.testing.expect(std.mem.indexOf(u8, out, bg_tool.foreground_truncation_notice) != null);
     // Nowhere near the 30 s timeout: the point of the cap is that it returns.
     try std.testing.expect(elapsed_ms < 5000);
+}
+
+test "edit: a hunk that would write the file back unchanged is refused" {
+    // It used to succeed: the file came out byte-identical, the tool reported a change,
+    // and the thing the model meant to edit was never touched. A no-op dressed as an
+    // edit is worse than an error, because nothing looks wrong.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Its own directory creation: the suite usually finds `/tmp/opencode` already
+    // there from another test, and a test that needs it is a test that fails alone.
+    std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode") catch {};
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = "/tmp/opencode/edit-noop.txt",
+        .data = "alpha\nbeta\n",
+    });
+
+    const out = try execute(std.testing.io, "edit",
+        \\{"path":"/tmp/opencode/edit-noop.txt","old_string":"beta","new_string":"beta"}
+    , arena, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "identical") != null);
+
+    // And the file is untouched, which is the half that matters: "nothing was written"
+    // has to mean nothing.
+    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/tmp/opencode/edit-noop.txt", arena, .limited(4096));
+    try std.testing.expectEqualStrings("alpha\nbeta\n", after);
 }
 
 test "a failed edit says WHICH of the three failures it was, and never says nothing" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const write_tool = @import("write.zig");
+const notebook_mod = @import("notebook.zig");
 const readcache = @import("../lib/readcache.zig");
 
 /// Line numbers past this are not worth caching precisely. Nothing real gets
@@ -97,6 +98,23 @@ fn readOne(
     cache: ?*readcache.Cache,
 ) ![]const u8 {
     var dir = std.Io.Dir.cwd();
+
+    // A NOTEBOOK is read as an outline, not as its JSON.
+    //
+    // The raw file is thousands of lines of escaped strings, and the one thing the
+    // model needs from it — which index each cell is — is a position it would have to
+    // count by hand. The outline prints those indices, the cell type, its size and its
+    // first line, which is what a cell is identified by.
+    //
+    // It degrades rather than blocks: a `.ipynb` that does not parse is still a file
+    // someone may want to look at, so the failure falls through to the ordinary read,
+    // which is where the real error (no such file, not readable) is reported.
+    if (std.mem.endsWith(u8, path, ".ipynb")) {
+        if (notebook_mod.outline(io, path, arena)) |text| {
+            return text;
+        } else |_| {}
+    }
+
     const first_line: u32 = @intCast(@min(offset, read_line_cap));
     const last_line: u32 = @intCast(@min(offset + limit, read_line_cap));
 

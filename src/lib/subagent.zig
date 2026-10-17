@@ -48,6 +48,7 @@ pub const tool_names = [_][]const u8{
     "list_files",
     "web_fetch",
     "web_search",
+    "lsp",
 };
 
 /// `ask` is deliberately absent (see the header): a subagent that asked from a

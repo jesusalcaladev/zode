@@ -18,6 +18,7 @@ const mascot = @import("lib/mascot.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");
+const taskstore = @import("lib/taskstore.zig");
 const kittyKeyboardPush = @import("lib/termseq.zig").kittyKeyboardPush;
 const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
 const skills = @import("lib/skills.zig");
@@ -214,6 +215,13 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // also kills anything still running: a `zode --chat` that exits with an
     // orphaned build writing to a closed pipe is worse than waiting.
     var bg = bgproc.Registry{};
+    // The task graph of a headless run: real for the run, memory only.
+    //
+    // This runner has no session file (`--chat` is one run in one process), so there
+    // is nothing for the list to survive in. The tools still work, and the graph is
+    // what `task_list` reads back inside the run — which is the whole point of a task
+    // list during a turn. Nothing is written, so nothing can be half-written either.
+    var tasks = taskstore.Store{ .gpa = gpa };
     defer bg.deinit(io, gpa);
 
     // The headless model gets ASKED for too. Without this, `--chat` against a
@@ -438,7 +446,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         try msgs.append(arena, .{ .role = "assistant", .content = "", .tool_calls_json = tc_json });
         for (result.ctx.parts.items) |*p| {
             models.dbg("\n[tool {s}] {s}\n", .{ p.name.items, p.args.items });
-            const res = execHeadless(io, &bg, &pending_images, p.name.items, p.args.items, arena) catch |err| {
+            const res = execHeadless(io, &bg, &tasks, &pending_images, p.name.items, p.args.items, arena) catch |err| {
                 try msgs.append(arena, .{
                     .role = "tool",
                     .content = try std.fmt.allocPrint(arena, "error: {t}", .{err}),
@@ -563,6 +571,7 @@ fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.M
 fn execHeadless(
     io: std.Io,
     bg: *bgproc.Registry,
+    tasks: *taskstore.Store,
     images: *images_mod.Pending,
     name: []const u8,
     args: []const u8,
@@ -581,7 +590,7 @@ fn execHeadless(
     // cache would only be able to help within it. The headless agent is also where
     // a "you already have this" answer is most confusing to debug, because there
     // is no session on screen to compare against.
-    return tools_mod.execute(io, name, args, arena, bg, null);
+    return tools_mod.executeWith(io, name, args, arena, bg, null, tasks);
 }
 
 /// TUI mode: zode (no args)

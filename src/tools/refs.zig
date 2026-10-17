@@ -61,11 +61,15 @@ pub fn findOccurrences(
     name: []const u8,
 ) ![]const Occurrence {
     var out: std.ArrayList(Occurrence) = .empty;
-    var walker = try common.walkAll(io, arena, subdir);
-    defer walker.deinit();
+    // The PROJECT's files (`git ls-files`), not a tree walk with a budget: see
+    // `common.gitFiles` for the measurement that made this necessary — a walk in this
+    // repository spent the whole budget inside an ignored vendored copy and reported
+    // "no declaration" for a symbol in `src/`.
+    var files_iter = common.searchableFiles(io, arena, subdir);
+    defer files_iter.deinit();
 
     var files: usize = 0;
-    while (walker.next()) |path| {
+    while (files_iter.next()) |path| {
         defer arena.free(path);
         if (files >= symbols.max_files) break;
         if (shouldSkip(basenameOf(path))) continue;
@@ -124,18 +128,21 @@ pub fn toolRefs(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     }
 
     const subdir = common.getStr(obj, "subdir") orelse ".";
-    var walker = try common.walkAll(io, arena, subdir);
-    defer walker.deinit();
+    var files_iter = common.searchableFiles(io, arena, subdir);
+    defer files_iter.deinit();
 
     var hits: std.ArrayList(symbols.Hit) = .empty;
     var total: usize = 0;
     var files: usize = 0;
-    var truncated = false;
+    var stopped_early = false;
 
-    while (walker.next()) |path| {
+    while (files_iter.next()) |path| {
         defer arena.free(path);
         if (files >= symbols.max_files) {
-            truncated = true;
+            // Its own flag, and its own sentence: "N hits existed and M are shown" is a
+            // lie when the walk is what stopped, and that is exactly the shape of
+            // silence that hid this bug for a month.
+            stopped_early = true;
             break;
         }
         if (shouldSkip(basenameOf(path))) continue;
@@ -189,7 +196,8 @@ pub fn toolRefs(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
         // Both counts matter and they are different: the walk gave up early, or
         // the hits did not fit. Either way the model is looking at a fragment and
         // has to be told so.
-        .truncated = truncated or total > hits.items.len,
+        .truncated = total > hits.items.len,
+        .stopped_early = stopped_early,
     });
 }
 

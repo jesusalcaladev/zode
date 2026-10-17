@@ -125,12 +125,26 @@ binary (1.9MB stripped).
 - Note: OpenRouter's free models do not report cache; the metric shines with
   Anthropic/DeepSeek/OpenAI.
 
-## Current tools (10)
+## Current tools (36)
 
-read, write, edit (multi-hunk), bash, glob, grep (native rg), list_files (a cheap
-flat listing), **web_fetch**, **web_search**, think (a scratchpad with no effects,
-for planning). They do not ask for permission: read, glob, grep, list_files,
-think, web_fetch, web_search.
+read, write, edit (multi-hunk), notebook_edit, bash (+background: `run_in_background`,
+`bash_output`, `bash_kill`), glob, grep (native rg), refs, rename, check,
+git_status/diff/log/branch/add/commit/stash, list_files, **web_fetch**,
+**web_search**, think (a scratchpad with no effects, for planning), todo, the
+task graph (`task_create`/`task_get`/`task_list`/`task_update`/`task_stop`), ask,
+lsp, skill, task (subagents), review, goal, sleep.
+
+**The authoritative list is `tools/dispatch.zig`'s `defs`** — this heading said
+"10" while the binary had 28, because a hand-kept copy is how a list goes stale.
+The `UnknownTool` message is hand-written, but a test pins it against `defs`
+(`the unknown-tool message names every tool in defs`): a tool added without a
+mention there fails the suite.
+
+No permission asked: read, glob, grep, refs, list_files, git_status/diff/log,
+web_fetch, web_search, think, todo, the five task tools (they change the
+SESSION's list, not the machine — and plan mode must let the agent write down
+its own plan), ask, skill, bash_output/bash_kill, sleep (it waits), review,
+goal. `rename` is NOT exempt: it rewrites files across the tree.
 
 ## The web tools: `web_fetch` and `web_search`
 
@@ -2616,6 +2630,79 @@ Three things came out on the way and cost some time:
 is why they all live in `dispatch.zig` even though they name a tool. The ones that
 test a helper go next to it. All 30 are still there.
 
+### The prompt lives with the tool (`src/tools/prompts/`)
+
+What the model READS about a tool was one line of the schema literal in
+`dispatch.zig`, next to every other tool's text — twenty-eight of them, and the
+read-only array was a hand-maintained COPY of eighteen of those lines, so the same
+description existed twice and was improved once. Now every tool's text is its own
+module: `prompts/<name>.zig` = `name`, `description`, `parameters`, the `json`
+entry assembled from them at comptime, and the test that pins it.
+
+`dispatch.zig` keeps only two things: the ORDER of `toolsJson()` and the read-only
+subset of `toolsJsonReadOnly()`. Both are composed from the SAME modules, so the
+eighteen duplicated entries are gone and a rule cannot be improved in one array and
+not in the other.
+
+Three things are the reason, and none of them is tidiness:
+
+- **The prose is a value with a NAME**, so a test can assert on it directly ("does
+  this still say the shell is fresh?"). Through the literal, the only test that can
+  reach it parses the WHOLE toolset, and the edit is made in a file that is not
+  about the tool.
+- **`description` carries no `"`, no `\` and no control character.** `json`
+  interpolates it at comptime, so one stray quote makes the entire tools array
+  invalid JSON — and the symptom is that NO tool can be called, not this one, in a
+  `const` nobody would think to look at. The invariant is a test, per tool, in
+  `prompts/validate.zig`.
+- **Tool-specific rules go in the schema; cross-tool routing stays in
+  `lib/prompt.zig`.** Routing has to survive a project's `AGENTS.md` replacing the
+  built-in prompt, so a copy inside a tool description is a rule paid for on every
+  request plus the copy that drifts. A test asserts that `bash`'s description names
+  none of the tools the routing table owns.
+
+`prompts/validate.zig` is the shared test, and it is **a pure function plus a
+printing wrapper**: `fault()` returns the reason (a `Fault` union) so a test can
+provoke every failure without printing anything, and `entry()` is what a tool's
+module calls. A suite that prints alarming lines while it is green is a suite whose
+output people stop reading, and the naive version would print four of them per run.
+
+The pieces that pair up (read-only ⟷ the permission table, the schema ⟷ `defs`) are
+pinned by tests in `dispatch.zig`, because they are one policy written twice and the
+day they disagree either the model is offered a tool that stops at a dialog in
+read-only mode or it is denied one that could not do anything anyway.
+
+### What the migration found, which is why it was worth doing
+
+- **`lsp` was declared in `defs` and never in the schema.** The tool was fully
+  implemented and the model could not call it; the count test had been red about it.
+  Writing the module is what closed it, and it is also what the tool's own doc
+  comment had been arguing for permission-wise (see the note below).
+- **`check` declared only `id` while its code reads `subdir` too** (a monorepo's
+  subproject). A dispatcher test already exercised the undocumented argument, so the
+  capability existed and was invisible. There is now a test that `subdir` is in the
+  schema, and the scan that found it compares the keys a tool reads (`getStr(obj,
+  "…")`) against the keys its module declares.
+- **`edit` accepted a hunk whose `old_string` equalled its `new_string`** and
+  reported a successful edit of a file that came out byte-identical. `rename` had
+  refused that no-op for a while; `edit` now does too, with a test that also checks
+  the file is untouched.
+- **`edit` and `write` gained the two rules the comparison was for**: keep the match
+  SMALL (ten lines of context is not safer, it is what makes a patch stop matching),
+  and overwriting an existing file is a decision rather than a reflex.
+
+Still true and not ours to change here: `needsPermission` asks for `lsp` while
+`src/tools/lsp.zig` documents "Permission: none" (the command it spawns comes from a
+fixed table, never from the model). The read-only test will name it the day someone
+takes one side.
+
+What `bash`'s text carries that the schema could not imply: every call is a fresh
+`/bin/sh -c`, so a `cd` does NOT survive to the next call; stdin is `/dev/null`, so
+an interactive flag waits for the timeout instead of failing; and the destructive
+git operations, `--no-verify` and unquoted paths with spaces are named instead of
+left to judgement. Its own message for `error.Timeout` came with it — the generic
+one told the model to "fix the cause" of a command that was merely slow.
+
 ### The `tools` module of `zig build tool-test`
 
 `zig build tool-test` **did not compile**, and AGENTS.md already said nobody ran it
@@ -4579,3 +4666,83 @@ use-after-free that the opposite choice produced — and it demonstrably improve
 the no-key case from "answers nothing" to "answers every time". It just is not
 the fix for the key case, and it is written here as hardening rather than as a
 cure.
+
+---
+
+# The 2026-10-16 batch: task graph, notebooks, sleep — and how they connect
+
+Three Claude-Code-class tools (Phase 15/17/19 of TASKS.md, all ticked) and the
+seams that make them part of the harness instead of three islands. Every seam
+below has a test that goes red if it rots.
+
+## The task graph vs `todo` — the relation the model needs (in the routing prompt)
+
+- **`todo` is the plan the USER watches** (one line above the input, rewritten
+  top to bottom). **The task graph is what the AGENT coordinates on**: stable
+  ids, `blocks`/`blocked_by`, an owner, and a file (`sessions/zode-<id>.tasks.json`)
+  that survives a compaction that eats prose. One source of truth per job; the
+  routing table says it in one bullet so the schema descriptions do not have to
+  fight over it.
+- `blocked_by` is DERIVED — `link(A,B)` writes both views and nothing else may
+  write either, which is also why "completing a blocker unblocks" needs no
+  unblock code.
+- `in_progress` without an owner in the SAME call is refused (the fix is in the
+  sentence); completing while a blocker is open is refused and NAMES it.
+- The store BINDS PER SESSION at the top of the tool batch (`bindTasks`):
+  `/new` and `--resume` change `s.path`, and `Store.bind` compares paths, so the
+  graph follows the session instead of showing a dead one's list. Idempotent,
+  and it happens on the turn's thread — which is what makes the parallel batch
+  safe to hand the same store to.
+- Parallelism: only `task_list`/`task_get` are `isParallelSafe` (the store is one
+  unlocked ArrayList); the three writers are excluded with the reason in a
+  comment. Subagents get NEITHER (`subagent.tool_names` is read-only): three
+  parallel subagents writing one store is the same race with the caller removed.
+- The exit gate does not count them as writes (their args carry no code path),
+  so a graph update never starts a build — pinned by "the gate counts every tool
+  that writes files, and only those".
+
+## Notebooks
+
+- `read` on a `.ipynb` returns the NUMBERED outline (index, type, size, first
+  line); `notebook_edit` addresses by that index. Never `edit`/`write` the raw
+  JSON: the cell source there is a JSON string with escaped newlines.
+- The round trip preserves outputs, execution counts, cell ids, metadata and
+  nbformat (the test checks each ONE BY ONE); a malformed file is refused WITH
+  the parse line/column (`std.json.Diagnostics` re-scan) and not one byte is
+  written — the whole file parses BEFORE any cell is touched. The error name is
+  `NotebookSyntax` (a syntax failure) vs `NotANotebook` (valid JSON, no `cells`),
+  and `read` falls back to the raw bytes on either.
+- It IS a write for every subsystem that counts writes: the permission dialog,
+  the `/undo` snapshot (`filePathOf` knows `notebook_path`), plan mode (it is in
+  `isEditTool`) and the exit gate — the gate was the ONLY one that did not count
+  it, and that is the drift fixed below.
+
+## `sleep`
+
+- No shell, no process; ESC cuts it and the result says how much of it actually
+  happened. The prompt names the REAL cost (the turn is blocked; each wake-up is
+  one more API call) and points at `bash_output` for polling a job.
+- It is deliberately NOT exempt from the repetition guard: `read` and
+  `bash_output` are, because re-reading and polling are their designed use —
+  but the same `sleep` twice in a row is a stall and the guard is right to say so.
+
+## Three drifts this batch found (all pinned now)
+
+1. `autochk.touchesFile` knew only write+edit, so `rename` (which rewrites code
+   in files its args NEVER name) and `notebook_edit` never asked the gate for a
+   check: a turn could end right after either with nothing verified. A rename
+   now ALWAYS counts as a write, by an explicit branch with the reason.
+2. The gate also could not see `notebook_edit`'s path: it reads `path`/`files`,
+   and the tool spells it `notebook_path` — plus `.ipynb` was not in
+   `typecheck.worthChecking`. All three added together; one alone would have
+   changed nothing.
+3. This file's "Current tools (10)" was 26 tools behind `defs` (see the section
+   above).
+
+And one cosmetic-but-real: `toolArgSummary` now names `notebook_path` for the
+timeline's `⏺ notebook_edit(...)` line, instead of relying on "the first string
+in the args" — which was one schema reorder away from printing a cell index.
+
+Two checks, run after all of the above: the language greps (test names and
+comments in English) come out empty, and `zig build test` is green with the new
+"the gate counts every tool that writes files, and only those" test among them.

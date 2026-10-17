@@ -7,7 +7,43 @@ const dispatch = @import("dispatch.zig");
 const common = @import("common.zig");
 const http = @import("../lib/http_client.zig");
 const web = @import("../lib/web.zig");
+const webcache = @import("../lib/webcache.zig");
 const agent = @import("../agent.zig");
+
+/// The page cache, and the lock around it.
+///
+/// `web_fetch` is on the parallel-safe list, so three of them can run at once
+/// and this is shared mutable state. It is a `std.atomic.Mutex` and NOT
+/// `std.Thread.Mutex` (which does not exist in 0.16), and the critical section
+/// is a map lookup: it holds for microseconds and never spans I/O.
+///
+/// The arena is never freed while the process runs (see `Model.deinit`): a map
+/// that several threads can read is not freed at runtime, only at teardown.
+var pages: webcache.Cache = .{ .gpa = std.heap.page_allocator };
+var pages_lock: std.atomic.Mutex = .unlocked;
+
+/// Takes the lock, yielding while somebody else has it.
+///
+/// `std.atomic.Mutex` is a spinlock in this Zig: `tryLock`/`unlock` and no
+/// `lock()`. A plain spin would be rude here because three `web_fetch` calls can
+/// land at once and each holds the lock for a map lookup, so the wait is short
+/// but real.
+fn lockPages() void {
+    while (!pages_lock.tryLock()) std.Thread.yield() catch {};
+}
+
+/// Drops every cached page. `/clean` calls it so a cache in memory is not the
+/// last thing left behind, and the tests call it so one does not see another's.
+pub fn clearFetchCache() void {
+    lockPages();
+    defer pages_lock.unlock();
+    pages.deinit();
+    pages = webcache.Cache.init(std.heap.page_allocator);
+}
+
+fn nowMs(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+}
 
 /// Hard cap on a web response. 200 KB of text is plenty to read a doc and
 /// keeps an endless page (a listing of 50 000 links) from blowing up the turn's
@@ -66,44 +102,127 @@ pub fn toolWebFetch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocato
         if (o > 0) offset = @intCast(o);
     }
 
+    // The page comes out of the cache BEFORE the window is applied, which is
+    // the whole point: `offset` is a window into the extracted text, so the
+    // second and third windows of a long document used to re-download and
+    // re-strip the whole page each time.
+    if (cachedText(trimmed, nowMs(io))) |page_text| {
+        return web.excerpt(arena, page_text, offset, max_bytes);
+    }
+
+    const got = try fetchPage(io, arena, trimmed);
+    switch (got) {
+        // A redirect that leaves the site is a DECISION, not a hop: the URL it
+        // names is a host the user never agreed to, and the page that redirected
+        // there is untrusted text that chose the address. So the tool reports
+        // it and the model asks again, and everything said about this host
+        // (and any allowlist entry for it) applies to the NEW one.
+        .other_site => |info| return std.fmt.allocPrint(
+            arena,
+            "redirect: {s} redirects to a DIFFERENT host, and this tool does not follow it on its own.\n" ++
+                "  from: {s}\n  to:   {s}  (HTTP {d})\n" ++
+                "Fetch that URL yourself if you want it: it is a different site, so anything you have allowed for {s} does not cover it.",
+            .{ web.urlHost(trimmed), trimmed, info.to, info.status, web.urlHost(trimmed) },
+        ),
+        .text => |t| {
+            storeText(trimmed, t, nowMs(io));
+            // CAREFUL: the result is COPIED into memory owned by the arena.
+            // Returning a slice of the HTTP buffer is a time bomb: the
+            // `defer freeBody` releases it when this function returns and the
+            // ArenaAllocator REUSES that memory on the next allocation. The
+            // caller read `0xAA` where the text should have been.
+            return web.excerpt(arena, t, offset, max_bytes);
+        },
+        // A 4xx/5xx, a compressed body or a transport failure. All three are
+        // answers the model can act on, and none of them is cached: the point
+        // of the cache is to make a REPEAT cheap, and nobody repeats a 403 on
+        // purpose.
+        .text_out => |m| return m,
+    }
+}
+
+const Fetched = union(enum) {
+    /// The extracted text of the page.
+    text: []const u8,
+    /// The URL points somewhere else, and the tool did not go.
+    other_site: struct { to: []const u8, status: u16 },
+    /// Something to say instead: a status, a refusal, a transport error.
+    text_out: []const u8,
+};
+
+/// GET `url`, following the redirects that stay on the same site.
+fn fetchPage(io: std.Io, arena: std.mem.Allocator, url: []const u8) !Fetched {
+    var url_buf: [web.max_url_len + 16]u8 = undefined;
+    @memcpy(url_buf[0..url.len], url);
+    var current: []const u8 = url_buf[0..url.len];
+
     var h = http.Http.init(arena, io);
     defer h.deinit();
 
-    const res = h.getWithHeaders(trimmed, &browserHeaders()) catch |err| {
-        return std.fmt.allocPrint(arena, "error fetching {s}: {t}", .{ trimmed, err });
-    };
-    defer h.freeBody(res.body);
+    var hops: usize = 0;
+    while (hops <= web.max_redirects) {
+        // `http://` is upgraded once, here, and a failure to do it is not an
+        // error: it means the URL was already https.
+        _ = web.upgradeHttps(current, url_buf[0..]);
 
-    const body = res.body;
-    // A compressed body is not text: saying so is infinitely better than
-    // returning binary and letting the model read it as if it were words.
-    if (looksCompressed(body)) |kind| {
-        return std.fmt.allocPrint(arena, "{s} answered with {s}-encoded content that zode cannot decode. Try a different URL (a .json or .txt endpoint usually works).", .{ trimmed, kind });
+        var loc_buf: [web.max_url_len]u8 = undefined;
+        const res = h.getInspect(current, &browserHeaders(), &loc_buf) catch |err| {
+            return .{ .text_out = std.fmt.allocPrint(arena, "error fetching {s}: {t}", .{ current, err }) catch "error: the request failed" };
+        };
+        defer h.freeBody(res.body);
+
+        if (res.status >= 300 and res.status < 400) {
+            hops += 1;
+            const location = res.location orelse {
+                return .{ .text_out = std.fmt.allocPrint(arena, "HTTP {d}: {s} redirected without a `location` to follow.", .{ res.status, current }) catch "the server sent a redirect with no target" };
+            };
+            var next_buf: [web.max_url_len]u8 = undefined;
+            const next = web.resolveLocation(current, location, &next_buf) orelse {
+                return .{ .text_out = std.fmt.allocPrint(arena, "HTTP {d}: {s} redirects to \"{s}\", which is not an http(s) URL.", .{ res.status, current, location }) catch "the redirect target is not a page" };
+            };
+            if (!web.sameSite(current, next)) {
+                return .{ .other_site = .{ .to = try arena.dupe(u8, next), .status = res.status } };
+            }
+            @memcpy(url_buf[0..next.len], next);
+            current = url_buf[0..next.len];
+            continue;
+        }
+
+        const body = res.body;
+        // A compressed body is not text: saying so is infinitely better than
+        // returning binary and letting the model read it as if it were words.
+        if (looksCompressed(body)) |kind| {
+            return .{ .text_out = std.fmt.allocPrint(arena, "{s} answered with {s}-encoded content that zode cannot decode. Try a different URL (a .json or .txt endpoint usually works).", .{ current, kind }) catch "the body came compressed" };
+        }
+        // A 4xx/5xx is information too: return the status and whatever the
+        // server said, which is where the real reason is.
+        if (res.status < 200 or res.status >= 300) {
+            return .{ .text_out = std.fmt.allocPrint(arena, "HTTP {d} {s}\n{s}", .{
+                res.status,
+                current,
+                body[0..@min(body.len, 2000)],
+            }) catch "the server refused" };
+        }
+
+        const is_html = looksLikeHtml(body);
+        const text = if (is_html) web.htmlToText(arena, body) else body;
+        if (text.len == 0) return .{ .text_out = "(empty body)" };
+        return .{ .text = text };
     }
-    // A 4xx/5xx is information too: return the status and whatever the
-    // server said, which is where the real reason is ("Model access is disabled").
-    if (res.status < 200 or res.status >= 300) {
-        return std.fmt.allocPrint(arena, "HTTP {d} {s}\n{s}", .{
-            res.status,
-            trimmed,
-            body[0..@min(body.len, 2000)],
-        });
-    }
 
-    const is_html = looksLikeHtml(body);
-    const text = if (is_html) web.htmlToText(arena, body) else body;
+    return .{ .text_out = std.fmt.allocPrint(arena, "{s} redirected more than {d} times and stopped being a page.", .{ url, web.max_redirects }) catch "too many redirects" };
+}
 
-    if (text.len == 0) return "(empty body)";
+fn cachedText(url: []const u8, now: i64) ?[]const u8 {
+    lockPages();
+    defer pages_lock.unlock();
+    return pages.get(url, now);
+}
 
-    // CAREFUL: the result is COPIED into memory owned by the arena. Returning a slice
-    // of the HTTP buffer is a time bomb: the `defer freeBody` above
-    // releases it when this function returns, and the ArenaAllocator REUSES
-    // that memory in the next allocation (the one from `client.deinit`'s pool, the
-    // buffer's own growth…). The caller read `0xAA` where the JSON
-    // should have been. `web.excerpt` appends into its own list, so the copy
-    // (and the offset window and the truncation note) all happen in one place,
-    // and only with an arena: that is why it never showed up in the network tests.
-    return web.excerpt(arena, text, offset, max_bytes);
+fn storeText(url: []const u8, text: []const u8, now: i64) void {
+    lockPages();
+    defer pages_lock.unlock();
+    pages.put(url, text, now);
 }
 
 /// `web_search`: real search results, with two engines behind one contract.
@@ -127,6 +246,14 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
         if (mr > 0) max_results = @min(@as(usize, @intCast(mr)), 20);
     }
 
+    var allowed = std.ArrayList([]const u8).empty;
+    defer allowed.deinit(arena);
+    var blocked = std.ArrayList([]const u8).empty;
+    defer blocked.deinit(arena);
+    readDomains(obj, "allowed_domains", arena, &allowed) catch {};
+    readDomains(obj, "blocked_domains", arena, &blocked) catch {};
+    const wants_filter = allowed.items.len > 0 or blocked.items.len > 0;
+
     // A real index when the user has one: `ZODE_BRAVE_KEY` turns it on, and the
     // free DuckDuckGo chain stays both the default (a tool that needs a signup to
     // work at all does not work) and the fallback (a configured-but-broken key
@@ -134,13 +261,70 @@ pub fn toolWebSearch(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
     // rides in front of whatever the free chain answers, so a wrong key is
     // visible exactly while it is wrong and never once it works.
     var engine_note: []const u8 = "";
+    // Empty and NOT `undefined`: with no Brave key the branch below never runs,
+    // and reading `.len` off `undefined` is reading garbage — it overflowed an
+    // integer in the live search test.
+    var results: []const u8 = "";
     if (braveKey()) |key| {
         switch (braveSearch(io, arena, key, q, max_results)) {
-            .done => |r| return r,
+            .done => |r| results = r,
             .fell_back => |why| engine_note = why,
         }
     }
-    return withNote(arena, engine_note, freeChain(io, arena, q, max_results));
+    if (results.len == 0) results = freeChain(io, arena, q, max_results);
+
+    if (wants_filter) {
+        const kept = web.filterByDomain(arena, results, allowed.items, blocked.items);
+        if (kept.len == 0) {
+            // "Nothing after filtering" is not "nothing on the internet". A model
+            // that reads the first one tells the user the topic has no pages at
+            // all, which is the one answer a search must never give.
+            return std.fmt.allocPrint(
+                arena,
+                "{d} result(s) for \"{s}\", and none of them is on the {s} domain(s). That is what the filter found, NOT that there is nothing about this: try another site or a broader query.",
+                .{ max_results, q, domainPhrase(allowed.items, blocked.items) },
+            ) catch "no result passed the domain filter";
+        }
+        results = kept;
+    }
+
+    const noted = withNote(arena, engine_note, results);
+    return std.fmt.allocPrint(arena, "{s}{s}", .{ noted, citeReminder }) catch noted;
+}
+
+/// One line, and it is the only instruction the model gets about sources.
+///
+/// A search result is a claim's evidence; without this the model answers from a
+/// snippet it half-read and the user has no way back to where it came from. It
+/// rides at the END, after the note about a broken key, because it is the last
+/// thing read and the last thing read is what a model is most likely to do.
+const citeReminder =
+    "\nCite the URL of every source you used, as a markdown link next to the claim it supports. " ++
+    "Do not cite a result you did not open.\n";
+
+/// `Domains foo.com, bar.com.` — used only in the "nothing passed" message, so
+/// it names what was filtered instead of leaving the model to guess.
+fn domainPhrase(allowed: []const []const u8, blocked: []const []const u8) []const u8 {
+    if (allowed.len > 0 and blocked.len > 0) return "allowed or blocked";
+    if (allowed.len > 0) return "allowed";
+    return "blocked";
+}
+
+/// Reads a `["a", "b"]` of domains out of the arguments.
+fn readDomains(
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    arena: std.mem.Allocator,
+    out: *std.ArrayList([]const u8),
+) !void {
+    const v = obj.get(key) orelse return;
+    if (v != .array) return;
+    for (v.array.items) |item| {
+        if (item != .string) continue;
+        const d = std.mem.trim(u8, item.string, " \t\r\n");
+        if (d.len == 0) continue;
+        try out.append(arena, d);
+    }
 }
 
 /// The key that turns on Brave's real index, when the user has one.

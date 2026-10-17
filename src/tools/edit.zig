@@ -105,6 +105,17 @@ pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     // Validate every hunk against the ORIGINAL text (transaction).
     for (hunks.items) |*h| {
         if (h.old.len == 0) return std.fmt.allocPrint(arena, "error: empty old_string (use write for new files)", .{});
+        // A hunk that writes the text back over itself is a patch that does
+        // nothing, and it used to SUCCEED: the file came out byte-identical, the
+        // model read "edited", and the thing it meant to change was never touched.
+        // Refusing it costs one line; accepting it costs a whole iteration spent on
+        // a change that was never made. `rename` refuses the same no-op, for the
+        // same reason.
+        if (std.mem.eql(u8, h.old, h.new)) return std.fmt.allocPrint(
+            arena,
+            "error: nothing was written. old_string and new_string are identical, so this hunk would write the file back unchanged. Send the text you meant to put there, or drop the hunk.",
+            .{},
+        );
         var count: usize = 0;
         var pos: usize = 0;
         while (std.mem.indexOfPos(u8, data, pos, h.old)) |idx| {
