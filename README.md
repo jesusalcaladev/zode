@@ -1,13 +1,13 @@
 # zode
 
 A code agent in the terminal, written in **pure Zig** (no libc, no C
-dependencies; the only external one is libvaxis). **1.34 MB** binary, 6 MB of
-RAM, all the code in one directory.
+dependencies; the only external one is libvaxis). **~1.3 MB** binary, ~6 MB RAM,
+all code in one directory.
 
 It is not a wrapper around another agent: it speaks HTTP with the provider, runs
 the tools on your machine, and decides on its own which tool to call.
 
-```
+```bash
 $ zode
 ######  ####  ####   ######
 ##  ## ##  ## ##   # ##
@@ -18,384 +18,138 @@ $ zode
 ❯ read src/tui.zig and tell me why the scroll does not follow
 ```
 
-## What it does
-
-- **An agent with tools**: it reads, writes, edits, compiles, searches, and uses
-  git. The agent loop decides on its own (with `ask` when the answer changes what
-  it does, and in Plan mode it investigates and asks you). Repeated identical
-  calls get one bounded corrective nudge before stopping with a clear reason.
-- **Tools in parallel** for the read-only ones, **bash in the background** with
-  incremental output, and **ESC kills the whole process group** (the grandchild
-  too).
-- **Parallel subagents**: several independent searches in one message go to
-  subagents at the same time (3 by default, `ZODE_TASK_PARALLEL`), each with its
-  own throwaway window, and the reports come back in the order you asked for them.
-- **`write` and `edit` take several files at once** — `files: [...]`, max 8.
-  Renaming a symbol is one call, not one per file, and **the file that failed is
-  named with the reason**, because a rename applied to nine files out of ten and
-  not reported is a codebase that does not compile.
-- **`read` takes several paths at once** — one call is one round trip, and a round
-  trip is a whole request. On a free tier (`total_credits: 0`, measured) every
-  request is also a chance to be rate-limited plus three backoff waits.
-- **`!` in the input**: `!git status` runs the command and puts its output into
-  the context, spending neither a turn nor a token.
-- **Skills**: folders of instructions loaded **only when they are needed**. The
-  prompt carries the name and when to use it; the body does not.
-- **Two-tier context compaction**: old tool results are elided without losing the
-  history, and if it still does not fit, a summary is asked for. The budget is
-  the **model's own** context window when the provider publishes one, and
-  `/context` says which of the three numbers it used.
-- **File cache**: a `read` of something that has not changed is not sent again.
-  It is the most direct token saving there is.
-- **A prompt cache you can see**: measured 2026-10-04 with an identical 3.5k
-  prefix, three requests in a row —
-  `openrouter/free` (a **router**) answered 3583 / 3273 / 3381 prompt tokens and
-  served **0%** from cache, and a fixed model answered 3611 / 3613 / 3613 and
-  served **3328 cached (98%)**. A router picks a different upstream per request,
-  the tokenizers differ and the caches are not shared, so no amount of prefix
-  tuning can make one hit. zode says so when you pick one, and `/cache`
-  diagnoses it from the evidence afterwards rather than from a list.
-- **Providers**: OpenCode, OpenRouter, Anthropic (native API with prompt
-  caching), OpenAI, Groq, DeepSeek, and local (Ollama/LM Studio). You connect
-  them from the TUI itself, without editing files.
-- **`check`**: typechecks THIS project with the project's own compiler —
-  `build.zig` → `zig build`, `tsconfig.json` → `tsc --noEmit`, `Cargo.toml` →
-  `cargo check` — in the background, and reports the errors with a file and a line.
-  It also runs on its own after an `edit` touches code (`ZODE_AUTO_CHECK=0` turns
-  that off), so a broken build is found before the next request goes out with it.
-  It is the 80 % of an LSP that costs zero bytes of RAM and needs nothing
-  installed.
-- **`rename`**: renames a symbol everywhere it appears as **real code**, in one
-  call, and reports every file it touched. A name inside a string, a comment or a
-  longer identifier is left alone — measured, not assumed. A rename applied by the
-  model one `edit` at a time lands on nine files out of ten and does not say which
-  one it missed; this cannot miss one silently.
-- **`refs`**: where a symbol is defined and where it is used, **in one call and
-  with the two separated**. It knows the declaration shapes of zig, rust, go,
-  python, js/ts, c and sh, steps over Go method receivers, skips comments and does
-  not match `foo` inside `foobar`. It is not an AST and it does not pretend to be:
-  it saves the model from guessing the declaration shape, running two greps and
-  working out which hit is the definition — three round trips, and a round trip is
-  a whole request.
-- **The repository as tools**: `git_status`, `git_diff` and `git_log` with
-  **fixed arguments** — no argument reaches git, so there is no new injection
-  surface, and `bash` is still there for a commit or a checkout.
-- **`/free-auto`**: spreads the turns across the free models each provider
-  publishes, and when one runs out of quota it **carries on by itself** with the
-  next one.
-- **Web research**: one focused search returns five concise results by default;
-  only the best primary sources are fetched, long pages are paged by offset, and
-  final claims link to their sources instead of repeating raw tool output.
-
-## Install
-
-Grab the binary and you are done. There is nothing else to install.
+## Quick Start
 
 ```bash
-./zode
+# Clone and build
+git clone https://github.com/jesusalcaladev/zode.git
+cd zode
+zig build -Doptimize=ReleaseSafe  # Release binary at ./zig-out/bin/zode
+
+# Configure (optional - uses OpenCode free tier by default)
+export ZODE_API_KEY="your-key"          # Generic fallback
+export ZODE_PROVIDER="openrouter"       # Or: opencode, anthropic, openai, groq, deepseek, local
+export ZODE_MODEL="kimi-k2.6"           # Model to use
+export ZODE_EFFORT="medium"             # low | medium | high (for o-series/GPT-5/Gemini)
+
+# Run
+./zig-out/bin/zode                      # TUI
+./zig-out/bin/zode --chat "your task"   # Headless streaming
+./zig-out/bin/zode --models             # List available models
 ```
+## Key Features
 
-## Build from source
+| Feature | Description |
+|---------|-------------|
+| **Agent with tools** | Reads, writes, edits, compiles, searches, uses git. The loop decides autonomously (`ask` when the answer changes what it does; Plan mode investigates and asks you). Repeated identical calls get one corrective nudge before stopping. |
+| **Parallel tools** | Read-only tools (read, grep, glob, list_files, web_fetch, web_search) run in parallel. Bash runs in background with incremental output. **ESC kills the whole process group** (grandchildren too). |
+| **Parallel subagents** | Independent searches in one message go to subagents simultaneously (3 by default, `ZODE_TASK_PARALLEL`). Each has a throwaway window; reports return in request order. |
+| **Multi-file operations** | `write`/`edit` accept `files: [...]` (max 8). Renaming a symbol is one call. Failed files are named with reasons. |
+| **Batched reads** | `read` takes multiple paths — one round trip per call. Critical on free tiers where every request risks rate limits + backoff. |
+| **`!` inline commands** | `!git status` runs the command and puts output into context, spending **no turn, no token**. |
+| **Skills** | Folders of instructions loaded **on demand**. Prompt carries name + when to use; body loads only when needed. |
+| **Two-tier compaction** | Old tool results elided without losing history; if still over budget, a summary is requested. Budget = model's context window. `/context` shows which number is used. |
+| **File cache** | Unchanged `read` results are not re-sent — the most direct token saving. |
+| **Visible prompt cache** | Fixed models show ~98% cache hit; routers (OpenRouter free) show 0% because each request hits a different upstream. zode tells you which you picked; `/cache` diagnoses from evidence. |
+| **Multi-provider** | OpenCode, OpenRouter, Anthropic (native API with prompt caching), OpenAI, Groq, DeepSeek, local (Ollama/LM Studio). Connect from TUI without editing files. |
+| **`check` tool** | Typechecks **this** project with its own compiler (`zig build`, `tsc --noEmit`, `cargo check`, etc.) in background, reports errors with file:line. Runs automatically after edits. |
+| **`/undo`** | File snapshots per turn (ring of 8 turns, 24 files, 256 KB/file). |
+| **`@file` mentions** | `@src/main.zig` injects file content into the prompt (last user message only). |
+| **Task graph** | `task_create`/`task_get`/`task_list`/`task_update`/`task_stop` — stable IDs, blocking, owner, persisted per session. |
 
-You need **Zig 0.16.0**.
 
-```bash
-zig build                    # release stripped, 1.34 MB (ReleaseSmall)
-zig build test               # 500+ unit tests, in Debug
-zig build -Doptimize=Debug   # with symbols, for when something crashes
-```
+## TUI Shortcuts
 
-`zig build` steps:
-
-| Step | What it does |
-|---|---|
-| `zig build` | The usual binary |
-| `zig build debug` | Same but **unstripped**, with a readable stack trace |
-| `zig build test` | The tests (`-- <filter>` runs only the ones whose name matches) |
-| `zig build tool-test -- "command"` | The tools headless, to try one without opening the TUI |
-| `zig build roster-probe` | Which providers you have a key for, and how many free models each publishes |
-| `zig build check-probe` | Runs the automatic typecheck against a project with a deliberate error in it |
-| `python3 tools/ram_probe.py` | RAM across turns, with the real model answering |
-| `python3 tools/ram_probe_replay.py` | RAM against session length, with no model at all |
-
-## First steps
-
-1. `./zode` and press **Ctrl+T** to pick a provider and a model, or **Ctrl+A** to
-   paste the provider key (saved in `~/.config/zode/auth.json` with 0600
-   permissions).
-2. The environment works too, which is what the scripts will use:
-   `ZODE_OPENCODE_KEY=… ./zode`.
-
-The model picker shows a saved catalog immediately while refreshing that
-provider in the background. Its footer reports whether the catalog is loading,
-current, updated, or being kept because the provider is unavailable. Choosing a
-different provider switches the picker to that provider's own catalog; late
-responses from the previous provider are discarded.
-
-No-TUI mode, to try it without a terminal and for scripts:
-
-```bash
-./zode --models              # list the provider's models
-./zode --chat "find my TODOs and tell me which ones are urgent"
-./zode --resume             # reopen the last session
-```
-
-### There is no default model
-
-A model name written into the code is a time bomb: the day the provider retires
-it, **every** request starts failing with a 403 that explains nothing. So the
-providers ship without a model and zode **does not guess**:
-
-- if there is a `ZODE_MODEL` or you picked one with `/model`, that one is used;
-- if not, zode **asks the provider** what the catalogue is and picks the first
-  free one, and says on screen which one it chose and why;
-- if the catalogue cannot be downloaded it **sends nothing**: it tells you and
-  opens the picker, instead of spending a turn on a 403.
-
-## Commands
-
-They start with `/` and autocomplete with **Tab**. **Ctrl+P** opens them in a
-palette that **runs** the one you pick.
-
-| | |
-|---|---|
-| `/help` | this list |
-| `/model` | model picker (modal, two columns: providers \| models) |
-| `/provider` | provider picker |
-| `/providers` | list the providers and whether they have a key |
-| `/models` | catalog counts for the active provider |
-| `/use <provider> [model]` | change provider and model at once |
-| `/effort [low\|medium\|high\|…]` | reasoning effort (no argument: opens the picker) |
-| `/free-auto [on\|off\|status]` | rotate across free models when one runs out of quota |
-| `/undo` | put the files back the way they were before a turn |
-| `/clean [yes]` | purge zode's leftovers (simulates by default) |
-| `/yolo` | automatic permissions |
-| `/allowlist` | tools that are always allowed (persisted) |
-| `/mode [build\|accept-edits\|plan\|bypass]` | choose the work/permission mode |
-| `/ask [on\|off]` | enable or disable Plan mode |
-| `/skills` | which skills there are and where they come from |
-| `/bg [list\|kill <id>\|killall]` | background commands |
-| `/new` · `/resume` | new session / reopen the last one |
-| `/context` | tokens used against the budget |
-| `/usage` | provider-reported token totals for this session |
-| `/bench` | session numbers: turns, iterations, first token |
-| `/quit` | exit |
-
-`/models` stays compact; use `/model` (or Ctrl+T) to browse the catalog without
-filling the conversation timeline. `/usage` reports provider-counted input and
-output tokens, cache reads/writes, and per-request averages. It is session-scoped
-and restored by `/resume`; `/context` remains the current prompt estimate/budget.
-Maintenance and diagnostics such as `/cache`, `/session`, `/bench`, `/bg`,
-`/clean`, and `/task-parallel` remain available by typing them directly, but are
-kept out of the default Ctrl+P palette.
-
-## License
-
-zode is distributed under the [MIT License](LICENSE).
-
-### Shortcuts
-
-| | |
-|---|---|
-| `Ctrl+P` | command palette |
-| `Ctrl+T` | model palette |
-| `Ctrl+A` | connect a provider |
-| `Ctrl+L` | clear the view (the session file is untouched) |
-| `Ctrl+R` | expand/collapse the last tool result or diff |
-| `Ctrl+U` / `Ctrl+D` | half a page of scroll |
-| `PageUp` / `PageDown` | a page |
-| mouse drag over history | select and copy text to the clipboard on release |
-| `Shift+Enter` | newline (Enter sends) |
-| `Shift+Tab` | cycle Build → accept-edits → Plan (shown in the status bar) |
-| `Esc` | stop the turn, kill the command, or answer "you decide" |
-| `Tab` | complete a `/` command |
-| `↑` / `↓` | prompt history |
+| Key | Action |
+|-----|--------|
+| `PageUp` / `PageDown` | Scroll history by page |
+| `Ctrl+U` / `Ctrl+D` | Scroll half page |
+| `Ctrl+P` | Command palette (grouped: Connect, Suggested, Model, Session) |
+| `Ctrl+T` | Model palette (providers | models, two columns) |
+| `Ctrl+A` | Connect provider (key entry) |
+| `/model` | Open model palette |
+| `/provider` | Switch provider |
+| `/use <provider> [model]` | Quick model switch |
+| `/effort` | Set reasoning effort (low/medium/high) |
+| `/yolo` | Disable permission prompts |
+| `/goal <text>` | Set task goal (enables ceiling at 60 iterations) |
+| `/plan` | Show/clear visible task list |
+| `/context` | Token budget gauge + breakdown |
+| `/cache` | Cache hit rate stats |
+| `/bench` | Iteration/TTFT/tok/s statistics |
+| `/free-auto` | Rotate through free models of all keyed providers |
+| `/submodel` | Override subagent model |
+| `Shift+Tab` | Toggle read-only / accept-edits mode |
+| `Esc` | Cancel stream / kill foreground / decline ask |
 
 ## Configuration
 
-**By environment.** You only need a key if you are not using Ctrl+A:
+Environment variables (`.env` supported via `set -a && source .env && set +a`):
 
-| Variable | What it does |
-|---|---|
-| `ZODE_<PROVIDER>_KEY` | that provider's key (`ZODE_ANTHROPIC_KEY`, `ZODE_GROQ_KEY`, …) |
-| `ZODE_API_KEY` | generic key, the last resort |
-| `ZODE_PROVIDER` | starting provider |
-| `ZODE_MODEL` | starting model |
-| `ZODE_EFFORT` | `low` \| `medium` \| `high` |
-| `ZODE_BASE_URL` / `ZODE_MODELS_URL` | endpoints, for your own providers or gateways |
-| `ZODE_CONTEXT_LIMIT` | context tokens (128k by default; the compaction budget is 80% of it) |
-| `ZODE_MAX_ITER` | agent loop iterations per turn (12) |
-| `ZODE_TASK_PARALLEL` | subagents at once (3; `1` = in series) |
-| `ZODE_RECENT_WINDOW` | recent messages compaction leaves alone (8) |
-| `ZODE_AUTO_BG` | `0` turns off auto-backgrounding slow verifications |
-| `ZODE_CHEAP_TURN` | a small model id: the main turn goes to it and falls back if it will not answer (off by default) |
-| `ZODE_CHEAP_MODEL` | the same thing, named separately, for when the flag is just `1` |
-| `ZODE_FREE_AUTO` | `1` starts with `/free-auto on` |
-| `ZODE_RESUME` | `1` reopens the last session |
-| `ZODE_DBG_ERR` | `1` dumps the status and body of every response to stderr |
-| `ZODE_YES` | `1` makes `/clean` apply without asking (for when the model runs it) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ZODE_API_KEY` | — | Generic fallback key |
+| `ZODE_PROVIDER` | `opencode` | Provider ID |
+| `ZODE_MODEL` | `kimi-k2.6` | Model name |
+| `ZODE_EFFORT` | `medium` | Reasoning effort (low/medium/high) |
+| `ZODE_BASE_URL` | `https://opencode.ai/inference/openai/v1` | Chat endpoint base |
+| `ZODE_MODELS_URL` | `https://opencode.ai/inference/v1/models` | Models endpoint |
+| `ZODE_CONTEXT_LIMIT` | `131072` | Context window (tokens) |
+| `ZODE_COMPACT` | `elide` | `off` | `elide` | `full` |
+| `ZODE_COMPACT_PCT` | `80` | Compaction trigger % |
+| `ZODE_FREE_AUTO` | `0` | Enable free-model rotation |
+| `ZODE_TASK_PARALLEL` | `3` | Max parallel subagents |
+| `ZODE_CHEAP_TURN` | `0` | Route calm main turns to small model |
+| `ZODE_AUTO_CHECK` | `1` | Auto typecheck after edits |
+| `ZODE_GOAL_MAX` | `60` | Hard iteration ceiling |
 
-**By file**, in `~/.config/zode/`:
-
-- `config.json` — your own providers (id, base_url, models_url, `key_env`,
-  `default_model`, `kind`), plus the default `provider`/`model`. Compiled
-  providers cannot be shadowed: the built-in wins.
-- `auth.json` — the keys you paste with Ctrl+A. **0600**, written to a temp file
-  and renamed. Never in `config.json`, which people version.
-- `skills/<name>/SKILL.md` — your skills.
-
-**In the project**, from wherever you launch it:
-
-- `AGENTS.md` (or `CLAUDE.md`) — project instructions. It looks in the current
-  directory and, failing that, at the repository root.
-- `.zode/skills/<name>/SKILL.md` — harness skills.
-- `.agents/skills/<name>/SKILL.md` — skills, in the convention shared with other
-  agents.
-- `sessions/zode-*.jsonl` — the sessions. Compressed: the big lines go through
-  DEFLATE and base64.
-
-## Skills
-
-A skill is a folder with a `SKILL.md` and `name` / `description` frontmatter.
-Only the name and the description go into the prompt; the body is read when the
-model decides it needs it, through the `skill` tool.
-
-```markdown
----
-name: pty-tests
-description: after touching the drawing code in tui.zig
----
-
-Verify TUI changes in a real pty: `python3 tools/pty_smoke.py`.
-```
-
-The `description` has to say **when** to use it, not what it contains: "after
-touching the drawing code in tui.zig" decides well; "notes about pty" makes the
-model guess. A project's skills **override** the global ones instead of merging:
-half a skill from another project is worse than not having it.
-
-`/skills` says which ones exist and where they come from.
-
-## Sessions
-
-Every turn is written to `sessions/zode-<id>.jsonl` (one line per event, with
-`tool_calls` raw so the replay is faithful). `/resume` reopens the last one and
-`/undo` gives you back **files**, not messages: the session is append-only and
-rewriting it halfway through a turn has no explanation.
-
-## How the memory behaves
-
-`tools/measure.py` answers the startup number — measured 2026-10-05: **6.09 MB**
-steady RSS, 3.7 ms to the first paint, 1.34 MB binary. It does NOT answer whether
-the memory *grows*, which is what decides whether a long session is usable:
-
-- `tools/ram_probe.py` — the slope **with the real model answering**. Measured over
-  8 turns of `space-bunny-free`: 7.96 MB at startup, 12.32 MB after 8 turns,
-  **+48 KB/turn and flattening** (per-turn deltas +60, −10, +100, +50, +40, +70,
-  +20 KB). It cannot go past a handful of turns on a free account: the daily quota
-  answers six and then stops.
-- `tools/ram_probe_replay.py` — against **session length, with no model at all**. A
-  5-turn and a 3000-turn session (a 1 MB history against a 2 KB one) land on the
-  same RSS step, because `pruneCold` compresses the paragraphs outside the scroll
-  window. RSS moves in ~2 MB steps here, so the report prints the levels it saw
-  rather than a difference between two of them.
-- `/context` shows where the bytes are: total RSS, the scrollback split into hot
-  and compressed, the segment cache and the read cache. A total on its own says
-  nothing about which part to fix.
-
-## Development
-
-```bash
-zig build test                              # unit tests
-zig build && python3 tools/pty_smoke.py     # smoke test in a real pty
-python3 tools/measure.py ./zig-out/bin/zode # startup and RSS
-python3 tools/esc_kill_pty.py               # ESC kills the grandchild, not the shell
-```
-
-`tools/pty_smoke.py` uses its own `HOME` on purpose: the app writes
-`~/.config/zode/auth.json` and `sessions/`, and an automated test must not touch
-the config of whoever runs it.
+User config: `~/.config/zode/config.json` (providers, model, custom providers).  
+Keys: `~/.config/zode/auth.json` (0600, written atomically).
 
 ## Architecture
 
-Two folders, and the line between them is whether the module can be tested
-without a terminal:
-
 ```
-src/                    what needs the TUI, a thread or the network
-  main.zig              CLI: --models / --chat / TUI / --resume
-  tui.zig               the TUI (vxfw): drawing, input, scroll, palettes
-  agent.zig             agent loop, permissions, turns, session state
-  commands.zig          the /commands and the tables /help prints
-  chat.zig              streaming SSE client + parser + native Anthropic
-  tools/                the 16 tools, one per file
-    dispatch.zig        the name the model sent -> the function that runs
-    common.zig          the helpers more than one tool needs
-    read.zig  write.zig  edit.zig  bash.zig  glob.zig  grep.zig
-    list_files.zig  web.zig  think.zig  todo.zig  bg.zig  git.zig
-    refs.zig  rename.zig  errors.zig
-  bgproc.zig            background commands
-  palette.zig           the Ctrl+P / Ctrl+T modal palette
-  session.zig           compressed JSONL sessions
-  config.zig            the user's config.json
-  compaction.zig        context budget, elision and summary
-  cache_stats.zig       the provider's cache hit rate
-  roster.zig            the free-model pool
-  free_auto.zig         /free-auto over the pool
-  roster_probe.zig      the `zig build roster-probe` probe
-  test_all.zig          the test aggregator
-  bin/                  helper executables (tool_test)
-  tools_root.zig        the `tools` module, re-exporting the dispatcher
+src/
+├── main.zig           # Entry, headless --chat, --models
+├── tui.zig            # TUI: layout, draw, input, scroll, palettes
+├── agent.zig          # Agent loop, tool execution, permissions, session
+├── commands.zig       # Slash command handlers
+├── tools/             # One file per tool (dispatcher in dispatch.zig)
+│   ├── prompts/       # Tool schemas + descriptions (per tool)
+│   ├── common.zig     # Shared helpers
+│   └── validate.zig   # Schema validation tests
+├── palette.zig        # Ctrl+P / Ctrl+T modal palettes
+├── bgproc.zig         # Background process registry
+├── session.zig        # Compressed JSONL (zjsonl) sessions
+├── config.zig         # User config.json loading
+├── compaction.zig     # Tier 1 (elide) + Tier 2 (summarize)
+├── cache_stats.zig    # Provider-agnostic cache stats
+├── roster.zig         # Free-model pool (order, caps, cooldowns)
+├── free_auto.zig      # /free-auto rotation logic
+└── roster_probe.zig   # `zig build roster-probe` probe
 
-src/lib/                modules that test on their own, no TUI and no network
-  readcache.zig         which files have already been sent to the model
-  project.zig           cwd, repository root and git branch
-  prompt.zig            the system prompt text
-  sleep.zig             nanosleep that does not touch the shared Io
-  skills.zig            the format of a SKILL.md
-  skillstore.zig        skill discovery on disk
-  mentions.zig          @file
-  markdown.zig          markdown + unified diff
-  highlight.zig         universal syntax highlighting
-  web.zig               HTML -> text, and the search result parser
-  models.zig            the model catalogue and its metadata
-  providers.zig         compiled providers + key precedence
-  provider.zig          per-environment config (compat)
-  http_client.zig       HTTP JSON on top of std.http.Client
-  subagent.zig          the subagent's report
-  ask.zig               the `ask` tool
-  plan.zig              the visible task list
-  checkpoint.zig        /undo's snapshots
-  editor.zig            the one-line editor
-  bench.zig             /bench
-  clean.zig             /clean
-  verify.zig            which verifications are slow enough to background
-  router.zig             which model answers the main turn (cheap, or yours)
-  symbols.zig            declarations per language + the string/comment mask
-  typecheck.zig          which command typechecks this project, per marker file
-  images.zig             image attachments: caps, mime, and the no-vision refusal
-  regex.zig             a mini regex engine
-  mascot.zig            Zo
-  theme.zig             colours
-  zjsonl.zig            DEFLATE + base64 per line
+src/lib/               # Pure modules (test without TUI/network)
+├── theme.zig          # Semantic colors + contrast tests
+├── markdown.zig       # Markdown + unified diff rendering
+├── highlight.zig      # Universal syntax highlighter
+├── web.zig            # HTML→text, search parser (pure, tested)
+├── http_client.zig    # HTTP JSON on std.http.Client
+├── providers.zig      # Compiled providers + key precedence
+├── models.zig         # Model catalogue + metadata
+├── subagent.zig       # Subagent report format
+├── ask.zig            # Ask tool (pure dialog logic)
+├── plan.zig           # Visible task list
+├── router.zig         # Cheap-turn model router
+├── verify.zig         # Slow verification → background
+├── skills.zig / skillstore.zig  # Skills on disk
+├── mentions.zig       # @file mention scanner
+├── checkpoint.zig     # /undo snapshots
+├── editor.zig         # Multiline input editor
+├── regex.zig          # Mini regex engine
+├── zjsonl.zig         # DEFLATE+base64 per session line
+└── ...
 ```
 
-`src/lib/` is not "the small files": it is **the ones that can be tested without
-starting the app**. That is why `roster.zig` does not move: it depends on
-`config.zig`, which already depends on the chat client.
-
-`src/tools/` is the interesting case: the tools ARE nearly all pure (they read
-files, they hit the network) but the **dispatcher** needs the background process
-registry, which lives in the `Model`. The answer was to split the file rather than
-move it: each tool in its own file, `dispatch.zig` holding what it needs from the
-`Model`. `ask`, `task` and `skill` are NOT there (they need the `Model` for the
-dialog, the worker and the skills) and are intercepted in `agent.zig`, which is
-where they already were.
-
-Any OpenAI-compatible provider works: OpenCode, OpenRouter, Groq, DeepSeek and
-any gateway that speaks the same format, by changing the `base_url`.
-
-`AGENTS.md` has the conventions of the code and **why** each unusual decision
-cost something (which Zig 0.16 traps have already been paid for, which memory
-bugs exist, and what must NOT be done). It is the file to read before touching
-anything.
+`src/lib/` = modules testable **without** TUI or network.  
+`src/tools/` = tools split per file; dispatcher holds Model deps.  
+`AGENTS.md` = code conventions + why each Zig 0.16 trap was paid for.

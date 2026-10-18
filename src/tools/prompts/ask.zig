@@ -9,7 +9,7 @@ const validate = @import("validate.zig");
 pub const name = "ask";
 
 pub const description: []const u8 =
-    "Ask the USER one question, and wait for the answer. USE IT WHEN: the answer changes what you do next — a choice between approaches, an ambiguous request with two real readings, a which one. Do NOT ask what you can find out yourself: read the file, grep, run the command first, and only ask if it is still unclear after that. One question per step, at most three in a whole turn. Put your recommendation first in the question text so the user can just press enter. With 2 to 5 options it becomes a menu; with no options the user types free text. If the user does not answer (esc) you must decide on your own, say which option you picked and why, and carry on — do not ask again. header is a 2-3 word label for the dialog, not the question.";
+    "Ask the USER one short, precise question. Use it ONLY when the answer changes what you do next (a choice between approaches, an ambiguous request). Do NOT ask what you can find out yourself — read, grep, or run the command first. One question per step, max 3 per turn. Put your recommendation first so the user can just press Enter. 2-5 options = menu; none = free text. If the user presses Esc, decide yourself, state which option you picked and why, then continue — do not re-ask. header = 2-3 word label for the dialog, not the question.";
 
 /// The `parameters` object, verbatim.
 const parameters: []const u8 =

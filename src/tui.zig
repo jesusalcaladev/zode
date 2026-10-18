@@ -2007,9 +2007,18 @@ pub const Model = struct {
         var lo = self.heightIndexAt(first_visible);
         var hi = self.heightLowerBound(last_visible);
         if (hi < lo) hi = lo;
-        // If the visible window is wider than the cap, the tail is kept (that
-        // is what you are reading: the very bottom).
-        if (hi - lo > Model.max_cached_paras) lo = hi - Model.max_cached_paras;
+        // If the visible window is wider than the cap, we must choose which
+        // paragraphs to keep in the cache. When at the bottom (follow_bottom),
+        // keep the tail so new arriving text is cached. When scrolled up, keep
+        // the window around the anchor (what the user is reading) so the
+        // content doesn't disappear.
+        if (hi - lo > Model.max_cached_paras) {
+            if (self.follow_bottom) {
+                lo = hi - Model.max_cached_paras;
+            } else {
+                hi = lo + Model.max_cached_paras;
+            }
+        }
 
         // ── drop what is cached outside the window ──
         var i: usize = 0;

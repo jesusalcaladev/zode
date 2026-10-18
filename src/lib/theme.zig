@@ -56,24 +56,17 @@ pub const line: vaxis.Style = rgb(0x2e, 0x2c, 0x2a);
 /// the input feels anchored without a box around it.
 pub const line_bright: vaxis.Style = rgb(0x3d, 0x3a, 0x37);
 
-// ── the accent: a matte teal ──────────────────────────────────
+// ─── the accent: a matte terracotta ─────────────────────────────────────────────
 //
-// HUE 186°, ~40% saturation, ~56% lightness. It replaced a matte green, and
-// the reason is worth keeping because the next retheme will face it too.
+// HUE 18°, ~40% saturation, ~56% lightness. A warm terracotta that reads as
+// an interface accent without being a status color. It is far from the diff's
+// green (135°) AND far from the code palette's orange/amber/lilac/pink/blue
+// bands, so the code palette only has to keep out ONE hue band (0-35°).
 //
-// The accent is the one color that appears in CHROME — your prompt, the caret,
-// the wordmark, the selected row, the live phase — so it has to clear
-// everything else on screen. It used to be green, which meant the syntax
-// palette had to contain NO green (see the `code palette` test) to avoid two
-// readings of one color. Teal moves that constraint: it is far from the diff's
-// green AND far from the orange/amber/lilac/pink of the tokens, so the code
-// palette only has to keep out ONE hue band instead of the two the green
-// needed.
+// MATTE is not decoration. A fully saturated orange is a warning, and next to a
+// diff it would read as a status color. The moderate saturation keeps it in the
+// interface layer: it marks YOUR things (prompt, caret, selection, wordmark).
 //
-// MATTE is not decoration. A fully saturated cyan is a highlighter pen, and
-// next to a diff it would read as a status color. Desaturating it is what
-// makes it read as an interface color.
-
 /// 8.5:1 on black, 7.6:1 on `well_bg`. The accent proper: your prompt, the
 /// caret, the selected row's mark. MATTE TERRACOTTA.
 pub const brand: vaxis.Style = rgb(0xb8, 0x7e, 0x68);
@@ -115,12 +108,13 @@ pub const well_bg: vaxis.Style = bg(0x12, 0x11, 0x10);
 
 // ── code token palette ────────────────────────────────────────
 //
-// NOT in the accent's hue band. The accent is teal (186°), so a token in
-// 165-210° would put brand and syntax on the same screen reading the same way —
-// which is what the green accent forced on the green band, and what
-// `codePaletteClearsAccent` below now enforces for the teal one. Orange, amber,
-// lilac, pink and a BLUE PUSHED PAST 213° instead: the classic high-legibility
-// set, with the two blues deliberately moved off the cyan they used to be.
+// NOT in the accent's hue band. The accent is terracotta (18°), so a token in
+// 357-39° (wrapping around 0°) would put brand and syntax on the same screen
+// reading the same way — which is what the green accent forced on the green
+// band, and what `codePaletteClearsAccent` below now enforces for the
+// terracotta one. Amber, lilac, pink and a BLUE PAST 213° instead: the classic
+// high-legibility set, with the two blues deliberately moved off the cyan they
+// used to be.
 
 pub const code_text: vaxis.Style = rgb(0xc9, 0xd1, 0xd9);
 pub const code_kw: vaxis.Style = rgb(0xc7, 0x7d, 0xb8); // orchid
@@ -437,7 +431,7 @@ test "the hairline is a hairline and NOT text" {
 }
 
 test "the accent and the diff green are told apart by CHROMA, not by lightness" {
-    // The whole two-green decision rests on a reader telling them apart. A
+    // The whole decision rests on a reader telling them apart. A
     // contrast ratio cannot measure that (they are the same lightness), so the
     // quantity that separates them is saturation: the accent is MATTE and `ok`
     // is VIVID. Both differences are asserted, because either one alone would
@@ -457,8 +451,7 @@ test "the accent and the diff green are told apart by CHROMA, not by lightness" 
 test "the code palette clears the accent's hue band" {
     // The accent is the only color in CHROME, and a token in its hue band would
     // put "brand" and "syntax" on the same screen reading the same way. With a
-    // green accent that meant "no green in the code palette"; with a teal one
-    // it means "nothing in 165-210°".
+    // terracotta accent (18°) the band is ±21° around it (357-39°).
     //
     // The band is ±21° around the accent, and the test is on SATURATION as
     // well as hue: `code_text` and `code_comment` are near-neutral, and a
