@@ -9951,7 +9951,7 @@ test "the + prefix and the body have DIFFERENT colors (green wall removed)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const segs = try md.inlineSegmentsLang(arena, "+const n", .diff, null, null, "zig", null);
+    const segs = try md.inlineSegmentsLang(arena, "+const n", .diff, null, null, "zig", null, null, 0);
     try std.testing.expect(segs.len >= 2);
     try std.testing.expectEqualStrings("+", segs[0].text);
     try std.testing.expect(!std.meta.eql(segs[0].style.fg, segs[1].style.fg));
