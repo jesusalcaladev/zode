@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const sleepz = @import("lib/sleep.zig");
 const vaxis = @import("vaxis");
 const builtin = @import("builtin");
@@ -7090,16 +7091,41 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
     // hidden, the shell prompt nowhere. The user's "it closed but zode is still
     // visible" is exactly this, and not a leaked process.
     //
-    // `termseq.restoreAll` and not the sequences inline: the same four have to
-    // be written on the normal exit path too, and a copy of them in two places
-    // is one that goes stale the day a third is added.
+    // We must write to /dev/tty (the controlling terminal) NOT stdout, because
+    // stdout may be redirected or not connected to the terminal (e.g. in tmux,
+    // script, or when piped). vaxis does the same: it opens /dev/tty and writes
+    // escape sequences there. We also restore the termios to exit raw mode,
+    // which the escape sequences alone cannot do.
     {
-        var out_buf: [256]u8 = undefined;
-        var fw = std.Io.File.stdout().writer(io, &out_buf);
+        // Open the controlling terminal directly
+        const tty_file = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch {
+            std.process.exit(0);
+        };
+        defer tty_file.close(io);
+        var tty_buf: [256]u8 = undefined;
+        var fw = tty_file.writerStreaming(io, &tty_buf);
         termseq.restoreAll(&fw.interface);
+
+        // Also restore termios (exit raw mode). This is what vaxis does in its
+        // deinit via posix.tcsetattr. Without this, the terminal stays in raw
+        // mode and the user can't type after exit.
+        const fd = tty_file.handle;
+        restoreTermios(fd);
     }
 
     std.process.exit(0);
+}
+
+fn restoreTermios(fd: posix.fd_t) void {
+    const termios = posix.tcgetattr(fd) catch return;
+    var termios_copy = termios;
+    termios_copy.lflag.ECHO = true;
+    termios_copy.lflag.ICANON = true;
+    termios_copy.lflag.ISIG = true;
+    termios_copy.oflag.OPOST = true;
+    termios_copy.iflag.ICRNL = true;
+    termios_copy.iflag.IXON = true;
+    _ = posix.tcsetattr(fd, .FLUSH, termios_copy) catch {};
 }
 
 /// Starts the startup probe: reads `ZODE_DBG_BOOT` and takes t0.
