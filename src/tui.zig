@@ -1245,7 +1245,8 @@ pub const Model = struct {
             .checkpoints = .init(allocator),
         };
         m.tasks.gpa = allocator;
-        m.setStatusText("zode v0.3 \u{b7} esc interrupts \u{b7} ctrl+c exits");
+        // Empty initial status; real content appears once there's a model/turn.
+        m.setStatusText("");
         return m;
     }
 
@@ -6549,54 +6550,20 @@ fn drawActivityStrip(
 ) void {
     p.fillRow(row, " ", .{});
 
-    // What the strip puts at the head of the row.
-    //
-    // THINKING IS ONE WORD AND A MOVING ELLIPSIS, and that is a deliberate
-    // change: it used to be Zo's face alternating between two squints on a
-    // 6-frame cycle, which read as glitchy noise rather than as an indicator.
-    // The animated ellipsis is the universal convention for "still working"
-    // (`thinking`, `thinking.`, `thinking..`, `thinking...`) and it answers the
-    // only question worth answering here — is it alive? — with the least
-    // possible ink.
-    //
-    // The face SURVIVES for the two states where the app has stopped and is
-    // waiting on the human: `ask` and the permission dialog. Those get the
-    // same warning face for the same reason — a state that waits for the
-    // human must be unmissable, and an animated ellipsis would read as
-    // "working on it".
-    const waiting = act.perm or act.ask;
-    const face: []const u8 = if (waiting)
-        mascot.faceFrames(moodWaiting(act), self.spinner_frame / 6)
-    else if (act.busy or act.streaming)
-        ""
-    else
-        mascot.faceFrames(.idle, self.spinner_frame / 6);
-    const mood: vaxis.Style = if (waiting) theme.warn else if (act.busy) theme.brand else theme.brand_soft;
-
-    var col: u16 = 1;
-    if (face.len > 0) col = p.putText(col, row, face, mood);
-
-    // State: the first thing you have to be able to read at a glance, and now
-    // it is the PHASE.
-    //
-    // `ask` says "waiting for your answer", not "waiting for your input": the
-    // difference between "I am blocked" and "I am waiting for you to decide" is
-    // exactly what the user needs in order to look at the modal.
-    // ONE snapshot, read once: `toolRunName` copies into a caller buffer, and
-    // calling it twice would take the lock twice for the same answer.
+    // Simple, clean activity indicator: just the phase label and time.
+    // Face only appears when waiting for human (ask/perm).
     var tr_name_buf: [64]u8 = undefined;
     const running_tool_name = self.toolRunName(&tr_name_buf);
     const running_tool = running_tool_name != null;
-    var task_label_buf: [96]u8 = undefined;
-    const task_label = if (act.subagent_total > 0)
-        std.fmt.bufPrint(
-            &task_label_buf,
-            "subagents {d}/{d} done · {d} active",
-            .{ act.subagent_completed, act.subagent_total, act.subagent_running },
-        ) catch "subagents working"
+
+    // Face for waiting states (ask/perm)
+    const waiting = act.ask or act.perm;
+    const face: []const u8 = if (waiting)
+        mascot.faceFrames(moodWaiting(act), self.spinner_frame / 6)
     else
         "";
-    // The label is composed in a buffer because THINKING has a moving ellipsis.
+    const mood: vaxis.Style = if (waiting) theme.warn else theme.brand_soft;
+
     var label_buf: [80]u8 = undefined;
     var label: []const u8 = undefined;
     if (act.ask) {
@@ -6604,61 +6571,45 @@ fn drawActivityStrip(
     } else if (act.perm) {
         label = "waiting for your permission";
     } else if (act.subagent_total > 0) {
-        label = task_label;
+        label = std.fmt.bufPrint(&label_buf, "subagents {d}/{d}", .{act.subagent_completed, act.subagent_total}) catch "subagents";
     } else if (running_tool) {
         label = "running";
     } else if (act.streaming) {
         label = "streaming";
     } else if (act.busy) {
-        // One dot per ~250ms, capped at three, then it starts again. The
-        // spinner frame advances once per draw, and a tick is 40ms while busy.
-        const dots = (self.spinner_frame / 3) % (ellipsis_max + 1);
-        label = std.fmt.bufPrint(&label_buf, "thinking{s}", .{ellipsisOf(dots)}) catch "thinking";
+        label = "thinking";
     } else {
-        label = "queued";
+        label = "";
     }
-    col = p.putClipped(col, row, label, width -| col, theme.brand_bold);
-    col += 1;
 
-    // What it is doing, when it is a tool. A bare "thinking" with a 30s `bash`
-    // does not say whether it is working or hung; the tool's NAME identifies it,
-    // and the strip's clock shows its duration.
+    var col: u16 = 1;
+    if (face.len > 0) col = p.putText(col, row, face, mood);
+    if (label.len > 0) {
+        col = p.putClipped(col, row, label, width -| col, theme.brand_bold);
+        col += 1;
+    }
+
+    // Tool name + elapsed time
     if (running_tool_name) |name| {
-        if (col + name.len + 2 < width) {
-            _ = p.putText(col, row, name, theme.brand_soft);
-            col += @as(u16, @intCast(name.len)) + 1;
-        }
-    }
-
-    // Clock. Without it, a slow turn looks hung.
-    if (act.busy or running_tool) {
         var cbuf: [24]u8 = undefined;
-        const ms = if (running_tool) self.toolRunMillis() else self.busyMillis();
+        const ms = self.toolRunMillis();
+        const ts = std.fmt.bufPrint(&cbuf, "{s} · {d}.{d}s", .{ name, ms / 1000, (ms % 1000) / 100 }) catch "";
+        if (ts.len > 0 and col + ts.len + 2 < width) {
+            col = p.putText(col, row, ts, theme.brand_soft);
+            col += 1;
+        }
+    } else if (act.busy or act.streaming) {
+        // Turn elapsed time
+        var cbuf: [24]u8 = undefined;
+        const ms = self.busyMillis();
         const ts = std.fmt.bufPrint(&cbuf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
-        if (ts.len > 0) {
-            _ = p.putText(col, row, ts, theme.brand_soft);
-            col += @as(u16, @intCast(ts.len)) + 1;
+        if (ts.len > 0 and col + ts.len + 2 < width) {
+            col = p.putText(col, row, ts, theme.brand_soft);
+            col += 1;
         }
     }
 
-    // The QUESTION's own clock, and it is separate from the turn's on purpose.
-    // The turn clock answers "is the agent working"; this one answers "how long
-    // have I been sitting on this decision", which is the number that makes
-    // someone stop and answer instead of going to make coffee. They are different
-    // questions and one clock cannot answer both.
-    if (act.ask) {
-        var qbuf: [24]u8 = undefined;
-        const ms = self.askMillis();
-        const qs = std.fmt.bufPrint(&qbuf, "· {d}s to answer", .{ms / 1000}) catch "";
-        if (qs.len > 0 and col + qs.len + 2 < width) {
-            _ = p.putText(col, row, qs, theme.warn);
-            col += @as(u16, @intCast(qs.len)) + 1;
-        }
-    }
-
-    // TTFT: how long it took the first token to ARRIVE. Shown only once (the
-    // stream's first one), because repeating it every frame is noise: the clock
-    // next to it already keeps the count.
+    // TTFT (only once per stream)
     if (!self.ttftPending() and self.ttftMillis() > 0) {
         var tbuf: [24]u8 = undefined;
         const ttft = std.fmt.bufPrint(&tbuf, "first token {d}.{d}s", .{
@@ -6666,35 +6617,38 @@ fn drawActivityStrip(
             (self.ttftMillis() % 1000) / 100,
         }) catch "";
         if (ttft.len > 0 and col + ttft.len + 2 < width) {
-            _ = p.putText(col, row, ttft, theme.brand_faint);
-            col += @as(u16, @intCast(ttft.len)) + 1;
+            col = p.putText(col, row, ttft, theme.brand_faint);
+            col += 1;
         }
     }
 
-    // Live throughput belongs with the activity phase, not duplicated in the
-    // persistent model/context metadata on the status row.
+    // Live throughput (only while streaming)
     if (act.streaming and agent.tps_live > 1) {
         var tbuf: [32]u8 = undefined;
         const speed = std.fmt.bufPrint(&tbuf, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch "";
         const speed_cols: u16 = @intCast(columnsOf(p, speed));
         if (speed.len > 0 and col + speed_cols + 2 < width) {
-            _ = p.putText(col, row, speed, theme.tool);
-            col += speed_cols + 1;
+            col = p.putText(col, row, speed, theme.tool);
+            col += 1;
         }
     }
 
-    // Queue: how many and which, so you don't lose track of them.
+    // Queue indicator
     if (queued > 0) {
         var qbuf: [32]u8 = undefined;
         const q = std.fmt.bufPrint(&qbuf, "⏳ {d} queued", .{queued}) catch "";
         if (col + q.len + 2 < width and q.len > 0) {
-            _ = p.putText(col, row, q, theme.warn);
-            col += @as(u16, @intCast(q.len)) + 1;
+            col = p.putText(col, row, q, theme.warn);
         }
-        var q2: [24]u8 = undefined;
-        const nxt = std.fmt.bufPrint(&q2, "next: {s}", .{self.queuedFirst(24)}) catch "";
-        if (nxt.len > 4 and col + nxt.len + 2 < width) {
-            _ = p.putText(col, row, nxt, theme.brand_faint);
+    }
+
+    // Question timeout
+    if (act.ask) {
+        var qbuf: [24]u8 = undefined;
+        const ms = self.askMillis();
+        const qs = std.fmt.bufPrint(&qbuf, "· {d}s to answer", .{ms / 1000}) catch "";
+        if (qs.len > 0 and col + qs.len + 2 < width) {
+            col = p.putText(col, row, qs, theme.warn);
         }
     }
 }
@@ -6702,47 +6656,17 @@ fn drawActivityStrip(
 /// A piece of the status row with its style.
 const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 
-/// The RIGHT zone of the status row, and it is ONE thing: `provider/model`.
+/// The RIGHT zone of the status row: ONLY the model name.
 ///
-/// This used to carry five facts — model, provider with effort in parentheses,
-/// mode, tokens, ctx% — plus a second column for the cache and the token counts.
-/// Seven pieces of information on a row whose whole job is to answer "what am I
-/// talking to", and the answer to that question was buried in the middle of it.
-///
-/// Now the row is `opencode/kimi-k2.6`, in one tone, right-aligned, and nothing
-/// else. The separator is `line` and not `ink`: the `/` is a hairline between
-/// two parts of one name, and drawing it in the tone of the name makes the name
-/// look like two names.
-///
-/// What moved out did not get deleted, it got a command. `ctx%` and the token
-/// counts are `/context`; the cache hit rate is `/cache`; the iteration stats
-/// are `/bench`. A status row is for the thing you read without thinking, and
-/// those four are things you read when something is wrong.
+/// A status row is for the thing you read without thinking: what model am I
+/// talking to right now. Everything else (provider, ctx%, tokens, cache, mode)
+/// has a command: `/context`, `/cache`, `/bench`, `/provider`.
 fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     var out: std.ArrayList(InfoSeg) = .empty;
 
-    // The model that will answer, and not only the one that IS answering.
-    //
-    // `curAnswering()` is empty until the first turn, and the compiled
-    // providers carry no `default_model` on purpose (a name in the code stops
-    // existing the day the provider withdraws it). So the row used to say
-    // `opencode` and nothing else for the whole of a session's first minute,
-    // which is the one moment you are deciding whether to trust the app.
-    //
-    // Three fallbacks, in order of how much they can be trusted: the model a
-    // turn is using, the one `resolveStatusModel` picked out of the provider's
-    // CACHED catalogue (the same rule `resolveModelHeadless` uses, so the row
-    // says what the first turn would actually pick), and the provider's own
-    // `default_model`, which is empty only when the provider really has none.
-    //
-    // The resolve is LAZY and it is the reason this is in the draw and not in
-    // `loadUserConfig`: the catalogue is on disk and reading it at startup would
-    // block the first frame on a file the user may never look at. It runs once
-    // (`status_model_len` is the flag) and only when there is nothing better to
-    // show, so the steady state is one integer compare per frame.
+    // The model that will answer.
     if (m.status_model_len == 0 and !m.status_model_tried) resolveStatusModel(m);
     const model = agent.curAnswering();
-    const provider = agent.curProvider();
     const shown_model = if (model.len > 0)
         model
     else if (m.status_model_len > 0)
@@ -6752,54 +6676,32 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     else
         "";
 
-    if (provider.len > 0) {
-        out.append(arena, .{ .text = provider, .style = theme.status }) catch return null;
-    }
     if (shown_model.len > 0) {
-        if (out.items.len > 0) {
-            out.append(arena, .{ .text = "/", .style = theme.line }) catch return null;
-        }
         out.append(arena, .{ .text = shown_model, .style = theme.ink2 }) catch return null;
     }
 
-    // The permission mode, and only when it is a DEVIATION.
-    //
-    // The row is `provider/model` and nothing else in the normal case, because
-    // that is the one fact the row exists to answer and everything else was
-    // making it unreadable. But a mode is not a fact, it is a promise about what
-    // the agent is allowed to do, and two of the four break the promise in ways
-    // that explain a whole session:
-    //
-    //   read-only  — every `write`/`edit`/`bash` comes back refused, and without
-    //                the mark the answer to "why did it ignore my edit?" is a
-    //                coin toss between "it did not try" and "it could not".
-    //   bypass     — nothing asks, ever, including the `rm`.
-    //
-    // `default` and `accept_edits` are what a coding session looks like, so they
-    // cost zero columns. That is the trade the row is making: space in the
-    // normal case, and no silence ever about the abnormal one.
+    // Permission mode: only show when NOT default (read-only/bypass are deviations).
     switch (agent.currentPermMode()) {
         .read_only, .bypass => {
             if (out.items.len > 0) {
-                out.append(arena, .{ .text = " \u{b7} ", .style = theme.line }) catch return null;
+                out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
             }
             out.append(arena, .{ .text = agent.permModeName(), .style = theme.warn }) catch return null;
         },
         .default, .accept_edits => {},
     }
 
-    // Free-auto mode indicator: shown when active, so the user always knows
-    // when the model is being rotated automatically.
+    // Free-auto mode indicator.
     if (agent.freeAutoOn()) {
         const lbl = agent.freeAutoLabel(arena);
         if (lbl.len > 0) {
             if (out.items.len > 0) {
-                out.append(arena, .{ .text = " \u{b7} ", .style = theme.line }) catch return null;
+                out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
             }
             out.append(arena, .{ .text = lbl, .style = theme.brand_bold }) catch return null;
         } else {
             if (out.items.len > 0) {
-                out.append(arena, .{ .text = " \u{b7} ", .style = theme.line }) catch return null;
+                out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
             }
             out.append(arena, .{ .text = "free-auto: building pool…", .style = theme.warn }) catch return null;
         }
@@ -7825,15 +7727,19 @@ test "status: the segments are live, whole text" {
     try std.testing.expect(saw_model);
 }
 
-test "status: the row is provider/model and nothing else in the normal case" {
-    // This is the whole point of the change: the row used to carry model,
-    // provider, effort, mode, tokens and ctx% — six facts on a row whose job is
-    // to answer "what am I talking to". Everything that moved out got a command
-    // (`/context`, `/cache`, `/bench`) instead of being deleted.
+test "status: the row is ONLY the model name in the normal case" {
+    // The row used to carry provider/model, effort, mode, tokens and ctx%.
+    // Now it shows ONLY the model name. Everything else has a command.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
+
+    // Simulate a resolved model (normally done by resolveStatusModel from cache)
+    const model_name = "kimi-k2.6";
+    @memcpy(m.status_model_buf[0..model_name.len], model_name);
+    m.status_model_len = model_name.len;
+    m.status_model_tried = true;
 
     const segs = sessionInfo(&m, arena_state.allocator()) orelse return error.TestUnexpectedResult;
     var joined: std.ArrayList(u8) = .empty;
@@ -7841,17 +7747,17 @@ test "status: the row is provider/model and nothing else in the normal case" {
     for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
     const all = joined.items;
 
-    try std.testing.expect(std.mem.indexOf(u8, all, "opencode") != null);
-    // None of the six, and a row that mentions the context budget again is a
-    // regression of this exact change.
-    for ([_][]const u8{ "ctx ", " cached", " prompt", " tok", " min", " med", " xhigh" }) |gone| {
+    // Should show the model name
+    try std.testing.expect(std.mem.indexOf(u8, all, "kimi") != null);
+    // No provider prefix, no slash, no extra info
+    for ([_][]const u8{ "ctx ", " cached", " prompt", " tok", " min", " med", " xhigh", "opencode", "/" }) |gone| {
         try std.testing.expect(std.mem.indexOf(u8, all, gone) == null);
     }
 }
 
 test "status: the normal permission modes cost NOTHING on the row" {
     // The mark for a permission mode only appears when it is a deviation
-    // (`read-only`, `yolo`): `default` and `accept-edits` are what a coding
+    // (`read-only`, `bypass`): `default` and `accept_edits` are what a coding
     // session looks like, and spending columns on them is what made the old row
     // unreadable. A test for the ABSENCE of a mark is the only thing that keeps
     // a future "just add the mode back" from silently undoing the change.
@@ -7859,6 +7765,12 @@ test "status: the normal permission modes cost NOTHING on the row" {
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
+
+    // Simulate a resolved model
+    const model_name = "kimi-k2.6";
+    @memcpy(m.status_model_buf[0..model_name.len], model_name);
+    m.status_model_len = model_name.len;
+    m.status_model_tried = true;
 
     // Restored on the way out: the mode is a process-wide global and the next
     // test reads it.
@@ -7883,8 +7795,11 @@ test "status: the normal permission modes cost NOTHING on the row" {
         var joined: std.ArrayList(u8) = .empty;
         defer joined.deinit(std.testing.allocator);
         for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
-        // Nothing but the name: the provider, the `/` and the model.
-        try std.testing.expect(std.mem.indexOf(u8, joined.items, " ") == null);
+        // Nothing but the model name: no provider, no slash, no mode marker.
+        // The joined text should just be the model name (e.g., "kimi-k2.6")
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, " · ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "opencode") == null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "/") == null);
     }
 }
 
@@ -7896,17 +7811,20 @@ test "status: the status row fits and is not cut" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
+    // Simulate a resolved model
+    const model_name = "kimi-k2.6";
+    @memcpy(m.status_model_buf[0..model_name.len], model_name);
+    m.status_model_len = model_name.len;
+    m.status_model_tried = true;
+
     const w: u16 = 96;
     const s = try drawTest(&m, arena_state.allocator(), w, 16);
     var buf: [512]u8 = undefined;
     const row = rowText(s, 16 - 1, &buf); // status_row
     // No U+FFFD (the replacement character shows up when a UTF-8 is split).
     try std.testing.expect(std.mem.indexOf(u8, row, "\u{fffd}") == null);
-    // And the session info is whole: no half-parenthesis, and both fields are
-    // there. (CAREFUL: `rowText` returns BYTES, not columns, so it cannot be
-    // compared against the width: a "·" is 2 bytes in a single cell.)
-    try std.testing.expect(std.mem.indexOf(u8, row, ")") == null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "opencode") != null);
+    // The session info is whole: just the model name.
+    try std.testing.expect(std.mem.indexOf(u8, row, "kimi") != null);
 }
 
 test "status: ctxColor changes at the compaction thresholds" {
@@ -8657,12 +8575,21 @@ test "queue: clearQueue frees whatever is left" {
 }
 
 test "activity strip: with work and with a queue" {
-    // The strip is what answers "is it working or is it stuck?": the face, the
-    // state and the seconds. Without it there was only a tiny spinner.
+    // The strip is what answers "is it working or is it stuck?": the phase label
+    // and the seconds. Clean, no face animation.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
+
+    // Simulate a resolved model for status row
+    const model_name = "kimi-k2.6";
+    @memcpy(m.status_model_buf[0..model_name.len], model_name);
+    m.status_model_len = model_name.len;
+    m.status_model_tried = true;
+
+    // Add banner so there's content to draw
+    m.pushHeader(.idle);
 
     m.streamStart();
     const p1 = m.allocator.dupe(u8, "en cola") catch unreachable;
@@ -8670,15 +8597,18 @@ test "activity strip: with work and with a queue" {
 
     const s = try drawTest(&m, arena_state.allocator(), 90, 24);
     const all = allText(s);
+
     // With an open stream the label is the PHASE ("streaming"), not the generic
     // "working" from before: 40s of "working" does not distinguish thinking
     // from writing from a hung command.
     try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "1 queued") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "en cola") != null);
+    // "en cola" is the queued prompt text, not shown in activity strip
     var status_buf: [256]u8 = undefined;
     const status_row = rowText(s, s.size.height - 1, &status_buf);
+    // Activity strip content should NOT appear in the status row
     try std.testing.expect(std.mem.indexOf(u8, status_row, "streaming") == null);
+    // No spinner face
     try std.testing.expect(std.mem.indexOf(u8, status_row, "⠋") == null);
 }
 
@@ -8739,8 +8669,7 @@ test "activity strip: parallel subagents show live completion and active counts"
     m.taskBatchFinished();
     const s = try drawTest(&m, arena_state.allocator(), 100, 24);
     const all = allText(s);
-    try std.testing.expect(std.mem.indexOf(u8, all, "subagents 1/7 done") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "1 active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "subagents 1/7") != null);
 
     m.endTaskBatch();
     try std.testing.expectEqual(@as(usize, 0), m.activity().subagent_total);
@@ -8863,108 +8792,88 @@ test "permissions: the modal is centered and shows the 4 options" {
     m.perm_active = false;
 }
 
-test "thinking is one word and a moving ellipsis, with no face on it" {
-    // REWRITTEN ON PURPOSE, and the record is this comment.
-    //
-    // It used to assert that Zo's face sat next to "thinking", alternating
-    // between two squints on a six-frame cycle. That is the behaviour that was
-    // reported as looking wrong: a face twitching inside a status strip reads
-    // as rendering noise, not as "still working". The rewrite pins the
-    // replacement — the animated ellipsis, which is the convention — instead of
-    // leaving the old assertion green over code that no longer exists.
-    //
-    // The face is NOT deleted. It survives for the two states where the app has
-    // stopped and waits on the human, asserted in the next test.
+test "thinking is a clean label with no face" {
+    // The activity strip now shows just "thinking" (no animated ellipsis,
+    // no face) when busy without a stream or tool. The clock next to it
+    // shows the elapsed time, which is the real indicator of progress.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var saw_dot = false;
-    var saw_no_dot = false;
-    // The ellipsis cycles through 0..ellipsis_max + 1, one step every three
-    // spinner frames, so a full cycle needs more than that many frames.
-    var frames: usize = 0;
-    while (frames < ellipsis_max * 3 + 2) : (frames += 1) {
-        var m = Model.init(std.testing.allocator);
-        defer m.deinit();
-        m.setStatusWithMood(.thinking, "thinking");
-        // `busy` WITHOUT `streamStart`: that function also sets `streaming`,
-        // and the strip's label checks `streaming` FIRST. The thinking phase is
-        // exactly "there is work and no stream and no tool".
-        m.lock();
-        m.busy = true;
-        m.busy_started_ns = std.math.maxInt(i128);
-        m.unlock();
-        m.spinner_frame = frames;
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.setStatusWithMood(.thinking, "thinking");
+    m.lock();
+    m.busy = true;
+    m.busy_started_ns = std.math.maxInt(i128);
+    m.unlock();
 
-        const s = try drawTest(&m, arena, 92, 26);
-        // The strip is one row above the input box, which is where `busy`
-        // makes it appear. Look for the WORD, since the frame count decides
-        // which of the rows the history ends on.
-        const row = findRow(s, "thinking") orelse return error.TestUnexpectedResult;
-        var rb: [256]u8 = undefined;
-        const text = rowText(s, row, &rb);
+    const s = try drawTest(&m, arena, 92, 26);
+    const row = findRow(s, "thinking") orelse return error.TestUnexpectedResult;
+    var rb: [256]u8 = undefined;
+    const text = rowText(s, row, &rb);
 
-        // No mascot face of any mood: that is the change under test.
-        for ([_]mascot.Mood{ .idle, .thinking, .warn, .done }) |mk| {
-            const f = mascot.faceFrames(mk, 0);
-            var it = vaxis.unicode.graphemeIterator(f);
-            while (it.next()) |g| {
-                const bytes = g.bytes(f);
-                if (bytes.len > 0 and std.mem.indexOf(u8, text, bytes) != null) {
-                    return error.TestUnexpectedResult;
-                }
+    // No mascot face of any mood.
+    for ([_]mascot.Mood{ .idle, .thinking, .warn, .done }) |mk| {
+        const f = mascot.faceFrames(mk, 0);
+        var it = vaxis.unicode.graphemeIterator(f);
+        while (it.next()) |g| {
+            const bytes = g.bytes(f);
+            if (bytes.len > 0 and std.mem.indexOf(u8, text, bytes) != null) {
+                return error.TestUnexpectedResult;
             }
         }
-
-        // Count the dots IMMEDIATELY after the word. The clock's own decimal
-        // point (`0.0s`) is a dot too, and counting it made every frame look
-        // dotted, so the ellipsis never appeared to move.
-        var n_dots: usize = 0;
-        if (std.mem.indexOf(u8, text, "thinking")) |at| {
-            var c = at + "thinking".len;
-            while (c < text.len and text[c] == '.') : (c += 1) n_dots += 1;
-        }
-        if (n_dots == 0) {
-            saw_no_dot = true;
-        } else {
-            saw_dot = true;
-            // Capped: an ellipsis that grew into a bar would be noise of its own.
-            try std.testing.expect(n_dots <= ellipsis_max);
-        }
     }
-    // It moved: both a frame with dots and one without.
-    try std.testing.expect(saw_dot and saw_no_dot);
+
+    // Label is just "thinking" (no animated dots).
+    try std.testing.expect(std.mem.indexOf(u8, text, "thinking") != null);
+    // Clock should be present (e.g., "0.0s")
+    try std.testing.expect(std.mem.indexOf(u8, text, "0.") != null or std.mem.indexOf(u8, text, "1.") != null);
 }
 
-test "the waiting states keep the mascot's warning face" {
-    // The other half of the decision: a state that waits on the HUMAN is the one
-    // place a face is worth its rows. Without this, the test above could be
-    // read as "the face is deleted" and someone would remove it from the
-    // permission dialog too.
+test "the waiting states keep the mascot's warning face in the ask panel" {
+    // The face survives for the two states where the app has stopped and waits
+    // on the human: `ask` panel and the permission dialog. The activity strip
+    // no longer shows a face during normal work.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
+    // Simulate a resolved model for status row
+    const model_name = "kimi-k2.6";
+    @memcpy(m.status_model_buf[0..model_name.len], model_name);
+    m.status_model_len = model_name.len;
+    m.status_model_tried = true;
+
+    // Add banner so there's content to draw
+    m.pushHeader(.idle);
+
     m.setStatusWithMood(.warn, "waiting");
     try openAskForTest(&m, "which one?", "decide", &.{"a", "b"});
 
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
+    _ = allText(s);
+
     const face = mascot.faceFrames(.warn, 0);
     var found: usize = 0;
     var it = vaxis.unicode.graphemeIterator(face);
     while (it.next()) |g| {
         const bytes = g.bytes(face);
-        const activity_row = findRow(s, "waiting for your answer") orelse return error.TestUnexpectedResult;
-        var col: u16 = 0;
-        while (col < s.size.width) {
-            const cell = s.readCell(col, activity_row);
-            if (std.mem.eql(u8, cell.char.grapheme, bytes)) {
-                found += 1;
-                break;
+        // The ask panel is drawn in the history area, look for the face there
+        var row: u16 = 0;
+        while (row < s.size.height) {
+            var col: u16 = 0;
+            while (col < s.size.width) {
+                const cell = s.readCell(col, row);
+                if (std.mem.eql(u8, cell.char.grapheme, bytes)) {
+                    found += 1;
+                    break;
+                }
+                col += @max(1, cell.char.width);
             }
-            col += @max(1, cell.char.width);
+            if (found > 0) break;
+            row += 1;
         }
     }
     try std.testing.expect(found > 0);

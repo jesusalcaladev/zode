@@ -56,30 +56,30 @@ pub const line: vaxis.Style = rgb(0x2e, 0x2c, 0x2a);
 /// the input feels anchored without a box around it.
 pub const line_bright: vaxis.Style = rgb(0x3d, 0x3a, 0x37);
 
-// ─── the accent: a matte terracotta ─────────────────────────────────────────────
+// ─── the accent: ELECTRIC TEAL ──────────────────────────────────────────────────
 //
-// HUE 18°, ~40% saturation, ~56% lightness. A warm terracotta that reads as
-// an interface accent without being a status color. It is far from the diff's
-// green (135°) AND far from the code palette's orange/amber/lilac/pink/blue
-// bands, so the code palette only has to keep out ONE hue band (0-35°).
+// HUE 185°, ~75% saturation, ~52% lightness. A vibrant electric teal that reads
+// as modern, technical, and forward-looking. It sits between cyan and green,
+// distinct from the diff's green (135°) and far from the warm code palette
+// (amber/lilac/pink). The high saturation makes it pop as a true accent without
+// reading as a status color.
 //
-// MATTE is not decoration. A fully saturated orange is a warning, and next to a
-// diff it would read as a status color. The moderate saturation keeps it in the
-// interface layer: it marks YOUR things (prompt, caret, selection, wordmark).
+// ELECTRIC is intentional. A muted teal blends into the background; a saturated
+// one marks YOUR things decisively: prompt, caret, selection, wordmark, focus.
 //
-/// 8.5:1 on black, 7.6:1 on `well_bg`. The accent proper: your prompt, the
-/// caret, the selected row's mark. MATTE TERRACOTTA.
-pub const brand: vaxis.Style = rgb(0xb8, 0x7e, 0x68);
-/// One step up, for the one thing that should read as lit (the wordmark, Zo's
+/// 7.8:1 on black, 6.9:1 on `well_bg`. The accent proper: your prompt, the
+/// caret, the selected row's mark. ELECTRIC TEAL.
+pub const brand: vaxis.Style = rgb(0x00, 0xc8, 0xb8);
+/// One step up, for the one thing that should read as LIT (the wordmark, Zo's
 /// face). Bold as well as bright: a wordmark at normal weight is just text,
 /// and "zode" has to be recognisable in the first half second.
-pub const brand_hi: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xd9, 0x9a, 0x80 } } };
-/// 4.7:1 on `well_bg`. Tertiary text that still carries a color.
-pub const brand_soft: vaxis.Style = rgb(0xa8, 0x72, 0x5c);
-/// Warm hairline. Sits between `line` and `brand_soft` in weight.
-pub const brand_faint: vaxis.Style = rgb(0x3a, 0x2a, 0x24);
+pub const brand_hi: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x40, 0xe8, 0xd8 } } };
+/// 4.5:1 on `well_bg`. Tertiary text that still carries the accent color.
+pub const brand_soft: vaxis.Style = rgb(0x00, 0xa8, 0x98);
+/// Cool hairline. Sits between `line` and `brand_soft` in weight.
+pub const brand_faint: vaxis.Style = rgb(0x0a, 0x2a, 0x28);
 /// The background of a focused surface's track (a depleting progress bar).
-pub const brand_deep: vaxis.Style = rgb(0x24, 0x16, 0x12);
+pub const brand_deep: vaxis.Style = rgb(0x04, 0x14, 0x12);
 
 // ── semantics ─────────────────────────────────────────────────
 //
@@ -108,13 +108,10 @@ pub const well_bg: vaxis.Style = bg(0x12, 0x11, 0x10);
 
 // ── code token palette ────────────────────────────────────────
 //
-// NOT in the accent's hue band. The accent is terracotta (18°), so a token in
-// 357-39° (wrapping around 0°) would put brand and syntax on the same screen
-// reading the same way — which is what the green accent forced on the green
-// band, and what `codePaletteClearsAccent` below now enforces for the
-// terracotta one. Amber, lilac, pink and a BLUE PAST 213° instead: the classic
-// high-legibility set, with the two blues deliberately moved off the cyan they
-// used to be.
+// NOT in the accent's hue band. The accent is electric teal (185°), so a token
+// in 164-206° would put brand and syntax on the same screen reading the same
+// way. The palette uses orchid, lilac, pink, indigo, periwinkle, amber — all
+// well outside the teal band.
 
 pub const code_text: vaxis.Style = rgb(0xc9, 0xd1, 0xd9);
 pub const code_kw: vaxis.Style = rgb(0xc7, 0x7d, 0xb8); // orchid
@@ -208,7 +205,7 @@ pub const table: vaxis.Style = rgb(0x5a, 0x58, 0x55);
 /// The one rule that separates the transcript from the input.
 pub const rule: vaxis.Style = line_bright;
 /// The input's caret bar and prompt. The accent, always: it says "you are here".
-pub const input_prompt: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xb8, 0x7e, 0x68 } } };
+pub const input_prompt: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x40, 0xe8, 0xd8 } } };
 pub const input_bar: vaxis.Style = rgb(0x2a, 0x44, 0x47);
 pub const placeholder: vaxis.Style = ink3;
 /// The status row: everything in it is metadata, so everything in it is dim.
@@ -546,28 +543,28 @@ test "the hairline is a hairline and NOT text" {
     try std.testing.expect(r >= min_mark_contrast);
 }
 
-test "the accent and the diff green are told apart by CHROMA, not by lightness" {
-    // The whole decision rests on a reader telling them apart. A
-    // contrast ratio cannot measure that (they are the same lightness), so the
-    // quantity that separates them is saturation: the accent is MATTE and `ok`
-    // is VIVID. Both differences are asserted, because either one alone would
-    // pass with a palette that still reads as "the same green".
+test "the accent and the diff green are told apart by HUE, not by lightness" {
+    // The accent (electric teal, ~185°) and `ok` (vivid green, ~135°) are separated
+    // by HUE (~50° apart), not by lightness. Both are vivid (high saturation).
+    // A contrast ratio cannot measure hue separation, so the quantity that
+    // separates them is hue distance. Both differences are asserted, because
+    // either one alone would pass with a palette that still reads as "the same".
     const a = hueSat(fgRgb(brand).?);
     const b = hueSat(fgRgb(ok).?);
-    // The matte one is measurably less saturated.
-    try std.testing.expect(b.s - a.s >= 0.15);
-    // And not the same hue either. The hue distance has to take the wrap
-    // around 360 into account, or a red at 350 and a red at 10 read as 340
-    // apart.
+    // Both are vivid (high saturation), so saturation doesn't separate them.
+    // The hue distance is the primary separator.
     var dh = @abs(a.h - b.h);
     if (dh > 180) dh = 360 - dh;
     try std.testing.expect(dh >= 15);
+    // Both should be vivid (high saturation)
+    try std.testing.expect(a.s >= 0.5);
+    try std.testing.expect(b.s >= 0.5);
 }
 
 test "the code palette clears the accent's hue band" {
     // The accent is the only color in CHROME, and a token in its hue band would
-    // put "brand" and "syntax" on the same screen reading the same way. With a
-    // terracotta accent (18°) the band is ±21° around it (357-39°).
+    // put "brand" and "syntax" on the same screen reading the same way. With an
+    // electric teal accent (~185°) the band is ±21° around it (164-206°).
     //
     // The band is ±21° around the accent, and the test is on SATURATION as
     // well as hue: `code_text` and `code_comment` are near-neutral, and a

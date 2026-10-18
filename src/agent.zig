@@ -8238,57 +8238,123 @@ fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
     return std.mem.lessThan(u8, a.id, b.id);
 }
 
-/// Opens the model palette in TWO COLUMNS: providers | the active one's models.
-///
-/// It reuses the list already downloaded from the active provider, so opening it
-/// costs no network call (and if there are no models yet, `pickerModelsAsync` is
-/// launched to have something to paint).
-/// Builds the model palette's items: providers first (with their key state) and
-/// then the models with their `free` flag or their context window. All strings
-/// are own copies from the model's allocator.
-fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
+/// Opens the model palette: a SINGLE flat list of all models from connected
+/// providers (providers that have a key), showing "Model Name    Provider · free/ctx".
+/// Reads from the cache of each connected provider, so it opens instantly.
+/// All strings are own copies from the model's allocator.
+fn buildModelItems(m: *tui.Model, _: []models_mod.Model) ?[]palette.Item {
     const gpa = m.allocator;
     var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer defs_arena_state.deinit();
     const defs = allProviders(defs_arena_state.allocator());
-    const n = defs.len + 1 + list.len; // +1 = "+ connect"
-    const items = gpa.alloc(palette.Item, n) catch return null;
-    var i: usize = 0;
-    for (defs) |*d| {
-        const active = std.mem.eql(u8, d.id, cur_provider_id);
-        const has_key = providers.hasKey(d, m.environ);
-        items[i] = .{
-            .kind = .provider,
-            .group = 1,
-            .label = gpa.dupe(u8, d.id) catch return null,
-            .hint = providerKeyHint(gpa, d, active, has_key) orelse return null,
-        };
-        i += 1;
+
+    // First pass: count total models from all connected providers
+    var total_models: usize = 0;
+    for (defs) |d| {
+        if (providers.hasKey(&d, m.environ)) {
+            var cache_arena = std.heap.ArenaAllocator.init(gpa);
+            if (modelcache.read(io_global, m.environ, cache_arena.allocator(), d.id, d.models_url)) |entry| {
+                total_models += entry.models.len;
+            }
+            cache_arena.deinit();
+        }
     }
-    // CAREFUL: EVERY label/hint has to be an OWN copy. A literal
-    // ("+ connect") freed with `gpa.free` is an "Invalid free" that only shows
-    // up on app exit, when the palette is destroyed.
+
+    // If no models from connected providers, try the active provider's cache
+    // (the user might be browsing before connecting a key)
+    if (total_models == 0) {
+        const active_def = activeProviderDef(m.environ);
+        if (active_def.id.len > 0) {
+            var cache_arena = std.heap.ArenaAllocator.init(gpa);
+            if (modelcache.read(io_global, m.environ, cache_arena.allocator(), active_def.id, active_def.models_url)) |entry| {
+                total_models = entry.models.len;
+            }
+            cache_arena.deinit();
+        }
+    }
+
+    // If still no models, return null to trigger fallback
+    if (total_models == 0) {
+        return null;
+    }
+
+    const items = gpa.alloc(palette.Item, total_models + 1) catch return null; // +1 for "+ connect"
+    var i: usize = 0;
+
+    // Second pass: add models from each connected provider
+    for (defs) |d| {
+        if (!providers.hasKey(&d, m.environ)) continue;
+
+        var cache_arena = std.heap.ArenaAllocator.init(gpa);
+        if (modelcache.read(io_global, m.environ, cache_arena.allocator(), d.id, d.models_url)) |entry| {
+            for (entry.models) |mi| {
+                const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
+                    std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
+                else
+                    "";
+                items[i] = .{
+                    .kind = .model,
+                    .group = 1,
+                    .label = gpa.dupe(u8, mi.id) catch return null,
+                    .hint = if (hint.len > 0)
+                        std.fmt.allocPrint(gpa, "{s} · {s}", .{d.id, hint}) catch gpa.dupe(u8, d.id) catch ""
+                    else
+                        gpa.dupe(u8, d.id) catch "",
+                    .ctx_tokens = mi.context_length,
+                };
+                i += 1;
+            }
+        }
+        cache_arena.deinit();
+    }
+
+    // If we got models from connected providers, we're done
+    if (i > 0) {
+        // "+ connect" item at the end
+        items[i] = .{
+            .kind = .connect,
+            .group = 2,
+            .label = gpa.dupe(u8, "+ connect") catch return null,
+            .hint = gpa.dupe(u8, "ctrl+a") catch return null,
+        };
+        return items;
+    }
+
+    // Fallback: active provider's models (if we got here, connected providers had no models
+    // but active provider did)
+    const active_def = activeProviderDef(m.environ);
+    if (active_def.id.len > 0) {
+        var cache_arena = std.heap.ArenaAllocator.init(gpa);
+        if (modelcache.read(io_global, m.environ, cache_arena.allocator(), active_def.id, active_def.models_url)) |entry| {
+            for (entry.models) |mi| {
+                const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
+                    std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
+                else
+                    "";
+                items[i] = .{
+                    .kind = .model,
+                    .group = 1,
+                    .label = gpa.dupe(u8, mi.id) catch return null,
+                    .hint = if (hint.len > 0)
+                        std.fmt.allocPrint(gpa, "{s} · {s}", .{active_def.id, hint}) catch gpa.dupe(u8, active_def.id) catch ""
+                    else
+                        gpa.dupe(u8, active_def.id) catch "",
+                    .ctx_tokens = mi.context_length,
+                };
+                i += 1;
+            }
+        }
+        cache_arena.deinit();
+    }
+
+    // "+ connect" item at the end
     items[i] = .{
         .kind = .connect,
         .group = 2,
         .label = gpa.dupe(u8, "+ connect") catch return null,
         .hint = gpa.dupe(u8, "ctrl+a") catch return null,
     };
-    i += 1;
-    for (list) |mi| {
-        const hint = if (isFree(mi)) "free" else if (mi.context_length > 0)
-            std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
-        else
-            "";
-        items[i] = .{
-            .kind = .model,
-            .group = 3,
-            .label = gpa.dupe(u8, mi.id) catch return null,
-            .hint = if (hint.len > 0) (gpa.dupe(u8, hint) catch "") else "",
-            .ctx_tokens = mi.context_length,
-        };
-        i += 1;
-    }
+
     return items;
 }
 
@@ -8339,7 +8405,13 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     // It delegates to `buildModelItems`: keeping TWO item constructors means
     // that as soon as one of them is not updated, loose literals show up (which
     // `freeItems` cannot free) and the app crashes on exit.
-    const items = buildModelItems(m, list) orelse return;
+    var items = buildModelItems(m, list);
+    if (items == null) {
+        // Fallback: no cached models from any connected provider.
+        // Build items from the active provider's list (passed as `list`).
+        items = fallbackModelItems(m, list);
+        if (items == null) return;
+    }
     if (m.pal.mode == .models) m.invalidateCatalogRequest();
     // The mode goes BEFORE `setItemsOwned`: `resetSelection` computes the active
     // column from the mode. With the old mode, opening the model palette left
@@ -8361,14 +8433,52 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
         m.pal.custom_title = "";
     }
 
-    m.pal.setItemsOwned(items, &model_groups);
+    m.pal.setItemsOwned(items.?, &model_groups);
 }
 
-/// Groups of the model palette.
+/// Fallback: builds model items from the active provider's list only.
+/// Used when no connected provider has cached models.
+fn fallbackModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
+    const gpa = m.allocator;
+    const total_models = list.len;
+    const items = gpa.alloc(palette.Item, total_models + 1) catch return null; // +1 for "+ connect"
+    var i: usize = 0;
+
+    const active_provider = if (cur_provider_id.len > 0) cur_provider_id else "unknown";
+
+    for (list) |mi| {
+        const hint = if (isFree(mi)) "free" else if (mi.context_length > 0)
+            std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
+        else
+            "";
+        items[i] = .{
+            .kind = .model,
+            .group = 1,
+            .label = gpa.dupe(u8, mi.id) catch return null,
+            .hint = if (hint.len > 0)
+                std.fmt.allocPrint(gpa, "{s} · {s}", .{active_provider, hint}) catch gpa.dupe(u8, active_provider) catch ""
+            else
+                gpa.dupe(u8, active_provider) catch "",
+            .ctx_tokens = mi.context_length,
+        };
+        i += 1;
+    }
+
+    // "+ connect" item at the end
+    items[i] = .{
+        .kind = .connect,
+        .group = 2,
+        .label = gpa.dupe(u8, "+ connect") catch return null,
+        .hint = gpa.dupe(u8, "ctrl+a") catch return null,
+    };
+
+    return items;
+}
+
+/// Groups of the model palette (single flat list of models).
 pub const model_groups = [_]palette.Group{
-    .{ .name = "Providers" },
-    .{ .name = "" }, // separator for the "Connect an integration" item
     .{ .name = "Models" },
+    .{ .name = "" }, // separator for the "Connect an integration" item
 };
 
 /// `/provider`: picker with all the providers and their key state.
