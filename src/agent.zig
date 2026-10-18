@@ -325,6 +325,7 @@ fn freeSkillsCacheLocked() void {
             gpa.free(e.name);
             gpa.free(e.description);
             gpa.free(e.path);
+            if (e.when_to_use.len > 0) gpa.free(e.when_to_use);
         }
         gpa.free(list);
         skills_cache = null;
@@ -345,11 +346,14 @@ fn freeSkillsCacheLocked() void {
 ///   - it got no verification rules, so a task took three times as long;
 ///   - it got no `todo` or `refs` guidance, so neither was used.
 ///
-/// And it was invisible from the TUI, where all of it works. Two prompts for the
-/// same agent, one of them a subset of the other, is not a configuration: it is a
-/// second definition of how the harness wants to be used.
-///
-/// So there is ONE composition now. The headless runner calls this.
+/// Test-only: reset the skills cache and stamps. Uses the lock internally.
+pub fn resetSkillsCacheForTest() void {
+    while (skills_lock.tryLock()) {}
+    defer skills_lock.unlock();
+    freeSkillsCacheLocked();
+    skills_stamp_len = 0;
+    skills_rescans = 0;
+}
 pub fn buildSystemPromptFor(
     gpa: std.mem.Allocator,
     env: ?*const std.process.Environ.Map,
@@ -876,7 +880,14 @@ fn cmdSkills(m: *tui.Model) void {
         if (entries.len == 1) @as([]const u8, "") else @as([]const u8, "s"),
     });
     for (entries) |e| {
-        const line = std.fmt.allocPrint(m.allocator, "  {s}: {s}", .{
+        const source_tag = switch (e.source) {
+            .project => "[project]",
+            .agents => "[agents]",
+            .user => "[user]",
+            .bundled => "[bundled]",
+        };
+        const line = std.fmt.allocPrint(m.allocator, "  {s} {s}: {s}", .{
+            source_tag,
             e.name,
             if (e.description.len > 0) e.description else "(no description)",
         }) catch continue;
@@ -5483,9 +5494,13 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
         return 1;
     };
     var want: []const u8 = "";
+    var args: ?[]const u8 = null;
     if (v == .object) {
         if (v.object.get("name")) |nv| {
             if (nv == .string) want = std.mem.trim(u8, nv.string, " \t\r\n");
+        }
+        if (v.object.get("args")) |av| {
+            if (av == .string) args = av.string;
         }
     }
 
@@ -5521,7 +5536,7 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
 
     var loader = skillstore.Loader.init(m.allocator, io_global, m.environ);
     var body: [skills.max_inline + 1024]u8 = undefined;
-    const text = loader.load(entry, &body) orelse {
+    const text = loader.loadWithArgs(entry, args, &body) orelse {
         const bad = std.fmt.allocPrint(arena, "the skill \"{s}\" could not be read ({s}). Continue without it.", .{ entry.name, entry.path }) catch "the skill could not be read";
         m.pushToolDone("skill", "unreadable", 0, bad);
         s.appendToolResult(call.id, "skill", bad) catch {};
@@ -9962,16 +9977,11 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     const saved_io = io_global;
     const saved_info = project_info;
     const saved_agents = agents_md_cache;
-    const saved_cache = skills_cache;
-    const saved_stamp_len = skills_stamp_len;
-    const saved_rescans = skills_rescans;
     defer {
         io_global = saved_io;
         project_info = saved_info;
         agents_md_cache = saved_agents;
-        skills_cache = saved_cache;
-        skills_stamp_len = saved_stamp_len;
-        skills_rescans = saved_rescans;
+        resetSkillsCacheForTest();
     }
 
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -9998,9 +10008,6 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     // test fail for a reason that has nothing to do with the cwd line.
     agents_md_cache = try std.testing.allocator.dupe(u8, "# proyecto de prueba\n");
     defer if (agents_md_cache != null and saved_agents == null) std.testing.allocator.free(agents_md_cache.?);
-    skills_cache = null;
-    skills_stamp_len = 0;
-    skills_rescans = 0;
 
     var out: [16 * 1024]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null);
@@ -10013,9 +10020,6 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     // and not an `ls` with grep.
     try std.testing.expect(std.mem.indexOf(u8, composed, "git status") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "git diff") != null);
-
-    // The skills cache this test left in place is freed by the `defer`.
-    freeSkillsCacheLocked();
 }
 
 test "prompt: the REPO's AGENTS.md is used when the cwd has none of its own" {
@@ -10092,29 +10096,42 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     skills_stamp_len = 0;
     skills_rescans = 0;
 
-    // 1) There is still no skill at all.
+    // 1) Bundled skills are always available (5 built-in skills).
     var env_map: std.process.Environ.Map = undefined;
     _ = &env_map;
     const empty = discoverSkills(std.testing.allocator, null);
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectEqual(@as(usize, 5), empty.len);
 
-    // 2) One appears. The root's `stat` has changed, so it has to show up
+    // 2) One project skill appears. The root's `stat` has changed, so it has to show up
     //    without restarting anything.
     var skill_file: [512]u8 = undefined;
     const skill_path = try std.fmt.bufPrint(&skill_file, "{s}/SKILL.md", .{dir});
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = skill_path, .data = "---\ndescription: recien creado\n---\nbody\n" });
 
     const found = discoverSkills(std.testing.allocator, null);
-    try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expectEqualStrings("nuevo", found[0].name);
-    try std.testing.expectEqualStrings("recien creado", found[0].description);
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+    // Find the new project skill
+    var found_nuevo = false;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "nuevo")) {
+            found_nuevo = true;
+            try std.testing.expectEqualStrings("recien creado", e.description);
+        }
+    }
+    try std.testing.expect(found_nuevo);
 
     // 3) And the list is BORROWED: asking for it again with no changes frees
     //    nothing (if the caller owned it, this would be a double free of live
     //    memory).
     const again = discoverSkills(std.testing.allocator, null);
-    try std.testing.expectEqual(@as(usize, 1), again.len);
-    try std.testing.expectEqualStrings("nuevo", again[0].name);
+    try std.testing.expectEqual(@as(usize, 6), again.len);
+    var found_nuevo_again = false;
+    for (again) |e| {
+        if (std.mem.eql(u8, e.name, "nuevo")) {
+            found_nuevo_again = true;
+        }
+    }
+    try std.testing.expect(found_nuevo_again);
 
     // 4) And the PROMPT carries name + description ONLY. The body is what the
     //    `skill` tool reads on demand — inlining it here would be a tax on every
@@ -10312,13 +10329,14 @@ test "system prompt: the volatile parts go LAST, so a mode change does not drop 
     // read-only note changes on a `shift+tab`, which is mid-turn and cheap to do
     // by accident; it was 4th of 6, so it also invalidated the skills list and
     // the location lines.
-    // `project_info` reads the clock through `io_global`, which is undefined in a
-    // bare test: reading the clock through garbage is a GPF, not a zero.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
     io_global = threaded.io();
     defer io_global = saved_io;
+
+    // Initialize project_info to avoid GPF when skills system accesses it.
+    setProjectInfoForTest(io_global, "/tmp");
 
     // The skills list is a module global that OWNS memory from whatever allocator
     // asked for it. Left pointing into `std.testing.allocator`, it is a leak that
@@ -10387,6 +10405,9 @@ test "system prompt: the verification rules are injected even with a project's A
     const saved_io = io_global;
     io_global = threaded.io();
     defer io_global = saved_io;
+
+    // Initialize project_info to avoid GPF when skills system accesses it.
+    setProjectInfoForTest(io_global, "/tmp");
 
     const saved_cache = skills_cache;
     const saved_rescans = skills_rescans;
@@ -10734,6 +10755,9 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
     const saved_io = io_global;
     io_global = threaded.io();
     defer io_global = saved_io;
+
+    // Initialize project_info to avoid GPF when skills system accesses it.
+    setProjectInfoForTest(io_global, "/tmp");
 
     // The AGENTS.md cache is a MODULE GLOBAL that outlives this test's arena, and
     // the next test would read a pointer into memory that has been freed. That is a
