@@ -463,3 +463,61 @@ test "grep args: unknown type is rejected" {
     defer arena_state.deinit();
     try std.testing.expectError(error.InvalidArgument, parseJson(arena_state.allocator(), "{\"pattern\":\"foo\",\"type\":\"unknown_type\"}"));
 }
+
+test "grep args: context_before and context_after work independently" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseJson(arena_state.allocator(),
+        "{\"pattern\":\"foo\",\"context_before\":2,\"context_after\":5}");
+    try std.testing.expectEqual(@as(usize, 2), a.context_before);
+    try std.testing.expectEqual(@as(usize, 5), a.context_after);
+    try std.testing.expectEqual(@as(usize, 0), a.context);
+}
+
+test "grep args: output_mode count is parsed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseJson(arena_state.allocator(),
+        "{\"pattern\":\"foo\",\"output_mode\":\"count\"}");
+    try std.testing.expectEqual(Args.OutputMode.count, a.output_mode);
+}
+
+test "grep args: output_mode content is default" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseJson(arena_state.allocator(),
+        "{\"pattern\":\"foo\"}");
+    try std.testing.expectEqual(Args.OutputMode.content, a.output_mode);
+}
+
+test "grep args: glob filter is parsed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseJson(arena_state.allocator(),
+        "{\"pattern\":\"foo\",\"glob\":\"**/*.test.zig\"}");
+    try std.testing.expectEqualStrings("**/*.test.zig", a.glob.?);
+}
+
+test "grep args: type filter is case-insensitive" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseJson(arena_state.allocator(),
+        "{\"pattern\":\"foo\",\"type\":\"ZIG\"}");
+    try std.testing.expectEqualStrings("ZIG", a.type.?);
+}
+
+test "grep args: head_limit defaults to 80" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseJson(arena_state.allocator(),
+        "{\"pattern\":\"foo\"}");
+    try std.testing.expectEqual(@as(usize, 80), a.head_limit);
+}
+
+test "grep args: subdir normalizes ./ prefix" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseJson(arena_state.allocator(),
+        "{\"pattern\":\"foo\",\"subdir\":\"./src/\"}");
+    try std.testing.expectEqualStrings("src", a.subdir);
+}

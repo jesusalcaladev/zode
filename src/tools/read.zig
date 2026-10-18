@@ -51,6 +51,12 @@ pub fn toolRead(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator, c
                 .{ pv.array.items.len, max_paths },
             );
         }
+        // PDF page ranges are not supported for multi-file reads yet
+        const pdf_page_start: usize = if (common.getInt(obj, "pdf_page_start")) |p| (if (p > 0) @intCast(p) else 1) else 0;
+        const pdf_page_end: usize = if (common.getInt(obj, "pdf_page_end")) |p| (if (p > 0) @intCast(p) else 0) else 0;
+        if (pdf_page_start > 0 or pdf_page_end > 0) {
+            return "error: `pdf_page_start` and `pdf_page_end` are only supported for single-file reads with `path`.";
+        }
         var out: std.ArrayList(u8) = .empty;
         // The header names every file and how big it is, so a model that reads
         // only the first two still knows what it did not read.
@@ -65,7 +71,7 @@ pub fn toolRead(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator, c
             // the path. Building a synthetic `ObjectMap` per file was the first
             // version and it does not work: in Zig 0.16 `ObjectMap` is an
             // `ArrayHashMap` and needs an allocator to hold even one key.
-            const one = readOne(io, p, 1, 2000, false, arena, cache) catch |err| {
+            const one = readOne(io, p, 1, 2000, false, 0, 0, arena, cache) catch |err| {
                 try out.appendSlice(arena, std.fmt.allocPrint(arena, "could not read: {t}", .{err}) catch "could not read");
                 continue;
             };
@@ -83,7 +89,10 @@ pub fn toolRead(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator, c
     // back, and it cannot argue its way out of a tool result. One boolean in the
     // schema is cheaper than a turn lost.
     const force = common.getBool(obj, "force");
-    return readOne(io, path, offset, limit, force, arena, cache);
+    // PDF page range support (1-indexed, inclusive)
+    const pdf_page_start: usize = if (common.getInt(obj, "pdf_page_start")) |p| (if (p > 0) @intCast(p) else 0) else 0;
+    const pdf_page_end: usize = if (common.getInt(obj, "pdf_page_end")) |p| (if (p > 0) @intCast(p) else 0) else 0;
+    return readOne(io, path, offset, limit, force, pdf_page_start, pdf_page_end, arena, cache);
 }
 
 /// One file, with the cache. Split out so `paths` reuses it without building a
@@ -94,6 +103,8 @@ fn readOne(
     offset: usize,
     limit: usize,
     force: bool,
+    pdf_page_start: usize,
+    pdf_page_end: usize,
     arena: std.mem.Allocator,
     cache: ?*readcache.Cache,
 ) ![]const u8 {
@@ -113,6 +124,11 @@ fn readOne(
         if (notebook_mod.outline(io, path, arena)) |text| {
             return text;
         } else |_| {}
+    }
+
+    // PDF page range support
+    if (std.mem.endsWith(u8, path, ".pdf") and (pdf_page_start > 0 or pdf_page_end > 0)) {
+        return readPdfPages(io, path, pdf_page_start, pdf_page_end, arena);
     }
 
     const first_line: u32 = @intCast(@min(offset, read_line_cap));
@@ -157,6 +173,66 @@ fn readOne(
 
     const data = try readAll(arena, io, path);
     return formatBody(arena, path, data, offset, limit);
+}
+
+/// Read specific pages from a PDF file using pdftotext.
+fn readPdfPages(
+    io: std.Io,
+    path: []const u8,
+    page_start: usize,
+    page_end: usize,
+    arena: std.mem.Allocator,
+) ![]const u8 {
+    // Use pdftotext to extract text from PDF pages
+    // pdftotext -f <first_page> -l <last_page> <pdf_file> -
+    const end_page = if (page_end > 0) page_end else page_start;
+    
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(std.heap.page_allocator);
+    try argv.append(std.heap.page_allocator, "pdftotext");
+    try argv.append(std.heap.page_allocator, "-f");
+    try argv.append(std.heap.page_allocator, try std.fmt.allocPrint(std.heap.page_allocator, "{}", .{page_start}));
+    try argv.append(std.heap.page_allocator, "-l");
+    try argv.append(std.heap.page_allocator, try std.fmt.allocPrint(std.heap.page_allocator, "{}", .{end_page}));
+    try argv.append(std.heap.page_allocator, path);
+    try argv.append(std.heap.page_allocator, "-"); // output to stdout
+
+    const result = std.process.run(arena, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(8 * 1024 * 1024),
+        .stderr_limit = .limited(2048),
+        .reserve_amount = 4096,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    }) catch |err| {
+        return std.fmt.allocPrint(arena,
+            "{s}: could not read PDF (pdftotext not available or failed: {t}). Install poppler-utils to read PDFs.",
+            .{ std.fs.path.basename(path), err }) catch "could not read PDF";
+    };
+
+    const code: u8 = switch (result.term) {
+        .exited => |c| c,
+        else => return std.fmt.allocPrint(arena,
+            "{s}: pdftotext failed to run", .{ std.fs.path.basename(path) }) catch "pdftotext failed",
+    };
+
+    if (code != 0) {
+        const err_msg = if (result.stderr.len > 0) result.stderr else "unknown error";
+        return std.fmt.allocPrint(arena,
+            "{s}: pdftotext exited with code {d}: {s}",
+            .{ std.fs.path.basename(path), code, err_msg }) catch "pdftotext error";
+    }
+
+    if (result.stdout.len == 0) {
+        return std.fmt.allocPrint(arena,
+            "{s}: no text extracted from pages {d}-{d}",
+            .{ std.fs.path.basename(path), page_start, end_page }) catch "no text extracted";
+    }
+
+    // Format the output with page markers
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "PDF: {s} (pages {d}-{d})\n\n", .{ std.fs.path.basename(path), page_start, end_page });
+    try out.appendSlice(arena, result.stdout);
+    return out.items;
 }
 
 /// Why a read failed, in words the model can act on.
@@ -240,4 +316,65 @@ pub fn formatBody(arena: std.mem.Allocator, path: []const u8, data: []const u8, 
         out.appendSlice(arena, "(empty file)") catch {};
     }
     return out.items;
+}
+
+// ─── tests ────────────────────────────────────────────────────────────
+
+fn parseReadArgs(a: std.mem.Allocator, json: []const u8) !struct {
+    path: ?[]const u8,
+    offset: usize,
+    limit: usize,
+    force: bool,
+    pdf_page_start: usize,
+    pdf_page_end: usize,
+} {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const obj = v.object;
+    const path = common.getStr(obj, "path");
+    const offset: usize = if (common.getInt(obj, "offset")) |o| (if (o > 0) @intCast(o) else 1) else 1;
+    const default_limit: usize = 2000;
+    const limit: usize = if (common.getInt(obj, "limit")) |l| (if (l > 0) @intCast(l) else default_limit) else default_limit;
+    const force = common.getBool(obj, "force");
+    const pdf_page_start: usize = if (common.getInt(obj, "pdf_page_start")) |p| (if (p > 0) @intCast(p) else 0) else 0;
+    const pdf_page_end: usize = if (common.getInt(obj, "pdf_page_end")) |p| (if (p > 0) @intCast(p) else 0) else 0;
+    return .{ .path = path, .offset = offset, .limit = limit, .force = force, .pdf_page_start = pdf_page_start, .pdf_page_end = pdf_page_end };
+}
+
+test "read args: pdf_page_start and pdf_page_end are parsed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseReadArgs(arena_state.allocator(), "{\"path\":\"doc.pdf\",\"pdf_page_start\":5,\"pdf_page_end\":10}");
+    try std.testing.expectEqualStrings("doc.pdf", a.path.?);
+    try std.testing.expectEqual(@as(usize, 5), a.pdf_page_start);
+    try std.testing.expectEqual(@as(usize, 10), a.pdf_page_end);
+}
+
+test "read args: pdf_page_start alone defaults pdf_page_end to same" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseReadArgs(arena_state.allocator(), "{\"path\":\"doc.pdf\",\"pdf_page_start\":3}");
+    try std.testing.expectEqual(@as(usize, 3), a.pdf_page_start);
+    try std.testing.expectEqual(@as(usize, 0), a.pdf_page_end);
+}
+
+test "read args: pdf_page_end alone is parsed (start defaults to 0)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseReadArgs(arena_state.allocator(), "{\"path\":\"doc.pdf\",\"pdf_page_end\":7}");
+    try std.testing.expectEqual(@as(usize, 0), a.pdf_page_start);
+    try std.testing.expectEqual(@as(usize, 7), a.pdf_page_end);
+}
+
+test "read args: negative pdf_page_start is treated as 0" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseReadArgs(arena_state.allocator(), "{\"path\":\"doc.pdf\",\"pdf_page_start\":-1}");
+    try std.testing.expectEqual(@as(usize, 0), a.pdf_page_start);
+}
+
+test "read args: zero pdf_page_start is treated as 0" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = try parseReadArgs(arena_state.allocator(), "{\"path\":\"doc.pdf\",\"pdf_page_start\":0}");
+    try std.testing.expectEqual(@as(usize, 0), a.pdf_page_start);
 }
