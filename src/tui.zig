@@ -354,25 +354,20 @@ fn appendContinuation(
 fn buildLines(
     pa: std.mem.Allocator,
     ctx: vxfw.DrawContext,
-    kind: md.Kind,
-    text: []const u8,
+    para: *Model.Para,
     width: u16,
 ) ![]const PLine {
-    return buildLinesBase(pa, ctx, kind, text, width, null, null, "");
+    return buildLinesBase(pa, ctx, para, width);
 }
 
 /// `buildLines` with an imposed base style (see `md.parseBase`).
 fn buildLinesBase(
     pa: std.mem.Allocator,
     ctx: vxfw.DrawContext,
-    kind: md.Kind,
-    text: []const u8,
+    para: *Model.Para,
     width: u16,
-    base: ?md.Style,
-    mood: ?vaxis.Style,
-    lang: []const u8,
 ) ![]const PLine {
-    const blocks = try md.parseLang(pa, kind, text, base, mood, lang);
+    const blocks = try md.parseLang(pa, para.kind, para.text, para.base, para.mood, para.lang, para.word_diff_map);
     var lines: std.ArrayList(PLine) = .empty;
     var first_line = true;
 
@@ -394,7 +389,7 @@ fn buildLinesBase(
             if (first_line) {
                 // The prefix (› ◆ ⚙ …) goes only on the first line of the
                 // paragraph.
-                const pre = md.prefix(kind);
+                const pre = md.prefix(para.kind);
                 var pit = vaxis.unicode.graphemeIterator(pre.text);
                 while (pit.next()) |pg| {
                     const pb = pg.bytes(pre.text);
@@ -1034,6 +1029,8 @@ pub const Model = struct {
         /// holds BEFORE the text turns into base64 (without that, compression
         /// would throw the height away with the newlines it was counted from).
         known_lines: usize = 0,
+        /// Word diff ranges for diff paragraphs. Keyed by line text.
+        word_diff_map: ?[]const md.WordDiffEntry = null,
 
         /// The paragraph's text, ready to be parsed. Rehydrates if needed.
         fn textLive(self: *Para, gpa: std.mem.Allocator) []const u8 {
@@ -1202,6 +1199,11 @@ pub const Model = struct {
     fn freePara(gpa: std.mem.Allocator, p: anytype) void {
         gpa.free(p.text);
         if (p.lang.len > 0) gpa.free(p.lang);
+        // Both Para and Pending now have word_diff_map field
+        if (p.word_diff_map) |map| {
+            for (map) |e| gpa.free(e.line_text);
+            gpa.free(map);
+        }
     }
 
     const Pending = struct {
@@ -1213,6 +1215,8 @@ pub const Model = struct {
         mood: ?vaxis.Style = null,
         /// Language of the content (see `Para.lang`). gpa-owned like `text`.
         lang: []const u8 = "",
+        /// Word diff ranges for diff paragraphs. Keyed by line text.
+        word_diff_map: ?[]const md.WordDiffEntry = null,
     };
 
     pub fn hasInput(self: *const Model) bool {
@@ -1267,7 +1271,7 @@ pub const Model = struct {
         self.ed.deinit();
         for (self.paras.items) |p| freePara(self.allocator, p);
         self.paras.deinit(self.allocator);
-        for (self.pending.items) |p| freePara(self.allocator, .{ .kind = p.kind, .text = p.text, .lang = p.lang });
+        for (self.pending.items) |p| freePara(self.allocator, .{ .kind = p.kind, .text = p.text, .lang = p.lang, .word_diff_map = p.word_diff_map });
         self.pending.deinit(self.allocator);
         if (self.last_tool) |*lt| lt.deinit(self.allocator);
         if (self.tool_run) |tr| tr.deinit(self.allocator);
@@ -1807,8 +1811,8 @@ pub const Model = struct {
         }
 
         // Rehydrate if the paragraph was pruned to its compressed form.
-        const text = p_.textLive(self.allocator);
-        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_.kind, text, width, p_.base, p_.mood, p_.lang);
+        _ = p_.textLive(self.allocator);
+        var lines = try buildLinesBase(para_arena.allocator(), ctx, &self.paras.items[idx], width);
         // A blank row BETWEEN paragraphs: without it the history is a wall of
         // text and you can't see where one response ends and another begins.
         //
@@ -2122,6 +2126,13 @@ pub const Model = struct {
             // height also lives in `Para.known_lines`.
             if (i >= self.para_heights.items.len) continue;
             if (p.known_lines == 0) p.known_lines = self.para_heights.items[i];
+
+            // Free word_diff_map before compressing (it points into the old text)
+            if (p.word_diff_map) |map| {
+                for (map) |e| self.allocator.free(e.line_text);
+                self.allocator.free(map);
+                p.word_diff_map = null;
+            }
 
             // `compressLine` needs a destination buffer; one allocation per
             // paragraph, freed right after.
@@ -3287,20 +3298,20 @@ pub const Model = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const lines = md.unifiedDiff(arena, before, after) catch return .{};
+        const diff_lines = md.unifiedDiffWithWordDiff(arena, before, after) catch return .{};
         var added: usize = 0;
         var removed: usize = 0;
-        for (lines) |l| {
-            if (l.len > 0 and l[0] == '+') added += 1;
-            if (l.len > 0 and l[0] == '-') removed += 1;
+        for (diff_lines) |l| {
+            if (l.text.len > 0 and l.text[0] == '+') added += 1;
+            if (l.text.len > 0 and l.text[0] == '-') removed += 1;
         }
         if (added == 0 and removed == 0) {
             // Either nothing changed, or the file goes over
             // `md.max_diff_lines` and what there is is a notice. In the second
             // case it IS shown: staying quiet would be "I saw nothing" (which
             // is what the model would conclude).
-            if (lines.len == 1 and std.mem.startsWith(u8, lines[0], "diff omitted")) {
-                const copy = self.allocator.dupe(u8, lines[0]) catch return .{};
+            if (diff_lines.len == 1 and std.mem.startsWith(u8, diff_lines[0].text, "diff omitted")) {
+                const copy = self.allocator.dupe(u8, diff_lines[0].text) catch return .{};
                 defer self.allocator.free(copy);
                 self.pushInfo(copy);
             }
@@ -3312,9 +3323,22 @@ pub const Model = struct {
         // and the capacity is separate, so freeing `items` with a bigger
         // capacity is an `Invalid free` (it blew up in the diff test).
         defer self.allocator.free(joined.allocatedSlice());
-        for (lines) |l| {
+        for (diff_lines) |l| {
             if (joined.items.len > 0) joined.append(self.allocator, '\n') catch return .{};
-            joined.appendSlice(self.allocator, l) catch return .{};
+            joined.appendSlice(self.allocator, l.text) catch return .{};
+        }
+
+        // Build word diff map for the paragraph
+        var word_diff_map: std.ArrayList(md.WordDiffEntry) = .empty;
+        for (diff_lines) |l| {
+            if (l.word_diff_ranges.len > 0) {
+                // The line text in the joined string will be exactly l.text
+                // (without the trailing newline since we join with newlines)
+                _ = word_diff_map.append(arena, .{
+                    .line_text = l.text,
+                    .ranges = l.word_diff_ranges,
+                }) catch {};
+            }
         }
 
         // A long diff COLLAPSES into a preview: a `write` of a 500-line file is
@@ -3322,22 +3346,25 @@ pub const Model = struct {
         // follow what the agent is doing. Put the summary before the excerpt so
         // the scale and the way to expand it are visible immediately.
         var short: ?[]const u8 = null;
-        if (lines.len > diff_preview_lines) {
+        if (diff_lines.len > diff_preview_lines) {
             var s: std.ArrayList(u8) = .empty;
             s.print(arena, "diff preview · +{d} −{d}\n", .{ added, removed }) catch {};
-            for (lines[0..diff_preview_lines], 0..) |l, i| {
+            for (diff_lines[0..diff_preview_lines], 0..) |l, i| {
                 if (i > 0 or s.items.len > 0) s.append(arena, '\n') catch break;
-                s.appendSlice(arena, l) catch break;
+                s.appendSlice(arena, l.text) catch break;
             }
             s.print(
                 arena,
                 "\n… {d} more lines · ctrl+r to expand",
-                .{lines.len - diff_preview_lines},
+                .{diff_lines.len - diff_preview_lines},
             ) catch {};
             if (s.items.len > 0) short = s.items;
         }
 
-        self.pushDiffKind(joined.items, short, lang);
+        // Convert word_diff_map to a slice for the paragraph
+        const word_diff_map_slice: ?[]const md.WordDiffEntry = if (word_diff_map.items.len > 0) word_diff_map.items else null;
+
+        self.pushDiffKind(joined.items, short, lang, word_diff_map_slice);
         return .{ .added = added, .removed = removed };
     }
 
@@ -3354,7 +3381,7 @@ pub const Model = struct {
     /// `pushToolStart` already copied from the path: otherwise the paragraph
     /// would point at the worker's arena, which is freed at the end of the
     /// turn.
-    fn pushDiffKind(self: *Model, text: []const u8, short: ?[]const u8, lang: []const u8) void {
+    fn pushDiffKind(self: *Model, text: []const u8, short: ?[]const u8, lang: []const u8, word_diff_map: ?[]const md.WordDiffEntry) void {
         const gpa = self.allocator;
 
         // What the paragraph shows, and what is kept for Ctrl+R. When either
@@ -3388,6 +3415,30 @@ pub const Model = struct {
             return;
         };
 
+        // Build the word diff map copy for the paragraph
+        var word_diff_map_copy: ?[]const md.WordDiffEntry = null;
+        if (word_diff_map) |map| {
+            // Allocate the map array
+            const map_copy = gpa.alloc(md.WordDiffEntry, map.len) catch null;
+            if (map_copy) |mc| {
+                var i: usize = 0;
+                for (map) |entry| {
+                    mc[i] = .{
+                        .line_text = gpa.dupe(u8, entry.line_text) catch break,
+                        .ranges = entry.ranges,
+                    };
+                    i += 1;
+                }
+                if (i == map.len) {
+                    word_diff_map_copy = mc;
+                } else {
+                    // Cleanup on partial failure
+                    for (mc[0..i]) |e| gpa.free(e.line_text);
+                    gpa.free(mc);
+                }
+            }
+        }
+
         self.lock();
         defer self.unlock();
         const idx = self.paras.items.len + self.pending.items.len;
@@ -3395,9 +3446,14 @@ pub const Model = struct {
             .kind = .diff,
             .text = text_copy,
             .lang = lang_copy,
+            .word_diff_map = word_diff_map_copy,
         }) catch {
             gpa.free(text_copy);
             gpa.free(lang_copy);
+            if (word_diff_map_copy) |m| {
+                for (m) |e| gpa.free(e.line_text);
+                gpa.free(m);
+            }
             freeDiffMemoParts(gpa, keep_full, keep_short);
             return;
         };
@@ -3476,6 +3532,14 @@ pub const Model = struct {
         const want = if (expanded) short else full;
         if (want.len == 0) return false;
         const p = &self.paras.items[idx];
+        
+        // Free word_diff_map before rehydrating/replacing text
+        if (p.word_diff_map) |map| {
+            for (map) |e| self.allocator.free(e.line_text);
+            self.allocator.free(map);
+            p.word_diff_map = null;
+        }
+        
         _ = p.textLive(self.allocator);
         const copy = self.allocator.dupe(u8, want) catch return false;
         self.allocator.free(p.text);
@@ -3650,16 +3714,49 @@ pub const Model = struct {
         // and it looked like scrolling didn't work.
         const hubo_nuevo = self.pending.items.len > 0;
         for (self.pending.items) |p| {
+            // Copy word_diff_map if present
+            var word_diff_map_copy: ?[]const md.WordDiffEntry = null;
+            if (p.word_diff_map) |map| {
+                const map_copy = self.allocator.alloc(md.WordDiffEntry, map.len) catch null;
+                if (map_copy) |mc| {
+                    var i: usize = 0;
+                    for (map) |entry| {
+                        mc[i] = .{
+                            .line_text = self.allocator.dupe(u8, entry.line_text) catch break,
+                            .ranges = entry.ranges,
+                        };
+                        i += 1;
+                    }
+                    if (i == map.len) {
+                        word_diff_map_copy = mc;
+                    } else {
+                        for (mc[0..i]) |e| self.allocator.free(e.line_text);
+                        self.allocator.free(mc);
+                    }
+                }
+            }
+            
             self.paras.append(self.allocator, .{
                 .kind = p.kind,
                 .text = p.text,
                 .base = p.base,
                 .mood = p.mood,
                 .lang = p.lang,
+                .word_diff_map = word_diff_map_copy,
             }) catch {
                 self.allocator.free(p.text);
                 if (p.lang.len > 0) self.allocator.free(p.lang);
+                if (word_diff_map_copy) |map| {
+                    for (map) |e| self.allocator.free(e.line_text);
+                    self.allocator.free(map);
+                }
             };
+            
+            // Free the pending item's word_diff_map (we've copied it to the paragraph)
+            if (p.word_diff_map) |map| {
+                for (map) |e| self.allocator.free(e.line_text);
+                self.allocator.free(map);
+            }
         }
         self.pending.clearRetainingCapacity();
         self.dirty = false;
@@ -5321,7 +5418,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     if (live_src.len > 0) {
         // `live_src` is already frame-arena owned (see the invariant above), so
         // there is nothing to copy here any more.
-        live_lines = buildLines(ctx.arena, ctx, live_kind, live_src, wrap_width) catch &.{};
+        // For the live paragraph, we don't have a Para struct, so use a temporary one
+        var live_para = Model.Para{
+            .kind = live_kind,
+            .text = live_src,
+            .lang = if (live_kind == .diff) "zig" else "",
+        };
+        live_lines = buildLines(ctx.arena, ctx, &live_para, wrap_width) catch &.{};
         live_active = live_lines.len > 0;
     }
 
@@ -9642,6 +9745,12 @@ test "Ctrl+R on a paragraph that went COLD rehydrates it instead of corrupting i
     try std.testing.expect(std.mem.indexOf(u8, m.paras.items[idx].text, "ctrl+r to expand") != null);
 
     // Cold, the way `pruneCold` leaves it when you scroll away.
+    // Also free word_diff_map since it points into the old text.
+    if (m.paras.items[idx].word_diff_map) |map| {
+        for (map) |e| m.allocator.free(e.line_text);
+        m.allocator.free(map);
+        m.paras.items[idx].word_diff_map = null;
+    }
     const buf = try std.testing.allocator.alloc(u8, text_len + 1);
     defer std.testing.allocator.free(buf);
     const packed_z = zjsonl.compressLine(buf, m.paras.items[idx].text) orelse return error.TestUnexpectedResult;
@@ -9842,7 +9951,7 @@ test "the + prefix and the body have DIFFERENT colors (green wall removed)" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const segs = try md.inlineSegmentsLang(arena, "+const n", .diff, null, null, "zig");
+    const segs = try md.inlineSegmentsLang(arena, "+const n", .diff, null, null, "zig", null);
     try std.testing.expect(segs.len >= 2);
     try std.testing.expectEqualStrings("+", segs[0].text);
     try std.testing.expect(!std.meta.eql(segs[0].style.fg, segs[1].style.fg));
