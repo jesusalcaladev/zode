@@ -238,7 +238,7 @@ pub fn parseLang(
                 segs = try appendSeg(arena, segs, .{ .text = pad, .style = base_override orelse styles.asst_text });
             }
             segs = try appendSeg(arena, segs, .{ .text = m.marker, .style = styles.bullet });
-            const body = try inlineSegmentsLang(arena, m.body, kind, base_override, mood_style, "", null);
+            const body = try inlineSegmentsLang(arena, m.body, kind, base_override, mood_style, "", null, null, 0);
             for (body) |sg| segs = try appendSeg(arena, segs, sg);
             try inline_lines.append(arena, segs);
             continue;
@@ -246,7 +246,7 @@ pub fn parseLang(
         if (kind != .banner and line.len > 0 and line[0] == '>') {
             var segs = try arena.alloc(Segment, 0);
             segs = try appendSeg(arena, segs, .{ .text = "│ ", .style = styles.quote_bar });
-            const body = try inlineSegmentsLang(arena, std.mem.trim(u8, line[1..], " "), kind, base_override, mood_style, "", null);
+            const body = try inlineSegmentsLang(arena, std.mem.trim(u8, line[1..], " "), kind, base_override, mood_style, "", null, null, 0);
             for (body) |sg| segs = try appendSeg(arena, segs, sg);
             try inline_lines.append(arena, segs);
             continue;
@@ -269,7 +269,7 @@ pub fn parseLang(
             }
         }
         
-        try inline_lines.append(arena, try inlineSegmentsLang(arena, line, kind, base_override, mood_style, line_lang, word_diff_ranges));
+        try inline_lines.append(arena, try inlineSegmentsLang(arena, line, kind, base_override, mood_style, line_lang, word_diff_ranges, null, 0));
     }
     // pending code without a closing fence
     if (in_code and code_lines.items.len > 0) {
@@ -373,11 +373,18 @@ fn baseStyle(kind: Kind) Style {
 /// 
 /// If `word_diff_ranges` is provided, it contains byte ranges in the line body
 /// (after the prefix) that should be highlighted with the diff add/delete background.
+/// 
+/// If `gutter_line` and `gutter_width` are provided, a gutter with the line number
+/// is prepended. `gutter_line` is the line number to show, `gutter_width` is the
+/// width of the gutter (number of digits). Continuation lines (wrapped) should
+/// pass `gutter_line = null` to show blank gutter.
 fn diffSegments(
     arena: std.mem.Allocator,
     line: []const u8,
     lang: []const u8,
     word_diff_ranges: ?[]const diff_tokenizer.DiffRange,
+    gutter_line: ?usize,
+    gutter_width: usize,
 ) ![]Segment {
     if (line.len == 0) {
         const segs = try arena.alloc(Segment, 1);
@@ -397,6 +404,20 @@ fn diffSegments(
         return segs;
     }
 
+    // Add gutter if requested (both line and width must be provided)
+    var out: std.ArrayList(Segment) = .empty;
+    if (gutter_width > 0) {
+        if (gutter_line) |ln| {
+            const num_str = try std.fmt.allocPrint(arena, "{}", .{ln});
+            try out.append(arena, .{ .text = num_str, .style = theme.gutter });
+        } else {
+            // Blank gutter for continuation lines
+            try out.append(arena, .{ .text = "", .style = theme.gutter });
+        }
+        // Gutter separator
+        try out.append(arena, .{ .text = " ", .style = theme.gutter });
+    }
+
     // The prefix (`+`, `-` or the context space) is a segment of its own, and
     // the rest is tokenized. The context space is NOT included in the body that
     // goes to the highlighter: otherwise the language would recognize nothing
@@ -407,7 +428,6 @@ fn diffSegments(
         @min(1, line.len)
     else
         0;
-    var out: std.ArrayList(Segment) = .empty;
     if (lead > 0) {
         try out.append(arena, .{ .text = line[0..lead], .style = pre_style });
     }
@@ -903,13 +923,15 @@ pub fn inlineSegmentsBase(
     base_override: ?Style,
     mood_style: ?Style,
 ) ![]Segment {
-    return inlineSegmentsLang(arena, line, kind, base_override, mood_style, "", null);
+    return inlineSegmentsLang(arena, line, kind, base_override, mood_style, "", null, null, 0);
 }
 
 /// Like `inlineSegmentsBase` but with the line's LANGUAGE.
 ///
+/// Like `inlineSegmentsBase` but with the line's LANGUAGE.
+/// 
 /// Needed for the diff: the prefix goes with its own color and the body is
-/// tokenized as code, so you have to know which language the file being edited
+/// tokenized as code, so you have to know which file being edited
 /// is in. For the other kinds the language does not matter.
 pub fn inlineSegmentsLang(
     arena: std.mem.Allocator,
@@ -919,8 +941,10 @@ pub fn inlineSegmentsLang(
     mood_style: ?Style,
     lang: []const u8,
     word_diff_ranges: ?[]const diff_tokenizer.DiffRange,
+    gutter_line: ?usize,
+    gutter_width: usize,
 ) ![]Segment {
-    if (kind == .diff) return diffSegments(arena, line, lang, word_diff_ranges);
+    if (kind == .diff) return diffSegments(arena, line, lang, word_diff_ranges, gutter_line, gutter_width);
 
     // Header: `*zode*` and `*─────*` glow inside the owl's art. With this the
     // glow lands INSIDE the drawing instead of painting a whole line, which is
@@ -1167,7 +1191,7 @@ test "a + line of the diff carries tokens, not a green segment" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const segs = try inlineSegmentsLang(arena, "+const n: u32 = 42", .diff, null, null, "zig", null);
+    const segs = try inlineSegmentsLang(arena, "+const n: u32 = 42", .diff, null, null, "zig", null, null, 0);
     try std.testing.expect(segs.len >= 4);
 
     const kw = findDiffSeg(segs, "const") orelse return error.TestUnexpectedResult;
