@@ -2,6 +2,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const hl = @import("highlight.zig");
 const theme = @import("theme.zig");
+const diff_tokenizer = @import("diff_tokenizer.zig");
 
 pub const Style = vaxis.Style;
 
@@ -100,7 +101,7 @@ const styles = struct {
 
 /// Parses text (possibly markdown) into blocks. Memory: arena.
 pub fn parse(arena: std.mem.Allocator, kind: Kind, text: []const u8) ![]Block {
-    return parseBase(arena, kind, text, null, null);
+    return parseBase(arena, kind, text, null, null, null);
 }
 
 /// `parse` with an imposed base style (see `inlineSegmentsBase`).
@@ -110,9 +111,18 @@ pub fn parseBase(
     text: []const u8,
     base_override: ?Style,
     mood_style: ?Style,
+    word_diff_map: ?[]const WordDiffEntry,
 ) ![]Block {
-    return parseLang(arena, kind, text, base_override, mood_style, "");
+    return parseLang(arena, kind, text, base_override, mood_style, "", word_diff_map);
 }
+
+/// Like `parseBase` but knowing which LANGUAGE the content is in.
+///
+/// A word diff entry for a specific line.
+pub const WordDiffEntry = struct {
+    line_text: []const u8,
+    ranges: []const diff_tokenizer.DiffRange,
+};
 
 /// Like `parseBase` but knowing which LANGUAGE the content is in.
 ///
@@ -126,6 +136,7 @@ pub fn parseLang(
     base_override: ?Style,
     mood_style: ?Style,
     lang: []const u8,
+    word_diff_map: ?[]const WordDiffEntry,
 ) ![]Block {
     const diff_lang = lang;
     var blocks: std.ArrayList(Block) = .empty;
@@ -227,7 +238,7 @@ pub fn parseLang(
                 segs = try appendSeg(arena, segs, .{ .text = pad, .style = base_override orelse styles.asst_text });
             }
             segs = try appendSeg(arena, segs, .{ .text = m.marker, .style = styles.bullet });
-            const body = try inlineSegmentsLang(arena, m.body, kind, base_override, mood_style, "");
+            const body = try inlineSegmentsLang(arena, m.body, kind, base_override, mood_style, "", null);
             for (body) |sg| segs = try appendSeg(arena, segs, sg);
             try inline_lines.append(arena, segs);
             continue;
@@ -235,7 +246,7 @@ pub fn parseLang(
         if (kind != .banner and line.len > 0 and line[0] == '>') {
             var segs = try arena.alloc(Segment, 0);
             segs = try appendSeg(arena, segs, .{ .text = "│ ", .style = styles.quote_bar });
-            const body = try inlineSegmentsLang(arena, std.mem.trim(u8, line[1..], " "), kind, base_override, mood_style, "");
+            const body = try inlineSegmentsLang(arena, std.mem.trim(u8, line[1..], " "), kind, base_override, mood_style, "", null);
             for (body) |sg| segs = try appendSeg(arena, segs, sg);
             try inline_lines.append(arena, segs);
             continue;
@@ -244,7 +255,21 @@ pub fn parseLang(
         // The diff needs the file's LANGUAGE to tokenize the body; the other
         // kinds ignore it (they are passed "").
         const line_lang: []const u8 = if (kind == .diff) diff_lang else "";
-        try inline_lines.append(arena, try inlineSegmentsLang(arena, line, kind, base_override, mood_style, line_lang));
+        
+        // Look up word diff ranges for this line
+        var word_diff_ranges: ?[]const diff_tokenizer.DiffRange = null;
+        if (kind == .diff) {
+            if (word_diff_map) |map| {
+                for (map) |entry| {
+                    if (std.mem.eql(u8, entry.line_text, line)) {
+                        word_diff_ranges = entry.ranges;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        try inline_lines.append(arena, try inlineSegmentsLang(arena, line, kind, base_override, mood_style, line_lang, word_diff_ranges));
     }
     // pending code without a closing fence
     if (in_code and code_lines.items.len > 0) {
@@ -345,7 +370,15 @@ fn baseStyle(kind: Kind) Style {
 /// Now the `+`/`-`/` ` prefix goes with its own color and the body goes through
 /// the highlighter with `lang`, which is what makes a diff readable: numbers
 /// look like numbers and Pascal identifiers look like types.
-fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![]Segment {
+/// 
+/// If `word_diff_ranges` is provided, it contains byte ranges in the line body
+/// (after the prefix) that should be highlighted with the diff add/delete background.
+fn diffSegments(
+    arena: std.mem.Allocator,
+    line: []const u8,
+    lang: []const u8,
+    word_diff_ranges: ?[]const diff_tokenizer.DiffRange,
+) ![]Segment {
     if (line.len == 0) {
         const segs = try arena.alloc(Segment, 1);
         segs[0] = .{ .text = line, .style = theme.diff_ctx };
@@ -381,16 +414,84 @@ fn diffSegments(arena: std.mem.Allocator, line: []const u8, lang: []const u8) ![
     const body = line[lead..];
     if (body.len > 0) {
         const toks = try hl.highlightLine(arena, body, lang);
-        for (toks) |t| {
-            // The highlight tokens bring their own colors; the diff prefix
-            // already goes separately. For the context (` ` lines) the body IS
-            // dimmed, because otherwise the diff of a whole file comes out with
-            // the same contrast as the changed lines.
-            var st = t.style;
-            if (lead == 0 or (lead == 1 and line[0] == ' ')) {
-                st = theme.diff_ctx;
+        // If we have word diff ranges, we need to split tokens at range boundaries
+        if (word_diff_ranges) |ranges| {
+            // Apply word diff highlighting
+            var range_idx: usize = 0;
+            var body_offset: usize = 0;
+            for (toks) |t| {
+                const token_text = t.text;
+                const token_start = body_offset;
+                const token_end = body_offset + token_text.len;
+                body_offset = token_end;
+                
+                // Check if this token overlaps with any diff range
+                var current_pos = token_start;
+                while (current_pos < token_end) {
+                    if (range_idx < ranges.len) {
+                        const range = ranges[range_idx];
+                        if (range.start < token_end and range.end > current_pos) {
+                            // Overlap with diff range
+                            if (range.start > current_pos) {
+                                // Unchanged portion before the range
+                                _ = range.start - current_pos;
+                                var st = t.style;
+                                if (lead == 0 or (lead == 1 and line[0] == ' ')) {
+                                    st = theme.diff_ctx;
+                                }
+                                try out.append(arena, .{
+                                    .text = token_text[current_pos - token_start .. range.start - token_start],
+                                    .style = st,
+                                });
+                                current_pos = range.start;
+                            }
+                            // Changed portion within the range
+                            const range_end = @min(range.end, token_end);
+                            var st = t.style;
+                            // Apply diff background based on prefix
+                            if (line[0] == '+') {
+                                st = .{ .fg = st.fg, .bg = theme.diff_add_bg.bg };
+                            } else if (line[0] == '-') {
+                                st = .{ .fg = st.fg, .bg = theme.diff_del_bg.bg };
+                            }
+                            try out.append(arena, .{
+                                .text = token_text[current_pos - token_start .. range_end - token_start],
+                                .style = st,
+                            });
+                            current_pos = range_end;
+                            if (range.end <= token_end) {
+                                range_idx += 1;
+                            }
+                        } else if (range.end <= current_pos) {
+                            range_idx += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                // Remaining unchanged portion of the token
+                if (current_pos < token_end) {
+                    var st = t.style;
+                    if (lead == 0 or (lead == 1 and line[0] == ' ')) {
+                        st = theme.diff_ctx;
+                    }
+                    try out.append(arena, .{
+                        .text = token_text[current_pos - token_start ..],
+                        .style = st,
+                    });
+                }
             }
-            try out.append(arena, .{ .text = t.text, .style = st });
+        } else {
+            // No word diff ranges, use original logic
+            for (toks) |t| {
+                var st = t.style;
+                if (lead == 0 or (lead == 1 and line[0] == ' ')) {
+                    st = theme.diff_ctx;
+                }
+                try out.append(arena, .{ .text = t.text, .style = st });
+            }
         }
     }
     return out.toOwnedSlice(arena);
@@ -418,6 +519,29 @@ const DiffLine = struct {
     fn changed(self: DiffLine) bool {
         return self.text[0] != ' ';
     }
+};
+
+/// A diff line with optional word-level diff ranges.
+/// For '+' lines (additions), ranges indicate which parts of the line are new.
+/// For '-' lines (deletions), ranges indicate which parts were removed.
+/// For ' ' lines (context), ranges is empty.
+/// For '@@' lines (headers), ranges is empty.
+pub const DiffLineWithWordDiff = struct {
+    text: []const u8,
+    old_no: ?usize,
+    new_no: ?usize,
+    /// Byte ranges in `text` (after the prefix) that are changed.
+    /// Only populated for '+' lines paired with a preceding '-' line.
+    word_diff_ranges: []const diff_tokenizer.DiffRange,
+};
+
+/// A hunk of diff with word-level diff info.
+pub const DiffHunk = struct {
+    lines: []const DiffLineWithWordDiff,
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
 };
 
 /// Builds a unified diff between two texts, with REAL HUNKS.
@@ -555,6 +679,206 @@ fn prefixed(arena: std.mem.Allocator, p: u8, line: []const u8) ![]const u8 {
     return buf;
 }
 
+/// Computes word-level diff ranges for a pair of lines.
+/// `old_line` is the line with '-' prefix, `new_line` is the line with '+' prefix.
+/// Returns ranges in the new_line (after the '+' prefix) that changed.
+fn computeWordDiffRanges(
+    arena: std.mem.Allocator,
+    old_line: []const u8,
+    new_line: []const u8,
+) ![]diff_tokenizer.DiffRange {
+    // Remove the prefix character for comparison
+    const old_content = old_line[1..];
+    const new_content = new_line[1..];
+    return diff_tokenizer.wordDiffRanges(arena, old_content, new_content);
+}
+
+/// Returns the diff lines with word-level diff ranges for paired +/- lines.
+/// This is like `unifiedDiff` but preserves the DiffLine structure and adds word diff ranges.
+pub fn unifiedDiffWithWordDiff(
+    arena: std.mem.Allocator,
+    before: []const u8,
+    after: []const u8,
+) ![]const DiffLineWithWordDiff {
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    var new_lines: std.ArrayList([]const u8) = .empty;
+    try splitLines(arena, before, &old_lines);
+    try splitLines(arena, after, &new_lines);
+
+    // LCS table (n+1) x (m+1) of usize.
+    const n = old_lines.items.len;
+    const m = new_lines.items.len;
+    if (n > max_diff_lines or m > max_diff_lines) {
+        const note = try arena.dupe(u8, "diff omitted (file too large)");
+        const one = try arena.alloc(DiffLineWithWordDiff, 1);
+        one[0] = .{
+            .text = note,
+            .old_no = null,
+            .new_no = null,
+            .word_diff_ranges = &.{},
+        };
+        return one;
+    }
+    const table = try arena.alloc(usize, (n + 1) * (m + 1));
+    @memset(table, 0);
+    var i = n;
+    while (i > 0) {
+        i -= 1;
+        var j = m;
+        while (j > 0) {
+            j -= 1;
+            table[i * (m + 1) + j] = if (std.mem.eql(u8, old_lines.items[i], new_lines.items[j]))
+                table[(i + 1) * (m + 1) + (j + 1)] + 1
+            else
+                @max(table[(i + 1) * (m + 1) + j], table[i * (m + 1) + (j + 1)]);
+        }
+    }
+
+    var raw: std.ArrayList(DiffLineWithWordDiff) = .empty;
+    var x: usize = 0;
+    var y: usize = 0;
+    while (x < n and y < m) {
+        if (std.mem.eql(u8, old_lines.items[x], new_lines.items[y])) {
+            try raw.append(arena, .{
+                .text = try prefixed(arena, ' ', old_lines.items[x]),
+                .old_no = x + 1,
+                .new_no = y + 1,
+                .word_diff_ranges = &.{},
+            });
+            x += 1;
+            y += 1;
+        } else if (table[(x + 1) * (m + 1) + y] >= table[x * (m + 1) + (y + 1)]) {
+            try raw.append(arena, .{
+                .text = try prefixed(arena, '-', old_lines.items[x]),
+                .old_no = x + 1,
+                .new_no = null,
+                .word_diff_ranges = &.{},
+            });
+            x += 1;
+        } else {
+            try raw.append(arena, .{
+                .text = try prefixed(arena, '+', new_lines.items[y]),
+                .old_no = null,
+                .new_no = y + 1,
+                .word_diff_ranges = &.{},
+            });
+            y += 1;
+        }
+    }
+    while (x < n) : (x += 1) {
+        try raw.append(arena, .{
+            .text = try prefixed(arena, '-', old_lines.items[x]),
+            .old_no = x + 1,
+            .new_no = null,
+            .word_diff_ranges = &.{},
+        });
+    }
+    while (y < m) : (y += 1) {
+        try raw.append(arena, .{
+            .text = try prefixed(arena, '+', new_lines.items[y]),
+            .old_no = null,
+            .new_no = y + 1,
+            .word_diff_ranges = &.{},
+        });
+    }
+
+    if (raw.items.len == 0) return &.{};
+    
+    // Now pair - and + lines and compute word diffs
+    var paired: std.ArrayList(DiffLineWithWordDiff) = .empty;
+    var pair_idx: usize = 0;
+    while (pair_idx < raw.items.len) {
+        const line = raw.items[pair_idx];
+        if (line.text.len > 0 and line.text[0] == '-' and pair_idx + 1 < raw.items.len) {
+            const next = raw.items[pair_idx + 1];
+            if (next.text.len > 0 and next.text[0] == '+') {
+                const ranges = try computeWordDiffRanges(arena, line.text, next.text);
+                try paired.append(arena, line);
+                try paired.append(arena, .{
+                    .text = next.text,
+                    .old_no = next.old_no,
+                    .new_no = next.new_no,
+                    .word_diff_ranges = ranges,
+                });
+                pair_idx += 2;
+                continue;
+            }
+        }
+        try paired.append(arena, line);
+        pair_idx += 1;
+    }
+    
+    return hunkWithWordDiff(arena, paired.items);
+}
+
+/// Collapses unchanged runs into hunks with `@@` headers, preserving word diff ranges.
+fn hunkWithWordDiff(arena: std.mem.Allocator, raw: []const DiffLineWithWordDiff) ![]const DiffLineWithWordDiff {
+    // `keep[i]` = line i is within `diff_context_lines` of a change.
+    var keep = try arena.alloc(bool, raw.len);
+    for (keep) |*k| k.* = false;
+    for (raw, 0..) |l, i| {
+        if (!diffLineWithWordDiffChanged(l)) continue;
+        const lo = i -| diff_context_lines;
+        const hi = @min(i + diff_context_lines, raw.len - 1);
+        var j = lo;
+        while (j <= hi) : (j += 1) keep[j] = true;
+    }
+
+    var out: std.ArrayList(DiffLineWithWordDiff) = .empty;
+    var i: usize = 0;
+    var first_hunk = true;
+    while (i < raw.len) {
+        if (!keep[i]) {
+            i += 1;
+            continue;
+        }
+        // Run of kept lines [i, end).
+        const start = i;
+        while (i < raw.len and keep[i]) i += 1;
+        const end = i;
+
+        if (!first_hunk) {
+            try out.append(arena, .{
+                .text = try arena.dupe(u8, "@@ ... @@"),
+                .old_no = null,
+                .new_no = null,
+                .word_diff_ranges = &.{},
+            });
+        }
+        first_hunk = false;
+
+        // Header: first line number of each side in the run, and its length.
+        var old_start: usize = 0;
+        var new_start: usize = 0;
+        var old_count: usize = 0;
+        var new_count: usize = 0;
+        for (raw[start..end]) |l| {
+            if (l.old_no) |o| {
+                if (old_count == 0) old_start = o;
+                old_count += 1;
+            }
+            if (l.new_no) |nn| {
+                if (new_count == 0) new_start = nn;
+                new_count += 1;
+            }
+        }
+        const header = try std.fmt.allocPrint(arena, "@@ -{d},{d} +{d},{d} @@",
+            .{ old_start, old_count, new_start, new_count });
+        try out.append(arena, .{
+            .text = header,
+            .old_no = null,
+            .new_no = null,
+            .word_diff_ranges = &.{},
+        });
+        for (raw[start..end]) |l| try out.append(arena, l);
+    }
+    return out.items;
+}
+
+fn diffLineWithWordDiffChanged(self: DiffLineWithWordDiff) bool {
+    return self.text.len > 0 and self.text[0] != ' ';
+}
+
 /// Splits into lines ignoring the final newline: "a\nb\n" is 2 lines, not 3.
 /// (Otherwise a file ending in \n produces a spurious empty line in the diff.)
 fn splitLines(arena: std.mem.Allocator, text: []const u8, out: *std.ArrayList([]const u8)) !void {
@@ -579,7 +903,7 @@ pub fn inlineSegmentsBase(
     base_override: ?Style,
     mood_style: ?Style,
 ) ![]Segment {
-    return inlineSegmentsLang(arena, line, kind, base_override, mood_style, "");
+    return inlineSegmentsLang(arena, line, kind, base_override, mood_style, "", null);
 }
 
 /// Like `inlineSegmentsBase` but with the line's LANGUAGE.
@@ -594,8 +918,9 @@ pub fn inlineSegmentsLang(
     base_override: ?Style,
     mood_style: ?Style,
     lang: []const u8,
+    word_diff_ranges: ?[]const diff_tokenizer.DiffRange,
 ) ![]Segment {
-    if (kind == .diff) return diffSegments(arena, line, lang);
+    if (kind == .diff) return diffSegments(arena, line, lang, word_diff_ranges);
 
     // Header: `*zode*` and `*─────*` glow inside the owl's art. With this the
     // glow lands INSIDE the drawing instead of painting a whole line, which is
@@ -842,7 +1167,7 @@ test "a + line of the diff carries tokens, not a green segment" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const segs = try inlineSegmentsLang(arena, "+const n: u32 = 42", .diff, null, null, "zig");
+    const segs = try inlineSegmentsLang(arena, "+const n: u32 = 42", .diff, null, null, "zig", null);
     try std.testing.expect(segs.len >= 4);
 
     const kw = findDiffSeg(segs, "const") orelse return error.TestUnexpectedResult;
@@ -895,7 +1220,7 @@ test "a banner starting with ## is NOT eaten as a heading" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const blocks = try parseBase(arena, .banner, "######  ####   ######\n##  ## ##  ## ##    ", null, null);
+    const blocks = try parseBase(arena, .banner, "######  ####   ######\n##  ## ##  ## ##    ", null, null, null);
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     const segs = blocks[0].lines[0];
     var text: std.ArrayList(u8) = .empty;
@@ -905,7 +1230,7 @@ test "a banner starting with ## is NOT eaten as a heading" {
 
     // And the other kinds STILL interpret headings: the fix is for `.banner`,
     // not a general deactivation.
-    const h = try parseBase(arena, .info, "## un titulo", null, null);
+    const h = try parseBase(arena, .info, "## un titulo", null, null, null);
     var ht: std.ArrayList(u8) = .empty;
     defer ht.deinit(std.testing.allocator);
     for (h[0].lines[0]) |seg| try ht.appendSlice(std.testing.allocator, seg.text);
