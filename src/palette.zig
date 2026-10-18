@@ -102,6 +102,8 @@ pub const Palette = struct {
     /// Whether `key_msg` is an error, set by whoever set it. See
     /// `keyMessageIsError`.
     key_msg_error: bool = false,
+    /// Custom title for models mode (e.g., to show current mode like free-auto, plan, etc.)
+    custom_title: []const u8 = "",
 
     pub fn init(gpa: std.mem.Allocator) Palette {
         return .{ .gpa = gpa };
@@ -144,6 +146,10 @@ pub const Palette = struct {
     pub fn deinit(self: *Palette) void {
         self.filtered[0].deinit(self.gpa);
         self.filtered[1].deinit(self.gpa);
+        if (self.custom_title.len > 0) {
+            self.gpa.free(self.custom_title);
+            self.custom_title = "";
+        }
     }
 
     pub fn queryText(self: *const Palette) []const u8 {
@@ -329,6 +335,7 @@ pub const Palette = struct {
         self.key_len = 0;
         self.key_msg_len = 0;
         self.key_msg_error = false;
+        self.custom_title = "";
         self.col = 1;
         self.sel = .{ 0, 0 };
         self.scroll = .{ 0, 0 };
@@ -647,11 +654,11 @@ pub fn draw(
     // ── title (left) and "esc" (right) ──
     const title = switch (pal.mode) {
         .commands => "Commands",
-        .models => "Choose a model",
+        .models => if (pal.custom_title.len > 0) pal.custom_title else "Choose a model",
         .connect => "Connect a provider",
         .key_prompt => "Add API key",
     };
-    var tb: [32]u8 = undefined;
+    var tb: [128]u8 = undefined;
     const t1 = std.fmt.bufPrint(&tb, " {s}", .{title}) catch " ";
     _ = p.putText(box.x + 2, box.y + 1, t1, theme.brand_bold);
     _ = p.putText(box.x + box.w - 4, box.y + 1, "esc", theme.brand_soft);
