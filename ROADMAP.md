@@ -53,8 +53,8 @@ an output-shaping layer, extension points, a finer permission model, and memory.
 
 | Capability | Today | Phase |
 |---|---|---|
-| Tool registry (one table instead of scattered `if/else` + flag lists) | `dispatch.zig` is 26 branches; flags live in 3 places | 0 |
-| A single result-cap layer | split between `textcap.zig`, `bgproc`, `max_tool_output` | 0 |
+| Tool registry (one table instead of scattered `if/else` + flag lists) | `src/tools/registry.zig`: one `ToolDef` table; `needsPermission`/`isParallelSafe`/`isDestructive`/`maxResultChars`/`toolsJson`/`toolsJsonReadOnly` all derived from `defs` | 0 ✅ |
+| A single result-cap layer | `src/lib/resultcap.zig`: `capResult` (per-tool) + `capAggregate` (trim largest first, notice inside budget) | 0 ✅ |
 | Bundled skills (shipped in the binary) | none | 1 |
 | Rich skill frontmatter (`when-to-use`, `allowed-tools`, `model`, `effort`, `context`) | only `name`/`description` | 1 |
 | Skill args (`$ARGUMENTS`) and `context: fork` | none | 2 |

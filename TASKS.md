@@ -41,13 +41,13 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 > Today one tool's facts live in four places. A new tool is a hunt. This makes it a row.
 
-- [ ] **0.1** `src/tools/registry.zig` — one table, not four lists
-  - [ ] `ToolDef { name, desc, schema, read_only, parallel_safe, destructive, max_result_chars, run }`
-  - [ ] `needsPermission(name)` = `!find(name).read_only`; `isParallelSafe` reads the table; `defs` generated
-  - [ ] Each row's `run` points at the existing per-tool file — keep the files, lose the scattered flags
-- [ ] **0.2** `src/lib/resultcap.zig` — the single cap layer ⚡
-  - [ ] Order: per-tool cap → batch aggregate cap → "persist instead of truncate" hook (Phase 3 plugs in here)
-  - [ ] Pure tests: per-tool cap respected · aggregate trims the largest first · a result exactly at the boundary untouched · a cut always carries its notice *inside* the budget
+- [x] **0.1** `src/tools/registry.zig` — one table, not four lists
+  - [x] `ToolDef { name, desc, schema, read_only, parallel_safe, destructive, max_result_chars }`
+  - [x] `needsPermission(name)` = `!find(name).read_only`; `isParallelSafe` reads the table; `defs` generated
+  - [x] Each row points at the existing per-tool file — keep the files, lose the scattered flags
+- [x] **0.2** `src/lib/resultcap.zig` — the single cap layer ⚡
+  - [x] Order: per-tool cap → batch aggregate cap → "persist instead of truncate" hook (Phase 3 plugs in here)
+  - [x] Pure tests: per-tool cap respected · aggregate trims the largest first · a result exactly at the boundary untouched · a cut always carries its notice *inside* the budget
 
 **Acceptance**: adding a tool requires no edit outside its own file + one registry row.
 
