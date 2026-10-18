@@ -6788,6 +6788,23 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
         .default, .accept_edits => {},
     }
 
+    // Free-auto mode indicator: shown when active, so the user always knows
+    // when the model is being rotated automatically.
+    if (agent.freeAutoOn()) {
+        const lbl = agent.freeAutoLabel(arena);
+        if (lbl.len > 0) {
+            if (out.items.len > 0) {
+                out.append(arena, .{ .text = " \u{b7} ", .style = theme.line }) catch return null;
+            }
+            out.append(arena, .{ .text = lbl, .style = theme.brand_bold }) catch return null;
+        } else {
+            if (out.items.len > 0) {
+                out.append(arena, .{ .text = " \u{b7} ", .style = theme.line }) catch return null;
+            }
+            out.append(arena, .{ .text = "free-auto: building pool…", .style = theme.warn }) catch return null;
+        }
+    }
+
     if (out.items.len == 0) return null;
     return out.items;
 }
