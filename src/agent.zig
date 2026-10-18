@@ -8303,6 +8303,37 @@ fn providerKeyHint(gpa: std.mem.Allocator, def: *const providers.ProviderDef, ac
     return gpa.dupe(u8, state) catch null;
 }
 
+/// Builds a mode indicator string for the model palette title.
+fn buildModeTitlePart(m: *tui.Model, buf: *[128]u8) []const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(m.allocator);
+
+    // Free-auto mode
+    if (free_auto.freeAutoOn()) {
+        const lbl = free_auto.freeAutoLabel(m.allocator);
+        if (lbl.len > 0) {
+            _ = parts.append(m.allocator, lbl) catch {};
+        } else {
+            _ = parts.append(m.allocator, "free-auto: building pool…") catch {};
+        }
+    }
+
+    // Permission mode (only when not default/accept_edits)
+    const perm_mode = currentPermMode();
+    if (perm_mode == .read_only or perm_mode == .bypass) {
+        _ = parts.append(m.allocator, permModeName()) catch {};
+    }
+
+    // Cheap router mode
+    if (router_mod.active(&cheap_router)) {
+        _ = parts.append(m.allocator, "cheap router") catch {};
+    }
+
+    if (parts.items.len == 0) return "";
+    const joined = std.mem.join(m.allocator, " · ", parts.items) catch return "";
+    return std.fmt.bufPrint(buf, "{s}", .{joined}) catch "";
+}
+
 fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     // The mode goes before `setItemsOwned` (see the note in the same function).
     // It delegates to `buildModelItems`: keeping TWO item constructors means
@@ -8317,6 +8348,19 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     m.pal.mode = .models;
     m.pal.active = true;
     m.pal.query_len = 0;
+
+    // Set a custom title that includes the current mode, so the user knows what
+    // mode they are in when selecting a model. This mirrors how `openEffortPicker`
+    // shows the effort ladder in the title.
+    var title_buf: [128]u8 = undefined;
+    const mode_part = buildModeTitlePart(m, &title_buf);
+    if (mode_part.len > 0) {
+        const title = std.fmt.bufPrint(&title_buf, "Choose a model · {s}", .{mode_part}) catch "Choose a model";
+        m.pal.custom_title = m.allocator.dupe(u8, title) catch "";
+    } else {
+        m.pal.custom_title = "";
+    }
+
     m.pal.setItemsOwned(items, &model_groups);
 }
 
