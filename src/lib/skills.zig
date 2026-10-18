@@ -22,6 +22,12 @@
 //! ---
 //! name: pty-tests
 //! description: Verify a TUI change in a real pty, not a homemade emulator
+//! when_to_use: After any change to tui.zig drawing code
+//! argument_hint: Optional path to review
+//! allowed_tools: ["read", "grep"]
+//! model: ""
+//! effort: low
+//! context: inline
 //! ---
 //!
 //! # Verifying a TUI
@@ -67,10 +73,22 @@ pub const max_inline = 32 * 1024;
 /// that do not fit are not listed at all (they are still loadable by name).
 pub const max_listed = 40;
 
-/// One skill's frontmatter.
+/// Skill execution context.
+pub const Context = enum {
+    inline_mode,
+    fork,
+};
+
+/// One skill's frontmatter (rich version for Phase 1+).
 pub const Meta = struct {
     name: []const u8 = "",
     description: []const u8 = "",
+    when_to_use: []const u8 = "",
+    argument_hint: []const u8 = "",
+    allowed_tools: []const u8 = "",
+    model: []const u8 = "",
+    effort: []const u8 = "",
+    context: Context = .inline_mode,
 };
 
 /// Splits the frontmatter from the body.
@@ -81,7 +99,7 @@ pub const Meta = struct {
 /// The parser is hand-written and DELIBERATELY narrow: `key: value` lines, one
 /// `---`-fenced block at the top, `#` comments inside it. It does not do YAML.
 /// A real YAML parser is 600 lines and a whole set of ways to be surprised by a
-/// tab, and the only two keys that matter here are two strings.
+/// tab, and the only keys that matter here are the known strings.
 pub fn splitFrontmatter(text: []const u8) ?struct { meta: Meta, body: []const u8 } {
     const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, "---")) return null;
@@ -120,11 +138,29 @@ pub fn splitFrontmatter(text: []const u8) ?struct { meta: Meta, body: []const u8
         {
             val = val[1 .. val.len - 1];
         }
+        // Known frontmatter keys
         if (std.mem.eql(u8, key, "name")) {
             meta.name = val;
         } else if (std.mem.eql(u8, key, "description")) {
             meta.description = val;
+        } else if (std.mem.eql(u8, key, "when_to_use")) {
+            meta.when_to_use = val;
+        } else if (std.mem.eql(u8, key, "argument_hint")) {
+            meta.argument_hint = val;
+        } else if (std.mem.eql(u8, key, "allowed_tools")) {
+            meta.allowed_tools = val;
+        } else if (std.mem.eql(u8, key, "model")) {
+            meta.model = val;
+        } else if (std.mem.eql(u8, key, "effort")) {
+            meta.effort = val;
+        } else if (std.mem.eql(u8, key, "context")) {
+            if (std.mem.eql(u8, val, "fork")) {
+                meta.context = .fork;
+            } else {
+                meta.context = .inline_mode;
+            }
         }
+        // Unknown keys are silently ignored — the parser stays narrow
     }
     return null; // unterminated frontmatter
 }
@@ -151,13 +187,29 @@ pub fn nameFor(meta: Meta, dir_name: []const u8) []const u8 {
     return dir_name;
 }
 
-/// One skill as discovered on disk.
+/// Skill source for shadowing precedence.
+pub const Source = enum {
+    project,
+    agents,
+    user,
+    bundled,
+};
+
+/// One skill as discovered on disk (or bundled).
 pub const Entry = struct {
     /// Valid name, unique across the search path (project shadows user).
     name: []const u8 = "",
     description: []const u8 = "",
     /// Full path of the `SKILL.md`. Owned by the loader.
     path: []const u8 = "",
+    /// Full body of the skill (loaded on demand). Owned by the loader when present.
+    body: ?[]const u8 = null,
+    /// Where this skill came from (for display and precedence).
+    source: Source = .project,
+    /// Execution context (inline or fork).
+    context: Context = .inline_mode,
+    /// Detailed "when to use" for the listing.
+    when_to_use: []const u8 = "",
 };
 
 /// Text for the `skill` tool: the body, framed so the model knows what it has.
@@ -198,7 +250,11 @@ pub fn systemPromptSection(entries: []const Entry, out: []u8) []const u8 {
     const n = @min(entries.len, max_listed);
     for (entries[0..n]) |e| {
         const d = if (e.description.len > 0) e.description else "(no description — read it before trusting it)";
-        w.print("- {s}: {s}\n", .{ e.name, d }) catch {};
+        w.print("- {s}: {s}", .{ e.name, d }) catch {};
+        if (e.when_to_use.len > 0) {
+            w.print(" — {s}", .{e.when_to_use}) catch {};
+        }
+        w.writeAll("\n") catch {};
     }
     if (entries.len > n) {
         w.print("- … and {d} more, loadable by name with the `skill` tool\n", .{entries.len - n}) catch {};
@@ -242,6 +298,31 @@ test "splitFrontmatter: quotes, comments and CRLF" {
     const r = skills.splitFrontmatter(text) orelse return error.NoFrontmatter;
     try std.testing.expectEqualStrings("quoted-name", r.meta.name);
     try std.testing.expectEqualStrings("single quoted", r.meta.description);
+}
+
+test "splitFrontmatter: rich frontmatter fields" {
+    const text =
+        \\---
+        \\name: test-skill
+        \\description: Test skill
+        \\when_to_use: When testing things
+        \\argument_hint: Optional test name
+        \\allowed_tools: ["read", "bash"]
+        \\model: custom-model
+        \\effort: high
+        \\context: fork
+        \\---
+        \\body
+    ;
+    const r = skills.splitFrontmatter(text) orelse return error.NoFrontmatter;
+    try std.testing.expectEqualStrings("test-skill", r.meta.name);
+    try std.testing.expectEqualStrings("Test skill", r.meta.description);
+    try std.testing.expectEqualStrings("When testing things", r.meta.when_to_use);
+    try std.testing.expectEqualStrings("Optional test name", r.meta.argument_hint);
+    try std.testing.expectEqualStrings("[\"read\", \"bash\"]", r.meta.allowed_tools);
+    try std.testing.expectEqualStrings("custom-model", r.meta.model);
+    try std.testing.expectEqualStrings("high", r.meta.effort);
+    try std.testing.expect(r.meta.context == .fork);
 }
 
 test "splitFrontmatter: without frontmatter it is null, and the whole body is the body" {
@@ -313,6 +394,15 @@ test "systemPromptSection: lists name + when to use it" {
     try std.testing.expect(std.mem.indexOf(u8, s, "no-desc: (no description") != null);
     // And it does NOT carry the body: that is the entire point of the design.
     try std.testing.expect(std.mem.indexOf(u8, s, "load ONE") != null);
+}
+
+test "systemPromptSection: includes when_to_use in listing" {
+    const entries = [_]skills.Entry{
+        .{ .name = "test-skill", .description = "Test skill", .when_to_use = "when testing" },
+    };
+    var buf: [2048]u8 = undefined;
+    const s = skills.systemPromptSection(&entries, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, s, "test-skill: Test skill — when testing") != null);
 }
 
 test "systemPromptSection: with 50 skills it says how many are left without listing them" {
