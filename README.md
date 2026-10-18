@@ -153,3 +153,17 @@ src/lib/               # Pure modules (test without TUI/network)
 `src/lib/` = modules testable **without** TUI or network.  
 `src/tools/` = tools split per file; dispatcher holds Model deps.  
 `AGENTS.md` = code conventions + why each Zig 0.16 trap was paid for.
+
+---
+
+## Contributing / Public repo files
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (Zig 0.16, pure std, tests)
+- [`SECURITY.md`](SECURITY.md) — vulnerability reporting, scope
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community conduct
+- [`.github/ISSUE_TEMPLATE/bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md) — bug template
+- [`.github/ISSUE_TEMPLATE/feature_request.md`](.github/ISSUE_TEMPLATE/feature_request.md) — feature template
+- [`.github/pull_request_template.md`](.github/pull_request_template.md) — PR template
+- [`.github/workflows/zig.yml`](.github/workflows/zig.yml) — basic CI (`zig build` + `zig build test`)
+
+This repo is under MIT (`LICENSE`). If you open a PR, confirm `zig build test` passes and that the change respects the `pure Zig std` rule.

@@ -1,0 +1,27 @@
+name: Zig CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build debug
+        run: zig build
+      - name: Build release
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Test
+        run: zig build test
+        env:
+          ZODE_NO_WARMUP: "1"
+      - name: Smoke (optional, needs pty)
+        run: |
+          if [ -f tools/pty_smoke.py ]; then python3 tools/pty_smoke.py || true; fi
