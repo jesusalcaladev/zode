@@ -380,6 +380,117 @@ pub fn hueSat(c: [3]u8) struct { h: f64, s: f64, l: f64 } {
     return .{ .h = h, .s = s, .l = l };
 }
 
+/// Terminal color capabilities.
+pub const Caps = struct {
+    rgb: bool = false,
+    no_color: bool = false,
+    daltonized: bool = false,
+};
+
+/// Converts an sRGB triple to the nearest ANSI 256 color index.
+/// 
+/// The grey ramp (232-255) is a COMPETITOR, not a fallback — we quantize to
+/// the 6x6x6 color cube (16-231), build BOTH candidates (cube + ramp), and
+/// pick the closer in RGB distance. Beyond the ramp's range the cube corner
+/// is the only option.
+pub fn ansi256FromRgb(r: u8, g: u8, b: u8) u8 {
+    // Standard 6x6x6 color cube: indices 16-231
+    // Each component maps to 0-5: (value * 5) / 255
+    const cube_r = (r * 5) / 255;
+    const cube_g = (g * 5) / 255;
+    const cube_b = (b * 5) / 255;
+    const cube_index = 16 + cube_r * 36 + cube_g * 6 + cube_b;
+    
+    // Grey ramp: indices 232-255 (24 levels of grey)
+    // Only consider if the color is close to grey (low saturation)
+    const max_c = @max(r, @max(g, b));
+    const min_c = @min(r, @min(g, b));
+    const saturation = if (max_c == 0) 0 else @as(f64, @floatFromInt(max_c - min_c)) / @as(f64, @floatFromInt(max_c));
+    
+    if (saturation < 0.15) {
+        const grey_level = (r + g + b) / 3;
+        const ramp_index = 232 + (grey_level * 23) / 255;
+        // Pick closer in RGB distance
+        const cube_r_rgb = cube_r * 51;
+        const cube_g_rgb = cube_g * 51;
+        const cube_b_rgb = cube_b * 51;
+        const ramp_rgb = 8 + ramp_index * 10; // 232=8, 233=18, ..., 255=238
+        
+        const dr = @as(i32, cube_r_rgb) - @as(i32, r);
+const dg = @as(i32, cube_g_rgb) - @as(i32, g);
+const db = @as(i32, cube_b_rgb) - @as(i32, b);
+const cube_dist_sq = @as(u32, @abs(dr) * @abs(dr) + @abs(dg) * @abs(dg) + @abs(db) * @abs(db));
+const cube_dist = @as(u32, @sqrt(@as(f64, @floatFromInt(cube_dist_sq))));
+        
+const dr2 = @as(i32, ramp_rgb) - @as(i32, r);
+const ramp_dist_sq = @as(u32, @abs(dr2) * @abs(dr2) * 3);
+const ramp_dist = @as(u32, @sqrt(@as(f64, @floatFromInt(ramp_dist_sq)))); // *3 since ramp is grey
+        
+        if (ramp_dist < cube_dist) {
+            return @intCast(@min(255, ramp_index));
+        }
+    }
+    
+    return @intCast(cube_index);
+}
+
+/// Converts a style to use ANSI 256 colors instead of RGB.
+pub fn styleToAnsi256(st: vaxis.Style) vaxis.Style {
+    var result = st;
+    if (st.fg) |fg| switch (fg) {
+        .rgb => |c| result.fg = .{ .index = ansi256FromRgb(c[0], c[1], c[2]) },
+        else => {},
+    };
+    if (st.bg) |bg_color| switch (bg_color) {
+        .rgb => |c| result.bg = .{ .index = ansi256FromRgb(c[0], c[1], c[2]) },
+        else => {},
+    };
+    return result;
+}
+
+/// Returns a style adapted to the terminal's color capabilities.
+/// 
+/// - If caps.rgb: returns style as-is (truecolor)
+/// - If caps.no_color: strips all colors, keeps only bold
+/// - Otherwise: converts RGB to ANSI 256
+pub fn resolveStyle(st: vaxis.Style, caps: Caps) vaxis.Style {
+    if (caps.no_color) {
+        return .{ .bold = st.bold, .italic = st.italic, .underline = st.underline, .strikethrough = st.strikethrough };
+    }
+    if (caps.rgb) {
+        return st;
+    }
+    return styleToAnsi256(st);
+}
+
+/// Returns the diff add/delete styles for the current capabilities.
+/// If daltonized is enabled, uses blue/orange instead of green/red.
+pub fn diffStyles(caps: Caps) DiffStyles {
+    if (caps.daltonized) {
+        // Blue/orange pair for deuteranopia/protanopia
+        return .{
+            .add = resolveStyle(rgb(0x4a, 0x9e, 0xff), caps),    // Blue
+            .del = resolveStyle(rgb(0xff, 0xa5, 0x00), caps),    // Orange
+            .add_bg = resolveStyle(bg(0x0a, 0x1a, 0x2a), caps),
+            .del_bg = resolveStyle(bg(0x2a, 0x15, 0x00), caps),
+        };
+    }
+    return .{
+        .add = resolveStyle(diff_add, caps),
+        .del = resolveStyle(diff_del, caps),
+        .add_bg = resolveStyle(diff_add_bg, caps),
+        .del_bg = resolveStyle(diff_del_bg, caps),
+    };
+}
+
+/// Diff styles container.
+const DiffStyles = struct {
+    add: vaxis.Style,
+    del: vaxis.Style,
+    add_bg: vaxis.Style,
+    del_bg: vaxis.Style,
+};
+
 test "contrast: the ratio is order-independent and correct on the anchors" {
     // White on black is the maximum; identical colors are 1.
     try std.testing.expectApproxEqAbs(@as(f64, 21.0), contrast(.{ 0xff, 0xff, 0xff }, .{ 0, 0, 0 }), 0.01);
