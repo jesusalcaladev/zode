@@ -14,7 +14,6 @@ const chat = @import("chat.zig");
 const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
 const compaction_mod = @import("compaction.zig");
-const mascot = @import("lib/mascot.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");

@@ -6,7 +6,6 @@ const compaction = @import("compaction.zig");
 const goal_mod = @import("lib/goal.zig");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
-const mascot = @import("lib/mascot.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -619,6 +618,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/cache", .desc = "cache hit-rate for this session", .palette_visible = false },
     .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
+    .{ .key = "/style", .desc = "select an output style: default|explanatory|learning (no args: report | off)" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
 };
 

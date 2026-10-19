@@ -21,7 +21,6 @@ const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
 const cache_stats = @import("cache_stats.zig");
 const compaction = @import("compaction.zig");
-const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
 
@@ -35,6 +34,8 @@ const images_mod = @import("lib/images.zig");
 const bench_mod = @import("lib/bench.zig");
 const skills = @import("lib/skills.zig");
 const skillstore = @import("lib/skillstore.zig");
+const outputstyles = @import("lib/outputstyles.zig");
+const outputstyle_store = @import("lib/outputstyle_store.zig");
 const project = @import("lib/project.zig");
 const taskstore = @import("lib/taskstore.zig");
 const termseq = @import("lib/termseq.zig");
@@ -65,6 +66,8 @@ pub var gpa_global: std.mem.Allocator = undefined;
 // the tests that assert on it keep reading `agent.default_system_prompt` and no
 // import outside this file changes.
 pub const default_system_prompt = prompt_mod.default_system_prompt;
+pub const default_system_prompt_core = prompt_mod.default_system_prompt_core;
+pub const coding_rules = prompt_mod.coding_rules;
 pub const tool_routing_prompt = prompt_mod.tool_routing_prompt;
 pub const verification_prompt = prompt_mod.verification_prompt;
 
@@ -205,6 +208,120 @@ pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.M
     return fresh;
 }
 
+/// Output styles found on disk, cached like skills (same reasons: the list goes
+/// into the system prompt, rebuilt for every request).
+///
+/// The styles list is small (a handful of entries), so the rescan cap and freshness
+/// check mirror skills but with smaller numbers.
+var styles_cache: ?[]outputstyles.Entry = null;
+var styles_stamps: [outputstyle_store.max_roots]outputstyle_store.Stamp = undefined;
+var styles_stamp_len: usize = 0;
+const styles_rescan_max: usize = 4;
+var styles_rescans: usize = 0;
+var styles_lock: std.atomic.Mutex = .unlocked;
+
+/// The styles on disk, or an empty list. BORROWED: do not free.
+pub fn discoverStyles(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []const outputstyles.Entry {
+    while (styles_lock.tryLock()) {}
+    defer styles_lock.unlock();
+
+    if (styles_cache != null and stylesFresh(gpa, env)) return styles_cache.?;
+    if (styles_rescans >= styles_rescan_max) return styles_cache orelse &.{};
+    styles_rescans += 1;
+
+    const fresh = loadStylesNow(gpa, env);
+    freeStylesCacheLocked();
+    styles_cache = fresh;
+    stampStyles(gpa, env);
+    return fresh;
+}
+
+/// Walks the roots right now and allocates the entries. The caller owns them.
+fn loadStylesNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []outputstyles.Entry {
+    var loader = stylesLoader(gpa, env);
+    var buf: [64]outputstyles.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+    const copy = gpa.dupe(outputstyles.Entry, found) catch {
+        // Out of memory: no styles rather than a half-built list.
+        for (found) |e| {
+            gpa.free(e.name);
+            gpa.free(e.description);
+            gpa.free(e.path);
+        }
+        return &.{};
+    };
+    return copy;
+}
+
+/// The loader, with its roots made ABSOLUTE.
+fn stylesLoader(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) outputstyle_store.Loader {
+    var loader = outputstyle_store.Loader.init(gpa, io_global, env);
+    const proj = &project_info;
+    const cwd = proj.cwd();
+    if (cwd.len == 0) return loader;
+
+    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    loader.project_dir = std.fmt.bufPrint(&bufs[0], "{s}/{s}", .{ cwd, outputstyles.project_dir }) catch loader.project_dir;
+
+    if (proj.root()) |root| {
+        if (!std.mem.eql(u8, root, cwd)) loader.repo_root = root;
+    }
+    return loader;
+}
+
+fn stampStyles(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
+    styles_stamp_len = 0;
+    var loader = stylesLoader(gpa, env);
+    var bufs: [outputstyle_store.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [outputstyle_store.max_roots][]const u8 = undefined;
+    const root_count = loader.roots(&bufs, &paths);
+    for (paths[0..root_count]) |p| addStyleStamp(p);
+    if (styles_cache) |list| {
+        for (list) |e| addStyleStamp(e.path);
+    }
+}
+
+fn addStyleStamp(path: []const u8) void {
+    if (styles_stamp_len >= styles_stamps.len) return;
+    if (!outputstyle_store.stampPath(io_global, path, &styles_stamps[styles_stamp_len])) return;
+    styles_stamp_len += 1;
+}
+
+fn stylesFresh(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) bool {
+    var loader = stylesLoader(gpa, env);
+    var bufs: [outputstyle_store.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [outputstyle_store.max_roots][]const u8 = undefined;
+    const root_count = loader.roots(&bufs, &paths);
+
+    for (paths[0..root_count]) |p| if (!styleStampUnchanged(p)) return false;
+    if (styles_cache) |list| {
+        for (list) |e| if (!styleStampUnchanged(e.path)) return false;
+    }
+    return true;
+}
+
+fn styleStampUnchanged(path: []const u8) bool {
+    for (styles_stamps[0..styles_stamp_len]) |*st| {
+        if (!std.mem.eql(u8, st.pathOf(), path)) continue;
+        var now: outputstyle_store.Stamp = .{};
+        if (!outputstyle_store.stampPath(io_global, path, &now)) return false;
+        return st.sameAs(&now);
+    }
+    return false;
+}
+
+fn freeStylesCacheLocked() void {
+    if (styles_cache) |list| {
+        for (list) |e| {
+            gpa_global.free(e.name);
+            gpa_global.free(e.description);
+            gpa_global.free(e.path);
+        }
+        if (list.len > 0) gpa_global.free(list);
+    }
+    styles_cache = null;
+}
+
 /// Walks the roots right now and allocates the entries. The caller owns them.
 fn loadSkillsNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []skills.Entry {
     var loader = skillsLoader(gpa, env);
@@ -328,7 +445,7 @@ fn freeSkillsCacheLocked() void {
             gpa.free(e.path);
             if (e.when_to_use.len > 0) gpa.free(e.when_to_use);
         }
-        gpa.free(list);
+        if (list.len > 0) gpa.free(list);
         skills_cache = null;
     }
     skills_stamp_len = 0;
@@ -355,6 +472,15 @@ pub fn resetSkillsCacheForTest() void {
     skills_stamp_len = 0;
     skills_rescans = 0;
 }
+
+/// Test-only: reset the styles cache and stamps. Uses the lock internally.
+pub fn resetStylesCacheForTest() void {
+    while (styles_lock.tryLock()) {}
+    defer styles_lock.unlock();
+    freeStylesCacheLocked();
+    styles_stamp_len = 0;
+    styles_rescans = 0;
+}
 pub fn buildSystemPromptFor(
     gpa: std.mem.Allocator,
     env: ?*const std.process.Environ.Map,
@@ -372,6 +498,21 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
 
     var loc_buf: [512]u8 = undefined;
     const location = project_info.promptLines(&loc_buf);
+
+    // --- Output style: injected at the END of the prompt ---
+    // Discover styles and find the currently selected one.
+    const style_entries = discoverStyles(gpa, env);
+    var style_entry: ?outputstyles.Entry = null;
+    if (current_style) |name| {
+        for (style_entries) |e| {
+            if (std.mem.eql(u8, e.name, name)) { style_entry = e; break; }
+        }
+    }
+    // When the selected style says keep_coding_instructions = false, the base
+    // prompt loses the "How to work" coding rules — the style replaces them.
+    const effective_base: []const u8 = if (style_entry) |s| (
+        if (!s.keep_coding_instructions) prompt_mod.default_system_prompt_core else base
+    ) else base;
 
     // The routing table goes in its OWN slot, right after the base, and is
     // emitted whether the base came from `AGENTS.md` or from the built-in text.
@@ -400,52 +541,36 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     //   base (per project) · routing (constant) · ask guidance (constant)
     //   · skills (per session) · location (per project)
     //   · read-only note (EVERY keypress of shift+tab, mid-turn)
+    //   · OUTPUT STYLE (last — selected by the user, changes rarely)
     const blocks_len = routing.len + verification_prompt.len + ask.guidance.len +
         section.len + location.len + mode_note.len;
-    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}", .{
-        base,
+    var style_block_len: usize = 0;
+    var style_buf: [8 * 1024]u8 = undefined;
+    if (style_entry) |s| {
+        const body = if (s.body) |b| b else "";
+        const framed = outputstyles.formatStyle(s.name, s.description, body, &style_buf);
+        style_block_len = framed.len;
+    }
+    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}", .{
+        effective_base,
         routing,
         verification_prompt,
         ask.guidance,
         section,
         location,
         mode_note,
+        if (style_entry) |s| outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf) else "",
     }) catch blk: {
-        // It did not fit, and the old answer was `catch return base`: the WHOLE
-        // prompt became the project's own text, with no routing table, no
-        // verification rule, no ask guidance, no skills and no location — silently,
-        // for every project whose instruction file is bigger than the buffer.
-        //
-        // That is the exact symptom this table was written for. Asked to find a
-        // games page, the model ran `bash curl`, because there was no rule saying
-        // not to; here it happens to any project with a 30 KB `AGENTS.md`, and it
-        // looks like "the model ignored my instructions" instead of "the harness
-        // dropped its own".
-        //
-        // So the CONSTANT blocks are the ones that survive and the per-project text
-        // is what gets trimmed — and it says so, because a project that cannot see
-        // half of its own instructions should be told rather than left to guess.
-        // The slack has to cover the note AND the separators. With 64 bytes the
-        // retry overflowed too and the answer was `catch routing`, which drops the
-        // verification rules and the ask guidance — the same class of loss as the
-        // bug being fixed, one function deeper.
+        // It did not fit... same fallback logic as before.
         const note_lead = "[the project instructions above were truncated to fit";
         const note_tail = "; the rest is in the project's instruction file]";
-        // The two counters are `{d}` of at most 20 digits each; the slack covers
-        // them plus the separator. It has to cover the note AND the separators:
-        // with too little, the retry overflows too and the answer becomes `catch
-        // routing`, which drops the verification rules and the ask guidance — the
-        // same class of loss as the bug being fixed, one function deeper.
         const overhead = note_lead.len + note_tail.len + 48;
         if (out.len <= blocks_len + overhead) break :blk routing;
         const room = out.len - blocks_len - overhead;
-        // The cut is on a line and a UTF-8 boundary, and it names how much of the
-        // project's file survived: a project that cannot see half of its own
-        // instructions is told so, with a number, instead of being left to guess.
-        const fit = prompt_mod.fitPrefix(base, room);
+        const fit = prompt_mod.fitPrefix(effective_base, room);
         break :blk std.fmt.bufPrint(
             out,
-            "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}\n{s}",
+            "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}",
             .{
                 fit,
                 note_lead,
@@ -458,6 +583,7 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
                 section,
                 location,
                 mode_note,
+                if (style_entry) |s| outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf) else "",
             },
         ) catch routing;
     };
@@ -591,6 +717,15 @@ fn readAgentsAt(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ?[]u8
 }
 
 pub var current_effort: chat.Effort = .medium;
+
+/// The currently selected output style name, or null when none is selected.
+///
+/// Set with `/style <name>`, cleared with `/style off` or `/style clear`.
+/// The buffer is static for the same reason as `cur_model_buf`: the string
+/// comes from the input line and dies with the next redraw.
+pub var current_style: ?[]const u8 = null;
+pub var current_style_buf: [128]u8 = undefined;
+pub var current_style_len: usize = 0;
 
 /// Permission mode: false = asks before write/edit/bash, true = auto.
 pub var yolo: bool = false;
@@ -894,6 +1029,88 @@ fn cmdSkills(m: *tui.Model) void {
         }) catch continue;
         pushInfoOwned(m, line);
     }
+}
+
+/// `/style <name>`: select an output style. No args reports the current one;
+/// `off`/`clear` clears it. The style block is injected at the end of the system
+/// prompt on the next request.
+fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
+    const trimmed = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (trimmed.len == 0) {
+        // Report current style
+        if (current_style) |name| {
+            const entries = discoverStyles(m.allocator, m.environ);
+            var found: ?[]const u8 = null;
+            var found_desc: []const u8 = "";
+            var found_keep: bool = true;
+            for (entries) |e| {
+                if (std.mem.eql(u8, e.name, name)) {
+                    found = e.name;
+                    found_desc = e.description;
+                    found_keep = e.keep_coding_instructions;
+                    break;
+                }
+            }
+            if (found) |n| {
+                const keep_note = if (found_keep) "" else " (coding rules replaced by this style)";
+                m.pushInfoFmt("output style: {s}{s} — {s}", .{n, keep_note, found_desc});
+            } else {
+                m.pushInfoFmt("output style: {s} (not found — was it removed?)", .{name});
+            }
+        } else {
+            pushInfo(m, "no output style selected. /style <name> picks one; /style off clears it.");
+        }
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "off") or std.ascii.eqlIgnoreCase(trimmed, "clear")) {
+        current_style = null;
+        current_style_len = 0;
+        pushInfo(m, "output style cleared. The base prompt (with coding rules) is used.");
+        return;
+    }
+
+    // Validate the name exists
+    const entries = discoverStyles(m.allocator, m.environ);
+    var found: ?[]const u8 = null;
+    var found_keep: bool = true;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.name, trimmed)) {
+            found = e.name;
+            found_keep = e.keep_coding_instructions;
+            break;
+        }
+    }
+    if (found == null) {
+        pushInfoFmt(m, "unknown output style '{s}'. Available: {s}", .{
+            trimmed,
+            if (entries.len > 0) styleNames(entries) else "none",
+        });
+        return;
+    }
+
+    // Copy into the static buffer (same rule as cur_model_buf)
+    const n = @min(trimmed.len, current_style_buf.len);
+    std.mem.copyForwards(u8, current_style_buf[0..n], trimmed[0..n]);
+    current_style_len = n;
+    current_style = current_style_buf[0..n];
+
+    const keep_note = if (found_keep) "" else " — this style replaces the coding rules";
+    pushInfoFmt(m, "output style: {s}{s}", .{trimmed, keep_note});
+}
+
+/// Joins style names with ", " for an error message.
+fn styleNames(entries: []const outputstyles.Entry) []const u8 {
+    // Reuse a static buffer for the list
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var first: bool = true;
+    for (entries) |e| {
+        if (!first) w.writeAll(", ") catch {};
+        first = false;
+        w.writeAll(e.name) catch {};
+    }
+    return w.buffered();
 }
 
 /// `/bg`: the background jobs, and the two ways to stop them.
@@ -1633,7 +1850,7 @@ fn pushErrorOwned(m: *tui.Model, text: []const u8) void {
 /// embedded and it came out duplicated and in the same grey as everything else
 /// (which is precisely the complaint that "you can't tell by the color").
 /// [roster] `pub` so `free_auto.zig` can use it.
-pub fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void {
+pub fn setStatusWithZo(m: *tui.Model, mood: tui.StatusKind, text: []const u8) void {
     m.setStatusWithMood(mood, text);
 }
 
@@ -1644,7 +1861,7 @@ pub fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void 
 /// the tempting alternative is `allocPrint(m.allocator, …)` + `pushInfoOwned`,
 /// which on an out-of-memory path hands a LITERAL to a function that frees it.
 /// Composing and copying in one call makes that mistake unrepresentable.
-pub fn setStatusWithZoFmt(m: *tui.Model, mood: mascot.Mood, comptime fmt: []const u8, args: anytype) void {
+pub fn setStatusWithZoFmt(m: *tui.Model, mood: tui.StatusKind, comptime fmt: []const u8, args: anytype) void {
     m.setStatusFmt(mood, fmt, args);
 }
 
@@ -2434,6 +2651,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdAskMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "skills")) {
         cmdSkills(m);
+    } else if (std.mem.eql(u8, cmd, "style")) {
+        cmdStyle(m, arg);
     } else if (std.mem.eql(u8, cmd, "reload-cmds") or std.mem.eql(u8, cmd, "reloadcmds") or std.mem.eql(u8, cmd, "reloadcmd")) {
         if (m.io_ready) {
             refreshUserCommandsForce(m.allocator, m.io, m.environ, true);
@@ -9951,7 +10170,11 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     // in the same way in both cases.
     const saved_cache = agents_md_cache;
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     defer {
+        resetStylesCacheForTest();
+        resetSkillsCacheForTest();
+        gpa_global = saved_gpa;
         agents_md_cache = saved_cache;
         io_global = saved_io;
     }
@@ -9972,6 +10195,8 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
     const fake_agents = try std.testing.allocator.dupe(u8, "# proyecto\nNo hagas esto.");
     defer std.testing.allocator.free(fake_agents);
     agents_md_cache = fake_agents;
@@ -10003,16 +10228,22 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     const saved_io = io_global;
     const saved_info = project_info;
     const saved_agents = agents_md_cache;
+    const saved_gpa = gpa_global;
     defer {
+        resetStylesCacheForTest();
+        resetSkillsCacheForTest();
+        gpa_global = saved_gpa;
         io_global = saved_io;
         project_info = saved_info;
         agents_md_cache = saved_agents;
-        resetSkillsCacheForTest();
     }
 
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+    resetSkillsCacheForTest();
     // A fake repo in /tmp: a `sandbox` under the cwd would be INSIDE zode's own
     // repo, and a "there is no repository" test there would be false.
     const root = "/tmp/zode-prompt-repo-test";
@@ -10358,8 +10589,15 @@ test "system prompt: the volatile parts go LAST, so a mode change does not drop 
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        resetStylesCacheForTest();
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
 
     // Initialize project_info to avoid GPF when skills system accesses it.
     setProjectInfoForTest(io_global, "/tmp");
@@ -10429,8 +10667,15 @@ test "system prompt: the verification rules are injected even with a project's A
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        resetStylesCacheForTest();
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
 
     // Initialize project_info to avoid GPF when skills system accesses it.
     setProjectInfoForTest(io_global, "/tmp");
@@ -10779,8 +11024,21 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        // `buildSystemPromptFor` below caches arena-allocated entries in the
+        // global `styles_cache`. Freeing them with `std.testing.allocator`
+        // (via `resetStylesCacheForTest`) would be an Invalid free; the arena
+        // is deinited separately, so just drop the reference.
+        styles_cache = null;
+        styles_stamp_len = 0;
+        styles_rescans = 0;
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
 
     // Initialize project_info to avoid GPF when skills system accesses it.
     setProjectInfoForTest(io_global, "/tmp");
@@ -10795,7 +11053,14 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
 
     var buf: [16 * 1024]u8 = undefined;
     const from_tui = buildSystemPrompt(a, &buf, null);
+    // The first call above caches arena-allocated entries in the globals.
+    // Drop them before the second call so `freeStylesCacheLocked`/`freeSkillsCacheLocked`
+    // don't try to free arena memory with `std.testing.allocator`.
+    styles_cache = null;
+    skills_cache = null;
     const headless = try buildSystemPromptFor(a, null);
+    styles_cache = null;
+    skills_cache = null;
 
     try std.testing.expectEqualStrings(from_tui, headless);
 
@@ -10839,8 +11104,20 @@ test "a project whose AGENTS.md does not fit still gets the ROUTING, not just it
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        // `buildSystemPrompt` above cached arena-allocated entries in the globals.
+        // Dropping the references (not freeing): the arena is deinited separately,
+        // and freeing with `std.testing.allocator` would be an Invalid free.
+        styles_cache = null;
+        skills_cache = null;
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+    resetSkillsCacheForTest();
 
     const saved_agents = agents_md_cache;
     agents_md_cache = null;

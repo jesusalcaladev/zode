@@ -7,7 +7,6 @@ const chat = @import("chat.zig");
 const md = @import("lib/markdown.zig");
 const theme = @import("lib/theme.zig");
 const ed = @import("lib/editor.zig");
-const mascot = @import("lib/mascot.zig");
 const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
 const taskstore = @import("lib/taskstore.zig");
@@ -24,6 +23,134 @@ const bench_mod = @import("lib/bench.zig");
 const models_mod = @import("lib/models.zig");
 const modelcache = @import("lib/modelcache.zig");
 const zjsonl = @import("lib/zjsonl.zig");
+
+/// The kind of the status: what color the face is and what phase the app is in.
+/// Replaces `StatusKind`; lives here so `agent.zig` can reference it as
+/// `tui.StatusKind` without importing the mascot module.
+pub const StatusKind = enum {
+    idle,
+    thinking,
+    tooling,
+    done,
+    warn,
+    err,
+
+    pub fn color(self: StatusKind) u8 {
+        return switch (self) {
+            .idle => 6, // cyan
+            .thinking => 5, // magenta
+            .tooling => 4, // blue
+            .done => 2, // green
+            .warn => 3, // yellow
+            .err => 1, // red
+        };
+    }
+};
+
+/// Zo's face for a status kind: the little face in the status bar and in the
+/// activity strip. Copied locally from `lib/mascot.zig` so the mascot module
+/// can be deleted.
+///
+/// NO SPACES inside: the status test walks the face's graphemes looking for
+/// them in the row, and a space matches any gap on screen.
+pub fn face(kind: StatusKind) []const u8 {
+    return switch (kind) {
+        .idle => "(◕◕)",
+        .thinking => "(◕_)",
+        .tooling => "(>_<)",
+        .done => "(^◕^)",
+        .warn => "(!_!)",
+        .err => "(××)",
+    };
+}
+
+/// Two frames of the face for the activity strip.
+pub fn faceFrames(kind: StatusKind, frame: u64) []const u8 {
+    const odd = frame % 2 == 1;
+    return switch (kind) {
+        .idle => if (odd) "(◔◔)" else "(◕◕)",
+        .thinking => if (odd) "(◕◔)" else "(◔◕)",
+        .tooling => if (odd) "(-◡-)" else "(>_<)",
+        .done => if (odd) "(◕◕)" else "(^◕^)",
+        .warn => if (odd) "(!◕!)" else "(!_!)",
+        .err => if (odd) "(◕×)" else "(××)",
+    };
+}
+
+/// Columns of an art fragment, not bytes.
+fn glyphCols(s: []const u8) usize {
+    @setEvalBranchQuota(10_000);
+    const view = std.unicode.Utf8View.initUnchecked(s);
+    var it = view.iterator();
+    var n: usize = 0;
+    while (it.nextCodepoint()) |_| n += 1;
+    return n;
+}
+
+const glyph_z = [_][]const u8{
+    "######",
+    "##  ##",
+    "   ## ",
+    "  ##  ",
+    "######",
+};
+const glyph_o = [_][]const u8{
+    " #### ",
+    "##  ##",
+    "##  ##",
+    "##  ##",
+    " #### ",
+};
+const glyph_d = [_][]const u8{
+    "####  ",
+    "##   #",
+    "##   #",
+    "##   #",
+    "####  ",
+};
+const glyph_e = [_][]const u8{
+    "######",
+    "##    ",
+    "###   ",
+    "##    ",
+    "######",
+};
+
+const wordmark = [_]struct { rows: []const []const u8, w: usize }{
+    .{ .rows = &glyph_z, .w = 6 },
+    .{ .rows = &glyph_o, .w = 6 },
+    .{ .rows = &glyph_d, .w = 6 },
+    .{ .rows = &glyph_e, .w = 6 },
+};
+
+/// How many rows the wordmark has (one per letter height).
+pub const banner_art_height = 5;
+
+/// Columns of the wordmark: 4 boxes of 6 with ONE separating space.
+pub const banner_art_width = 4 * 6 + 3;
+
+/// Assemble row `r` of the wordmark: the fixed gaps between the letters.
+fn bannerRow(comptime r: usize) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (wordmark, 0..) |letter, i| {
+        if (i > 0) out = out ++ " ";
+        if (i + 1 < wordmark.len) {
+            const missing = letter.w - glyphCols(letter.rows[r]);
+            const filler = " " ** missing;
+            out = out ++ letter.rows[r] ++ filler;
+        } else {
+            out = out ++ letter.rows[r];
+        }
+    }
+    return out;
+}
+
+/// Welcome banner for the TUI startup: ONLY the wordmark.
+pub const banner = bannerRow(0) ++ "\n" ++
+    bannerRow(1) ++ "\n" ++
+    bannerRow(2) ++ "\n" ++
+    bannerRow(3) ++ "\n" ++
+    bannerRow(4);
 
 /// Item of the modal picker (opencode style). Labels/descs are gpa-owned
 /// and closePicker frees them.
@@ -745,9 +872,9 @@ pub const Model = struct {
     selection_start: ?SelectionPoint = null,
     selection_end: ?SelectionPoint = null,
     selecting_text: bool = false,
-    /// Mood the status was composed with (to color the face).
-    status_mood: mascot.Mood = .idle,
-    status_mood_set: bool = false,
+    /// Kind the status was composed with (to color the face).
+    status_kind: StatusKind = .idle,
+    status_kind_set: bool = false,
 
     /// Permission dialog (fixed buffers, no churn between threads).
     perm_tool: [64]u8 = undefined,
@@ -1489,14 +1616,14 @@ pub const Model = struct {
 
     /// Text + mood. The activity strip uses this mood for its single animated
     /// face; the persistent status row no longer repeats activity feedback.
-    pub fn setStatusWithMood(self: *Model, new_mood: mascot.Mood, text: []const u8) void {
+    pub fn setStatusWithMood(self: *Model, new_mood: StatusKind, text: []const u8) void {
         self.lock();
         defer self.unlock();
         const n = @min(text.len, self.status_buf.len);
         @memcpy(self.status_buf[0..n], text[0..n]);
         self.status_len = n;
-        self.status_mood = new_mood;
-        self.status_mood_set = true;
+        self.status_kind = new_mood;
+        self.status_kind_set = true;
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
     }
@@ -1507,7 +1634,7 @@ pub const Model = struct {
     /// cannot leak a literal into an ownership-taking path, and the mood stays
     /// paired with the text in one call (which is what makes the face come out in
     /// the right color).
-    pub fn setStatusFmt(self: *Model, new_mood: mascot.Mood, comptime fmt: []const u8, args: anytype) void {
+    pub fn setStatusFmt(self: *Model, new_mood: StatusKind, comptime fmt: []const u8, args: anytype) void {
         var buf: [160]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, fmt, args) catch {
             self.setStatusWithMood(new_mood, fmt);
@@ -1527,10 +1654,10 @@ pub const Model = struct {
 
     /// Mood of the current state. If nobody set it, it is deduced from the
     /// work.
-    pub fn mood(self: *Model) mascot.Mood {
+    pub fn mood(self: *Model) StatusKind {
         self.lock();
         defer self.unlock();
-        if (self.status_mood_set) return self.status_mood;
+        if (self.status_kind_set) return self.status_kind;
         if (self.perm_active) return .warn;
         if (self.busy or self.streaming) return .thinking;
         return .idle;
@@ -2608,7 +2735,7 @@ pub const Model = struct {
     /// `start_mood` is no longer used to paint anything here: the face is in the
     /// activity row, which is where it is read. The parameter stays to avoid
     /// changing the signature at the two call sites.
-    pub fn pushHeader(self: *Model, start_mood: mascot.Mood) void {
+    pub fn pushHeader(self: *Model, start_mood: StatusKind) void {
         _ = start_mood;
         // NO leading spaces: the draw centers this block (`heroFrame`), so the
         // indent is a function of the terminal width and not a guess made at
@@ -5503,7 +5630,17 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // iterations. A status row is for what you read without thinking, and those
     // are for when something is wrong.
     const info: []const InfoSeg = sessionInfo(self, ctx.arena) orelse &.{};
-    const info_width = sessionInfoWidth(info);
+    const ctx_segs: []const InfoSeg = contextInfo(ctx.arena) orelse &.{};
+    // Combine context info (left) and session info (right) into one right-aligned block.
+    var combined: [8]InfoSeg = undefined;
+    var ci: usize = 0;
+    for (ctx_segs) |s| { combined[ci] = s; ci += 1; }
+    if (ci < combined.len) { combined[ci] = .{ .text = "  ", .style = theme.line }; ci += 1; }
+    for (info) |s| {
+        if (ci < combined.len) { combined[ci] = s; ci += 1; }
+    }
+    const combined_segs = if (ci > 0) combined[0..ci] else &.{};
+    const info_width = sessionInfoWidth(combined_segs);
     // `drawSessionInfo`'s third argument is the RIGHT EDGE the row ends at, not
     // the column it starts at: passing `width - info_width - 2` put the edge
     // two columns to the LEFT of where the text is, so the row was painted over
@@ -5548,13 +5685,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         else
             "";
 
-        // Mascot face on the left: shows current mood/state
+        // Mascot face on the left: shows current state.
         const mood = self.mood();
         var col: u16 = 1;
-        const face = mascot.face(mood);
-        if (face.len > 0) {
+        const face_text = face(mood);
+        if (face_text.len > 0) {
             const face_style = vaxis.Style{ .fg = .{ .index = mood.color() } };
-            col = p.putText(1, status_row, face, face_style);
+            col = p.putText(1, status_row, face_text, face_style);
         }
 
         if (label.len > 0) {
@@ -5575,7 +5712,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             }
         }
     }
-    if (info.len > 0) drawSessionInfo(&p, status_row, info_right, info);
+    if (combined_segs.len > 0) drawSessionInfo(&p, status_row, info_right, combined_segs);
 
     // There is no FRAME around the status row, and that is the whole entry. It
     // used to draw a `│` at column 0 and one at the far edge, which framed a row
@@ -5699,9 +5836,18 @@ fn drawInput(
     // width in layout and paint prevents clipping a final grapheme.
     // In ask-answer mode (question open, input is the answer field), show a
     // distinct prompt glyph to distinguish from normal prompt.
+    // When the input starts with `!` (shell-out mode), the prompt is colored
+    // differently so the user can see at a glance that Enter will run a shell
+    // command rather than start a turn.
     const in_ask_answer = self.askActive();
-    const prompt_glyph = if (in_ask_answer) "? " else "› ";
-    const prompt_fg = if (in_ask_answer) theme.warn.fg else theme.input_prompt.fg;
+    const bang_cmd = self.ed.text().len > 0 and self.ed.text()[0] == '!';
+    const prompt_glyph = if (in_ask_answer) "? " else if (bang_cmd) "! " else "› ";
+    const prompt_fg = if (in_ask_answer)
+        theme.warn.fg
+    else if (bang_cmd)
+        theme.warn.fg
+    else
+        theme.input_prompt.fg;
     const prompt_style: vaxis.Style = .{
         .bold = true,
         .fg = prompt_fg,
@@ -6061,7 +6207,7 @@ fn drawPermissionModal(
     tool: []const u8,
     detail: []const u8,
 ) void {
-    const w: u16 = @min(width -| 6, 68);
+    const w: u16 = @min(width -| 6, 90);
     if (w < 30) return;
     const h: u16 = 9;
     if (height < h + 2) return;
@@ -6198,7 +6344,7 @@ fn drawAskPanel(
     // overlap: `top = (height - box_h) / 2` here against `y0 = (height - box_h) / 4`
     // there, and this box is the WIDER one for any question over ~56 columns.
     const text_col_off: u16 = 2; // inside the borders
-    const box_w: u16 = @min(@as(u16, 78), width - 4);
+    const box_w: u16 = @min(@as(u16, 100), width - 4);
     const inner_w: u16 = if (box_w > 6) box_w - 4 else box_w - 2;
     const left: u16 = (width - box_w) / 2;
 
@@ -6570,8 +6716,8 @@ fn drawActivityStrip(
 
     // Face for waiting states (ask/perm)
     const waiting = act.ask or act.perm;
-    const face: []const u8 = if (waiting)
-        mascot.faceFrames(moodWaiting(act), self.spinner_frame / 6)
+    const face_text: []const u8 = if (waiting)
+        faceFrames(moodWaiting(act), self.spinner_frame / 6)
     else
         "";
     const mood: vaxis.Style = if (waiting) theme.warn else theme.brand_soft;
@@ -6595,7 +6741,7 @@ fn drawActivityStrip(
     }
 
     var col: u16 = 1;
-    if (face.len > 0) col = p.putText(col, row, face, mood);
+    if (face_text.len > 0) col = p.putText(col, row, face_text, mood);
     if (label.len > 0) {
         col = p.putClipped(col, row, label, width -| col, theme.brand_bold);
         col += 1;
@@ -6723,6 +6869,22 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     return out.items;
 }
 
+/// Context gauge segments for the status bar: shows tokens and context %.
+///
+/// Returns null when there is nothing to show (no context tracked yet).
+fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
+    if (agent.ctx_used == 0 and !agent.ctx_real) return null;
+    var out: std.ArrayList(InfoSeg) = .empty;
+    const label = if (agent.ctx_real) "ctx" else "ctx~";
+    const pct_suffix = if (agent.ctx_pct > 999) ">" else "";
+    out.append(arena, .{ .text = label, .style = theme.status }) catch return null;
+    out.append(arena, .{ .text = " ", .style = theme.status }) catch return null;
+    var nb: [8]u8 = undefined;
+    const pct_txt = std.fmt.bufPrint(&nb, "{d}{s}%", .{agent.ctx_pct, pct_suffix}) catch return null;
+    out.append(arena, .{ .text = pct_txt, .style = theme.status }) catch return null;
+    return out.items;
+}
+
 /// Width in COLUMNS of a group of status segments.
 ///
 /// Measured with the grapheme iterator and not with `.len`: `⚡` is 3 bytes for 1
@@ -6770,7 +6932,7 @@ fn drawSessionInfo(p: *Painter, row: u16, right_edge: u16, segs: []const InfoSeg
 
 /// Centered modal in opencode style: title, filter, items with selection and footer.
 fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
-    const box_w: u16 = @min(width -| 4, 64);
+    const box_w: u16 = @min(width -| 4, 90);
     const box_h: u16 = @min(height -| 4, 15);
     if (box_w < 20 or box_h < 6) return;
     const x0 = (width - box_w) / 2;
@@ -7651,7 +7813,7 @@ test "header: asterisks are marks, no characters are lost" {
     const arena = arena_state.allocator();
 
     var checked: usize = 0;
-    var it = std.mem.splitScalar(u8, mascot.banner, '\n');
+    var it = std.mem.splitScalar(u8, banner, '\n');
     while (it.next()) |line| {
         try expectMarksAreOnlyMarks(arena, line, &checked);
     }
@@ -8826,8 +8988,8 @@ test "thinking is a clean label with no face" {
     const text = rowText(s, row, &rb);
 
     // No mascot face of any mood.
-    for ([_]mascot.Mood{ .idle, .thinking, .warn, .done }) |mk| {
-        const f = mascot.faceFrames(mk, 0);
+    for ([_]StatusKind{ .idle, .thinking, .warn, .done }) |mk| {
+        const f = faceFrames(mk, 0);
         var it = vaxis.unicode.graphemeIterator(f);
         while (it.next()) |g| {
             const bytes = g.bytes(f);
@@ -8867,11 +9029,11 @@ test "the waiting states keep the mascot's warning face in the ask panel" {
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
     _ = allText(s);
 
-    const face = mascot.faceFrames(.warn, 0);
+    const face_text = faceFrames(.warn, 0);
     var found: usize = 0;
-    var it = vaxis.unicode.graphemeIterator(face);
+    var it = vaxis.unicode.graphemeIterator(face_text);
     while (it.next()) |g| {
-        const bytes = g.bytes(face);
+        const bytes = g.bytes(face_text);
         // The ask panel is drawn in the history area, look for the face there
         var row: u16 = 0;
         while (row < s.size.height) {
@@ -11177,8 +11339,8 @@ test "ctrl+d scrolls back down and does NOT quit" {
     // The clickable `↓ latest` zone lives on the status row. With the mascot
     // face now on the left (5 chars: "(◕◕)"), the label starts at column 6.
     // Click on the "l" of "latest" (column 7) to hit the zone.
-    const face = mascot.face(m.mood());
-    const face_width = face.len;
+    const face_text = face(m.mood());
+    const face_width = face_text.len;
     const click_col = 1 + face_width + 1; // 1 (start) + face_width + 1 (space before label)
     try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
         .col = @intCast(click_col),
@@ -11575,7 +11737,7 @@ const ellipsis_max: usize = 3;
 
 /// The mood of the face shown while the app waits on the human. Both states
 /// are "stop and look at me", and the mascot gets the same face in each.
-fn moodWaiting(act: Model.Activity) mascot.Mood {
+fn moodWaiting(act: Model.Activity) StatusKind {
     _ = act;
     return .warn;
 }
