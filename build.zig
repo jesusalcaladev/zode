@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     // Version - can be overridden at build time: `zig build -Dversion=v0.1.0`
     const version = b.option([]const u8, "version", "Version string (default: dev)") orelse "dev";
 
-    // ReleaseSmall POR DEFECTO.
+    // ReleaseSmall for Default.
     //
     // `zig build` used to produce a Debug binary (10.8 MB, 79 % of it debug
     // sections, with the `DebugAllocator` on the hot path). Then it became

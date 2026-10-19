@@ -5547,6 +5547,16 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             self.status()
         else
             "";
+
+        // Mascot face on the left: shows current mood/state
+        const mood = self.mood();
+        var col: u16 = 1;
+        const face = mascot.face(mood);
+        if (face.len > 0) {
+            const face_style = vaxis.Style{ .fg = .{ .index = mood.color() } };
+            col = p.putText(1, status_row, face, face_style);
+        }
+
         if (label.len > 0) {
             // Only the session column is reserved now: it is the one thing on
             // this row that can grow, and the left label has to stop before it.
@@ -5555,11 +5565,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             // read as one sentence.
             const left_width = if (width > info_width + 7) width - info_width - 7 else 0;
             if (scrolled and left_width >= 8) {
-                _ = p.putClipped(1, status_row, label, 8, theme.brand);
-                self.scroll_bottom_start = 1;
-                self.scroll_bottom_end = 9;
+                _ = p.putClipped(col, status_row, label, 8, theme.brand);
+                self.scroll_bottom_start = col;
+                self.scroll_bottom_end = col + 8;
             } else {
-                _ = p.putClipped(1, status_row, label, left_width, theme.brand_soft);
+                _ = p.putClipped(col, status_row, label, left_width, theme.brand_soft);
+                self.scroll_bottom_start = col;
+                self.scroll_bottom_end = col + left_width;
             }
         }
     }
@@ -11162,12 +11174,14 @@ test "ctrl+d scrolls back down and does NOT quit" {
     try std.testing.expect(std.mem.indexOf(u8, status, "latest") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "↓ 1") == null);
     const latest = m.currentMaxOffset();
-    // The clickable `↓ latest` zone lives on the status row, and the status row
-    // is now the LAST one: the input lost its box and took the row the box's
-    // bottom border used to be. A click that used to land on the scroll-to-bottom
-    // affordance would now land on the prompt and type nothing.
+    // The clickable `↓ latest` zone lives on the status row. With the mascot
+    // face now on the left (5 chars: "(◕◕)"), the label starts at column 6.
+    // Click on the "l" of "latest" (column 7) to hit the zone.
+    const face = mascot.face(m.mood());
+    const face_width = face.len;
+    const click_col = 1 + face_width + 1; // 1 (start) + face_width + 1 (space before label)
     try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
-        .col = 2,
+        .col = @intCast(click_col),
         .row = @intCast(scrolled.size.height - 1),
         .button = .left,
         .mods = .{},
