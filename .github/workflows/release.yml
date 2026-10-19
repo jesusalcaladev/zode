@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-linux
+          - aarch64-linux
+          - x86_64-macos
+          - aarch64-macos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build ReleaseSmall
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-linux)
+              zig build -Doptimize=ReleaseSmall -Dstrip=true
+              ;;
+            aarch64-linux)
+              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=aarch64-linux
+              ;;
+            x86_64-macos)
+              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=x86_64-macos
+              ;;
+            aarch64-macos)
+              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=aarch64-macos
+              ;;
+          esac
+
+      - name: Test
+        run: zig build test
+        env:
+          ZODE_NO_WARMUP: "1"
+
+      - name: Prepare binary
+        id: binary
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-linux)
+              PLATFORM="linux-x86_64"
+              ;;
+            aarch64-linux)
+              PLATFORM="linux-aarch64"
+              ;;
+            x86_64-macos)
+              PLATFORM="macos-x86_64"
+              ;;
+            aarch64-macos)
+              PLATFORM="macos-aarch64"
+              ;;
+          esac
+          BINARY="zig-out/bin/zode"
+          ASSET_NAME="zode-${PLATFORM}"
+          cp "$BINARY" "$ASSET_NAME"
+          echo "asset_name=$ASSET_NAME" >> $GITHUB_OUTPUT
+          echo "platform=$PLATFORM" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.binary.outputs.asset_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Also build and test on multiple Zig versions for compatibility
+  compatibility:
+    name: Compatibility (Zig ${{ matrix.zig_version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        zig_version: ['0.16.0', '0.15.1']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ matrix.zig_version }}
+      - run: zig build test
+        env:
+          ZODE_NO_WARMUP: "1"
+
+  # Build and upload install.sh as well
+  install-script:
+    name: Upload install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upload install.sh to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
