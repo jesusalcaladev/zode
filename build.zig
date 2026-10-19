@@ -2,6 +2,10 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+
+    // Version - can be overridden at build time: `zig build -Dversion=v0.1.0`
+    const version = b.option([]const u8, "version", "Version string (default: dev)") orelse "dev";
+
     // ReleaseSmall POR DEFECTO.
     //
     // `zig build` used to produce a Debug binary (10.8 MB, 79 % of it debug
@@ -55,11 +59,17 @@ pub fn build(b: *std.Build) void {
     // rebuild leaves another 49 MB in `.zig-cache/o`.
     const strip_tests = b.option(bool, "strip-tests", "Strip the test binary (default: true)") orelse true;
 
+    // Build options module for passing version to code
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    const build_options_mod = build_options.createModule();
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("build_options", build_options_mod);
 
     const vaxis = b.dependency("vaxis", .{
         .target = target,
@@ -223,6 +233,7 @@ pub fn build(b: *std.Build) void {
     const e2e = b.option(bool, "e2e", "run the network E2E tests (needs a provider key)") orelse false;
     const opts = b.addOptions();
     opts.addOption(bool, "e2e", e2e);
+    opts.addOption([]const u8, "version", version);
     test_mod.addImport("build_options", opts.createModule());
     // `zig build test -- <filter>` runs only the tests whose name contains the
     // filter. Zig 0.16's runner has no `--test-filter`, so the filter is applied

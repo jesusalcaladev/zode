@@ -703,6 +703,20 @@ fn runTui(init: std.process.Init) !u8 {
         agent.catalogWarmupAsync(&model) catch {};
     }
 
+    // Self-update check (non-blocking, runs in background)
+    // Only checks once per 24 hours, so it's very cheap
+    if (envGet(init.environ_map, "ZODE_NO_SELF_UPDATE") == null) {
+        _ = std.Thread.spawn(.{}, struct {
+            fn run(allocator: std.mem.Allocator, io_ref: std.Io) void {
+                const selfupdate = @import("lib/selfupdate.zig");
+                var arena_state = std.heap.ArenaAllocator.init(allocator);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                _ = selfupdate.autoUpdate(io_ref, arena) catch {};
+            }
+        }.run, .{ init.gpa, init.io }) catch {};
+    }
+
     agent.bootMark("app.run start");
 
     // WHY WE ARE LEAVING, ALWAYS, ON STDERR.
@@ -784,6 +798,11 @@ pub fn main(init: std.process.Init) !u8 {
             };
             return runChat(init.gpa, init.io, init.environ_map, text);
         }
+        if (std.mem.eql(u8, arg0, "--version")) {
+            const version = @import("build_options").version;
+            std.debug.print("zode {s}\n", .{version});
+            return 0;
+        }
         if (std.mem.eql(u8, arg0, "--help")) {
             std.debug.print(
                 "zode — code agent harness\n\n" ++
@@ -791,6 +810,7 @@ pub fn main(init: std.process.Init) !u8 {
                     "  --models     list the models of the provider\n" ++
                     "  --chat TXT   send a message (streaming)\n" ++
                     "  --resume     resume the last session\n" ++
+                    "  --version    show version\n" ++
                     "  --help       this help\n",
                 .{},
             );

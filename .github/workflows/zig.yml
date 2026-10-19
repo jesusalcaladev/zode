@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: mlugg/setup-zig@v2
         with:
-          node-version: 20
+          version: 0.16.0
       - name: Build debug
         run: zig build
       - name: Build release
@@ -25,3 +25,17 @@ jobs:
       - name: Smoke (optional, needs pty)
         run: |
           if [ -f tools/pty_smoke.py ]; then python3 tools/pty_smoke.py || true; fi
+
+  # Also test with version flag
+  build-with-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build with version
+        run: zig build -Dversion=test-version
+      - name: Verify version in binary
+        run: |
+          ./zig-out/bin/zode --version | grep -q "test-version" || (echo "Version not found in binary" && exit 1)
