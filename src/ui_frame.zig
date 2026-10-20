@@ -111,6 +111,10 @@ fn render(wtr: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, sc: Scene, wi
     // number move, and a scene that rendered it as 0.0s proved nothing about
     // whether the clock advances.
     m.attachIo(io);
+    // The model name the footer shows. Without it the footer's right half is
+    // EMPTY, and a scene that renders the design without the half that carries
+    // the session's numbers is a scene of a different design.
+    tui.setStatusModel(&m, "kimi-k2.6");
     sc.fill(&m);
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
