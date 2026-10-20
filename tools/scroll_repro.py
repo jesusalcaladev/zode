@@ -163,10 +163,13 @@ def main() -> int:
 
     ok = True
     t = Term()
-    # Startup: banner, input box, status bar.
+    # Startup: the hero, the composer and its footer.
     t.pump(2.0)
     s0 = t.screen()
-    ok &= check("app started", "######" in s0)
+    # The check used to look for "######", the ASCII wordmark of a hero that is
+    # no longer drawn. It had been failing on a green suite, which is worse
+    # than no check: it looks like it is watching the startup.
+    ok &= check("app started", "zode" in s0)
 
     # A history to scroll through. The banner plus the prompt is all the app
     # has on its own, and with 43 rows of history that does not scroll at all
