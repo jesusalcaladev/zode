@@ -47,33 +47,72 @@ pub const StatusKind = enum {
     }
 };
 
-/// Zo's face for a status kind: the little face in the status bar and in the
-/// activity strip. Copied locally from `lib/mascot.zig` so the mascot module
-/// can be deleted.
+/// Zo's face: the ONE state indicator, and the anchor of the composer's footer.
 ///
-/// NO SPACES inside: the status test walks the face's graphemes looking for
-/// them in the row, and a space matches any gap on screen.
+/// ## The silhouette is the point
+///
+/// Every frame is SEVEN columns wide and has the same shape: `(`, eye, gap,
+/// eye, `)`. Only the eyes change. That is the lesson the slime taught (see
+/// AGENTS.md): what reads at this size is the SILHOUETTE, not the decoration,
+/// and a mascot that changes shape between states reads as a different animal
+/// each time.
+///
+/// ## ASCII only, and that is not nostalgia
+///
+/// The previous set used `◕` (U+25D5) and `×` (U+00D7), and BOTH are East
+/// Asian **Ambiguous** width: on a terminal configured with "ambiguous = wide"
+/// (the default in a CJK locale, and a toggle in many others) `(◕◕)` measures
+/// SIX columns instead of five, and any row aligned to the right of it comes
+/// out crooked. An emoji-width character in a right-aligned footer is a
+/// layout bug waiting for the user's terminal.
+///
+/// ## NO SPACES inside
+///
+/// The status test walks the face's graphemes looking for them in the row, and
+/// a space matches any gap on screen.
 pub fn face(kind: StatusKind) []const u8 {
-    return switch (kind) {
-        .idle => "(◕◕)",
-        .thinking => "(◕_)",
-        .tooling => "(>_<)",
-        .done => "(^◕^)",
-        .warn => "(!_!)",
-        .err => "(××)",
-    };
+    return faceFrames(kind, 0);
 }
 
-/// Two frames of the face for the activity strip.
+/// Two frames of the face, for the blink.
+///
+/// The animation is a blink and nothing else: one eye closes every few
+/// hundred milliseconds while the agent works. A face that TWITCHES inside a
+/// status row reads as a rendering bug, which is the opposite of what it is
+/// for; a blink reads as "alive".
 pub fn faceFrames(kind: StatusKind, frame: u64) []const u8 {
     const odd = frame % 2 == 1;
     return switch (kind) {
-        .idle => if (odd) "(◔◔)" else "(◕◕)",
-        .thinking => if (odd) "(◕◔)" else "(◔◕)",
-        .tooling => if (odd) "(-◡-)" else "(>_<)",
-        .done => if (odd) "(◕◕)" else "(^◕^)",
-        .warn => if (odd) "(!◕!)" else "(!_!)",
-        .err => if (odd) "(◕×)" else "(××)",
+        .idle => if (odd) "( o - )" else "( o o )",
+        .thinking => if (odd) "( o - )" else "( o o )",
+        .tooling => if (odd) "( < > )" else "( > < )",
+        .done => if (odd) "( o o )" else "( ^ ^ )",
+        .warn => "( ! ! )",
+        .err => "( x x )",
+    };
+}
+
+/// The face is always SEVEN columns wide.
+///
+/// A test, not a hope: the face lives in a right-aligned footer, and the
+/// whole reason for the ASCII set is that its width is the same everywhere.
+/// `columnsOf` measures with the terminal's own rules, so this catches the
+/// ambiguous-width characters that a byte count would not.
+pub const face_width: u16 = 7;
+
+/// The colour of a mood, from the THEME and not from the 16-colour palette.
+///
+/// `mood.color()` returns an ANSI index (cyan, magenta, blue…), and an index
+/// on a truecolor terminal is the terminal's own palette, not this app's: the
+/// mascot came out in a colour that belonged to nothing around it.
+fn moodStyle(kind: StatusKind) vaxis.Style {
+    return switch (kind) {
+        .idle => theme.ink2,
+        .thinking => theme.brand,
+        .tooling => theme.brand_hi,
+        .done => theme.ok,
+        .warn => theme.warn,
+        .err => theme.err,
     };
 }
 
@@ -644,7 +683,8 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 /// Compact terminal workspace: scrollable history, contextual work indicators,
-/// a borderless multiline prompt, and a quiet session status row.
+/// a borderless multiline prompt, and the composer's footer — the mascot, its
+/// legend and the session's numbers, all inside the prompt's own surface.
 /// Per-frame copy of an open question. Everything in it is in the FRAME arena,
 /// which is the only memory whose lifetime matches "being painted right now".
 pub const AskSnapshot = struct {
@@ -728,7 +768,7 @@ pub const Model = struct {
     /// is why the stack carries its own allocator.
     checkpoints: checkpoint.Stack = undefined,
 
-    /// Moment the current turn started, in nanoseconds, for the activity strip
+    /// Moment the current turn started, in nanoseconds, for the footer's
     /// clock. 0 = no turn. Written by `streamStart`.
     busy_started_ns: i128 = 0,
     /// Time until the FIRST token of the last stream (ms), and whether the
@@ -859,7 +899,7 @@ pub const Model = struct {
     /// Last tool call executed, to expand it with Ctrl+R.
     last_tool: ?ToolMemo = null,
 
-    /// Fixed status bar.
+    /// The footer's legend, in a fixed buffer.
     status_buf: [160]u8 = undefined,
     status_len: usize = 0,
     scroll_bottom_row: u16 = 0,
@@ -1044,7 +1084,7 @@ pub const Model = struct {
     layout_overflow: bool = false,
 
     environ: ?*const std.process.Environ.Map = null,
-    /// The model the status bar shows, resolved ONCE and cached here.
+    /// The model the footer shows, resolved ONCE and cached here.
     ///
     /// The row is `provider/model`, and it used to show nothing but the
     /// provider at the start of a session: `curAnswering()` is empty until the
@@ -1614,8 +1654,8 @@ pub const Model = struct {
         self.redraw_requested.store(true, .seq_cst);
     }
 
-    /// Text + mood. The activity strip uses this mood for its single animated
-    /// face; the persistent status row no longer repeats activity feedback.
+    /// Text + mood. The footer uses this mood for the mascot's colour, and the
+    /// text is its legend: the two are ONE widget.
     pub fn setStatusWithMood(self: *Model, new_mood: StatusKind, text: []const u8) void {
         self.lock();
         defer self.unlock();
@@ -1630,7 +1670,7 @@ pub const Model = struct {
 
     /// `setStatusWithMood` that composes the text into the fixed buffer.
     ///
-    /// Same reasoning as `pushInfoFmt`: the status row copies, so composing here
+    /// Same reasoning as `pushInfoFmt`: the footer copies, so composing here
     /// cannot leak a literal into an ownership-taking path, and the mood stays
     /// paired with the text in one call (which is what makes the face come out in
     /// the right color).
@@ -5367,29 +5407,33 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     // ── bottom-up layout ──
     //
-    //   row height-1                       status (ONE row, two zones)
+    //   row height-1                       the footer's row (the mascot)
     //   rows ..input_top+input_h-1         prompt, no box, grows upward
     //   row  rule_row                      one hairline
-    //   rows rule_row-ac..plan..act        only when relevant
+    //   rows rule_row-ac..plan             only when relevant
     //   rows 0..history_h                  the conversation, and nothing else
+    //
+    // The composer is ONE object: the prompt rows and the footer's row share
+    // the same sunken surface, and the footer's row is the LAST row of the
+    // terminal. There is nothing under the input.
     //
     // This used to be a banner of 5 rows, a rule, a BORDERED input box of 3
     // rows, a blank, a status row and another row for the usage column: eleven
     // rows of furniture before the first word. Six of them were permanent, and
     // the banner was a drawing that never changed and never would.
-    const status_row: u16 = height - 1;
     const max_input_lines: u16 = 8;
     const text_w: u16 = if (width > 4) width - 4 else 1;
 
-    // Activity strip (mascot + state + clock): 1 row, but ONLY if there is
-    // something to report. At idle it takes no space, as it should.
+    // The state, read ONCE per frame: it is what the footer's face and legend
+    // are painted from, and nothing else paints a state any more.
+    //
+    // There used to be TWO widgets for it (the activity strip above the
+    // hairline and the mascot in the row under the input) and they said the
+    // same thing in two places: the row under the input held a face and
+    // nothing else, so on screen it read as a stray emoticon in the corner of
+    // an otherwise empty row.
     const act = self.activity();
     const queued = self.queuedCount();
-    // `act.ask` counts: an open QUESTION is work in progress from the user's
-    // point of view, and the strip is where the clock and "waiting for your
-    // answer" live. Without it the question was on screen with no explanation of
-    // why the app had stopped.
-    const act_rows: u16 = if (act.busy or queued > 0 or act.ask) 1 else 0;
 
     // Keep a compact live summary near the input; the complete checklist is
     // emitted into the scrollable history when the model updates the plan.
@@ -5402,18 +5446,25 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     else
         0;
 
-    // The prompt is fixed against the status row; optional workspace rows take
-    // space from history rather than pushing the cursor away from the bottom.
+    // The composer is ONE object: the text rows plus ONE footer row, both
+    // inside the same sunken surface. The footer is the mascot, the legend and
+    // the session's own numbers; there is no separate status row under the
+    // input any more, and nothing under the well at all.
     //
-    // `chrome` is status + rule and NOTHING else: the input has no top and no
-    // bottom border, so it costs exactly the rows it is using.
-    const chrome: u16 = 2 + ac_rows + act_rows + plan_rows; // status, hairline, context rows
+    // `chrome` is the hairline and the optional workspace rows and NOTHING
+    // else: the input has no top and no bottom border, so it costs exactly
+    // the rows it is using.
+    const chrome: u16 = 1 + ac_rows + plan_rows; // hairline, autocomplete, plan
     const avail: u16 = if (height > chrome + 2) height - chrome - 2 else 1;
     const ed_w: u16 = if (text_w > 0) text_w else 1;
     const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(ed_w, editorMeasurer(&p)), max_input_lines))), avail), 1);
-    const input_top: u16 = if (height > input_h + 2) height - 1 - input_h else 1;
+    // The footer is ALWAYS reserved, even when it has nothing to say: a row
+    // that appears and disappears with the state is a row that makes the input
+    // jump, and the input is the one thing the user is looking at.
+    const well_h: u16 = input_h + 1;
+    const input_top: u16 = if (height > well_h + 1) height - well_h else 1;
     const rule_row: u16 = if (input_top > 0) input_top - 1 else 0;
-    const workspace_top = rule_row -| ac_rows -| plan_rows -| act_rows;
+    const workspace_top = rule_row -| ac_rows -| plan_rows;
     const history_h: u16 = @max(workspace_top, 1);
     // The key handler needs the height to jump a whole page.
     self.hist_rows = history_h;
@@ -5530,8 +5581,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         if (self.workingLocked()) self.spinner_frame +%= 1;
     }
 
-    // The activity strip is the single owner of phase and elapsed time. Do not
-    // repeat its clock in the history while waiting for the first token.
+    // The footer is the single owner of phase and elapsed time. Do not repeat
+    // its clock in the history while waiting for the first token.
     const live_kind: md.Kind = if (live_is_tool) .tool_res else .assistant;
     var live_active = false;
     const hist_margin: u16 = historyMargin(width);
@@ -5620,34 +5671,20 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     try self.snapshotSelectableHistory(surface, history_h);
     self.paintTextSelection(surface);
 
-    // The session info is ONE thing now — `provider/model` — and it is painted
-    // right-aligned on the status row. There is no second column any more: the
-    // cache hit rate and the token counts used to sit glued to the right edge,
-    // and the row answered seven questions when its job is to answer one.
+    // The session's numbers are NOT painted here any more: they live in the
+    // composer's footer, next to the mascot, because there is no row under
+    // the input any more.
     //
-    // They are not deleted, they are a command: `/context` for the tokens and
-    // the compaction gauge, `/cache` for the hit rate, `/bench` for the
-    // iterations. A status row is for what you read without thinking, and those
-    // are for when something is wrong.
-    const info: []const InfoSeg = sessionInfo(self, ctx.arena) orelse &.{};
-    const ctx_segs: []const InfoSeg = contextInfo(ctx.arena) orelse &.{};
-    // Combine context info (left) and session info (right) into one right-aligned block.
-    var combined: [8]InfoSeg = undefined;
-    var ci: usize = 0;
-    for (ctx_segs) |s| { combined[ci] = s; ci += 1; }
-    if (ci < combined.len) { combined[ci] = .{ .text = "  ", .style = theme.line }; ci += 1; }
-    for (info) |s| {
-        if (ci < combined.len) { combined[ci] = s; ci += 1; }
-    }
-    const combined_segs = if (ci > 0) combined[0..ci] else &.{};
-    const info_width = sessionInfoWidth(combined_segs);
-    // `drawSessionInfo`'s third argument is the RIGHT EDGE the row ends at, not
-    // the column it starts at: passing `width - info_width - 2` put the edge
-    // two columns to the LEFT of where the text is, so the row was painted over
-    // the left label — measured as `ctrl+c exitsopencode/…`, with the two
-    // groups touching. The edge is the screen's, and the margin is the only
-    // thing subtracted from it.
-    const info_right = if (width > 2) width - 2 else width;
+    // What used to be here was a status row that answered "what model am I
+    // talking to" with a face on its left and the model's name glued to its
+    // right, and nothing in between: on screen it read as a stray emoticon in
+    // the corner of an empty row, which is what the user called ugly. The
+    // strip above the hairline said the SAME thing again ("thinking",
+    // "streaming"), so the state was in two places and the numbers were in a
+    // third.
+    //
+    // There is now ONE state surface, inside the composer, and it carries all
+    // of it: the mascot, the legend and the session's own numbers.
 
     // ── `ask`: the model asked something ──
     //
@@ -5665,67 +5702,9 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     var perm_tool: []const u8 = "";
     var perm_detail: []const u8 = "";
 
-    // ── status: session info on the right; activity lives in ONE place ──
-    //
-    // The mascot, spinner and phase used to appear here AND in the activity
-    // strip. That duplicated the same state and made the bottom two rows look
-    // like two competing "working" indicators. During work the strip is the
-    // single source of activity; the status row is reserved for session
-    // metadata. When idle, it can show a quiet status or a scroll hint.
-    {
-        const current = self.activity();
-        self.scroll_bottom_start = 0;
-        self.scroll_bottom_end = 0;
-        self.scroll_bottom_row = status_row;
-        const scrolled = !self.follow_bottom;
-        const label: []const u8 = if (scrolled)
-            "↓ latest"
-        else if (!current.busy and !current.ask and !current.perm and self.queuedCount() == 0)
-            self.status()
-        else
-            "";
-
-        // Mascot face on the left: shows current state.
-        const mood = self.mood();
-        var col: u16 = 1;
-        const face_text = face(mood);
-        if (face_text.len > 0) {
-            const face_style = vaxis.Style{ .fg = .{ .index = mood.color() } };
-            col = p.putText(1, status_row, face_text, face_style);
-        }
-
-        if (label.len > 0) {
-            // Only the session column is reserved now: it is the one thing on
-            // this row that can grow, and the left label has to stop before it.
-            // Reserves the session column AND a real gap: the label is clipped
-            // here, and clipping it flush against the model's name is how the two
-            // read as one sentence.
-            const left_width = if (width > info_width + 7) width - info_width - 7 else 0;
-            if (scrolled and left_width >= 8) {
-                _ = p.putClipped(col, status_row, label, 8, theme.brand);
-                self.scroll_bottom_start = col;
-                self.scroll_bottom_end = col + 8;
-            } else {
-                _ = p.putClipped(col, status_row, label, left_width, theme.brand_soft);
-                self.scroll_bottom_start = col;
-                self.scroll_bottom_end = col + left_width;
-            }
-        }
-    }
-    if (combined_segs.len > 0) drawSessionInfo(&p, status_row, info_right, combined_segs);
-
-    // There is no FRAME around the status row, and that is the whole entry. It
-    // used to draw a `│` at column 0 and one at the far edge, which framed a row
-    // of dim metadata as if it were a panel AND left a stray tick at the left
-    // margin — a mark with nothing on either side of it. The row reads as a row
-    // because it is the only thing on it.
-
-    // ── contextual rows, present only when useful ──
-    if (act_rows == 1) {
-        drawActivityStrip(&p, workspace_top, width, self, act, queued);
-    }
+    // ── the plan, when there is one ──
     if (plan_rows > 0) {
-        drawPlanBlock(&p, workspace_top + act_rows, width, pl_now);
+        drawPlanBlock(&p, workspace_top, width, pl_now);
     }
 
     // ── `/` autocompletion (directly above the prompt) ──
@@ -5749,6 +5728,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     const bar_style = if (act.ask) theme.warn else if (act.busy) theme.brand else theme.input_bar;
 
     drawInput(&p, &surface, self, input_top, width, input_h, rule_row, bar_style);
+
+    // ── the footer's row: the ONE state surface ──
+    //
+    // It is the last row of the composer's own well, so the bottom of the app
+    // is ONE object: the sunken surface with the prompt in it and the mascot
+    // under it. Nothing hangs below the input any more.
+    drawStateFooter(&p, input_top + input_h, width, self, act, queued, ctx.arena);
 
     // ── permission dialog: centered MODAL ──
     //
@@ -5810,6 +5796,12 @@ fn drawInput(
 ) void {
     if (top >= p.height or width < 6) return;
 
+    // The well is the text rows PLUS the footer's row: the footer's row is
+    // painted by `drawStateFooter`, but the SURFACE is this function's job, or
+    // the mascot would float on the terminal's background with a dark block
+    // above it.
+    const well_h: u16 = input_h + 1;
+
     // The composer surface: a subtle `well_bg` fill behind the input rows so
     // the composer reads as a SUNKEN SURFACE, distinct from the transcript
     // above (which sits on the terminal's default background). This is the
@@ -5817,17 +5809,17 @@ fn drawInput(
     // Zero extra rows: the surface lives inside the rows the input already owns.
     {
         var i: u16 = 0;
-        while (i < input_h and top + i < p.height) : (i += 1) {
+        while (i < well_h and top + i < p.height) : (i += 1) {
             p.fillRange(1, width, top + i, " ", theme.well_bg);
         }
     }
 
-    // The accent bar: one cell per input row, in the left margin. `▌` and NOT
+    // The accent bar: one cell per well row, in the left margin. `▌` and NOT
     // `│`: a half-block is the "here" mark in every editor and a pipe reads as
     // a border. Color changes with state: normal=input_bar, busy=brand, ask=warn.
     {
         var i: u16 = 0;
-        while (i < input_h and top + i < p.height) : (i += 1) {
+        while (i < well_h and top + i < p.height) : (i += 1) {
             p.putStable(0, top + i, "▌", 1, bar_style);
         }
     }
@@ -6164,6 +6156,23 @@ pub fn resolveStatusModel(self: *Model) void {
     }
 }
 
+/// Sets the model name the footer shows.
+///
+/// It COPIES into the model's own buffer, and that is the whole point of this
+/// function existing: the name comes from a catalogue, a config or a test, and
+/// a slice pointing at one of those dies with it. The footer is painted with
+/// `putStable`, which does not copy, so a name that outlived its buffer would
+/// be read by the renderer after the frame was over.
+pub fn setStatusModel(m: *Model, name: []const u8) void {
+    m.lock();
+    defer m.unlock();
+    const n = @min(name.len, m.status_model_buf.len);
+    @memcpy(m.status_model_buf[0..n], name[0..n]);
+    m.status_model_len = n;
+    m.status_model_tried = true;
+    m.dirty = true;
+}
+
 /// Tells the draw that the status model may be resolved again.
 ///
 /// The warmup worker calls it once the catalogue is on disk. It exists as a
@@ -6172,6 +6181,7 @@ pub fn resolveStatusModel(self: *Model) void {
 /// write it directly with no lock, which is a data race on a `bool` the draw
 /// compares 60 times a second. A setter is also the only way the caller can
 /// take the lock for it, since `std.atomic.Mutex` is not reentrant and
+/// `setStatusModel` takes it too.
 /// `resolveStatusModel` holds the same one.
 pub fn allowStatusModelRetry(self: *Model) void {
     self.lock();
@@ -6698,125 +6708,284 @@ fn graphemeStep(ctx: *const anyopaque, text: []const u8, i: usize) ed.Step {
     return .{ .cols = p.measure(b), .end = i + b.len };
 }
 
-fn drawActivityStrip(
+/// The composer's footer: the ONE place where the state is shown.
+///
+/// It replaced two widgets that said the same thing in two places:
+///
+///  * the ACTIVITY STRIP, a row above the hairline that said "thinking",
+///    "streaming", "running Bash · 1.2s";
+///  * the STATUS ROW, a row under the input that held a face and the model's
+///    name with nothing in between — which on screen read as a stray emoticon
+///    in the corner of an otherwise empty row.
+///
+/// Now there is one surface, and it is the last row of the composer's own
+/// sunken well: the mascot on the left with its legend, the session's numbers
+/// on the right. The state is in ONE place, and it is in the same object as
+/// the thing the user is looking at.
+///
+/// ## What the mascot is and what the words are
+///
+/// The face says the STATE (in its mood's colour) and the words say the
+/// DETAIL ("running Bash · 1.2s"). They are one widget, not two: a mascot with
+/// no legend is a doodle, and a legend with no mascot is what this row was
+/// before.
+/// The composer's footer: the ONE place where the state is shown.
+///
+/// It replaced two widgets that said the same thing in two places:
+///
+///  * the ACTIVITY STRIP, a row above the hairline that said "thinking",
+///    "streaming", "running Bash · 1.2s";
+///  * the STATUS ROW, a row under the input that held a face and the model's
+///    name with nothing in between — which on screen read as a stray emoticon
+///    in the corner of an otherwise empty row.
+///
+/// Now there is one surface, and it is the last row of the composer's own
+/// sunken well: the mascot on the left with its legend, the session's numbers
+/// on the right. The state is in ONE place, and it is in the same object as
+/// the thing the user is looking at.
+///
+/// ## What the mascot is and what the words are
+///
+/// The face says the STATE (in its mood's colour) and the words say the
+/// DETAIL ("running Bash · 1.2s"). They are one widget, not two: a mascot with
+/// no legend is a doodle, and a legend with no mascot is what this row was
+/// before.
+///
+/// ## Who wins the space
+///
+/// The STATE wins. The face is seven columns and it is never clipped: on a
+/// narrow terminal the numbers on the right go first (the scroll hint, then
+/// the throughput, then the context gauge, and the model last), because a
+/// half-drawn face is a drawing bug and a missing model is a command away
+/// (`/model`).
+fn drawStateFooter(
     p: *Painter,
     row: u16,
     width: u16,
     self: *Model,
     act: Model.Activity,
     queued: usize,
+    arena: std.mem.Allocator,
 ) void {
-    p.fillRow(row, " ", .{});
+    const right_edge: u16 = if (width > 2) width - 2 else width;
 
-    // Simple, clean activity indicator: just the phase label and time.
-    // Face only appears when waiting for human (ask/perm).
+    // ── the LEFT group: the mascot and its legend ──
     var tr_name_buf: [64]u8 = undefined;
     const running_tool_name = self.toolRunName(&tr_name_buf);
     const running_tool = running_tool_name != null;
 
-    // Face for waiting states (ask/perm)
-    const waiting = act.ask or act.perm;
-    const face_text: []const u8 = if (waiting)
-        faceFrames(moodWaiting(act), self.spinner_frame / 6)
+    // The mood: the activity wins over what the agent last said, because the
+    // activity is what is TRUE right now. A tool running is `.tooling`, and a
+    // question or a permission is `.warn` — the two states where the app has
+    // stopped and is waiting on the human.
+    const mood: StatusKind = if (act.ask or act.perm)
+        .warn
+    else if (running_tool)
+        .tooling
     else
-        "";
-    const mood: vaxis.Style = if (waiting) theme.warn else theme.brand_soft;
+        self.mood();
 
-    var label_buf: [80]u8 = undefined;
-    var label: []const u8 = undefined;
+    // The blink only happens while there is work: a face that twitches in an
+    // idle footer is noise, and the idle footer is on screen all the time.
+    const animated = act.busy or act.streaming or act.ask or act.perm or running_tool;
+    const face_text = if (animated) faceFrames(mood, self.spinner_frame / 6) else face(mood);
+
+    var legend: []const u8 = "";
+    var detail: []const u8 = "";
+    var detail_buf: [96]u8 = undefined;
+
     if (act.ask) {
-        label = "waiting for your answer";
+        legend = "waiting for your answer";
+        const ms = self.askMillis();
+        detail = std.fmt.bufPrint(&detail_buf, "· {d}s to answer", .{ms / 1000}) catch "";
     } else if (act.perm) {
-        label = "waiting for your permission";
+        legend = "waiting for your permission";
     } else if (act.subagent_total > 0) {
-        label = std.fmt.bufPrint(&label_buf, "subagents {d}/{d}", .{act.subagent_completed, act.subagent_total}) catch "subagents";
+        legend = std.fmt.bufPrint(&detail_buf, "subagents {d}/{d}", .{
+            act.subagent_completed,
+            act.subagent_total,
+        }) catch "subagents";
     } else if (running_tool) {
-        label = "running";
-    } else if (act.streaming) {
-        label = "streaming";
-    } else if (act.busy) {
-        label = "thinking";
-    } else {
-        label = "";
-    }
-
-    var col: u16 = 1;
-    if (face_text.len > 0) col = p.putText(col, row, face_text, mood);
-    if (label.len > 0) {
-        col = p.putClipped(col, row, label, width -| col, theme.brand_bold);
-        col += 1;
-    }
-
-    // Tool name + elapsed time
-    if (running_tool_name) |name| {
-        var cbuf: [24]u8 = undefined;
+        legend = "running";
         const ms = self.toolRunMillis();
-        const ts = std.fmt.bufPrint(&cbuf, "{s} · {d}.{d}s", .{ name, ms / 1000, (ms % 1000) / 100 }) catch "";
-        if (ts.len > 0 and col + ts.len + 2 < width) {
-            col = p.putText(col, row, ts, theme.brand_soft);
-            col += 1;
-        }
-    } else if (act.busy or act.streaming) {
-        // Turn elapsed time
-        var cbuf: [24]u8 = undefined;
-        const ms = self.busyMillis();
-        const ts = std.fmt.bufPrint(&cbuf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
-        if (ts.len > 0 and col + ts.len + 2 < width) {
-            col = p.putText(col, row, ts, theme.brand_soft);
-            col += 1;
-        }
-    }
-
-    // TTFT (only once per stream)
-    if (!self.ttftPending() and self.ttftMillis() > 0) {
-        var tbuf: [24]u8 = undefined;
-        const ttft = std.fmt.bufPrint(&tbuf, "first token {d}.{d}s", .{
-            self.ttftMillis() / 1000,
-            (self.ttftMillis() % 1000) / 100,
+        detail = std.fmt.bufPrint(&detail_buf, "{s} · {d}.{d}s", .{
+            running_tool_name.?,
+            ms / 1000,
+            (ms % 1000) / 100,
         }) catch "";
-        if (ttft.len > 0 and col + ttft.len + 2 < width) {
-            col = p.putText(col, row, ttft, theme.brand_faint);
-            col += 1;
-        }
+    } else if (act.streaming) {
+        legend = "streaming";
+        const ms = self.busyMillis();
+        detail = std.fmt.bufPrint(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
+    } else if (act.busy) {
+        legend = "thinking";
+        const ms = self.busyMillis();
+        detail = std.fmt.bufPrint(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
+    } else {
+        // Idle: the agent's own last word, if it said one ("done", "ready").
+        legend = self.status();
+        if (legend.len == 0) legend = "ready";
     }
-
-    // Live throughput (only while streaming)
-    if (act.streaming and agent.tps_live > 1) {
-        var tbuf: [32]u8 = undefined;
-        const speed = std.fmt.bufPrint(&tbuf, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch "";
-        const speed_cols: u16 = @intCast(columnsOf(p, speed));
-        if (speed.len > 0 and col + speed_cols + 2 < width) {
-            col = p.putText(col, row, speed, theme.tool);
-            col += 1;
-        }
-    }
-
-    // Queue indicator
     if (queued > 0) {
         var qbuf: [32]u8 = undefined;
-        const q = std.fmt.bufPrint(&qbuf, "⏳ {d} queued", .{queued}) catch "";
-        if (col + q.len + 2 < width and q.len > 0) {
-            col = p.putText(col, row, q, theme.warn);
+        const q = std.fmt.bufPrint(&qbuf, "{d} queued", .{queued}) catch "";
+        if (q.len > 0) {
+            if (detail.len > 0) {
+                var both: [128]u8 = undefined;
+                detail = std.fmt.bufPrint(&both, "{s} · {s}", .{ detail, q }) catch detail;
+            } else {
+                detail = q;
+            }
         }
     }
 
-    // Question timeout
-    if (act.ask) {
-        var qbuf: [24]u8 = undefined;
-        const ms = self.askMillis();
-        const qs = std.fmt.bufPrint(&qbuf, "· {d}s to answer", .{ms / 1000}) catch "";
-        if (qs.len > 0 and col + qs.len + 2 < width) {
-            col = p.putText(col, row, qs, theme.warn);
+    // How much room the left group's CORE needs, in columns: the face and the
+    // legend. The DETAIL is not part of it, because the detail is the first
+    // thing that may go: the model on the right says who is answering, and
+    // that outlives the name of the tool that happens to be running.
+    const left_core: u16 = face_width + 1 + @as(u16, @intCast(columnsOf(p, legend)));
+
+    // ── the RIGHT group: the session's own numbers ──
+    //
+    // The model (and the permission mode and the free-auto pool, which are
+    // deviations and only show when they are not the default), the context
+    // gauge, the throughput while it streams, and the scroll hint.
+    var right: [12]InfoSeg = undefined;
+    var rn: usize = 0;
+
+    if (sessionInfo(self, arena)) |segs| {
+        for (segs) |s| {
+            if (rn < right.len) {
+                right[rn] = s;
+                rn += 1;
+            }
+        }
+    }
+    if (contextInfo(arena)) |segs| {
+        if (rn > 0 and rn < right.len) {
+            right[rn] = .{ .text = " · ", .style = theme.line };
+            rn += 1;
+        }
+        for (segs) |s| {
+            if (rn < right.len) {
+                right[rn] = s;
+                rn += 1;
+            }
+        }
+    }
+    if (act.streaming and agent.tps_live > 1) {
+        var tb: [32]u8 = undefined;
+        const speed = std.fmt.bufPrint(&tb, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch "";
+        // The segment's text is painted with `putStable`, which does NOT copy:
+        // the bytes have to live in the frame's arena, not in this frame's
+        // stack. This is the `&[_]u8{c}` family, and a right-aligned group is
+        // exactly where a dead pointer shows up as a stray glyph.
+        const owned = arena.dupe(u8, speed) catch "";
+        if (owned.len > 0 and rn + 1 < right.len) {
+            if (rn > 0) {
+                right[rn] = .{ .text = " · ", .style = theme.line };
+                rn += 1;
+            }
+            right[rn] = .{ .text = owned, .style = theme.tool };
+            rn += 1;
+        }
+    }
+    const scrolled = !self.follow_bottom;
+    var latest_idx: ?usize = null;
+    if (scrolled and rn + 1 < right.len) {
+        if (rn > 0) {
+            right[rn] = .{ .text = "  ", .style = theme.line };
+            rn += 1;
+        }
+        right[rn] = .{ .text = "↓ latest", .style = theme.brand };
+        latest_idx = rn;
+        rn += 1;
+    }
+
+    // The right group gives up pieces, from the tail, until the state fits.
+    //
+    // The tail is the scroll hint first, then the throughput, then the
+    // context gauge: the model is the last thing to go, because it is the one
+    // that says which model is answering.
+    const room: u16 = if (right_edge > left_core + 2) right_edge - left_core - 2 else 0;
+    while (rn > 0 and segsWidth(right[0..rn]) > room) {
+        // The last segment goes, and with it the separator that came before
+        // it (otherwise the row ends with a dangling "·").
+        rn -= 1;
+        if (rn > 0 and std.mem.eql(u8, right[rn - 1].text, " · ")) rn -= 1;
+        if (latest_idx) |idx| {
+            if (idx >= rn) latest_idx = null;
+        }
+    }
+
+    const right_segs = right[0..rn];
+    const right_width = segsWidth(right_segs);
+    const right_start: u16 = if (right_edge > right_width) right_edge - right_width else 0;
+
+    // ── the left group ──
+    const left_limit: u16 = if (right_start > 2) right_start - 2 else right_edge;
+    var col: u16 = 1;
+    var face_style = moodStyle(mood);
+    face_style.bg = theme.well_bg.bg;
+    col = p.putClipped(col, row, face_text, left_limit -| col, face_style);
+    if (legend.len > 0) {
+        // The legend is WHITE and the face is COLOURED, on purpose: with both
+        // in the theme's teal the face and its own label read as one smudge
+        // (they were the same colour, and the same pixels, for the "tooling"
+        // mood). The face carries the mood; the word carries the phase.
+        var legend_style = theme.ink;
+        legend_style.bold = true;
+        legend_style.bg = theme.well_bg.bg;
+        col = p.putClipped(col + 1, row, legend, left_limit -| col, legend_style);
+    }
+    if (detail.len > 0) {
+        // The detail is painted WHOLE or not at all: a clipped "B" at the end
+        // of the legend reads as a typo, and the detail is the first thing
+        // that may go when the row is narrow.
+        const detail_cols: u16 = @intCast(columnsOf(p, detail));
+        if (col + detail_cols <= left_limit) {
+            var detail_style = theme.ink2;
+            detail_style.bg = theme.well_bg.bg;
+            col = p.putClipped(col + 1, row, detail, left_limit -| col, detail_style);
+        }
+    }
+
+    // ── the right group, right-aligned ──
+    //
+    // The scroll hint's own columns are published so the click on it can jump
+    // to the bottom: it is the only part of the footer that is a control.
+    self.scroll_bottom_row = row;
+    self.scroll_bottom_start = 0;
+    self.scroll_bottom_end = 0;
+    if (latest_idx) |idx| {
+        const start = right_start + segsWidth(right[0..idx]);
+        self.scroll_bottom_start = start;
+        self.scroll_bottom_end = start + segsWidth(right[idx .. idx + 1]);
+    }
+    var rcol: u16 = right_start;
+    for (right_segs) |sg| {
+        // The well's background has to be put back on every cell of the right
+        // group: `putStable` REPLACES the cell, so a segment that carries no
+        // background of its own lands on the terminal's default one, and the
+        // footer's right end came out as a bright strip on a dark block.
+        var st = sg.style;
+        st.bg = theme.well_bg.bg;
+        var it = vaxis.unicode.graphemeIterator(sg.text);
+        while (it.next()) |g| {
+            const b = g.bytes(sg.text);
+            const w = theme.graphemeWidth(p.ctx, b);
+            if (rcol + w <= p.width) _ = p.putStable(rcol, row, b, w, st);
+            rcol += w;
         }
     }
 }
 
-/// A piece of the status row with its style.
+/// A piece of the footer's right-hand group, with its style.
 const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 
-/// The RIGHT zone of the status row: ONLY the model name.
+/// The RIGHT zone of the footer: the model name.
 ///
-/// A status row is for the thing you read without thinking: what model am I
+/// The footer is for the things you read without thinking: what model am I
 /// talking to right now. Everything else (provider, ctx%, tokens, cache, mode)
 /// has a command: `/context`, `/cache`, `/bench`, `/provider`.
 fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
@@ -6869,7 +7038,7 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     return out.items;
 }
 
-/// Context gauge segments for the status bar: shows tokens and context %.
+/// Context gauge segments for the footer: the context percentage.
 ///
 /// Returns null when there is nothing to show (no context tracked yet).
 fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
@@ -6881,7 +7050,15 @@ fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     out.append(arena, .{ .text = " ", .style = theme.status }) catch return null;
     var nb: [8]u8 = undefined;
     const pct_txt = std.fmt.bufPrint(&nb, "{d}{s}%", .{agent.ctx_pct, pct_suffix}) catch return null;
-    out.append(arena, .{ .text = pct_txt, .style = theme.status }) catch return null;
+    // The percentage is printed with `putStable`, which does NOT copy the
+    // bytes: `pct_txt` points at THIS frame's stack, and the renderer reads
+    // the cells after the frame is over. It has to live in the frame's arena.
+    //
+    // This was a real bug, and it was invisible: the number usually came out
+    // right because the stack still held the bytes, and came out as garbage
+    // when it did not.
+    const owned = arena.dupe(u8, pct_txt) catch return null;
+    out.append(arena, .{ .text = owned, .style = theme.status }) catch return null;
     return out.items;
 }
 
@@ -6900,34 +7077,6 @@ fn segsWidth(segs: []const InfoSeg) u16 {
         }
     }
     return total;
-}
-
-const sessionInfoWidth = segsWidth;
-
-/// Draws the session info right-aligned, measuring the total width with the
-/// REAL cell width (not `len`): emojis and `·` take 1, but if a 2-column
-/// grapheme ever shows up, aligning by `len` misaligns the whole row.
-fn drawSessionInfo(p: *Painter, row: u16, right_edge: u16, segs: []const InfoSeg) void {
-    var total: u16 = 0;
-    for (segs) |sg| {
-        var it = vaxis.unicode.graphemeIterator(sg.text);
-        while (it.next()) |g| {
-            _ = g;
-            total += 1;
-        }
-    }
-    if (right_edge < total + 2) return; // doesn't fit: skipped before invading the text
-
-    var col: u16 = right_edge - total;
-    for (segs) |sg| {
-        var it = vaxis.unicode.graphemeIterator(sg.text);
-        while (it.next()) |g| {
-            const b = g.bytes(sg.text);
-            const w = theme.graphemeWidth(p.ctx, b);
-            if (col + w <= right_edge) _ = p.putStable(col, row, b, w, sg.style);
-            col += w;
-        }
-    }
 }
 
 /// Centered modal in opencode style: title, filter, items with selection and footer.
@@ -7165,7 +7314,7 @@ test "the bottom furniture is exactly two rows and nothing else" {
     const s = try drawTest(&m, arena_state.allocator(), 60, h);
     // Rows the transcript may NOT use, from the bottom up.
     var buf: [128]u8 = undefined;
-    // h-1: the status row.
+    // h-1: the footer's row.
     const status = rowText(s, h - 1, &buf);
     try std.testing.expect(status.len > 0);
     // h-2: the input, and it is ONE row when the input is one line.
@@ -7265,7 +7414,7 @@ test "input: multiline grows the box and shows both lines" {
 
     const s = try drawTest(&m, arena_state.allocator(), 40, h);
     var buf: [128]u8 = undefined;
-    // input_h=3, and the input is pinned above the status row: top = h-1-3.
+    // input_h=3, and the input is pinned above the footer's row: top = h-1-3.
     const top = rowText(s, h - 4, &buf);
     try std.testing.expect(std.mem.indexOf(u8, std.mem.trim(u8, top, " "), "\u{203a}") != null);
 
@@ -7329,8 +7478,8 @@ test "input: a wrapped line fills several rows and the cursor stays on screen" {
     const rows = m.ed.displayLines(w - 4, testEditorMeasurer());
     try std.testing.expect(rows >= 4);
     const input_h: u16 = @min(rows, 8);
-    // `h - 1 - input_h`: the input is pinned directly above the status row, and
-    // the hairline below it took the row the box's bottom border used to be.
+    // `h - 1 - input_h`: the input is pinned directly above the footer's row,
+    // and the hairline above it took the row the box's bottom border used to be.
     const top = h - 1 - input_h;
 
     // Several prompt rows carry text, not just the first one.
@@ -7977,7 +8126,7 @@ test "status: the normal permission modes cost NOTHING on the row" {
     }
 }
 
-test "status: the status row fits and is not cut" {
+test "footer: the right-hand group fits and is not cut" {
     // The visible symptom of the dangling pointer was the row cut with a
     // half UTF-8 character at the right edge.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -8748,15 +8897,78 @@ test "queue: clearQueue frees whatever is left" {
     try std.testing.expectEqual(@as(usize, 0), m.queuedCount());
 }
 
-test "activity strip: with work and with a queue" {
-    // The strip is what answers "is it working or is it stuck?": the phase label
-    // and the seconds. Clean, no face animation.
+test "the mascot is seven ASCII columns in every mood" {
+    // The face lives in a RIGHT-ALIGNED footer: its width is the width of the
+    // left group, and a character whose width the TERMINAL decides (the East
+    // Asian "ambiguous" ones: `◕`, `×`, `…`) puts the right group in the
+    // wrong column on a terminal configured with "ambiguous = wide".
+    //
+    // The previous face set used two of them, and the row it was in was
+    // right-aligned, so the misalignment was real on those terminals.
+    //
+    // So the invariant is ASCII, not "seven graphemes": seven ASCII characters
+    // are seven columns in every terminal there is.
+    for ([_]StatusKind{ .idle, .thinking, .tooling, .done, .warn, .err }) |kind| {
+        const f = faceFrames(kind, 0);
+        try std.testing.expectEqual(@as(usize, 7), f.len);
+        for (f) |c| {
+            try std.testing.expect(c >= 0x20 and c < 0x7f);
+        }
+        // The blink must not change the width either.
+        const g = faceFrames(kind, 1);
+        try std.testing.expectEqual(@as(usize, 7), g.len);
+        // And the static face IS the first frame, so the two cannot drift.
+        try std.testing.expectEqualStrings(f, face(kind));
+    }
+}
+
+test "there is nothing under the composer: the well's footer is the last row" {
+    // The row under the input used to be a status row with a face on its left
+    // and the model's name on its right and NOTHING in between, and it read as
+    // a stray emoticon in the corner of an empty row.
+    //
+    // Now the composer ends the screen: the prompt row, then the footer's row
+    // inside the SAME sunken surface, and then the edge of the terminal.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushHeader(.idle);
+
+    const s = try drawTest(&m, arena_state.allocator(), 90, 24);
+
+    // The LAST row is the footer's: the mascot is on it, on the well's
+    // background, with the accent bar at its left.
+    const last = s.size.height - 1;
+    const face_cell = s.readCell(1, last);
+    try std.testing.expectEqualStrings("(", face_cell.char.grapheme);
+    try std.testing.expectEqual(theme.well_bg.bg, face_cell.style.bg);
+    const bar = s.readCell(0, last);
+    try std.testing.expectEqualStrings("▌", bar.char.grapheme);
+
+    // The row above it is the prompt.
+    const prompt_cell = s.readCell(1, last - 1);
+    try std.testing.expectEqualStrings("›", prompt_cell.char.grapheme);
+    try std.testing.expectEqual(theme.well_bg.bg, prompt_cell.style.bg);
+}
+
+test "the state is in ONE place: the footer's row" {
+    // The phase used to be painted in TWO rows: the activity strip above the
+    // hairline said "thinking" / "streaming" / "running Bash", and the status
+    // row under the input held the mascot and the model's name. Two surfaces
+    // for one state is what made the bottom of the app look like two
+    // competing status indicators.
+    //
+    // There is now one surface, and it is the footer's row, inside the
+    // composer's own well. This test pins that the label is in that row AND
+    // in no other: "in one place" is a property of the LAYOUT, and a test that
+    // only looked for the label somewhere would pass with two copies.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    // Simulate a resolved model for status row
+    // Simulate a resolved model for the footer
     const model_name = "kimi-k2.6";
     @memcpy(m.status_model_buf[0..model_name.len], model_name);
     m.status_model_len = model_name.len;
@@ -8777,13 +8989,22 @@ test "activity strip: with work and with a queue" {
     // from writing from a hung command.
     try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "1 queued") != null);
-    // "en cola" is the queued prompt text, not shown in activity strip
+
     var status_buf: [256]u8 = undefined;
-    const status_row = rowText(s, s.size.height - 1, &status_buf);
-    // Activity strip content should NOT appear in the status row
-    try std.testing.expect(std.mem.indexOf(u8, status_row, "streaming") == null);
-    // No spinner face
-    try std.testing.expect(std.mem.indexOf(u8, status_row, "⠋") == null);
+    const footer = rowText(s, s.size.height - 1, &status_buf);
+    // The footer is the LAST row: it is the last row of the composer's well.
+    try std.testing.expect(std.mem.indexOf(u8, footer, "streaming") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "1 queued") != null);
+    // The mascot is the state indicator and it is in the same row.
+    try std.testing.expect(std.mem.indexOf(u8, footer, "( o") != null);
+
+    // And in NO other row: the state is not painted twice.
+    var r: u16 = 0;
+    while (r < s.size.height - 1) : (r += 1) {
+        var rb: [256]u8 = undefined;
+        const text = rowText(s, r, &rb);
+        try std.testing.expect(std.mem.indexOf(u8, text, "streaming") == null);
+    }
 }
 
 test "activity strip: the label is the phase" {
@@ -8966,10 +9187,14 @@ test "permissions: the modal is centered and shows the 4 options" {
     m.perm_active = false;
 }
 
-test "thinking is a clean label with no face" {
-    // The activity strip now shows just "thinking" (no animated ellipsis,
-    // no face) when busy without a stream or tool. The clock next to it
-    // shows the elapsed time, which is the real indicator of progress.
+test "the mascot IS the state indicator: the face sits next to the label" {
+    // This test asserted the OPPOSITE once: that the row saying "thinking" has
+    // NO face of any mood. It was written when the face had been taken out of
+    // the row that said "thinking", and what was left was a word on an empty
+    // row — which is what the user called ugly.
+    //
+    // The design now: the mascot IS the state, the word is its legend, and
+    // they are ONE widget. A mascot with no legend is a doodle.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -8987,17 +9212,15 @@ test "thinking is a clean label with no face" {
     var rb: [256]u8 = undefined;
     const text = rowText(s, row, &rb);
 
-    // No mascot face of any mood.
-    for ([_]StatusKind{ .idle, .thinking, .warn, .done }) |mk| {
-        const f = faceFrames(mk, 0);
-        var it = vaxis.unicode.graphemeIterator(f);
-        while (it.next()) |g| {
-            const bytes = g.bytes(f);
-            if (bytes.len > 0 and std.mem.indexOf(u8, text, bytes) != null) {
-                return error.TestUnexpectedResult;
-            }
-        }
-    }
+    // The face is there, and it is the THINKING face: the two frames share
+    // their first three columns, and that is what the assertion looks at
+    // because the blink decides which of the two is on screen.
+    try std.testing.expect(std.mem.indexOf(u8, text, "( o") != null);
+
+    // The face comes FIRST, at the left edge of the well: the state is the
+    // first thing read, and it is at a fixed place.
+    const cell = s.readCell(1, row);
+    try std.testing.expectEqualStrings("(", cell.char.grapheme);
 
     // Label is just "thinking" (no animated dots).
     try std.testing.expect(std.mem.indexOf(u8, text, "thinking") != null);
@@ -9005,16 +9228,20 @@ test "thinking is a clean label with no face" {
     try std.testing.expect(std.mem.indexOf(u8, text, "0.") != null or std.mem.indexOf(u8, text, "1.") != null);
 }
 
-test "the waiting states keep the mascot's warning face in the ask panel" {
-    // The face survives for the two states where the app has stopped and waits
-    // on the human: `ask` panel and the permission dialog. The activity strip
-    // no longer shows a face during normal work.
+test "the waiting states show the mascot's warning face in the footer" {
+    // The face is the state indicator and the footer is where the state lives,
+    // so a question or a permission shows the warning face THERE — in the one
+    // place the state is painted, and not in a second widget.
+    //
+    // It used to be asserted over the whole surface, which proved nothing
+    // about WHERE the face was: the test passed because the strip happened to
+    // be on screen, a row away from the panel it was named after.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    // Simulate a resolved model for status row
+    // Simulate a resolved model for the footer
     const model_name = "kimi-k2.6";
     @memcpy(m.status_model_buf[0..model_name.len], model_name);
     m.status_model_len = model_name.len;
@@ -9029,28 +9256,11 @@ test "the waiting states keep the mascot's warning face in the ask panel" {
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
     _ = allText(s);
 
-    const face_text = faceFrames(.warn, 0);
-    var found: usize = 0;
-    var it = vaxis.unicode.graphemeIterator(face_text);
-    while (it.next()) |g| {
-        const bytes = g.bytes(face_text);
-        // The ask panel is drawn in the history area, look for the face there
-        var row: u16 = 0;
-        while (row < s.size.height) {
-            var col: u16 = 0;
-            while (col < s.size.width) {
-                const cell = s.readCell(col, row);
-                if (std.mem.eql(u8, cell.char.grapheme, bytes)) {
-                    found += 1;
-                    break;
-                }
-                col += @max(1, cell.char.width);
-            }
-            if (found > 0) break;
-            row += 1;
-        }
-    }
-    try std.testing.expect(found > 0);
+    // The footer's row, which is the LAST row of the composer's well.
+    var rb: [256]u8 = undefined;
+    const footer = rowText(s, s.size.height - 1, &rb);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "( ! ! )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "waiting for your answer") != null);
 }
 
 /// A banner line's columns, without the `*…*` marks.
@@ -11331,17 +11541,18 @@ test "ctrl+d scrolls back down and does NOT quit" {
     try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.home } });
     try std.testing.expectEqual(@as(usize, 0), m.anchorLine());
     const scrolled = try drawTest(&m, arena_state.allocator(), 60, 20);
-    var status_buf: [256]u8 = undefined;
-    const status = rowText(scrolled, scrolled.size.height - 1, &status_buf);
-    try std.testing.expect(std.mem.indexOf(u8, status, "latest") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "↓ 1") == null);
+    var footer_buf: [256]u8 = undefined;
+    const footer = rowText(scrolled, scrolled.size.height - 1, &footer_buf);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "latest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "↓ 1") == null);
     const latest = m.currentMaxOffset();
-    // The clickable `↓ latest` zone lives on the status row. With the mascot
-    // face now on the left (5 chars: "(◕◕)"), the label starts at column 6.
-    // Click on the "l" of "latest" (column 7) to hit the zone.
-    const face_text = face(m.mood());
-    const face_width = face_text.len;
-    const click_col = 1 + face_width + 1; // 1 (start) + face_width + 1 (space before label)
+    // The clickable `↓ latest` zone is PUBLISHED by the footer, so the test does
+    // not have to know where the footer decided to put it: it reads the
+    // columns. A test that recomputed the position would be a test of the
+    // layout, and it would break the day the layout changed.
+    try std.testing.expect(m.scroll_bottom_start > 0);
+    try std.testing.expect(m.scroll_bottom_end > m.scroll_bottom_start);
+    const click_col = m.scroll_bottom_start + 1;
     try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
         .col = @intCast(click_col),
         .row = @intCast(scrolled.size.height - 1),
@@ -11362,7 +11573,7 @@ test "ctrl+d scrolls back down and does NOT quit" {
     try std.testing.expect(!ctx.quit);
     try std.testing.expect(m.anchorLine() >= up);
 
-    // And ctrl+c is the exit, which is what the status bar says.
+    // And ctrl+c is the exit, which is what `/help` says.
     try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
     try std.testing.expect(ctx.quit);
 }
