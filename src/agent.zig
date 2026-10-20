@@ -713,7 +713,20 @@ fn readAgentsIn(gpa: std.mem.Allocator, dir: ?[]const u8) ?[]u8 {
 fn readAgentsAt(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ?[]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return null;
-    return std.Io.Dir.cwd().readFileAlloc(io_global, path, gpa, .limited(256 * 1024)) catch null;
+    // The limit is 1 MB, and it was 256 KB, and THAT WAS A BUG that only
+    // showed up because this repository's own `AGENTS.md` crossed the line:
+    //
+    // `readFileAlloc` with `.limited(n)` returns `error.FileTooBig` for a file
+    // over `n`, and the caller does `catch null`, and `null` means "this
+    // project has no instruction file". So a project whose `AGENTS.md` was a
+    // little too big got the BUILT-IN prompt instead of its own, with no
+    // error anywhere: the harness silently stopped reading the project's
+    // rules, and the symptom was "the model ignored my instructions".
+    //
+    // The size does not matter much: the base is trimmed to the prompt buffer
+    // (16 KB) before it is sent, so a megabyte of instructions is read, cached
+    // and cut down to what fits.
+    return std.Io.Dir.cwd().readFileAlloc(io_global, path, gpa, .limited(1024 * 1024)) catch null;
 }
 
 pub var current_effort: chat.Effort = .medium;
@@ -11083,6 +11096,43 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
             return error.RuleMissing;
         }
     }
+}
+
+test "the project's own AGENTS.md is READ, even when it is big" {
+    // The read had a 256 KB limit and `catch null`, and `null` means "this
+    // project has no instruction file". So a project whose `AGENTS.md` was a
+    // LITTLE too big got the BUILT-IN prompt instead of its own, with no
+    // error anywhere: the harness silently stopped reading the project's
+    // rules, and the symptom was "the model ignored my instructions".
+    //
+    // It was found because THIS repository's own `AGENTS.md` crossed the
+    // line, and the test below failed for a reason nobody could read: the
+    // prompt was the built-in one, so it fit, so there was nothing to
+    // truncate and nothing to announce.
+    //
+    // The file being big is not the interesting part; the interesting part is
+    // that it is READ AT ALL. The limit is 1 MB now, and the size of the
+    // file is not what decides what the model sees: the base is trimmed to
+    // the prompt buffer before it is sent.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    const saved_agents = agents_md_cache;
+    io_global = threaded.io();
+    agents_md_cache = null;
+    defer {
+        // The cache was filled with the TESTING allocator, so it is freed with
+        // it: leaving it behind is a leak the test runner would report for a
+        // file the test did not create.
+        if (agents_md_cache) |c| std.testing.allocator.free(c);
+        agents_md_cache = saved_agents;
+        io_global = saved_io;
+    }
+
+    const base = systemPromptBase(std.testing.allocator);
+    // It is this repository's own file, and it is over the old 256 KB limit.
+    try std.testing.expect(base.len > 256 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, base, "# zode") != null);
 }
 
 test "a project whose AGENTS.md does not fit still gets the ROUTING, not just its own text" {
