@@ -4746,3 +4746,120 @@ in the args" — which was one schema reorder away from printing a cell index.
 Two checks, run after all of the above: the language greps (test names and
 comments in English) come out empty, and `zig build test` is green with the new
 "the gate counts every tool that writes files, and only those" test among them.
+
+---
+
+# El fondo del input: una sola superficie (2026-10-19)
+
+El complaint fue "la parte de abajo del input es horrible", y tenía razón. Lo
+que había debajo del input era una fila con `(◕◕)` a la izquierda y el nombre
+del modelo pegado a la derecha, con **nada en medio**: en pantalla era un
+emotrón suelto en la esquina de una fila vacía. Y el estado estaba en **dos**
+sitios: la tira de actividad (arriba de la regla) decía "thinking" /
+"streaming" / "running Bash · 1.2s", y la fila de abajo tenía la cara.
+
+Tres reglas, y las tres son la misma regla:
+
+1. **Un solo indicador de estado.** La mascota (o la tira, o la fila) — no dos.
+2. **La fila que sobra se borra**, no se decora. Una fila permanente que no
+   dice nada es mueble, y el mueble se paga en cada frame y en cada lectura.
+3. **El estado se pinta donde el usuario está mirando**, que es el input.
+
+## Lo que hay ahora
+
+```
+  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   regla (hairline)
+  ▌› Ask anything… · / for commands                        input (1..8 filas)
+  ▌( o o ) ready                                  kimi-k2.6 · ctx 12%
+```
+
+El compositor es **UN objeto**: las filas del prompt y la del pie comparten la
+misma superficie hundida (`well_bg`) y la misma barra de acento (`▌`). El pie
+es la **última fila de la pantalla**: debajo del input no hay nada.
+
+El pie lleva dos grupos:
+
+- **izquierda**: la mascota + su leyenda. La cara dice el ESTADO (en el color
+  del mood) y las palabras el DETALLE ("running Bash · 1.2s"). Son un widget,
+  no dos: una mascota sin leyenda es un garabato, y una leyenda sin mascota es
+  lo que había antes.
+- **derecha**: el modelo, el `ctx %` y, sólo mientras streamea, los `tok/s`.
+
+## La mascota: rediseñada, y con un bug debajo
+
+El set anterior era `(◕◕)`, `(>_<)`, `(!_!)`, `(××)`. Dos cosas:
+
+1. **`◕` (U+25D5) y `×` (U+00D7) son East Asian *Ambiguous***: en un terminal
+   con "ambiguous = ancho" miden 2 columnas, y la fila estaba alineada a la
+   derecha → el descuadre era real en esos terminales. El set nuevo es **ASCII
+   puro**: 7 columnas en cualquier terminal que exista. Hay un test que lo
+   fija (`the mascot is seven ASCII columns in every mood`), porque es
+   exactamente el tipo de cosa que se vuelve a meter sin querer.
+2. **Silueta constante**: `(`, ojo, hueco, ojo, `)`. Los 7 caracteres y en el
+   mismo orden; sólo cambian los ojos. Es la lección del slime: a este tamaño
+   se lee la SILUETA, no la decoración, y una mascota que cambia de forma entre
+   estados parece un animal distinto cada vez.
+
+Elblink es un parpadeo (un ojo se cierra) y sólo mientras hay trabajo: una cara
+que se agita en un pie que está en pantalla todo el tiempo se lee como ruido.
+
+El color sale del THEME (`moodStyle`), no del índice ANSI de 16 colores
+(`mood.color()`): un índice en un terminal truecolor es la paleta del terminal,
+no la de la app, y la cara salía en un color que no pertenecía a nada de lo
+que tenía alrededor.
+
+## Tres cosas que se fueron y a dónde fueron
+
+| Se fue | A dónde |
+|---|---|
+| La tira de actividad (una fila arriba de la regla) | Al pie. `drawActivityStrip` no existe. |
+| La fila de status (debajo del input) | Al pie. No hay fila. |
+| El texto idle (`self.status()`) | La leyenda del pie. Sin texto: "ready". |
+| El indicador `↓ latest` | Al pie, a la derecha, en color highlight. |
+| El clic en la fila de status para "ir al final" | `scroll_bottom_row` apunta al pie. |
+
+El `↓ latest` publica sus propias columnas (`scroll_bottom_start/end`), y el
+test las **lee** en vez de recalcularlas: un test que recalcula la posición
+está probando el layout, y se rompe el día que el layout cambia.
+
+## Quién gana el espacio
+
+El **estado** gana. La cara son 7 columnas y **no se recorta nunca**: en un
+terminal estrecho lo que se va es lo de la derecha (el `↓ latest`, luego los
+`tok/s`, luego el `ctx %`, y el modelo el último), porque una cara a medias es
+un bug de dibujo y un modelo que falta tiene un comando (`/model`).
+
+El detalle ("Bash · 1.2s") se pinta **entero o nada**: un "B" recortado al
+final de la leyenda se lee como una errata.
+
+## El bug que salió por el camino
+
+`contextInfo` metía en el arena un `pct_txt` que apuntaba al **stack** del
+frame, y el pie se pinta con `putStable`, que NO copia: el renderer leía esas
+bytes después de que el frame se hubiera acabado. Solía salir bien porque el
+stack todavía las tenía, y salía basura cuando no. Es la familia `&[_]u8{c}` de
+siempre, y en una fila alineada a la derecha es justo donde se nota.
+
+Lo mismo con el `⚡ N tok/s`: el texto se copia al arena del frame antes de
+become un segmento.
+
+## Dos checks que estaban mirando lo que ya no existe
+
+- `tools/pty_smoke.py` buscaba `"esc interrupts"` en la fila de status: una
+  cadena que la app dejó de decir hace tiempo, así que el check llevaba tiempo
+  **fallando en una suite verde**. Ahora mira la cosa actual: la cara y la
+  leyenda del pie.
+- `tools/scroll_repro.py` buscaba `"######"`, el wordmark ASCII de un hero que
+  ya no se dibuja.
+
+Un check que nadie lee deja de mirar lo que miraba, y un check que falla en
+verde es peor que no tener check: parece que está vigilando.
+
+## El pie y la pty
+
+La pty es la única que dice la verdad sobre el render (vaxis repinta de forma
+**diferencial**), y el smoke tiene su propio `HOME` para no tocar la config de
+nadie. Con una `auth.json` real copiada dentro, la app en ReleaseSmall se queda
+**dead** (el bug abierto más grande del repo, documentado más arriba): los
+checks que necesitan que la app conteste fallan y hay que comparar con
+`tools/ab_probe.py` antes de leerlos como una regresión.
