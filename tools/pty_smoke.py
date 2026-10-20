@@ -177,7 +177,15 @@ def main() -> int:
     # frame is the claim and "no ╭" is the part that can regress silently.
     ok &= check("input: no box borders", "╭" not in t and "╰" not in t, t)
     ok &= check("input: the accent bar is there", "▌" in t, t)
-    ok &= check("status bar", "esc interrupts" in t, t)
+    # The composer's footer: the mascot, its legend and the model.
+    #
+    # This check used to look for "esc interrupts" in the status row — a
+    # string the app stopped saying a long time ago, so it had been failing
+    # on a green suite for nobody to notice. A check nobody reads is a check
+    # that stops watching the thing it watched, which is the reason it has to
+    # name the CURRENT design and not a remembered one.
+    ok &= check("footer: the mascot is there", "( o o )" in t, t)
+    ok &= check("footer: the legend is there", "ready" in t, t)
     ok &= check("the user prompt echoes", "hola mundo" in t, t)
     ok &= check("no panic", "panic" not in t.lower(), t)
     ok &= check("no 'Invalid free'", "invalid free" not in t.lower(), t)
