@@ -4863,3 +4863,32 @@ nadie. Con una `auth.json` real copiada dentro, la app en ReleaseSmall se queda
 **dead** (el bug abierto más grande del repo, documentado más arriba): los
 checks que necesitan que la app conteste fallan y hay que comparar con
 `tools/ab_probe.py` antes de leerlos como una regresión.
+
+## Y un bug que salió por el camino: el `AGENTS.md` grande no se leía
+
+Documentar el rediseño **empeoró** el `AGENTS.md` de este repo por encima del
+límite de lectura (256 KB), y el test de abajo se puso rojo:
+
+```
+error: 'agent.test.a project whose AGENTS.md does not fit still gets the
+ROUTING, not just its own text' failed without output
+```
+
+El motivo era invisible: `readFileAlloc(..., .limited(256 * 1024))` devuelve
+`error.FileTooBig` para un fichero más grande, el llamador hace `catch null`,
+y **`null` significa "este proyecto no tiene fichero de instrucciones"**. O
+sea: un proyecto cuyo `AGENTS.md` era un poco *demasiado grande* se quedaba
+con el prompt **incorporado** en vez del suyo, **sin ningún error**: el harness
+dejaba de leer las reglas del proyecto en silencio, y el síntoma era "el modelo
+ignora mis instrucciones".
+
+El límite ahora es 1 MB, y hay un test que fija lo único que importa: que el
+fichero **se lee**. El tamaño no decide lo que ve el modelo —la base se recorta
+al búfer del prompt (16 KB) antes de mandarse—; lo que decide es si se leyó o
+no.
+
+Un test que falla "sin output" es un test que hay que mirar dos veces: el
+`error.PromptIncomplete` de al lado **sí** imprimía el bloque que faltaba, y
+ese era el que no salía. El que fallaba era el otro: `TruncationNotAnnounced`,
+que no imprime nada porque "no hay nada que truncar" es exactamente lo que
+parece cuando el prompt entero cabe… porque no es el prompt del proyecto.
