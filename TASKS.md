@@ -427,22 +427,26 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 > Today: scroll up, select with the mouse, copy with the terminal's own machinery — three steps and a scroll position to lose.
 
-- [ ] **28.1** Walk newest-first and skip the turns that said nothing (wrong role / API error / empty text); join one turn's text blocks with `\n\n`; strip prompt-XML tags first (or a system-only block becomes a fake "code block")
-- [ ] **28.2** `/copy N` reaches back N−1 turns, `MAX_LOOKBACK = 20`; honest arithmetic on failure ("Only 3 assistant messages available to copy" — not "invalid", pluralisation included)
-- [ ] **28.3** The picker only appears when there is something to choose; first row = the whole response, focused:
+- [x] **28.1** Walk newest-first and skip the turns that said nothing (wrong role / API error / empty text); join one turn's text blocks with `\n\n`; strip prompt-XML tags first (or a system-only block becomes a fake "code block")
+- [x] **28.2** `/copy N` reaches back N−1 turns, `MAX_LOOKBACK = 20`; honest arithmetic on failure ("Only 3 assistant messages available to copy" — not "invalid", pluralisation included)
+- [x] **28.3** The picker only appears when there is something to choose; first row = the whole response, focused:
   ```
   Full response (8123 characters, 214 lines)   ← focused
   <first line of block 0>  (zig, 40 lines)
   Always copy full response
   ```
   - Labels are the code's own first line, truncated to 60 columns by **display width**; the "Always copy" row is remembered (a picker that reappears identically teaches the user it is broken); row labels are heap copies (the `askPickerChosen` rule)
-- [ ] **28.4** Clipboard = a three-rung ladder, decided BEFORE the copy runs: native (pbcopy/wl-copy) → `tmux load-buffer` → OSC 52
-  - [ ] OSC 52 first, file I/O after (upstream's expensive lesson: awaiting tmux cost 50–100 ms); in a vaxis TUI the OSC must go through the render, never outside `vx.render` — `tui.zig` already has the scar of one painted over the UI
-  - [ ] The file is written ALWAYS and the message says so with numbers (`Copied … (8123 characters, 214 lines) — also written to /tmp/…/response.md`); OSC 52 is genuinely best-effort, and a copy confirmation you cannot check is not a confirmation
-- [ ] **28.5** Fence language → file extension, sanitised (`[^a-zA-Z0-9]` stripped; empty/`plaintext` → `.txt`) — a language tag is model output, a path is a filesystem
-- [ ] **28.6** Cancelled is not an error: Esc shows `Copy cancelled` as a system line, not a failure in the history; a failed write says `Failed to write file: …` — shown, not swallowed
-- [ ] Not ported: `config.copyFullResponse` as a global setting (a session flag is enough until someone asks)
-- [ ] Tests + a `*_smoke.py` wiring check (a command can be unit-perfect and still do nothing when typed)
+  - The picker hands over the **index**, not the label: two blocks can start with the same line, and matching the label back to the entry would copy the wrong one while showing the right row
+- [x] **28.4** Clipboard = a three-rung ladder, decided BEFORE the copy runs: native (pbcopy/wl-copy) → `tmux load-buffer` → OSC 52
+  - [x] OSC 52 first, file I/O after (upstream's expensive lesson: awaiting tmux cost 50–100 ms); in a vaxis TUI the OSC must go through the render, never outside `vx.render` — `tui.zig` already has the scar of one painted over the UI
+  - [x] The file is written ALWAYS and the message says so with numbers (`Copied … (8123 characters, 214 lines) — also written to /tmp/…/response.md`); OSC 52 is genuinely best-effort, and a copy confirmation you cannot check is not a confirmation
+  - The message names the **rung** that was used, because "copied!" in the dark is a hope, not a confirmation
+- [x] **28.5** Fence language → file extension, sanitised (`[^a-zA-Z0-9]` stripped; empty/`plaintext` → `.txt`) — a language tag is model output, a path is a filesystem
+- [x] **28.6** Cancelled is not an error: Esc shows `Copy cancelled` as a system line, not a failure in the history; a failed write says `Failed to write file: …` — shown, not swallowed
+- [x] Not ported: `config.copyFullResponse` as a global setting (a session flag is enough until someone asks) — DONE as the session flag `Model.copy_always_full`
+- [x] Tests + a `*_smoke.py` wiring check (a command can be unit-perfect and still do nothing when typed) — `tools/copy_smoke.py`
+
+**Acceptance**: `zig build test` green · the smoke opens the picker, writes the file the message names, and says `Copy cancelled` on Esc.
 
 ## Phase 29 — `/resume` as a picker
 

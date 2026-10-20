@@ -39,6 +39,8 @@ pub const verify = @import("lib/verify.zig");
 pub const prompt = @import("lib/prompt.zig");
 pub const commands = @import("commands.zig");
 pub const selfupdate = @import("lib/selfupdate.zig");
+pub const clipboard = @import("clipboard.zig");
+pub const copytext = @import("lib/copytext.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

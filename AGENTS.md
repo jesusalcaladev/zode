@@ -4892,3 +4892,52 @@ Un test que falla "sin output" es un test que hay que mirar dos veces: el
 ese era el que no salía. El que fallaba era el otro: `TruncationNotAnnounced`,
 que no imprime nada porque "no hay nada que truncar" es exactamente lo que
 parece cuando el prompt entero cabe… porque no es el prompt del proyecto.
+
+---
+
+## `/copy`: llevarte la respuesta (2026-10-20)
+
+`/copy` [N] pone una respuesta en el portapapeles **y** en un fichero. N
+llega hacia atrás (1 = la última). Sin N y sin bloques de código, copia
+directo; con bloques, abre un picker: la respuesta entera, un fila por bloque
+de código (su primera línea) y la fila de «always».
+
+**La escalera se decide ANTES de copiar**, y el mensaje dice qué escalón se
+usó: `wl-copy`/`xclip`/`xsel`/`pbcopy` → `tmux load-buffer` → OSC 52. Un
+portapapeles que no se puede comprobar no es una confirmación, es una
+esperanza.
+
+Tres cosas que costaron:
+
+1. **El picker entrega el ÍNDICE, no la etiqueta** (`openPickerIdx`). Dos
+   bloques de código pueden empezar por la misma línea: con la etiqueta, el
+   segundo copiaba el código del primero mientras enseñaba la fila del
+   segundo. Una etiqueta es algo que se LEE; un índice es algo sobre lo que se
+   ACTÚA.
+2. **El OSC 52 sale por el RENDER** (`ctx.copyToClipboard` en el manejador de
+   eventos), nunca escrito a mano al tty: una secuencia escrita fuera del
+   render es una que el siguiente frame tapa, y en un terminal sin OSC 52 es
+   un muro de `^[]52;c;…` visible. El texto espera en `Model.copy_pending` y
+   lo recoge el próximo evento (un tick es un evento).
+3. **El fichero se escribe SIEMPRE**, en 0600 dentro de un 0700: contiene la
+   respuesta del modelo y `/tmp` es legible por todo el mundo. Y si la
+   escritura falla, el mensaje lo dice («the file could not be written»): lo
+   que falló se enseña, no se traga.
+
+**Un bug que salió por el camino**: `zode --resume` NO reanudaba. El flag se
+despacha antes de leer el entorno, y la línea que asignaba la respuesta del
+entorno lo **sobrescribía**: la app decía «nothing to resume; starting a new
+session», justo lo que el flag le pedía que no hiciese. Ahora el entorno sólo
+puede AÑADIR un resume, nunca quitarlo (`agent.shouldResume`).
+
+Y el fichero de texto puro (`src/lib/copytext.zig`) llegó con **cuatro
+expectativas de test equivocadas y un bug real** (el recorte de una línea
+multi-byte caminaba hacia atrás dentro del carácter y lo partía en dos). Un
+fichero WIP que nadie compiló: sus tests en rojo nunca se habían visto.
+
+El smoke es `tools/copy_smoke.py`: la app real, en una pty, con una sesión de
+fichero que tiene una respuesta dentro, y las tres cosas que importan —el
+picker se abre, el fichero escrito es el que el mensaje nombra, y Esc dice
+«Copy cancelled» y no un fallo—. Sin clave de API a propósito: la build
+ReleaseSmall se queda **dead** cuando el proveedor activo tiene una clave (el
+bug abierto más grande del repo), y `/copy` no necesita proveedor.

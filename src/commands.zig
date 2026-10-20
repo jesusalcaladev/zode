@@ -619,6 +619,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
     .{ .key = "/style", .desc = "select an output style: default|explanatory|learning (no args: report | off)" },
+    .{ .key = "/copy", .desc = "copy an answer to the clipboard: /copy (the last one) | /copy N (N answers back)", .key_hint = "N" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
 };
 

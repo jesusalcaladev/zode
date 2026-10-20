@@ -23,6 +23,7 @@ const bench_mod = @import("lib/bench.zig");
 const models_mod = @import("lib/models.zig");
 const modelcache = @import("lib/modelcache.zig");
 const zjsonl = @import("lib/zjsonl.zig");
+const copytext = @import("lib/copytext.zig");
 
 /// The kind of the status: what color the face is and what phase the app is in.
 /// Replaces `StatusKind`; lives here so `agent.zig` can reference it as
@@ -199,6 +200,22 @@ pub const PickerItem = struct {
 };
 
 pub const PickerCb = *const fn (*Model, tag: u32, label: []const u8) void;
+
+/// The callback that gets the INDEX of the chosen item instead of its label.
+///
+/// A label is a thing to READ; an index is a thing to ACT on. `/copy` needs
+/// the index: its rows are "the whole answer", then one per code block, and
+/// two blocks can start with the SAME line, so matching the label back to
+/// the entry is a guess — and a wrong guess copies the wrong block while
+/// showing the right row.
+pub const PickerCbIdx = *const fn (*Model, tag: u32, index: usize) void;
+
+/// Called when the picker is closed with ESC.
+///
+/// A cancel is NOT an error: `/copy` says "Copy cancelled" as a system line,
+/// and without this callback the command could not tell a cancel from a
+/// choice.
+pub const PickerCancelCb = *const fn (*Model, tag: u32) void;
 
 /// Immutable copy of the picker state for drawing (frame memory).
 const PickerSnapshot = struct {
@@ -1065,6 +1082,28 @@ pub const Model = struct {
     picker_active: bool = false,
     picker_tag: u32 = 0,
     picker_cb: ?PickerCb = null,
+    /// The index flavour of the callback (see `PickerCbIdx`).
+    picker_cb_idx: ?PickerCbIdx = null,
+    /// Called when the picker is closed with ESC.
+    picker_cancel_cb: ?PickerCancelCb = null,
+
+    // ── `/copy` ──────────────────────────────────────────────────────────
+    //
+    /// The text waiting to go to the clipboard as OSC 52.
+    ///
+    /// It goes through the RENDER (vaxis writes the escape sequence with the
+    /// frame), never straight to the tty: a sequence written outside the
+    /// render is a sequence the next frame paints over, and on a terminal that
+    /// does not implement OSC 52 it is a wall of visible `^[]52;c;…`.
+    copy_pending: ?[]u8 = null,
+
+    /// `/copy` remembers this for the session: "always copy the full
+    /// response". A picker that reappears identically teaches the user it is
+    /// broken.
+    copy_always_full: bool = false,
+
+    /// What the `/copy` picker needs while it is open (owned).
+    copy_ctx: ?copytext.Ctx = null,
 
     /// History paragraph that `seg_cache.items[0]` corresponds to.
     /// The cache is a WINDOW `[cache_lo, cache_lo + len)`, not a queue: that is
@@ -1420,6 +1459,10 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         // The task graph holds its own strings and its file path.
         self.tasks.deinit();
+        // `/copy`: the pending clipboard text and the picker's context are
+        // the model's memory, and nobody else frees them.
+        if (self.copy_pending) |p| self.allocator.free(p);
+        if (self.copy_ctx) |*c| c.deinit();
         // The checkpoint snapshots are memory of the model's allocator and
         // nobody else frees them: without this, every turn with tools leaves the
         // whole repo in memory until exit.
@@ -1475,6 +1518,38 @@ pub const Model = struct {
     /// Opens the picker. Takes ownership of `items` (labels/descs gpa-owned).
     /// Thread-safe: called by the /models worker.
     pub fn openPicker(self: *Model, tag: u32, title: []const u8, items: []PickerItem, cb: PickerCb) void {
+        self.openPickerInner(tag, title, items);
+        self.lock();
+        self.picker_cb = cb;
+        self.picker_cb_idx = null;
+        self.picker_cancel_cb = null;
+        self.unlock();
+    }
+
+    /// Opens the picker with a callback that gets the INDEX of the chosen
+    /// item, and one that is called when it is closed with ESC.
+    ///
+    /// The index is the ORIGINAL index (not the position in the filtered
+    /// list): the filter is a way of finding a row, not a way of renumbering
+    /// the rows.
+    pub fn openPickerIdx(
+        self: *Model,
+        tag: u32,
+        title: []const u8,
+        items: []PickerItem,
+        cb: PickerCbIdx,
+        cancel: ?PickerCancelCb,
+    ) void {
+        self.openPickerInner(tag, title, items);
+        self.lock();
+        self.picker_cb = null;
+        self.picker_cb_idx = cb;
+        self.picker_cancel_cb = cancel;
+        self.unlock();
+    }
+
+    /// The part both openers share: the items, the title and the state.
+    fn openPickerInner(self: *Model, tag: u32, title: []const u8, items: []PickerItem) void {
         self.lock();
         defer self.unlock();
         for (items) |it| {
@@ -1488,7 +1563,6 @@ pub const Model = struct {
         @memcpy(self.picker_title[0..nt], title[0..nt]);
         self.picker_title_len = nt;
         self.picker_tag = tag;
-        self.picker_cb = cb;
         self.picker_query_len = 0;
         self.picker_sel = 0;
         self.picker_scroll = 0;
@@ -1503,6 +1577,8 @@ pub const Model = struct {
         if (!self.picker_active and self.picker_items.items.len == 0) return;
         self.picker_active = false;
         self.picker_cb = null;
+        self.picker_cb_idx = null;
+        self.picker_cancel_cb = null;
         for (self.picker_items.items) |it| {
             self.allocator.free(it.label);
             if (it.desc.len > 0) self.allocator.free(it.desc);
@@ -1515,6 +1591,42 @@ pub const Model = struct {
         self.lock();
         defer self.unlock();
         return self.picker_active;
+    }
+
+    // ── `/copy` ──────────────────────────────────────────────────────────
+
+    /// Keeps what the picker needs while it is open. It takes OWNERSHIP: the
+    /// previous one is freed, so opening the picker twice does not leak the
+    /// first answer.
+    pub fn setCopyCtx(self: *Model, ctx: copytext.Ctx) void {
+        if (self.copy_ctx) |*old| old.deinit();
+        self.copy_ctx = ctx;
+    }
+
+    /// Takes the context back. The caller owns it from that moment on.
+    pub fn takeCopyCtx(self: *Model) ?copytext.Ctx {
+        const ctx = self.copy_ctx orelse return null;
+        self.copy_ctx = null;
+        return ctx;
+    }
+
+    /// The text waiting to go to the clipboard as OSC 52.
+    pub fn setCopyPending(self: *Model, text: []const u8) void {
+        if (self.copy_pending) |old| self.allocator.free(old);
+        self.copy_pending = self.allocator.dupe(u8, text) catch null;
+    }
+
+    /// Hands the pending text to vaxis, which writes it as OSC 52.
+    ///
+    /// It goes through the RENDER: vaxis writes the escape sequence with the
+    /// frame, so the next frame knows about it. Writing it straight to the
+    /// tty is what produced the `^[]52;c;…` wall of visible text on the
+    /// terminals that do not implement OSC 52 (see `copySelectedText`).
+    pub fn flushCopyPending(self: *Model, ctx: *vxfw.EventContext) void {
+        const text = self.copy_pending orelse return;
+        self.copy_pending = null;
+        defer self.allocator.free(text);
+        ctx.copyToClipboard(text) catch {};
     }
 
     fn pickerRefilter(self: *Model) void {
@@ -1552,6 +1664,7 @@ pub const Model = struct {
                 else
                     null;
                 const cb = self.picker_cb;
+                const cb_idx = self.picker_cb_idx;
                 const tag = self.picker_tag;
                 const label = if (ix) |i|
                     self.allocator.dupe(u8, self.picker_items.items[i].label) catch null
@@ -1559,15 +1672,22 @@ pub const Model = struct {
                     null;
                 self.unlock();
                 self.closePicker();
-                if (label) |l| {
+                // The INDEX flavour first: it is the one that knows WHICH row
+                // was chosen, and the label is only a thing to read.
+                if (cb_idx) |f| {
+                    if (ix) |i| f(self, tag, i);
+                } else if (label) |l| {
                     if (cb) |f| f(self, tag, l);
-                    self.allocator.free(l);
                 }
+                if (label) |l| self.allocator.free(l);
                 return true;
             },
             27 => { // esc
+                const cancel = self.picker_cancel_cb;
+                const tag = self.picker_tag;
                 self.unlock();
                 self.closePicker();
+                if (cancel) |f| f(self, tag);
                 return true;
             },
             127, 8 => { // backspace
@@ -4461,6 +4581,8 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
 
     self.ed.commit(); // saves to history and clears
     self.ac = .{};
+    // `/copy` (and any other command) may have queued a clipboard write.
+    self.flushCopyPending(ctx);
     ctx.redraw = true;
     try self.armTick(ctx);
 }
@@ -4905,6 +5027,11 @@ fn acceptAutocomplete(self: *Model) bool {
 // ── root widget handlers ─────────────────────────────────
 fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
     const self: *Model = @ptrCast(@alignCast(ud));
+    // `/copy`: a text waiting for the clipboard leaves through the RENDER.
+    // It is flushed at the TOP of every event, so it goes out with the next
+    // tick even if the user does not touch anything (a tick is an event, and
+    // it carries an EventContext).
+    self.flushCopyPending(ctx);
     switch (event) {
         .key_press => |key| {
             // Ctrl+C: first clears the input, the second press exits (so
@@ -4979,6 +5106,8 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // Modal picker active: captures ALL input.
             if (self.pickerActive()) {
                 if (self.pickerHandleKey(key)) {
+                    // The picker's callback may have queued a clipboard write.
+                    self.flushCopyPending(ctx);
                     ctx.redraw = true;
                     try self.armTick(ctx);
                     return;

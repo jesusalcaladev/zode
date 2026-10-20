@@ -667,7 +667,13 @@ fn runTui(init: std.process.Init) !u8 {
     chat.dbgInitEnv(init.environ_map);
     // Same for the model catalog, whose diagnostics also land on the terminal.
     models_mod.dbgInitEnv(init.environ_map);
-    agent.resume_on_start = std.mem.eql(u8, envGet(init.environ_map, "ZODE_RESUME") orelse "", "1");
+    // `ZODE_RESUME=1` turns the resume ON. It does NOT turn it OFF: the
+    // `--resume` FLAG has already set it by the time we get here (main
+    // dispatches it before calling `runTui`), and this line used to
+    // overwrite it with the environment's answer — so `zode --resume`
+    // silently started a NEW session and said "nothing to resume; starting a
+    // new session", which is exactly what the flag asks it not to do.
+    agent.resume_on_start = agent.shouldResume(agent.resume_on_start, init.environ_map);
     defer agent.shutdownUserConfig();
     defer agent.shutdownBuffers(); // the 1 MiB body buffer (see `bodyBuf`)
     agent.loadUserConfig();

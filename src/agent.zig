@@ -43,6 +43,8 @@ const subagent_mod = @import("lib/subagent.zig");
 const textcap = @import("lib/textcap.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
+const copytext = @import("lib/copytext.zig");
+const clipboard = @import("clipboard.zig");
 const commands_mod = @import("commands.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeats.zig");
@@ -1112,6 +1114,21 @@ fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
     pushInfoFmt(m, "output style: {s}{s}", .{trimmed, keep_note});
 }
 
+/// Should the app reopen the last session at startup?
+///
+/// The `--resume` FLAG and the `ZODE_RESUME=1` variable both turn it ON, and
+/// neither of them turns it OFF.
+///
+/// That asymmetry is the whole point: the flag is dispatched BEFORE the
+/// environment is read, so a line that ASSIGNED the environment's answer
+/// over it made `zode --resume` start a new session and answer "nothing to
+/// resume; starting a new session" — which is exactly what the flag asks it
+/// not to do. The environment can only add a resume, never remove one.
+pub fn shouldResume(flag: bool, env: ?*const std.process.Environ.Map) bool {
+    if (flag) return true;
+    return std.mem.eql(u8, envGet(env, "ZODE_RESUME") orelse "", "1");
+}
+
 /// Joins style names with ", " for an error message.
 fn styleNames(entries: []const outputstyles.Entry) []const u8 {
     // Reuse a static buffer for the list
@@ -1125,6 +1142,290 @@ fn styleNames(entries: []const outputstyles.Entry) []const u8 {
     }
     return w.buffered();
 }
+
+// ── `/copy`: taking the answer with you ───────────────────────────────────
+//
+// The upstream is `code-base/commands/copy/copy.tsx` (Claude Code's `/copy`).
+// What is ported is written next to each piece; what is not:
+//
+// - `config.copyFullResponse` as a global setting: here it is a SESSION flag
+//   (`Model.copy_always_full`), because a session flag is enough until
+//   somebody asks for more.
+// - The `w` shortcut (write to file without copying): the file is written
+//   ALWAYS, so there is nothing left for a second key to do.
+// - The analytics.
+//
+// The three things this has to get right, and why:
+//
+// 1. **The arithmetic.** `/copy N` reaches back N-1 answers. A refusal says
+//    what to do ("Only 3 assistant messages available to copy"), because a
+//    refusal the user cannot act on is a dead end.
+// 2. **The order.** Newest first, and only the turns that SAID something: a
+//    tool-only turn has no text.
+// 3. **The honesty.** The clipboard has three rungs and they are not equally
+//    reliable, so the message names the one that was used, and the file is
+//    written every time: a copy confirmation you cannot check is not a
+//    confirmation.
+
+/// The tag of the `/copy` picker.
+const copy_picker_tag: u32 = 0x0c0;
+
+/// The assistant texts of the session, newest first.
+///
+/// Only the turns that said something: a tool-only turn has no text, and an
+/// API error is a history notice, not an assistant message.
+fn collectAssistantTexts(s: *session_mod.Session, out: *[copytext.max_lookback][]const u8) usize {
+    var n: usize = 0;
+    var i = s.messages.items.len;
+    while (i > 0 and n < copytext.max_lookback) : (i -= 1) {
+        const msg = s.messages.items[i - 1];
+        if (msg.role != .assistant) continue;
+        if (msg.content.len == 0) continue;
+        out[n] = msg.content;
+        n += 1;
+    }
+    return n;
+}
+
+/// `/copy [N]`: the answer, on the clipboard and in a file.
+fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
+    const s = session orelse {
+        pushInfo(m, copytext.no_messages_msg);
+        return;
+    };
+    var texts: [copytext.max_lookback][]const u8 = undefined;
+    const n = collectAssistantTexts(s, &texts);
+    if (n == 0) {
+        pushInfo(m, copytext.no_messages_msg);
+        return;
+    }
+
+    const sel = copytext.select(texts[0..n], arg);
+    const index: usize = switch (sel) {
+        .found => |i| i,
+        .no_messages => {
+            pushInfo(m, copytext.no_messages_msg);
+            return;
+        },
+        .usage, .too_few => {
+            var buf: [256]u8 = undefined;
+            pushInfo(m, copytext.formatRefusal(&buf, sel, arg));
+            return;
+        },
+    };
+
+    var ctx = copytext.buildCtx(m.allocator, texts[index]) catch {
+        pushInfo(m, "the answer could not be prepared for copying");
+        return;
+    };
+
+    // Nothing to choose (no code blocks) or the user asked for the full
+    // response always: there is no picker to open.
+    if (ctx.blocks.len == 0 or m.copy_always_full) {
+        defer ctx.deinit();
+        performCopy(m, &ctx, 0);
+        return;
+    }
+
+    const items = buildCopyItems(m, &ctx);
+    if (items.len == 0) {
+        ctx.deinit();
+        pushInfo(m, copytext.no_messages_msg);
+        return;
+    }
+    m.setCopyCtx(ctx);
+    m.openPickerIdx(copy_picker_tag, "Copy", items, copyPickerChosen, copyPickerCancelled);
+}
+
+/// The rows of the `/copy` picker: the whole answer, one per code block, and
+/// the row that remembers the choice.
+///
+/// The labels are the code's OWN first lines (that is what the user
+/// recognises), cut to 60 columns. Two blocks that start with the same line
+/// get a counter, because a picker with two identical rows is a picker where
+/// the user cannot tell what they are about to copy.
+fn buildCopyItems(m: *tui.Model, ctx: *const copytext.Ctx) []tui.PickerItem {
+    const gpa = m.allocator;
+    var items: std.ArrayList(tui.PickerItem) = .empty;
+
+    var full_buf: [128]u8 = undefined;
+    const full_text = copytext.formatFullLabel(
+        &full_buf,
+        copytext.countChars(ctx.full),
+        copytext.countLines(ctx.full),
+    );
+    const full_label = gpa.dupe(u8, full_text) catch return items.toOwnedSlice(gpa) catch return &.{};
+    items.append(gpa, .{ .label = full_label, .desc = "" }) catch {
+        gpa.free(full_label);
+        return items.toOwnedSlice(gpa) catch return &.{};
+    };
+
+    var label_buf: [copytext.label_buf_len]u8 = undefined;
+    var base_buf: [copytext.label_buf_len]u8 = undefined;
+    var desc_buf: [96]u8 = undefined;
+    for (ctx.blocks, 0..) |b, bi| {
+        // The base label is COPIED out of the scratch buffer: the loop below
+        // uses the same buffer, and a label that changes under the comparison
+        // is a label that matches the wrong row.
+        const base = copytext.truncateToCols(b.code, copytext.label_max_cols, &label_buf);
+        @memcpy(base_buf[0..base.len], base);
+        const base_label = base_buf[0..base.len];
+        // How many EARLIER rows already say the same thing? Only the earlier
+        // ones: counting the later ones too would give three identical blocks
+        // the same "(3)" and the picker three rows that look the same.
+        var same: usize = 0;
+        for (ctx.blocks[0..bi]) |prev| {
+            if (prev.code.len == b.code.len and std.mem.eql(u8, prev.code, b.code)) continue;
+            const prev_label = copytext.truncateToCols(prev.code, copytext.label_max_cols, &label_buf);
+            if (std.mem.eql(u8, prev_label, base_label)) same += 1;
+        }
+        const label = copytext.uniqueLabel(gpa, base_label, same) catch continue;
+        const desc_text = copytext.formatBlockDesc(&desc_buf, b.lang, b.code);
+        // An EMPTY desc is a literal, not an allocation: `closePicker` only
+        // frees a desc that is not empty, so an allocated "" would leak.
+        const desc = if (desc_text.len == 0) "" else (gpa.dupe(u8, desc_text) catch "");
+        items.append(gpa, .{ .label = label, .desc = desc }) catch {
+            gpa.free(label);
+            if (desc.len > 0) gpa.free(desc);
+            continue;
+        };
+    }
+
+    const always = gpa.dupe(u8, copytext.always_label) catch return items.toOwnedSlice(gpa) catch return &.{};
+    const always_desc = gpa.dupe(u8, copytext.always_desc) catch "";
+    items.append(gpa, .{ .label = always, .desc = always_desc }) catch {
+        gpa.free(always);
+        if (always_desc.len > 0) gpa.free(always_desc);
+    };
+    return items.toOwnedSlice(gpa) catch return &.{};
+}
+
+/// The picker chose a row.
+///
+/// Index 0 is the whole answer, 1..n are the code blocks, and the row after
+/// them is "always copy the full response" (which copies the answer AND
+/// remembers not to ask again).
+fn copyPickerChosen(m: *tui.Model, tag: u32, index: usize) void {
+    _ = tag;
+    var ctx = m.takeCopyCtx() orelse return;
+    defer ctx.deinit();
+    const always = index > ctx.blocks.len;
+    if (always) {
+        m.copy_always_full = true;
+        performCopy(m, &ctx, 0);
+        return;
+    }
+    performCopy(m, &ctx, index);
+}
+
+/// The picker was closed with ESC: a cancel is not an error.
+fn copyPickerCancelled(m: *tui.Model, tag: u32) void {
+    _ = tag;
+    if (m.takeCopyCtx()) |ctx| {
+        var c = ctx;
+        c.deinit();
+    }
+    pushInfo(m, copytext.cancelled_msg);
+}
+
+/// The copy itself: the clipboard first, then the file, then the message.
+fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
+    const text = ctx.textAt(index) orelse return;
+    const chars = copytext.countChars(text);
+    const lines = copytext.countLines(text);
+
+    // The clipboard FIRST, and the file after: upstream learned that the
+    // clipboard call is the one that can be slow (waiting for tmux), and the
+    // message that says "copied" should not arrive after the file.
+    const decision = copyToClipboard(m, text);
+
+    var name_buf: [64]u8 = undefined;
+    const filename = copyFileName(index, ctx, &name_buf);
+    const path = writeCopyFile(m, text, filename);
+
+    var msg_buf: [512]u8 = undefined;
+    if (path) |p| {
+        defer m.allocator.free(p);
+        pushInfo(m, copytext.formatCopiedVia(&msg_buf, chars, lines, decision.method.phrase(), p));
+    } else {
+        // The file could not be written: said out loud, not swallowed. The
+        // clipboard half may still have worked.
+        pushInfo(m, copytext.formatCopiedNoFile(&msg_buf, chars, lines, decision.method.phrase()));
+    }
+}
+
+/// The name of the file the copy is written to.
+///
+/// The whole answer is `response.md`; a block is `copy<ext>`, with the
+/// extension taken from the fence's language. A language tag is MODEL OUTPUT
+/// and a path is a FILESYSTEM, so the tag is sanitised (`copytext`).
+fn copyFileName(index: usize, ctx: *const copytext.Ctx, buf: []u8) []const u8 {
+    if (index == 0) return copytext.full_filename;
+    const block = ctx.blocks[index - 1];
+    return copytext.filenameForBlock(block.lang, buf);
+}
+
+/// The clipboard, with the ladder.
+///
+/// The decision (which rung) is made BEFORE anything is spawned, and the
+/// message names the rung that was used. The last rung is OSC 52, which goes
+/// through the RENDER: the TUI owns the escape sequence, because a sequence
+/// written outside the render is one the next frame paints over.
+fn copyToClipboard(m: *tui.Model, text: []const u8) clipboard.Decision {
+    const env = m.environ orelse {
+        m.setCopyPending(text);
+        return .{ .method = .osc52 };
+    };
+    if (!m.io_ready) {
+        m.setCopyPending(text);
+        return .{ .method = .osc52 };
+    }
+    const plan = clipboard.planFor(m.io, env);
+    const decision = clipboard.copy(m.io, plan, text);
+    if (decision.method == .osc52) {
+        m.setCopyPending(text);
+    }
+    return decision;
+}
+
+/// The file the copy is ALSO written to.
+///
+/// It is written ALWAYS: the clipboard is best-effort by nature (a terminal
+/// that ignores OSC 52, a tool that is not there), and a file is not.
+///
+/// The file is 0600 in a 0700 directory: it holds the model's answer, and
+/// `/tmp` is world-readable.
+fn writeCopyFile(m: *tui.Model, text: []const u8, filename: []const u8) ?[]const u8 {
+    if (!m.io_ready) return null;
+    const gpa = m.allocator;
+    const tmp = clipboard.copyDir(m.environ);
+    const dir_path = std.fmt.allocPrint(gpa, "{s}/zode", .{tmp}) catch return null;
+    defer gpa.free(dir_path);
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, filename }) catch return null;
+
+    var dir = std.Io.Dir.cwd().openDir(m.io, ".", .{}) catch return null;
+    defer dir.close(m.io);
+    // The directory is 0700 and the file 0600: it holds the model's answer and
+    // `/tmp` is world-readable. The mode goes on the OPEN file, not after the
+    // write: a `create` + `chmod` leaves a window in which the file exists
+    // world-readable.
+    _ = dir.createDirPathStatus(m.io, dir_path, copy_dir_mode) catch {};
+    var file = dir.createFile(m.io, path, .{ .truncate = true }) catch {
+        gpa.free(path);
+        return null;
+    };
+    defer file.close(m.io);
+    file.setPermissions(m.io, copy_file_mode) catch {};
+    file.writeStreamingAll(m.io, text) catch {
+        gpa.free(path);
+        return null;
+    };
+    return path;
+}
+
+/// 0700 for the directory of copies, 0600 for the file itself.
+const copy_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
+const copy_file_mode: std.Io.File.Permissions = @enumFromInt(0o600);
 
 /// `/bg`: the background jobs, and the two ways to stop them.
 fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
@@ -2666,6 +2967,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdSkills(m);
     } else if (std.mem.eql(u8, cmd, "style")) {
         cmdStyle(m, arg);
+    } else if (std.mem.eql(u8, cmd, "copy")) {
+        cmdCopy(m, arg);
     } else if (std.mem.eql(u8, cmd, "reload-cmds") or std.mem.eql(u8, cmd, "reloadcmds") or std.mem.eql(u8, cmd, "reloadcmd")) {
         if (m.io_ready) {
             refreshUserCommandsForce(m.allocator, m.io, m.environ, true);
@@ -12716,6 +13019,330 @@ test "the parallel batch's tool results outlive the per-call arenas" {
         std.mem.doNotOptimizeAway(want);
     }
     try std.testing.expectEqual(@as(usize, 3), seen_fn);
+}
+
+// ── `/copy`: taking the answer with you ──────────────────────────────────
+//
+// The unit tests of `lib/copytext.zig` cover the TEXT (the arithmetic, the
+// fences, the labels). These cover the WIRING: the command, the picker, the
+// file and the clipboard. A command can be unit-perfect and still do nothing
+// when it is typed, and that is what these are for.
+
+/// A session with one assistant answer, for the `/copy` tests.
+fn copyTestSession(gpa: std.mem.Allocator, text: []const u8) !*session_mod.Session {
+    const s = try gpa.create(session_mod.Session);
+    errdefer gpa.destroy(s);
+    s.* = session_mod.Session.init(gpa);
+    try s.appendAssistant(text, null);
+    return s;
+}
+
+/// The session the `/copy` tests run against, and its teardown.
+///
+/// The session is a global (the agent owns one), so a test that puts one
+/// there has to take it away again: three leaked allocations per test is the
+/// DebugAllocator saying exactly that.
+const CopySession = struct {
+    ptr: *session_mod.Session,
+
+    fn setup(gpa: std.mem.Allocator, text: []const u8) !CopySession {
+        const sp = try copyTestSession(gpa, text);
+        session = sp;
+        return .{ .ptr = sp };
+    }
+
+    fn done(self: CopySession) void {
+        session = null;
+        self.ptr.deinit();
+        std.testing.allocator.destroy(self.ptr);
+    }
+};
+
+/// The text of the whole history, for the assertions.
+fn historyText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
+    m.drainPending();
+    var out: std.ArrayList(u8) = .empty;
+    for (m.paras.items) |p| {
+        try out.appendSlice(gpa, p.text);
+        try out.append(gpa, '\n');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "/copy with no answer says so, instead of doing nothing" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    session = null;
+
+    cmdCopy(&m, null);
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, copytext.no_messages_msg) != null);
+}
+
+test "/copy N refuses with the count it HAS, and with the plural right" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator, "the only answer");
+    defer cs.done();
+
+    cmdCopy(&m, "3");
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Only 1 assistant message available to copy") != null);
+}
+
+test "/copy with a word instead of a number says HOW to use it" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator, "the only answer");
+    defer cs.done();
+
+    cmdCopy(&m, "abc");
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Usage: /copy [N]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 (latest)") != null);
+}
+
+test "/copy opens the picker with the whole answer, the blocks and the always row" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\Here is the answer.
+        \\
+        \\```zig
+        \\const a = 1;
+        \\```
+        \\
+        \\And another one.
+        \\
+        \\```zig
+        \\const b = 2;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    // Three rows: the whole answer, the two blocks... and the "always" row.
+    try std.testing.expectEqual(@as(usize, 4), m.picker_items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[0].label, "Full response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[1].label, "const a = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[2].label, "const b = 2;") != null);
+    try std.testing.expectEqualStrings(copytext.always_label, m.picker_items.items[3].label);
+}
+
+test "/copy with no code block copies the answer straight away, with no picker" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator, "just prose, no fences");
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(!m.pickerActive());
+}
+
+test "the /copy picker copies the row that was highlighted, even with two identical first lines" {
+    // Two blocks that start with the SAME line: with a label-based callback
+    // the second one would copy the first one's code while showing the second
+    // one's row. The index callback is what makes this correct.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\```zig
+        \\const same = 1;
+        \\```
+        \\
+        \\```zig
+        \\const same = 2;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    // The rows are: the whole answer, the first block, the second block, the
+    // "always" row. Two downs land on the SECOND block.
+    _ = m.pickerHandleKey(.{ .codepoint = 57353 }); // down
+    _ = m.pickerHandleKey(.{ .codepoint = 57353 }); // down
+    _ = m.pickerHandleKey(.{ .codepoint = 13 }); // enter
+    try std.testing.expect(!m.pickerActive());
+
+    // What went to the clipboard is the SECOND block, not the first one that
+    // says the same thing.
+    try std.testing.expect(m.copy_pending != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.copy_pending.?, "const same = 2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.copy_pending.?, "const same = 1;") == null);
+}
+
+test "the /copy picker copies the file it says it copied" {
+    // The whole path: the command, the picker, the file on disk and the
+    // message that names it. A unit test of the label arithmetic would pass
+    // with none of this wired.
+    const tmp = "/tmp/opencode/zode-copy-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, tmp) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, tmp) catch {};
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.io_ready = true;
+    m.io = std.testing.io;
+
+    var map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("TMPDIR", tmp);
+    // A PATH with nothing in it: no native clipboard tool, so the last rung
+    // (OSC 52) is the one that takes it, and the text waits in the Model for
+    // the render to write it.
+    try map.put("PATH", "");
+    m.environ = &map;
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\The answer.
+        \\
+        \\```zig
+        \\const x = 1;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    // The first row is the whole answer: take it.
+    _ = m.pickerHandleKey(.{ .codepoint = 13 }); // enter
+    try std.testing.expect(!m.pickerActive());
+
+    // The file is on disk, with the answer in it.
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/zode/response.md", .{tmp});
+    defer std.testing.allocator.free(path);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "The answer.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "const x = 1;") != null);
+
+    // And the message says what happened, with the numbers and the path.
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Copied to") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "characters") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, path) != null);
+
+    // The clipboard text is waiting for the render: the last rung is OSC 52,
+    // and it goes through vaxis, not straight to the tty.
+    try std.testing.expect(m.copy_pending != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.copy_pending.?, "The answer.") != null);
+}
+
+test "ESC in the /copy picker is a cancel, not an error" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\```zig
+        \\const x = 1;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    _ = m.pickerHandleKey(.{ .codepoint = 27 }); // esc
+    try std.testing.expect(!m.pickerActive());
+
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, copytext.cancelled_msg) != null);
+    // And it is NOT an error line: a cancel is not a failure.
+    for (m.paras.items) |p| {
+        try std.testing.expect(p.kind != .error_msg);
+    }
+}
+
+test "two blocks with the same first line get DIFFERENT labels" {
+    // Three blocks that start with the same line: the picker has to be able
+    // to tell them apart, and counting the LATER ones too would give all
+    // three the same "(3)".
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\```zig
+        \\const same = 1;
+        \\const body_a = 1;
+        \\```
+        \\
+        \\```zig
+        \\const same = 1;
+        \\const body_b = 2;
+        \\```
+        \\
+        \\```zig
+        \\const same = 1;
+        \\const body_c = 3;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    try std.testing.expectEqual(@as(usize, 5), m.picker_items.items.len);
+    try std.testing.expectEqualStrings("const same = 1;", m.picker_items.items[1].label);
+    try std.testing.expectEqualStrings("const same = 1; (2)", m.picker_items.items[2].label);
+    try std.testing.expectEqualStrings("const same = 1; (3)", m.picker_items.items[3].label);
+}
+
+test "/copy shows up in /help" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    commands_mod.cmdHelp(&m);
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/copy") != null);
+}
+
+test "the --resume flag is not overwritten by the environment" {
+    // The flag is dispatched BEFORE the environment is read, and the line that
+    // assigned the environment's answer over it made `zode --resume` start a
+    // NEW session: the app said "nothing to resume; starting a new session",
+    // which is exactly what the flag asks it not to do.
+    var map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer map.deinit();
+
+    try std.testing.expect(shouldResume(true, &map));
+    try std.testing.expect(!shouldResume(false, &map));
+
+    try map.put("ZODE_RESUME", "1");
+    try std.testing.expect(shouldResume(false, &map));
+    // And the flag still wins when both are there.
+    try std.testing.expect(shouldResume(true, &map));
+
+    // No environment at all is not a crash and not a resume.
+    try std.testing.expect(!shouldResume(false, null));
 }
 
 test "E2E: a real turn against a real provider completes and answers" {

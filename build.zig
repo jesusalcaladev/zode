@@ -295,4 +295,12 @@ pub fn build(b: *std.Build) void {
     run_scroll.has_side_effects = true;
     pty_check.dependOn(&run_smoke.step);
     pty_check.dependOn(&run_scroll.step);
+    // `/copy`: the command, the picker and the file, in a real pty, with a
+    // session that has an answer in it. It sets NO api key on purpose: the
+    // ReleaseSmall build stops answering keys when the active provider has
+    // one (the open bug in AGENTS.md), and `/copy` needs no provider.
+    const run_copy = b.addSystemCommand(&.{ "python3", "tools/copy_smoke.py" });
+    run_copy.setName("copy_smoke");
+    run_copy.has_side_effects = true;
+    pty_check.dependOn(&run_copy.step);
 }
