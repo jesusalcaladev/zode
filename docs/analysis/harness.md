@@ -4,11 +4,16 @@ A verified gap analysis of the **machinery** — the parts of a harness that are
 the model: permissions, hooks, background tasks, context/compaction, memory,
 subagents/teams, skills, tool results, cost, sandbox.
 
-Upstream is the vendored copy of Claude Code's source in `code-base/` (TypeScript).
+Upstream is the **reference implementation** (Claude Code, written in TypeScript).
 Ours is `src/` (Zig 0.16, no C deps).
 
-Every claim below is cited with `path:line`. A mechanism described in one paragraph
-of upstream prose is not treated as a mechanism until its implementation was read.
+Every claim below was read in the reference implementation's own code before it
+was written down here: a mechanism described in one paragraph of upstream prose
+is not treated as a mechanism until its implementation was read. The
+source-level citations that used to accompany each claim have been **removed on
+purpose** — this repository must not point into a tree it does not ship — so each
+mechanism is instead described in prose, with the names of the pieces and the
+order of the checks, in enough detail to implement it from this document alone.
 
 ---
 
@@ -55,57 +60,55 @@ parallel-safety table are all derived (`src/tools/registry.zig:453` `needsPermis
 ### 2.1 Permissions
 
 **Upstream.** The rule model is a *language*, not a list. A rule is
-`ToolName(content)` — `code-base/utils/permissions/permissionRuleParser.ts:93`
-`permissionRuleValueFromString` splits on the first unescaped `(` (`:158`
-`findFirstUnescapedChar`) and unescapes `\(`, `\)`, `\\` (`:74`
-`unescapeRuleContent`). Legacy tool names are aliased so a renamed tool does not
-orphan its rules (`permissionRuleParser.ts:21` `LEGACY_TOOL_NAME_ALIASES`).
+`ToolName(content)`: the parser (`permissionRuleValueFromString`) splits on the
+first **unescaped** `(` — the helper that finds it (`findFirstUnescapedChar`)
+skips escaped parens — and the content is then unescaped (`unescapeRuleContent`
+handles `\(`, `\)`, `\\`). Legacy tool names are aliased so a renamed tool does not
+orphan its rules (`LEGACY_TOOL_NAME_ALIASES`).
 
 Behaviours are `allow | deny | ask`
-(`code-base/utils/permissions/PermissionRule.ts:25` `permissionBehaviorSchema`).
+(`permissionBehaviorSchema`).
 Rules are loaded **per source** — `userSettings`, `projectSettings`,
 `localSettings`, `flagSettings`, `policySettings`
-(`code-base/utils/settings/constants.ts:7` `SETTING_SOURCES`), and each source keeps
+(`SETTING_SOURCES`, an ordered list of setting sources), and each source keeps
 its own allow/deny/ask triple
-(`code-base/utils/permissions/permissionsLoader.ts:91` `settingsJsonToRules`,
-`:140` `getPermissionRulesForSource`). A managed policy can lock the whole thing
-down (`permissionsLoader.ts:31` `shouldAllowManagedPermissionRulesOnly`).
+(`settingsJsonToRules` turns a settings JSON blob into rules;
+`getPermissionRulesForSource` picks one source's). A managed policy can lock the
+whole thing down (`shouldAllowManagedPermissionRulesOnly`).
 
 The evaluation order is the substance of the feature
-(`code-base/utils/permissions/permissions.ts:1158` `hasPermissionsToUseToolInner`):
+(`hasPermissionsToUseToolInner`), and it is **ordered, not a priority score**:
 
-- **1a** whole-tool deny rule (`:1171`)
-- **1b** whole-tool ask rule (`:1184`) — *except* when bash is sandboxed and
-  auto-allow is on (`:1189-1194`)
-- **1c** the tool's own `checkPermissions` (`:1216`, `Tool.ts:500`)
-- **1d** the tool denied (`:1226`)
-- **1e** `requiresUserInteraction()` survives bypass mode (`:1231`, `Tool.ts:435`)
-- **1f** a content-specific *ask* rule beats `bypassPermissions` (`:1244`)
+- **1a** whole-tool deny rule
+- **1b** whole-tool ask rule — *except* when bash is sandboxed and
+  auto-allow is on (`canSandboxAutoAllow` is the carve-out)
+- **1c** the tool's own `checkPermissions`
+- **1d** the tool denied
+- **1e** `requiresUserInteraction()` survives bypass mode
+- **1f** a content-specific *ask* rule beats `bypassPermissions`
 - **1g** safety checks (`.git/`, `.claude/`, `.vscode/`, shell configs) are
-  bypass-immune (`:1255`, `code-base/utils/permissions/filesystem.ts:620`
-  `checkPathSafetyForAutoEdit`)
+  bypass-immune (`checkPathSafetyForAutoEdit`)
 
-A separate `checkRuleBasedPermissions` (`permissions.ts:1071`) is the subset that
+A separate `checkRuleBasedPermissions` is the subset that
 survives bypass mode, so a hook's "allow" cannot override a `deny`
-(`code-base/services/tools/toolHooks.ts:373` `ruleCheck`).
+(the tool-hook layer's `ruleCheck`).
 
 Shell rules have three shapes — exact, legacy prefix (`npm:*`), and wildcard with
-`\*`/`\\` escapes (`code-base/utils/permissions/shellRuleMatching.ts:159`
-`parsePermissionRule`, `:90` `matchWildcardPattern`). The wildcard matcher is
+`\*`/`\\` escapes (`parsePermissionRule` classifies the shape,
+`matchWildcardPattern` does the matching). The wildcard matcher is
 carefully specified: a trailing ` *` with exactly one unescaped star matches both
-`git add` and bare `git` (`shellRuleMatching.ts:142-145`).
+`git add` and bare `git`.
 
 Deny rules are *enforced against the model's own tool list*: a denied tool is
 removed from the schema, not merely blocked at call time
-(`code-base/tools.ts:262` `filterToolsByDenyRules`).
+(`filterToolsByDenyRules`).
 
-There is also a **shadowed-rule detector** (`code-base/utils/permissions/shadowedRuleDetection.ts:14`
-`ShadowType`) that tells the user their `allow` rule can never fire because a
-`deny` shadows it, and a **dangerous-rule stripper**
-(`code-base/utils/permissions/dangerousPatterns.ts:44` `DANGEROUS_BASH_PATTERNS` —
+There is also a **shadowed-rule detector** (`ShadowType`, an enum of the ways a
+rule can be shadowed) that tells the user their `allow` rule can never fire
+because a `deny` shadows it, and a **dangerous-rule stripper**
+(`DANGEROUS_BASH_PATTERNS` —
 `python`, `node`, `bash`, `curl`, …) used when entering auto mode
-(`code-base/utils/permissions/permissionSetup.ts:510`
-`stripDangerousPermissionsForAutoMode`).
+(`stripDangerousPermissionsForAutoMode`).
 
 **Ours.** A permission decision is `read_only` on a registry row
 (`src/tools/registry.zig:453` `needsPermission` = `!read_only`) plus a flat
@@ -118,7 +121,8 @@ a refusal to accept a chained remainder
 allowlist is per-session and persisted; the "always allow" key for `bash` saves
 the *command*, not the tool (`src/agent.zig:1883` `allowAlwaysFor`), which is the
 right instinct and matches upstream's prefix-suggestion idea
-(`code-base/utils/permissions/shellRuleMatching.ts:211` `suggestionForPrefix`).
+(`suggestionForPrefix`, which proposes the rule to add for a command that was
+just refused).
 
 **Delta.**
 
@@ -133,9 +137,11 @@ right instinct and matches upstream's prefix-suggestion idea
    cannot tighten what a user globally allowed.
 4. **No path-scoped rules at all.** Upstream validates the *path* of a read/edit
    against the working directory and against deny rules
-   (`code-base/utils/permissions/pathValidation.ts:141` `isPathAllowed`), and
+   (`isPathAllowed`, in this order: resolve the path → apply the deny rules →
+   check the internal editable paths → **safety check** → working-directory
+   check → sandbox allowlist → allow rule), and
    blocks `.git/`, `.claude/`, `.vscode/`, `.idea/` and the user's shell configs
-   (`code-base/utils/permissions/filesystem.ts:74` `DANGEROUS_DIRECTORIES`).
+   (`DANGEROUS_DIRECTORIES`).
    Ours has **no path validation on `write`/`edit`/`rename`**: `src/tools/write.zig:61`
    writes whatever path it is given relative to the cwd, and `src/tools/write.zig:46`
    does the same for the multi-file form. A model that writes `.git/config` gets
@@ -151,7 +157,8 @@ dangerous-rule stripping and shadow detection.
 **Risk.** Medium. A rule language is a *security surface*, not a feature: `deny`
 rules and path rules make the harness safer, but a parser that mis-reads
 `Bash(rm *)` as `Bash(rm)` is a hole. The upstream parser is 198 lines and its
-escape rules are subtle (`permissionRuleParser.ts:55-79`).
+escape rules are subtle (the escape/unescape pair is ~25 lines and the *order*
+of operations is the whole thing — see §5.8).
 
 **TASKS phase.** Phase 6 (`TASKS.md:140`) covers "rule model with sources and
 precedence" and "once-off suggestions" and "bash read-only classification table"
@@ -162,8 +169,8 @@ protection, or the stripper/shadow-detector.
 
 ### 2.2 Hooks
 
-**Upstream.** 27 event names (`code-base/entrypoints/sdk/coreTypes.ts:25-53`
-`HOOK_EVENTS`), covering the tool lifecycle (`PreToolUse`, `PostToolUse`,
+**Upstream.** 27 event names (`HOOK_EVENTS`),
+covering the tool lifecycle (`PreToolUse`, `PostToolUse`,
 `PostToolUseFailure`), the turn lifecycle (`UserPromptSubmit`, `Stop`,
 `StopFailure`, `SessionStart`, `SessionEnd`), the compaction lifecycle
 (`PreCompact`, `PostCompact`), the permission lifecycle (`PermissionRequest`,
@@ -174,32 +181,31 @@ environment (`CwdChanged`, `FileChanged`, `ConfigChange`, `WorktreeCreate`,
 
 Four hook *types*: `command` (shell), `prompt` (an LLM evaluates a prompt),
 `agent` (an LLM runs a full query), `http` (POST JSON to a URL)
-(`code-base/schemas/hooks.ts:32` `BashCommandHookSchema`, `:67` `PromptHookSchema`,
-`:97` `HttpHookSchema`).
+(`BashCommandHookSchema`, `PromptHookSchema`,
+`HttpHookSchema`).
 
 The payload is a fixed JSON document on stdin
-(`code-base/utils/hooks.ts:301` `createBaseHookInput`: `session_id`,
-`transcript_path`, `cwd`, `permission_mode`, `agent_id`, `agent_type`).
-The `if` field uses **permission-rule syntax** to filter which calls fire
-(`code-base/schemas/hooks.ts:19-27` `IfConditionSchema`, filtered at
-`code-base/utils/hooks.ts:1819-1821`), so `if: "Bash(git *)"` reuses the rule
+(`createBaseHookInput`: `session_id`,
+`transcript_path`, `cwd`, `permission_mode`, `agent_id`, `agent_type`). The `if` field uses **permission-rule syntax** to filter which calls fire
+(`IfConditionSchema`, evaluated when the hook is
+registered), so `if: "Bash(git *)"` reuses the rule
 language.
 
 The output contract is richer than "exit code":
-`code-base/types/hooks.ts:70-165` defines per-event `hookSpecificOutput`, including
+a per-event `hookSpecificOutput` schema (~95 lines) defines, among others,
 `permissionDecision` (`allow|deny|ask`), `updatedInput` (a hook can *rewrite the
 tool's arguments*), `additionalContext` (text injected into the model's context),
 `updatedMCPToolOutput`, `watchPaths`, and a `decision: approve|block` + `reason`.
-Exit code **2** is the blocking signal (`code-base/utils/hooks.ts:2648`,
-`:3334` `blocked = result.status === 2 || jsonBlocked`); any other non-zero is a
+Exit code **2** is the blocking signal (the hook runner computes
+`blocked = result.status === 2 || jsonBlocked`, in the two places where a hook's
+verdict is turned into a decision); any other non-zero is a
 non-critical error shown to the user only.
 
 A hook's *allow* does not bypass a `deny` rule
-(`code-base/services/tools/toolHooks.ts:373-405`), and a hook's *deny* is absolute
-(`toolHooks.ts:408`).
+(the tool-hook layer states it in one branch, and the
+permission layer in another), and a hook's *deny* is absolute.
 
 `PermissionRequest` is the headless path: a headless agent has no dialog, so
-`code-base/utils/permissions/permissions.ts:400`
 `runPermissionRequestHooksForHeadlessAgent` lets a hook decide, and only
 auto-denies if no hook answered.
 
@@ -222,10 +228,10 @@ context).
 **Risk.** Medium-high, and it is a *security* risk, not a complexity one: a hook
 runs an arbitrary command with the user's privileges. Upstream's mitigations are
 worth copying verbatim — workspace-trust gating for every hook type
-(`code-base/utils/hooks.ts:286` `shouldSkipHookDueToTrust`), an SSRF guard for
-HTTP hooks (`code-base/utils/hooks/ssrfGuard.ts`), a URL allowlist for HTTP hooks
-(`code-base/utils/hooks/execHttpHook.ts:49` `getHttpHookPolicy`), and a
-10-minute execution timeout (`code-base/utils/hooks.ts:166`).
+(`shouldSkipHookDueToTrust`), an SSRF guard for
+HTTP hooks (a dedicated SSRF-guard module), a URL allowlist for HTTP hooks
+(`getHttpHookPolicy`), and a
+10-minute execution timeout (a single constant on the hook runner).
 
 **TASKS phase.** Phase 5 (`TASKS.md:126`) covers exactly four events
 (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`), a `.zode/hooks.json`
@@ -239,32 +245,31 @@ types. **Phase 5 is a reasonable v1; the gap is the output contract.**
 ### 2.3 Background tasks
 
 **Upstream.** A background task is a first-class object with a **typed** lifecycle:
-`code-base/Task.ts:6` `TaskType` (`local_bash | local_agent | remote_agent |
-in_process_teammate | local_workflow | monitor_mcp | dream`), `Task.ts:15`
-`TaskStatus` (`pending|running|completed|failed|killed`), `Task.ts:27`
-`isTerminalTaskStatus`. The state carries an output file path and a read offset
-(`Task.ts:45-57` `TaskStateBase`: `outputFile`, `outputOffset`, `notified`).
+`TaskType` (`local_bash | local_agent | remote_agent |
+in_process_teammate | local_workflow | monitor_mcp | dream`), `TaskStatus`
+(`pending|running|completed|failed|killed`), and `isTerminalTaskStatus` as the
+single predicate for "this task is over". The state carries an output file path
+and a read offset (`TaskStateBase`: `outputFile`, `outputOffset`, `notified`).
 
 Output goes to a **file** per task
-(`code-base/utils/task/diskOutput.ts:72` `getTaskOutputPath`, opened with
-`O_NOFOLLOW` at `diskOutput.ts:21` so a symlink in the tasks directory cannot
-redirect the write). The `TaskOutput` tool is explicitly **deprecated** in favour
-of "Read the task's output file path"
-(`code-base/tools/TaskOutputTool/TaskOutputTool.tsx:173`).
+(`getTaskOutputPath`; the file is opened with
+`O_NOFOLLOW` so a symlink in the tasks directory cannot
+redirect the write). The tool that reads a task's output directly is explicitly
+**deprecated** in favour of "Read the task's output file path".
 
 The key mechanism we do not have: **the model is told when a task finishes.** A
 completion enqueues a `<task-notification>` message
-(`code-base/tasks/LocalShellTask/LocalShellTask.tsx:160-171`), with a
+(enqueued by the local shell task itself), with a
 `notified` flag on the task state so the notification fires exactly once
-(`LocalShellTask.tsx:110-119`) and a `TaskStop` does not double-notify. The
+(set inside an atomic state update) and a `TaskStop` does not double-notify. The
 notification carries the task id, the tool-use id, the **output file path**, the
 status and a one-line summary. The model is told to *read the file*, not to
 poll. Background commands that finish are also collapsed into a single summary
-message (`code-base/utils/collapseBackgroundBashNotifications.ts:71`).
+message (a dedicated collapsing helper).
 
 Upstream also blocks a foreground `sleep` in the Bash tool with a message
 telling the model to use `run_in_background`
-(`code-base/tools/BashTool/BashTool.tsx:524-536` `validateInput`).
+(the Bash tool's `validateInput`).
 
 **Ours.** `src/bgproc.zig:156` `slots` — a fixed array of 8 `Job`s
 (`src/bgproc.zig:35` `max_jobs = 8`), each with its own mutex and buffer, one
@@ -302,7 +307,7 @@ session-scoped directory); S for the `notified` flag.
 **Risk.** Medium. Injecting a message into a running turn is a re-entrancy
 problem: the turn may be mid-flight, may be in a permission dialog, or may be
 about to end. Upstream solves it with a notification *queue*
-(`code-base/utils/messageQueueManager.ts:142` `enqueuePendingNotification`) and
+(`enqueuePendingNotification`) and
 delivers it between turns.
 
 **TASKS phase.** Phase 10 (`TASKS.md:183`) covers the registry unification, the
@@ -314,41 +319,39 @@ file output, incremental polling and the notification. **Well covered.**
 
 **Upstream.** Three mechanisms, not one.
 
-1. **Microcompaction** (`code-base/services/compact/microCompact.ts:253`
-   `microcompactMessages`) clears the *content* of old tool results while keeping
+1. **Microcompaction** (`microcompactMessages`)
+   clears the *content* of old tool results while keeping
    the tool_use blocks, for a fixed set of tools
-   (`microCompact.ts:41` `COMPACTABLE_TOOLS`: read, shell, grep, glob, web_search,
+   (`COMPACTABLE_TOOLS`: read, shell, grep, glob, web_search,
    web_fetch, edit, write). It has a **time-based trigger**
-   (`microCompact.ts:422` `evaluateTimeBasedTrigger`,
-   `code-base/services/compact/timeBasedMCConfig.ts:30`): when more than 60 minutes
+   (`evaluateTimeBasedTrigger`, configured by a small
+   time-based config module): when more than 60 minutes
    have passed since the last assistant message the server-side prompt cache has
    expired anyway, so clearing old tool results *before* the request shrinks what
    gets rewritten for free. There is also a cache-editing variant
-   (`microCompact.ts:305` `cachedMicrocompactPath`) that uses Anthropic's
+   (`cachedMicrocompactPath`) that uses Anthropic's
    `cache_edits` API to delete tool results **without invalidating the cached
    prefix** — that is a provider feature, not a portable mechanism.
 
-2. **Auto-compaction** (`code-base/services/compact/autoCompact.ts:241`
-   `autoCompactIfNeeded`) summarizes the conversation when the token count crosses
-   `context_window - 13_000` (`autoCompact.ts:62` `AUTOCOMPACT_BUFFER_TOKENS`),
-   with warning/error thresholds 20 000 below that (`autoCompact.ts:63-64`) and a
+2. **Auto-compaction** (`autoCompactIfNeeded`)
+   summarizes the conversation when the token count crosses
+   `context_window - 13_000` (`AUTOCOMPACT_BUFFER_TOKENS`),
+   with warning/error thresholds 20 000 below that and a
    **circuit breaker**: after 3 consecutive failures it stops trying
-   (`autoCompact.ts:70` `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES`, with the comment
+   (`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES`, with the comment
    "1,279 sessions had 50+ consecutive failures … wasting ~250K API calls/day").
 
 3. **Boundary + preservation.** Compaction leaves a boundary marker and only the
-   messages after it are sent (`code-base/utils/messages.ts:4643`
-   `getMessagesAfterCompactBoundary`). The boundary carries relink metadata so
+   messages after it are sent (`getMessagesAfterCompactBoundary`). The boundary carries relink metadata so
    the preserved segment stays connected in the transcript
-   (`code-base/services/compact/compact.ts:349`
-   `annotateBoundaryWithPreservedSegment`). After compaction, the **files that were
+   (`annotateBoundaryWithPreservedSegment`). After compaction, the **files that were
    read** and the **skills that were invoked** are re-attached
-   (`compact.ts:1415` `createPostCompactFileAttachments`, 5 files / 50 000 token
-   budget; `compact.ts:1494` `createSkillAttachmentIfNeeded`, 5 000 per skill /
+   (`createPostCompactFileAttachments`, 5 files / 50 000 token
+   budget; `createSkillAttachmentIfNeeded`, 5 000 per skill /
    25 000 total).
 
 Grouping is by API round, not by human turn
-(`code-base/services/compact/grouping.ts:22` `groupMessagesByApiRound`), so a
+(`groupMessagesByApiRound`), so a
 single-turn agentic session can still be compacted reactively.
 
 **Ours.** `src/compaction.zig:201` `elideTier` replaces old tool results (>256 B,
@@ -368,7 +371,7 @@ messages and replaces the middle with one user note
 
 1. **No boundary.** Ours rewrites the message list in place; there is no marker
    and no "only send what is after the last boundary". A resume therefore
-   re-sends the whole summarized history. Upstream's `getMessagesAfterCompactBoundary`
+   re-sends the whole summarized history. Upstream's boundary marker
    is the mechanism that makes a resumed session cheap.
 2. **No preservation of read files / invoked skills across a compaction.** Ours
    summarizes them away; upstream re-attaches them (bounded).
@@ -403,38 +406,37 @@ files, and the circuit breaker. **Essentially fully covered.** Phase 3
 
 **Upstream.** A *directory* of markdown files, not a list.
 
-- `code-base/memdir/memdir.ts:34` `ENTRYPOINT_NAME = "MEMORY.md"` is an **index**
+- `ENTRYPOINT_NAME = "MEMORY.md"` is an **index**
   in the memory directory, capped at 200 lines and 25 000 bytes, with a truncation
   warning that names which cap fired
-  (`memdir.ts:57` `truncateEntrypointContent`). The detail lives in topic files.
+  (`truncateEntrypointContent`). The detail lives in topic files.
 - The memory directory is guaranteed to exist so the model never has to `mkdir`
-  (`memdir.ts:130` `ensureMemoryDirExists`, with the guidance string at `:116`:
+  (`ensureMemoryDirExists`, with the guidance string
   "This directory already exists — write to it directly with the Write tool").
-- Memories have a **type** (`code-base/memdir/memoryTypes.ts:14` `MEMORY_TYPES`:
+- Memories have a **type** (`MEMORY_TYPES`:
   `user | feedback | project | reference`), and each type has its own scope
   (`private` or `team`) and its own `when_to_save` / `how_to_use` guidance
-  (`memoryTypes.ts:37` `TYPES_SECTION_COMBINED`).
+  (`TYPES_SECTION_COMBINED`).
 - Extraction is **automatic and at the end of the turn**: a forked agent reads the
   transcript and writes memories
-  (`code-base/services/extractMemories/extractMemories.ts:1-10`, run at the end
-  of the turn from `code-base/query/stopHooks.ts:149`
+  (a dedicated extraction module, run at the end
+  of the turn from the stop-hook layer's
   `executeExtractMemories`).
-- Recall is **selective**: `code-base/memdir/findRelevantMemories.ts:39`
-  `findRelevantMemories` scans the headers and asks a *cheap model* to pick up to
+- Recall is **selective**: `findRelevantMemories`
+  scans the headers and asks a *cheap model* to pick up to
   5 relevant files, excluding `MEMORY.md` itself and excluding files already
-  surfaced in a previous turn (`findRelevantMemories.ts:46`, `:35` on
-  `alreadySurfaced`).
-- Memories carry a **staleness note**: `code-base/memdir/memoryAge.ts:15`
-  `memoryAge` renders "47 days ago" instead of a raw timestamp, because "models
-  are poor at date arithmetic", and `memoryAge.ts:33` `memoryFreshnessText` adds
+  surfaced in a previous turn (an `alreadySurfaced` set).
+- Memories carry a **staleness note**: `memoryAge`
+  renders "47 days ago" instead of a raw timestamp, because "models
+  are poor at date arithmetic", and `memoryFreshnessText` adds
   "Memories are point-in-time observations, not live state — claims about code
   behavior or file:line citations may be outdated".
-- There is a **consolidation** job (`code-base/services/autoDream/autoDream.ts:1-11`:
+- There is a **consolidation** job (a dream/consolidation module:
   time gate + session count + a lock) and a **session memory** that is a running
   markdown summary of the current conversation
-  (`code-base/services/SessionMemory/sessionMemory.ts:1-5`).
+  (a dedicated session-memory module).
 - Team memories have their own path tree and a secret scanner
-  (`code-base/memdir/teamMemPaths.ts`, `code-base/services/teamMemorySync/secretScanner.ts`).
+  (a team-memory path module and a dedicated secret scanner).
 
 **Ours.** **Nothing.** There is no memory directory, no index, no extraction, no
 recall. What we have is the project's own `AGENTS.md` read once at startup
@@ -471,37 +473,34 @@ cheap-model recall step, the staleness notes, or the consolidation job.
 
 **Upstream.**
 
-- **Subagents** are the `Agent` tool (`code-base/tools/AgentTool/AgentTool.tsx`).
-  They can run in the background (`AgentTool.tsx:87` `run_in_background`) and the
-  model is told it will be notified (`code-base/tools/AgentTool/prompt.ts:263`).
-  They can be **isolated** in a worktree or a remote environment
-  (`AgentTool.tsx:99` `isolation`), they can be **resumed**
-  (`code-base/tools/AgentTool/resumeAgent.ts`) and **forked**
-  (`code-base/tools/AgentTool/forkSubagent.ts`, which shares the parent's prompt
+- **Subagents** are the `Agent` tool.
+  They can run in the background (`run_in_background`) and the
+  model is told it will be notified (the Agent tool's own prompt says so). They can be **isolated** in a worktree or a remote environment
+  (`isolation`), they can be **resumed**
+  (a dedicated resume helper) and **forked**
+  (a dedicated fork helper, which shares the parent's prompt
   cache). The tool set is filtered by role
-  (`code-base/tools/AgentTool/agentToolUtils.ts:70` `filterToolsForAgent`:
+  (`filterToolsForAgent`, driven by three lists:
   `ALL_AGENT_DISALLOWED_TOOLS`, `ASYNC_AGENT_ALLOWED_TOOLS`,
   `CUSTOM_AGENT_DISALLOWED_TOOLS`).
-- **Definitions on disk**: `code-base/tools/AgentTool/loadAgentsDir.ts:73`
-  `AgentJsonSchema` — `description`, `tools`, `disallowedTools`, `prompt`, `model`,
+- **Definitions on disk**: an agent JSON schema — `description`, `tools`, `disallowedTools`, `prompt`, `model`,
   `effort`, `permissionMode`, `mcpServers`, `hooks`, `maxTurns`, `skills`,
   `initialPrompt`, `memory` (scope), `background`, `isolation`.
-- **Built-in roles**: `code-base/tools/AgentTool/builtInAgents.ts:22`
-  `getBuiltInAgents` — general-purpose, statusline-setup, Explore, Plan,
+- **Built-in roles**: `getBuiltInAgents` — general-purpose, statusline-setup, Explore, Plan,
   claude-code-guide, Verification.
-- **Teams**: `code-base/tools/TeamCreateTool/prompt.ts:24` — "Teams have a 1:1
+- **Teams**: the team-creation tool's prompt says "Teams have a 1:1
   correspondence with task lists". A team is a config file
   (`~/.claude/teams/{name}/config.json`) plus a task-list directory. Teammates are
-  spawned as in-process tasks (`code-base/tasks/InProcessTeammateTask/`), claim
+  spawned as in-process tasks, claim
   work from the shared task list, and go idle between turns. Messages are a tool
-  (`code-base/tools/SendMessageTool/SendMessageTool.tsx`), not prose: "Plain
+  (a dedicated send-message tool), not prose: "Plain
   assistant text is NOT visible to another agent — a message is a tool call, that
-  is the only channel" (`TeamCreateTool/prompt.ts:381` in the board's terms).
+  is the only channel" (in the board's terms).
 - The task store is **file-per-task with locking**, and claiming is atomic:
-  `code-base/utils/tasks.ts:541` `claimTask` takes an exclusive lock on the task
+  `claimTask` takes an exclusive lock on the task
   file, re-reads, checks `owner`/`completed`/`blockedBy`, and writes — returning a
   reason (`already_claimed`, `already_resolved`, `blocked`) instead of throwing.
-  Task ids come from a high-water-mark file (`utils/tasks.ts:110-130`).
+  Task ids come from a high-water-mark file (a small id allocator).
 
 **Ours.**
 
@@ -545,7 +544,7 @@ idle/wake lifecycle).
 surface: two agents waiting on each other). Low for definitions on disk, but the
 safety floor has to be enforced: upstream's rule is that a custom agent cannot
 *escalate* — `filterToolsForAgent` removes the disallowed tools
-(`agentToolUtils.ts:94-99`).
+(the escalation list is applied after the allowed list).
 
 **TASKS phase.** Phase 9 (`TASKS.md:172`) = agent definitions on disk;
 Phase 20 (`TASKS.md:373`) = team mode; Phase 26 (`TASKS.md:450`) = built-in
@@ -556,23 +555,23 @@ are the gap** — Phase 10 covers background *shell* jobs, not background *agent
 
 ### 2.7 Skills
 
-**Upstream.** `code-base/skills/loadSkillsDir.ts:185` `parseSkillFrontmatterFields`
+**Upstream.** a frontmatter parser (`parseSkillFrontmatterFields`)
 parses, per skill: `displayName`, `description`, `allowedTools`, `argumentHint`,
 `argumentNames`, `whenToUse`, `version`, `model` (with `"inherit"` meaning
-inherit, `loadSkillsDir.ts:222`), `disableModelInvocation`, `userInvocable`,
-`hooks` (`:259`), `executionContext` (`'fork'`, `:260`), `agent` (`:261`),
-`effort` (`:262`), `shell` (`:263`).
+inherit), `disableModelInvocation`, `userInvocable`,
+`hooks`, `executionContext` (`'fork'`), `agent`,
+`effort`, `shell`.
 
 Two more mechanisms:
 
 - **Conditional skills by path**: a skill with a `paths:` frontmatter is not
   listed until a matching file is touched
-  (`code-base/skills/loadSkillsDir.ts:159` `parseSkillPaths`,
-  `:986` `activateConditionalSkillsForPaths`).
+  (`parseSkillPaths` and
+  `activateConditionalSkillsForPaths`).
 - **Budgeted listing**: the listing gets 1% of the context window, with a 250
   character per-entry cap and a fallback of "names only"
-  (`code-base/tools/SkillTool/prompt.ts:20-29` `SKILL_BUDGET_CONTEXT_PERCENT`,
-  `MAX_LISTING_DESC_CHARS`, `:31` `getCharBudget`, `:70`
+  (`SKILL_BUDGET_CONTEXT_PERCENT`,
+  `MAX_LISTING_DESC_CHARS`, `getCharBudget`,
   `formatCommandsWithinBudget`).
 
 **Ours.** `src/lib/skills.zig:83` `Meta{name, description, when_to_use,
@@ -592,13 +591,13 @@ the `skill` tool. `$ARGUMENTS` is substituted (`src/lib/skills.zig`, `Meta.argum
    (`grep -rn allowed_tools src/` finds only the parser and the bundled
    definitions). A skill that says `allowed_tools: ["read"]` is not enforced.
    Upstream enforces `allowedTools`
-   (`loadSkillsDir.ts:243`) and resolves `model`/`effort` per skill.
+   (the frontmatter parser stores it and the skill runner applies it) and resolves `model`/`effort` per skill.
 2. **`context: fork` is parsed and never read.** `src/lib/skills.zig:91` and
    `:157` set it; the only reader is a test
    (`src/lib/skills.zig:325`). The board says so explicitly
    (`TASKS.md:30`: "`context: fork` is parsed and never read").
 3. **`when_to_use` is displayed but not a matcher.** Upstream's `whenToUse` is
-   part of the description in the listing (`code-base/tools/SkillTool/prompt.ts:44`
+   part of the description in the listing (the skill tool's prompt
    `getCommandDescription` appends it), which is what we do
    (`src/lib/skills.zig:240`), so this one is fine.
 4. **No conditional skills by path.** Upstream can hide a skill until the project
@@ -627,14 +626,14 @@ cover enforcing `allowed_tools`, nor the `model`/`effort` fields that Phase 1
 
 ### 2.8 Output styles
 
-**Upstream.** `code-base/outputStyles/loadOutputStylesDir.ts:26`
-`getOutputStyleDirStyles` — a flat directory of `.md` files, one per style, from
+**Upstream.** a directory scan (`getOutputStyleDirStyles`)
+— a flat directory of `.md` files, one per style, from
 the project (`.claude/output-styles/`) and the user (`~/.claude/output-styles/`),
 project shadowing user. The filename is the style name; frontmatter gives
 `name`, `description` and `keep-coding-instructions`
-(`loadOutputStylesDir.ts:52-62`, the flag parsed as boolean or the string
+(the flag parsed as boolean or the string
 `"true"`/`"false"`). Plugin styles are loaded separately and the caches are
-invalidated on change (`loadOutputStylesDir.ts:94` `clearOutputStyleCaches`).
+invalidated on change (`clearOutputStyleCaches`).
 
 **Ours.** `src/lib/outputstyles.zig` — a **directory** per style, each containing
 an `OUTPUT_STYLE.md` (`src/lib/outputstyles.zig:38` `filename`), discovered in
@@ -645,7 +644,7 @@ skills. The style block is injected at the **end** of the system prompt
 (`src/agent.zig:515-519`). Three styles ship bundled
 (`src/output_styles/default.md`, `explanatory.md`, `learning.md`).
 
-**Delta.** Small and mostly cosmetic: ours is a directory-per-style with a
+**Delta.** Small and mostly cosmetic: ours is a directory-per-style with an
 `OUTPUT_STYLE.md` inside, upstream is a flat `.md` file; the frontmatter key is
 `keep_coding_instructions` (underscores) vs upstream's `keep-coding-instructions`
 (hyphens). Upstream also has plugin-provided styles.
@@ -661,25 +660,26 @@ understates it.**
 
 ### 2.9 MCP and deferred tool loading
 
-**Upstream.** `code-base/services/mcp/client.ts` connects to MCP servers over
-five transports (`code-base/services/mcp/types.ts:23` `TransportSchema`:
+**Upstream.** an MCP client connects to MCP servers over
+five transports (`TransportSchema`:
 `stdio | sse | sse-ide | http | ws | sdk`) and exposes tools, resources and
 prompts. Server config lives in `.mcp.json`, written atomically (temp file +
-rename) preserving the file mode (`code-base/services/mcp/config.ts:88`
-`writeMcpjsonFile`).
+rename) preserving the file mode (`writeMcpjsonFile`).
 
 The part that matters for the *machinery* is **deferred tool loading**. A tool
-can be marked `shouldDefer` (`code-base/Tool.ts:442`) or `alwaysLoad`
-(`Tool.ts:449`); deferred tools are sent with `defer_loading: true` and their
+can be marked `shouldDefer` or `alwaysLoad`;
+deferred tools are sent with `defer_loading: true` and their
 schemas are excluded from the prompt-cache hash
-(`code-base/services/api/claude.ts:1208-1246`, `:1461-1466`). The model then finds
+(two places in the API layer: the body builder, and the
+computation of the cache key). The model then finds
 them with the **ToolSearch** tool
-(`code-base/tools/ToolSearchTool/ToolSearchTool.ts`), which searches tool names
-and descriptions by keyword (`:132` `parseToolName` splits `mcp__server__tool`
-and CamelCase into tokens; `:167` `compileTermPatterns`; the search itself is
-at `:181+`), supports a direct `select:<tool_name>` form, and returns up to
+(a dedicated tool-search tool), which searches tool names
+and descriptions by keyword (`parseToolName` splits `mcp__server__tool`
+and CamelCase into tokens; `compileTermPatterns` compiles them
+into patterns; the search itself runs over the compiled
+patterns), supports a direct `select:<tool_name>` form, and returns up to
 `max_results` (default 5) matches plus the count of deferred tools and any
-pending MCP servers (`ToolSearchTool.ts:37-45` `outputSchema`).
+pending MCP servers (its `outputSchema`).
 
 **Ours.** **No MCP.** There *is* a JSON-RPC client — `src/lsp/client.zig` — but
 it speaks LSP, not MCP, and it is a per-language server, not a general tool
@@ -699,8 +699,8 @@ our own search index.
 **Risk.** Medium-high. MCP servers are third-party code the harness spawns; the
 tool names they inject are attacker-controlled in a shared project. Upstream's
 mitigations are worth copying: a channel allowlist
-(`code-base/services/mcp/channelAllowlist.ts`), server approval
-(`code-base/services/mcp/mcpServerApproval.tsx`), and per-server OAuth.
+(a dedicated channel-allowlist module), server approval
+(a dedicated server-approval module), and per-server OAuth.
 
 **TASKS phase.** Phase 12 (`TASKS.md:204`) covers MCP over stdio (connect, list
 tools, call) **and** deferred tool loading / tool search. **Covered** — with the
@@ -711,30 +711,30 @@ design.
 
 ### 2.10 Tool result storage and rendering
 
-**Upstream.** `code-base/utils/toolResultStorage.ts` is the whole mechanism:
+**Upstream.** The tool-result storage layer is the whole mechanism:
 
-- **Persist, don't truncate.** `toolResultStorage.ts:137` `persistToolResult`
+- **Persist, don't truncate.** `persistToolResult`
   writes a result over its threshold to
   `<project>/<session>/tool-results/<tool_use_id>.txt` and returns a preview
-  (`:109` `PREVIEW_SIZE_BYTES = 2000`). The file is written with the `wx` flag
+  (`PREVIEW_SIZE_BYTES = 2000`). The file is written with the `wx` flag
   so a replayed turn does not rewrite it and a symlink cannot redirect it
-  (`:161-172`, with the comment "Use 'wx' instead of a stat-then-write race").
+  (with the comment "Use 'wx' instead of a stat-then-write race").
   The model gets `<persisted-output>` … `</persisted-output>` with the path and
-  the preview (`:189` `buildLargeToolResultMessage`).
-- **Per-tool thresholds** (`toolResultStorage.ts:55` `getPersistenceThreshold`),
+  the preview (`buildLargeToolResultMessage`).
+- **Per-tool thresholds** (`getPersistenceThreshold`),
   with `Infinity` as a hard opt-out for `Read` (whose output is self-bounded and
   whose persistence would create a circular Read→file→Read loop).
 - **A per-message aggregate budget**, enforced across the whole message group
-  (`:769` `enforceToolResultBudget`, limit from `:421`
+  (`enforceToolResultBudget`, limit from
   `getPerMessageBudgetLimit`), and the decision is **frozen**: once a result has
   been replaced, the replacement is re-applied verbatim on later turns
-  (`:802-803` `mustReapply`, `:797` `partitionByPriorDecision`) so the prompt
+  (`mustReapply`, `partitionByPriorDecision`) so the prompt
   cache does not break. The frozen state is reconstructed from the transcript on
-  resume (`:960` `reconstructContentReplacementState`).
+  resume (`reconstructContentReplacementState`).
 - **Collapsed rendering** of read/search calls in the transcript
-  (`code-base/utils/collapseReadSearch.ts`), so a run of reads is one line.
+  (a dedicated collapsing helper), so a run of reads is one line.
 - A one-line human summary of a tool batch generated by a cheap model
-  (`code-base/services/toolUseSummary/toolUseSummaryGenerator.ts:45`).
+  (a dedicated tool-use-summary generator).
 
 **Ours.** `src/lib/resultcap.zig` is a **pure cap layer**: per-tool
 (`src/tools/registry.zig:471` `maxResultChars`, `read` unbounded) and per-message
@@ -775,15 +775,16 @@ file + preview + path, the four constants, and the per-tool render.
 
 ### 2.11 Cost tracking
 
-**Upstream.** `code-base/cost-tracker.ts` accumulates per-model usage
-(`ModelUsage`), total cost in USD (`:177` `calculateUSDCost` in
-`code-base/utils/modelCost.ts`, which uses a per-model price table), input/output
+**Upstream.** A cost tracker accumulates per-model usage
+(`ModelUsage`), total cost in USD (`calculateUSDCost`, which
+uses a per-model price table held in a dedicated price
+module), input/output
 tokens, cache read/creation tokens, total duration, API duration with and without
 retries, **tool** duration, web-search request count, and **lines added/removed**
 (`addToTotalLinesChanged`). Cost state is persisted per session in the project
 config so a resumed session keeps its number
-(`cost-tracker.ts:87` `getStoredSessionCosts`, which refuses a stale
-`lastSessionId`). `/cost` prints it (`code-base/commands/cost/cost.ts:6`).
+(`getStoredSessionCosts`, which refuses a stale
+`lastSessionId`). A `/cost` command prints it.
 
 **Ours.** `src/cache_stats.zig` tracks tokens and cache hit-rate.
 `src/lib/bench.zig:22` `Stats` tracks turns, iterations, tool calls, asks, TTFT
@@ -799,7 +800,7 @@ and a stale price is a wrong number, which is worse than no number).
 
 **Risk.** Low, but note the failure mode: **a cost number that is wrong is worse
 than no cost number**, because the user trusts it. Upstream solves this with
-`hasUnknownModelCost` (`cost-tracker.ts:56`).
+`hasUnknownModelCost`.
 
 **TASKS phase.** Phase 30.5 (`TASKS.md:616`) mentions "the cost state" as
 something a resume should restore — but no phase *creates* a cost state. **This
@@ -812,31 +813,28 @@ is the clearest "no phase owns it" gap in the board.**
 **Upstream.** Two separate things.
 
 **Sandbox.** Upstream wraps Anthropic's `sandbox-runtime`
-(`code-base/utils/sandbox/sandbox-adapter.ts:1-3`). The config is a first-class
-schema (`code-base/entrypoints/sandboxTypes.ts:14` `SandboxNetworkConfigSchema`,
-`:44` `SandboxFilesystemConfigSchema`) with `allowWrite`/`denyWrite`/`denyRead`/
+(behind a dedicated adapter). The config is a first-class
+schema (`SandboxNetworkConfigSchema`,
+`SandboxFilesystemConfigSchema`) with `allowWrite`/`denyWrite`/`denyRead`/
 `allowRead`, network domain allowlists, Unix-socket policy, and a **violation
 store** (`SandboxViolationStore`) that surfaces what the sandbox caught. Two
 permission interactions matter: a sandboxed `Bash` can be **auto-allowed** even
-when an `ask` rule matches (`code-base/utils/permissions/permissions.ts:1094-1100`
-`canSandboxAutoAllow`), and `excludedCommands` keeps specific commands out of
-the sandbox (`code-base/tools/BashTool/shouldUseSandbox.ts:21`
-`containsExcludedCommand`, which splits compound commands so
+when an `ask` rule matches (`canSandboxAutoAllow`), and `excludedCommands` keeps specific commands out of
+the sandbox (a `containsExcludedCommand` helper,
+which splits compound commands so
 `docker ps && curl evil.com` cannot escape via the first subcommand).
 
 **Bash safety.** The read-only classification is a **table with per-command safe
-flags**, not a heuristic: `code-base/utils/shell/readOnlyCommandValidation.ts:104`
-`GIT_READ_ONLY_COMMANDS` (every git subcommand with its safe flags),
-`:1539` `EXTERNAL_READONLY_COMMANDS`, `:1416` `RIPGREP_READ_ONLY_COMMANDS`,
-`:1386` `DOCKER_READ_ONLY_COMMANDS`, `:1504` `PYRIGHT_READ_ONLY_COMMANDS`.
+flags**, not a heuristic: `GIT_READ_ONLY_COMMANDS` (every git subcommand with its safe flags),
+`EXTERNAL_READONLY_COMMANDS`, `RIPGREP_READ_ONLY_COMMANDS`,
+`DOCKER_READ_ONLY_COMMANDS`, `PYRIGHT_READ_ONLY_COMMANDS`.
 The rules exclude the flags that turn a read into a write, with the reason in
-comments (`:52-60`: "`-x/--exec` and `-X/--exec-batch` are deliberately excluded
+comments ("`-x/--exec` and `-X/--exec-batch` are deliberately excluded
 — they execute arbitrary commands for each search result"). Separately there is a
 **destructive-command warning** table for the dialog
-(`code-base/tools/BashTool/destructiveCommandWarning.ts:12`
-`DESTRUCTIVE_PATTERNS`: `git reset --hard`, `git push --force`, `rm -rf`,
+(`DESTRUCTIVE_PATTERNS`: `git reset --hard`, `git push --force`, `rm -rf`,
 `DROP TABLE`, `terraform destroy`, …) and **command injection** detection
-(`code-base/tools/BashTool/bashSecurity.ts`, 2592 lines).
+(a dedicated bash-security module, 2592 lines).
 
 **Ours.** No sandbox at all. For bash safety we have exactly one thing:
 `src/lib/verify.zig:174` `classify`, a table of *verification* commands
@@ -886,12 +884,12 @@ in its implementation, with no phase in the board that owns it.
 
 ### 3.1 Path-scoped permissions and dangerous-path protection — **NOT COVERED**
 
-Upstream: `code-base/utils/permissions/pathValidation.ts:141` `isPathAllowed`
+Upstream: `isPathAllowed`
 (resolve → deny rule → internal editable paths → **safety check** → working-dir
-check → sandbox allowlist → allow rule); `code-base/utils/permissions/filesystem.ts:620`
-`checkPathSafetyForAutoEdit` (blocks `.git/`, `.claude/`, `.vscode/`, `.idea/`
-(`filesystem.ts:74`), the user's shell configs, UNC paths, and Windows path
-patterns); `filesystem.ts:683` `pathInAllowedWorkingPath` (symlink-resolved
+check → sandbox allowlist → allow rule); `checkPathSafetyForAutoEdit`
+(blocks `.git/`, `.claude/`, `.vscode/`, `.idea/`
+(the dangerous-directories table), the user's shell configs, UNC paths, and Windows path
+patterns); `pathInAllowedWorkingPath` (symlink-resolved
 working-directory containment).
 
 Ours: nothing. `src/tools/write.zig:61` writes any path relative to the cwd.
@@ -918,9 +916,9 @@ sensitive path asks rather than refuses).
 
 ### 3.2 The frozen-decision property of the result cap — **NOT COVERED**
 
-Upstream: `code-base/utils/toolResultStorage.ts:797` `partitionByPriorDecision`
-and `:802-803` re-apply a frozen replacement verbatim on every later turn;
-`:960` `reconstructContentReplacementState` rebuilds it from the transcript on
+Upstream: `partitionByPriorDecision`
+and the re-apply of a frozen replacement verbatim on every later turn;
+`reconstructContentReplacementState` rebuilds it from the transcript on
 resume.
 
 Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call.
@@ -944,8 +942,7 @@ That is invisible until the bill arrives.
 Phase 6 (`TASKS.md:144`) does list `deny / allow / ask` as the actions, so this is
 *arguably* covered — but the board gives it one clause with no mention of the
 precedence order, of the deny-beats-allow rule, or of deny rules removing the
-tool from the model's schema (`code-base/tools.ts:262`
-`filterToolsByDenyRules`).
+tool from the model's schema (`filterToolsByDenyRules`).
 
 **Proposal.** Make the semantics explicit in Phase 6 and add the two upstream
 behaviours that are easy to miss: (a) a `deny` rule for a tool removes that
@@ -962,10 +959,8 @@ lands as a pure module.
 
 ### 3.4 Dangerous-allow-rule stripping and shadowed-rule detection — **NOT COVERED**
 
-Upstream: `code-base/utils/permissions/dangerousPatterns.ts:44`
-`DANGEROUS_BASH_PATTERNS` + `permissionSetup.ts:510`
-`stripDangerousPermissionsForAutoMode`; and
-`code-base/utils/permissions/shadowedRuleDetection.ts:14` (a rule that can never
+Upstream: `DANGEROUS_BASH_PATTERNS` + `stripDangerousPermissionsForAutoMode`; and
+a shadowed-rule detector (a rule that can never
 fire because another rule shadows it).
 
 Ours: nothing. An allowlist entry `bash` is the upstream `Bash(python:*)` hazard
@@ -973,7 +968,7 @@ in its purest form.
 
 **Proposal.** In the Phase 6 rule store, mark a rule "broad" when its pattern is
 a bare interpreter (`python`, `node`, `sh`, `bash`, `curl`, `sudo`, `env`,
-`xargs` — upstream's list at `dangerousPatterns.ts:18-42`). When the user
+`xargs` — upstream keeps the same list in a fixed table of its own). When the user
 answers "always allow" with such a rule, either refuse it or warn once. And when
 the rule set is loaded, detect and report shadowed rules.
 
@@ -984,9 +979,8 @@ the rule set is loaded, detect and report shadowed rules.
 
 ### 3.5 A cost number, per model — **NOT COVERED** (no phase creates a cost state)
 
-Upstream: `code-base/cost-tracker.ts` + `code-base/utils/modelCost.ts:177`
-`calculateUSDCost` + `/cost` (`code-base/commands/cost/cost.ts:6`) and the
-per-session persistence at `cost-tracker.ts:87`.
+Upstream: a cost tracker + `calculateUSDCost` + a `/cost` command, and the
+per-session persistence at `getStoredSessionCosts`.
 
 Ours: tokens and hit-rate (`src/cache_stats.zig`), session counters
 (`src/lib/bench.zig`), no money.
@@ -1006,8 +1000,8 @@ rather than a number — upstream's `hasUnknownModelCost` is the right precedent
 
 ### 3.6 The hook output contract (`updatedInput`, `additionalContext`) — **NOT COVERED**
 
-Upstream: `code-base/types/hooks.ts:70-165` — `hookSpecificOutput` per event,
-including `updatedInput` (rewrite the call's arguments), `additionalContext`
+Upstream: a per-event `hookSpecificOutput` schema — including `updatedInput`
+(rewrite the call's arguments), `additionalContext`
 (put text in the model's context), `permissionDecision`, `updatedMCPToolOutput`,
 `decision: approve|block`.
 
@@ -1038,10 +1032,10 @@ Phase 11 (`TASKS.md:193-200`) covers the store, the extractor and `@import`
 precedence. It does not cover the two mechanisms that make memory *useful*
 rather than merely *present*:
 
-- `code-base/memdir/findRelevantMemories.ts:39` `findRelevantMemories` — a cheap
+- `findRelevantMemories` — a cheap
   model picks ≤5 relevant memories per query, excluding `MEMORY.md` and
-  excluding already-surfaced files (`:46`).
-- `code-base/memdir/memoryAge.ts:15` `memoryAge` and `:33` `memoryFreshnessText`
+  excluding already-surfaced files.
+- `memoryAge` and `memoryFreshnessText`
   — "this memory is 47 days ago" and "point-in-time observations, not live state".
 
 **Proposal.** In Phase 11: (a) an index file (`MEMORY.md`) with the upstream caps
@@ -1060,9 +1054,9 @@ contents; (b) a `findRelevantMemories` step using our own subagent machinery
 ### 3.8 Background *subagents* and their notification — **NOT COVERED**
 
 Phase 10 (`TASKS.md:183`) is about background *shell* jobs. Upstream's background
-*agents* (`code-base/tools/AgentTool/AgentTool.tsx:87` `run_in_background`,
-`:567` `shouldRunAsync`) are a different thing: the model keeps working while a
-search runs, and is notified when it lands (`code-base/tools/AgentTool/prompt.ts:263`:
+*agents* (the Agent tool's `run_in_background` and
+`shouldRunAsync`) are a different thing: the model keeps working while a
+search runs, and is notified when it lands (the Agent tool's prompt says:
 "you will be automatically notified when it completes — do NOT sleep, poll, or
 proactively check on its progress").
 
@@ -1087,11 +1081,11 @@ that spawned it.
 
 ### 3.9 Atomic task claiming — **NOT COVERED**
 
-Upstream: `code-base/utils/tasks.ts:541` `claimTask` — an exclusive lock on the
+Upstream: `claimTask` — an exclusive lock on the
 task file, then a re-read, then `owner` / `completed` / `blockedBy` checks, and
 a *reason* on failure (`already_claimed`, `already_resolved`, `blocked`) instead
 of an exception. The lock options are sized for ~10 concurrent swarm agents
-(`utils/tasks.ts:95-108`).
+(the lock's own options are configured for that many workers).
 
 Ours: `src/lib/taskstore.zig:222` `setOwner` and `:198` (the
 `in_progress`-needs-an-owner refusal). Two agents can both set the same owner;
@@ -1115,9 +1109,9 @@ them (`grep -rn allowed_tools src/` finds only the parser at
 `src/lib/skills.zig:150` and the bundled definitions in
 `src/lib/bundled_skills.zig:40-84`).
 
-Upstream enforces `allowedTools` (`code-base/skills/loadSkillsDir.ts:243`) and
-resolves `model` (`loadSkillsDir.ts:222`, where `"inherit"` means inherit) and
-`effort` (`:262`).
+Upstream enforces `allowedTools` (the frontmatter parser stores it and the skill
+runner applies it) and resolves `model` (where `"inherit"` means inherit) and
+`effort`.
 
 **Proposal.** When the `skill` tool loads a skill, take its `allowed_tools` as
 the subagent's tool list (a skill that says `["read"]` gets only `read`) and its
@@ -1134,8 +1128,8 @@ failure is silent.
 
 ### 3.11 Conditional skills by path — **NOT COVERED**
 
-Upstream: `code-base/skills/loadSkillsDir.ts:159` `parseSkillPaths` + `:986`
-`activateConditionalSkillsForPaths` — a skill with `paths:` is not even listed
+Upstream: `parseSkillPaths` + `activateConditionalSkillsForPaths` — a skill
+with `paths:` is not even listed
 until a matching file is touched. This is how upstream keeps the skill list
 small without hiding skills that do not apply.
 
@@ -1152,10 +1146,10 @@ match anything read/written this session is not listed.
 ### 3.12 A `dontAsk` permission mode — **NOT COVERED**
 
 Upstream has six modes: `default`, `plan`, `acceptEdits`, `bypassPermissions`,
-`dontAsk`, `auto` (`code-base/utils/permissions/PermissionMode.ts:45-91`). Ours has
+`dontAsk`, `auto` (a single enum carrying all six). Ours has
 four (`src/agent.zig:789` `PermMode`): `default`, `accept_edits`, `read_only`,
 `bypass`. The missing one that matters for automation is `dontAsk`: it converts
-"ask" into "deny" (`code-base/utils/permissions/permissions.ts:505-517`).
+"ask" into "deny" (one branch in the permission evaluation).
 
 That is the mode a CI runner or a script wants: "run the agent, but never block
 on a human — if it is not pre-approved, fail". Ours has no equivalent: in
@@ -1180,8 +1174,7 @@ Phase 7 lists "Circuit breaker: after N failed summarizer attempts, stop trying"
 (`src/agent.zig:1520-1521`) is a *budget*: `summary_gap = 6` iterations and
 `summary_max = 3` per session, and a failure counts against the budget
 (`src/agent.zig:5280`). Upstream's is a **consecutive-failure** counter
-(`code-base/services/compact/autoCompact.ts:70`
-`MAX_CONSECPTIVE_AUTOCOMPACT_FAILURES = 3`), so a session whose summarizer works
+(`MAX_CONSECPTIVE_AUTOCOMPACT_FAILURES = 3`), so a session whose summarizer works
 keeps compacting forever while a session whose summarizer is broken stops after
 three tries.
 
@@ -1195,8 +1188,7 @@ success. The failure count and the success count are two numbers
 
 ### 3.14 A `PermissionRequest` hook path for headless runs — **NOT COVERED**
 
-Upstream: `code-base/utils/permissions/permissions.ts:400`
-`runPermissionRequestHooksForHeadlessAgent` — in a headless run there is no
+Upstream: `runPermissionRequestHooksForHeadlessAgent` — in a headless run there is no
 dialog, so a `PermissionRequest` hook gets to decide, and only if no hook
 answered does the tool auto-deny.
 
@@ -1216,8 +1208,8 @@ The decision path already exists (`src/agent.zig:7078-7098`).
 ### 3.15 A "the model was told to stop and did not" mechanism — **PARTIALLY COVERED, upstream is the other shape**
 
 Upstream's `Stop` hook can **prevent the turn from ending**
-(`code-base/query/stopHooks.ts:269-280`, `preventContinuation` +
-`stopReason`) and the loop continues with the hook's message attached. Ours does
+(a `preventContinuation` + `stopReason` pair) and the loop continues with the hook's
+message attached. Ours does
 the opposite: the exit gate (`src/lib/exitgate.zig:190` `decide`) *refuses* to
 let the turn end and the harness keeps iterating.
 
@@ -1241,9 +1233,9 @@ loop.
 ### 3.16 A per-session price/usage table the `/context` command can show — **NOT COVERED**
 
 Related to §3.5 but separate in shape: upstream's `/cost` and the per-model
-`ModelUsage` breakdown (`code-base/cost-tracker.ts`, exported at `:52-69`) sit
-next to a context-window readout per model (`getContextWindowForModel`,
-`cost-tracker.ts:105`). Ours' `/context` shows tokens and hit-rate
+`ModelUsage` breakdown (exported as a per-model usage type) sit
+next to a context-window readout per model (`getContextWindowForModel`).
+Ours' `/context` shows tokens and hit-rate
 (`src/cache_stats.zig`, `src/agent.zig:1575` `ctxTokens`) but not a per-model
 split, so "which model is eating the window" is unanswerable.
 
@@ -1295,15 +1287,15 @@ Stated honestly, with the caveat where it applies.
    14 steps, no shell, no pipes, no network — with the permission set of a batch
    being the **union** of the tools its steps are calls to
    (`src/tools/registry.zig:494`). Upstream has no batch primitive; it has
-   parallel tool calls (`code-base/services/tools/toolOrchestration.ts:91`
-   `partitionToolCalls`), which is a different thing (many round trips, not one).
+   parallel tool calls (a `partitionToolCalls` helper in the
+   tool-orchestration layer), which is a different thing (many round trips, not one).
 
 6. **Parallelism that is provably safe.** Ours splits the call set by a static
    `parallel_safe` flag and each call gets its own arena
    (`src/agent.zig`, "Tools in parallel"), and the read-only set is enforced by
    the registry (`src/tools/registry.zig:459`). Upstream computes
    `isConcurrencySafe(input)` per call
-   (`code-base/Tool.ts:402`, `code-base/services/tools/StreamingToolExecutor.ts:40`)
+   (in the tool interface and in the streaming tool executor)
    — more flexible, but the safety argument lives in each tool's own code, which
    is 29 places to keep in sync instead of one table.
 
@@ -1313,14 +1305,14 @@ Stated honestly, with the caveat where it applies.
    table at comptime (`src/tools/registry.zig:600` `blob`), with a test that
    fails if the two ever disagree (`src/tools/registry.zig:802`). Upstream
    spreads the same facts over the `Tool` interface
-   (`code-base/Tool.ts:394-500`), the schema builders, `constants/tools.ts` and
-   `tools.ts`.
+   (a ~100-line block of interface members), the schema builders and a
+   central list of tool constants.
 
 8. **Ask-mode semantics that produce a decidable answer.** `src/lib/ask.zig:48`
    `declined_text` ("decide yourself and say which") and `:56` `timed_out_text`
    are instructions *to the model*, not empty results. Upstream's
-   `AskUserQuestionTool` returns the answers map and nothing else
-   (`code-base/tools/AskUserQuestionTool/AskUserQuestionTool.tsx`); a model told
+   ask-user-question tool returns the answers map and nothing else
+   (a dedicated ask-user-question tool); a model told
    "the user declined" will stop or repeat, and the upstream schema has no place
    to say what to do instead.
 
@@ -1334,10 +1326,10 @@ Stated honestly, with the caveat where it applies.
    (§2.9).
 
 10. **The free-auto rotation.** `src/roster.zig` + `src/free_auto.zig` — the
-    harness rotates across the free models of every provider and survives one
-    model's quota. Upstream has a classifier-based fallback
-    (`code-base/utils/permissions/yoloClassifier.ts`) and a cheap-turn router, but
-    no quota-aware pool.
+     harness rotates across the free models of every provider and survives one
+     model's quota. Upstream has a classifier-based fallback
+     (a dedicated yolo classifier) and a cheap-turn router, but
+     no quota-aware pool.
 
 ---
 
@@ -1349,10 +1341,10 @@ them.
 ### 5.1 The permission dialog blocks a worker thread; upstream never blocks
 
 Upstream is single-threaded React: `useCanUseTool` returns a `Promise` that the
-UI resolves (`code-base/hooks/useCanUseTool.tsx:32`). The tool execution awaits
-it (`code-base/services/tools/toolExecution.ts:921` `resolveHookPermissionDecision`
-→ `canUseTool`). The UI pushes a queue item and the user's answer calls back
-into the promise (`code-base/hooks/toolPermission/handlers/interactiveHandler.ts:92`
+UI resolves. The tool execution awaits
+it (a permission-decision resolver in the tool-execution
+layer). The UI pushes a queue item and the user's answer calls back
+into the promise (the interactive permission handler's
 `ctx.pushToQueue`).
 
 Ours blocks a *worker thread* on a mutex plus a `nanosleep` backoff
@@ -1363,8 +1355,8 @@ the port must respect:
   (`src/tui.zig:987` `perm_epoch`, and the comment at `src/tui.zig:878` about
   "the model lock (which the worker may hold in `requestPermission`)").
 - **A "resolve once" guard is mandatory.** Upstream has one explicitly:
-  `code-base/hooks/toolPermission/PermissionContext.ts:75` `createResolveOnce`
-  with an atomic `claim()` (`:88`) so that two racing resolvers (the user
+  a `createResolveOnce` helper with an atomic
+  `claim()` so that two racing resolvers (the user
   clicking *and* an abort firing) cannot both resolve. Ours has the same race
   shape: `src/tui.zig:1897` `answerPermission` can be called twice (ESC and then
   a keypress) and `src/tui.zig:1890` reads `perm_answer` unconditionally. There
@@ -1373,8 +1365,7 @@ the port must respect:
 ### 5.2 The `notified` flag is what makes a notification exactly-once
 
 Upstream's completion notification is guarded by a flag on the task state
-(`code-base/tasks/LocalShellTask/LocalShellTask.tsx:110-119`), set inside an
-atomic state update, with the comment "Atomically check and set notified flag to
+(set inside an atomic state update, in the local shell task), with the comment "Atomically check and set notified flag to
 prevent duplicate notifications … If the task was already marked as notified
 (e.g., by TaskStopTool), skip enqueueing". A `TaskStop` and a natural completion
 can race, and without the flag the model gets two notifications for one task.
@@ -1386,8 +1377,8 @@ avoid: the flag must live with the task state, not with the notifier.
 
 This one already bit us and is documented in `src/bgproc.zig:74` ("`wait()`
 mutates it and `kill()` zeroes its `id`, so it cannot be shared with the registry
-slot"). The upstream shape is the same: `killTask`
-(`code-base/tasks/LocalShellTask/killShellTasks.ts:16`) and the reader's `wait`
+slot"). The upstream shape is the same: a `killTask`
+helper and the reader's `wait`
 are two reapers of one pid. Upstream avoids the double-reap because the reader
 owns the wait. **Keep the reader as the sole reaper** — the port's version of
 this is `src/bgproc.zig` `killTree`, which signals and does not reap.
@@ -1395,8 +1386,8 @@ this is `src/bgproc.zig` `killTree`, which signals and does not reap.
 ### 5.4 A hook's `allow` must not bypass a `deny` rule
 
 Upstream states this twice and implements it twice
-(`code-base/services/tools/toolHooks.ts:373-405` and
-`code-base/utils/permissions/permissions.ts:1071` `checkRuleBasedPermissions`).
+(in the tool-hook layer and in the permission layer's
+`checkRuleBasedPermissions`).
 A hook that says "allow" is an *input* to the permission system, not a decision
 that overrides it. If Phase 5 lets a hook's `allow` win outright, the `deny`
 rules Phase 6 adds become advisory.
@@ -1405,7 +1396,7 @@ rules Phase 6 adds become advisory.
 
 Upstream backfills derived fields on a *shallow clone* so observers (hooks,
 `canUseTool`) see the enriched input while the API-bound input is untouched
-(`code-base/services/tools/toolExecution.ts:775-793`, with the comment "that
+(a ~20-line block in the tool-execution layer, with the comment "that
 mutation must not reach `call()` because tool results embed the input path
 verbatim … changing it alters the serialized transcript and VCR fixture
 hashes"). A hook's `updatedInput` is the same hazard: it must reach `call()`
@@ -1414,10 +1405,9 @@ but the *tool result* must reflect what actually happened.
 ### 5.6 The permission rules must survive the settings reload
 
 Upstream's rules live in a settings file that is re-read; the in-memory context
-is updated separately (`code-base/utils/permissions/PermissionUpdate.ts`
-`applyPermissionUpdates` / `persistPermissionUpdates`), and a hook's
+is updated separately (`applyPermissionUpdates` / `persistPermissionUpdates`), and a hook's
 `updatedPermissions` are persisted *and* applied
-(`code-base/utils/permissions/permissions.ts:424-434`). Ours' allowlist is loaded
+(one branch in the permission evaluation). Ours' allowlist is loaded
 once (`src/agent.zig:1928` `loadAllowlist`) and saved on change
 (`:1976` `saveAllowlist`) — but `reloadUserConfig` (`src/agent.zig:2381`) does
 **not** reload the allowlist, so a config reload and an allowlist change can
@@ -1426,8 +1416,8 @@ disagree. Minor today, fatal once the allowlist becomes a rule file.
 ### 5.7 Do not read the environment from a module global that a test can leave undefined
 
 Upstream's `getAllowedSettingSources` reaches into bootstrap state
-(`code-base/utils/settings/constants.ts:159` → `getAllowedSettingSources` in
-`code-base/bootstrap/state.ts`). Ours has the same class of bug already fixed
+(a settings-constants helper that reads the bootstrap
+state). Ours has the same class of bug already fixed
 once: `src/agent.zig:1966-1967` ("`environ_global` panicked when the global was
 null, which is its normal state in every test that did not set it"). The rule
 that keeps holding: **an environment read takes the map as a parameter**, and a
@@ -1435,7 +1425,7 @@ module global is a fallback, not the source.
 
 ### 5.8 The rule parser's escape rules are subtle; copy them, do not reinvent them
 
-`code-base/utils/permissions/permissionRuleParser.ts:55-79`:
+The reference implementation's escape helpers:
 `escapeRuleContent` escapes backslashes *first* and parentheses second;
 `unescapeRuleContent` unescapes parentheses *first* and backslashes last. The
 order is the whole thing, and it is the inverse of the escape order. A Zig port
@@ -1443,14 +1433,14 @@ that gets the order wrong turns `Bash(python -c "print\\(1\\)")` into a rule
 that matches the wrong commands.
 
 The wildcard matcher has one more subtlety that is easy to miss
-(`code-base/utils/permissions/shellRuleMatching.ts:142-145`): a pattern ending
+(the matching helper itself): a pattern ending
 in ` *` with **exactly one** unescaped star matches both `git add` and bare
 `git`; with two or more stars it does not (otherwise `* run *` would match
 `npm run`). A port that compiles the pattern to a plain glob gets this wrong.
 
 ### 5.9 "Permission: none" is a claim about *where the command comes from*, not about the tool
 
-Upstream's `Tool.ts:435` `requiresUserInteraction` and the permission rules make
+Upstream's `requiresUserInteraction` and the permission rules make
 this explicit: the tool's *own* safety checks (`checkPermissions`) run before the
 generic system. Ours encodes the same idea in the registry row
 (`src/tools/registry.zig:351` `lsp` is `read_only = true` "because the command
@@ -1461,9 +1451,10 @@ the argument is written down.
 
 ### 5.10 The upstream read-only table is per-*flag*, not per-*command*
 
-`code-base/utils/shell/readOnlyCommandValidation.ts:52-60` excludes `-x/--exec`
+The reference implementation's read-only table is per-*flag*, not per-*command*:
+it excludes `-x/--exec`
 from `fd` because "they execute arbitrary commands for each search result", and
-`:77-78` excludes `-l/--list-details` because "internally executes `ls` as
+excludes `-l/--list-details` because "internally executes `ls` as
 subprocess". A Phase 6 table keyed on command names would classify
 `fd -x rm` as read-only. **The flag level is the requirement, not a nicety** —
 and the exclusions are the interesting part of the table, because they are the
@@ -1472,9 +1463,9 @@ cases where a "read" command runs something else.
 ### 5.11 A per-message budget that is recomputed breaks the prompt cache
 
 Upstream freezes the decision per result
-(`code-base/utils/toolResultStorage.ts:797` `partitionByPriorDecision`) and
-reconstructs it on resume (`:960` `reconstructContentReplacementState`), with
-the reason at `:833-840`: "Mark non-persisting candidates as seen NOW
+(`partitionByPriorDecision`) and reconstructs it on resume
+(`reconstructContentReplacementState`), with the reason spelled out in the code:
+"Mark non-persisting candidates as seen NOW
 (synchronously) … keeps the pair atomic under observation so no concurrent reader
 … ever sees X∈seenIds but X∉replacements, which would misclassify X as frozen
 and send full content while the main thread sends the preview → cache miss".
@@ -1486,7 +1477,7 @@ to the *shape* of the module, not a new function.
 ### 5.12 The permission dialog must not be the only place a decision is visible
 
 Upstream logs every decision with its source
-(`code-base/hooks/toolPermission/permissionLogging.ts`, 238 lines) and writes a
+(a dedicated permission-logging module, 238 lines) and writes a
 `<task-notification>`-style summary for the transcript. Ours shows a modal and
 nothing else. When Phase 5 lands and hooks can decide, the decision's *source*
 becomes invisible — a hook that silently allows everything would look exactly
@@ -1494,17 +1485,17 @@ like the user clicking "always allow". The record is cheap; add it.
 
 ### 5.13 Sandbox exclusion must be applied per subcommand, not per command line
 
-`code-base/tools/BashTool/shouldUseSandbox.ts:60-70` splits compound commands so
+The reference implementation's sandbox decision splits compound commands so
 `docker ps && curl evil.com` cannot escape the sandbox through its first
-subcommand, and `:82-101` iterates the strip operations to a fixed point so
+subcommand, and iterates the strip operations to a fixed point so
 `timeout 300 FOO=bar bazel run` matches `bazel:*`. A Phase 6/25 sandbox that
 matches the whole line is bypassable by prefixing a command.
 
 ### 5.14 A "deny" rule must remove the tool from the schema, not only block the call
 
-`code-base/tools.ts:262` `filterToolsByDenyRules` strips a denied tool from the
+`filterToolsByDenyRules` strips a denied tool from the
 tool list the model sees, using the same matcher as the runtime check
-(`code-base/utils/permissions/permissions.ts:238` `toolMatchesRule`) so that
+(`toolMatchesRule`) so that
 MCP server-prefix rules strip every tool of that server *before* the model sees
 it. A `deny` that only blocks at call time still spends the schema tokens and
 still shows the model a tool it may not use — and a denied tool in the prompt is
@@ -1514,7 +1505,7 @@ an invitation to try it.
 
 Upstream's `Read` is exempt from persistence because "persisting its output to a
 file the model reads back with Read is circular"
-(`code-base/utils/toolResultStorage.ts:60-64`). Ours' `read` is unbounded
+(the exemption is stated in the threshold table). Ours' `read` is unbounded
 (`src/tools/registry.zig:90` `max_result_chars = 0` → `maxInt`), with the same
 reasoning recorded at `src/tools/registry.zig:67-71`. Keep the reason next to
 the number: a number without a reason is a number that gets "fixed" later.
@@ -1523,14 +1514,14 @@ the number: a number without a reason is a number that gets "fixed" later.
 
 ## Appendix: file counts read
 
-| Area | Upstream (`code-base/`) | Ours (`src/`) |
+| Area | Upstream (reference implementation) | Ours (`src/`) |
 |---|---|---|
-| Tools | 184 files, 43 tool dirs, 29 in `getAllBaseTools` (`tools.ts:193`) | 37 tools in one table (`src/tools/registry.zig:82`), 23 files in `src/tools/` |
-| Hooks | 104 files, 27 events (`entrypoints/sdk/coreTypes.ts:25`) | 0 |
+| Tools | 184 files, 43 tool dirs, 29 in the base-tool registry | 37 tools in one table (`src/tools/registry.zig:82`), 23 files in `src/tools/` |
+| Hooks | 104 files, 27 events | 0 |
 | Services | 130 files | — |
-| Tasks | 12 files + `Task.ts` + `tasks.ts` | `src/lib/taskstore.zig` + `src/tools/tasks.zig` |
+| Tasks | 12 files + the task model + the task store | `src/lib/taskstore.zig` + `src/tools/tasks.zig` |
 | Context | 9 files (React contexts) | `src/compaction.zig` + `src/lib/resultcap.zig` |
-| Memory | 8 files (`memdir/`) + `services/SessionMemory` + `services/extractMemories` + `services/autoDream` | 0 |
+| Memory | 8 files (the memory directory) + the session-memory, extraction and consolidation services | 0 |
 | Skills | 20 files | `src/lib/skills.zig` + `src/lib/skillstore.zig` + `src/skills/*.md` |
 | Output styles | 1 file | `src/lib/outputstyles.zig` + `src/lib/outputstyle_store.zig` + `src/output_styles/` |
 | Plugins | 2 files | 0 |

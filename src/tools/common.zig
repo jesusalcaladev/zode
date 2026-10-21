@@ -97,16 +97,17 @@ pub const Walker = struct {
 ///
 /// `refs` and `rename` walked the tree with `walkAll`, and that walk has a file budget
 /// (`symbols.max_files`) and no order worth trusting. In this repository it spent the
-/// whole budget inside `code-base/` — a vendored reference copy, 1902 files, gitignored
-/// — and answered **"no declaration in the files searched"** for a symbol that is right
-/// there in `src/`. A tool that cannot see the project's own code is not slow, it is
-/// blind, and it says so in a sentence that reads like the symbol does not exist.
+/// whole budget inside an ignored tree — a vendored copy of another project,
+/// thousands of files, none of them ours — and answered **"no declaration in the
+/// files searched"** for a symbol that is right there in `src/`. A tool that cannot
+/// see the project's own code is not slow, it is blind, and it says so in a
+/// sentence that reads like the symbol does not exist.
 ///
 /// `git ls-files --cached --others --exclude-standard` is exactly the set of files the
 /// user considers theirs: 336 here, against 2057 on disk, in 5 ms. It includes a file
 /// the agent just wrote and has not staged (the reason a plain `--cached` would be
-/// wrong), and it excludes the ignored trees (`code-base/`, `zig-pkg/`, `sessions/`)
-/// the same way `rg` already does for `grep`.
+/// wrong), and it excludes the ignored trees (the vendored copy, `zig-pkg/`,
+/// `sessions/`) the same way `rg` already does for `grep`.
 ///
 /// Returns `null` when git cannot answer — not a repository, no git, a failure — and
 /// the caller falls back to the walker, which is what a directory outside a repo needs.

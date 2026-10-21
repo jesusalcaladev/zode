@@ -1,7 +1,8 @@
 # zode — audit of its own weaknesses
 
 **Date:** 2026-10-21 · **Scope:** this repository only (`src/`, `build.zig`, `tools/*.py`,
-`TASKS.md`, `AGENTS.md`). `code-base/` was not read.
+`TASKS.md`, `AGENTS.md`). The reference implementation was not read: this audit is
+about US.
 
 **Method.** Everything below was either measured on this machine or read out of the source.
 Where a claim could not be verified, it says so. The one place where I changed code was a

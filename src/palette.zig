@@ -390,9 +390,9 @@ pub fn matches(item: Item, groups: []const Group, q: []const u8) bool {
     }
     // The FUZZY fallback: the query as a subsequence of the label.
     //
-    // It is what upstream's picker does (`code-base/components/design-system/
-    // FuzzyPicker.tsx:74-76`) and it is the difference between a search box
-    // and a search box that forgives: "cs4" finds "claude-sonnet-4-5".
+    // It is what the reference implementation's picker does, and it is the
+    // difference between a search box and a search box that forgives: "cs4"
+    // finds "claude-sonnet-4-5".
     //
     // It is LAST, on purpose: an exact match always wins, so the item the
     // user meant is never pushed down by a lucky subsequence.
@@ -989,10 +989,10 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, n
 
 /// Paints a label with the MATCHED characters in the accent colour.
 ///
-/// This is upstream's "the matched characters are highlighted" (the fuzzy
-/// picker, `code-base/components/design-system/FuzzyPicker.tsx:74-76`), and it
-/// is the half of the fuzzy search that the user actually sees: the list says
-/// WHICH part of "anthropic/claude-sonnet-4-5" answered the query.
+/// This is the reference implementation's "the matched characters are
+/// highlighted" (its fuzzy picker), and it is the half of the fuzzy search
+/// that the user actually sees: the list says WHICH part of
+/// "anthropic/claude-sonnet-4-5" answered the query.
 ///
 /// The positions are BYTE offsets and the painting walks GRAPHEMES, so the
 /// two meet at the grapheme's first byte: a match that lands inside a

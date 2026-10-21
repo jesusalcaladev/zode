@@ -27,9 +27,9 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
       is painted, the word diff is computed where the diff is painted, and the colour
       ladder is applied where the cell is written.
 - [ ] 🔴 **Sprint A2 — Phase 33** (the TUI at Claude Code's level): the port list,
-      42 features read out of the vendored upstream source. 33.1 and 33.2 are done;
+      42 features read out of the reference implementation. 33.1 and 33.2 are done;
       the rest is the board. The porting notes are in `docs/analysis/tui-chrome.md`.
-- [ ] 🔴 **Sprint A3 — Phase 34** (the machinery upstream has and we do not): sixteen
+- [ ] 🔴 **Sprint A3 — Phase 34** (the machinery the reference implementation has and we do not): sixteen
       mechanisms that no phase owned, of which **34.1 (path-scoped permissions)** is
       the one that should not wait — today `write` writes any path it is handed.
 - [ ] 🔴 **Sprint B — Phase 2** (skill listing budget + named args + `context: fork`):
@@ -51,7 +51,7 @@ called — it is wired now, with `diagnostics` and `lsp_servers`)** ·
 warmup — plus the two build steps that promised an artifact and produced none)**.
 
 **The analysis behind the new phases** lives in `docs/analysis/`:
-`tui-chrome.md` (the TUI port list, 42 features) · `commands.md` (72 upstream
+`tui-chrome.md` (the TUI port list, 42 features) · `commands.md` (72 reference
 commands, 26 gaps) · `harness.md` (the machinery gaps) · `audit.md` (our own
 state, the open bug and the quality bar).
 
@@ -480,7 +480,7 @@ some servers support).
 
 ## Phase 27 — The diff you can read — **DONE 2026-10-21**
 
-`✨ feature + 🐛 fix · 🔴 · independent · complete 999-line source to port: native-ts/color-diff/index.ts`
+`✨ feature + 🐛 fix · 🔴 · independent · a complete colour-diff implementation to port (native TypeScript, ~1000 lines)`
 
 > The part worth stealing is not the colours, it is the **order of the pipeline**. Measured today: the diff has NO background at all (`diff_add_bg`/`diff_del_bg` are declared and never painted) and no line numbers.
 
@@ -563,7 +563,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 ## Phase 28 — `/copy`: taking the answer with you
 
-`✨ feature · 🔴 · reuses the picker + termseq · source: commands/copy/copy.tsx (370 lines, complete)`
+`✨ feature · 🔴 · reuses the picker + termseq · a complete command to port (~370 lines)`
 
 > Today: scroll up, select with the mouse, copy with the terminal's own machinery — three steps and a scroll position to lose.
 
@@ -637,7 +637,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 ## Phase 31 — Commanding git: `/commit`, `/pr`, `` !`cmd` ``
 
-`✨ feature · 🟡 · depends on 0 (per-command allowlist = a registry property) · source: commands/commit.ts (complete — copy the prompt text verbatim)`
+`✨ feature · 🟡 · depends on 0 (per-command allowlist = a registry property) · a complete command to port (copy the prompt text verbatim)`
 
 - [ ] **31.1** Layer 1 — verified context inlined into the prompt:
   ```
@@ -682,11 +682,11 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 `✨ feature · 🔴 · the port list · source: docs/analysis/tui-chrome.md`
 
-> The reference is a vendored copy of Claude Code's own source (`code-base/`,
-> TypeScript + Ink), read line by line. 42 candidate features: **18 PORT**,
-> **15 ALREADY** (we are equal or better), **9 SKIP** (with reasons). The full
-> table with the citations is in `docs/analysis/tui-chrome.md`; this is the
-> board version, and the porting notes for the top rows are in §4 of that file.
+> The reference is the TUI of Claude Code (TypeScript + Ink), read line by
+> line. 42 candidate features: **18 PORT**, **15 ALREADY** (we are equal or
+> better), **9 SKIP** (with reasons). The full table is in
+> `docs/analysis/tui-chrome.md`; this is the board version, and the porting
+> notes for the top rows are in §4 of that file.
 >
 > **The rule of the phase**: nothing enters the TUI that does not answer a
 > question the user actually has. A decorative port is a port that costs
@@ -694,38 +694,38 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 - [x] **33.1** The footer says the state that decides the next tool call — **DONE 2026-10-21**
   - [x] The **effective** effort level (`chat.effortSupport` decides whether there is a knob at all) — the preference is not the same thing, and showing it would be a lie: the footer would say `xhigh` while the wire carries `high`
-  - [ ] The permission-mode **glyph** (`○ ◐ ● ◉`, upstream `figures.ts:11-14`) — a word costs 12 columns in a footer that has to survive an 80-column terminal
+  - [ ] The permission-mode **glyph** (`○ ◐ ● ◉`, the four shapes the reference implementation uses) — a word costs 12 columns in a footer that has to survive an 80-column terminal
   - [ ] …and with it, `accept edits` becomes visible again: the test that pins "the normal permission modes cost NOTHING on the row" is a decision about COLUMNS, and a glyph is one column
 - [x] **33.2** The "N new" counter — **DONE 2026-10-21**
-  - [x] Counts assistant **turns**, not entries (upstream `FullscreenLayout.tsx:200-213`): a tool line is not an answer the reader is missing
+  - [x] Counts assistant **turns**, not entries (the reference implementation counts them the same way): a tool line is not an answer the reader is missing
   - [x] The baseline moves with the reader: leaving the bottom starts a count, reaching it ends the one that was running
-  - [ ] The **pill** over the transcript (upstream `FullscreenLayout.tsx:491-537`): a centred "3 new messages" that floats over the scrollback, with a click target
-- [ ] **33.3** The sticky prompt header (upstream `FullscreenLayout.tsx:551-589`) — **fixed ONE row**, or the transcript shifts every time the sticky prompt changes (upstream says so in its own comment at `:544-550`)
+  - [ ] The **pill** over the transcript: a centred "3 new messages" that floats over the scrollback, with a click target
+- [ ] **33.3** The sticky prompt header — **fixed ONE row**, or the transcript shifts every time the sticky prompt changes (the reference implementation says so in its own comment)
   - [ ] It has to live OUTSIDE `history_h` or the clear at `tui.zig:5728-5731` erases it
-- [ ] **33.4** The transcript screen (`ctrl+o`, upstream `useGlobalKeybindings.tsx:95-132`) — a VIEW of our own history, not new content; `ctrl+e` shows all (`:135-141`)
-- [ ] **33.5** The bottom-anchored modal pane with a `▔` divider (upstream `FullscreenLayout.tsx:426`) — a pane that keeps 2 transcript rows visible beats a centred box that hides the context
+- [ ] **33.4** The transcript screen (`ctrl+o`) — a VIEW of our own history, not new content; `ctrl+e` shows all
+- [ ] **33.5** The bottom-anchored modal pane with a `▔` divider — a pane that keeps 2 transcript rows visible beats a centred box that hides the context
 - [x] **33.6** The fuzzy picker with the matched characters highlighted — **DONE 2026-10-21**
   - [x] The query as a **subsequence** of the label, with a WINDOW (three times the query plus eight) so the fallback does not match half the catalogue
   - [x] Leftmost and **runs win**: "bc" in "a-xbc" highlights the run and not a scattered "b"
   - [x] The matched characters are painted in the accent colour, and the positions are BYTE offsets joined to the painting at the grapheme's first byte
   - [x] The fuzzy is a FALLBACK: an exact match always wins, so the item the user meant is never pushed down
-  - [ ] The list is still in the provider's order, and upstream sorts by score. Ours is deliberate (the free models first), so sorting is a decision and not a port
-- [ ] **33.7** The picker with a **preview pane** (upstream `FuzzyPicker.tsx:26`, `:35`) — the model preview (context window, price, free) is the most useful picker addition we do not have
+  - [ ] The list is still in the provider's order, and the reference implementation sorts by score. Ours is deliberate (the free models first), so sorting is a decision and not a port
+- [ ] **33.7** The picker with a **preview pane** (at the bottom or at the right) — the model preview (context window, price, free) is the most useful picker addition we do not have
   - [ ] It has to be a **bottom pane**, not a third column: at 110 columns there is no room for a third one
-- [ ] **33.8** Markdown tables (upstream `MarkdownTable.tsx`) — models emit tables and we render them as prose; a contained addition to `src/lib/markdown.zig`
-- [ ] **33.9** The notifications channel (upstream `PromptInput/Notifications.tsx:55` + `context/notifications.ts`) — a transient queue for "the updater restarted", "the IDE connected", "the token budget is nearly gone"; absolutely positioned, so nothing shifts
-- [ ] **33.10** The context visualisation (upstream `ContextVisualization.tsx:219-242`) — we compute the numbers; upstream draws a proportional chart per category (system, tools, messages, skills, compaction reserve)
-- [ ] **33.11** The task panel with blockers and priorities (upstream `TaskListV2.tsx:143-190`) — **the data model already exists** (`src/lib/taskstore.zig`: `blocks`/`blocked_by`/`hasOpenBlocker`) and is not surfaced
-- [ ] **33.12** The per-message actions (upstream `messageActions.tsx`) — `shift+↑` targets the message under the cursor; ours has `/copy N` and no per-message targeting
-- [ ] **33.13** The transcript search (`/` and `n`/`N`, upstream `ink/searchHighlight.ts:26`) — our paragraphs are already segmented, so the scan is over the segments, not the cells
+- [ ] **33.8** Markdown tables — models emit tables and we render them as prose; a contained addition to `src/lib/markdown.zig`
+- [ ] **33.9** The notifications channel — a transient queue for "the updater restarted", "the IDE connected", "the token budget is nearly gone"; absolutely positioned, so nothing shifts
+- [ ] **33.10** The context visualisation — we compute the numbers; the reference implementation draws a proportional chart per category (system, tools, messages, skills, compaction reserve)
+- [ ] **33.11** The task panel with blockers and priorities — **the data model already exists** (`src/lib/taskstore.zig`: `blocks`/`blocked_by`/`hasOpenBlocker`) and is not surfaced
+- [ ] **33.12** The per-message actions — `shift+↑` targets the message under the cursor; ours has `/copy N` and no per-message targeting
+- [ ] **33.13** The transcript search (`/` and `n`/`N`) — our paragraphs are already segmented, so the scan is over the segments, not the cells
 - [ ] **33.14** OSC 8 hyperlinks — the paths and the URLs as real links; the detection is ~30 lines and vaxis exposes the cell attributes
-- [ ] **33.15** The shortcut help in the footer (`? for shortcuts`, upstream `PromptInputHelpMenu.tsx`) — discoverability, cheap
+- [ ] **33.15** The shortcut help in the footer (`? for shortcuts`) — discoverability, cheap
 - [ ] **33.16** The external editor (`ctrl+g`) and the image paste (`ctrl+v`) — the image path already exists (`src/lib/images.zig`)
-- [ ] **33.17** The focus detection (dim the caret when the window is not focused, upstream `TextInput.tsx:65`) — vaxis reports focus events
-- [ ] **33.18** The modal diff viewer (upstream `components/diff/DiffDialog.tsx`) — only worth it once a turn can produce multi-file diffs
-- [ ] **33.19** The compact-summary line (upstream `CompactSummary.tsx:48`) — after a tier-2 compaction the transcript loses history **silently**; one honest line says what was summarised
-- [ ] **33.20** The queued prompts' **text**, not just the count (upstream `PromptInputQueuedCommands.tsx`)
-- [ ] **33.21** The permission dialog with the **rule** explanation (upstream `permissions/PermissionRuleExplanation.tsx`) — which rule matched, and the rule the user could accept instead of a bare "always allow"
+- [ ] **33.17** The focus detection (dim the caret when the window is not focused) — vaxis reports focus events
+- [ ] **33.18** The modal diff viewer — only worth it once a turn can produce multi-file diffs
+- [ ] **33.19** The compact-summary line — after a tier-2 compaction the transcript loses history **silently**; one honest line says what was summarised
+- [ ] **33.20** The queued prompts' **text**, not just the count
+- [ ] **33.21** The permission dialog with the **rule** explanation — which rule matched, and the rule the user could accept instead of a bare "always allow"
 
 **What we deliberately do NOT copy** (and why) — the reasoning is in
 `docs/analysis/tui-chrome.md` §5: the alternate screen (it destroys the
@@ -736,59 +736,59 @@ permanent CPU cost for a decoration).
 
 ---
 
-## Phase 34 — The machinery upstream has and we do not
+## Phase 34 — The machinery the reference implementation has and we do not
 
 `✨ feature · 🔴 · the gap list · source: docs/analysis/harness.md §3`
 
-> Sixteen upstream mechanisms that no phase on this board owned. Every one was
-> read in its **implementation**, not in its prose, and every one is cited to
-> the upstream file and line. Ranked by value per unit of risk.
+> Sixteen mechanisms of the reference implementation that no phase on this
+> board owned. Every one was read in its **implementation**, not in its prose.
+> Ranked by value per unit of risk.
 
 - [ ] **34.1** Path-scoped permissions and the dangerous-path protection — **NOT COVERED, highest value**
-  - Upstream: `utils/permissions/pathValidation.ts:141` `isPathAllowed` (resolve → deny rule → editable paths → **safety check** → working-dir check → allow rule) and `utils/permissions/filesystem.ts:620` `checkPathSafetyForAutoEdit` (blocks `.git/`, `.claude/`, `.vscode/`, `.idea/`, the shell configs)
+  - The reference implementation: a path is allowed through SEVEN checks in this order — resolve the path → the deny rules → the internally editable paths → the **safety check** → the working-directory check → the sandbox allowlist → the allow rules. Its safety check blocks `.git/`, `.claude/`, `.vscode/`, `.idea/`, the shell configs and the UNC paths
   - Ours: nothing. `src/tools/write.zig:61` writes **any** path it is handed
   - [ ] `src/lib/pathrules.zig` (new, pure): `resolve` (symlinks resolved), `dangerous` (the table), `allowed(path, rules)` with the SAME `Tool(pattern)` grammar Phase 6 introduces
   - [ ] Wire it into `write`, `edit`, `rename` and into the permission detail the dialog shows
   - [ ] A sensitive path **asks**, it does not refuse: a rule that resolves wrong must not block legitimate work
 - [ ] **34.2** The **frozen decision** of the result cap — **NOT COVERED**
-  - Upstream: `utils/toolResultStorage.ts:797` `partitionByPriorDecision` re-applies a frozen replacement verbatim on every later turn, and `:960` rebuilds it from the transcript on resume
+  - The reference implementation: the cap layer keeps a **frozen decision** — a cut is re-applied verbatim on every later turn instead of being recomputed — and it rebuilds that state from the transcript on resume
   - Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call
   - [ ] A `Caps` state (result id → the cut that was made), persisted next to the session and reloaded on resume
   - [ ] Why it matters: a session that compacts differently on resume **silently loses its cached prefix**, and that is invisible until the bill arrives
 - [ ] **34.3** `deny` and `ask` as real permission behaviours — Phase 6 says "deny/allow/ask" but never the **precedence**
-  - [ ] A `deny` rule removes the tool's schema from the request (upstream `tools.ts:262` `filterToolsByDenyRules`) — `src/tools/registry.zig`'s `blob` is where the filter goes
+  - [ ] A `deny` rule removes the tool's schema from the request (the reference implementation filters the tools by the deny rules before composing them) — `src/tools/registry.zig`'s `blob` is where the filter goes
   - [ ] The precedence table written down and pinned by a test, the way `src/lib/exitgate.zig:190` `decide` pins the exit rule
 - [ ] **34.4** The dangerous-allow-rule warning and the shadowed-rule detection — **NOT COVERED**
-  - Upstream: `utils/permissions/dangerousPatterns.ts:18-42` (the bare-interpreter list) and `utils/permissions/shadowedRuleDetection.ts:14` (a rule that can never fire)
-  - Ours: an allowlist entry of `bash` is the upstream `Bash(python:*)` hazard in its purest form
+  - The reference implementation: a list of the DANGEROUS patterns (the bare interpreters) and a detector for the SHADOWED rules (a rule that can never fire because another one covers it)
+  - Ours: an allowlist entry of `bash` is that hazard in its purest form
   - [ ] When the user answers "always allow" with a broad rule, warn once — a warning, not a refusal
 - [ ] **34.5** A **cost** number, per model — **NOT COVERED** (no phase creates a cost state)
-  - Upstream: `cost-tracker.ts` + `utils/modelCost.ts:177` `calculateUSDCost` + the `/cost` command
+  - The reference implementation: a cost tracker that multiplies the token counts by the model's price, and a `/cost` command that prints the total and the per-model breakdown
   - Ours: tokens and hit-rate (`src/cache_stats.zig`), no money
   - [ ] `src/lib/cost.zig` over the price table `src/lib/models.zig` already parses
   - [ ] A model whose price is unknown prints **"price unknown"**, never a number
 - [ ] **34.6** The hook output contract (`updatedInput`, `additionalContext`) — Phase 5 has the events, not the contract
-  - [ ] Upstream: `utils/hooks.ts` + `schemas/hooks.ts` (27 events, 5 hook types)
+  - [ ] The reference implementation: 27 events and 5 hook types
 - [ ] **34.7** The memory recall by relevance and the staleness notes — Phase 11 has the store, not the recall
 - [ ] **34.8** The background **subagents** (not the background shell jobs) — **NOT COVERED**
-  - Upstream: `tools/AgentTool/` runs a whole agent in the background; Phase 10 is about `bgproc`
+  - The reference implementation: the agent tool can run a whole agent in the background; Phase 10 is about `bgproc`
   - [ ] `run_in_background: bool` on the `task` tool, and a **notification to the model** when it lands
-- [ ] **34.9** The atomic task claiming — **NOT COVERED** (upstream `utils/tasks.ts` `claimTask`): three parallel agents must not take the same task
+- [ ] **34.9** The atomic task claiming — **NOT COVERED** (the reference implementation has a `claim` operation): three parallel agents must not take the same task
 - [ ] **34.10** The enforcement of a skill's `allowed_tools` / `model` / `effort` — **NOT COVERED**
   - Phase 1 put the three fields in the frontmatter; **nothing reads them**. A skill that says `allowed_tools: read` can still call `write`
 - [ ] **34.11** The conditional skills by path — **NOT COVERED** (a `paths:` field in the frontmatter)
 - [ ] **34.12** The `dontAsk` permission mode — **NOT COVERED** (a third state, not a bool: `ask` becomes "answer for yourself")
 - [ ] **34.13** The circuit breaker keyed on **consecutive failures**, not on a budget — Phase 7 has the budget
 - [ ] **34.14** The `PermissionRequest` hook path for the headless runs
-- [ ] **34.15** The "the model was told to stop and did not" mechanism — upstream's `Stop` hook is the user-written version of our exit gate
+- [ ] **34.15** The "the model was told to stop and did not" mechanism — the reference implementation's `Stop` hook is the user-written version of our exit gate
   - [ ] The composition rule has to be explicit: our gate and a user hook must not both claim the turn
 - [ ] **34.16** The per-session price/usage table that `/context` can show
 
-**Where we are BETTER than upstream** (so nobody ports it backwards) —
-`docs/analysis/harness.md` §4 lists ten: the exit gate, the `goal` checkpoint,
-the `verdictCredible` refusal, the `batch` sandbox, the "stale green" detection
-(upstream has no equivalent), the free-model rotation, the edit hint, the
-repetition guard, the `ask` cap and the `proofWord` precision.
+**Where we are BETTER than the reference implementation** (so nobody ports it
+backwards) — `docs/analysis/harness.md` §4 lists ten: the exit gate, the
+`goal` checkpoint, the `verdictCredible` refusal, the `batch` sandbox, the
+"stale green" detection (no equivalent there), the free-model rotation, the
+edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 
 ---
 
@@ -796,30 +796,29 @@ repetition guard, the `ask` cap and the `proofWord` precision.
 
 `✨ feature · 🟡 · the gap list · source: docs/analysis/commands.md`
 
-> 72 upstream commands, inventoried one by one with the exact `name:` line of
-> each command object. 26 gaps (MISSING or PARTIAL), each with the upstream
-> behaviour, the source lines that define it and a Zig port's home. The ~30
-> commands that are Anthropic-account or marketplace surface are **not** gaps
-> and are listed as such, so nobody goes looking for them.
+> 72 commands of the reference implementation, inventoried one by one. 26 gaps
+> (MISSING or PARTIAL), each with the behaviour, what it does and a Zig port's
+> home. The ~30 commands that are Anthropic-account or marketplace surface are
+> **not** gaps and are listed as such, so nobody goes looking for them.
 
-- [ ] **35.1** `/files` — **S, the cheapest item on the list**: eight lines of upstream code and we already hold the data (`src/lib/readcache.zig`). It answers "what is the model looking at?", which is the question you ask when a turn goes sideways
-- [ ] **35.2** `/init` — **M** for the prompt, **L** with the interview phase. The highest-value missing command: without it a new project has no `AGENTS.md` and the harness silently runs with the built-in prompt only. Port upstream's prompt text **verbatim** and let the model do the work
+- [ ] **35.1** `/files` — **S, the cheapest item on the list**: eight lines of work and we already hold the data (`src/lib/readcache.zig`). It answers "what is the model looking at?", which is the question you ask when a turn goes sideways
+- [ ] **35.2** `/init` — **M** for the prompt, **L** with the interview phase. The highest-value missing command: without it a new project has no `AGENTS.md` and the harness silently runs with the built-in prompt only. Port the reference implementation's prompt text **verbatim** and let the model do the work
 - [ ] **35.3** `/rename` + the `#tag` + the session title — **S** each, and together they are the readability layer of the session list. Phase 30.1 has the design; the command is 20 lines
-- [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic upstream command we lack. Both are prompt commands whose text is upstream's, and Phase 31.1 already has the `` !`cmd` `` substitution
+- [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic command we lack. Both are prompt commands whose text is the reference implementation's, and Phase 31.1 already has the `` !`cmd` `` substitution
 - [ ] **35.5** `/clear` (with the cache reset) and the `/exit` alias — **S**. `/new` exists but leaves the read cache, the skills-sent marker and the user commands stale
 - [ ] **35.6** `/doctor` — **M**: the one command you run when zode behaves strangely. Half the checks (the key state, the config, the session dir's permissions) we already compute elsewhere
 - [ ] **35.7** `/config` + `/status` + `/usage` as ONE panel — **M**: six scattered commands become one "what is my configuration?" screen, assembled from the functions the commands already call, so it cannot drift
 - [ ] **35.8** `/compact` on demand — **S-M**: the machinery is done, the trigger and the argument are missing
 - [ ] **35.9** `/release-notes` + `/version` — **S**: two one-liners over `src/lib/selfupdate.zig`, which already runs at startup with nobody told
-- [ ] **35.10** `/diff` — **M**: upstream's `DiffDialog` shows the uncommitted changes and the per-turn diffs; the renderer exists (`src/lib/diffview.zig`), the command is the missing half
+- [ ] **35.10** `/diff` — **M**: a diff dialog shows the uncommitted changes and the per-turn diffs; the renderer exists (`src/lib/diffview.zig`), the command is the missing half
 - [ ] **35.11** `/permissions` (the rule editor) · `/hooks` (the hook editor) · `/agents` (the subagent definitions) — **M** each, and each one is a panel over a mechanism another phase builds. **They wait for it**: a UI over a rule engine that does not exist yet is how a command ends up promising something the engine does not do
 - [ ] **35.12** `/rewind` (an arbitrary point, not the last turn) · `/compact` · `/resume` as a picker — covered by Phases 29 and 30
 - [ ] **35.13** `/add-dir` · `/sandbox` · `/mcp` · `/vim` — wait for Phases 6, 12 and 13
 - [ ] **35.14** `/btw` (a side question that does not interrupt) — **S**: one subagent call whose answer is appended, not a turn
-- [ ] **35.15** The **name collision** to settle: upstream's `/color` sets the agent colour and ours sets the **diff palette**. Rename one of them the day the other lands
+- [ ] **35.15** The **name collision** to settle: the reference implementation's `/color` sets the agent colour and ours sets the **diff palette**. Rename one of them the day the other lands
 
-**Not gaps** (upstream surface that is Anthropic-account, browser or
-marketplace, and that we are not going to copy): `/login`, `/logout`,
+**Not gaps** (surface that is Anthropic-account, browser or marketplace, and
+that we are not going to copy): `/login`, `/logout`,
 `/upgrade`, `/usage`, `/feedback`, `/bug`, `/release-notes`'s browser half,
 `/channel`, `/theme`, `/sandbox`'s cloud half — listed in
 `docs/analysis/commands.md` §3.26 with the reason for each.

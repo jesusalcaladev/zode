@@ -1,338 +1,330 @@
-# TUI chrome and interaction: Claude Code (upstream) vs zode
+# TUI chrome and interaction: the reference implementation (Claude Code) vs zode
 
 Scope: **screen composition** (header / transcript / input / footer), **overlay
 painting**, **transcript rendering**, and **interaction** (keys, mouse,
 modals, pickers).
 
-Everything below is read from the two trees in this repository:
+Everything below compares two implementations:
 
-* upstream = `code-base/` (vendored Claude Code, TypeScript + Ink)
-* ours = `src/` (zode, Zig + libvaxis/vxfw)
+* the **reference implementation** (Claude Code, TypeScript + Ink), read from
+  its own source tree
+* **ours** = `src/` (zode, Zig + libvaxis/vxfw)
 
-Citations are `path:line`. Where a claim is about *behaviour* rather than a
-single line, the range of the function is given.
+The reference implementation is **not** part of this repository and is not
+redistributed here, so this document deliberately carries **no pointers into
+its tree**: no file paths, no line numbers. Every claim about it names the
+*component* and describes the *mechanism* in prose instead, so a reader can
+check each statement against **our** code (the `src/…:line` citations below
+are exact and point at this repository) and against the observable behaviour
+of the reference implementation itself.
 
 No source file was modified to produce this document.
 
 ---
 
-## 1. Upstream screen anatomy
+## 1. The reference implementation's screen anatomy
 
 ### 1.1 The root: an alternate screen, then a flexbox column
 
-Upstream has **two rendering modes** (alt-buffer fullscreen vs. normal
-scrollback) plus a **third screen** (the transcript, `ctrl+o`), and it picks
-between the first two with an environment flag.
+The reference implementation has **two rendering modes** (alt-buffer fullscreen
+vs. normal scrollback) plus a **third screen** (the transcript, `ctrl+o`), and
+it picks between the first two with an environment flag.
 
-* `code-base/utils/fullscreen.ts` — `isFullscreenEnvEnabled()` decides whether
-  the REPL owns the terminal's alternate buffer. It is opt-in for external
-  users (`CLAUDE_CODE_NO_FLICKER=1`), default-on internally, and it is
+* An environment probe, `isFullscreenEnvEnabled()`, decides whether the REPL
+  owns the terminal's alternate buffer. It is opt-in for external users
+  (`CLAUDE_CODE_NO_FLICKER=1`), default-on internally, and it is
   **auto-disabled under `tmux -CC`** because alt-screen + mouse tracking
-  corrupts terminal state there (`code-base/utils/fullscreen.ts`, function
-  `isFullscreenEnvEnabled`, and `isTmuxControlMode()` above it).
-* `code-base/screens/REPL.tsx:4484-4488` — when virtual scroll is available the
-  whole REPL is wrapped in `<AlternateScreen mouseTracking={isMouseTrackingEnabled()}>`.
-* `code-base/ink/components/AlternateScreen.tsx:33` — the component itself.
+  corrupts terminal state there. The same module holds `isTmuxControlMode()`,
+  the check that detects tmux control mode.
+* When virtual scroll is available the whole REPL is wrapped in an
+  `AlternateScreen` component with `mouseTracking={isMouseTrackingEnabled()}`.
+* The `AlternateScreen` component itself is the thing that switches the
+  terminal into the alternate buffer.
 
 Inside the alt buffer the screen is a **Yoga flexbox column** with three
 regions, not a hand-computed row arithmetic:
 
-`code-base/components/FullscreenLayout.tsx:270` — `FullscreenLayout(props)`
-receives five slots:
+The fullscreen layout component receives five slots:
 
-| prop | meaning | line |
+| prop | meaning | slot order |
 |---|---|---|
-| `scrollable` | the transcript | `:33` |
-| `bottom` | spinner + prompt + permissions | `:34` |
-| `overlay` | rendered *inside* the scroll box, after the messages | `:37` |
-| `bottomFloat` | absolutely positioned, bottom-right, over the scrollback | `:42` |
-| `modal` | an absolutely positioned bottom-anchored pane | `:47` |
+| `scrollable` | the transcript | 1 |
+| `bottom` | spinner + prompt + permissions | 2 |
+| `overlay` | rendered *inside* the scroll box, after the messages | 3 |
+| `bottomFloat` | absolutely positioned, bottom-right, over the scrollback | 4 |
+| `modal` | an absolutely positioned bottom-anchored pane | 5 |
 
-The composition (`:338-445`):
+The composition, in source order:
 
 ```
-:361   <ScrollBox flexGrow={1} flexDirection="column" paddingTop={t9} stickyScroll={true}>
-:392   <Box flexGrow={1} flexDirection="column" overflow="hidden">   <- sticky header + scrollbox + pill + float
-:414   <Box flexDirection="column" flexShrink={0} width="100%" maxHeight="50%">  <- the bottom slot
-:426   <Box position="absolute" bottom={0} left={0} right={0} maxHeight={terminalRows - MODAL_TRANSCRIPT_PEEK} opaque={true}>  <- modal
+<ScrollBox flexGrow={1} flexDirection="column" paddingTop={t9} stickyScroll={true}>
+<Box flexGrow={1} flexDirection="column" overflow="hidden">   <- sticky header + scrollbox + pill + float
+<Box flexDirection="column" flexShrink={0} width="100%" maxHeight="50%">  <- the bottom slot
+<Box position="absolute" bottom={0} left={0} right={0} maxHeight={terminalRows - MODAL_TRANSCRIPT_PEEK} opaque={true}>  <- modal
 ```
 
 Three consequences that we do not have:
 
-1. **The bottom slot is capped at 50 % of the terminal height**
-   (`FullscreenLayout.tsx:414`). The prompt can never eat the whole screen.
-2. **The transcript is a virtualised scroll box with sticky bottom**
-   (`code-base/ink/components/ScrollBox.tsx`, 236 lines) — the app keeps its own
-   scroll offset and renders only the visible window.
+1. **The bottom slot is capped at 50 % of the terminal height** (`maxHeight="50%"`
+   on the bottom slot). The prompt can never eat the whole screen.
+2. **The transcript is a virtualised scroll box with sticky bottom** (the
+   `ScrollBox` component, 236 lines) — the app keeps its own scroll offset and
+   renders only the visible window.
 3. **The modal is a bottom-anchored pane with a `▔` divider and 2 rows of
-   transcript still visible above it**:
-   `FullscreenLayout.tsx:20` (`MODAL_TRANSCRIPT_PEEK = 2`) and `:426`
-   (`{"\u2594".repeat(columns)}` is the `▔` rule, `paddingX={2}`).
+   transcript still visible above it**: the constant `MODAL_TRANSCRIPT_PEEK = 2`
+   and the absolute pane whose rule is `{"\u2594".repeat(columns)}` (the `▔`)
+   with `paddingX={2}`.
 
-Outside fullscreen the same component degrades to a plain sequence
-(`FullscreenLayout.tsx:447-458`): `{scrollable}{bottom}{overlay}{modal}`.
+Outside fullscreen the same component degrades to a plain sequence:
+`{scrollable}{bottom}{overlay}{modal}`.
 
 ### 1.2 The scroll-derived chrome (the "N new" pill and the sticky header)
 
-This is upstream's most distinctive piece of screen chrome and we have nothing
-equivalent.
+This is the reference implementation's most distinctive piece of screen chrome
+and we have nothing equivalent.
 
-* `code-base/components/FullscreenLayout.tsx:86` — `useUnseenDivider(messageCount)`
-  tracks where the user was when they scrolled away from the bottom.
-  `:135-136` — the "am I at the bottom" test uses
+* A hook, `useUnseenDivider(messageCount)`, tracks where the user was when they
+  scrolled away from the bottom. The "am I at the bottom" test uses
   `scrollTop + pendingDelta >= scrollHeight - viewportHeight`, i.e. it accounts
-  for the wheel momentum that has not been applied yet.
-  `:141-145` — on the **first** scroll-away it snapshots `scrollHeight` and
-  records the message index; later scroll-aways are ref-only no-ops so the
-  transcript does not re-render.
-* `code-base/components/FullscreenLayout.tsx:200` — `countUnseenAssistantTurns`
-  counts *turns*, not raw entries: tool-use-only assistant entries are skipped
-  so `"⏺ Searched for 13 patterns"` does not tick the pill (`:205-213`).
-* `code-base/components/FullscreenLayout.tsx:239` — `computeUnseenDivider`
-  floors the count at 1 so the pill flips from "Jump to bottom" to "1 new
-  message" as soon as anything arrives (`:254`).
-* `code-base/components/FullscreenLayout.tsx:491-537` — `NewMessagesPill`: an
-  absolutely positioned centred pill at `bottom={0}` over the scrollback, with a
-  background colour and a hover state (`:509`, `:520`).
-  `:512` — the text is `"{count} new {message|messages}"` or `"Jump to bottom"`.
-* `code-base/components/FullscreenLayout.tsx:551-589` — `StickyPromptHeader`:
-  a **fixed one-row** breadcrumb above the scroll box that pins the prompt the
-  assistant was answering, with `figures.pointer` and `wrap="truncate-end"`.
-  The comment at `:544-550` is the design rule: a *variable* height header
-  shifts the scroll box by one row every time the sticky prompt changes, so the
-  content jumps on screen even though `scrollTop` did not move.
+  for the wheel momentum that has not been applied yet. On the **first**
+  scroll-away it snapshots `scrollHeight` and records the message index; later
+  scroll-aways are ref-only no-ops so the transcript does not re-render.
+* `countUnseenAssistantTurns` counts *turns*, not raw entries: tool-use-only
+  assistant entries are skipped so `"⏺ Searched for 13 patterns"` does not tick
+  the pill.
+* `computeUnseenDivider` floors the count at 1 so the pill flips from "Jump to
+  bottom" to "1 new message" as soon as anything arrives.
+* The **"N new" pill** (`NewMessagesPill`): an absolutely positioned centred
+  pill at `bottom={0}` over the scrollback, with a background colour and a
+  hover state. Its text is `"{count} new {message|messages}"` or
+  `"Jump to bottom"`.
+* The **sticky prompt header** (`StickyPromptHeader`): a **fixed one-row**
+  breadcrumb above the scroll box that pins the prompt the assistant was
+  answering, with `figures.pointer` and `wrap="truncate-end"`. The comment next
+  to it is the design rule: a *variable* height header shifts the scroll box by
+  one row every time the sticky prompt changes, so the content jumps on screen
+  even though `scrollTop` did not move.
 
 ### 1.3 The prompt (input box)
 
-`code-base/components/PromptInput/PromptInput.tsx:2244-2296`:
+The reference implementation's prompt component:
 
 * The prompt is a **box with only a bottom rounded border**:
-  `:2268` — `borderStyle="round" borderLeft={false} borderRight={false} borderBottom`
+  `borderStyle="round" borderLeft={false} borderRight={false} borderBottom`
   (so the shape is `╰─────────╯`).
-* The border colour follows the **mode**: `:2214-2235` `getBorderColor()`
-  returns `bashBorder` in bash mode, the teammate colour when a teammate owns
-  the turn, `promptBorder` otherwise.
-* `:2237-2241` — while an external editor is open, the prompt is replaced by
-  the single line `Save and close editor to continue...`.
-* `:2246-2248` — while a permission is suppressed, a `Waiting for permission…`
-  line is printed above the box.
-* `:2250-2267` — the "swarm banner" mode replaces the border with a coloured
-  banner whose text is embedded in a full-width rule.
-* `:2293-2295` — notifications are **absolutely positioned** above the prompt
+* The border colour follows the **mode**: `getBorderColor()` returns
+  `bashBorder` in bash mode, the teammate colour when a teammate owns the
+  turn, `promptBorder` otherwise.
+* While an external editor is open, the prompt is replaced by the single line
+  `Save and close editor to continue...`.
+* While a permission is suppressed, a `Waiting for permission…` line is
+  printed above the box.
+* The "swarm banner" mode replaces the border with a coloured banner whose
+  text is embedded in a full-width rule.
+* Notifications are **absolutely positioned** above the prompt
   (`position="absolute" marginTop={-1} height={1}`), so an appearing
-  notification does not shift the prompt by a row. The comment at `:2276-2292`
-  explains the negative margins and why the box stays mounted.
-* `:1999` — the input viewport is capped at
+  notification does not shift the prompt by a row. The comment there explains
+  the negative margins and why the box stays mounted.
+* The input viewport is capped at
   `max(MIN_INPUT_VIEWPORT_LINES, floor(rows / 2) - PROMPT_FOOTER_LINES)`: the
   prompt may not take more than half the terminal.
-* `:2014` — the placeholder is a **suggestion**: `showPromptSuggestion &&
+* The placeholder is a **suggestion**: `showPromptSuggestion &&
   promptSuggestion ? promptSuggestion : defaultPlaceholder`.
 
 ### 1.4 The footer
 
-Two components, side by side.
+Two components, side by side: the footer shell and the footer's left side.
 
-`code-base/components/PromptInput/PromptInputFooter.tsx:138-152`:
+The footer shell, in source order:
 
 ```
-:139  <Box flexDirection={isNarrow ? 'column' : 'row'} justifyContent={isNarrow ? 'flex-start' : 'space-between'} paddingX={2} gap={isNarrow ? 0 : 1}>
-:140    <Box flexDirection="column" flexShrink={isNarrow ? 0 : 1}>
-:141      {mode === 'prompt' && !isShort && !exitMessage.show && !isPasting && statusLineShouldDisplay(settings) && <StatusLine .../>}
-:142      <PromptInputFooterLeftSide ... />
-:144    <Box flexShrink={1} gap={1}>
-:145      {isFullscreen ? null : <Notifications ... />}
+<Box flexDirection={isNarrow ? 'column' : 'row'} justifyContent={isNarrow ? 'flex-start' : 'space-between'} paddingX={2} gap={isNarrow ? 0 : 1}>
+  <Box flexDirection="column" flexShrink={isNarrow ? 0 : 1}>
+    {mode === 'prompt' && !isShort && !exitMessage.show && !isPasting && statusLineShouldDisplay(settings) && <StatusLine .../>}
+    <PromptInputFooterLeftSide ... />
+  <Box flexShrink={1} gap={1}>
+    {isFullscreen ? null : <Notifications ... />}
 ```
 
-* `:105` — `isNarrow = columns < 80`: under 80 columns the footer becomes a
-  **column** instead of a row.
-* `:110` — `isShort = isFullscreen && rows < 24`: under 24 rows the optional
-  status line is dropped.
-* `:122` — the `? for shortcuts` hint is suppressed when a custom status line
-  exists or while searching.
+* `isNarrow = columns < 80`: under 80 columns the footer becomes a **column**
+  instead of a row.
+* `isShort = isFullscreen && rows < 24`: under 24 rows the optional status
+  line is dropped.
+* The `? for shortcuts` hint is suppressed when a custom status line exists or
+  while searching.
 
-`code-base/components/PromptInput/PromptInputFooterLeftSide.tsx`:
+The footer's left side:
 
-* `:150` — `Press {key} again to exit` (the double-press ctrl+c guard).
-* `:161` — `Pasting text…` (a large paste is acknowledged).
-* `:191` — `-- INSERT --` (vim mode).
-* `:348-355` — the **permission mode pill**: `{symbol} {title} on` in the
-  mode's colour, plus a dim `shift+tab to cycle` hint
-  (`:353` `KeyboardShortcutHint`).
-* `:375` — `getSpinnerHintParts(...)`: the footer hint is assembled from
-  `esc`, `ctrl+t` (todos), `ctrl+x ctrl+k` (kill agents) and the teammate
-  state, so the hint changes with what is running.
-* `:180` — while a history search is open, the footer left side is *replaced*
-  by the search input (`HistorySearchInput`).
+* `Press {key} again to exit` (the double-press ctrl+c guard).
+* `Pasting text…` (a large paste is acknowledged).
+* `-- INSERT --` (vim mode).
+* The **permission mode pill**: `{symbol} {title} on` in the mode's colour,
+  plus a dim `shift+tab to cycle` hint (rendered by a
+  `KeyboardShortcutHint` component).
+* `getSpinnerHintParts(...)`: the footer hint is assembled from `esc`,
+  `ctrl+t` (todos), `ctrl+x ctrl+k` (kill agents) and the teammate state, so
+  the hint changes with what is running.
+* While a history search is open, the footer left side is *replaced* by the
+  search input (`HistorySearchInput`).
 
-`code-base/components/StatusLine.tsx`:
+The status line:
 
-* `:36-127` — the status line is **a user-configured external command**. The
-  app builds a JSON object (model, workspace, cost, context window, rate
-  limits, vim mode, agent type, worktree) and runs the user's command; the
-  output is the status line.
-* `:226-234` — it is re-evaluated on a **300 ms debounce** and only when the
-  assistant message id, permission mode, vim mode or model changed (`:238`).
-* `:309-312` — in fullscreen the status line must have a **stable height**: a
-  0→1 row change would steal a row from the scroll box and shift the content.
+* The status line is **a user-configured external command**. The app builds a
+  JSON object (model, workspace, cost, context window, rate limits, vim mode,
+  agent type, worktree) and runs the user's command; the output is the status
+  line.
+* It is re-evaluated on a **300 ms debounce** and only when the assistant
+  message id, permission mode, vim mode or model changed.
+* In fullscreen the status line must have a **stable height**: a 0→1 row
+  change would steal a row from the scroll box and shift the content.
 
 ### 1.5 The transcript
 
-**Tool calls.** `code-base/components/messages/AssistantToolUseMessage.tsx`:
+**Tool calls.** The assistant tool-use message:
 
-* `:186` — the leading marker is a `ToolUseLoader` (spinner) for an
-  unresolved call and a dim `BLACK_CIRCLE` (`⏺` on macOS, `●` elsewhere —
-  `code-base/constants/figures.ts:4`) for a queued one.
-* `:200` — the tool name is **bold**, `flexShrink={0}`, `wrap="truncate-end"`.
-* `:210` — the arguments are in parentheses in a separate `<Text>`.
-* `:228` — the whole header is `minWidth={stringWidth(name) + 2}` so the row
-  does not reflow when the name changes.
+* The leading marker is a `ToolUseLoader` (spinner) for an unresolved call and
+  a dim `BLACK_CIRCLE` (`⏺` on macOS, `●` elsewhere — the figure constants
+  define it) for a queued one.
+* The tool name is **bold**, `flexShrink={0}`, `wrap="truncate-end"`.
+* The arguments are in parentheses in a separate `<Text>`.
+* The whole header is `minWidth={stringWidth(name) + 2}` so the row does not
+  reflow when the name changes.
 
-**Tool results.** `code-base/components/MessageResponse.tsx:29` — the result
-is prefixed with a dim gutter `  ⎿  `, and `:31` marks that gutter as
-`NoSelect` so a mouse selection does not include it. `:65-71` — nested results
-do not repeat the `⎿` (a context flag).
+**Tool results.** The message-response component prefixes the result with a
+dim gutter `  ⎿  `, and marks that gutter as `NoSelect` so a mouse selection
+does not include it. Nested results do not repeat the `⎿` (a context flag).
 
-**Diffs.** `code-base/components/StructuredDiff.tsx`:
+**Diffs.** The structured-diff component:
 
-* `:46-49` — `computeGutterWidth(patch)`: the gutter is
+* `computeGutterWidth(patch)`: the gutter is
   `marker + space + right-aligned line number + space`, and the width depends
   only on the patch, so it is cacheable.
-* `:59-60` — **if the gutter would eat the whole width (narrow terminal) the
-  split is skipped**; the single-column output stays correct, only `noSelect`
-  is lost.
-* `:41` — a `WeakMap` cache keyed by patch identity, `:61` a key that includes
+* **If the gutter would eat the whole width (narrow terminal) the split is
+  skipped**; the single-column output stays correct, only `noSelect` is lost.
+* A `WeakMap` cache keyed by patch identity, plus a key that includes
   theme/width/dim/gutter.
 
-**Todos / tasks.** `code-base/components/TaskListV2.tsx`:
+**Todos / tasks.** The task-list panel:
 
-* `:51` — `maxDisplay = rows <= 10 ? 0 : min(10, max(3, rows - 14))`: the
-  panel shrinks on a short terminal.
-* `:143-166` — when the list is truncated the **priority is** recently
-  completed (within 30 s) → in progress → pending (unblocked first) → older
-  completed.
-* `:185` — the hidden ones are summarised as `… +2 in progress, 3 pending`.
-* `:187` — a task shows its **open blockers** (`openBlockers={task.blockedBy.filter(...)}`).
+* `maxDisplay = rows <= 10 ? 0 : min(10, max(3, rows - 14))`: the panel
+  shrinks on a short terminal.
+* When the list is truncated the **priority is** recently completed (within
+  30 s) → in progress → pending (unblocked first) → older completed.
+* The hidden ones are summarised as `… +2 in progress, 3 pending`.
+* A task shows its **open blockers** (`openBlockers={task.blockedBy.filter(...)}`).
 
-**Thinking.** `code-base/components/messages/AssistantThinkingMessage.tsx`
-and `HighlightedThinkingText.tsx` exist as separate message kinds.
+**Thinking.** The thinking message and its highlighted-text variant exist as
+separate message kinds.
 
 ### 1.6 Overlays
 
 Four overlay mechanisms, and they do not overlap by accident:
 
-1. **Modal pane** (`FullscreenLayout.tsx:426`) — bottom-anchored, `▔` rule,
-   `paddingX={2}`, `opaque`, and it paints **over both the scroll box and the
-   bottom slot**. It carries a `ModalContext` with
-   `{rows: terminalRows - 3, columns: columns - 4}` (`:423-425`) so a
-   `Dialog` inside it knows it is inside a modal and skips its own frame
-   (`code-base/components/design-system/Pane.tsx:39-49`).
-2. **Suggestions overlay** (`FullscreenLayout.tsx:599-616`) — a
-   `position="absolute" bottom="100%"` box above the prompt, portalled out of
-   `PromptInput` so it is not clipped by the prompt's own box.
-3. **Dialog overlay** (`FullscreenLayout.tsx:621-636`) — same escape pattern,
-   rendered later in tree order so it paints over the suggestions.
-4. **Permission dialog** (`code-base/components/permissions/PermissionDialog.tsx:64`)
-   — a **top border only** box:
+1. **Modal pane** (the absolute bottom-anchored box of the fullscreen layout)
+   — bottom-anchored, `▔` rule, `paddingX={2}`, `opaque`, and it paints **over
+   both the scroll box and the bottom slot**. It carries a `ModalContext` with
+   `{rows: terminalRows - 3, columns: columns - 4}` so a `Dialog` inside it
+   knows it is inside a modal and skips its own frame (the design system's
+   `Pane` handles that).
+2. **Suggestions overlay** (an absolute `bottom="100%"` box above the prompt) —
+   portalled out of the prompt component so it is not clipped by the prompt's
+   own box.
+3. **Dialog overlay** — same escape pattern, rendered later in tree order so
+   it paints over the suggestions.
+4. **Permission dialog** — a **top border only** box:
    `borderStyle="round" borderLeft={false} borderRight={false} borderBottom={false}`,
    `marginTop={1}`.
 
-Dialogs themselves: `code-base/components/design-system/Dialog.tsx:30-137` —
-title in bold, optional dim subtitle, children in a column with `gap={1}`,
-and an **input guide** line (`:60`): `Enter to confirm · Esc to cancel`, or
-`Press {key} again to exit` when a ctrl+c is pending.
+Dialogs themselves: the design system's dialog component — title in bold,
+optional dim subtitle, children in a column with `gap={1}`, and an **input
+guide** line: `Enter to confirm · Esc to cancel`, or `Press {key} again to
+exit` when a ctrl+c is pending.
 
 ### 1.7 Interaction model
 
-**Keybindings are data.** `code-base/keybindings/defaultBindings.ts` is a
-table of `{context, bindings}` blocks; `code-base/keybindings/parser.ts:13`
-parses `"ctrl+shift+k"` into a `ParsedKeystroke`; `code-base/keybindings/schema.ts`
-and `validate.ts` validate a user file; `code-base/keybindings/reservedShortcuts.ts`
-refuses to let the user rebind ctrl+c / ctrl+d.
+**Keybindings are data.** The reference implementation keeps its keybindings in
+a table of `{context, bindings}` blocks; a separate parser turns
+`"ctrl+shift+k"` into a `ParsedKeystroke`; a schema and a validator check a
+user file; and a reserved-shortcut list refuses to let the user rebind
+ctrl+c / ctrl+d.
 
 The contexts and what is in them:
 
-| context | keys | line |
+| context | keys | scope |
 |---|---|---|
-| Global | `ctrl+c` interrupt, `ctrl+d` exit, `ctrl+l` redraw, `ctrl+t` todos, `ctrl+o` transcript, `ctrl+r` history search, `ctrl+shift+f` global search, `ctrl+shift+p` quick open | `:34-62` |
-| Chat | `esc` cancel, `shift+tab` cycle mode, `meta+p` model picker, `meta+t` thinking, `enter` submit, `↑/↓` history, `ctrl+_` undo, `ctrl+g` external editor, `ctrl+s` stash, `ctrl+v` image paste, `shift+↑` message actions | `:64-98` |
-| Autocomplete | `tab` accept, `esc` dismiss, `↑/↓` | `:100-106` |
-| Confirmation | `y/n/enter/esc`, `↑/↓`, `tab`, `space`, `shift+tab` cycle, `ctrl+e` toggle explanation, `ctrl+d` debug info | `:131-149` |
-| Tabs | `tab`/`shift+tab`/`←/→` | `:151-158` |
-| Transcript | `ctrl+e` show all, `ctrl+c`/`esc`/`q` exit | `:161-169` |
-| HistorySearch | `ctrl+r` next, `esc`/`tab` accept, `ctrl+c` cancel, `enter` execute | `:172-179` |
-| Scroll | `pageup/pagedown`, `wheelup/wheeldown`, `ctrl+home/end`, `ctrl+shift+c` copy | `:196-213` |
-| Footer | `↑/↓/←/→`, `enter` open, `esc` clear | `:234-245` |
-| MessageActions | `↑/↓/j/k`, `ctrl+↑/↓`, `c` copy, `p` paste | `:271-293` |
-| DiffDialog | `esc`, `←/→` source, `↑/↓` file, `enter` details | `:298-305` |
+| Global | `ctrl+c` interrupt, `ctrl+d` exit, `ctrl+l` redraw, `ctrl+t` todos, `ctrl+o` transcript, `ctrl+r` history search, `ctrl+shift+f` global search, `ctrl+shift+p` quick open | everywhere, including the transcript screen |
+| Chat | `esc` cancel, `shift+tab` cycle mode, `meta+p` model picker, `meta+t` thinking, `enter` submit, `↑/↓` history, `ctrl+_` undo, `ctrl+g` external editor, `ctrl+s` stash, `ctrl+v` image paste, `shift+↑` message actions | the prompt |
+| Autocomplete | `tab` accept, `esc` dismiss, `↑/↓` | the completion popup |
+| Confirmation | `y/n/enter/esc`, `↑/↓`, `tab`, `space`, `shift+tab` cycle, `ctrl+e` toggle explanation, `ctrl+d` debug info | a confirmation dialog |
+| Tabs | `tab`/`shift+tab`/`←/→` | tabbed panes |
+| Transcript | `ctrl+e` show all, `ctrl+c`/`esc`/`q` exit | the transcript screen (`ctrl+o`) |
+| HistorySearch | `ctrl+r` next, `esc`/`tab` accept, `ctrl+c` cancel, `enter` execute | the history-search input |
+| Scroll | `pageup/pagedown`, `wheelup/wheeldown`, `ctrl+home/end`, `ctrl+shift+c` copy | the scrollable transcript |
+| Footer | `↑/↓/←/→`, `enter` open, `esc` clear | the footer |
+| MessageActions | `↑/↓/j/k`, `ctrl+↑/↓`, `c` copy, `p` paste | the per-message action menu |
+| DiffDialog | `esc`, `←/→` source, `↑/↓` file, `enter` details | the modal diff viewer |
 
 **The transcript screen is a separate screen, not a mode of the prompt.**
-`code-base/hooks/useGlobalKeybindings.tsx:95-132` — `ctrl+o` swaps
-`screen` between `'prompt'` and `'transcript'`; `:135` — `ctrl+e` toggles
-"show all" *inside* the transcript; `:144` — `ctrl+c`/`esc`/`q` leave it.
-`code-base/screens/REPL.tsx:4466-4473` — in transcript mode the bottom slot is
-a `TranscriptModeFooter` (or a `TranscriptSearchBar` when searching), and the
+A global-keybindings hook swaps `screen` between `'prompt'` and `'transcript'`
+on `ctrl+o`; `ctrl+e` toggles "show all" *inside* the transcript;
+`ctrl+c`/`esc`/`q` leave it. In transcript mode the bottom slot is a
+`TranscriptModeFooter` (or a `TranscriptSearchBar` when searching), and the
 prompt is **not mounted at all**. The pager keys in that screen follow
 `less`/`tmux copy-mode`: `g`/`G`, `ctrl+u`/`ctrl+d` (half page),
-`ctrl+b`/`ctrl+f` (full page), space (`code-base/components/ScrollKeybindingHandler.tsx:519-556`,
-`:883-1005`).
+`ctrl+b`/`ctrl+f` (full page), space (handled by the scroll-keybinding
+handler, which binds both the half-page and the full-page motions).
 
-**Selection and copy.** `code-base/ink/selection.ts` is a 917-line module:
-line-based selection with an anchor and a focus, word/line snapping for
-multi-click, accumulators for the rows that scrolled out of the viewport
-during the drag (`scrolledOffAbove` / `scrolledOffBelow`, `:29-38`), and
-`softWrap` bits so a soft-wrapped row is joined back into its logical line
-(`:43-46`). `code-base/ink/searchHighlight.ts:26` inverts **all** matches in
-the screen buffer; `code-base/ink/render-to-screen.ts:212`
-`applyPositionedHighlight` paints the *current* match on top in yellow.
+**Selection and copy.** The selection module is 917 lines: line-based
+selection with an anchor and a focus, word/line snapping for multi-click,
+accumulators for the rows that scrolled out of the viewport during the drag
+(`scrolledOffAbove` / `scrolledOffBelow`), and `softWrap` bits so a
+soft-wrapped row is joined back into its logical line. The search-highlight
+module inverts **all** matches in the screen buffer; the screen renderer has
+`applyPositionedHighlight`, which paints the *current* match on top in yellow.
 
-**Key parsing.** `code-base/ink/parse-keypress.ts:19` documents the
-**kitty keyboard protocol** (`CSI u`), `:104` the kitty mode query, `:630` the
-`CSI u` branch. `code-base/ink/supports-hyperlinks.ts:26` detects OSC 8
-support (ghostty, kitty, alacritty, iTerm, plus `LC_TERMINAL` so it survives
-tmux).
+**Key parsing.** The keypress parser documents the **kitty keyboard protocol**
+(`CSI u`), has the kitty mode query, and the `CSI u` branch. A separate
+module detects OSC 8 support (ghostty, kitty, alacritty, iTerm, plus
+`LC_TERMINAL` so it survives tmux).
 
-**Spinners.** `code-base/components/Spinner.tsx:44` — the spinner row is a
-**50 ms animation frame** (`code-base/components/Spinner/SpinnerAnimationRow.tsx:98`)
-carrying a random verb (`code-base/constants/spinnerVerbs.ts:15`:
-*Accomplishing, Baking, Beaming, Booping…*), the elapsed time, and — after
-30 s — the token count (`SpinnerAnimationRow.tsx:23` `SHOW_TOKENS_AFTER_MS`).
-`code-base/components/Spinner/useStalledAnimation.ts` turns the spinner red
-when it stalls.
+**Spinners.** The spinner row is a **50 ms animation frame** carrying a random
+verb (*Accomplishing, Baking, Beaming, Booping…*), the elapsed time, and —
+after 30 s — the token count (`SHOW_TOKENS_AFTER_MS`). A separate hook turns
+the spinner red when it stalls.
 
-**Notifications.** `code-base/components/PromptInput/Notifications.tsx:55` —
-a priority/timeout keyed notification store (`code-base/context/notifications.ts`)
-that surfaces: API key status, auto-updater, IDE connection, token warning
-(`code-base/components/TokenWarning.tsx`), MCP clients, sandbox hints.
+**Notifications.** A priority/timeout keyed notification store (in the app's
+notification context) surfaces: API key status, auto-updater, IDE connection,
+token warning, MCP clients, sandbox hints.
 
-### 1.8 Other components upstream has
+### 1.8 Other components the reference implementation has
 
 | component | what it is |
 |---|---|
-| `code-base/components/ContextVisualization.tsx:105` | a per-category context breakdown with a proportional bar chart, a "free space" line and the autocompact reserve |
-| `code-base/components/ContextSuggestions.tsx` | concrete suggestions to reduce the context |
-| `code-base/components/GlobalSearchDialog.tsx` | search across the whole session |
-| `code-base/components/HistorySearchDialog.tsx` | search the prompt history |
-| `code-base/components/MessageSelector.tsx` (830 lines) | pick a past message to rewind to |
-| `code-base/components/messageActions.tsx` | per-message actions (copy, rewind, …) |
-| `code-base/components/diff/DiffDialog.tsx` | a modal diff viewer that navigates between files and between the old/new side |
-| `code-base/components/diff/DiffDetailView.tsx` | the per-hunk detail view of that dialog |
-| `code-base/components/MarkdownTable.tsx` | markdown tables rendered as a flexbox grid |
-| `code-base/components/design-system/ProgressBar.tsx` | a determinate bar |
-| `code-base/components/design-system/Tabs.tsx` | tabbed panes |
-| `code-base/components/design-system/FuzzyPicker.tsx` | the shared picker (`:74` `DEFAULT_VISIBLE = 8`, `:75` `CHROME_ROWS = 10`) |
-| `code-base/components/design-system/SearchBox.tsx` | the search field with a `⌕` prefix and an inverse cursor |
-| `code-base/components/design-system/ListItem.tsx` | the list row with a `❯` pointer, a `✓` tick and a dim description |
-| `code-base/components/design-system/Byline.tsx` | the dim hint line under a dialog |
-| `code-base/components/design-system/KeyboardShortcutHint.tsx` | the `ctrl+o to expand` chip |
-| `code-base/components/design-system/Ratchet.tsx` | a box that keeps its height while it is off-screen (lazy rendering) |
-| `code-base/components/HighlightedCode.tsx` | syntax-highlighted code blocks |
-| `code-base/components/ThinkingToggle.tsx` | a modal to enable/disable extended thinking |
-| `code-base/components/EffortIndicator.ts` | the effort glyph (`○ ◐ ● ◉`, `code-base/constants/figures.ts:11-14`) |
-| `code-base/components/PromptInput/PromptInputQueuedCommands.tsx` | the queue of prompts waiting to be sent |
-| `code-base/components/PromptInput/PromptInputStashNotice.tsx` | "you have a stashed prompt" |
-| `code-base/components/PromptInput/ShimmeredInput.tsx` | a shimmering placeholder for suggested input |
-| `code-base/components/LogoV2/` | the startup logo / welcome screen |
-| `code-base/vim/` | a full vim mode for the prompt |
+| Context visualisation | a per-category context breakdown with a proportional bar chart, a "free space" line and the autocompact reserve |
+| Context suggestions | concrete suggestions to reduce the context |
+| Global search dialog | search across the whole session |
+| History search dialog | search the prompt history |
+| Message selector (830 lines) | pick a past message to rewind to |
+| Per-message actions | per-message actions (copy, rewind, …) |
+| Modal diff viewer | a modal diff viewer that navigates between files and between the old/new side |
+| Per-hunk diff detail view | the per-hunk detail view of that dialog |
+| Markdown table renderer | markdown tables rendered as a flexbox grid |
+| Design-system progress bar | a determinate bar |
+| Design-system tabs | tabbed panes |
+| Design-system fuzzy picker | the shared picker (`DEFAULT_VISIBLE = 8`, `CHROME_ROWS = 10`) |
+| Design-system search box | the search field with a `⌕` prefix and an inverse cursor |
+| Design-system list item | the list row with a `❯` pointer, a `✓` tick and a dim description |
+| Design-system byline | the dim hint line under a dialog |
+| Design-system keyboard-shortcut hint | the `ctrl+o to expand` chip |
+| Design-system ratchet | a box that keeps its height while it is off-screen (lazy rendering) |
+| Highlighted code | syntax-highlighted code blocks |
+| Thinking toggle | a modal to enable/disable extended thinking |
+| Effort indicator | the effort glyph (`○ ◐ ● ◉`) |
+| Queued-commands strip | the queue of prompts waiting to be sent |
+| Stash notice | "you have a stashed prompt" |
+| Shimmered input | a shimmering placeholder for suggested input |
+| Startup logo / welcome screen | the startup logo / welcome screen |
+| Vim mode | a full vim mode for the prompt |
 
 ---
 
@@ -388,30 +380,32 @@ Paint order in one frame:
 
 ### 2.2 What we have that is equal or better
 
-**Fewer permanent rows.** Upstream's prompt block is a box with a rounded
-bottom border plus a status line plus a left/right footer row
-(`PromptInput.tsx:2268`, `PromptInputFooter.tsx:139-149`): at least 4 rows of
-furniture. Ours is a **hairline + the prompt rows + one footer row**
+**Fewer permanent rows.** The reference implementation's prompt block is a box
+with a rounded bottom border plus a status line plus a left/right footer row
+(the prompt component plus the footer shell): at least 4 rows of furniture.
+Ours is a **hairline + the prompt rows + one footer row**
 (`src/tui.zig:5543`, `:5550`), and the footer row is *always* reserved so the
 input never jumps (`:5547-5549`).
 
-**One state surface.** Upstream shows the state in up to three places at once:
-the spinner row, the footer's `ModeIndicator` and the notifications
-(`PromptInputFooter.tsx:141-145`). Ours has exactly one: the footer's row
+**One state surface.** The reference implementation shows the state in up to
+three places at once: the spinner row, the footer's `ModeIndicator` and the
+notifications (the footer shell renders the status line, the left side and the
+notifications row). Ours has exactly one: the footer's row
 (`src/tui.zig:6911` `drawStateFooter`). The comment at `:5513-5520` records
 that the previous design had the activity strip **and** the mascot row saying
 the same thing in two places.
 
 **A footer that degrades in a defined order.** `src/tui.zig:7062-7076` — the
 right-hand group gives up pieces from the tail (scroll hint → tok/s → ctx %)
-and the model name is the last thing to go. Upstream's footer just hides
-whole components at 80/24 columns (`PromptInputFooter.tsx:105`, `:110`).
+and the model name is the last thing to go. The reference implementation's
+footer just hides whole components at 80/24 columns (its `isNarrow` and
+`isShort` rules).
 
 **Contrast is tested, not asserted.** `src/lib/theme.zig` — the palette has
 three ink steps with measured ratios (`:41` 18.1:1, `:43` 6.9:1, `:49` 5.6:1),
 `line` deliberately below 3:1 because a rule must recede (`:52`), and a
 `contrastOk` test that fails the build if a pair goes under the floor.
-Upstream has a theme (`code-base/components/design-system/ThemeProvider.tsx`)
+The reference implementation has a theme (the design system's theme provider)
 but no equivalent contrast gate that we found.
 
 **An ASCII mascot with a fixed width.** `src/tui.zig:74` `face`,
@@ -423,8 +417,8 @@ Ambiguous** width. The blink only runs while there is work (`:6947`).
 `src/lib/diffview.zig` (376 lines) computes the word ranges per row;
 `src/lib/markdown.zig:120-130` documents that a collapsed diff shows the row
 tints but not the word highlights, and that the expanded diff turns them on.
-Upstream does the word diff in a Rust NAPI module (`StructuredDiff.tsx:50`
-`expectColorDiff()`).
+The reference implementation does the word diff in a Rust NAPI module
+(`expectColorDiff()`).
 
 **Overlays that survive wide cells.** `src/tui.zig:6165` `expandWideCells`
 splits a wide cell into one cell per column before an overlay paints, and the
@@ -432,8 +426,8 @@ comment at `:6148-6164` explains exactly why: vaxis's renderer *skips* the
 columns a wide cell covers, so a modal painted over the hero's 95-column rule
 had a hole in it. Every overlay calls it (`src/tui.zig:7259` for the picker,
 `:6373` for the permission dialog, `src/palette.zig:685` for the palette).
-Upstream solves the same problem in the renderer (`code-base/ink/screen.ts`
-`CellWidth.SpacerHead` / `SpacerTail`) but has no equivalent "expand before
+The reference implementation solves the same problem in the renderer
+(`CellWidth.SpacerHead` / `SpacerTail`) but has no equivalent "expand before
 painting" call, because its layout engine never produces a cell that claims
 more columns than it prints.
 
@@ -444,12 +438,12 @@ section "Scroll: the anchor was an absolute line").
 
 **Selection.** `src/tui.zig:4146` `snapshotSelectableHistory`,
 `:4190` `selectionPoint`, `:4231` `paintTextSelection` — mouse drag selection
-with the selection painted on the surface. Upstream's is far larger
-(`code-base/ink/selection.ts`, 917 lines) but it exists in both.
+with the selection painted on the surface. The reference implementation's is
+far larger (its selection module, 917 lines) but it exists in both.
 
 ### 2.3 What we are missing
 
-Stated plainly, from the upstream inventory above:
+Stated plainly, from the inventory above:
 
 * no alternate screen (we always write to the normal buffer, so the terminal's
   own scrollback keeps the history that scrolled off);
@@ -461,7 +455,7 @@ Stated plainly, from the upstream inventory above:
 * no notifications/toasts;
 * no markdown tables;
 * no per-hunk line-number gutter (our diff has a gutter but not the
-  `marker + number` layout upstream computes per patch);
+  `marker + number` layout the reference implementation computes per patch);
 * no external-editor integration, no image paste, no stash;
 * no user-rebindable keybindings;
 * no OSC 8 hyperlinks;
@@ -476,50 +470,50 @@ Stated plainly, from the upstream inventory above:
 `PORT` = worth doing. `ALREADY` = we have it (or something equivalent).
 `SKIP` = do not copy.
 
-| # | Feature | Upstream ref | Our ref | Verdict | Effort | Risk | Notes |
+| # | Feature | Reference impl | Our ref | Verdict | Effort | Risk | Notes |
 |---|---|---|---|---|---|---|---|
-| 1 | Alternate screen (alt buffer) for the REPL | `code-base/screens/REPL.tsx:4485`, `code-base/ink/components/AlternateScreen.tsx:33`, `code-base/utils/fullscreen.ts` | — | **PORT** | L | High | Kills the terminal's native scrollback; upstream auto-disables it under `tmux -CC` for good reason. Only with an opt-in env flag. |
-| 2 | Separate transcript screen (`ctrl+o`) | `code-base/hooks/useGlobalKeybindings.tsx:95-132`, `code-base/screens/REPL.tsx:4466-4473` | `src/tui.zig:5045` (ctrl+r = expand last tool) | **PORT** | M | Med | Our transcript already exists in the history; the screen is a *view*, not new content. Needs a second layout path in `typeErasedDrawFn`. |
-| 3 | `ctrl+e` show-all inside the transcript | `code-base/hooks/useGlobalKeybindings.tsx:135-141` | — | **PORT** | S | Low | Cheap once (2) exists; one flag in `Model`. |
-| 4 | `▔`-divider bottom-anchored modal pane (slash-command screens) | `code-base/components/FullscreenLayout.tsx:426`, `:20` | `src/tui.zig:5783`, `:5832` (centred boxes) | **PORT** | S | Med | A pane that keeps 2 transcript rows visible is cheaper on screen than a centred modal that hides the context. |
-| 5 | Sticky prompt header when scrolled up | `code-base/components/FullscreenLayout.tsx:551-589` | — | **PORT** | S | Med | Must be **fixed 1 row** (upstream's comment at `:544-550` explains why a variable height shifts the view). Pairs with our `(paragraph, offset)` anchor. |
-| 6 | "N new messages" pill / "Jump to bottom" | `code-base/components/FullscreenLayout.tsx:491-537`, `:200-256` | `src/tui.zig:7050-7060` (`↓ latest`) | **PORT** | S | Low | We already have `↓ latest` in the footer; the pill adds the *count* and a click target. We already publish its columns (`src/tui.zig:7117-7124`) and handle the click (`:5431-5439`). |
-| 7 | Transcript search bar (`/`, `n`/`N`, match badge) and global search (`ctrl+shift+f`) | `code-base/ink/searchHighlight.ts:26`, `code-base/ink/render-to-screen.ts:212`, `code-base/screens/REPL.tsx:4433`, `code-base/components/GlobalSearchDialog.tsx` | — | **PORT** | M | Med | Needs a screen-buffer scan; our paragraphs are already segmented, so we can scan the segments instead of the cells. The global search is the same scanner over the whole session. |
-| 8 | Prompt-history search (`ctrl+r`) | `code-base/keybindings/defaultBindings.ts:49`, `code-base/components/HistorySearchDialog.tsx` | `src/tui.zig:5045` already used | **SKIP** | S | Med | Our ctrl+r is taken by *expand last tool result* and that is more useful day to day. The history can still be walked with ↑/↓ (`src/lib/editor.zig:18`). |
-| 9 | Fuzzy picker with match highlighting and scored ordering | `code-base/components/design-system/FuzzyPicker.tsx:74-76`, `code-base/components/design-system/ListItem.tsx` | `src/palette.zig:377-392` (substring + group match) | **PORT** | M | Low | Our filter is substring; a fuzzy scorer with the matched characters highlighted is a visible quality jump in a 464-model list. |
-| 10 | Picker with a **preview pane** | `code-base/components/design-system/FuzzyPicker.tsx:26` (`renderPreview`), `:35` (`previewPosition: 'bottom' | 'right'`) | `src/palette.zig:666` | **PORT** | M | Med | A model preview (context window, price, whether it is free) next to the model list is the single most useful picker addition. |
-| 11 | Slash-command suggestions as a floating overlay above the prompt | `code-base/components/FullscreenLayout.tsx:599-616` | `src/tui.zig:6008` `drawAutocomplete` (a block above the input) | **ALREADY** | — | — | Ours is inline in the flow; upstream portals it so the prompt does not move. Ours does not move the prompt either (the rows are reserved at `:5530-5533`), so the behaviour matches. |
-| 12 | Prompt box with a **rounded bottom border** | `code-base/components/PromptInput/PromptInput.tsx:2268` | `src/tui.zig:5811` (a hairline above) | **SKIP** | S | Low | Ours deliberately replaced the box with a rule: it costs 2 rows and 4 glyphs to say what the rule says in one (`src/tui.zig:5801-5806`). The border is a *style*, not a capability. |
-| 13 | Responsive footer: reflows to a column under 80 columns, drops the optional status line under 24 rows | `code-base/components/PromptInput/PromptInputFooter.tsx:105`, `:110`, `:139`, `:141` | `src/tui.zig:7062-7076` (drops segments from the tail), `:5544`, `:5546` | **ALREADY** | — | — | Ours degrades by dropping segments, upstream by re-flowing into a column and by dropping the status line. Ours keeps the model name visible, which is the more useful of the two; but ours shrinks the *input* on a short terminal, which is the wrong trade — the input is the thing the user looks at. |
-| 14 | User-configurable status line (an external command) | `code-base/components/StatusLine.tsx:36-127`, `:226-234` | `src/tui.zig:7151` `sessionInfo` | **SKIP** | M | High | Running a user shell command on every model change is an execution surface we do not need; `/context`, `/bench`, `/cache` cover the same ground. |
-| 15 | Random "verb" spinner (`Accomplishing…`, `Baking…`) | `code-base/constants/spinnerVerbs.ts:15`, `code-base/components/Spinner/SpinnerAnimationRow.tsx:98` | `src/tui.zig:6978` (`thinking`) | **SKIP** | S | Low | Ours says the *phase* (`thinking` / `streaming` / `running <tool>`), which is more informative than a random verb. Upstream's own comment on the phase distinction is in our AGENTS.md. |
-| 16 | Thinking shimmer / glow animation | `code-base/components/Spinner/SpinnerAnimationRow.tsx:27-38` | — | **SKIP** | M | Med | A 50 ms animation frame is a permanent CPU cost; ours ticks at 250 ms when idle (`Model.tickIntervalMs`). |
-| 17 | Stall detection (the spinner turns red) | `code-base/components/Spinner/useStalledAnimation.ts` | `src/tui.zig:5644` (a live clock next to the tool) | **ALREADY** | — | — | Ours answers "is it stuck?" with an elapsed clock that is always on screen; upstream with a colour change. Ours is more explicit. |
-| 18 | Token count in the spinner after 30 s | `code-base/components/Spinner/SpinnerAnimationRow.tsx:23` | `src/tui.zig:7033-7049` (`⚡ N tok/s` while streaming) | **ALREADY** | — | — | Ours shows tok/s only while tokens are actually arriving (`:7033`), which is the fix upstream's own notes describe. |
-| 19 | Permission-mode pill + effort glyph in the footer (`accept edits on`, `○ ◐ ● ◉`) | `code-base/components/PromptInput/PromptInputFooterLeftSide.tsx:348-355`, `code-base/constants/figures.ts:11-14`, `code-base/components/EffortIndicator.ts` | `src/commands.zig:609` (`/mode`), `:598` (`/effort`), `src/tui.zig:7151` `sessionInfo` | **PORT** | S | Low | The current mode is invisible in ours unless you open `/context` or `/mode`. Two one-segment additions to the footer's right group. The **effective** effort level must be shown, not the preference, or the footer says `xhigh` and the wire carries `high`. |
-| 20 | `Press {key} again to exit` (double-press ctrl+c) | `code-base/components/PromptInput/PromptInputFooterLeftSide.tsx:150` | `src/tui.zig:4996-5005` (ctrl+c clears the input, then exits) | **ALREADY** | — | — | Ours uses a two-press rule with a different semantic (clear, then exit). Upstream's message is friendlier. |
-| 21 | Kitty keyboard protocol (`CSI u`) parsing | `code-base/ink/parse-keypress.ts:19`, `:630` | vaxis | **ALREADY** | — | — | vaxis owns the terminal protocol layer; we should not re-implement it. |
-| 22 | OSC 8 hyperlinks | `code-base/ink/supports-hyperlinks.ts:26` | — | **PORT** | S | Low | File paths and URLs in the transcript as real hyperlinks. vaxis exposes the cell attributes; the detection (TERM_PROGRAM / LC_TERMINAL / COLORTERM) is ~30 lines. |
-| 23 | Mouse selection + `ctrl+shift+c` copy | `code-base/ink/selection.ts`, `code-base/keybindings/defaultBindings.ts:210-211` | `src/tui.zig:4146`, `:4231` (selection), `:5018` (`/copy`) | **ALREADY** | — | — | We have selection and a copy command; we lack the `ctrl+shift+c` shortcut. Add the key, not the machinery. |
-| 24 | Markdown tables | `code-base/components/MarkdownTable.tsx` | `src/lib/markdown.zig:16` (`Kind` has no table) | **PORT** | M | Med | Models emit tables. Ours renders them as prose. A grid renderer is a contained addition to `markdown.zig`. |
-| 25 | Diff gutter = marker + right-aligned line number, per hunk | `code-base/components/StructuredDiff.tsx:46-49` | `src/lib/diffview.zig`, `src/tui.zig:548` `diffRowIndent` | **ALREADY** | — | — | Our gutter exists; upstream's *width is computed from the patch*, ours is per-row. Equivalent in effect. |
-| 26 | Narrow-terminal fallback when the gutter does not fit | `code-base/components/StructuredDiff.tsx:59-60` | `src/tui.zig:514` `appendContinuation` | **ALREADY** | — | — | Ours clips and indents the continuation; upstream drops the split. Both are correct. |
-| 27 | Modal diff viewer navigating between files / old-new sides | `code-base/components/diff/DiffDialog.tsx`, `code-base/keybindings/defaultBindings.ts:309-318` | `src/tui.zig:5045` (ctrl+r expands one result inline) | **PORT** | L | Med | A diff *dialog* is a different feature from an inline diff. Only worth it if we get multi-file diffs in one turn. |
-| 28 | Notifications / toasts with priority and timeout (+ the token-budget warning) | `code-base/components/PromptInput/Notifications.tsx:55`, `code-base/context/notifications.ts`, `code-base/components/TokenWarning.tsx` | `src/tui.zig:5775` (the `ask` panel only), `:7204` `contextInfo` | **PORT** | M | Med | We push everything into the transcript; upstream has a transient channel for "the auto-updater restarted", "the IDE connected", "the token budget is nearly gone". A one-line queue above the input (absolutely positioned, so nothing shifts) is a contained change. The same queue can carry the **token-budget warning**: we show the percentage, upstream shows a warning with a threshold and the collapse progress. |
-| 29 | Context visualisation (per-category breakdown) | `code-base/components/ContextVisualization.tsx:105`, `:219-242` | `src/commands.zig:614` (`/context`, 3 lines) | **PORT** | M | Med | We already compute the token counts; upstream draws a proportional chart per category (system prompt, tools, messages, MCP, skills, autocompact reserve). High information density per row. |
-| 30 | Task/todo panel with blockers and priorities | `code-base/components/TaskListV2.tsx:51`, `:143-190` | `src/lib/taskstore.zig:123` (`Store`, `link`, `hasOpenBlocker`), `src/tui.zig:6440` `drawPlanBlock` | **PORT** | M | Med | The **data model already exists** (the task graph with `blocked_by`) but is not surfaced. A panel is the missing half. |
-| 31 | Message actions per message (copy / rewind) | `code-base/components/messageActions.tsx`, `code-base/keybindings/defaultBindings.ts:271-293` | `src/commands.zig:623` (`/copy N`) | **PORT** | M | Med | Upstream binds `shift+↑` to a per-message menu. Ours has `/copy N` (N answers back) but no per-message targeting. A `shift+↑` that targets the message under the cursor would make `/copy` redundant. |
-| 32 | Quick open file palette (`ctrl+shift+p`) | `code-base/components/QuickOpenDialog.tsx` | `src/tui.zig:4743` `refreshFileMatches` (`@` mention popup) | **ALREADY** | — | — | The `@` popup is the same capability with a different trigger. |
-| 33 | Compact-summary line ("Summarized N messages … (ctrl+o to expand history)") | `code-base/components/CompactSummary.tsx:48` | `src/lib/compaction.zig` (no visible marker) | **PORT** | S | Med | After a tier-2 compaction the transcript silently loses history. A one-line marker saying what was summarised is cheap and honest. |
-| 34 | Permission dialog with a **rules explanation** (`ctrl+e` toggles it) | `code-base/components/permissions/PermissionRuleExplanation.tsx`, `code-base/keybindings/defaultBindings.ts:145` | `src/tui.zig:6352` `drawPermissionModal` | **PORT** | M | Med | Our dialog shows the tool and the argument; upstream also explains *which rule* matched and lets the user edit the rule. That is the "always allow" story. |
-| 35 | Permission dialog shape (top border only, no sides) | `code-base/components/permissions/PermissionDialog.tsx:64` | `src/tui.zig:6378-6388` (a full box) | **SKIP** | S | Low | A full box is more visible, and ours is a *modal* on purpose: the AGENTS.md notes the previous four-line version looked like a hang. Visibility wins. |
-| 36 | "Waiting for permission…" suppression line above the prompt | `code-base/components/PromptInput/PromptInput.tsx:2246-2248` | `src/tui.zig:6958` (the footer says `waiting for your permission`) | **ALREADY** | — | — | Ours says it in the one state surface. |
-| 37 | Queued prompts shown above the prompt | `code-base/components/PromptInput/PromptInputQueuedCommands.tsx` | `src/tui.zig:6986` (`N queued` in the footer) | **ALREADY** | — | — | Ours shows the count, upstream shows the text of the next one. A small upgrade worth taking. |
-| 38 | External editor (`ctrl+g`) | `code-base/keybindings/defaultBindings.ts:83-84`, `code-base/components/PromptInput/PromptInput.tsx:2236-2241` | — | **PORT** | S | Med | `!cmd` already exists as a shell-out; an external editor for a long prompt is the same idea with a better editor. |
-| 39 | Image paste (`ctrl+v`) | `code-base/keybindings/defaultBindings.ts:87` | `src/lib/images.zig` (images exist) | **PORT** | M | Med | The infrastructure is already there. |
-| 40 | Startup logo / welcome screen | `code-base/components/LogoV2/` | `src/tui.zig:6239` `heroFrame` | **ALREADY** | — | — | Ours shows a centred hero only when the conversation is empty (`:6240-6241`). Same intent. |
-| 41 | Keyboard-shortcut help in the footer (`? for shortcuts`) | `code-base/components/PromptInput/PromptInputHelpMenu.tsx`, `code-base/components/PromptInput/PromptInputFooter.tsx:122` | `src/commands.zig:592` (`/help`) | **PORT** | S | Low | A `?` hint in the footer that opens the key list. Cheap, and the discoverability win is real. |
-| 42 | Terminal focus detection (dim the cursor when the window is not focused) | `code-base/components/TextInput.tsx:65` (`canShowCursor`) | — | **PORT** | S | Low | vaxis reports focus events; hiding the caret in an unfocused terminal is the standard behaviour and prevents a "phantom cursor" in a screenshot. |
+| 1 | Alternate screen (alt buffer) for the REPL | the REPL's alt-buffer wrapper, the `AlternateScreen` component and the fullscreen env probe | — | **PORT** | L | High | Kills the terminal's native scrollback; the reference implementation auto-disables it under `tmux -CC` for good reason. Only with an opt-in env flag. |
+| 2 | Separate transcript screen (`ctrl+o`) | the global-keybindings hook that swaps the screen, and the REPL's transcript branch | `src/tui.zig:5045` (ctrl+r = expand last tool) | **PORT** | M | Med | Our transcript already exists in the history; the screen is a *view*, not new content. Needs a second layout path in `typeErasedDrawFn`. |
+| 3 | `ctrl+e` show-all inside the transcript | the same global-keybindings hook (`ctrl+e` inside the transcript) | — | **PORT** | S | Low | Cheap once (2) exists; one flag in `Model`. |
+| 4 | `▔`-divider bottom-anchored modal pane (slash-command screens) | the absolute modal box of the fullscreen layout (`MODAL_TRANSCRIPT_PEEK = 2`) | `src/tui.zig:5783`, `:5832` (centred boxes) | **PORT** | S | Med | A pane that keeps 2 transcript rows visible is cheaper on screen than a centred modal that hides the context. |
+| 5 | Sticky prompt header when scrolled up | the `StickyPromptHeader` component of the fullscreen layout (fixed one row) | — | **PORT** | S | Med | Must be **fixed 1 row** (the reference implementation's own comment explains why a variable height shifts the view). Pairs with our `(paragraph, offset)` anchor. |
+| 6 | "N new messages" pill / "Jump to bottom" | the `NewMessagesPill` component and the unseen-turn counter of the fullscreen layout | `src/tui.zig:7050-7060` (`↓ latest`) | **PORT** | S | Low | We already have `↓ latest` in the footer; the pill adds the *count* and a click target. We already publish its columns (`src/tui.zig:7117-7124`) and handle the click (`:5431-5439`). |
+| 7 | Transcript search bar (`/`, `n`/`N`, match badge) and global search (`ctrl+shift+f`) | the search-highlight module, the screen renderer's `applyPositionedHighlight`, the REPL's transcript branch and the global-search dialog | — | **PORT** | M | Med | Needs a screen-buffer scan; our paragraphs are already segmented, so we can scan the segments instead of the cells. The global search is the same scanner over the whole session. |
+| 8 | Prompt-history search (`ctrl+r`) | the global keybinding table (`ctrl+r`) and the history-search dialog | `src/tui.zig:5045` already used | **SKIP** | S | Med | Our ctrl+r is taken by *expand last tool result* and that is more useful day to day. The history can still be walked with ↑/↓ (`src/lib/editor.zig:18`). |
+| 9 | Fuzzy picker with match highlighting and scored ordering | the design system's fuzzy picker (`DEFAULT_VISIBLE = 8`, `CHROME_ROWS = 10`) and its list-item component | `src/palette.zig:377-392` (substring + group match) | **PORT** | M | Low | Our filter is substring; a fuzzy scorer with the matched characters highlighted is a visible quality jump in a 464-model list. |
+| 10 | Picker with a **preview pane** | the fuzzy picker's `renderPreview` slot, with `previewPosition: 'bottom' \| 'right'` | `src/palette.zig:666` | **PORT** | M | Med | A model preview (context window, price, whether it is free) next to the model list is the single most useful picker addition. |
+| 11 | Slash-command suggestions as a floating overlay above the prompt | the absolute suggestions box of the fullscreen layout, portalled out of the prompt | `src/tui.zig:6008` `drawAutocomplete` (a block above the input) | **ALREADY** | — | — | Ours is inline in the flow; the reference implementation portals it so the prompt does not move. Ours does not move the prompt either (the rows are reserved at `:5530-5533`), so the behaviour matches. |
+| 12 | Prompt box with a **rounded bottom border** | the prompt component's `borderStyle="round" borderBottom` | `src/tui.zig:5811` (a hairline above) | **SKIP** | S | Low | Ours deliberately replaced the box with a rule: it costs 2 rows and 4 glyphs to say what the rule says in one (`src/tui.zig:5801-5806`). The border is a *style*, not a capability. |
+| 13 | Responsive footer: reflows to a column under 80 columns, drops the optional status line under 24 rows | the footer shell's `isNarrow` (`columns < 80`), `isShort` (`rows < 24`) and its row/column switch | `src/tui.zig:7062-7076` (drops segments from the tail), `:5544`, `:5546` | **ALREADY** | — | — | Ours degrades by dropping segments, the reference implementation by re-flowing into a column and by dropping the status line. Ours keeps the model name visible, which is the more useful of the two; but ours shrinks the *input* on a short terminal, which is the wrong trade — the input is the thing the user looks at. |
+| 14 | User-configurable status line (an external command) | the status-line component: a user shell command fed a JSON payload | `src/tui.zig:7151` `sessionInfo` | **SKIP** | M | High | Running a user shell command on every model change is an execution surface we do not need; `/context`, `/bench`, `/cache` cover the same ground. |
+| 15 | Random "verb" spinner (`Accomplishing…`, `Baking…`) | the spinner's verb list and the 50 ms spinner animation row | `src/tui.zig:6978` (`thinking`) | **SKIP** | S | Low | Ours says the *phase* (`thinking` / `streaming` / `running <tool>`), which is more informative than a random verb. The reference implementation's own comment on the phase distinction is in our AGENTS.md. |
+| 16 | Thinking shimmer / glow animation | the spinner's shimmer/glow animation | — | **SKIP** | M | Med | A 50 ms animation frame is a permanent CPU cost; ours ticks at 250 ms when idle (`Model.tickIntervalMs`). |
+| 17 | Stall detection (the spinner turns red) | the spinner's stalled-animation hook | `src/tui.zig:5644` (a live clock next to the tool) | **ALREADY** | — | — | Ours answers "is it stuck?" with an elapsed clock that is always on screen; the reference implementation with a colour change. Ours is more explicit. |
+| 18 | Token count in the spinner after 30 s | the spinner animation row's `SHOW_TOKENS_AFTER_MS` gate | `src/tui.zig:7033-7049` (`⚡ N tok/s` while streaming) | **ALREADY** | — | — | Ours shows tok/s only while tokens are actually arriving (`:7033`), which is the fix the reference implementation's own notes describe. |
+| 19 | Permission-mode pill + effort glyph in the footer (`accept edits on`, `○ ◐ ● ◉`) | the footer left side's mode pill, the figure constants for the effort glyph and the effort-indicator component | `src/commands.zig:609` (`/mode`), `:598` (`/effort`), `src/tui.zig:7151` `sessionInfo` | **PORT** | S | Low | The current mode is invisible in ours unless you open `/context` or `/mode`. Two one-segment additions to the footer's right group. The **effective** effort level must be shown, not the preference, or the footer says `xhigh` and the wire carries `high`. |
+| 20 | `Press {key} again to exit` (double-press ctrl+c) | the footer left side's double-press message | `src/tui.zig:4996-5005` (ctrl+c clears the input, then exits) | **ALREADY** | — | — | Ours uses a two-press rule with a different semantic (clear, then exit). The reference implementation's message is friendlier. |
+| 21 | Kitty keyboard protocol (`CSI u`) parsing | the keypress parser's kitty (`CSI u`) branch | vaxis | **ALREADY** | — | — | vaxis owns the terminal protocol layer; we should not re-implement it. |
+| 22 | OSC 8 hyperlinks | the hyperlink-support detection module | — | **PORT** | S | Low | File paths and URLs in the transcript as real hyperlinks. vaxis exposes the cell attributes; the detection (TERM_PROGRAM / LC_TERMINAL / COLORTERM) is ~30 lines. |
+| 23 | Mouse selection + `ctrl+shift+c` copy | the selection module and the global keybinding table's copy binding | `src/tui.zig:4146`, `:4231` (selection), `:5018` (`/copy`) | **ALREADY** | — | — | We have selection and a copy command; we lack the `ctrl+shift+c` shortcut. Add the key, not the machinery. |
+| 24 | Markdown tables | the markdown-table renderer (a flexbox grid) | `src/lib/markdown.zig:16` (`Kind` has no table) | **PORT** | M | Med | Models emit tables. Ours renders them as prose. A grid renderer is a contained addition to `markdown.zig`. |
+| 25 | Diff gutter = marker + right-aligned line number, per hunk | the structured-diff component's `computeGutterWidth(patch)` | `src/lib/diffview.zig`, `src/tui.zig:548` `diffRowIndent` | **ALREADY** | — | — | Our gutter exists; the reference implementation's *width is computed from the patch*, ours is per-row. Equivalent in effect. |
+| 26 | Narrow-terminal fallback when the gutter does not fit | the structured-diff component's narrow-terminal skip | `src/tui.zig:514` `appendContinuation` | **ALREADY** | — | — | Ours clips and indents the continuation; the reference implementation drops the split. Both are correct. |
+| 27 | Modal diff viewer navigating between files / old-new sides | the diff dialog component and the global keybinding table's diff bindings | `src/tui.zig:5045` (ctrl+r expands one result inline) | **PORT** | L | Med | A diff *dialog* is a different feature from an inline diff. Only worth it if we get multi-file diffs in one turn. |
+| 28 | Notifications / toasts with priority and timeout (+ the token-budget warning) | the prompt's notifications component, the notification-context store and the token-warning component | `src/tui.zig:5775` (the `ask` panel only), `:7204` `contextInfo` | **PORT** | M | Med | We push everything into the transcript; the reference implementation has a transient channel for "the auto-updater restarted", "the IDE connected", "the token budget is nearly gone". A one-line queue above the input (absolutely positioned, so nothing shifts) is a contained change. The same queue can carry the **token-budget warning**: we show the percentage, the reference implementation shows a warning with a threshold and the collapse progress. |
+| 29 | Context visualisation (per-category breakdown) | the context-visualisation component (a proportional chart per category) | `src/commands.zig:614` (`/context`, 3 lines) | **PORT** | M | Med | We already compute the token counts; the reference implementation draws a proportional chart per category (system prompt, tools, messages, MCP, skills, autocompact reserve). High information density per row. |
+| 30 | Task/todo panel with blockers and priorities | the task-list panel (`maxDisplay`, the truncation priority, the open blockers) | `src/lib/taskstore.zig:123` (`Store`, `link`, `hasOpenBlocker`), `src/tui.zig:6440` `drawPlanBlock` | **PORT** | M | Med | The **data model already exists** (the task graph with `blocked_by`) but is not surfaced. A panel is the missing half. |
+| 31 | Message actions per message (copy / rewind) | the per-message actions module and the global keybinding table's `shift+↑` binding | `src/commands.zig:623` (`/copy N`) | **PORT** | M | Med | The reference implementation binds `shift+↑` to a per-message menu. Ours has `/copy N` (N answers back) but no per-message targeting. A `shift+↑` that targets the message under the cursor would make `/copy` redundant. |
+| 32 | Quick open file palette (`ctrl+shift+p`) | the quick-open dialog | `src/tui.zig:4743` `refreshFileMatches` (`@` mention popup) | **ALREADY** | — | — | The `@` popup is the same capability with a different trigger. |
+| 33 | Compact-summary line ("Summarized N messages … (ctrl+o to expand history)") | the compact-summary component | `src/lib/compaction.zig` (no visible marker) | **PORT** | S | Med | After a tier-2 compaction the transcript silently loses history. A one-line marker saying what was summarised is cheap and honest. |
+| 34 | Permission dialog with a **rules explanation** (`ctrl+e` toggles it) | the permission rule-explanation component and the confirmation context's `ctrl+e` binding | `src/tui.zig:6352` `drawPermissionModal` | **PORT** | M | Med | Our dialog shows the tool and the argument; the reference implementation also explains *which rule* matched and lets the user edit the rule. That is the "always allow" story. |
+| 35 | Permission dialog shape (top border only, no sides) | the permission dialog's top-border-only box | `src/tui.zig:6378-6388` (a full box) | **SKIP** | S | Low | A full box is more visible, and ours is a *modal* on purpose: the AGENTS.md notes the previous four-line version looked like a hang. Visibility wins. |
+| 36 | "Waiting for permission…" suppression line above the prompt | the prompt component's suppressed-permission line | `src/tui.zig:6958` (the footer says `waiting for your permission`) | **ALREADY** | — | — | Ours says it in the one state surface. |
+| 37 | Queued prompts shown above the prompt | the prompt's queued-commands strip | `src/tui.zig:6986` (`N queued` in the footer) | **ALREADY** | — | — | Ours shows the count, the reference implementation shows the text of the next one. A small upgrade worth taking. |
+| 38 | External editor (`ctrl+g`) | the global keybinding table's `ctrl+g` and the prompt component's external-editor branch | — | **PORT** | S | Med | `!cmd` already exists as a shell-out; an external editor for a long prompt is the same idea with a better editor. |
+| 39 | Image paste (`ctrl+v`) | the global keybinding table's `ctrl+v` | `src/lib/images.zig` (images exist) | **PORT** | M | Med | The infrastructure is already there. |
+| 40 | Startup logo / welcome screen | the startup logo / welcome screen component | `src/tui.zig:6239` `heroFrame` | **ALREADY** | — | — | Ours shows a centred hero only when the conversation is empty (`:6240-6241`). Same intent. |
+| 41 | Keyboard-shortcut help in the footer (`? for shortcuts`) | the prompt's help menu and the footer shell's `? for shortcuts` hint | `src/commands.zig:592` (`/help`) | **PORT** | S | Low | A `?` hint in the footer that opens the key list. Cheap, and the discoverability win is real. |
+| 42 | Terminal focus detection (dim the cursor when the window is not focused) | the text input's `canShowCursor` check | — | **PORT** | S | Low | vaxis reports focus events; hiding the caret in an unfocused terminal is the standard behaviour and prevents a "phantom cursor" in a screenshot. |
 
 ---
 
@@ -557,7 +551,7 @@ scrollbar) is reused unchanged.
   assuming it is fine.
 * The scroll anchor is `(paragraph, offset)`; entering the transcript has to
   keep or reset it deliberately. Resetting to the bottom on entry is the
-  upstream behaviour (`useUnseenDivider`, `code-base/components/FullscreenLayout.tsx:125`).
+  reference implementation's behaviour (its unseen-divider hook).
 * The `↓ latest` click target is published from the footer
   (`src/tui.zig:7117-7124`); in transcript mode there is no footer, so the
   target must be cleared or the click will scroll a screen that is not there.
@@ -576,17 +570,16 @@ Model.sticky_prompt: ?[]const u8   // the prompt of the turn being read
 Model.unseen_count: usize           // turns since the user scrolled away
 ```
 
-`unseen_count` must be counted the way upstream counts it
-(`code-base/components/FullscreenLayout.tsx:200-223`): assistant *turns* with
-visible text, not raw entries — a tool-only entry does not tick the counter.
+`unseen_count` must be counted the way the reference implementation counts it
+(its unseen-turn counter): assistant *turns* with visible text, not raw
+entries — a tool-only entry does not tick the counter.
 
 **What could break.**
 
-* Upstream's sticky header is **fixed at one row** for a reason
-  (`code-base/components/FullscreenLayout.tsx:544-550`): a variable height
-  shifts the scroll box and the content jumps. Ours must reserve the row
-  unconditionally, or the transcript will move every time the sticky prompt
-  changes.
+* The reference implementation's sticky header is **fixed at one row** for a
+  reason (its own comment says so): a variable height shifts the scroll box
+  and the content jumps. Ours must reserve the row unconditionally, or the
+  transcript will move every time the sticky prompt changes.
 * The row has to be painted *before* the history, and the history area is
   cleared at `src/tui.zig:5728-5731` — so the sticky row must be outside
   `history_h`, or the clear will erase it.
@@ -627,15 +620,15 @@ pane in `boxFor` (`:646-650` already computes a two-column split).
 **Files:** `src/tui.zig` (`drawStateFooter` at `:6911`).
 
 **Data flow.** The footer already degrades by dropping segments
-(`:7062-7076`). Adding the upstream behaviour means **re-flowing** the left
-group below the right group when `width < 80` — which costs a row, and the
-footer row is deliberately always one row (`:5547-5549`).
+(`:7062-7076`). Adding the reference implementation's behaviour means
+**re-flowing** the left group below the right group when `width < 80` — which
+costs a row, and the footer row is deliberately always one row
+(`:5547-5549`).
 
 **What could break.** The input's height would jump when the terminal is
-resized across 80 columns. The right answer is the upstream one
-(`code-base/components/PromptInput/PromptInputFooter.tsx:110`): the
-`isShort` reduction drops the *optional* content, not the row count. Ours
-would have to drop the ctx % or the tok/s, not add a row.
+resized across 80 columns. The right answer is the reference implementation's
+one (its `isShort` reduction): it drops the *optional* content, not the row
+count. Ours would have to drop the ctx % or the tok/s, not add a row.
 
 ### 4.5 (19) Permission mode and effort glyph in the footer
 
@@ -688,12 +681,11 @@ Model.notices: []Notice   // {text, style, expires_at}
 
 Painted **above the input** in the `chrome` rows already computed at
 `src/tui.zig:5543` (the same rows the autocomplete popup uses at `:5530`).
-The upstream trick is to make the notification layer *absolutely positioned*
-so it does not shift the prompt
-(`code-base/components/PromptInput/PromptInput.tsx:2293`); ours cannot do
-that (there is no absolute positioning in the surface), so the rows have to
-be **reserved** — which means the autocomplete popup and the notification
-cannot both be visible, or the layout needs one more reserved row.
+The reference implementation's trick is to make the notification layer
+*absolutely positioned* so it does not shift the prompt; ours cannot do that
+(there is no absolute positioning in the surface), so the rows have to be
+**reserved** — which means the autocomplete popup and the notification cannot
+both be visible, or the layout needs one more reserved row.
 
 **What could break.** The input's height would jump every time a notice
 appears or expires. The reserved-row approach fixes that but costs a row
@@ -722,10 +714,9 @@ row (`:5527`) and the panel needs up to ten.
   while a worker may be writing it from the tool call. This is the same
   hazard the task-graph section of the AGENTS.md describes for the parallel
   batch; the panel needs a snapshot.
-* Upstream's own panel **prioritises** the rows it shows
-  (`code-base/components/TaskListV2.tsx:143-166`): recently completed first,
-  then in progress, then unblocked pending. A naive "first N rows" panel would
-  hide the step the agent is on.
+* The reference implementation's own panel **prioritises** the rows it shows:
+  recently completed first, then in progress, then unblocked pending. A naive
+  "first N rows" panel would hide the step the agent is on.
 
 ### 4.9 (34) Permission dialog with the rule explanation
 
@@ -767,152 +758,151 @@ and `putStable` does not copy).
   to be told to ignore it, or the column arithmetic of the whole row shifts.
 * Terminals that do not support OSC 8 will print the sequence literally.
   The detection has to be per-terminal (`TERM_PROGRAM`, `LC_TERMINAL`,
-  `COLORTERM`), exactly as upstream does
-  (`code-base/ink/supports-hyperlinks.ts:26-50`).
+  `COLORTERM`), exactly as the reference implementation does (its
+  hyperlink-support detection reads the same three variables).
 
 ---
 
-## 5. Things upstream does that we should NOT copy
+## 5. Things the reference implementation does that we should NOT copy
 
-1. **The alternate screen as the default.** Upstream's own code auto-disables
-   it under `tmux -CC` because alt-screen plus mouse tracking corrupts the
-   terminal (`code-base/utils/fullscreen.ts`, `isFullscreenEnvEnabled` /
-   `isTmuxControlMode`), and it leaves the tmux `mouse` option alone on
+1. **The alternate screen as the default.** The reference implementation's own
+   code auto-disables it under `tmux -CC` because alt-screen plus mouse
+   tracking corrupts the terminal (the `isFullscreenEnvEnabled` /
+   `isTmuxControlMode` pair), and it leaves the tmux `mouse` option alone on
    purpose. Our terminal scrollback is a feature: the history that scrolled
    off is still there after the app exits. If we ever port it, it must be
    opt-in, and it must keep the mouse off by default.
 
-2. **The random verb spinner** (`code-base/constants/spinnerVerbs.ts:15`).
+2. **The random verb spinner** (the spinner's verb list).
    "Accomplishing…" says less than "running Bash · 12.4s", and our footer
    already names the phase. A verb is decoration that costs a 50 ms animation
    frame.
 
-3. **The thinking shimmer** (`code-base/components/Spinner/SpinnerAnimationRow.tsx:27-38`).
+3. **The thinking shimmer** (the spinner's shimmer/glow animation).
    A permanent 50 ms repaint of the whole screen to make three words glow.
    Ours ticks at 250 ms when idle.
 
-4. **The external status-line command** (`code-base/components/StatusLine.tsx:36-127`).
+4. **The external status-line command** (the status-line component).
    It runs a user shell command with a JSON payload on every model or message
    change. It is an execution surface, and `/context`, `/bench` and `/cache`
    already answer the same questions.
 
 5. **The prompt box with a rounded bottom border**
-   (`code-base/components/PromptInput/PromptInput.tsx:2268`). Ours replaced
+   (the prompt component's `borderStyle="round" borderBottom`). Ours replaced
    the box with a single hairline deliberately (`src/tui.zig:5801-5806`): a
    box is two extra rows and four more glyphs to say "this is the boundary of
    the page". This is a style choice that was made on purpose and measured
    ("eleven rows of furniture before the first word").
 
 6. **The permission dialog as a top-border-only pane**
-   (`code-base/components/permissions/PermissionDialog.tsx:64`). Ours is a
-   centred box with a clean background, and the reason is in the AGENTS.md:
+   (the permission dialog's `borderBottom={false}` box). Ours is a centred
+   box with a clean background, and the reason is in the AGENTS.md:
    the previous version was four lines glued above the input, half hidden
    under a full history, and the app looked hung. Visibility wins over
    elegance for the one dialog that blocks the turn.
 
-7. **Two state indicators.** Upstream can show the spinner, the mode pill, the
-   notifications and the status line at the same time
-   (`code-base/components/PromptInput/PromptInputFooter.tsx:139-149`). Ours
-   has exactly one state surface (`src/tui.zig:6911`) and that is a
-   deliberate rule ("un solo indicador de estado"), not an accident.
+7. **Two state indicators.** The reference implementation can show the spinner,
+   the mode pill, the notifications and the status line at the same time
+   (the footer shell renders the status line, the left side and the
+   notifications row). Ours has exactly one state surface
+   (`src/tui.zig:6911`) and that is a deliberate rule ("un solo indicador de
+   estado"), not an accident.
 
-8. **Rewinding the conversation** (`code-base/components/MessageSelector.tsx`,
-   830 lines). It changes the session's semantics; it is a product feature,
+8. **Rewinding the conversation** (the message selector, 830 lines).
+   It changes the session's semantics; it is a product feature,
    not chrome, and it is the one thing in this list that could corrupt state.
 
 9. **Vim mode.** A mode system inside the editor for a user base that mostly
    types plain text.
 
-10. **User-rebindable keybindings.** The upstream system is a table plus a
-    parser plus a validator plus a reserved-shortcut list
-    (`code-base/keybindings/`). Ours is a short hard-coded chain
-    (`src/tui.zig:4996-5054`). If the chain ever needs rebinding, the table
-    is the right shape — but porting the whole subsystem before there is a
-    demand for it is the kind of thing that rots.
+10. **User-rebindable keybindings.** The reference implementation's system is a
+    table plus a parser plus a validator plus a reserved-shortcut list. Ours is
+    a short hard-coded chain (`src/tui.zig:4996-5054`). If the chain ever
+    needs rebinding, the table is the right shape — but porting the whole
+    subsystem before there is a demand for it is the kind of thing that rots.
 
-11. **The `⎿` gutter repeated at every nesting level.** Upstream suppresses
-    nested `⎿` with a context flag
-    (`code-base/components/MessageResponse.tsx:65-71`). Ours does not have
-    nested results, so this is a non-issue — but if a nested result ever
-    appears, the suppression has to come with it.
+11. **The `⎿` gutter repeated at every nesting level.** The reference
+    implementation suppresses nested `⎿` with a context flag on the result
+    component. Ours does not have nested results, so this is a non-issue — but
+    if a nested result ever appears, the suppression has to come with it.
 
 ---
 
 ## 6. Open questions
 
-1. **How much of upstream's layout is the Yoga flexbox doing?** The
-   composition at `code-base/components/FullscreenLayout.tsx:361-426` uses
-   `flexGrow`, `flexShrink`, `maxHeight="50%"` and `position="absolute"`. Our
-   layout is hand arithmetic (`src/tui.zig:5494-5556`). Before porting the
-   transcript screen we should measure how much of upstream's *appearance*
-   comes from the flexbox rather than from the components. The `maxHeight="50%"`
-   on the bottom slot is the part that has no equivalent in ours.
+1. **How much of the reference implementation's layout is the Yoga flexbox
+   doing?** Its composition uses `flexGrow`, `flexShrink`, `maxHeight="50%"`
+   and `position="absolute"`. Our layout is hand arithmetic
+   (`src/tui.zig:5494-5556`). Before porting the transcript screen we should
+   measure how much of the reference implementation's *appearance* comes from
+   the flexbox rather than from the components. The `maxHeight="50%"` on the
+   bottom slot is the part that has no equivalent in ours.
 
-2. **What does upstream's `Ratchet` (`code-base/components/design-system/Ratchet.tsx`)
-   actually save?** It keeps the box's height while the content is
-   off-screen, so an off-screen block does not collapse. Our segment cache
-   (`src/tui.zig:5572-5585`) is the equivalent idea, but we do not know
-   whether upstream's saving is significant at our scale (we cap the cache at
-   128 paragraphs).
+2. **What does the reference implementation's `Ratchet` actually save?** It
+   keeps the box's height while the content is off-screen, so an off-screen
+   block does not collapse. Our segment cache (`src/tui.zig:5572-5585`) is the
+   equivalent idea, but we do not know whether the reference implementation's
+   saving is significant at our scale (we cap the cache at 128 paragraphs).
 
-3. **Is the "N new" pill worth the count semantics?** Upstream counts
-   assistant *turns* with visible text and skips tool-only entries
-   (`code-base/components/FullscreenLayout.tsx:205-213`). Our history has
-   paragraphs, not messages, so the mapping from "turn" to "paragraph" is not
-   obvious: a turn that produced three tool calls and one answer is four
-   paragraphs in ours and one turn upstream.
+3. **Is the "N new" pill worth the count semantics?** The reference
+   implementation counts assistant *turns* with visible text and skips
+   tool-only entries. Our history has paragraphs, not messages, so the mapping
+   from "turn" to "paragraph" is not obvious: a turn that produced three tool
+   calls and one answer is four paragraphs in ours and one turn in the
+   reference implementation.
 
-4. **How does upstream handle the transcript when the prompt is unmounted?**
-   `code-base/screens/REPL.tsx:4466-4473` swaps the bottom slot for a
+4. **How does the reference implementation handle the transcript when the
+   prompt is unmounted?** It swaps the bottom slot for a
    `TranscriptModeFooter`; the *notification* and *permission* channels then
    have no home. We would have the same problem, and the answer is not
    obvious.
 
-5. **Does upstream's mouse selection survive a `tmux` pane without the
-   `mouse` option?** `code-base/utils/fullscreen.ts` has a dedicated hint
+5. **Does the reference implementation's mouse selection survive a `tmux` pane
+   without the `mouse` option?** Its fullscreen module has a dedicated hint
    for exactly that (`maybeGetTmuxMouseHint`). We have a selection
    implementation (`src/tui.zig:4146`) and we have never tested it inside
    tmux with `mouse off`.
 
-6. **What is the actual upstream default for `CLAUDE_CODE_NO_FLICKER` for
-   external users?** The code says "off for external users
-   (`CLAUDE_CODE_NO_FLICKER=1` to opt in)" in the comment at
-   `code-base/components/FullscreenLayout.tsx:264-265`, but
-   `isFullscreenEnvEnabled()` returns `process.env.USER_TYPE === 'ant'` at
-   the end, so for an external user the default is **off**. The comment is
-   right but the way it is phrased is ambiguous.
+6. **What is the actual default for `CLAUDE_CODE_NO_FLICKER` for external
+   users?** The code says "off for external users
+   (`CLAUDE_CODE_NO_FLICKER=1` to opt in)" in the comment next to the
+   fullscreen layout's alt-buffer branch, but `isFullscreenEnvEnabled()`
+   returns `process.env.USER_TYPE === 'ant'` at the end, so for an external
+   user the default is **off**. The comment is right but the way it is phrased
+   is ambiguous.
 
-7. **Does upstream's `▔` divider have a name or is it just `"\u2594"`?**
-   `code-base/components/FullscreenLayout.tsx:426` uses the literal
+7. **Does the reference implementation's `▔` divider have a name or is it just
+   `"\u2594"`?** The absolute modal box uses the literal
    `"\u2594".repeat(columns)`. It is the same character as `▔` but with the
    `REPEAT` semantics of a "heavy up" bar. If we port the pane, we should
    check whether the intent was a *half-height* rule (which reads as a
    "sheet of paper sliding up") rather than a full rule.
 
-8. **How much of upstream's visual identity is the theme file?** We did not
-   find upstream's `utils/theme.ts` in the vendored tree in this pass, so the
-   comparison of palettes (`code-base/components/design-system/ThemeProvider.tsx`)
-   is incomplete. Our `src/lib/theme.zig` has a measured contrast contract
-   that upstream does not appear to have; that is a difference in *quality*,
+8. **How much of the reference implementation's visual identity is the theme
+   file?** We did not find its theme module in this pass, so the comparison of
+   palettes (the design system's theme provider) is incomplete. Our
+   `src/lib/theme.zig` has a measured contrast contract that the reference
+   implementation does not appear to have; that is a difference in *quality*,
    not in feature, and it should not be traded away.
 
-9. **Is the upstream `CtrlOToExpand` chip visible by default?** It is
-   rendered inside the transcript's collapsible blocks
-   (`code-base/components/CtrlOToExpand.tsx:29-45`) and returns `null` inside
-   a sub-agent or a virtual list (`:34-36`). We could not determine whether
-   the chip appears in the normal chat transcript.
+9. **Is the reference implementation's `CtrlOToExpand` chip visible by
+   default?** It is rendered inside the transcript's collapsible blocks and
+   returns `null` inside a sub-agent or a virtual list. We could not determine
+   whether the chip appears in the normal chat transcript.
 
-10. **What is upstream's behaviour when the terminal is narrower than the
-    permission dialog?** `code-base/components/permissions/PermissionDialog.tsx`
-    has no width handling of its own; it relies on Yoga. Our
+10. **What is the reference implementation's behaviour when the terminal is
+    narrower than the permission dialog?** Its permission dialog has no width
+    handling of its own; it relies on Yoga. Our
     `drawPermissionModal` returns early when `w < 30` (`src/tui.zig:6360`),
     which means **no dialog at all** on a very narrow terminal — a
     permission request that cannot be answered is a hang. This is a bug on
-    our side that upstream cannot have; it is not in the port list because it
-    is ours, but it should be fixed.
+    our side that the reference implementation cannot have; it is not in the
+    port list because it is ours, but it should be fixed.
 
 ---
 
-*Generated from `code-base/` and `src/` at commit time. Every claim above is
-anchored to a `path:line` in one of the two trees; no source file was
-modified.*
+*Generated from the reference implementation's source and from `src/` at
+commit time. Every claim about **ours** is anchored to a `path:line` in
+`src/`; the claims about the reference implementation name the component and
+describe the mechanism, because that tree is not part of this repository. No
+source file was modified.*

@@ -6,11 +6,11 @@
 //! that?"), a fence parsed wrong, a language tag turned into a path. None of
 //! it needs a TUI or the network, so all of it is tested here.
 //!
-//! The upstream source is `code-base/commands/copy/copy.tsx` (the Claude Code
-//! `/copy` command). What is ported is written next to each piece; what is not:
-//! `config.copyFullResponse` as a global setting (a session flag is enough),
-//! the `w` = write-to-file shortcut (the file is written ALWAYS, so there is
-//! nothing left for a second key to do), and the analytics.
+//! The shape of the command comes from the `/copy` of the reference
+//! implementation (Claude Code). What is ported is written next to each piece;
+//! what is not: `config.copyFullResponse` as a global setting (a session flag
+//! is enough), the `w` = write-to-file shortcut (the file is written ALWAYS,
+//! so there is nothing left for a second key to do), and the analytics.
 //!
 //! The rules this module exists to keep honest:
 //!
@@ -118,9 +118,9 @@ pub fn formatRefusal(buf: []u8, sel: Select, arg: ?[]const u8) []const u8 {
 
 // ── prompt-XML tags ───────────────────────────────────────────────────────
 
-/// The prompt-XML blocks upstream strips before looking for code
-/// (`STRIPPED_TAGS_RE` in code-base/utils/messages.ts): a `<context>` block
-/// with a fenced example inside would otherwise be a fake code block.
+/// The prompt-XML blocks the reference implementation strips before looking for
+/// code: a `<context>` block with a fenced example inside would otherwise be a
+/// fake code block.
 const stripped_tags = [_][]const u8{ "commit_analysis", "context", "function_analysis", "pr_analysis" };
 
 /// `text` minus every `<tag>…</tag>` of `stripped_tags` (and the newline after

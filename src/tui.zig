@@ -907,9 +907,8 @@ pub const Model = struct {
     /// from the bottom.
     ///
     /// It is the baseline for the "N new" counter: everything appended after
-    /// this point is what the reader has not seen. Upstream counts the same
-    /// thing (`code-base/components/FullscreenLayout.tsx:200-223`) and calls
-    /// it the unseen divider.
+    /// this point is what the reader has not seen. The reference implementation
+    /// counts the same thing and calls it the unseen divider.
     unseen_base_para: usize = 0,
     /// Whether the reader is away from the bottom right now.
     ///
@@ -4178,10 +4177,10 @@ pub const Model = struct {
 
     /// How many assistant turns the reader has not seen.
     ///
-    /// It counts TURNS and not paragraphs, the way upstream counts them
-    /// (`code-base/components/FullscreenLayout.tsx:200-213`): a tool-only
-    /// entry must not tick the counter, or "3 new" would be "3 tool calls" and
-    /// the reader would come back to a turn that says nothing.
+    /// It counts TURNS and not paragraphs, the way the reference implementation
+    /// counts them: a tool-only entry must not tick the counter, or "3 new"
+    /// would be "3 tool calls" and the reader would come back to a turn that
+    /// says nothing.
     fn unseenTurns(self: *const Model) usize {
         if (!self.was_away) return 0;
         const base = @min(self.unseen_base_para, self.paras.items.len);
@@ -7157,11 +7156,11 @@ fn drawStateFooter(
         // "↓ 3 new" instead of "↓ latest", when the reader is away and
         // something arrived.
         //
-        // Upstream floats a centred "N new messages" pill over the transcript
-        // (`code-base/components/FullscreenLayout.tsx:491-537`) and the count
-        // is the point: "latest" says where you can go, "3 new" says what you
-        // are missing. The pill is the fancier half of it and it is a separate
-        // piece of chrome; the NUMBER is what changes the day.
+        // The reference implementation floats a centred "N new messages" pill
+        // over the transcript, and the count is the point: "latest" says where
+        // you can go, "3 new" says what you are missing. The pill is the
+        // fancier half of it and it is a separate piece of chrome; the NUMBER
+        // is what changes the day.
         //
         // The count is of ASSISTANT TURNS, not of paragraphs: a tool line is
         // not something the reader is missing an answer to.
@@ -7303,10 +7302,9 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     // it ("the normal permission modes cost NOTHING on the row"): `default`
     // and `accept_edits` are what a coding session looks like, and spending 12
     // columns on the word "accept edits" in every row of every session is what
-    // made this row unreadable. Upstream shows the mode as a GLYPH
-    // (`code-base/components/PromptInput/PromptInputFooterLeftSide.tsx:348-355`),
-    // which is the way to have it and keep the row cheap — that is on the
-    // board as 33.1.
+    // made this row unreadable. The reference implementation shows the mode as
+    // a GLYPH, which is the way to have it and keep the row cheap — that is on
+    // the board as 33.1.
     switch (agent.currentPermMode()) {
         .read_only, .bypass => {
             if (out.items.len > 0) {

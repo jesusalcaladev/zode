@@ -5304,22 +5304,28 @@ word), and a patch whose tokens were `x += 1;` came back with no tokens at
 all in the first version of the hint.
 
 **A preview is a quiet box.** A collapsed diff shows the row tints and NOT the
-word highlights, and Ctrl+R turns them on. The upstream calls the same thing
+word highlights, and Ctrl+R turns them on. The reference implementation calls the same thing
 `dim`; here it is a flag on the paragraph.
 
 ---
 
 # The analysis, the board, and the crash that was ours (2026-10-21)
 
-Four agents read the tree and the vendored upstream (`code-base/`, Claude Code's
-own source) in parallel. The four reports are in `docs/analysis/` and the
+Four agents read the tree and the reference implementation (Claude Code's TUI,
+TypeScript + Ink) in parallel. The four reports are in `docs/analysis/` and the
 findings became three new phases of `TASKS.md` (33 the TUI, 34 the machinery,
 35 the command surface) plus a fourth that is a fix list (36).
 
-**The upstream is a real reference, not a blog post.** `code-base/` is 1902
-files of TypeScript. Every row of the port list cites a `path:line` in it, and
-the port list says what we are **better** at, because a port list that only
-says "they have it and we do not" is a wish list.
+**The reference is a real implementation, not a blog post.** Every row of the
+port list was read in the source, and the port list says what we are **better**
+at, because a port list that only says "they have it and we do not" is a wish
+list.
+
+**Nothing in this repository points into the reference tree.** The reports
+carry the substance — what it does, how it is built, what we should copy and
+what we should not — and the citations were removed on purpose: the tree is
+not part of this repository and is not redistributed here, so a path into it
+is a dangling reference for everyone who reads this.
 
 ## The crash: two `defer`s and a free
 
@@ -5408,18 +5414,19 @@ to reach "claude-sonnet-4-5", 15 characters wide).
 
 **The fuzzy is a FALLBACK**: an exact match always wins, so the item the user
 meant is never pushed down by a lucky subsequence. The list keeps the
-provider's order (the free models first is deliberate), and upstream sorts by
-score: that is a decision, not a port.
+provider's order (the free models first is deliberate), and the reference
+implementation sorts by score: that is a decision, not a port.
 
 ## The board
 
 `TASKS.md` Phase 33 (the TUI port list, 21 items), Phase 34 (sixteen
-mechanisms upstream has and we do not, of which **34.1 — path-scoped
-permissions** — is the one that should not wait: today `write` writes any
-path it is handed) and Phase 35 (the command surface: 72 upstream commands,
+mechanisms the reference implementation has and we do not, of which **34.1 —
+path-scoped permissions** — is the one that should not wait: today `write`
+writes any path it is handed) and Phase 35 (the command surface: 72 commands,
 26 gaps) were written from the reports, not from memory.
 
-**The one that matters most in all three**: upstream blocks writes to `.git/`,
-`.claude/`, `.vscode/`, `.idea/` and the shell configs, and constrains reads
-to the working directory. We have nothing. A harness that gives the model
-`write` with no path rules is one `rm -rf` away from a very bad afternoon.
+**The one that matters most in all three**: the reference implementation blocks
+writes to `.git/`, `.claude/`, `.vscode/`, `.idea/` and the shell configs, and
+constrains reads to the working directory. We have nothing. A harness that gives
+the model `write` with no path rules is one `rm -rf` away from a very bad
+afternoon.
