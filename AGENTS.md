@@ -5007,3 +5007,45 @@ nunca lo enseña.
 Y un detalle que costó una vuelta: el test NO puede buscar "hay una celda
 ancha" para no ser vacío, porque **el arreglo las parte** — "hay una celda
 ancha" es verdad exactamente cuando el bug está.
+
+---
+
+## YOLO sin preguntas (2026-10-20)
+
+`/yolo` (el modo *bypass*) existe para una cosa: **que la app no se pare a
+esperar al humano**. Y una pregunta que abre un diálogo para la app es
+exactamente tan parada como un diálogo de permiso. Así que en ese modo el
+tool `ask` **no pregunta**.
+
+Qué pasa con la pregunta:
+
+- **Con opciones**, el harness se queda con **la recomendación del propio
+  modelo** (el esquema le dice que ponga la recomendación PRIMERO, así que la
+  primera opción *es* la recomendación) y sigue.
+- **Sin opciones** no hay nada que quedarse, así que la pregunta **queda
+  ABIERTA** y el modelo tiene que decidir él.
+
+Y en los dos casos el modelo tiene que **decirlo en su resumen**: una
+decisión que el usuario nunca vio es una decisión que el usuario no puede
+comprobar, y una pregunta abierta que nadie menciona es una pregunta que se
+pierde. Por eso el texto que vuelve al modelo lo pide explícitamente, y por
+eso el modo está en el **prompt** (igual que el de plan): un modelo que
+planea un `ask` y luego se encuentra con que no hay nadie lo lee como un bug
+del harness y se lo salta.
+
+El harness **también lo dice**, sin fiarse del modelo:
+
+- la línea del tool en la historia: `answered for you (yolo): postgres` /
+  `left open (yolo): el header`,
+- el **resumen del turno**: `· 1 question answered for you · 1 question still
+  OPEN` y, debajo, el texto de la pregunta abierta,
+- `/bench`: `asks 3 (2 auto, 1 open)`.
+
+El texto de la pregunta abierta **no se repite** en el tool result: el modelo
+la escribió, ya está en su contexto, y repetir 600 caracteres para decir "sigue
+abierta" son tokens del usuario para nada.
+
+La decisión es una función **pura** (`ask.decide(bypass, has_options)`) y no
+una rama dentro del `askCall`: el `askCall` de verdad **abre un diálogo y
+parchea el turno**, así que un test que lo llame se queda colgado esperando a
+un humano que no está. La regla se prueba sola y el agente solo la obedece.

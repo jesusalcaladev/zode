@@ -25,6 +25,14 @@ turns_capped: usize = 0,
 iterations: usize = 0,
 tool_calls: usize = 0,
 asks: usize = 0,
+/// Questions the harness answered by itself because nobody was going to
+/// answer them (YOLO mode, and the model wrote a recommendation first).
+asks_auto: usize = 0,
+/// Questions that were LEFT OPEN (YOLO mode, no option to take).
+///
+/// These are the ones the user has to read in the summary: a question that
+/// nobody mentions is a question that is lost.
+asks_open: usize = 0,
 /// Counted from several threads at once now that subagents run in parallel, so
 /// it is atomic. A plain `usize += 1` from N threads is a lost update, and the
 /// only reader is `/bench`: a wrong number there is not a crash, it is a number
@@ -130,7 +138,7 @@ pub fn report(self: *const Stats, out: []u8, max_iter: usize, hit_pct: u8) ![]co
         \\bench · {d} turn{s} · {d}.{d}s avg
         \\iterations {d:.1} avg (limit {d}) · {d}% hit the limit
         \\first token {d}ms avg · p50 {d}ms · p95 {d}ms{s}
-        \\tools {d} · asks {d} · subagents {d} · bg jobs {d}
+        \\tools {d} · asks {d} ({d} auto, {d} open) · subagents {d} · bg jobs {d}
         \\cache hit {d}% · read cache: {d} re-reads avoided
         \\
     , .{
@@ -147,6 +155,8 @@ pub fn report(self: *const Stats, out: []u8, max_iter: usize, hit_pct: u8) ![]co
         dropped_tail,
         self.tool_calls,
         self.asks,
+        self.asks_auto,
+        self.asks_open,
         self.subagents.load(.seq_cst),
         self.bg_jobs,
         hit_pct,
@@ -232,6 +242,22 @@ test "report: prints one readable line and does not blow up with the given buffe
     try std.testing.expect(std.mem.indexOf(u8, full, "first token 900ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, full, "limit 12") != null);
     try std.testing.expect(std.mem.indexOf(u8, full, "asks 2") != null);
+}
+
+test "report: the questions nobody answered are a number the user can see" {
+    // In YOLO mode the harness answers the questions itself. The user has to
+    // be able to see that it happened, and how many are still open: a
+    // decision that was taken for them is a decision they cannot check.
+    var s = Stats{};
+    s.asks = 3;
+    s.asks_auto = 2;
+    s.asks_open = 1;
+
+    var buf: [1024]u8 = undefined;
+    const full = try s.report(&buf, 12, 80);
+    try std.testing.expect(std.mem.indexOf(u8, full, "asks 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "2 auto") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "1 open") != null);
 }
 
 test "report with zero turns invents no data" {

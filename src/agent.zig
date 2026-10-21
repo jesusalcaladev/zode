@@ -530,6 +530,8 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
         "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line. Zode displays the complete numbered checklist in the scrollable history; end your turn so the user can review and approve it. On approval zode switches itself to Build mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
     else if (accept_edits)
         "ACCEPT-EDITS MODE is on (shift+tab to cycle): file edits (write, edit, rename) run without asking, but bash still asks for permission. Ask the user with `ask` before running anything destructive.\n\n"
+    else if (yolo)
+        "YOLO MODE is on (shift+tab or /mode to cycle): nothing asks for permission, and your `ask` questions are NOT shown to anyone — the harness takes your own recommendation (the FIRST option) or leaves the question OPEN. Either way, MENTION it in your final summary: what you decided, or what question is still open for the user. An unmentioned decision is a decision the user cannot check.\n\n"
     else
         "";
 
@@ -2464,6 +2466,15 @@ pub const TurnStats = struct {
     /// worth seeing as a number rather than as an absence: "0 reviews" reads as a fact
     /// and a missing line reads as something nobody looked for.
     reviews: usize = 0,
+    /// Questions the harness answered on its own because nobody was going to
+    /// answer them (YOLO mode).
+    yolo_auto: usize = 0,
+    /// The questions that were LEFT OPEN (YOLO mode, nothing to take).
+    ///
+    /// They are kept because the summary has to name them: a question nobody
+    /// was asked and nobody mentions is a question that is lost, and the user
+    /// is the only one who can answer it.
+    yolo_open: std.ArrayList([]const u8) = .empty,
     /// Files touched, in order of appearance, without repeats.
     files: std.ArrayList([]const u8) = .empty,
     lines_added: usize = 0,
@@ -2482,11 +2493,27 @@ pub const TurnStats = struct {
     }
 
     pub fn deinit(self: *TurnStats) void {
-        // `files.capacity == 0` = list with no memory of its own: there is nothing
-        // to free and `gpa` may be uninitialized.
-        if (self.files.capacity == 0) return;
-        for (self.files.items) |f| self.gpa.free(f);
-        self.files.deinit(self.gpa);
+        // `capacity == 0` = list with no memory of its own: there is nothing
+        // to free and `gpa` may be uninitialized. Each list is checked on its
+        // OWN: one early return for the files used to skip the open questions,
+        // and they leaked.
+        if (self.files.capacity > 0) {
+            for (self.files.items) |f| self.gpa.free(f);
+            self.files.deinit(self.gpa);
+        }
+        if (self.yolo_open.capacity > 0) {
+            for (self.yolo_open.items) |q| self.gpa.free(q);
+            self.yolo_open.deinit(self.gpa);
+        }
+    }
+
+    /// Records a question that nobody answered and nobody will.
+    pub fn noteYoloOpen(self: *TurnStats, question: []const u8) void {
+        const copy = self.gpa.dupe(u8, question) catch return;
+        self.yolo_open.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return;
+        };
     }
 
     /// Records a touched file with its diff. If it was already there, it only adds
@@ -2543,6 +2570,18 @@ pub const TurnStats = struct {
         try w.writeAll("\u{23ba} Done \u{b7} ");
         try w.print("{d} tool{s}", .{ self.tools, if (self.tools == 1) "" else "s" });
         if (self.denied > 0) try w.print(" \u{b7} {d} denied", .{self.denied});
+        if (self.yolo_auto > 0) {
+            try w.print(" \u{b7} {d} question{s} answered for you", .{
+                self.yolo_auto,
+                if (self.yolo_auto == 1) "" else "s",
+            });
+        }
+        if (self.yolo_open.items.len > 0) {
+            try w.print(" \u{b7} {d} question{s} still OPEN", .{
+                self.yolo_open.items.len,
+                if (self.yolo_open.items.len == 1) "" else "s",
+            });
+        }
         if (self.files.items.len > 0) {
             try w.print(" \u{b7} {d} file{s} changed", .{
                 self.files.items.len,
@@ -2573,6 +2612,23 @@ pub const TurnStats = struct {
             if (!first) try w.writeAll(" \u{b7} ");
             first = false;
             try w.writeAll(f);
+        }
+        return w.buffered();
+    }
+
+    /// The questions that are still open, one per line.
+    ///
+    /// They are the user's to answer, and the summary says there are some: a
+    /// number ("1 question still OPEN") says that something needs a human,
+    /// and the TEXT of the question is what lets them answer it.
+    pub fn yoloOpenLine(self: *const TurnStats, buf: []u8) ![]const u8 {
+        if (self.yolo_open.items.len == 0) return "";
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll("still open (nobody was asked): ");
+        const q = self.yolo_open.items[0];
+        try w.writeAll(if (q.len > 120) q[0..120] else q);
+        if (self.yolo_open.items.len > 1) {
+            try w.print(" (+{d} more)", .{self.yolo_open.items.len - 1});
         }
         return w.buffered();
     }
@@ -2811,7 +2867,7 @@ pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
 /// shows the mode that applies; turning it off returns to default.
 fn cmdYolo(m: *tui.Model) void {
     setPermMode(m, if (yolo) .default else .bypass);
-    const msg = if (yolo) "yolo ON: no confirmations" else "yolo OFF: asks for permission";
+    const msg = if (yolo) "yolo ON: no confirmations, and no questions (your questions are answered for you and said in the summary)" else "yolo OFF: asks for permission";
     pushInfo(m, msg);
     setStatusWithZo(m, if (yolo) .warn else .idle, msg);
 }
@@ -4156,11 +4212,22 @@ fn pushTurnSummary(m: *tui.Model) void {
     const line = s.summaryLine(&line_buf, ms, ctx_used, cacheHitPct()) catch return;
     pushInfo(m, line);
 
-    if (s.files.items.len == 0) return;
+    if (s.files.items.len == 0 and s.yolo_open.items.len == 0) return;
     var detail_buf: [512]u8 = undefined;
     const detail = s.detailLine(&detail_buf) catch return;
-    if (detail.len == 0) return;
-    pushInfo(m, detail);
+    if (detail.len > 0) pushInfo(m, detail);
+
+    // The questions nobody answered, in the summary.
+    //
+    // The model is TOLD to mention them in its own answer, and it usually
+    // does. But "usually" is not a guarantee, and the one thing the user has
+    // to act on is exactly the thing the model might forget: a question that
+    // nobody was asked and nobody mentions is a question that is lost.
+    if (s.yolo_open.items.len > 0) {
+        var ybuf: [256]u8 = undefined;
+        const y = s.yoloOpenLine(&ybuf) catch return;
+        if (y.len > 0) pushInfo(m, y);
+    }
 }
 
 /// Cache hit-rate of the session, rounded (0 = no data).
@@ -5977,6 +6044,53 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
 
     m.asks_this_turn += 1;
     m.bench.asks += 1;
+
+    // ── YOLO: nobody is going to answer ──
+    //
+    // `/yolo` exists so the app does not stop to wait for the human, and a
+    // question that opens a dialog stops the app exactly as much as a
+    // permission dialog does. So the question is NOT shown to anybody:
+    //
+    // - With OPTIONS, the harness takes the model's OWN recommendation (the
+    //   schema tells it to put the recommendation FIRST, so the first option
+    //   IS the recommendation) and carries on.
+    // - Without options there is nothing to take, so the question stays OPEN
+    //   and the model has to decide by itself.
+    //
+    // In BOTH cases the model is told to SAY it in its final summary: a
+    // decision the user never saw is a decision the user cannot check, and an
+    // open question nobody mentions is a question that is lost.
+    const decision = ask.decide(currentPermMode() == .bypass, question.options.len > 0);
+    if (decision != .ask) {
+        m.pushToolStart("ask", question.question);
+        var ybuf: [ask.yolo_buf_len]u8 = undefined;
+        var sum_buf: [96]u8 = undefined;
+        var sum: []const u8 = "yolo";
+        const res: []const u8 = switch (decision) {
+            .take_recommendation => blk: {
+                const opt = question.options[0];
+                m.bench.asks_auto += 1;
+                const head = if (opt.len > 48) opt[0..48] else opt;
+                sum = std.fmt.bufPrint(&sum_buf, "answered for you (yolo): {s}{s}", .{
+                    head,
+                    if (opt.len > 48) "…" else "",
+                }) catch "answered for you (yolo)";
+                break :blk ask.formatYoloTaken(&ybuf, opt);
+            },
+            .leave_open => blk: {
+                m.bench.asks_open += 1;
+                turn_stats.noteYoloOpen(question.question);
+                sum = std.fmt.bufPrint(&sum_buf, "left open (yolo): {s}", .{
+                    if (question.header.len > 0) question.header else "the question",
+                }) catch "left open (yolo)";
+                break :blk ask.formatYoloDeferred(&ybuf);
+            },
+            .ask => unreachable,
+        };
+        m.pushToolDone("ask", sum, 0, res);
+        s.appendToolResult(call.id, "ask", res) catch {};
+        return 1;
+    }
 
     // The header shows the question, so that is what goes into the history next
     // to `ask(...)`. A history that says `ask(Which database?)` is the difference
@@ -11767,6 +11881,172 @@ test "a checkpoint with NO open plan steps says so, instead of implying there is
 test "no goal, no note" {
     var g: goal_mod.Goal = .{};
     try std.testing.expectError(error.NoGoal, goalNote(std.testing.allocator, &g, 5, false, 0));
+}
+
+// ── YOLO: the `ask` tool does not ask ─────────────────────────────────────
+
+test "in YOLO mode the question is not asked: the harness takes the recommendation" {
+    // `/yolo` exists so the app does not stop to wait for the human, and a
+    // question that opens a dialog stops the app exactly as much as a
+    // permission dialog does. So the question is answered by the harness,
+    // with the model's OWN recommendation (the schema tells it to put the
+    // recommendation FIRST).
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = yolo;
+    defer yolo = saved;
+    yolo = true;
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const call = TurnCtx.Call{
+        .id = "c1",
+        .name = "ask",
+        .args_json = "{\"question\":\"which database?\",\"header\":\"db\",\"options\":[\"postgres (recommended)\",\"sqlite\"]}",
+    };
+    try std.testing.expectEqual(@as(usize, 1), askCall(&m, &s, call));
+
+    // The panel was NOT opened: nobody is asked.
+    try std.testing.expect(!m.askActive());
+
+    // The tool result says what happened, and asks for the summary.
+    try std.testing.expectEqual(@as(usize, 1), s.messages.items.len);
+    const res = s.messages.items[0].content;
+    try std.testing.expect(std.mem.indexOf(u8, res, "Nobody was asked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "postgres (recommended)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "final summary") != null);
+
+    // And it is counted: the user can see it in `/bench`.
+    try std.testing.expectEqual(@as(usize, 1), m.bench.asks_auto);
+    try std.testing.expectEqual(@as(usize, 0), m.bench.asks_open);
+}
+
+test "in YOLO mode a question with no options stays OPEN, and the model is told to say so" {
+    // There is nothing to take: no option means no recommendation. The
+    // question is left open, and the model has to MENTION it in its summary:
+    // an open question nobody mentions is a question that is lost.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = yolo;
+    defer yolo = saved;
+    yolo = true;
+
+    // The turn stats own the OPEN questions, and the global's allocator is
+    // `undefined` until a turn starts: using it before that is a jump through
+    // a garbage vtable, not a nice error.
+    turn_stats.reset(std.testing.allocator, 0);
+    defer turn_stats.reset(std.testing.allocator, 0);
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const call = TurnCtx.Call{
+        .id = "c1",
+        .name = "ask",
+        .args_json = "{\"question\":\"what should the endpoint be called?\"}",
+    };
+    try std.testing.expectEqual(@as(usize, 1), askCall(&m, &s, call));
+    try std.testing.expect(!m.askActive());
+
+    const res = s.messages.items[0].content;
+    try std.testing.expect(std.mem.indexOf(u8, res, "stays OPEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "final summary") != null);
+    // The question is NOT repeated: the model wrote it, it is in its context
+    // already, and repeating 600 characters to say "still open" is the user's
+    // tokens for nothing.
+    try std.testing.expect(std.mem.indexOf(u8, res, "what should the endpoint be called?") == null);
+
+    try std.testing.expectEqual(@as(usize, 0), m.bench.asks_auto);
+    try std.testing.expectEqual(@as(usize, 1), m.bench.asks_open);
+
+    // And the TURN SUMMARY names it: the user is the one who can answer it,
+    // and the model's own answer might not mention it.
+    var sum_buf: [256]u8 = undefined;
+    const sum = try turn_stats.summaryLine(&sum_buf, 0, 0, 0);
+    try std.testing.expect(std.mem.indexOf(u8, sum, "1 question still OPEN") != null);
+    var ybuf: [256]u8 = undefined;
+    const open = try turn_stats.yoloOpenLine(&ybuf);
+    try std.testing.expect(std.mem.indexOf(u8, open, "what should the endpoint be called?") != null);
+}
+
+test "outside YOLO the question IS asked (the mode is the only thing that changes it)" {
+    // The DECISION is what the test pins, and not the whole call: the call
+    // opens a dialog and parks the turn waiting for a human, which in a test
+    // is a hang. The rule is pure (`ask.decide`) and the agent only acts on
+    // it.
+    try std.testing.expectEqual(ask.Decision.ask, ask.decide(false, true));
+    try std.testing.expectEqual(ask.Decision.ask, ask.decide(false, false));
+    try std.testing.expectEqual(ask.Decision.take_recommendation, ask.decide(true, true));
+    try std.testing.expectEqual(ask.Decision.leave_open, ask.decide(true, false));
+}
+
+test "/yolo says what it does with the questions, because the user reads that line" {
+    // "no confirmations" was the whole message, and it was not true: the
+    // questions were still asked. Now they are not, and the line says so.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = yolo;
+    defer {
+        yolo = saved;
+        setPermMode(&m, .default);
+    }
+    yolo = false;
+
+    cmdYolo(&m);
+    try std.testing.expect(yolo);
+    m.drainPending();
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (m.paras.items) |p| {
+        try joined.appendSlice(std.testing.allocator, p.text);
+        try joined.append(std.testing.allocator, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "no questions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "summary") != null);
+}
+
+test "the YOLO mode note is in the prompt, because the model has to know BEFORE it asks" {
+    // The same reason the read-only note is in the prompt: a model that plans
+    // an `ask` and then finds out nobody is there reads it as a harness bug
+    // and works around it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The prompt reads the project's instruction file, so it needs an `Io` and
+    // the caches have to be dropped afterwards (the same dance the other
+    // prompt tests do).
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    const saved_gpa = gpa_global;
+    io_global = threaded.io();
+    defer {
+        styles_cache = null;
+        skills_cache = null;
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+    resetSkillsCacheForTest();
+
+    const saved_agents = agents_md_cache;
+    agents_md_cache = null;
+    defer agents_md_cache = saved_agents;
+
+    const saved = yolo;
+    defer yolo = saved;
+    yolo = true;
+
+    var out: [64 * 1024]u8 = undefined;
+    const composed = buildSystemPrompt(a, &out, null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "YOLO MODE is on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "MENTION it in your final summary") != null);
 }
 
 test "a `goal` CALL reaches the Model, which the two pure tests could not see" {

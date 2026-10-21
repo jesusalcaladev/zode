@@ -604,7 +604,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
-    .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing" },
+    .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
     .{ .key = "/mode", .desc = "set work mode: build | accept-edits | plan | bypass" },
     .{ .key = "/allowlist", .desc = "always-allowed tools + bash (persisted)" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },

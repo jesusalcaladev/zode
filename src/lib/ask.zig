@@ -66,6 +66,74 @@ pub const timed_out_text =
 /// valid as an expression and the number is needed in a computation.
 pub const answered_buf_len = max_option_len * 2 + 64;
 
+// ── YOLO: the mode where nobody is asked ─────────────────────────────────
+//
+// `/yolo` (the "bypass" permission mode) exists for one reason: the app does
+// not stop to wait for the human. A QUESTION that opens a dialog stops the
+// app exactly as much as a permission dialog does, so in that mode the `ask`
+// tool must not open one.
+//
+// So the question is answered by the harness — with the model's OWN
+// recommendation, which the schema tells it to put FIRST, so the first option
+// IS the recommendation — or, when there is no option to take, it is left
+// OPEN.
+//
+// And in BOTH cases the model has to SAY it in its final summary: a decision
+// the user never saw is a decision the user cannot check, and an open
+// question nobody mentions is a question that is lost.
+
+/// The text the model reads when the harness took its recommendation.
+pub const yolo_taken_prefix = "Nobody was asked (YOLO mode): I took your own recommendation, ";
+pub const yolo_taken_suffix =
+    ". Say in ONE short line in your final summary that you chose it yourself and why.";
+
+/// The text the model reads when the question is left OPEN.
+///
+/// The question is NOT repeated: the model wrote it, it is in its own context
+/// already, and repeating a 600-character question to say "this is still
+/// open" is a waste of the user's tokens.
+pub const yolo_deferred_text =
+    "Nobody was asked (YOLO mode): this question stays OPEN. Decide yourself now and keep going, " ++
+    "and MENTION this open question in your final summary so the user can answer it later. " ++
+    "Do not ask again this turn.";
+
+/// Size of the buffer for the YOLO texts. They carry an option, so they are
+/// bigger than the "answered" one.
+pub const yolo_buf_len = max_option_len + 256;
+
+/// What to do with a question, given the permission mode.
+pub const Decision = enum {
+    /// Ask the user (every mode but YOLO).
+    ask,
+    /// Nobody is going to answer and there IS a recommendation: take it.
+    take_recommendation,
+    /// Nobody is going to answer and there is nothing to take: leave it open.
+    leave_open,
+};
+
+/// The decision, as a function of the mode and of the question.
+///
+/// It is PURE on purpose: the alternative is a test that opens a dialog and
+/// waits for a human that is not there (which hangs), and the rule is the
+/// thing worth pinning.
+pub fn decide(bypass: bool, has_options: bool) Decision {
+    if (!bypass) return .ask;
+    if (has_options) return .take_recommendation;
+    return .leave_open;
+}
+
+/// The text the model reads when the harness took its recommendation.
+pub fn formatYoloTaken(buf: []u8, option: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}\"{s}\"{s}", .{ yolo_taken_prefix, option, yolo_taken_suffix }) catch
+        "Nobody was asked (YOLO mode): I took your own recommendation. Say it in your final summary.";
+}
+
+/// The text the model reads when the question is left open.
+pub fn formatYoloDeferred(buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}", .{yolo_deferred_text}) catch
+        "Nobody was asked (YOLO mode). Mention it in your final summary.";
+}
+
 pub const Answered = struct {
     buf: [answered_buf_len]u8 = undefined,
     len: usize = 0,
@@ -383,4 +451,33 @@ test "guidance: `ask` is for decisions, not for progress reports or sign-off" {
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "else is your job") != null);
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "press enter without reading") != null);
     try std.testing.expect(std.mem.indexOf(u8, ask.guidance, "whatever you think is right") != null);
+}
+
+test "the YOLO texts: the taken one names the option, the open one names the summary" {
+    var buf: [ask.yolo_buf_len]u8 = undefined;
+
+    // The taken one: the option is IN the text (the model has to know what
+    // was taken) and the summary is asked for.
+    const taken = ask.formatYoloTaken(&buf, "postgres (recommended)");
+    try std.testing.expect(std.mem.indexOf(u8, taken, "postgres (recommended)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, taken, "Nobody was asked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, taken, "final summary") != null);
+
+    // The open one: the question is NOT repeated. The model wrote it, it is in
+    // its context already, and repeating 600 characters to say "still open" is
+    // the user's tokens for nothing.
+    const open = ask.formatYoloDeferred(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, open, "stays OPEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open, "final summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open, "Do not ask again") != null);
+}
+
+test "the decision: only YOLO skips the question, and only with options is there something to take" {
+    try std.testing.expectEqual(ask.Decision.ask, ask.decide(false, true));
+    try std.testing.expectEqual(ask.Decision.ask, ask.decide(false, false));
+    // With options there IS a recommendation to take (the schema tells the
+    // model to put it first).
+    try std.testing.expectEqual(ask.Decision.take_recommendation, ask.decide(true, true));
+    // Without options there is nothing to take: the question stays open.
+    try std.testing.expectEqual(ask.Decision.leave_open, ask.decide(true, false));
 }
