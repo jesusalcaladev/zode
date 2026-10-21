@@ -63,12 +63,32 @@ const sleep_prompt = @import("prompts/sleep.zig");
 const batch_prompt = @import("prompts/batch.zig");
 const validate = @import("prompts/validate.zig");
 
+/// The result cap of a tool, in characters. `0` means UNBOUNDED.
+///
+/// The rule, which the table's comment used to state two things at once: a row
+/// with `max_result_chars = 0` is unbounded, and `read` is the one that is.
+///
+/// `read` is unbounded ON PURPOSE: it has a line limit of its own (2000 lines
+/// by default) and it is the tool that brings content into the context, so a
+/// second cap on top of it would only cut a file the model asked for in
+/// pieces. The AGGREGATE budget (`resultcap.max_results_per_message_chars`)
+/// is the backstop for that, and it is applied where the results of one
+/// message are appended.
+pub fn resultCap(name: []const u8) usize {
+    for (defs) |d| {
+        if (std.mem.eql(u8, d.name, name)) return d.max_result_chars;
+    }
+    // A tool that is not in the table cannot be called, so this is only
+    // reachable from a typo: the default cap is the safe answer.
+    return resultcap.default_max_result_chars;
+}
+
 // ── the table ─────────────────────────────────────────────────────────────
 // One row per tool. `read_only == true` means it never asks for permission
 // (the inverse of `needsPermission`). `parallel_safe` means it may run in a
 // batch alongside other read-only tools. `destructive` means it writes files
-// or runs commands. `max_result_chars` is the per-tool result cap (0 = use
-// `resultcap.default_max_result_chars`; `read` is unbounded).
+// or runs commands. `max_result_chars` is the per-tool result cap (0 =
+// unbounded; `read` is the one that is).
 pub const ToolDef = struct {
     name: []const u8,
     desc: []const u8,
@@ -857,4 +877,20 @@ test "maxResultChars: read is unbounded, others use the default cap" {
     try std.testing.expectEqual(resultcap.default_max_result_chars, maxResultChars("write"));
     try std.testing.expectEqual(resultcap.default_max_result_chars, maxResultChars("bash"));
     try std.testing.expectEqual(resultcap.default_max_result_chars, maxResultChars("grep"));
+}
+
+test "the registry: every tool but read has a result cap" {
+    // A row that forgets its cap is unbounded, and an unbounded result is a
+    // megabyte in a message. `read` is the ONE exception, and it is deliberate.
+    for (defs) |d| {
+        if (std.mem.eql(u8, d.name, "read")) {
+            try std.testing.expectEqual(@as(usize, 0), d.max_result_chars);
+            continue;
+        }
+        try std.testing.expect(d.max_result_chars > 0);
+    }
+    // And the accessor agrees with the table.
+    try std.testing.expectEqual(@as(usize, 0), resultCap("read"));
+    try std.testing.expectEqual(@as(usize, resultcap.default_max_result_chars), resultCap("write"));
+    try std.testing.expectEqual(@as(usize, resultcap.default_max_result_chars), resultCap("a-tool-that-does-not-exist"));
 }

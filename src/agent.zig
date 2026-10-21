@@ -42,6 +42,8 @@ const taskstore = @import("lib/taskstore.zig");
 const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const textcap = @import("lib/textcap.zig");
+const resultcap = @import("lib/resultcap.zig");
+const tools_registry = @import("tools/registry.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
 const copytext = @import("lib/copytext.zig");
@@ -1157,8 +1159,8 @@ fn styleNames(entries: []const outputstyles.Entry) []const u8 {
 
 // ── `/copy`: taking the answer with you ───────────────────────────────────
 //
-// The upstream is `code-base/commands/copy/copy.tsx` (Claude Code's `/copy`).
-// What is ported is written next to each piece; what is not:
+// The shape of the command comes from the reference implementation's `/copy`
+// (Claude Code). What is ported is written next to each piece; what is not:
 //
 // - `config.copyFullResponse` as a global setting: here it is a SESSION flag
 //   (`Model.copy_always_full`), because a session flag is enough until
@@ -7026,12 +7028,53 @@ pub fn killForeground() usize {
 ///
 /// This is the serial path: everything with side effects, and the single-call
 /// case for a read-only tool (a batch of one is not worth a thread).
+/// The budget for the tool results of ONE assistant message.
+///
+/// ## Why this exists
+///
+/// `resultcap.max_results_per_message_chars` was DEAD CODE. The module was
+/// written, the registry declared a per-tool cap that nobody read, and nothing
+/// capped the SUM — so the number existed in the source and in no request.
+///
+/// The per-tool caps alone do not bound a message. Five parallel greps at
+/// 16 KB each are 80 KB in a single user message; a turn that reads eight
+/// files at 2000 lines each is over a megabyte. The context is the expensive
+/// resource ("anything that goes into the LLM has to earn its place"), and this
+/// is the place where the size of a message is decided.
+///
+/// The rule is the one `resultcap` already had: cut the largest first. Here
+/// the results are appended one at a time, so the budget is a RUNNING one and
+/// the first results are the ones that get the room — which is the same
+/// outcome when the results are similar in size, and the only one available
+/// without rewriting the session.
+const ResultBudget = struct {
+    used: usize = 0,
+
+    /// The cap for the next result: the smaller of the tool's own cap and what
+    /// is left of the message.
+    ///
+    /// A tool with no cap of its own (`read`) is bounded by the message: that
+    /// is the backstop, and it is why `read` being unbounded is a decision
+    /// about the PER-TOOL cap and not about the message.
+    fn capFor(self: *const ResultBudget, per_tool: usize) usize {
+        const total = resultcap.max_results_per_message_chars;
+        const left = if (self.used < total) total - self.used else 0;
+        if (per_tool == 0) return left;
+        return @min(per_tool, left);
+    }
+
+    fn charge(self: *ResultBudget, n: usize) void {
+        self.used += n;
+    }
+};
+
 fn execOneCall(
     m: *tui.Model,
     s: *session_mod.Session,
     call: TurnCtx.Call,
     arena: std.mem.Allocator,
     denied: *usize,
+    budget: *ResultBudget,
 ) usize {
     const arg = toolArgSummary(call.name, call.args_json, arena);
     // The timeline may lead with WHAT IT IS FOR (`bash`'s description); the
@@ -7228,7 +7271,15 @@ fn execOneCall(
         }
     }
 
-    s.appendToolResult(call.id, call.name, res) catch {};
+    // The result that goes into the message is the one that was capped, and the
+    // cap is the SMALLER of the tool's own and what is left of the message.
+    //
+    // The cut carries its notice inside the budget, so the model is told the
+    // result is incomplete instead of believing it is the whole thing.
+    const capped = resultcap.capResult(arena, res, budget.capFor(tools_registry.resultCap(call.name))) catch
+        resultcap.Capped{ .text = res, .cut = false };
+    budget.charge(capped.text.len);
+    s.appendToolResult(call.id, call.name, capped.text) catch {};
     if (std.mem.eql(u8, call.name, "read")) {
         if (s.messages.items.len > 0) {
             const idx: u32 = @intCast(s.messages.items.len - 1);
@@ -7270,6 +7321,7 @@ fn runParallelBatch(
     from: usize,
     to: usize,
     arena: std.mem.Allocator,
+    budget: *ResultBudget,
 ) struct { ok: usize, denied: usize } {
     const n = to - from;
     const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
@@ -7303,7 +7355,7 @@ fn runParallelBatch(
         var ok: usize = 0;
         var denied: usize = 0;
         for (t.calls.items[from..to]) |call| {
-            ok += execOneCall(m, s, call, arena, &denied);
+            ok += execOneCall(m, s, call, arena, &denied, budget);
         }
         return .{ .ok = ok, .denied = denied };
     };
@@ -7378,7 +7430,12 @@ fn runParallelBatch(
         turn_stats.noteTool();
         const summary = toolResultSummary(t.calls.items[from + k].name, r.text, arena);
         m.pushToolDone(t.calls.items[from + k].name, summary, r.ms, r.text);
-        s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, r.text) catch {};
+        // The same cap as the serial path: the budget belongs to the MESSAGE,
+        // not to the way the calls happened to be run.
+        const capped = resultcap.capResult(arena, r.text, budget.capFor(tools_registry.resultCap(t.calls.items[from + k].name))) catch
+            resultcap.Capped{ .text = r.text, .cut = false };
+        budget.charge(capped.text.len);
+        s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, capped.text) catch {};
         // `r.text` is the caller's and both consumers above COPIED it
         // (`pushToolDone` dupes for the paragraph and the Ctrl+R memo,
         // `appendToolResult` dupes into the session), so this is ours to free.
@@ -7476,6 +7533,10 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
     var ran: usize = 0;
     var denied: usize = 0;
+    // The budget of THIS message: it is reset for every assistant message, and
+    // it is what stops a fan-out of reads from putting a megabyte in one turn.
+    var budget: ResultBudget = .{};
+    _ = &budget;
 
     var i: usize = 0;
     while (i < t.calls.items.len) {
@@ -7541,7 +7602,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         while (batch < t.calls.items.len and tools_mod.isParallelSafe(t.calls.items[batch].name)) batch += 1;
 
         if (batch - i > 1) {
-            const n = runParallelBatch(m, s, t, i, batch, arena);
+            const n = runParallelBatch(m, s, t, i, batch, arena, &budget);
             ran += n.ok;
             denied += n.denied;
             i = batch;
@@ -7549,7 +7610,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         }
 
         i += 1;
-        ran += execOneCall(m, s, call, arena, &denied);
+        ran += execOneCall(m, s, call, arena, &denied, &budget);
     }
     // The repetition guard, fed HERE because this is the only place a tool call is
     // seen with its arguments. The loop checks the flag; it cannot count, because it
@@ -13500,7 +13561,8 @@ test "the parallel batch's tool results outlive the per-call arenas" {
     var sess = session_mod.Session.init(std.testing.allocator);
     defer sess.deinit();
 
-    const r = runParallelBatch(&m, &sess, &t, 0, t.calls.items.len, arena);
+    var test_budget: ResultBudget = .{};
+    const r = runParallelBatch(&m, &sess, &t, 0, t.calls.items.len, arena, &test_budget);
 
     // The batch really ran all three.
     try std.testing.expectEqual(@as(usize, 3), r.ok);

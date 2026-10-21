@@ -127,12 +127,25 @@ pub fn toolGlob(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     const a = try parseArgs(obj);
     var matches: std.ArrayList(Match) = .empty;
 
-    var walker = try common.walkZig(io, arena, a.subdir);
-    defer walker.deinit();
+    // The file list comes from `searchableFiles`, which asks git first.
+    //
+    // It used to be the plain tree walk, and the difference is not a detail: the
+    // walk has a hardcoded list of directories to skip, and anything git ignores
+    // but that list does not name is walked. In THIS repository that is
+    // `code-base/` — 1902 files of someone else's code — so a `glob` with
+    // `limit: 200` in walk order returned mostly third-party files, while `grep`
+    // and `refs` over the same tree did not show any of them. Three tools, three
+    // different answers about what the project contains.
+    //
+    // `git ls-files --cached --others --exclude-standard` is the same set `rg`
+    // uses: tracked plus untracked, minus ignored. Outside a repository the
+    // walk is still there, because a directory that is not under git is exactly
+    // where the walk is the right answer.
+    var files_iter = common.searchableFiles(io, arena, a.subdir);
+    defer files_iter.deinit();
 
     const need_mtime = a.sort == .newest or a.sort == .oldest;
-    while (walker.next()) |entry_path| {
-        defer arena.free(entry_path);
+    while (files_iter.next()) |entry_path| {
         if (!globMatches(&a, entry_path)) continue;
         const copy = try arena.dupe(u8, entry_path);
         try matches.append(arena, .{ .path = copy, .mtime = if (need_mtime) mtimeOf(io, copy) else 0 });

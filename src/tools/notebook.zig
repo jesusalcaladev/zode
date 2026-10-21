@@ -29,6 +29,7 @@
 /// and this module does the splitting into the array of lines that nbformat stores.
 /// The model never counts escapes and never counts columns.
 const std = @import("std");
+const pathsafe = @import("../lib/pathsafe.zig");
 const common = @import("common.zig");
 
 const max_notebook_bytes = 32 * 1024 * 1024;
@@ -173,6 +174,11 @@ fn setCellType(arena: std.mem.Allocator, cell: *std.json.ObjectMap, kind: []cons
 /// The whole `notebook_edit` call.
 pub fn toolNotebookEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const path = common.getStr(obj, "notebook_path") orelse common.getStr(obj, "path") orelse return error.MissingPath;
+
+    // The same rule as `write` and `edit`: a notebook is a file, and there are
+    // places this tool does not write.
+    const verdict = pathsafe.checkWrite(path);
+    if (verdict != .ok) return pathsafe.refusalText(arena, verdict);
     if (!std.mem.endsWith(u8, path, ".ipynb")) return error.NotANotebook;
     const index_raw = common.getInt(obj, "cell_number") orelse common.getInt(obj, "cell_index") orelse return error.MissingCellNumber;
     if (index_raw < 0) return error.BadCellNumber;

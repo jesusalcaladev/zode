@@ -3,6 +3,7 @@ const common = @import("common.zig");
 const write_tool = @import("write.zig");
 const notebook_mod = @import("notebook.zig");
 const readcache = @import("../lib/readcache.zig");
+const pathsafe = @import("../lib/pathsafe.zig");
 
 /// Line numbers past this are not worth caching precisely. Nothing real gets
 /// there, and the point of the cap is to keep the arithmetic in `usize` until the
@@ -108,6 +109,20 @@ fn readOne(
     arena: std.mem.Allocator,
     cache: ?*readcache.Cache,
 ) ![]const u8 {
+    // A file whose CONTENT is a secret is not read.
+    //
+    // `read` never asks for permission (it is `read_only = true`), so this is
+    // the ONLY place a refusal can happen: without it the model reads
+    // `~/.ssh/id_rsa` or `~/.config/zode/auth.json` and sends the bytes to the
+    // model provider, and the user sees nothing on screen at all.
+    //
+    // The list is short and unambiguous (a private key, a credentials file).
+    // A `.env` inside the project is NOT in it: that is a project file the
+    // user may well want the agent to look at, and a rule that blocks the
+    // ordinary case is a rule that gets switched off.
+    const secret = pathsafe.checkRead(path);
+    if (secret != .ok) return pathsafe.refusalText(arena, secret);
+
     var dir = std.Io.Dir.cwd();
 
     // A NOTEBOOK is read as an outline, not as its JSON.

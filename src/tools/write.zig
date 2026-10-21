@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const pathsafe = @import("../lib/pathsafe.zig");
 
 /// How many files one `write {files:[...]}` call may carry.
 ///
@@ -7,6 +8,25 @@ const common = @import("common.zig");
 /// in one call has to be small enough that a failure halfway through is visible
 /// and re-runnable, and small enough that the result fits a turn.
 pub const max_files_per_call = 8;
+
+/// Whether this tool may write to `path`, and the sentence when it may not.
+///
+/// The check is here, in the tool that writes, and not in the permission
+/// dialog: the dialog asks "may I write X?" and the user says yes to a file
+/// name they did not read. A `.git/hooks/pre-commit` passes that, because the
+/// name looks like a path and not like code that runs on every commit.
+///
+/// The refusal NAMES what writing there would do, and it names the way out
+/// (`bash`, which goes through the permission dialog with the user's eyes on
+/// it). A refusal without a way forward is a wall, and a model answers a wall
+/// by trying the next tool until one of them works.
+pub fn writeAllowed(arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    const v = pathsafe.checkWrite(path);
+    return switch (v) {
+        .ok => null,
+        else => pathsafe.refusalText(arena, v),
+    };
+}
 
 // ── write ────────────────────────────────────────────────────
 pub fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
@@ -43,6 +63,14 @@ pub fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
                 out.print(arena, "  skipped {s}: no `content`\n", .{p}) catch {};
                 continue;
             };
+            // The refusal is PER FILE: a batch of four files where one of them
+            // is a git hook writes the other three and says why it did not
+            // write the fourth. Refusing the whole call would make one bad path
+            // lose the three good ones.
+            if (writeAllowed(arena, p)) |why| {
+                out.print(arena, "  refused {s}: {s}\n", .{ p, why }) catch {};
+                continue;
+            }
             var d = std.Io.Dir.cwd();
             d.writeFile(io, .{ .sub_path = p, .data = c }) catch |err| {
                 // One failure does not lose the others: four files and one error
@@ -57,6 +85,8 @@ pub fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
 
     const path = common.getStr(obj, "path") orelse return error.MissingPath;
     const content = common.getStr(obj, "content") orelse return error.MissingContent;
+
+    if (writeAllowed(arena, path)) |why| return why;
 
     var dir = std.Io.Dir.cwd();
     dir.writeFile(io, .{
