@@ -5743,3 +5743,69 @@ No amount of reading would have found it; the test runs a REAL bubblewrap.
 And the sandbox is a FLAG on the `bash` tool and not a policy: a harness that
 sandboxes every command breaks every build, and a harness that breaks the
 build is a harness the user turns off.
+
+---
+
+# `/files`: what the model is looking at (TASKS 35.1, 2026-10-21)
+
+The question it answers is "what is the model looking at?", which is the
+question you ask when a turn goes sideways. The data was already there — the
+read cache knows every file the model has read — and NOTHING showed it.
+
+```
+files · 3 read · 2 changed this session
+  src/tui.zig                       3420 lines  · in context
+  src/agent.zig                     6230 lines  · in context
+  build.zig                           88 lines  · not in context
+changed
+  src/agent.zig
+  src/commands.zig
+read cache · 2 re-reads avoided · ~49 KB not re-sent
+```
+
+**Two lists, because they are two different facts.** READ is what the model
+has read, and whether its content is STILL in the context (a compacted-away
+read is not, and "the model THINKS it has this" is how an agent quotes a file
+it never saw). CHANGED is what the agent WROTE to, this session: a question
+about "what did it do to my repo" is about the whole session, not the last
+turn.
+
+**The changed list is recorded on the SUCCESS path.** A denied `edit`, a
+`write` to a path that could not be opened and an `edit` whose old string was
+not found all changed nothing, and a list that says "changed" about them is a
+list that lies. It uses `tools.callTouchedPaths` (the multi-file form of
+`edit`, the writing steps of a `batch`) and NOT `filePathOf`. A `rename` is
+in neither: it FINDS its own files and its arguments never name them.
+
+**The list says what it does not know.** A `bash` that was not read-only may
+have changed files, and a command is a string and not a list of files: the
+report says so instead of implying that the list is complete.
+
+**The read cache is read UNDER ITS OWN LOCK.** `read` is in `isParallelSafe`,
+so several reads run at once and a worker can be writing the entries while
+the command reads them: `Cache.withAll` hands the table to a callback with
+the lock held, and the paths it lends out are only valid until the callback
+returns.
+
+## The bug it found: the read cache survived `/new`
+
+The cache lives in the `Model` and the Model outlives a session change, so
+after `/new` the entries still said "the model has this file" — and the first
+`read` of a file the PREVIOUS session had read took the fast path, answered
+"it is already in your context" and did NOT send the body.
+
+The new session's context is EMPTY. The model would have been working from a
+file it could not see, and it would have said so with the confidence of
+somebody who had read it. `/new` and `/resume` now clear it
+(`agent.resetSessionFiles`).
+
+**A cache that survives the thing it describes is a cache that lies.** It is
+the same shape as the compaction case the cache was written for: an entry
+whose content was dropped has to be told, or the model is told it has a file
+it does not have.
+
+**Where it is**: `src/lib/filesview.zig` (the report: pure, tested, no TUI) ·
+`src/lib/readcache.zig` (`withAll`, `statsSnapshot`, `clear`) ·
+`src/commands.zig` `cmdFiles` · one row in the command table · the hook in
+`agent.execOneCall` · `tools/pty_smoke.py` TYPES it, because a command can be
+unit-perfect and still do nothing when it is typed.

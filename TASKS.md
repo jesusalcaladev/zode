@@ -36,8 +36,8 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
       `max_listed = 40` is still a constant and `context: fork` is parsed and never read.
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
 - [ ] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety)
-- [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` and `/init` first;
-      the panels that need a rule engine wait for the engine (Phase 6).
+- [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
+      next; the panels that need a rule engine wait for the engine (Phase 6).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
 - [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): most needed, least fun — quietly wrong today
 - [ ] 🟢 Everything else per the dependency table at the bottom.
@@ -809,7 +809,7 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 > home. The ~30 commands that are Anthropic-account or marketplace surface are
 > **not** gaps and are listed as such, so nobody goes looking for them.
 
-- [ ] **35.1** `/files` — **S, the cheapest item on the list**: eight lines of work and we already hold the data (`src/lib/readcache.zig`). It answers "what is the model looking at?", which is the question you ask when a turn goes sideways
+- [x] **35.1** `/files` — **DONE 2026-10-21**: the files the model has READ (and whether their content is still in the context) and the files the agent WROTE to, this session. It is the answer to "what is the model looking at?", which is the question you ask when a turn goes sideways. It also found a bug: the read cache survived `/new`, so the new session's first `read` of a file the previous session had read answered "it is already in your context" WITHOUT sending the body — the model would have been working from a file it could not see
 - [ ] **35.2** `/init` — **M** for the prompt, **L** with the interview phase. The highest-value missing command: without it a new project has no `AGENTS.md` and the harness silently runs with the built-in prompt only. Port the reference implementation's prompt text **verbatim** and let the model do the work
 - [ ] **35.3** `/rename` + the `#tag` + the session title — **S** each, and together they are the readability layer of the session list. Phase 30.1 has the design; the command is 20 lines
 - [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic command we lack. Both are prompt commands whose text is the reference implementation's, and Phase 31.1 already has the `` !`cmd` `` substitution
@@ -830,6 +830,52 @@ that we are not going to copy): `/login`, `/logout`,
 `/upgrade`, `/usage`, `/feedback`, `/bug`, `/release-notes`'s browser half,
 `/channel`, `/theme`, `/sandbox`'s cloud half — listed in
 `docs/analysis/commands.md` §3.26 with the reason for each.
+
+### 35.1 — What `/files` was, and what it found (2026-10-21)
+
+**The data was already there and nothing showed it.** The read cache knows
+every file the model has read; `/context` showed its counters and no place
+showed the FILES. The board called it "eight lines of work" and it was more
+than that, because the honest answer needs two lists and not one.
+
+**Two lists, because they are two different facts.**
+
+- **READ**: the files the model has read, most recent first, and whether their
+  content is STILL in the context. A compacted-away read is not in the context
+  any more, and saying so is the difference between "the model has this" and
+  "the model THINKS it has this" — the second one is how an agent quotes a
+  file it never saw.
+- **CHANGED**: the files the agent WROTE to, this session. A question about
+  "what did it do to my repo" is about the whole session, not the last turn.
+
+**The changed list is recorded on the SUCCESS path, not from the list of
+calls.** A denied `edit`, a `write` to a path that could not be opened and an
+`edit` whose old string was not found all changed nothing, and a list that
+says "changed" about them is a list that lies. `callTouchedPaths` knows the
+multi-file form of `edit` and the writing steps of a `batch`; `filePathOf` does
+not, and a `rename` is in neither (it FINDS its own files, and its arguments
+never name them).
+
+**The list says what it does not know.** A `bash` that was not read-only may
+have changed files, and a command is a string and not a list of files: the
+report says so instead of implying that the list is complete. Same for the
+files that did not fit in the table (64) and for the ones the read cache
+evicted (128, LRU).
+
+**The bug it found: the read cache survived `/new`.** The cache is in the
+`Model` and the Model outlives a session change, so after `/new` the entries
+still said "the model has this file" — and the first `read` of a file the
+PREVIOUS session had read took the fast path, answered "it is already in your
+context" and did NOT send the body. The new session's context is empty, so
+the model would have been working from a file it could not see, and it would
+have said so with the confidence of somebody who had read it. `/new` and
+`/resume` now clear it (`agent.resetSessionFiles`).
+
+**Where it is**: `src/lib/filesview.zig` (the report, pure and tested) ·
+`src/lib/readcache.zig` (`withAll`, `statsSnapshot`, `clear`) ·
+`src/commands.zig` `cmdFiles` · one row in the command table · the hook in
+`agent.execOneCall` · `tools/pty_smoke.py` types it (a command can be
+unit-perfect and still do nothing when it is typed).
 
 ---
 

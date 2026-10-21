@@ -2618,6 +2618,21 @@ fn langFromPath(path: []const u8) []const u8 {
     return base[dot + 1 ..];
 }
 
+/// The per-session file state: the read cache and the changed list.
+///
+/// A new session's context is EMPTY, so an entry that says "the model has this
+/// file" is a lie from that moment on: the next `read` would take the fast
+/// path, answer "it is already in your context" WITHOUT sending the body, and
+/// the model would be working from a file it cannot see.
+///
+/// It is its own function so that a test can drive it without a session (and
+/// without the `Io` that creating one needs).
+pub fn resetSessionFiles(m: *tui.Model) void {
+    m.reads.clear();
+    m.changed.clear();
+    m.bash_may_write = false;
+}
+
 /// Creates a new session and discards the current one.
 pub fn newSession(m: *tui.Model) void {
     if (session) |old| {
@@ -2633,6 +2648,11 @@ pub fn newSession(m: *tui.Model) void {
     // session changes it. These are the only two moments that can: everything else in a
     // session happens inside the same tree.
     forgetGitRepoProbe();
+    // The read cache and the changed list are about THIS session: a new
+    // session's context is EMPTY, so an entry that says "the model has this
+    // file" would make the next `read` skip the body — and the model would
+    // be working from a file it cannot see.
+    resetSessionFiles(m);
 }
 
 // ── turn stats (ROADMAP phase 3) ──────────────────────────────
@@ -3206,6 +3226,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdGoal(m, rest);
     } else if (std.mem.eql(u8, cmd, "session")) {
         commands_mod.cmdSession(m);
+    } else if (std.mem.eql(u8, cmd, "files")) {
+        commands_mod.cmdFiles(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {
         commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
@@ -3788,6 +3810,10 @@ fn resumeLatest(m: *tui.Model) void {
     session_elided = 0;
     resetSummaries();
     forgetGitRepoProbe();
+    // The resumed session's context is the one in the FILE, and the read cache
+    // does not know what is in it: an entry that says "the model has this
+    // file" is a guess. Clearing it costs a re-read and buys a truth.
+    resetSessionFiles(m);
     m.pushInfoFmt("session resumed: {s} · {d} messages", .{ path, s.messages.items.len });
     refreshContextUsage(m);
 }
@@ -7567,6 +7593,30 @@ fn execOneCall(
         if (isWriteTool(call.name)) {
             m.reads.invalidate(pth);
         }
+    }
+
+    // [/files] The files this call WROTE to, for the session's list.
+    //
+    // It is the SUCCESS path and not the list of calls: a denied `edit`, a
+    // `write` to a path that could not be opened and an `edit` whose old
+    // string was not found ALL changed nothing, and a list that says "changed"
+    // about them is a list that lies.
+    //
+    // `callTouchedPaths` and not `filePathOf`: it knows the MULTI-FILE form of
+    // `edit` (`files: [{path,…}]`) and the writing steps of a `batch`, and
+    // those are the calls that touch more than one file. A `rename` is NOT
+    // here: it FINDS its own files and its arguments never name them, so
+    // there is nothing to read out of the call.
+    if (callIsWrite(call.name, call.args_json, arena)) {
+        for (tools_mod.callTouchedPaths(call.name, call.args_json, arena)) |pth| {
+            m.changed.note(pth);
+        }
+    }
+    // A `bash` that was NOT read-only may have changed files, and the paths
+    // are not in the arguments: a command is a string, not a list of files.
+    // The report says so instead of implying that the list is complete.
+    if (std.mem.eql(u8, call.name, "bash") and !reads_only) {
+        m.bash_may_write = true;
     }
 
     // The result that goes into the message is the one that was capped, and the
@@ -14791,4 +14841,101 @@ test "a command that only reads is not a write, and the plan mode lets it run" {
     try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"weird-tool --x\"}", a));
     // Another tool is not a command at all.
     try std.testing.expect(!callReadsOnly("write", "{\"path\":\"a.zig\"}", a));
+}
+
+// ── `/files`: the session's file state ─────────────────────────
+
+test "a write is recorded in the session's changed files" {
+    // The seam: the tool call → the Model. The list is the session's, and a
+    // list that says "changed" about a file nobody changed is a lie.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // YOLO: nobody is asked, so the call does not park on a dialog that
+    // nobody is there to answer.
+    const saved_yolo = yolo;
+    defer yolo = saved_yolo;
+    yolo = true;
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const tmp_path = "/tmp/opencode/zode-test-files";
+    try std.Io.Dir.cwd().createDirPath(io_global, tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(io_global, tmp_path) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/a.txt\",\"content\":\"hola\"}}", .{tmp_path});
+    const call = TurnCtx.Call{ .id = "c1", .name = "write", .args_json = args };
+    var denied: usize = 0;
+    var budget: ResultBudget = .{};
+    _ = execOneCall(&m, &s, call, arena, &denied, &budget);
+
+    try std.testing.expectEqual(@as(usize, 1), m.changed.count());
+    try std.testing.expect(std.mem.indexOf(u8, m.changed.at(0), "a.txt") != null);
+}
+
+test "a call that changed nothing is not in the changed files" {
+    // A `read` is not a change, and neither is a call that failed: the list is
+    // of files that were WRITTEN.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved_yolo = yolo;
+    defer yolo = saved_yolo;
+    yolo = true;
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const tmp_path = "/tmp/opencode/zode-test-files-read";
+    try std.Io.Dir.cwd().createDirPath(io_global, tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(io_global, tmp_path) catch {};
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = tmp_path ++ "/a.txt", .data = "hola" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/a.txt\"}}", .{tmp_path});
+    const call = TurnCtx.Call{ .id = "c1", .name = "read", .args_json = args };
+    var denied: usize = 0;
+    var budget: ResultBudget = .{};
+    _ = execOneCall(&m, &s, call, arena, &denied, &budget);
+
+    try std.testing.expectEqual(@as(usize, 0), m.changed.count());
+    // But the READ is in the cache, which is the other half of the report.
+    try std.testing.expectEqual(@as(usize, 1), m.reads.liveEntries());
+}
+
+test "a new session's file state starts empty" {
+    // The read cache does not survive a session change: the new session's
+    // context is EMPTY, and an entry that says "the model has this file"
+    // would make the next `read` skip the body.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    m.reads.record("a.zig", stat, 1, 1, 10, 10);
+    m.changed.note("a.zig");
+    try std.testing.expectEqual(@as(usize, 1), m.reads.liveEntries());
+
+    resetSessionFiles(&m);
+    try std.testing.expectEqual(@as(usize, 0), m.reads.liveEntries());
+    try std.testing.expectEqual(@as(usize, 0), m.changed.count());
 }

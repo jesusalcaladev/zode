@@ -373,6 +373,46 @@ pub const Cache = struct {
         }
         return n;
     }
+
+    /// The counters, under the lock.
+    pub fn statsSnapshot(self: *Cache) Stats {
+        self.lockIt();
+        defer self.unlockIt();
+        return self.stats;
+    }
+
+    /// The whole table, with the lock held.
+    ///
+    /// The callback runs UNDER the lock: the entries are fixed buffers that a
+    /// worker can rewrite at any moment, so a caller that reads them has to
+    /// copy what it needs while the lock is held. The paths it hands out are
+    /// only valid until the callback returns.
+    ///
+    /// The callback must not call back into the cache (`lockIt` is a spinlock
+    /// and it is not reentrant) and it must not block: the worker that owns
+    /// the cache is waiting for it.
+    pub fn withAll(self: *Cache, ctx: anytype, comptime f: fn (@TypeOf(ctx), []const Entry) void) void {
+        self.lockIt();
+        defer self.unlockIt();
+        f(ctx, self.entries[0..self.len]);
+    }
+
+    /// Forgets everything.
+    ///
+    /// A new session has NOTHING in its context, so an entry that says "the
+    /// model has this file" is a lie from that moment on: the next `read`
+    /// would take the fast path and answer "it is already in your context"
+    /// WITHOUT sending the body, and the model would be working from a file it
+    /// cannot see.
+    ///
+    /// The bytes of the entries are not zeroed: `len` is what makes them
+    /// unreadable, and `push` overwrites an entry whole before using it.
+    pub fn clear(self: *Cache) void {
+        self.lockIt();
+        defer self.unlockIt();
+        self.len = 0;
+        self.stats = .{};
+    }
 };
 
 /// The hash of the bytes, which is the thing that decides whether a file really
@@ -555,4 +595,47 @@ test "hashBytes: same content, same hash" {
     try std.testing.expectEqual(hashBytes("hola"), hashBytes("hola"));
     try std.testing.expect(hashBytes("hola") != hashBytes("holo"));
     try std.testing.expectEqual(hashBytes(""), hashBytes(""));
+}
+
+test "cache: clear forgets everything, and a new session has nothing in its context" {
+    // The failure this prevents: after `/new`, the cache still says "the model
+    // has this file", the next `read` takes the fast path and does NOT send
+    // the body, and the model works from a file it cannot see.
+    var c: Cache = .{};
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    c.record("f.txt", stat, 1, 1, 10, 10);
+    try std.testing.expectEqual(@as(usize, 1), c.liveEntries());
+
+    c.clear();
+    try std.testing.expectEqual(@as(usize, 0), c.len);
+    try std.testing.expectEqual(@as(usize, 0), c.liveEntries());
+    switch (c.check("f.txt", stat, 1, 10)) {
+        .read_then_decide => {},
+        .already_sent => return error.TestUnexpectedResult,
+    }
+}
+
+test "cache: withAll hands the table to the callback, and the counters come back" {
+    var c: Cache = .{};
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    c.record("a.txt", stat, 1, 1, 10, 10);
+    c.record("b.txt", stat, 1, 1, 20, 20);
+
+    const Ctx = struct {
+        seen: usize = 0,
+        lines: u32 = 0,
+        fn take(self: *@This(), entries: []const Entry) void {
+            for (entries) |e| {
+                self.seen += 1;
+                self.lines += e.lines;
+            }
+        }
+    };
+    var ctx = Ctx{};
+    c.withAll(&ctx, Ctx.take);
+    try std.testing.expectEqual(@as(usize, 2), ctx.seen);
+    try std.testing.expectEqual(@as(u32, 30), ctx.lines);
+
+    const s = c.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 0), s.hits);
 }

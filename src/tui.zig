@@ -19,6 +19,7 @@ const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const agent_mod = @import("agent.zig");
 const readcache = @import("lib/readcache.zig");
+const filesview = @import("lib/filesview.zig");
 const bench_mod = @import("lib/bench.zig");
 const models_mod = @import("lib/models.zig");
 const modelcache = @import("lib/modelcache.zig");
@@ -1140,6 +1141,19 @@ pub const Model = struct {
     /// says "you already have this file". Fixed buffers inside, so there is
     /// nothing to deinit.
     reads: readcache.Cache = .{},
+    /// The files the agent has WRITTEN to, this session (`/files`).
+    ///
+    /// The read cache knows what the model has READ; a file that was written
+    /// and never read is not in it at all. This is the other half of "what is
+    /// the model looking at", and it is a fixed table inside the `Model`: no
+    /// allocator, nothing to deinit, and it dies with the session.
+    changed: filesview.Changed = .{},
+    /// A `bash` command that was NOT read-only ran in this session.
+    ///
+    /// A command is a string and not a list of files, so the files it changed
+    /// are not knowable. `/files` says so instead of implying that the changed
+    /// list is complete.
+    bash_may_write: bool = false,
     /// The session's task graph (`task_create`/`task_get`/`task_list`/
     /// `task_update`/`task_stop`).
     ///

@@ -6,6 +6,8 @@ const compaction = @import("compaction.zig");
 const goal_mod = @import("lib/goal.zig");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
+const filesview = @import("lib/filesview.zig");
+const readcache = @import("lib/readcache.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -570,6 +572,71 @@ pub fn cmdSession(m: *tui.Model) void {
     }
 }
 
+/// `/files`: what the model is looking at, and what it changed.
+///
+/// The question it answers is "what is the model looking at?", which is the
+/// question you ask when a turn goes sideways. The data was already there (the
+/// read cache) and NOTHING showed it.
+///
+/// Two lists, because they are two different facts:
+///
+/// - the files the model has READ, and whether their content is still in the
+///   context (a compacted-away read is not, and a model that thinks it has a
+///   file it does not have is how an agent quotes something it never saw);
+/// - the files the agent WROTE to, this session.
+///
+/// The read cache is read UNDER ITS OWN LOCK: a worker can be reading a file
+/// right now, and the entries are the fixed buffers it writes into.
+pub fn cmdFiles(m: *tui.Model) void {
+    const gpa = m.allocator;
+    var report = filesview.Report.init(gpa);
+    defer report.deinit();
+
+    const Collect = struct {
+        report: *filesview.Report,
+
+        fn take(self: *@This(), entries: []const readcache.Entry) void {
+            if (entries.len == 0) return;
+            // Most recent FIRST: "what is the model looking at" is a question
+            // about NOW, and the table's own order is the order of insertion.
+            var idx: [readcache.max_entries]usize = undefined;
+            for (entries, 0..) |_, i| idx[i] = i;
+            var i: usize = 1;
+            while (i < entries.len) : (i += 1) {
+                const key = idx[i];
+                var j = i;
+                while (j > 0 and entries[idx[j - 1]].used < entries[key].used) : (j -= 1) {
+                    idx[j] = idx[j - 1];
+                }
+                idx[j] = key;
+            }
+            for (idx[0..entries.len]) |k| {
+                const e = entries[k];
+                self.report.addRead(e.pathOf(), e.lines, e.in_context) catch return;
+            }
+        }
+    };
+    var collect = Collect{ .report = &report };
+    m.reads.withAll(&collect, Collect.take);
+
+    // The files the agent changed. The paths are borrowed from the Model's
+    // table, which outlives the report.
+    if (m.changed.count() > 0) {
+        report.addSection("changed") catch {};
+        var paths: [filesview.max_changed][]const u8 = undefined;
+        const n = m.changed.fill(&paths);
+        for (paths[0..n]) |p| {
+            report.addChanged(p) catch break;
+        }
+    }
+
+    const rc = m.reads.statsSnapshot();
+    const stats = filesview.Stats{ .hits = rc.hits, .misses = rc.misses, .saved = rc.saved };
+    report.bash_may_write = m.bash_may_write;
+    const text = report.finish(stats, m.changed.dropped) catch return;
+    agent.pushInfoOwned(m, text);
+}
+
 /// `/providers`: lists the providers with their key state.
 pub fn cmdProviders(m: *tui.Model) void {
     var defs_arena_state = std.heap.ArenaAllocator.init(m.allocator);
@@ -656,6 +723,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
     .{ .key = "/session", .desc = "session info", .palette_visible = false },
+    .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
     .{ .key = "/cache", .desc = "cache hit-rate for this session", .palette_visible = false },
     .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
@@ -675,3 +743,60 @@ pub const Cmd = struct {
     /// command palette while preserving direct commands and `/help`.
     palette_visible: bool = true,
 };
+
+// ── `/files` ──────────────────────────────────────────────────
+
+/// The text the command pushed, as one string.
+fn pendingText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
+    var all: std.ArrayList(u8) = .empty;
+    errdefer all.deinit(gpa);
+    for (m.pending.items) |item| try all.appendSlice(gpa, item.text);
+    return all.toOwnedSlice(gpa);
+}
+
+test "the files command names what the model read and what the agent changed" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 100), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    m.reads.record("src/tui.zig", stat, 0xabcd, 1, 100, 3420);
+    m.changed.note("src/agent.zig");
+
+    cmdFiles(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "src/tui.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "in context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "src/agent.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 changed") != null);
+}
+
+test "the files command says when there is nothing, instead of showing an empty list" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    cmdFiles(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "nothing read or written") != null);
+}
+
+test "the files command says a file is NOT in the context when it is not" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 100), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    m.reads.record("build.zig", stat, 0xabcd, 1, 100, 88);
+    // A write forgets the entry: the model does not have the OLD text any more.
+    m.reads.invalidate("build.zig");
+
+    cmdFiles(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "build.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "not in context") != null);
+}

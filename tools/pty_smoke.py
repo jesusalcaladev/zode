@@ -340,6 +340,25 @@ def main() -> int:
     ok &= check("/which-cmd says not found for a file that is not there", "not found: /zode-no-such" in t9, t9)
     ok &= check("the new commands do not break anything", "panic" not in t9.lower(), t9)
 
+    # 10) `/files`: the command that answers "what is the model looking at?".
+    #
+    #     The unit test drives the command directly; this one types it, because
+    #     a command can be perfect and still do nothing when it is TYPED (the
+    #     `/free-auto` lesson). Two enters: the first is taken by the
+    #     autocompletion popup (the input is a command prefix) and the second
+    #     sends it.
+    #
+    #     The answer is one of two shapes: nothing has been read yet (the
+    #     empty session) or there is a list with a count. Both are accepted,
+    #     because what is being checked is that the command ANSWERS.
+    out10, t10 = drive([b"/files", b"\r", b"\r"], budget=9.0)
+    ok &= check(
+        "/files answers",
+        "nothing read or written" in t10 or "changed this session" in t10,
+        t10,
+    )
+    ok &= check("/files does not break anything", "panic" not in t10.lower(), t10)
+
     if not ok:
         print("\n--- plain text (truncated) ---")
         for line in t.splitlines()[:40]:
