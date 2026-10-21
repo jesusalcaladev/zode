@@ -5430,3 +5430,72 @@ writes to `.git/`, `.claude/`, `.vscode/`, `.idea/` and the shell configs, and
 constrains reads to the working directory. We have nothing. A harness that gives
 the model `write` with no path rules is one `rm -rf` away from a very bad
 afternoon.
+
+---
+
+# Phase 33: the TUI, ported (2026-10-21)
+
+The first slice of the port list. Six of the twenty-one items, and the two
+that were done before (the effective effort, the fuzzy picker) are part of it.
+
+## The sticky header is an OVERLAY, and that is a decision
+
+The reference implementation pins a **one-row** header above the scroll box.
+The rule it states is about the header's HEIGHT being variable, and the
+conclusion is that the row has to be reserved so the content does not move.
+
+**Reserving the row here moved the content, and it cost ten tests and a
+crash.** The history area is rows `0..history_h`, and taking one of them for
+the header means the transcript is painted one row lower — which moves the
+`hist_rows` the key handler pages with, the scrollbar's track, the
+selection's row map and the click's row map. Ten tests failed and the click
+handler **panicked** (`attempt to use null value`) because a row that was not
+in the snapshot was looked up anyway.
+
+So the header goes **OVER** the transcript's first row, like the editor's own
+sticky line (vim's ruler, VS Code's sticky scroll): it covers what is under
+it, it costs no layout, and it moves nothing.
+
+**And it only appears when the reader is away from the bottom.** At the bottom
+the prompt is right there in the transcript, and covering the answer while the
+model is writing is a cost with no benefit.
+
+## A glyph is one column, and that is why the mode is visible now
+
+The permission mode used to be a WORD ("plan", "bypass", "accept-edits") and
+there was a test that pinned that `accept_edits` was NOT shown at all. The
+reasoning behind that test was about COLUMNS: twelve of them in a footer that
+has to survive an eighty-column terminal.
+
+The mode is now a **glyph** (`○ ◐ ● ◉`), and the test was **rewritten on
+purpose**, with the reason in its comment:
+
+- the **default** still costs NOTHING (a footer that repeats the default in
+  every row of every session is a footer nobody reads),
+- a **deviation** costs ONE column, and `accept_edits` is visible again.
+
+**A glyph with no legend is a glyph nobody can read**, so the legend travels
+with the shortcut list (`?`): the four shapes and what they mean are four rows
+of the picker.
+
+## The tables know the width, or they are prose
+
+`markdown.zig` takes a `width` in its options, and the table renderer uses it:
+the columns shrink, a cell that is still too wide **wraps inside the cell**
+(it is never clipped: a clipped cell loses information without saying so), and
+a table that does not fit at all degrades into `name: value` rows.
+
+**"Does it fit" is a question only the width can answer**, and the parser is
+the only place that can shrink a table: the TUI paints the segments it gets.
+
+## Two things the `ui-frame` harness is FOR
+
+The scene `scroll` exists because the two new pieces of chrome **only exist
+when the reader is away from the bottom**, and every other scene sits at the
+bottom. The harness gained an `after` hook for it: the first draw is what
+makes the conversation measurable (the heights are estimates until the
+paragraphs are parsed), and without it `scrollBy` has nothing to scroll.
+
+**A scene that cannot show the state is not evidence.** The unit tests say
+"the header names the turn" and "the pill says how many"; the scene says
+whether the two of them look like a design.

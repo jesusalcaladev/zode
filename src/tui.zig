@@ -578,7 +578,17 @@ fn buildLinesBase(
     para: *Model.Para,
     width: u16,
 ) ![]const PLine {
-    const blocks = try md.parseLang(pa, para.kind, para.text, para.base, para.mood, para.lang, .{ .word_diff = para.word_diff });
+    // The width goes to the parser so a TABLE knows how much room it has: a
+    // table that does not fit is degraded into `name: value` rows, and that
+    // decision can only be made with the width in hand.
+    //
+    // The two columns are the paragraph's prefix ("› "), which lands on the
+    // first line: a table that OPENS a paragraph would otherwise be two
+    // columns wider than the terminal and the TUI would wrap the box.
+    const blocks = try md.parseLang(pa, para.kind, para.text, para.base, para.mood, para.lang, .{
+        .word_diff = para.word_diff,
+        .width = width -| 2,
+    });
     var lines: std.ArrayList(PLine) = .empty;
     var first_line = true;
 
@@ -3091,6 +3101,21 @@ pub const Model = struct {
         return first;
     }
 
+    /// The text of the NEXT queued prompt, without taking it out.
+    ///
+    /// It is what the footer shows: the count says there is a queue, and the
+    /// TEXT says what is coming. "2 queued" makes the user open their
+    /// memory; "2 queued · fix the tests" does not.
+    ///
+    /// The slice belongs to the queue and the queue is drained by the WORKER,
+    /// so the caller has to copy it before painting it. The footer does.
+    pub fn queuedNext(self: *Model) ?[]const u8 {
+        self.lock();
+        defer self.unlock();
+        if (self.queue.items.len == 0) return null;
+        return self.queue.items[0];
+    }
+
     /// Tenths of a second the current turn has been running. An instant is
     /// stored when streaming opens because `Timestamp.now` through the `Io`
     /// from draw is exactly what you don't want in the hot path.
@@ -4594,8 +4619,61 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
 
 // ── input key handler ──────────────────────────────
 /// Translates a key into an input edit. Returns true if it consumed it.
+/// The keyboard shortcuts, as a picker.
+///
+/// `?` on an empty input opens it. The reference implementation has a footer
+/// hint for it, and the HINT is the discoverability: a binding nobody knows
+/// about is a binding nobody presses, and half of ours were written down
+/// nowhere until `/help` grew a second block.
+fn openShortcutsPicker(self: *Model) void {
+    const gpa = self.allocator;
+    // The LEGEND of the permission glyphs travels with the shortcut list: the
+    // footer shows a bare "●" to save twelve columns, and a glyph with no
+    // legend is a glyph nobody can read.
+    const modes = [_][2][]const u8{
+        .{ "○", "build (the default: every write asks)" },
+        .{ "◐", "accept-edits (writes go through without asking)" },
+        .{ "●", "plan (read-only: every write is refused)" },
+        .{ "◉", "bypass (nothing asks)" },
+    };
+    const n = agent.shortcuts.len + modes.len;
+    const items = gpa.alloc(PickerItem, n) catch return;
+    for (agent.shortcuts, 0..) |s, i| {
+        // The palette OWNS the labels and frees them when it closes: a literal
+        // here is an "Invalid free" on exit.
+        items[i] = .{
+            .label = gpa.dupe(u8, s.key) catch return,
+            .desc = gpa.dupe(u8, s.desc) catch return,
+        };
+    }
+    for (modes, 0..) |m, i| {
+        items[agent.shortcuts.len + i] = .{
+            .label = gpa.dupe(u8, m[0]) catch return,
+            .desc = gpa.dupe(u8, m[1]) catch return,
+        };
+    }
+    self.openPicker(9, "keyboard shortcuts", items, onShortcutPick);
+}
+
+/// Picking a shortcut does nothing: the list is a REFERENCE, not a menu.
+/// The callback exists because the picker's contract is a callback.
+fn onShortcutPick(_: *Model, _: u32, _: []const u8) void {}
+
 fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     const k = key;
+
+    // `?` on an EMPTY input opens the shortcut list.
+    //
+    // Only when the input is empty: a `?` inside a prompt is a question
+    // mark, and stealing it would be the kind of shortcut that makes people
+    // hate shortcuts.
+    if (k.codepoint == '?' and !k.mods.ctrl and !k.mods.alt and
+        self.ed.text().len == 0 and !self.pal.active and !self.pickerActive())
+    {
+        openShortcutsPicker(self);
+        ctx.redraw = true;
+        return true;
+    }
 
     // Enter submits; Shift+Enter / Alt+Enter insert a line break.
     //
@@ -5802,6 +5880,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         drawLines(&p, live_lines, line_cursor, first_visible, history_h, pad, hero.x_off);
     }
     drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
+    // The sticky header and the pill go OVER the transcript, and that is the
+    // editor's own convention (a sticky line covers the content under it).
+    // Reserving a row for them would move the text under the reader's eyes
+    // every time they appeared, and the transcript is what they are reading.
+    drawStickyHeader(&p, self, width, ctx.arena);
+    drawNewMessagesPill(&p, self, width, history_h);
     try self.snapshotSelectableHistory(surface, history_h);
     self.paintTextSelection(surface);
 
@@ -6170,6 +6254,109 @@ fn scrollbarOffset(row: usize, track_rows: usize, max_offset: usize) usize {
     const track_pos = @min(centered, thumb.travel);
     const scaled = @as(u128, @intCast(track_pos)) * @as(u128, @intCast(max_offset));
     return @intCast(scaled / thumb.travel);
+}
+
+/// The prompt of the turn you are reading, pinned over the top of the
+/// transcript.
+///
+/// It is the reference implementation's "the sticky prompt header", and it
+/// answers a question the transcript alone cannot: **"which request is
+/// this?"** — the answer when you are reading the middle of a long session,
+/// where the request is ten screens up.
+///
+/// **It goes OVER the transcript and not in a row of its own.** A row
+/// reserved for it would move the text under the reader's eyes every time it
+/// appeared, and the transcript is what they are reading; the editor's own
+/// sticky line covers the content under it for the same reason.
+///
+/// **It only appears when the reader is away from the bottom.** At the bottom
+/// the prompt is right there in the transcript, and covering the answer while
+/// the model is writing would be a cost with no benefit.
+fn drawStickyHeader(
+    p: *Painter,
+    self: *const Model,
+    width: u16,
+    arena: std.mem.Allocator,
+) void {
+    if (self.follow_bottom) return;
+    if (width < 12) return;
+    const text = stickyPrompt(self) orelse return;
+
+    // Only the FIRST line of the prompt: a prompt with three lines is a
+    // paragraph, and a header is a line.
+    var first_line = text;
+    if (std.mem.indexOfScalar(u8, first_line, '\n')) |nl| first_line = first_line[0..nl];
+
+    const avail = width -| 3;
+    if (avail == 0) return;
+
+    // The row is cleared first: the header goes over the transcript, and a
+    // header over half a line of text is two half-legible things.
+    p.fillRange(0, width, 0, " ", .{});
+    var col: u16 = 1;
+    col = p.putText(col, 0, "›", theme.brand_soft);
+    // The text is copied into the frame's arena: `putText` does not copy, and
+    // the renderer reads the bytes after this frame is over.
+    const owned = arena.dupe(u8, first_line) catch return;
+    _ = p.putClipped(col + 1, 0, owned, avail, theme.hint);
+}
+
+/// The text of the user prompt of the turn being read.
+fn stickyPrompt(self: *const Model) ?[]const u8 {
+    if (self.paras.items.len == 0) return null;
+    // The anchor is the paragraph the reader is looking at. While the reader
+    // is at the bottom, the anchor is the last paragraph anyway, so the same
+    // search answers both cases.
+    const upto = @min(self.anchor_para + 1, self.paras.items.len);
+    var i = upto;
+    while (i > 0) {
+        i -= 1;
+        const para = self.paras.items[i];
+        if (para.kind == .user and para.text.len > 0) return para.text;
+    }
+    return null;
+}
+
+/// The "3 new messages" pill, floating over the transcript.
+///
+/// It is the reference implementation's pill, and the COUNT is the point:
+/// "↓ latest" in the footer says where you can go, "3 new" says what you are
+/// missing.
+///
+/// It floats OVER the last row of the transcript, and that is a deliberate
+/// cost: a control that is on its own row moves the transcript every time it
+/// appears, and the transcript is what the reader is reading. The footer
+/// keeps the clickable "↓ N new", so nothing is lost by covering a line.
+fn drawNewMessagesPill(
+    p: *Painter,
+    self: *const Model,
+    width: u16,
+    history_h: u16,
+) void {
+    if (self.follow_bottom) return;
+    const unseen = self.unseenTurns();
+    if (unseen == 0) return;
+    if (history_h < 2 or width < 20) return;
+
+    var buf: [32]u8 = undefined;
+    const label = if (unseen == 1)
+        std.fmt.bufPrint(&buf, "1 new message", .{}) catch "new"
+    else
+        std.fmt.bufPrint(&buf, "{d} new messages", .{unseen}) catch "new";
+    if (label.len == 0) return;
+
+    const w: u16 = @intCast(label.len + 2);
+    if (w > width) return;
+    const x: u16 = (width - w) / 2;
+    const y: u16 = history_h - 1;
+
+    // A pill needs a BACKGROUND: without it the text floats over the
+    // transcript and both are readable, which is not readable.
+    var st = theme.brand_bold;
+    st.bg = theme.brand.bg;
+    st.fg = theme.code_bg.fg;
+    p.fillRange(x, x + w, y, " ", st);
+    _ = p.putText(x + 1, y, label, st);
 }
 
 fn drawHistoryScrollbar(
@@ -7097,6 +7284,30 @@ fn drawStateFooter(
                 detail = q;
             }
         }
+        // THE TEXT OF THE NEXT ONE, not only the count.
+        //
+        // "2 queued" says there is a queue; "2 queued · fix the tests" says
+        // what is coming, and the user does not have to open their memory to
+        // find out. The reference implementation shows the queued commands
+        // above the prompt for the same reason.
+        //
+        // It is truncated, and the ellipsis says so: a half-line that looks
+        // complete is a lie about what is queued.
+        if (self.queuedNext()) |next| {
+            const trimmed = std.mem.trim(u8, next, " \t\r\n");
+            if (trimmed.len > 0) {
+                var tbuf: [48]u8 = undefined;
+                const shown = if (trimmed.len <= 40)
+                    trimmed
+                else
+                    std.fmt.bufPrint(&tbuf, "{s}…", .{trimmed[0..39]}) catch "";
+                if (shown.len > 0) {
+                    var both: [192]u8 = undefined;
+                    const joined = std.fmt.bufPrint(&both, "{s} · {s}", .{ detail, shown }) catch "";
+                    if (joined.len > 0) detail = joined;
+                }
+            }
+        }
     }
 
     // How much room the left group's CORE needs, in columns: the face and the
@@ -7239,6 +7450,21 @@ fn drawStateFooter(
         }
     }
 
+    // The `?` hint: the discoverability of the shortcut list.
+    //
+    // It is the reference implementation's footer hint, and it is here for the
+    // same reason: a binding nobody knows about is a binding nobody presses.
+    // It goes at the END of the left group and it only appears when there is
+    // room, because the STATE is what the left group is for and a hint that
+    // squeezes the state out is a hint that costs more than it gives.
+    if (!self.pal.active and !self.pickerActive() and self.ed.text().len == 0) {
+        const hint = "? for shortcuts";
+        const hint_cols: u16 = @intCast(columnsOf(p, hint));
+        if (col + 2 + hint_cols <= left_limit) {
+            _ = p.putClipped(col + 2, row, hint, left_limit -| col, theme.hint_faint);
+        }
+    }
+
     // ── the right group, right-aligned ──
     //
     // The scroll hint's own columns are published so the click on it can jump
@@ -7298,21 +7524,31 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
 
     // Permission mode: only show when NOT default (read-only/bypass are deviations).
     //
-    // `accept_edits` is deliberately NOT shown, and there is a test that pins
-    // it ("the normal permission modes cost NOTHING on the row"): `default`
-    // and `accept_edits` are what a coding session looks like, and spending 12
-    // columns on the word "accept edits" in every row of every session is what
-    // made this row unreadable. The reference implementation shows the mode as
-    // a GLYPH, which is the way to have it and keep the row cheap — that is on
-    // the board as 33.1.
+    // `accept_edits` is shown as a GLYPH, and that is the point: the mode
+    // decides whether the next tool call asks, and the only way to know is to
+    // look. A word costs twelve columns in a footer that has to survive an
+    // eighty-column terminal; a glyph costs one.
+    //
+    // The four shapes are the ones the reference implementation uses: `○` for
+    // the default, `◐` for accept-edits, `●` for read-only and `◉` for the
+    // bypass. The DEFAULT shows nothing, because there is a test that pins
+    // "the normal permission modes cost NOTHING on the row" and it is right:
+    // a footer that repeats the default in every row of every session is a
+    // footer nobody reads.
     switch (agent.currentPermMode()) {
-        .read_only, .bypass => {
+        .read_only, .bypass, .accept_edits => {
             if (out.items.len > 0) {
                 out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
             }
-            out.append(arena, .{ .text = agent.permModeName(), .style = theme.warn }) catch return null;
+            const glyph = switch (agent.currentPermMode()) {
+                .accept_edits => "◐",
+                .read_only => "●",
+                .bypass => "◉",
+                .default => "",
+            };
+            out.append(arena, .{ .text = glyph, .style = theme.warn }) catch return null;
         },
-        .default, .accept_edits => {},
+        .default => {},
     }
 
     // The EFFECTIVE effort level: the one that goes on the wire, after the
@@ -8401,12 +8637,18 @@ test "status: the row is ONLY the model name in the normal case" {
     }
 }
 
-test "status: the normal permission modes cost NOTHING on the row" {
-    // The mark for a permission mode only appears when it is a deviation
-    // (`read-only`, `bypass`): `default` and `accept_edits` are what a coding
-    // session looks like, and spending columns on them is what made the old row
-    // unreadable. A test for the ABSENCE of a mark is the only thing that keeps
-    // a future "just add the mode back" from silently undoing the change.
+test "status: the DEFAULT permission mode costs NOTHING on the row, and a deviation costs ONE column" {
+    // REWRITTEN ON PURPOSE (2026-10-21), and the reason is the change, not a
+    // bug: the old version pinned that `accept_edits` was NOT shown either.
+    //
+    // The reasoning behind the old pin was about COLUMNS — a word costs
+    // twelve of them in a footer that has to survive an eighty-column
+    // terminal, and a footer nobody can read is a footer nobody reads. That
+    // reasoning still holds, and it is why the mode is now a GLYPH.
+    //
+    // What changed is the ANSWER to the question the mode answers: it decides
+    // whether the next tool call asks, and the only way to know that is to
+    // look. One column is a price worth paying; twelve were not.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -8435,17 +8677,36 @@ test "status: the normal permission modes cost NOTHING on the row" {
         );
     }
 
-    for ([_]agent.PermMode{ .default, .accept_edits }) |pm| {
+    // The DEFAULT: nothing but the model name. A test for the ABSENCE of a
+    // mark is the only thing that keeps a future "just add the mode back"
+    // from silently undoing the change.
+    agent.setPermMode(&m, .default);
+    {
+        const segs = sessionInfo(&m, arena_state.allocator()) orelse return error.TestUnexpectedResult;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(std.testing.allocator);
+        for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, " · ") == null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "opencode") == null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "/") == null);
+    }
+
+    // A DEVIATION: the glyph, and only the glyph.
+    for ([_]agent.PermMode{ .accept_edits, .read_only, .bypass }) |pm| {
         agent.setPermMode(&m, pm);
         const segs = sessionInfo(&m, arena_state.allocator()) orelse return error.TestUnexpectedResult;
         var joined: std.ArrayList(u8) = .empty;
         defer joined.deinit(std.testing.allocator);
         for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
-        // Nothing but the model name: no provider, no slash, no mode marker.
-        // The joined text should just be the model name (e.g., "kimi-k2.6")
-        try std.testing.expect(std.mem.indexOf(u8, joined.items, " · ") == null);
+        // The glyph is there...
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "◐") != null or
+            std.mem.indexOf(u8, joined.items, "●") != null or
+            std.mem.indexOf(u8, joined.items, "◉") != null);
+        // ...and it is ONE column wide: no word, no provider, no path.
         try std.testing.expect(std.mem.indexOf(u8, joined.items, "opencode") == null);
         try std.testing.expect(std.mem.indexOf(u8, joined.items, "/") == null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "read-only") == null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "bypass") == null);
     }
 }
 
@@ -11645,9 +11906,14 @@ test "ask: with no open question the snapshot is null (not an empty panel)" {
     try std.testing.expect(m.askSnapshot(arena_state.allocator()) == null);
 }
 
-test "read-only shows up in the status bar" {
+test "the permission mode shows up in the status bar as a GLYPH" {
     // A mode you cannot see is a mode in which "the model ignored my edit" cannot
     // be told apart from "the model never tried".
+    //
+    // REWRITTEN (2026-10-21): the mode used to be a WORD ("plan", "bypass",
+    // "accept-edits") and it is now a GLYPH, because a word costs twelve
+    // columns in a footer that has to survive an eighty-column terminal. The
+    // legend of the glyphs is in the shortcut list (`?`).
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -11659,6 +11925,9 @@ test "read-only shows up in the status bar" {
 
     const before = try drawTest(&m, arena, 100, 30);
     const before_row = rowText(before, status_row, &buf);
+    // The default shows NOTHING: a footer that repeats the default in every
+    // row of every session is a footer nobody reads.
+    try std.testing.expect(std.mem.indexOf(u8, before_row, "●") == null);
     try std.testing.expect(std.mem.indexOf(u8, before_row, "plan") == null);
 
     agent.read_only = true;
@@ -11666,7 +11935,9 @@ test "read-only shows up in the status bar" {
 
     const after = try drawTest(&m, arena, 100, 30);
     const after_row = rowText(after, status_row, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, after_row, "plan") != null);
+    // The glyph is there, and it is ONE column wide.
+    try std.testing.expect(std.mem.indexOf(u8, after_row, "●") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_row, "plan") == null);
 }
 
 test "@ mention: the popup lists files AND is painted, and does not hide the ones that do not fit" {
@@ -12624,4 +12895,136 @@ test "status: the footer shows the EFFECTIVE effort, and only when there is a kn
     joined.clearRetainingCapacity();
     for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
     try std.testing.expect(std.mem.indexOf(u8, joined.items, "high") == null);
+}
+
+test "the sticky header names the turn you are reading" {
+    // The question it answers is "which request is this?", and it is the
+    // question you ask when you are reading the middle of a long session.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushInfo("an info line that sits at the top of the transcript");
+    m.pushKind(.user, "first request");
+    m.pushKind(.assistant, "an answer that is long enough to need a few rows on the screen");
+    m.pushKind(.user, "second request");
+    m.pushKind(.assistant, "another answer, also long enough to fill a couple of rows here");
+    // The conversation has to be TALLER than the screen, or there is nothing
+    // to scroll and the reader never leaves the bottom.
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        m.pushInfoFmt("relleno {d}", .{i});
+        m.pushKind(.assistant, "una respuesta de relleno un poco mas larga que la anterior");
+    }
+
+    const h: u16 = 20;
+    _ = try drawTest(&m, arena, 60, h);
+
+    // Scroll up into the middle of the conversation.
+    m.scrollBy(3);
+    const away = try drawTest(&m, arena, 60, h);
+    var buf: [256]u8 = undefined;
+    const row0 = rowText(away, 0, &buf);
+
+    // The header names the turn.
+    try std.testing.expect(std.mem.indexOf(u8, row0, "request") != null);
+
+    // AND it is the HEADER and not the transcript: the header paints the
+    // prompt dim (`theme.hint`) and the user's own line in the transcript
+    // paints it bright (`theme.ink`). Without the style check the test would
+    // pass on the transcript's own prompt and prove nothing.
+    const at = std.mem.indexOf(u8, row0, "request") orelse return error.TestUnexpectedResult;
+    const cell = away.readCell(@intCast(at), 0);
+    try std.testing.expectEqualStrings(
+        &theme.hint.fg.rgb,
+        &cell.style.fg.rgb,
+    );
+}
+
+test "the sticky header is not painted while the reader is at the bottom" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushInfo("an info line at the top of the transcript");
+    m.pushKind(.user, "a prompt that would be the header if the reader scrolled up");
+    m.pushKind(.assistant, "an answer");
+
+    const s = try drawTest(&m, arena, 60, 20);
+    var buf: [256]u8 = undefined;
+    const row0 = rowText(s, 0, &buf);
+    // Row 0 is the transcript, not a header: the prompt is IN the transcript.
+    try std.testing.expect(std.mem.indexOf(u8, row0, "a prompt that would be") == null);
+}
+
+test "the pill says how many answers arrived while the reader was away" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        m.pushInfoFmt("linea {d}", .{i});
+        m.pushKind(.assistant, "una respuesta un poco mas larga que la anterior");
+    }
+    _ = try drawTest(&m, arena, 60, 20);
+
+    m.scrollBy(6);
+    try std.testing.expect(!m.follow_bottom);
+
+    // Nothing arrived yet: no pill.
+    const none = try drawTest(&m, arena, 60, 20);
+    try std.testing.expect(findRow(none, "new message") == null);
+
+    m.pushKind(.assistant, "tercera respuesta");
+    m.pushKind(.assistant, "cuarta respuesta");
+    const s = try drawTest(&m, arena, 60, 20);
+    try std.testing.expect(findRow(s, "2 new messages") != null);
+}
+
+test "the footer tells what is queued, not only how much" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // The queue owns its text, so the copy has to be a copy.
+    const text = m.allocator.dupe(u8, "arregla los tests que fallan") catch return error.TestUnexpectedResult;
+    _ = m.enqueuePrompt(text);
+
+    const s = try drawTest(&m, arena, 100, 30);
+    var buf: [512]u8 = undefined;
+    const row = rowText(s, 29, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, row, "1 queued") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "arregla los tests") != null);
+}
+
+test "the ? key opens the shortcut list" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // The picker is a modal: it is open while it is open.
+    openShortcutsPicker(&m);
+    try std.testing.expect(m.pickerActive());
+
+    // The legend of the permission glyphs travels with it: a glyph with no
+    // legend is a glyph nobody can read.
+    var found_mode = false;
+    for (m.picker_items.items) |it| {
+        if (std.mem.indexOf(u8, it.desc, "plan") != null) found_mode = true;
+    }
+    try std.testing.expect(found_mode);
 }

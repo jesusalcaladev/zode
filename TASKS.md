@@ -694,14 +694,16 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 - [x] **33.1** The footer says the state that decides the next tool call — **DONE 2026-10-21**
   - [x] The **effective** effort level (`chat.effortSupport` decides whether there is a knob at all) — the preference is not the same thing, and showing it would be a lie: the footer would say `xhigh` while the wire carries `high`
-  - [ ] The permission-mode **glyph** (`○ ◐ ● ◉`, the four shapes the reference implementation uses) — a word costs 12 columns in a footer that has to survive an 80-column terminal
-  - [ ] …and with it, `accept edits` becomes visible again: the test that pins "the normal permission modes cost NOTHING on the row" is a decision about COLUMNS, and a glyph is one column
+  - [x] The permission-mode **glyph** (`○ ◐ ● ◉`, the four shapes the reference implementation uses) — a word costs 12 columns in a footer that has to survive an 80-column terminal
+  - [x] …and with it, `accept edits` becomes visible again: the test that pins "the normal permission modes cost NOTHING on the row" is a decision about COLUMNS, and a glyph is one column. **The test was rewritten on purpose** (the default still costs nothing; a deviation costs ONE column) and the legend of the glyphs lives in the shortcut list (`?`)
 - [x] **33.2** The "N new" counter — **DONE 2026-10-21**
   - [x] Counts assistant **turns**, not entries (the reference implementation counts them the same way): a tool line is not an answer the reader is missing
   - [x] The baseline moves with the reader: leaving the bottom starts a count, reaching it ends the one that was running
-  - [ ] The **pill** over the transcript: a centred "3 new messages" that floats over the scrollback, with a click target
-- [ ] **33.3** The sticky prompt header — **fixed ONE row**, or the transcript shifts every time the sticky prompt changes (the reference implementation says so in its own comment)
-  - [ ] It has to live OUTSIDE `history_h` or the clear at `tui.zig:5728-5731` erases it
+  - [x] The **pill** over the transcript: a centred "3 new messages" that floats over the scrollback. It covers the last row on purpose — a control on its own row would move the transcript every time it appeared
+- [x] **33.3** The sticky prompt header — **DONE 2026-10-21, as an OVERLAY**
+  - [x] It names the turn you are reading: the last `.user` paragraph at or above the anchor
+  - [x] It goes OVER the transcript's first row and **only when the reader is away from the bottom**. A reserved row was tried FIRST and it moved the text under the reader's eyes (10 tests and a crash in the click/selection math): a header that appears and disappears takes a row away exactly when the reader is looking
+  - [x] The editor's own convention: a sticky line covers the content under it
 - [ ] **33.4** The transcript screen (`ctrl+o`) — a VIEW of our own history, not new content; `ctrl+e` shows all
 - [ ] **33.5** The bottom-anchored modal pane with a `▔` divider — a pane that keeps 2 transcript rows visible beats a centred box that hides the context
 - [x] **33.6** The fuzzy picker with the matched characters highlighted — **DONE 2026-10-21**
@@ -712,19 +714,20 @@ Ctrl+R turns them on. That is the same rule with a different name.
   - [ ] The list is still in the provider's order, and the reference implementation sorts by score. Ours is deliberate (the free models first), so sorting is a decision and not a port
 - [ ] **33.7** The picker with a **preview pane** (at the bottom or at the right) — the model preview (context window, price, free) is the most useful picker addition we do not have
   - [ ] It has to be a **bottom pane**, not a third column: at 110 columns there is no room for a third one
-- [ ] **33.8** Markdown tables — models emit tables and we render them as prose; a contained addition to `src/lib/markdown.zig`
+- [x] **33.8** Markdown tables — **DONE 2026-10-21**: a boxed table, cells padded to the column width, shrinking to fit and **wrapping inside the cell** instead of being clipped; a table that does not fit at all degrades to `name: value` rows. 11 pure tests, and the invariant that every cell's text survives the rendering
+  - [x] The parser receives the WIDTH (`DiffOpts.width`), because "does it fit" is a question only the width can answer
 - [ ] **33.9** The notifications channel — a transient queue for "the updater restarted", "the IDE connected", "the token budget is nearly gone"; absolutely positioned, so nothing shifts
 - [ ] **33.10** The context visualisation — we compute the numbers; the reference implementation draws a proportional chart per category (system, tools, messages, skills, compaction reserve)
 - [ ] **33.11** The task panel with blockers and priorities — **the data model already exists** (`src/lib/taskstore.zig`: `blocks`/`blocked_by`/`hasOpenBlocker`) and is not surfaced
 - [ ] **33.12** The per-message actions — `shift+↑` targets the message under the cursor; ours has `/copy N` and no per-message targeting
 - [ ] **33.13** The transcript search (`/` and `n`/`N`) — our paragraphs are already segmented, so the scan is over the segments, not the cells
 - [ ] **33.14** OSC 8 hyperlinks — the paths and the URLs as real links; the detection is ~30 lines and vaxis exposes the cell attributes
-- [ ] **33.15** The shortcut help in the footer (`? for shortcuts`) — discoverability, cheap
+- [x] **33.15** The shortcut help in the footer (`? for shortcuts`) — **DONE 2026-10-21**: `?` on an empty input opens the list, and the list carries the LEGEND of the permission glyphs. The hint in the footer only appears when the state has room for it
 - [ ] **33.16** The external editor (`ctrl+g`) and the image paste (`ctrl+v`) — the image path already exists (`src/lib/images.zig`)
 - [ ] **33.17** The focus detection (dim the caret when the window is not focused) — vaxis reports focus events
 - [ ] **33.18** The modal diff viewer — only worth it once a turn can produce multi-file diffs
 - [ ] **33.19** The compact-summary line — after a tier-2 compaction the transcript loses history **silently**; one honest line says what was summarised
-- [ ] **33.20** The queued prompts' **text**, not just the count
+- [x] **33.20** The queued prompts' **text**, not just the count — **DONE 2026-10-21**: "2 queued · arregla los tests" instead of "2 queued", truncated with an ellipsis (a half-line that looks complete is a lie about what is queued)
 - [ ] **33.21** The permission dialog with the **rule** explanation — which rule matched, and the rule the user could accept instead of a bare "always allow"
 
 **What we deliberately do NOT copy** (and why) — the reasoning is in

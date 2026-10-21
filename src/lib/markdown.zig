@@ -127,6 +127,17 @@ pub const DiffOpts = struct {
     /// cannot see the whole change anyway, so which words changed inside
     /// those twelve rows is noise. The expanded diff has them.
     word_diff: bool = true,
+
+    /// The width of the terminal the content is painted into, in COLUMNS.
+    ///
+    /// Only the tables use it: a table has to FIT, and a table that does not
+    /// fit is not a table (it becomes a list of `name: value` rows).
+    ///
+    /// 0 means "the caller does not know the width": the table keeps its
+    /// natural column widths, nothing is shrunk, and a cell wider than
+    /// `default_cell_width` is wrapped onto more lines inside its cell
+    /// instead of becoming a 400-column line.
+    width: u16 = 0,
 };
 
 /// What the painter needs to know about the row it is painting.
@@ -189,8 +200,18 @@ pub fn parseLang(
     }
 
     var idx: usize = 0;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| : (idx += 1) {
+    // The lines are collected BEFORE the loop because a table has to LOOK
+    // AHEAD: a header line is only a table when the NEXT line is its
+    // separator. A streaming iterator cannot look ahead, so the text is
+    // split once and the loop walks the array.
+    var src_lines: std.ArrayList([]const u8) = .empty;
+    {
+        var split = std.mem.splitScalar(u8, text, '\n');
+        while (split.next()) |l| try src_lines.append(arena, l);
+    }
+
+    while (idx < src_lines.items.len) : (idx += 1) {
+        const line = src_lines.items[idx];
         // A diff is NOT prose. It has no fences (a markdown file's own ``` is
         // a context row that starts with a space), no bullets (a deleted
         // line starts with "- " and was being painted as a LIST ITEM), no
@@ -258,6 +279,36 @@ pub fn parseLang(
                 try arena.alloc(Segment, 0);
             try code_lines.append(arena, segs);
             continue;
+        }
+
+        // ── a table ──
+        //
+        // A header line followed by its separator is a table, and it is NOT
+        // prose: `| a | b |` painted as prose is a row of pipes that the
+        // reader has to decode. The table is a BLOCK of its own (the borders
+        // are not prose), but it is painted like text: the TUI only treats a
+        // `.code` block specially.
+        //
+        // The banner is a drawing, not prose: do not look for structure in it.
+        if (kind != .banner) {
+            if (try tableAt(arena, src_lines.items, idx)) |tbl| {
+                // The pending text closes first: the table is its own block.
+                if (inline_lines.items.len > 0) {
+                    try blocks.append(arena, .{
+                        .kind = kind,
+                        .lines = try inline_lines.toOwnedSlice(arena),
+                    });
+                    inline_lines = .empty;
+                }
+                const table_lines = try renderTable(arena, kind, base_override, mood_style, tbl, opts.width);
+                try blocks.append(arena, .{
+                    .kind = kind,
+                    .lines = table_lines,
+                });
+                // The table used the header, the separator and every body row.
+                idx = tbl.last_line;
+                continue;
+            }
         }
 
         // headings
@@ -959,6 +1010,527 @@ pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
     };
 }
 
+// ── tables ───────────────────────────────────────────────────────────────────
+
+/// A table read from the text: the header cells and the body rows.
+const Table = struct {
+    headers: [][]const u8,
+    rows: [][][]const u8,
+    ncols: usize,
+    /// The index of the LAST line the table used: the separator, or the last
+    /// body row.
+    last_line: usize,
+};
+
+/// The narrowest a column can be: one column of content.
+const min_col_width = 1;
+
+/// The width of a cell that is wider than any column when the caller does
+/// not know the terminal's width.
+const default_cell_width = 40;
+
+/// The columns of the box that are NOT content: the borders and the space on
+/// each side of every cell.
+fn tableOverhead(ncols: usize) usize {
+    return 3 * ncols + 1;
+}
+
+/// The narrowest a table of `ncols` columns can be: every column at one
+/// column of content, plus the box.
+fn minTableWidth(ncols: usize) usize {
+    return 4 * ncols + 1;
+}
+
+/// Reads the table that starts at `lines[i]`, if there is one.
+///
+/// A table is a header line (it starts with a pipe) followed by a SEPARATOR
+/// line (every cell is dashes and maybe colons), and then every line that
+/// starts with a pipe is a body row.
+///
+/// The separator is what makes it a table: a line that starts with a pipe and
+/// has no separator after it is prose, and a single line of pipes is not a
+/// table either.
+fn tableAt(arena: std.mem.Allocator, lines: []const []const u8, i: usize) !?Table {
+    if (i + 1 >= lines.len) return null;
+
+    const header_line = std.mem.trimStart(u8, lines[i], " \t");
+    if (header_line.len == 0 or header_line[0] != '|') return null;
+
+    const headers = try splitRowCells(arena, header_line);
+    // One column is not a table: it is a line that happens to have a pipe.
+    if (headers.len < 2) return null;
+
+    const sep = try splitRowCells(arena, lines[i + 1]);
+    if (sep.len != headers.len) return null;
+    if (!isSeparatorCells(sep)) return null;
+
+    var rows: std.ArrayList([][]const u8) = .empty;
+    var ncols = headers.len;
+    var j = i + 2;
+    while (j < lines.len) : (j += 1) {
+        const l = std.mem.trimStart(u8, lines[j], " \t");
+        if (l.len == 0 or l[0] != '|') break;
+        const cells = try splitRowCells(arena, l);
+        // A row with MORE cells than the header gets its own column: the
+        // extra cell's text would be lost otherwise, and nothing may be lost.
+        if (cells.len > ncols) ncols = cells.len;
+        try rows.append(arena, cells);
+    }
+
+    // Every row is padded to the number of columns, so the rendering can
+    // assume the same shape everywhere.
+    const padded_rows = try arena.alloc([][]const u8, rows.items.len);
+    for (rows.items, 0..) |r, k| {
+        const pr = try arena.alloc([]const u8, ncols);
+        for (pr, 0..) |*c, ci| c.* = if (ci < r.len) r[ci] else "";
+        padded_rows[k] = pr;
+    }
+    const hdr = try arena.alloc([]const u8, ncols);
+    for (hdr, 0..) |*c, ci| c.* = if (ci < headers.len) headers[ci] else "";
+
+    return Table{
+        .headers = hdr,
+        .rows = padded_rows,
+        .ncols = ncols,
+        .last_line = j - 1,
+    };
+}
+
+/// Splits a table row into its cells.
+///
+/// A `\|` is a LITERAL pipe: without this a cell that contains one (a table
+/// of file paths, a command line) is split in two and the row has one cell
+/// too many.
+fn splitRowCells(arena: std.mem.Allocator, line: []const u8) ![][]const u8 {
+    const t = std.mem.trim(u8, line, " \t");
+    var cells: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    if (t.len > 0 and t[0] == '|') i = 1;
+    var cell_start = i;
+    var has_escape = false;
+    var ended_with_pipe = false;
+    while (i < t.len) {
+        const c = t[i];
+        if (c == '\\' and i + 1 < t.len and t[i + 1] == '|') {
+            has_escape = true;
+            ended_with_pipe = false;
+            i += 2;
+            continue;
+        }
+        if (c == '|') {
+            try cells.append(arena, try cellText(arena, t[cell_start..i], has_escape));
+            has_escape = false;
+            cell_start = i + 1;
+            ended_with_pipe = true;
+            i += 1;
+            continue;
+        }
+        ended_with_pipe = false;
+        i += 1;
+    }
+    // A row that ends with a pipe does not have a cell after it.
+    if (!ended_with_pipe) {
+        try cells.append(arena, try cellText(arena, t[cell_start..], has_escape));
+    }
+    return cells.toOwnedSlice(arena);
+}
+
+/// The text of a cell: trimmed, and with the escaped pipes unescaped.
+fn cellText(arena: std.mem.Allocator, raw: []const u8, has_escape: bool) ![]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t");
+    if (!has_escape) return trimmed;
+    const out = try arena.alloc(u8, trimmed.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < trimmed.len) {
+        if (trimmed[i] == '\\' and i + 1 < trimmed.len and trimmed[i + 1] == '|') {
+            out[n] = '|';
+            n += 1;
+            i += 2;
+            continue;
+        }
+        out[n] = trimmed[i];
+        n += 1;
+        i += 1;
+    }
+    return out[0..n];
+}
+
+/// Is this the separator row of a table (`|---|---|`, `|:---|---:|`, …)?
+fn isSeparatorCells(cells: []const []const u8) bool {
+    if (cells.len == 0) return false;
+    for (cells) |c| {
+        if (!isDashCell(c)) return false;
+    }
+    return true;
+}
+
+/// One cell of a separator: dashes, with an optional colon on each side (the
+/// alignment markers).
+fn isDashCell(c: []const u8) bool {
+    var s = std.mem.trim(u8, c, " \t");
+    if (s.len > 0 and s[0] == ':') s = s[1..];
+    if (s.len > 0 and s[s.len - 1] == ':') s = s[0 .. s.len - 1];
+    if (s.len == 0) return false;
+    for (s) |ch| {
+        if (ch != '-') return false;
+    }
+    return true;
+}
+
+/// The natural width of every column: the widest cell in it.
+fn naturalWidths(arena: std.mem.Allocator, table: Table) ![]usize {
+    const widths = try arena.alloc(usize, table.ncols);
+    for (widths) |*w| w.* = 0;
+    for (table.headers, 0..) |c, k| {
+        widths[k] = @max(widths[k], textWidth(c));
+    }
+    for (table.rows) |row| {
+        for (row, 0..) |c, k| {
+            widths[k] = @max(widths[k], textWidth(c));
+        }
+    }
+    return widths;
+}
+
+/// Shrinks the columns until they fit in `budget` columns of content.
+///
+/// Proportionally first, so a very wide column does not eat everything, and
+/// then one column at a time from the widest, which is what "the widest
+/// first" means: the reduction lands where there is room to take it.
+///
+/// The columns never go below `min_col_width`, and the caller has already
+/// checked that the budget is at least one column per column.
+fn shrinkColumns(widths: []usize, budget: usize) void {
+    var total: usize = 0;
+    for (widths) |w| total += w;
+    if (total <= budget) return;
+
+    for (widths) |*w| {
+        const scaled = (w.* * budget) / total;
+        w.* = @max(scaled, min_col_width);
+    }
+    total = 0;
+    for (widths) |w| total += w;
+
+    // The floor of the proportional step can leave it over the budget.
+    while (total > budget) {
+        const k = widestColumn(widths);
+        if (widths[k] <= min_col_width) break;
+        widths[k] -= 1;
+        total -= 1;
+    }
+    // And the floor can leave room under it: give it back to the widest.
+    while (total < budget) {
+        const k = widestColumn(widths);
+        widths[k] += 1;
+        total += 1;
+    }
+}
+
+/// The index of the widest column (the leftmost one when they tie).
+fn widestColumn(widths: []const usize) usize {
+    var best: usize = 0;
+    for (widths, 0..) |w, k| {
+        if (w > widths[best]) best = k;
+    }
+    return best;
+}
+
+/// Renders the table as a box of lines.
+fn renderTable(
+    arena: std.mem.Allocator,
+    kind: Kind,
+    base_override: ?Style,
+    mood_style: ?Style,
+    table: Table,
+    width: u16,
+) ![]const []const Segment {
+    const widths = try naturalWidths(arena, table);
+
+    if (width > 0) {
+        const budget: usize = width;
+        // It does not fit at all: not even with every column at ONE column.
+        // Then it is not a table any more: it is a list of rows.
+        if (budget < minTableWidth(table.ncols)) {
+            return renderDegraded(arena, kind, base_override, mood_style, table);
+        }
+        const content = budget - tableOverhead(table.ncols);
+        shrinkColumns(widths, content);
+    } else {
+        // No width known: the columns keep their natural width, but a cell
+        // wider than `default_cell_width` is wrapped onto more lines inside
+        // its cell instead of becoming a 400-column line.
+        for (widths) |*w| w.* = @min(w.*, default_cell_width);
+    }
+
+    var out: std.ArrayList([]const Segment) = .empty;
+    try out.append(arena, try borderLine(arena, widths, "┌", "┬", "┐"));
+    try appendRow(arena, &out, kind, base_override, mood_style, table.headers, widths, true);
+    if (table.rows.len > 0) {
+        try out.append(arena, try borderLine(arena, widths, "├", "┼", "┤"));
+        for (table.rows) |row| {
+            try appendRow(arena, &out, kind, base_override, mood_style, row, widths, false);
+        }
+    }
+    try out.append(arena, try borderLine(arena, widths, "└", "┴", "┘"));
+    return out.toOwnedSlice(arena);
+}
+
+/// One of the three horizontal borders of the box.
+fn borderLine(
+    arena: std.mem.Allocator,
+    widths: []const usize,
+    left: []const u8,
+    mid: []const u8,
+    right: []const u8,
+) ![]const Segment {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(arena, left);
+    for (widths, 0..) |w, k| {
+        if (k > 0) try buf.appendSlice(arena, mid);
+        var i: usize = 0;
+        while (i < w + 2) : (i += 1) try buf.appendSlice(arena, "─");
+    }
+    try buf.appendSlice(arena, right);
+    const segs = try arena.alloc(Segment, 1);
+    segs[0] = .{ .text = buf.items, .style = theme.table };
+    return segs;
+}
+
+/// Appends the lines of one row (a header or a body row).
+///
+/// A row can be TALLER than one line: a cell that does not fit in its column
+/// is wrapped onto more lines, and the other cells of the row leave that
+/// space empty.
+fn appendRow(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList([]const Segment),
+    kind: Kind,
+    base_override: ?Style,
+    mood_style: ?Style,
+    cells: []const []const u8,
+    widths: []const usize,
+    header: bool,
+) !void {
+    const base = base_override orelse baseStyle(kind);
+    var cell_lines: std.ArrayList([]const []const Segment) = .empty;
+    var height: usize = 0;
+    for (cells, 0..) |c, k| {
+        const segs = try inlineSegmentsLang(arena, c, kind, base_override, mood_style, "", null);
+        if (header) {
+            // The header is the row the reader scans: it is bold.
+            for (segs) |*s| s.style = boldStyle(s.style, base);
+        }
+        const lines = try cellLines(arena, segs, widths[k]);
+        height = @max(height, lines.len);
+        try cell_lines.append(arena, lines);
+    }
+
+    var i: usize = 0;
+    while (i < height) : (i += 1) {
+        var segs: std.ArrayList(Segment) = .empty;
+        for (cell_lines.items, 0..) |cl, k| {
+            try segs.append(arena, .{ .text = "│", .style = theme.table });
+            try segs.append(arena, .{ .text = " ", .style = base });
+            var used: usize = 0;
+            if (i < cl.len) {
+                for (cl[i]) |s| {
+                    try segs.append(arena, s);
+                    used += textWidth(s.text);
+                }
+            }
+            const pad = widths[k] -| used;
+            if (pad > 0) {
+                try segs.append(arena, .{ .text = try spaces(arena, pad), .style = base });
+            }
+            try segs.append(arena, .{ .text = " ", .style = base });
+        }
+        try segs.append(arena, .{ .text = "│", .style = theme.table });
+        try out.append(arena, try segs.toOwnedSlice(arena));
+    }
+}
+
+/// The lines of one cell, wrapped to `width` columns.
+///
+/// The wrapping is done on the SEGMENTS and not on the text: a cell that is
+/// half bold is wrapped without losing the bold, and the padding is computed
+/// on what is actually painted.
+fn cellLines(arena: std.mem.Allocator, segs: []const Segment, width: usize) ![][]const Segment {
+    const w = @max(width, 1);
+    var out: std.ArrayList([]const Segment) = .empty;
+    var cur: std.ArrayList(Segment) = .empty;
+    var col: usize = 0;
+
+    for (segs) |sg| {
+        var text = sg.text;
+        while (text.len > 0) {
+            const tw = textWidth(text);
+            if (col + tw <= w) {
+                // `text` and not `sg`: after a split this is the REMAINDER of
+                // the segment, and appending the segment would put the whole
+                // text back into the line that was just closed.
+                try cur.append(arena, .{ .text = text, .style = sg.style });
+                col += tw;
+                break;
+            }
+            if (col > 0) {
+                // The line is full: close it and start the next one with
+                // this segment.
+                try out.append(arena, try cur.toOwnedSlice(arena));
+                cur = .empty;
+                col = 0;
+                continue;
+            }
+            // The segment does not fit even in an empty line: split it.
+            const take = fitPrefix(text, w);
+            var brk: usize = 0;
+            var k = @min(take, text.len - 1);
+            while (k > 0) : (k -= 1) {
+                if (text[k] == ' ') {
+                    brk = k;
+                    break;
+                }
+            }
+            const cut = if (brk > 0) brk else take;
+            try cur.append(arena, .{ .text = text[0..cut], .style = sg.style });
+            try out.append(arena, try cur.toOwnedSlice(arena));
+            cur = .empty;
+            col = 0;
+            text = text[cut..];
+            // The space the line broke at is not repeated at the start of
+            // the next one.
+            if (brk > 0 and text.len > 0 and text[0] == ' ') text = text[1..];
+        }
+    }
+    try out.append(arena, try cur.toOwnedSlice(arena));
+    return out.toOwnedSlice(arena);
+}
+
+/// The table as a list of rows, for a table that does not fit.
+///
+/// `Name: value · Other: value` is readable where a squeezed box is not, and
+/// it loses nothing: every cell is there.
+fn renderDegraded(
+    arena: std.mem.Allocator,
+    kind: Kind,
+    base_override: ?Style,
+    mood_style: ?Style,
+    table: Table,
+) ![]const []const Segment {
+    const base = base_override orelse baseStyle(kind);
+    var out: std.ArrayList([]const Segment) = .empty;
+
+    if (table.rows.len == 0) {
+        var segs: std.ArrayList(Segment) = .empty;
+        for (table.headers, 0..) |h, k| {
+            if (k > 0) try segs.append(arena, .{ .text = " · ", .style = base });
+            for (try inlineSegmentsLang(arena, h, kind, base_override, mood_style, "", null)) |s| {
+                try segs.append(arena, .{ .text = s.text, .style = boldStyle(s.style, base) });
+            }
+        }
+        try out.append(arena, try segs.toOwnedSlice(arena));
+        return out.toOwnedSlice(arena);
+    }
+
+    for (table.rows) |row| {
+        var segs: std.ArrayList(Segment) = .empty;
+        for (table.headers, 0..) |h, k| {
+            if (k > 0) try segs.append(arena, .{ .text = " · ", .style = base });
+            for (try inlineSegmentsLang(arena, h, kind, base_override, mood_style, "", null)) |s| {
+                try segs.append(arena, .{ .text = s.text, .style = boldStyle(s.style, base) });
+            }
+            try segs.append(arena, .{ .text = ": ", .style = base });
+            for (try inlineSegmentsLang(arena, row[k], kind, base_override, mood_style, "", null)) |s| {
+                try segs.append(arena, s);
+            }
+        }
+        try out.append(arena, try segs.toOwnedSlice(arena));
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// A style in bold, keeping its color, and taking the base's color when it
+/// has none.
+fn boldStyle(st: Style, base: Style) Style {
+    var s = st;
+    s.bold = true;
+    if (s.fg == .default) s.fg = base.fg;
+    return s;
+}
+
+/// `n` spaces.
+fn spaces(arena: std.mem.Allocator, n: usize) ![]const u8 {
+    const buf = try arena.alloc(u8, n);
+    @memset(buf, ' ');
+    return buf;
+}
+
+/// How many bytes of `text` fit in `avail` columns.
+fn fitPrefix(text: []const u8, avail: usize) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const cw = codepointWidthAt(text, i);
+        if (w + cw > avail) break;
+        w += cw;
+        i += len;
+    }
+    if (i == 0 and text.len > 0) {
+        // The first character does not fit even in an empty line: take it
+        // anyway, or the wrap would not make progress.
+        return std.unicode.utf8ByteSequenceLength(text[0]) catch 1;
+    }
+    return i;
+}
+
+/// The columns a piece of text takes.
+///
+/// The table's cells are padded to a width in COLUMNS, not in bytes: a CJK
+/// character is two columns, and a byte count paints a table whose right
+/// border does not line up.
+pub fn textWidth(text: []const u8) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        w += codepointWidthAt(text, i);
+        i += len;
+    }
+    return w;
+}
+
+/// The columns the character at `i` takes.
+fn codepointWidthAt(text: []const u8, i: usize) usize {
+    const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+    const end = @min(i + len, text.len);
+    const cp = std.unicode.utf8Decode(text[i..end]) catch return 1;
+    return codepointWidth(cp);
+}
+
+/// The columns one codepoint takes.
+///
+/// The East Asian Wide and Fullwidth ranges are two columns, and the
+/// combining marks ride on the character before them.
+fn codepointWidth(cp: u21) usize {
+    if (cp >= 0x0300 and cp <= 0x036f) return 0;
+    if (cp >= 0x1100 and cp <= 0x115f) return 2;
+    if (cp >= 0x2e80 and cp <= 0x303e) return 2;
+    if (cp >= 0x3041 and cp <= 0x33ff) return 2;
+    if (cp >= 0x3400 and cp <= 0x4dbf) return 2;
+    if (cp >= 0x4e00 and cp <= 0x9fff) return 2;
+    if (cp >= 0xa000 and cp <= 0xa4cf) return 2;
+    if (cp >= 0xac00 and cp <= 0xd7a3) return 2;
+    if (cp >= 0xf900 and cp <= 0xfaff) return 2;
+    if (cp >= 0xfe30 and cp <= 0xfe6f) return 2;
+    if (cp >= 0xff00 and cp <= 0xff60) return 2;
+    if (cp >= 0xffe0 and cp <= 0xffe6) return 2;
+    if (cp >= 0x1f300 and cp <= 0x1f9ff) return 2;
+    if (cp >= 0x20000 and cp <= 0x3fffd) return 2;
+    return 1;
+}
+
 // basic test
 test "basic markdown parse" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1578,4 +2150,289 @@ test "with no color at all the diff still points at what changed" {
     for (rows[2]) |sg| {
         try std.testing.expect(sg.style.bg == .default);
     }
+}
+
+// ── the tables ───────────────────────────────────────────────────────────────
+
+/// The text of every line of a block, one string per line.
+fn blockLines(arena: std.mem.Allocator, blk: Block) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (blk.lines) |line| {
+        var buf: std.ArrayList(u8) = .empty;
+        for (line) |seg| try buf.appendSlice(arena, seg.text);
+        try out.append(arena, buf.items);
+    }
+    return out.items;
+}
+
+/// The whole block as one string, with a newline per line.
+fn blockText(arena: std.mem.Allocator, blk: Block) ![]const u8 {
+    const lines = try blockLines(arena, blk);
+    var out: std.ArrayList(u8) = .empty;
+    for (lines) |l| {
+        try out.appendSlice(arena, l);
+        try out.append(arena, '\n');
+    }
+    return out.items;
+}
+
+/// The text without the spaces: the padding and the wrapping do not count.
+fn stripSpaces(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (text) |c| {
+        if (c != ' ' and c != '\t' and c != '\n') try out.append(arena, c);
+    }
+    return out.items;
+}
+
+/// Is `needle` a subsequence of `haystack`? (the order matters, the gaps do not)
+fn isSubsequence(needle: []const u8, haystack: []const u8) bool {
+    var i: usize = 0;
+    for (haystack) |c| {
+        if (i < needle.len and c == needle[i]) i += 1;
+    }
+    return i == needle.len;
+}
+
+test "a table is detected and painted as a box" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parse(arena, .assistant,
+        \\| Name | Context |
+        \\|---|---|
+        \\| gpt | 200k |
+    );
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    const lines = try blockLines(arena, blocks[0]);
+    try std.testing.expectEqual(@as(usize, 5), lines.len);
+    try std.testing.expectEqualStrings("┌──────┬─────────┐", lines[0]);
+    try std.testing.expectEqualStrings("│ Name │ Context │", lines[1]);
+    try std.testing.expectEqualStrings("├──────┼─────────┤", lines[2]);
+    try std.testing.expectEqualStrings("│ gpt  │ 200k    │", lines[3]);
+    try std.testing.expectEqualStrings("└──────┴─────────┘", lines[4]);
+}
+
+test "the column of a table is as wide as its widest cell" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    // The first column is `Name` (4) against `gpt` (3): the column is 4 and
+    // the shorter cell is padded, not the column shrunk.
+    const blocks = try parse(arena, .assistant,
+        \\| Name | Context |
+        \\|---|---|
+        \\| gpt | 200k |
+    );
+    const lines = try blockLines(arena, blocks[0]);
+    for (lines) |l| {
+        // Every line of the box is exactly as wide as the top border.
+        try std.testing.expectEqual(textWidth(lines[0]), textWidth(l));
+    }
+    try std.testing.expectEqual(@as(usize, 18), textWidth(lines[0]));
+}
+
+test "a table wider than the width shrinks and never exceeds it" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const text =
+        \\| Model | Context | Price |
+        \\|---|---|---|
+        \\| claude-sonnet-4-5 | 200000 | 3.00 |
+    ;
+    // Without a width the table is 38 columns wide: the width is what makes
+    // it shrink.
+    const natural = try parse(arena, .assistant, text);
+    const nat_lines = try blockLines(arena, natural[0]);
+    try std.testing.expect(textWidth(nat_lines[0]) > 30);
+
+    const blocks = try parseLang(arena, .assistant, text, null, null, "", .{ .width = 30 });
+    const lines = try blockLines(arena, blocks[0]);
+    for (lines) |l| {
+        try std.testing.expect(textWidth(l) <= 30);
+    }
+    // And it is still a table (the box is there).
+    try std.testing.expect(std.mem.startsWith(u8, lines[0], "┌"));
+}
+
+test "a cell longer than its column wraps instead of being clipped" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const cell = "a very long description that does not fit in a narrow column";
+    const text = try std.fmt.allocPrint(arena,
+        \\| Name | Description |
+        \\|---|---|
+        \\| x | {s} |
+    , .{cell});
+
+    const blocks = try parseLang(arena, .assistant, text, null, null, "", .{ .width = 40 });
+    const lines = try blockLines(arena, blocks[0]);
+    // The row took more than one line: the cell was wrapped, not clipped.
+    try std.testing.expect(lines.len > 5);
+    for (lines) |l| {
+        try std.testing.expect(textWidth(l) <= 40);
+    }
+    // And the text is NOT lost: every character of the cell is in the table,
+    // in order.
+    const all = try stripSpaces(arena, try blockText(arena, blocks[0]));
+    const stripped = try stripSpaces(arena, cell);
+    try std.testing.expect(isSubsequence(stripped, all));
+}
+
+test "an escaped pipe does not split the cell" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parse(arena, .assistant,
+        \\| Cmd | Note |
+        \\|---|---|
+        \\| a \| b | two cells |
+    );
+    const lines = try blockLines(arena, blocks[0]);
+    // Two columns, not three: the escaped pipe is part of the cell.
+    try std.testing.expectEqualStrings("┌───────┬───────────┐", lines[0]);
+    try std.testing.expectEqualStrings("│ Cmd   │ Note      │", lines[1]);
+    try std.testing.expectEqualStrings("│ a | b │ two cells │", lines[3]);
+}
+
+test "a table that does not fit degrades to name: value rows" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parseLang(arena, .assistant,
+        \\| Name | Context |
+        \\|---|---|
+        \\| gpt | 200k |
+    , null, null, "", .{ .width = 8 });
+    const lines = try blockLines(arena, blocks[0]);
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    try std.testing.expectEqualStrings("Name: gpt · Context: 200k", lines[0]);
+    // And it is NOT a box any more: there is no room for one.
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "┌") == null);
+}
+
+test "a line that starts with a pipe and has no separator is prose" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    // No separator: it is not a table and it stays prose.
+    const blocks = try parse(arena, .assistant, "| a | b |\n| c | d |");
+    const text = try blockText(arena, blocks[0]);
+    try std.testing.expect(std.mem.indexOf(u8, text, "┌") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "| a | b |") != null);
+
+    // A separator with another number of cells is not the separator of this
+    // header.
+    const mismatch = try parse(arena, .assistant, "| a | b |\n|---|");
+    const mismatch_text = try blockText(arena, mismatch[0]);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch_text, "┌") == null);
+
+    // And one column is a line that happens to have a pipe, not a table.
+    const one = try parse(arena, .assistant, "| a |\n|---|");
+    const one_text = try blockText(arena, one[0]);
+    try std.testing.expect(std.mem.indexOf(u8, one_text, "┌") == null);
+}
+
+test "the prose around a table survives the table" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parse(arena, .assistant,
+        \\antes
+        \\| Name | Context |
+        \\|---|---|
+        \\| gpt | 200k |
+        \\despues
+    );
+    // The table is a block of its own, and the prose before and after it is
+    // still prose.
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    const first = try blockText(arena, blocks[0]);
+    try std.testing.expectEqualStrings("antes\n", first);
+    const last = try blockText(arena, blocks[2]);
+    try std.testing.expectEqualStrings("despues\n", last);
+    const middle = try blockText(arena, blocks[1]);
+    try std.testing.expect(std.mem.indexOf(u8, middle, "┌") != null);
+}
+
+test "every cell of a table survives the rendering" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    // The invariant that matters: the text of every cell is IN the table.
+    // A table that drops a cell (or a whole column) looks fine and says
+    // nothing about the half of the answer that is missing.
+    const blocks = try parse(arena, .assistant,
+        \\| Name | Context | Price |
+        \\|---|---|---|
+        \\| gpt | 200k | 3.00 |
+        \\| claude | 1m | 15.00 |
+    );
+    const text = try blockText(arena, blocks[0]);
+    const cells = [_][]const u8{
+        "Name", "Context", "Price",
+        "gpt",  "200k",    "3.00",
+        "claude", "1m",   "15.00",
+    };
+    for (cells) |c| {
+        if (std.mem.indexOf(u8, text, c) == null) {
+            std.debug.print("the cell `{s}` is not in the table\n", .{c});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "the inline markdown inside a cell still works" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parse(arena, .assistant,
+        \\| Name | Kind |
+        \\|---|---|
+        \\| **bold** | `code` |
+    );
+    const lines = try blockLines(arena, blocks[0]);
+    // The markers are markers: the cell says `bold`, not `**bold**`.
+    try std.testing.expect(std.mem.indexOf(u8, lines[3], "**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[3], "bold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[3], "`") == null);
+    // And the styles are the ones of the module: the bold is bold.
+    var bold_found = false;
+    for (blocks[0].lines[3]) |seg| {
+        if (std.mem.eql(u8, seg.text, "bold")) {
+            bold_found = true;
+            try std.testing.expect(seg.style.bold);
+        }
+    }
+    try std.testing.expect(bold_found);
+}
+
+test "a table inside a code block is code, not a table" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parse(arena, .assistant,
+        \\```markdown
+        \\| Name | Context |
+        \\|---|---|
+        \\| gpt | 200k |
+        \\```
+    );
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(Kind.code, blocks[0].kind);
+    const text = try blockText(arena, blocks[0]);
+    try std.testing.expect(std.mem.indexOf(u8, text, "┌") == null);
 }

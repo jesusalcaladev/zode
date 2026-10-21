@@ -36,6 +36,14 @@ const palette = @import("palette.zig");
 const Scene = struct {
     name: []const u8,
     fill: *const fn (m: *tui.Model) void,
+    /// What happens AFTER the first draw, when the layout exists.
+    ///
+    /// The first draw is what makes the SCROLL possible: the heights are
+    /// estimates until the paragraphs are parsed, and without a layout there
+    /// is nothing to scroll and `scrollBy` does nothing at all. A scene that
+    /// wants to show the reader halfway up the conversation needs the frame
+    /// that made the conversation measurable.
+    after: ?*const fn (m: *tui.Model) void = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -84,6 +92,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "models", .fill = sceneModels },
         .{ .name = "plan", .fill = scenePlan },
         .{ .name = "long", .fill = sceneLong },
+        .{ .name = "scroll", .fill = sceneScroll, .after = sceneScrollAfter },
     };
 
     const all = std.mem.eql(u8, scene_name, "all");
@@ -122,6 +131,12 @@ fn render(wtr: *std.Io.Writer, gpa: std.mem.Allocator, io: std.Io, sc: Scene, wi
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // The FIRST draw is what makes the scene measurable: the heights are
+    // estimates until the paragraphs are parsed. A scene that scrolls needs
+    // it, and a scene that does not is unaffected by it.
+    _ = try tui.drawTest(&m, arena, width, height);
+    if (sc.after) |after| after(&m);
 
     const s = try tui.drawTest(&m, arena, width, height);
 
@@ -576,4 +591,33 @@ fn paletteGroups() []const palette.Group {
         .{ .name = "Model" },
         .{ .name = "Session" },
     };
+}
+
+/// The reader is halfway up a long conversation, and an answer arrived while
+/// they were reading.
+///
+/// This scene exists for the TWO pieces of chrome that only exist when the
+/// reader is away from the bottom: the sticky header (the prompt of the turn
+/// you are reading) and the pill (how many answers you are missing). Neither
+/// of them can be judged from a frame that is sitting at the bottom.
+fn sceneScroll(m: *tui.Model) void {
+    m.pushHeader(.idle);
+    m.pushKind(.user, "reescribe el theme y dime qué contrasta mal");
+    m.pushKind(.assistant, "El problema real: `brand_faint` esta en 1.9:1 y lo usas para texto, no solo para hairlines.");
+    m.pushKind(.user, "ahora hazlo, y anade el test de contraste");
+    m.pushKind(.assistant, "Hecho: la rampa tiene cuatro niveles y cada color lleva su test.");
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        m.pushInfoFmt("linea de relleno {d}", .{i});
+        m.pushKind(.assistant, "una respuesta de relleno, un poco mas larga que la anterior");
+    }
+}
+
+/// What happens after the first frame: the reader scrolls up, and an answer
+/// arrives while they are away.
+fn sceneScrollAfter(m: *tui.Model) void {
+    // Far enough up that the reader is INSIDE a turn and not in the hero: the
+    // header names the turn, and in the hero there is no prompt yet.
+    m.scrollBy(10);
+    m.pushKind(.assistant, "una respuesta que llego mientras el lector estaba en otro turno");
 }
