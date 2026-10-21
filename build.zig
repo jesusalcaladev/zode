@@ -78,7 +78,13 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("vaxis", vaxis.module("vaxis"));
 
     // The strip goes on the MODULE (`root_module.strip`), not on the executable.
-    if (strip) exe_mod.strip = true;
+    //
+    // AND IT IS SET EXPLICITLY, in both directions: `strip = null` is NOT
+    // "unstripped", it is "use the default", and the default for ReleaseSmall
+    // and ReleaseFast is TO STRIP. So `if (strip) exe_mod.strip = true;` left
+    // `-Dstrip=false` as a no-op, and the binary came out stripped anyway.
+    // `false` has to be written down for it to mean anything.
+    exe_mod.strip = strip;
     const exe = b.addExecutable(.{
         .name = "zode",
         .root_module = exe_mod,
@@ -110,6 +116,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     debug_mod.addImport("vaxis", vaxis.module("vaxis"));
+    // `build_options` is NOT optional: `main.zig` and `lib/selfupdate.zig`
+    // import it for the version, and a module that does not have it cannot
+    // compile at all.
+    //
+    // It was missing here, so `zig build debug` — the step whose ENTIRE job is
+    // to be a trustworthy artifact for a crash — did not compile. The binary on
+    // disk was a leftover from some earlier `zig build`, byte-identical to the
+    // stripped release one: a file with a reassuring name and nothing behind it.
+    debug_mod.addImport("build_options", build_options_mod);
     const debug_exe = b.addExecutable(.{ .name = "zode-debug", .root_module = debug_mod });
     // Kept as well as `.Debug`, and both are needed: `.Debug` is what CREATES the
     // symbols and `strip = null` is what stops them being taken away again.

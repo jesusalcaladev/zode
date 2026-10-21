@@ -8792,8 +8792,14 @@ pub fn listModelsAsync(m: *tui.Model) !void {
 /// run once and found nothing.
 pub fn catalogWarmupAsync(m: *tui.Model) !void {
     const gpa = m.allocator;
-    const job = try gpa.create(WarmupJob);
-    errdefer gpa.destroy(job);
+    // NO `errdefer` HERE, and that is deliberate: the spawn-failure branch
+    // below frees the job itself, so an `errdefer` would free it a SECOND time
+    // on the way out — a double free, and the two failures cancel out into
+    // "the app crashed and nobody knows why".
+    //
+    // The ownership is in the TYPE of the failure: the only error between the
+    // `create` and the `spawn` is the spawn, and that branch owns the job.
+    const job = gpa.create(WarmupJob) catch |e| return e;
     job.* = .{ .model = m };
     m.beginWorker();
     const thread = std.Thread.spawn(.{}, warmupWorker, .{job}) catch {
@@ -8807,9 +8813,25 @@ pub fn catalogWarmupAsync(m: *tui.Model) !void {
 const WarmupJob = struct { model: *tui.Model };
 
 fn warmupWorker(job: *WarmupJob) void {
-    defer job.model.endWorker();
-    defer job.model.allocator.destroy(job);
+    // THE ORDER OF THESE TWO DEFERS IS THE WHOLE FUNCTION.
+    //
+    // `defer` is LIFO: the LAST one registered runs FIRST. The two lines used
+    // to be in the other order, so the job was FREED and then
+    // `job.model.endWorker()` dereferenced the freed block to do its atomic
+    // RMW — a use-after-free that killed the app with SIGSEGV while it was
+    // warming the model catalogue.
+    //
+    // It was read as a HANG for a month ("ReleaseSmall + a saved key = the TUI
+    // stops answering"), and the A/B that said "it is not ours" was right about
+    // the regression and wrong about the bug: it was ours since the warmup was
+    // written.
+    //
+    // The pointer is copied into a local BEFORE anything can die, so the second
+    // defer never reads the job it is about to free. `modelsWorker` (a hundred
+    // lines away) already had the right order.
     const m = job.model;
+    defer m.allocator.destroy(job); // registered first  -> runs LAST
+    defer m.endWorker(); // registered second -> runs FIRST
     const gpa = m.allocator;
     const def = activeProviderDef(m.environ);
     if (def.models_url.len == 0) return;
