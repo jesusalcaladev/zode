@@ -191,6 +191,8 @@ pub const callTouchedPaths = registry.callTouchedPaths;
 pub const batchPermissionDetail = registry.batchPermissionDetail;
 /// The paths of a call that the sensitive-path rule would refuse.
 pub const riskyPaths = registry.riskyPaths;
+/// The subjects a permission rule is matched against.
+pub const callSubjects = registry.callSubjects;
 
 /// Runs a tool with JSON args. Returns the (truncated) result —
 /// `arena` memory, valid until the arena is freed.

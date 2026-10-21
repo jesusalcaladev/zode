@@ -41,6 +41,8 @@ pub const commands = @import("commands.zig");
 pub const selfupdate = @import("lib/selfupdate.zig");
 pub const clipboard = @import("clipboard.zig");
 pub const copytext = @import("lib/copytext.zig");
+pub const permrules = @import("lib/permrules.zig");
+pub const pathsafe = @import("lib/pathsafe.zig");
 
 // The language server. It was in its own aggregator (`src/lsp_test.zig`) that
 // no build step referenced: 33 test blocks written, and 32 of them not even

@@ -5566,3 +5566,77 @@ The `Tool(pattern)` grammar of Phase 6. The rule model is still "the table
 plus a one-shot approval", so a project that wants to allow `.vscode/` for
 good has no way to say so — and the approval list is not it either: it dies
 with the session, on purpose.
+
+---
+
+# The rules: `Tool(pattern)` (2026-10-21)
+
+The last piece of 34.1 and the first piece of Phase 6: **a rule is
+`Tool(pattern)` and an action**, and a project can say what it wants in its
+own file.
+
+```json
+{ "rules": [
+    "Write(.vscode/**) allow",
+    "Bash(git *) allow",
+    {"tool": "Read", "pattern": "*.pem", "action": "deny"}
+] }
+```
+
+## The grammar, in one paragraph
+
+`Tool` is the tool's name (case-insensitive, or `*` for any). The pattern is
+a glob over **the thing the call acts on**: the PATH for a file tool, the
+COMMAND for `bash`. `*` matches any run of characters (including `/`, so
+`*.ts` finds `src/main.ts`) and `?` matches exactly one. The action is
+`allow`, `deny` or `ask`, and it is **optional**: `Bash(git *)` is the whole
+rule.
+
+The same rule written as an object is the same rule: the object form is
+there because a JSON file with a pattern in it is easier to write with a tool
+than by hand, and the two forms are parsed by the SAME code.
+
+## The precedence, and the one rule that is not about specificity
+
+Four sources, the first that matches wins: `local` (this session) ·
+`project` (`.zode/permissions.json`) · `user`
+(`~/.config/zode/permissions.json`) · `policy` (the built-in table).
+
+**A `deny` beats any `allow`, from any source.** That is the one rule that is
+not about specificity: a deny is a statement about what must never happen,
+and the most specific file in the world does not get to overrule it.
+
+Within one source, the LAST matching rule wins — so a file can override an
+earlier line of its own by adding another one.
+
+## Where the rules are read
+
+The rules are read ONCE (at startup, next to the allowlist they live with)
+and the hot path reads the cached set. The arena that owns them lives until
+the process exits: a worker can be reading the rules while the config is
+reloaded, and a rule set that is freed under a reader is a use-after-free
+(the same rule as the saved keys).
+
+**The project file is looked up from the PROJECT ROOT**, not from the working
+directory: the file travels with the project, and a run from a subdirectory
+has to find the same rules.
+
+## The three things that were not obvious
+
+1. **A tool cannot be the subject of the question and the answer at the same
+   time.** The rule is matched against the SUBJECTS of the call: the paths
+   for a file tool, the command for `bash`. A call that touches four files
+   has four subjects, and a rule that matches one of them is about that one.
+2. **The loader takes the `Io` AND the allocator as arguments.** The
+   global `io_global` is `undefined` in a test, and a file read through an
+   uninitialised `Io` is a jump through a garbage vtable — the test crashed
+   with a general protection fault before the loader took the arguments.
+3. **A rule that does not parse does not cost the others.** A hand-edited
+   file with a typo in one line must not cost the user the other nineteen.
+
+## What is still missing
+
+The "always allow" answer still remembers the **tool** and not a pattern.
+"always allow `Bash(git *)`" is the rule the user would want, and the flat
+list is a coarser answer — and changing it is a change to what the users who
+already have a `permissions.json` mean by "always".

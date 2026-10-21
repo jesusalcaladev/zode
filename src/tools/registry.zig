@@ -600,6 +600,25 @@ pub fn callTouchedPaths(name: []const u8, args_json: []const u8, arena: std.mem.
     return batch_lib.touchedPaths(arena, b) catch &.{};
 }
 
+/// The subjects a PERMISSION RULE is matched against.
+///
+/// A rule is `Tool(pattern)`, and the pattern is over the thing the call
+/// acts on: the PATH for a file tool, the COMMAND for `bash`. A call that
+/// touches four files has four subjects, and a rule that matches one of them
+/// is about that one.
+pub fn callSubjects(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const []const u8 {
+    if (std.mem.eql(u8, name, "bash")) {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return &.{};
+        if (parsed != .object) return &.{};
+        const cmd = parsed.object.get("command") orelse return &.{};
+        if (cmd != .string or cmd.string.len == 0) return &.{};
+        const one = arena.alloc([]const u8, 1) catch return &.{};
+        one[0] = cmd.string;
+        return one;
+    }
+    return callTouchedPaths(name, args_json, arena);
+}
+
 /// The paths of a call that the SENSITIVE-PATH rule would refuse.
 ///
 /// It is the PURE check, and it is asked about BEFORE the call runs: the

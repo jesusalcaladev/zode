@@ -113,6 +113,45 @@ pub fn cmdAllowlist(m: *tui.Model) void {
     agent.pushInfoOwned(m, msg);
 }
 
+/// `/permissions`: the RULES (Phase 6) and where they live.
+///
+/// The rules are the answer to "why did it ask / why did it refuse", and
+/// there is no other way to find out: a rule that lives in a file the user
+/// wrote and never sees again is a rule that surprises them.
+pub fn cmdPermissions(m: *tui.Model) void {
+    const gpa = m.allocator;
+    const set = agent.permRuleSet();
+
+    agent.pushInfoOwned(m, gpa.dupe(u8, "rules  ·  Tool(pattern) action  ·  allow | deny | ask") catch return);
+
+    if (set.rules.len == 0) {
+        agent.pushInfoOwned(m, gpa.dupe(u8, "  (none)") catch return);
+    } else {
+        for (set.rules) |r| {
+            const line = std.fmt.allocPrint(
+                gpa,
+                "  {s: <8} {s}",
+                .{ r.source.name(), r.text },
+            ) catch continue;
+            agent.pushInfoOwned(m, line);
+        }
+    }
+
+    // The two files, and the order they win in. The order IS the rule: a
+    // project rule beats a user rule, and a DENY beats any allow.
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    const files = std.fmt.allocPrint(
+        gpa,
+        "files  ·  {s} (project)  ·  ~/.config/zode/permissions.json (user)",
+        .{agent.project_rules_file},
+    ) catch return;
+    agent.pushInfoOwned(m, files);
+    agent.pushInfoOwned(
+        m,
+        gpa.dupe(u8, "order  ·  project > user  ·  a deny beats any allow  ·  the last rule of a file wins") catch return,
+    );
+}
+
 /// `/cache`: prompt cache hit-rate of the session.
 pub fn cmdCache(m: *tui.Model) void {
     const st = &cache_stats.session;
@@ -608,6 +647,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
     .{ .key = "/mode", .desc = "set work mode: build | accept-edits | plan | bypass" },
     .{ .key = "/allowlist", .desc = "always-allowed tools + bash (persisted)" },
+    .{ .key = "/permissions", .desc = "the rules: Tool(pattern) allow | deny | ask" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
     .{ .key = "/new", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },

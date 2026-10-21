@@ -18,6 +18,7 @@ const modelcache = @import("lib/modelcache.zig");
 const clean_mod = @import("lib/clean.zig");
 const usercmds_mod = @import("lib/usercmds.zig");
 const pathsafe = @import("lib/pathsafe.zig");
+const permrules = @import("lib/permrules.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
@@ -2013,6 +2014,120 @@ fn readFileTo(arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(io_global, path, arena, .limited(1 << 20)) catch null;
 }
 
+/// The same, with the `Io` as an argument.
+///
+/// The global one reads `io_global`, which is `undefined` in a test: a file
+/// read through an uninitialised `Io` is a jump through a garbage vtable.
+fn readFileToWith(io: std.Io, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch null;
+}
+
+// ── the permission rules (Phase 6) ─────────────────────────────────────────
+
+/// The rules of every source, and the arena that owns them.
+///
+/// The rules are read on EVERY call that needs a decision, so they are
+/// cached and the cache is what the hot path reads. The arena lives until
+/// the process exits: a worker can be reading the rules while the config is
+/// reloaded, and a rule set that is freed under a reader is a use-after-free
+/// (the same rule as the saved keys).
+pub var perm_rules: permrules.Set = .{};
+var perm_rules_arena: ?std.heap.ArenaAllocator = null;
+
+/// The project-level rules file, relative to the working directory.
+pub const project_rules_file = ".zode/permissions.json";
+
+/// Loads the rules: the project file and the user file.
+///
+/// The ORDER is the precedence — the strongest source first — and
+/// `permrules.decide` picks the first that matches. A `deny` beats any
+/// `allow` from any source, and that is decided inside `decide`.
+///
+/// The project file is the one that answers the question this whole
+/// mechanism exists for: a project that wants `.vscode/` written without a
+/// question says so in ITS OWN file, and the file travels with the project.
+pub fn loadPermRules() void {
+    var pbuf: [512]u8 = undefined;
+    var rbuf: [640]u8 = undefined;
+    // The PROJECT ROOT, and not the working directory: the file travels with
+    // the project, and a run from a subdirectory has to find the same rules.
+    const project_path = if (project_info.root()) |root|
+        std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file
+    else
+        project_rules_file;
+    if (perm_rules_arena == null) {
+        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
+    }
+    loadPermRulesInto(
+        perm_rules_arena.?.allocator(),
+        io_global,
+        project_path,
+        permissionsFilePath(&pbuf),
+    );
+}
+
+/// The rules, loaded from the two files.
+///
+/// The paths are PARAMETERS and not read from the environment here, for one
+/// reason: a test has to be able to point them at a fixture. "The rules of
+/// this machine" and "the rules of a file" are the same code with a different
+/// argument.
+pub fn loadPermRulesFrom(io: std.Io, project_path: ?[]const u8, user_path: ?[]const u8) void {
+    if (perm_rules_arena == null) {
+        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
+    }
+    loadPermRulesInto(perm_rules_arena.?.allocator(), io, project_path, user_path);
+}
+
+/// The rules, loaded into a GIVEN arena.
+///
+/// The allocator is an argument because the global one does not exist in a
+/// test, and a test that cannot load a rule file cannot test a rule.
+pub fn loadPermRulesInto(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_path: ?[]const u8,
+    user_path: ?[]const u8,
+) void {
+    const a = arena;
+
+    var all: std.ArrayList(permrules.Rule) = .empty;
+
+    // The PROJECT file: `.zode/permissions.json`, next to the code.
+    if (project_path) |path| {
+        if (readFileToWith(io, a, path)) |data| {
+            if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
+                for (permrules.parseJson(parsed, .project, a)) |r| all.append(a, r) catch {};
+            } else |_| {}
+        }
+    }
+
+    // The USER file: `~/.config/zode/permissions.json`, next to the keys.
+    if (user_path) |path| {
+        if (readFileToWith(io, a, path)) |data| {
+            if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
+                for (permrules.parseJson(parsed, .user, a)) |r| all.append(a, r) catch {};
+            } else |_| {}
+        }
+    }
+
+    perm_rules = .{ .rules = all.items };
+}
+
+/// The rules, as they stand.
+pub fn permRuleSet() permrules.Set {
+    return perm_rules;
+}
+
+/// The decision for a call: `allow`, `deny`, `ask` or nothing.
+///
+/// The SUBJECTS are the things the call acts on: the paths for a file tool,
+/// the command for `bash`. A rule with a pattern matches if it matches ANY
+/// of them, and a rule with no pattern matches any subject.
+pub fn permDecision(tool: []const u8, subjects: []const []const u8) ?permrules.Decision {
+    return permrules.decide(perm_rules.rules, tool, subjects);
+}
+
 // ── environment and history notices ───────────────────────────
 
 /// An env var read as a boolean, with a default.
@@ -2313,6 +2428,10 @@ pub fn loadUserConfig() void {
             }
         }
         loadAllowlist();
+        // The permission RULES (Phase 6): the project file and the user file.
+        // They are read here, next to the allowlist they live with, and the
+        // hot path reads the cached set.
+        loadPermRules();
         loadAuthKeys(cfg_arena_state.?.allocator());
 
         // The user's language servers. The manager COPIES them into its own
@@ -3029,6 +3148,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
         commands_mod.cmdAllowlist(m);
+    } else if (std.mem.eql(u8, cmd, "permissions")) {
+        commands_mod.cmdPermissions(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "usage")) {
@@ -7105,6 +7226,39 @@ fn execOneCall(
         return 0;
     }
 
+    // ── the permission RULES (Phase 6) ──
+    //
+    // The rules come BEFORE the questions: a rule that says "allow" means the
+    // call does not ask at all, and a rule that says "deny" means it does
+    // not run at all. The questions are for the calls that no rule has an
+    // opinion about.
+    //
+    // The SUBJECTS are what the call acts on: the paths for a file tool, the
+    // command for `bash`. A rule with a pattern is about ONE of them.
+    const subjects = tools_mod.callSubjects(call.name, call.args_json, arena);
+    const rule_decision = permDecision(call.name, subjects);
+    var rule_allowed = false;
+    if (rule_decision) |d| {
+        switch (d.action) {
+            .allow => {
+                rule_allowed = true;
+            },
+            .deny => {
+                // The refusal NAMES the rule: "this is not allowed" is not an
+                // answer, "your own rule says so" is.
+                const msg = std.fmt.allocPrint(
+                    arena,
+                    "refused: the rule `{s}` ({s}) does not allow this.",
+                    .{ d.rule.text, d.rule.source.name() },
+                ) catch "refused: a permission rule does not allow this.";
+                m.pushToolDone(call.name, "refused by a rule", 0, msg);
+                s.appendToolResult(call.id, call.name, msg) catch {};
+                return 0;
+            },
+            .ask => {},
+        }
+    }
+
     // ── the SENSITIVE-PATH question ──
     //
     // It comes BEFORE the general permission dialog, and it is a DIFFERENT
@@ -7120,7 +7274,7 @@ fn execOneCall(
     // "the agent may write inside .git/" is the opposite of the rule.
     const risky = tools_mod.riskyPaths(call.name, call.args_json, arena);
     var risky_allowed = false;
-    if (risky.len > 0 and !yolo) {
+    if (risky.len > 0 and !yolo and !rule_allowed) {
         var asked = false;
         for (risky) |p| {
             const v = pathsafe.checkWrite(p);
@@ -7172,7 +7326,7 @@ fn execOneCall(
     // write would have asked.
     const perm_tools = tools_mod.callPermissionTools(call.name, call.args_json, arena);
     const auto_allowed = permAutoAllowed(call.name, arg, call.args_json, arena);
-    if (!yolo and !auto_allowed and !risky_allowed and permNeedsDialog(perm_tools)) {
+    if (!yolo and !auto_allowed and !risky_allowed and !rule_allowed and permNeedsDialog(perm_tools)) {
         var dbuf: [384]u8 = undefined;
         // A batch's dialog says WHICH FILES it would touch: the user is being
         // asked to approve a set of writes, and the set is the whole question.
@@ -14155,4 +14309,78 @@ test "E2E: a real turn against a real provider completes and answers" {
     // in silence. `accounted` already holds the answer to that, so this is the same fact
     // said in the language a test failure uses.
     try std.testing.expect(accounted);
+}
+
+test "a project rule allows what the sensitive table asks about" {
+    // The whole reason the rule model exists: a project that wants
+    // `.vscode/` written without a question says so in ITS OWN file, and the
+    // file travels with the project.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, ".zode");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".zode/permissions.json",
+        .data =
+        \\{"rules": [
+        \\  "Write(.vscode/**) allow",
+        \\  "Bash(git *) allow"
+        \\]}
+        ,
+    });
+
+    var pbuf: [512]u8 = undefined;
+    const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
+    var fbuf: [640]u8 = undefined;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+
+    // The rules are a global and the next test reads them: the state is put
+    // back the way it was.
+    const saved = perm_rules;
+    defer perm_rules = saved;
+    loadPermRulesInto(arena_state.allocator(), io, path, null);
+
+    // The rule answers for the path the sensitive table would ask about.
+    const d = permDecision("Write", &.{".vscode/settings.json"}).?;
+    try std.testing.expectEqual(permrules.Action.allow, d.action);
+    try std.testing.expectEqual(permrules.Source.project, d.rule.source);
+
+    // And it says nothing about anything else.
+    try std.testing.expect(permDecision("Write", &.{"src/main.zig"}) == null);
+
+    // The command rules work the same way.
+    const b = permDecision("Bash", &.{"git status"}).?;
+    try std.testing.expectEqual(permrules.Action.allow, b.action);
+}
+
+test "a rule that denies beats a rule that allows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, ".zode");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".zode/permissions.json",
+        .data = "{\"rules\": [\"Write(.git/**) deny\"]}",
+    });
+
+    var pbuf: [512]u8 = undefined;
+    const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
+    var fbuf: [640]u8 = undefined;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+
+    const saved = perm_rules;
+    defer perm_rules = saved;
+    loadPermRulesInto(arena_state.allocator(), io, path, null);
+
+    const d = permDecision("Write", &.{".git/config"}).?;
+    try std.testing.expectEqual(permrules.Action.deny, d.action);
+    try std.testing.expectEqualStrings("project", d.rule.source.name());
 }
