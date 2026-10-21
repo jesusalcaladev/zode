@@ -127,6 +127,28 @@ fn glyphCols(s: []const u8) usize {
     return n;
 }
 
+/// The wordmark, one glyph per letter, 6 columns wide and 5 rows tall.
+///
+/// The letters are drawn to be READ, and the two that used to be confusable
+/// are the two that were fixed:
+///
+/// - **D** has a FLAT left stem and a curved right bowl. It used to be a
+///   rounded blob, and the v3 wordmark's whole point was that "O and D are
+///   distinguishable at a glance" — a rounded D is an O with a different
+///   letter's name.
+/// - **E** has a FIVE-wide middle bar. With a three-wide one it read as an F
+///   with a stub.
+///
+/// The strokes are two columns wide, except where the shape of the letter
+/// needs one (the D's bowl). A drawing whose strokes change weight halfway
+/// reads as a mistake, and there is no way to see it in a terminal that
+/// substitutes the font.
+///
+/// It is plain ASCII (`#` and a space) and NOT box drawing, and that is a
+/// decision that was paid for: a v2 built of `█ ╗ ╝ ═ ║` was illegible in
+/// the user's terminal — a relief smudge that read as nothing — because the
+/// strokes depend on how the font draws the full block. Plain ASCII reads
+/// the same in every terminal there is.
 const glyph_z = [_][]const u8{
     "######",
     "##  ##",
@@ -143,15 +165,15 @@ const glyph_o = [_][]const u8{
 };
 const glyph_d = [_][]const u8{
     "####  ",
-    "##   #",
-    "##   #",
-    "##   #",
+    "## ## ",
+    "##  ##",
+    "## ## ",
     "####  ",
 };
 const glyph_e = [_][]const u8{
     "######",
     "##    ",
-    "###   ",
+    "##### ",
     "##    ",
     "######",
 };
@@ -185,7 +207,12 @@ fn bannerRow(comptime r: usize) []const u8 {
     return out;
 }
 
-/// Welcome banner for the TUI startup: ONLY the wordmark.
+/// The welcome banner: the wordmark, and NOTHING else.
+///
+/// It is ONE paragraph with the five rows inside it, and that is the whole
+/// trick: the ASCII art used to be five paragraphs, and the separator between
+/// paragraphs put a blank row between the letters — the logo was read in
+/// pieces. A drawing is one block.
 pub const banner = bannerRow(0) ++ "\n" ++
     bannerRow(1) ++ "\n" ++
     bannerRow(2) ++ "\n" ++
@@ -2960,7 +2987,11 @@ pub const Model = struct {
         // NO leading spaces: the draw centers this block (`heroFrame`), so the
         // indent is a function of the terminal width and not a guess made at
         // startup and frozen into eight paragraphs.
-        self.pushHero("*zode*", theme.brand, theme.brand_hi);
+        //
+        // THE WORDMARK IS THE ART, and it is ONE paragraph with the five rows
+        // inside it. It used to be the word "zode" in a colour, and the ASCII
+        // art was in the tree but nobody drew it.
+        self.pushHero(banner, theme.brand, theme.brand_hi);
         self.pushHero("a code agent in your terminal", theme.ink3, theme.ink3);
         self.pushHero(hero_rule, theme.line, theme.line);
         // A blank row between the rule and the grid, and one after it. Without
@@ -10017,10 +10048,15 @@ test "the hero is ONLY the wordmark and its grid, with nothing hung below it" {
     // Complaining about "junk in the view" is being right, and this test is what
     // pins it down: if someone hangs a line under the hero again, it fails.
     //
-    // What it asserts is the hero's SHAPE, and the shape is what survived the
-    // five rows of `#`: a wordmark, one line of what this is, a rule, and a
-    // two-column grid. The art itself is gone (see AGENTS.md on why), so the
-    // test does not compare pixels — it compares the CONTENT that must be there.
+    // What it asserts is the hero's SHAPE: the wordmark (FIVE rows of ASCII
+    // art), one line of what this is, a rule and a two-column grid. The art
+    // itself is not compared against a hand-written copy — a test that did that
+    // would pass with any broken art — it is compared by its SHAPE: five rows
+    // that are all drawing and nothing else.
+    //
+    // REWRITTEN (2026-10-21): the wordmark was the word "zode" in a colour
+    // and the ASCII art was in the tree but nobody drew it. The shape is the
+    // same idea with the art back in it.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -10038,14 +10074,18 @@ test "the hero is ONLY the wordmark and its grid, with nothing hung below it" {
     while (row < m.hist_rows and row < s.size.height) : (row += 1) {
         var rb: [512]u8 = undefined;
         const r = std.mem.trim(u8, rowText(s, row, &rb), " ");
-        if (std.mem.indexOf(u8, r, "zode") != null and std.mem.indexOf(u8, r, "code agent") == null) found += 1;
+        // A row of the ART: it is drawing and nothing else. The art is the
+        // only place a `#` appears.
+        if (std.mem.indexOf(u8, r, "#") != null and
+            std.mem.indexOf(u8, r, "zode") == null and
+            std.mem.indexOf(u8, r, "code agent") == null) found += 1;
         if (std.mem.indexOf(u8, r, "a code agent in your terminal") != null) found += 1;
         if (std.mem.indexOf(u8, r, "commands") != null) found += 1;
         if (std.mem.indexOf(u8, r, "choose a model") != null) found += 1;
         if (std.mem.indexOf(u8, r, "attach a file") != null) found += 1;
     }
-    // 1 wordmark + 1 tagline + 3 grid rows. Nothing else.
-    try std.testing.expectEqual(@as(usize, 5), found);
+    // 5 art rows + 1 tagline + 3 grid rows. Nothing else.
+    try std.testing.expectEqual(@as(usize, 9), found);
 }
 
 test "the hero has no blank rows between its lines and nothing hung below them" {
@@ -10071,10 +10111,17 @@ test "the hero has no blank rows between its lines and nothing hung below them" 
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
     var rb: [512]u8 = undefined;
 
-    // The seven lines of the hero, in order. A row that is empty where a line
+    // The lines of the hero, in order. A row that is empty where a line
     // should be means the separator landed inside the header.
+    //
+    // The first five are the ART, and they are checked as art: a row of
+    // drawing and nothing else. The rest are the text.
     const expect_txt = [_]?[]const u8{
-        "zode",
+        null, // the art's five rows
+        null,
+        null,
+        null,
+        null,
         "a code agent in your terminal",
         null, // the rule is `─` only, so it is checked as all-dashes below
         null, // the blank row between the rule and the grid
@@ -10086,7 +10133,26 @@ test "the hero has no blank rows between its lines and nothing hung below them" 
     // Start at the first non-empty history row: the hero is CENTERED
     // (`heroFrame`), so row 0 can be blank on a tall terminal.
     while (row < m.hist_rows and std.mem.trim(u8, rowText(s, row, &rb), " ").len == 0) : (row += 1) {}
-    for (expect_txt) |want| {
+    // The art's five rows, and they are CONTIGUOUS: a blank row between the
+    // letters is what made the old logo read in pieces.
+    var art_row: u16 = 0;
+    while (art_row < 5) : (art_row += 1) {
+        const got = std.mem.trim(u8, rowText(s, row, &rb), " ");
+        if (std.mem.indexOf(u8, got, "#") == null) {
+            std.debug.print("hero art row {d}: expected drawing, got '{s}'\n", .{ row, got });
+            return error.HeroBroken;
+        }
+        // A drawing row is drawing and NOTHING else: the tagline and the grid
+        // are the other rows of the hero.
+        if (std.mem.indexOf(u8, got, "zode") != null or
+            std.mem.indexOf(u8, got, "code agent") != null)
+        {
+            std.debug.print("hero art row {d}: the art carries text: '{s}'\n", .{ row, got });
+            return error.HeroBroken;
+        }
+        row += 1;
+    }
+    for (expect_txt[5..]) |want| {
         const got = std.mem.trim(u8, rowText(s, row, &rb), " ");
         if (want) |txt| {
             if (std.mem.indexOf(u8, got, txt) == null) {
@@ -13036,4 +13102,81 @@ test "the ? key opens the shortcut list" {
         if (std.mem.indexOf(u8, it.desc, "plan") != null) found_mode = true;
     }
     try std.testing.expect(found_mode);
+}
+
+test "the wordmark: every row is the same width, and the O is not the D" {
+    // Box-drawing art is a MAP of cells: if the rows do not land on the same
+    // columns there is nothing to read, and comparing the WHOLE row is the
+    // only thing that tells you. A byte count is not a column count, and a
+    // row that is one column short shifts everything to its right.
+    //
+    // The five rows are checked at COMPTIME, because `bannerRow` takes a
+    // comptime row: the art is composed at comptime on purpose (the padding
+    // on the right gets stripped by an editor, and a stripped row is a
+    // shifted row).
+    //
+    // The art is PURE ASCII (`#` and a space), so a byte IS a column here.
+    // The general measurement — the terminal's own rules — is for the fonts;
+    // this is for a drawing we control.
+    const widths = comptime blk: {
+        var out: [5]usize = undefined;
+        out[0] = std.mem.trimEnd(u8, bannerRow(0), " ").len;
+        out[1] = std.mem.trimEnd(u8, bannerRow(1), " ").len;
+        out[2] = std.mem.trimEnd(u8, bannerRow(2), " ").len;
+        out[3] = std.mem.trimEnd(u8, bannerRow(3), " ").len;
+        out[4] = std.mem.trimEnd(u8, bannerRow(4), " ").len;
+        break :blk out;
+    };
+    for (widths) |w| {
+        // The RIGHT EDGE of the letters varies (the D's bowl and the E's
+        // middle bar end before the others do), and that is the art. What
+        // cannot vary is the WIDTH: a row one column short shifts
+        // everything to its right.
+        try std.testing.expect(w <= banner_art_width);
+    }
+    // The composed rows are all the same width, trailing spaces included:
+    // that is what the composition is for.
+    try std.testing.expectEqual(banner_art_width, bannerRow(0).len);
+    try std.testing.expectEqual(banner_art_width, bannerRow(1).len);
+    try std.testing.expectEqual(banner_art_width, bannerRow(2).len);
+    try std.testing.expectEqual(banner_art_width, bannerRow(3).len);
+    try std.testing.expectEqual(banner_art_width, bannerRow(4).len);
+
+    // The O and the D are different LETTERS and they have to look it: the
+    // v3 wordmark's whole point was "O and D are distinguishable at a
+    // glance", and a D with a rounded stem is an O with another name.
+    //
+    // The D has a FLAT left stem: its rows start with two columns of `#`
+    // every time. The O's do not: its top and bottom rows start with a space.
+    const o_top = std.mem.trimEnd(u8, glyph_o[0], " ");
+    const d_top = std.mem.trimEnd(u8, glyph_d[0], " ");
+    try std.testing.expectEqualStrings(" ####", o_top);
+    try std.testing.expectEqualStrings("####", d_top);
+    try std.testing.expect(!std.mem.eql(u8, glyph_o[1], glyph_d[1]));
+}
+
+test "the wordmark is drawn as FIVE rows of art, and it is not read as headings" {
+    // The `#` at the start of a row is a markdown HEADING, and the parser
+    // eats it: the art came out as "####  ####   *zode*". The `.banner` kind
+    // is the one that does not look for structure, and this is what pins it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushHeader(.idle);
+
+    const s = try drawTest(&m, arena, 92, 26);
+    var rb: [512]u8 = undefined;
+
+    // Five rows of drawing, in a row, and the first one still has its six
+    // `#` in it.
+    var row: u16 = 0;
+    while (row < m.hist_rows and std.mem.trim(u8, rowText(s, row, &rb), " ").len == 0) : (row += 1) {}
+    const first = std.mem.trim(u8, rowText(s, row, &rb), " ");
+    try std.testing.expect(std.mem.startsWith(u8, first, "######"));
+    // And the LAST row of the art is a full one: the art is not cut.
+    const last = std.mem.trim(u8, rowText(s, row + banner_art_height - 1, &rb), " ");
+    try std.testing.expect(std.mem.startsWith(u8, last, "######"));
 }
