@@ -180,6 +180,216 @@ pub fn checkRead(path: []const u8) Verdict {
     return .ok;
 }
 
+// ── resolving the path ─────────────────────────────────────────────────────
+
+/// The path with its symlinks resolved, or null when it cannot be resolved.
+///
+/// It is component by component and it is PURE ZIG (`readLink`), NOT
+/// `realpath(3)`: this project has no libc dependency and a musl target is a
+/// thing worth keeping.
+///
+/// **Why it matters**: the rule compares the path AS WRITTEN, and a symlink
+/// with an innocent name (`ln -s .git/hooks hooks`) is a path whose NAME says
+/// nothing and whose TARGET is exactly the thing the rule protects. Without
+/// the resolution, the rule has a hole that is one `ln -s` wide.
+///
+/// It returns null when the path does not exist: there is nothing to
+/// resolve, and the path as written is all the caller has.
+pub fn resolveSymlinks(
+    dir: std.Io.Dir,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    path: []const u8,
+) ?[]const u8 {
+    var link_buf: [4096]u8 = undefined;
+
+    // The components still to walk, as a STACK: the next one is at the END.
+    //
+    // A stack and not an index, because a symlink's target has to be walked
+    // BEFORE the rest of the path and the target's components have to be
+    // walked IN ORDER: an index that the inserts disturb reads the same
+    // component twice, and the path comes out with a piece of itself doubled.
+    var todo: std.ArrayList([]const u8) = .empty;
+    defer todo.deinit(arena);
+
+    var it = std.mem.splitScalar(u8, path, '/');
+    var comps: std.ArrayList([]const u8) = .empty;
+    defer comps.deinit(arena);
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        comps.append(arena, seg) catch return null;
+    }
+    // Pushed in REVERSE, so the FIRST component of the path is on top.
+    var ci: usize = comps.items.len;
+    while (ci > 0) {
+        ci -= 1;
+        todo.append(arena, comps.items[ci]) catch return null;
+    }
+
+    // The resolved prefix, with a trailing slash so the next component can
+    // be appended without a join.
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(arena);
+
+    var rounds: usize = 0;
+    while (todo.items.len > 0) {
+        rounds += 1;
+        // A chain of links pointing at each other is a loop, and a loop in
+        // a path is not something to resolve.
+        if (rounds > 64) return null;
+        const comp = todo.pop().?;
+        if (std.mem.eql(u8, comp, ".")) continue;
+        if (std.mem.eql(u8, comp, "..")) {
+            // Up one: the last component of the prefix goes.
+            popComponent(&acc);
+            continue;
+        }
+        const candidate = std.fmt.allocPrint(arena, "{s}{s}", .{ acc.items, comp }) catch return null;
+        const n = dir.readLink(io, candidate, &link_buf) catch {
+            // Not a link: it is what it says it is.
+            acc.appendSlice(arena, comp) catch return null;
+            acc.append(arena, '/') catch return null;
+            continue;
+        };
+        const target = link_buf[0..n];
+        if (target.len > 0 and target[0] == '/') {
+            // An ABSOLUTE target replaces the whole prefix.
+            acc.clearRetainingCapacity();
+        } else {
+            // A RELATIVE one replaces the LAST component of the prefix.
+            popComponent(&acc);
+        }
+        // The target's components go ON TOP of the stack, in REVERSE, so the
+        // first one of them is walked first.
+        var sub: std.ArrayList([]const u8) = .empty;
+        defer sub.deinit(arena);
+        var tit = std.mem.splitScalar(u8, target, '/');
+        while (tit.next()) |seg| {
+            if (seg.len == 0) continue;
+            sub.append(arena, seg) catch return null;
+        }
+        var k: usize = sub.items.len;
+        while (k > 0) {
+            k -= 1;
+            todo.append(arena, sub.items[k]) catch return null;
+        }
+    }
+    if (acc.items.len == 0) return null;
+    // A COPY, and not a slice of the list: the list is freed on the way out
+    // (`defer acc.deinit`), and a returned slice into freed memory is a
+    // dangling pointer that reads as an empty string.
+    return arena.dupe(u8, acc.items[0 .. acc.items.len - 1]) catch null;
+}
+
+/// Drops the LAST component of the resolved prefix.
+///
+/// It is a helper because the empty prefix is a case: the first component of
+/// a path can be a symlink, and a relative target replaces the component it
+/// hangs from — which does not exist yet.
+fn popComponent(acc: *std.ArrayList(u8)) void {
+    if (acc.items.len == 0) return;
+    const trimmed = std.mem.trimEnd(u8, acc.items, "/");
+    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse 0;
+    const keep = if (slash == 0) 0 else slash + 1;
+    acc.shrinkRetainingCapacity(keep);
+}
+
+/// The verdict for a write to `path`, looking at the path it RESOLVES to.
+///
+/// The path as written AND the path it resolves to are both checked: a
+/// symlink into `.git/` has an innocent name and a guilty target, and only
+/// the second one tells the truth.
+pub fn checkWriteResolved(
+    dir: std.Io.Dir,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    path: []const u8,
+) Verdict {
+    const written = checkWrite(path);
+    if (written != .ok) return written;
+    const resolved = resolveSymlinks(dir, io, arena, path) orelse return .ok;
+    if (std.mem.eql(u8, resolved, path)) return .ok;
+    return checkWrite(resolved);
+}
+
+//
+// A sensitive path ASKS and does not refuse: a project with a `.vscode/`
+// that the user wants edited is blocked forever by a refusal, and a rule
+// that gets in the way of real work gets turned OFF — and then it protects
+// nothing.
+//
+// Asking needs an answer that REACHES the tool that would do the write, and
+// the tool has no `Model`: it cannot ask, and it cannot see the dialog. So
+// the answer comes here, in the one place both can reach: the dispatcher
+// approves the path and the tool's own check lets it through.
+//
+// This is the ONLY stateful thing in this module, and it is a set of paths
+// with a lock, not a file on disk: a "yes" to one write is not a standing
+// permission, and it dies with the session.
+
+const max_approved = 8;
+const approved_max_len = 256;
+var approved_paths: [max_approved][approved_max_len]u8 = undefined;
+var approved_lens: [max_approved]usize = @splat(0);
+var approved_count: usize = 0;
+var approve_lock: std.atomic.Mutex = .unlocked;
+
+/// Takes the approval lock, spinning until it is free.
+///
+/// It is a SPINLOCK (`std.atomic.Mutex` is one) and the wait is short: the
+/// critical section is a comparison over eight paths.
+fn lockApprovals() void {
+    while (!approve_lock.tryLock()) std.Thread.yield() catch {};
+}
+
+/// Records that the user approved writing to `path`.
+///
+/// It is ONE path per call and the set is small: an approval is for a
+/// specific write, and a session that approved thirty paths is a session
+/// where the rule is not doing anything.
+pub fn approve(path: []const u8) void {
+    if (path.len == 0) return;
+    lockApprovals();
+    defer approve_lock.unlock();
+    if (approved_count >= max_approved) return;
+    const n = @min(path.len, approved_max_len);
+    @memcpy(approved_paths[approved_count][0..n], path[0..n]);
+    approved_lens[approved_count] = n;
+    approved_count += 1;
+}
+
+/// Whether the user approved this path.
+pub fn isApproved(path: []const u8) bool {
+    lockApprovals();
+    defer approve_lock.unlock();
+    for (approved_lens[0..approved_count], 0..) |l, i| {
+        if (eqIgnoreCase(approved_paths[i][0..l], path)) return true;
+    }
+    return false;
+}
+
+/// Forgets every approval (a new session, or `/new`).
+pub fn forgetApprovals() void {
+    lockApprovals();
+    defer approve_lock.unlock();
+    approved_count = 0;
+}
+
+/// The verdict for a write, HONOURING the user's approval.
+///
+/// The tools use THIS one and the dispatcher uses the pure `checkWrite`: the
+/// dispatcher is the one that asks, and it has to be able to see the
+/// problem BEFORE the user has answered it.
+pub fn checkWriteApproved(
+    dir: std.Io.Dir,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    path: []const u8,
+) Verdict {
+    if (isApproved(path)) return .ok;
+    return checkWriteResolved(dir, io, arena, path);
+}
+
 /// The sentence the model reads when a write is refused.
 ///
 /// It names the file, says what writing there WOULD DO, and says where the
@@ -291,4 +501,69 @@ test "pathsafe: the refusal text names the file and the way out" {
     const text = refusalText(arena, checkWrite(".git/hooks/pre-commit"));
     try t.expect(std.mem.indexOf(u8, text, "refused") != null);
     try t.expect(std.mem.indexOf(u8, text, "bash") != null);
+}
+
+test "pathsafe: the user's approval lets ONE write through, and it is not a standing permission" {
+    // The rule ASKS and does not refuse, and asking needs an answer that
+    // reaches the tool: the dispatcher approves the path and the tool's own
+    // check lets it through.
+    //
+    // The approval is for ONE path: a "yes" to one write is not a standing
+    // permission, and a session that approved thirty paths is a session where
+    // the rule is not doing anything.
+    defer forgetApprovals();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inside = "proj/.git/hooks/pre-commit";
+    try std.testing.expect(checkWrite(inside) != .ok);
+    try std.testing.expect(checkWriteApproved(std.Io.Dir.cwd(), std.testing.io, arena, inside) != .ok);
+
+    approve(inside);
+    try std.testing.expect(isApproved(inside));
+    try std.testing.expectEqual(Verdict{ .ok = {} }, checkWriteApproved(std.Io.Dir.cwd(), std.testing.io, arena, inside));
+
+    // ANOTHER path is still refused: the approval is not a key that opens
+    // everything.
+    try std.testing.expect(checkWriteApproved(std.Io.Dir.cwd(), std.testing.io, arena, "proj/.git/config") != .ok);
+
+    // And it dies with the session.
+    forgetApprovals();
+    try std.testing.expect(!isApproved(inside));
+    try std.testing.expect(checkWriteApproved(std.Io.Dir.cwd(), std.testing.io, arena, inside) != .ok);
+}
+
+test "pathsafe: a symlink into .git/ is caught by its TARGET, not by its name" {
+    // The rule compares the path AS WRITTEN, and a symlink with an innocent
+    // name is a path whose name says nothing and whose target is exactly the
+    // thing the rule protects. Without the resolution the rule has a hole
+    // that is one `ln -s` wide.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A temporary directory with a symlink into a `.git` directory.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDir(io, ".git", .default_dir);
+    try tmp.dir.createDir(io, ".git/hooks", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/hooks/pre-commit", .data = "#!/bin/sh\n" });
+    // The innocent name: "hooks" points at ".git/hooks".
+    try tmp.dir.symLink(io, ".git/hooks", "hooks", .{});
+
+    // The path as written says nothing dangerous.
+    try std.testing.expectEqual(Verdict{ .ok = {} }, checkWrite("hooks/pre-commit"));
+
+    // The path it RESOLVES to says everything.
+    const resolved = resolveSymlinks(tmp.dir, io, arena, "hooks/pre-commit") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, resolved, ".git") != null);
+    try std.testing.expect(checkWrite(resolved) != .ok);
+
+    // And the whole verdict says it too.
+    try std.testing.expect(checkWriteResolved(tmp.dir, io, arena, "hooks/pre-commit") != .ok);
 }

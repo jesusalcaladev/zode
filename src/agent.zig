@@ -17,6 +17,7 @@ const goal_mod = @import("lib/goal.zig");
 const modelcache = @import("lib/modelcache.zig");
 const clean_mod = @import("lib/clean.zig");
 const usercmds_mod = @import("lib/usercmds.zig");
+const pathsafe = @import("lib/pathsafe.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
@@ -7102,6 +7103,48 @@ fn execOneCall(
         m.pushToolDone(call.name, "blocked by plan mode", 0, read_only_text);
         s.appendToolResult(call.id, call.name, read_only_text) catch {};
         return 0;
+    }
+
+    // ── the SENSITIVE-PATH question ──
+    //
+    // It comes BEFORE the general permission dialog, and it is a DIFFERENT
+    // question: not "may I run this tool" but "may I write IN HERE", where
+    // "here" is a place where writing is a bad idea (`.git/`, a hook, a
+    // shell config).
+    //
+    // The tool cannot ask: it has no `Model` and it cannot see a dialog. The
+    // dispatcher can, so the question happens here and the answer is handed
+    // to the tool as an approval of that one path.
+    //
+    // It asks ONCE and never offers "always allow": a rule that remembers
+    // "the agent may write inside .git/" is the opposite of the rule.
+    const risky = tools_mod.riskyPaths(call.name, call.args_json, arena);
+    if (risky.len > 0 and !yolo) {
+        var asked = false;
+        for (risky) |p| {
+            const v = pathsafe.checkWrite(p);
+            if (v == .ok) continue;
+            if (asked) continue;
+            asked = true;
+            var dbuf: [384]u8 = undefined;
+            const detail = std.fmt.bufPrint(
+                &dbuf,
+                "{s} is not a place this tool writes: {s}",
+                .{ p, switch (v) { .dangerous => |d| d.why, else => "it is protected" } },
+            ) catch p;
+            switch (m.requestPermissionOnce(call.name, detail)) {
+                .allow => pathsafe.approve(p),
+                .allow_always => pathsafe.approve(p),
+                .deny, .none => {
+                    denied.* += 1;
+                    turn_stats.noteDenied();
+                    const msg = pathsafe.refusalText(arena, v);
+                    m.pushToolDone(call.name, "refused: sensitive path", 0, msg);
+                    s.appendToolResult(call.id, call.name, msg) catch {};
+                    return 0;
+                },
+            }
+        }
     }
 
     // ── permission ──

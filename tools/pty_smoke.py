@@ -169,7 +169,11 @@ def main() -> int:
     # the four commands worth knowing in the first thirty seconds. A pty check
     # for "␣ ######" would now fail on a REDESIGN, which is what a check pinned
     # to pixels does — it stops watching the thing it watched.
-    ok &= check("hero: the wordmark is on screen", "zode" in t, t)
+    # The wordmark is the ASCII ART again (it was the word "zode" in a colour
+    # for a while, and the art was in the tree but nobody drew it). The check
+    # looks for the DRAWING and not for pixels of it: the art's own test
+    # pins the rows, and this one pins that it is ON THE SCREEN.
+    ok &= check("hero: the wordmark is on screen", "######  ####" in t, t)
     ok &= check("hero: the tagline is on screen", "a code agent in your terminal" in t, t)
     ok &= check("hero: the command grid is on screen", "choose a model" in t, t)
     # No box around the input: a hairline above it and an accent bar on the

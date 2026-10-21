@@ -189,6 +189,8 @@ pub const callTouchedPaths = registry.callTouchedPaths;
 /// What the permission dialog says about a batch: what it would do, and to
 /// which files.
 pub const batchPermissionDetail = registry.batchPermissionDetail;
+/// The paths of a call that the sensitive-path rule would refuse.
+pub const riskyPaths = registry.riskyPaths;
 
 /// Runs a tool with JSON args. Returns the (truncated) result —
 /// `arena` memory, valid until the arena is freed.

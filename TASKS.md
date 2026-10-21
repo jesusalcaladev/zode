@@ -747,14 +747,16 @@ permanent CPU cost for a decoration).
 > board owned. Every one was read in its **implementation**, not in its prose.
 > Ranked by value per unit of risk.
 
-- [ ] **34.1** Path-scoped permissions and the dangerous-path protection — **PARTIALLY COVERED (the table + the write tools)**
+- [ ] **34.1** Path-scoped permissions and the dangerous-path protection — **MOSTLY COVERED (2026-10-21)**
   - The reference implementation: a path is allowed through SEVEN checks in this order — resolve the path → the deny rules → the internally editable paths → the **safety check** → the working-directory check → the sandbox allowlist → the allow rules. Its safety check blocks `.git/`, `.claude/`, `.vscode/`, `.idea/`, the shell configs and the UNC paths
   - [x] `src/lib/pathsafe.zig` (new, pure): the table, matched **by SEGMENT and case-insensitively** (`a/b/.git/hooks/x` and `.Git/hooks/x` are both caught; `myproject.git`, `zig-out-mine` and `.gitignore` are NOT), and a separate table for the files whose CONTENT is a secret
   - [x] Wired into `write`, `edit`, `notebook_edit` (per file: one bad path does not lose the good ones) and into `read` — `read` never asks for permission, so it was the only place a secret could be refused before going to the provider
   - [x] The refusal NAMES what writing there would do ("a hook there runs on every commit") and points at `bash`, which asks the user
-  - [ ] **It REFUSES where the plan says it should ASK.** The false-positive surface is small (a static table, no symlink resolution) but it is not zero: a project with a `.vscode/` the user wants edited is blocked. The "ask" version needs the permission engine of Phase 6, because a tool cannot ask on its own: `ask`/`review`/`skill` are intercepted in `agent.zig` precisely because they need the `Model`
-  - [ ] `resolve` (symlinks) — the comparison is on the path as WRITTEN, so a symlink into `.git/` is not caught
-  - [ ] The `Tool(pattern)` grammar of Phase 6, and `rename` + the permission detail the dialog shows
+  - [x] **It ASKS now, it does not refuse** (2026-10-21): the dispatcher finds the risky paths of the call, opens a question that says WHICH path and WHY, and the answer approves that one path. The tool cannot ask (it has no `Model` and cannot see a dialog), so the answer comes back through `pathsafe.approve` — the one place both can reach. The question has **no "always allow"**: a rule that remembers "the agent may write inside .git/" is the opposite of the rule
+  - [x] `rename` is wired in too: it finds its own files, so its arguments NEVER name them, and it is the tool a rename reaches that the dialog could not ask about
+  - [x] The multi-file form of `edit` (`files: [{path,…}]`) is in the permission detail AND in the risky-path question: the dialog used to name NO file for a call that touches eight
+  - [x] **The path it RESOLVES to is checked too** (2026-10-21): a symlink with an innocent name (`ln -s .git/hooks hooks`) is a path whose NAME says nothing and whose TARGET is exactly what the rule protects. The resolver is component by component and in PURE ZIG (`readLink`), not `realpath(3)`: this project has no libc dependency
+  - [ ] The `Tool(pattern)` grammar of Phase 6 — the rule model is still "the table plus the approval", and a project that wants to allow `.vscode/` for good has no way to say so
 - [ ] **34.2** The **frozen decision** of the result cap — **NOT COVERED**
   - The reference implementation: the cap layer keeps a **frozen decision** — a cut is re-applied verbatim on every later turn instead of being recomputed — and it rebuilds that state from the transcript on resume
   - Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call

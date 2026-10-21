@@ -192,12 +192,18 @@ pub const banner_art_height = 5;
 pub const banner_art_width = 4 * 6 + 3;
 
 /// Assemble row `r` of the wordmark: the fixed gaps between the letters.
+///
+/// The width of a glyph row is its BYTE count, and that is not a shortcut:
+/// the art is pure ASCII (`#` and a space), so a byte is a column — and the
+/// count has to be available at COMPILE TIME, because the art is composed at
+/// compile time on purpose (the padding on the right gets stripped by an
+/// editor, and a stripped row is a shifted row).
 fn bannerRow(comptime r: usize) []const u8 {
     comptime var out: []const u8 = "";
     inline for (wordmark, 0..) |letter, i| {
         if (i > 0) out = out ++ " ";
         if (i + 1 < wordmark.len) {
-            const missing = letter.w - glyphCols(letter.rows[r]);
+            const missing = letter.w - letter.rows[r].len;
             const filler = " " ** missing;
             out = out ++ letter.rows[r] ++ filler;
         } else {
@@ -1022,6 +1028,12 @@ pub const Model = struct {
     perm_detail: [384]u8 = undefined,
     perm_detail_len: usize = 0,
     perm_active: bool = false,
+    /// Whether the open dialog offers "always allow".
+    ///
+    /// It is false for the questions that must not become a standing
+    /// permission (a write into `.git/`), and the "A" key does not answer
+    /// them: the option is not on the table, so the key is not a key.
+    perm_allow_always: bool = true,
     perm_answer: PermAnswer = .none,
     /// The dialog's OWN lock, separate from the history's `spin` (1.7).
     ///
@@ -1942,6 +1954,34 @@ pub const Model = struct {
         self.perm_active = false;
         self.permUnlock();
         return a;
+    }
+
+    /// Asks a question that must NOT become a standing permission.
+    ///
+    /// "Always allow" is not on the table: the question is about ONE write
+    /// into a place where writing is a bad idea, and a rule that remembers
+    /// it would put that whole place on the list of places the agent writes
+    /// without asking — which is the opposite of what the question is for.
+    ///
+    /// The answer is "allow once" or "deny", and nothing else.
+    pub fn requestPermissionOnce(self: *Model, tool: []const u8, detail: []const u8) PermAnswer {
+        self.permLock();
+        const was = self.perm_allow_always;
+        self.perm_allow_always = false;
+        self.permUnlock();
+        defer {
+            self.permLock();
+            self.perm_allow_always = was;
+            self.permUnlock();
+        }
+        return self.requestPermission(tool, detail);
+    }
+
+    /// Whether the open dialog offers "always allow".
+    pub fn permAllowAlways(self: *Model) bool {
+        self.permLock();
+        defer self.permUnlock();
+        return self.perm_allow_always;
     }
 
     /// UI: answers the open dialog.
@@ -5402,7 +5442,10 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 if (cp == 'y' or cp == 'Y') {
                     self.answerPermission(.allow);
                 } else if (cp == 'a' or cp == 'A') {
-                    self.answerPermission(.allow_always);
+                    // Only when the option is on the table. A question that
+                    // must not become a standing permission does not show it,
+                    // and a key that answers an invisible option is a trap.
+                    if (self.permAllowAlways()) self.answerPermission(.allow_always);
                 } else if (cp == 'n' or cp == 'N') {
                     self.answerPermission(.deny);
                 }
@@ -6002,7 +6045,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // a centered box with a border, a clean background and big options: there
     // is no way not to see it.
     if (self.permView(&perm_tool, &perm_detail)) {
-        drawPermissionModal(&p, width, height, perm_tool, perm_detail);
+        drawPermissionModal(&p, width, height, perm_tool, perm_detail, self.permAllowAlways());
     }
 
     // ── `ask`: the question itself ──
@@ -6630,6 +6673,7 @@ fn drawPermissionModal(
     height: u16,
     tool: []const u8,
     detail: []const u8,
+    allow_always: bool,
 ) void {
     const w: u16 = @min(width -| 6, 104);
     const h: u16 = 9;
@@ -6693,12 +6737,19 @@ fn drawPermissionModal(
 
     // Options, each with its key in large type. The first one (y) is the one
     // you press without looking, so it is highlighted.
-    const opts = [_]struct { key: []const u8, label: []const u8 }{
+    //
+    // WITHOUT "always allow" for a question that must not become a standing
+    // permission: a path inside `.git/` is asked ONCE. "Always allow" there
+    // would put the whole `.git/` on the list of places the agent writes
+    // without asking, which is the opposite of what the question is for.
+    const opts_all = [_]struct { key: []const u8, label: []const u8 }{
         .{ .key = "Y", .label = "allow once" },
         .{ .key = "A", .label = "always allow" },
         .{ .key = "N", .label = "deny" },
         .{ .key = "ESC", .label = "cancel" },
     };
+    var opts: []const @TypeOf(opts_all[0]) = &opts_all;
+    if (!allow_always) opts = &.{ opts_all[0], opts_all[2], opts_all[3] };
     var ox: u16 = x + 3;
     for (opts, 0..) |o, i| {
         _ = p.putText(ox, y + 7, o.key, theme.brand_bold);

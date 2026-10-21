@@ -22,6 +22,7 @@ const common = @import("common.zig");
 const resultcap = @import("../lib/resultcap.zig");
 const batch_lib = @import("../lib/batch.zig");
 const subagent = @import("../lib/subagent.zig");
+const pathsafe = @import("../lib/pathsafe.zig");
 
 // Per-tool prompt modules: the JSON schema each tool offers the model.
 const read_prompt = @import("prompts/read.zig");
@@ -570,6 +571,23 @@ pub fn callTouchedPaths(name: []const u8, args_json: []const u8, arena: std.mem.
     if (!std.mem.eql(u8, name, "batch")) {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return &.{};
         if (parsed != .object) return &.{};
+        if (parsed.object.get("files")) |fv| {
+            // The MULTI-FILE form of `edit`: `files: [{path, …}, …]`.
+            //
+            // It was not here, and the permission dialog therefore named NO
+            // file for a call that touches eight: the user was asked to
+            // approve "edit" and the set of files was the whole question.
+            if (fv != .array) return &.{};
+            var out: std.ArrayList([]const u8) = .empty;
+            for (fv.array.items) |item| {
+                if (item != .object) continue;
+                const p = item.object.get("path") orelse continue;
+                if (p != .string or p.string.len == 0) continue;
+                out.append(arena, p.string) catch return &.{};
+            }
+            if (out.items.len > 0) return out.items;
+            return &.{};
+        }
         const v = parsed.object.get("path") orelse parsed.object.get("notebook_path") orelse return &.{};
         if (v != .string or v.string.len == 0) return &.{};
         const one = arena.alloc([]const u8, 1) catch return &.{};
@@ -580,6 +598,23 @@ pub fn callTouchedPaths(name: []const u8, args_json: []const u8, arena: std.mem.
     if (parsed != .object) return &.{};
     const b = batch_lib.parse(arena, parsed.object) catch return &.{};
     return batch_lib.touchedPaths(arena, b) catch &.{};
+}
+
+/// The paths of a call that the SENSITIVE-PATH rule would refuse.
+///
+/// It is the PURE check, and it is asked about BEFORE the call runs: the
+/// dispatcher is the one that can open the dialog, and the tool cannot.
+///
+/// The result is what the user is asked about, so it is only the paths that
+/// are actually a problem: a call that touches four files and one of them
+/// is inside `.git/` asks about ONE path.
+pub fn riskyPaths(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const []const u8 {
+    const all = callTouchedPaths(name, args_json, arena);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (all) |p| {
+        if (pathsafe.checkWrite(p) != .ok) out.append(arena, p) catch return &.{};
+    }
+    return out.items;
 }
 
 /// The sentence the permission dialog shows for a batch.
@@ -893,4 +928,29 @@ test "the registry: every tool but read has a result cap" {
     try std.testing.expectEqual(@as(usize, 0), resultCap("read"));
     try std.testing.expectEqual(@as(usize, resultcap.default_max_result_chars), resultCap("write"));
     try std.testing.expectEqual(@as(usize, resultcap.default_max_result_chars), resultCap("a-tool-that-does-not-exist"));
+}
+
+test "riskyPaths: only the paths the rule would refuse, and the multi-file form too" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // One ordinary file: nothing to ask about.
+    const none = riskyPaths("write", "{\"path\":\"src/main.zig\"}", arena);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    // One inside `.git/`: that is the question.
+    const one = riskyPaths("write", "{\"path\":\".git/hooks/pre-commit\"}", arena);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings(".git/hooks/pre-commit", one[0]);
+
+    // The MULTI-FILE form of `edit`: the question is about the ONE file that
+    // is a problem, and the other three are not part of it.
+    const many = riskyPaths(
+        "edit",
+        "{\"files\":[{\"path\":\"src/a.zig\"},{\"path\":\".git/config\"},{\"path\":\"src/b.zig\"}]}",
+        arena,
+    );
+    try std.testing.expectEqual(@as(usize, 1), many.len);
+    try std.testing.expectEqualStrings(".git/config", many[0]);
 }

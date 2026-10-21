@@ -63,7 +63,7 @@ pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
             // The same rule as `write`: a path that is not a place this tool
             // writes is refused PER FILE, so one bad path does not lose the
             // three good ones in the same call.
-            const verdict = pathsafe.checkWrite(p);
+            const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, p);
             if (verdict != .ok) {
                 try out.print(arena, "  refused {s}: {s}\n", .{ p, pathsafe.refusalText(arena, verdict) });
                 continue;
@@ -85,7 +85,7 @@ pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     // A path that is not a place this tool writes. The reason is in the
     // refusal: a `.git/hooks/pre-commit` is code that runs on every commit, and
     // a file name in a permission dialog does not look like that.
-    const verdict = pathsafe.checkWrite(path);
+    const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, path);
     if (verdict != .ok) return pathsafe.refusalText(arena, verdict);
 
     // Collect hunks: `edits: [{old_string,new_string},...]` or a single pair.

@@ -177,7 +177,7 @@ pub fn toolNotebookEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allo
 
     // The same rule as `write` and `edit`: a notebook is a file, and there are
     // places this tool does not write.
-    const verdict = pathsafe.checkWrite(path);
+    const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, path);
     if (verdict != .ok) return pathsafe.refusalText(arena, verdict);
     if (!std.mem.endsWith(u8, path, ".ipynb")) return error.NotANotebook;
     const index_raw = common.getInt(obj, "cell_number") orelse common.getInt(obj, "cell_index") orelse return error.MissingCellNumber;
