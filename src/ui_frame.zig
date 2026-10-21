@@ -77,6 +77,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "running", .fill = sceneRunning },
         .{ .name = "bash", .fill = sceneBash },
         .{ .name = "diff", .fill = sceneDiff },
+        .{ .name = "bigwrite", .fill = sceneBigWrite },
         .{ .name = "ask", .fill = sceneAsk },
         .{ .name = "perm", .fill = scenePerm },
         .{ .name = "palette", .fill = scenePalette },
@@ -324,6 +325,52 @@ fn sceneDiff(m: *tui.Model) void {
     _ = m.pushDiffLang(before, after, "zig");
     m.pushToolDone("Edit", "Edit  src/lib/theme.zig", 7, "x");
     m.pushInfoFmt("{d} tool results elided", .{3});
+}
+
+/// A `write` of a 600-line file: the diff does not fit, so it collapses into
+/// a preview.
+///
+/// The scene exists because the composition of the collapsed diff is a
+/// question no unit test answers: the preview is twelve rows, the summary is
+/// above them, and the way to expand it is below them. A scene that shows a
+/// hundred rows of diff proves nothing about how a big change reads.
+fn sceneBigWrite(m: *tui.Model) void {
+    m.pushHeader(.idle);
+    m.pushKind(.user, "escribe el modulo de la lista de tareas");
+    m.pushToolStart("Write", "src/lib/taskstore.zig");
+    m.toolRunEnd();
+
+    var before: std.ArrayList(u8) = .empty;
+    defer before.deinit(std.heap.page_allocator);
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(std.heap.page_allocator);
+    var i: usize = 0;
+    while (i < 600) : (i += 1) {
+        const line = std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "pub fn task_{d}(m: *Model) void {{ m.note(\"line {d}\"); }}\n",
+            .{ i, i },
+        ) catch break;
+        defer std.heap.page_allocator.free(line);
+        if (i % 7 == 3) {
+            // Every seventh line CHANGED, and it is a small change: the word
+            // diff has something to point at, and the diff is long enough to
+            // collapse into a preview.
+            const changed = std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "pub fn task_{d}(m: *Model) void {{ m.note(\"LINE {d}\"); }}\n",
+                .{ i, i },
+            ) catch break;
+            defer std.heap.page_allocator.free(changed);
+            before.appendSlice(std.heap.page_allocator, line) catch break;
+            after.appendSlice(std.heap.page_allocator, changed) catch break;
+            continue;
+        }
+        before.appendSlice(std.heap.page_allocator, line) catch break;
+        after.appendSlice(std.heap.page_allocator, line) catch break;
+    }
+    _ = m.pushDiffLang(before.items, after.items, "zig");
+    m.pushToolDone("Write", "Write  src/lib/taskstore.zig (600 lines)", 31, "x");
 }
 
 fn sceneAsk(m: *tui.Model) void {

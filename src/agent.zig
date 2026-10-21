@@ -4,6 +4,7 @@ const sleepz = @import("lib/sleep.zig");
 const vaxis = @import("vaxis");
 const builtin = @import("builtin");
 const tui = @import("tui.zig");
+const theme = @import("lib/theme.zig");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 const http_client = @import("lib/http_client.zig");
@@ -2999,6 +3000,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         openModelPaletteAsync(m);
     } else if (std.mem.eql(u8, cmd, "effort")) {
         cmdEffort(m, arg);
+    } else if (std.mem.eql(u8, cmd, "color")) {
+        cmdColor(m, arg);
     } else if (std.mem.eql(u8, cmd, "submodel")) {
         cmdSubmodel(m, arg);
     } else if (std.mem.eql(u8, cmd, "task-parallel")) {
@@ -8686,6 +8689,64 @@ fn onProviderPick(m: *tui.Model, _: u32, label: []const u8) void {
 
 fn onEffortPick(m: *tui.Model, _: u32, label: []const u8) void {
     cmdEffort(m, label);
+}
+
+/// `/color`: the palette the diff is painted with.
+///
+/// The DEFAULT pair is green for an added row and red for a deleted one, and
+/// that pair is invisible to a reader with the most common colour-vision
+/// deficiency: green and red collapse into the same yellow, and a diff whose
+/// two halves are the same colour is a diff with no halves. The DALTONIZED
+/// pair is blue and orange, which survive it.
+///
+/// The choice is for the session, and it says what it did: a palette that
+/// changed without saying so is a palette the user cannot trust.
+fn cmdColor(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        if (std.mem.eql(u8, a, "default") or std.mem.eql(u8, a, "normal")) {
+            theme.caps.daltonized = false;
+            m.pushInfoFmt("diff palette → default (green / red)", .{});
+        } else if (std.mem.eql(u8, a, "daltonized") or std.mem.eql(u8, a, "daltonise") or
+            std.mem.eql(u8, a, "daltonize"))
+        {
+            theme.caps.daltonized = true;
+            m.pushInfoFmt("diff palette → daltonized (blue / orange)", .{});
+        } else {
+            m.pushInfoFmt("unknown palette: {s} (default | daltonized)", .{a});
+            return;
+        }
+        // The whole history is painted with the old palette, so it has to be
+        // laid out again.
+        m.clearSegCache();
+        m.dirty = true;
+        return;
+    }
+    openColorPicker(m);
+}
+
+/// The palette picker: the two pairs, with the active one marked.
+fn openColorPicker(m: *tui.Model) void {
+    const gpa = m.allocator;
+    const names = [_][]const u8{ "default", "daltonized" };
+    const items = gpa.alloc(tui.PickerItem, names.len) catch return;
+    for (names, 0..) |n, i| {
+        const desc = if ((i == 1) == theme.caps.daltonized)
+            gpa.dupe(u8, "← active") catch ""
+        else if (i == 1)
+            gpa.dupe(u8, "blue / orange") catch ""
+        else
+            gpa.dupe(u8, "green / red") catch "";
+        items[i] = .{ .label = gpa.dupe(u8, n) catch return, .desc = desc };
+    }
+    var title_buf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "diff palette · {s}", .{
+        if (theme.caps.no_color) "no color (NO_COLOR)" else if (theme.caps.daltonized) "daltonized" else "default",
+    }) catch "diff palette";
+    m.openPicker(4, title, items, onColorPick);
+}
+
+fn onColorPick(m: *tui.Model, _: u32, label: []const u8) void {
+    cmdColor(m, label);
 }
 
 /// Job of the `/models` catalog summary and the model picker.

@@ -5227,3 +5227,82 @@ invisible to the fake.
 **And the 32 test blocks that never compiled** are in `src/test_all.zig` and
 run. A test in a file no build step references is a comment about what
 should be true.
+
+---
+
+## The diff you can read (2026-10-21) — TASKS Phase 27
+
+The three pieces of the diff (the word diff, the gutter, the colour ladder)
+were **written and never wired**: the gutter's caller passed `null, 0`, the
+ladder was called from nowhere outside `theme.zig`, and the word diff compared
+the indices of one token list against the indices of another. The work was
+not writing the diff; it was finding out what was there and what was broken
+about it.
+
+**The LCS filled the table with the SUFFIX convention and walked it back with
+the PREFIX one.** The table had the right shape and the wrong answer, and the
+word diff it fed marked the wrong tokens. It looked right whenever the two
+lines happened to line up, which is most of the time in a small edit. A table
+and a walk that disagree about what an index means is invisible in the shape
+and obvious in the answer.
+
+**The word diff is computed where the diff is PAINTED.** The ranges used to
+travel in a map keyed by the line's TEXT, and that map was copied, freed and
+re-hydrated in five places (the paragraph, the pending item, the drain, the
+compression and the Ctrl+R toggle). Now `src/lib/diffview.zig` reads the diff
+text ONCE and says what every row is: its number, the width of its hunk's
+gutter and the words that changed in it. The map is gone, and with it five
+places that could forget to free it.
+
+**A key by TEXT is a key by accident.** Two identical rows in a diff got the
+first one's ranges, and the lookup was a linear scan per row. The diff text
+knows which row is which: it is the N-th line.
+
+**A diff is not prose.** A deleted line starts with `- ` and the markdown
+parser read that as a BULLET: the row came out as a list item and the `+`/`-`
+that says what happened was gone. The diff has its own path through the
+parser now, before the fences, the headings, the quotes and the lists. (A
+markdown file's own ``` is a CONTEXT row that starts with a space, and the
+fence check trimmed it away: a diff of a markdown file lost a row.)
+
+**The highlighter's state is per SIDE, not per hunk.** A `-` row is a line of
+the old file and a `+` row is a line of the new one, so there are TWO states:
+a deleted line that opens a multiline string used to leave the ADDED line
+painted as inside a string. A context row is the same line in both files, so
+it carries the two states along together.
+
+**Two tints per side.** The ROW is the band (the reader sees "this row is
+new") and the WORDS are the point (the reader sees "this is what is new
+inside the row"). With ONE tint the changed words disappear into their own
+row, and a rewrite is a green wall.
+
+**The 256-colour ramp is a COMPETITOR and it was not one.** `ansi256FromRgb`
+only considered the grey ramp for colours with a saturation under 0.15, which
+is the fallback behaviour the rule warns about: a near-black green tint
+(#08120b) went to the cube, which has nothing between #000000 and #333333 in
+it, and the band the tint was supposed to paint disappeared. Both candidates
+are built now and the closer one wins, in RGB distance.
+
+**The ladder is applied where the cell is written** (`Painter.putStable`),
+so there is ONE place that can send a colour the terminal cannot show.
+vaxis writes `38;2;r;g;b` whatever the terminal answered, and it does not
+ask: its own `COLORTERM` sniffing is commented out in the library. So the app
+asks the environment (`NO_COLOR`, `COLORTERM`, `TERM`), which is where every
+terminal documents the answer. With no color at all the diff is still a diff:
+the marker is BOLD and the changed words are BOLD.
+
+**The gutter's width is per HUNK, and the wrapped rows know it.** The number
+is painted as part of the row, so a row that wraps has to skip the number,
+its space and the marker to stay under the code. The indent is computed from
+the cells that carry the gutter's style, which is the only place that knows
+which cells are the number.
+
+**One tokenizer for the diff and the edit hint.** `edit_hint` used to split on
+whitespace and `diff_tokenizer` knew about operators, so the two disagreed
+about what a word in code is. `x += 1` is FIVE tokens (the operator is a
+word), and a patch whose tokens were `x += 1;` came back with no tokens at
+all in the first version of the hint.
+
+**A preview is a quiet box.** A collapsed diff shows the row tints and NOT the
+word highlights, and Ctrl+R turns them on. The upstream calls the same thing
+`dim`; here it is a flag on the paragraph.

@@ -23,6 +23,7 @@ const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
 const lsp_manager = @import("lsp/manager.zig");
+const theme = @import("lib/theme.zig");
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = map orelse return null;
@@ -617,6 +618,16 @@ fn runTui(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
     agent.bootStart(io, init.environ_map);
+
+    // What the terminal can do, BEFORE a single cell is painted.
+    //
+    // vaxis does not ask the terminal whether it speaks truecolor (its own
+    // `COLORTERM` sniffing is commented out in the library) and it does not
+    // convert rgb→256 either: it writes `38;2;r;g;b` whatever the terminal
+    // answered. So a terminal that does not speak truecolor got a byte
+    // sequence it does not understand. The app asks the environment instead,
+    // which is where every terminal documents the answer.
+    theme.caps = theme.detectCaps(init.environ_map);
 
     // 64 KiB instead of 1 MB (5.4 of the ROADMAP): the TTY buffer is PERMANENT
     // memory (it lives for the whole process) and 1 MB is paid for 99% of the

@@ -23,9 +23,9 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 ## 🚀 Next up — the roadmap's own verdict
 
-- [ ] 🔴 **Sprint A — Phase 27** (the diff you can read): the word diff and the gutter are
-      written but the GUTTER IS NEVER PAINTED (the caller passes `null, 0`) and the colour
-      ladder is never called outside `theme.zig`. Both are dead code today.
+- [x] 🔴 **Sprint A — Phase 27** (the diff you can read) — **DONE 2026-10-21**: the gutter
+      is painted, the word diff is computed where the diff is painted, and the colour
+      ladder is applied where the cell is written.
 - [ ] 🔴 **Sprint B — Phase 2** (skill listing budget + named args + `context: fork`):
       `max_listed = 40` is still a constant and `context: fork` is parsed and never read.
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
@@ -37,7 +37,8 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 **Done since the board was written**: Phase 1 (bundled skills + rich frontmatter) ·
 Phase 16 (the `batch` tool: many operations, one round trip) · Phase 28 (`/copy`) ·
 **Phase 14 (the language server: the tool was offered to the model and could not be
-called — it is wired now, with `diagnostics` and `lsp_servers`)**.
+called — it is wired now, with `diagnostics` and `lsp_servers`)** ·
+**Phase 27 (the diff you can read: the gutter, the word diff and the colour ladder)**.
 
 ---
 
@@ -462,32 +463,86 @@ some servers support).
 
 ---
 
-## Phase 27 — The diff you can read 🔴 ← start here
+## Phase 27 — The diff you can read — **DONE 2026-10-21**
 
 `✨ feature + 🐛 fix · 🔴 · independent · complete 999-line source to port: native-ts/color-diff/index.ts`
 
 > The part worth stealing is not the colours, it is the **order of the pipeline**. Measured today: the diff has NO background at all (`diff_add_bg`/`diff_del_bg` are declared and never painted) and no line numbers.
 
-- [ ] **27.1** Word-level diff — which words changed, not which lines
-  - [ ] Per hunk, in order: (1) assign marker + line number via two counters (`+`→new, `-`→old, context shows the new one) · (2) pair a `-` run with the following `+` run positionally; pure insertions/deletions stay unpaired and get NO word diff · (3) tokenize + token-level LCS → byte ranges · (4) the noise guard · (5) split segments at the range boundaries
-  - [ ] The tokenizer is **shared with `edit_hint.zig`** — one tokenizer or the two diffs disagree: a `[\p{L}\p{N}_]` run = 1 token, whitespace run = 1 token, **everything else one token per codepoint** (`x += 1` = 5 tokens; in code, `+=`/`=>`/`!=` are words)
-  - [ ] `CHANGE_THRESHOLD = 0.4`: above 40% changed → discard the word ranges, flat line colour (a rewrite is not information, it is confetti — the same call as edit_hint's 0.50 Jaccard)
-  - [ ] Word diff skipped entirely when the block is `dim` (collapsed preview / collapsed Ctrl+R — highlights inside a quiet box are noise)
-  - [ ] Forced change: `diffSegments` must call `highlightLineState` with the state threaded down the hunk (a changed line is often the middle of a block comment or a multiline string) and reset at each `@@`
-- [ ] **27.2** Gutter: marker + right-aligned line number; width = digits of the hunk's max line **per hunk** (not per file); wrapped continuation rows get blank gutter cells and never a second copy of the number
+- [x] **27.1** Word-level diff — which words changed, not which lines
+  - [x] Per hunk, in order: (1) assign marker + line number via two counters (`+`→new, `-`→old, context shows the new one) · (2) pair a `-` run with the following `+` run positionally; pure insertions/deletions stay unpaired and get NO word diff · (3) tokenize + token-level LCS → byte ranges · (4) the noise guard · (5) split segments at the range boundaries
+  - [x] The tokenizer is **shared with `edit_hint.zig`** — one tokenizer or the two diffs disagree: a `[\p{L}\p{N}_]` run = 1 token, whitespace run = 1 token, **everything else one token per codepoint** (`x += 1` = 5 tokens; in code, `+=`/`=>`/`!=` are words)
+  - [x] `CHANGE_THRESHOLD = 0.4`: above 40% changed → discard the word ranges, flat line colour (a rewrite is not information, it is confetti — the same call as edit_hint's 0.50 Jaccard)
+  - [x] Word diff skipped entirely when the block is `dim` (collapsed preview / collapsed Ctrl+R — highlights inside a quiet box are noise)
+  - [x] Forced change: `diffSegments` must call `highlightLineState` with the state threaded down the hunk (a changed line is often the middle of a block comment or a multiline string) and reset at each `@@`
+- [x] **27.2** Gutter: marker + right-aligned line number; width = digits of the hunk's max line **per hunk** (not per file); wrapped continuation rows get blank gutter cells and never a second copy of the number
 
-- [ ] **27.3** Colour capability ladder 🐛
-  - [ ] vaxis does NOT convert rgb→256 (`Vaxis.zig:626-630`): every one of the 32 `rgb()`/`bg()` literals in `theme.zig` ships as `38;2;r;g;b` even when DA1 said no truecolor. Ladder: `caps.rgb` true → palette as-is · false → `.index` colours via a ported `ansi256FromRgb` · `no_color` → `+`/`-` in **bold** and nothing else
-  - [ ] `ansi256FromRgb`: the grey ramp is a **competitor**, not a fallback — quantize to the cube, build BOTH candidates (cube + ramp), pick the closer in RGB distance; beyond the ramp's range the cube corner is the only option
-  - [ ] Lives in `theme.zig` behind the existing `rgb()`/`bg()` helpers — 38 call sites, one change; `no_color` is a single early return
-- [ ] **27.4** Colour-vision-safe palette 🔒
-  - [ ] `ZODE_DALTONIZED=1` (+ a `/color daltonized` picker entry) → blue/orange pair instead of green/red (the most common deficiency, and the axis most monitors collapse)
-  - [ ] A test asserts the add/delete pair differs in **hue** via `hueSat`, not only lightness (precedent: `theme.zig:439`)
+- [x] **27.3** Colour capability ladder 🐛
+  - [x] vaxis does NOT convert rgb→256 (`Vaxis.zig:626-630`): every one of the 32 `rgb()`/`bg()` literals in `theme.zig` ships as `38;2;r;g;b` even when DA1 said no truecolor. Ladder: `caps.rgb` true → palette as-is · false → `.index` colours via a ported `ansi256FromRgb` · `no_color` → `+`/`-` in **bold** and nothing else
+  - [x] `ansi256FromRgb`: the grey ramp is a **competitor**, not a fallback — quantize to the cube, build BOTH candidates (cube + ramp), pick the closer in RGB distance; beyond the ramp's range the cube corner is the only option
+  - [x] Lives in `theme.zig` behind the existing `rgb()`/`bg()` helpers — 38 call sites, one change; `no_color` is a single early return
+- [x] **27.4** Colour-vision-safe palette 🔒
+  - [x] `ZODE_DALTONIZED=1` (+ a `/color daltonized` picker entry) → blue/orange pair instead of green/red (the most common deficiency, and the axis most monitors collapse)
+  - [x] A test asserts the add/delete pair differs in **hue** via `hueSat`, not only lightness (precedent: `theme.zig:439`)
 - [x] **27.5** NOT ported on purpose: `asTerminalEscaped`/`colorToEscape`/the `{r,g,b,a}` sentinel struct (~120 lines — vaxis paints cells, escape generation is its job), the highlight.js integration, the `BAT_THEME` stub, the lazy loader. `ColorFile` (plain file view with line numbers) deferred to a future `/file`
-- [ ] **27.6** Pure tests: `x += 1` is 5 tokens · a pure deletion stays unpaired · a line 50% changed gets no ranges · a line 10% changed does (not vacuous) · ranges split a segment into three · **the segments of a diffed line concatenate to the original line** · ansi256 picks the cube for a saturated colour and the ramp for a grey · every theme colour survives the 256 round trip (no colour becomes "terminal default") · the daltonized pair differs in hue · drawTest: only the changed token carries the word background
-- [ ] Plus one `zig build ui-frame` scene (a `write` of a 600-line file) so the *composition* is judged — the question only that harness can answer
+- [x] **27.6** Pure tests: `x += 1` is 5 tokens · a pure deletion stays unpaired · a line 50% changed gets no ranges · a line 10% changed does (not vacuous) · ranges split a segment into three · **the segments of a diffed line concatenate to the original line** · ansi256 picks the cube for a saturated colour and the ramp for a grey · every theme colour survives the 256 round trip (no colour becomes "terminal default") · the daltonized pair differs in hue · drawTest: only the changed token carries the word background
+- [x] Plus one `zig build ui-frame` scene (a `write` of a 600-line file) so the *composition* is judged — the question only that harness can answer
 
 **Acceptance**: green suite + the scene reads as designed at 80x24 and 200x50.
+
+### What was done, and what it cost to find out (2026-10-21)
+
+The three pieces (the word diff, the gutter, the colour ladder) were **written and
+never wired**: the gutter's caller passed `null, 0`, the ladder was called from
+nowhere outside `theme.zig`, and the word diff compared the indices of one token
+list against the indices of another. The first job was not writing the diff: it
+was finding out what was already there and what was broken about it.
+
+**The LCS was filling the table with the SUFFIX convention and walking it back
+with the PREFIX one.** The table had the right shape and the wrong answer, and
+the word diff it fed marked the wrong tokens. It looked right whenever the two
+lines happened to line up, which is most of the time in a small edit.
+
+**The word diff is computed where the diff is PAINTED.** The ranges used to
+travel in a map keyed by the line's TEXT, which was copied, freed and
+re-hydrated in five places (the paragraph, the pending item, the drain, the
+compression and the Ctrl+R toggle). Now `diffview.analyze` reads the diff text
+once and says what every row is: its number, the width of its hunk's gutter and
+the words that changed in it. The map is gone, and with it five places that
+could forget to free it.
+
+**A diff is not prose.** A deleted line starts with `- ` and the markdown
+parser read that as a BULLET: the row came out as a list item and the `+`/`-`
+that says what happened was gone. The diff now has its own path through the
+parser, before the fences, the headings, the quotes and the lists.
+
+**The highlighter's state is per SIDE, not per hunk.** A `-` row is a line of
+the old file and a `+` row is a line of the new one, so there are two states:
+a deleted line that opens a multiline string used to leave the ADDED line
+painted as inside a string.
+
+**Two tints per side.** The row is the band (the reader sees "this row is new")
+and the words are the point (the reader sees "this is what is new inside the
+row"). With ONE tint the changed words disappear into their own row, and a
+rewrite is a green wall.
+
+**The 256-colour ramp is a COMPETITOR and it was not one.** `ansi256FromRgb`
+only considered the grey ramp for colours with a saturation under 0.15, which
+is the fallback behaviour the rule warns about: a near-black green tint
+(#08120b) went to the cube, which has nothing between #000000 and #333333 in
+it, and the band the tint was supposed to paint disappeared. Both candidates
+are built now and the closer one wins.
+
+**The ladder is applied where the cell is written** (`Painter.putStable`), so
+there is ONE place that can send a colour the terminal cannot show. vaxis
+writes `38;2;r;g;b` whatever the terminal answered, and it does not ask: its
+own `COLORTERM` sniffing is commented out in the library. So the app asks the
+environment (`NO_COLOR`, `COLORTERM`, `TERM`), which is where every terminal
+documents the answer.
+
+**Not ported**: the `dim` style of the upstream. A collapsed preview is the
+quiet box here: it shows the row tints and NOT the word highlights, and
+Ctrl+R turns them on. That is the same rule with a different name.
 
 ---
 

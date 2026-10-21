@@ -596,6 +596,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
+    .{ .key = "/color", .desc = "the diff palette: default | daltonized (no args: picker)" },
     .{ .key = "/submodel", .desc = "which model the SUBAGENTS use (no args: report | <model> | <provider> <model> | off)" },
     .{ .key = "/task-parallel", .desc = "simultaneous subagent limit: 1..8 | auto", .key_hint = "1..8 | auto", .palette_visible = false },
     .{ .key = "/reload-cmds", .desc = "reload user commands from disk", .palette_visible = false },

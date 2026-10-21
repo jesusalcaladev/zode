@@ -140,6 +140,22 @@ pub const diff_add: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
 pub const diff_add_bg: vaxis.Style = bg(0x0e, 0x1f, 0x14);
 pub const diff_del: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
 pub const diff_del_bg: vaxis.Style = bg(0x22, 0x10, 0x0f);
+/// The tint of a WHOLE added row, one step fainter than the words that
+/// changed inside it.
+///
+/// Two tints per side, and the order matters: the line is the band (the
+/// reader sees "this row is new") and the words are the point (the reader
+/// sees "this is what is new inside the row"). With ONE tint the changed
+/// words disappear into their own line, and a diff of a rewritten function
+/// is a green wall.
+pub const diff_add_line_bg: vaxis.Style = bg(0x08, 0x12, 0x0b);
+pub const diff_del_line_bg: vaxis.Style = bg(0x15, 0x0a, 0x09);
+/// The line number in a diff's gutter.
+///
+/// It is CONTENT (the line to go and look at) and not chrome, so it is
+/// readable: `gutter` is a hairline color and a line number painted in it
+/// is a number nobody can read.
+pub const diff_gutter: vaxis.Style = rgb(0x85, 0x83, 0x80);
 /// A context line: the unchanged rows around a change. Dimmest thing in a diff
 /// that is still a word.
 ///
@@ -315,6 +331,11 @@ pub const text_pairs = [_][2]vaxis.Style{
     .{ brand_soft, well_bg },
     .{ ok, diff_add_bg },
     .{ err, diff_del_bg },
+    .{ diff_add, diff_add_line_bg },
+    .{ diff_del, diff_del_line_bg },
+    .{ diff_gutter, well_bg },
+    .{ diff_gutter, diff_add_line_bg },
+    .{ diff_gutter, diff_del_line_bg },
     .{ diff_ctx, well_bg },
     .{ code_text, well_bg },
     .{ code_kw, well_bg },
@@ -387,53 +408,120 @@ pub const Caps = struct {
     daltonized: bool = false,
 };
 
-/// Converts an sRGB triple to the nearest ANSI 256 color index.
-/// 
-/// The grey ramp (232-255) is a COMPETITOR, not a fallback — we quantize to
-/// the 6x6x6 color cube (16-231), build BOTH candidates (cube + ramp), and
-/// pick the closer in RGB distance. Beyond the ramp's range the cube corner
-/// is the only option.
-pub fn ansi256FromRgb(r: u8, g: u8, b: u8) u8 {
-    // Standard 6x6x6 color cube: indices 16-231
-    // Each component maps to 0-5: (value * 5) / 255
-    const cube_r = (@as(u16, r) * 5) / 255;
-    const cube_g = (@as(u16, g) * 5) / 255;
-    const cube_b = (@as(u16, b) * 5) / 255;
-    const cube_index = 16 + cube_r * 36 + cube_g * 6 + cube_b;
-    
-    // Grey ramp: indices 232-255 (24 levels of grey)
-    // Only consider if the color is close to grey (low saturation)
-    const max_c = @max(r, @max(g, b));
-    const min_c = @min(r, @min(g, b));
-    const saturation = if (max_c == 0) 0 else @as(f64, @floatFromInt(max_c - min_c)) / @as(f64, @floatFromInt(max_c));
-    
-    if (saturation < 0.15) {
-        const grey_level = (@as(u16, r) + @as(u16, g) + @as(u16, b)) / 3;
-        const ramp_index = 232 + (grey_level * 23) / 255;
-        // Pick closer in RGB distance
-        const cube_r_rgb = cube_r * 51;
-        const cube_g_rgb = cube_g * 51;
-        const cube_b_rgb = cube_b * 51;
-        // Grey ramp: 232=8, 233=18, ..., 255=238 (step 10)
-        const ramp_rgb = 8 + (ramp_index - 232) * 10;
-        
-        const dr = @as(i32, cube_r_rgb) - @as(i32, r);
-        const dg = @as(i32, cube_g_rgb) - @as(i32, g);
-        const db = @as(i32, cube_b_rgb) - @as(i32, b);
-        const cube_dist_sq = @as(u32, @abs(dr) * @abs(dr) + @abs(dg) * @abs(dg) + @abs(db) * @abs(db));
-        const cube_dist = @as(u32, @intFromFloat(@sqrt(@as(f64, @floatFromInt(cube_dist_sq)))));
-        
-        const dr2 = @as(i32, ramp_rgb) - @as(i32, r);
-        const dr2_abs = @abs(dr2);
-        const ramp_dist_sq = @as(u32, dr2_abs) * @as(u32, dr2_abs) * 3;
-        const ramp_dist = @as(u32, @intFromFloat(@sqrt(@as(f64, @floatFromInt(ramp_dist_sq))))); // *3 since ramp is grey
-        
-        if (ramp_dist < cube_dist) {
-            return @intCast(@min(255, ramp_index));
+/// What the terminal this app is talking to can do.
+///
+/// Set ONCE, at startup, and read by every paint. It is a global because the
+/// alternative is threading it through every painter, every style and every
+/// widget, and the capability of a terminal does not change while the app
+/// runs (except for the daltonized palette, which is a user choice and is
+/// changed on purpose).
+pub var caps: Caps = .{ .rgb = true };
+
+/// Reads the capabilities out of the environment.
+///
+/// vaxis does NOT ask the terminal whether it speaks truecolor: its DA1 probe
+/// answers the keyboard and the screen, and the `COLORTERM` sniffing in
+/// `Vaxis.queryTerminal` is commented out in the library. So the app asks the
+/// environment, which is where every terminal documents the answer:
+///
+///   - `NO_COLOR` (any value) → no color at all
+///   - `COLORTERM=truecolor|24bit` → truecolor
+///   - `TERM=…direct…` → truecolor
+///   - `TERM=…256color…` → the 256-color palette
+///   - anything else → truecolor, which is what a modern terminal does and
+///     what the app did before it had a ladder
+///
+/// The default is truecolor on purpose: a terminal that does not support it
+/// and does not say so is a terminal nobody has met.
+pub fn detectCaps(env: ?*std.process.Environ.Map) Caps {
+    var c = Caps{ .rgb = true };
+    if (env) |e| {
+        if (e.get("NO_COLOR")) |v| {
+            if (v.len > 0) c.no_color = true;
+        }
+        if (e.get("COLORTERM")) |v| {
+            if (std.ascii.eqlIgnoreCase(v, "truecolor") or std.ascii.eqlIgnoreCase(v, "24bit")) {
+                c.rgb = true;
+            }
+        }
+        if (e.get("TERM")) |v| {
+            if (std.mem.indexOf(u8, v, "direct") != null) {
+                c.rgb = true;
+            } else if (std.mem.indexOf(u8, v, "256color") != null) {
+                c.rgb = false;
+            }
         }
     }
-    
-    return @intCast(cube_index);
+    if (env) |e| {
+        if (e.get("ZODE_DALTONIZED")) |v| {
+            if (v.len > 0 and !std.ascii.eqlIgnoreCase(v, "0") and
+                !std.ascii.eqlIgnoreCase(v, "false"))
+            {
+                c.daltonized = true;
+            }
+        }
+    }
+    return c;
+}
+
+/// The style a terminal that cannot do truecolor gets.
+///
+/// This is the ONE place the ladder is applied: every cell is painted through
+/// it, so a color that cannot be shown never reaches the wire. An rgb triple
+/// on a 256-color terminal is not "a bit off", it is a byte sequence the
+/// terminal does not understand, and what it does with it is undefined.
+pub fn resolve(st: vaxis.Style) vaxis.Style {
+    return resolveStyle(st, caps);
+}
+
+/// Converts an sRGB triple to the nearest ANSI 256 color index.
+///
+/// The grey ramp (232-255) is a COMPETITOR, not a fallback: the 6x6x6 cube
+/// has no dark greys at all (its darkest is #000000) and it has no light ones
+/// either, so a terminal that only has the ramp is the only one that can
+/// show a very dark tint at all. Both candidates are built and the CLOSER one
+/// wins, in RGB distance.
+///
+/// The first version only considered the ramp for colours with a saturation
+/// below 0.15, which is the "fallback" behaviour the rule warns about: a
+/// near-black green tint (#08120b) went to the cube, which has nothing
+/// between #000000 and #333333 in it, and the band the tint was supposed to
+/// paint disappeared.
+pub fn ansi256FromRgb(r: u8, g: u8, b: u8) u8 {
+    // The 6x6x6 cube: indices 16-231, six levels per channel.
+    const cube_r: u16 = (@as(u16, r) * 5 + 127) / 255;
+    const cube_g: u16 = (@as(u16, g) * 5 + 127) / 255;
+    const cube_b: u16 = (@as(u16, b) * 5 + 127) / 255;
+    const cube_index: u16 = 16 + cube_r * 36 + cube_g * 6 + cube_b;
+    const cube_rgb = [3]i32{
+        @as(i32, cube_r) * 51,
+        @as(i32, cube_g) * 51,
+        @as(i32, cube_b) * 51,
+    };
+
+    // The grey ramp: indices 232-255, twenty-four greys from 8 to 238.
+    const avg: u16 = (@as(u16, r) + @as(u16, g) + @as(u16, b)) / 3;
+    var level: u16 = 0;
+    if (avg > 8) level = (avg - 8 + 5) / 10;
+    if (level > 23) level = 23;
+    const ramp_index: u16 = 232 + level;
+    const gray: i32 = 8 + @as(i32, @intCast(level)) * 10;
+    const ramp_rgb = [3]i32{ gray, gray, gray };
+
+    const to = [3]i32{ @as(i32, r), @as(i32, g), @as(i32, b) };
+    const cube_dist = distance(cube_rgb, to);
+    const ramp_dist = distance(ramp_rgb, to);
+    return @intCast(if (ramp_dist < cube_dist) ramp_index else cube_index);
+}
+
+/// The squared RGB distance between two triples.
+fn distance(a: [3]i32, b: [3]i32) i32 {
+    var sum: i32 = 0;
+    for (a, b) |x, y| {
+        const d = x - y;
+        sum += d * d;
+    }
+    return sum;
 }
 
 /// Converts a style to use ANSI 256 colors instead of RGB.
@@ -455,43 +543,89 @@ pub fn styleToAnsi256(st: vaxis.Style) vaxis.Style {
 /// - If caps.rgb: returns style as-is (truecolor)
 /// - If caps.no_color: strips all colors, keeps only bold
 /// - Otherwise: converts RGB to ANSI 256
-pub fn resolveStyle(st: vaxis.Style, caps: Caps) vaxis.Style {
-    if (caps.no_color) {
+pub fn resolveStyle(st: vaxis.Style, c: Caps) vaxis.Style {
+    if (c.no_color) {
         return .{ .bold = st.bold, .italic = st.italic, .strikethrough = st.strikethrough };
     }
-    if (caps.rgb) {
+    if (c.rgb) {
         return st;
     }
     return styleToAnsi256(st);
 }
 
-/// Returns the diff add/delete styles for the current capabilities.
-/// If daltonized is enabled, uses blue/orange instead of green/red.
-pub fn diffStyles(caps: Caps) DiffStyles {
-    if (caps.daltonized) {
-        // Blue/orange pair for deuteranopia/protanopia
-        return .{
-            .add = resolveStyle(rgb(0x4a, 0x9e, 0xff), caps),    // Blue
-            .del = resolveStyle(rgb(0xff, 0xa5, 0x00), caps),    // Orange
-            .add_bg = resolveStyle(bg(0x0a, 0x1a, 0x2a), caps),
-            .del_bg = resolveStyle(bg(0x2a, 0x15, 0x00), caps),
-        };
-    }
-    return .{
-        .add = resolveStyle(diff_add, caps),
-        .del = resolveStyle(diff_del, caps),
-        .add_bg = resolveStyle(diff_add_bg, caps),
-        .del_bg = resolveStyle(diff_del_bg, caps),
-    };
-}
-
-/// Diff styles container.
-const DiffStyles = struct {
+/// The diff's colours for a set of capabilities.
+///
+/// The daltonized pair is BLUE/ORANGE instead of GREEN/RED: the most common
+/// colour-vision deficiency collapses green and red into the same yellow, and
+/// a diff whose two halves are the same colour is a diff with no halves.
+pub const DiffStyles = struct {
     add: vaxis.Style,
     del: vaxis.Style,
     add_bg: vaxis.Style,
     del_bg: vaxis.Style,
+    add_line_bg: vaxis.Style,
+    del_line_bg: vaxis.Style,
 };
+
+pub fn diffStyles(c: Caps) DiffStyles {
+    if (c.daltonized) {
+        return .{
+            .add = resolveStyle(rgb(0x4a, 0x9e, 0xff), c), // blue
+            .del = resolveStyle(rgb(0xff, 0xa5, 0x00), c), // orange
+            .add_bg = resolveStyle(bg(0x0e, 0x1f, 0x2e), c),
+            .del_bg = resolveStyle(bg(0x2a, 0x1c, 0x05), c),
+            .add_line_bg = resolveStyle(bg(0x07, 0x11, 0x1a), c),
+            .del_line_bg = resolveStyle(bg(0x1a, 0x11, 0x03), c),
+        };
+    }
+    return .{
+        .add = resolveStyle(diff_add, c),
+        .del = resolveStyle(diff_del, c),
+        .add_bg = resolveStyle(diff_add_bg, c),
+        .del_bg = resolveStyle(diff_del_bg, c),
+        .add_line_bg = resolveStyle(diff_add_line_bg, c),
+        .del_line_bg = resolveStyle(diff_del_line_bg, c),
+    };
+}
+
+/// The `+` marker of an added row.
+///
+/// With no color at all the marker is BOLD: the sign is still there, and
+/// weight is the only thing left to make it stand out.
+pub fn diffAdd() vaxis.Style {
+    if (caps.no_color) return .{ .bold = true };
+    return diffStyles(caps).add;
+}
+
+/// The `-` marker of a deleted row.
+pub fn diffDel() vaxis.Style {
+    if (caps.no_color) return .{ .bold = true };
+    return diffStyles(caps).del;
+}
+
+/// The background of the CHANGED WORDS of an added row.
+pub fn diffAddBg() vaxis.Style {
+    if (caps.no_color) return .{};
+    return diffStyles(caps).add_bg;
+}
+
+/// The background of the CHANGED WORDS of a deleted row.
+pub fn diffDelBg() vaxis.Style {
+    if (caps.no_color) return .{};
+    return diffStyles(caps).del_bg;
+}
+
+/// The background of a whole added row.
+pub fn diffAddLineBg() vaxis.Style {
+    if (caps.no_color) return .{};
+    return diffStyles(caps).add_line_bg;
+}
+
+/// The background of a whole deleted row.
+pub fn diffDelLineBg() vaxis.Style {
+    if (caps.no_color) return .{};
+    return diffStyles(caps).del_line_bg;
+}
 
 test "contrast: the ratio is order-independent and correct on the anchors" {
     // White on black is the maximum; identical colors are 1.
@@ -629,6 +763,7 @@ test "every theme colour survives the 256 round trip" {
         user, assistant, tool_name, tool_arg, tool_res, notice, heading, bullet, quote,
         code_text, code_kw, code_kw2, code_builtin, code_type, code_str, code_comment, code_num, code_fn, code_deco,
         diff_add, diff_del, diff_ctx, diff_hunk, diff_stat_add, diff_stat_del,
+        diff_gutter, diff_add_bg, diff_del_bg, diff_add_line_bg, diff_del_line_bg,
         rail, gutter, gutter_soft,
         selected,
     };
@@ -681,8 +816,64 @@ test "hueSat: basic colors" {
     try std.testing.expect(daltonized_orange_hs.h >= 0.0 and daltonized_orange_hs.h < 360.0);
 }
 
-// test "the daltonized pair differs in hue" {
-//     // TODO: This test crashes with "failed without output" - investigate later
-//     // The daltonized colors work in "hueSat: basic colors" test
-//     // but crash in this test. Likely a test runner issue with float operations.
-// }
+test "the daltonized pair differs in HUE, not only in lightness" {
+    // A red/green pair is invisible to a reader with the most common
+    // colour-vision deficiency, and the deficiency does not make the two
+    // colours EQUAL: it moves them together in hue. So the quantity that
+    // separates them is the hue distance, and the test has to be on that and
+    // not on a contrast ratio (the green and the red have almost the same
+    // lightness, so a contrast test would say they are the SAME).
+    const s = diffStyles(.{ .rgb = true, .daltonized = true });
+    const a = hueSat(fgRgb(s.add).?);
+    const b = hueSat(fgRgb(s.del).?);
+    var dh = @abs(a.h - b.h);
+    if (dh > 180) dh = 360 - dh;
+    try std.testing.expect(dh >= 30);
+    // And the default pair is the green/red one, which is what a reader
+    // WITHOUT the deficiency expects.
+    const d = diffStyles(.{ .rgb = true });
+    const ga = hueSat(fgRgb(d.add).?);
+    const gb = hueSat(fgRgb(d.del).?);
+    try std.testing.expect(ga.h > 90 and ga.h < 160); // green
+    try std.testing.expect(gb.h < 20 or gb.h > 330); // red
+}
+
+test "the ladder: a terminal without truecolor gets the 256 palette" {
+    // The style is the same color; what changes is how it is written.
+    const st = rgb(0x4c, 0xc7, 0x6b);
+    const prev = caps;
+    defer caps = prev;
+
+    caps = .{ .rgb = true };
+    try std.testing.expect(resolve(st).fg == .rgb);
+
+    caps = .{ .rgb = false };
+    const idx = resolve(st).fg;
+    try std.testing.expect(idx == .index);
+
+    // And a terminal that asked for no color gets no color: the attributes
+    // survive, the color does not.
+    caps = .{ .no_color = true };
+    const plain = resolve(.{ .bold = true, .fg = .{ .rgb = .{ 1, 2, 3 } } });
+    try std.testing.expect(plain.bold);
+    try std.testing.expect(plain.fg == .default);
+}
+
+test "detectCaps: the environment decides, and the default is truecolor" {
+    var m = std.process.Environ.Map.init(std.testing.allocator);
+    defer m.deinit();
+
+    // No environment at all: truecolor, which is what the app did before it
+    // had a ladder.
+    const none = detectCaps(null);
+    try std.testing.expect(none.rgb);
+    try std.testing.expect(!none.no_color);
+    try std.testing.expect(!none.daltonized);
+
+    try m.put("NO_COLOR", "1");
+    try m.put("TERM", "xterm-256color");
+    const c = detectCaps(&m);
+    try std.testing.expect(c.no_color);
+    try std.testing.expect(!c.rgb); // 256color, and no truecolor claim
+}
+
