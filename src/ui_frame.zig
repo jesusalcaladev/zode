@@ -80,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "ask", .fill = sceneAsk },
         .{ .name = "perm", .fill = scenePerm },
         .{ .name = "palette", .fill = scenePalette },
+        .{ .name = "models", .fill = sceneModels },
         .{ .name = "plan", .fill = scenePlan },
         .{ .name = "long", .fill = sceneLong },
     };
@@ -379,6 +380,84 @@ fn scenePalette(m: *tui.Model) void {
     m.pushHeader(.idle);
     m.pushKind(.user, "/mo");
     m.openPaletteWith(.commands, paletteItems(), paletteGroups());
+}
+
+/// The MODELS palette (Ctrl+T): two columns, providers on the left and the
+/// models on the right.
+///
+/// It is a scene of its own because the two-column modal is where the
+/// geometry shows: how wide the box is, how many rows the list has, and
+/// whether the columns line up.
+fn sceneModels(m: *tui.Model) void {
+    m.pushHeader(.idle);
+    m.pushKind(.user, "/model");
+    m.openPaletteWith(.models, modelItems(), modelGroups());
+}
+
+/// A catalogue with enough models to overflow the list, which is the case
+/// where the geometry has to work.
+fn modelItems() []const palette.Item {
+    const gpa = std.heap.page_allocator;
+    var items: std.ArrayList(palette.Item) = .empty;
+    const providers = [_][]const u8{ "opencode", "openrouter", "anthropic", "groq" };
+    for (providers) |p| {
+        items.append(gpa, .{
+            .kind = .provider,
+            .group = 1,
+            .label = gpa.dupe(u8, p) catch return &.{},
+            .hint = gpa.dupe(u8, "active · connected") catch return &.{},
+        }) catch return &.{};
+    }
+    const models = [_][]const u8{
+        "xingchen-agi/xing4.0-29b-a4b:free",
+        "nvidia/nemotron-3.5-super-v1:free",
+        "dots-studio/dots-3-note-preview:free",
+        "liquid/lfm-2.5-2.6b:free",
+        "nvidia/nemotron-3.5-lightning:free",
+        "thinkingmachines/inkling-small:free",
+        "poolside/llama-s-2.1:free",
+        "cohere/north-mini-code:free",
+        "nvidia/nemotron-3-content-safety:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "google/lyria-3-pro-preview",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "openai/gpt-oss-120b:free",
+        "openai/gpt-oss-20b:free",
+        "mistralai/mistral-small-3.2-24b-instruct:free",
+        "qwen/qwen3-coder-30b-a3b:free",
+        "deepseek/deepseek-r1-0528:free",
+        "meta-llama/llama-4-scout-17b-16e-instruct:free",
+        "google/gemma-3-27b-it:free",
+        "openai/gpt-5-mini:free",
+        "z-ai/glm-4.5-air:free",
+        "arcee-ai/merge-labs-merge-model:free",
+        "bytedance/seed-oss-36b:free",
+    };
+    for (models) |mi| {
+        items.append(gpa, .{
+            .kind = .model,
+            .group = 2,
+            .label = gpa.dupe(u8, mi) catch return &.{},
+            .hint = gpa.dupe(u8, "openrouter · free") catch return &.{},
+            .ctx_tokens = 200_000,
+        }) catch return &.{};
+    }
+    items.append(gpa, .{
+        .kind = .connect,
+        .group = 3,
+        .label = gpa.dupe(u8, "+ connect") catch return &.{},
+        .hint = gpa.dupe(u8, "ctrl+a") catch return &.{},
+    }) catch return &.{};
+    return items.toOwnedSlice(gpa) catch return &.{};
+}
+
+fn modelGroups() []const palette.Group {
+    return &.{
+        .{ .name = "Providers" },
+        .{ .name = "Models" },
+        .{ .name = "Connect" },
+    };
 }
 
 fn scenePlan(m: *tui.Model) void {

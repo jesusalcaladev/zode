@@ -309,13 +309,24 @@ pub const Palette = struct {
         self.sel[c] = @intCast(next);
     }
 
-    /// Keeps the highlighted item inside the `rows` window.
-    pub fn clampScroll(self: *Palette, c: usize, rows: usize) void {
-        if (rows == 0) return;
-        if (self.sel[c] < self.scroll[c]) self.scroll[c] = self.sel[c];
-        if (self.sel[c] >= self.scroll[c] + rows) self.scroll[c] = self.sel[c] - rows + 1;
-        const n = self.filtered[c].items.len;
-        if (n > rows and self.scroll[c] > n - rows) self.scroll[c] = n - rows;
+    /// Keeps the selected row inside the window.
+    ///
+    /// The scroll is in ROWS (the list is drawn with the group headers inside
+    /// it, so an item's row is not its index) and `sel_row` is the row of the
+    /// selected item in that space. `total_rows` is how many rows the whole
+    /// column has.
+    ///
+    /// The old version clamped on the ITEM index against a window measured in
+    /// rows, and the mismatch showed up as a highlight that vanished one row
+    /// before the end of the list.
+    pub fn clampScrollRows(self: *Palette, c: usize, total_rows: usize, visible: usize, sel_row: ?usize) void {
+        if (visible == 0) return;
+        const sr = sel_row orelse return;
+        if (sr < self.scroll[c]) self.scroll[c] = sr;
+        if (sr >= self.scroll[c] + visible) self.scroll[c] = sr - visible + 1;
+        if (total_rows > visible and self.scroll[c] > total_rows - visible) {
+            self.scroll[c] = total_rows - visible;
+        }
     }
 
     /// Frees the owned items (labels and hints) and empties the list.
@@ -539,23 +550,45 @@ test "move: does not go past the ends" {
     try t.expectEqual(@as(usize, 0), pal.sel[0]);
 }
 
-test "clampScroll: the selection is always visible" {
+test "the selected row is always visible, even with a group header in the window" {
+    // The scroll is in ROWS and the window is in ROWS, because the list is
+    // drawn with the group headers inside it: an item's row is not its index.
+    // The old version clamped the ITEM index against a window measured in
+    // rows, and the highlight vanished one row before the end of the list.
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     var items: [10]Item = undefined;
-    for (&items) |*it| {
-        it.* = .{ .kind = .command, .label = "x" };
+    for (&items, 0..) |*it, i| {
+        // Two groups: the header and the blank line before it take two rows
+        // that are not items.
+        it.* = .{ .kind = .command, .label = "x", .group = if (i < 5) 1 else 2 };
     }
-    pal.setItems(&items, &.{});
+    pal.setItems(&items, &.{.{ .name = "one" }, .{ .name = "two" }});
+    pal.refilter();
 
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const rows = try columnRows(&pal, 0, arena_state.allocator());
+    // 10 items + 2 headers + 1 blank between the groups = 13 rows.
+    try t.expectEqual(@as(usize, 13), rows.len);
+
+    const visible: usize = 5;
+    // The LAST item: with the item-index clamp it landed on a row the
+    // headers had pushed out of the window.
     pal.sel[0] = 9;
-    pal.clampScroll(0, 4);
-    try t.expect(pal.sel[0] >= pal.scroll[0]);
-    try t.expect(pal.sel[0] < pal.scroll[0] + 4);
+    pal.clampScrollRows(0, rows.len, visible, selectedRow(&pal, 0, rows));
+    const sel_row = selectedRow(&pal, 0, rows).?;
+    try t.expect(sel_row >= pal.scroll[0]);
+    try t.expect(sel_row < pal.scroll[0] + visible);
 
+    // And back to the top: the selection is visible again. The scroll is not
+    // necessarily ZERO (the group's header is a row of its own and the window
+    // starts on the item), so the assertion is the INVARIANT and not a number.
     pal.sel[0] = 0;
-    pal.clampScroll(0, 4);
-    try t.expectEqual(@as(usize, 0), pal.scroll[0]);
+    pal.clampScrollRows(0, rows.len, visible, selectedRow(&pal, 0, rows));
+    const top_row = selectedRow(&pal, 0, rows).?;
+    try t.expect(top_row >= pal.scroll[0]);
+    try t.expect(top_row < pal.scroll[0] + visible);
 }
 
 // ── drawing ───────────────────────────────────────────────────
@@ -601,11 +634,18 @@ pub const Box = struct {
 
 /// Computes the modal's size. Models mode: two columns; commands: one.
 pub fn boxFor(pal: *const Palette, width: u16, height: u16) Box {
-    const w: u16 = @min(width -| 4, 76);
+    // The modal was 76 columns wide and the model ids are 40: the names were
+    // cut, the "openrouter · free" hints collided with them, and the whole
+    // thing looked cramped on a wide terminal. It takes what the terminal has
+    // (minus a margin) up to 110 columns, which is where a model id and its
+    // hint fit side by side.
+    const w: u16 = @min(width -| 4, 110);
     const h: u16 = @min(height -| 4, 24);
     // The key prompt needs more height: it has a field, a message and two hints.
     const hh: u16 = if (pal.mode == .key_prompt) @min(height -| 4, 12) else h;
     const two_cols = pal.mode == .models and pal.countIn(0) > 0;
+    // The providers column is a third: it holds short names and a key state,
+    // and the models column is the one that has to fit a 40-character id.
     const col_w: u16 = if (two_cols) @max(18, w / 3) else w;
     // h = border(1) + title(1) + search(1) + items + footer(1) + border(1)
     const list_rows: usize = if (hh > 7) @as(usize, hh) - 5 else 1;
@@ -635,8 +675,14 @@ pub fn draw(
     if (box.w < 24 or box.h < 8) return;
 
     // ── background and borders ──
+    //
+    // The wide cells of the row are split FIRST: a cell that claims many
+    // columns (the rule under the hero is one) makes the renderer skip the
+    // columns it covers, and the modal would be EATEN by the history behind
+    // it: the border disappears and the interior shows the rule.
     var y: u16 = 0;
     while (y < box.h) : (y += 1) {
+        tui.expandWideCells(p.surface, box.y + y, width);
         p.fillRange(box.x, box.x + box.w, box.y + y, " ", .{});
     }
     p.fillRange(box.x + 1, box.x + box.w - 1, box.y, "─", theme.brand_faint);
@@ -697,18 +743,71 @@ pub fn draw(
         while (ry < box.h - 2) : (ry += 1) {
             p.putStable(box.x + box.col_w, box.y + ry, "│", 1, theme.brand_faint);
         }
-        drawColumn(p, pal, box, 0, box.x + 1, box.col_w - 1, "");
-        drawColumn(p, pal, box, 1, box.x + box.col_w + 1, box.w - box.col_w - 2, notice);
+        // The models column keeps ONE column for the scrollbar: the list is
+        // cut (464 models, 19 rows) and a cut list with no sign that it goes
+        // on is a list that looks COMPLETE — the user reads "these are the
+        // models" and stops.
+        const r0 = drawColumn(p, pal, box, 0, box.x + 1, box.col_w - 1, "");
+        const r1 = drawColumn(p, pal, box, 1, box.x + box.col_w + 1, box.w - box.col_w - 3, notice);
+        drawColumnScrollbar(p, pal, box, box.x + box.w - 2, if (pal.column() == 0) r0 else r1);
     } else {
-        drawColumn(p, pal, box, 0, box.x + 1, box.w - 2, "");
+        // One column less: the scrollbar has its own column, so the hint on
+        // the right of a row is not painted under it.
+        const r0 = drawColumn(p, pal, box, 0, box.x + 1, box.w - 3, "");
+        drawColumnScrollbar(p, pal, box, box.x + box.w - 2, r0);
     }
 
     // ── footer ──
     drawFooter(p, pal, box, notice);
 }
 
+/// One row of a column: an item, a group header, or the blank line between
+/// two groups.
+const Row = struct {
+    kind: enum { item, group, blank },
+    /// The index into `filtered[c].items` (only for `.item`).
+    item: usize,
+    /// The group (only for `.group`).
+    group: u8,
+};
+
+/// The rows of a column, with the group headers and the blank lines between
+/// them.
+///
+/// The scroll is measured in ROWS and not in items, and that is the whole
+/// point: the list is drawn with the headers INSIDE it, so an item's row is
+/// not its index. A scroll measured in items left the selected row BELOW
+/// the last visible one as soon as a header was in the window — the list
+/// looked cut and the highlight was nowhere.
+fn columnRows(pal: *const Palette, c: usize, arena: std.mem.Allocator) ![]Row {
+    const filtered = pal.filtered[c].items;
+    var rows: std.ArrayList(Row) = .empty;
+    var last_group: u8 = 0;
+    for (filtered, 0..) |item_ix, i| {
+        const it = pal.items[item_ix];
+        if (it.group != 0 and it.group != last_group) {
+            last_group = it.group;
+            // A blank line between the groups (like opencode), and the header
+            // itself.
+            if (rows.items.len > 0) try rows.append(arena, .{ .kind = .blank, .item = 0, .group = 0 });
+            try rows.append(arena, .{ .kind = .group, .item = 0, .group = it.group });
+        }
+        try rows.append(arena, .{ .kind = .item, .item = i, .group = 0 });
+    }
+    return rows.toOwnedSlice(arena);
+}
+
+/// The row of the selected item of a column, or null when there is none.
+fn selectedRow(pal: *const Palette, c: usize, rows: []const Row) ?usize {
+    const sel = pal.sel[c];
+    for (rows, 0..) |r, i| {
+        if (r.kind == .item and r.item == sel) return i;
+    }
+    return null;
+}
+
 /// A column of items, with group header, scroll and highlight.
-fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, notice: []const u8) void {
+fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, notice: []const u8) usize {
     const filtered = pal.filtered[c].items;
     if (filtered.len == 0) {
         const msg: []const u8 = if (pal.mode == .connect)
@@ -718,69 +817,98 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, n
         else
             "no matches";
         _ = p.putClipped(x0 + 2, box.y + 3, msg, w -| 4, theme.hint);
-        return;
+        return 0;
     }
-    pal.clampScroll(c, box.list_rows);
+    const rows = columnRows(pal, c, p.arena) catch return 0;
+    pal.clampScrollRows(c, rows.len, box.list_rows, selectedRow(pal, c, rows));
 
-    var shown: usize = 0;
-    var last_group: u8 = 0;
-    var i = pal.scroll[c];
-    while (i < filtered.len and shown < box.list_rows) : (i += 1) {
-        const it = pal.items[filtered[i]];
-
-        // Group header, with a blank line before it (like opencode).
-        if (it.group != 0 and it.group != last_group) {
-            last_group = it.group;
-            if (shown > 0) {
-                shown += 1; // separator between groups
-                if (shown >= box.list_rows) break;
-            }
-            const gname = groupName(pal, it.group);
-            if (gname.len > 0 and w > 2) {
-                _ = p.putText(x0 + 1, box.y + 3 + @as(u16, @intCast(shown)), gname, theme.group);
-            }
-            shown += 1;
-            if (shown >= box.list_rows) break;
-        }
-
-        // CAREFUL: the row is computed AFTER the group block. If it were
-        // computed before, the label came out one row too high and the header
-        // ate its spot (the list looked out of order).
+    for (rows, 0..) |r, ri| {
+        if (ri < pal.scroll[c]) continue;
+        const shown = ri - pal.scroll[c];
+        if (shown >= box.list_rows) break;
         const row = box.y + 3 + @as(u16, @intCast(shown));
-        // Only the FOCUSED column really highlights. Before, both painted their
-        // selection alike and there was no way to know which one was active:
-        // you pressed the arrows and the models list did not move, which is
-        // exactly what makes you think the list does not exist.
-        const is_sel = i == pal.sel[c];
-        const focused = c == pal.column();
-        if (is_sel and focused) p.fillRange(x0, x0 + w, row, " ", theme.selected);
-        // In the unfocused column, the chosen row is marked with a ▸ in dim
-        // blue: you can see which one it is without it looking focused.
-        if (is_sel and !focused) _ = p.putText(x0, row, "▸", theme.brand_soft);
-        _ = p.putText(
-            x0 + 1,
-            row,
-            it.label,
-            if (is_sel) theme.item_sel else if (focused) theme.item else theme.dim,
-        );
+        switch (r.kind) {
+            .blank => {},
+            .group => {
+                const gname = groupName(pal, r.group);
+                if (gname.len > 0 and w > 2) {
+                    _ = p.putText(x0 + 1, row, gname, theme.group);
+                }
+            },
+            .item => {
+                const it = pal.items[filtered[r.item]];
 
-        // Right column aligned to the edge: shortcut, "free", price…
-        //
-        // Only if both LABEL and hint fit with a gap in between. Before, only
-        // whether the hint itself fit was checked, and in the narrow providers
-        // column the hint was painted ON TOP of the label and you read
-        // "anthrclaude-sonnet-4-5". The label wins: that is what you select.
-        const label_w = displayWidth(it.label);
-        const hint_w = displayWidth(it.hint);
-        if (hint_w > 0 and label_w + hint_w + 3 <= w) {
-            _ = p.putText(
-                x0 + w - 1 - @as(u16, @intCast(hint_w)),
-                row,
-                it.hint,
-                if (is_sel) theme.item_sel else theme.brand_faint,
-            );
+                // Only the FOCUSED column really highlights. Before, both
+                // painted their selection alike and there was no way to know
+                // which one was active: you pressed the arrows and the models
+                // list did not move, which is exactly what makes you think
+                // the list does not exist.
+                const is_sel = r.item == pal.sel[c];
+                const focused = c == pal.column();
+                if (is_sel and focused) p.fillRange(x0, x0 + w, row, " ", theme.selected);
+                // In the unfocused column, the chosen row is marked with a ▸ in
+                // dim blue: you can see which one it is without it looking
+                // focused.
+                if (is_sel and !focused) _ = p.putText(x0, row, "\u{25b8}", theme.brand_soft);
+                _ = p.putText(
+                    x0 + 1,
+                    row,
+                    it.label,
+                    if (is_sel) theme.item_sel else if (focused) theme.item else theme.dim,
+                );
+
+                // Right column aligned to the edge: shortcut, "free", price…
+                //
+                // Only if both LABEL and hint fit with a gap in between.
+                // Before, only whether the hint itself fit was checked, and in
+                // the narrow providers column the hint was painted ON TOP of
+                // the label and you read "anthrclaude-sonnet-4-5". The label
+                // wins: that is what you select.
+                const label_w = displayWidth(it.label);
+                const hint_w = displayWidth(it.hint);
+                if (hint_w > 0 and label_w + hint_w + 3 <= w) {
+                    _ = p.putText(
+                        x0 + w - 1 - @as(u16, @intCast(hint_w)),
+                        row,
+                        it.hint,
+                        if (is_sel) theme.item_sel else theme.brand_faint,
+                    );
+                }
+            },
         }
-        shown += 1;
+    }
+    return rows.len;
+}
+
+/// The scrollbar of the column that has the focus, on the right edge of the
+/// modal.
+///
+/// The list is CUT: 464 models do not fit in 19 rows, and the only sign that
+/// there are more is the scrollbar. Without it the list looks complete, and
+/// "complete" is a lie the user cannot see through.
+fn drawColumnScrollbar(p: *Painter, pal: *const Palette, box: Box, x: u16, total_rows: usize) void {
+    const c = pal.column();
+    const visible = box.list_rows;
+    // Everything fits: no scrollbar, and no thumb that lies about there being
+    // more.
+    if (total_rows <= visible) return;
+    const max_offset = total_rows - visible;
+    const metrics = tui.scrollbarThumb(visible, max_offset);
+    const first = @min(pal.scroll[c], max_offset);
+    const thumb_top = if (metrics.travel == 0)
+        0
+    else
+        metrics.travel * first / max_offset;
+    var row: usize = 0;
+    while (row < visible) : (row += 1) {
+        const in_thumb = row >= thumb_top and row < thumb_top + metrics.size;
+        p.putStable(
+            x,
+            box.y + 3 + @as(u16, @intCast(row)),
+            if (in_thumb) "\u{2588}" else "\u{2502}",
+            1,
+            if (in_thumb) theme.brand else theme.rule,
+        );
     }
 }
 
@@ -796,6 +924,22 @@ fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) vo
     const hint_x = box.x + box.w - 2 -| hint_width;
     if (hint.len > 0 and hint_width + 4 < box.w) {
         _ = p.putText(hint_x, fy, hint, theme.brand_soft);
+    }
+    // How far down the list we are, and how many there are. The scrollbar
+    // says "there is more"; this says "how much", and a number is what makes
+    // a cut list legible instead of mysterious.
+    {
+        const c = pal.column();
+        const total = pal.filtered[c].items.len;
+        if (total > 0) {
+            var cb: [32]u8 = undefined;
+            const counter = std.fmt.bufPrint(&cb, "{d}/{d}", .{ pal.sel[c] + 1, total }) catch "";
+            const cw: u16 = @intCast(displayWidth(counter));
+            if (cw > 0 and cw + 2 < box.w) {
+                const cx = if (hint_x > cw + 2) hint_x - cw - 2 else box.x + 2;
+                _ = p.putText(cx, fy, counter, theme.hint);
+            }
+        }
     }
     if (pal.mode == .models) {
         // Shortcut to connect without having to reach the item at the bottom.

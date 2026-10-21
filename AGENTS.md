@@ -4941,3 +4941,69 @@ picker se abre, el fichero escrito es el que el mensaje nombra, y Esc dice
 «Copy cancelled» y no un fallo—. Sin clave de API a propósito: la build
 ReleaseSmall se queda **dead** cuando el proveedor activo tiene una clave (el
 bug abierto más grande del repo), y `/copy` no necesita proveedor.
+
+---
+
+## El modal, la lista y la mascota (2026-10-20)
+
+Cuatro cosas que el usuario señaló en una captura del modal de modelos, y las
+cuatro eran bugs de verdad.
+
+### 1. La mascota va DEBAJO del input, no dentro del pozo
+
+El compositor era UN objeto: las filas del prompt y la del pie compartían la
+misma superficie hundida (`well_bg`) y la misma barra de acento (`▌`). En
+pantalla eso se leía como un bloque solo: el `▌›` del prompt y el `▌( o o )`
+de la mascota parecían las dos partes de un input, y la mascota parecía algo
+donde se puede escribir.
+
+Ahora **el pozo es solo las filas del prompt** y la fila del pie está DEBAJO,
+sobre el fondo del terminal, sin barra de acento. La mascota es el ESTADO, y
+el estado no es el input.
+
+El test que fijaba el diseño viejo (`there is nothing under the composer…`)
+está **reescrito a propósito**: un test que fija lo que se ha medido mal se
+borra en abierto, con el motivo.
+
+### 2. Los modales eran estrechos
+
+El de modelos medía 76 columnas y los ids de modelo miden 40: el nombre
+quedaba cortado y el hint ("openrouter · free") se le encima. Ahora el modal
+toma lo que hay (menos un margen) hasta **110 columnas**, y el picker, el
+dialog de permiso y el panel de `ask` también han crecido (104/104/110).
+
+### 3. La lista se cortaba SIN DECIRLO
+
+464 modelos en 19 filas: la lista se corta, y sin ningún signo de que siga el
+usuario lee "estos son los modelos" y se rinde. Ahora hay:
+
+- una **barra de scroll** en el borde derecho de la columna enfocada, y
+- un **contador** en el pie ("1/24").
+
+Y el scroll estaba **medido en ítems con la ventana medida en filas**: los
+cabeceras de grupo (`Models`, `Connect`) y la línea en blanco entre ellos
+viven DENTRO de la lista, así que la fila de un ítem no es su índice, y el
+resaltado desaparecía una fila antes del final. El scroll ahora es en
+**filas** (`columnRows` + `clampScrollRows`), que es el mismo espacio que la
+ventana.
+
+### 4. Las celdas anchas se comían el modal (el bug de verdad)
+
+La regla bajo el hero es **UNA celda** que reclama 95 columnas, y el renderer
+de vaxis **se salta las columnas que una celda ancha cubre**: escribe la celda
+y salta `width - 1` columnas. Un modal pintado encima de esa fila salía con
+un agujero: el borde desaparecía y la regla cruzaba el centro de la caja.
+
+Los overlays (el modal, el picker, el permiso, el panel de `ask`) **parten las
+celdas anchas antes de pintar** (`tui.expandWideCells`): la celda ancha se
+reescribe como una celda por columna, y a partir de ahí se puede pintar
+encima.
+
+El test mira la fila **como camina el renderer** (una celda ancha se escribe y
+las columnas que cubre se saltan), porque leer las celdas de la superficie
+daría "el borde está ahí" (está: el modal lo escribió) mientras el terminal
+nunca lo enseña.
+
+Y un detalle que costó una vuelta: el test NO puede buscar "hay una celda
+ancha" para no ser vacío, porque **el arreglo las parte** — "hay una celda
+ancha" es verdad exactamente cuando el bug está.

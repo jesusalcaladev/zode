@@ -5925,11 +5925,19 @@ fn drawInput(
 ) void {
     if (top >= p.height or width < 6) return;
 
-    // The well is the text rows PLUS the footer's row: the footer's row is
-    // painted by `drawStateFooter`, but the SURFACE is this function's job, or
-    // the mascot would float on the terminal's background with a dark block
-    // above it.
-    const well_h: u16 = input_h + 1;
+    // The well is the TEXT rows only.
+    //
+    // It used to be the text rows PLUS the footer's row, with the mascot
+    // inside the same sunken surface and under the same accent bar. On screen
+    // that read as one block: the `▌›` of the prompt and the `▌( o o )` of the
+    // mascot looked like the input had two parts, and the mascot looked like
+    // something you could type into.
+    //
+    // The mascot is the STATE, and the state is not the input. It now lives on
+    // its own row BELOW the well, on the terminal's background: the input
+    // block ends, and under it there is the line that says what the app is
+    // doing.
+    const well_h: u16 = input_h;
 
     // The composer surface: a subtle `well_bg` fill behind the input rows so
     // the composer reads as a SUNKEN SURFACE, distinct from the transcript
@@ -6138,7 +6146,12 @@ fn historyMargin(width: u16) u16 {
     return if (width > 8) 2 else 0;
 }
 
-fn scrollbarThumb(track_rows: usize, max_offset: usize) struct { size: usize, travel: usize } {
+/// The size and travel of a scrollbar's thumb.
+///
+/// Public because the palette has a scrollbar too (the models list is cut at
+/// 19 rows and there are 464 of them), and two implementations of "how big is
+/// the thumb" is two answers to the same question.
+pub fn scrollbarThumb(track_rows: usize, max_offset: usize) struct { size: usize, travel: usize } {
     if (track_rows == 0 or max_offset == 0) return .{ .size = track_rows, .travel = 0 };
     const total = track_rows + max_offset;
     const size = @max(1, track_rows * track_rows / total);
@@ -6172,6 +6185,46 @@ fn drawHistoryScrollbar(
     while (row < track_rows) : (row += 1) {
         const in_thumb = row >= thumb_top and row < thumb_top + metrics.size;
         p.putStable(col, @intCast(row), if (in_thumb) "█" else "│", 1, if (in_thumb) theme.brand else theme.rule);
+    }
+}
+
+/// Splits the WIDE cells of a row into one cell per column.
+///
+/// A cell can be wider than one column: the rule under the hero is ONE cell
+/// that carries ninety-five "─" and claims ninety-five columns, and vaxis's
+/// renderer SKIPS the cells a wide cell covers — it writes the wide cell and
+/// jumps `width - 1` columns ahead. So a modal painted over a row that has
+/// one of those cells is NOT painted: the rule eats the modal's border and its
+/// whole interior, and the modal looks like it has a hole in it.
+///
+/// The split writes the wide cell's graphemes one per column, so the row is
+/// made of ordinary cells and anything can be painted over it. It has to
+/// happen BEFORE the overlay paints: the expansion writes the rule's own
+/// graphemes into the columns the wide cell covered, and the overlay's cells
+/// have to come after them to win.
+///
+/// This is called by every overlay (the palette, the picker, the permission
+/// dialog, the ask panel) on the rows it is about to paint.
+pub fn expandWideCells(surface: *vxfw.Surface, row: u16, width: u16) void {
+    var col: u16 = 0;
+    while (col < width) : (col += 1) {
+        const cell = surface.readCell(col, row);
+        const cell_w = cell.char.width;
+        if (cell_w <= 1) continue;
+        const g = cell.char.grapheme;
+        var it = vaxis.unicode.graphemeIterator(g);
+        var c = col;
+        while (it.next()) |gr| {
+            if (c >= width) break;
+            surface.writeCell(c, row, .{
+                .char = .{ .grapheme = gr.bytes(g), .width = 1 },
+                .style = cell.style,
+            });
+            c += 1;
+        }
+        // The wide cell covered `cell_w` columns and the graphemes are one
+        // per column now: the loop continues after the last one.
+        col = if (c > 0) c - 1 else col;
     }
 }
 
@@ -6346,7 +6399,7 @@ fn drawPermissionModal(
     tool: []const u8,
     detail: []const u8,
 ) void {
-    const w: u16 = @min(width -| 6, 90);
+    const w: u16 = @min(width -| 6, 104);
     if (w < 30) return;
     const h: u16 = 9;
     if (height < h + 2) return;
@@ -6354,8 +6407,13 @@ fn drawPermissionModal(
     const y: u16 = (height -| h) / 2;
 
     // Background: without this the history items show through underneath.
+    //
+    // And the wide cells are split first: a cell that claims many columns
+    // makes the renderer skip the ones it covers, and the history's rule would
+    // eat the dialog's border.
     var r: u16 = 0;
     while (r < h) : (r += 1) {
+        expandWideCells(p.surface, y + r, width);
         p.fillRange(x, x + w, y + r, " ", .{});
     }
 
@@ -6483,7 +6541,7 @@ fn drawAskPanel(
     // overlap: `top = (height - box_h) / 2` here against `y0 = (height - box_h) / 4`
     // there, and this box is the WIDER one for any question over ~56 columns.
     const text_col_off: u16 = 2; // inside the borders
-    const box_w: u16 = @min(@as(u16, 100), width - 4);
+    const box_w: u16 = @min(@as(u16, 110), width - 4);
     const inner_w: u16 = if (box_w > 6) box_w - 4 else box_w - 2;
     const left: u16 = (width - box_w) / 2;
 
@@ -6512,6 +6570,7 @@ fn drawAskPanel(
         const compact_rows = @min(height, 7);
         var fill_row: u16 = 0;
         while (fill_row < compact_rows) : (fill_row += 1) {
+            expandWideCells(p.surface, fill_row, width);
             p.fillRange(0, width, fill_row, " ", theme.code_bg);
         }
         var compact_row: u16 = 0;
@@ -6574,8 +6633,13 @@ fn drawAskPanel(
 
     { // opaque background: the history behind is dense text and a box with the
         // history showing through reads as a rendering bug.
+        //
+        // And the wide cells are split first: a cell that claims many columns
+        // makes the renderer skip the ones it covers, and the history's rule
+        // would eat the panel's border.
         var br: u16 = 0;
         while (br < box_h) : (br += 1) {
+            expandWideCells(p.surface, top + br, width);
             p.fillRange(left, left + box_w, top + br, " ", theme.code_bg);
         }
     }
@@ -6898,6 +6962,13 @@ fn drawStateFooter(
 ) void {
     const right_edge: u16 = if (width > 2) width - 2 else width;
 
+    // The row is the app's own background, not the input's well: the mascot
+    // is UNDER the input, and it says so by being on a different surface.
+    // The fill is here because nothing else paints this row any more (the
+    // well stopped covering it), and a row that keeps the previous frame's
+    // pixels is a row with ghosts in it.
+    p.fillRange(0, width, row, " ", .{});
+
     // ── the LEFT group: the mascot and its legend ──
     var tr_name_buf: [64]u8 = undefined;
     const running_tool_name = self.toolRunName(&tr_name_buf);
@@ -7052,10 +7123,15 @@ fn drawStateFooter(
     const right_start: u16 = if (right_edge > right_width) right_edge - right_width else 0;
 
     // ── the left group ──
+    //
+    // NO background here: the footer's row is UNDER the input's well, on the
+    // terminal's own background. The styles used to carry `well_bg` because
+    // the mascot was inside the well, and keeping it painted the row in the
+    // input's surface — which is exactly what made the two look like one
+    // block.
     const left_limit: u16 = if (right_start > 2) right_start - 2 else right_edge;
     var col: u16 = 1;
-    var face_style = moodStyle(mood);
-    face_style.bg = theme.well_bg.bg;
+    const face_style = moodStyle(mood);
     col = p.putClipped(col, row, face_text, left_limit -| col, face_style);
     if (legend.len > 0) {
         // The legend is WHITE and the face is COLOURED, on purpose: with both
@@ -7064,7 +7140,6 @@ fn drawStateFooter(
         // mood). The face carries the mood; the word carries the phase.
         var legend_style = theme.ink;
         legend_style.bold = true;
-        legend_style.bg = theme.well_bg.bg;
         col = p.putClipped(col + 1, row, legend, left_limit -| col, legend_style);
     }
     if (detail.len > 0) {
@@ -7073,8 +7148,7 @@ fn drawStateFooter(
         // that may go when the row is narrow.
         const detail_cols: u16 = @intCast(columnsOf(p, detail));
         if (col + detail_cols <= left_limit) {
-            var detail_style = theme.ink2;
-            detail_style.bg = theme.well_bg.bg;
+            const detail_style = theme.ink2;
             col = p.putClipped(col + 1, row, detail, left_limit -| col, detail_style);
         }
     }
@@ -7210,15 +7284,22 @@ fn segsWidth(segs: []const InfoSeg) u16 {
 
 /// Centered modal in opencode style: title, filter, items with selection and footer.
 fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
-    const box_w: u16 = @min(width -| 4, 90);
+    // 104 columns: the picker's rows are "label  ·  description" and at 90
+    // the description was the part that got cut.
+    const box_w: u16 = @min(width -| 4, 104);
     const box_h: u16 = @min(height -| 4, 15);
     if (box_w < 20 or box_h < 6) return;
     const x0 = (width - box_w) / 2;
     const y0 = (height - box_h) / 4; // a bit above the center
 
     // clean background of the box
+    //
+    // The wide cells of the row are split FIRST: a cell that claims fifty
+    // columns (the rule under the hero is one) makes the renderer SKIP the
+    // columns it covers, and the box would be eaten by the history behind it.
     var yy = y0;
     while (yy < y0 + box_h) : (yy += 1) {
+        expandWideCells(p.surface, yy, width);
         p.fillRange(x0, x0 + box_w, yy, " ", .{});
     }
     // horizontal borders
@@ -9051,13 +9132,99 @@ test "the mascot is seven ASCII columns in every mood" {
     }
 }
 
-test "there is nothing under the composer: the well's footer is the last row" {
+test "the modal is not eaten by the history's wide cells" {
+    // The rule under the hero is ONE cell that claims the whole width, and
+    // vaxis's renderer SKIPS the cells a wide cell covers: it writes the wide
+    // cell and jumps `width - 1` columns ahead. A modal painted over that row
+    // came out with a HOLE in it — the border gone and the rule across the
+    // middle of the box.
+    //
+    // The overlays split the wide cells before they paint. This test pins
+    // that: the modal's border has to be there on EVERY row, including the
+    // one the rule is on.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushHeader(.idle);
+    // A message AFTER the hero: the rule under the hero is the separator of
+    // the paragraph that follows it, so without one there is no wide cell and
+    // the test would prove nothing.
+    m.pushKind(.user, "hola");
+    m.openPaletteWith(.commands, &.{}, &.{});
+
+    // A WIDE terminal on purpose: the modal is 110 columns and the terminal
+    // is 140, so the modal's left edge (column 15) is to the RIGHT of the
+    // rule's cell (column 2). When the two coincide the modal's own fill
+    // replaces the wide cell and the bug hides.
+    const w: u16 = 140;
+    const h: u16 = 30;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    const box = palette.boxFor(&m.pal, w, h);
+    try std.testing.expect(box.w > 24 and box.h > 8);
+    try std.testing.expect(box.x > 4); // the modal does NOT start where the rule does
+
+    // The rule's row: the separator that goes under the hero. It has to be ON
+    // a row of the modal, or the test proves nothing: a row with no rule
+    // cannot be eaten by one.
+    //
+    // It is found by the DASHES that the rule leaves to the LEFT of the modal
+    // (the modal's own background covers the rest of it), and NOT by looking
+    // for a wide cell: the fix SPLITS the wide cells, so "there is a wide
+    // cell" is true exactly when the bug is there.
+    const rule = "\u{2500}";
+    var rule_rows: usize = 0;
+    var row: u16 = box.y + 1;
+    while (row < box.y + box.h - 1) : (row += 1) {
+        var col: u16 = 2;
+        while (col < box.x) : (col += 1) {
+            const cell = s.readCell(col, row);
+            if (cell.char.grapheme.len > 0 and std.mem.startsWith(u8, cell.char.grapheme, rule)) {
+                rule_rows += 1;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(rule_rows > 0);
+
+    // Every row of the modal, walked the way the RENDERER walks it: a wide
+    // cell is written and the columns it covers are SKIPPED. Reading the
+    // surface's cells directly would say the border is there (it is: the
+    // modal wrote it) while the terminal never shows it — which is the bug.
+    row = box.y + 1;
+    while (row < box.y + box.h - 1) : (row += 1) {
+        var col: u16 = 0;
+        var left_seen = false;
+        var right_seen = false;
+        while (col < w) {
+            const cell = s.readCell(col, row);
+            const cw = @max(1, cell.char.width);
+            if (col == box.x and std.mem.eql(u8, cell.char.grapheme, "\u{2502}")) left_seen = true;
+            if (col == box.x + box.w - 1 and std.mem.eql(u8, cell.char.grapheme, "\u{2502}")) right_seen = true;
+            col += cw;
+        }
+        try std.testing.expect(left_seen);
+        try std.testing.expect(right_seen);
+    }
+}
+
+test "the mascot is BELOW the input's well, not inside it" {
     // The row under the input used to be a status row with a face on its left
     // and the model's name on its right and NOTHING in between, and it read as
     // a stray emoticon in the corner of an empty row.
     //
-    // Now the composer ends the screen: the prompt row, then the footer's row
-    // inside the SAME sunken surface, and then the edge of the terminal.
+    // Then the composer became ONE sunken surface: the prompt row and the
+    // footer's row inside the same well, with the accent bar running down
+    // both. That is what this test pinned — and it is what the user called
+    // confusing: the `▌›` of the prompt and the `▌( o o )` of the mascot
+    // looked like one input block with two parts, and the mascot looked like
+    // something you could type into.
+    //
+    // The mascot is the STATE, and the state is not the input. It is now on
+    // its own row BELOW the well, on the terminal's background, with no accent
+    // bar: the input block ends, and under it is the line that says what the
+    // app is doing.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -9066,19 +9233,22 @@ test "there is nothing under the composer: the well's footer is the last row" {
 
     const s = try drawTest(&m, arena_state.allocator(), 90, 24);
 
-    // The LAST row is the footer's: the mascot is on it, on the well's
-    // background, with the accent bar at its left.
+    // The LAST row is the footer's: the mascot is on it, on the terminal's
+    // background (NOT the well), with no accent bar at its left.
     const last = s.size.height - 1;
     const face_cell = s.readCell(1, last);
     try std.testing.expectEqualStrings("(", face_cell.char.grapheme);
-    try std.testing.expectEqual(theme.well_bg.bg, face_cell.style.bg);
+    try std.testing.expectEqual(vaxis.Color.default, face_cell.style.bg);
     const bar = s.readCell(0, last);
-    try std.testing.expectEqualStrings("▌", bar.char.grapheme);
+    try std.testing.expect(bar.char.grapheme.len == 0 or !std.mem.eql(u8, bar.char.grapheme, "▌"));
 
-    // The row above it is the prompt.
+    // The row above it is the prompt, and IT is on the well.
     const prompt_cell = s.readCell(1, last - 1);
     try std.testing.expectEqualStrings("›", prompt_cell.char.grapheme);
     try std.testing.expectEqual(theme.well_bg.bg, prompt_cell.style.bg);
+    // And the well's accent bar stops with the well.
+    const prompt_bar = s.readCell(0, last - 1);
+    try std.testing.expectEqualStrings("▌", prompt_bar.char.grapheme);
 }
 
 test "the state is in ONE place: the footer's row" {
