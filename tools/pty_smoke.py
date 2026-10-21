@@ -196,6 +196,19 @@ def main() -> int:
     ok &= check("ctrl+p opens the command palette", "Commands" in t2, t2)
     ok &= check("esc closes the palette and restores input", "after palette" in t2, t2)
 
+    # 2b) `?` on an empty input opens the shortcut list.
+    #
+    #    A command can be perfect and still do nothing when it is TYPED, and
+    #    this one is a key: the unit test opens the picker directly, which
+    #    proves nothing about the key that is supposed to open it.
+    out2b, t2b = drive([b"?", b"\x1b"])
+    ok &= check("? opens the shortcut list", "keyboard shortcuts" in t2b, t2b)
+    # And the legend of the permission glyphs travels with it: a glyph with
+    # no legend is a glyph nobody can read.
+    ok &= check("the shortcut list carries the mode legend", "accept-edits" in t2b, t2b)
+    ok &= check("no panic after ?", "panic" not in t2b.lower(), t2b)
+    ok &= check("no 'Invalid free' after ?", "invalid free" not in t2b.lower(), t2b)
+
     # 3) Connecting is a guided flow: choose a provider, back out of the key
     #    field to the provider list, then close. Escape must not change the modal
     #    into the unrelated model picker.

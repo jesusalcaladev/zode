@@ -4667,7 +4667,16 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     // Only when the input is empty: a `?` inside a prompt is a question
     // mark, and stealing it would be the kind of shortcut that makes people
     // hate shortcuts.
-    if (k.codepoint == '?' and !k.mods.ctrl and !k.mods.alt and
+    //
+    // THE CHARACTER IS LOOKED FOR IN `text` AND NOT ONLY IN THE CODEPOINT.
+    // The editor inserts printable keys from `key.text`, and with the kitty
+    // keyboard protocol the codepoint of a text key is not the character
+    // itself. The first version checked the codepoint only, and the key was
+    // inserted into the prompt like any other: the unit test opened the
+    // picker directly and the pty smoke typed the key and nothing happened.
+    // **A test that calls the function is not a test of the key.**
+    const is_question = (k.text != null and std.mem.eql(u8, k.text.?, "?")) or k.codepoint == '?';
+    if (is_question and !k.mods.ctrl and !k.mods.alt and
         self.ed.text().len == 0 and !self.pal.active and !self.pickerActive())
     {
         openShortcutsPicker(self);
