@@ -12313,3 +12313,25 @@ test "render: a diff row that wraps stays under the code" {
     const first_char = std.mem.indexOfNone(u8, cont, " ").?;
     try std.testing.expectEqual(code_col, first_char);
 }
+
+test "/color switches the diff palette and says what it did" {
+    // The daltonized pair (blue/orange) is the one that survives the most
+    // common colour-vision deficiency, and a palette that changed without
+    // saying so is a palette the user cannot trust.
+    const prev = theme.caps;
+    defer theme.caps = prev;
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    theme.caps = .{ .rgb = true };
+    try agent.submit(&m, "/color daltonized");
+    try std.testing.expect(theme.caps.daltonized);
+
+    try agent.submit(&m, "/color default");
+    try std.testing.expect(!theme.caps.daltonized);
+
+    // An unknown palette is refused and it does NOT change anything.
+    try agent.submit(&m, "/color mauve");
+    try std.testing.expect(!theme.caps.daltonized);
+}
