@@ -44,8 +44,9 @@ pub const user_subdir = "zode/commands";
 /// than the task it was written for.
 pub const max_body = 64 * 1024;
 
-/// Past this the LIST itself becomes the tax (same reasoning as
-/// `skills.max_listed`): they stay on disk, they are just not offered.
+/// Past this the LIST itself becomes the tax (same reasoning as the skills
+/// listing, which is under a BUDGET now): they stay on disk, they are just
+/// not offered.
 pub const max_cmds = 48;
 
 pub const max_name = 40;

@@ -99,14 +99,14 @@ state, the open bug and the quality bar).
 
 `✨ feature · 🔴 · depends on 1`
 
-- [ ] **2.1** Listing under a budget ⚡
-  - [ ] Budget = **1% of `ZODE_CONTEXT_LIMIT`**, per-entry cap **250 chars**; bundled entries never truncated; worst case: names only
-  - [ ] Replaces the fixed `max_listed = 40`
+- [x] **2.1** Listing under a budget ⚡ — **DONE 2026-10-21** (`src/lib/skills.zig`): the budget is **1% of `ZODE_CONTEXT_LIMIT`** in characters (at the same ~4 chars/token the compaction estimate uses), the per-entry cap is **250 columns**, a **bundled** entry is never truncated, and the ladder when it does not fit is: everything in full → the bundled ones keep their description and the rest degrade to their **name** → everything degrades to its name → entries are left out from the end and the note says how many. The fixed `max_listed = 40` is **gone**. Two details that are decisions and not details: the budget comes from `ZODE_CONTEXT_LIMIT` and **not** from the model's published window (the free-auto rotation changes the model every turn, and a budget that moved with it would rewrite the system prompt — and invalidate the provider's cache — every turn), and the **header is not part of the budget** (the budget buys entries; a header with no list under it is a shape that costs sixty tokens per request to say nothing). Under the budget the bytes are **the same as before**, so the cached prefix keeps its warmth.
+  - [x] Budget = **1% of `ZODE_CONTEXT_LIMIT`**, per-entry cap **250 chars**; bundled entries never truncated; worst case: names only
+  - [x] Replaces the fixed `max_listed = 40`
 - [ ] **2.2** Send the listing **once per session** as an attachment at the END of the prompt (cacheable prefix untouched); dedupe per session; reset on config reload, NOT on compaction
 - [ ] **2.3** Named args (`$1`, `$name`) substituted into the body
 - [ ] **2.4** `context: fork` runs the skill via `lib/subagent.zig` (effort low, read-only, disposable window) and returns the result to the main turn
 - [ ] **2.5** `!cmd` inside a skill: run the command, substitute its output (behind Phase 6 permissions)
-- [ ] Tests: budget caps total size · bundled survive a tight budget while others degrade to names · args substituted · a fork skill leaves the parent message list length unchanged
+- [ ] Tests: budget caps total size ✓ · bundled survive a tight budget while others degrade to names ✓ · args substituted · a fork skill leaves the parent message list length unchanged
 
 ---
 
@@ -869,8 +869,8 @@ that we are not going to copy): `/login`, `/logout`,
 
 | Constant | Value | Phase |
 |---|---|---|
-| Skill listing budget | 1% of `ZODE_CONTEXT_LIMIT` | 2 |
-| Skill per-entry cap | 250 chars | 2 |
+| Skill listing budget | 1% of `ZODE_CONTEXT_LIMIT` (in chars) | 2.1 ✓ |
+| Skill per-entry cap | 250 chars | 2.1 ✓ |
 | `default_max_result_chars` | 50 000 | 0/3 |
 | `max_result_bytes` | 400 000 | 3 |
 | `max_results_per_message_chars` | 200 000 | 3 |

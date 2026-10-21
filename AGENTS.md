@@ -1975,6 +1975,35 @@ the **directory**, which is what actually exists on disk: a frontmatter `name`
 that does not match the directory would make the tool call fail and the model has
 no way to recover.
 
+## The listing is under a BUDGET (2026-10-21)
+
+The listing was capped at 40 entries, a constant that says nothing about the
+model and nothing about the project. It is now **1% of `ZODE_CONTEXT_LIMIT`**,
+in characters, at the same ~4 chars/token the compaction estimate uses.
+
+Three decisions, and the two first ones are about the CACHE (the listing lives
+in the biggest stable prefix of every request):
+
+- **The budget comes from `ZODE_CONTEXT_LIMIT` and NOT from the model's
+  published window.** The free-auto rotation changes the active model every
+  turn; a budget that moved with it would rewrite the system prompt — and
+  invalidate the provider's cache for the whole request — every turn.
+- **The header is not part of the budget.** The budget buys ENTRIES. A header
+  with no list under it is a shape that costs sixty tokens per request to say
+  nothing, so what gets cut is the list and never the sentence explaining it.
+- **Under the budget the bytes are the same as before**, so the cached prefix
+  keeps its warmth. There is a test that pins the exact bytes.
+
+The ladder when it does not fit (`src/lib/skills.zig`): everything in full →
+the **bundled** entries keep their description and the rest degrade to their
+**name** → everything degrades to its name → entries are left out from the end
+and the note says how many. A bundled description is never truncated by the
+250-column per-entry cap: those are ours, and truncating them hides the one
+thing the model has to read to decide.
+
+The note is the last thing to go, and it is 57 characters: a list that is cut
+without saying so reads as "these are all of them".
+
 ## Three things that hung on the way
 
 1. **`readPrefix` returned a slice of its own stack** (`.zode-skills-test-N`).

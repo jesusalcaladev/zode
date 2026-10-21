@@ -100,18 +100,36 @@ pub fn getBundled(name: []const u8) ?BundledSkill {
 /// Returns all bundled skills as Entry structs for the prompt.
 ///
 /// These are appended AFTER on-disk skills so they can be shadowed.
+///
+/// **Every string is a COPY the caller owns**, and that is not a detail: the
+/// loader frees an entry's name, description and "when to use", and a literal
+/// freed with the allocator is an "Invalid free" — the kind that only shows up
+/// in the teardown of whoever used the list.
 pub fn bundledEntries(gpa: std.mem.Allocator) ![]skills.Entry {
     var entries = std.ArrayList(skills.Entry).empty;
     try entries.ensureTotalCapacity(gpa, bundled_skills.len);
+    errdefer entries.deinit(gpa);
 
     for (bundled_skills) |s| {
         var path_buf: [128]u8 = undefined;
         const path_str = std.fmt.bufPrint(path_buf[0..], "bundled://{s}", .{s.name}) catch return error.OutOfMemory;
         const path = gpa.dupe(u8, path_str) catch return error.OutOfMemory;
+        errdefer gpa.free(path);
+        const name = gpa.dupe(u8, s.name) catch return error.OutOfMemory;
+        errdefer gpa.free(name);
+        const description = gpa.dupe(u8, s.description) catch return error.OutOfMemory;
+        errdefer gpa.free(description);
+        const when = gpa.dupe(u8, s.when_to_use) catch return error.OutOfMemory;
+        errdefer gpa.free(when);
         const entry = skills.Entry{
-            .name = s.name,
-            .description = s.description,
+            .name = name,
+            .description = description,
             .path = path,
+            // The source matters: the listing under a budget never truncates a
+            // BUNDLED description, and it decides that by the source.
+            .source = .bundled,
+            .when_to_use = when,
+            .context = s.context,
         };
         try entries.append(gpa, entry);
     }
@@ -159,5 +177,8 @@ test "bundledEntries returns valid entries" {
         try std.testing.expect(e.name.len > 0);
         try std.testing.expect(e.description.len > 0);
         try std.testing.expect(std.mem.startsWith(u8, e.path, "bundled://"));
+        // The source is what tells the listing under a budget that this
+        // description is OURS and must not be truncated.
+        try std.testing.expect(e.source == .bundled);
     }
 }

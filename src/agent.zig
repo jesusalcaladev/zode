@@ -498,12 +498,34 @@ pub fn buildSystemPromptFor(
     return gpa.dupe(u8, buildSystemPrompt(gpa, &buf, env));
 }
 
+/// The room the SKILLS LISTING has, in characters.
+///
+/// 1% of the context window: `ZODE_CONTEXT_LIMIT` when it is set, the 128k
+/// default when it is not.
+///
+/// Two decisions worth writing down, because both of them are about the cache:
+///
+/// 1. **The MODEL's window is not part of it.** The board says "1% of
+///    `ZODE_CONTEXT_LIMIT`", and that is also the only stable answer: the
+///    free-auto rotation changes the active model on every turn, and a budget
+///    that moved with the model would rewrite the system prompt — and
+///    invalidate the provider's cache for the whole request — on every turn.
+/// 2. **The environment comes from `environ_global` when the caller has none.**
+///    The prompt is composed TWICE with two different arguments
+///    (`buildSystemPromptFor` gets the real environment, `syncSystemPrompt`
+///    gets `null`), and a budget that differed between the two would make the
+///    two prompts differ — the same cache bust, one step later.
+fn skillListingBudget(env: ?*const std.process.Environ.Map) usize {
+    const e = env orelse environ_global;
+    return skills.budgetCharsFor(compaction.contextLimitFor(e, 0));
+}
+
 fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process.Environ.Map) []const u8 {
     const base = systemPromptBase(gpa);
     const entries = discoverSkills(gpa, env);
 
-    var list_buf: [8 * 1024]u8 = undefined;
-    const section = skills.systemPromptSection(entries, &list_buf);
+    var list_buf: [16 * 1024]u8 = undefined;
+    const section = skills.systemPromptSection(entries, skillListingBudget(env), &list_buf);
 
     var loc_buf: [512]u8 = undefined;
     const location = project_info.promptLines(&loc_buf);
@@ -11271,7 +11293,128 @@ test "ask: the per-turn cap is 3, and it is in the guidance" {
 
 test "skills: with no directories the prompt section is EMPTY (0 tokens)" {
     var buf: [512]u8 = undefined;
-    try std.testing.expectEqualStrings("", skills.systemPromptSection(&.{}, &buf));
+    try std.testing.expectEqualStrings("", skills.systemPromptSection(&.{}, 1024, &buf));
+}
+
+test "the skills listing budget comes from ZODE_CONTEXT_LIMIT, and not from the model" {
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZODE_CONTEXT_LIMIT", "6000");
+    // 1% of 6000 tokens is 60 tokens, which is 240 characters.
+    try std.testing.expectEqual(@as(usize, 240), skillListingBudget(&map));
+
+    // The MODEL's window is not part of it. The free-auto rotation changes the
+    // active model on every turn, and a budget that moved with the model would
+    // rewrite the system prompt — and invalidate the provider's cache for the
+    // whole request — on every turn.
+    const saved_ctx = cur_model_ctx;
+    defer cur_model_ctx = saved_ctx;
+    cur_model_ctx = 1_000_000;
+    try std.testing.expectEqual(@as(usize, 240), skillListingBudget(&map));
+    cur_model_ctx = 0;
+
+    // And with no environment at all, the default window: 1% of 128k.
+    const saved = environ_global;
+    environ_global = null;
+    defer environ_global = saved;
+    try std.testing.expectEqual(@as(usize, 5120), skillListingBudget(null));
+}
+
+/// The environment a prompt-building test needs, and the teardown that puts the
+/// module globals back.
+///
+/// It is a helper and not a copy in each test because the globals ARE the trap:
+/// an `Io` that is `undefined` until startup assigns it (a file read through it
+/// is a GPF, not a zero), a project directory that must not be the repository of
+/// whoever runs the suite, and two caches that outlive the test's arena.
+///
+/// The caches are DROPPED and not freed: a rescan frees the previous list with
+/// `gpa_global`, and the list was allocated with this test's arena. Freeing it
+/// here is an "Invalid free"; dropping the reference lets the arena have it.
+const PromptTestEnv = struct {
+    arena_state: std.heap.ArenaAllocator,
+    threaded: std.Io.Threaded,
+    saved_io: std.Io,
+    saved_gpa: std.mem.Allocator,
+    saved_env: ?*const std.process.Environ.Map,
+    saved_agents: ?[]u8,
+
+    fn init() PromptTestEnv {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer arena_state.deinit();
+        var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+        errdefer threaded.deinit();
+
+        const saved_agents = agents_md_cache;
+        agents_md_cache = null;
+        styles_cache = null;
+        styles_stamp_len = 0;
+        styles_rescans = 0;
+        skills_cache = null;
+        skills_stamp_len = 0;
+        skills_rescans = 0;
+
+        io_global = threaded.io();
+        gpa_global = std.testing.allocator;
+        setProjectInfoForTest(io_global, "/tmp");
+
+        return .{
+            .arena_state = arena_state,
+            .threaded = threaded,
+            .saved_io = io_global,
+            .saved_gpa = gpa_global,
+            .saved_env = environ_global,
+            .saved_agents = saved_agents,
+        };
+    }
+
+    fn deinit(self: *PromptTestEnv) void {
+        styles_cache = null;
+        styles_stamp_len = 0;
+        styles_rescans = 0;
+        skills_cache = null;
+        skills_stamp_len = 0;
+        skills_rescans = 0;
+        agents_md_cache = self.saved_agents;
+        gpa_global = self.saved_gpa;
+        io_global = self.saved_io;
+        environ_global = self.saved_env;
+        self.threaded.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn allocator(self: *PromptTestEnv) std.mem.Allocator {
+        return self.arena_state.allocator();
+    }
+};
+
+test "the skills listing in the PROMPT goes under a tight budget" {
+    // The wiring: the budget has to reach the prompt and not only the pure
+    // function. A budget that is computed and never used is a comment.
+    var env = PromptTestEnv.init();
+    defer env.deinit();
+
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZODE_CONTEXT_LIMIT", "6000");
+
+    var buf: [16 * 1024]u8 = undefined;
+    const tight = buildSystemPrompt(env.allocator(), &buf, &map);
+    // The bundled skills are there, but only their NAMES: 1% of a 6000-token
+    // window is 240 characters, and that is not a description.
+    try std.testing.expect(std.mem.indexOf(u8, tight, "- simplify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tight, "Review a diff for reuse") == null);
+}
+
+test "the skills listing in the PROMPT keeps the descriptions when there is room" {
+    // A budget that quietly emptied the list would look like a feature.
+    var env = PromptTestEnv.init();
+    defer env.deinit();
+
+    var buf: [16 * 1024]u8 = undefined;
+    const roomy = buildSystemPrompt(env.allocator(), &buf, null);
+    try std.testing.expect(std.mem.indexOf(u8, roomy, "- simplify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roomy, "Review a diff for reuse") != null);
 }
 
 test "prompt: the routing guide survives the project's AGENTS.md" {
