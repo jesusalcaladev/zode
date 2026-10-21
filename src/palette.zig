@@ -388,7 +388,111 @@ pub fn matches(item: Item, groups: []const Group, q: []const u8) bool {
     for (groups, 0..) |g, i| {
         if (i + 1 == item.group and containsIgnoreCase(g.name, q)) return true;
     }
+    // The FUZZY fallback: the query as a subsequence of the label.
+    //
+    // It is what upstream's picker does (`code-base/components/design-system/
+    // FuzzyPicker.tsx:74-76`) and it is the difference between a search box
+    // and a search box that forgives: "cs4" finds "claude-sonnet-4-5".
+    //
+    // It is LAST, on purpose: an exact match always wins, so the item the
+    // user meant is never pushed down by a lucky subsequence.
+    var buf: [64]u32 = undefined;
+    if (fuzzyMatch(item.label, q, &buf) != null) return true;
     return false;
+}
+
+// ── fuzzy matching ────────────────────────────────────────────
+
+/// How much wider than the query the matched window may be.
+///
+/// The rule exists because a subsequence match with no width limit matches
+/// almost everything: "abc" is a subsequence of half a model catalogue, and a
+/// filter that returns half the list is a filter that does not filter.
+///
+/// The window is generous (three times the query, plus eight) because what
+/// is searched is a model id with a provider prefix and a version suffix:
+/// "cs4" has to reach "claude-sonnet-4-5" and that is 15 characters wide.
+pub const fuzzy_window_slack: usize = 8;
+
+/// Matches the query as a SUBSEQUENCE of the label and says WHICH
+/// characters matched.
+///
+/// The positions are BYTE offsets into the label, written into `buf`; the
+/// return value is how many there are, or null when the query is not a
+/// subsequence of the label.
+///
+/// Two decisions that are not obvious:
+///
+/// * **Leftmost.** The scan starts where the previous match ended, so a
+///   scattered match never beats an earlier one. The user typed the
+///   characters in an order and the first place they appear is the one they
+///   meant.
+/// * **Runs win.** A run of consecutive characters is taken whole, and it is
+///   the substring when there is one. "bc" in "a-xbc" highlights "bc" and
+///   not "b" alone with a lonely "c" four columns away.
+pub fn fuzzyMatch(label: []const u8, q: []const u8, buf: []u32) ?usize {
+    if (q.len == 0) return 0;
+    if (q.len > buf.len) return null;
+    var n: usize = 0;
+    var li: usize = 0;
+    var qi: usize = 0;
+    while (qi < q.len) {
+        // The first occurrence of this character at or after the last match.
+        var j = li;
+        while (j < label.len) : (j += 1) {
+            if (std.ascii.toLower(label[j]) == std.ascii.toLower(q[qi])) break;
+        }
+        if (j >= label.len) return null;
+        // And the run that starts there, taken whole.
+        var run: usize = 1;
+        while (qi + run < q.len and j + run < label.len and
+            std.ascii.toLower(label[j + run]) == std.ascii.toLower(q[qi + run])) : (run += 1)
+        {}
+        for (0..run) |k| {
+            buf[n] = @intCast(j + k);
+            n += 1;
+        }
+        li = j + run;
+        qi += run;
+    }
+    // The WINDOW: the matched characters have to fit in a span that is not
+    // much wider than the query. Without it the fuzzy fallback is noise.
+    const span = buf[n - 1] - buf[0] + 1;
+    if (span > q.len * 3 + fuzzy_window_slack) return null;
+    return n;
+}
+
+/// The positions to HIGHLIGHT in the label, for the given query.
+///
+/// It prefers the contiguous substring (the common case, and the one the eye
+/// reads as "the match") and falls back to the fuzzy positions.
+pub fn highlightPositions(label: []const u8, q: []const u8, buf: []u32) ?usize {
+    if (q.len == 0) return null;
+    if (label.len > 0 and startsWithIgnoreCase(label, q)) {
+        for (q, 0..) |_, i| buf[i] = @intCast(i);
+        return q.len;
+    }
+    if (containsIgnoreCase(label, q)) {
+        const at = indexOfIgnoreCase(label, q) orelse return null;
+        for (q, 0..) |_, i| buf[i] = @intCast(at + i);
+        return q.len;
+    }
+    return fuzzyMatch(label, q, buf);
+}
+
+/// The first position of `needle` in `hay`, ignoring the case.
+///
+/// `std.mem` has no case-insensitive index in this Zig version, and writing
+/// it here is four lines: the ASCII comparison is the same one
+/// `containsIgnoreCase` already uses.
+pub fn indexOfIgnoreCase(hay: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > hay.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return i;
+    }
+    return null;
 }
 
 pub fn startsWithIgnoreCase(hay: []const u8, needle: []const u8) bool {
@@ -850,11 +954,14 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, n
                 // dim blue: you can see which one it is without it looking
                 // focused.
                 if (is_sel and !focused) _ = p.putText(x0, row, "\u{25b8}", theme.brand_soft);
-                _ = p.putText(
+                putLabelHighlighted(
+                    p,
                     x0 + 1,
                     row,
                     it.label,
+                    pal.queryText(),
                     if (is_sel) theme.item_sel else if (focused) theme.item else theme.dim,
+                    if (is_sel) theme.brand_bold else theme.brand,
                 );
 
                 // Right column aligned to the edge: shortcut, "free", price…
@@ -878,6 +985,60 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, n
         }
     }
     return rows.len;
+}
+
+/// Paints a label with the MATCHED characters in the accent colour.
+///
+/// This is upstream's "the matched characters are highlighted" (the fuzzy
+/// picker, `code-base/components/design-system/FuzzyPicker.tsx:74-76`), and it
+/// is the half of the fuzzy search that the user actually sees: the list says
+/// WHICH part of "anthropic/claude-sonnet-4-5" answered the query.
+///
+/// The positions are BYTE offsets and the painting walks GRAPHEMES, so the
+/// two meet at the grapheme's first byte: a match that lands inside a
+/// multi-byte character highlights the whole character, which is the only
+/// thing that can be painted.
+fn putLabelHighlighted(
+    p: *Painter,
+    col: u16,
+    row: u16,
+    label: []const u8,
+    query: []const u8,
+    base: vaxis.Style,
+    hl: vaxis.Style,
+) void {
+    if (label.len == 0) return;
+    var positions: [64]u32 = undefined;
+    const n = highlightPositions(label, query, &positions) orelse 0;
+    if (n == 0) {
+        _ = p.putText(col, row, label, base);
+        return;
+    }
+    // The label is copied into the frame arena, like `putText` does: a pointer
+    // to a stack temporary reaches the renderer as garbage.
+    const stable = p.arena.dupe(u8, label) catch {
+        _ = p.putText(col, row, label, base);
+        return;
+    };
+    var it = vaxis.unicode.graphemeIterator(stable);
+    var c = col;
+    var off: usize = 0;
+    while (it.next()) |g| {
+        const b = g.bytes(stable);
+        const gw = p.measure(b);
+        if (c + gw > p.width) break;
+        // Is the grapheme's first byte one of the matched ones?
+        var matched = false;
+        for (positions[0..n]) |pos| {
+            if (pos == off) {
+                matched = true;
+                break;
+            }
+        }
+        p.putStable(c, row, b, gw, if (matched) hl else base);
+        c += gw;
+        off += b.len;
+    }
 }
 
 /// The scrollbar of the column that has the focus, on the right edge of the
@@ -1608,4 +1769,62 @@ test "the key message carries whether it is an error, instead of the drawing gue
     pal.close();
     try t.expect(!pal.keyMessageIsError());
     try t.expectEqualStrings("", pal.keyMessage());
+}
+
+test "fuzzy: the query is a subsequence of the label, and the positions say which" {
+    var buf: [64]u32 = undefined;
+
+    // The ordinary case: a model id with a provider prefix and a version.
+    const n = fuzzyMatch("anthropic/claude-sonnet-4-5", "cs4", &buf).?;
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(u32, 8), buf[0]); // the 'c' of "claude"
+    try std.testing.expectEqual(@as(u32, 17), buf[1]); // the 's' of "sonnet"
+    try std.testing.expectEqual(@as(u32, 24), buf[2]); // the '4'
+
+    // Case does not matter: it is a search box, not a compiler.
+    try std.testing.expect(fuzzyMatch("Claude-Sonnet", "son", &buf) != null);
+
+    // Not a subsequence: no match, and the caller has to say so.
+    try std.testing.expect(fuzzyMatch("claude-sonnet", "zzz", &buf) == null);
+}
+
+test "fuzzy: a run of consecutive characters wins over a scattered one" {
+    // "bc" in "a-xbc": the highlight has to be the RUN, because a "b" alone
+    // with a lonely "c" four columns away does not read as a match.
+    var buf: [64]u32 = undefined;
+    const n = fuzzyMatch("a-xbc", "bc", &buf).?;
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u32, 3), buf[0]);
+    try std.testing.expectEqual(@as(u32, 4), buf[1]);
+}
+
+test "fuzzy: the window keeps the fallback from matching everything" {
+    // Without a width limit, "abc" is a subsequence of half a catalogue, and
+    // a filter that returns half the list is a filter that does not filter.
+    var buf: [64]u32 = undefined;
+    try std.testing.expect(fuzzyMatch("a-very-long-label-that-goes-on-and-on", "abc", &buf) == null);
+    // …and the same query on a tight label does match.
+    try std.testing.expect(fuzzyMatch("abc", "abc", &buf) != null);
+}
+
+test "matches: the fuzzy fallback finds what the substring does not" {
+    const groups = [_]Group{.{ .name = "Models" }};
+    const item = Item{ .kind = .command, .label = "anthropic/claude-sonnet-4-5" };
+
+    // The substring finds it.
+    try std.testing.expect(matches(item, &groups, "sonnet"));
+    // The fuzzy finds the abbreviation.
+    try std.testing.expect(matches(item, &groups, "cs4"));
+    // And something that is not there at all does not.
+    try std.testing.expect(!matches(item, &groups, "qqq"));
+}
+
+test "highlightPositions: the substring is preferred over the fuzzy positions" {
+    var buf: [64]u32 = undefined;
+    // "sonnet" in "claude-sonnet-4-5": the CONTIGUOUS run, not the first
+    // scattered one.
+    const n = highlightPositions("claude-sonnet-4-5", "sonnet", &buf).?;
+    try std.testing.expectEqual(@as(usize, 6), n);
+    try std.testing.expectEqual(@as(u32, 7), buf[0]);
+    try std.testing.expectEqual(@as(u32, 12), buf[5]);
 }

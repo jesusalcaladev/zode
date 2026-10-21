@@ -903,6 +903,21 @@ pub const Model = struct {
     /// Pinned to the bottom. When true the draw ignores `anchor` and shows
     /// `max_offset`, which is what makes new text follow you down.
     follow_bottom: bool = true,
+    /// The number of paragraphs that existed when the reader scrolled AWAY
+    /// from the bottom.
+    ///
+    /// It is the baseline for the "N new" counter: everything appended after
+    /// this point is what the reader has not seen. Upstream counts the same
+    /// thing (`code-base/components/FullscreenLayout.tsx:200-223`) and calls
+    /// it the unseen divider.
+    unseen_base_para: usize = 0,
+    /// Whether the reader is away from the bottom right now.
+    ///
+    /// It is a separate flag and not `!follow_bottom`, because the flag also
+    /// has to be true when the reader was away and the new text ARRIVED: the
+    /// counter must keep counting while the reader reads, not reset because
+    /// the view did not move.
+    was_away: bool = false,
     /// What the LAST frame painted, published for the `↓ N` indicator and for
     /// the tests. `max_offset - first_visible` is what has to be shown to the
     /// user: the raw offset used to be shown, debt included.
@@ -2246,6 +2261,10 @@ pub const Model = struct {
             // exactly the amount the fix was supposed to absorb.
             first = t.max_offset;
             self.follow_bottom = true;
+            // The reader is back at the bottom (or never left): the "N new"
+            // count ends here, and the baseline moves with the history.
+            self.was_away = false;
+            self.unseen_base_para = self.paras.items.len;
             self.setAnchorLine(first);
         } else {
             self.follow_bottom = false;
@@ -4135,12 +4154,42 @@ pub const Model = struct {
         // Reaching the bottom re-arms the follow, so the next line that arrives
         // keeps coming at you instead of freezing the view where you happened to
         // land.
+        const was_following = self.follow_bottom;
         self.follow_bottom = (first >= mo);
+        // The "N new" baseline moves with the reader: leaving the bottom starts
+        // a new count, and coming back to it ends the one that was running.
+        //
+        // It is set HERE, where the reader's decision is, and not in the draw:
+        // the draw knows what arrived, but only this knows when the reader
+        // stopped looking.
+        if (self.follow_bottom) {
+            self.was_away = false;
+            self.unseen_base_para = self.paras.items.len;
+        } else if (was_following) {
+            self.was_away = true;
+            self.unseen_base_para = self.paras.items.len;
+        }
         // Published HERE, not only by the draw. The key handler knows the new
         // view the moment it computes it, and the `↓ N` indicator must not show
         // the previous frame's number while waiting for one.
         self.first_visible = first;
         self.max_offset = mo;
+    }
+
+    /// How many assistant turns the reader has not seen.
+    ///
+    /// It counts TURNS and not paragraphs, the way upstream counts them
+    /// (`code-base/components/FullscreenLayout.tsx:200-213`): a tool-only
+    /// entry must not tick the counter, or "3 new" would be "3 tool calls" and
+    /// the reader would come back to a turn that says nothing.
+    fn unseenTurns(self: *const Model) usize {
+        if (!self.was_away) return 0;
+        const base = @min(self.unseen_base_para, self.paras.items.len);
+        var n: usize = 0;
+        for (self.paras.items[base..]) |p| {
+            if (p.kind == .assistant) n += 1;
+        }
+        return n;
     }
 
     fn snapshotSelectableHistory(self: *Model, surface: vxfw.Surface, rows: u16) !void {
@@ -6357,9 +6406,22 @@ fn drawPermissionModal(
     detail: []const u8,
 ) void {
     const w: u16 = @min(width -| 6, 104);
-    if (w < 30) return;
     const h: u16 = 9;
-    if (height < h + 2) return;
+    // A TERMINAL TOO SMALL FOR THE BOX IS NOT A REASON TO PAINT NOTHING.
+    //
+    // It used to `return` here, and this function is what BLOCKS the turn: the
+    // worker spins until the user answers, and on a 30-column terminal there
+    // was no dialog to answer with. The app looked exactly like the "it stops
+    // answering" bug — the input was dead because it was waiting for a key
+    // nobody could know to press.
+    //
+    // The compact form asks the same question in two rows and fits in 20
+    // columns. The direction that matters: it is better to show a cramped
+    // question than an invisible one.
+    if (w < 30 or height < h + 2) {
+        drawPermissionModalCompact(p, width, height, tool);
+        return;
+    }
     const x: u16 = (width -| w) / 2;
     const y: u16 = (height -| h) / 2;
 
@@ -6420,6 +6482,48 @@ fn drawPermissionModal(
         if (i + 1 < opts.len and ox + 4 < x + w) {
             ox = p.putText(ox, y + 7, "   ", theme.brand_faint);
         }
+    }
+}
+
+/// The permission question in TWO ROWS, for a terminal that has no room for the
+/// box.
+///
+/// The box needs 36 columns and 11 rows. A 30-column terminal (a split pane, a
+/// phone over SSH) does not have them, and the question is still asked: the
+/// worker is waiting for an answer that the user cannot give. So the question
+/// is asked in the smallest form that still says WHAT and HOW to answer it:
+///
+///     ⚠ Permission: bash
+///     Y allow · A always · N deny · ESC cancel
+///
+/// Two rows, 24 columns, and it is painted at the BOTTOM of the screen, over
+/// the history: the bottom is where the eye is, and the bottom is where the
+/// input box is, so the question and the thing that is blocked are together.
+fn drawPermissionModalCompact(
+    p: *Painter,
+    width: u16,
+    height: u16,
+    tool: []const u8,
+) void {
+    if (height == 0 or width == 0) return;
+    const rows: u16 = if (height >= 2) 2 else 1;
+    const y: u16 = height - rows;
+
+    // The whole row is cleared first: the history would show through the
+    // question, and a question you cannot read is a question you cannot answer.
+    var r: u16 = 0;
+    while (r < rows) : (r += 1) {
+        expandWideCells(p.surface, y + r, width);
+        p.fillRange(0, width, y + r, " ", .{});
+    }
+
+    var nb: [64]u8 = undefined;
+    const head = std.fmt.bufPrint(&nb, "⚠ Permission: {s}", .{tool}) catch "⚠ Permission";
+    _ = p.putClipped(1, y, head, width -| 2, theme.warn_bold);
+
+    if (rows >= 2) {
+        const opts = "Y allow · A always · N deny · ESC cancel";
+        _ = p.putClipped(1, y + 1, opts, width -| 2, theme.brand_soft);
     }
 }
 
@@ -7050,13 +7154,39 @@ fn drawStateFooter(
     const scrolled = !self.follow_bottom;
     var latest_idx: ?usize = null;
     if (scrolled and rn + 1 < right.len) {
-        if (rn > 0) {
-            right[rn] = .{ .text = "  ", .style = theme.line };
+        // "↓ 3 new" instead of "↓ latest", when the reader is away and
+        // something arrived.
+        //
+        // Upstream floats a centred "N new messages" pill over the transcript
+        // (`code-base/components/FullscreenLayout.tsx:491-537`) and the count
+        // is the point: "latest" says where you can go, "3 new" says what you
+        // are missing. The pill is the fancier half of it and it is a separate
+        // piece of chrome; the NUMBER is what changes the day.
+        //
+        // The count is of ASSISTANT TURNS, not of paragraphs: a tool line is
+        // not something the reader is missing an answer to.
+        const unseen = self.unseenTurns();
+        const label: []const u8 = if (unseen > 0) "↓ new" else "↓ latest";
+        if (unseen > 0) {
+            if (rn > 0) {
+                right[rn] = .{ .text = "  ", .style = theme.line };
+                rn += 1;
+            }
+            var nb2: [24]u8 = undefined;
+            const txt = std.fmt.bufPrint(&nb2, "↓ {d} new", .{unseen}) catch label;
+            const owned = arena.dupe(u8, txt) catch "";
+            right[rn] = .{ .text = owned, .style = theme.brand };
+            latest_idx = rn;
+            rn += 1;
+        } else {
+            if (rn > 0) {
+                right[rn] = .{ .text = "  ", .style = theme.line };
+                rn += 1;
+            }
+            right[rn] = .{ .text = label, .style = theme.brand };
+            latest_idx = rn;
             rn += 1;
         }
-        right[rn] = .{ .text = "↓ latest", .style = theme.brand };
-        latest_idx = rn;
-        rn += 1;
     }
 
     // The right group gives up pieces, from the tail, until the state fits.
@@ -7168,6 +7298,15 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     }
 
     // Permission mode: only show when NOT default (read-only/bypass are deviations).
+    //
+    // `accept_edits` is deliberately NOT shown, and there is a test that pins
+    // it ("the normal permission modes cost NOTHING on the row"): `default`
+    // and `accept_edits` are what a coding session looks like, and spending 12
+    // columns on the word "accept edits" in every row of every session is what
+    // made this row unreadable. Upstream shows the mode as a GLYPH
+    // (`code-base/components/PromptInput/PromptInputFooterLeftSide.tsx:348-355`),
+    // which is the way to have it and keep the row cheap — that is on the
+    // board as 33.1.
     switch (agent.currentPermMode()) {
         .read_only, .bypass => {
             if (out.items.len > 0) {
@@ -7176,6 +7315,25 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
             out.append(arena, .{ .text = agent.permModeName(), .style = theme.warn }) catch return null;
         },
         .default, .accept_edits => {},
+    }
+
+    // The EFFECTIVE effort level: the one that goes on the wire, after the
+    // model's own ladder degraded it.
+    //
+    // The preference is not the same thing and showing it would be a lie: the
+    // footer would say `xhigh` while the request carries `high`, and the user
+    // would be told the model is thinking harder than it is. AGENTS.md has the
+    // whole story (`effortFor` degrades DOWNWARDS, never upwards).
+    //
+    // It is only shown when the model HAS a knob: a model with no effort
+    // control has no level to show, and a footer full of words nobody can act
+    // on is a footer nobody reads.
+    if (chat.effortSupport(shown_model) != .none) {
+        const eff = agent.effectiveEffort();
+        if (out.items.len > 0) {
+            out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
+        }
+        out.append(arena, .{ .text = eff.label(), .style = theme.ink2 }) catch return null;
     }
 
     // Free-auto mode indicator.
@@ -12334,4 +12492,138 @@ test "/color switches the diff palette and says what it did" {
     // An unknown palette is refused and it does NOT change anything.
     try agent.submit(&m, "/color mauve");
     try std.testing.expect(!theme.caps.daltonized);
+}
+
+test "the permission question is painted even when the terminal has no room for the box" {
+    // The dialog BLOCKS the turn: the worker waits for an answer. On a
+    // terminal with no room for the box, the old code painted NOTHING, and the
+    // app looked exactly like the "it stopped answering" bug — the input was
+    // dead because it was waiting for a key nobody could know to press.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.perm_tool_len = @min("bash".len, m.perm_tool.len);
+    @memcpy(m.perm_tool[0..m.perm_tool_len], "bash");
+    m.perm_active = true;
+
+    // 24 columns: too narrow for the 36-column box.
+    const s = try drawTest(&m, arena, 24, 10);
+    var buf: [256]u8 = undefined;
+
+    // The question is on screen, with the tool's name on it.
+    var saw_question = false;
+    var row: u16 = 0;
+    while (row < s.size.height) : (row += 1) {
+        const text = rowText(s, row, &buf);
+        if (std.mem.indexOf(u8, text, "Permission") != null) saw_question = true;
+    }
+    try std.testing.expect(saw_question);
+
+    // And the four ways to answer are on screen too: a question you cannot
+    // answer is the same as no question.
+    var saw_options = false;
+    row = 0;
+    while (row < s.size.height) : (row += 1) {
+        const text = rowText(s, row, &buf);
+        if (std.mem.indexOf(u8, text, "Y allow") != null) saw_options = true;
+    }
+    try std.testing.expect(saw_options);
+}
+
+test "the footer counts the assistant turns the reader has not seen" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        m.pushInfoFmt("linea corta {d}", .{i});
+        m.pushKind(.assistant, "una respuesta un poco mas larga que la anterior");
+    }
+
+    // The first frame LAYS OUT the history: the heights are estimates until
+    // the paragraphs are parsed, and the scroll needs a real `max_offset` to
+    // have something to scroll away from.
+    _ = try drawTest(&m, arena, 60, 20);
+    try std.testing.expectEqual(@as(usize, 0), m.unseenTurns());
+
+    // The reader scrolls up: the baseline is now the end of the history.
+    m.scrollBy(6);
+    try std.testing.expect(!m.follow_bottom);
+    try std.testing.expectEqual(@as(usize, 0), m.unseenTurns());
+
+    // Two answers arrive while the reader is away.
+    m.pushKind(.assistant, "tercera respuesta");
+    m.pushKind(.assistant, "cuarta respuesta");
+    _ = try drawTest(&m, arena, 60, 20);
+    try std.testing.expectEqual(@as(usize, 2), m.unseenTurns());
+
+    // A TOOL line is not an answer the reader is missing: upstream counts
+    // turns, not entries, and a counter that ticks on every tool call is a
+    // counter the reader learns to ignore.
+    m.pushKind(.tool_res, "⎿  read 10 lines");
+    _ = try drawTest(&m, arena, 60, 20);
+    try std.testing.expectEqual(@as(usize, 2), m.unseenTurns());
+
+    // Back at the bottom: the count is over.
+    m.scrollTo(m.currentMaxOffset());
+    try std.testing.expect(m.follow_bottom);
+    try std.testing.expectEqual(@as(usize, 0), m.unseenTurns());
+}
+
+test "status: the footer shows the EFFECTIVE effort, and only when there is a knob" {
+    // The preference is not the level that goes on the wire: the model's own
+    // ladder degrades it (an `xhigh` on a model that tops out at `high`
+    // becomes `high`). A footer that said `xhigh` while the request carried
+    // `high` would be telling the user a story about the model that is not
+    // true.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const saved_model = agent.curModel();
+    const saved_effort = agent.current_effort;
+    // The model that is ANSWERING is a global that another test may have set
+    // (the router and the free pool both write it), and the footer reads THAT
+    // one. It is cleared here and restored on the way out, because a test that
+    // depends on the order of the suite is a test that fails on a Tuesday.
+    const saved_answering = agent.curAnswering();
+    defer {
+        agent.setModel(saved_model);
+        agent.current_effort = saved_effort;
+        agent.setAnswering(saved_answering);
+    }
+    agent.setAnswering("");
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // A model WITH a knob: the level has to be on the row.
+    agent.setModel("gpt-5.1");
+    agent.current_effort = .high;
+    @memcpy(m.status_model_buf[0.."gpt-5.1".len], "gpt-5.1");
+    m.status_model_len = "gpt-5.1".len;
+    m.status_model_tried = true;
+
+    var segs = sessionInfo(&m, arena_state.allocator()).?;
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "high") != null);
+
+    // A model WITHOUT one: there is no level to show, and a row full of
+    // words nobody can act on is a row nobody reads.
+    agent.setModel("kimi-k2.6");
+    @memcpy(m.status_model_buf[0.."kimi-k2.6".len], "kimi-k2.6");
+    m.status_model_len = "kimi-k2.6".len;
+
+    segs = sessionInfo(&m, arena_state.allocator()).?;
+    joined.clearRetainingCapacity();
+    for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "high") == null);
 }

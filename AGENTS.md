@@ -5306,3 +5306,120 @@ all in the first version of the hint.
 **A preview is a quiet box.** A collapsed diff shows the row tints and NOT the
 word highlights, and Ctrl+R turns them on. The upstream calls the same thing
 `dim`; here it is a flag on the paragraph.
+
+---
+
+# The analysis, the board, and the crash that was ours (2026-10-21)
+
+Four agents read the tree and the vendored upstream (`code-base/`, Claude Code's
+own source) in parallel. The four reports are in `docs/analysis/` and the
+findings became three new phases of `TASKS.md` (33 the TUI, 34 the machinery,
+35 the command surface) plus a fourth that is a fix list (36).
+
+**The upstream is a real reference, not a blog post.** `code-base/` is 1902
+files of TypeScript. Every row of the port list cites a `path:line` in it, and
+the port list says what we are **better** at, because a port list that only
+says "they have it and we do not" is a wish list.
+
+## The crash: two `defer`s and a free
+
+The open bug of 2026-10-14 — "ReleaseSmall + a saved key = the TUI stops
+answering" — was **ours since the warmup was written**, and it was not a hang.
+
+```zig
+fn warmupWorker(job: *WarmupJob) void {
+    defer job.model.endWorker();            // registered FIRST  -> runs LAST
+    defer job.model.allocator.destroy(job); // registered SECOND -> runs FIRST
+```
+
+`defer` is LIFO. The job was freed and then `job.model.endWorker()`
+dereferenced the freed block to do its atomic RMW. The backtrace:
+
+```
+#0 atomic.Value(usize).fetchSub at std/atomic.zig:57
+#1 tui.Model.endWorker         at tui.zig:3222
+#2 agent.warmupWorker          at agent.zig:8810   <- rdi = 0x3 (garbage)
+```
+
+`modelsWorker`, a hundred lines away, already had the right order. The fix
+copies the pointer into a local FIRST, so the second defer never reads the job
+it is about to free.
+
+**Three things about the diagnosis that were wrong, and what they cost:**
+
+- "The app stops answering" — it died with signal 11. The probe killed the
+  child before reading its status, and a crash read as a hang.
+- "ReleaseSmall + a saved key" — the real trigger is a **cold model catalogue
+  cache**. With a warm cache the warmup never runs. With the provider
+  unreachable, EVERY build dies.
+- "Gating the warmup off changed nothing" — **the flag did not exist in the
+  tree**. The elimination that pointed away from the right file was
+  unverifiable, and it is the reason the bug was open for a month.
+
+The lesson is the one this file keeps repeating: **a mechanism that explains
+the symptom is not evidence that it IS the symptom.**
+
+## Two build steps that lied
+
+`zig build debug` — the step whose whole job is to be a trustworthy artifact
+for a crash — **did not compile**: `debug_mod` was missing the `build_options`
+import. The `zode-debug` on disk was a leftover of some earlier build,
+byte-identical to the stripped release one.
+
+`-Dstrip=false` did not disable the stripping, because `strip = null` is not
+"unstripped", it is "use the default", and the default for ReleaseSmall is TO
+STRIP. An option that is not written down does not mean anything.
+
+**A build step's DESCRIPTION is part of the interface**, and here the
+description was confidently false and was consulted as evidence.
+
+## The TUI port: what went in, and what did not
+
+Done: the **effective effort** in the footer (the level that goes on the wire,
+not the preference) · the **"N new" counter** (assistant TURNS, not entries) ·
+the **fuzzy picker** with the matched characters highlighted · the **compact
+permission dialog**.
+
+**The permission dialog is the one that was a HANG.** It needs 36 columns and
+11 rows, and it used to `return` when it did not have them: nothing was
+painted, and the dialog BLOCKS the turn. A 30-column terminal asked a question
+that could not be seen and could not be answered, and the app looked exactly
+like the "it stopped answering" bug. Now it asks in two rows.
+
+**`accept edits` is NOT in the footer, and that is a decision, not an
+oversight.** There is a test that pins "the normal permission modes cost
+NOTHING on the row": `default` and `accept_edits` are what a coding session
+looks like, and 12 columns on every row is what made it unreadable. Upstream
+shows the mode as a GLYPH (`○ ◐ ● ◉`), which is how to have it and keep the
+row cheap — that is board item 33.1, and it is the way to settle it.
+
+## The fuzzy picker, and the window that keeps it honest
+
+The query is a **subsequence** of the label, leftmost, and a RUN of
+consecutive characters wins ("bc" in "a-xbc" highlights the run, not a
+scattered "b").
+
+**The window is what makes it a filter and not a lottery**: the matched
+characters have to fit in a span of at most `3 × query + 8`. Without it "abc"
+is a subsequence of half a model catalogue, and a filter that returns half the
+list is a filter that does not filter. The window is generous because what is
+searched is a model id with a provider prefix and a version suffix ("cs4" has
+to reach "claude-sonnet-4-5", 15 characters wide).
+
+**The fuzzy is a FALLBACK**: an exact match always wins, so the item the user
+meant is never pushed down by a lucky subsequence. The list keeps the
+provider's order (the free models first is deliberate), and upstream sorts by
+score: that is a decision, not a port.
+
+## The board
+
+`TASKS.md` Phase 33 (the TUI port list, 21 items), Phase 34 (sixteen
+mechanisms upstream has and we do not, of which **34.1 — path-scoped
+permissions** — is the one that should not wait: today `write` writes any
+path it is handed) and Phase 35 (the command surface: 72 upstream commands,
+26 gaps) were written from the reports, not from memory.
+
+**The one that matters most in all three**: upstream blocks writes to `.git/`,
+`.claude/`, `.vscode/`, `.idea/` and the shell configs, and constrains reads
+to the working directory. We have nothing. A harness that gives the model
+`write` with no path rules is one `rm -rf` away from a very bad afternoon.
