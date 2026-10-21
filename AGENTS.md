@@ -5499,3 +5499,70 @@ paragraphs are parsed), and without it `scrollBy` has nothing to scroll.
 **A scene that cannot show the state is not evidence.** The unit tests say
 "the header names the turn" and "the pill says how many"; the scene says
 whether the two of them look like a design.
+
+---
+
+# 34.1: a sensitive path asks, and the path it RESOLVES to counts (2026-10-21)
+
+The rule was refusing where the plan says it should ask, and a refusal that
+blocks legitimate work is a rule that gets turned OFF — and then it protects
+nothing.
+
+## The tool cannot ask, and that is the whole design problem
+
+A tool has no `Model`: it cannot open a dialog and it cannot see the answer.
+The **dispatcher** can (`agent.zig` `execOneCall` is the one that intercepts
+`ask`/`review`/`skill`, precisely because they need the `Model`).
+
+So the question happens in the dispatcher and the answer comes back through
+`pathsafe.approve` — the one place both can reach. The tool's own check
+stays as the BACKSTOP (it is what covers a `batch`'s steps), and it consults
+the approval.
+
+**The approval is for ONE path and it dies with the session.** A "yes" to one
+write is not a standing permission, and a session that approved thirty paths
+is a session where the rule is not doing anything.
+
+## The question has NO "always allow"
+
+A rule that remembers "the agent may write inside `.git/`" is the opposite of
+the rule. So the dialog paints three options and **the "A" key does not
+answer**: an option that is not on the table is not a key.
+
+**And the general permission dialog is skipped for that call.** The user has
+just approved THIS write with the reason in front of them; asking again
+about the same file with the reason hidden is a dialog too many.
+
+## The path it RESOLVES to is checked too
+
+The rule compared the path AS WRITTEN, and a symlink with an innocent name
+(`ln -s .git/hooks hooks`) is a path whose name says nothing and whose target
+is exactly what the rule protects. One `ln -s` was the width of the hole.
+
+The resolver is component by component and in **PURE ZIG** (`readLink`), NOT
+`realpath(3)`: this project has no libc dependency and a musl target is a
+thing worth keeping.
+
+**Four bugs on the way, all of them mine, and three of them are the families
+this file keeps listing**:
+
+1. The walk read the components **BACKWARDS** (a stack popped from the end
+   walks the path in reverse).
+2. The inserts **skipped** the components they had just added.
+3. `shrinkRetainingCapacity` **panicked** on the empty prefix (the first
+   component of a path can be a symlink, and a relative target replaces the
+   component it hangs from — which does not exist yet).
+4. The returned slice pointed into a list that the `defer` **freed**: the
+   caller read an empty string. The family again: a pointer to bytes that
+   died first.
+
+**The fix for the fourth one is a COPY**: the resolver returns a duplicate in
+the caller's arena, and the list is freed on the way out. A function that
+returns a view of something it destroys is a bug with a delay.
+
+## What is still missing
+
+The `Tool(pattern)` grammar of Phase 6. The rule model is still "the table
+plus a one-shot approval", so a project that wants to allow `.vscode/` for
+good has no way to say so — and the approval list is not it either: it dies
+with the session, on purpose.

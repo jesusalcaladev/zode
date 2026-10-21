@@ -13231,3 +13231,34 @@ test "the wordmark is drawn as FIVE rows of art, and it is not read as headings"
     const last = std.mem.trim(u8, rowText(s, row + banner_art_height - 1, &rb), " ");
     try std.testing.expect(std.mem.startsWith(u8, last, "######"));
 }
+
+test "the sensitive-path question has no 'always allow'" {
+    // A rule that remembers "the agent may write inside .git/" is the
+    // opposite of the rule, so the question is asked ONCE and the option is
+    // not on the table.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.perm_tool_len = @min("write".len, m.perm_tool.len);
+    @memcpy(m.perm_tool[0..m.perm_tool_len], "write");
+    m.perm_detail_len = @min(".git/hooks/pre-commit is not a place this tool writes".len, m.perm_detail.len);
+    @memcpy(m.perm_detail[0..m.perm_detail_len], ".git/hooks/pre-commit is not a place this tool writes");
+    m.perm_active = true;
+
+    // The ordinary question: four options, and "always allow" is one of them.
+    const normal = try drawTest(&m, arena, 80, 24);
+    try std.testing.expect(findRow(normal, "always allow") != null);
+
+    // The sensitive one: three.
+    m.perm_allow_always = false;
+    const once = try drawTest(&m, arena, 80, 24);
+    try std.testing.expect(findRow(once, "always allow") == null);
+    try std.testing.expect(findRow(once, "allow once") != null);
+    try std.testing.expect(findRow(once, "deny") != null);
+    // And the REASON is in the dialog: the user is being asked about a path
+    // they cannot see otherwise.
+    try std.testing.expect(findRow(once, "not a place this tool writes") != null);
+}

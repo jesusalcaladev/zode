@@ -7119,6 +7119,7 @@ fn execOneCall(
     // It asks ONCE and never offers "always allow": a rule that remembers
     // "the agent may write inside .git/" is the opposite of the rule.
     const risky = tools_mod.riskyPaths(call.name, call.args_json, arena);
+    var risky_allowed = false;
     if (risky.len > 0 and !yolo) {
         var asked = false;
         for (risky) |p| {
@@ -7133,8 +7134,18 @@ fn execOneCall(
                 .{ p, switch (v) { .dangerous => |d| d.why, else => "it is protected" } },
             ) catch p;
             switch (m.requestPermissionOnce(call.name, detail)) {
-                .allow => pathsafe.approve(p),
-                .allow_always => pathsafe.approve(p),
+                .allow => {
+                    pathsafe.approve(p);
+                    // The user has just approved THIS write, with the reason
+                    // in front of them. The general dialog would ask the same
+                    // question about the same file with the reason hidden, and
+                    // two dialogs for one write is a dialog too many.
+                    risky_allowed = true;
+                },
+                .allow_always => {
+                    pathsafe.approve(p);
+                    risky_allowed = true;
+                },
                 .deny, .none => {
                     denied.* += 1;
                     turn_stats.noteDenied();
@@ -7161,7 +7172,7 @@ fn execOneCall(
     // write would have asked.
     const perm_tools = tools_mod.callPermissionTools(call.name, call.args_json, arena);
     const auto_allowed = permAutoAllowed(call.name, arg, call.args_json, arena);
-    if (!yolo and !auto_allowed and permNeedsDialog(perm_tools)) {
+    if (!yolo and !auto_allowed and !risky_allowed and permNeedsDialog(perm_tools)) {
         var dbuf: [384]u8 = undefined;
         // A batch's dialog says WHICH FILES it would touch: the user is being
         // asked to approve a set of writes, and the set is the whole question.
