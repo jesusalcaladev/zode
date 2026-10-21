@@ -255,7 +255,10 @@ pub const Loader = struct {
                 .name = name_copy,
                 .description = desc_copy,
                 .path = path_copy,
-                .body = null,
+                // The body travels WITH the entry: a bundled skill's body is
+                // in the binary, and its path is not a file at all. Carrying
+                // it is what lets `load` answer without opening anything.
+                .body = bs.body,
                 .source = .bundled,
                 .context = bs.context,
                 .when_to_use = when_copy,
@@ -287,6 +290,15 @@ pub const Loader = struct {
         entry: skills.Entry,
         out: []u8,
     ) ?[]const u8 {
+        // A body that came WITH the entry never opens a file.
+        //
+        // That is what the bundled skills are: their body is in the binary and
+        // their path (`bundled://name`) is not a file at all. A loader that
+        // opened the disk for them would fail, and the body it was already
+        // holding would be thrown away with the failure.
+        if (entry.body) |b| {
+            return skills.formatSkill(entry.name, entry.description, b, out);
+        }
         // Bundled skills: body is in the embedded data
         if (std.mem.startsWith(u8, entry.path, "bundled://")) {
             const name = entry.path["bundled://".len..];
@@ -315,6 +327,19 @@ pub const Loader = struct {
         args: ?[]const u8,
         out: []u8,
     ) ?[]const u8 {
+        // The body that came with the entry: same rule as `load`, and the
+        // substitution happens on it.
+        if (entry.body) |b| {
+            if (args) |a| {
+                const trimmed = std.mem.trim(u8, a, " \t\r\n");
+                if (trimmed.len > 0) {
+                    var buf: [8192]u8 = undefined;
+                    const substituted = bundled.substituteArguments(b, trimmed, &buf);
+                    return skills.formatSkill(entry.name, entry.description, substituted, out);
+                }
+            }
+            return skills.formatSkill(entry.name, entry.description, b, out);
+        }
         if (std.mem.startsWith(u8, entry.path, "bundled://")) {
             const name = entry.path["bundled://".len..];
             const bundled_skill = bundled.getBundled(name) orelse return null;
@@ -884,6 +909,63 @@ test "scan: bundled skills are appended and can be shadowed" {
         gpa.free(e.when_to_use);
     }
     try std.testing.expect(found_simplify);
+}
+
+test "load: an entry that carries its body never opens a file" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+
+    // The path does not exist, ON PURPOSE. A loader that went to the disk
+    // for this body would answer null, and the body it was already holding
+    // would be thrown away with the failure: the skill would look broken
+    // exactly when it is the one that cannot be broken.
+    const entry = skills.Entry{
+        .name = "embedded",
+        .description = "a skill whose body is already here",
+        .path = "/tmp/zode-skill-that-does-not-exist/SKILL.md",
+        .body = "# The rules\n\nOne rule per paragraph.",
+    };
+
+    var out: [8192]u8 = undefined;
+    const text = loader.load(entry, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, text, "One rule per paragraph.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "=== skill: embedded ===") != null);
+}
+
+test "load: a bundled entry carries its body, so nothing is read from the disk" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    var buf: [16]skills.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+
+    var bundled_body: ?[]const u8 = null;
+    var bundled_name: []const u8 = "";
+    for (found) |e| {
+        if (e.source == .bundled and e.body != null) {
+            bundled_body = e.body;
+            bundled_name = e.name;
+        }
+    }
+    try std.testing.expect(bundled_body != null);
+    try std.testing.expect(bundled_name.len > 0);
+
+    // And it loads: the body is in the binary, so the path is never opened.
+    var verify_entry: ?skills.Entry = null;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "verify")) verify_entry = e;
+    }
+    try std.testing.expect(verify_entry != null);
+    try std.testing.expect(verify_entry.?.body != null);
+
+    var out: [16384]u8 = undefined;
+    const text = loader.load(verify_entry.?, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(text.len > 0);
 }
 
 test "loadWithArgs: substitutes $ARGUMENTS in bundled skills" {

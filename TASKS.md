@@ -23,15 +23,23 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 ## 🚀 Next up — the roadmap's own verdict
 
-- [ ] 🔴 **Sprint A — Phase 27 + 28** (the diff you can read + `/copy`)
-      Minimum next delivery. 27 pays on the *first* tool call; 0 pays on the 21st change.
-- [ ] 🔴 **Sprint B — Phase 0 → 1 → 2** (registry → bundled skills → skill budget/args)
-      Highest value for least risk; the registry stops later phases spreading state.
+- [ ] 🔴 **Sprint A — Phase 27** (the diff you can read): the word diff and the gutter are
+      written but the GUTTER IS NEVER PAINTED (the caller passes `null, 0`) and the colour
+      ladder is never called outside `theme.zig`. Both are dead code today.
+- [ ] 🔴 **Sprint B — Phase 2** (skill listing budget + named args + `context: fork`):
+      `max_listed = 40` is still a constant and `context: fork` is parsed and never read.
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
 - [ ] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety)
-- [ ] 🟡 **Tool track — Phase 15 → 16 → 14 → 26** (task graph → batch → LSP → roles); 20 waits on 15, 32 on 26
+- [ ] 🟡 **Tool track — Phase 14 → 25 → 26 → 20** (LSP → bash safety → roles → teams); 20 waits on 15, 32 on 26
 - [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): most needed, least fun — quietly wrong today
 - [ ] 🟢 Everything else per the dependency table at the bottom.
+
+**Done since the board was written**: Phase 1 (bundled skills + rich frontmatter) ·
+Phase 16 (the `batch` tool: many operations, one round trip) · Phase 28 (`/copy`).
+
+**The `lsp` tool is offered to the model and cannot be called** — the dispatcher has no
+branch for it. Phase 14 has the details; it is the cheapest of the unfinished ones to
+make real, because the library is already written.
 
 ---
 
@@ -55,20 +63,21 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 ## Phase 1 — Bundled skills + rich frontmatter
 
-`✨ feature · 🔴 · reuses skills.zig + skillstore.zig (already works) · roadmap says "start here"`
+`✨ feature · 🔴 · reuses skills.zig + skillstore.zig (already works) · roadmap says "start here"` — **DONE 2026-10-20**
 
 > Skills compiled into the binary. Highest value for the least risk.
 
-- [ ] **1.1** `src/lib/bundled_skills.zig` + bodies in `src/skills/<name>.md` via `@embedFile`
-  - [ ] No extraction to disk, no temp files at runtime
-  - [ ] Ship 5 first: **simplify** (review the diff for reuse/duplication) · **verify** (narrowest command that would break if you were wrong) · **skillify** (turn a repeated task into a SKILL.md) · **debug** (reproduce → isolate → fix the cause, backgrounded) · **goal** (split the objective → drive the `todo` list)
-- [ ] **1.2** Rich frontmatter in `skills.zig` (parser stays narrow: `key: value`, no YAML)
-  - [ ] `when_to_use`, `argument_hint`, `allowed_tools`, `model`, `effort`, `context: inline|fork`
-- [ ] **1.3** `Entry` gains `body`, `source` (`project|agents|user|bundled`), `context`, `when_to_use`
-- [ ] **1.4** Discovery: bundled appended AFTER on-disk; project/user shadow bundled; `/skills` tags `[bundled]`/`[project]`/`[user]`
-- [ ] **1.5** Listing prints `when_to_use` next to the description
-- [ ] **1.6** `skill` tool takes optional `args`; `$ARGUMENTS` substituted (single substitution; named args = Phase 2)
-- [ ] **1.7** Pure tests: table (unique valid names, non-empty desc/body) · parser (8 fields, CRLF, a file ending at the closing fence) · prompt includes `when_to_use` · `Loader.load` with `body != null` never opens disk (point it at a nonexistent path on purpose) · shadowing · `$ARGUMENTS`
+- [x] **1.1** `src/lib/bundled_skills.zig` + bodies in `src/skills/<name>.md` via `@embedFile`
+  - [x] No extraction to disk, no temp files at runtime
+  - [x] Ship 5 first: **simplify** (review the diff for reuse/duplication) · **verify** (narrowest command that would break if you were wrong) · **skillify** (turn a repeated task into a SKILL.md) · **debug** (reproduce → isolate → fix the cause, backgrounded) · **goal** (split the objective → drive the `todo` list)
+- [x] **1.2** Rich frontmatter in `skills.zig` (parser stays narrow: `key: value`, no YAML)
+  - [x] `when_to_use`, `argument_hint`, `allowed_tools`, `model`, `effort`, `context: inline|fork`
+- [x] **1.3** `Entry` gains `body`, `source` (`project|agents|user|bundled`), `context`, `when_to_use`
+  - [x] The body travels WITH the entry for a bundled skill: it is in the binary and its path is not a file, so `load` never opens the disk for it
+- [x] **1.4** Discovery: bundled appended AFTER on-disk; project/user shadow bundled; `/skills` tags `[bundled]`/`[project]`/`[user]`
+- [x] **1.5** Listing prints `when_to_use` next to the description
+- [x] **1.6** `skill` tool takes optional `args`; `$ARGUMENTS` substituted (single substitution; named args = Phase 2)
+- [x] **1.7** Pure tests: table (unique valid names, non-empty desc/body) · parser (8 fields, CRLF, a file ending at the closing fence) · prompt includes `when_to_use` · `Loader.load` with `body != null` never opens disk (point it at a nonexistent path on purpose) · shadowing · `$ARGUMENTS`
 
 **Acceptance**: `zig build test` green · `/skills` shows bundled tagged · prompt grows ≤ ~1 KB with the five skills.
 
@@ -213,7 +222,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 ## Phase 14 — Semantic code intelligence (a language-server client)
 
-`✨ feature · 🟡 · depends on 12 (stdio JSON-RPC transport)`
+`✨ feature · 🟡 · depends on 12 (stdio JSON-RPC transport)` — **the library is written; NOTHING is wired (2026-10-20)**
 
 > `refs`/`rename` are regex heuristics; the compiler already knows the answer. LSP is asked for when precision matters; `refs` stays (instant, no server needed).
 
@@ -225,6 +234,35 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [ ] Per-project `lsp_servers` table in config (extension → command) + small built-in defaults (zls, rust-analyzer, gopls, typescript-language-server, pyright, clangd); "not installed → skip" like `check`
 - [ ] Small `max_result_chars` — semantic answers are short (a location, a signature)
 - [ ] Tests: the fake server drives every operation · a missing server degrades to a named error and never hangs · a server that dies mid-session is restarted once · `document_symbols` on a real fixture returns the outline · **`refs` still works with zero servers installed**
+
+### The state of it, measured 2026-10-20 (so the next session does not start from zero)
+
+`src/lsp/` holds ~1700 lines (protocol · client · process · manager · servers · format) and
+`src/tools/lsp.zig` holds the tool. **33 test blocks are written and 32 of them do not
+even compile**: `src/lsp_test.zig` is referenced by no build step and by no aggregator.
+
+Four things are missing, and they are the four that make it a feature:
+
+1. **The dispatcher has no `lsp` branch.** The model IS offered the tool (the schema is
+   in the registry) and calling it answers `there is no tool called lsp`. **This is a
+   bug today**: a tool in the prompt that cannot be called.
+2. **The manager is never initialised and never shut down.** `manager.init` is called
+   only by the probe and by two tests, so `ready` is false in the app and every request
+   degrades.
+3. **There is no `lsp_servers` key in `config.json`.** The override plumbing exists
+   (`servers.find(extra, path)`) and nothing ever fills `extra`.
+4. **`diagnostics` is not implemented**, and a dead server is not restarted: the client
+   stays in the map and every later call fails with `ServerClosed`.
+
+The 32 dead test blocks and `src/lsp_raw.zig` / `src/lsp_probe.zig` (scratch binaries
+with no build step) are the other half of the work: they have to be moved into
+`src/test_all.zig` before any of them can catch a regression.
+
+**A drift to settle while wiring it**: `src/tools/lsp.zig` documents `Permission: none`
+and `src/lib/subagent.zig` lists `lsp` among the read-only tools, while the registry
+says `read_only = false` — so the model gets a dialog for a tool nobody thought should
+ask, and the read-only drift test does not see it (the tool is simply absent from the
+read-only array).
 
 ---
 
@@ -243,17 +281,31 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 ## Phase 16 — Batch execution: many operations, one round trip
 
-`⚡ tokens · 🟡 tool-track #2 · depends on 0`
+`⚡ tokens · 🟡 tool-track #2 · depends on 0` — **DONE 2026-10-20**
 
 > "Count lines in 4 files, find the TODOs in the 2 that have them, write a report" = 5 calls, 5 round trips. A round trip is a whole request.
 
-- [ ] `batch` tool: a small **sandboxed** step runner; steps run in order host-side; returns only the final value plus a one-line log per step
-- [ ] Exposes the read-only primitives (`read`, `grep`, `glob`, `list_files`, `refs`, `git_*`) + the editors (`write`, `edit`) under the **same** permission rules as a direct call — a batch is not a way to bypass the dialog
-- [ ] **Not a shell and not a general language**: no process spawn, no network, no arbitrary code — a fixed, enumerable set of step kinds (`map`, `filter`, `select`, `count`, `write`); the size of the surface IS the safety argument
-- [ ] Read-only by default; a batch that writes needs the same approval a `write` call would, naming the files it would touch
-- [ ] Failure is per-step and named; the rest does not run unless the batch declares `continue_on_error`
-- [ ] The savings are visible: the log reports `9 steps, 1 request`
-- [ ] Pure tests: step parsing and validation · the read-only default refuses a write without approval · a failed step stops the batch and names itself · a batch over four files returns one result and no per-file round trip · the permission set of a batch equals the union of its steps
+- [x] `batch` tool: a small **sandboxed** step runner; steps run in order host-side; returns only the final value plus a one-line log per step
+  - [x] The step kinds are a FIXED, enumerable list: `read` · `read_many` · `grep` · `glob` · `list_files` · `refs` · `git_status` · `git_diff` · `map` · `filter` · `select` · `count` · `write` · `edit`. There is no way to spell a step that is not one of them
+  - [x] The log's first line says what it bought: `4 step(s), 1 request`
+- [x] Exposes the read-only primitives (`read`, `grep`, `glob`, `list_files`, `refs`, `git_*`) + the editors (`write`, `edit`) under the **same** permission rules as a direct call — a batch is not a way to bypass the dialog
+  - [x] **The permission set of a batch is the UNION of its steps**: a batch of reads asks for nothing; a batch with a `write` step asks for exactly what that `write` would have asked, and the dialog names the files
+  - [x] "always allow" on a batch remembers the **tools** its steps call (`write`), not `batch` — one approval must not cover every batch the model writes later
+- [x] **Not a shell and not a general language**: the model never supplies a command, there is no way to spell a step that is not one of the fourteen, and there is no network — the size of the surface IS the safety argument. (The only processes that run are the two FIXED git reads, the same commands the `git_status` and `git_diff` tools run.)
+- [x] Read-only by default; a batch that writes needs the same approval a `write` call would, naming the files it would touch
+- [x] Failure is per-step and named; the rest does not run unless the batch declares `continue_on_error`
+- [x] The savings are visible: the log reports `9 steps, 1 request`
+- [x] Pure tests: step parsing and validation · the read-only default refuses a write without approval · a failed step stops the batch and names itself · a batch over four files returns one result and no per-file round trip · the permission set of a batch equals the union of its steps
+
+**Where the code is**: `src/lib/batch.zig` (the model, the parser, the item collection and the permission set — pure) · `src/tools/batch.zig` (the executor) · `src/tools/prompts/batch.zig` (the schema) · one row in `src/tools/registry.zig`.
+
+**Two decisions that are not obvious**:
+
+- **The batch is NOT in the read-only toolset.** A batch's steps can write, so the
+  static flag says `read_only = false` and the model is not offered it in plan
+  mode. The per-call answer (does THIS batch ask?) is the union of its steps.
+- **`/undo` snapshots every file a batch touches**, not one: a batch that wrote
+  three files and snapshotted one would undo a third of the turn.
 
 ---
 
@@ -413,7 +465,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [ ] **27.4** Colour-vision-safe palette 🔒
   - [ ] `ZODE_DALTONIZED=1` (+ a `/color daltonized` picker entry) → blue/orange pair instead of green/red (the most common deficiency, and the axis most monitors collapse)
   - [ ] A test asserts the add/delete pair differs in **hue** via `hueSat`, not only lightness (precedent: `theme.zig:439`)
-- [ ] **27.5** NOT ported on purpose: `asTerminalEscaped`/`colorToEscape`/the `{r,g,b,a}` sentinel struct (~120 lines — vaxis paints cells, escape generation is its job), the highlight.js integration, the `BAT_THEME` stub, the lazy loader. `ColorFile` (plain file view with line numbers) deferred to a future `/file`
+- [x] **27.5** NOT ported on purpose: `asTerminalEscaped`/`colorToEscape`/the `{r,g,b,a}` sentinel struct (~120 lines — vaxis paints cells, escape generation is its job), the highlight.js integration, the `BAT_THEME` stub, the lazy loader. `ColorFile` (plain file view with line numbers) deferred to a future `/file`
 - [ ] **27.6** Pure tests: `x += 1` is 5 tokens · a pure deletion stays unpaired · a line 50% changed gets no ranges · a line 10% changed does (not vacuous) · ranges split a segment into three · **the segments of a diffed line concatenate to the original line** · ansi256 picks the cube for a saturated colour and the ramp for a grey · every theme colour survives the 256 round trip (no colour becomes "terminal default") · the daltonized pair differs in hue · drawTest: only the changed token carries the word background
 - [ ] Plus one `zig build ui-frame` scene (a `write` of a 600-line file) so the *composition* is judged — the question only that harness can answer
 
@@ -540,11 +592,11 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 ## 🔧 Tool upgrades (independent, one registry row each, no permission changes)
 
-- [ ] **`grep`** + context lines (`-A/-B/-C`), a `glob`/`type` filter, an output mode (`content` / `files_with_matches` / `count`), and a `head_limit` — today the model compensates with more calls
+- [x] **`grep`** + context lines (`-A/-B/-C`), a `glob`/`type` filter, an output mode (`content` / `files_with_matches` / `count`), and a `head_limit` — today the model compensates with more calls — shipped 2026-10-16
 - [x] **`bash`** + a `description` field: one line for the timeline ("running the test suite") so the user reads what a command is FOR — shipped 2026-10-16 (the timeline and the status bar show the description; the permission dialog and the allowlist keep matching the COMMAND, so prose can never ride an allowed prefix)
-- [ ] **`read`** + PDF page ranges (the image path already exists), so a spec handed to the agent is readable without shelling out to a converter
+- [x] **`read`** + PDF page ranges (the image path already exists), so a spec handed to the agent is readable without shelling out to a converter — shipped 2026-10-20
 - [x] **`glob`** + a `subdir` and a `limit`, so "the 20 newest `.zig` under `src/`" is one call (plus `sort: newest|oldest|name`, which is what makes "newest" true — shipped 2026-10-16)
-- [ ] One pure test per row on the argument parsing
+- [x] One pure test per row on the argument parsing
 
 ---
 

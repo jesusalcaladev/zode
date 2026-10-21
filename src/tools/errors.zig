@@ -33,7 +33,7 @@ pub fn describeError(arena: std.mem.Allocator, err: anyerror, name: []const u8, 
     if (err == error.UnknownTool) {
         return std.fmt.allocPrint(
             arena,
-            "there is no tool called \"{s}\". The tools you have are: read, write, edit, notebook_edit, bash, glob, grep, refs, rename, check, git_status, git_diff, git_log, git_branch, git_add, git_commit, git_stash, list_files, web_fetch, web_search, think, todo, task_create, task_get, task_list, task_update, task_stop, ask, lsp, skill, task, review, goal, bash_output, bash_kill, sleep. Use one of those names exactly.",
+            "there is no tool called \"{s}\". The tools you have are: read, write, edit, notebook_edit, bash, glob, grep, refs, rename, check, git_status, git_diff, git_log, git_branch, git_add, git_commit, git_stash, list_files, web_fetch, web_search, think, todo, task_create, task_get, task_list, task_update, task_stop, ask, lsp, skill, task, review, goal, bash_output, bash_kill, sleep, batch. Use one of those names exactly.",
             .{name},
         ) catch "there is no tool with that name.";
     }

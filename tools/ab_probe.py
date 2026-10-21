@@ -80,6 +80,26 @@ def main() -> int:
     ap.add_argument("--wait", type=float, default=10.0)
     args = ap.parse_args()
 
+    # A MISSING BINARY IS NOT A PASSING RUN.
+    #
+    # `pty.fork` + `execve` of a path that does not exist: the child raises
+    # FileNotFoundError, the TRACEBACK goes to the pty (it is the child's
+    # stderr), and the harness sees bytes and calls it "answers". The base
+    # column then reports a healthy binary that was never run — which is the
+    # worst kind of wrong, because it exonerates the change under test.
+    #
+    # This is the same trap as the missing `exit.txt` in the task harness: a
+    # file that was never created and a file that was created empty look
+    # identical from the outside, and only one of them is evidence.
+    for label, binary in (("base", args.base), ("current", args.current)):
+        if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+            print(
+                f"  {label}: {binary} is not there. Build it first "
+                f"(the base is usually the parent commit: git stash, zig build, "
+                f"cp zig-out/bin/zode /tmp/opencode/z-base-mine)."
+            )
+            return 2
+
     for label, key in (("no saved key", False), ("real saved key", True)):
         for name, binary in (("base", args.base), ("current", args.current)):
             verdicts = []

@@ -20,6 +20,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const resultcap = @import("../lib/resultcap.zig");
+const batch_lib = @import("../lib/batch.zig");
 
 // Per-tool prompt modules: the JSON schema each tool offers the model.
 const read_prompt = @import("prompts/read.zig");
@@ -58,6 +59,7 @@ const goal_prompt = @import("prompts/goal.zig");
 const bash_output_prompt = @import("prompts/bash_output.zig");
 const bash_kill_prompt = @import("prompts/bash_kill.zig");
 const sleep_prompt = @import("prompts/sleep.zig");
+const batch_prompt = @import("prompts/batch.zig");
 const validate = @import("prompts/validate.zig");
 
 // ── the table ─────────────────────────────────────────────────────────────
@@ -401,6 +403,23 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .destructive = false,
         .max_result_chars = resultcap.default_max_result_chars,
     },
+    .{
+        // `read_only = false` because a batch with a `write` or an `edit` step
+        // writes. The flag is static and the truth is not: what a batch needs
+        // is decided by its STEPS, and `callPermissionTools` is where that is
+        // answered. The flag says the safe thing — a batch is never assumed to
+        // be free — and the steps say the rest.
+        //
+        // It is therefore NOT in the read-only schema: in plan mode the model
+        // is offered the tools that cannot change the machine, and a batch can.
+        .name = "batch",
+        .desc = "Run several operations in one round trip",
+        .schema = batch_prompt.json,
+        .read_only = false,
+        .parallel_safe = false,
+        .destructive = true,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
 };
 
 // ── lookups ───────────────────────────────────────────────────────────────
@@ -436,6 +455,115 @@ pub fn maxResultChars(name: []const u8) usize {
     const d = find(name) orelse return resultcap.default_max_result_chars;
     if (d.max_result_chars == 0) return std.math.maxInt(usize);
     return d.max_result_chars;
+}
+
+// ── the batch, whose permission set depends on its arguments ───
+//
+// `batch` is a call to SEVERAL tools at once, so the static flag in the table
+// cannot answer whether it needs permission: a batch of reads must not ask,
+// and a batch that writes must ask exactly what the write would have asked.
+//
+// The answer is the UNION of the tools its steps are calls to. A batch is a
+// way of doing several things in ONE round trip, never a way of doing one of
+// them without asking: that is the whole safety argument of the tool, and it
+// is one function.
+
+/// The tools one call needs permission for.
+///
+/// For every tool but `batch` it is the tool itself. For `batch` it is the
+/// union of the tools its steps are calls to. A batch whose arguments do not
+/// parse answers with the tool ITSELF, because a batch nobody can reason
+/// about is the one that has to ask.
+pub fn callPermissionTools(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const []const u8 {
+    if (!std.mem.eql(u8, name, "batch")) {
+        return oneTool(arena, name);
+    }
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
+        return oneTool(arena, name);
+    };
+    if (parsed != .object) {
+        return oneTool(arena, name);
+    }
+    const b = batch_lib.parse(arena, parsed.object) catch {
+        return oneTool(arena, name);
+    };
+    const set = batch_lib.permissionTools(arena, b) catch {
+        return oneTool(arena, name);
+    };
+    if (set.len == 0) {
+        return oneTool(arena, name);
+    }
+    return set;
+}
+
+/// A one-element set, in the ARENA.
+///
+/// Not a local array: returning a slice of a local is a dangling pointer the
+/// moment the function returns, and this is read a few lines later, by a
+/// different function, on another stack frame. It is the `&[_]u8{c}` family
+/// again, with a bigger blast radius.
+fn oneTool(arena: std.mem.Allocator, name: []const u8) []const []const u8 {
+    const one = arena.alloc([]const u8, 1) catch return &.{};
+    one[0] = name;
+    return one;
+}
+
+/// Does this call change a file?
+///
+/// For `batch` it is whether any of its steps does. A batch whose arguments
+/// do not parse counts as writing: the safe direction is the one that asks.
+pub fn callWrites(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    if (!std.mem.eql(u8, name, "batch")) return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return true;
+    if (parsed != .object) return true;
+    const b = batch_lib.parse(arena, parsed.object) catch return true;
+    for (b.steps) |s| {
+        if (s.op.writes()) return true;
+    }
+    return false;
+}
+
+/// The files one call would write or edit.
+///
+/// For every tool but `batch` it is the one path the arguments name. For
+/// `batch` it is every path its writing steps name, in order and without
+/// repeats: the permission dialog names the files, because a dialog that
+/// says "batch" and nothing else is a dialog about nothing.
+pub fn callTouchedPaths(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const []const u8 {
+    if (!std.mem.eql(u8, name, "batch")) {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return &.{};
+        if (parsed != .object) return &.{};
+        const v = parsed.object.get("path") orelse parsed.object.get("notebook_path") orelse return &.{};
+        if (v != .string or v.string.len == 0) return &.{};
+        const one = arena.alloc([]const u8, 1) catch return &.{};
+        one[0] = v.string;
+        return one;
+    }
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return &.{};
+    if (parsed != .object) return &.{};
+    const b = batch_lib.parse(arena, parsed.object) catch return &.{};
+    return batch_lib.touchedPaths(arena, b) catch &.{};
+}
+
+/// The sentence the permission dialog shows for a batch.
+///
+/// It says WHAT the batch would do and TO WHICH FILES: the user is being
+/// asked to approve a set of writes, and the set is the whole of the
+/// question.
+pub fn batchPermissionDetail(args_json: []const u8, arena: std.mem.Allocator) []const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch
+        return "batch";
+    if (parsed != .object) return "batch";
+    const b = batch_lib.parse(arena, parsed.object) catch return "batch";
+    const paths = batch_lib.touchedPaths(arena, b) catch return "batch";
+    if (paths.len == 0) return "batch";
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(arena, "batch") catch return "batch";
+    for (paths) |p| {
+        out.append(arena, ' ') catch return "batch";
+        out.appendSlice(arena, p) catch return "batch";
+    }
+    return out.items;
 }
 
 // ── schema generation (derived from the table, not hand-maintained) ──
@@ -515,6 +643,8 @@ pub const toolsJsonBlob: []const u8 = "["
     ++ defs[34].schema
     ++ ","
     ++ defs[35].schema
+    ++ ","
+    ++ defs[36].schema
     ++ "]";
 
 pub const toolsJsonReadOnlyBlob: []const u8 = "["
@@ -589,8 +719,92 @@ test "needsPermission" {
     try std.testing.expect(!needsPermission("sleep"));
     try std.testing.expect(!needsPermission("review"));
     try std.testing.expect(!needsPermission("goal"));
+    // `batch` can write, so it is not on the free list. WHAT it needs is
+    // decided by its steps — see the test below.
+    try std.testing.expect(needsPermission("batch"));
     // Unknown tools are conservative: they need permission.
     try std.testing.expect(needsPermission("no_such_tool"));
+}
+
+test "a batch of reads asks for nothing, and a batch that writes asks for the write" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The read-only default: a batch that only reads needs no permission.
+    // This is the property that makes the tool usable at all — a dialog for
+    // every batch would be a dialog per round trip saved.
+    const reads = callPermissionTools(
+        "batch",
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"grep","pattern":"x"},{"op":"count"}]}
+    ,
+        arena,
+    );
+    try std.testing.expect(reads.len > 0);
+    for (reads) |t| {
+        try std.testing.expect(!needsPermission(t));
+    }
+
+    // A batch with a write step needs exactly what the write would have
+    // needed — and NOT the tool "batch", which would be a hole.
+    const writes = callPermissionTools(
+        "batch",
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"write","path":"out.md"}]}
+    ,
+        arena,
+    );
+    try std.testing.expectEqual(@as(usize, 2), writes.len);
+    try std.testing.expectEqualStrings("read", writes[0]);
+    try std.testing.expectEqualStrings("write", writes[1]);
+    try std.testing.expect(needsPermission(writes[1]));
+
+    // A batch whose arguments do not parse asks: the safe direction is the
+    // one that asks.
+    const broken = callPermissionTools("batch", "{\"steps\":", arena);
+    try std.testing.expectEqual(@as(usize, 1), broken.len);
+    try std.testing.expectEqualStrings("batch", broken[0]);
+    try std.testing.expect(needsPermission(broken[0]));
+}
+
+test "a batch writes only when one of its steps writes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expect(!callWrites("batch", "{\"steps\":[{\"op\":\"read\",\"path\":\"a\"}]}", arena));
+    try std.testing.expect(!callWrites("batch", "{\"steps\":[{\"op\":\"grep\",\"pattern\":\"x\"},{\"op\":\"map\",\"field\":\"lines\"}]}", arena));
+    try std.testing.expect(callWrites("batch", "{\"steps\":[{\"op\":\"read\",\"path\":\"a\"},{\"op\":\"write\",\"path\":\"o.md\"}]}", arena));
+    try std.testing.expect(callWrites("batch", "{\"steps\":[{\"op\":\"edit\",\"path\":\"a\",\"old_string\":\"x\",\"new_string\":\"y\"}]}", arena));
+    // An unreadable batch counts as writing: the safe direction is the one
+    // that asks.
+    try std.testing.expect(callWrites("batch", "not json", arena));
+
+    // The files it would touch are named, and only the writing ones.
+    const paths = callTouchedPaths(
+        "batch",
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"write","path":"out.md"},{"op":"edit","path":"a.zig","old_string":"x","new_string":"y"}]}
+    ,
+        arena,
+    );
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expectEqualStrings("out.md", paths[0]);
+    try std.testing.expectEqualStrings("a.zig", paths[1]);
+}
+
+test "the permission dialog is told WHICH FILES a batch would touch" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const detail = batchPermissionDetail(
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"write","path":"out.md"},{"op":"edit","path":"src/b.zig","old_string":"x","new_string":"y"}]}
+    ,
+        arena,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, detail, "out.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "src/b.zig") != null);
+    // And it does NOT name a file the batch only reads.
+    try std.testing.expect(std.mem.indexOf(u8, detail, "a.zig") == null);
 }
 
 test "isParallelSafe mirrors the table" {

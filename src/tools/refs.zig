@@ -114,20 +114,29 @@ pub fn findOccurrences(
     return out.items;
 }
 
-pub fn toolRefs(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
-    const name = common.getStr(obj, "symbol") orelse return error.MissingSymbol;
+/// What a symbol search found.
+pub const HitResult = struct {
+    hits: []const symbols.Hit,
+    /// How many hits existed before the caps. A count that says 500 with 120
+    /// shown is a lie the caller has to be able to see.
+    total: usize,
+    /// The walk gave up before it finished.
+    stopped_early: bool,
+};
 
-    // A pattern here would turn this into a grep with extra steps, and the model
-    // would reach for it instead of `grep` for the things `grep` is better at.
-    if (!symbols.validSymbol(name)) {
-        return std.fmt.allocPrint(
-            arena,
-            "`{s}` is not a plain identifier, so it cannot be a symbol. `refs` finds a definition and its uses; for a pattern or a piece of text use `grep`, which is what it is for.",
-            .{name},
-        );
-    }
-
-    const subdir = common.getStr(obj, "subdir") orelse ".";
+/// Every place a symbol appears as real code, across a tree.
+///
+/// This is the search itself, without the rendering, so that a caller that
+/// wants the HITS (the `batch` tool, which puts them in a collection) and the
+/// tool that wants the TEXT (this file) cannot drift apart: two scanners
+/// would disagree about what counts as a use, and the count in one answer
+/// would be a number about something else.
+pub fn findHits(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    subdir: []const u8,
+    name: []const u8,
+) !HitResult {
     var files_iter = common.searchableFiles(io, arena, subdir);
     defer files_iter.deinit();
 
@@ -190,14 +199,37 @@ pub fn toolRefs(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
         }
     }
 
-    return symbols.render(arena, name, .{
+    return .{
         .hits = hits.items,
         .total = total,
+        .stopped_early = stopped_early,
+    };
+}
+
+pub fn toolRefs(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+    const name = common.getStr(obj, "symbol") orelse return error.MissingSymbol;
+
+    // A pattern here would turn this into a grep with extra steps, and the model
+    // would reach for it instead of `grep` for the things `grep` is better at.
+    if (!symbols.validSymbol(name)) {
+        return std.fmt.allocPrint(
+            arena,
+            "`{s}` is not a plain identifier, so it cannot be a symbol. `refs` finds a definition and its uses; for a pattern or a piece of text use `grep`, which is what it is for.",
+            .{name},
+        );
+    }
+
+    const subdir = common.getStr(obj, "subdir") orelse ".";
+    const found = try findHits(io, arena, subdir, name);
+
+    return symbols.render(arena, name, .{
+        .hits = found.hits,
+        .total = found.total,
         // Both counts matter and they are different: the walk gave up early, or
         // the hits did not fit. Either way the model is looking at a fragment and
         // has to be told so.
-        .truncated = total > hits.items.len,
-        .stopped_early = stopped_early,
+        .truncated = found.total > found.hits.len,
+        .stopped_early = found.stopped_early,
     });
 }
 

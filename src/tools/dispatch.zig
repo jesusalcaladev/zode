@@ -30,6 +30,7 @@ const todo_tool = @import("todo.zig");
 const goal_tool = @import("goal.zig");
 const tasks_tool = @import("tasks.zig");
 const sleep_tool = @import("sleep.zig");
+const batch_tool = @import("batch.zig");
 
 // The per-tool prompt modules: the TEXT the model reads about a tool lives with that
 // tool, as `prompts/<name>.zig`. This file decides the ORDER and nothing else, so a
@@ -170,6 +171,24 @@ test "the read-only schema is exactly the tools that do not ask for permission" 
 /// are free. What makes it acceptable is that it cannot write.
 pub const needsPermission = registry.needsPermission;
 
+/// The tools ONE CALL needs permission for.
+///
+/// For every tool but `batch` it is the tool itself. For `batch` it is the
+/// union of the tools its steps are calls to: a batch of reads asks for
+/// nothing, and a batch with a write step asks for exactly what that write
+/// would have asked. The union is the whole safety argument of the tool.
+pub const callPermissionTools = registry.callPermissionTools;
+
+/// Does this call change a file? A batch is decided by its steps.
+pub const callWrites = registry.callWrites;
+
+/// The files this call would write or edit. A batch can be several.
+pub const callTouchedPaths = registry.callTouchedPaths;
+
+/// What the permission dialog says about a batch: what it would do, and to
+/// which files.
+pub const batchPermissionDetail = registry.batchPermissionDetail;
+
 /// Runs a tool with JSON args. Returns the (truncated) result —
 /// `arena` memory, valid until the arena is freed.
 ///
@@ -284,6 +303,8 @@ pub fn executeWith(
         return bg_tool.toolBashKill(obj, arena, bg, io);
     } else if (std.mem.eql(u8, name, "sleep")) {
         return sleep_tool.toolSleep(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "batch")) {
+        return batch_tool.toolBatch(io, obj, arena);
     }
     return error.UnknownTool;
 }

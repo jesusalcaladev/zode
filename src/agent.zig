@@ -1039,10 +1039,18 @@ fn cmdSkills(m: *tui.Model) void {
             .user => "[user]",
             .bundled => "[bundled]",
         };
-        const line = std.fmt.allocPrint(m.allocator, "  {s} {s}: {s}", .{
+        // The `when to use it` goes with the description, because a description
+        // says WHAT the skill is and the `when` says WHEN to reach for it: a
+        // list that only says what is a list of things the model cannot
+        // choose between.
+        const line = std.fmt.allocPrint(m.allocator, "  {s} {s}: {s}{s}", .{
             source_tag,
             e.name,
             if (e.description.len > 0) e.description else "(no description)",
+            if (e.when_to_use.len > 0)
+                std.fmt.allocPrint(m.allocator, " — {s}", .{e.when_to_use}) catch ""
+            else
+                "",
         }) catch continue;
         pushInfoOwned(m, line);
     }
@@ -1823,7 +1831,12 @@ fn addBashPatternNoSave(pat: []const u8) bool {
 /// everything". Plan (read-only) and bypass are handled BEFORE
 /// this is consulted: plan blocks writes outright and bypass
 /// skips the dialog, so neither reaches here.
-fn permAutoAllowed(name: []const u8, arg: []const u8) bool {
+fn permAutoAllowed(name: []const u8, arg: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    // A batch is covered by accept-edits when it WRITES: the standing "I trust
+    // the file edits" is about the edits, and a batch's write step is one.
+    if (std.mem.eql(u8, name, "batch")) {
+        return accept_edits and tools_mod.callWrites(name, args_json, arena);
+    }
     return (accept_edits and isEditTool(name)) or bashPatternAllowed(name, arg);
 }
 
@@ -7027,7 +7040,11 @@ fn execOneCall(
     // call is not going to happen, so asking "may I run this write?" and then
     // saying no is a dialog that lies. The user asked for "look, don't touch", and
     // a permission prompt for a write in that mode is a bug in the UI.
-    if (read_only and isWriteTool(call.name)) {
+    //
+    // A BATCH is decided by its steps: a batch of reads is a read, and a batch
+    // with a write step is a write. The static list of write tools cannot say
+    // that, and a batch that wrote in plan mode would be a hole in the mode.
+    if (read_only and callIsWrite(call.name, call.args_json, arena)) {
         m.plan_write_blocked_this_turn = true;
         m.pushToolDone(call.name, "blocked by plan mode", 0, read_only_text);
         s.appendToolResult(call.id, call.name, read_only_text) catch {};
@@ -7041,13 +7058,24 @@ fn execOneCall(
     // Both are the user's standing "I trust this" — the selective
     // part of selective permissions — and everything else that
     // needs permission still asks, unless `/yolo` said not to.
-    const auto_allowed = permAutoAllowed(call.name, arg);
-    if (!yolo and !auto_allowed and tools_mod.needsPermission(call.name) and !isAlwaysAllowed(call.name)) {
+    //
+    // The permission set of a CALL is the union of the tools it calls, and for
+    // every tool but `batch` that union is the tool itself. A batch of reads
+    // asks for nothing; a batch with a write step asks for exactly what that
+    // write would have asked.
+    const perm_tools = tools_mod.callPermissionTools(call.name, call.args_json, arena);
+    const auto_allowed = permAutoAllowed(call.name, arg, call.args_json, arena);
+    if (!yolo and !auto_allowed and permNeedsDialog(perm_tools)) {
         var dbuf: [384]u8 = undefined;
-        const detail = std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
+        // A batch's dialog says WHICH FILES it would touch: the user is being
+        // asked to approve a set of writes, and the set is the whole question.
+        const detail = if (std.mem.eql(u8, call.name, "batch"))
+            tools_mod.batchPermissionDetail(call.args_json, arena)
+        else
+            std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
         switch (m.requestPermission(call.name, detail)) {
             .allow => {},
-            .allow_always => allowAlwaysFor(m, call.name, arg),
+            .allow_always => allowAlwaysForCall(m, call.name, arg, perm_tools),
             .deny, .none => {
                 // The denial is handed back to the model as a result
                 // so it changes strategy instead of retrying.
@@ -7068,8 +7096,17 @@ fn execOneCall(
     // exist" (permissions, a directory), NO snapshot is taken: `/undo` would
     // delete a file it never managed to read, which is the worst thing an undo
     // can do.
+    //
+    // A BATCH can touch SEVERAL files, and `/undo` has to be able to put all
+    // of them back. The snapshot is taken per file, exactly as it is for a
+    // direct call: a batch that wrote three files and snapshotted one would
+    // undo a third of the turn.
     var before: ?[]const u8 = null;
-    if (touchesFile(call.name)) {
+    if (std.mem.eql(u8, call.name, "batch")) {
+        for (tools_mod.callTouchedPaths(call.name, call.args_json, arena)) |pth| {
+            snapshotForUndo(m, pth, arena);
+        }
+    } else if (touchesFile(call.name)) {
         if (filePathOf(call.args_json, arena)) |pth| {
             if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
                 before = content;
@@ -7905,6 +7942,64 @@ fn touchesFile(name: []const u8) bool {
         std.mem.eql(u8, name, "notebook_edit");
 }
 
+/// Does this CALL modify a file?
+///
+/// A `batch` is decided by its steps: a batch of reads is a read, and a batch
+/// with a `write` or an `edit` step is a write. The static list of write
+/// tools cannot say that, and a batch that wrote in plan mode would be a
+/// hole in the mode.
+fn callIsWrite(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    if (std.mem.eql(u8, name, "batch")) return tools_mod.callWrites(name, args_json, arena);
+    return isWriteTool(name);
+}
+
+/// The BEFORE snapshot of one file, for `/undo`.
+///
+/// `existed` is separate because "it was not there" and "it was empty" undo
+/// differently (delete vs write empty), and a `catch ""` does not tell them
+/// apart. A read that fails for any OTHER reason takes no snapshot at all:
+/// `/undo` would delete a file it never managed to read, which is the worst
+/// thing an undo can do.
+fn snapshotForUndo(m: *tui.Model, pth: []const u8, arena: std.mem.Allocator) void {
+    if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
+        m.snapshotFile(pth, content, true);
+    } else |err| {
+        switch (err) {
+            error.FileNotFound => m.snapshotFile(pth, "", false),
+            else => {},
+        }
+    }
+}
+
+/// Does this call need the permission dialog?
+///
+/// The permission set is the union of the tools the call is a call to, and a
+/// tool that is already on the allowlist does not ask again.
+fn permNeedsDialog(perm_tools: []const []const u8) bool {
+    for (perm_tools) |t| {
+        if (tools_mod.needsPermission(t) and !isAlwaysAllowed(t)) return true;
+    }
+    return false;
+}
+
+/// The `a` key on the permission dialog, for a call whose permission set is a
+/// UNION.
+///
+/// For a batch it remembers the TOOLS its steps are calls to, and not
+/// "batch": what the user approved, having just read a dialog that named the
+/// files, is the write. Remembering "batch" would make one approval cover
+/// every batch the model writes later, which is not what anybody answered.
+fn allowAlwaysForCall(m: *tui.Model, name: []const u8, arg: []const u8, perm_tools: []const []const u8) void {
+    if (!std.mem.eql(u8, name, "batch")) {
+        allowAlwaysFor(m, name, arg);
+        return;
+    }
+    for (perm_tools) |t| {
+        if (!tools_mod.needsPermission(t)) continue;
+        setAlwaysAllowed(m, t);
+    }
+}
+
 /// Tools blocked in read-only mode.
 ///
 /// `bash` is in the list even though a `bash` can be a pure read, because it can
@@ -7957,6 +8052,15 @@ fn filePathOf(args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
 fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return "";
     if (parsed != .object) return "";
+    // A batch's arguments are a LIST of steps: there is no single path to
+    // name, and the "first string wins" fallback below would find none (the
+    // strings are inside the steps). The COUNT is what one row can say, and
+    // it is the thing the user wants to know: how much this one call does.
+    if (std.mem.eql(u8, name, "batch")) {
+        const steps_v = parsed.object.get("steps") orelse return "steps";
+        if (steps_v != .array) return "steps";
+        return std.fmt.allocPrint(arena, "{d} steps", .{steps_v.array.items.len}) catch "steps";
+    }
     const wanted: []const u8 = if (std.mem.eql(u8, name, "read") or
         std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit") or
         std.mem.eql(u8, name, "list_files"))
@@ -12981,24 +13085,56 @@ test "permAutoAllowed: accept-edits allows edits, a bash prefix allows that bash
     // `git status` pattern is set below and allowed in EVERY mode,
     // so the command that must ask here is one it does not name.
     setPermMode(&m, .default);
-    try std.testing.expect(!permAutoAllowed("write", "{}"));
-    try std.testing.expect(!permAutoAllowed("bash", "zig build test"));
+    try std.testing.expect(!permAutoAllowed("write", "{}", "{}", std.testing.allocator));
+    try std.testing.expect(!permAutoAllowed("bash", "zig build test", "{}", std.testing.allocator));
 
     // Accept-edits: file edits run, but bash still asks.
     setPermMode(&m, .accept_edits);
-    try std.testing.expect(permAutoAllowed("write", "{}"));
-    try std.testing.expect(permAutoAllowed("edit", "{}"));
-    try std.testing.expect(permAutoAllowed("rename", "{}"));
+    try std.testing.expect(permAutoAllowed("write", "{}", "{}", std.testing.allocator));
+    try std.testing.expect(permAutoAllowed("edit", "{}", "{}", std.testing.allocator));
+    try std.testing.expect(permAutoAllowed("rename", "{}", "{}", std.testing.allocator));
     // A bash command with no allowed prefix still asks, even here:
     // accepting edits is not accepting commands.
-    try std.testing.expect(!permAutoAllowed("bash", "zig build test"));
+    try std.testing.expect(!permAutoAllowed("bash", "zig build test", "{}", std.testing.allocator));
 
     // A bash prefix allows that command in ANY mode: it is the
     // user's standing "I trust this", independent of the mode.
     setPermMode(&m, .default);
-    try std.testing.expect(permAutoAllowed("bash", "git status"));
-    try std.testing.expect(permAutoAllowed("bash", "git status --short"));
-    try std.testing.expect(!permAutoAllowed("bash", "rm -rf /"));
+    try std.testing.expect(permAutoAllowed("bash", "git status", "{}", std.testing.allocator));
+    try std.testing.expect(permAutoAllowed("bash", "git status --short", "{}", std.testing.allocator));
+    try std.testing.expect(!permAutoAllowed("bash", "rm -rf /", "{}", std.testing.allocator));
+}
+
+test "a batch is covered by accept-edits only when it WRITES" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = read_only, .ae = accept_edits, .y = yolo };
+    defer {
+        read_only = saved.ro;
+        accept_edits = saved.ae;
+        yolo = saved.y;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const reads =
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"grep","pattern":"x"}]}
+    ;
+    const writes =
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"write","path":"out.md"}]}
+    ;
+
+    // Default mode: nothing is auto-allowed, and that is true of a batch too.
+    setPermMode(&m, .default);
+    try std.testing.expect(!permAutoAllowed("batch", "", reads, arena));
+    try std.testing.expect(!permAutoAllowed("batch", "", writes, arena));
+
+    // Accept-edits covers a batch that writes (its write step is an edit).
+    setPermMode(&m, .accept_edits);
+    try std.testing.expect(permAutoAllowed("batch", "", writes, arena));
 }
 
 test "the `a` key on a bash dialog saves the COMMAND, not the whole tool" {

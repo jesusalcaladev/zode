@@ -125,14 +125,14 @@ binary (1.9MB stripped).
 - Note: OpenRouter's free models do not report cache; the metric shines with
   Anthropic/DeepSeek/OpenAI.
 
-## Current tools (36)
+## Current tools (37)
 
 read, write, edit (multi-hunk), notebook_edit, bash (+background: `run_in_background`,
 `bash_output`, `bash_kill`), glob, grep (native rg), refs, rename, check,
 git_status/diff/log/branch/add/commit/stash, list_files, **web_fetch**,
 **web_search**, think (a scratchpad with no effects, for planning), todo, the
 task graph (`task_create`/`task_get`/`task_list`/`task_update`/`task_stop`), ask,
-lsp, skill, task (subagents), review, goal, sleep.
+lsp, skill, task (subagents), review, goal, sleep, **batch**.
 
 **The authoritative list is `tools/dispatch.zig`'s `defs`** — this heading said
 "10" while the binary had 28, because a hand-kept copy is how a list goes stale.
@@ -145,6 +145,18 @@ web_fetch, web_search, think, todo, the five task tools (they change the
 SESSION's list, not the machine — and plan mode must let the agent write down
 its own plan), ask, skill, bash_output/bash_kill, sleep (it waits), review,
 goal. `rename` is NOT exempt: it rewrites files across the tree.
+
+**`batch` is the exception that is NOT in the list above, and it is not an
+exemption**: a batch of reads asks for nothing, and a batch with a `write`
+step asks for exactly what that write would have asked. The decision is per
+CALL, not per tool — see "The `batch` tool: the permission set is the union".
+
+**`lsp` is in the list and CANNOT BE CALLED**: the schema is in the prompt
+and the dispatcher has no branch for it, so the model gets `there is no tool
+called lsp`. The library (`src/lsp/`, ~1700 lines, 33 test blocks) is written
+and not wired: the manager is never initialised, there is no `lsp_servers`
+key in `config.json`, and 32 of those test blocks are in a file no build step
+references. TASKS.md § Phase 14 has the full list.
 
 ## The web tools: `web_fetch` and `web_search`
 
@@ -5049,3 +5061,105 @@ La decisión es una función **pura** (`ask.decide(bypass, has_options)`) y no
 una rama dentro del `askCall`: el `askCall` de verdad **abre un diálogo y
 parchea el turno**, así que un test que lo llame se queda colgado esperando a
 un humano que no está. La regla se prueba sola y el agente solo la obedece.
+
+---
+
+## The `batch` tool: the permission set is the union (2026-10-20)
+
+TASKS.md § Phase 16. "Count the lines in 4 files, find the TODOs in the 2
+that have them, write a report" is 5 tool calls, and **each one is a whole
+model request**: the prompt goes out, the answer comes back, and the whole
+thing is billed again on the next iteration.
+
+### The surface is a fixed list, and that IS the safety argument
+
+`src/lib/batch.zig`'s `Op` has fourteen members and there is no way to spell
+a step that is not one of them. The model never supplies a command, there
+are no pipes and there is no network. The only processes that run are the
+two FIXED git reads (`git status --porcelain=v1` and `git diff HEAD`), which
+are the same commands the `git_status` and `git_diff` tools run.
+
+A tool that evaluates what the model wrote has a power that grows with the
+model's imagination, and **the permission dialog cannot describe what it
+cannot enumerate**. That is the whole reason the batch is a list of steps and
+not a mini-language.
+
+### The permission set of a batch is the UNION of its steps
+
+This is the part that had to be right, and the registry's static `read_only`
+flag cannot express it: a batch of READS must not ask, and a batch with a
+WRITE step must ask exactly what that write would have asked.
+
+So the table says `read_only = false` (the conservative answer) and the
+per-CALL answer comes from `registry.callPermissionTools`:
+
+- every step names the tool it is a call to (`read` is a call to `read`,
+  `write` is a call to `write`),
+- the union of those is the batch's permission set,
+- `permNeedsDialog` asks when one of them needs permission and is not on the
+  allowlist.
+
+Three things fall out of that and are worth keeping:
+
+1. **"always allow" on a batch remembers the TOOLS, not `batch`.** What the
+   user approved, having just read a dialog that named the files, is the
+   write. Remembering `batch` would make one approval cover every batch the
+   model writes later, which is not what anybody answered.
+2. **Plan mode decides by the steps too** (`callIsWrite`): a batch of reads
+   is a read and a batch with a write step is blocked. The static list of
+   write tools cannot say that.
+3. **`/undo` snapshots EVERY file a batch touches.** A batch that wrote
+   three files and snapshotted one would undo a third of the turn.
+
+### A batch whose arguments do not parse ASKS
+
+The direction that is safe to be wrong in: a batch nobody can reason about
+is the one that has to ask. The same for a batch whose steps are malformed —
+the refusal names the step and says what is missing.
+
+### The log says what it bought
+
+`4 step(s), 1 request` is the first line, and one line per step after it.
+The saving is the reason the tool exists, so it is said OUT LOUD rather than
+left for the model to infer from a shorter answer.
+
+### `refs` was refactored, not copied
+
+The batch's `refs` step needed the hits, not the rendered text, so
+`refs.findHits` was extracted out of `toolRefs` and both use it: two scanners
+would disagree about what counts as a use, and the count in one answer would
+be a number about something else.
+
+## A missing binary is not a passing run (2026-10-20)
+
+`tools/ab_probe.py` compares the base commit against the current one on the
+one condition that matters (does the app answer a keypress with a saved key
+in `auth.json`?). Its `--base` default is a path that does not exist on this
+machine.
+
+**The probe said "base: answers" anyway.** `pty.fork` + `execve` of a path
+that is not there: the child raises `FileNotFoundError`, the TRACEBACK goes
+to the pty (it is the child's stderr), and the harness sees bytes and calls
+it a healthy run. The base column was measuring a failed exec.
+
+It cost a real detour: the first reading of that output said the change
+under test had broken the app, when the honest A/B (`git stash`, build, run
+both) showed **base and current behaving identically** — which is the
+documented open bug (ReleaseSmall + a saved key stops the input loop).
+
+The probe now refuses to run when either binary is missing. It is the same
+trap as the missing `exit.txt` in the task harness: **a file that was never
+created and a file that was created empty look identical from the outside**,
+and only one of them is evidence.
+
+## A bundled skill's body travels WITH its entry (2026-10-20)
+
+TASKS.md § Phase 1. `skills.Entry` had a `body` field that was ALWAYS null:
+the bundled skills' bodies were reached through a `bundled://name` path
+prefix and a second lookup, and the field was decoration.
+
+Now the body travels with the entry, and `Loader.load` answers from it
+**without opening the disk**. The test points the entry at a path that does
+not exist, on purpose: a loader that went to the disk would answer null and
+throw away the body it was already holding — the skill would look broken
+exactly when it is the one that cannot be broken.
