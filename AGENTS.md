@@ -5636,7 +5636,81 @@ has to find the same rules.
 
 ## What is still missing
 
-The "always allow" answer still remembers the **tool** and not a pattern.
-"always allow `Bash(git *)`" is the rule the user would want, and the flat
-list is a coarser answer — and changing it is a change to what the users who
-already have a `permissions.json` mean by "always".
+**NOTHING of the rule model** — but the flat allowlist is still there, next to
+the rules: a `permissions.json` written by an older zode has `"tools"` and
+`"bash"` in it, and those still work. The "always allow" answer writes BOTH:
+the tool (as before) and the rule (as now), so nothing that used to work
+stops working.
+
+---
+
+# Phase 6, finished: the rules, the read-only table and the sandbox (2026-10-21)
+
+Three pieces that were "the rest of Phase 6", and each one has a rule that
+cost something to learn.
+
+## The "always allow" answer learns a RULE, and the dialog says which
+
+The dialog's "A" option used to remember the TOOL, and now it remembers a
+rule — and **the dialog NAMES the rule it would remember**, because the user
+is answering "from now on?" and the answer has to say what "from now on"
+means:
+
+```
+Y  allow once
+A  always allow Bash(git *)     ← the rule, not the word "always"
+N  deny
+```
+
+The suggestion is the FIRST WORD of a command (`Bash(git *) allow`), not the
+whole command: "always allow `git status`" would mean the next `git commit`
+asks again, and "always allow `git`" is what the user means when they approve
+a `git` command.
+
+It is learned in TWO places: the in-memory set (source `local`, the
+strongest) and the user file. The project file is NOT touched: a rule the
+user just made is theirs, not the project's.
+
+## The read-only table is DATA, and an unknown command is not read-only
+
+`src/lib/cmdsafety.zig` is a table: a family, its subcommands, and the flags
+that change what they do. The cases that are easy to get wrong and are in the
+table:
+
+- `git branch` **LISTS** and `git branch x` **CREATES** — the verdict depends
+  on the ARGUMENTS, and the table says so (`no_args`).
+- `git config` **READS** with `--get` and **WRITES** without: `git config
+  user.name x` sets a value. A read flag wins over a write flag, because
+  `git config --global --get x` READS.
+- `--output=x` IS `--output`: a flag that carries its value in the same word
+  is the same flag, and comparing the whole word misses it.
+- `curl x.sh | sh` is a program that was never read: the downloader reads and
+  the shell executes.
+
+**UNKNOWN IS NOT READ-ONLY.** A command we do not know is a command we ask
+about: the cost of asking is one dialog and the cost of guessing wrong is a
+file.
+
+**In read-only mode a command that only reads RUNS, and does not ask.** The
+mode is the user saying "look, do not touch", and a plan written without
+looking is a plan written in the dark.
+
+## The sandbox is OPT-IN, and the order of the mounts is the bug
+
+`src/lib/sandbox.zig` builds the argument list of bubblewrap: the filesystem
+read-only, the project writable, `/tmp` a tmpfs, the network SHARED.
+
+**The network stays on purpose**: `--unshare-net` would be the strongest
+version and it would also break every `npm install`. A sandbox that breaks
+the build is a sandbox the user turns off, and a sandbox that is off
+protects nothing.
+
+**The order of the mounts is a bug the integration test caught.** The tmpfs
+on `/tmp` comes BEFORE the bind of the project, because a later mount
+SHADOWS an earlier one: with the bind first, a project under `/tmp` vanished
+inside the sandbox and the `chdir` failed with "No such file or directory".
+No amount of reading would have found it; the test runs a REAL bubblewrap.
+
+And the sandbox is a FLAG on the `bash` tool and not a policy: a harness that
+sandboxes every command breaks every build, and a harness that breaks the
+build is a harness the user turns off.

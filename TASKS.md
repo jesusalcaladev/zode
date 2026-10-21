@@ -156,11 +156,11 @@ state, the open bug and the quality bar).
 
 `🔒 security · 🟡 · independent`
 
-- [x] Rule model with sources and precedence: local > project > user > policy; syntax `Tool(pattern)` (`Bash(git *)`, `Read(*.ts)`); actions `deny` / `allow` / `ask` — **the grammar is DONE 2026-10-21** (`src/lib/permrules.zig`): a rule is `Tool(pattern) action`, the pattern is a glob over the path (a file tool) or the command (`bash`), the files are `.zode/permissions.json` (project) and `~/.config/zode/permissions.json` (user), and **a `deny` beats any `allow` from any source**. Two of the four SOURCES are not rule files yet: `local` (this session) and `policy` (the built-in table)
-- [ ] Once-off suggestions: a permission request returns rules the user can accept ("always allow `Bash(git *)`") → learned per tool+pattern (today: a flat allowlist that remembers the TOOL)
-- [ ] Bash read-only classification table (`git status`, `rg`, `ls`, `wc`…) — by command and flags, never by guessing
-- [ ] Optional sandbox: if `bwrap`/`firejail` is present, run `bash` inside it
-- [x] Pure tests: rule parsing and precedence · `Tool(pattern)` matching · a `deny` beats any `allow` — the read-only table is not there yet
+- [x] Rule model with sources and precedence: local > project > user > policy; syntax `Tool(pattern)` (`Bash(git *)`, `Read(*.ts)`); actions `deny` / `allow` / `ask` — **DONE 2026-10-21** (`src/lib/permrules.zig`): a rule is `Tool(pattern) action`, the pattern is a glob over the path (a file tool) or the command (`bash`), the files are `.zode/permissions.json` (project) and `~/.config/zode/permissions.json` (user), and **a `deny` beats any `allow` from any source**. The four SOURCES are all real: `local` is the rule the user just made, `policy` is the built-in sensitive table (whose action is ASK)
+- [x] Once-off suggestions: a permission request returns rules the user can accept ("always allow `Bash(git *)`") → learned per tool+pattern — **DONE 2026-10-21**: the "A" option NAMES the rule it would remember (in the dialog), and the answer writes it to the user file
+- [x] Bash read-only classification table (`git status`, `rg`, `ls`, `wc`…) — by command and flags, never by guessing — **DONE 2026-10-21** (`src/lib/cmdsafety.zig`): the table is DATA (a family, its subcommands, and the flags that change what they do), and an UNKNOWN command is not read-only. In read-only mode a command that only reads runs and does not ask
+- [x] Optional sandbox: if `bwrap`/`firejail` is present, run `bash` inside it — **DONE 2026-10-21** (`src/lib/sandbox.zig`): the tool's `sandbox: true` runs the command with the filesystem read-only except the project, and `/tmp` empty. It is OPT-IN and not a policy: a harness that sandboxes every command breaks every build
+- [x] Pure tests: rule parsing and precedence · `Tool(pattern)` matching · the read-only table (a write command with a read-looking name is NOT exempt) · a `deny` beats any `allow`
 
 ---
 
@@ -453,9 +453,9 @@ some servers support).
 
 > Phase 6 decides *whether* to ask; this decides *what is dangerous*. A dialog is useless if one line hides an `rm -rf` behind a pipe.
 
-- [ ] `lib/cmdsafety.zig` (pure): split a command into its parts (pipelines, `&&`/`||`/`;`, substitutions); flag the ones that write, delete, exfiltrate, or chain into a shell (`curl … | sh`), naming the **exact dangerous fragment**
-- [ ] The classifier is **data, not a heuristic**: command families + the flags that change them — `git status` is quiet and `git clean -fdx` is not; a new family is one row
-- [ ] The dialog shows the risk in words, not the raw line: "this deletes unreferenced files" beats `git clean -fdx`
+- [x] **25.1** `lib/cmdsafety.zig` (pure): split a command into its parts (pipelines, `&&`/`||`/`;`, substitutions); flag the ones that write, delete, exfiltrate, or chain into a shell (`curl … | sh`), naming the **exact dangerous fragment** — **DONE 2026-10-21** (as part of Phase 6's read-only table): the splitter knows the separators, the redirections and the substitutions, and the verdict is the WORST of the parts
+- [x] **25.2** The classifier is **data, not a heuristic**: command families + the flags that change them — `git status` is quiet and `git clean -fdx` is not; a new family is one row — **DONE 2026-10-21**: `git branch` LISTS and `git branch x` CREATES, and `git config` READS with `--get` and WRITES without
+- [x] **25.3** The dialog shows the risk in words, not the raw line: "this deletes unreferenced files" beats `git clean -fdx` — **DONE 2026-10-21**
 - [ ] Phase 6's read-only table reuses it: a command is only "read-only" if the scanner found nothing to flag
 - [ ] Optional sandbox: if `bwrap` exists, offer a sandboxed `bash` for flagged commands — a dialog is not the only answer
 - [ ] Pure tests: the parser splits quoted separators correctly (a `;` inside a string is not a separator) · a pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution

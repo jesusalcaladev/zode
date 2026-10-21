@@ -42,6 +42,8 @@ pub const selfupdate = @import("lib/selfupdate.zig");
 pub const clipboard = @import("clipboard.zig");
 pub const copytext = @import("lib/copytext.zig");
 pub const permrules = @import("lib/permrules.zig");
+pub const cmdsafety = @import("lib/cmdsafety.zig");
+pub const sandbox = @import("lib/sandbox.zig");
 pub const pathsafe = @import("lib/pathsafe.zig");
 
 // The language server. It was in its own aggregator (`src/lsp_test.zig`) that

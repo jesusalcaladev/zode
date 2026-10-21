@@ -14,7 +14,7 @@ pub const description: []const u8 =
 
 /// The `parameters` object, verbatim.
 const parameters: []const u8 =
-    "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\",\"description\":\"one line saying what the command is FOR, shown to the user in the timeline (e.g. running the test suite)\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"foreground only; default 30; setting it means you decided, so auto-background does not apply\"},\"run_in_background\":{\"type\":\"boolean\",\"description\":\"return a job id at once instead of waiting\"}},\"required\":[\"command\"]}";
+    "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\",\"description\":\"one line saying what the command is FOR, shown to the user in the timeline (e.g. running the test suite)\"},\"timeout_seconds\":{\"type\":\"integer\",\"description\":\"foreground only; default 30; setting it means you decided, so auto-background does not apply\"},\"run_in_background\":{\"type\":\"boolean\",\"description\":\"return a job id at once instead of waiting\"},\"sandbox\":{\"type\":\"boolean\",\"description\":\"run it inside a sandbox (bubblewrap or firejail) when one is installed: the filesystem is read-only except the project, and /tmp is empty. Use it for a command that deletes or changes things you are not sure about. It breaks the commands that need the network or a writable home, and no sandbox is installed everywhere\"}},\"required\":[\"command\"]}";
 
 /// The whole entry, ready to be spliced into the tools array.
 pub const json: []const u8 =

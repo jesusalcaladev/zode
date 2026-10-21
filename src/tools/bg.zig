@@ -140,9 +140,24 @@ pub fn runForeground(
     timeout_s: u64,
     out_limit: usize,
 ) !Foreground {
-    var argv = [_][]const u8{ "/bin/sh", "-c", command };
+    var plain = [_][]const u8{ "/bin/sh", "-c", command };
+    return runForegroundArgv(gpa, io, &plain, timeout_s, out_limit);
+}
+
+/// The same, with the ARGUMENT LIST the caller chose.
+///
+/// It is what the sandbox needs: the sandbox's own arguments come FIRST and
+/// the command is the last thing in the list, and a "command string" cannot
+/// express that without quoting the quoting.
+pub fn runForegroundArgv(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    timeout_s: u64,
+    out_limit: usize,
+) !Foreground {
     var child = try std.process.spawn(io, .{
-        .argv = &argv,
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,

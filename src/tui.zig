@@ -1028,6 +1028,13 @@ pub const Model = struct {
     perm_detail: [384]u8 = undefined,
     perm_detail_len: usize = 0,
     perm_active: bool = false,
+    /// The rule the "always allow" option would remember.
+    ///
+    /// It is shown IN the dialog, because the user is answering "allow this
+    /// command from now on?" and the answer has to name what it is: "always
+    /// allow" alone says nothing about what is being remembered.
+    perm_suggestion: [96]u8 = undefined,
+    perm_suggestion_len: usize = 0,
     /// Whether the open dialog offers "always allow".
     ///
     /// It is false for the questions that must not become a standing
@@ -1975,6 +1982,22 @@ pub const Model = struct {
             self.permUnlock();
         }
         return self.requestPermission(tool, detail);
+    }
+
+    /// The rule the "always allow" option would remember.
+    pub fn setPermSuggestion(self: *Model, text: []const u8) void {
+        self.permLock();
+        defer self.permUnlock();
+        const n = @min(text.len, self.perm_suggestion.len);
+        @memcpy(self.perm_suggestion[0..n], text[0..n]);
+        self.perm_suggestion_len = n;
+    }
+
+    /// The rule the open dialog would remember, or "" when there is none.
+    pub fn permSuggestion(self: *Model) []const u8 {
+        self.permLock();
+        defer self.permUnlock();
+        return self.perm_suggestion[0..self.perm_suggestion_len];
     }
 
     /// Whether the open dialog offers "always allow".
@@ -6045,7 +6068,15 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // a centered box with a border, a clean background and big options: there
     // is no way not to see it.
     if (self.permView(&perm_tool, &perm_detail)) {
-        drawPermissionModal(&p, width, height, perm_tool, perm_detail, self.permAllowAlways());
+        drawPermissionModal(
+            &p,
+            width,
+            height,
+            perm_tool,
+            perm_detail,
+            self.permAllowAlways(),
+            self.permSuggestion(),
+        );
     }
 
     // ── `ask`: the question itself ──
@@ -6674,6 +6705,7 @@ fn drawPermissionModal(
     tool: []const u8,
     detail: []const u8,
     allow_always: bool,
+    suggestion: []const u8,
 ) void {
     const w: u16 = @min(width -| 6, 104);
     const h: u16 = 9;
@@ -6750,16 +6782,33 @@ fn drawPermissionModal(
     };
     var opts: []const @TypeOf(opts_all[0]) = &opts_all;
     if (!allow_always) opts = &.{ opts_all[0], opts_all[2], opts_all[3] };
+    // The "always allow" option NAMES the rule it would remember: the user is
+    // answering "from now on?", and the answer has to say what "from now on"
+    // means.
+    var suggestion_buf: [128]u8 = undefined;
+    const suggestion_label_text = suggestion_label(suggestion, &suggestion_buf);
     var ox: u16 = x + 3;
     for (opts, 0..) |o, i| {
         _ = p.putText(ox, y + 7, o.key, theme.brand_bold);
         const adv: u16 = @as(u16, @intCast(o.key.len)) + 1;
         ox += adv;
-        ox = p.putText(ox, y + 7, o.label, if (i == 0) theme.brand else theme.brand_soft);
+        // The "A" row carries the rule it would remember.
+        const label: []const u8 = if (i == 1 and suggestion_label_text.len > 0) suggestion_label_text else o.label;
+        ox = p.putText(ox, y + 7, label, if (i == 0) theme.brand else theme.brand_soft);
         if (i + 1 < opts.len and ox + 4 < x + w) {
             ox = p.putText(ox, y + 7, "   ", theme.brand_faint);
         }
     }
+}
+
+/// The label of the "always allow" option: the rule it would remember.
+///
+/// It is the SUGGESTION and not the word "always allow", because the user is
+/// answering a question about the future ("from now on?") and the answer has
+/// to name what "from now on" means.
+fn suggestion_label(suggestion: []const u8, buf: []u8) []const u8 {
+    if (suggestion.len == 0) return "";
+    return std.fmt.bufPrint(buf, "always allow {s}", .{suggestion}) catch "";
 }
 
 /// The permission question in TWO ROWS, for a terminal that has no room for the

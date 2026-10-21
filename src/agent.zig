@@ -19,6 +19,7 @@ const clean_mod = @import("lib/clean.zig");
 const usercmds_mod = @import("lib/usercmds.zig");
 const pathsafe = @import("lib/pathsafe.zig");
 const permrules = @import("lib/permrules.zig");
+const cmdsafety = @import("lib/cmdsafety.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
@@ -2125,7 +2126,30 @@ pub fn permRuleSet() permrules.Set {
 /// the command for `bash`. A rule with a pattern matches if it matches ANY
 /// of them, and a rule with no pattern matches any subject.
 pub fn permDecision(tool: []const u8, subjects: []const []const u8) ?permrules.Decision {
-    return permrules.decide(perm_rules.rules, tool, subjects);
+    if (permrules.decide(perm_rules.rules, tool, subjects)) |d| return d;
+
+    // The POLICY: the built-in sensitive table. Its action is ASK, and that
+    // is the whole point of it: the built-in table does not REFUSE (a project
+    // with a `.vscode/` the user wants edited is blocked forever by a
+    // refusal), it asks, and a rule in a file can answer "allow" for it.
+    for (subjects) |sub| {
+        const v = pathsafe.checkWrite(sub);
+        if (v == .ok) continue;
+        return .{
+            .action = .ask,
+            .rule = .{
+                .tool = tool,
+                .pattern = sub,
+                .action = .ask,
+                .source = .policy,
+                .text = switch (v) {
+                    .dangerous => |d| d.what,
+                    else => "a protected file",
+                },
+            },
+        };
+    }
+    return null;
 }
 
 // ── environment and history notices ───────────────────────────
@@ -7135,10 +7159,26 @@ pub const max_asks_per_turn = 3;
 /// loop, and the cap is what saves you from it).
 pub const read_only_text =
     "plan (read-only) mode is on: the user asked zode to look before it touches anything, " ++
-    "so write/edit/bash did not run. Do NOT retry it. Read what you need and write the " ++
+    "so write/edit and the commands that CHANGE something did not run. The commands that only " ++
+    "read (git status, git diff, rg, ls, cat) still run, and they do not ask. Do NOT retry the " ++
+    "blocked one. Read what you need and write the " ++
     "IMPLEMENTATION PLAN with the `todo` tool, then end your turn — the user will be asked " ++
     "to approve it and zode will switch itself out of plan mode. For anything you need to " ++
     "know first, use `ask` — or say so in one line — the user can turn plan mode off with shift+tab.";
+
+/// Whether a call is a `bash` that only READS.
+///
+/// It is the table of `lib/cmdsafety.zig`: `git status`, `rg`, `ls`… read and
+/// change nothing, and a command we do not know is NOT read-only (the cost of
+/// asking is one dialog and the cost of guessing wrong is a file).
+fn callReadsOnly(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    if (!std.mem.eql(u8, name, "bash")) return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return false;
+    if (parsed != .object) return false;
+    const cmd = parsed.object.get("command") orelse return false;
+    if (cmd != .string) return false;
+    return cmdsafety.isReadOnly(cmd.string, arena);
+}
 
 /// ESC: kills the foreground command if there is one. Returns how many were
 /// killed. See `bgproc.killForeground` for why this is not a no-op.
@@ -7219,7 +7259,13 @@ fn execOneCall(
     // A BATCH is decided by its steps: a batch of reads is a read, and a batch
     // with a write step is a write. The static list of write tools cannot say
     // that, and a batch that wrote in plan mode would be a hole in the mode.
-    if (read_only and callIsWrite(call.name, call.args_json, arena)) {
+    //
+    // A `bash` that only READS is not a write: `git status`, `rg`, `ls` change
+    // nothing, and the mode is about not touching things. Blocking them would
+    // mean the agent cannot LOOK, and a plan written without looking is a
+    // plan written in the dark.
+    const reads_only = callReadsOnly(call.name, call.args_json, arena);
+    if (read_only and !reads_only and callIsWrite(call.name, call.args_json, arena)) {
         m.plan_write_blocked_this_turn = true;
         m.pushToolDone(call.name, "blocked by plan mode", 0, read_only_text);
         s.appendToolResult(call.id, call.name, read_only_text) catch {};
@@ -7326,17 +7372,39 @@ fn execOneCall(
     // write would have asked.
     const perm_tools = tools_mod.callPermissionTools(call.name, call.args_json, arena);
     const auto_allowed = permAutoAllowed(call.name, arg, call.args_json, arena);
-    if (!yolo and !auto_allowed and !risky_allowed and !rule_allowed and permNeedsDialog(perm_tools)) {
+    //
+    // In READ-ONLY mode a command that only reads does not ask: the mode is
+    // the user saying "look, do not touch", and a dialog about `ls` is the
+    // mode asking the question it was meant to settle.
+    const no_dialog = read_only and reads_only;
+    if (!yolo and !auto_allowed and !risky_allowed and !rule_allowed and !no_dialog and permNeedsDialog(perm_tools)) {
         var dbuf: [384]u8 = undefined;
         // A batch's dialog says WHICH FILES it would touch: the user is being
         // asked to approve a set of writes, and the set is the whole question.
-        const detail = if (std.mem.eql(u8, call.name, "batch"))
+        var detail: []const u8 = if (std.mem.eql(u8, call.name, "batch"))
             tools_mod.batchPermissionDetail(call.args_json, arena)
         else
             std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
+        // The RISK, in words, for a command that has one: "this deletes
+        // unreferenced files" beats `git clean -fdx` on its own.
+        //
+        // The user is being asked to approve a command they did not write,
+        // and the raw line is not a risk: it is a spelling.
+        if (std.mem.eql(u8, call.name, "bash") and cmdsafety.classify(arg, arena).why.len > 0) {
+            const why = cmdsafety.classify(arg, arena).why;
+            var both: [640]u8 = undefined;
+            const with_why = std.fmt.bufPrint(&both, "{s} — {s}", .{ detail, why }) catch detail;
+            detail = with_why;
+        }
         switch (m.requestPermission(call.name, detail)) {
             .allow => {},
-            .allow_always => allowAlwaysForCall(m, call.name, arg, perm_tools),
+            .allow_always => {
+                allowAlwaysForCall(m, call.name, arg, perm_tools);
+                // And it learns the RULE, not only the tool: "always allow
+                // `Bash(git *)`" is what the user answered, and the flat list
+                // is a coarser memory of the same answer.
+                learnRuleForCall(m, call.name, call.args_json, arena);
+            },
             .deny, .none => {
                 // The denial is handed back to the model as a result
                 // so it changes strategy instead of retrying.
@@ -8278,6 +8346,154 @@ fn permNeedsDialog(perm_tools: []const []const u8) bool {
 /// "batch": what the user approved, having just read a dialog that named the
 /// files, is the write. Remembering "batch" would make one approval cover
 /// every batch the model writes later, which is not what anybody answered.
+/// The rule the "always allow" answer would remember, as TEXT.
+///
+/// It is what the dialog shows and what the answer learns:
+///
+/// - a `bash` command becomes `Bash(git *) allow` — the FIRST WORD, and not
+///   the whole command: "always allow `git status`" would mean the next
+///   `git commit` asks again, and "always allow `git`" is the answer the
+///   user actually means when they approve a `git` command;
+/// - a tool that writes a file becomes `Write(src/main.zig) allow` — the file
+///   itself, because a directory is a bigger promise than the user made;
+/// - anything else becomes `<tool>(*) allow`.
+///
+/// It is a SUGGESTION and not a decision: the user reads it in the dialog
+/// before answering, and the answer is what is remembered.
+pub fn permSuggestion(call_name: []const u8, args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
+    if (std.mem.eql(u8, call_name, "bash")) {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
+        if (parsed != .object) return null;
+        const cmd = parsed.object.get("command") orelse return null;
+        if (cmd != .string) return null;
+        const first = firstWord(cmd.string);
+        if (first.len == 0) return null;
+        return std.fmt.allocPrint(arena, "Bash({s} *) allow", .{first}) catch null;
+    }
+    const paths = tools_mod.callTouchedPaths(call_name, args_json, arena);
+    if (paths.len == 1 and paths[0].len > 0) {
+        return std.fmt.allocPrint(arena, "{s}({s}) allow", .{ call_name, paths[0] }) catch null;
+    }
+    return std.fmt.allocPrint(arena, "{s}(*) allow", .{call_name}) catch null;
+}
+
+/// The first word of a command, without the quotes.
+fn firstWord(command: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < command.len and (command[i] == ' ' or command[i] == '\t')) i += 1;
+    const start = i;
+    while (i < command.len and command[i] != ' ' and command[i] != '\t') i += 1;
+    return command[start..i];
+}
+
+/// Learns the rule of an "always allow" answer.
+///
+/// It goes in TWO places: the in-memory set (source `local`, the strongest,
+/// because the user just said it) and the USER file, so it survives the
+/// session. The project file is NOT touched: a rule the user just made is
+/// theirs, not the project's.
+fn learnRuleForCall(m: *tui.Model, call_name: []const u8, args_json: []const u8, arena: std.mem.Allocator) void {
+    const text = permSuggestion(call_name, args_json, arena) orelse return;
+    const rule = permrules.parseRule(text, .local, arena) orelse return;
+
+    // The in-memory set: the strongest source, so the rule the user just
+    // made wins over the ones in the files.
+    if (perm_rules_arena == null) {
+        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
+    }
+    const a = perm_rules_arena.?.allocator();
+    var all: std.ArrayList(permrules.Rule) = .empty;
+    for (perm_rules.rules) |r| all.append(a, r) catch {};
+    all.append(a, rule) catch {};
+    perm_rules = .{ .rules = all.items };
+
+    // And the file, so it is there tomorrow.
+    if (savePermRule(rule)) {
+        const msg = std.fmt.allocPrint(m.allocator, "always allowed: {s}", .{text}) catch return;
+        pushInfoOwned(m, msg);
+    }
+}
+
+/// Appends a rule to the USER's `permissions.json`.
+///
+/// The file is written WHOLE, and the parts this code does not know about
+/// are kept: it is hand-edited, it carries the allowlist too, and dropping
+/// what the user wrote by hand is the one thing a permission file must never
+/// do.
+fn savePermRule(rule: permrules.Rule) bool {
+    var pbuf: [512]u8 = undefined;
+    const path = permissionsFilePath(&pbuf) orelse return false;
+
+    var astate = std.heap.ArenaAllocator.init(gpa_global);
+    defer astate.deinit();
+    const a = astate.allocator();
+
+    // What is in there now: the tools, the bash patterns and the rules.
+    var names: [max_always][]const u8 = undefined;
+    var n: usize = 0;
+    var pats: [max_bash_patterns][]const u8 = undefined;
+    var np: usize = 0;
+    var rules: std.ArrayList([]const u8) = .empty;
+    if (readFileTo(a, path)) |data| {
+        if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
+            switch (parsed) {
+                .object => |o| {
+                    if (o.get("tools")) |tv| {
+                        if (tv == .array) for (tv.array.items) |v| {
+                            if (v == .string and n < names.len) {
+                                names[n] = v.string;
+                                n += 1;
+                            }
+                        };
+                    }
+                    if (o.get("bash")) |bv| {
+                        if (bv == .array) for (bv.array.items) |v| {
+                            if (v == .string and np < pats.len) {
+                                pats[np] = v.string;
+                                np += 1;
+                            }
+                        };
+                    }
+                    if (o.get("rules")) |rv| {
+                        if (rv == .array) for (rv.array.items) |v| {
+                            if (v == .string) rules.append(a, v.string) catch {};
+                        };
+                    }
+                },
+                .array => |arr| {
+                    // The old shape: a bare array is the tool allowlist.
+                    for (arr.items) |v| {
+                        if (v == .string and n < names.len) {
+                            names[n] = v.string;
+                            n += 1;
+                        }
+                    }
+                },
+                else => {},
+            }
+        } else |_| {}
+    }
+
+    // The new rule, as the STRING the grammar is written in: it is the shape
+    // a human reads, and the parser accepts it.
+    rules.append(a, rule.text) catch return false;
+
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{{\"tools\":", .{}) catch return false;
+    config_mod.writeStringArray(&w, gpa_global, names[0..n]) catch return false;
+    w.print(",\"bash\":", .{}) catch return false;
+    config_mod.writeStringArray(&w, gpa_global, pats[0..np]) catch return false;
+    w.print(",\"rules\":[", .{}) catch return false;
+    for (rules.items, 0..) |r, i| {
+        if (i > 0) w.print(",", .{}) catch return false;
+        config_mod.writeJsonString(&w, gpa_global, r) catch return false;
+    }
+    w.print("]}}", .{}) catch return false;
+    std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = w.buffered() }) catch return false;
+    return true;
+}
+
 fn allowAlwaysForCall(m: *tui.Model, name: []const u8, arg: []const u8, perm_tools: []const []const u8) void {
     if (!std.mem.eql(u8, name, "batch")) {
         allowAlwaysFor(m, name, arg);
@@ -14383,4 +14599,53 @@ test "a rule that denies beats a rule that allows" {
     const d = permDecision("Write", &.{".git/config"}).?;
     try std.testing.expectEqual(permrules.Action.deny, d.action);
     try std.testing.expectEqualStrings("project", d.rule.source.name());
+}
+
+test "the 'always allow' suggestion names the rule it would remember" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A command becomes its FIRST WORD: "always allow `git status`" would
+    // mean the next `git commit` asks again.
+    const bash = permSuggestion("bash", "{\"command\":\"git status --short\"}", a).?;
+    try std.testing.expectEqualStrings("Bash(git *) allow", bash);
+
+    // A file becomes the file: a directory is a bigger promise than the user
+    // made.
+    const write = permSuggestion("write", "{\"path\":\"src/main.zig\"}", a).?;
+    try std.testing.expectEqualStrings("write(src/main.zig) allow", write);
+
+    // And a tool with nothing to narrow becomes itself.
+    const other = permSuggestion("task", "{\"prompt\":\"look around\"}", a).?;
+    try std.testing.expectEqualStrings("task(*) allow", other);
+}
+
+test "the suggestion is a rule the parser understands" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const text = permSuggestion("bash", "{\"command\":\"npm test\"}", a).?;
+    const rule = permrules.parseRule(text, .local, a).?;
+    try std.testing.expectEqualStrings("Bash", rule.tool);
+    try std.testing.expectEqualStrings("npm *", rule.pattern);
+    try std.testing.expectEqual(permrules.Action.allow, rule.action);
+}
+
+test "a command that only reads is not a write, and the plan mode lets it run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    try std.testing.expect(callReadsOnly("bash", "{\"command\":\"git status\"}", a));
+    try std.testing.expect(callReadsOnly("bash", "{\"command\":\"rg foo src/\"}", a));
+    // And a command that changes something is not.
+    try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"git push\"}", a));
+    try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"rm -rf build\"}", a));
+    // A command we do not know is NOT read-only: the cost of asking is one
+    // dialog and the cost of guessing wrong is a file.
+    try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"weird-tool --x\"}", a));
+    // Another tool is not a command at all.
+    try std.testing.expect(!callReadsOnly("write", "{\"path\":\"a.zig\"}", a));
 }
