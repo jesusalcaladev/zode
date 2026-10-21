@@ -21,6 +21,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const resultcap = @import("../lib/resultcap.zig");
 const batch_lib = @import("../lib/batch.zig");
+const subagent = @import("../lib/subagent.zig");
 
 // Per-tool prompt modules: the JSON schema each tool offers the model.
 const read_prompt = @import("prompts/read.zig");
@@ -333,12 +334,28 @@ pub const defs: []const ToolDef = &[_]ToolDef{
     },
     .{
         .name = "lsp",
-        .desc = "Ask a language server goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls",
+        .desc = "Ask a language server where a symbol is defined, where it is used, its type, the symbols in a file, its call hierarchy or the problems it found",
         .schema = lsp_prompt.json,
-        .read_only = false,
+        // It asks for NO permission, and this row is where that is decided.
+        //
+        // The command that gets spawned comes from the table in
+        // `lsp/servers.zig` (or from the user's `lsp_servers`), never from the
+        // model: there is no argument a model could put an obligation in, which
+        // is the same reason `read` asks nothing. It is a READ of the code, and
+        // the subagent's read-only toolset has always said so.
+        //
+        // The two used to disagree: this row said `false` (a dialog for
+        // everything) while the tool's own doc said "Permission: none" and
+        // `lib/subagent.zig` listed it as read-only. The model got a dialog
+        // for a tool nobody thought should ask.
+        .read_only = true,
         .parallel_safe = false,
         .destructive = false,
-        .max_result_chars = resultcap.default_max_result_chars,
+        // A semantic answer is a location, a signature or a list of problems:
+        // short by nature. The formatter's own ceiling is 24 KB, and this cap
+        // is the same number, so the tool never builds a megabyte of text that
+        // the formatter was going to cut anyway.
+        .max_result_chars = 24 * 1024,
     },
     .{
         .name = "skill",
@@ -571,131 +588,32 @@ pub fn batchPermissionDetail(args_json: []const u8, arena: std.mem.Allocator) []
 // read-only ones. Both are built once at comptime from `defs`, so they can
 // never drift from the permission table.
 
-pub const toolsJsonBlob: []const u8 = "["
-    ++ defs[0].schema
-    ++ ","
-    ++ defs[1].schema
-    ++ ","
-    ++ defs[2].schema
-    ++ ","
-    ++ defs[3].schema
-    ++ ","
-    ++ defs[4].schema
-    ++ ","
-    ++ defs[5].schema
-    ++ ","
-    ++ defs[6].schema
-    ++ ","
-    ++ defs[7].schema
-    ++ ","
-    ++ defs[8].schema
-    ++ ","
-    ++ defs[9].schema
-    ++ ","
-    ++ defs[10].schema
-    ++ ","
-    ++ defs[11].schema
-    ++ ","
-    ++ defs[12].schema
-    ++ ","
-    ++ defs[13].schema
-    ++ ","
-    ++ defs[14].schema
-    ++ ","
-    ++ defs[15].schema
-    ++ ","
-    ++ defs[16].schema
-    ++ ","
-    ++ defs[17].schema
-    ++ ","
-    ++ defs[18].schema
-    ++ ","
-    ++ defs[19].schema
-    ++ ","
-    ++ defs[20].schema
-    ++ ","
-    ++ defs[21].schema
-    ++ ","
-    ++ defs[22].schema
-    ++ ","
-    ++ defs[23].schema
-    ++ ","
-    ++ defs[24].schema
-    ++ ","
-    ++ defs[25].schema
-    ++ ","
-    ++ defs[26].schema
-    ++ ","
-    ++ defs[27].schema
-    ++ ","
-    ++ defs[28].schema
-    ++ ","
-    ++ defs[29].schema
-    ++ ","
-    ++ defs[30].schema
-    ++ ","
-    ++ defs[31].schema
-    ++ ","
-    ++ defs[32].schema
-    ++ ","
-    ++ defs[33].schema
-    ++ ","
-    ++ defs[34].schema
-    ++ ","
-    ++ defs[35].schema
-    ++ ","
-    ++ defs[36].schema
-    ++ "]";
+/// The JSON array of the tools, composed at COMPILE TIME from `defs`.
+///
+/// It used to be a hand-written list of INDICES (`defs[0].schema ++ "," ++
+/// defs[1].schema ++ ...`), and a hand-written list of indices is a list that
+/// goes stale the day a tool is added in the middle: the entry that moves is
+/// simply not offered, and nothing says so. The `lsp` tool was in the table
+/// and in the model's schema, and the read-only copy had not caught up — the
+/// two said different things about the same tool and the test that compares
+/// them was the only thing that noticed.
+fn blob(comptime read_only_only: bool) []const u8 {
+    var out: []const u8 = "[";
+    var first = true;
+    inline for (defs) |d| {
+        if (read_only_only and !d.read_only) continue;
+        if (!first) out = out ++ ",";
+        out = out ++ d.schema;
+        first = false;
+    }
+    return out ++ "]";
+}
 
-pub const toolsJsonReadOnlyBlob: []const u8 = "["
-    ++ defs[0].schema
-    ++ ","
-    ++ defs[5].schema
-    ++ ","
-    ++ defs[6].schema
-    ++ ","
-    ++ defs[7].schema
-    ++ ","
-    ++ defs[10].schema
-    ++ ","
-    ++ defs[11].schema
-    ++ ","
-    ++ defs[12].schema
-    ++ ","
-    ++ defs[17].schema
-    ++ ","
-    ++ defs[18].schema
-    ++ ","
-    ++ defs[19].schema
-    ++ ","
-    ++ defs[20].schema
-    ++ ","
-    ++ defs[21].schema
-    ++ ","
-    ++ defs[22].schema
-    ++ ","
-    ++ defs[23].schema
-    ++ ","
-    ++ defs[24].schema
-    ++ ","
-    ++ defs[25].schema
-    ++ ","
-    ++ defs[26].schema
-    ++ ","
-    ++ defs[27].schema
-    ++ ","
-    ++ defs[29].schema
-    ++ ","
-    ++ defs[31].schema
-    ++ ","
-    ++ defs[32].schema
-    ++ ","
-    ++ defs[33].schema
-    ++ ","
-    ++ defs[34].schema
-    ++ ","
-    ++ defs[35].schema
-    ++ "]";
+/// Every registered tool, in `defs` order.
+pub const toolsJsonBlob: []const u8 = blob(false);
+
+/// Only the tools that ask for no permission: the schema of read-only mode.
+pub const toolsJsonReadOnlyBlob: []const u8 = blob(true);
 
 pub fn toolsJson() []const u8 {
     return toolsJsonBlob;
@@ -719,11 +637,33 @@ test "needsPermission" {
     try std.testing.expect(!needsPermission("sleep"));
     try std.testing.expect(!needsPermission("review"));
     try std.testing.expect(!needsPermission("goal"));
+    // The language server asks for nothing: the command that gets spawned is
+    // fixed by a table, never chosen by the model, so there is no argument a
+    // model could put an obligation in. It used to ask (a dialog for every
+    // question about the code) while its own doc said "Permission: none".
+    try std.testing.expect(!needsPermission("lsp"));
     // `batch` can write, so it is not on the free list. WHAT it needs is
     // decided by its steps — see the test below.
     try std.testing.expect(needsPermission("batch"));
     // Unknown tools are conservative: they need permission.
     try std.testing.expect(needsPermission("no_such_tool"));
+}
+
+test "every tool a subagent may use is read-only in this table" {
+    // The subagent's list is a POLICY about this table, and the two used to
+    // disagree: `lsp` was in the subagent's read-only list and `read_only =
+    // false` here. The model got a permission dialog for a tool nobody
+    // thought should ask, and the read-only schema did not carry it.
+    //
+    // The other direction matters too: a tool in the subagent's list that
+    // needs permission would put a dialog in front of a thread that is not
+    // the turn's — and nobody would be there to answer it.
+    for (subagent.tool_names) |n| {
+        if (needsPermission(n)) {
+            std.debug.print("the subagent may use `{s}`, which asks for permission\n", .{n});
+            return error.SubagentToolAsks;
+        }
+    }
 }
 
 test "a batch of reads asks for nothing, and a batch that writes asks for the write" {

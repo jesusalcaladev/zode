@@ -18,8 +18,9 @@
 //!   gets a different sentence for each, with the fallback tool named.
 //!
 //! Permission: none. The command that gets spawned is fixed by the table in
-//! `lsp/servers.zig` and is never chosen by the model, so there is no argument a
-//! model could put an obligation in — the same reason `read` asks nothing.
+//! `lsp/servers.zig` (or by the user's own `lsp_servers` in config.json), and
+//! is never chosen by the model, so there is no argument a model could put an
+//! obligation in — the same reason `read` asks nothing.
 
 const std = @import("std");
 const common = @import("common.zig");
@@ -42,7 +43,14 @@ const retry_delays_ms = [_]u64{ 500, 1000, 2000 };
 const max_source_bytes = client.max_doc_bytes;
 
 pub const operations_help =
-    "Valid operations: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls.";
+    "Valid operations: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, prepareCallHierarchy, incomingCalls, outgoingCalls, diagnostics.";
+
+/// How long to wait for the server to publish its diagnostics.
+///
+/// It is its own number and not the request timeout: a request is answered in
+/// milliseconds, and a diagnostic arrives when the server has finished
+/// analyzing the file, which is a different clock entirely.
+pub const diagnostics_timeout_ms: i64 = 8_000;
 
 pub fn toolLsp(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const op_name = common.getStr(obj, "operation") orelse
@@ -59,11 +67,11 @@ pub fn toolLsp(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![
         else => return std.fmt.allocPrint(arena, "could not open {s}: {t}", .{ rel, e }),
     };
 
-    if (!servers.supported(&.{}, abs)) {
+    if (!servers.supported(manager.extraServers(), abs)) {
         return std.fmt.allocPrint(
             arena,
             "no language server is configured for `{s}` ({s}). Ones that are: {s}. For plain text use `grep` or `read`.",
-            .{ rel, std.fs.path.extension(rel), try servers.knownExtensions(arena, &.{}) },
+            .{ rel, std.fs.path.extension(rel), try servers.knownExtensions(arena, manager.extraServers()) },
         );
     }
 
@@ -96,14 +104,23 @@ pub fn toolLsp(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![
         if (why.len > 0) return std.fmt.allocPrint(arena, "{s}. Fall back to `refs`, `grep` or `read`.", .{why});
         return "could not start a language server for that file. Fall back to `refs`, `grep` or `read`.";
     };
-    const c = maybe_client orelse return std.fmt.allocPrint(
-        arena,
-        "no language server is configured for `{s}` (yet). Ones that are: {s}.",
-        .{ rel, try servers.knownExtensions(arena, &.{}) },
-    );
+    const c = maybe_client orelse {
+        if (!manager.isReady()) {
+            return "the language server manager is not running in this process, so no server can answer. Fall back to `refs`, `grep` or `read`.";
+        }
+        return std.fmt.allocPrint(
+            arena,
+            "no language server is configured for `{s}` (yet). Ones that are: {s}.",
+            .{ rel, try servers.knownExtensions(arena, manager.extraServers()) },
+        );
+    };
     defer manager.done(c);
 
-    const uri = c.ensureOpen(arena, abs) catch |e| switch (e) {
+    // The language id is asked PER FILE: one server can serve two languages
+    // (typescript-language-server answers for `.ts` and for `.tsx`), and a
+    // client that carries one id for both opens a `.tsx` as TypeScript.
+    const lang_id = manager.languageIdFor(abs);
+    const uri = c.ensureOpen(arena, abs, lang_id) catch |e| switch (e) {
         error.FileTooBig => return std.fmt.allocPrint(
             arena,
             "{s} is bigger than the {d} MB a language server is sent. Search inside it with `grep`.",
@@ -247,6 +264,11 @@ fn runWithRetry(
                 .{ f.code, f.message },
             ),
             .no_item => return "no symbol was found at that position, so there is nothing to follow calls from. Check the line with `symbol` or `read`.",
+            .no_diagnostics => return std.fmt.allocPrint(
+                arena,
+                "the language server did not report any problems for this file in {d} seconds. It may still be indexing the project — try again in a moment, or use `check` for a compiler check.",
+                .{diagnostics_timeout_ms / 1000},
+            ),
         }
     }
 }
@@ -256,6 +278,12 @@ const Outcome = union(enum) {
     content_modified,
     failed: client.Fail,
     no_item,
+    /// The server did not publish any diagnostics for the file in time.
+    ///
+    /// It is NOT the same as "there are no problems": a server that is still
+    /// indexing says nothing at all, and telling the model "the file is
+    /// clean" would be a lie it acts on.
+    no_diagnostics,
 };
 
 fn attempt_(
@@ -289,6 +317,18 @@ fn attempt_(
                 .err => |e| errOutcome(e),
                 .ok => |v| .{ .result = v },
             };
+        },
+        .diagnostics => {
+            // The server PUBLISHES its diagnostics; there is nothing to ask.
+            // The document was opened just before this, so the publication is
+            // either already in hand or on its way.
+            const raw = c.awaitDiagnostics(arena, uri, diagnostics_timeout_ms) catch |e| switch (e) {
+                error.Timeout => return .no_diagnostics,
+                else => return e,
+            };
+            const text = raw orelse return .no_diagnostics;
+            const items = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return .no_diagnostics;
+            return .{ .result = items };
         },
         .workspaceSymbol => {
             var aw = std.Io.Writer.Allocating.init(arena);
@@ -448,6 +488,96 @@ fn parseObj(arena: std.mem.Allocator, json: []const u8) !std.json.ObjectMap {
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     if (v != .object) return error.NotAnObject;
     return v.object;
+}
+
+/// The fake server's script, as an absolute path, or null when it is not there.
+///
+/// It is looked up RELATIVE to the working directory and made absolute, so the
+/// test does not depend on where the test binary was started from.
+fn fakeServerPath(arena: std.mem.Allocator) ?[]const u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(testing.io, "tools/fake_lsp.py", arena) catch null;
+}
+
+test "lsp: a fake server drives every operation, end to end" {
+    // The whole path at once: the dispatcher, the manager, the SPAWN, the
+    // handshake, the request, the formatter. A test that only exercised the
+    // formatter would pass with a tool that cannot be called, which is exactly
+    // what the tool was for a year.
+    //
+    // The server is a python script instead of `zls` so the test runs on a
+    // machine with no language server installed. Without python3 it is skipped
+    // rather than failed: a missing interpreter is not a broken tool.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const script = fakeServerPath(a) orelse return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.fakezig", .data = "pub fn main() void {}\n" });
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, "a.fakezig", a);
+
+    manager.init(testing.allocator, testing.io, null);
+    defer manager.shutdown();
+    // The user's own server, from `lsp_servers` in config.json: the same
+    // table the tool reads, so this test also covers that path.
+    try manager.setServers(&[_]servers.Server{.{
+        .name = "fake",
+        .language_id = "fakezig",
+        .command = &.{ "python3", script },
+        .extensions = &.{".fakezig"},
+    }});
+
+    const Case = struct { op: []const u8, want: []const u8, query: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .op = "goToDefinition", .want = "1 definition:" },
+        .{ .op = "findReferences", .want = "2 references:" },
+        .{ .op = "hover", .want = "pub fn main() void" },
+        .{ .op = "documentSymbol", .want = "main (Function)" },
+        // The workspace search is the only one that needs a query of its own.
+        .{ .op = "workspaceSymbol", .want = "Server (Class)", .query = "Serv" },
+        .{ .op = "goToImplementation", .want = "no implementation found" },
+        .{ .op = "prepareCallHierarchy", .want = "main (Function)" },
+        .{ .op = "incomingCalls", .want = "caller (Function)" },
+        .{ .op = "outgoingCalls", .want = "callee (Function)" },
+        .{ .op = "diagnostics", .want = "error: expected ';'" },
+    };
+
+    for (cases) |c| {
+        // The symbol is passed for every operation: the ones that need a
+        // position take it from the file (that is the path a model takes), and
+        // the ones that do not ignore it.
+        const args = if (c.query) |q|
+            try std.fmt.allocPrint(a, "{{\"operation\":\"{s}\",\"file\":\"{s}\",\"symbol\":\"main\",\"query\":\"{s}\"}}", .{ c.op, abs, q })
+        else
+            try std.fmt.allocPrint(a, "{{\"operation\":\"{s}\",\"file\":\"{s}\",\"symbol\":\"main\"}}", .{ c.op, abs });
+        const out = try toolLsp(testing.io, try parseObj(a, args), a);
+        // No python3 on this machine: the tool says which binary is missing,
+        // and the test has nothing to say about the tool.
+        if (std.mem.indexOf(u8, out, "is not installed") != null) return error.SkipZigTest;
+        if (std.mem.indexOf(u8, out, c.want) == null) {
+            std.debug.print("`{s}` did not answer with \"{s}\":\n{s}\n", .{ c.op, c.want, out });
+            return error.WrongAnswer;
+        }
+    }
+}
+
+test "lsp: a file with no server for it says so, and names the fallback" {
+    // The answer a model gets when it asks about a language zode does not
+    // serve. It has to name the way out, or the model tries again with the
+    // same tool.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "notes.txt", .data = "hello\n" });
+    const abs = try tmp.dir.realPathFileAlloc(testing.io, "notes.txt", a);
+    const args = try std.fmt.allocPrint(a, "{{\"operation\":\"hover\",\"file\":\"{s}\"}}", .{abs});
+    const out = try toolLsp(testing.io, try parseObj(a, args), a);
+    try testing.expect(std.mem.indexOf(u8, out, "no language server is configured") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "grep") != null);
 }
 
 test "lsp: a real clangd answers documentSymbol and hover (skipped without clangd)" {

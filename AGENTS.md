@@ -144,19 +144,21 @@ No permission asked: read, glob, grep, refs, list_files, git_status/diff/log,
 web_fetch, web_search, think, todo, the five task tools (they change the
 SESSION's list, not the machine — and plan mode must let the agent write down
 its own plan), ask, skill, bash_output/bash_kill, sleep (it waits), review,
-goal. `rename` is NOT exempt: it rewrites files across the tree.
+goal, **lsp**. `rename` is NOT exempt: it rewrites files across the tree.
 
 **`batch` is the exception that is NOT in the list above, and it is not an
 exemption**: a batch of reads asks for nothing, and a batch with a `write`
 step asks for exactly what that write would have asked. The decision is per
 CALL, not per tool — see "The `batch` tool: the permission set is the union".
 
-**`lsp` is in the list and CANNOT BE CALLED**: the schema is in the prompt
-and the dispatcher has no branch for it, so the model gets `there is no tool
-called lsp`. The library (`src/lsp/`, ~1700 lines, 33 test blocks) is written
-and not wired: the manager is never initialised, there is no `lsp_servers`
-key in `config.json`, and 32 of those test blocks are in a file no build step
-references. TASKS.md § Phase 14 has the full list.
+**`lsp` asks for NO permission** (it is in the list above): the command that gets
+spawned comes from a table (or from the user's `lsp_servers`), never from the
+model, so there is no argument a model could put an obligation in — the same
+reason `read` asks nothing. It used to ask (a dialog for every question about
+the code) while the tool's own doc said "Permission: none" and the subagent's
+read-only list said it did not. The registry row is the place where that
+decision lives, and the read-only schema is now COMPOSED from the table, so
+the copy that drifts cannot exist.
 
 ## The web tools: `web_fetch` and `web_search`
 
@@ -2703,10 +2705,12 @@ read-only mode or it is denied one that could not do anything anyway.
   SMALL (ten lines of context is not safer, it is what makes a patch stop matching),
   and overwriting an existing file is a decision rather than a reflex.
 
-Still true and not ours to change here: `needsPermission` asks for `lsp` while
-`src/tools/lsp.zig` documents "Permission: none" (the command it spawns comes from a
-fixed table, never from the model). The read-only test will name it the day someone
-takes one side.
+Settled on 2026-10-20: `lsp` is `read_only = true`, so `needsPermission` does NOT
+ask for it, which is what `src/tools/lsp.zig` documents ("Permission: none" — the
+command it spawns comes from a fixed table, never from the model) and what the
+subagent's read-only list always said. The drift test in `registry.zig` now pins
+both directions: a tool the subagent may use that asks for permission would put a
+dialog in front of a thread that is not the turn's, and nobody would be there.
 
 What `bash`'s text carries that the schema could not imply: every call is a fresh
 `/bin/sh -c`, so a `cd` does NOT survive to the next call; stdin is `/dev/null`, so
@@ -5163,3 +5167,63 @@ Now the body travels with the entry, and `Loader.load` answers from it
 not exist, on purpose: a loader that went to the disk would answer null and
 throw away the body it was already holding — the skill would look broken
 exactly when it is the one that cannot be broken.
+
+## The language server: a tool the model could SEE and could not CALL (2026-10-20)
+
+TASKS.md § Phase 14. The `lsp` tool was in the registry, so its schema was in
+the prompt and the model was offered it, and the dispatcher had **no branch
+for it**: every call answered `there is no tool called lsp`.
+
+**A tool the model can see and cannot use is a promise the harness does not
+keep**, and it is worse than no tool at all: the model spends an iteration
+discovering it, and then spends another one deciding whether to work around
+it.
+
+The library (`src/lsp/`, ~1700 lines) was written and not wired. What it took
+to make it a feature, and the four things that were not obvious:
+
+1. **`diagnostics` is NOT a request.** A server PUBLISHES its diagnostics as a
+   `textDocument/publishDiagnostics` NOTIFICATION, so the operation WAITS for
+   one (`awaitDiagnostics`, 8 s) instead of asking. The client keeps the last
+   publication per file and **forgets it when the file is sent again**: the
+   diagnostics of the previous version would be reported as the current ones.
+   "No diagnostics arrived" and "there are no problems" are two different
+   facts, and only the first one is ever said out loud.
+2. **A notification that arrives while another request is in flight is not
+   lost.** The diagnostics usually land in the middle of a `hover`, and the
+   reader used to skip every message without an `id` — which is every
+   notification. The publication is now recorded BEFORE the id is looked at.
+3. **One server can serve two languages.** `typescript-language-server`
+   answers for `.ts` ("typescript") and for `.tsx` ("typescriptreact"), and a
+   client that carries ONE language id opens a `.tsx` as TypeScript. The id
+   is asked per FILE (`manager.languageIdFor`).
+4. **The user's servers are COPIED, not borrowed.** `config.json` lives in an
+   arena that is freed on every reload (connecting a provider reloads it), so
+   a server list that pointed into it is a dangling pointer from then on.
+   The key of a running client in the manager's map is a copy for the same
+   reason.
+
+**The read-only schema was a hand-written list of INDICES** (`defs[0].schema
+++ "," ++ defs[1].schema ++ …`) and the `lsp` row had never been added to it.
+Both arrays are now composed at comptime from the table (`registry.blob`): a
+copy that drifts cannot exist, and the test that compares the schema with the
+permission table stays green because there is only one table.
+
+**The permission drift is settled**: `lsp` is `read_only = true`. The command
+that gets spawned comes from a table (or from the user's `lsp_servers`),
+never from the model, so there is no argument a model could put an obligation
+in — the same reason `read` asks nothing. The model got a dialog for a tool
+nobody thought should ask.
+
+**How it is checked**: `tools/fake_lsp.py` is a fake server that speaks the
+wire, and the test drives EVERY operation through the real dispatcher, the
+real manager and a real spawn — no `zls` on the machine, no network, the same
+answer every time. `zig build lsp-probe` is the complement: it asks a REAL
+server (clangd) about a real file and prints what comes back. The fake proves
+the wire and the probe proves the server; a bug that only shows up with a real
+one (a URI with an accent, a server that answers in two round trips) is
+invisible to the fake.
+
+**And the 32 test blocks that never compiled** are in `src/test_all.zig` and
+run. A test in a file no build step references is a comment about what
+should be true.

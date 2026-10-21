@@ -30,6 +30,7 @@ pub const Process = struct {
         .writeAll = writeAll,
         .readSome = readSome,
         .close = close,
+        .kill = kill,
     };
 
     fn writeAll(ctx: *anyopaque, bytes: []const u8) anyerror!void {
@@ -66,6 +67,17 @@ pub const Process = struct {
         self.child.stdout = null;
         self.child.stderr = null;
         self.gpa.destroy(self);
+    }
+
+    /// Kills the server and its children WITHOUT releasing anything.
+    ///
+    /// The difference with `close` is the whole point: a thread that is inside
+    /// `readSome` is using this struct, and freeing it under that thread is a
+    /// use-after-free. Killing the process closes the pipe, so the thread
+    /// wakes up with an end-of-stream and leaves on its own.
+    fn kill(ctx: *anyopaque) void {
+        const self: *Process = @ptrCast(@alignCast(ctx));
+        if (self.pid != 0) std.posix.kill(-self.pid, std.posix.SIG.KILL) catch {};
     }
 };
 

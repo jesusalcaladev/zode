@@ -34,6 +34,13 @@ pub const Transport = struct {
         /// "as long as it takes"). Returns 0 on end of stream.
         readSome: *const fn (ctx: *anyopaque, buf: []u8, timeout_ms: i64) anyerror!usize,
         close: *const fn (ctx: *anyopaque) void,
+        /// Kills the server WITHOUT releasing anything.
+        ///
+        /// It is not the same as `close`: `close` frees the transport, and
+        /// freeing it while a thread is inside `readSome` is a use-after-free.
+        /// This one only makes the server go away, so the pipe closes and the
+        /// thread inside it wakes up with an end-of-stream.
+        kill: *const fn (ctx: *anyopaque) void,
     };
 
     pub fn writeAll(self: Transport, bytes: []const u8) !void {
@@ -44,6 +51,9 @@ pub const Transport = struct {
     }
     pub fn close(self: Transport) void {
         self.vtable.close(self.ctx);
+    }
+    pub fn kill(self: Transport) void {
+        self.vtable.kill(self.ctx);
     }
 };
 
@@ -59,6 +69,17 @@ pub const Response = union(enum) {
 
 const Doc = struct { version: i64, hash: u64 };
 
+/// One `textDocument/publishDiagnostics` payload, kept as the RAW JSON text of
+/// the `diagnostics` array.
+///
+/// The text and not the parsed value: the value would live in an arena that
+/// the client does not own, and this map has to outlive the request that
+/// happened to read it.
+pub const Diag = struct {
+    /// The raw JSON array of diagnostic objects.
+    items: []u8,
+};
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -73,7 +94,13 @@ pub const Client = struct {
     request_timeout_ms: i64 = 15_000,
     /// Documents sent to this server: uri -> version + content hash.
     docs: std.StringHashMapUnmanaged(Doc) = .empty,
+    /// The last diagnostics the server published, per uri.
+    diags: std.StringHashMapUnmanaged(Diag) = .empty,
     lock: std.atomic.Mutex = .unlocked,
+    /// Set when the server's pipe closed: the process is gone and every later
+    /// request on this client would fail with the same error. The manager reads
+    /// it to know that the client has to be replaced instead of reused.
+    dead: bool = false,
     /// The last `initialize` failure, for the manager's message. Fixed buffer, so
     /// it survives the arena that carried the response.
     init_fail: Fail = .{},
@@ -105,9 +132,25 @@ pub const Client = struct {
         var it = self.docs.iterator();
         while (it.next()) |e| self.gpa.free(e.key_ptr.*);
         self.docs.deinit(self.gpa);
+        var dit = self.diags.iterator();
+        while (dit.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.items);
+        }
+        self.diags.deinit(self.gpa);
         self.in_buf.deinit(self.gpa);
         self.gpa.free(self.root_uri);
         self.gpa.destroy(self);
+    }
+
+    /// Kills the server WITHOUT freeing the client.
+    ///
+    /// For the exit path: the server must not outlive the app, and a client
+    /// that a thread is still inside must not be freed. Killing the process
+    /// closes the pipe, so the thread wakes up with an end-of-stream and
+    /// unwinds on its own.
+    pub fn kill(self: *Client) void {
+        self.transport.kill();
     }
 
     /// Takes the per-client lock. One request at a time per server, because a
@@ -170,13 +213,16 @@ pub const Client = struct {
     /// agent already edited. The content hash makes the common case (nothing
     /// changed since the last query) cost nothing on the wire while never
     /// leaving the server stale.
-    pub fn ensureOpen(self: *Client, arena: std.mem.Allocator, abs_path: []const u8) ![]const u8 {
+    pub fn ensureOpen(self: *Client, arena: std.mem.Allocator, abs_path: []const u8, language_id: []const u8) ![]const u8 {
         const uri = try protocol.pathToUri(arena, abs_path);
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, abs_path, arena, .limited(max_doc_bytes)) catch |e| switch (e) {
             error.StreamTooLong => return error.FileTooBig,
             else => return error.FileReadFailed,
         };
         const h = std.hash.Wyhash.hash(0, text);
+        // An empty language id means "the client's own": the caller knows which
+        // language the file is in, and the client's is only the fallback.
+        const lang = if (language_id.len > 0) language_id else self.language_id;
         if (self.docs.getPtr(uri)) |d| {
             if (d.hash == h) return uri;
             const v = d.version + 1;
@@ -185,22 +231,36 @@ pub const Client = struct {
             d.hash = h;
             return uri;
         }
-        try self.sendDidOpen(arena, uri, 1, text);
+        try self.sendDidOpen(arena, uri, 1, text, lang);
         const key = try self.gpa.dupe(u8, uri);
         errdefer self.gpa.free(key);
         try self.docs.put(self.gpa, key, .{ .version = 1, .hash = h });
         return uri;
     }
 
-    fn sendDidOpen(self: *Client, arena: std.mem.Allocator, uri: []const u8, version: i64, text: []const u8) !void {
+    /// Forgets the diagnostics kept for `uri`.
+    ///
+    /// Called when the document is sent again, because the ones we kept belong
+    /// to the PREVIOUS version of the file: a server that has not re-published
+    /// yet would make the tool report problems that are not there any more (or,
+    /// worse, hide the ones that are).
+    fn forgetDiags(self: *Client, uri: []const u8) void {
+        if (self.diags.fetchRemove(uri)) |kv| {
+            self.gpa.free(kv.key);
+            self.gpa.free(kv.value.items);
+        }
+    }
+
+    fn sendDidOpen(self: *Client, arena: std.mem.Allocator, uri: []const u8, version: i64, text: []const u8, language_id: []const u8) !void {
         var aw = std.Io.Writer.Allocating.init(arena);
         try aw.writer.writeAll("{\"textDocument\":{\"uri\":");
         try protocol.writeJsonString(&aw.writer, uri);
         try aw.writer.writeAll(",\"languageId\":");
-        try protocol.writeJsonString(&aw.writer, self.language_id);
+        try protocol.writeJsonString(&aw.writer, language_id);
         try aw.writer.print(",\"version\":{d},\"text\":", .{version});
         try protocol.writeJsonString(&aw.writer, text);
         try aw.writer.writeAll("}}");
+        self.forgetDiags(uri);
         try self.notify(arena, "textDocument/didOpen", aw.toArrayList().items);
     }
 
@@ -211,6 +271,7 @@ pub const Client = struct {
         try aw.writer.print(",\"version\":{d}}},\"contentChanges\":[{{\"text\":", .{version});
         try protocol.writeJsonString(&aw.writer, text);
         try aw.writer.writeAll("}]}");
+        self.forgetDiags(uri);
         try self.notify(arena, "textDocument/didChange", aw.toArrayList().items);
     }
 
@@ -245,6 +306,13 @@ pub const Client = struct {
                 .object => |o| o,
                 else => continue,
             };
+            // A NOTIFICATION has no `id`, so it is handled BEFORE the id is
+            // looked at: a `publishDiagnostics` that arrives while we wait for
+            // another answer is exactly the one the `diagnostics` operation
+            // needs, and skipping it here would throw it away.
+            if (obj.get("method") != null) {
+                try self.notePublishDiagnostics(arena, obj);
+            }
             const idv = obj.get("id") orelse continue;
             const has_method = obj.get("method") != null;
             if (has_method) {
@@ -272,6 +340,79 @@ pub const Client = struct {
         }
     }
 
+    /// Keeps the diagnostics of a `textDocument/publishDiagnostics` notification.
+    ///
+    /// The payload is stored as TEXT: the parsed value would live in the arena
+    /// of the request that happened to read it, and this map outlives it.
+    fn notePublishDiagnostics(self: *Client, arena: std.mem.Allocator, obj: std.json.ObjectMap) !void {
+        const m = obj.get("method") orelse return;
+        if (m != .string or !std.mem.eql(u8, m.string, "textDocument/publishDiagnostics")) return;
+        const params = obj.get("params") orelse return;
+        const pobj = switch (params) {
+            .object => |o| o,
+            else => return,
+        };
+        const uri_v = pobj.get("uri") orelse return;
+        if (uri_v != .string) return;
+        const uri = uri_v.string;
+        const items = pobj.get("diagnostics") orelse return;
+
+        const text = switch (items) {
+            .array => |a| blk: {
+                _ = a;
+                var aw = std.Io.Writer.Allocating.init(arena);
+                try std.json.Stringify.value(items, .{}, &aw.writer);
+                break :blk aw.toArrayList().items;
+            },
+            .null => "[]",
+            else => return,
+        };
+        const key = try self.gpa.dupe(u8, uri);
+        const copy = try self.gpa.dupe(u8, text);
+        // The old entry (if any) is freed HERE and not by the caller: the map
+        // owns the key and the text, and a leaked old copy is a leak per edit.
+        if (self.diags.fetchRemove(uri)) |kv| {
+            self.gpa.free(kv.key);
+            self.gpa.free(kv.value.items);
+        }
+        try self.diags.put(self.gpa, key, .{ .items = copy });
+    }
+
+    /// Waits for the server to publish the diagnostics of `uri`.
+    ///
+    /// Returns null when nothing arrived before the deadline: a server that is
+    /// still indexing says nothing, and "no diagnostics" and "the server has
+    /// not answered yet" are two different facts.
+    pub fn awaitDiagnostics(self: *Client, arena: std.mem.Allocator, uri: []const u8, timeout_ms: i64) !?[]const u8 {
+        if (self.diags.get(uri)) |d| return d.items;
+        const deadline = self.deadlineNs(timeout_ms);
+        while (true) {
+            const msg = self.readMessage(arena, deadline) catch |e| switch (e) {
+                error.Timeout => return null,
+                else => return e,
+            };
+            const obj = switch (msg) {
+                .object => |o| o,
+                else => continue,
+            };
+            const method = obj.get("method") orelse continue;
+            try self.notePublishDiagnostics(arena, obj);
+            if (self.diags.get(uri)) |d| return d.items;
+            // A request FROM the server while we wait: it is answered with a
+            // null result, exactly as in `awaitResponse`. A server that waits
+            // for the answer would otherwise hold its diagnostics back.
+            if (method == .string) {
+                if (obj.get("id")) |idv| {
+                    if (idv == .integer) {
+                        var aw = std.Io.Writer.Allocating.init(arena);
+                        try aw.writer.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":null}}", .{idv.integer});
+                        try self.sendFrame(arena, aw.toArrayList().items);
+                    }
+                }
+            }
+        }
+    }
+
     fn deadlineNs(self: *Client, timeout_ms: i64) i64 {
         if (timeout_ms <= 0) return 0;
         return self.nowNs() + timeout_ms * std.time.ns_per_ms;
@@ -286,7 +427,13 @@ pub const Client = struct {
                 error.Timeout => return error.Timeout,
                 else => return e,
             };
-            if (n == 0) return error.ServerClosed;
+            if (n == 0) {
+                // The pipe is closed: the server is gone. The flag is what lets
+                // the manager replace this client instead of handing out one
+                // that answers nothing but the same error.
+                self.dead = true;
+                return error.ServerClosed;
+            }
             try self.in_buf.appendSlice(self.gpa, tmp[0..n]);
             if (self.in_buf.items.len > max_frame_bytes) return error.MessageTooLarge;
         }
@@ -323,6 +470,9 @@ const Fake = struct {
     gpa: std.mem.Allocator,
     responses: []const u8,
     pos: usize = 0,
+    /// When the scripted bytes run out, answer "end of stream" (0) instead of
+    /// timing out. That is what a server that died looks like.
+    eof: bool = false,
     written: std.ArrayList(u8) = .empty,
 
     fn transport(self: *Fake) Transport {
@@ -333,6 +483,7 @@ const Fake = struct {
         .writeAll = writeAll,
         .readSome = readSome,
         .close = close,
+        .kill = kill,
     };
 
     fn writeAll(ctx: *anyopaque, bytes: []const u8) anyerror!void {
@@ -342,13 +493,19 @@ const Fake = struct {
     fn readSome(ctx: *anyopaque, buf: []u8, timeout_ms: i64) anyerror!usize {
         const self: *Fake = @ptrCast(@alignCast(ctx));
         _ = timeout_ms;
-        if (self.pos >= self.responses.len) return error.Timeout;
+        if (self.pos >= self.responses.len) {
+            if (self.eof) return 0;
+            return error.Timeout;
+        }
         const n = @min(buf.len, self.responses.len - self.pos);
         @memcpy(buf[0..n], self.responses[self.pos .. self.pos + n]);
         self.pos += n;
         return n;
     }
     fn close(ctx: *anyopaque) void {
+        _ = ctx;
+    }
+    fn kill(ctx: *anyopaque) void {
         _ = ctx;
     }
 
@@ -475,18 +632,112 @@ test "client: ensureOpen sends didOpen, then didChange only when the file change
     defer c.destroy();
     try c.handshake(arena);
 
-    _ = try c.ensureOpen(arena, abs);
+    _ = try c.ensureOpen(arena, abs, "zig");
     try std.testing.expect(std.mem.indexOf(u8, fake.written.items, "\"method\":\"textDocument/didOpen\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.written.items, "\"languageId\":\"zig\"") != null);
 
     // Same bytes -> nothing more on the wire.
     const before = fake.written.items.len;
-    _ = try c.ensureOpen(arena, abs);
+    _ = try c.ensureOpen(arena, abs, "zig");
     try std.testing.expectEqual(before, fake.written.items.len);
 
     // Different bytes -> a full-text didChange with version 2.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "const a = 2;\n" });
-    _ = try c.ensureOpen(arena, abs);
+    _ = try c.ensureOpen(arena, abs, "zig");
     try std.testing.expect(std.mem.indexOf(u8, fake.written.items[before..], "\"method\":\"textDocument/didChange\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.written.items[before..], "\"version\":2") != null);
+}
+
+test "client: the diagnostics a server publishes are kept, and a closed pipe marks the client dead" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const responses = try frameAll(arena, &.{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+        // The server PUBLISHES its diagnostics; nobody asks for them.
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///a.zig\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":3,\"character\":2}},\"severity\":1,\"message\":\"expected ';'\"}]}}",
+    });
+    var fake = Fake{ .gpa = std.testing.allocator, .responses = responses, .eof = true };
+    defer fake.deinit();
+
+    const c = try Client.create(std.testing.allocator, std.testing.io, fake.transport(), "zig", "file:///proj");
+    defer c.destroy();
+    try c.handshake(arena);
+
+    const raw = try c.awaitDiagnostics(arena, "file:///a.zig", 1000);
+    try std.testing.expect(raw != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.?, "expected ';'") != null);
+
+    // The pipe is at the end now: the client has to say so, because the
+    // manager replaces a dead client instead of handing it out again.
+    try std.testing.expectError(error.ServerClosed, c.request(arena, "textDocument/hover", "{}", 100));
+    try std.testing.expect(c.dead);
+}
+
+test "client: a notification that arrives while waiting for an answer is not lost" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const responses = try frameAll(arena, &.{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+        // The diagnostics arrive BEFORE the answer to the next request, which
+        // is the normal order: a server publishes and then answers.
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///a.zig\",\"diagnostics\":[]}}",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":7}",
+    });
+    var fake = Fake{ .gpa = std.testing.allocator, .responses = responses };
+    defer fake.deinit();
+
+    const c = try Client.create(std.testing.allocator, std.testing.io, fake.transport(), "zig", "file:///proj");
+    defer c.destroy();
+    try c.handshake(arena);
+
+    const resp = try c.request(arena, "textDocument/hover", "{}", 1000);
+    try std.testing.expectEqual(@as(i64, 7), resp.ok.integer);
+    // The notification was read on the way and kept.
+    try std.testing.expect(c.diags.contains("file:///a.zig"));
+}
+
+test "client: the diagnostics of a file are forgotten when it is sent again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "const a = 1;\n" });
+    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, "a.zig", arena);
+    // The URI the file is opened under: the fake server publishes for exactly
+    // this one, because that is how a real server answers.
+    const uri = try protocol.pathToUri(arena, abs);
+    const publish = try std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{{\"uri\":\"{s}\",\"diagnostics\":[{{\"message\":\"old\"}}]}}}}",
+        .{uri},
+    );
+
+    const responses = try frameAll(arena, &.{
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+        publish,
+    });
+    var fake = Fake{ .gpa = std.testing.allocator, .responses = responses };
+    defer fake.deinit();
+
+    const c = try Client.create(std.testing.allocator, std.testing.io, fake.transport(), "zig", "file:///proj");
+    defer c.destroy();
+    try c.handshake(arena);
+
+    _ = try c.ensureOpen(arena, abs, "zig");
+    const raw = try c.awaitDiagnostics(arena, uri, 1000);
+    try std.testing.expect(raw != null);
+    try std.testing.expect(c.diags.contains(uri));
+
+    // The file changes: the diagnostics we kept belong to the PREVIOUS
+    // version, and a server that has not re-published yet would make the tool
+    // report problems that are not there any more (or hide the ones that are).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "const a = 2;\n" });
+    _ = try c.ensureOpen(arena, abs, "zig");
+    try std.testing.expect(!c.diags.contains(uri));
 }

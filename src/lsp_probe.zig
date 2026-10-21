@@ -1,3 +1,12 @@
+//! The LSP probe: it asks a REAL language server (the one for the file it
+//! writes) about a real file and prints what comes back.
+//!
+//! It is the debugging companion of `tools/fake_lsp.py`: the fake server
+//! proves the WIRE, and this proves the SERVER. A bug that only shows up with
+//! a real `clangd` (a URI with an accent, a server that answers in two
+//! round trips) is invisible to the fake one.
+//!
+//! `zig build lsp-probe`
 const std = @import("std");
 const manager = @import("lsp/manager.zig");
 const format = @import("lsp/format.zig");
@@ -31,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer manager.done(c);
 
-    const uri = try c.ensureOpen(a, abs);
+    const uri = try c.ensureOpen(a, abs, manager.languageIdFor(abs));
     std.debug.print("uri: {s}\n", .{uri});
 
     const timeout = manager.requestTimeoutMs();
@@ -58,6 +67,30 @@ pub fn main(init: std.process.Init) !void {
     try roundTrip(a, c, uri, timeout, "textDocument/definition", call_pos, .goToDefinition);
     try roundTrip(a, c, uri, timeout, "textDocument/hover", call_pos, .hover);
     try roundTrip(a, c, uri, timeout, "textDocument/references", call_pos, .findReferences);
+
+    // The diagnostics: a server PUBLISHES them, so this is a wait and not a
+    // request. A file with a real error in it, because a clean file would
+    // answer "no problems" and prove nothing.
+    const bad =
+        \\int main(void) {
+        \\    int x = "not a number";
+        \\    return x
+        \\}
+    ;
+    try dir.writeFile(io, .{ .sub_path = "bad.c", .data = bad });
+    const bad_abs = try dir.realPathFileAlloc(io, "bad.c", a);
+    const bad_uri = try c.ensureOpen(a, bad_abs, manager.languageIdFor(bad_abs));
+    const raw = c.awaitDiagnostics(a, bad_uri, 8000) catch |e| {
+        std.debug.print("diagnostics error {t}\n", .{e});
+        return;
+    };
+    if (raw) |text| {
+        const items = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+        const ctx = format.Ctx{ .arena = a, .root = manager.workspaceRoot(), .current_uri = bad_uri };
+        std.debug.print("--- diagnostics ---\n{s}\n", .{try format.render(ctx, .diagnostics, items)});
+    } else {
+        std.debug.print("--- diagnostics ---\n(nothing published in 8s)\n", .{});
+    }
 }
 
 fn roundTrip(

@@ -199,6 +199,24 @@ pub fn build(b: *std.Build) void {
     const roster_probe_step = b.step("roster-probe", "Shows the pool of free models of every provider");
     roster_probe_step.dependOn(&roster_probe_run.step);
 
+    // The LSP probe: it asks a REAL language server about a real file and
+    // prints what comes back. The companion of `tools/fake_lsp.py`, which
+    // proves the wire and this one proves the server.
+    //
+    // Same placement reason as `roster_probe`: the module's path is the
+    // directory, and the probe needs `lsp/` from `src/`.
+    const lsp_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/lsp_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lsp_probe_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const lsp_probe = b.addExecutable(.{ .name = "lsp_probe", .root_module = lsp_probe_mod });
+    const lsp_probe_run = b.addRunArtifact(lsp_probe);
+    if (b.args) |args| lsp_probe_run.addArgs(args);
+    const lsp_probe_step = b.step("lsp-probe", "Asks a real language server about a real file");
+    lsp_probe_step.dependOn(&lsp_probe_run.step);
+
     // Tests that need vaxis (markdown/highlight test styles).
     // ALWAYS in Debug: the binary already comes out ReleaseSafe+strip, but
     // compiling the suite in ReleaseSafe takes 2 minutes and finds no MORE bug —

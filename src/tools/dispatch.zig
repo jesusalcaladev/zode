@@ -31,6 +31,7 @@ const goal_tool = @import("goal.zig");
 const tasks_tool = @import("tasks.zig");
 const sleep_tool = @import("sleep.zig");
 const batch_tool = @import("batch.zig");
+const lsp_tool = @import("lsp.zig");
 
 // The per-tool prompt modules: the TEXT the model reads about a tool lives with that
 // tool, as `prompts/<name>.zig`. This file decides the ORDER and nothing else, so a
@@ -305,6 +306,8 @@ pub fn executeWith(
         return sleep_tool.toolSleep(io, obj, arena);
     } else if (std.mem.eql(u8, name, "batch")) {
         return batch_tool.toolBatch(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "lsp")) {
+        return lsp_tool.toolLsp(io, obj, arena);
     }
     return error.UnknownTool;
 }
@@ -390,6 +393,18 @@ test "think returns OK with no effects" {
     defer arena_state.deinit();
     const out = try execute(std.testing.io, "think", "{\"thought\":\"plan: read file first\"}", arena_state.allocator(), null, null);
     try std.testing.expect(std.mem.indexOf(u8, out, "noted") != null);
+}
+
+test "the lsp tool is CALLED, not unknown" {
+    // The tool was in the schema (the model was offered it) and there was no
+    // branch for it in the dispatcher, so every call answered "there is no
+    // tool called lsp". A tool the model can see and cannot use is worse than
+    // no tool at all: it is a promise the harness does not keep.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const out = try execute(std.testing.io, "lsp", "{\"operation\":\"hover\"}", arena_state.allocator(), null, null);
+    // The tool's own answer, not the dispatcher's.
+    try std.testing.expect(std.mem.indexOf(u8, out, "needs a `file`") != null);
 }
 
 test "the read tool reads this file" {

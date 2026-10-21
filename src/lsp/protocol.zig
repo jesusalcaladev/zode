@@ -221,6 +221,12 @@ pub const Operation = enum {
     prepareCallHierarchy,
     incomingCalls,
     outgoingCalls,
+    /// The problems the server has found in the file (errors, warnings).
+    ///
+    /// It is NOT a request: a server publishes its diagnostics as a
+    /// `textDocument/publishDiagnostics` NOTIFICATION, so this operation waits
+    /// for that notification instead of asking for an answer.
+    diagnostics,
 
     pub fn parse(s: []const u8) ?Operation {
         inline for (std.meta.fields(Operation)) |f| {
@@ -229,7 +235,9 @@ pub const Operation = enum {
         return null;
     }
 
-    /// The `textDocument/*` method, or null for the two that are not.
+    /// The `textDocument/*` method, or null for the ones that are not a
+    /// request at all (`workspaceSymbol` is a request but not a
+    /// `textDocument/*` one, and `diagnostics` is a notification).
     pub fn method(self: Operation) ?[]const u8 {
         return switch (self) {
             .goToDefinition => "textDocument/definition",
@@ -239,6 +247,7 @@ pub const Operation = enum {
             .goToImplementation => "textDocument/implementation",
             .prepareCallHierarchy, .incomingCalls, .outgoingCalls => "textDocument/prepareCallHierarchy",
             .workspaceSymbol => null,
+            .diagnostics => null,
         };
     }
 
@@ -246,10 +255,10 @@ pub const Operation = enum {
     ///
     /// `documentSymbol` needs the file but not a position (it lists the whole
     /// document) and `workspaceSymbol` needs neither: the search is by name
-    /// across the workspace.
+    /// across the workspace. `diagnostics` is about the whole file too.
     pub fn needsPosition(self: Operation) bool {
         return switch (self) {
-            .documentSymbol, .workspaceSymbol => false,
+            .documentSymbol, .workspaceSymbol, .diagnostics => false,
             else => true,
         };
     }
@@ -266,6 +275,7 @@ pub const Operation = enum {
             .prepareCallHierarchy => "call hierarchy item",
             .incomingCalls => "incoming call",
             .outgoingCalls => "outgoing call",
+            .diagnostics => "diagnostic",
         };
     }
 };
@@ -336,4 +346,13 @@ test "Operation parses exactly the nine names" {
     try std.testing.expect(!Operation.workspaceSymbol.needsPosition());
     try std.testing.expect(Operation.hover.needsPosition());
     try std.testing.expect(Operation.findReferences.needsPosition());
+}
+
+test "Operation: diagnostics is a notification, not a request" {
+    try std.testing.expectEqual(Operation.diagnostics, Operation.parse("diagnostics").?);
+    // It is about the whole file, so it needs no position...
+    try std.testing.expect(!Operation.diagnostics.needsPosition());
+    // ...and there is no method to ask for it: a server PUBLISHES its
+    // diagnostics, and a client that waited for an answer would wait forever.
+    try std.testing.expect(Operation.diagnostics.method() == null);
 }

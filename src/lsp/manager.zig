@@ -56,6 +56,73 @@ var root: []const u8 = &.{};
 var root_uri: []const u8 = &.{};
 /// server name -> running client. Keys are the STATIC names from `servers.zig`.
 var clients: std.StringHashMapUnmanaged(*client.Client) = .empty;
+/// The user's own servers (`lsp_servers` in config.json).
+///
+/// COPIED into the manager's own arena, and that is not tidiness: the config's
+/// arena is freed on every reload (connecting a provider reloads it), and a
+/// server list that pointed into it would be a dangling pointer from the next
+/// reload on — the manager would hand the model a command built from freed
+/// memory.
+var extra: []const servers.Server = &.{};
+var extra_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+
+/// The servers the user configured, in the manager's own memory.
+pub fn extraServers() []const servers.Server {
+    return extra;
+}
+
+/// Has the manager been initialised?
+///
+/// It has not in a test that calls the tool without an app around it, and
+/// that is worth saying out loud: "no language server is configured for .zig"
+/// would send the reader looking at the server TABLE when the problem is that
+/// nobody started the manager.
+pub fn isReady() bool {
+    return ready;
+}
+
+/// The language id of the server that would answer for `path` ("zig", "c"...).
+///
+/// It is asked per FILE and not per client because one server can serve two
+/// languages: `typescript-language-server` answers for `.ts` ("typescript") and
+/// for `.tsx` ("typescriptreact"), and a client that carries ONE language id
+/// opens a `.tsx` file as TypeScript — which is a parse error waiting to
+/// happen.
+pub fn languageIdFor(path: []const u8) []const u8 {
+    const spec = servers.find(extra, path) orelse return "";
+    return spec.language_id;
+}
+
+/// Replaces the user's servers with `list`.
+///
+/// The list is copied: the caller's memory (the config's arena) does not
+/// outlive the call.
+pub fn setServers(list: []const servers.Server) !void {
+    lock2();
+    defer unlock();
+    // The new list is built in a FRESH arena and the old one is thrown away
+    // only when the new one is complete: a half-installed list is worse than
+    // the previous one, and the old arena is freed while it is still in use.
+    var new_arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer new_arena.deinit();
+    const a = new_arena.allocator();
+    var out: std.ArrayList(servers.Server) = .empty;
+    for (list) |s| {
+        var cmd: std.ArrayList([]const u8) = .empty;
+        for (s.command) |c| try cmd.append(a, try a.dupe(u8, c));
+        var ext: std.ArrayList([]const u8) = .empty;
+        for (s.extensions) |e| try ext.append(a, try a.dupe(u8, e));
+        try out.append(a, .{
+            .name = try a.dupe(u8, s.name),
+            .language_id = try a.dupe(u8, s.language_id),
+            .command = cmd.items,
+            .extensions = ext.items,
+        });
+    }
+    extra_arena.deinit();
+    extra_arena = new_arena;
+    extra = out.items;
+}
 
 pub fn init(g: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) void {
     lock2();
@@ -81,14 +148,46 @@ pub fn shutdown() void {
     lock2();
     defer unlock();
     var it = clients.iterator();
-    while (it.next()) |e| e.value_ptr.*.destroy();
+    while (it.next()) |e| {
+        gpa.free(e.key_ptr.*);
+        // A client is only freed if NOBODY is inside it. A worker in the
+        // middle of a question holds the client's lock, and freeing it under
+        // that thread is a use-after-free in a thread that is not the turn's.
+        //
+        // The server is killed either way: a `zls` that outlives the app keeps
+        // indexing a project nobody is looking at any more. Killing the
+        // process (and not freeing the transport) closes the pipe, so the
+        // thread inside it wakes up and unwinds on its own.
+        if (tryTake(e.value_ptr.*)) {
+            e.value_ptr.*.destroy();
+        } else {
+            e.value_ptr.*.kill();
+        }
+    }
     clients.deinit(gpa);
     clients = .empty;
+    extra_arena.deinit();
+    extra_arena = .init(std.heap.page_allocator);
+    extra = &.{};
     root_arena.deinit();
     root_arena = .init(std.heap.page_allocator);
     root = &.{};
     root_uri = &.{};
     ready = false;
+}
+
+/// Takes the client's lock if nobody holds it, and gives it back.
+///
+/// Bounded on purpose: the exit does not wait for a server that is thinking.
+fn tryTake(c: *client.Client) bool {
+    var spins: u32 = 0;
+    while (!c.lock.tryLock()) {
+        spins += 1;
+        if (spins > 1000) return false;
+        std.Thread.yield() catch {};
+    }
+    c.lock.unlock();
+    return true;
 }
 
 pub fn workspaceRoot() []const u8 {
@@ -121,11 +220,29 @@ pub fn use(abs_path: []const u8, err_out: *ErrText) !?*client.Client {
     lock2();
     defer unlock();
     if (!ready) return null;
-    const spec = servers.find(&.{}, abs_path) orelse return null;
+    const spec = servers.find(extra, abs_path) orelse return null;
 
     if (clients.get(spec.name)) |c| {
-        c.acquire();
-        return c;
+        if (!c.dead) {
+            c.acquire();
+            return c;
+        }
+        // The server is GONE (its pipe closed). Handing out this client again
+        // would answer every question with `ServerClosed`, so it is replaced.
+        //
+        // The client is taken over FIRST: `destroy` frees it, and a thread that
+        // is still inside it would be reading freed memory. Nobody can be
+        // inside it AND waiting for the manager's lock (the tool takes the
+        // client lock before it takes the manager's), so this is safe.
+        if (tryTake(c)) {
+            if (clients.fetchRemove(spec.name)) |kv| gpa.free(kv.key);
+            c.destroy();
+        } else {
+            // Somebody is inside it right now: they will get the error, and the
+            // NEXT call replaces the client.
+            c.acquire();
+            return c;
+        }
     }
 
     const t = process.spawn(gpa, io_g, spec.command) catch |e| switch (e) {
@@ -158,7 +275,12 @@ pub fn use(abs_path: []const u8, err_out: *ErrText) !?*client.Client {
         return e;
     };
 
-    try clients.put(gpa, spec.name, c);
+    // The KEY is a copy and not `spec.name`: a user's server name lives in the
+    // config's arena, which is freed when the config is reloaded, and a map key
+    // that dangles is a use-after-free the next time the map is walked.
+    const key = try gpa.dupe(u8, spec.name);
+    errdefer gpa.free(key);
+    try clients.put(gpa, key, c);
     c.acquire();
     return c;
 }
@@ -192,6 +314,61 @@ test "manager: an extension with no server starts nothing and reports null" {
     const none = try use("notes.txt", &err_text);
     try std.testing.expect(none == null);
     try std.testing.expectEqual(@as(usize, 0), err_text.len);
+}
+
+test "manager: the user's server wins over the built-in one" {
+    init(std.testing.allocator, std.testing.io, null);
+    defer shutdown();
+
+    // Without the user's server, `.zig` is zls and `.txt` is nothing.
+    try std.testing.expectEqualStrings("zls", servers.find(extraServers(), "a.zig").?.name);
+    try std.testing.expect(servers.find(extraServers(), "a.txt") == null);
+
+    try setServers(&[_]servers.Server{
+        .{
+            .name = "my-zls",
+            .language_id = "zig",
+            .command = &.{"my-lsp"},
+            .extensions = &.{".zig"},
+        },
+        .{
+            .name = "txtlsp",
+            .language_id = "text",
+            .command = &.{"txtlsp"},
+            .extensions = &.{".txt"},
+        },
+    });
+
+    // The user's server wins for the extension it claims...
+    try std.testing.expectEqualStrings("my-zls", servers.find(extraServers(), "a.zig").?.name);
+    // ...and it can claim one zode does not ship at all.
+    try std.testing.expectEqualStrings("txtlsp", servers.find(extraServers(), "a.txt").?.name);
+    // The language id is asked PER FILE: one server can serve two languages.
+    try std.testing.expectEqualStrings("zig", languageIdFor("a.zig"));
+    try std.testing.expectEqualStrings("text", languageIdFor("a.txt"));
+    try std.testing.expectEqualStrings("", languageIdFor("a.unknown"));
+}
+
+test "manager: the user's servers are COPIED, not borrowed" {
+    init(std.testing.allocator, std.testing.io, null);
+    defer shutdown();
+
+    // The caller's memory is the config's arena, which is freed on the next
+    // reload. A manager that kept the pointer would be holding freed memory
+    // from then on, and the symptom would be a command built out of garbage.
+    var name: [8]u8 = undefined;
+    @memcpy(name[0..4], "mine");
+    const list = [_]servers.Server{.{
+        .name = name[0..4],
+        .language_id = "zig",
+        .command = &.{"my-lsp"},
+        .extensions = &.{".zig"},
+    }};
+    try setServers(&list);
+    // The caller's buffer goes away...
+    @memset(&name, 'x');
+    // ...and the manager still has the real name.
+    try std.testing.expectEqualStrings("mine", extraServers()[0].name);
 }
 
 test "manager: a known extension with a missing binary names the binary" {

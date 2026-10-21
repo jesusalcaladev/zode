@@ -30,16 +30,14 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
       `max_listed = 40` is still a constant and `context: fork` is parsed and never read.
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
 - [ ] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety)
-- [ ] 🟡 **Tool track — Phase 14 → 25 → 26 → 20** (LSP → bash safety → roles → teams); 20 waits on 15, 32 on 26
+- [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
 - [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): most needed, least fun — quietly wrong today
 - [ ] 🟢 Everything else per the dependency table at the bottom.
 
 **Done since the board was written**: Phase 1 (bundled skills + rich frontmatter) ·
-Phase 16 (the `batch` tool: many operations, one round trip) · Phase 28 (`/copy`).
-
-**The `lsp` tool is offered to the model and cannot be called** — the dispatcher has no
-branch for it. Phase 14 has the details; it is the cheapest of the unfinished ones to
-make real, because the library is already written.
+Phase 16 (the `batch` tool: many operations, one round trip) · Phase 28 (`/copy`) ·
+**Phase 14 (the language server: the tool was offered to the model and could not be
+called — it is wired now, with `diagnostics` and `lsp_servers`)**.
 
 ---
 
@@ -222,47 +220,67 @@ make real, because the library is already written.
 
 ## Phase 14 — Semantic code intelligence (a language-server client)
 
-`✨ feature · 🟡 · depends on 12 (stdio JSON-RPC transport)` — **the library is written; NOTHING is wired (2026-10-20)**
+`✨ feature · 🟡 · depends on 12 (stdio JSON-RPC transport)` — **DONE 2026-10-20**
 
 > `refs`/`rename` are regex heuristics; the compiler already knows the answer. LSP is asked for when precision matters; `refs` stays (instant, no server needed).
 
-- [ ] Optional LSP client: keyed by file extension, started on demand over stdio, reused for the session, killed at teardown
-- [ ] One `lsp` tool with `operation`: `definition` · `references` · `hover` · `document_symbols` · `workspace_symbols` · `implementations` · `incoming_calls`/`outgoing_calls` · `diagnostics`
-- [ ] **Degrade, never block**: no server for the file type → named error, the model falls back to `refs`/`grep`. The server is a bonus, not a barrier
-- [ ] Position = `file` + `line` + `character` (1-based); `character` resolved from the symbol name when given, so the model does not count columns
-- [ ] `lib/lsp_protocol.zig` pure and tested separately (framing, requests, `initialize`/`shutdown` handshake, `textDocument/*` mapping) against a fake server over a pipe — no editor, no network
-- [ ] Per-project `lsp_servers` table in config (extension → command) + small built-in defaults (zls, rust-analyzer, gopls, typescript-language-server, pyright, clangd); "not installed → skip" like `check`
-- [ ] Small `max_result_chars` — semantic answers are short (a location, a signature)
-- [ ] Tests: the fake server drives every operation · a missing server degrades to a named error and never hangs · a server that dies mid-session is restarted once · `document_symbols` on a real fixture returns the outline · **`refs` still works with zero servers installed**
+- [x] Optional LSP client: keyed by file extension, started on demand over stdio, reused for the session, killed at teardown
+- [x] One `lsp` tool with `operation`: `definition` · `references` · `hover` · `document_symbols` · `workspace_symbols` · `implementations` · `incoming_calls`/`outgoing_calls` · `diagnostics`
+- [x] **Degrade, never block**: no server for the file type → named error, the model falls back to `refs`/`grep`. The server is a bonus, not a barrier
+- [x] Position = `file` + `line` + `character` (1-based); `character` resolved from the symbol name when given, so the model does not count columns
+- [x] `lsp/protocol.zig` pure and tested separately (framing, requests, `initialize`/`shutdown` handshake, `textDocument/*` mapping) against a fake server over a pipe — no editor, no network
+- [x] Per-project `lsp_servers` table in config (extension → command) + small built-in defaults (zls, rust-analyzer, gopls, typescript-language-server, pyright, clangd); "not installed → skip" like `check`
+- [x] Small `max_result_chars` — semantic answers are short (a location, a signature)
+- [x] Tests: the fake server drives every operation · a missing server degrades to a named error and never hangs · a server that dies mid-session is restarted once · `document_symbols` on a real fixture returns the outline · **`refs` still works with zero servers installed**
 
-### The state of it, measured 2026-10-20 (so the next session does not start from zero)
+### What was done, and what it cost to find out (2026-10-20)
 
-`src/lsp/` holds ~1700 lines (protocol · client · process · manager · servers · format) and
-`src/tools/lsp.zig` holds the tool. **33 test blocks are written and 32 of them do not
-even compile**: `src/lsp_test.zig` is referenced by no build step and by no aggregator.
+The library was written and the tool was offered to the model with **no branch in the
+dispatcher**: every call answered `there is no tool called lsp`. A tool the model can see
+and cannot use is a promise the harness does not keep.
 
-Four things are missing, and they are the four that make it a feature:
+**What is wired now**: the dispatcher branch · the manager (started at boot, killed at
+exit — a `zls` that outlives the app keeps indexing a project nobody is looking at) ·
+`lsp_servers` in `config.json` · `diagnostics` · a dead server is replaced instead of
+answering `ServerClosed` forever · the 32 test blocks that never compiled are in
+`src/test_all.zig` and run.
 
-1. **The dispatcher has no `lsp` branch.** The model IS offered the tool (the schema is
-   in the registry) and calling it answers `there is no tool called lsp`. **This is a
-   bug today**: a tool in the prompt that cannot be called.
-2. **The manager is never initialised and never shut down.** `manager.init` is called
-   only by the probe and by two tests, so `ready` is false in the app and every request
-   degrades.
-3. **There is no `lsp_servers` key in `config.json`.** The override plumbing exists
-   (`servers.find(extra, path)`) and nothing ever fills `extra`.
-4. **`diagnostics` is not implemented**, and a dead server is not restarted: the client
-   stays in the map and every later call fails with `ServerClosed`.
+**Five things that were not obvious**:
 
-The 32 dead test blocks and `src/lsp_raw.zig` / `src/lsp_probe.zig` (scratch binaries
-with no build step) are the other half of the work: they have to be moved into
-`src/test_all.zig` before any of them can catch a regression.
+1. **`diagnostics` is NOT a request.** A server PUBLISHES its diagnostics as a
+   `textDocument/publishDiagnostics` notification, so the operation WAITS for one. The
+   client keeps the last publication per file and forgets it when the file is sent
+   again: the diagnostics of the previous version would be reported as the current
+   ones. "No diagnostics arrived in 8 s" and "there are no problems" are two different
+   facts, and only the first one is ever said.
+2. **A notification that arrives while another request is in flight is not lost.** The
+   diagnostics usually land in the middle of a `hover`, and the reader used to skip
+   every message without an `id` — which is every notification.
+3. **One server can serve two languages.** `typescript-language-server` answers for
+   `.ts` ("typescript") and for `.tsx` ("typescriptreact"), and a client that carries
+   ONE language id opens a `.tsx` as TypeScript. The id is asked per FILE now.
+4. **The user's servers are COPIED, not borrowed.** `config.json` lives in an arena
+   that is freed on every reload (connecting a provider reloads it), so a server list
+   that pointed into it is a dangling pointer from then on. The map key of a running
+   client is a copy for the same reason.
+5. **The read-only schema was a hand-written list of INDICES** (`defs[0].schema ++ "," ++
+   defs[1].schema ++ …`), and the `lsp` row had never been added to it. Both arrays are
+   now composed at comptime from the table, so the copy that drifts cannot exist.
 
-**A drift to settle while wiring it**: `src/tools/lsp.zig` documents `Permission: none`
-and `src/lib/subagent.zig` lists `lsp` among the read-only tools, while the registry
-says `read_only = false` — so the model gets a dialog for a tool nobody thought should
-ask, and the read-only drift test does not see it (the tool is simply absent from the
-read-only array).
+**The permission drift is settled**: `lsp` is `read_only = true`. The command that gets
+spawned comes from a table (or from the user's `lsp_servers`), never from the model,
+so there is no argument a model could put an obligation in — the same reason `read`
+asks nothing. The model got a dialog for a tool nobody thought should ask.
+
+**How it is checked**: `tools/fake_lsp.py` is a fake server that speaks the wire, and
+the test drives EVERY operation through the real dispatcher, the real manager and a real
+spawn. `zig build lsp-probe` does the same against a REAL server (clangd) and prints
+what comes back: the two are complements — the fake proves the wire, the probe proves
+the server.
+
+**Not done** (and not on this board): the `shutdown`/`exit` request of the protocol (the
+server is killed, not asked), and `workspace/diagnostic` (the workspace-wide pull that
+some servers support).
 
 ---
 

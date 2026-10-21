@@ -87,6 +87,45 @@ const R = struct {
         try self.add(try std.fmt.allocPrint(self.ctx.arena, "{s}:{d}:{d}", .{ path, pos.line + 1, pos.character + 1 }));
         self.count += 1;
     }
+
+    /// One diagnostic: where it is, how bad it is and what it says.
+    ///
+    /// The source line comes AFTER the message, not before it: the message is
+    /// what the model has to act on, and a line of code in front of it makes
+    /// the model read the code before it reads the problem.
+    fn diagnostic(
+        self: *R,
+        pos: protocol.Position,
+        severity: i64,
+        message: []const u8,
+        source: ?[]const u8,
+        code: ?[]const u8,
+    ) !void {
+        const path = try pathFor(self.ctx, self.ctx.current_uri);
+        var line = try std.fmt.allocPrint(self.ctx.arena, "{s}:{d}:{d}  {s}: {s}", .{
+            path, pos.line + 1, pos.character + 1, severityName(severity), message,
+        });
+        if (source) |s| {
+            if (s.len > 0) line = try std.fmt.allocPrint(self.ctx.arena, "{s} ({s})", .{ line, s });
+        }
+        if (code) |c| {
+            if (c.len > 0) line = try std.fmt.allocPrint(self.ctx.arena, "{s} [{s}]", .{ line, c });
+        }
+        if (self.ctx.read_line) |rf| {
+            const abs = try absFor(self.ctx, self.ctx.current_uri);
+            if (abs.len > 0) {
+                if (rf(self.ctx.read_ud, abs, pos.line)) |src| {
+                    const trimmed = std.mem.trim(u8, src, " \t\r\n");
+                    if (trimmed.len > 0) {
+                        const snippet = trimmed[0..@min(trimmed.len, 160)];
+                        line = try std.fmt.allocPrint(self.ctx.arena, "{s}\n    {s}", .{ line, snippet });
+                    }
+                }
+            }
+        }
+        try self.add(line);
+        self.count += 1;
+    }
 };
 
 fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -145,6 +184,14 @@ pub const symbolKindNames = [_][]const u8{
     "Null",        "EnumMember",  "Struct",     "Event",       "Operator",
     "TypeParameter",
 };
+
+/// The severity names of the LSP, in the order the spec numbers them.
+const severity_names = [_][]const u8{ "problem", "error", "warning", "information", "hint" };
+
+pub fn severityName(s: i64) []const u8 {
+    if (s >= 1 and s <= severity_names.len) return severity_names[@intCast(s)];
+    return severity_names[0];
+}
 
 pub fn symbolKindName(k: i64) []const u8 {
     if (k >= 1 and k <= symbolKindNames.len) return symbolKindNames[@intCast(k - 1)];
@@ -285,10 +332,47 @@ fn renderHover(arena: std.mem.Allocator, result: std.json.Value) ![]const u8 {
     return text;
 }
 
+/// Renders the diagnostics a server published for a file.
+///
+/// The order is the server's: they come in the order the server found them,
+/// and a list sorted by severity would be a second opinion about what matters.
+pub fn renderDiagnostics(ctx: Ctx, items: std.json.Value) ![]const u8 {
+    const arr = arrayOf(items) orelse return "the server published no diagnostics";
+    var r = R{ .ctx = ctx };
+    for (arr) |it| {
+        const obj = objOf(it) orelse continue;
+        const severity = getInt(obj, "severity");
+        const message = getStr(obj, "message") orelse "(no message)";
+        const source = getStr(obj, "source");
+        const code = codeOf(ctx.arena, obj);
+        const pos = startOf(it) orelse protocol.Position{ .line = 0, .character = 0 };
+        try r.diagnostic(pos, severity, message, source, code);
+    }
+    if (r.count == 0) {
+        return "the language server reported no problems in this file";
+    }
+    if (r.truncated > 0) {
+        try r.out.appendSlice(ctx.arena, try std.fmt.allocPrint(ctx.arena, "(+{d} more not shown)\n", .{r.truncated}));
+    }
+    const plural = if (r.count == 1) "" else "s";
+    return std.fmt.allocPrint(ctx.arena, "{d} diagnostic{s}:\n{s}", .{ r.count, plural, r.out.items });
+}
+
+/// The `code` of a diagnostic, which can be a string or a number.
+fn codeOf(arena: std.mem.Allocator, obj: std.json.ObjectMap) ?[]const u8 {
+    const v = obj.get("code") orelse return null;
+    return switch (v) {
+        .string => |s| if (s.len > 0) s else null,
+        .integer => |i| std.fmt.allocPrint(arena, "{d}", .{i}) catch null,
+        else => null,
+    };
+}
+
 /// Renders one operation's result. `result` is the JSON `result` field of the
 /// response (already unwrapped from the JSON-RPC envelope).
 pub fn render(ctx: Ctx, op: protocol.Operation, result: std.json.Value) ![]const u8 {
     if (op == .hover) return renderHover(ctx.arena, result);
+    if (op == .diagnostics) return renderDiagnostics(ctx, result);
 
     var r = R{ .ctx = ctx };
     switch (op) {
@@ -302,6 +386,7 @@ pub fn render(ctx: Ctx, op: protocol.Operation, result: std.json.Value) ![]const
         .incomingCalls => try renderCallTargets(&r, result, "from", true),
         .outgoingCalls => try renderCallTargets(&r, result, "to", false),
         .hover => unreachable,
+        .diagnostics => unreachable,
     }
 
     if (r.count == 0) {
@@ -419,4 +504,40 @@ test "format: workspaceSymbol uses the location inside each symbol" {
     );
     const out = try render(testCtx(arena), .workspaceSymbol, result);
     try std.testing.expect(std.mem.indexOf(u8, out, "Server (Class) s.zig:7:1") != null);
+}
+
+test "format: diagnostics say where they are, how bad they are and what they are" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const items = try parse(arena,
+        \\[{"range":{"start":{"line":11,"character":4}},"severity":1,"source":"clangd","code":"err-42","message":"expected ';'"},
+        \\ {"range":{"start":{"line":2,"character":0}},"severity":2,"message":"unused variable"}]
+    );
+    const out = try render(testCtx(arena), .diagnostics, items);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2 diagnostics:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig:12:5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "error: expected ';'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "(clangd)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[err-42]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "warning: unused variable") != null);
+    // The line the problem is on comes with it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub fn main() void {") != null);
+}
+
+test "format: no diagnostics is an answer, not an empty list" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const none = try parse(arena, "[]");
+    const out = try render(testCtx(arena), .diagnostics, none);
+    try std.testing.expect(std.mem.indexOf(u8, out, "no problems") != null);
+}
+
+test "format: a severity the spec does not have is still a word" {
+    try std.testing.expectEqualStrings("error", severityName(1));
+    try std.testing.expectEqualStrings("warning", severityName(2));
+    try std.testing.expectEqualStrings("hint", severityName(4));
+    // An unknown number is not a crash and not a lie about the severity.
+    try std.testing.expectEqualStrings("problem", severityName(99));
 }

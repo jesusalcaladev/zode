@@ -50,6 +50,7 @@ const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeats.zig");
 const build_options = @import("build_options");
 const autochk = @import("autochk.zig");
+const lsp_manager = @import("lsp/manager.zig");
 const review_mod = @import("lib/review.zig");
 
 // The `/help` tables live with the commands they document. Re-exported because
@@ -2309,6 +2310,12 @@ pub fn loadUserConfig() void {
         }
         loadAllowlist();
         loadAuthKeys(cfg_arena_state.?.allocator());
+
+        // The user's language servers. The manager COPIES them into its own
+        // memory, because this arena is freed on the next reload (connecting a
+        // provider reloads the config) and a server list that pointed into it
+        // would be a dangling pointer from then on.
+        lsp_manager.setServers(user_config.lsp_servers) catch {};
 
         // The status bar's `provider/model`, resolved now that the provider is
         // known. It reads the CACHED catalogue and never the network, so this is
@@ -7767,10 +7774,20 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
     chat.cancel_current.store(true, .seq_cst);
     m.waitWorkers(60);
 
-    // 3. The session. One write, and it is the only reason any of this exists.
+    // 3. The language servers. They are children too, and they are NOT in the
+    // job registry: a `zls` that outlived the app would keep indexing a
+    // project nobody is looking at any more.
+    //
+    // AFTER the workers are asked to stop, and not before: a worker in the
+    // middle of a question holds the client, and the manager does not free a
+    // client somebody is inside (it kills the server instead, which is what
+    // matters at this point).
+    lsp_manager.shutdown();
+
+    // 4. The session. One write, and it is the only reason any of this exists.
     if (session) |s| s.flush();
 
-    // 4. The terminal. `std.process.exit` runs NO defer, and vaxis leaves the
+    // 5. The terminal. `std.process.exit` runs NO defer, and vaxis leaves the
     // screen in the alternate buffer (`CSI ? 1049 h`) with the mouse captured
     // and the cursor hidden. So the defers that would undo it never run, and
     // ctrl+c left the app ON SCREEN: the last frame still there, the cursor

@@ -42,6 +42,17 @@ pub const selfupdate = @import("lib/selfupdate.zig");
 pub const clipboard = @import("clipboard.zig");
 pub const copytext = @import("lib/copytext.zig");
 
+// The language server. It was in its own aggregator (`src/lsp_test.zig`) that
+// no build step referenced: 33 test blocks written, and 32 of them not even
+// compiled. They are here now, where `zig build test` reaches them.
+pub const lsp_protocol = @import("lsp/protocol.zig");
+pub const lsp_servers = @import("lsp/servers.zig");
+pub const lsp_format = @import("lsp/format.zig");
+pub const lsp_client = @import("lsp/client.zig");
+pub const lsp_process = @import("lsp/process.zig");
+pub const lsp_manager = @import("lsp/manager.zig");
+pub const lsp_tool = @import("tools/lsp.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

@@ -22,6 +22,7 @@ const kittyKeyboardPush = @import("lib/termseq.zig").kittyKeyboardPush;
 const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
+const lsp_manager = @import("lsp/manager.zig");
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = map orelse return null;
@@ -163,6 +164,11 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     agent.gpa_global = gpa;
     agent.environ_global = env;
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
+    // The language servers. Started LAZILY (a server is spawned when a file of
+    // its language is asked about) but the manager has to exist before the
+    // config is read, because the config is what says which servers there are.
+    lsp_manager.init(gpa, io, env);
+    defer lsp_manager.shutdown();
     agent.initProjectInfo(io, env); // cwd + repo root, before any prompt is composed
     chat.io_global = io;
     free_auto.attachIo(io); // el reloj de los cooldowns del free-auto
@@ -654,6 +660,13 @@ fn runTui(init: std.process.Init) !u8 {
     agent.api_key_global = envGet(init.environ_map, "ZODE_API_KEY");
     agent.environ_global = init.environ_map;
     agent.gpa_global = init.gpa;
+    // The language servers, before the config is read: the config says which
+    // servers there are, and the manager is what asks for them.
+    //
+    // Nothing is spawned here. A server is started when a file of its language
+    // is asked about, so a session that never uses `lsp` never pays for one.
+    lsp_manager.init(init.gpa, io, init.environ_map);
+    defer lsp_manager.shutdown();
     // The automatic typecheck reads `ZODE_AUTO_CHECK` off its OWN environment field,
     // not off the module global, so this is not optional: without it the flag silently
     // reads as "no environment" and every setting takes its default.
