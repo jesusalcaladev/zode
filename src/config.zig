@@ -2,6 +2,7 @@ const std = @import("std");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 const servers = @import("lsp/servers.zig");
+const mcp_servers = @import("mcp/servers.zig");
 
 /// User config: `~/.config/zode/config.json`.
 ///
@@ -47,6 +48,16 @@ pub const Config = struct {
     /// one it does. The command is FIXED here and never chosen by the model:
     /// that is what lets the `lsp` tool run without a permission dialog.
     lsp_servers: []const servers.Server = &.{},
+    /// The user's MCP servers (`mcp_servers`).
+    ///
+    /// USER-level and not per project, on purpose: a server is a PROGRAM, and
+    /// a program the project chooses is remote code execution with the user's
+    /// credentials. The user's own config is the place where that decision
+    /// belongs, and a project that wants a server asks for one to be added.
+    ///
+    /// The command is FIXED here and never chosen by the model: that is what
+    /// lets the `mcp` tool read a server's catalogue without a dialog.
+    mcp_servers: []const mcp_servers.Server = &.{},
     /// Config path that was loaded (for diagnostics), or null.
     path: ?[]const u8 = null,
     pub const empty: Config = .{};
@@ -123,6 +134,20 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
                 try list.append(arena, s);
             }
             cfg.lsp_servers = list.items;
+        }
+    }
+    // The user's MCP servers. Same rule as the language servers: a malformed
+    // entry is SKIPPED and not an error, because one bad row must not take the
+    // whole config (and with it the provider that was working) down.
+    if (root.get("mcp_servers")) |v| {
+        if (v == .array) {
+            var list: std.ArrayList(mcp_servers.Server) = .empty;
+            for (v.array.items) |item| {
+                if (item != .object) continue;
+                const s = parseMcpServer(arena, item.object) catch continue;
+                try list.append(arena, s);
+            }
+            cfg.mcp_servers = list.items;
         }
     }
 
@@ -239,6 +264,71 @@ fn parseServer(arena: std.mem.Allocator, o: std.json.ObjectMap) !servers.Server 
         .language_id = lang,
         .command = cmd.items,
         .extensions = ext.items,
+    };
+}
+
+/// One MCP server, as the user wrote it.
+///
+/// The shape is the obvious one:
+///
+///     { "name": "github", "command": ["npx", "-y", "server-github"],
+///       "env": { "GITHUB_TOKEN": "..." } }
+///
+/// `env` is an OBJECT (a name and a value), and also accepts an array of
+/// `{name, value}` objects, because both are what people write and the second
+/// one is what a generator emits.
+fn parseMcpServer(arena: std.mem.Allocator, o: std.json.ObjectMap) !mcp_servers.Server {
+    const name_v = o.get("name") orelse return error.BadServer;
+    if (name_v != .string or name_v.string.len == 0) return error.BadServer;
+    const name = try arena.dupe(u8, name_v.string);
+
+    const cmd_v = o.get("command") orelse return error.BadServer;
+    if (cmd_v != .array or cmd_v.array.items.len == 0) return error.BadServer;
+    var cmd: std.ArrayList([]const u8) = .empty;
+    for (cmd_v.array.items) |c| {
+        if (c != .string or c.string.len == 0) return error.BadServer;
+        try cmd.append(arena, try arena.dupe(u8, c.string));
+    }
+
+    var envs: std.ArrayList(mcp_servers.EnvVar) = .empty;
+    if (o.get("env")) |ev| {
+        switch (ev) {
+            .object => |map| {
+                var it = map.iterator();
+                while (it.next()) |kv| {
+                    const v = kv.value_ptr.*;
+                    if (v != .string) continue;
+                    // `Environ.Map.put` ASSERTS on a name with an `=` in it, and
+                    // an assert in the user's own configuration is a crash the
+                    // user cannot do anything about.
+                    if (!mcp_servers.validEnvName(kv.key_ptr.*)) continue;
+                    try envs.append(arena, .{
+                        .name = try arena.dupe(u8, kv.key_ptr.*),
+                        .value = try arena.dupe(u8, v.string),
+                    });
+                }
+            },
+            .array => |items| {
+                for (items.items) |item| {
+                    if (item != .object) continue;
+                    const n = item.object.get("name") orelse continue;
+                    const v = item.object.get("value") orelse continue;
+                    if (n != .string or v != .string) continue;
+                    if (!mcp_servers.validEnvName(n.string)) continue;
+                    try envs.append(arena, .{
+                        .name = try arena.dupe(u8, n.string),
+                        .value = try arena.dupe(u8, v.string),
+                    });
+                }
+            },
+            else => {},
+        }
+    }
+
+    return .{
+        .name = name,
+        .command = cmd.items,
+        .env = envs.items,
     };
 }
 
@@ -410,6 +500,60 @@ test "parse: a malformed language server is skipped, and the rest survives" {
     // down, and must not take the good row with it.
     try std.testing.expectEqual(@as(usize, 1), cfg.lsp_servers.len);
     try std.testing.expectEqualStrings("ok", cfg.lsp_servers[0].name);
+    // The provider is still there: that is the point of skipping.
+    try std.testing.expectEqualStrings("vllm", cfg.provider);
+}
+
+test "parse: the user's MCP servers are parsed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"mcp_servers":[
+        \\ {"name":"github","command":["npx","-y","server-github"],"env":{"GITHUB_TOKEN":"abc"}},
+        \\ {"name":"fs","command":["mcp-fs","/tmp"],"env":[{"name":"MODE","value":"ro"}]}
+        \\]}
+    ;
+    const cfg = try parse(arena, json, "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 2), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("github", cfg.mcp_servers[0].name);
+    try std.testing.expectEqual(@as(usize, 3), cfg.mcp_servers[0].command.len);
+    try std.testing.expectEqualStrings("npx", cfg.mcp_servers[0].command[0]);
+    // The environment is an object, and also an array: both are what people
+    // write, and the second one is what a generator emits.
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers[0].env.len);
+    try std.testing.expectEqualStrings("GITHUB_TOKEN", cfg.mcp_servers[0].env[0].name);
+    try std.testing.expectEqualStrings("abc", cfg.mcp_servers[0].env[0].value);
+    try std.testing.expectEqualStrings("MODE", cfg.mcp_servers[1].env[0].name);
+
+    // No servers configured is not an error and not an empty list of garbage.
+    const bare = try parse(arena, "{}", "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 0), bare.mcp_servers.len);
+}
+
+test "parse: a malformed MCP server is skipped, and the rest survives" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"provider":"vllm","mcp_servers":[
+        \\ {"name":"no-command"},
+        \\ {"name":"empty-command","command":[]},
+        \\ {"command":["x"]},
+        \\ {"name":"ok","command":["x"],"env":{"BAD=NAME":"v"}}
+        \\]}
+    ;
+    const cfg = try parse(arena, json, "/tmp/cfg.json");
+    // One bad row must not take the whole config (and with it the provider)
+    // down, and must not take the good row with it.
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("ok", cfg.mcp_servers[0].name);
+    // And an environment variable whose NAME is not a name is dropped, not
+    // asserted on: `Environ.Map.put` asserts, and an assert in the user's own
+    // configuration is a crash the user cannot do anything about.
+    try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers[0].env.len);
     // The provider is still there: that is the point of skipping.
     try std.testing.expectEqualStrings("vllm", cfg.provider);
 }

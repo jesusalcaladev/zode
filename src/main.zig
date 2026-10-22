@@ -23,6 +23,7 @@ const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
 const lsp_manager = @import("lsp/manager.zig");
+const mcp_manager = @import("mcp/manager.zig");
 const theme = @import("lib/theme.zig");
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
@@ -170,6 +171,9 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // config is read, because the config is what says which servers there are.
     lsp_manager.init(gpa, io, env);
     defer lsp_manager.shutdown();
+    // The MCP servers: same reason, same laziness.
+    mcp_manager.init(gpa, io, env);
+    defer mcp_manager.shutdown();
     agent.initProjectInfo(io, env); // cwd + repo root, before any prompt is composed
     chat.io_global = io;
     free_auto.attachIo(io); // el reloj de los cooldowns del free-auto
@@ -678,6 +682,11 @@ fn runTui(init: std.process.Init) !u8 {
     // is asked about, so a session that never uses `lsp` never pays for one.
     lsp_manager.init(init.gpa, io, init.environ_map);
     defer lsp_manager.shutdown();
+    // The MCP servers, for the same reason and with the same laziness: the
+    // manager has to exist before the config is read (the config says which
+    // servers there are) and nothing is spawned until a server is asked about.
+    mcp_manager.init(init.gpa, io, init.environ_map);
+    defer mcp_manager.shutdown();
     // The automatic typecheck reads `ZODE_AUTO_CHECK` off its OWN environment field,
     // not off the module global, so this is not optional: without it the flag silently
     // reads as "no environment" and every setting takes its default.

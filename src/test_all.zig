@@ -58,6 +58,16 @@ pub const lsp_process = @import("lsp/process.zig");
 pub const lsp_manager = @import("lsp/manager.zig");
 pub const lsp_tool = @import("tools/lsp.zig");
 
+// The MCP client. The same lesson as the language server above: the modules
+// have to be in this aggregator or their tests never compile.
+pub const mcp_protocol = @import("mcp/protocol.zig");
+pub const mcp_client = @import("mcp/client.zig");
+pub const mcp_process = @import("mcp/process.zig");
+pub const mcp_servers = @import("mcp/servers.zig");
+pub const mcp_search = @import("mcp/search.zig");
+pub const mcp_manager = @import("mcp/manager.zig");
+pub const mcp_tool = @import("tools/mcp.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

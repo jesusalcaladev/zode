@@ -125,14 +125,14 @@ binary (1.9MB stripped).
 - Note: OpenRouter's free models do not report cache; the metric shines with
   Anthropic/DeepSeek/OpenAI.
 
-## Current tools (37)
+## Current tools (38)
 
 read, write, edit (multi-hunk), notebook_edit, bash (+background: `run_in_background`,
 `bash_output`, `bash_kill`), glob, grep (native rg), refs, rename, check,
 git_status/diff/log/branch/add/commit/stash, list_files, **web_fetch**,
 **web_search**, think (a scratchpad with no effects, for planning), todo, the
 task graph (`task_create`/`task_get`/`task_list`/`task_update`/`task_stop`), ask,
-lsp, skill, task (subagents), review, goal, sleep, **batch**.
+lsp, skill, task (subagents), review, goal, sleep, **batch**, **mcp**.
 
 **The authoritative list is `tools/dispatch.zig`'s `defs`** — this heading said
 "10" while the binary had 28, because a hand-kept copy is how a list goes stale.
@@ -5809,3 +5809,125 @@ it does not have.
 `src/commands.zig` `cmdFiles` · one row in the command table · the hook in
 `agent.execOneCall` · `tools/pty_smoke.py` TYPES it, because a command can be
 unit-perfect and still do nothing when it is typed.
+
+---
+
+## MCP: a server is a PROGRAM, and the schemas do not go into the prompt (2026-10-21)
+
+TASKS Phase 12. An MCP server gives zode a capability it does not have (an issue
+tracker, a database, a design file). The protocol is JSON-RPC 2.0 over stdio.
+
+### The framing is NOT the LSP framing
+
+MCP frames **one JSON-RPC message per line**. LSP uses `Content-Length`
+headers. The two protocols speak the same dialect and frame it differently,
+and a server that gets the wrong framing answers NOTHING AT ALL — the symptom
+is "the tool does not work" with no message anywhere.
+
+`src/mcp/client.zig` has its own `Transport` vtable instead of sharing
+`src/lsp/client.zig`'s, and the difference is called out in both files,
+because copying the LSP framer here is the single most likely way to get this
+wrong.
+
+### ONE tool, not one tool per server tool
+
+The `mcp` tool has three operations — `search`, `list`, `call` — and the
+schemas of every server's tools live in the manager's catalogue, NOT in the
+request's `tools` array.
+
+**The reason is the cache.** The `tools` array is the biggest stable prefix of
+every request, and the provider's cache is indexed by its LITERAL BYTES. Ten
+servers with fifty tools each would be half a megabyte of schema in every
+request, and adding a server would rewrite the prefix of every request of
+every session: the cache would never hit again. The schema arrives in the
+result of a `search`, and nowhere else.
+
+The test that pins it is in `src/tools/dispatch.zig`: the tools array does NOT
+contain `create_issue`, the search DOES bring it with its schema, and the call
+then works.
+
+### The server's configuration is USER-level, and a project's `.mcp.json` is ignored
+
+A server is a PROGRAM. Honouring one from a clone is remote code execution
+with the user's credentials. zode already treats `.mcp.json` as a file the
+model must not write (`src/lib/pathsafe.zig`), and the honest reading of that
+is that the HARNESS decides which servers run — so the decision is the user's,
+in `~/.config/zode/config.json` under `mcp_servers`:
+
+```json
+{ "mcp_servers": [
+    { "name": "github", "command": ["npx", "-y", "server-github"],
+      "env": { "GITHUB_TOKEN": "..." } }
+] }
+```
+
+`env` is an object and also accepts an array of `{name, value}`. A malformed
+server is SKIPPED, not an error: one bad row must not take the whole config
+(and with it the provider that was working) down.
+
+### The permission question is about the TOOL, not about `mcp`
+
+- `list` and `search` ask for NOTHING: they read the user's own catalogue and
+  change nothing. A dialog for every search would be a dialog per round trip
+  saved.
+- A `call` asks about the QUALIFIED name: `github.create_issue`. The "always
+  allow" answer remembers that name, and the rule it learns is
+  `Mcp(github.create_issue) allow`.
+
+Remembering `mcp` would make one approval cover every server the user ever
+configures, which is not what anybody answered. The rule's tool name matches
+case-insensitively, so `Mcp` and `mcp` are the same tool.
+
+### A call counts as a write in plan mode; a search does not
+
+The tool behind an MCP call is the user's own and zode cannot know what it
+does, so plan mode blocks it (`registry.callWrites` decides per CALL). The
+`list` and `search` operations only read the catalogue, and a plan written
+without looking is a plan written in the dark.
+
+### Where the state lives
+
+`src/mcp/manager.zig` is a MODULE GLOBAL, like `src/lsp/manager.zig`: the
+call site is `tools.execute`, which has no `Model`, and a server is expensive
+to start (a process, a handshake, a catalogue) and useless if it is restarted
+per call.
+
+- The SERVER LIST is COPIED into the manager's own arena: the config's arena
+  is freed on every reload (connecting a provider reloads it), and a server
+  list that pointed into it would be a command built out of freed memory.
+- The CATALOGUE lives in an arena that is only freed at shutdown, because a
+  search reads it long after the call that built it.
+- A DEAD server is replaced, not handed out: handing out a client whose pipe
+  closed answers every question with `ServerClosed`.
+- The clients are killed at exit (`agent.quitFast` and the TUI teardown): a
+  server that outlives the app keeps running a process for nobody.
+
+### The two bugs the tests caught
+
+1. **The fake transport mixed the index of the scripted answer with the offset
+   INSIDE it.** With one counter, the second answer was the third BYTE of the
+   first one, and every test with more than one scripted answer failed for a
+   reason that had nothing to do with the client.
+2. **The query splitter counted `_` as a word character.** So `create_issue`
+   was ONE term, and the tool called `createIssue` (whose lowercased name is
+   `createissue`) did not contain it. The three spellings of a query
+   (`createIssue`, `create_issue`, `create issue`) have to be the same TERMS.
+
+### The check that proves it
+
+`tools/fake_mcp.py` is a fake server that speaks the wire (newline-delimited
+JSON-RPC over stdio), and the test drives the REAL dispatcher, the REAL
+manager and a REAL spawn: `an MCP tool is invisible until it is searched, and
+callable afterwards`. It skips without `python3` — a missing interpreter is not
+a broken tool.
+
+### What it costs
+
+42 KB in the stripped binary (2,019,160 → 2,061,184 bytes, measured with the
+same build on both sides). The protocol is JSON-RPC and the transport is std's
+process spawning, so there is nothing new to link; what the 42 KB is, is the
+catalogue's text and the client's own line handling.
+
+The other cost is in the PROMPT, and it is the one that mattered: the `mcp`
+tool's own schema is ~900 bytes in the cached prefix of every request, and
+NOT one byte of any server's tools is in it.

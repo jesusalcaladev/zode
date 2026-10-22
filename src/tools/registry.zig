@@ -62,7 +62,14 @@ const bash_output_prompt = @import("prompts/bash_output.zig");
 const bash_kill_prompt = @import("prompts/bash_kill.zig");
 const sleep_prompt = @import("prompts/sleep.zig");
 const batch_prompt = @import("prompts/batch.zig");
+const mcp_prompt = @import("prompts/mcp.zig");
 const validate = @import("prompts/validate.zig");
+
+// The `mcp` TOOL, for the one thing the registry has to know about it: the
+// qualified name of the tool a call is about. It is the name the permission
+// rules match on and the name the "always allow" list remembers, and it is
+// decided by the arguments of the call, not by the table.
+const mcp_tool = @import("mcp.zig");
 
 /// The result cap of a tool, in characters. `0` means UNBOUNDED.
 ///
@@ -442,6 +449,24 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .max_result_chars = resultcap.default_max_result_chars,
     },
     .{
+        // `read_only = false` because a CALL can change the world: the tool
+        // behind it is the user's own and zode cannot know what it does. The
+        // `list` and `search` operations only read the catalogue and do not
+        // ask, and that is decided per CALL (`callPermissionTools`), not by
+        // the row.
+        //
+        // It is NOT in the read-only schema either: in plan mode the model is
+        // offered the tools that cannot change the machine, and an MCP call
+        // can.
+        .name = "mcp",
+        .desc = "Search and call the tools of an MCP server (deferred: the schemas come with the search)",
+        .schema = mcp_prompt.json,
+        .read_only = false,
+        .parallel_safe = false,
+        .destructive = true,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
         // `read_only = false` because a batch with a `write` or an `edit` step
         // writes. The flag is static and the truth is not: what a batch needs
         // is decided by its STEPS, and `callPermissionTools` is where that is
@@ -514,6 +539,19 @@ pub fn maxResultChars(name: []const u8) usize {
 /// about is the one that has to ask.
 pub fn callPermissionTools(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const []const u8 {
     if (!std.mem.eql(u8, name, "batch")) {
+        // The `mcp` tool's permission set depends on the OPERATION: a `list`
+        // or a `search` only reads the catalogue and asks for nothing, and a
+        // `call` asks about the qualified name of the tool it is about.
+        //
+        // The name that goes into the set is `server.tool` and not `mcp`: the
+        // answer the user gives is about THAT tool, and a rule that remembers
+        // `mcp` would cover every server the user ever configures.
+        if (std.mem.eql(u8, name, "mcp")) {
+            const q = mcp_tool.qualifiedOf(parseObject(arena, args_json) orelse return &.{}, arena) orelse return &.{};
+            const one = arena.alloc([]const u8, 1) catch return &.{};
+            one[0] = q;
+            return one;
+        }
         return oneTool(arena, name);
     }
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
@@ -546,11 +584,34 @@ fn oneTool(arena: std.mem.Allocator, name: []const u8) []const []const u8 {
     return one;
 }
 
+/// The arguments of a call as an object, or null when they are not one.
+///
+/// The `mcp` tool's permission set depends on the OPERATION and on the tool
+/// it names, and both live in the arguments. A call whose arguments do not
+/// parse gets no subject, which means no rule can match it and it asks: the
+/// direction that is safe to be wrong in.
+fn parseObject(arena: std.mem.Allocator, args_json: []const u8) ?std.json.ObjectMap {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
+    if (parsed != .object) return null;
+    return parsed.object;
+}
+
 /// Does this call change a file?
 ///
 /// For `batch` it is whether any of its steps does. A batch whose arguments
 /// do not parse counts as writing: the safe direction is the one that asks.
+///
+/// For `mcp` it is whether the call is a CALL: an MCP tool can change the
+/// world (the tool behind it is the user's own and zode cannot know what it
+/// does), while `list` and `search` only read the catalogue. The decision is
+/// per CALL and not per TOOL, because the same tool does both.
 pub fn callWrites(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    if (std.mem.eql(u8, name, "mcp")) {
+        const obj = parseObject(arena, args_json) orelse return true;
+        const op = obj.get("operation") orelse return true;
+        if (op != .string) return true;
+        return std.ascii.eqlIgnoreCase(op.string, "call");
+    }
     if (!std.mem.eql(u8, name, "batch")) return false;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return true;
     if (parsed != .object) return true;
@@ -614,6 +675,17 @@ pub fn callSubjects(name: []const u8, args_json: []const u8, arena: std.mem.Allo
         if (cmd != .string or cmd.string.len == 0) return &.{};
         const one = arena.alloc([]const u8, 1) catch return &.{};
         one[0] = cmd.string;
+        return one;
+    }
+    // The `mcp` tool's subject is the qualified name of the tool it calls:
+    // `github.create_issue`. It is the name the model typed, the name the
+    // rules match on and the name the "always allow" list remembers, and one
+    // spelling for all three is what makes the rule legible.
+    if (std.mem.eql(u8, name, "mcp")) {
+        const obj = parseObject(arena, args_json) orelse return &.{};
+        const q = mcp_tool.qualifiedOf(obj, arena) orelse return &.{};
+        const one = arena.alloc([]const u8, 1) catch return &.{};
+        one[0] = q;
         return one;
     }
     return callTouchedPaths(name, args_json, arena);
@@ -803,6 +875,63 @@ test "a batch writes only when one of its steps writes" {
     try std.testing.expectEqual(@as(usize, 2), paths.len);
     try std.testing.expectEqualStrings("out.md", paths[0]);
     try std.testing.expectEqualStrings("a.zig", paths[1]);
+}
+
+test "an MCP call asks about the TOOL, and a search asks about nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A `search` and a `list` only read the user's own catalogue: they ask
+    // for nothing, and a dialog for every search would be a dialog per
+    // round trip saved.
+    const searching = callPermissionTools("mcp", "{\"operation\":\"search\",\"query\":\"issue\"}", arena);
+    try std.testing.expectEqual(@as(usize, 0), searching.len);
+    const listing = callPermissionTools("mcp", "{\"operation\":\"list\"}", arena);
+    try std.testing.expectEqual(@as(usize, 0), listing.len);
+
+    // A CALL asks about the QUALIFIED name of the tool, and not about `mcp`:
+    // the answer the user gives is about that one tool, and a rule that
+    // remembered `mcp` would cover every server the user ever configures.
+    const calling = callPermissionTools(
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"github\",\"tool\":\"create_issue\"}",
+        arena,
+    );
+    try std.testing.expectEqual(@as(usize, 1), calling.len);
+    try std.testing.expectEqualStrings("github.create_issue", calling[0]);
+    // And an unknown name asks: the direction that is safe to be wrong in.
+    try std.testing.expect(needsPermission(calling[0]));
+
+    // The subject is the same name: the rules match on it.
+    const subjects = callSubjects(
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"github\",\"tool\":\"create_issue\"}",
+        arena,
+    );
+    try std.testing.expectEqual(@as(usize, 1), subjects.len);
+    try std.testing.expectEqualStrings("github.create_issue", subjects[0]);
+
+    // A call whose arguments do not parse has no subject and asks.
+    const broken = callPermissionTools("mcp", "not json", arena);
+    try std.testing.expect(needsPermission("mcp"));
+    try std.testing.expect(broken.len == 0 or needsPermission(broken[0]));
+}
+
+test "an MCP call counts as a write in plan mode, and a search does not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A CALL can change the world: the tool behind it is the user's own and
+    // zode cannot know what it does.
+    try std.testing.expect(callWrites("mcp", "{\"operation\":\"call\",\"server\":\"g\",\"tool\":\"t\"}", arena));
+    // The `list` and `search` operations only read the catalogue, and a plan
+    // written without looking is a plan written in the dark.
+    try std.testing.expect(!callWrites("mcp", "{\"operation\":\"search\",\"query\":\"x\"}", arena));
+    try std.testing.expect(!callWrites("mcp", "{\"operation\":\"list\"}", arena));
+    // And a call whose arguments do not parse counts as a write.
+    try std.testing.expect(callWrites("mcp", "not json", arena));
 }
 
 test "the permission dialog is told WHICH FILES a batch would touch" {

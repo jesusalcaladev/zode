@@ -9,6 +9,11 @@ const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 const http_client = @import("lib/http_client.zig");
 const tools_mod = @import("tools/dispatch.zig");
+// The `mcp` tool's own module, for the ONE thing the timeline needs from it:
+// the qualified name of the tool a call is about. The dispatcher does not
+// re-export it because nothing else wants it, and a re-export would be a
+// second name for the same thing.
+const mcp_tool = @import("tools/mcp.zig");
 const roster_mod = @import("roster.zig");
 const free_auto = @import("free_auto.zig");
 const router_mod = @import("lib/router.zig");
@@ -57,6 +62,7 @@ const repeats_mod = @import("lib/repeats.zig");
 const build_options = @import("build_options");
 const autochk = @import("autochk.zig");
 const lsp_manager = @import("lsp/manager.zig");
+const mcp_manager = @import("mcp/manager.zig");
 const review_mod = @import("lib/review.zig");
 
 // The `/help` tables live with the commands they document. Re-exported because
@@ -2485,6 +2491,11 @@ pub fn loadUserConfig() void {
         // provider reloads the config) and a server list that pointed into it
         // would be a dangling pointer from then on.
         lsp_manager.setServers(user_config.lsp_servers) catch {};
+
+        // The user's MCP servers. The same reason as the language servers: the
+        // manager COPIES them into its own memory, because this arena is freed
+        // on the next reload (connecting a provider reloads the config).
+        mcp_manager.setServers(user_config.mcp_servers) catch {};
 
         // The status bar's `provider/model`, resolved now that the provider is
         // known. It reads the CACHED catalogue and never the network, so this is
@@ -8196,6 +8207,11 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
     // matters at this point).
     lsp_manager.shutdown();
 
+    // 3b. The MCP servers. They are children too, and they are NOT in the job
+    // registry either: an MCP server that outlived the app would keep running
+    // for nobody.
+    mcp_manager.shutdown();
+
     // 4. The session. One write, and it is the only reason any of this exists.
     if (session) |s| s.flush();
 
@@ -8379,6 +8395,11 @@ fn touchesFile(name: []const u8) bool {
 /// hole in the mode.
 fn callIsWrite(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
     if (std.mem.eql(u8, name, "batch")) return tools_mod.callWrites(name, args_json, arena);
+    // An MCP CALL can change the world: the tool behind it is the user's own
+    // and zode cannot know what it does, so plan mode blocks it. The `list`
+    // and `search` operations only read the catalogue and are allowed: a plan
+    // written without looking is a plan written in the dark.
+    if (std.mem.eql(u8, name, "mcp")) return tools_mod.callWrites(name, args_json, arena);
     return isWriteTool(name);
 }
 
@@ -8441,6 +8462,18 @@ pub fn permSuggestion(call_name: []const u8, args_json: []const u8, arena: std.m
         const first = firstWord(cmd.string);
         if (first.len == 0) return null;
         return std.fmt.allocPrint(arena, "Bash({s} *) allow", .{first}) catch null;
+    }
+    // An MCP call remembers the QUALIFIED name of the tool: `Mcp(github.create_issue)`.
+    //
+    // Not `Mcp(*)`: that would be every server the user ever configures, and
+    // the answer the user gives is about ONE tool whose name they just read.
+    if (std.mem.eql(u8, call_name, "mcp")) {
+        // The subject IS the qualified name, and it is empty when the call is
+        // not a call or its arguments do not parse: then there is nothing to
+        // suggest, and the dialog falls back to the generic one.
+        const q = tools_mod.callSubjects(call_name, args_json, arena);
+        if (q.len != 1 or q[0].len == 0) return null;
+        return std.fmt.allocPrint(arena, "Mcp({s}) allow", .{q[0]}) catch null;
     }
     const paths = tools_mod.callTouchedPaths(call_name, args_json, arena);
     if (paths.len == 1 and paths[0].len > 0) {
@@ -8567,6 +8600,18 @@ fn savePermRule(rule: permrules.Rule) bool {
 }
 
 fn allowAlwaysForCall(m: *tui.Model, name: []const u8, arg: []const u8, perm_tools: []const []const u8) void {
+    // An MCP call remembers the QUALIFIED name of the tool it is about
+    // (`github.create_issue`), and not the tool `mcp`: what the user approved,
+    // having just read a dialog that named the tool, is that one tool.
+    // Remembering `mcp` would make one approval cover every server the user
+    // ever configures, which is not what anybody answered.
+    if (std.mem.eql(u8, name, "mcp")) {
+        for (perm_tools) |t| {
+            if (!tools_mod.needsPermission(t)) continue;
+            setAlwaysAllowed(m, t);
+        }
+        return;
+    }
     if (!std.mem.eql(u8, name, "batch")) {
         allowAlwaysFor(m, name, arg);
         return;
@@ -8637,6 +8682,17 @@ fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
         const steps_v = parsed.object.get("steps") orelse return "steps";
         if (steps_v != .array) return "steps";
         return std.fmt.allocPrint(arena, "{d} steps", .{steps_v.array.items.len}) catch "steps";
+    }
+    // An MCP call's one interesting argument is the tool it is about:
+    // `mcp(call)` says nothing, and the line the user reads is the line they
+    // are approving. The qualified name is decided by the tool's own module,
+    // so the timeline and the permission rule cannot disagree about it.
+    if (std.mem.eql(u8, name, "mcp")) {
+        if (mcp_tool.qualifiedOf(parsed.object, arena)) |qualified| return qualified;
+        // A search names its query instead: there is no tool yet.
+        const query = parsed.object.get("query") orelse return "";
+        if (query != .string) return "";
+        return query.string;
     }
     const wanted: []const u8 = if (std.mem.eql(u8, name, "read") or
         std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit") or
@@ -11072,6 +11128,18 @@ test "a tool argument is clipped so one row cannot fill the timeline" {
     const wide = toolArgSummary("bash", "{\"command\":\"日本語のとても長いコマンドをここに書きます。これはテストです。\"}", arena);
     try std.testing.expect(std.unicode.utf8ValidateSlice(wide));
     try std.testing.expect(textcap.fits(wide, arg_max_cols));
+
+    // An MCP call names the TOOL it is about, because that is the line the
+    // user reads and the line they are approving. `mcp(call)` says nothing.
+    const mcp_call = toolArgSummary(
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"github\",\"tool\":\"create_issue\",\"arguments\":{\"title\":\"x\"}}",
+        arena,
+    );
+    try std.testing.expectEqualStrings("github.create_issue", mcp_call);
+    // And a search names its query: there is no tool yet.
+    const mcp_search = toolArgSummary("mcp", "{\"operation\":\"search\",\"query\":\"issue\"}", arena);
+    try std.testing.expectEqualStrings("issue", mcp_search);
 }
 
 
@@ -14812,6 +14880,26 @@ test "the 'always allow' suggestion names the rule it would remember" {
     // And a tool with nothing to narrow becomes itself.
     const other = permSuggestion("task", "{\"prompt\":\"look around\"}", a).?;
     try std.testing.expectEqualStrings("task(*) allow", other);
+
+    // An MCP call names the QUALIFIED tool: `Mcp(github.create_issue)`.
+    //
+    // Not `Mcp(*)`: that would be every server the user ever configures, and
+    // the answer the user gives is about ONE tool whose name they just read.
+    const mcp = permSuggestion(
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"github\",\"tool\":\"create_issue\"}",
+        a,
+    ).?;
+    try std.testing.expectEqualStrings("Mcp(github.create_issue) allow", mcp);
+
+    // And the rule it names is one the parser understands, with the tool
+    // name in the spelling the matcher uses (case-insensitively).
+    const rule = permrules.parseRule(mcp, .local, a).?;
+    try std.testing.expectEqualStrings("Mcp", rule.tool);
+    try std.testing.expectEqualStrings("github.create_issue", rule.pattern);
+    try std.testing.expect(permrules.matches(rule, "mcp", "github.create_issue"));
+    // And it does NOT cover another tool of the same server.
+    try std.testing.expect(!permrules.matches(rule, "mcp", "github.list_issues"));
 }
 
 test "the suggestion is a rule the parser understands" {

@@ -218,11 +218,69 @@ state, the open bug and the quality bar).
 
 ## Phase 12 — MCP over stdio + deferred tool loading
 
-`✨ feature · 🟡 · depends on 0`
+`✨ feature · 🟡 · depends on 0` — **DONE 2026-10-21**
 
-- [ ] MCP over stdio (JSON-RPC): connect, list tools, call
-- [ ] **Deferred tool loading / tool search**: with many tools (MCP servers), do not put every schema in the prompt; load them by search — this is what keeps MCP from wrecking the cache
-- [ ] Tests: a fake MCP server over a pipe · a deferred tool is invisible until searched and callable afterwards
+> An MCP server is a PROGRAM the user runs to give zode a capability it does not have
+> (an issue tracker, a database, a design file). The protocol is JSON-RPC 2.0 over
+> stdio, and the interesting part is not the protocol: it is that a server publishes
+> dozens of tools, and putting every schema in the prompt would rewrite the cached
+> prefix of every request of every session.
+
+- [x] MCP over stdio (JSON-RPC): connect, list tools, call
+- [x] **Deferred tool loading / tool search**: with many tools (MCP servers), do not put every schema in the prompt; load them by search — this is what keeps MCP from wrecking the cache
+- [x] Tests: a fake MCP server over a pipe · a deferred tool is invisible until searched and callable afterwards
+
+### What was done, and what it cost to find out (2026-10-21)
+
+**One tool, not one tool per server tool.** `mcp` has three operations — `search`,
+`list`, `call` — and the schemas of every server's tools live in the manager's
+catalogue, NOT in the request's `tools` array. The `tools` array is the biggest
+stable prefix of every request and the provider's cache is indexed by its LITERAL
+BYTES: a server's schemas in there would rewrite the prefix of every request of
+every session, and the cache would never hit again. The schema arrives in the result
+of a `search`, and nowhere else.
+
+**What is wired now**: `src/mcp/` (protocol · client · process · servers · search ·
+manager) · the `mcp` tool with its schema in `src/tools/prompts/mcp.zig` · the
+dispatcher branch · `mcp_servers` in `config.json` · the manager starts at boot and
+is killed at exit · a dead server is replaced instead of answering `ServerClosed`
+forever.
+
+**Five things that were not obvious**:
+
+1. **MCP's framing is NOT LSP's.** Both speak the same JSON-RPC dialect; MCP frames
+   it as **one message per line** and LSP uses `Content-Length` headers. A server
+   that gets the wrong framing answers nothing at all, and the symptom is "the tool
+   does not work" with no message anywhere. The client has its own transport
+   vtable instead of sharing the LSP one, and the difference is called out in the
+   code.
+2. **The server's configuration is USER-level, and a project's `.mcp.json` is
+   ignored on purpose.** A server is a program: honouring one from a clone is
+   remote code execution with the user's credentials. zode already treats
+   `.mcp.json` as a file the model must not write (`lib/pathsafe.zig`), and the
+   honest reading of that is that the HARNESS decides which servers run — so the
+   decision is the user's, in their own config.
+3. **The permission question is about the tool, not about `mcp`.** A `call` asks
+   about `github.create_issue`, the "always allow" answer remembers that name, and
+   the rule it learns is `Mcp(github.create_issue) allow`. Remembering `mcp` would
+   make one approval cover every server the user ever configures, which is not what
+   anybody answered. The `list` and `search` operations ask for nothing: they read
+   the user's own catalogue and change nothing.
+4. **A call counts as a write in plan mode; a search does not.** The tool behind an
+   MCP call is the user's own and zode cannot know what it does, so the mode blocks
+   it. The `list` and `search` operations only read the catalogue, and a plan
+   written without looking is a plan written in the dark.
+5. **The catalogue outlives the call that built it.** The tools of a server are
+   listed ONCE, when the server starts, and they live in an arena that is only
+   freed at shutdown — a search reads them later. The server LIST is copied into
+   the manager's own memory, because the config's arena is freed on every reload.
+
+**Two bugs the tests caught**: the fake transport mixed the index of the scripted
+answer with the offset INSIDE it, so every test with more than one answer failed
+for a reason that had nothing to do with the client; and the query splitter counted
+`_` as a word character, so `create_issue` was one term and the tool called
+`createIssue` did not contain it. The three spellings of a query have to be the
+same TERMS.
 
 ---
 

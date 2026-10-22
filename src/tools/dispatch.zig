@@ -32,6 +32,9 @@ const tasks_tool = @import("tasks.zig");
 const sleep_tool = @import("sleep.zig");
 const batch_tool = @import("batch.zig");
 const lsp_tool = @import("lsp.zig");
+const mcp_tool = @import("mcp.zig");
+const mcp_manager = @import("../mcp/manager.zig");
+const mcp_servers = @import("../mcp/servers.zig");
 
 // The per-tool prompt modules: the TEXT the model reads about a tool lives with that
 // tool, as `prompts/<name>.zig`. This file decides the ORDER and nothing else, so a
@@ -312,6 +315,8 @@ pub fn executeWith(
         return batch_tool.toolBatch(io, obj, arena);
     } else if (std.mem.eql(u8, name, "lsp")) {
         return lsp_tool.toolLsp(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "mcp")) {
+        return mcp_tool.toolMcp(io, obj, arena);
     }
     return error.UnknownTool;
 }
@@ -409,6 +414,101 @@ test "the lsp tool is CALLED, not unknown" {
     const out = try execute(std.testing.io, "lsp", "{\"operation\":\"hover\"}", arena_state.allocator(), null, null);
     // The tool's own answer, not the dispatcher's.
     try std.testing.expect(std.mem.indexOf(u8, out, "needs a `file`") != null);
+}
+
+test "an MCP tool is invisible until it is searched, and callable afterwards" {
+    // The deferred loading, end to end: a real server, over a real pipe, with
+    // the real dispatcher in front of it and the real manager behind it.
+    //
+    // The three steps are the whole design:
+    //
+    // 1. NOTHING of the server is in the prompt. The tools array is the
+    //    biggest stable prefix of every request and the provider's cache is
+    //    indexed by its literal bytes: a server's schemas in there would
+    //    rewrite the prefix of every request of every session.
+    // 2. The SEARCH brings the schema, in the result.
+    // 3. The CALL works, because the model read the schema in step 2.
+    //
+    // The server is a python script instead of a real MCP server so the test
+    // runs on a machine with none installed. Without python3 it is skipped
+    // rather than failed: a missing interpreter is not a broken tool.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const script = std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, "tools/fake_mcp.py", a) catch
+        return error.SkipZigTest;
+
+    mcp_manager.init(std.testing.allocator, std.testing.io, null);
+    defer mcp_manager.shutdown();
+    try mcp_manager.setServers(&[_]mcp_servers.Server{.{
+        .name = "fake",
+        .command = &.{ "python3", script },
+    }});
+
+    // 1. The prompt knows nothing about the server's tools.
+    const prompt_tools = registry.toolsJson();
+    try std.testing.expect(std.mem.indexOf(u8, prompt_tools, "create_issue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_tools, "list_issues") == null);
+    // The gateway itself IS there: the model has to be able to reach it.
+    try std.testing.expect(std.mem.indexOf(u8, prompt_tools, "\"mcp\"") != null);
+
+    // 2. The search finds the tool AND its schema.
+    const found = try execute(std.testing.io, "mcp", "{\"operation\":\"search\",\"query\":\"create issue\"}", a, null, null);
+    if (std.mem.indexOf(u8, found, "not installed") != null) return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, found, "fake.create_issue") != null);
+    // The schema is the point: it arrives with the search.
+    try std.testing.expect(std.mem.indexOf(u8, found, "input schema") != null);
+    try std.testing.expect(std.mem.indexOf(u8, found, "\"required\"") != null);
+
+    // 3. And now it can be called, with the arguments the schema asked for.
+    const called = try execute(
+        std.testing.io,
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"fake\",\"tool\":\"create_issue\",\"arguments\":{\"title\":\"hello\"}}",
+        a,
+        null,
+        null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, called, "created issue #42: hello") != null);
+
+    // A tool that fails is a MESSAGE and not a crash: the call went through
+    // and the tool decided it could not do it.
+    const failed = try execute(
+        std.testing.io,
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"fake\",\"tool\":\"fails\"}",
+        a,
+        null,
+        null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, failed, "the tracker is unreachable") != null);
+}
+
+test "an MCP call to a tool that does not exist says so, and names the ones that do" {
+    // The model guessed a tool name. The answer has to say WHICH ones exist,
+    // or the model tries again with a worse guess.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    mcp_manager.init(std.testing.allocator, std.testing.io, null);
+    defer mcp_manager.shutdown();
+    try mcp_manager.setServers(&[_]mcp_servers.Server{.{
+        .name = "fake",
+        .command = &.{ "python3", "zode-no-such-mcp-binary" },
+    }});
+
+    const out = try execute(
+        std.testing.io,
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"nope\",\"tool\":\"whatever\"}",
+        a,
+        null,
+        null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "no MCP server named `nope`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "fake") != null);
 }
 
 test "the read tool reads this file" {
