@@ -37,7 +37,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
 - [ ] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety)
 - [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
-      next; the panels that need a rule engine wait for the engine (Phase 6).
+      **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
 - [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): most needed, least fun — quietly wrong today
 - [ ] 🟢 Everything else per the dependency table at the bottom.
@@ -48,7 +48,8 @@ Phase 16 (the `batch` tool: many operations, one round trip) · Phase 28 (`/copy
 called — it is wired now, with `diagnostics` and `lsp_servers`)** ·
 **Phase 27 (the diff you can read: the gutter, the word diff and the colour ladder)** ·
 **Phase 36 (the crash that was open for a month — a use-after-free in the catalogue
-warmup — plus the two build steps that promised an artifact and produced none)**.
+warmup — plus the two build steps that promised an artifact and produced none)** ·
+**Phase 35.2 (`/init`: the highest-value missing command, writes AGENTS.md)**.
 
 **The analysis behind the new phases** lives in `docs/analysis/`:
 `tui-chrome.md` (the TUI port list, 42 features) · `commands.md` (72 reference
@@ -868,7 +869,7 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 > **not** gaps and are listed as such, so nobody goes looking for them.
 
 - [x] **35.1** `/files` — **DONE 2026-10-21**: the files the model has READ (and whether their content is still in the context) and the files the agent WROTE to, this session. It is the answer to "what is the model looking at?", which is the question you ask when a turn goes sideways. It also found a bug: the read cache survived `/new`, so the new session's first `read` of a file the previous session had read answered "it is already in your context" WITHOUT sending the body — the model would have been working from a file it could not see
-- [ ] **35.2** `/init` — **M** for the prompt, **L** with the interview phase. The highest-value missing command: without it a new project has no `AGENTS.md` and the harness silently runs with the built-in prompt only. Port the reference implementation's prompt text **verbatim** and let the model do the work
+- [x] **35.2** `/init` — **M** for the prompt, **L** with the interview phase. The highest-value missing command: without it a new project has no `AGENTS.md` and the harness silently runs with the built-in prompt only. Port the reference implementation's prompt text **verbatim** and let the model do the work — **DONE 2026-10-22**
 - [ ] **35.3** `/rename` + the `#tag` + the session title — **S** each, and together they are the readability layer of the session list. Phase 30.1 has the design; the command is 20 lines
 - [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic command we lack. Both are prompt commands whose text is the reference implementation's, and Phase 31.1 already has the `` !`cmd` `` substitution
 - [ ] **35.5** `/clear` (with the cache reset) and the `/exit` alias — **S**. `/new` exists but leaves the read cache, the skills-sent marker and the user commands stale

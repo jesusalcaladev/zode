@@ -3235,6 +3235,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "goal")) {
         commands_mod.cmdGoal(m, rest);
+    } else if (std.mem.eql(u8, cmd, "init")) {
+        commands_mod.cmdInit(m);
     } else if (std.mem.eql(u8, cmd, "session")) {
         commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "files")) {
@@ -3840,7 +3842,7 @@ pub const ChatJob = struct {
     text: []const u8,
 };
 
-fn startChat(m: *tui.Model, input: []const u8) !void {
+pub fn startChat(m: *tui.Model, input: []const u8) !void {
     const s = ensureSession(m, m.allocator);
     const copy = try m.allocator.dupe(u8, input);
     errdefer m.allocator.free(copy);

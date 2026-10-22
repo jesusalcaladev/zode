@@ -8,6 +8,7 @@ const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 const filesview = @import("lib/filesview.zig");
 const readcache = @import("lib/readcache.zig");
+const init_mod = @import("lib/init.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -424,6 +425,22 @@ pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
     agent.pushInfoOwned(m, line);
 }
 
+/// `/init`: analyse the codebase and write AGENTS.md.
+///
+/// This runs the initialization prompt (see `lib/init.zig`) which has the model
+/// survey the repo, interview the user, and write AGENTS.md + CLAUDE.local.md.
+pub fn cmdInit(m: *tui.Model) void {
+    if (!m.io_ready) return;
+    const prompt = init_mod.prompt(m.allocator) catch {
+        m.pushError("could not load init prompt");
+        return;
+    };
+    defer m.allocator.free(prompt);
+    agent.startChat(m, prompt) catch |err| {
+        m.pushErrorFmt("could not start init: {t}", .{err});
+    };
+}
+
 /// `/context`: gauge of context used against the limit and the budget.
 pub fn cmdContext(m: *tui.Model) void {
     _ = agent.ensureSession(m, m.allocator);
@@ -709,6 +726,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name", .palette_visible = false },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
+    .{ .key = "/init", .desc = "analyse the codebase and write AGENTS.md" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
     .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
