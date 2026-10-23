@@ -59,6 +59,22 @@ pub fn build(b: *std.Build) void {
     // rebuild leaves another 49 MB in `.zig-cache/o`.
     const strip_tests = b.option(bool, "strip-tests", "Strip the test binary (default: true)") orelse true;
 
+    // The LIVE network tests (`web_fetch for real`, `web_search for real`, the
+    // offset round trip, `braveSearch for real`) are OFF by default and behind
+    // `zig build test -Dlive`.
+    //
+    // They are real requests to DuckDuckGo / Bing / example.com, and they fail
+    // for reasons that are not zode's: measured on 2026-10-23, both DuckDuckGo
+    // endpoints answered HTTP 202 (anomaly detection) for minutes at a time and
+    // the suite went red on a machine where nothing had changed.
+    //
+    // A red suite that is red because a scraper got rate-limited is how a suite
+    // gets ignored — and this one is IN the release workflow's test step, so a
+    // scrape mood would block a release. The gate is the same idea as `-De2e`:
+    // the tests stay reachable by hand (`zig build test -Dlive`), and they stop
+    // being a coin toss on every run.
+    const live = b.option(bool, "live", "run the live network tests (web fetch/search against the real internet)") orelse false;
+
     // Build options module for passing version to code
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -155,11 +171,17 @@ pub fn build(b: *std.Build) void {
     // `readcache`, `regex` and `verify` from `src/`. Rooted inside `src/tools/`
     // those would be imports from outside the module. It only re-exports the
     // dispatcher; `tool_test.zig` keeps importing a module named `tools`.
-    tt_mod.addImport("tools", b.createModule(.{
+    // The tools module needs its OWN `build_options` (with `live`): the live
+    // network tests live in `src/tools/web.zig`, which is compiled here too.
+    const tools_opts = b.addOptions();
+    tools_opts.addOption(bool, "live", live);
+    const tools_mod_root = b.createModule(.{
         .root_source_file = b.path("src/tools_root.zig"),
         .target = target,
         .optimize = optimize,
-    }));
+    });
+    tools_mod_root.addImport("build_options", tools_opts.createModule());
+    tt_mod.addImport("tools", tools_mod_root);
     const tt = b.addExecutable(.{ .name = "tool_test", .root_module = tt_mod });
     const tt_run = b.addRunArtifact(tt);
     if (b.args) |args| tt_run.addArgs(args);
@@ -266,6 +288,7 @@ pub fn build(b: *std.Build) void {
     const e2e = b.option(bool, "e2e", "run the network E2E tests (needs a provider key)") orelse false;
     const opts = b.addOptions();
     opts.addOption(bool, "e2e", e2e);
+    opts.addOption(bool, "live", live);
     opts.addOption([]const u8, "version", version);
     test_mod.addImport("build_options", opts.createModule());
     // `zig build test -- <filter>` runs only the tests whose name contains the
