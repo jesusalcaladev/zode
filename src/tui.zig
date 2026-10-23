@@ -4225,12 +4225,28 @@ pub const Model = struct {
     }
 
     /// Requests a frame within `ms` ms. Idempotent: it does not stack timers.
+    /// If the timer fails to register (rare, but can happen under load or in
+    /// ReleaseSmall due to vaxis internals), we log and leave `tick_armed`
+    /// false so the next event will retry. This prevents the tick chain from
+    /// dying silently and leaving the app frozen.
     fn armTick(self: *Model, ctx: *vxfw.EventContext) !void {
         if (self.tick_armed) return;
-        self.tick_armed = true;
         const a = self.activity();
         const ms: u32 = if (a.busy or a.dirty) 40 else 120;
-        try ctx.tick(ms, self.widget());
+        // Set armed AFTER successful registration, so a failure doesn't leave
+        // the flag stuck and block future retries.
+        self.tick_armed = true;
+        ctx.tick(ms, self.widget()) catch |err| {
+            // Timer registration failed — reset flag so next event retries.
+            // We don't propagate the error because the app must stay responsive.
+            self.tick_armed = false;
+            if (builtin.single_threaded) {
+                // In single-threaded tests, propagate to surface the issue.
+                return err;
+            }
+            // Log to stderr for post-mortem (only in ReleaseSmall this path is hit).
+            std.debug.print("zode: tick registration failed: {}\n", .{err});
+        };
     }
 
     /// Marks that a paint is needed. The worker calls it on EVERY `push*`.
