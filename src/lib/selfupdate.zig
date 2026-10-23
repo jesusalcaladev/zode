@@ -184,12 +184,27 @@ pub fn installUpdate(io: std.Io, arena: std.mem.Allocator, version: []const u8) 
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = binary_data });
 
-    // Make executable using portable std.fs.chmod (works on all architectures)
-    const cwd = std.fs.cwd();
-    try cwd.chmod(tmp_path, 0o755);
+    // Make executable and replace atomically using portable shell commands
+    // This works on all architectures (x86_64, aarch64, etc.) and OSes (Linux, macOS)
+    const chmod_cmd = try std.fmt.allocPrint(arena, "chmod 755 {s}", .{tmp_path});
+    const rename_cmd = try std.fmt.allocPrint(arena, "mv {s} {s}", .{tmp_path, current_path});
 
-    // Replace current binary using portable std.fs.rename
-    try cwd.rename(tmp_path, current_path);
+    const chmod_process = try std.process.run(arena, io, .{ .argv = &[_][]const u8{ "sh", "-c", chmod_cmd } });
+    switch (chmod_process.term) {
+        .exited => |code| if (code != 0) return error.UpdateFailed,
+        else => return error.UpdateFailed,
+    }
+    // Free stdout/stderr buffers
+    arena.free(chmod_process.stdout);
+    arena.free(chmod_process.stderr);
+
+    const rename_process = try std.process.run(arena, io, .{ .argv = &[_][]const u8{ "sh", "-c", rename_cmd } });
+    switch (rename_process.term) {
+        .exited => |code| if (code != 0) return error.UpdateFailed,
+        else => return error.UpdateFailed,
+    }
+    arena.free(rename_process.stdout);
+    arena.free(rename_process.stderr);
 }
 
 /// Detect current platform string
