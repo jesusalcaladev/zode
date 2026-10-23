@@ -184,22 +184,12 @@ pub fn installUpdate(io: std.Io, arena: std.mem.Allocator, version: []const u8) 
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = binary_data });
 
-    // Make executable
-    const tmp_path_c = try std.fmt.allocPrint(arena, "{s}\x00", .{tmp_path});
-    defer arena.free(tmp_path_c);
-    const SYS = @import("std").os.linux.SYS;
-    _ = @import("std").os.linux.syscall2(SYS.chmod, @intFromPtr(tmp_path_c.ptr), 0o755);
+    // Make executable using portable std.fs.chmod (works on all architectures)
+    const cwd = std.fs.cwd();
+    try cwd.chmod(tmp_path, 0o755);
 
-    // Replace current binary
-    const tmp_path_c2 = try std.fmt.allocPrint(arena, "{s}\x00", .{tmp_path});
-    defer arena.free(tmp_path_c2);
-    const current_path_c = try std.fmt.allocPrint(arena, "{s}\x00", .{current_path});
-    defer arena.free(current_path_c);
-    _ = @import("std").os.linux.syscall2(
-        SYS.rename,
-        @intFromPtr(tmp_path_c2.ptr),
-        @intFromPtr(current_path_c.ptr),
-    );
+    // Replace current binary using portable std.fs.rename
+    try cwd.rename(tmp_path, current_path);
 }
 
 /// Detect current platform string
