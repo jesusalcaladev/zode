@@ -38,6 +38,18 @@ The script is also shipped in the repo as [`install.sh`](install.sh) and is atta
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+### Updating
+
+`zode` checks for a newer release in the background and, when there is one, says so in the conversation:
+
+```
+zode v0.2.0 is available (minor) · /update installs it
+```
+
+The `(major)` / `(minor)` / `(patch)` part is the kind of change, because that is what decides whether to update now. `/update` downloads the release asset, **runs it once to prove it works on this machine**, and only then replaces the binary atomically — a build for another CPU never replaces a working one. Restart `zode` afterwards.
+
+The check itself is cheap: the answer is cached in `~/.cache/zode/update.json` for six hours, so most starts read one small file and never touch the network. `ZODE_NO_SELF_UPDATE=1` disables it, and `ZODE_AUTO_UPDATE=1` installs without asking.
+
 ### Build from source
 
 Requires **Zig 0.16.0** (the only dependency besides libvaxis, which is fetched by `build.zig.zon`).
@@ -56,6 +68,7 @@ Build flags:
 - `-Doptimize=ReleaseSafe` — safer, slightly larger (~2.2 MB).
 - `-Dstrip=true` (default) — strips debug sections.
 - `-Dversion=v0.1.0` — embeds a version string (shown by `--version`).
+- `-Dcpu=baseline` — **required for a binary you distribute**. Without it `zig build` targets THIS machine's CPU (SHA-NI, AVX-512…), and the binary dies with `Illegal instruction` on an older one.
 
 For a debuggable build with symbols (for crash traces), use `zig build -Doptimize=Debug` — `-Dstrip=false` alone does **not** produce symbols on ReleaseSmall/ReleaseSafe because those modes never emit them.
 

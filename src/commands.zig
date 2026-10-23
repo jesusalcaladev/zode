@@ -903,6 +903,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
+    .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
     .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
     .{ .key = "/session", .desc = "session info", .palette_visible = false },
@@ -982,4 +983,17 @@ test "the files command says a file is NOT in the context when it is not" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "build.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "not in context") != null);
+}
+
+test "/update is offered in the palette, not hidden behind its name" {
+    // A command the user cannot find is a command that does not exist: the
+    // notice says "/update installs it", so the palette has to agree.
+    var found = false;
+    for (commands) |c| {
+        if (!std.mem.eql(u8, c.key, "/update")) continue;
+        found = true;
+        try std.testing.expect(c.palette_visible);
+        try std.testing.expect(std.mem.indexOf(u8, c.desc, "newest release") != null);
+    }
+    try std.testing.expect(found);
 }

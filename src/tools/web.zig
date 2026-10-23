@@ -795,6 +795,15 @@ test "web_search for real: returns results with a URL" {
     // (the HTML changed, which is what this test is for).
     if (looksRateLimited(out)) return error.SkipZigTest;
 
+    // The two expectations below used to fail WITHOUT OUTPUT, which is an
+    // undiagnosable red: the free chain has three failure modes (a rate limit we
+    // skip, a layout change we must catch, and an engine answering something
+    // else entirely) and only one of them is the bug this test exists for.
+    // Seeing the text is the difference between "our scraper is stale" and "the
+    // network is having a day" — so the text is printed.
+    if (std.mem.indexOf(u8, out, "1. ") == null or std.mem.indexOf(u8, out, "http") == null) {
+        std.debug.print("[web_search live] nothing parseable came back:\n{s}\n", .{out[0..@min(out.len, 700)]});
+    }
     try std.testing.expect(std.mem.indexOf(u8, out, "1. ") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "http") != null);
 }

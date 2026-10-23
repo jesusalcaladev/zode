@@ -741,23 +741,13 @@ fn runTui(init: std.process.Init) !u8 {
         agent.catalogWarmupAsync(&model) catch {};
     }
 
-    // Self-update check (non-blocking, runs in background)
-    // Only checks once per 24 hours, so it's very cheap.
-    // Uses its OWN Threaded Io so blocking HTTPS cannot starve the main event
-    // loop (same hardening as the warmup worker).
-    if (envGet(init.environ_map, "ZODE_NO_SELF_UPDATE") == null) {
-        _ = std.Thread.spawn(.{}, struct {
-            fn run(allocator: std.mem.Allocator) void {
-                const selfupdate = @import("lib/selfupdate.zig");
-                var arena_state = std.heap.ArenaAllocator.init(allocator);
-                defer arena_state.deinit();
-                const arena = arena_state.allocator();
-                var threaded: std.Io.Threaded = .init(allocator, .{});
-                defer threaded.deinit();
-                _ = selfupdate.autoUpdate(threaded.io(), arena) catch {};
-            }
-        }.run, .{ init.gpa }) catch {};
-    }
+    // Self-update check: a worker, its own `Io`, and an answer cached on disk for
+    // six hours — so a normal start reads ~60 bytes instead of opening TLS to
+    // GitHub. When a newer release exists it is SAID in the history
+    // (`v0.2.0 is available (minor) · /update`) instead of the binary being
+    // replaced behind the user's back, which is what `autoUpdate` used to do
+    // while the running process went on being the old build.
+    agent.startUpdateCheck(&model);
 
     agent.bootMark("app.run start");
 
@@ -820,6 +810,40 @@ fn runTui(init: std.process.Init) !u8 {
     agent.quitFast(&model, io);
 }
 
+/// One HTTPS request, and exit.
+///
+/// This exists for the UPDATER, and the reason is a real crash: `--version`
+/// proves the binary starts and does NOT prove it can do TLS. The 0.1.0 asset
+/// was built with the CI runner's CPU, answered `--version` perfectly, and
+/// trapped with SIGILL inside the TLS handshake seconds after its first frame.
+/// So `/update` runs the downloaded file with this flag before it replaces the
+/// binary that works.
+///
+/// The exit code is deliberately 0 for every UNCLEAN outcome (a network error,
+/// an unreachable host): the network is not the binary's fault and must not
+/// veto an update. Only a FAULT is a verdict, and the caller reads that from
+/// the process term (a signal), not from here.
+pub fn runSelftest(init: std.process.Init) u8 {
+    var threaded: std.Io.Threaded = .init(init.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: std.http.Client = .{ .allocator = init.gpa, .io = io };
+    defer client.deinit();
+
+    const uri = std.Uri.parse("https://api.github.com/") catch return 0;
+    var req = client.request(.GET, uri, .{ .headers = .{
+        .accept_encoding = .omit,
+        .user_agent = .{ .override = "zode-selftest" },
+    } }) catch return 0;
+    defer req.deinit();
+    req.sendBodiless() catch return 0;
+
+    var redirect_buf: [8192]u8 = undefined;
+    _ = req.receiveHead(&redirect_buf) catch return 0;
+    return 0;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     var it = std.process.Args.Iterator.init(init.minimal.args);
     _ = it.next(); // argv[0]
@@ -840,6 +864,9 @@ pub fn main(init: std.process.Init) !u8 {
             };
             return runChat(init.gpa, init.io, init.environ_map, text);
         }
+        if (std.mem.eql(u8, arg0, "--selftest")) {
+            return runSelftest(init);
+        }
         if (std.mem.eql(u8, arg0, "--version")) {
             const version = @import("build_options").version;
             var buf: [128]u8 = undefined;
@@ -856,6 +883,7 @@ pub fn main(init: std.process.Init) !u8 {
                     "  --chat TXT   send a message (streaming)\n" ++
                     "  --resume     resume the last session\n" ++
                     "  --version    show version\n" ++
+                    "  --selftest   internal: one HTTPS request, for the updater\n" ++
                     "  --help       this help\n",
                 .{},
             );

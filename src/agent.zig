@@ -30,6 +30,7 @@ const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
 const cache_stats = @import("cache_stats.zig");
 const cost_mod = @import("lib/cost.zig");
+const selfupdate = @import("lib/selfupdate.zig");
 const compaction = @import("compaction.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
@@ -3245,6 +3246,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdUsage(m);
     } else if (std.mem.eql(u8, cmd, "cost")) {
         commands_mod.cmdCost(m);
+    } else if (std.mem.eql(u8, cmd, "update")) {
+        cmdUpdate(m);
     } else if (std.mem.eql(u8, cmd, "compact")) {
         commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "goal")) {
@@ -9492,6 +9495,114 @@ fn warmupWorker(job: *WarmupJob) void {
     modelcache.write(worker_io, m.environ, def.id, def.models_url, list.items);
     // The catalogue is on disk now; the draw may look again.
     tui.allowStatusModelRetry(m);
+}
+
+// ── self-update ─────────────────────────────────────────────────
+
+/// Looks for a newer release at startup, in a worker, and says so if there is
+/// one. It says NOTHING when the build is current: a line on every start saying
+/// "you are up to date" is noise, and it is the same line that makes the real
+/// notice invisible.
+///
+/// The check costs a file read on almost every start: `selfupdate` caches the
+/// answer on disk for six hours, so the network is touched twice a day at most.
+pub fn startUpdateCheck(m: *tui.Model) void {
+    if (envGet(m.environ, "ZODE_NO_SELF_UPDATE") != null) return;
+    spawnUpdateJob(m, .check) catch {};
+}
+
+/// `/update`: installs the newest release. It runs in a WORKER because it
+/// downloads ~2 MB, and a download on the UI thread is the app frozen for as
+/// long as GitHub takes.
+fn cmdUpdate(m: *tui.Model) void {
+    spawnUpdateJob(m, .install) catch pushError(m, "could not start the update");
+}
+
+const UpdateMode = enum { check, install };
+const UpdateJob = struct { model: *tui.Model, mode: UpdateMode };
+
+fn spawnUpdateJob(m: *tui.Model, mode: UpdateMode) !void {
+    const gpa = m.allocator;
+    const job = try gpa.create(UpdateJob);
+    job.* = .{ .model = m, .mode = mode };
+    m.beginWorker();
+    const thread = std.Thread.spawn(.{}, updateWorker, .{job}) catch {
+        m.endWorker();
+        gpa.destroy(job);
+        return error.ThreadSpawnFailed;
+    };
+    thread.detach();
+}
+
+fn updateWorker(job: *UpdateJob) void {
+    const m = job.model;
+    const mode = job.mode;
+    // LIFO, and the order matters: the job is freed LAST, after `endWorker` has
+    // read the model's counter through the (still valid) job.
+    defer m.allocator.destroy(job);
+    defer m.endWorker();
+
+    // Its own `Io`: a detached worker doing blocking TLS on the UI's event loop
+    // is the shape that made the app look hung.
+    var threaded: std.Io.Threaded = .init(m.allocator, .{});
+    defer threaded.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+
+    const ctx: selfupdate.Context = .{
+        .io = threaded.io(),
+        .alloc = arena_state.allocator(),
+        .env = m.environ,
+    };
+
+    switch (mode) {
+        .check => {
+            const up = selfupdate.check(ctx, false) orelse return;
+            announceUpdate(m, up);
+            // Opt-in automatic install. The default is to TELL the user: a
+            // binary replaced behind their back is a change they cannot see and
+            // a restart they never asked for.
+            if (envGet(m.environ, "ZODE_AUTO_UPDATE") != null) installUpdateNow(m, ctx);
+        },
+        .install => installUpdateNow(m, ctx),
+    }
+}
+
+fn announceUpdate(m: *tui.Model, up: selfupdate.Update) void {
+    var buf: [160]u8 = undefined;
+    const phrase = selfupdate.phrase(&buf, up);
+    m.pushInfoFmt("zode {s} · /update installs it", .{phrase});
+    setStatusWithZoFmt(m, .warn, "{s} available · /update", .{up.version});
+}
+
+fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
+    m.pushInfoFmt("updating zode from {s}…", .{selfupdate.current_version});
+    const tag = selfupdate.installLatest(ctx) catch |err| switch (err) {
+        // Not a failure: there is simply nothing newer to install.
+        error.AlreadyNewest => {
+            m.pushInfoFmt("zode {s} is already the newest release", .{selfupdate.current_version});
+            return;
+        },
+        else => {
+            m.pushErrorFmt("update failed: {s}", .{updateErrorPhrase(err)});
+            return;
+        },
+    };
+    m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
+    setStatusWithZoFmt(m, .done, "updated to {s} · restart", .{tag});
+}
+
+/// What went wrong, in words the user can act on. "UpdateFailed" is not one:
+/// the three cases have three different fixes (wait, reinstall, sudo).
+fn updateErrorPhrase(err: selfupdate.InstallError) []const u8 {
+    return switch (err) {
+        error.AlreadyNewest => "already the newest release",
+        error.NoAssetForPlatform => "this platform has no release binary",
+        error.DownloadFailed => "could not download it (network, GitHub, or no release yet)",
+        error.BinaryDoesNotRun => "the downloaded binary does not run here; nothing was replaced",
+        error.NotWritable => "could not replace the running binary (permissions?)",
+        error.UnsupportedPlatform => "no releases for this OS/arch",
+    };
 }
 
 /// `/model` and Ctrl+T: the two-column model palette.

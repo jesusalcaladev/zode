@@ -6008,3 +6008,137 @@ command can be perfect and still do nothing when it is typed.
 What is NOT covered by an automated check: a real turn followed by `/cost` with
 real provider prices. That needs a key and a quota, and the sandbox can only
 fabricate the catalogue file, not the bill.
+
+---
+
+# The release that only ran on the CI runner's CPU (2026-10-23)
+
+Two reports in one: `install.sh` printed `[INFO] zode installer` and stopped,
+and zode died with `Illegal instruction (core dumped)` leaving the terminal
+full of `35;96;30M…` on every mouse move.
+
+## `install.sh`: a skipped `&& echo` is a failing command under `set -e`
+
+`log_verbose` ended in `[[ "$VERBOSE" == "true" ]] && echo …`. With
+`set -euo pipefail`, the skipped echo is a command that returns 1, so the FIRST
+verbose line — right after `[INFO] zode installer` — exited the script with
+status 1 and no message. `bash -x` shows it stopping after
+`log_verbose 'Platform: …'`. The fix is `if …; then echo …; fi`: a false
+condition inside `if` is not a failing command.
+
+The same family, three more places:
+
+- `VERSION=$(get_latest_version)` and `url=$(… | grep …)` returned 1 from a
+  no-match pipeline (`pipefail`) and exited **before** the `[[ -z ]]` check
+  that would have explained it. Both now end in `|| true`, and the empty check
+  speaks.
+- `${SHELL}` under `set -u`: an environment without SHELL killed the script at
+  the PATH step (a container, `env -i`, some CI shells).
+- `file` is not present on every system, and when it was missing the check said
+  "not an executable" about a perfectly good download. It is optional now, and
+  the real check is running the binary.
+
+And the report asked for something the script never printed: the platform, the
+version, the download and the destination are INFO lines now. CI also passes
+`-Dversion=${{ github.ref_name }}` — without it the binary answered `zode dev`,
+`check_existing` compared `dev` against the tag, and every install.sh run
+downloaded the 2 MB asset again instead of saying "already installed".
+
+## SIGILL: the artifact carried the RUNNER's CPU
+
+The release asset died with SIGILL at startup on an i5-8350U; a local build of
+the same commit did not. `coredumpctl` plus gdb on the core named it in one
+shot:
+
+```
+0x11118bf: sha256msg1 %xmm7,%xmm4
+```
+
+SHA-NI. The workflow passed `-Dtarget` only for the CROSS targets, so the
+native x86_64 build inherited the GitHub runner's CPU (a server chip with
+SHA-NI and AVX-512). Any machine without SHA-NI — Kaby Lake and older, which is
+a lot of laptops — trapped the first time TLS hashed. It is invisible in
+`--version`, and it appears seconds after the first frame (the catalogue warmup
+or the self-update check), silently. The wall of `35;96;30M…` in the report is
+the aftermath: `ESC[<35;x;yM` mouse motion reports echoed by a shell the app left
+in mouse-tracking mode, because a SIGILL never reaches vaxis's cleanup.
+
+Fix, in `.github/workflows/release.yml`:
+
+- `-Dcpu=baseline` and an explicit `-Dtarget` on EVERY matrix entry.
+- A step that greps the artifact for extension mnemonics (`sha256msg*`,
+  `vpternlog*`, `zmm`) and fails the release if one is there. A baseline build
+  has zero (verified: also zero `ymm`), so the check cannot pass by accident.
+
+Deterministic repro, no TUI and no pty: `HOME=$(mktemp -d) zode --models`.
+The old artifact exits 132 (128 + SIGILL) on the first TLS handshake; the
+baseline one lists the catalogue.
+
+**The lesson**: a release asset runs on the USER's machine, so `zig build`'s
+default target (the CPU of the machine that built it) is the wrong default for
+it. `-Dcpu=baseline` is not a performance knob; it is the difference between a
+binary that works and one that traps.
+
+---
+
+# Self-update: the check is free, the notice says WHICH kind, and `/update` is verified before it replaces anything (2026-10-23)
+
+Three things were wrong and none of them was the download itself.
+
+## The cache was two module globals, which is no cache at all
+
+`last_check_ns` and `cached_latest_version` only survive inside one process, so
+every `zode` start paid a full HTTPS round trip to `api.github.com` before
+drawing a frame — the most expensive thing the app did at startup, and it bought
+an answer the app already had.
+
+Now `~/.cache/zode/update.json` (`XDG_CACHE_HOME` respected) holds
+`{checked_at, latest}` for **six hours**: a normal start reads about sixty bytes
+and never touches the network. It is in the CACHE and not in `~/.config/zode`
+because it is derived data that can be deleted at any moment.
+
+And it is **one** request instead of two. `/releases/latest` already carries the
+asset list, so asking again for the tag (to then find the asset in a second
+response) was a round trip nobody wanted: `fetchRelease` returns both.
+
+## A newer release was installed SILENTLY and mid-session
+
+`autoUpdate` downloaded the asset and `mv`'d it over the running binary,
+logged it with `std.log` — invisible under the TUI, and noise where it was
+visible — and the process went on being the OLD build with no message anywhere.
+From the outside that is "an update that did nothing", which is worse than no
+update at all.
+
+Now the check **only notifies**, in the conversation:
+
+```
+zode v0.2.0 is available (minor) · /update installs it
+```
+
+`(major)` / `(minor)` / `(patch)` is `kindBetween`, because the kind is what
+decides whether to update now or after lunch. A `dev` build (no semver) says
+`(new)` instead of inventing a number. The automatic install still exists
+behind `ZODE_AUTO_UPDATE=1`: removing a behaviour somebody relies on is not an
+improvement.
+
+`/update` runs in a worker (it downloads ~2 MB) with **its own `Io`**, and it is
+in the palette so a command that the notice names can be found.
+
+## The install is checked BEFORE it replaces anything
+
+Download → write `{exe}.new` on the same filesystem (so the rename is atomic) →
+**run it (`--version`)** → rename over. A binary that does not run here never
+replaces the one that does.
+
+That is precisely the check that would have caught the 0.1.0 asset: it was built
+with the CI runner's CPU, died with SIGILL on an i5-8350U, and the old code
+installed it and announced success.
+
+`/update` also **refuses to go backwards** (`error.AlreadyNewest`): installing
+an older release because the local build is ahead of the last tag is how a
+working binary becomes the broken asset of a previous release.
+
+Six tests in `src/lib/selfupdate.zig` (semver precedence including prerelease,
+`kindBetween`, the `dev` build, the cache path, the phrasing) and one in
+`src/commands.zig` pinning that `/update` is visible in the palette and its
+description matches what the notice promises.
