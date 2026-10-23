@@ -23,13 +23,13 @@ $ zode
 The fastest way is the installer script, which downloads the latest release binary for your platform (Linux x86_64 / aarch64, macOS x86_64 / aarch64) and places it in `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/zode/main/install.sh | bash
+curl -fsSL https://github.com/jesusalcaladev/zode/releases/latest/download/install.sh | bash
 ```
 
 Or with options:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jesusalcaladev/zode/main/install.sh | bash -s -- --version v0.1.0 --install-dir ~/.local/bin
+curl -fsSL https://github.com/jesusalcaladev/zode/releases/latest/download/install.sh | bash -s -- --version v0.1.0 --install-dir ~/.local/bin
 ```
 
 The script is also shipped in the repo as [`install.sh`](install.sh) and is attached to every GitHub release by CI. After installing, make sure `~/.local/bin` is in your `PATH`:
