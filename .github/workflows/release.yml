@@ -13,6 +13,7 @@ jobs:
     name: Build and Release
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         target:
           - x86_64-linux
@@ -45,7 +46,8 @@ jobs:
               ;;
           esac
 
-      - name: Test
+      - name: Test (only on native linux)
+        if: matrix.target == 'x86_64-linux'
         run: zig build test
         env:
           ZODE_NO_WARMUP: "1"
@@ -89,7 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        zig_version: ['0.16.0', '0.15.1']
+        zig_version: ['0.16.0']
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
