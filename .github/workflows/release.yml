@@ -29,22 +29,46 @@ jobs:
         with:
           version: 0.16.0
 
+      # `-Dcpu=baseline` IS NOT OPTIONAL HERE.
+      #
+      # With no `-Dtarget`, `zig build` compiles for the CPU OF THE RUNNER. The
+      # GitHub runners are server chips with SHA-NI, AVX-512 and friends, so the
+      # artifact carried `sha256msg1` and died with SIGILL on any older CPU (an
+      # i5-8350U hit it in the TLS handshake, seconds after the first frame, with
+      # no message and the terminal left in mouse mode). A release asset is run on
+      # the USER's machine; it has to assume the baseline ISA.
+      # `-Dversion=${{ github.ref_name }}` is what makes the installer able to
+      # say "already installed": without it the binary answers `zode dev`,
+      # `check_existing` compares `dev` against the tag, and every run of
+      # install.sh downloads the 2 MB asset again.
       - name: Build ReleaseSmall
         run: |
           case "${{ matrix.target }}" in
             x86_64-linux)
-              zig build -Doptimize=ReleaseSmall -Dstrip=true
+              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=x86_64-linux -Dcpu=baseline -Dversion=${{ github.ref_name }}
               ;;
             aarch64-linux)
-              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=aarch64-linux
+              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=aarch64-linux -Dcpu=baseline -Dversion=${{ github.ref_name }}
               ;;
             x86_64-macos)
-              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=x86_64-macos
+              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=x86_64-macos -Dcpu=baseline -Dversion=${{ github.ref_name }}
               ;;
             aarch64-macos)
-              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=aarch64-macos
+              zig build -Doptimize=ReleaseSmall -Dstrip=true -Dtarget=aarch64-macos -Dcpu=baseline -Dversion=${{ github.ref_name }}
               ;;
           esac
+
+      # The check that would have caught the SHA-NI artifact BEFORE it shipped.
+      # It looks for instructions that only exist above the baseline ISA; a
+      # baseline build has none of them (verified on the current tree: 0 hits).
+      - name: Check the binary runs on a baseline CPU
+        if: matrix.target == 'x86_64-linux'
+        run: |
+          if objdump -d zig-out/bin/zode | grep -qE '\b(sha256msg1|sha256msg2|sha256rnds2|sha1msg1|sha1msg2|vpternlogd|vpternlogq|zmm)\b'; then
+            echo "::error::the binary requires CPU extensions above baseline — build with -Dcpu=baseline"
+            exit 1
+          fi
+          echo "ok: no SHA-NI / AVX-512 instructions in the artifact"
 
       - name: Test (only on native linux)
         if: matrix.target == 'x86_64-linux'
