@@ -162,15 +162,16 @@ install_binary() {
     log_verbose "Downloading from $url"
     local tmp_file
     tmp_file=$(mktemp)
-    trap 'rm -f "$tmp_file"' EXIT
 
     if ! curl -fL# "$url" -o "$tmp_file"; then
+        rm -f "$tmp_file"
         log_error "Failed to download binary"
         exit 1
     fi
 
     # Verify it's an executable
     if ! file "$tmp_file" | grep -q "executable"; then
+        rm -f "$tmp_file"
         log_error "Downloaded file is not an executable"
         exit 1
     fi
