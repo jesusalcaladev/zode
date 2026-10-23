@@ -456,7 +456,7 @@ that measurement exists today**. The third column is the honest state of the har
 | **Q9** | **Every build step's description is true.** | `zig build --help` vs. the actual steps | **partly.** The descriptions are excellent prose; two of them are false today (`debug`, `-Dstrip=false`). A one-line test (`zig build debug && nm zig-out/bin/zode-debug`) would pin it. | 2 false descriptions |
 | **Q10** | **The repo's own claims are still true.** | a "docs vs. reality" check | **no.** At least four stale claims: (a) `AGENTS.md:4592-4654` mischaracterises the open bug (a SIGSEGV, not a hang; not ReleaseSmall-specific; the trigger is a cold catalogue cache, not the key); (b) `AGENTS.md:4625` eliminates the warmup using `ZODE_NO_WARMUP=1`, **a flag that does not exist in the tree**; (c) `AGENTS.md:4638` says `debug` and `ReleaseSafe` "both answer normally", but `zig build debug` does not compile, so the claim about `debug` is unverifiable; (d) the "A build step whose description is the promise it did not keep" section still describes a `zig build debug` that produces a 59 MB binary. | 4 stale claims, one of which pointed the previous diagnosis at the wrong file |
 
-**What "Claude-Code-grade" would mean here, in one line per property:** a turn that cannot
+**What "reference-grade" would mean here, in one line per property:** a turn that cannot
 finish says so; a crash says what it was doing; a keypress is answered or the app is dead
 and says so; a file on disk is either complete or absent; a tool call has a result; a
 "verified" claim has a check behind it; nothing outlives its owner; a release build can be

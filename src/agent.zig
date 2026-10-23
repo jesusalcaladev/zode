@@ -1191,8 +1191,8 @@ fn styleNames(entries: []const outputstyles.Entry) []const u8 {
 
 // ── `/copy`: taking the answer with you ───────────────────────────────────
 //
-// The shape of the command comes from the reference implementation's `/copy`
-// (Claude Code). What is ported is written next to each piece; what is not:
+// The shape of the command comes from the reference implementation's `/copy`.
+// What is ported is written next to each piece; what is not:
 //
 // - `config.copyFullResponse` as a global setting: here it is a SESSION flag
 //   (`Model.copy_always_full`), because a session flag is enough until

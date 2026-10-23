@@ -1,7 +1,7 @@
-# Claude Code's command surface vs. ours
+# The reference command surface vs. ours
 
 An inventory of every user-facing slash command in the **reference
-implementation** (Claude Code), compared with zode's own command surface.
+implementation**, compared with zode's own command surface.
 
 > **Note on citations.** This report was written while the reference
 > implementation's source was available locally, and it cited it by file and
@@ -38,7 +38,7 @@ and are not part of the user-facing surface.
 
 **Not in scope**: the tool surface (the reference implementation's `TodoWrite`,
 `Task`, `Bash`, …) except where a command is a thin wrapper over a tool. Its
-`/todos` **does not exist** — Claude Code's todo list is the `TodoWrite` tool,
+`/todos` **does not exist** — the reference todo list is the `TodoWrite` tool,
 and the visible list is drawn by the UI, not by a command (there is no
 `name: 'todos'` entry anywhere in the reference command registry). zode's
 `todo` tool (`src/tools/registry.zig:273`) is the same idea and is already more
@@ -125,10 +125,10 @@ returns text, `local-jsx` opens a React modal.
 |---|---|---|---|---|---|
 | `/add-dir` | command definition | local-jsx | Adds a working directory to the workspace, persists it in `additionalDirectories` and applies a permission update | **MISSING** | — |
 | `/advisor` | command definition | local | Configures the advisor model (`/advisor <model>\|off`); validates the model supports the advisor | **MISSING** (the *tool* is planned, not the command) | — |
-| `/agents` | command definition + the `AgentsMenu` component | local-jsx | `AgentsMenu` — manage the subagent definitions (`~/.claude/agents`, `.claude/agents`) | **MISSING** | — |
+| `/agents` | command definition + the `AgentsMenu` component | local-jsx | `AgentsMenu` — manage the subagent definitions (its user and project agent directories) | **MISSING** | — |
 | `/branch` (alias `/fork`) | command definition | local-jsx | Forks the conversation at this point into a new session file, with provenance | **MISSING** (planned) | — |
 | `/btw` | command definition | local-jsx | Asks a quick side question **without** interrupting the main conversation (own scrollback, own request) | **MISSING** | — |
-| `/chrome` | command definition | local-jsx | Claude-in-Chrome (beta) settings | **MISSING** (N/A: no browser tool) | — |
+| `/chrome` | command definition | local-jsx | Browser-extension (beta) settings | **MISSING** (N/A: no browser tool) | — |
 | `/clear` (aliases `/reset`, `/new`) | command definition + a teardown helper and a cache-reset helper | local | Wipes the conversation, regenerates the session id, frees the context, clears every cache | **PARTIAL** — `/new` does the job; no `/clear`, no `/reset` | `src/agent.zig:2454` |
 | `/color` | command definition | local-jsx | Sets the **prompt-bar / agent colour** for this session (persisted in the transcript) | **PARTIAL** — the name is taken by our *diff* palette, a different feature | `src/agent.zig:8704` |
 | `/compact` | command definition + a compaction helper | local | Compacts now: clears the history but keeps a summary; accepts custom summarization instructions | **PARTIAL** — ours sets the automatic compaction *mode*, it does not compact on demand | `src/commands.zig:256` |
@@ -136,7 +136,7 @@ returns text, `local-jsx` opens a React modal.
 | `/context` | command definition (plus a non-interactive variant) | local-jsx | A **coloured grid** of the context, computed on the *API view* (post-collapse, post-microcompact) | **PARTIAL** — ours is a text gauge on the raw history | `src/commands.zig:387` |
 | `/copy` | command definition | local-jsx | Copies the last response (or the Nth-latest, `MAX_LOOKBACK = 20`) to the clipboard, with a code-block picker | **HAVE** | `src/agent.zig:1203`, `src/clipboard.zig:102` |
 | `/cost` | command definition | local | Total cost and **duration** of the session, in dollars (hidden for subscribers) | **HAVE the money, MISSING the duration** (2026-10-22): per model, from the catalogue's prices, with `price unknown` never rendered as `$0.00`; the duration lives in `/bench` | `src/commands.zig` (`cmdCost`), `src/lib/cost.zig` |
-| `/desktop` (alias `/app`) | command definition | local-jsx | Continue the current session in Claude Desktop | **MISSING** (N/A) | — |
+| `/desktop` (alias `/app`) | command definition | local-jsx | Continue the current session in the vendor's desktop app | **MISSING** (N/A) | — |
 | `/diff` | command definition + the `DiffDialog` component | local-jsx | `DiffDialog` — uncommitted changes **and** the per-turn diffs | **PARTIAL** — we paint the diff inline after a write/edit and Ctrl+R expands it, but there is no `/diff` and no uncommitted view | `src/tui.zig:3770` (`toggleLastTool`), `src/lib/diffview.zig` |
 | `/doctor` | command definition + the `Doctor` screen + a diagnostics helper | local-jsx | `Doctor` screen — version, install type, PATH, alias, settings errors, MCP warnings, keybinding warnings, sandbox dependencies, agent directories | **MISSING** | — |
 | `/effort` | command definition | local-jsx | Sets the reasoning effort (`low\|medium\|high\|max\|auto`), persisted per settings source | **HAVE** | `src/agent.zig:2943` |
@@ -147,14 +147,14 @@ returns text, `local-jsx` opens a React modal.
 | `/hooks` | command definition + the `HooksConfigMenu` component | local-jsx | `HooksConfigMenu` — view/edit the hook configurations per tool event | **MISSING** (Phase 5) | — |
 | `/ide` | command definition | local-jsx | Detects the IDEs, manages the integration, shows the status, `open` | **MISSING** (we have the `lsp` tool instead) | — |
 | `/init` | prompt text (`NEW_INIT_PROMPT`, about 200 lines; the old variant about 20 lines) | prompt | Analyses the codebase and writes `CLAUDE.md` (new variant: also skills and hooks, 8 phases) | **MISSING** | — |
-| `/install-github-app` | command definition | local-jsx | Sets up Claude GitHub Actions for a repository (OAuth, secret, workflow) | **MISSING** (N/A) | — |
-| `/install-slack-app` | command definition | local | Installs the Claude Slack app | **MISSING** (N/A) | — |
+| `/install-github-app` | command definition | local-jsx | Sets up the vendor's GitHub Actions for a repository (OAuth, secret, workflow) | **MISSING** (N/A) | — |
+| `/install-slack-app` | command definition | local | Installs the vendor's Slack app | **MISSING** (N/A) | — |
 | `/keybindings` | command definition | local | Creates the keybindings template and opens it in `$EDITOR` | **MISSING** | — |
 | `/login` | command definition | local-jsx | OAuth sign-in (or switch account) with an Anthropic account | **PARTIAL** — we have API keys (`/provider`, Ctrl+A, `auth.json`), no OAuth | `src/agent.zig:9477` |
 | `/logout` | command definition | local-jsx | Removes the credentials, wipes the secure storage and the auth caches | **MISSING** | — |
 | `/mcp` | command definition + the `MCPSettings` panel | local-jsx | Manage the MCP servers: list, enable/disable, add; `enable\|disable [server]` | **MISSING** (Phase 12) | — |
-| `/memory` | command definition + a memory-file helper | local-jsx | Picks a memory file (`CLAUDE.md`, `~/.claude/CLAUDE.md`) and opens it in `$EDITOR` | **MISSING** | — |
-| `/mobile` (aliases `/ios`, `/android`) | command definition | local-jsx | Shows a QR code to download the Claude mobile app | **MISSING** (N/A) | — |
+| `/memory` | command definition + a memory-file helper | local-jsx | Picks a memory file (`CLAUDE.md`, in the project or in the config dir) and opens it in `$EDITOR` | **MISSING** | — |
+| `/mobile` (aliases `/ios`, `/android`) | command definition | local-jsx | Shows a QR code to download the vendor's mobile app | **MISSING** (N/A) | — |
 | `/model` | command definition + the `ModelPicker` component | local-jsx | `ModelPicker` — pick the model (and the effort, and fast mode) | **HAVE** | `src/agent.zig:8911` |
 | `/output-style` (hidden) | command definition | local-jsx | **Deprecated in the reference implementation**: prints "use /config". Ours implements the feature properly as `/style` | **HAVE** (as `/style`) | `src/agent.zig:1064` |
 | `/passes` | command definition | local-jsx | Referral programme: share a free week | **MISSING** (N/A) | — |
@@ -179,22 +179,22 @@ returns text, `local-jsx` opens a React modal.
 | `/stats` | command definition + the `Stats` component | local-jsx | `Stats` — usage statistics and activity | **PARTIAL** — `/bench` has the turn/iteration/TTFT numbers, not the activity | `src/agent.zig:970` |
 | `/status` | command definition + the `Status` tab of the `Settings` panel | local-jsx | The `Status` tab of the Settings panel: version, model, account, API connectivity, tool statuses | **PARTIAL** — spread over `/session`, `/providers`, `/bench` | — |
 | `/statusline` | prompt text | prompt | Sets up a custom status line: spawns a `statusline-setup` subagent that reads the shell PS1 and writes the config | **MISSING** | — |
-| `/stickers` | command definition | local | Orders Claude Code stickers | **MISSING** (N/A) | — |
+| `/stickers` | command definition | local | Orders vendor merchandise | **MISSING** (N/A) | — |
 | `/tag` | command definition | local-jsx | Toggles a searchable tag on the current session | **MISSING** | — |
 | `/terminal-setup` | command definition | local-jsx | Installs the Shift+Enter (CSI-u) key binding into the terminal's config (iTerm2, VS Code, Ghostty, Kitty, WezTerm) | **PARTIAL** — Shift+Enter already works in our editor (`src/lib/editor.zig`), but there is no installer | — |
 | `/theme` | command definition + the `ThemePicker` component | local-jsx | `ThemePicker` — changes the theme at runtime | **MISSING** — our theme is compile-time (`src/lib/theme.zig`) | — |
 | `/think-back` | command definition | local-jsx | The 2025 Year in Review | **MISSING** (N/A) | — |
 | `/thinkback-play` (hidden) | command definition | local | Plays the thinkback animation | **MISSING** (N/A) | — |
-| `/upgrade` | command definition | local-jsx | Opens `claude.ai/upgrade/max` in the browser and re-logs in — upgrades the **subscription** | **PARTIAL** — we self-update the **binary** automatically, with no command | `src/lib/selfupdate.zig:243`, `src/main.zig:744` |
+| `/upgrade` | command definition | local-jsx | Opens the subscription page in the browser and re-logs in — upgrades the **plan** | **PARTIAL** — we self-update the **binary** automatically, with no command | `src/lib/selfupdate.zig:243`, `src/main.zig:744` |
 | `/usage` | command definition + the `Usage` tab of the `Settings` panel | local-jsx | The `Usage` tab of the Settings panel: the **plan's** usage limits (subscription quota) | **PARTIAL** — ours is the session's token totals | `src/commands.zig:157` |
 | `/vim` | command definition | local | Toggles vim / normal editing modes, persisted in the global config | **MISSING** | — |
 | `/voice` | command definition | local | Toggles voice mode | **MISSING** (N/A) | — |
-| `/web-setup` | command definition | local-jsx | Sets up Claude Code on the web (needs a GitHub connection) | **MISSING** (N/A) | — |
+| `/web-setup` | command definition | local-jsx | Sets the harness up on the web (needs a GitHub connection) | **MISSING** (N/A) | — |
 | `/extra-usage` | command definition (plus a non-interactive variant) | local-jsx | Configures the overage ("extra usage") so a rate limit does not stop the work | **MISSING** (N/A) | — |
 | `/insights` | a registry entry + a very large prompt template (about 3 200 lines) | prompt | A 3 200-line analysis of your own sessions → a report (a JSON schema of 9 sections) | **PARTIAL** — `/bench` has the raw counters, not the analysis | `src/lib/bench.zig:120` |
-| `/ultrareview` | command definition | local-jsx | Remote ("Claude Code on the web") bug hunt over your branch | **MISSING** (N/A) | — |
+| `/ultrareview` | command definition | local-jsx | Remote ("on the web") bug hunt over your branch | **MISSING** (N/A) | — |
 | `/tasks` (alias `/bashes`) | command definition + the `BackgroundTasksDialog` component | local-jsx | `BackgroundTasksDialog` — list and manage the background tasks | **PARTIAL** — `/bg` lists and kills `bgproc` jobs only, not the subagents | `src/agent.zig:1443` |
-| `/install` | a CLI flow (`claude install`), dispatched from the CLI's own handler — not a REPL slash command | local-jsx | Installs the native build — **a CLI flow** (`claude install`), not a REPL slash command | n/a | — |
+| `/install` | a CLI flow (the CLI's own `install` subcommand), dispatched from the CLI's handler — not a REPL slash command | local-jsx | Installs the native build — **a CLI flow**, not a REPL slash command | n/a | — |
 
 ### 2.2 Anthropic-internal commands (`INTERNAL_ONLY_COMMANDS`)
 
@@ -208,10 +208,10 @@ public surface.
 | `/commit-push-pr` | prompt text | prompt | Branch + commit + push + `gh pr create`/`edit`, with a PR body template, a changelog block and a reviewer | **MISSING** |
 | `/init-verifiers` | prompt text | prompt | Creates verifier *skills* (Playwright / Tmux / HTTP) for the project's areas | **MISSING** |
 | `/version` | command definition | local | Prints the version this session is running | **MISSING** (the version is known: `src/lib/selfupdate.zig:10`) |
-| `/ultraplan` | command definition | local-jsx | Remote planner on claude.ai | **MISSING** (N/A) |
+| `/ultraplan` | command definition | local-jsx | Remote planner, vendor-hosted | **MISSING** (N/A) |
 | `/bridge-kick` | command definition | local | Injects bridge failure states for testing | **MISSING** (N/A) |
 | `/reset-limits` | a one-line disabled stub | stub | Disabled stub (`isEnabled: () => false`) | n/a |
-| `/backfill-sessions`, `/break-cache`, `/bughunter`, `/ctx_viz`, `/good-claude`, `/issue`, `/mock-limits`, `/onboarding`, `/share`, `/summary`, `/teleport`, `/env`, `/oauth-refresh`, `/debug-tool-call`, `/ant-trace`, `/perf-issue`, `/autofix-pr` | one-line disabled stubs | stub | All are one-line disabled stubs (`export default { isEnabled: () => false, isHidden: true, name: 'stub' }`) | n/a |
+| `/backfill-sessions`, `/break-cache`, `/bughunter`, `/ctx_viz`, `/issue`, `/mock-limits`, `/onboarding`, `/share`, `/summary`, `/teleport`, `/env`, `/oauth-refresh`, `/debug-tool-call`, `/ant-trace`, `/perf-issue`, `/autofix-pr` | one-line disabled stubs | stub | All are one-line disabled stubs (`export default { isEnabled: () => false, isHidden: true, name: 'stub' }`) | n/a |
 
 ### 2.3 Referenced by the command registry but **not present in the reference build**
 
@@ -223,9 +223,9 @@ dropped when it exists), `/buddy`, `/peers`, `/workflows`, `/torch`,
 
 ### 2.4 The dynamic part of the surface (not a fixed registry entry)
 
-- **User markdown commands**: `.claude/commands/*.md` — loaded as
+- **User markdown commands**: the reference's own `commands/*.md` directory — loaded as
   `loadedFrom: 'commands_DEPRECATED'`.
-- **Skills**: `.claude/skills/<name>/SKILL.md`, bundled skills, plugin skills —
+- **Skills**: `skills/<name>/SKILL.md` in its config dir, bundled skills, plugin skills —
   the registry carries a second array for the skills, and the skills loader
   reads those directories.
 - **Plugin and MCP-provided commands**: contributed by the plugin loader.
@@ -476,7 +476,7 @@ a bad summary is invisible until the next turn.
 ### 3.11 `/agents` — manage the subagent definitions
 
 **Reference implementation**: the `/agents` command opens an `AgentsMenu`: list
-the agent definitions from `~/.claude/agents` and `.claude/agents`, see their
+the agent definitions from its user and project agent directories, see their
 tools and model, create and delete them.
 
 **Ours**: no agent definitions on disk at all. `src/lib/skills.zig:60` reads
@@ -622,7 +622,7 @@ budget and prints the notes.
 
 **Reference implementation**: the `/add-dir` command opens an
 `AddWorkspaceDirectory` panel: validates the path, adds it to
-`additionalDirectories` (so its `CLAUDE.md` is read), and applies a permission
+`additionalDirectories` (so its instruction file is read), and applies a permission
 update so the tools may reach it.
 
 **Ours**: no. The harness is single-root: the `read`/`write`/`grep` tools are
@@ -731,7 +731,7 @@ bg session if we ever want one). **Risk**: low.
   **Effort M** (the analysis is a prompt plus a schema; the *data* is ours
   already), **risk low** (it is read-only over the session files),
   **dependencies**: `src/session.zig`, `src/lib/bench.zig`.
-- **`/memory`** — picks a memory file (`CLAUDE.md`, `~/.claude/CLAUDE.md`),
+- **`/memory`** — picks a memory file (`CLAUDE.md`, in the project or in the config dir),
   creates it if missing, and opens it in `$EDITOR`. **Ours**: nothing, but the
   file we read is `AGENTS.md` and the `edit` tool can already write it — the
   gap is the *picker and the editor hand-off*, not the capability. **Effort S**,

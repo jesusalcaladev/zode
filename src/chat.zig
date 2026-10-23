@@ -1394,7 +1394,7 @@ pub fn buildBody(buf: []u8, model: []const u8, user_text: []const u8, effort: Ef
 
 /// Anthropic Messages API format:
 ///  - system and tools go at root level, with `cache_control` breakpoints
-///    (Claude Code style prompt caching: the stable prefix —tools+system+
+///    (prompt caching as other harnesses do it: the stable prefix —tools+system+
 ///    history— is served from the server's cache between turns).
 ///  - assistant.tool_calls (OpenAI format) → `tool_use` blocks.
 ///  - runs of role=tool messages → ONE user message with `tool_result` blocks.

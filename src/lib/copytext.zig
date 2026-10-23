@@ -6,9 +6,9 @@
 //! that?"), a fence parsed wrong, a language tag turned into a path. None of
 //! it needs a TUI or the network, so all of it is tested here.
 //!
-//! The shape of the command comes from the `/copy` of the reference
-//! implementation (Claude Code). What is ported is written next to each piece;
-//! what is not: `config.copyFullResponse` as a global setting (a session flag
+//! The shape of the command comes from the reference implementation's `/copy`.
+//! What is ported is written next to each piece; what is not:
+//! `config.copyFullResponse` as a global setting (a session flag
 //! is enough), the `w` = write-to-file shortcut (the file is written ALWAYS,
 //! so there is nothing left for a second key to do), and the analytics.
 //!

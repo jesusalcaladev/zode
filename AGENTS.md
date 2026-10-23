@@ -1,7 +1,7 @@
 # zode — AGENTS.md
 
-A code harness in pure Zig (no C deps), in the style of Claude Code, focused on
-speed and on saving tokens.
+A code harness in pure Zig (no C deps), in the style of a mature coding harness,
+focused on speed and on saving tokens.
 
 ## Project principles
 
@@ -301,8 +301,8 @@ or the JSON, and that is tested with fixtures.
   (Anthropic rejects them).
 - **3 `cache_control:{type:"ephemeral"}` breakpoints**: the last tool, the system
   and the last block of the last message → the stable prefix (tools+system+history)
-  is served from the server's cache every turn (the technique Claude Code uses for
-  a ~90% hit rate).
+  is served from the server's cache every turn (the technique other harnesses use
+  for a ~90% hit rate).
 - Anthropic SSE parsed in `dispatchEvents`: `message_start` (usage
   input+cache_read), `content_block_start`/`content_block_delta`
   (`text_delta`, `input_json_delta`), `message_delta` (output_tokens, stop_reason
@@ -571,7 +571,7 @@ better to fix the contract and give the result a second look.
 
 ## The Ctrl+P modal palette (`palette.zig`)
 
-A modal in the style of opencode/Claude Code, with two modes:
+A modal in the style of opencode, with two modes:
 
 - **Ctrl+P** — commands, grouped (Suggested · Model · Session) with the shortcut
   on the right. Enter **puts the command in the input** instead of running it:
@@ -614,7 +614,7 @@ Decisions that are not obvious:
 
 - PageUp/PageDown move a **page** (the window, minus one line), not a fixed 5.
   `hist_rows` is published from the draw (the only place that knows the height).
-- **Ctrl+U / Ctrl+D** = half a page, like in less and in Claude Code.
+- **Ctrl+U / Ctrl+D** = half a page, like in less.
 - The rightmost history column is an interactive scrollbar: click/drag maps to
   the absolute history range; wheel events, including touchpad scrolling, use
   the same clamped anchor as the keyboard.
@@ -4716,7 +4716,7 @@ cure.
 
 # The 2026-10-16 batch: task graph, notebooks, sleep — and how they connect
 
-Three Claude-Code-class tools (Phase 15/17/19 of TASKS.md, all ticked) and the
+Three mature-harness tools (Phase 15/17/19 of TASKS.md, all ticked) and the
 seams that make them part of the harness instead of three islands. Every seam
 below has a test that goes red if it rots.
 
@@ -5340,7 +5340,7 @@ word highlights, and Ctrl+R turns them on. The reference implementation calls th
 
 # The analysis, the board, and the crash that was ours (2026-10-21)
 
-Four agents read the tree and the reference implementation (Claude Code's TUI,
+Four agents read the tree and the reference implementation (a TUI written in
 TypeScript + Ink) in parallel. The four reports are in `docs/analysis/` and the
 findings became three new phases of `TASKS.md` (33 the TUI, 34 the machinery,
 35 the command surface) plus a fourth that is a fix list (36).

@@ -3,7 +3,7 @@ const std = @import("std");
 /// Multiline input editor for the TUI.
 ///
 /// `vxfw.TextField` is single-line, and the input is exactly where the
-/// difference with Claude Code shows most: pasting a stack trace, writing a long
+/// difference shows most: pasting a stack trace, writing a long
 /// prompt, or reviewing before sending. This editor covers the essentials:
 ///
 ///  - buffer with a cursor (byte offset), insertion and deletion per grapheme

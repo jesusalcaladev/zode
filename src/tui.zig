@@ -3579,7 +3579,7 @@ pub const Model = struct {
         self.pushKind(.tool, text);
     }
 
-    // ── Claude Code style tool calls ───────────────────────
+    // ── tool calls in the timeline ─────────────────────────
     /// Header of a tool in progress: "⏺ Read(src/tui.zig)".
     /// Header of a tool: `⏺ write(hola.js)`.
     ///
@@ -5511,7 +5511,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // you can see what came before and what comes after). Before they
             // moved 5 fixed rows, which in a 40-row terminal did not feel like
             // scrolling.
-            // Ctrl+U / Ctrl+D do half a page, like in less and in Claude Code.
+            // Ctrl+U / Ctrl+D do half a page, like in less.
             const k = key;
             const page: usize = @max(3, self.hist_rows -| 1);
             const half: usize = @max(2, self.hist_rows / 2);

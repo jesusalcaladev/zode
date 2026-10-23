@@ -7,7 +7,7 @@ const tui = @import("tui.zig");
 
 const Painter = tui.Painter;
 
-/// Modal palette of commands and models, in the style of opencode / Claude Code.
+/// Modal palette of commands and models, in the style of opencode.
 ///
 /// Two modes:
 ///   - `.commands`: grouped list of commands with the shortcut on the right.

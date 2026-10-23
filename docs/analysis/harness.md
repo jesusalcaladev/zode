@@ -1,10 +1,10 @@
-# Harness machinery: zode vs. Claude Code
+# Harness machinery: zode vs. the reference implementation
 
 A verified gap analysis of the **machinery** — the parts of a harness that are not
 the model: permissions, hooks, background tasks, context/compaction, memory,
 subagents/teams, skills, tool results, cost, sandbox.
 
-Upstream is the **reference implementation** (Claude Code, written in TypeScript).
+Upstream is the **reference implementation** (written in TypeScript).
 Ours is `src/` (Zig 0.16, no C deps).
 
 Every claim below was read in the reference implementation's own code before it
@@ -487,10 +487,10 @@ cheap-model recall step, the staleness notes, or the consolidation job.
   `effort`, `permissionMode`, `mcpServers`, `hooks`, `maxTurns`, `skills`,
   `initialPrompt`, `memory` (scope), `background`, `isolation`.
 - **Built-in roles**: `getBuiltInAgents` — general-purpose, statusline-setup, Explore, Plan,
-  claude-code-guide, Verification.
+  a built-in guide role, Verification.
 - **Teams**: the team-creation tool's prompt says "Teams have a 1:1
   correspondence with task lists". A team is a config file
-  (`~/.claude/teams/{name}/config.json`) plus a task-list directory. Teammates are
+  (one per team, under its config dir) plus a task-list directory. Teammates are
   spawned as in-process tasks, claim
   work from the shared task list, and go idle between turns. Messages are a tool
   (a dedicated send-message tool), not prose: "Plain
@@ -628,7 +628,8 @@ cover enforcing `allowed_tools`, nor the `model`/`effort` fields that Phase 1
 
 **Upstream.** a directory scan (`getOutputStyleDirStyles`)
 — a flat directory of `.md` files, one per style, from
-the project (`.claude/output-styles/`) and the user (`~/.claude/output-styles/`),
+the project (a `output-styles/` directory in the project) and the user (the same
+under its config dir),
 project shadowing user. The filename is the style name; frontmatter gives
 `name`, `description` and `keep-coding-instructions`
 (the flag parsed as boolean or the string

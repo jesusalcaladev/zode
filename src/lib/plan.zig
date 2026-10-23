@@ -12,8 +12,8 @@ const std = @import("std");
 ///
 /// ## Semantics: full replacement AND in-place patches
 ///
-/// `items` replaces the whole list, which is what Claude Code does with
-/// `TodoWrite` and what models are trained to emit. It stays the base form.
+/// `items` replaces the whole list, which is the shape models are trained to
+/// emit. It stays the base form.
 ///
 /// On top of it, `update`, `remove` and `add` address single steps by their
 /// 1-based position. They exist because replacement has a cost that only shows up

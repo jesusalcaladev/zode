@@ -844,7 +844,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (std.mem.eql(u8, arg0, "--help")) {
             std.debug.print(
                 "zode — code agent harness\n\n" ++
-                    "  (no args)    Claude Code style TUI\n" ++
+                    "  (no args)    full TUI\n" ++
                     "  --models     list the models of the provider\n" ++
                     "  --chat TXT   send a message (streaming)\n" ++
                     "  --resume     resume the last session\n" ++

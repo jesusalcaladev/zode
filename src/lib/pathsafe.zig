@@ -2,12 +2,11 @@
 //!
 //! ## Why this module exists
 //!
-//! Upstream (Claude Code) has a path layer that zode does not have at all:
-//! writes are refused inside `.git/`, `.claude/`, `.vscode/`, `.idea/` and the
-//! shell configs, and reads are constrained to the working directory. The
-//! upstream lists are in `utils/permissions/filesystem.ts` (`DANGEROUS_FILES`,
-//! `DANGEROUS_DIRECTORIES`) and `utils/permissions/pathValidation.ts`
-//! (`validatePath`).
+//! Other harnesses have a path layer that zode did not have at all: writes are
+//! refused inside `.git/`, `.claude/`, `.vscode/`, `.idea/` and the shell
+//! configs, and reads are constrained to the working directory. The idea is the
+//! same here; the table below is this project's own, and the protected
+//! directories are matched by segment so a nested one cannot slip through.
 //!
 //! In zode the gap is not theoretical. `read` is `read_only = true`, so it
 //! NEVER asks: the model can read `~/.config/zode/auth.json` (the provider

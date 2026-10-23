@@ -131,8 +131,8 @@ pub fn toolGlob(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     //
     // It used to be the plain tree walk, and the difference is not a detail: the
     // walk has a hardcoded list of directories to skip, and anything git ignores
-    // but that list does not name is walked. In THIS repository that is
-    // `code-base/` — 1902 files of someone else's code — so a `glob` with
+    // but that list does not name is walked. In THIS repository that was
+    // a vendored tree — 1902 files of someone else's code — so a `glob` with
     // `limit: 200` in walk order returned mostly third-party files, while `grep`
     // and `refs` over the same tree did not show any of them. Three tools, three
     // different answers about what the project contains.

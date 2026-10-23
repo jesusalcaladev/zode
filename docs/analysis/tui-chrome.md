@@ -1,4 +1,4 @@
-# TUI chrome and interaction: the reference implementation (Claude Code) vs zode
+# TUI chrome and interaction: the reference implementation vs zode
 
 Scope: **screen composition** (header / transcript / input / footer), **overlay
 painting**, **transcript rendering**, and **interaction** (keys, mouse,
@@ -6,8 +6,8 @@ modals, pickers).
 
 Everything below compares two implementations:
 
-* the **reference implementation** (Claude Code, TypeScript + Ink), read from
-  its own source tree
+* the **reference implementation** (a TUI written in TypeScript + Ink), read
+  from its own source tree
 * **ours** = `src/` (zode, Zig + libvaxis/vxfw)
 
 The reference implementation is **not** part of this repository and is not
@@ -31,8 +31,8 @@ vs. normal scrollback) plus a **third screen** (the transcript, `ctrl+o`), and
 it picks between the first two with an environment flag.
 
 * An environment probe, `isFullscreenEnvEnabled()`, decides whether the REPL
-  owns the terminal's alternate buffer. It is opt-in for external users
-  (`CLAUDE_CODE_NO_FLICKER=1`), default-on internally, and it is
+  owns the terminal's alternate buffer. It is opt-in for external users (one
+  env flag turns it on), default-on internally, and it is
   **auto-disabled under `tmux -CC`** because alt-screen + mouse tracking
   corrupts terminal state there. The same module holds `isTmuxControlMode()`,
   the check that detects tmux control mode.
@@ -863,9 +863,9 @@ and `putStable` does not copy).
    implementation (`src/tui.zig:4146`) and we have never tested it inside
    tmux with `mouse off`.
 
-6. **What is the actual default for `CLAUDE_CODE_NO_FLICKER` for external
+6. **What is the actual default for that env flag for external
    users?** The code says "off for external users
-   (`CLAUDE_CODE_NO_FLICKER=1` to opt in)" in the comment next to the
+   (set the flag to opt in)" in the comment next to the
    fullscreen layout's alt-buffer branch, but `isFullscreenEnvEnabled()`
    returns `process.env.USER_TYPE === 'ant'` at the end, so for an external
    user the default is **off**. The comment is right but the way it is phrased

@@ -26,7 +26,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [x] 🔴 **Sprint A — Phase 27** (the diff you can read) — **DONE 2026-10-21**: the gutter
       is painted, the word diff is computed where the diff is painted, and the colour
       ladder is applied where the cell is written.
-- [ ] 🔴 **Sprint A2 — Phase 33** (the TUI at Claude Code's level): the port list,
+- [ ] 🔴 **Sprint A2 — Phase 33** (the TUI at a mature harness's level): the port list,
       42 features read out of the reference implementation. 33.1 and 33.2 are done;
       the rest is the board. The porting notes are in `docs/analysis/tui-chrome.md`.
 - [ ] 🔴 **Sprint A3 — Phase 34** (the machinery the reference implementation has and we do not): sixteen
@@ -737,11 +737,11 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 ---
 
-## Phase 33 — The TUI at Claude Code's level
+## Phase 33 — The TUI at a mature harness's level
 
 `✨ feature · 🔴 · the port list · source: docs/analysis/tui-chrome.md`
 
-> The reference is the TUI of Claude Code (TypeScript + Ink), read line by
+> The reference is a TUI written in TypeScript + Ink, read line by
 > line. 42 candidate features: **18 PORT**, **15 ALREADY** (we are equal or
 > better), **9 SKIP** (with reasons). The full table is in
 > `docs/analysis/tui-chrome.md`; this is the board version, and the porting
