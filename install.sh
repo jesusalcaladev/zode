@@ -187,7 +187,53 @@ install_binary() {
     log_success "Installed zode to $binary_path"
 }
 
-# Add to PATH if needed
+# Add to PATH if needed - automatically update shell config
+ensure_path() {
+    if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
+        return 0
+    fi
+    
+    local shell_name
+    shell_name=$(basename "$SHELL")
+    local config_file=""
+    local export_line="export PATH=\"\$PATH:$INSTALL_DIR\""
+    
+    case "$shell_name" in
+        bash)
+            config_file="$HOME/.bashrc"
+            ;;
+        zsh)
+            config_file="$HOME/.zshrc"
+            ;;
+        fish)
+            config_file="$HOME/.config/fish/config.fish"
+            export_line="set -gx PATH \$PATH $INSTALL_DIR"
+            ;;
+        *)
+            # Default to .profile for other shells
+            config_file="$HOME/.profile"
+            ;;
+    esac
+    
+    # Create config file if it doesn't exist
+    [[ -f "$config_file" ]] || touch "$config_file"
+    
+    # Check if already in config
+    if grep -q "$INSTALL_DIR" "$config_file" 2>/dev/null; then
+        log_info "PATH already configured in $config_file"
+        return 0
+    fi
+    
+    # Add to config
+    echo "" >> "$config_file"
+    echo "# Added by zode installer" >> "$config_file"
+    echo "$export_line" >> "$config_file"
+    
+    log_success "Added $INSTALL_DIR to PATH in $config_file"
+    log_info "Run 'source $config_file' or restart your shell to use zode"
+}
+
+# Legacy check_path for backwards compat
 check_path() {
     if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
         log_warn "$INSTALL_DIR is not in your PATH"
@@ -213,7 +259,7 @@ main() {
 
     # Check if already installed
     if check_existing "$VERSION"; then
-        check_path
+        ensure_path
         exit 0
     fi
 
@@ -222,7 +268,7 @@ main() {
     log_verbose "Asset URL: $asset_url"
 
     install_binary "$asset_url"
-    check_path
+    ensure_path
 
     # Verify installation
     local installed_version
