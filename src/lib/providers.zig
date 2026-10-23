@@ -105,16 +105,19 @@ pub fn activeDef(env: ?*const std.process.Environ.Map) *const ProviderDef {
 /// They live in memory (loaded from `~/.config/zode/auth.json` at startup and
 /// updated on save) because `keyFor` runs on every request and cannot afford to
 /// read a file from disk each time. `setup` fills it once.
-var saved_keys: ?*std.StringHashMapUnmanaged([]const u8) = null;
+/// ATOMIC because multiple threads (UI + workers) read it concurrently with
+/// the initial write in `loadAuthKeys`. In ReleaseSmall the compiler can
+/// otherwise cache the null value in a register and never see the update.
+var saved_keys: std.atomic.Value(?*std.StringHashMapUnmanaged([]const u8)) = .init(null);
 
 /// Stores the key map from `auth.json` (or null if there is none).
 pub fn setSavedKeys(map: ?*std.StringHashMapUnmanaged([]const u8)) void {
-    saved_keys = map;
+    saved_keys.store(map, .release);
 }
 
 /// Key stored by the user for this provider (without looking at the env).
 pub fn savedKeyFor(id: []const u8) ?[]const u8 {
-    const m = saved_keys orelse return null;
+    const m = saved_keys.load(.acquire) orelse return null;
     return m.get(id);
 }
 
