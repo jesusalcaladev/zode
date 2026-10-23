@@ -838,7 +838,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         if (std.mem.eql(u8, arg0, "--version")) {
             const version = @import("build_options").version;
-            std.debug.print("zode {s}\n", .{version});
+            var buf: [128]u8 = undefined;
+            var out = std.Io.File.stdout().writer(init.io, &buf);
+            try out.interface.print("zode {s}\n", .{version});
+            try out.interface.flush();
             return 0;
         }
         if (std.mem.eql(u8, arg0, "--help")) {

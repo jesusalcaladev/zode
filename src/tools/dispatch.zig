@@ -608,7 +608,10 @@ test "a pattern that starts with a dash is a pattern, not an option" {
         if (err == error.FileNotFound) return error.SkipZigTest; // no rg/grep in PATH
         return err;
     };
-    try std.testing.expectEqualStrings("no matches", out);
+    // rg, git grep and zode's own engine each answer "no matches" on exit 1;
+    // only the engine notice (printed when ripgrep is missing) differs, so the
+    // assertion is on the result, not on the exact bytes.
+    try std.testing.expect(std.mem.indexOf(u8, out, "no matches") != null);
 }
 
 test "write returns a PREVIEW of the file, not an opaque OK" {
@@ -618,6 +621,7 @@ test "write returns a PREVIEW of the file, not an opaque OK" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     var body: std.ArrayList(u8) = .empty;
     try body.appendSlice(arena, "{\"path\":\"/tmp/opencode/preview-test.txt\",\"content\":\"");
@@ -646,6 +650,7 @@ test "read: the SECOND read of the same thing does not repeat the file" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
@@ -679,6 +684,7 @@ test "read: if the file changes, it is sent whole again" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-change-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
@@ -704,6 +710,7 @@ test "read: the same content with another timestamp is NOT resent" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-touch-test.txt";
     const body = "contenido estable\n";
@@ -726,6 +733,7 @@ test "read: force:true returns it all even if nothing changed" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-force-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
@@ -748,6 +756,7 @@ test "read: a range that was never read IS sent" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-range-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "uno\ndos\ntres\n" });
@@ -767,6 +776,7 @@ test "read: invalidate sends the new content even if the stat did not move" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-invalidate-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "antes de editar\n" });
@@ -787,6 +797,7 @@ test "read: markDroppedAt undoes the cache when compaction takes the result away
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-dropped-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "contenido que se perdio\n" });
@@ -816,6 +827,7 @@ test "edit: two hunks, the second inside the first's new text, and NOTHING is wr
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/edit-clobber-test.txt";
     // `marker` exists once. Hunk 1 renames it to `keep`; hunk 2 renames
@@ -850,6 +862,7 @@ test "edit: allow_multiple is honoured inside `edits`, not only on the single fo
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/edit-am-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "aa b aa\n" });
@@ -870,6 +883,7 @@ test "edit: the count in the answer is the REAL one" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/edit-count-test.txt";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "aa bb aa\n" });
