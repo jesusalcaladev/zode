@@ -9,6 +9,8 @@ const chat = @import("chat.zig");
 const filesview = @import("lib/filesview.zig");
 const readcache = @import("lib/readcache.zig");
 const init_mod = @import("lib/init.zig");
+const cost_mod = @import("lib/cost.zig");
+const modelcache_mod = @import("lib/modelcache.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -242,23 +244,100 @@ pub fn cmdUsage(m: *tui.Model) void {
 }
 
 fn formatTokenCount(buf: []u8, value: i64) []const u8 {
-    const n: u64 = @intCast(@max(value, 0));
-    var len: usize = 1;
-    var divisor: u64 = 1;
-    while (divisor <= n / 10) : (divisor *= 10) {
-        len += 1;
+    // The grouping lives in `lib/cost.zig` now that `/cost` writes the same
+    // numbers: two renderings of a token count in two commands is how one of them
+    // ends up with a format the other does not have.
+    return cost_mod.groupDigits(buf, value);
+}
+
+/// `/cost`: what this session has spent, per model, in dollars.
+///
+/// ## Why per model and not one total
+///
+/// A session talks to several models: `free-auto` rotates when a pool model runs
+/// out of quota, the cheap router falls back to the user's own, and `/submodel`
+/// sends subagents somewhere else on purpose. One total multiplied by one price
+/// would be a number about a model that did not answer.
+///
+/// ## The prices come from the CACHED catalogue
+///
+/// Not from the network and not from a table in the binary: the provider
+/// publishes the price and `modelcache.zig` already has it on disk. A model nobody
+/// prices is `price unknown`, and the total says it is a floor — `$0.00` for a
+/// model with no published price is a bill that reads as free.
+pub fn cmdCost(m: *tui.Model) void {
+    const st = agent.cacheSessionStats();
+    if (st.requests == 0) {
+        agent.pushInfo(
+            m,
+            "cost \u{b7} no provider-reported usage yet: a turn has to finish before there are tokens to price.",
+        );
+        return;
     }
-    var out: usize = 0;
-    for (0..len) |i| {
-        buf[out] = '0' + @as(u8, @intCast((n / divisor) % 10));
-        out += 1;
-        if (i + 1 < len and (len - i - 1) % 3 == 0) {
-            buf[out] = ',';
-            out += 1;
+
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const tr = &cost_mod.session;
+    var rows: std.ArrayList(cost_mod.Row) = .empty;
+    var i: usize = 0;
+    while (i < tr.len) : (i += 1) {
+        const e = &tr.entries[i];
+        rows.append(a, .{
+            .model = e.text(),
+            .prompt = e.prompt_tokens,
+            .completion = e.completion_tokens,
+            .price = priceForModel(m, a, e.text()),
+        }) catch break;
+    }
+    // What did not fit the table is one row and not a silence: a token count that
+    // disappears is a bill that is wrong.
+    if (tr.spill_requests > 0) {
+        rows.append(a, .{
+            .model = "other models",
+            .prompt = tr.spill_prompt,
+            .completion = tr.spill_completion,
+            .price = null,
+        }) catch {};
+    }
+
+    const text = cost_mod.report(m.allocator, rows.items, st.requests, st.prompt_tokens) catch {
+        m.pushError("could not build the cost report");
+        return;
+    };
+    agent.pushInfoOwned(m, text);
+}
+
+/// The published price of ONE model, from the cached catalogue of a provider that
+/// has a key.
+///
+/// Null means "nobody publishes a price for it", which the report renders as
+/// `price unknown`. A free model is a price of zero and NOT an unknown one: those
+/// two answers send the reader to different places.
+///
+/// The catalogue is read here and not held: `/cost` is typed by hand, so a handful
+/// of small file reads is cheaper than a cache with a lifetime to get wrong.
+fn priceForModel(m: *tui.Model, a: std.mem.Allocator, model_id: []const u8) ?cost_mod.Price {
+    // A `Model` built by a test has no `Io`, and reading a file through one is a
+    // jump through a garbage vtable, not an error.
+    if (!m.io_ready) return null;
+
+    var defs_arena_state = std.heap.ArenaAllocator.init(a);
+    defer defs_arena_state.deinit();
+    for (agent.allProviders(defs_arena_state.allocator())) |*d| {
+        if (!providers.hasKey(d, m.environ)) continue;
+        var cache_arena = std.heap.ArenaAllocator.init(a);
+        defer cache_arena.deinit();
+        const entry = modelcache_mod.read(m.io, m.environ, cache_arena.allocator(), d.id, d.models_url) orelse continue;
+        // The DECISION (free / unpriced / priced) lives in `lib/cost.zig` with the
+        // rest of the money, so it is tested without a catalogue on disk.
+        switch (cost_mod.priceOf(entry.models, model_id)) {
+            .missing => continue,
+            .found => |price| return price,
         }
-        divisor /= 10;
     }
-    return buf[0..out];
+    return null;
 }
 
 test "formatTokenCount groups digits from the right" {
@@ -268,6 +347,91 @@ test "formatTokenCount groups digits from the right" {
     try std.testing.expectEqualStrings("1,000", formatTokenCount(&buf, 1_000));
     try std.testing.expectEqualStrings("12,345", formatTokenCount(&buf, 12_345));
     try std.testing.expectEqualStrings("1,234,567", formatTokenCount(&buf, 1_234_567));
+}
+
+test "cost command prices what it can and says what it cannot" {
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+    cost_mod.session.reset();
+    defer cost_mod.session.reset();
+
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 12_345, .cached = 0, .completion = 678 });
+    cost_mod.session.record("kimi-k2.6", 12_345, 678);
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    cmdCost(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "kimi-k2.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "12,345 in") != null);
+    // A test `Model` has no `Io`, so no catalogue was read. A price that could not
+    // be read is NOT a price of zero, and the report has to say so.
+    try std.testing.expect(std.mem.indexOf(u8, text, "no total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "$0.00") == null);
+}
+
+test "the cost command prices a model from the provider's cached catalogue" {
+    // The glue the two pure halves cannot cover: a HOME with the catalogue file
+    // `modelcache.write` leaves behind, a provider with a key, and a report that
+    // has to come out with real money in it.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, ".config/zode/models");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".config/zode/models/opencode.json",
+        .data =
+        \\{"version":1,"url":"https://opencode.ai/inference/v1/models","fetched_at":0,"models":[
+        \\ {"id":"kimi-k2.6","ctx":128000,"free":false,"by":"opencode","pp":0.000001,"pc":0.000002},
+        \\ {"id":"space-bunny-free","ctx":32000,"free":true,"by":"opencode","pp":0,"pc":0}
+        \\]}
+        ,
+    });
+    var pbuf: [512]u8 = undefined;
+    const np = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", pbuf[0..np]);
+    try env.put("ZODE_API_KEY", "test-key");
+
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+    cost_mod.session.reset();
+    defer cost_mod.session.reset();
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 1_000_000, .completion = 500_000 });
+    cost_mod.session.record("kimi-k2.6", 1_000_000, 500_000);
+    cost_mod.session.record("space-bunny-free", 2_000, 100);
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.environ = &env;
+    m.attachIo(io);
+    cmdCost(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    // 1M prompt tokens at $1/M + 500k completion at $2/M = $2.00.
+    try std.testing.expect(std.mem.indexOf(u8, text, "$2.00") != null);
+    // The free model is a PRICE of zero, not an unknown one.
+    try std.testing.expect(std.mem.indexOf(u8, text, "$0.00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "price unknown") == null);
+}
+
+test "cost command says there is nothing to price before the first turn" {
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    cmdCost(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no provider-reported usage yet") != null);
 }
 
 test "usage command reports provider totals and distinguishes estimates" {
@@ -738,6 +902,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
+    .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
     .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
     .{ .key = "/session", .desc = "session info", .palette_visible = false },

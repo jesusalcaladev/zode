@@ -359,6 +359,20 @@ def main() -> int:
     )
     ok &= check("/files does not break anything", "panic" not in t10.lower(), t10)
 
+    # 11) `/cost`: the money, per model. It prices from the CACHED catalogue, so in
+    #     the smoke's HOME (no catalogue, no key) the honest answer is that there is
+    #     nothing to price yet. What is checked is that the command ANSWERS when it
+    #     is typed, and that it never turns "I could not read a price" into a
+    #     `$0.00` total: a bill that reads as free is the one failure a cost display
+    #     must not have.
+    out11, t11 = drive([b"/cost", b"\r", b"\r"], budget=9.0)
+    ok &= check(
+        "/cost answers",
+        "no provider-reported usage yet" in t11 or "cost \u00b7" in t11,
+        t11,
+    )
+    ok &= check("/cost does not break anything", "panic" not in t11.lower(), t11)
+
     if not ok:
         print("\n--- plain text (truncated) ---")
         for line in t.splitlines()[:40]:

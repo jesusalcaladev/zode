@@ -29,6 +29,7 @@ const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
 const cache_stats = @import("cache_stats.zig");
+const cost_mod = @import("lib/cost.zig");
 const compaction = @import("compaction.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
@@ -2955,6 +2956,9 @@ test "TurnStats: a 0-line diff invents no files" {
 /// Empties the current session's history without creating a new one.
 pub fn resetSession(m: *tui.Model) void {
     cache_stats.session.reset();
+    // The money is per session like the tokens are: a `/new` that kept the cost
+    // of the old one would show a bill for a conversation that no longer exists.
+    cost_mod.session.reset();
     if (session) |s| {
         s.messages.clearRetainingCapacity();
         s.appendUsageSnapshot(cache_stats.session) catch |err| {
@@ -2967,8 +2971,16 @@ pub fn resetSession(m: *tui.Model) void {
     m.pushInfoFmt("session reset", .{});
 }
 
-fn recordSessionUsage(m: *tui.Model, usage: chat.Usage, kind: chat.ProviderKind) void {
+/// Records one finished request against the session: tokens for `/usage`, and the
+/// same tokens against the MODEL for `/cost`.
+///
+/// `model` is the one that ANSWERED and not `curModel()`: the free-auto rotation
+/// and the cheap router both swap the target mid-turn, and a cost attributed to the
+/// model the user picked instead of the one that replied is a number about the
+/// wrong bill.
+fn recordSessionUsage(m: *tui.Model, usage: chat.Usage, kind: chat.ProviderKind, model: []const u8) void {
     cache_stats.session.recordFor(usage, kind);
+    cost_mod.session.record(model, cache_stats.totalInputTokens(usage, kind), usage.completion);
     if (session) |s| {
         s.appendUsageSnapshot(cache_stats.session) catch |err| {
             m.pushErrorFmt("could not save session usage: {t}", .{err});
@@ -3231,6 +3243,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "usage")) {
         commands_mod.cmdUsage(m);
+    } else if (std.mem.eql(u8, cmd, "cost")) {
+        commands_mod.cmdCost(m);
     } else if (std.mem.eql(u8, cmd, "compact")) {
         commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "goal")) {
@@ -5719,7 +5733,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // The provider's own completion count when it sent one: the same window of
     // time, the real tokenizer (see `finishTps`).
     finishTps(tstate.chars, tstate.stream_start_ns, chat.last_usage.completion);
-    recordSessionUsage(m, chat.last_usage, pick.kind);
+    recordSessionUsage(m, chat.last_usage, pick.kind, pick.model);
 
     // Closes the streaming paragraph: what arrived stays in the history.
     m.streamEnd();

@@ -829,11 +829,14 @@ permanent CPU cost for a decoration).
   - The reference implementation: a list of the DANGEROUS patterns (the bare interpreters) and a detector for the SHADOWED rules (a rule that can never fire because another one covers it)
   - Ours: an allowlist entry of `bash` is that hazard in its purest form
   - [ ] When the user answers "always allow" with a broad rule, warn once — a warning, not a refusal
-- [ ] **34.5** A **cost** number, per model — **NOT COVERED** (no phase creates a cost state)
+- [x] **34.5** A **cost** number, per model — **DONE 2026-10-22**
   - The reference implementation: a cost tracker that multiplies the token counts by the model's price, and a `/cost` command that prints the total and the per-model breakdown
-  - Ours: tokens and hit-rate (`src/cache_stats.zig`), no money
-  - [ ] `src/lib/cost.zig` over the price table `src/lib/models.zig` already parses
-  - [ ] A model whose price is unknown prints **"price unknown"**, never a number
+  - Ours was tokens and hit-rate (`src/cache_stats.zig`), no money
+  - [x] `src/lib/cost.zig` (pure, tested) over the price `src/lib/models.zig` already parses. `/cost` reads the price from the **cached** catalogue (`modelcache.zig`), never the network
+  - [x] A model whose price is unknown prints **"price unknown"**, never a number; the total then says it is a floor, and a session with NO priced row prints "no total" instead of `$0.00`
+  - [x] Per MODEL and not one bucket: `free-auto` rotates, the cheap router falls back and `/submodel` sends subagents elsewhere, so the row is the model that **answered** (`pick.model`), not the one that was selected
+  - [x] A resumed session says which tokens are not in the breakdown: the per-model rows live in memory and the token totals are restored from the session file
+  - Where: `commands.cmdCost` + the dispatch in `agent.zig` · `recordSessionUsage` now takes the model · the price decision (`free` / `unpriced` / `priced`) is `cost.priceOf`, so it is tested with no catalogue on disk
 - [ ] **34.6** The hook output contract (`updatedInput`, `additionalContext`) — Phase 5 has the events, not the contract
   - [ ] The reference implementation: 27 events and 5 hook types
 - [ ] **34.7** The memory recall by relevance and the staleness notes — Phase 11 has the store, not the recall

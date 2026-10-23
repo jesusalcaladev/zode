@@ -5931,3 +5931,80 @@ catalogue's text and the client's own line handling.
 The other cost is in the PROMPT, and it is the one that mattered: the `mcp`
 tool's own schema is ~900 bytes in the cached prefix of every request, and
 NOT one byte of any server's tools is in it.
+
+---
+
+# `/cost`: the money, and why `null` is not zero (2026-10-22)
+
+TASKS 34.5. `src/lib/cost.zig` (pure) + `commands.cmdCost` + one row in the
+command table. The board kept it as "no phase creates a cost state", and that was
+the whole job: the prices were already parsed and nothing multiplied them.
+
+## Three answers, and only one of them is a zero
+
+`models.Model` carries `price_prompt`/`price_completion`, and a provider that
+publishes no `pricing` object at all leaves BOTH at 0. So "0" means two different
+things, and a naive `tokens * price` turns the second one into a bill that reads
+as free:
+
+| what the catalogue says | what `/cost` prints |
+|---|---|
+| the model is marked free | `$0.00` |
+| prices were published | the price |
+| no prices at all, or the model is in no catalogue | `price unknown` |
+
+`cost.priceOf` answers with a `Lookup`: `missing` (not in THIS catalogue, so try
+the next provider) or `found: ?Price` (`null` = in the catalogue and unpriced).
+The two are different on purpose. A model missing from opencode's catalogue may be
+priced by openrouter, and collapsing them into one `null` would stop the walk at
+the first provider that does not list it.
+
+When NO row can be priced the header says "no total", never `$0.00`, and when some
+rows can the total says it is a floor. That is the same rule as `proofWord`:
+a number has to be reported at the precision it was earned.
+
+## Per model, because a session talks to several
+
+`free-auto` rotates when a pool model runs out of quota, the cheap router falls
+back to the user's own model, and `/submodel` sends subagents somewhere else on
+purpose. One session total multiplied by one price would be a number about a model
+that did not answer. The row is recorded where the fact is known —
+`recordSessionUsage(…, pick.model)`, the target that actually answered — and NOT
+from `curModel()`, which is what the user selected.
+
+## Where the price comes from, and why not a table in the binary
+
+`modelcache.zig` already keeps the catalogue on disk with `pp`/`pc`, and
+`models.zig` already parses OpenRouter's decimal strings. `/cost` walks the
+providers that have a key, reads their cached catalogue and takes the first one
+that lists the model: no network, and no price table in the source to go stale the
+week a provider changes it.
+
+The catalogue is read per invocation and not cached again: `/cost` is typed by
+hand, so a handful of small files is cheaper than another cache with a lifetime to
+get wrong.
+
+## A resumed session has totals and no rows
+
+`cache_stats.session` is persisted WITH the session (a usage snapshot) and restored
+on `--resume`; the per-model rows are a process global and are not. The report
+therefore compares the session's tokens with what the rows account for and names
+the difference — a total sitting above a breakdown that does not add up to it is
+the quiet kind of inconsistency this repo keeps paying for.
+
+And the empty case says "no per-model breakdown in this process", NOT "no published
+price": the second is a lie about why, and it is exactly the kind of plausible
+wrong sentence that sends someone debugging the catalogue.
+
+## What is tested, and what the unit tests cannot reach
+
+`cost.zig` holds the tracker, the three-way price decision, the money format and
+the report. `commands.zig` has one test with a REAL temp `HOME` holding a
+`models/opencode.json` and a seeded tracker: that is the only place the glue runs
+(it prices $2.00 out of the file, and asserts that a free model is `$0.00` while
+nothing says "price unknown"). `tools/pty_smoke.py` types `/cost`, because a
+command can be perfect and still do nothing when it is typed.
+
+What is NOT covered by an automated check: a real turn followed by `/cost` with
+real provider prices. That needs a key and a quota, and the sandbox can only
+fabricate the catalogue file, not the bill.

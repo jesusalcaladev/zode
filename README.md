@@ -76,6 +76,7 @@ export ZODE_EFFORT="medium"             # low | medium | high (for o-series/GPT-
 | `/plan` | Show/clear visible task list |
 | `/context` | Token budget gauge + breakdown |
 | `/cache` | Cache hit rate stats |
+| `/cost` | What the session has cost, per model (USD from the catalogue) |
 | `/bench` | Iteration/TTFT/tok/s statistics |
 | `/free-auto` | Rotate through free models of all keyed providers |
 | `/submodel` | Override subagent model |
