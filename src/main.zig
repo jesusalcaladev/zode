@@ -742,17 +742,21 @@ fn runTui(init: std.process.Init) !u8 {
     }
 
     // Self-update check (non-blocking, runs in background)
-    // Only checks once per 24 hours, so it's very cheap
+    // Only checks once per 24 hours, so it's very cheap.
+    // Uses its OWN Threaded Io so blocking HTTPS cannot starve the main event
+    // loop (same hardening as the warmup worker).
     if (envGet(init.environ_map, "ZODE_NO_SELF_UPDATE") == null) {
         _ = std.Thread.spawn(.{}, struct {
-            fn run(allocator: std.mem.Allocator, io_ref: std.Io) void {
+            fn run(allocator: std.mem.Allocator) void {
                 const selfupdate = @import("lib/selfupdate.zig");
                 var arena_state = std.heap.ArenaAllocator.init(allocator);
                 defer arena_state.deinit();
                 const arena = arena_state.allocator();
-                _ = selfupdate.autoUpdate(io_ref, arena) catch {};
+                var threaded: std.Io.Threaded = .init(allocator, .{});
+                defer threaded.deinit();
+                _ = selfupdate.autoUpdate(threaded.io(), arena) catch {};
             }
-        }.run, .{ init.gpa, init.io }) catch {};
+        }.run, .{ init.gpa }) catch {};
     }
 
     agent.bootMark("app.run start");
