@@ -95,6 +95,9 @@ pub const Foreground = struct {
     term: ?std.process.Child.Term,
     /// The output was longer than the cap, so the child was KILLED at the cap.
     truncated: bool = false,
+    /// How many bytes of stdout+stderr were actually captured (before any cut).
+    /// Honest: this is what the model sees, not a guess about how much more there was.
+    bytes_read: usize = 0,
 
     fn deinit(self: Foreground, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -112,6 +115,28 @@ pub const foreground_truncation_notice =
     "\\n… (output cut at the tool's cap and the command was stopped; re-run it " ++
     "through `head` or a narrower scope to get the rest)\\n";
 
+
+/// What the model is told when a foreground command was cut short.
+///
+/// `shown_bytes` is how many bytes the model actually sees; `cap_bytes` is the
+/// tool's cap. The notice is written directly into `out`.
+pub fn foregroundTruncationNotice(
+    out: *std.ArrayList(u8),
+    arena: std.mem.Allocator,
+    shown_bytes: usize,
+    cap_bytes: usize,
+) !void {
+    const cap_kb = cap_bytes / 1024;
+    const shown_kb = shown_bytes / 1024;
+    try out.print(
+        arena,
+        "\\n… (output cut at {d} KB; tool cap is {d} KB. Command was stopped at the cap; "
+        ++ "re-run through `head` or a narrower scope to get the rest)\\\\n",
+        .{ shown_kb, cap_kb },
+    );
+}
+
+/// Runs a command in the FOREGROUND and returns what it printed.
 /// Runs a command in the FOREGROUND and returns what it printed.
 ///
 /// ## Why over the cap truncates instead of failing
@@ -219,6 +244,7 @@ pub fn runForegroundArgv(
         .stderr = stderr_slice,
         .term = term,
         .truncated = truncated,
+        .bytes_read = stdout_slice.len + stderr_slice.len,
     };
 }
 

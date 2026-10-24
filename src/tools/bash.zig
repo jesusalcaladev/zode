@@ -119,7 +119,9 @@ pub fn toolBash(
     // output. A silent cut is the failure this replaces — with one, the model can
     // tell "that was everything" from "that was the first 16 KB", which is the whole
     // difference between rephrasing the request and repeating it.
-    if (result.truncated) try out.appendSlice(arena, bg_tool.foreground_truncation_notice);
+    if (result.truncated) {
+        try bg_tool.foregroundTruncationNotice(&out, arena, result.bytes_read, common.max_tool_output);
+    }
     return out.items;
 }
 

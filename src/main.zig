@@ -8,7 +8,7 @@ const modelcache = @import("lib/modelcache.zig");
 const models_mod = models;
 const provider = @import("lib/provider.zig");
 const providers = @import("lib/providers.zig");
-const tools_mod = @import("tools/dispatch.zig");
+const tools_mod = @import("tools_root.zig");
 const cache_stats = @import("cache_stats.zig");
 const chat = @import("chat.zig");
 const agent = @import("agent.zig");
@@ -52,6 +52,7 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     agent.io_global = io;
     agent.environ_global = env;
     agent.gpa_global = gpa;
+    // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     agent.loadUserConfig();
     defer agent.shutdownUserConfig();
 
@@ -166,6 +167,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     agent.gpa_global = gpa;
     agent.environ_global = env;
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
+    // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     // The language servers. Started LAZILY (a server is spawned when a file of
     // its language is asked about) but the manager has to exist before the
     // config is read, because the config is what says which servers there are.
@@ -687,6 +689,7 @@ fn runTui(init: std.process.Init) !u8 {
     agent.api_key_global = envGet(init.environ_map, "ZODE_API_KEY");
     agent.environ_global = init.environ_map;
     agent.gpa_global = init.gpa;
+    // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     // The language servers, before the config is read: the config says which
     // servers there are, and the manager is what asks for them.
     //

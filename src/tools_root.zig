@@ -24,9 +24,26 @@ pub const isParallelSafe = tools.isParallelSafe;
 pub const toolsJson = tools.toolsJson;
 pub const needsPermission = tools.needsPermission;
 pub const execute = tools.execute;
+pub const executeWith = tools.executeWith;
 pub const describeError = tools.describeError;
 pub const setAutoBackground = tools.setAutoBackground;
-pub const max_tool_output = tools.max_tool_output;
+pub var max_tool_output = tools.max_tool_output;
+pub fn initMaxToolOutput(env: ?*const std.process.Environ.Map) void {
+    tools.initMaxToolOutput(env);
+    max_tool_output = tools.max_tool_output;
+}
+
+/// Initialise the `git` diff caps from the environment.
+pub fn initDiffLimit(env: ?*const std.process.Environ.Map) void {
+    const git = @import("tools/git.zig");
+    git.initDiffLimit(env);
+}
+
+/// Initialise the `grep` capture cap from the environment.
+pub fn initGrepCapture(env: ?*const std.process.Environ.Map) void {
+    const grep = @import("tools/grep.zig");
+    grep.initGrepCapture(env);
+}
 
 test {
     try std.testing.expect(tools.defs.len > 0);

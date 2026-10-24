@@ -114,6 +114,7 @@ binary (1.9MB stripped).
 - Verified with real OpenRouter key: 471 models (19 free) fetched successfully
 - **Auto-switch provider when selecting model from picker**: When user selects a model from the model picker (Ctrl+T or /model), the provider now automatically switches to match the model's provider. This fixes the bug where selecting an OpenRouter model (e.g., `cohere/north-mini-code:free`) while OpenCode was active would fail because the request went to the wrong provider.
 - **Scroll empty space bug fixed**: The bug where large empty space appeared in history was caused by `wrap_w` being 0 before the first draw, making `estHeight` use 40 columns as fallback. On wide terminals (100+ cols), this made estimated heights 2-3x larger than actual wrapped heights, creating large blank areas. Fixed by initializing `wrap_w` to 80 and using it directly in `estHeight`.
+- **Self-update version comparison fixed**: When current_version is "dev" (or any invalid semver), the old code treated ANY cached version as "newer", causing it to suggest downgrading (e.g., user has v0.1.3 but update suggests v0.1.1). Fixed by adding `isValidVersion()` check - if current version is not a valid semver, don't trust cached version, force fetch from GitHub instead.
 
 ## Mascot: Zo
 

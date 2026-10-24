@@ -257,9 +257,9 @@ pub const Http = struct {
             if (out.len > 0) location = parseLocation(response.head, out);
         }
 
-        var transfer_buf: [64 * 1024]u8 = undefined;
+        var transfer_buf: [256 * 1024]u8 = undefined;
         const rd = response.reader(&transfer_buf);
-        const max = 10 * 1024 * 1024;
+        const max = 50 * 1024 * 1024;
         const alloc_body = try rd.allocRemaining(self.gpa, .limited(max));
         errdefer self.gpa.free(alloc_body);
 

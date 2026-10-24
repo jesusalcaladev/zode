@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const tui = @import("tui.zig");
 const theme = @import("lib/theme.zig");
 const providers = @import("lib/providers.zig");
+const md = @import("lib/markdown.zig");
 const chat = @import("chat.zig");
 const http_client = @import("lib/http_client.zig");
 const tools_mod = @import("tools/dispatch.zig");
@@ -2338,6 +2339,24 @@ pub fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
     m.pushInfoOwned(text);
 }
 
+/// Replays the session messages into the TUI history so they are visible
+/// when a session is resumed. The session messages are stored in the session
+/// file but the TUI's history (`paras`) is separate and needs to be populated
+/// from the session messages on resume.
+pub fn replaySessionMessages(m: *tui.Model, s: *session_mod.Session) void {
+    for (s.messages.items) |sm| {
+        const kind = switch (sm.role) {
+            .user => md.Kind.user,
+            .assistant => md.Kind.assistant,
+            .tool => md.Kind.tool_res,
+            .system => md.Kind.info,
+        };
+        m.pushKind(kind, sm.content);
+    }
+    // Drain the pending queue so the paragraphs are in `paras` immediately
+    m.drainPending();
+}
+
 /// Error to the history, in RED (`md.Kind.error_msg`, `✗` prefix).
 ///
 /// The Kind and the prefix existed from the start, and NO caller used it:
@@ -3861,6 +3880,8 @@ fn resumeLatest(m: *tui.Model) void {
     // does not know what is in it: an entry that says "the model has this
     // file" is a guess. Clearing it costs a re-read and buys a truth.
     resetSessionFiles(m);
+    // Replay session messages into TUI history so they are visible
+    replaySessionMessages(m, s);
     m.pushInfoFmt("session resumed: {s} · {d} messages", .{ path, s.messages.items.len });
     refreshContextUsage(m);
 }
