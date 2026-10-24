@@ -26,6 +26,7 @@ const modelcache = @import("lib/modelcache.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 const copytext = @import("lib/copytext.zig");
 const fuzzy = @import("lib/fuzzy.zig");
+const filesearch = @import("lib/filesearch.zig");
 
 /// The kind of the status: what color the face is and what phase the app is in.
 /// Replaces `StatusKind`; lives here so `agent.zig` can reference it as
@@ -1648,6 +1649,8 @@ pub const Model = struct {
         // `@` completion matches: gpa-owned paths (see `freeFileMatches`).
         freeFileMatches(self);
         self.ac.file_matches.deinit(self.allocator);
+        freeFilePool(self);
+        self.ac.file_pool.deinit(self.allocator);
         // Background jobs: killed FIRST (a child writing to a pipe nobody reads
         // would keep the process alive), then their buffers freed.
         // `null` when there is no `Io`: a test Model has none, and `bgproc.deinit`
@@ -2229,24 +2232,30 @@ pub const Model = struct {
         @memset(self.height_tree.items, 0);
         self.height_tree_capacity = cap;
         for (self.para_heights.items, 0..) |h, i| {
-            self.height_tree.items[cap + i] = h;
+            self.height_tree.items[satAdd(cap, i)] = h;
         }
         var node = cap - 1;
         while (node > 0) : (node -= 1) {
             self.height_tree.items[node] =
-                self.height_tree.items[node * 2] + self.height_tree.items[node * 2 + 1];
+                satAdd(
+                    self.height_tree.items[satMul(node, 2)],
+                    self.height_tree.items[satAdd(satMul(node, 2), 1)],
+                );
         }
     }
 
     fn setHeightTreeValue(self: *Model, index: usize, value: usize) void {
         const cap = self.height_tree_capacity;
-        if (cap == 0 or index >= cap or self.height_tree.items.len < cap * 2) return;
-        var node = cap + index;
+        if (cap == 0 or index >= cap or self.height_tree.items.len < satMul(cap, 2)) return;
+        var node = satAdd(cap, index);
         self.height_tree.items[node] = value;
         node /= 2;
         while (node > 0) : (node /= 2) {
             self.height_tree.items[node] =
-                self.height_tree.items[node * 2] + self.height_tree.items[node * 2 + 1];
+                satAdd(
+                    self.height_tree.items[satMul(node, 2)],
+                    self.height_tree.items[satAdd(satMul(node, 2), 1)],
+                );
         }
     }
 
@@ -2255,22 +2264,22 @@ pub const Model = struct {
     fn heightPrefix(self: *const Model, end: usize) usize {
         const stop = @min(end, self.para_heights.items.len);
         const cap = self.height_tree_capacity;
-        if (cap == 0 or stop > cap or self.height_tree.items.len < cap * 2) {
+        if (cap == 0 or stop > cap or self.height_tree.items.len < satMul(cap, 2)) {
             var sum: usize = 0;
-            for (self.para_heights.items[0..stop]) |h| sum += h;
+            for (self.para_heights.items[0..stop]) |h| sum = satAdd(sum, h);
             return sum;
         }
         var left = cap;
-        var right = cap + stop;
+        var right = satAdd(cap, stop);
         var sum: usize = 0;
         while (left < right) {
             if ((left & 1) != 0) {
-                sum += self.height_tree.items[left];
+                sum = satAdd(sum, self.height_tree.items[left]);
                 left += 1;
             }
             if ((right & 1) != 0) {
                 right -= 1;
-                sum += self.height_tree.items[right];
+                sum = satAdd(sum, self.height_tree.items[right]);
             }
             left /= 2;
             right /= 2;
@@ -2285,11 +2294,11 @@ pub const Model = struct {
         const total = self.heightPrefix(n);
         if (line >= total) return n;
         const cap = self.height_tree_capacity;
-        if (cap == 0 or n > cap or self.height_tree.items.len < cap * 2) {
+        if (cap == 0 or n > cap or self.height_tree.items.len < satMul(cap, 2)) {
             var sum: usize = 0;
             for (self.para_heights.items, 0..) |h, i| {
-                if (line < sum + h) return i;
-                sum += h;
+                if (line < satAdd(sum, h)) return i;
+                sum = satAdd(sum, h);
             }
             return n;
         }
@@ -2323,6 +2332,19 @@ pub const Model = struct {
     /// `wrap_w` is the width the last frame laid out with, published by the
     /// draw. Initialized to 80 (common terminal default) so `estHeight` has a
     /// reasonable fallback before the first frame.
+    /// Saturating add for usize: UI layout tolerates approximate heights,
+    /// but never a panic from integer overflow.
+    fn satAdd(a: usize, b: usize) usize {
+        if (a > std.math.maxInt(usize) - b) return std.math.maxInt(usize);
+        return a + b;
+    }
+
+    /// Saturating multiply for usize.
+    fn satMul(a: usize, b: usize) usize {
+        if (b != 0 and a > std.math.maxInt(usize) / b) return std.math.maxInt(usize);
+        return a * b;
+    }
+
     fn estHeight(self: *const Model, text: []const u8) usize {
         const per_line: usize = @intCast(self.wrap_w);
         const nl = std.mem.count(u8, text, "\n");
@@ -2332,9 +2354,9 @@ pub const Model = struct {
         // the scroll range from growing as you scroll down through a history
         // full of code.
         const fences = std.mem.count(u8, text, "```") + std.mem.count(u8, text, "~~~");
-        // Wrapping arithmetic: UI layout tolerates approximate values, but not a panic.
-        const fence_cost: usize = 3 * fences;
-        return @max(1, nl + 1 + wrapped + fence_cost);
+        // Saturating arithmetic: a pathological text cannot overflow usize.
+        const fence_cost: usize = satMul(3, fences);
+        return @max(1, satAdd(satAdd(satAdd(nl, 1), wrapped), fence_cost));
     }
 
     /// Parses and wraps a paragraph, and puts it in the cache with its height.
@@ -2512,13 +2534,13 @@ pub const Model = struct {
             self.follow_bottom = false;
         }
         self.anchor = first;
-        return .{ .first = first, .last = first + @max(history_h, 1), .total = t.total, .max_offset = t.max_offset };
+        return .{ .first = first, .last = satAdd(first, @max(history_h, 1)), .total = t.total, .max_offset = t.max_offset };
     }
 
     /// The absolute line of the top of the view, from (paragraph, offset).
     fn anchorLine(self: *const Model) usize {
         const upto = @min(self.anchor_para, self.para_heights.items.len);
-        return self.heightPrefix(upto) + self.anchor_off;
+        return satAdd(self.heightPrefix(upto), self.anchor_off);
     }
 
     /// The other direction: turn an absolute line into (paragraph, offset).
@@ -2529,7 +2551,8 @@ pub const Model = struct {
         const i = self.heightIndexAt(line);
         if (i < self.para_heights.items.len) {
             self.anchor_para = i;
-            self.anchor_off = line - self.heightPrefix(i);
+            const base = self.heightPrefix(i);
+            self.anchor_off = if (line >= base) line - base else 0;
             return;
         }
         // Past the last paragraph: the top of the view is below all of them.
@@ -4825,6 +4848,15 @@ pub const Autocomplete = struct {
     /// via `freeFileMatches`). Strings, not a `Palette`: the popup is one
     /// column and the paths need no descriptions.
     file_matches: std.ArrayList([]u8) = .empty,
+    /// EVERY file of the project, walked once and kept (`filesearch.collect`).
+    /// The popup is refiltered on every keystroke, so the disk is read once per
+    /// `file_pool_ttl_s` and not once per character. A test Model has no `Io`,
+    /// so this stays empty there.
+    file_pool: std.ArrayList([]u8) = .empty,
+    file_pool_ready: bool = false,
+    /// Unix seconds of the last walk: the pool is rebuilt when it stales, so a
+    /// file created by the agent during the session shows up without a restart.
+    file_pool_at: i64 = 0,
 
     /// Is the current input text a command in progress?
     /// Only offered if there are no spaces yet: "/mod" yes, "/mod x" no.
@@ -5203,95 +5235,72 @@ fn fileQueryAt(text: []const u8, cursor: usize) ?struct { token_start: usize, to
     return null;
 }
 
-/// Refills the file matches for the `@token` being typed.
+/// How long the project file pool is trusted before it is walked again.
 ///
-/// Reads the CURRENT directory only (like `list_files`): `src/` narrows
-/// inside the prefix, deeper trees are one `@` away. Directories first (they
-/// are the way down the tree), then files, both alphabetical. Needs the `Io`
-/// (`io_ready`): in tests without one the list just stays empty.
+/// Long enough that typing a path never costs a walk, short enough that a file
+/// the agent just created shows up while you are still in the same session.
+const file_pool_ttl_s: i64 = 10;
+
+/// How many scored matches the popup keeps. More than the rows it can show, so
+/// scrolling within the list still works, and few enough that the per-keystroke
+/// refilter stays in the microseconds.
+const file_matches_max: usize = 40;
+
+/// Empties the cached project listing (`filesearch.collect` owns its strings).
+fn freeFilePool(self: *Model) void {
+    for (self.ac.file_pool.items) |p| self.allocator.free(p);
+    self.ac.file_pool.clearRetainingCapacity();
+    self.ac.file_pool_ready = false;
+}
+
+/// Walks the project ONCE per `file_pool_ttl_s` and keeps every path.
+///
+/// This is what makes `@` a project-wide search instead of a directory listing:
+/// the old version read one directory per keystroke, so `@tui` said "nothing"
+/// unless you happened to be in `src/`, and `@src/lib/fuzzy` was four
+/// keystrokes of drilling. One walk and one fuzzy pass answer both.
+fn ensureFilePool(self: *Model) void {
+    if (!self.io_ready) return;
+    const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+    if (self.ac.file_pool_ready and now - self.ac.file_pool_at <= file_pool_ttl_s) return;
+    freeFilePool(self);
+    filesearch.collect(self.allocator, self.io, ".", &self.ac.file_pool, filesearch.default_cap);
+    // Shallow first, so a bare `@` opens on the files you are most likely to
+    // mean instead of whatever `readdir` returned.
+    filesearch.sortShallowFirst(self.ac.file_pool.items);
+    self.ac.file_pool_ready = true;
+    self.ac.file_pool_at = now;
+}
+
+/// Refills the matches for the `@token` being typed: fuzzy over the whole
+/// project, best score first.
+///
+/// The query is the token as typed, `/` included, so `src/edi` and `edi` both
+/// reach `src/lib/editor.zig`: the separator is a word boundary to `fuzzy`, and
+/// nothing has to be split into "directory" and "name" here.
 fn refreshFileMatches(self: *Model, token: []const u8) void {
     freeFileMatches(self);
     if (!self.io_ready) return;
+    ensureFilePool(self);
+    if (self.ac.file_pool.items.len == 0) return;
 
-    // Split the token into directory + partial name: `src/edi` lists `src/`.
-    var dir_path: []const u8 = ".";
-    var partial: []const u8 = token;
-    if (std.mem.lastIndexOfScalar(u8, token, '/')) |slash| {
-        dir_path = token[0..slash];
-        partial = token[slash + 1 ..];
-    }
-
-    const names = listDirNames(self.allocator, self.io, dir_path, 40) catch return;
-    defer {
-        for (names) |e| self.allocator.free(e.name);
-        self.allocator.free(names);
-    }
-
-    for (names) |e| {
-        if (!startsWithIgnoreCase(e.name, partial)) continue;
-        // Skip dotfiles unless the user is typing one (`.gitignore`).
-        if (e.name.len > 0 and e.name[0] == '.' and (partial.len == 0 or partial[0] != '.')) continue;
-        const has_dir_part = std.mem.indexOfScalar(u8, token, '/') != null;
-        const candidate = std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
-            if (has_dir_part) dir_path else "",
-            if (has_dir_part and !std.mem.endsWith(u8, dir_path, "/")) "/" else "",
-            e.name,
-        }) catch continue;
-        if (e.is_dir) {
-            const with_slash = std.fmt.allocPrint(self.allocator, "{s}/", .{candidate}) catch {
-                self.allocator.free(candidate);
-                continue;
-            };
-            self.allocator.free(candidate);
-            self.ac.file_matches.append(self.allocator, with_slash) catch {
-                self.allocator.free(with_slash);
-            };
-        } else {
-            self.ac.file_matches.append(self.allocator, candidate) catch {
-                self.allocator.free(candidate);
-            };
+    const pool = self.ac.file_pool.items;
+    if (token.len == 0) {
+        // A bare `@`: the first `file_matches_max` of the pool, already shallow
+        // first. Ranked would mean scoring 20 000 paths for a query of nothing.
+        for (pool[0..@min(pool.len, file_matches_max)]) |p| {
+            const copy = self.allocator.dupe(u8, p) catch continue;
+            self.ac.file_matches.append(self.allocator, copy) catch self.allocator.free(copy);
         }
+        return;
     }
-}
 
-/// One directory entry: the name and whether it is a directory (so the popup
-/// appends the `/` that invites the next level).
-const DirEntry = struct { name: []u8, is_dir: bool };
-
-/// Directory listing as an owned slice. Best-effort: any error (missing dir,
-/// `Io` not ready in tests) yields an error, and the caller leaves the popup
-/// empty — a popup that fails to open must not take the input down with it.
-///
-/// CAREFUL (AGENTS.md): `openDir` WITHOUT `.iterate = true` is a panic (EBADF)
-/// the moment you call `iterate()`, not a clean error.
-fn listDirNames(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-    max: usize,
-) ![]DirEntry {
-    var out: std.ArrayList(DirEntry) = .empty;
-    errdefer {
-        for (out.items) |e| gpa.free(e.name);
-        out.deinit(gpa);
+    const scored = fuzzy.rank(self.allocator, token, pool) catch return;
+    defer self.allocator.free(scored);
+    for (scored[0..@min(scored.len, file_matches_max)]) |s| {
+        const copy = self.allocator.dupe(u8, pool[s.index]) catch continue;
+        self.ac.file_matches.append(self.allocator, copy) catch self.allocator.free(copy);
     }
-    var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (out.items.len < max) {
-        const e = it.next(io) catch break orelse break;
-        if (e.name.len == 0 or std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) continue;
-        try out.append(gpa, .{ .name = try gpa.dupe(u8, e.name), .is_dir = e.kind == .directory });
-    }
-    // Alphabetical so the popup is stable while typing. Directories first:
-    // they are how you walk DOWN the tree, which is what `@` is for.
-    std.mem.sort(DirEntry, out.items, {}, struct {
-        fn lt(_: void, a: DirEntry, b: DirEntry) bool {
-            if (a.is_dir != b.is_dir) return a.is_dir;
-            return std.ascii.orderIgnoreCase(a.name, b.name) == .lt;
-        }
-    }.lt);
-    return out.toOwnedSlice(gpa);
 }
 
 /// Does `haystack` start with `needle` (case-insensitive)?
@@ -5431,7 +5440,10 @@ fn acceptAutocomplete(self: *Model) bool {
         },
         .file => blk: {
             const path = matchLabel(self, self.ac.sel) orelse return false;
-            break :blk std.fmt.allocPrint(self.allocator, "@{s}", .{path}) catch return false;
+            // The trailing space ends the mention. Without it the next word
+            // glued itself to the path (`@src/a.zigy` was one token to
+            // `mentions.scan`, and the file looked missing).
+            break :blk std.fmt.allocPrint(self.allocator, "@{s} ", .{path}) catch return false;
         },
         .none => return false,
     };
@@ -6506,6 +6518,70 @@ fn drawInput(
     }
 }
 
+/// Paints `text` with the fuzzy-matched characters BOLD, and — when `accent` is
+/// given — everything from `accent_from` on in the accent color.
+///
+/// Three axes in one pass: the directories dim, the file name in the accent, the
+/// characters the query reached in bold. That is how a file palette reads in an
+/// editor: the eye lands on the name, and the bold says WHY this row is here.
+///
+/// One `putText` per run of equal style, and runs are cut at GRAPHEME
+/// boundaries: `positions` are byte offsets (fuzzy's contract), so a match that
+/// lands inside a multi-byte character paints that whole character. You cannot
+/// half-highlight a glyph.
+///
+/// Returns the next free column.
+fn putStyled(
+    p: *Painter,
+    col: u16,
+    row: u16,
+    text: []const u8,
+    positions: []const u32,
+    base: vaxis.Style,
+    accent: ?vaxis.Style,
+    accent_from: usize,
+) u16 {
+    if (text.len == 0) return col;
+    var x = col;
+    var run_start: usize = 0;
+    var run_style: vaxis.Style = base;
+    var off: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| {
+        const len = g.bytes(text).len;
+        if (len == 0) continue;
+        var is_hit = false;
+        for (positions) |p32| {
+            const at: usize = p32;
+            if (at >= off and at < off + len) {
+                is_hit = true;
+                break;
+            }
+        }
+        const plain: vaxis.Style = if (accent) |a| (if (off < accent_from) base else a) else base;
+        const want: vaxis.Style = if (is_hit)
+            .{ .bold = true, .fg = theme.brand_hi.fg, .bg = plain.bg }
+        else
+            plain;
+        if (!std.meta.eql(want, run_style)) {
+            x = p.putText(x, row, text[run_start..off], run_style);
+            run_start = off;
+            run_style = want;
+        }
+        off += len;
+    }
+    if (off > run_start) x = p.putText(x, row, text[run_start..off], run_style);
+    return x;
+}
+
+/// A file path: directories dim, file name in the accent, matches bold.
+fn putMatchPath(p: *Painter, col: u16, row: u16, path: []const u8, positions: []const u32, selected: bool) u16 {
+    const name_start: usize = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| s + 1 else 0;
+    const base = if (selected) theme.selected else theme.dim;
+    const name = if (selected) theme.selected else theme.accent;
+    return putStyled(p, col, row, path, positions, base, name, name_start);
+}
+
 /// List of commands matching what was typed after the `/`.
 fn drawAutocomplete(
     p: *Painter,
@@ -6540,10 +6616,16 @@ fn drawAutocomplete(
         const is_sel = first + i == self.ac.sel;
         if (is_sel) p.fillRange(0, width, y, " ", theme.selected);
         // `@` paths are already prefixed in the label? No: the label is the raw
-        // path, the `@` is drawn dim so the mention form is visible.
+        // path, the `@` is drawn dim so the mention form is visible. The path is
+        // painted run by run so that the characters the query matched are bold:
+        // with 40 candidates, "this row is here because of `edt`" is the thing
+        // that lets you pick without reading every one.
         if (self.ac.mode == .file) {
             _ = p.putText(1, y, "@", if (is_sel) theme.selected else theme.dim);
-            _ = p.putText(2, y, label, if (is_sel) theme.selected else theme.accent);
+            var hbuf: [128]u32 = undefined;
+            const q = acPrefix(self) orelse "";
+            const hn = fuzzy.highlightPositions(label, q, &hbuf) orelse 0;
+            _ = putMatchPath(p, 2, y, label, hbuf[0..hn], is_sel);
         } else {
             _ = p.putText(1, y, label, if (is_sel) theme.selected else theme.accent);
         }
@@ -6815,12 +6897,14 @@ fn drawLines(
         // height tree, the key handlers and the scrollbar. Faking a negative
         // scroll to get some air would put all three out by the same amount, and
         // the first PageUp would jump.
-        const row: u16 = @intCast(abs - first_visible + pad);
+        const row_raw: usize = abs - first_visible + @as(usize, pad);
+        const row: u16 = if (row_raw > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(row_raw);
         if (row >= hh) break;
         var col: u16 = margin;
         for (ln.cells) |cell| {
             p.putStable(col, row, cell.text, cell.w, cell.style);
-            col += cell.w;
+            const new_col: usize = @as(usize, col) + @as(usize, cell.w);
+            col = if (new_col > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(new_col);
             if (col >= p.width) break;
         }
     }
@@ -8079,12 +8163,26 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
         const row = y0 + 2 + @as(u16, @intCast(i));
         const is_sel = ps.first_visible + i == ps.sel;
         if (is_sel) p.fillRange(x0 + 1, x0 + box_w - 1, row, " ", theme.selected);
-        var ib: [256]u8 = undefined;
-        const line_txt = if (it.desc.len > 0)
-            std.fmt.bufPrint(&ib, "{s}  {s}", .{ it.label, it.desc }) catch it.label
-        else
-            it.label;
-        _ = p.putText(x0 + 2, row, line_txt, if (is_sel) theme.selected else theme.text);
+        // The label is painted with the characters the FILTER matched in bold,
+        // and the description after it in the dim color: one `putText` for the
+        // whole row made the two look like one sentence, and the query the row
+        // matched was invisible (the filter found it, the eye could not).
+        var hbuf: [64]u32 = undefined;
+        const hn = fuzzy.highlightPositions(it.label, ps.query, &hbuf) orelse 0;
+        var after = putStyled(
+            p,
+            x0 + 2,
+            row,
+            it.label,
+            hbuf[0..hn],
+            if (is_sel) theme.selected else theme.text,
+            null,
+            0,
+        );
+        if (it.desc.len > 0) {
+            after = p.putText(after, row, "  ", if (is_sel) theme.selected else theme.dim);
+            _ = p.putText(after, row, it.desc, if (is_sel) theme.selected else theme.dim);
+        }
     }
 
     // footer
@@ -12421,6 +12519,65 @@ test "@ mention: the popup lists files AND is painted, and does not hide the one
         const ac_rows: u16 = @intCast(@min(m.ac.file_matches.items.len, m.ac.max_visible) + 1);
         try std.testing.expect(ac_rows >= @as(u16, @intCast(m.ac.max_visible)));
     }
+}
+
+test "@ mention: a name deep in the tree is found, ranked first, and its matched letters are BOLD" {
+    // The old popup listed ONE directory, read on every keystroke: `@fuzzy`
+    // answered nothing unless you happened to be standing in `src/lib/`, and
+    // going deeper meant typing the path by hand. The list is now the project
+    // index (`filesearch`), filtered and ranked by `fuzzy`, and the popup paints
+    // the characters the query reached in bold — with dozens of candidates, WHY
+    // a row is there has to be visible.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.attachIo(threaded.io());
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const io = std.testing.io;
+    const root = try std.fmt.allocPrint(a, ".zode-at-deep-{d}", .{std.testing.random_seed});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const deep = try std.fmt.allocPrint(a, "{s}/nested", .{root});
+    try std.Io.Dir.cwd().createDirPath(io, deep);
+    const file = try std.fmt.allocPrint(a, "{s}/needle_marker.zig", .{deep});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "pub const x = 1;\n" });
+
+    m.ed.clear();
+    _ = m.ed.insert("@needle") catch unreachable;
+    m.ed.setCursor(7);
+    syncAutocomplete(&m);
+
+    try std.testing.expectEqual(Autocomplete.Mode.file, m.ac.mode);
+    try std.testing.expect(m.ac.file_matches.items.len > 0);
+    // The basename wins over everything else that can hide "needle" as a
+    // subsequence: the ranking is what makes a 20 000-file index usable.
+    try std.testing.expect(std.mem.endsWith(u8, m.ac.file_matches.items[0], "needle_marker.zig"));
+
+    const surf = try drawTest(&m, arena_state.allocator(), 100, 24);
+    var rb: [256]u8 = undefined;
+    var found_row: ?u16 = null;
+    var hit_col: u16 = 0;
+    for (0..24) |r| {
+        const row = rowText(surf, @intCast(r), &rb);
+        const at = std.mem.indexOf(u8, row, "needle_marker") orelse continue;
+        found_row = @intCast(r);
+        hit_col = @intCast(at);
+        break;
+    }
+    try std.testing.expect(found_row != null);
+
+    // `n` of "needle" (the first matched byte) is painted with the bright
+    // accent and bold; the `/` before the name is not.
+    const hit = surf.readCell(hit_col, found_row.?);
+    try std.testing.expect(hit.style.bold);
+    try std.testing.expect(hit.style.fg != null);
+    try std.testing.expect(std.mem.eql(u8, &hit.style.fg.?.rgb, &theme.brand_hi.fg.?.rgb));
+    const dir_cell = surf.readCell(2, found_row.?);
+    try std.testing.expect(!dir_cell.style.bold);
 }
 
 test "timeline: a wrapped paragraph keeps a gutter on every continuation row" {
