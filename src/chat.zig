@@ -1044,6 +1044,7 @@ pub fn streamChatCtx(
     user_cb: Callbacks,
     kind: ProviderKind,
     mirror_globals: bool,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !StreamResult {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = user_cb, .kind = kind, .mirror_globals = mirror_globals };
@@ -1052,7 +1053,7 @@ pub fn streamChatCtx(
     // `destroy` is the one that frees them; a plain `gpa.destroy(ctx)` without
     // it leaked both on every 429/5xx.
     errdefer ctx.destroy();
-    try streamRaw(gpa, http, url, bearer, body, ctx);
+    try streamRaw(gpa, http, url, bearer, body, ctx, extra_headers);
     return .{ .ctx = ctx, .partial = ctx.partial };
 }
 
@@ -1063,6 +1064,7 @@ fn streamRaw(
     bearer: ?[]const u8,
     body: []u8,
     ctx: *StreamCtx,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !void {
     _ = gpa; // the parser lives in the ctx (line_buf)
     // Fresh per request: do not carry over fields from the previous turn.
@@ -1084,7 +1086,8 @@ fn streamRaw(
     }
 
     const Hdr = http_client.Http.ExtraHeader;
-    var hdrs_buf: [2]Hdr = undefined;
+    // Capacity: 2 for Anthropic (x-api-key, anthropic-version) + extra_headers
+    var hdrs_buf: [8]Hdr = undefined;
     var n: usize = 0;
     // Anthropic does not use Bearer: x-api-key + API version.
     var auth: ?[]const u8 = bearer;
@@ -1096,6 +1099,12 @@ fn streamRaw(
         hdrs_buf[n] = .{ .name = "anthropic-version", .value = "2023-06-01" };
         n += 1;
         auth = null;
+    }
+    // Append any extra headers (e.g., OpenRouter's HTTP-Referer, X-OpenRouter-Title)
+    for (extra_headers) |h| {
+        if (n >= hdrs_buf.len) break;
+        hdrs_buf[n] = h;
+        n += 1;
     }
 
     const Feed = struct {
@@ -1228,11 +1237,12 @@ pub fn streamChat(
     cb: Callbacks,
     kind: ProviderKind,
     mirror_globals: bool,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !void {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind, .mirror_globals = mirror_globals };
     defer ctx.destroy(); // frees parts and destroys the struct
-    try streamRaw(gpa, http, url, bearer, body, ctx);
+    try streamRaw(gpa, http, url, bearer, body, ctx, extra_headers);
 }
 
 /// `streamChat`, but the server's own error text comes back in a buffer the
@@ -1256,11 +1266,12 @@ pub fn streamChatDetail(
     kind: ProviderKind,
     mirror_globals: bool,
     err_out: *ErrBuf,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !void {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind, .mirror_globals = mirror_globals };
     defer ctx.destroy();
-    streamRaw(gpa, http, url, bearer, body, ctx) catch |err| {
+    streamRaw(gpa, http, url, bearer, body, ctx, extra_headers) catch |err| {
         err_out.* = ctx.err; // ErrBuf is a fixed-size struct: nothing to free here
         return err;
     };

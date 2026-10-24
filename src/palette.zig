@@ -1077,7 +1077,7 @@ fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) vo
     const fy = box.y + box.h - 2;
     const hint: []const u8 = switch (pal.mode) {
         .commands => "↑↓ move · enter run · esc close",
-        .models => "↑↓ move · tab switch · enter select",
+        .models => "↑↓ move · tab switch · enter select · ctrl+r refresh",
         .connect => "↑↓ move · enter add / replace key",
         .key_prompt => "",
     };
@@ -1210,6 +1210,8 @@ pub const Action = union(enum) {
     /// buffers: whoever receives the action must copy them BEFORE closing the
     /// palette.
     connect: struct { provider: []const u8, key: []const u8 },
+    /// Refresh the model list (invalidate cache and re-fetch).
+    refresh_models,
     /// Close.
     close,
 };
@@ -1287,6 +1289,10 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
             pal.col = 1;
             pal.refilter();
             return .{ .none = {} };
+        }
+        // Ctrl+R: refresh model list
+        if (key.matches('r', .{ .ctrl = true })) {
+            return .{ .refresh_models = {} };
         }
     }
 

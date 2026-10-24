@@ -4569,6 +4569,12 @@ pub const Model = struct {
                 try agent.applyModel(self, mo.id, mo.ctx_tokens);
                 return true;
             },
+            .refresh_models => {
+                self.closePalette();
+                self.invalidateCatalogRequest();
+                agent.openModelPaletteAsync(self);
+                return true;
+            },
             .connect => |conn| {
                 // Saving the key is I/O: the agent does it. The palette stays
                 // open so you can see the result.

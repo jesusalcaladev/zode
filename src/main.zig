@@ -191,6 +191,17 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{def.base_url}) catch def.base_url;
     const key = providers.keyFor(def, env);
 
+    // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+    var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+    var extra_hdrs_len: usize = 0;
+    if (std.mem.eql(u8, def.id, "openrouter")) {
+        extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+        extra_hdrs_len += 1;
+        extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+        extra_hdrs_len += 1;
+    }
+    const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -331,6 +342,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                         effort_pref,
                         cur[sum_from..upto],
                         arena,
+                        &.{},
                     )) |s| {
                         const note = try std.fmt.allocPrint(
                             arena,
@@ -375,7 +387,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         const result = chat.streamChatCtx(gpa, &http, url, key, @constCast(body), .{
             .userdata = null,
             .onDelta = Cb.onDelta,
-        }, kind, true) catch |err| {
+        }, kind, true, extra_headers) catch |err| {
             // The server's reason, for EVERY error and not only for a 5xx.
             //
             // A 401 is the case this matters most in and the one that used to

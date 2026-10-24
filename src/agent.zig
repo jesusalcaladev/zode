@@ -2727,6 +2727,23 @@ pub const TurnStats = struct {
             for (self.yolo_open.items) |q| self.gpa.free(q);
             self.yolo_open.deinit(self.gpa);
         }
+        // FORGET BOTH LISTS, and this is the half that was missing.
+        //
+        // `chatWorker` calls `reset()` at the start of every turn and
+        // `deinit()` in a `defer` at the end, so the sequence for the SECOND
+        // turn is deinit (turn 1) → reset → deinit AGAIN. Without these two
+        // lines the second `deinit` still saw `capacity > 0` over freed memory
+        // and freed the same pointers again — a double free that showed up as
+        // a general protection exception at `self.gpa.free(f)` in a WORKER
+        // thread, which is exactly the shape of the open crash this repo has
+        // been hunting: silent in ReleaseSmall, immediate in a debug build.
+        //
+        // Reproduced (2026-10-23) with two turns in one session, the second
+        // one after a turn that had written a file: `tools/stress_tui.py`.
+        // Only turns that TOUCHED a file (or asked a question) have a non-empty
+        // list, which is why it looked random instead of every second turn.
+        self.files = .empty;
+        self.yolo_open = .empty;
     }
 
     /// Records a question that nobody answered and nobody will.
@@ -5468,6 +5485,18 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             const sp = pickTarget(m);
             var surl_buf: [1024]u8 = undefined;
             const surl = targetUrl(&surl_buf, sp);
+
+            // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+            var sum_extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+            var sum_extra_hdrs_len: usize = 0;
+            if (std.mem.eql(u8, sp.def.id, "openrouter")) {
+                sum_extra_hdrs_buf[sum_extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+                sum_extra_hdrs_len += 1;
+                sum_extra_hdrs_buf[sum_extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+                sum_extra_hdrs_len += 1;
+            }
+            const sum_extra_headers = sum_extra_hdrs_buf[0..sum_extra_hdrs_len];
+
             if (summarizeTurns(
                 gpa,
                 &sum_http,
@@ -5480,6 +5509,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
                 chat.effectiveEffort(sp.model, current_effort),
                 comp.msgs[sum_from..upto],
                 arena,
+                sum_extra_headers,
             )) |summary| {
                 noteSummarized(iteration);
                 pushInfoFmt(m, "\u{b7} older turns summarized ({d} chars, was {d} messages)", .{
@@ -5647,6 +5677,17 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         // only set x-api-key `if (bearer) |k|`, and there was no k.
         const bearer: ?[]const u8 = pick.key;
 
+        // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+        var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+        var extra_hdrs_len: usize = 0;
+        if (std.mem.eql(u8, pick.def.id, "openrouter")) {
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+            extra_hdrs_len += 1;
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+            extra_hdrs_len += 1;
+        }
+        const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
+
         chat.streamChat(
             gpa,
             &http,
@@ -5661,6 +5702,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             },
             pick.kind,
             true, // the turn the user watches: publishes usage/errors/cancel
+            extra_headers,
         ) catch |err| {
             // The cheap router falls back BEFORE anything else touches the error,
             // because this is the one case where the failure is a fact about the
@@ -6945,6 +6987,18 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
         if (pick.key == null and pick.def.key_env.len > 0)
             return subagent_mod.refused("no api key for this provider", rep);
         const bearer: ?[]const u8 = pick.key;
+
+        // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+        var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+        var extra_hdrs_len: usize = 0;
+        if (std.mem.eql(u8, pick.def.id, "openrouter")) {
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+            extra_hdrs_len += 1;
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+            extra_hdrs_len += 1;
+        }
+        const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
+
         // `streamChatDetail` returns `void`: it owns the StreamCtx and destroys
         // it, and hands back the server's error text in `err_detail` on the way
         // out (the model fallback below needs the body, not just the status).
@@ -6969,6 +7023,7 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             // the user set with ESC.
             false,
             &err_detail,
+            extra_headers,
         ) catch |err| {
             cstate.deinit();
             // A cancelled subagent returns what it found, if anything. Treating
@@ -9272,6 +9327,7 @@ pub fn summarizeTurns(
     effort: chat.Effort,
     msgs: []chat.ChatMessage,
     arena: std.mem.Allocator,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) ?[]const u8 {
     var ast = std.heap.ArenaAllocator.init(gpa);
     defer ast.deinit();
@@ -9303,7 +9359,7 @@ pub fn summarizeTurns(
     };
     // Not the user's turn: its usage is not the turn's, and its errors are not
     // the turn's either.
-    chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind, false) catch |err| {
+    chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind, false, extra_headers) catch |err| {
         models_mod.dbg("[compaction] el resumen fallo: {t}\n", .{err});
         return null;
     };
