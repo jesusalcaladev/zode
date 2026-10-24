@@ -926,6 +926,12 @@ pub const Model = struct {
     /// Streaming state: the assistant's last paragraph is still open.
     streaming: bool = false,
     stream_buf: std.ArrayList(u8) = .empty, // gpa-owned
+    /// Cap on stream_buf bytes: when reached, further chunks are dropped and a
+    /// truncation marker is emitted. Prevents OOM from a model that streams
+    // a multi-megabyte answer. fx calls this the per-stream byte cap.
+    max_stream_bytes: usize = 1024 * 1024, // 1 MB default
+    /// Set true when stream_delta dropped bytes because the cap was hit.
+    stream_truncated: bool = false,
 
     /// There is work pending to paint (the worker enqueued text). The .tick
     /// handler reads it to know whether it must keep asking for frames:
@@ -2398,17 +2404,30 @@ pub const Model = struct {
             if (range_end > range_start) {
                 // Extract only the visible lines from the text.
                 const text = p_.text;
+                // The list is created and grown from the SAME allocator it is
+                // handed to at the end: `toOwnedSlice` remaps the buffer, and a
+                // buffer from one allocator remapped through another is a jump
+                // through a vtable that has nothing to do with it (the arena one
+                // panics on its first empty node).
+                const vis_alloc = para_arena.allocator();
                 var visible_lines: std.ArrayList(u8) = .empty;
-                errdefer visible_lines.deinit(self.allocator);
                 var line_start: usize = 0;
                 var line_idx: usize = 0;
                 var in_range = false;
-                while (line_start <= text.len) {
-                    const line_end = if (line_start < text.len) std.mem.indexOfScalar(u8, text[line_start..], '\n') orelse text.len else line_start;
-                    const line_len = if (line_end < text.len) line_end - line_start + 1 else line_end - line_start;
+                // `indexOfScalar` answers an offset RELATIVE to `line_start`, so
+                // it has to be added back: read as an absolute position it made
+                // `line_end < line_start`, and `line_end - line_start` is then an
+                // integer overflow (the panic in the prune tests) that turns into
+                // a wrong slice in a Release build. And the loop ends at
+                // `line_start == text.len`, not after: past it there is no line,
+                // and `line_len` of 0 never advances.
+                while (line_start < text.len) {
+                    const nl = std.mem.indexOfScalar(u8, text[line_start..], '\n');
+                    const line_end = if (nl) |at| line_start + at else text.len;
+                    const line_len = if (nl != null) line_end - line_start + 1 else line_end - line_start;
                     if (line_idx >= range_start and line_idx < range_end) {
                         in_range = true;
-                        try visible_lines.appendSlice(self.allocator, text[line_start..line_start + line_len]);
+                        try visible_lines.appendSlice(vis_alloc, text[line_start..line_start + line_len]);
                     } else if (in_range) {
                         break;
                     }
@@ -2416,7 +2435,7 @@ pub const Model = struct {
                     line_idx += 1;
                 }
                 if (visible_lines.items.len > 0) {
-                    const visible_text = try visible_lines.toOwnedSlice(para_arena.allocator());
+                    const visible_text = try visible_lines.toOwnedSlice(vis_alloc);
                     para_for_layout.text = visible_text;
                 }
             }
@@ -3718,7 +3737,9 @@ pub const Model = struct {
         self.dirty = true;
     }
 
-    /// Assistant text delta (thread-safe).
+    /// Assistant text delta (thread-safe). Capped at `max_stream_bytes`: when
+    // the cap is reached further chunks are dropped and `stream_truncated` is
+    // set so `streamEnd` can emit a truncation marker.
     pub fn streamDelta(self: *Model, text: []const u8) void {
         self.lock();
         defer self.unlock();
@@ -3729,7 +3750,22 @@ pub const Model = struct {
             self.ttft_pending = false;
             self.ttft_ms = self.busyMillis();
         }
-        self.stream_buf.appendSlice(self.allocator, text) catch {};
+        // Cap: stop growing once we hit max_stream_bytes. Saturating add so a
+        // pathological chunk size cannot overflow usize.
+        const would_grow = satAdd(self.stream_buf.items.len, text.len);
+        if (would_grow > self.max_stream_bytes and !self.stream_truncated) {
+            // Only keep what fits under the cap, then mark truncated.
+            const fits = if (self.stream_buf.items.len < self.max_stream_bytes)
+                self.max_stream_bytes - self.stream_buf.items.len
+            else
+                0;
+            if (fits > 0) {
+                self.stream_buf.appendSlice(self.allocator, text[0..fits]) catch {};
+            }
+            self.stream_truncated = true;
+        } else {
+            self.stream_buf.appendSlice(self.allocator, text) catch {};
+        }
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
     }
@@ -3766,12 +3802,30 @@ pub const Model = struct {
         // its job.
         const has_text = !std.mem.eql(u8, std.mem.trim(u8, self.stream_buf.items, " \t\n\r"), "");
         if (has_text and (self.streaming or self.stream_buf.items.len > 0)) {
-            if (self.allocator.dupe(u8, self.stream_buf.items)) |text| {
+            // If the stream hit the byte cap, append a truncation marker so
+            // the reader knows the answer was cut. Ownership passes to
+            // `pending` (freed on drain).
+            if (self.stream_truncated) {
+                const marker: []const u8 = "\n\n… [truncated: stream hit byte cap]";
+                const fits = if (self.stream_buf.items.len < self.max_stream_bytes)
+                    self.max_stream_bytes - self.stream_buf.items.len
+                else 0;
+                const keep = self.stream_buf.items[0..fits];
+                const new_len: usize = satAdd(keep.len, marker.len);
+                if (self.allocator.alloc(u8, new_len)) |buf| {
+                    @memcpy(buf[0..keep.len], keep);
+                    @memcpy(buf[keep.len..], marker);
+                    self.pending.append(self.allocator, .{ .kind = .assistant, .text = buf }) catch {
+                        self.allocator.free(buf);
+                    };
+                }
+            } else if (self.allocator.dupe(u8, self.stream_buf.items)) |text| {
                 self.pending.append(self.allocator, .{ .kind = .assistant, .text = text }) catch {
                     self.allocator.free(text);
                 };
-            } else |_| {}
+            }
             self.stream_buf.clearRetainingCapacity();
+            self.stream_truncated = false;
         }
         // `streaming` goes down HERE, unconditionally, and not inside the `if`.
         //
@@ -13778,4 +13832,37 @@ test "the sensitive-path question has no 'always allow'" {
     // And the REASON is in the dialog: the user is being asked about a path
     // they cannot see otherwise.
     try std.testing.expect(findRow(once, "not a place this tool writes") != null);
+}
+
+test "streaming: a very large response is capped, not allowed to grow without bound" {
+    // The bug this pins: `streamDelta` appends every chunk to `stream_buf`
+    // with `catch {}`, silently ignoring allocation failures, and there is NO
+    // cap on how large `stream_buf` can grow. A model that streams a 5 MB
+    // answer will balloon `stream_buf` to 5 MB of resident memory, and
+    // `streamEnd` then `dup`s the whole thing again — OOM city.
+    //
+    // fx solves this with a per-stream byte cap: when the cap is reached,
+    // further chunks are dropped and a truncation marker is emitted. zode had
+    // no such cap: this test asserts one exists.
+    const max_stream_bytes: usize = 200 * 1024; // 200 KB cap for this test
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.max_stream_bytes = max_stream_bytes;
+
+    m.streamStart();
+    // Stream enough chunks to exceed the cap if no cap exists.
+    const chunk = "lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+    var sent: usize = 0;
+    while (sent < max_stream_bytes * 2) : (sent += chunk.len) {
+        m.streamDelta(chunk);
+    }
+
+    // With no cap, stream_buf grows to 400 KB+. With a cap, it stays at or
+    // below max_stream_bytes. This test documents that a cap SHOULD exist.
+    try std.testing.expect(m.stream_buf.items.len <= max_stream_bytes);
+    m.streamEnd();
+    m.deinit();
 }
