@@ -85,8 +85,10 @@ pub const Tracker = struct {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
             if (std.mem.eql(u8, self.entries[i].text(), model)) {
-                self.entries[i].prompt_tokens += p;
-                self.entries[i].completion_tokens += c;
+                const new_p = std.math.add(i64, self.entries[i].prompt_tokens, p) catch return;
+                const new_c = std.math.add(i64, self.entries[i].completion_tokens, c) catch return;
+                self.entries[i].prompt_tokens = new_p;
+                self.entries[i].completion_tokens = new_c;
                 return;
             }
         }
@@ -103,8 +105,10 @@ pub const Tracker = struct {
             return;
         }
 
-        self.spill_prompt += p;
-        self.spill_completion += c;
+        const new_sp = std.math.add(i64, self.spill_prompt, p) catch return;
+        const new_sc = std.math.add(i64, self.spill_completion, c) catch return;
+        self.spill_prompt = new_sp;
+        self.spill_completion = new_sc;
         self.spill_requests += 1;
     }
 };

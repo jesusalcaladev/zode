@@ -6495,6 +6495,86 @@ fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
 /// the only green in the bottom third of the screen and it is always where the
 /// caret is, which is the entire job.
 ///
+/// Input display text: if the buffer is longer than `max_display_bytes`, show
+/// the head, then `... +N more`, then the tail. Image file paths are shown as
+/// `[image.{ext}]`. The FULL text stays in the editor buffer for sending.
+/// Returns an arena-owned slice; caller must not free (arena lives for frame).
+fn inputDisplayText(arena: std.mem.Allocator, text: []const u8, max_display_bytes: usize) []const u8 {
+    if (text.len == 0) return "";
+
+    // Detect image file paths and replace with [image.{ext}].
+    // A path is an image if it ends with a known image extension.
+    const image_exts = [_][]const u8{ "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "tiff" };
+    var has_image: bool = false;
+    var processed: []const u8 = text;
+    var processed_buf: []u8 = undefined;
+    var processed_allocated: bool = false;
+
+    // Simple image detection: look for known extensions at word boundaries.
+    // If found, replace the whole path token with [image.ext].
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        // A token starts at a non-space char.
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            try out.append(arena, c);
+            i += 1;
+            continue;
+        }
+        // Find end of token.
+        var j = i;
+        while (j < text.len and text[j] != ' ' and text[j] != '\t' and text[j] != '\n' and text[j] != '\r') j += 1;
+        const token = text[i..j];
+        // Check if token ends with an image extension.
+        var matched_ext: ?[]const u8 = null;
+        for (image_exts) |ext| {
+            if (token.len > ext.len + 1 and std.mem.endsWithIgnoreCase(u8, token, ext)) {
+                matched_ext = ext;
+                break;
+            }
+        }
+        if (matched_ext) |ext| {
+            has_image = true;
+            const tag = try std.fmt.allocPrint(arena, "[image.{s}]", .{ext});
+            try out.appendSlice(arena, tag);
+            arena.free(tag);
+        } else {
+            try out.appendSlice(arena, token);
+        }
+        i = j;
+    }
+
+    if (out.items.len > 0) {
+        processed_allocated = true;
+        processed_buf = try out.toOwnedSlice(arena);
+        processed = processed_buf;
+    }
+
+    // Truncate if longer than max_display_bytes.
+    if (processed.len <= max_display_bytes) {
+        if (processed_allocated) arena.free(processed_buf);
+        return processed;
+    }
+
+    // Show head + "... +N more" + tail.
+    const head_len: usize = max_display_bytes / 2 - 10;
+    const tail_len: usize = max_display_bytes / 2 - 10;
+    const skipped: usize = processed.len - head_len - tail_len;
+    const head = processed[0..head_len];
+    const tail = processed[processed.len - tail_len..];
+
+    const head_and_marker = try std.fmt.allocPrint(arena, "{s}… +{d} more", .{head, skipped});
+    const result_len = head_and_marker.len + tail.len;
+    const result_buf = try arena.alloc(u8, result_len);
+    @memcpy(result_buf[0..head_and_marker.len], head_and_marker);
+    @memcpy(result_buf[head_and_marker.len..], tail);
+
+    if (processed_allocated) arena.free(processed_buf);
+
+    return result_buf;
+}
+
 /// The terminal cursor is anchored at the real editor position.
 fn drawInput(
     p: *Painter,
