@@ -5421,7 +5421,7 @@ fn withMentions(
     }
     const li = last orelse return msgs;
 
-    const exp = mentions.expand(arena, io_global, msgs[li].content) catch return msgs;
+    const exp = mentions.expand(io_global, msgs[li].content) catch return msgs;
     if (exp.files == 0) return msgs;
     count.files = exp.files;
     count.missing = exp.missing;

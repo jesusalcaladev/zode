@@ -138,7 +138,7 @@ pub fn highlightMatch(label: []const u8, positions: []const u32, n: usize) []con
     return label;
 }
 
-pub fn expand(allocator: std.mem.Allocator, io: std.Io, text: []const u8) !Expansion {
+pub fn expand(io: std.Io, text: []const u8) !Expansion {
     const scan_result = try scan(text);
 
     var loaded_paths: [max_files][32]u8 = undefined;
@@ -150,7 +150,6 @@ pub fn expand(allocator: std.mem.Allocator, io: std.Io, text: []const u8) !Expan
     var file_texts: [max_files][]const u8 = undefined;
     var missing_count: u8 = 0;
 
-    var file_handles: [max_files]std.Io.File = undefined;
     var handle_count: usize = 0;
 
     for (0..max_to_load) |i| {
@@ -173,12 +172,10 @@ pub fn expand(allocator: std.mem.Allocator, io: std.Io, text: []const u8) !Expan
             continue;
         }
 
-        var data: []const u8 = undefined;
-        try {
-            data = file.readAll(io);
-        } catch {
+        const data = file.readAll(io) catch {
             missing_count += 1;
-        }
+            continue;
+        };
 
         if (handle_count < max_files) {
             file_texts[handle_count] = data;
