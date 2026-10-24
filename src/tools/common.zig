@@ -31,15 +31,15 @@ pub fn getBool(obj: std.json.ObjectMap, key: []const u8) bool {
     };
 }
 
-/// The per-tool output budget, in bytes. Defaults to 10 MB.
+/// The per-tool output budget, in bytes. Defaults to 1 MB.
 ///
 /// Read once at startup from `ZODE_MAX_TOOL_OUTPUT`, which accepts bare numbers
 /// and the suffixes `K`, `M`, `G` (case-insensitive, e.g. `5M`, `1G`, `512K`).
 ///
 /// There is also a hard cap (`max_tool_output_hard_cap`) so a runaway command
 /// cannot exhaust memory: if the env value exceeds it, the cap wins.
-pub var max_tool_output: usize = 10 * 1024 * 1024;
-pub var max_tool_output_hard_cap: usize = 100 * 1024 * 1024;
+pub var max_tool_output: usize = 1 * 1024 * 1024;
+pub var max_tool_output_hard_cap: usize = 10 * 1024 * 1024;
 
 /// Read `ZODE_MAX_TOOL_OUTPUT` from the environment and install it as the
 /// per-tool budget. Safe to call once at startup; calling it again overwrites

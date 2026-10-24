@@ -520,7 +520,8 @@ fn wrapCellsGutter(
                     }
                 }
             }
-            try appendContinuation(pa, lines, cells[start..split], @intCast(line_used), if (first) 0 else ind_w, if (first) null else gutter);
+            const safe_line_used: u16 = if (line_used > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(line_used);
+            try appendContinuation(pa, lines, cells[start..split], safe_line_used, if (first) 0 else ind_w, if (first) null else gutter);
             start = split;
             first = false;
             used = 0;
@@ -532,7 +533,8 @@ fn wrapCellsGutter(
             // continuation row. Keep the same hard-wrap guarantee in that case.
             const cw_next: usize = @intCast(@min(c.w, next_limit));
             if (used > 0 and used + cw_next > next_limit) {
-                try appendContinuation(pa, lines, cells[start..i], @intCast(used), ind_w, gutter);
+                const safe_used: u16 = if (used > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(used);
+                try appendContinuation(pa, lines, cells[start..i], safe_used, ind_w, gutter);
                 start = i;
                 used = 0;
             }
@@ -543,7 +545,8 @@ fn wrapCellsGutter(
             break_width = used;
         }
     }
-    try appendContinuation(pa, lines, cells[start..], @intCast(used), if (first) 0 else ind_w, if (first) null else gutter);
+    const safe_used_final: u16 = if (used > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(used);
+    try appendContinuation(pa, lines, cells[start..], safe_used_final, if (first) 0 else ind_w, if (first) null else gutter);
 }
 
 /// Appends a line to the array, with `pad` indent columns at the start.
@@ -575,7 +578,10 @@ fn appendContinuation(
     try out.appendSlice(pa, cells);
     const pad_w: usize = @intCast(pad);
     const final_w: usize = used + pad_w;
-    try lines.append(pa, .{ .cells = out.items, .w = @intCast(final_w) });
+    // Saturate to u16 max so a pathological line (no spaces, very wide) does not
+    // integer-overflow when casting the PLine width field.
+    const safe_w: u16 = if (final_w > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(final_w);
+    try lines.append(pa, .{ .cells = out.items, .w = safe_w });
 }
 
 /// The columns a diff row's wrapped rows have to be indented by.
@@ -1335,7 +1341,9 @@ pub const Model = struct {
 
     /// Max paragraphs with cells in memory at once (the ones outside the
     /// window are re-parsed when you look at them again).
-    const max_cached_paras = 128;
+    /// Kept small (64) so a session with long tool outputs does not OOM:
+    /// 64 × 1 MB cap = 64 MB worst case, not 128 × 10 MB = 1.28 GB.
+    const max_cached_paras = 64;
 
     const SelectionPoint = struct { row: u16, col: u16 };
     /// Range of absolute history lines that are visible on screen for a paragraph.

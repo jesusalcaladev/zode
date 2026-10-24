@@ -350,7 +350,7 @@ const Native = union(enum) {
 /// (`error.StreamTooLong`). The old limit was 16 KB — the same size as the
 /// tool budget — so every search with a big answer lost it and fell through to
 /// a different engine.
-pub var grep_capture: usize = 10 * 1024 * 1024;
+pub var grep_capture: usize = 1 * 1024 * 1024;
 
 /// Read `ZODE_MAX_TOOL_OUTPUT` and install it as `grep_capture`. Safe to call
 /// once at startup.
@@ -377,7 +377,7 @@ pub fn initGrepCapture(env: ?*const std.process.Environ.Map) void {
     }
 
     var wanted = n * mult;
-    const hard_cap = 100 * 1024 * 1024;
+    const hard_cap = 10 * 1024 * 1024;
     if (wanted > hard_cap) wanted = hard_cap;
     grep_capture = wanted;
 }
