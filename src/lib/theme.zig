@@ -254,6 +254,7 @@ pub const rule_old = line;
 // panel yet. `code_bg` was the old name for a modal's interior and it pointed
 // at the same value `panel_bg` does.
 pub const code_bg = panel_bg;
+pub const code_border: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x5a, 0x58, 0x55 } } };
 pub const input_text = ink;
 pub const warn_bold: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xf5, 0xa5, 0x24 } } };
 /// A palette group heading. Bold `ink2`: a LABEL, one step above the items and
