@@ -25,6 +25,7 @@ const models_mod = @import("lib/models.zig");
 const modelcache = @import("lib/modelcache.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 const copytext = @import("lib/copytext.zig");
+const fuzzy = @import("lib/fuzzy.zig");
 
 /// The kind of the status: what color the face is and what phase the app is in.
 /// Replaces `StatusKind`; lives here so `agent.zig` can reference it as
@@ -251,6 +252,9 @@ pub const PickerCbIdx = *const fn (*Model, tag: u32, index: usize) void;
 /// choice.
 pub const PickerCancelCb = *const fn (*Model, tag: u32) void;
 
+/// Tag for the sessions picker (used for footer hint).
+pub const sessions_picker_tag: u32 = 99;
+
 /// Immutable copy of the picker state for drawing (frame memory).
 const PickerSnapshot = struct {
     title: []const u8,
@@ -258,6 +262,7 @@ const PickerSnapshot = struct {
     sel: usize,
     first_visible: usize,
     total: usize,
+    tag: u32,
     items: []PickerItem,
 };
 
@@ -495,15 +500,15 @@ fn wrapCellsGutter(
     }
     const ind_w: u16 = @min(indent, @max(width -| 1, 1));
     var start: usize = 0;
-    var used: u16 = 0; // columns USED by real cells
+    var used: usize = 0; // columns USED by real cells (usize to avoid u16 overflow)
     var first = true;
     var break_after: ?usize = null;
-    var break_width: u16 = 0;
+    var break_width: usize = 0;
     for (cells, 0..) |c, i| {
         // The limit of a continuation is the width MINUS the indent, because
         // the indent occupies real columns.
-        const limit: u16 = if (first) @max(width, 1) else @max(width - ind_w, 1);
-        const cw: u16 = @min(c.w, @max(limit, 1));
+        const limit: usize = @intCast(if (first) @max(width, 1) else @max(width - ind_w, 1));
+        const cw: usize = @intCast(@min(c.w, @max(limit, 1)));
         if (used > 0 and used + cw > limit) {
             var split = i;
             var line_used = used;
@@ -515,18 +520,19 @@ fn wrapCellsGutter(
                     }
                 }
             }
-            try appendContinuation(pa, lines, cells[start..split], line_used, if (first) 0 else ind_w, if (first) null else gutter);
+            try appendContinuation(pa, lines, cells[start..split], @intCast(line_used), if (first) 0 else ind_w, if (first) null else gutter);
             start = split;
             first = false;
             used = 0;
-            const next_limit = @max(width - ind_w, 1);
-            for (cells[split..i]) |tail| used += @min(tail.w, next_limit);
+            const next_limit: usize = @intCast(@max(width - ind_w, 1));
+            for (cells[split..i]) |tail| used += @intCast(@min(tail.w, next_limit));
             break_after = null;
 
             // A long word can fit on the unindented first row but not on a
             // continuation row. Keep the same hard-wrap guarantee in that case.
-            if (used > 0 and used + @min(c.w, next_limit) > next_limit) {
-                try appendContinuation(pa, lines, cells[start..i], used, ind_w, gutter);
+            const cw_next: usize = @intCast(@min(c.w, next_limit));
+            if (used > 0 and used + cw_next > next_limit) {
+                try appendContinuation(pa, lines, cells[start..i], @intCast(used), ind_w, gutter);
                 start = i;
                 used = 0;
             }
@@ -537,7 +543,7 @@ fn wrapCellsGutter(
             break_width = used;
         }
     }
-    try appendContinuation(pa, lines, cells[start..], used, if (first) 0 else ind_w, if (first) null else gutter);
+    try appendContinuation(pa, lines, cells[start..], @intCast(used), if (first) 0 else ind_w, if (first) null else gutter);
 }
 
 /// Appends a line to the array, with `pad` indent columns at the start.
@@ -567,7 +573,9 @@ fn appendContinuation(
         try out.append(pa, .{ .text = text, .w = 1, .style = cell_style });
     }
     try out.appendSlice(pa, cells);
-    try lines.append(pa, .{ .cells = out.items, .w = used + pad });
+    const pad_w: usize = @intCast(pad);
+    const final_w: usize = used + pad_w;
+    try lines.append(pa, .{ .cells = out.items, .w = @intCast(final_w) });
 }
 
 /// The columns a diff row's wrapped rows have to be indented by.
@@ -1202,6 +1210,10 @@ pub const Model = struct {
     picker_cb_idx: ?PickerCbIdx = null,
     /// Called when the picker is closed with ESC.
     picker_cancel_cb: ?PickerCancelCb = null,
+    /// Called when F2 is pressed on a picker item (for renaming).
+    picker_rename_cb: ?PickerCb = null,
+    /// The session path being renamed (for the sessions picker).
+    picker_rename_target: ?[]u8 = null,
 
     // ── `/copy` ──────────────────────────────────────────────────────────
     //
@@ -1237,6 +1249,16 @@ pub const Model = struct {
     /// kill.
     layout_iters: usize = 0,
     layout_overflow: bool = false,
+    /// Monotonically increasing frame counter for LRU cache eviction.
+    frame_counter: u64 = 0,
+    /// Differential render tracking: first visible line of previous frame.
+    diff_last_first: usize = 0,
+    /// Differential render tracking: last visible line of previous frame.
+    diff_last_last: usize = 0,
+    /// Differential render tracking: whether the live paragraph was active last frame.
+    diff_last_live_active: bool = false,
+    /// Differential render tracking: forces a full redraw of history (first frame or after scroll).
+    diff_needs_full_redraw: bool = true,
 
     environ: ?*const std.process.Environ.Map = null,
     /// The model the footer shows, resolved ONCE and cached here.
@@ -1307,6 +1329,8 @@ pub const Model = struct {
         /// worse — the `while (cache.len < paras.len)` loop had no way to
         /// terminate (see `layoutWindow`).
         para_idx: usize,
+        /// Last frame this entry was accessed (for LRU eviction).
+        last_frame_used: u64 = 0,
     };
 
     /// Max paragraphs with cells in memory at once (the ones outside the
@@ -1314,6 +1338,8 @@ pub const Model = struct {
     const max_cached_paras = 128;
 
     const SelectionPoint = struct { row: u16, col: u16 };
+    /// Range of absolute history lines that are visible on screen for a paragraph.
+    const VisibleRange = struct { start: usize, end: usize };
 
     const Para = struct {
         kind: md.Kind,
@@ -1661,6 +1687,26 @@ pub const Model = struct {
         self.picker_cb = null;
         self.picker_cb_idx = cb;
         self.picker_cancel_cb = cancel;
+        self.picker_rename_cb = null;
+        self.unlock();
+    }
+
+    /// Opens the picker with a rename callback (for F2).
+    pub fn openPickerIdxRename(
+        self: *Model,
+        tag: u32,
+        title: []const u8,
+        items: []PickerItem,
+        cb: PickerCbIdx,
+        cancel: ?PickerCancelCb,
+        rename: PickerCb,
+    ) void {
+        self.openPickerInner(tag, title, items);
+        self.lock();
+        self.picker_cb = null;
+        self.picker_cb_idx = cb;
+        self.picker_cancel_cb = cancel;
+        self.picker_rename_cb = rename;
         self.unlock();
     }
 
@@ -1695,6 +1741,11 @@ pub const Model = struct {
         self.picker_cb = null;
         self.picker_cb_idx = null;
         self.picker_cancel_cb = null;
+        self.picker_rename_cb = null;
+        if (self.picker_rename_target) |t| {
+            self.allocator.free(t);
+            self.picker_rename_target = null;
+        }
         for (self.picker_items.items) |it| {
             self.allocator.free(it.label);
             if (it.desc.len > 0) self.allocator.free(it.desc);
@@ -1749,8 +1800,9 @@ pub const Model = struct {
         // caller holds lock
         const q = self.picker_query[0..self.picker_query_len];
         self.picker_filtered.clearRetainingCapacity();
+        var buf: [128]u32 = undefined;
         for (self.picker_items.items, 0..) |it, ix| {
-            if (q.len == 0 or containsIgnoreCase(it.label, q)) {
+            if (q.len == 0 or fuzzy.highlightPositions(it.label, q, &buf) != null) {
                 self.picker_filtered.append(self.allocator, ix) catch {};
             }
         }
@@ -1804,6 +1856,26 @@ pub const Model = struct {
                 self.unlock();
                 self.closePicker();
                 if (cancel) |f| f(self, tag);
+                return true;
+            },
+            57365 => { // F2: rename
+                const rename_cb = self.picker_rename_cb;
+                const ix = if (self.picker_sel < self.picker_filtered.items.len)
+                    self.picker_filtered.items[self.picker_sel]
+                else
+                    null;
+                if (rename_cb) |f| {
+                    if (ix) |i| {
+                        const label = self.allocator.dupe(u8, self.picker_items.items[i].label) catch null;
+                        if (label) |l| {
+                            self.unlock();
+                            f(self, self.picker_tag, l);
+                            self.allocator.free(l);
+                            return true;
+                        }
+                    }
+                }
+                self.unlock();
                 return true;
             },
             127, 8 => { // backspace
@@ -1869,6 +1941,7 @@ pub const Model = struct {
             .sel = self.picker_sel,
             .first_visible = start,
             .total = total,
+            .tag = self.picker_tag,
             .items = items,
         };
     }
@@ -2245,17 +2318,30 @@ pub const Model = struct {
     fn estHeight(self: *const Model, text: []const u8) usize {
         const per_line: usize = @intCast(self.wrap_w);
         const nl = std.mem.count(u8, text, "\n");
-        const wrapped = (text.len -| nl) / per_line;
+        const wrapped = if (per_line > 0) (text.len -| nl) / per_line else 0;
         // A fence costs three rows the line count cannot see: a blank row, the
         // language chip and another blank row. Counting them here is what stops
         // the scroll range from growing as you scroll down through a history
         // full of code.
         const fences = std.mem.count(u8, text, "```") + std.mem.count(u8, text, "~~~");
-        return @max(1, nl + 1 + wrapped + 3 * fences);
+        // Wrapping arithmetic: UI layout tolerates approximate values, but not a panic.
+        const fence_cost: usize = 3 * fences;
+        return @max(1, nl + 1 + wrapped + fence_cost);
     }
 
     /// Parses and wraps a paragraph, and puts it in the cache with its height.
-    fn layoutOne(self: *Model, ctx: vxfw.DrawContext, idx: usize, width: u16) !void {
+    ///
+    /// When `visible_range` is provided (lazy parsing for very long paragraphs),
+    /// only the lines whose absolute positions fall within `[start, end)` are
+    /// wrapped. The paragraph's height is set to the full estimate so scroll
+    /// math stays correct, but only visible lines consume render memory.
+    fn layoutOne(
+        self: *Model,
+        ctx: vxfw.DrawContext,
+        idx: usize,
+        width: u16,
+        visible_range: ?Model.VisibleRange,
+    ) !void {
         const p_ = &self.paras.items[idx];
 
         const para_arena = try self.allocator.create(std.heap.ArenaAllocator);
@@ -2267,7 +2353,42 @@ pub const Model = struct {
 
         // Rehydrate if the paragraph was pruned to its compressed form.
         _ = p_.textLive(self.allocator);
-        var lines = try buildLinesBase(para_arena.allocator(), ctx, &self.paras.items[idx], width);
+
+        // ── Lazy parsing: for very long paragraphs, only wrap visible lines ──
+        var para_for_layout = self.paras.items[idx];
+        if (visible_range) |vr| {
+            const para_start = self.heightPrefix(idx);
+            const para_end = self.heightPrefix(idx + 1);
+            // Clamp the requested range to this paragraph's actual lines.
+            const range_start = @max(vr.start, para_start);
+            const range_end = @min(vr.end, para_end);
+            if (range_end > range_start) {
+                // Extract only the visible lines from the text.
+                const text = p_.text;
+                var visible_lines: std.ArrayList(u8) = .empty;
+                errdefer visible_lines.deinit(self.allocator);
+                var line_start: usize = 0;
+                var line_idx: usize = 0;
+                var in_range = false;
+                while (line_start <= text.len) {
+                    const line_end = if (line_start < text.len) std.mem.indexOfScalar(u8, text[line_start..], '\n') orelse text.len else line_start;
+                    const line_len = if (line_end < text.len) line_end - line_start + 1 else line_end - line_start;
+                    if (line_idx >= range_start and line_idx < range_end) {
+                        in_range = true;
+                        try visible_lines.appendSlice(self.allocator, text[line_start..line_start + line_len]);
+                    } else if (in_range) {
+                        break;
+                    }
+                    line_start += line_len;
+                    line_idx += 1;
+                }
+                if (visible_lines.items.len > 0) {
+                    const visible_text = try visible_lines.toOwnedSlice(para_arena.allocator());
+                    para_for_layout.text = visible_text;
+                }
+            }
+        }
+        var lines = try buildLinesBase(para_arena.allocator(), ctx, &para_for_layout, width);
         // A blank row BETWEEN paragraphs: without it the history is a wall of
         // text and you can't see where one response ends and another begins.
         //
@@ -2464,12 +2585,34 @@ pub const Model = struct {
         self.ensureParaHeights();
         self.layout_iters = 0;
         self.layout_overflow = false;
+        self.frame_counter += 1;
         if (self.paras.items.len == 0) return;
 
         // ── target window: the paragraphs covering [first, last] ──
         var lo = self.heightIndexAt(first_visible);
         var hi = self.heightLowerBound(last_visible);
         if (hi < lo) hi = lo;
+
+        // ── VIRTUAL SCROLL: compute how many paragraphs actually fit in history_h ──
+        // Instead of parsing every paragraph in [lo, hi), we only parse the ones
+        // that can actually appear on screen. `para_heights` has the height of
+        // every paragraph (estimate or exact), so we can walk from `first_visible`
+        // and count how many paragraphs fit before exceeding `history_h` rows.
+        const viewport_rows = last_visible - first_visible;
+        var visible_para_count: usize = 0;
+        var lines_used: usize = 0;
+        var p = lo;
+        while (p < self.para_heights.items.len and lines_used < viewport_rows) {
+            lines_used += self.para_heights.items[p];
+            visible_para_count += 1;
+            p += 1;
+        }
+        // Cap the window to what fits on screen, plus one paragraph for context.
+        if (visible_para_count > 0) {
+            hi = lo + visible_para_count;
+            if (hi > self.para_heights.items.len) hi = self.para_heights.items.len;
+        }
+
         // If the visible window is wider than the cap, we must choose which
         // paragraphs to keep in the cache. When at the bottom (follow_bottom),
         // keep the tail so new arriving text is cached. When scrolled up, keep
@@ -2490,6 +2633,8 @@ pub const Model = struct {
             if (idx < lo or idx >= hi) {
                 self.evictCached(i);
             } else {
+                // Mark as recently used for LRU.
+                self.seg_cache.items[i].last_frame_used = self.frame_counter;
                 i += 1;
             }
         }
@@ -2497,6 +2642,21 @@ pub const Model = struct {
 
         // ── prune: compress what is outside the window ──
         self.pruneCold(lo, hi);
+
+        // ── LRU: if cache is full, evict the least recently used entry ──
+        while (self.seg_cache.items.len > Model.max_cached_paras) {
+            var lru_idx: usize = 0;
+            var lru_frame: u64 = self.frame_counter;
+            var j: usize = 0;
+            while (j < self.seg_cache.items.len) {
+                if (self.seg_cache.items[j].last_frame_used < lru_frame) {
+                    lru_frame = self.seg_cache.items[j].last_frame_used;
+                    lru_idx = j;
+                }
+                j += 1;
+            }
+            self.evictCached(lru_idx);
+        }
 
         // ── parse whatever is missing in the window ──
         for (lo..hi) |idx| {
@@ -2510,7 +2670,37 @@ pub const Model = struct {
                 self.layout_overflow = true;
                 return;
             }
-            try self.layoutOne(ctx, idx, width);
+            // ── Lazy parsing: for very long paragraphs, only wrap visible lines ──
+            const para_est_h = self.para_heights.items[idx];
+            const para_start = self.heightPrefix(idx);
+            const para_end = self.heightPrefix(idx + 1);
+            var visible_range: ?Model.VisibleRange = null;
+            if (para_est_h > 50) {
+                visible_range = Model.VisibleRange{
+                    .start = @max(first_visible, para_start),
+                    .end = @min(last_visible, para_end),
+                };
+            }
+            try self.layoutOne(ctx, idx, width, visible_range);
+            // Mark as recently used.
+            if (self.seg_cache.items.len > 0) {
+                self.seg_cache.items[self.seg_cache.items.len - 1].last_frame_used = self.frame_counter;
+            }
+            // When lazy-parsing, lines.len is only the visible subset. Keep the
+            // full estimate in para_heights so scroll math stays correct.
+            if (visible_range == null) {
+                if (idx < self.para_heights.items.len) {
+                    self.para_heights.items[idx] = self.seg_cache.items[self.seg_cache.items.len - 1].height;
+                    self.setHeightTreeValue(idx, self.seg_cache.items[self.seg_cache.items.len - 1].height);
+                }
+                self.paras.items[idx].known_lines = self.seg_cache.items[self.seg_cache.items.len - 1].height;
+            } else {
+                // Lazy-parsed: keep the estimate, don't overwrite with partial height.
+                if (idx < self.para_heights.items.len) {
+                    self.setHeightTreeValue(idx, para_est_h);
+                }
+                self.paras.items[idx].known_lines = para_est_h;
+            }
         }
 
         // ── keep the cache SORTED by `para_idx` ──
@@ -4299,6 +4489,8 @@ pub const Model = struct {
         const first = @min(first_line, mo);
         self.setAnchorLine(first);
         self.anchor = first;
+        // Scrolling changes what is visible: full redraw needed next frame.
+        self.diff_needs_full_redraw = true;
         // Reaching the bottom re-arms the follow, so the next line that arrives
         // keeps coming at you instead of freezing the view where you happened to
         // land.
@@ -5953,6 +6145,8 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     var live_lines: []const PLine = &.{};
     if (live_src.len > 0) {
+        // Streaming text changes every frame: force a redraw so new tokens appear.
+        self.diff_needs_full_redraw = true;
         // `live_src` is already frame-arena owned (see the invariant above), so
         // there is nothing to copy here any more.
         // For the live paragraph, we don't have a Para struct, so use a temporary one
@@ -5990,16 +6184,18 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     self.max_offset = vis.max_offset;
     self.live_h = if (live_active) live_lines.len else 0;
 
-    // ── clears the history area BEFORE painting ──
-    //
-    // Without this, pixels of the previous version of the streaming text stay
-    // around: the live paragraph is re-wrapped on every frame and when it
-    // SHRINKS (which happens every time the model breathes between tokens) the
-    // leftover cells keep the old text. You saw the same paragraph twice, split
-    // and mixed, in the middle of the answer.
-    var clear_row: u16 = 0;
-    while (clear_row < history_h) : (clear_row += 1) {
-        p.fillRange(0, width, clear_row, " ", .{});
+    // ── differential render: decide what needs clearing/repainting ──
+    // If nothing changed since last frame and we're not streaming, skip
+    // clearing/repainting entirely. If scrolling or first frame, do full redraw.
+    const needs_full_redraw = self.diff_needs_full_redraw
+        or (first_visible != self.diff_last_first)
+        or (last_visible != self.diff_last_last)
+        or (live_active != self.diff_last_live_active);
+    if (needs_full_redraw) {
+        var clear_row: u16 = 0;
+        while (clear_row < history_h) : (clear_row += 1) {
+            p.fillRange(0, width, clear_row, " ", .{});
+        }
     }
 
     // ── paints only the visible lines ──
@@ -6015,16 +6211,28 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     const content_lines = self.heightPrefix(self.paras.items.len) + live_lines.len;
     const hero = heroFrame(self, wrap_width + 2 * hist_margin, history_h, content_lines);
     const pad = hero.pad;
-    var line_cursor = self.heightPrefix(self.cache_lo);
+    // ── paint cached paragraphs ──
+    // Use `heightPrefix(para_idx)` for the absolute line position of each
+    // cached paragraph. This correctly handles gaps in the cache (virtual
+    // scroll means not every paragraph is parsed).
     for (self.seg_cache.items) |c| {
-        defer line_cursor += c.height;
-        if (line_cursor >= last_visible) break;
-        if (line_cursor + c.height <= first_visible) continue;
-        drawLines(&p, c.lines, line_cursor, first_visible, history_h, pad, hero.x_off);
+        const para_abs_start = self.heightPrefix(c.para_idx);
+        if (para_abs_start >= last_visible) break;
+        if (para_abs_start + c.height <= first_visible) continue;
+        drawLines(&p, c.lines, para_abs_start, first_visible, history_h, pad, hero.x_off);
     }
+    // ── paint live paragraph ──
+    // Its absolute position is the total height of all closed paragraphs.
     if (live_active) {
-        drawLines(&p, live_lines, line_cursor, first_visible, history_h, pad, hero.x_off);
+        const live_abs_start = self.heightPrefix(self.paras.items.len);
+        drawLines(&p, live_lines, live_abs_start, first_visible, history_h, pad, hero.x_off);
     }
+
+    // ── update differential tracking state ──
+    self.diff_last_first = first_visible;
+    self.diff_last_last = last_visible;
+    self.diff_last_live_active = live_active;
+    self.diff_needs_full_redraw = false;
     drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
     // The sticky header and the pill go OVER the transcript, and that is the
     // editor's own convention (a sticky line covers the content under it).
