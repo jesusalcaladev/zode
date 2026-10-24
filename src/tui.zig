@@ -27,6 +27,7 @@ const zjsonl = @import("lib/zjsonl.zig");
 const copytext = @import("lib/copytext.zig");
 const fuzzy = @import("lib/fuzzy.zig");
 const filesearch = @import("lib/filesearch.zig");
+const mascot = @import("lib/mascot.zig");
 
 /// The kind of the status: what color the face is and what phase the app is in.
 /// Replaces `StatusKind`; lives here so `agent.zig` can reference it as
@@ -1043,6 +1044,8 @@ pub const Model = struct {
     /// Kind the status was composed with (to color the face).
     status_kind: StatusKind = .idle,
     status_kind_set: bool = false,
+    /// Animated mascot state: tracks elapsed time per state and picks frames.
+    mascot_animator: mascot.Animator = .{},
 
     /// Permission dialog (fixed buffers, no churn between threads).
     perm_tool: [64]u8 = undefined,
@@ -1609,6 +1612,7 @@ pub const Model = struct {
             // `undefined` and set in `deinit`, but then any test that calls
             // `snapshotFile` without it reads garbage.
             .checkpoints = .init(allocator),
+            .mascot_animator = mascot.Animator.init(.idle),
         };
         m.tasks.gpa = allocator;
         // Empty initial status; real content appears once there's a model/turn.
@@ -7823,7 +7827,21 @@ fn drawStateFooter(
     // The blink only happens while there is work: a face that twitches in an
     // idle footer is noise, and the idle footer is on screen all the time.
     const animated = act.busy or act.streaming or act.ask or act.perm or running_tool;
-    const face_text = if (animated) faceFrames(mood, self.spinner_frame / 6) else face(mood);
+    // Convert tui.StatusKind -> mascot.StatusKind (same variant order, safe cast).
+    const m_kind: mascot.StatusKind = switch (mood) {
+        .idle => .idle,
+        .thinking => .thinking,
+        .tooling => .tooling,
+        .done => .done,
+        .warn => .warn,
+        .err => .err,
+    };
+    // Advance the mascot animation clock each frame.
+    const now_ms: u64 = std.Io.Timestamp.now(self.io, .real).toSeconds() * 1000;
+    if (animated or self.mascot_animator.kind != m_kind) {
+        self.mascot_animator.setKind(m_kind, now_ms);
+    }
+    const face_text = self.mascot_animator.face(now_ms);
 
     var legend: []const u8 = "";
     var detail: []const u8 = "";
