@@ -248,7 +248,11 @@ pub fn check(ctx: Context, force: bool) ?Update {
             if (c.latest.len > 0 and now - c.checked_at < ttl_secs) {
                 if (c.latest.len == 0) return null;
                 const newer = blk: {
-                    const cur = Version.parse(current_version) orelse break :blk c.latest.len > 0;
+                    // If current version is not a valid semver (e.g. "dev"),
+                    // we CANNOT trust the cached version to be "newer" — it
+                    // might be older. Force a fetch from GitHub instead.
+                    if (!isValidVersion(current_version)) break :blk false;
+                    const cur = Version.parse(current_version) orelse break :blk false;
                     const lat = Version.parse(c.latest) orelse break :blk false;
                     break :blk Version.order(lat, cur) == .gt;
                 };
@@ -271,6 +275,11 @@ pub fn check(ctx: Context, force: bool) ?Update {
 
     if (!newerThan(release.tag, current_version)) return null;
     return .{ .version = release.tag, .kind = kindBetween(current_version, release.tag), .from_cache = false };
+}
+
+/// Is the "current" version a valid semver? (not "dev", not empty, not garbage)
+fn isValidVersion(v: []const u8) bool {
+    return Version.parse(v) != null;
 }
 
 fn newerThan(latest: []const u8, current: []const u8) bool {
