@@ -3816,14 +3816,20 @@ pub const Model = struct {
                 else 0;
                 const keep = self.stream_buf.items[0..fits];
                 const new_len: usize = satAdd(keep.len, marker.len);
-                if (self.allocator.alloc(u8, new_len)) |buf| {
-                    @memcpy(buf[0..keep.len], keep);
-                    @memcpy(buf[keep.len..], marker);
-                    self.pending.append(self.allocator, .{ .kind = .assistant, .text = buf }) catch {
-                        self.allocator.free(buf);
-                    };
-                }
-            } else if (self.allocator.dupe(u8, self.stream_buf.items)) |text| {
+                const buf = self.allocator.alloc(u8, new_len) catch {
+                    self.stream_truncated = false;
+                    return;
+                };
+                @memcpy(buf[0..keep.len], keep);
+                @memcpy(buf[keep.len..], marker);
+                self.pending.append(self.allocator, .{ .kind = .assistant, .text = buf }) catch {
+                    self.allocator.free(buf);
+                };
+            } else {
+                const text = self.allocator.dupe(u8, self.stream_buf.items) catch {
+                    self.stream_truncated = false;
+                    return;
+                };
                 self.pending.append(self.allocator, .{ .kind = .assistant, .text = text }) catch {
                     self.allocator.free(text);
                 };
@@ -7917,7 +7923,7 @@ fn drawStateFooter(
         .err => .err,
     };
     // Advance the mascot animation clock each frame.
-    const now_ms: u64 = std.Io.Timestamp.now(self.io, .real).toSeconds() * 1000;
+    const now_ms: u64 = @as(u64, @intCast(std.Io.Timestamp.now(self.io, .real).toSeconds())) * 1000;
     if (animated or self.mascot_animator.kind != m_kind) {
         self.mascot_animator.setKind(m_kind, now_ms);
     }

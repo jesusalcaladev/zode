@@ -68,7 +68,7 @@ pub fn scan(text: []const u8) !ScanResult {
         if (n >= scanned_max) { i = end; continue; }
         var dup = false;
         for (0..n) |prev| {
-            if (std.mem.eql(u8, prev.pathOf(), path)) dup = true;
+            if (std.mem.eql(u8, mentions[prev].path[0..mentions[prev].len], path)) dup = true;
         }
         if (!dup) {
             if (path.len < path_max) {
@@ -143,10 +143,11 @@ pub fn expand(io: std.Io, text: []const u8) !Expansion {
 
     var loaded_paths: [max_files][32]u8 = undefined;
     var loaded_path_count: usize = 0;
-    var loaded_count: usize = 0;
+    var loaded_count: u8 = 0;
 
     const max_to_load = if (scan_result.mentions.len < max_files) scan_result.mentions.len else max_files;
 
+    var file_storage: [max_files][file_max]u8 = undefined;
     var file_texts: [max_files][]const u8 = undefined;
     var missing_count: u8 = 0;
 
@@ -158,7 +159,7 @@ pub fn expand(io: std.Io, text: []const u8) !Expansion {
 
         var already_loaded = false;
         for (0..loaded_path_count) |idx| {
-            if (std.mem.eql(u8, loaded_paths[idx], path)) {
+            if (std.mem.eql(u8, loaded_paths[idx][0..], path)) {
                 already_loaded = true;
                 break;
             }
@@ -166,23 +167,24 @@ pub fn expand(io: std.Io, text: []const u8) !Expansion {
 
         if (already_loaded) { continue; }
 
-        const file = std.Io.File.openRead(io, path);
-        if (!file) {
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
             missing_count += 1;
             continue;
-        }
+        };
 
-        const data = file.readAll(io) catch {
+        var buf: [file_max]u8 = undefined;
+        const n = file.readPositionalAll(io, buf[0..], 0) catch {
             missing_count += 1;
             continue;
         };
 
         if (handle_count < max_files) {
-            file_texts[handle_count] = data;
+            @memcpy(file_storage[handle_count][0..], buf[0..n]);
+            file_texts[handle_count] = file_storage[handle_count][0..n];
         }
 
         if (loaded_path_count < max_files) {
-            loaded_paths[loaded_path_count] = path;
+            @memcpy(loaded_paths[loaded_path_count][0..path.len], path);
             loaded_path_count += 1;
         }
 
@@ -239,8 +241,8 @@ pub fn expand(io: std.Io, text: []const u8) !Expansion {
     }
 
     const result_len = @min(ri, result.len - 4);
-    if (result_len > 0) return result[0..result_len];
-    return []const u8;
+    if (result_len > 0) return Expansion{ .text = result[0..result_len], .files = loaded_count, .missing = missing_count };
+    return Expansion{ .text = result[0..0], .files = loaded_count, .missing = missing_count };
 }
 
 // ── tests ─────────────────────────────────────────────────────
@@ -320,7 +322,7 @@ test "scan: a mention inside parentheses or quotes counts too" {
 }
 
 test "highlightMatch: contiguous substring wins over scattered" {
-    var buf: [64]u8 = undefined;
+    var buf: [64]u32 = undefined;
     const n = fuzzy.highlightPositions("a-xbc", "bc", &buf).?;
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqual(@as(u32, 3), buf[0]);
@@ -328,7 +330,7 @@ test "highlightMatch: contiguous substring wins over scattered" {
 }
 
 test "highlightMatch: prefix wins over substring" {
-    var buf: [64]u8 = undefined;
+    var buf: [64]u32 = undefined;
     const n = fuzzy.highlightPositions("sonnet", "son", &buf).?;
     try std.testing.expectEqual(@as(usize, 4), n);
     try std.testing.expectEqual(@as(u32, 0), buf[0]);

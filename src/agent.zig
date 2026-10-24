@@ -49,6 +49,7 @@ const skillstore = @import("lib/skillstore.zig");
 const outputstyles = @import("lib/outputstyles.zig");
 const outputstyle_store = @import("lib/outputstyle_store.zig");
 const project = @import("lib/project.zig");
+const sessionpath = @import("lib/sessionpath.zig");
 const taskstore = @import("lib/taskstore.zig");
 const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
@@ -132,6 +133,14 @@ pub var project_info: project.Info = .{};
 pub fn initProjectInfo(io: std.Io, env: ?*const std.process.Environ.Map) void {
     if (project_info.cwd_len != 0) return;
     project.detect(io, env, &project_info);
+}
+
+/// Resolves the sessions directory for the current project, using gpa for
+/// allocation. Stores nothing globally — the caller uses the returned path.
+/// Idempotent: safe to call multiple times (each call allocates).
+pub fn resolveSessionsDirIn(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
+    const project_root = project_info.cwd();
+    _ = sessionpath.resolveSessionsDir(gpa, io_global, env, project_root) catch {};
 }
 
 /// Fills `project_info` from a given directory. For tests only.
@@ -3988,7 +3997,7 @@ pub fn startChat(m: *tui.Model, input: []const u8) !void {
 /// Called on the truncated display input to keep the UI compact.
 pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
     // Common image extensions
-    const image_exts = &.{"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"};
+    const image_exts = &[_][]const u8{"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"};
     
     // Find @image.ext patterns and replace them with [image.ext]
     var result: [512]u8 = undefined;
@@ -4017,12 +4026,33 @@ pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
                 continue;
             }
             const ext = filename[dot + 1 .. fe];
-            if (std.mem.indexOfScalar(u8, image_exts, ext) != null) {
+            var is_image = false;
+            var ei: usize = 0;
+            while (ei < image_exts.len) {
+                if (ext.len == image_exts[ei].len) {
+                    var match = true;
+                    var ci: usize = 0;
+                    while (ci < ext.len) {
+                        if (std.ascii.toLower(ext[ci]) != std.ascii.toLower(image_exts[ei][ci])) {
+                            match = false;
+                            break;
+                        }
+                        ci += 1;
+                    }
+                    if (match) {
+                        is_image = true;
+                        break;
+                    }
+                }
+                ei += 1;
+            }
+            if (is_image) {
                 // Replace @image.ext with [image.ext]
-                const replacement = "[image." ++ ext ++ "]";
-                const repl_len = replacement.len;
-                if (ri + repl_len > result.len) break;
-                @memcpy(result[ri .. ri + repl_len], replacement);
+                var repl_buf: [32]u8 = undefined;
+                const repl_slice = std.fmt.bufPrint(repl_buf[0..], "[image.{s}]", .{ext}) catch break;
+                const repl_len = repl_slice.len;
+                if (ri + repl_len > 512) break;
+                @memcpy(result[ri .. ri + repl_len], repl_buf[0..repl_len]);
                 ri += repl_len;
                 li = fe;
                 continue;

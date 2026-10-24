@@ -266,7 +266,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // the file". Expanded HERE, on the session's own text, because the headless
     // runner has no per-iteration arena like `runOneTurn` has.
     const mentions_mod = @import("lib/mentions.zig");
-    const expanded = mentions_mod.expand(arena, io, text) catch
+    const expanded = mentions_mod.expand(io, text) catch
         mentions_mod.Expansion{ .text = text, .files = 0, .missing = 0 };
     try msgs.append(arena, .{ .role = "user", .content = expanded.text });
 
