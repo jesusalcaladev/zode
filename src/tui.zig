@@ -1266,6 +1266,9 @@ pub const Model = struct {
     diff_last_live_active: bool = false,
     /// Differential render tracking: forces a full redraw of history (first frame or after scroll).
     diff_needs_full_redraw: bool = true,
+    /// Toast notification: text shown when user copies to clipboard, and frames remaining.
+    copy_toast_text: []const u8 = "",
+    copy_toast_frames: u64 = 0,
 
     environ: ?*const std.process.Environ.Map = null,
     /// The model the footer shows, resolved ONCE and cached here.
@@ -4668,7 +4671,7 @@ pub const Model = struct {
         }
     }
 
-    fn copySelectedText(self: *const Model, ctx: *vxfw.EventContext) !void {
+    fn copySelectedText(self: *Model, ctx: *vxfw.EventContext) !void {
         // A PRESS followed by a RELEASE at the same point is a CLICK, not a
         // selection, and it used to fire OSC 52 anyway: `selectedText` on one
         // cell yields that one trimmed grapheme, which is non-empty, so every
@@ -4688,6 +4691,9 @@ pub const Model = struct {
         defer ctx.alloc.free(text);
         if (text.len == 0) return;
         try ctx.copyToClipboard(text);
+        // Show a toast in the top-right corner for ~2 seconds.
+        self.copy_toast_text = "Copied to clipboard";
+        self.copy_toast_frames = 120; // ~2 s at 60 fps
     }
 
     fn selectionPointLess(a: SelectionPoint, b: SelectionPoint) bool {
@@ -5341,13 +5347,20 @@ fn recomputeMatches(self: *Model) void {
 /// the `/`. FILES: the token after the `@` (empty when just typed).
 fn acPrefix(self: *const Model) ?[]const u8 {
     const text = self.ed.text();
-    if (self.ac.prefix_len == 0 or self.ac.prefix_len > text.len) return null;
     return switch (self.ac.mode) {
-        .command => text[1..self.ac.prefix_len],
+        // `prefix_len == 0` means a bare `/`, which is a real query (every
+        // command matches it); for FILES it means the `@` is the FIRST character
+        // of the input, which is the normal way to mention a file. The guard used
+        // to be shared and it made `@needle` at the start of a line query "" —
+        // every candidate matched, and the popup highlighted nothing.
+        .command => if (self.ac.prefix_len == 0 or self.ac.prefix_len > text.len)
+            null
+        else
+            text[1..self.ac.prefix_len],
         .file => blk: {
             // The token runs to the cursor, like `fileQueryAt` saw it.
             const end = @min(self.ed.cursor, text.len);
-            if (end < self.ac.prefix_len) break :blk "";
+            if (end <= self.ac.prefix_len) break :blk "";
             break :blk text[self.ac.prefix_len + 1 .. end];
         },
         .none => null,
@@ -6371,7 +6384,48 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         palette.draw(&p, &surface, &self.pal, width, height, self.catalogNotice(ctx.arena));
     }
 
+    // ── copy toast: top-right, rounded border, ~2 seconds ──
+    if (self.copy_toast_frames > 0) {
+        self.copy_toast_frames -= 1;
+        drawCopyToast(&p, width, height, self.copy_toast_text);
+    }
+
     return surface;
+}
+
+/// Copy toast: small rounded box in the top-right corner that appears for
+/// ~2 seconds after the user copies selected text to the clipboard.
+fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
+    if (width < 10 or height < 4) return;
+    const pad: u16 = 2;
+    const text_w: u16 = if (text.len > 40) 40 else @intCast(text.len);
+    const toast_w: u16 = @min(@max(text_w + 4, 20), width - 2 * pad);
+    const toast_h: u16 = 3;
+    const toast_x: u16 = width - toast_w - pad;
+    const toast_y: u16 = pad;
+
+    // Background.
+    var r: u16 = 0;
+    while (r < toast_h) : (r += 1) {
+        p.fillRange(toast_x, toast_x + toast_w, toast_y + r, " ", theme.code_bg);
+    }
+
+    // Rounded border.
+    p.fillRange(toast_x + 1, toast_x + toast_w - 1, toast_y, "─", theme.code_border);
+    p.fillRange(toast_x + 1, toast_x + toast_w - 1, toast_y + toast_h - 1, "─", theme.code_border);
+    var c: u16 = 1;
+    while (c < toast_h - 1) : (c += 1) {
+        p.putStable(toast_x, toast_y + c, "│", 1, theme.code_border);
+        p.putStable(toast_x + toast_w - 1, toast_y + c, "│", 1, theme.code_border);
+    }
+    p.putStable(toast_x, toast_y, "╭", 1, theme.code_border);
+    p.putStable(toast_x + toast_w - 1, toast_y, "╮", 1, theme.code_border);
+    p.putStable(toast_x, toast_y + toast_h - 1, "╰", 1, theme.code_border);
+    p.putStable(toast_x + toast_w - 1, toast_y + toast_h - 1, "╯", 1, theme.code_border);
+
+    // Text, centered.
+    const text_x: u16 = toast_x + (toast_w - text_w) / 2;
+    _ = p.putText(text_x, toast_y + 1, text, theme.ink);
 }
 
 /// The prompt. No box, no borders, no top rule of its own: the hairline above
@@ -12574,10 +12628,11 @@ test "@ mention: a name deep in the tree is found, ranked first, and its matched
     // accent and bold; the `/` before the name is not.
     const hit = surf.readCell(hit_col, found_row.?);
     try std.testing.expect(hit.style.bold);
-    try std.testing.expect(hit.style.fg != null);
-    try std.testing.expect(std.mem.eql(u8, &hit.style.fg.?.rgb, &theme.brand_hi.fg.?.rgb));
+    try std.testing.expect(std.meta.eql(hit.style.fg, theme.brand_hi.fg));
+    // The directory in front of the name is NOT the bright accent: the eye has
+    // to land on the file, and the path only says which one it is.
     const dir_cell = surf.readCell(2, found_row.?);
-    try std.testing.expect(!dir_cell.style.bold);
+    try std.testing.expect(!std.meta.eql(dir_cell.style.fg, theme.brand_hi.fg));
 }
 
 test "timeline: a wrapped paragraph keeps a gutter on every continuation row" {
