@@ -1857,10 +1857,12 @@ test "bash: output over the cap is CUT and says so, not an error" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // ~240 KB, which is fifteen times the 16 KB cap. Before this change every one of
-    // these thirty times over returned `error.StreamTooLong`, which the model reads as
-    // "the tool failed" and answers by rephrasing a request that cannot be rephrased
-    // under 16 KB.
+    // Lower the cap so a modest output exceeds it: the point of the test is
+    // that over-cap output is cut WITH a notice, not that 240 KB is special.
+    const old_cap = common.max_tool_output;
+    defer common.max_tool_output = old_cap;
+    common.max_tool_output = 1024;
+
     const out = try execute(std.testing.io, "bash",
         \\{"command":"seq 1 40000","timeout_seconds":30}
     , arena, null, null);
@@ -1870,8 +1872,9 @@ test "bash: output over the cap is CUT and says so, not an error" {
     // nobody reads).
     try std.testing.expect(std.mem.indexOf(u8, out, "1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "--- stdout ---") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, bg_tool.foreground_truncation_notice) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "stopped") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "output cut at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tool cap is") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "stopped at the cap") != null);
     // And no invented exit code: `128+9` looks like a crash the command caused.
     try std.testing.expect(std.mem.indexOf(u8, out, "exit=(stopped at the tool's output cap)") != null);
 }
@@ -1899,6 +1902,11 @@ test "bash: a command that only prints a LOT does not leave a grandchild behind"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Lower the cap so `yes` is truncated quickly (1 KB is enough).
+    const old_cap = common.max_tool_output;
+    defer common.max_tool_output = old_cap;
+    common.max_tool_output = 1024;
+
     // `yes` never stops on its own, so a truncation that did not kill it would hang
     // here for the full timeout instead of returning.
     const t0 = std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds();
@@ -1907,7 +1915,8 @@ test "bash: a command that only prints a LOT does not leave a grandchild behind"
     , arena, null, null);
     const elapsed_ms = @as(f64, @floatFromInt(std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds() - t0)) / 1e6;
 
-    try std.testing.expect(std.mem.indexOf(u8, out, bg_tool.foreground_truncation_notice) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "output cut at") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tool cap is") != null);
     // Nowhere near the 30 s timeout: the point of the cap is that it returns.
     try std.testing.expect(elapsed_ms < 5000);
 }

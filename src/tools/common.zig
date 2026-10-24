@@ -31,7 +31,51 @@ pub fn getBool(obj: std.json.ObjectMap, key: []const u8) bool {
     };
 }
 
-pub const max_tool_output = 16 * 1024; // output budget per tool
+/// The per-tool output budget, in bytes. Defaults to 10 MB.
+///
+/// Read once at startup from `ZODE_MAX_TOOL_OUTPUT`, which accepts bare numbers
+/// and the suffixes `K`, `M`, `G` (case-insensitive, e.g. `5M`, `1G`, `512K`).
+///
+/// There is also a hard cap (`max_tool_output_hard_cap`) so a runaway command
+/// cannot exhaust memory: if the env value exceeds it, the cap wins.
+pub var max_tool_output: usize = 10 * 1024 * 1024;
+pub var max_tool_output_hard_cap: usize = 100 * 1024 * 1024;
+
+/// Read `ZODE_MAX_TOOL_OUTPUT` from the environment and install it as the
+/// per-tool budget. Safe to call once at startup; calling it again overwrites
+/// the previous value (which is what tests do).
+pub fn initMaxToolOutput(env: ?*const std.process.Environ.Map) void {
+    const raw = if (env) |e| e.get("ZODE_MAX_TOOL_OUTPUT") else null;
+    const val = raw orelse return;
+    if (val.len == 0) return;
+
+    // Parse an optional numeric suffix: 5M, 1G, 512K, 1024, etc.
+    var digits: usize = 0;
+    while (digits < val.len and std.ascii.isDigit(val[digits])) : (digits += 1) {}
+
+    const num_str = val[0..digits];
+    const suffix = std.mem.trim(u8, val[digits..], " ");
+
+    const n = std.fmt.parseInt(usize, num_str, 10) catch return;
+
+    var mult: usize = 1;
+    if (suffix.len > 0) {
+        const s = std.ascii.toLower(suffix[0]);
+        if (s == 'k') {
+            mult = 1024;
+        } else if (s == 'm') {
+            mult = 1024 * 1024;
+        } else if (s == 'g') {
+            mult = 1024 * 1024 * 1024;
+        } else {
+            return; // unknown suffix: ignore, keep the default
+        }
+    }
+
+    var wanted = n * mult;
+    if (wanted > max_tool_output_hard_cap) wanted = max_tool_output_hard_cap;
+    max_tool_output = wanted;
+}
 
 pub const Walker = struct {
     io: std.Io,

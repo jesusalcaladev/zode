@@ -40,7 +40,7 @@ const markdown = @import("../lib/markdown.zig");
 /// a real change crosses it easily — a lockfile is 40 000 lines. The output is
 /// cut at a line boundary and says how much is missing, because "here is the
 /// first 16 KB of a diff" without saying so reads as "this is the diff".
-pub const diff_limit = 16 * 1024;
+pub var diff_limit: usize = 10 * 1024 * 1024;
 
 /// What we let git produce BEFORE we start cutting.
 ///
@@ -53,7 +53,41 @@ pub const diff_limit = 16 * 1024;
 /// arrived as an error with no diff at all. So git gets a bigger pipe and this
 /// tool does the cutting, which is the only place that knows what a line of a
 /// diff is.
-const diff_capture = 256 * 1024;
+pub var diff_capture: usize = 50 * 1024 * 1024;
+
+/// Read `ZODE_MAX_TOOL_OUTPUT` and install it as both `diff_limit` and
+/// `diff_capture` (scaled). Safe to call once at startup.
+pub fn initDiffLimit(env: ?*const std.process.Environ.Map) void {
+    const raw = if (env) |e| e.get("ZODE_MAX_TOOL_OUTPUT") else null;
+    const val = raw orelse return;
+    if (val.len == 0) return;
+
+    var digits: usize = 0;
+    while (digits < val.len and std.ascii.isDigit(val[digits])) : (digits += 1) {}
+
+    const num_str = val[0..digits];
+    const suffix = std.mem.trim(u8, val[digits..], " ");
+
+    const n = std.fmt.parseInt(usize, num_str, 10) catch return;
+
+    var mult: usize = 1;
+    if (suffix.len > 0) {
+        const s = std.ascii.toLower(suffix[0]);
+        if (s == 'k') mult = 1024
+        else if (s == 'm') mult = 1024 * 1024
+        else if (s == 'g') mult = 1024 * 1024 * 1024
+        else return;
+    }
+
+    var wanted = n * mult;
+    const hard_cap = 200 * 1024 * 1024;
+    if (wanted > hard_cap) wanted = hard_cap;
+    diff_limit = wanted;
+    diff_capture = wanted * 5;
+    if (diff_capture > hard_cap) diff_capture = hard_cap;
+}
+
+/// The mode of the file the commit message is written to.
 
 /// The mode of the file the commit message is written to.
 ///

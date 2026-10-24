@@ -55,6 +55,9 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     agent.loadUserConfig();
     defer agent.shutdownUserConfig();
+    tools_mod.initMaxToolOutput(env);
+    tools_mod.initDiffLimit(env);
+    tools_mod.initGrepCapture(env);
 
     var http = http_client.Http.init(gpa, io);
     defer http.deinit();
@@ -168,6 +171,9 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     agent.environ_global = env;
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
     // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
+    tools_mod.initMaxToolOutput(env);
+    tools_mod.initDiffLimit(env);
+    tools_mod.initGrepCapture(env);
     // The language servers. Started LAZILY (a server is spawned when a file of
     // its language is asked about) but the manager has to exist before the
     // config is read, because the config is what says which servers there are.
@@ -690,6 +696,9 @@ fn runTui(init: std.process.Init) !u8 {
     agent.environ_global = init.environ_map;
     agent.gpa_global = init.gpa;
     // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
+    tools_mod.initMaxToolOutput(init.environ_map);
+    tools_mod.initDiffLimit(init.environ_map);
+    tools_mod.initGrepCapture(init.environ_map);
     // The language servers, before the config is read: the config says which
     // servers there are, and the manager is what asks for them.
     //
