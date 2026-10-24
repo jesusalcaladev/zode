@@ -112,6 +112,7 @@ binary (1.9MB stripped).
 - Footer hint updated to show "ctrl+r refresh"
 - Double-free bug fixed in `TurnStats.reset()` by clearing lists after deinit
 - Verified with real OpenRouter key: 471 models (19 free) fetched successfully
+- **Auto-switch provider when selecting model from picker**: When user selects a model from the model picker (Ctrl+T or /model), the provider now automatically switches to match the model's provider. This fixes the bug where selecting an OpenRouter model (e.g., `cohere/north-mini-code:free`) while OpenCode was active would fail because the request went to the wrong provider.
 
 ## Mascot: Zo
 

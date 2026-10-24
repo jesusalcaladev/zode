@@ -974,7 +974,7 @@ pub const Model = struct {
     /// Columns the history was last laid out with (width minus the margin).
     /// `estHeight` needs it to estimate a WRAPPED height, and without it the
     /// estimate was the height of an infinitely wide terminal.
-    wrap_w: u16 = 0,
+    wrap_w: u16 = 80,
     /// History rows in the last frame. The key handler uses it to jump a
     /// PAGE (the whole window) instead of a fixed number: with 5 fixed, in a
     /// tall terminal PageUp barely moved anything.
@@ -2240,10 +2240,10 @@ pub const Model = struct {
     /// within a factor of the real height, which is what the scroll needs.
     ///
     /// `wrap_w` is the width the last frame laid out with, published by the
-    /// draw. With no frame yet (a key pressed before the first draw) it falls
-    /// back to 40, which is close enough for a clamp.
+    /// draw. Initialized to 80 (common terminal default) so `estHeight` has a
+    /// reasonable fallback before the first frame.
     fn estHeight(self: *const Model, text: []const u8) usize {
-        const per_line: usize = if (self.wrap_w > 8) self.wrap_w else 40;
+        const per_line: usize = @intCast(self.wrap_w);
         const nl = std.mem.count(u8, text, "\n");
         const wrapped = (text.len -| nl) / per_line;
         // A fence costs three rows the line count cannot see: a blank row, the
