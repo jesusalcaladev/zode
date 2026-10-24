@@ -35,6 +35,17 @@ pub const ProviderDef = struct {
     /// could not be read". Anthropic therefore had no pickable models and the
     /// only way to use it was to type the name by hand.
     key_style: KeyStyle = .bearer,
+    /// The model ids the provider DOCUMENTS, for the providers that publish no
+    /// `/models` endpoint (their `models_url` is empty, so there is nothing to
+    /// fetch and the picker would be an empty box).
+    ///
+    /// This is NOT `default_model` and it is not a guess about which one to use:
+    /// zode still refuses to pick by itself and the choice stays with the user.
+    /// It is the list the picker SHOWS, so the user can point at one instead of
+    /// typing its name. It will age — that is why it is only ever a suggestion
+    /// and never written to the catalogue cache (a retired id fails loudly at
+    /// the first request instead of silently becoming the session's model).
+    suggested_models: []const []const u8 = &.{},
 };
 
 pub const KeyStyle = enum { bearer, x_api_key };
@@ -154,6 +165,37 @@ pub const defs = [_]ProviderDef{
         .models_url = "https://api.x.ai/v1/models",
         .key_env = &.{"ZODE_XAI_KEY"},
         .note = "Grok models",
+    },
+    .{
+        .id = "zai",
+        .name = "Z.AI",
+        // The OpenAI-compatible path. `/api/v1` is their Responses API and
+        // `/api/anthropic` their Messages API; zode speaks chat/completions.
+        .base_url = "https://api.z.ai/api/paas/v4",
+        // EMPTY ON PURPOSE, and verified against their OpenAPI document: the
+        // only paths are chat/completions, images, videos, audio, tokenizer,
+        // web_search, reader and files. Nothing lists models, so the empty URL
+        // says "publishes no catalogue" and the picker falls back to
+        // `suggested_models`.
+        .models_url = "",
+        .key_env = &.{ "ZODE_ZAI_KEY", "ZAI_API_KEY" },
+        .note = "GLM · 1M context · no model list: /model shows the documented ids",
+        .suggested_models = &.{ "glm-5.3", "glm-5.3-flash", "glm-5.3-flashx", "glm-5.2", "glm-4.7" },
+    },
+    .{
+        .id = "zai-coding",
+        .name = "Z.AI Coding Plan",
+        // The subscription endpoint: same chat/completions shape, quota instead
+        // of per-token billing.
+        .base_url = "https://api.z.ai/api/coding/paas/v4",
+        .models_url = "",
+        // A SEPARATE key from the API one (their guide: the two are managed
+        // apart since 2026-10-16). A plan key at the standard endpoint is a 401
+        // that says nothing about which key went to which URL, so the two rows
+        // exist instead of one row plus a footnote.
+        .key_env = &.{"ZODE_ZAI_CODING_KEY"},
+        .note = "subscription quota · key is NOT the API key",
+        .suggested_models = &.{ "glm-5.3", "glm-5.3-flash", "glm-5.2" },
     },
 };
 
@@ -276,6 +318,22 @@ test "catalogAuth: anthropic authenticates with x-api-key, everyone else with th
     // 401, which is the honest answer for a provider nobody connected.
     const none = authWithKey(.x_api_key, null);
     try std.testing.expect(none.x_api_key == null);
+}
+
+test "a provider with no catalog ships the ids the picker can show" {
+    // An empty `models_url` with no suggestions is a provider the user can only
+    // reach by typing a model name from memory: the picker opens on "+ connect"
+    // and nothing else. The two fields go together.
+    for (&defs) |d| {
+        if (d.models_url.len != 0) continue;
+        if (d.suggested_models.len == 0) {
+            std.debug.print("provider {s} publishes no catalogue and suggests no models\n", .{d.id});
+            return error.TestUnexpectedResult;
+        }
+        for (d.suggested_models) |id| {
+            if (id.len == 0) return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "no provider's chat base is a models (or chat) endpoint" {

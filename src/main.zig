@@ -86,14 +86,29 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     const key = providers.keyFor(def, env);
 
     // No catalogue endpoint (`models_url = ""`): `--models` is the command you
-    // run to see a list, and there is no list to see. Saying so is the answer;
-    // fetching "" would dress it up as a network failure.
+    // run to see a list, and there is no list to fetch. What the provider
+    // DOCUMENTS is still what a person is after, so it is printed — labelled as
+    // what it is, because a suggestion that looks like a fetched catalogue is
+    // how a retired id gets picked a year from now.
     if (url.len == 0) {
+        if (def.suggested_models.len == 0) {
+            std.debug.print(
+                "{s} publishes no model catalog: pick the model by hand (`/use {s} <model>` or ZODE_MODEL).\n",
+                .{ def.id, def.id },
+            );
+            return 1;
+        }
+        var ids_buf: [4096]u8 = undefined;
+        var ids_out = std.Io.File.stdout().writer(io, &ids_buf);
+        for (def.suggested_models) |id| {
+            try ids_out.interface.print("{s}\tdocumented\n", .{id});
+        }
+        try ids_out.interface.flush();
         std.debug.print(
-            "{s} publishes no model catalog: pick the model by hand (`/use {s} <model>` or ZODE_MODEL).\n",
-            .{ def.id, def.id },
+            "{d} ids · {s} publishes no /models endpoint, so this is the documented list (a suggestion, not a catalog)\n",
+            .{ def.suggested_models.len, def.id },
         );
-        return 1;
+        return 0;
     }
 
     // `--models` is the worst case for a cold network: 772 KB and a 400-800 ms round
@@ -194,6 +209,11 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     mcp_manager.init(gpa, io, env);
     defer mcp_manager.shutdown();
     agent.initProjectInfo(io, env); // cwd + repo root, before any prompt is composed
+    // The same session directory the TUI resolves: one project, one history.
+    // Without this `--chat` wrote `./sessions` (the compiled-in default) while
+    // the TUI wrote `<state>/sessions/<hash>`, so each side could not see the
+    // other's sessions in `/session`.
+    agent.resolveSessionsDirIn(gpa, env);
     chat.io_global = io;
     free_auto.attachIo(io); // el reloj de los cooldowns del free-auto
     models.dbg_io = io;
@@ -284,6 +304,11 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             // wrong thing.
             if (def.models_url.len == 0) {
                 std.debug.print("error: {s} publishes no model catalog: there is no /models endpoint to ask.\n", .{def.id});
+                if (def.suggested_models.len > 0) {
+                    std.debug.print("       the ids it documents:", .{});
+                    for (def.suggested_models) |id| std.debug.print(" {s}", .{id});
+                    std.debug.print("\n", .{});
+                }
             } else {
                 std.debug.print("error: could not read {s}'s model catalog ({t}).\n", .{ def.id, err });
             }

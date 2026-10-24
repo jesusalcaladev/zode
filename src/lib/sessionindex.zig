@@ -1,324 +1,360 @@
-//! Session index and metadata sidecars.
+//! Session metadata and the list of sessions of one project.
 //!
-//! The index lives at `<state>/index.json` and tracks:
-//! - `last_model`, `last_provider` (for session restoration)
-//! - Per-project `{last_session, session_count}`
+//! There are two things a session needs to be worth listing:
 //!
-//! Each session has a sidecar `<session>.meta.json` with:
-//! - `name` (user-given name)
-//! - `model` (the model the session mostly ran on)
-//! - `created_at` (timestamp)
+//!   - a NAME, because `zode-2026-10-24T18-12-03.jsonl` is not something a
+//!     person recognises three days later;
+//!   - an AGE it can read at a glance ("3h", "2mo"), because "which one was the
+//!     one I was working on this morning" is the only question the list answers.
+//!
+//! Both live HERE and not in the session file itself: the `.jsonl` is
+//! append-only, compressed line by line (`zjsonl`), and rewriting the head of it
+//! to change a name would mean decoding and re-encoding a whole history. So the
+//! name goes in a sidecar next to it, `<session>.meta.json`, written temp+rename
+//! at 0600 like everything else that is not the user's project.
+//!
+//! ## There is no index
+//!
+//! A `<state>/index.json` with a per-project count and a "last session" pointer
+//! is a CACHE of what the directory already says, and a cache that can disagree
+//! with the truth is how a session list shows a session that no longer exists
+//! (deleted, or written by another version). Listing a project means reading one
+//! directory; that is a file-system operation, not a network one.
 
 const std = @import("std");
 const sessionpath = @import("sessionpath.zig");
 
-/// Session metadata sidecar.
+/// The sidecar next to a session file.
 pub const Meta = struct {
+    /// User-given name. Empty means "never named": the UI shows the id.
     name: []const u8 = "",
+    /// The model the session mostly ran on, for the list's second column.
     model: []const u8 = "",
+    /// Unix seconds. 0 means "unknown, use the file's mtime".
     created_at: i64 = 0,
-
-    pub fn writeTo(self: Meta, writer: anytype) !void {
-        try writer.writeAll("{\n");
-        try writer.writeAll("  \"name\": ");
-        try writeJsonString(writer, self.name);
-        try writer.writeAll(",\n");
-        try writer.writeAll("  \"model\": ");
-        try writeJsonString(writer, self.model);
-        try writer.writeAll(",\n");
-        try writer.writeAll("  \"created_at\": ");
-        try std.fmt.format(writer, "{}", .{self.created_at});
-        try writer.writeAll("\n}\n");
-    }
 };
 
-/// Per-project entry in the index.
-pub const Project = struct {
-    last_session: []const u8 = "",
-    session_count: u32 = 0,
+/// One session in the list.
+pub const Entry = struct {
+    /// Full path to the `.jsonl`. This is what a resume needs.
+    path: []const u8,
+    /// User-given name, or "" when it was never named.
+    name: []const u8,
+    model: []const u8,
+    /// Unix seconds: the sidecar's `created_at`, or the file's mtime.
+    created_at: i64,
 };
 
-/// Global index.
-pub const Index = struct {
-    last_model: []const u8 = "",
-    last_provider: []const u8 = "",
-    projects: std.StringHashMap(Project) = std.StringHashMap(Project).init,
-
-    pub fn deinit(self: *Index, gpa: std.mem.Allocator) void {
-        for (self.projects.valueIterator()) |proj| {
-            gpa.free(proj.last_session);
-        }
-        self.projects.deinit();
-    }
-
-    pub fn setLastModel(self: *Index, model: []const u8, gpa: std.mem.Allocator) !void {
-        self.last_model = try gpa.dupe(u8, model);
-    }
-
-    pub fn setLastProvider(self: *Index, provider: []const u8, gpa: std.mem.Allocator) !void {
-        self.last_provider = try gpa.dupe(u8, provider);
-    }
-
-    pub fn project(self: *Index, project_hash: []const u8) ?*Project {
-        return self.projects.getPtr(project_hash);
-    }
-
-    pub fn setProject(self: *Index, project_hash: []const u8, proj: Project, gpa: std.mem.Allocator) !void {
-        const entry = try self.projects.getOrPut(gpa, project_hash);
-        entry.value_ptr.* = proj;
-    }
-
-    pub fn noteSession(self: *Index, project_hash: []const u8, session_path: []const u8, gpa: std.mem.Allocator) !void {
-        const entry = try self.projects.getOrPut(gpa, project_hash);
-        entry.value_ptr.*.session_count += 1;
-        entry.value_ptr.*.last_session = try gpa.dupe(u8, session_path);
-    }
-};
-
-/// Returns the meta sidecar path for a session file.
+/// `<session>.jsonl` → `<session>.meta.json`. The suffix is REPLACED, not
+/// appended: `zode-1.jsonl.meta.json` would be a second extension on a file
+/// whose name is already a timestamp, and every glob for `*.jsonl` would match
+/// the sidecar if it ended in `.json`.
 pub fn metaPath(arena: std.mem.Allocator, session_path: []const u8) ![]u8 {
-    // session_path ends with .jsonl, replace with .meta.json
-    const base = session_path[0 .. session_path.len - ".jsonl".len];
-    return try std.fs.path.join(arena, &.{ base, ".meta.json" });
+    const suffix = ".jsonl";
+    const base = if (std.mem.endsWith(u8, session_path, suffix))
+        session_path[0 .. session_path.len - suffix.len]
+    else
+        session_path;
+    return std.fmt.allocPrint(arena, "{s}.meta.json", .{base});
 }
 
-/// Reads the meta sidecar, returns defaults if missing or malformed.
-pub fn readMeta(arena: std.mem.Allocator, io: std.Io, path: []const u8) Meta {
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return Meta{};
-    defer file.close(io);
+/// Reads the sidecar of `session_path` (the `.jsonl`, not the `.meta.json`: the
+/// derivation lives in ONE place, `metaPath`). Any problem (missing file,
+/// truncated JSON) is "no metadata", never an error: a session whose name
+/// cannot be read still has to appear in the list, with its path and its age.
+pub fn readMeta(arena: std.mem.Allocator, io: std.Io, session_path: []const u8) Meta {
+    const mp = metaPath(arena, session_path) catch return .{};
+    const data = std.Io.Dir.cwd().readFileAlloc(io, mp, arena, .limited(8 * 1024)) catch return .{};
+    return parseMeta(arena, data);
+}
 
-    var buf: [4096]u8 = undefined;
-    const n = file.readAll(io, &buf) catch return Meta{};
-
-    // Simple JSON parse for our known fields
+/// The pure half of `readMeta`, so the parsing has a test that does not need a
+/// file system.
+pub fn parseMeta(arena: std.mem.Allocator, data: []const u8) Meta {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, data, .{}) catch return .{};
+    if (parsed != .object) return .{};
+    const o = parsed.object;
     var meta = Meta{};
-    const text = buf[0..n];
-    if (std.mem.indexOfScalar(u8, text, '{') == null) return meta;
-
-    // Extract name
-    if (std.mem.indexOfScalar(u8, text, "\\\"name\\\"") != null) {
-        // Find "name": "value"
-        const name_key = "\"name\"";
-        if (std.mem.indexOfScalar(u8, text, name_key)) |idx| {
-            const after = text[idx + name_key.len ..];
-            if (std.mem.indexOfScalar(u8, after, '"')) |start| {
-                const after2 = after[start + 1 ..];
-                if (std.mem.indexOfScalar(u8, after2, '"')) |end| {
-                    meta.name = arena.dupe(u8, after2[0..end]) catch "";
-                }
-            }
-        }
+    if (o.get("name")) |v| {
+        if (v == .string) meta.name = v.string;
     }
-
-    // Extract model
-    if (std.mem.indexOfScalar(u8, text, "\\\"model\\\"") != null) {
-        const model_key = "\"model\"";
-        if (std.mem.indexOfScalar(u8, text, model_key)) |idx| {
-            const after = text[idx + model_key.len ..];
-            if (std.mem.indexOfScalar(u8, after, '"')) |start| {
-                const after2 = after[start + 1 ..];
-                if (std.mem.indexOfScalar(u8, after2, '"')) |end| {
-                    meta.model = arena.dupe(u8, after2[0..end]) catch "";
-                }
-            }
-        }
+    if (o.get("model")) |v| {
+        if (v == .string) meta.model = v.string;
     }
-
-    // Extract created_at
-    if (std.mem.indexOfScalar(u8, text, "\\\"created_at\\\"") != null) {
-        const key = "\"created_at\"";
-        if (std.mem.indexOfScalar(u8, text, key)) |idx| {
-            const after = text[idx + key.len ..];
-            // Find first digit
-            var i: usize = 0;
-            while (i < after.len and !std.ascii.isDigit(after[i])) : (i += 1) {}
-            const num_start = i;
-            while (i < after.len and std.ascii.isDigit(after[i])) : (i += 1) {}
-            if (i > num_start) {
-                const num_str = after[num_start..i];
-                if (std.fmt.parseInt(i64, num_str, 10)) |v| {
-                    meta.created_at = v;
-                }
-            }
-        }
+    if (o.get("created_at")) |v| {
+        if (v == .integer) meta.created_at = v.integer;
     }
-
     return meta;
 }
 
-/// Writes the meta sidecar atomically (temp + rename, 0600).
-pub fn writeMeta(io: std.Io, arena: std.mem.Allocator, path: []const u8, meta: Meta) !void {
-    const temp = try std.fs.path.join(arena, &.{ path, ".tmp" });
-    defer {
-        _ = io.cwd().remove(io, temp) catch {};
+/// Writes the sidecar for `session_path`, atomically (temp + rename, 0600), the
+/// way `auth.json` is written: a half-written sidecar left by a crash would be
+/// read as "no name" forever, because parsing failure is not an error.
+///
+/// It takes the SESSION path and derives the sidecar with `metaPath`, instead of
+/// taking the sidecar path: the first version took the sidecar, and one caller
+/// passing the session path renamed the metadata OVER the `.jsonl`. The test
+/// caught it (the file stopped existing where the session was), and the lesson
+/// is that the API should not make that mistake expressible.
+pub fn writeMeta(io: std.Io, arena: std.mem.Allocator, session_path: []const u8, meta: Meta) !void {
+    const path = try metaPath(arena, session_path);
+    const tmp = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
+    var file = std.Io.Dir.cwd().createFile(io, tmp, .{
+        .truncate = true,
+        .permissions = sessionpath.session_mode,
+    }) catch |err| return err;
+    file.setPermissions(io, sessionpath.session_mode) catch {};
+    {
+        var wbuf: [1024]u8 = undefined;
+        var fw = file.writer(io, &wbuf);
+        writeMetaJson(&fw.interface, meta) catch |err| {
+            file.close(io);
+            _ = std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+            return err;
+        };
+        fw.interface.flush() catch |err| {
+            file.close(io);
+            _ = std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+            return err;
+        };
     }
-
-    var file = try io.cwd().createFile(io, temp, .{ .mode = sessionpath.session_mode });
-    defer file.close(io);
-
-    var writer = file.writer(io, &[0]u8{0});
-    try meta.writeTo(&writer);
-    try writer.flush();
-
-    try io.cwd().rename(io, temp, path);
+    file.close(io);
+    try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
 }
 
-/// Loads the index from disk, or returns empty if missing/malformed.
-pub fn loadIndex(_: std.mem.Allocator, io: std.Io, path: []const u8) !Index {
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return Index{};
-    defer file.close(io);
-
-    var buf: [16384]u8 = undefined;
-    _ = file.readAll(io, &buf) catch return Index{};
-
-    // For simplicity, return empty index - full JSON parse is complex
-    // and the index is rebuilt from sessions on startup anyway.
-    return Index{};
+fn writeMetaJson(w: *std.Io.Writer, meta: Meta) !void {
+    try w.writeAll("{\"name\":");
+    try writeJsonString(w, meta.name);
+    try w.writeAll(",\"model\":");
+    try writeJsonString(w, meta.model);
+    try w.print(",\"created_at\":{d}}}\n", .{meta.created_at});
 }
 
-/// Saves the index atomically.
-pub fn saveIndex(io: std.Io, arena: std.mem.Allocator, path: []const u8, index: Index) !void {
-    const temp = try std.fs.path.join(arena, &.{ path, ".tmp" });
-    defer {
-        _ = io.cwd().remove(io, temp) catch {};
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeAll("\"");
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        const esc: ?[]const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => null,
+        };
+        const e = esc orelse continue;
+        if (i > start) try w.writeAll(s[start..i]);
+        try w.writeAll(e);
+        start = i + 1;
     }
-
-    var file = try io.cwd().createFile(io, temp, .{ .mode = sessionpath.session_mode });
-    defer file.close(io);
-
-    var writer = file.writer(io, &[0]u8{0});
-    try writer.writeAll("{\n");
-    try writer.writeAll("  \"last_model\": ");
-    try writeJsonString(&writer, index.last_model);
-    try writer.writeAll(",\n");
-    try writer.writeAll("  \"last_provider\": ");
-    try writeJsonString(&writer, index.last_provider);
-    try writer.writeAll(",\n");
-    try writer.writeAll("  \"projects\": {}\n");
-    try writer.writeAll("}\n");
-    try writer.flush();
-
-    try io.cwd().rename(io, temp, path);
+    if (start < s.len) try w.writeAll(s[start..]);
+    try w.writeAll("\"");
 }
 
-/// Escapes a string for JSON.
-fn writeJsonString(writer: anytype, s: []const u8) !void {
-    try writer.writeAll("\"");
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => if (c < 0x20) {
-                try std.fmt.format(writer, "\\u{04x}", .{c});
-            } else {
-                try writer.writeAll(&c);
-            },
-        }
+/// Every session in `dir_path`, NEWEST FIRST.
+///
+/// One directory read and one sidecar read per session: the list is opened by a
+/// keystroke, so it cannot walk the project or parse a history. A missing
+/// directory is an empty list — a project that never saved a session has no
+/// sessions, which is not an error to show.
+pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
+
+    var list: std.ArrayList(Entry) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind == .directory) continue;
+        if (!sessionpath.isSessionFile(e.name)) continue;
+
+        const path = std.fs.path.join(arena, &.{ dir_path, e.name }) catch continue;
+        const mtime = blk: {
+            const st = dir.statFile(io, e.name, .{}) catch break :blk @as(i64, 0);
+            break :blk st.mtime.toSeconds();
+        };
+
+        var name: []const u8 = "";
+        var model: []const u8 = "";
+        var created: i64 = 0;
+        const meta = readMeta(arena, io, path);
+        // Only take what is non-empty: `parseMeta` allocates in the same arena,
+        // so the slices stay valid for as long as the list does.
+        if (meta.name.len > 0) name = meta.name;
+        if (meta.model.len > 0) model = meta.model;
+        if (meta.created_at > 0) created = meta.created_at;
+        if (created == 0) created = mtime;
+
+        list.append(arena, .{
+            .path = path,
+            .name = name,
+            .model = model,
+            .created_at = created,
+        }) catch continue;
     }
-    try writer.writeAll("\"");
+
+    std.mem.sort(Entry, list.items, {}, newerFirst);
+    return list.items;
 }
 
-/// Atomic write: temp file + rename, 0600.
-pub fn writeFileAtomic(io: std.Io, arena: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    const temp = try std.fs.path.join(arena, &.{ path, ".tmp" });
-    defer {
-        _ = io.cwd().remove(io, temp) catch {};
-    }
+fn newerFirst(_: void, a: Entry, b: Entry) bool {
+    if (a.created_at != b.created_at) return a.created_at > b.created_at;
+    // Same second (two sessions created by a script): the path decides, so the
+    // order is stable between two openings of the list instead of whatever the
+    // directory happened to return.
+    return std.mem.lessThan(u8, a.path, b.path);
+}
 
-    var file = try io.cwd().createFile(io, temp, .{ .mode = sessionpath.session_mode });
-    defer file.close(io);
-
-    try file.writeAll(io, data);
-    try io.cwd().rename(io, temp, path);
+/// How long ago, in the shortest unit that is still true: `now`, `42s`, `12m`,
+/// `3h`, `2d`, `3w`, `4mo`, `2y`.
+///
+/// `mo` and not `m` for months: with `m` already meaning minutes, `3m` and `3m`
+/// are two different ages that read the same.
+pub fn ageLabel(now: i64, then: i64, buf: []u8) []const u8 {
+    const d = now - then;
+    if (d <= 1) return std.fmt.bufPrint(buf, "now", .{}) catch "now";
+    const s: u64 = @intCast(d);
+    const pair: struct { n: u64, unit: []const u8 } = if (s < 60)
+        .{ .n = s, .unit = "s" }
+    else if (s < 3600)
+        .{ .n = s / 60, .unit = "m" }
+    else if (s < 86_400)
+        .{ .n = s / 3600, .unit = "h" }
+    else if (s < 7 * 86_400)
+        .{ .n = s / 86_400, .unit = "d" }
+    else if (s < 30 * 86_400)
+        .{ .n = s / (7 * 86_400), .unit = "w" }
+    else if (s < 365 * 86_400)
+        .{ .n = s / (30 * 86_400), .unit = "mo" }
+    else
+        .{ .n = s / (365 * 86_400), .unit = "y" };
+    return std.fmt.bufPrint(buf, "{d}{s}", .{ pair.n, pair.unit }) catch "?";
 }
 
 // ── tests ─────────────────────────────────────────────────────
 
 const t = std.testing;
 
-test "metaPath: replaces .jsonl with .meta.json" {
+test "metaPath: replaces .jsonl, does not append" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const a = arena_state.allocator();
 
-    const path = try metaPath(arena, "/state/sessions/abc/zode-123.jsonl");
-    try t.expectEqualStrings("/state/sessions/abc/zode-123.meta.json", path);
+    try t.expectEqualStrings(
+        "/state/sessions/abc/zode-1.meta.json",
+        try metaPath(a, "/state/sessions/abc/zode-1.jsonl"),
+    );
+    // A path without the suffix gets it too, instead of losing characters.
+    try t.expectEqualStrings("/tmp/zode-1.meta.json", try metaPath(a, "/tmp/zode-1"));
 }
 
-test "writeMeta and readMeta roundtrip" {
+test "parseMeta: the three fields, and garbage is 'no metadata'" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const a = arena_state.allocator();
 
-    var env_map = std.process.Environ.Map.init(arena);
-    defer env_map.deinit();
-    try env_map.put("HOME", "/home/user");
+    const m = parseMeta(a, "{\"name\":\"fix the parser\",\"model\":\"glm-5.3\",\"created_at\":1761234567}");
+    try t.expectEqualStrings("fix the parser", m.name);
+    try t.expectEqualStrings("glm-5.3", m.model);
+    try t.expectEqual(1761234567, m.created_at);
 
-    const io = std.io.getStdOut().io();
-    const state = try sessionpath.stateDir(arena, env_map);
-    const sessions = try std.fs.path.join(arena, &.{ state, "sessions", "test" });
-    _ = try io.cwd().createDirPathStatus(io, sessions, sessionpath.sessions_dir_mode);
-
-    const session_path = try std.fs.path.join(arena, &.{ sessions, "zode-test.jsonl" });
-    const meta = Meta{ .name = "my session", .model = "kimi-k2.6", .created_at = 1234567890 };
-
-    try writeMeta(io, arena, session_path, meta);
-    const read = readMeta(arena, io, session_path);
-
-    try t.expectEqualStrings("my session", read.name);
-    try t.expectEqualStrings("kimi-k2.6", read.model);
-    try t.expectEqual(1234567890, read.created_at);
+    // A name with an escaped quote survives the round trip of the writer below.
+    const empty = parseMeta(a, "not json at all");
+    try t.expectEqualStrings("", empty.name);
+    try t.expectEqual(@as(i64, 0), empty.created_at);
 }
 
-test "writeFileAtomic: writes and renames" {
+test "writeMetaJson escapes what JSON cannot carry bare" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeMetaJson(&w, .{ .name = "a\"b\\c", .model = "m", .created_at = 5 });
+    const out = w.buffered();
+
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var env_map = std.process.Environ.Map.init(arena);
-    defer env_map.deinit();
-    try env_map.put("HOME", "/home/user");
-
-    const io = std.io.getStdOut().io();
-    const path = try std.fs.path.join(arena, &.{ "/tmp", "zode-test-atomic.txt" });
-
-    try writeFileAtomic(io, arena, path, "hello world");
-    const file = try io.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    var buf: [32]u8 = undefined;
-    const n = file.readAll(io, &buf) catch unreachable;
-    try t.expectEqualStrings("hello world", buf[0..n]);
-    _ = io.cwd().remove(io, path);
+    const back = parseMeta(arena_state.allocator(), out);
+    try t.expectEqualStrings("a\"b\\c", back.name);
+    try t.expectEqual(@as(i64, 5), back.created_at);
 }
 
-test "Index: setLastModel and setLastProvider" {
-    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var index = Index{};
-    try index.setLastModel("kimi-k2.6", arena);
-    try index.setLastProvider("opencode", arena);
-    try t.expectEqualStrings("kimi-k2.6", index.last_model);
-    try t.expectEqualStrings("opencode", index.last_provider);
-    index.deinit(arena);
+test "ageLabel: the shortest unit that is still true" {
+    var buf: [16]u8 = undefined;
+    const cases = [_]struct { d: i64, want: []const u8 }{
+        .{ .d = 0, .want = "now" },
+        .{ .d = 1, .want = "now" },
+        .{ .d = 2, .want = "2s" },
+        .{ .d = 59, .want = "59s" },
+        .{ .d = 60, .want = "1m" },
+        .{ .d = 3599, .want = "59m" },
+        .{ .d = 3600, .want = "1h" },
+        .{ .d = 86_399, .want = "23h" },
+        .{ .d = 86_400, .want = "1d" },
+        .{ .d = 6 * 86_400, .want = "6d" },
+        .{ .d = 7 * 86_400, .want = "1w" },
+        .{ .d = 29 * 86_400, .want = "4w" },
+        .{ .d = 30 * 86_400, .want = "1mo" },
+        .{ .d = 364 * 86_400, .want = "12mo" },
+        .{ .d = 365 * 86_400, .want = "1y" },
+        // A clock that went backwards (NTP, or a session file copied with a
+        // future mtime) is "now", not "-3h".
+        .{ .d = -100, .want = "now" },
+    };
+    for (cases) |c| {
+        try t.expectEqualStrings(c.want, ageLabel(100_000, 100_000 - c.d, &buf));
+    }
 }
 
-test "Index: noteSession increments count" {
+test "writeMeta and readMeta roundtrip through a real file" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
 
-    var index = Index{};
-    try index.noteSession("proj1", "/sessions/zode-1.jsonl", arena);
-    try index.noteSession("proj1", "/sessions/zode-2.jsonl", arena);
-    const proj = index.project("proj1").?;
-    try t.expectEqual(2, proj.session_count);
-    try t.expect(std.mem.endsWith(u8, proj.last_session, "zode-2.jsonl"));
-    index.deinit(arena);
+    const root = try std.fmt.allocPrint(a, ".zode-meta-rt-{d}", .{t.random_seed});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    const session = try std.fs.path.join(a, &.{ root, "zode-1.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = session, .data = "{}\n" });
+
+    try writeMeta(io, a, session, .{ .name = "named", .model = "glm-5.3", .created_at = 42 });
+    // The sidecar exists where `metaPath` says, and the SESSION file is
+    // untouched (that was a real bug: the meta renamed over the session).
+    const still = try std.Io.Dir.cwd().readFileAlloc(io, session, a, .limited(64));
+    try t.expectEqualStrings("{}\n", still);
+    const back = readMeta(a, io, session);
+    try t.expectEqualStrings("named", back.name);
+    try t.expectEqualStrings("glm-5.3", back.model);
+    try t.expectEqual(@as(i64, 42), back.created_at);
+}
+
+test "scan: newest first, sidecars and non-session files ignored" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+
+    const root = try std.fmt.allocPrint(a, ".zode-sessionindex-{d}", .{t.random_seed});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    // Three sessions: one named, one only with a sidecar date, one not a
+    // session file at all (a sidecar must not show up as a session).
+    const old = try std.fs.path.join(a, &.{ root, "zode-old.jsonl" });
+    const new = try std.fs.path.join(a, &.{ root, "zode-new.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = old, .data = "{}\n" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = new, .data = "{}\n" });
+    try writeMeta(io, a, old, .{ .name = "the old one", .model = "glm-5.3", .created_at = 1_000 });
+    try writeMeta(io, a, new, .{ .name = "", .model = "", .created_at = 2_000 });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ root, "notes.txt" }), .data = "x" });
+
+    const list = scan(a, io, root);
+    try t.expectEqual(@as(usize, 2), list.len);
+    // Newest first, even though "old" sorts first alphabetically.
+    try t.expect(std.mem.endsWith(u8, list[0].path, "zode-new.jsonl"));
+    try t.expectEqualStrings("the old one", list[1].name);
+    try t.expectEqualStrings("glm-5.3", list[1].model);
+    try t.expectEqual(@as(i64, 1_000), list[1].created_at);
+
+    // A directory that does not exist is an empty list, not an error.
+    try t.expectEqual(@as(usize, 0), scan(a, io, try std.fmt.allocPrint(a, "{s}/nope", .{root})).len);
 }

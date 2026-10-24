@@ -98,7 +98,18 @@ pub const Session = struct {
 
         var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         defer dir.close(io);
-        _ = try dir.createDirPathStatus(io, "sessions", sessions_dir_mode);
+        // `sessions_dir` and not the literal "sessions": it is the BASE for
+        // `sessionPath` below, so creating the literal while the file goes to
+        // `<state>/projects/<hash>/sessions` left the new session in a directory
+        // that did not exist — the first turn of the first session after the
+        // state-dir move failed with "could not open the session file".
+        if (std.fs.path.isAbsolute(sessions_dir)) {
+            // An absolute path does not resolve against `dir`; the state dir is
+            // almost always absolute.
+            try std.Io.Dir.cwd().createDirPath(io, sessions_dir);
+        } else {
+            _ = try dir.createDirPathStatus(io, sessions_dir, sessions_dir_mode);
+        }
         const file = try dir.createFile(io, s.path.?, .{ .truncate = false });
         // `createFile` takes no mode: POSIX gives 0666 & ~umask, which is 0644 on a
         // default umask. The mode is set on the open file, so there is no window in
@@ -405,8 +416,7 @@ pub fn list(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]Entry
         const st = dir.statFile(io, e.name, .{}) catch continue;
 
         const path = try std.fs.path.join(arena, &.{ dir_path, e.name });
-        const mp = try sessionindex.metaPath(arena, path);
-        const meta = sessionindex.readMeta(arena, io, mp);
+        const meta = sessionindex.readMeta(arena, io, path);
 
         var entry = Entry{
             .path = path,
@@ -418,7 +428,10 @@ pub fn list(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]Entry
             .last_active = st.mtime.toSeconds(),
             .bytes = st.size,
         };
-        entry.preview = previewOf(arena, io, path, head);
+        // Only when it can be the LABEL: a named session already shows the
+        // user's own words, and reading 64 KB of every named file to fill a
+        // field nobody will see is what makes a 300-session list slow.
+        entry.preview = if (entry.name.len > 0) "" else previewOf(arena, io, path, head);
         try out.append(arena, entry);
     }
 
@@ -476,19 +489,21 @@ fn firstLineCut(arena: std.mem.Allocator, text: []const u8, max_bytes: usize) []
 }
 
 /// Rename a session by writing the new name to its sidecar.
+/// Both of these take the SESSION path and let `sessionindex` derive the
+/// sidecar: the first version derived it here and passed the sidecar in, and
+/// `writeMeta` derived it AGAIN, so the name was written to
+/// `zode-1.meta.meta.json` and the list never saw it.
 pub fn setSessionName(io: std.Io, arena: std.mem.Allocator, path: []const u8, name: []const u8) !void {
-    const mp = try sessionindex.metaPath(arena, path);
-    var meta = sessionindex.readMeta(arena, io, mp);
+    var meta = sessionindex.readMeta(arena, io, path);
     meta.name = try arena.dupe(u8, name);
-    try sessionindex.writeMeta(io, arena, mp, meta);
+    try sessionindex.writeMeta(io, arena, path, meta);
 }
 
 /// Set the model in the session's sidecar.
 pub fn setSessionModel(io: std.Io, arena: std.mem.Allocator, path: []const u8, model: []const u8) !void {
-    const mp = try sessionindex.metaPath(arena, path);
-    var meta = sessionindex.readMeta(arena, io, mp);
+    var meta = sessionindex.readMeta(arena, io, path);
     meta.model = try arena.dupe(u8, model);
-    try sessionindex.writeMeta(io, arena, mp, meta);
+    try sessionindex.writeMeta(io, arena, path, meta);
 }
 
 /// Frees a list of entries (their path/name/model/preview are in the arena).
@@ -709,4 +724,35 @@ test "latestSessionPath: finds a .jsonl in the directory (the iterate flag)" {
     defer std.Io.Dir.cwd().deleteTree(io, empty) catch {};
     try std.Io.Dir.cwd().createDirPath(io, empty);
     try std.testing.expect(try Session.latestSessionPathIn(astate.allocator(), io, empty) == null);
+}
+
+test "create: an ABSOLUTE sessions_dir is created, and the file lands inside it" {
+    // The state dir move (`sessionpath`): `create` used to `createDirPath` the
+    // literal "sessions" while writing the file to `sessions_dir`, so the first
+    // session of a project without a legacy dir failed with "file not found" —
+    // or worse, wrote into a `sessions/` inside the repository. An absolute path
+    // does not resolve against the cwd dir handle, which is the other half.
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const root = try std.fmt.allocPrint(a, "/tmp/zode-session-create-{d}/nested", .{std.testing.random_seed});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    setSessionsDir(root);
+    defer setSessionsDir("sessions");
+
+    const s = try Session.create(std.testing.allocator, io);
+    defer {
+        s.deinit();
+        std.testing.allocator.destroy(s);
+    }
+
+    const path = s.path orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, path, root));
+    try std.testing.expect(std.mem.endsWith(u8, path, ".jsonl"));
+    const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try std.testing.expectEqual(std.Io.File.Kind.file, st.kind);
+    // The repo-relative dir was NOT created as a side effect.
+    try std.testing.expect(!std.mem.startsWith(u8, path, "sessions/"));
 }

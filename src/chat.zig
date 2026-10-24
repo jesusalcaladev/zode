@@ -199,6 +199,14 @@ pub const EffortSupport = enum {
     /// `medium` would receive `medium` for being the middle rung of a ladder
     /// that nobody looked up.
     no_medium,
+    /// `low | high | max`. The Z.AI GLM-5.2/5.3 family (docs: `reasoning_effort`
+    /// takes exactly `low`, `high` and `max`, default `max`, and for GLM-5.3 any
+    /// OTHER value is an error, not a degradation).
+    ///
+    /// It is the only ladder whose TOP is called `max` instead of `xhigh`, and
+    /// the only one where "do not think" has to come out as `low` because
+    /// `thinking.type = disabled` is refused by GLM-5.3/5.3-FLASH.
+    low_high_max,
 };
 
 pub fn effortSupport(model: []const u8) EffortSupport {
@@ -219,6 +227,10 @@ pub fn effortSupport(model: []const u8) EffortSupport {
     // they take, and `medium` is the only level that could surprise us (it is
     // documented as unsupported on 3-pro-preview), so that one degrades high.
     if (containsAny(model, &.{"gemini"})) return .basic;
+    // Z.AI's GLM-5.2 and 5.3. `reasoning_effort` only exists from 5.2 up (their
+    // Deep Thinking page: "supported by GLM-5.2 and above"), so 5/5.1/4.7 stay
+    // in `.none`: no field at all, and the model uses its own default.
+    if (containsAny(model, &.{ "glm-5.3", "glm-5.2" })) return .low_high_max;
     if (containsAny(model, &.{ "gpt-5", "gpt5", "o3", "o4", "o1" })) return .basic;
     return .none;
 }
@@ -267,6 +279,16 @@ pub fn effortFor(model: []const u8, want: Effort) ?Effort {
             .none, .minimal, .low, .medium => .low,
             .high, .xhigh, .max => .high,
         },
+        // Three rungs, and the top one is SPELLED `max`. "Do not think" lands on
+        // `low` because `thinking.type: disabled` is an error on GLM-5.3 (their
+        // migration note says exactly this: turn `disabled` into `low`). Asking
+        // for more than `high` is `max`, because `xhigh` is not a word this
+        // family knows.
+        .low_high_max => switch (want) {
+            .none, .minimal, .low => .low,
+            .medium, .high => .high,
+            .xhigh, .max => .max,
+        },
     };
 }
 
@@ -300,6 +322,7 @@ pub fn maxEffortFor(model: []const u8) Effort {
     return switch (effortSupport(model)) {
         .none, .basic, .gpt51, .gemini3_minimal, .no_medium => .high,
         .codex_max => .xhigh,
+        .low_high_max => .max,
     };
 }
 
@@ -316,6 +339,7 @@ pub fn effortLevels(model: []const u8) []const Effort {
         .codex_max => &.{ .none, .minimal, .low, .medium, .high, .xhigh },
         .gemini3_minimal => &.{ .minimal, .low, .medium, .high },
         .no_medium => &.{ .low, .high },
+        .low_high_max => &.{ .low, .high, .max },
     };
 }
 
@@ -2064,6 +2088,45 @@ test "max is its own level, and no model is told a word it does not know" {
     try std.testing.expectEqual(@as(u32, 65536), Effort.max.outputCeiling());
     try std.testing.expectEqual(Effort.xhigh, Effort.max.degrade());
     try std.testing.expectEqual(Effort.xhigh, clampEffort("gpt-5.1-codex-max", .max));
+}
+
+test "GLM: low/high/max with the top rung spelled max, and no thinking block" {
+    // Verified against Z.AI's GLM-5.3 page: `reasoning_effort` takes exactly
+    // `low`, `high` and `max` (default `max`), and `thinking.type` may only be
+    // `enabled` — `disabled` is an ERROR there, not a no-op. zode sends neither
+    // `thinking` nor `budget_tokens` on the OpenAI path, which is what makes
+    // 5.3 work without a provider special case.
+    var buf: [64 * 1024]u8 = undefined;
+    const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
+
+    try std.testing.expectEqual(Effort.max, maxEffortFor("glm-5.3"));
+    try std.testing.expectEqual(Effort.high, defaultEffort("glm-5.3"));
+    try std.testing.expectEqualSlices(Effort, &[_]Effort{ .low, .high, .max }, effortLevels("glm-5.3"));
+
+    // There is no `medium` on this ladder: it lands on `high`, a level they know.
+    const mid = try buildBodyMessages(&buf, "glm-5.3", &msgs, .medium, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, mid, "\"reasoning_effort\":\"high\"") != null);
+
+    // The top is `max`, never `xhigh`.
+    const top = try buildBodyMessages(&buf, "glm-5.3", &msgs, .xhigh, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, top, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "\"reasoning_effort\":\"xhigh\"") == null);
+
+    // "Do not think" cannot be asked for: the cheapest rung they have is `low`.
+    const off = try buildBodyMessages(&buf, "glm-5.3", &msgs, .none, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"reasoning_effort\":\"low\"") != null);
+
+    // The Anthropic-shaped block never goes out on this path.
+    try std.testing.expect(std.mem.indexOf(u8, top, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "budget_tokens") == null);
+
+    // Same family, same ladder.
+    try std.testing.expectEqual(Effort.max, maxEffortFor("glm-5.3-flash"));
+
+    // GLM-5.1 and 4.7 have no `reasoning_effort` at all (docs: 5.2 and above),
+    // so no field goes out: an unknown level there is a 400.
+    const old = try buildBodyMessages(&buf, "glm-5.1", &msgs, .high, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, old, "reasoning_effort") == null);
 }
 
 test "buildBodyOpenAI: a normal model keeps max_tokens" {

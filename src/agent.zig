@@ -3930,7 +3930,17 @@ pub const ChatJob = struct {
 
 pub fn startChat(m: *tui.Model, input: []const u8) !void {
     const s = ensureSession(m, m.allocator);
-    const copy = try m.allocator.dupe(u8, input);
+    // Truncate long inputs for UI display, keep full text for model
+    const TRUNCATE_SIZE = 200;
+    var display_input = input;
+    var full_input = input;
+    if (input.len > TRUNCATE_SIZE) {
+        display_input = input[0..TRUNCATE_SIZE] ++ " ...";
+        full_input = input;
+    }
+    // Replace image references with [image.ext] placeholders for UI display
+    display_input = replaceImagePlaceholders(display_input);
+    const copy = try m.allocator.dupe(u8, full_input);
     errdefer m.allocator.free(copy);
 
     // If a turn is already in flight, QUEUE it instead of launching a worker in
@@ -3972,6 +3982,59 @@ pub fn startChat(m: *tui.Model, input: []const u8) !void {
         return error.ThreadSpawnFailed;
     };
     th.detach();
+}
+
+/// Replace image references with [image.ext] placeholders for UI display.
+/// Called on the truncated display input to keep the UI compact.
+pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
+    // Common image extensions
+    const image_exts = &.{"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"};
+    
+    // Find @image.ext patterns and replace them with [image.ext]
+    var result: [512]u8 = undefined;
+    var ri: usize = 0;
+    var li: usize = 0;
+    
+    while (li < text.len) {
+        // Look for @ followed by potential image filename
+        if (text[li] == '@' and li + 1 < text.len) {
+            li += 1;
+            // Collect the filename part (up to space, newline, tab, or end)
+            var fe: usize = li;
+            while (fe < text.len and text[fe] != ' ' and text[fe] != '\n' and text[fe] != '\t' and text[fe] != '@') {
+                fe += 1;
+            }
+            const filename = text[li .. fe];
+            // Check if it has an image extension (the part after the last dot)
+            const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse continue;
+            // Extension must not be at the start (like .gitignore) and must exist
+            if (dot >= filename.len - 1) {
+                // No valid extension found, copy @ as-is
+                if (ri + 1 > result.len) break;
+                result[ri] = '@';
+                ri += 1;
+                li += 1;
+                continue;
+            }
+            const ext = filename[dot + 1 .. fe];
+            if (std.mem.indexOfScalar(u8, image_exts, ext) != null) {
+                // Replace @image.ext with [image.ext]
+                const replacement = "[image." ++ ext ++ "]";
+                const repl_len = replacement.len;
+                if (ri + repl_len > result.len) break;
+                @memcpy(result[ri .. ri + repl_len], replacement);
+                ri += repl_len;
+                li = fe;
+                continue;
+            }
+        }
+        // Copy normal character
+        if (ri + 1 > result.len) break;
+        result[ri] = text[li];
+        ri += 1;
+        li += 1;
+    }
+    return result[0..ri];
 }
 
 /// The worker: one turn of conversation with the API, with tools.

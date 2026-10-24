@@ -906,7 +906,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
     .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
-    .{ .key = "/session", .desc = "session info", .palette_visible = false },
+    .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
     .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
     .{ .key = "/cache", .desc = "cache hit-rate for this session", .palette_visible = false },
     .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
