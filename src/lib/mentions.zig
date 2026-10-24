@@ -14,6 +14,8 @@ pub const Mention = struct {
 
 pub const ScanResult = struct {
     mentions: [scanned_max]Mention,
+    /// How many of `mentions` are valid (the rest are uninitialized).
+    count: u8 = 0,
     just_at: bool,
 };
 
@@ -27,20 +29,20 @@ pub fn scan(text: []const u8) !ScanResult {
         if (text[i] != '@') { i += 1; continue; }
 
         var is_bare_at: bool = false;
-        if (i == 0) {
+        const start = i + 1;
+        if (start >= text.len) {
+            // '@' at end of text: bare @
             is_bare_at = true;
         } else {
-            const prev = text[i - 1];
-            if (std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '@' or prev == '.' or prev == '/') {
-                i += 1; continue;
-            }
-            const start = i + 1;
-            if (start >= text.len) {
+            const c = text[start];
+            if (!std.ascii.isAlphanumeric(c) and c != '/' and c != '_' and c != '-' and c != '.') {
+                // '@' followed by non-path char: bare @
                 is_bare_at = true;
-            } else {
-                const c = text[start];
-                if (!std.ascii.isAlphanumeric(c) and c != '/' and c != '_' and c != '-' and c != '.') {
-                    is_bare_at = true;
+            } else if (i > 0) {
+                // '@' not at start: check previous char isn't part of a word
+                const prev = text[i - 1];
+                if (std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '@' or prev == '.' or prev == '/') {
+                    i += 1; continue;
                 }
             }
         }
@@ -50,7 +52,6 @@ pub fn scan(text: []const u8) !ScanResult {
             i += 1; continue;
         }
 
-        const start = i + 1;
         var j = start;
         while (j < text.len) : (j += 1) {
             const c = text[j];
@@ -80,7 +81,7 @@ pub fn scan(text: []const u8) !ScanResult {
         i = end;
     }
 
-    const result = ScanResult{ .mentions = mentions, .just_at = just_at };
+    const result = ScanResult{ .mentions = mentions, .count = n, .just_at = just_at };
     return result;
 }
 
@@ -145,7 +146,7 @@ pub fn expand(io: std.Io, text: []const u8) !Expansion {
     var loaded_path_count: usize = 0;
     var loaded_count: u8 = 0;
 
-    const max_to_load = if (scan_result.mentions.len < max_files) scan_result.mentions.len else max_files;
+    const max_to_load = if (scan_result.count < max_files) scan_result.count else max_files;
 
     var file_storage: [max_files][file_max]u8 = undefined;
     var file_texts: [max_files][]const u8 = undefined;
@@ -199,7 +200,7 @@ pub fn expand(io: std.Io, text: []const u8) !Expansion {
     var file_idx: usize = 0;
 
     while (li < text.len) {
-        if (mention_idx < scan_result.mentions.len) {
+        if (mention_idx < scan_result.count) {
             const mention_path = scan_result.mentions[mention_idx].pathOf();
             if (li + mention_path.len <= text.len and
                 std.mem.eql(u8, text[li..li + mention_path.len], mention_path)) {
@@ -249,7 +250,7 @@ pub fn expand(io: std.Io, text: []const u8) !Expansion {
 
 test "scan: finds the mentions in order" {
     const result = try scan("revisa @src/agent.zig y luego @src/tui.zig");
-    try std.testing.expectEqual(@as(u8, 2), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 2), result.count);
     try std.testing.expectEqualStrings("src/agent.zig", result.mentions[0].pathOf());
     try std.testing.expectEqualStrings("src/tui.zig", result.mentions[1].pathOf());
     try std.testing.expect(result.just_at == false);
@@ -257,26 +258,26 @@ test "scan: finds the mentions in order" {
 
 test "scan: an email address is NOT a mention" {
     const result = try scan("mándaselo a jorge@example.com");
-    try std.testing.expectEqual(@as(u8, 0), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 0), result.count);
     try std.testing.expect(result.just_at == false);
 }
 
 test "scan: @ at start of text is bare @" {
     const result = try scan("@");
     try std.testing.expect(result.just_at == true);
-    try std.testing.expectEqual(@as(u8, 0), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 0), result.count);
 }
 
 test "scan: @ followed by text is NOT bare @" {
     const result = try scan("@a.txt");
     try std.testing.expect(result.just_at == false);
-    try std.testing.expectEqual(@as(u8, 1), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 1), result.count);
     try std.testing.expectEqualStrings("a.txt", result.mentions[0].pathOf());
 }
 
 test "scan: trailing punctuation does not eat the path" {
     const result = try scan("mira @notas.txt, y @docs/guía.md.");
-    try std.testing.expectEqual(@as(u8, 2), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 2), result.count);
     try std.testing.expectEqualStrings("notas.txt", result.mentions[0].pathOf());
     try std.testing.expectEqualStrings("docs/guía.md", result.mentions[1].pathOf());
     try std.testing.expect(result.just_at == false);
@@ -285,12 +286,12 @@ test "scan: trailing punctuation does not eat the path" {
 test "scan: bare @ at end of text" {
     const result = try scan("hola @");
     try std.testing.expect(result.just_at == true);
-    try std.testing.expectEqual(@as(u8, 0), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 0), result.count);
 }
 
 test "scan: decorators do NOT spend the budget" {
     const result = try scan("revisa esto @Override @deprecated @staticmethod @final @pure @param @import y mira @src/agent.zig");
-    try std.testing.expectEqual(@as(u8, 1), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 1), result.count);
     try std.testing.expectEqualStrings("src/agent.zig", result.mentions[0].pathOf());
     try std.testing.expect(result.just_at == false);
 }
@@ -309,7 +310,7 @@ test "looksLikePath: a path or an extension; a bare word is not" {
 
 test "scan: does not repeat the same file" {
     const result = try scan("@a.txt y otra vez @a.txt y @b.txt");
-    try std.testing.expectEqual(@as(u8, 2), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 2), result.count);
     try std.testing.expectEqualStrings("a.txt", result.mentions[0].pathOf());
     try std.testing.expectEqualStrings("b.txt", result.mentions[1].pathOf());
     try std.testing.expect(result.just_at == false);
@@ -317,7 +318,7 @@ test "scan: does not repeat the same file" {
 
 test "scan: a mention inside parentheses or quotes counts too" {
     const result = try scan("(mira @src/a.zig) y \"@src/b.zig\"");
-    try std.testing.expectEqual(@as(u8, 2), result.mentions.len);
+    try std.testing.expectEqual(@as(u8, 2), result.count);
     try std.testing.expect(result.just_at == false);
 }
 
@@ -332,7 +333,7 @@ test "highlightMatch: contiguous substring wins over scattered" {
 test "highlightMatch: prefix wins over substring" {
     var buf: [64]u32 = undefined;
     const n = fuzzy.highlightPositions("sonnet", "son", &buf).?;
-    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(@as(u32, 0), buf[0]);
     try std.testing.expectEqual(@as(u32, 1), buf[1]);
     try std.testing.expectEqual(@as(u32, 2), buf[2]);

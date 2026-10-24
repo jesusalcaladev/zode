@@ -3757,7 +3757,9 @@ pub const Model = struct {
         // Cap: stop growing once we hit max_stream_bytes. Saturating add so a
         // pathological chunk size cannot overflow usize.
         const would_grow = satAdd(self.stream_buf.items.len, text.len);
-        if (would_grow > self.max_stream_bytes and !self.stream_truncated) {
+        if (self.stream_truncated) {
+            // Already hit the cap: drop all further chunks.
+        } else if (would_grow > self.max_stream_bytes) {
             // Only keep what fits under the cap, then mark truncated.
             const fits = if (self.stream_buf.items.len < self.max_stream_bytes)
                 self.max_stream_bytes - self.stream_buf.items.len
@@ -7923,7 +7925,10 @@ fn drawStateFooter(
         .err => .err,
     };
     // Advance the mascot animation clock each frame.
-    const now_ms: u64 = @as(u64, @intCast(std.Io.Timestamp.now(self.io, .real).toSeconds())) * 1000;
+    const now_ms: u64 = if (self.io_ready)
+        @as(u64, @intCast(std.Io.Timestamp.now(self.io, .real).toSeconds())) * 1000
+    else
+        0;
     if (animated or self.mascot_animator.kind != m_kind) {
         self.mascot_animator.setKind(m_kind, now_ms);
     }
@@ -13967,6 +13972,4 @@ test "streaming: a very large response is capped, not allowed to grow without bo
     // With no cap, stream_buf grows to 400 KB+. With a cap, it stays at or
     // below max_stream_bytes. This test documents that a cap SHOULD exist.
     try std.testing.expect(m.stream_buf.items.len <= max_stream_bytes);
-    m.streamEnd();
-    m.deinit();
 }

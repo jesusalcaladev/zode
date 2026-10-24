@@ -227,5 +227,6 @@ test "mascot animator resets on kind change" {
 
 test "mascot done has jump hint" {
     var a = Animator.init(StatusKind.done);
-    try std.testing.expect(a.jumpHint(300));
+    // Frame 3 "( O O )" with .jump starts at 180+120+110 = 410 ms.
+    try std.testing.expect(a.jumpHint(450));
 }
