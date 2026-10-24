@@ -85,6 +85,17 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     const url = def.models_url;
     const key = providers.keyFor(def, env);
 
+    // No catalogue endpoint (`models_url = ""`): `--models` is the command you
+    // run to see a list, and there is no list to see. Saying so is the answer;
+    // fetching "" would dress it up as a network failure.
+    if (url.len == 0) {
+        std.debug.print(
+            "{s} publishes no model catalog: pick the model by hand (`/use {s} <model>` or ZODE_MODEL).\n",
+            .{ def.id, def.id },
+        );
+        return 1;
+    }
+
     // `--models` is the worst case for a cold network: 772 KB and a 400-800 ms round
     // trip, for a list that changes once a month. It reads the cache first, prints, and
     // refreshes only if there is nothing saved (or the save is ancient). A machine with
@@ -126,7 +137,7 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     }
     if (printed) return 0;
 
-    var list = models.listModels(gpa, &http, url, key) catch |err| {
+    var list = models.listModels(gpa, &http, url, providers.authWithKey(def.key_style, key)) catch |err| {
         std.debug.print("error: {t}\n", .{err});
         return 1;
     };
@@ -267,7 +278,15 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // a provider with no `default_model` would send `"model": ""` and the
         // server error would say nothing about why.
         model_name = agent.resolveModelHeadless(gpa, &http, env) catch |err| {
-            std.debug.print("error: could not read {s}'s model catalog ({t}).\n", .{ def.id, err });
+            // Two different problems, two different sentences: a provider that
+            // publishes no catalogue at all (empty `models_url`) is not a broken
+            // network, and "could not read" would send the reader to fix the
+            // wrong thing.
+            if (def.models_url.len == 0) {
+                std.debug.print("error: {s} publishes no model catalog: there is no /models endpoint to ask.\n", .{def.id});
+            } else {
+                std.debug.print("error: could not read {s}'s model catalog ({t}).\n", .{ def.id, err });
+            }
             std.debug.print("       set ZODE_MODEL=<id> or add a model to ~/.config/zode/config.json.\n", .{});
             return error.NoModel;
         };
