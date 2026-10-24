@@ -26,7 +26,37 @@ pub const ProviderDef = struct {
     note: []const u8 = "",
     /// Whether the provider exposes pricing/context in /models.
     has_pricing: bool = false,
+    /// How the provider wants its key when it LISTS its catalogue.
+    ///
+    /// Not cosmetic, and not the chat path (`chat.streamRaw` builds its own
+    /// headers). `models.listModels` used to send `Authorization: Bearer` and
+    /// nothing else, and Anthropic has no Bearer at all: its catalogue answers
+    /// 401 `invalid x-api-key`, which `resolveModel` reports as "the catalog
+    /// could not be read". Anthropic therefore had no pickable models and the
+    /// only way to use it was to type the name by hand.
+    key_style: KeyStyle = .bearer,
 };
+
+pub const KeyStyle = enum { bearer, x_api_key };
+
+/// The credentials one request to a catalogue needs. A value produced by
+/// `authWithKey` / `catalogAuth`, so no caller has to remember which provider
+/// uses which header.
+pub const CatalogAuth = struct {
+    bearer: ?[]const u8 = null,
+    x_api_key: ?[]const u8 = null,
+};
+
+pub fn authWithKey(style: KeyStyle, key: ?[]const u8) CatalogAuth {
+    return switch (style) {
+        .bearer => .{ .bearer = key },
+        .x_api_key => .{ .x_api_key = key },
+    };
+}
+
+pub fn catalogAuth(def: *const ProviderDef, env: ?*const std.process.Environ.Map) CatalogAuth {
+    return authWithKey(def.key_style, keyFor(def, env));
+}
 
 pub const defs = [_]ProviderDef{
     .{
@@ -53,6 +83,9 @@ pub const defs = [_]ProviderDef{
         .models_url = "https://api.anthropic.com/v1/models",
         .key_env = &.{"ZODE_ANTHROPIC_KEY"},
         .note = "native Messages API with prompt caching",
+        // x-api-key, and NOT Bearer: verified with curl, `GET /v1/models` with
+        // `Authorization: Bearer …` answers 401 `invalid x-api-key`.
+        .key_style = .x_api_key,
     },
     .{
         .id = "openai",
@@ -85,6 +118,42 @@ pub const defs = [_]ProviderDef{
         .models_url = "http://localhost:11434/v1/models",
         .key_env = &.{},
         .note = "no key · overrides via config.json",
+    },
+    .{
+        .id = "mistral",
+        .name = "Mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .models_url = "https://api.mistral.ai/v1/models",
+        .key_env = &.{"ZODE_MISTRAL_KEY"},
+        .note = "fast and capable models",
+    },
+    .{
+        .id = "command-code",
+        .name = "CommandCode",
+        .base_url = "https://api.commandcode.ai/provider/v1",
+        .models_url = "https://api.commandcode.ai/provider/v1/models",
+        .key_env = &.{"ZODE_COMMAND_CODE_KEY"},
+        .note = "code-focused models",
+    },
+    .{
+        .id = "github-copilot",
+        .name = "GitHub Copilot",
+        // NOT `/models`: `base_url` is the PREFIX and `/chat/completions` is
+        // appended to it, so this used to send every request to
+        // `…/models/chat/completions`. The catalogue endpoint needs the suffix;
+        // the chat base must not have it.
+        .base_url = "https://api.githubcopilot.com",
+        .models_url = "https://api.githubcopilot.com/models",
+        .key_env = &.{"ZODE_GITHUB_COPILOT_KEY"},
+        .note = "code completion and chat · the chat API also wants its own headers",
+    },
+    .{
+        .id = "xai",
+        .name = "xAI",
+        .base_url = "https://api.x.ai/v1",
+        .models_url = "https://api.x.ai/v1/models",
+        .key_env = &.{"ZODE_XAI_KEY"},
+        .note = "Grok models",
     },
 };
 
@@ -190,6 +259,40 @@ test "keyFor: with nothing it returns null" {
     const def = byId("anthropic").?;
     try std.testing.expect(keyFor(def, null) == null);
     try std.testing.expect(!hasKey(def, null));
+}
+
+test "catalogAuth: anthropic authenticates with x-api-key, everyone else with the bearer" {
+    // The two styles are not interchangeable. Sending Anthropic a Bearer is a
+    // 401 that reads as "no catalogue", which is the bug this field fixes.
+    const anthropic = authWithKey(byId("anthropic").?.key_style, "sk-ant-x");
+    try std.testing.expect(anthropic.bearer == null);
+    try std.testing.expectEqualStrings("sk-ant-x", anthropic.x_api_key.?);
+
+    const openai = authWithKey(byId("openai").?.key_style, "sk-x");
+    try std.testing.expect(openai.x_api_key == null);
+    try std.testing.expectEqualStrings("sk-x", openai.bearer.?);
+
+    // No key is not an error here: the request goes out and the provider says
+    // 401, which is the honest answer for a provider nobody connected.
+    const none = authWithKey(.x_api_key, null);
+    try std.testing.expect(none.x_api_key == null);
+}
+
+test "no provider's chat base is a models (or chat) endpoint" {
+    // `base_url` is a PREFIX: `main.zig`, `agent.zig` and `lib/provider.zig` all
+    // append `/chat/completions` to it. A base that already ends in `/models`
+    // therefore sends every request to `…/models/chat/completions`, and the
+    // failure reads as "the provider is down" — github-copilot shipped like
+    // that. HTTPS on port 443 for all of them, so the test is on the PATH only.
+    for (&defs) |d| {
+        if (std.mem.endsWith(u8, d.base_url, "/models") or
+            std.mem.endsWith(u8, d.base_url, "/chat/completions") or
+            std.mem.endsWith(u8, d.base_url, "/messages"))
+        {
+            std.debug.print("provider {s} has base_url = \"{s}\": /chat/completions is appended to it\n", .{ d.id, d.base_url });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "no built-in provider ships with a default model" {

@@ -15,7 +15,21 @@
 const session_mode: std.Io.File.Permissions = @enumFromInt(0o600);
 const sessions_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
 
+/// Base directory for session files (default "sessions", override with setSessionsDir).
+///
+/// `setSessionsDir` COPIES into a static buffer: the string comes from an arena that
+/// dies, and the pointer must stay valid. The buffer is sized for max_path_bytes.
+pub var sessions_dir: []const u8 = "sessions";
+var sessions_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+pub fn setSessionsDir(dir: []const u8) void {
+    if (dir.len > sessions_dir_buf.len) return;
+    @memcpy(sessions_dir_buf[0..dir.len], dir);
+    sessions_dir = sessions_dir_buf[0..dir.len];
+}
+
 const std = @import("std");
+const sessionindex = @import("lib/sessionindex.zig");
 
 /// The first bytes of the goal note, so it can be found again and replaced.
 pub const goal_note_marker = "\u{1}ZODE-GOAL\u{1}";
@@ -273,7 +287,7 @@ pub const Session = struct {
 
     /// Path of the most recent session (by mtime); null if there is none.
     pub fn latestSessionPath(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
-        return latestSessionPathIn(arena, io, "sessions");
+        return latestSessionPathIn(arena, io, sessions_dir);
     }
 
     /// The most recent `.jsonl` inside `dir_path`, as a path relative to the
@@ -297,7 +311,7 @@ pub const Session = struct {
         while (it.next(io) catch null) |e| {
             if (e.kind != .file) continue;
             if (!std.mem.endsWith(u8, e.name, ".jsonl")) continue;
-            const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir_path, e.name });
+            const full = try std.fs.path.join(arena, &.{ dir_path, e.name });
             const st = dir.statFile(io, e.name, .{}) catch continue;
             const mtime_s = st.mtime.toSeconds();
             if (mtime_s > best_mtime) {
@@ -333,6 +347,157 @@ pub const Session = struct {
     }
 };
 
+/// One row of `/sessions`.
+///
+/// `path` is the identity: it is what `--resume` reopens. `name` is what the user
+/// called it (empty when they never did), `preview` is the first user message, and
+/// the rest is what the filesystem already knows.
+///
+/// There is no message count on purpose: counting means reading every session to
+/// the end, and a `/sessions` that takes a second on a machine with 300 of them is a
+/// command people stop typing. `bytes` is a fact `stat` gives for free.
+pub const Entry = struct {
+    /// Full path (or relative to the cwd) of the `.jsonl`.
+    path: []const u8,
+    /// File stem: `zode-<id>`.
+    id: []const u8,
+    /// User-given name; empty when unnamed.
+    name: []const u8,
+    /// The model the session mostly ran on (from the sidecar); empty when unknown.
+    model: []const u8,
+    /// First line of the first user message, trimmed and safely cut.
+    preview: []const u8,
+    /// From the sidecar, or the file's mtime when it has none.
+    created_at: i64,
+    /// The file's mtime: what "recent" means here.
+    last_active: i64,
+    bytes: u64,
+
+    /// What the picker shows on the left: the name the user chose, else the first
+    /// thing they typed, else the file name. Never empty, so a row is clickable.
+    pub fn label(self: Entry) []const u8 {
+        if (self.name.len > 0) return self.name;
+        if (self.preview.len > 0) return self.preview;
+        return self.id;
+    }
+};
+
+/// Everything in `dir_path` that is a session, most recent first.
+///
+/// A missing directory is an empty list: `/sessions` before the first session and
+/// `/sessions` on a machine whose state dir was just wiped are the same answer.
+pub fn list(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]Entry {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
+        return &.{};
+    defer dir.close(io);
+
+    // One buffer for every file's head, instead of one per file: the head is only
+    // needed to find the first user message.
+    const head = try arena.alloc(u8, 64 * 1024);
+
+    var out: std.ArrayList(Entry) = .empty;
+    errdefer out.deinit(arena);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file) continue;
+        if (!std.mem.endsWith(u8, e.name, ".jsonl")) continue;
+        const st = dir.statFile(io, e.name, .{}) catch continue;
+
+        const path = try std.fs.path.join(arena, &.{ dir_path, e.name });
+        const mp = try sessionindex.metaPath(arena, path);
+        const meta = sessionindex.readMeta(arena, io, mp);
+
+        var entry = Entry{
+            .path = path,
+            .id = e.name[0 .. e.name.len - ".jsonl".len],
+            .name = meta.name,
+            .model = meta.model,
+            .preview = "",
+            .created_at = if (meta.created_at > 0) meta.created_at else st.mtime.toSeconds(),
+            .last_active = st.mtime.toSeconds(),
+            .bytes = st.size,
+        };
+        entry.preview = previewOf(arena, io, path, head);
+        try out.append(arena, entry);
+    }
+
+    const items = try out.toOwnedSlice(arena);
+    sortEntriesRecent(items);
+    return items;
+}
+
+/// Most recent first; ties broken by path so the order is total (and a list does not
+/// reshuffle between two runs on files with the same second).
+pub fn sortEntriesRecent(items: []Entry) void {
+    std.mem.sort(Entry, items, {}, struct {
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            if (a.last_active != b.last_active) return a.last_active > b.last_active;
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
+}
+
+/// The first user message of a session, on one line and cut to a readable width.
+///
+/// It reads the HEAD of the file and not the whole of it: the system prompt is the
+/// first line and the first user message is right after it, so a transcript of 40 MB
+/// costs the same as one of 4 KB. A session with no user message answers "" and the
+/// caller falls back to the id.
+fn previewOf(arena: std.mem.Allocator, io: std.Io, path: []const u8, head: []u8) []const u8 {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return "";
+    defer file.close(io);
+    const n = file.readPositionalAll(io, head, 0) catch return "";
+
+    // A line can be cut by the buffer's end; it is then unparseable and skipped,
+    // which is correct: we are looking for the FIRST complete user message.
+    var lines = std.mem.splitScalar(u8, head[0..n], '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const m = parseLine(arena, line) catch continue;
+        if (m.role != .user) continue;
+        return firstLineCut(arena, m.content, 96);
+    }
+    return "";
+}
+
+/// One line, trimmed, at most `max_bytes` bytes and never inside a UTF-8 sequence.
+fn firstLineCut(arena: std.mem.Allocator, text: []const u8, max_bytes: usize) []const u8 {
+    const nl = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const line = text[0..nl];
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len <= max_bytes) return arena.dupe(u8, trimmed) catch "";
+    // Cut at byte boundary, then walk back to UTF-8 boundary.
+    var cut = trimmed[0..max_bytes];
+    while (cut.len > 0 and (cut[cut.len - 1] & 0xC0) == 0x80) {
+        cut = cut[0..cut.len - 1];
+    }
+    return arena.dupe(u8, cut) catch "";
+}
+
+/// Rename a session by writing the new name to its sidecar.
+pub fn setSessionName(io: std.Io, arena: std.mem.Allocator, path: []const u8, name: []const u8) !void {
+    const mp = try sessionindex.metaPath(arena, path);
+    var meta = sessionindex.readMeta(arena, io, mp);
+    meta.name = try arena.dupe(u8, name);
+    try sessionindex.writeMeta(io, arena, mp, meta);
+}
+
+/// Set the model in the session's sidecar.
+pub fn setSessionModel(io: std.Io, arena: std.mem.Allocator, path: []const u8, model: []const u8) !void {
+    const mp = try sessionindex.metaPath(arena, path);
+    var meta = sessionindex.readMeta(arena, io, mp);
+    meta.model = try arena.dupe(u8, model);
+    try sessionindex.writeMeta(io, arena, mp, meta);
+}
+
+/// Frees a list of entries (their path/name/model/preview are in the arena).
+pub fn freeEntries(arena: std.mem.Allocator, entries: []Entry) void {
+    // Entries are arena-allocated, nothing to free individually.
+    _ = arena;
+    _ = entries;
+}
+
 fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
@@ -353,7 +518,7 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
 }
 
 fn sessionPath(allocator: std.mem.Allocator, id: *const [8]u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "sessions/zode-{s}.jsonl", .{id});
+    return std.fmt.allocPrint(allocator, "{s}{c}zode-{s}.jsonl", .{ sessions_dir, std.fs.path.sep, id });
 }
 
 /// Rebuilds a session from a JSONL file (for `zode --resume`).

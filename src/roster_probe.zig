@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var with_key: usize = 0;
     for (defs) |*d| {
         const key = providers.keyFor(d, init.environ_map);
-        var list = models.listModels(arena, &http, d.models_url, key) catch |err| {
+        var list = models.listModels(arena, &http, d.models_url, providers.authWithKey(d.key_style, key)) catch |err| {
             try out.print("  {s:<12} key={s:<3} LIST FAILED ({t})\n", .{
                 d.id,
                 if (key != null) "yes" else "no",

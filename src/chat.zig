@@ -36,6 +36,15 @@ pub const Effort = enum {
     high,
     /// Above `high`. Only some models take it (OpenAI gpt-5.1+, OpenRouter).
     xhigh,
+    /// The same rung as `xhigh` under the name Z.AI uses for its top level
+    /// (`reasoning_effort: "max"`, which is also its default).
+    ///
+    /// It is a member of its own and not `xhigh` renamed because the WORD is the
+    /// contract: a model that only knows `max` answers 400 to `xhigh`, and the
+    /// other way around. No ladder in `effortSupport` offers it yet, so asking
+    /// for it lands on the model's top rung and `"max"` never reaches a provider
+    /// that did not ask for it.
+    max,
 
     pub fn parse(s: []const u8) ?Effort {
         const eq = std.ascii.eqlIgnoreCase;
@@ -44,7 +53,8 @@ pub const Effort = enum {
         if (eq(s, "low")) return .low;
         if (eq(s, "medium") or eq(s, "med")) return .medium;
         if (eq(s, "high")) return .high;
-        if (eq(s, "xhigh") or eq(s, "max")) return .xhigh;
+        if (eq(s, "xhigh")) return .xhigh;
+        if (eq(s, "max")) return .max;
         return null;
     }
 
@@ -62,6 +72,7 @@ pub const Effort = enum {
             .medium => .low,
             .high => .medium,
             .xhigh => .high,
+            .max => .xhigh,
         };
     }
 
@@ -77,6 +88,7 @@ pub const Effort = enum {
             .medium => 32768,
             .high => 65536,
             .xhigh => 65536,
+            .max => 65536,
         };
     }
 
@@ -91,6 +103,7 @@ pub const Effort = enum {
             .medium => 8192,
             .high => 16384,
             .xhigh => 24576,
+            .max => 24576,
         };
     }
 };
@@ -226,28 +239,33 @@ pub fn effortFor(model: []const u8, want: Effort) ?Effort {
         .basic => switch (want) {
             .none, .minimal, .low => .low,
             .medium => .medium,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
         },
         .gpt51 => switch (want) {
             .none => .none,
             .minimal => .minimal,
             .low => .low,
             .medium => .medium,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
         },
-        .codex_max => want,
+        // OpenAI's vocabulary tops at `xhigh`: sending it the word `max` is a
+        // 400, so the wish for "more than high" lands on the rung it does have.
+        .codex_max => switch (want) {
+            .max => .xhigh,
+            else => want,
+        },
         // Gemini has no `none`: its floor is `minimal`.
         .gemini3_minimal => switch (want) {
             .none, .minimal => .minimal,
             .low => .low,
             .medium => .medium,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
         },
         // No `medium`: degrade towards `low` (the requested level is more than
         // the model can do, and `low` is the nearest one below it).
         .no_medium => switch (want) {
             .none, .minimal, .low, .medium => .low,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
         },
     };
 }
@@ -269,6 +287,7 @@ pub fn reasoningEffortString(model: []const u8, want: Effort) ?[]const u8 {
         .medium => "medium",
         .high => "high",
         .xhigh => "xhigh",
+        .max => "max",
     };
 }
 
@@ -2010,6 +2029,41 @@ test "buildBodyOpenAI: o-series uses max_completion_tokens + reasoning_effort" {
     // And plain `gpt-5.1` degrades xhigh to high, which is what the docs say.
     const xh3 = try buildBodyMessages(&buf, "gpt-5.1", &msgs, .xhigh, "", .openai);
     try std.testing.expect(std.mem.indexOf(u8, xh3, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "max is its own level, and no model is told a word it does not know" {
+    // Z.AI's top rung is called `max` (and is its default); OpenAI's is `xhigh`.
+    // They are the same rung, and the WORD is the contract: a model that only
+    // knows `max` 400s on `xhigh` and the other way around. `max` exists as a
+    // level so a family that speaks it can ask for it; until one does, the wish
+    // lands on the top rung of the model that is running.
+    try std.testing.expectEqual(Effort.max, Effort.parse("max").?);
+    try std.testing.expectEqual(Effort.xhigh, Effort.parse("xhigh").?);
+
+    var buf: [64 * 1024]u8 = undefined;
+    const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
+
+    // codex-max is the one model with `xhigh`; it has no `max`.
+    const cm = try buildBodyMessages(&buf, "gpt-5.1-codex-max", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, cm, "\"reasoning_effort\":\"xhigh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cm, "\"reasoning_effort\":\"max\"") == null);
+
+    // Every other ladder degrades it to `high`.
+    const p51 = try buildBodyMessages(&buf, "gpt-5.1", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, p51, "\"reasoning_effort\":\"high\"") != null);
+
+    const basic = try buildBodyMessages(&buf, "o3-mini", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, basic, "\"reasoning_effort\":\"high\"") != null);
+
+    // A model with no knob at all still gets no field.
+    const none = try buildBodyMessages(&buf, "kimi-k2.6", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, none, "reasoning_effort") == null);
+
+    // The ceiling `max` asks for is the top one, so a turn that thinks this
+    // hard is not cut off by a 32k limit.
+    try std.testing.expectEqual(@as(u32, 65536), Effort.max.outputCeiling());
+    try std.testing.expectEqual(Effort.xhigh, Effort.max.degrade());
+    try std.testing.expectEqual(Effort.xhigh, clampEffort("gpt-5.1-codex-max", .max));
 }
 
 test "buildBodyOpenAI: a normal model keeps max_tokens" {

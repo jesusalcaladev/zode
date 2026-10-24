@@ -1,5 +1,6 @@
 const std = @import("std");
 const http_client = @import("http_client.zig");
+const providers = @import("providers.zig");
 
 /// Diagnostics for the model catalog, OFF unless asked for.
 ///
@@ -291,9 +292,28 @@ pub fn listModels(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
     url: []const u8,
-    bearer: ?[]const u8,
+    creds: providers.CatalogAuth,
 ) !ModelList {
-    const res = try http.get(url, bearer);
+    // A provider with no `/models` endpoint declares `models_url = ""` (Z.AI is
+    // one: its API reference has chat/completions, images, video, audio and
+    // nothing that lists models). `http.get("")` is a request to nowhere and
+    // the error it produces talks about a URL, not about the provider, so the
+    // empty URL answers before any socket is opened.
+    if (url.len == 0) return error.NoCatalog;
+
+    // The auth is per PROVIDER and the two styles are not interchangeable:
+    // Anthropic answers 401 to a Bearer and 400 to a request without
+    // `anthropic-version`. Both look like "no catalogue" from here, and the
+    // style is a column of the provider table, not a guess made at this depth.
+    var hdr_buf: [2]http_client.Http.ExtraHeader = undefined;
+    var hdr_len: usize = 0;
+    if (creds.x_api_key) |k| {
+        hdr_buf[hdr_len] = .{ .name = "x-api-key", .value = k };
+        hdr_len += 1;
+        hdr_buf[hdr_len] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+        hdr_len += 1;
+    }
+    const res = try http.getWith(url, creds.bearer, hdr_buf[0..hdr_len]);
     defer http.freeBody(res.body);
     if (res.status != 200) {
         dbg("HTTP {d}: {s}\n", .{ res.status, res.body[0..@min(res.body.len, 300)] });
@@ -419,6 +439,18 @@ test "listModels parses OpenRouter's context_length and pricing" {
     // Model with no pricing: 0, not NaN.
     const no_price = data.array.items[1].object.get("pricing");
     try std.testing.expect(no_price == null);
+}
+
+test "listModels: an empty url is NoCatalog, and no request goes out" {
+    // The guard at the top of `listModels`. Without it the empty URL becomes a
+    // DNS/TLS error that reads like a broken network, which is the worst
+    // possible message for "this provider publishes no catalogue".
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var http = http_client.Http.init(std.testing.allocator, threaded.io());
+    defer http.deinit();
+
+    try std.testing.expectError(error.NoCatalog, listModels(std.testing.allocator, &http, "", .{}));
 }
 
 test "jsonNumber accepts float, integer and decimal string" {

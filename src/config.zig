@@ -217,6 +217,10 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
             .key_env = keys.items,
             .default_model = model,
             .note = note,
+            // The same `kind` that says the chat path is the Anthropic Messages
+            // API says how its CATALOGUE expects the key: an anthropic proxy
+            // with `kind: "anthropic"` and no Bearer would list nothing.
+            .key_style = if (kind_anthropic) .x_api_key else .bearer,
         });
         try kinds.append(arena, kind_anthropic);
     }
@@ -622,6 +626,12 @@ pub fn writeFileSecure(
         .permissions = @enumFromInt(0o600),
     });
     defer file.close(io);
+    // `permissions` above only applies when the file is CREATED. A
+    // `auth.json.tmp` left behind by a crashed write keeps whatever mode it had
+    // — and if that one was written 0644 (by an older zode, or by hand), the
+    // rename publishes it as `auth.json` at 0644 with the keys readable by every
+    // user on the machine. So the mode is set on the OPEN file, every time.
+    file.setPermissions(io, @enumFromInt(0o600)) catch {};
     // `File` has no writeAll in 0.16: build a writer with its own buffer.
     var wbuf: [4096]u8 = undefined;
     var fw = file.writer(io, &wbuf);
@@ -630,6 +640,28 @@ pub fn writeFileSecure(
     // The temp file is renamed to its final name: writing in place would leave
     // half of the key in a 0644 file if it failed midway.
     try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
+}
+
+/// Tightens an existing file to 0600 if it is looser.
+///
+/// The private mode is applied when zode WRITES `auth.json`, so a file written
+/// by an older zode, restored from a backup, or created with `echo … > auth.json`
+/// stays 0644 forever: the keys are readable by every user on the machine, and
+/// every start of the app reads them and does nothing about it. This is the
+/// check that makes "the file is 0600" a property of the FILE and not of the
+/// writer that happened to create it.
+///
+/// Best-effort, and deliberately silent: no file yet (nobody connected a
+/// provider), a read-only mount or a file owned by somebody else are not
+/// reasons to refuse to start. The caller keeps going, with or without keys.
+pub fn tightenPermissions(io: std.Io, path: []const u8) void {
+    if (path.len == 0) return;
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
+    defer file.close(io);
+    const st = file.stat(io) catch return;
+    // 0o077 is group+other: anything in there is someone else's read (or write).
+    if (@intFromEnum(st.permissions) & 0o077 == 0) return;
+    file.setPermissions(io, @enumFromInt(0o600)) catch {};
 }
 
 // ── minimal hand-written JSON ─────────────────────────────────
@@ -709,4 +741,74 @@ test "writeFileSecure: creates the directory and writes with 0600" {
     };
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("{\"a\":\"b\"}", got);
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
+}
+
+/// Mode bits of `path`, for the tests below. Read through an open file because
+/// `statFile` wants its own options struct and this is the same code either way.
+fn modeOf(io: std.Io, path: []const u8) !u32 {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+    // `Permissions` carries the file-type bits too (0100644 for a regular
+    // file), so only the mode itself is interesting here.
+    return @intFromEnum(st.permissions) & 0o7777;
+}
+
+test "writeFileSecure: a leftover 0644 temp file does not publish auth.json at 0644" {
+    // The hole this covers: `createFile(.permissions = 0o600)` only sets the
+    // mode when it CREATES. A `.tmp` from a crashed run kept its old mode, the
+    // rename published it under the real name, and the keys ended up readable by
+    // every user on the machine.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const home: [:0]const u8 = "HOME=/tmp/zode-test-tmp-home\x00";
+    try env_map.putPosixBlock(.{ .slice = &.{home} });
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "/tmp/zode-test-tmp-home/.config/zode/auth.json";
+    std.Io.Dir.cwd().deleteTree(io, "/tmp/zode-test-tmp-home") catch {};
+    try std.Io.Dir.cwd().createDirPath(io, "/tmp/zode-test-tmp-home/.config/zode");
+
+    // A pre-existing temp file, forced to 0644 so the test does not depend on
+    // the umask of whoever runs it.
+    const tmp = path ++ ".tmp";
+    const stale = try std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true });
+    stale.setPermissions(io, @enumFromInt(0o644)) catch {};
+    stale.close(io);
+    try std.testing.expectEqual(@as(u32, 0o644), try modeOf(io, tmp));
+
+    try writeFileSecure(io, &env_map, path, "{\"k\":\"v\"}");
+
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
+}
+
+test "tightenPermissions: a 0644 auth.json becomes 0600, a private one is left alone" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = "/tmp/zode-test-perms";
+    const path = dir ++ "/auth.json";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    // No file: not an error, nothing to do (nobody connected a provider yet).
+    tightenPermissions(io, path);
+    tightenPermissions(io, "");
+
+    const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    f.setPermissions(io, @enumFromInt(0o644)) catch {};
+    f.close(io);
+    try std.testing.expectEqual(@as(u32, 0o644), try modeOf(io, path));
+
+    tightenPermissions(io, path);
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
+
+    // Idempotent: calling it again cannot fail or change anything.
+    tightenPermissions(io, path);
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
 }

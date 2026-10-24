@@ -215,7 +215,7 @@ pub const Roster = struct {
 
             // `var` and not `const`: `deinit` needs a non-const pointer to free
             // the list (Zig does not let a `*const` be passed to a `*`).
-            var list = models.listModels(self.arena, &http, def.models_url, providers.keyFor(&def, env)) catch {
+            var list = models.listModels(self.arena, &http, def.models_url, providers.catalogAuth(&def, env)) catch {
                 // A down provider does not bring the pool down: carry on with the rest.
                 self.last_error = error.ProviderListFailed;
                 continue;

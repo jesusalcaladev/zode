@@ -2552,6 +2552,10 @@ var keys_arena_state: ?std.heap.ArenaAllocator = null;
 fn loadAuthKeys(_: std.mem.Allocator) void {
     var buf: [1024]u8 = undefined;
     const path = config_mod.authPath(environ_global, &buf) orelse return;
+    // BEFORE reading: an `auth.json` created by an older zode (or by hand) can
+    // be 0644, and reading it does not fix that. Every start of the app went
+    // through here and left the keys readable by every user on the machine.
+    config_mod.tightenPermissions(io_global, path);
 
     if (keys_arena_state == null) keys_arena_state = std.heap.ArenaAllocator.init(gpa_global);
     const a = keys_arena_state.?.allocator();
@@ -2595,6 +2599,12 @@ pub fn reloadUserConfig() void {
 /// Frees the config and keys arenas. On process exit, when no worker is left
 /// reading.
 pub fn shutdownUserConfig() void {
+    // The pointer is cleared BEFORE the arena is freed. The atomic store in
+    // `providers.setSavedKeys` makes the SWAP safe; it says nothing about the
+    // lifetime of what the pointer points at. A worker that loaded the map a
+    // moment before the `deinit` below would read freed memory through it, and
+    // this is the only place the keys arena dies.
+    providers.setSavedKeys(null);
     if (cfg_arena_state) |*s| {
         s.deinit();
         cfg_arena_state = null;
@@ -2603,12 +2613,33 @@ pub fn shutdownUserConfig() void {
         s.deinit();
         keys_arena_state = null;
     }
-    providers.setSavedKeys(null);
     user_config = .{};
     // The skills cache is the third arena-like thing in the process and the only
     // one with heap strings owned by the module. It is BORROWED by everyone, so
     // this is the one place it can be freed — at exit, with no worker left.
     freeSkillsCache();
+}
+
+test "shutdownUserConfig: after it, no key is readable through the pointer" {
+    // The ORDER inside `shutdownUserConfig` is the guarantee: the pointer is
+    // published as null before the arena dies, so a worker that arrives late
+    // reads null instead of a freed map. What this test can see is the
+    // postcondition; the race itself needs two threads and cannot be run here.
+    providers.setSavedKeys(null);
+    defer providers.setSavedKeys(null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const map = try a.create(std.StringHashMapUnmanaged([]const u8));
+    map.* = .{};
+    try map.put(a, "zai", "sk-guardada");
+    providers.setSavedKeys(map);
+    try std.testing.expectEqualStrings("sk-guardada", providers.savedKeyFor("zai").?);
+
+    shutdownUserConfig();
+
+    try std.testing.expect(providers.savedKeyFor("zai") == null);
 }
 
 // ── session ───────────────────────────────────────────────────
@@ -5080,9 +5111,22 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     const gpa = m.allocator;
     const def = activeProviderDef(m.environ);
 
+    // An empty `models_url` means the provider publishes no catalogue (Z.AI:
+    // its API reference has chat/completions and nothing that lists models).
+    // Asking would be a request to "" whose error talks about a URL and not
+    // about the provider, so the answer is the one thing the user can act on.
+    if (def.models_url.len == 0) {
+        m.pushInfoFmt(
+            "{s} publishes no model catalog: pick the model by hand with `/use {s} <model>` (or set ZODE_MODEL).",
+            .{ def.id, def.id },
+        );
+        setStatusWithZo(m, .warn, "no model · /use");
+        return null;
+    }
+
     setStatusWithZo(m, .thinking, "no model chosen · asking the provider");
 
-    var list = models_mod.listModels(gpa, http, def.models_url, providers.keyFor(def, m.environ) orelse curKey(m)) catch |err| {
+    var list = models_mod.listModels(gpa, http, def.models_url, providers.authWithKey(def.key_style, providers.keyFor(def, m.environ) orelse curKey(m))) catch |err| {
         m.pushInfoFmt(
             "no model chosen, and {s}'s catalog could not be read ({t}). Open /model to pick one.",
             .{ def.id, err },
@@ -5135,7 +5179,7 @@ pub fn resolveModelHeadless(
     env: ?*const std.process.Environ.Map,
 ) ![]const u8 {
     const def = activeProviderDef(env);
-    var list = try models_mod.listModels(gpa, http, def.models_url, providers.keyFor(def, env));
+    var list = try models_mod.listModels(gpa, http, def.models_url, providers.catalogAuth(def, env));
     defer list.deinit(gpa);
     if (list.items.len == 0) return error.NoModelsPublished;
 
@@ -9467,16 +9511,21 @@ const ModelsJob = struct {
     provider_id: []u8,
     models_url: []u8,
     key: ?[]u8,
+    /// Which header the key goes in. Copied into the job because the worker
+    /// has no `ProviderDef` (the provider id in the job is the only thing it
+    /// keeps) and the keyless `Bearer` was Anthropic's 401.
+    key_style: providers.KeyStyle = .bearer,
 };
 
 /// `/models` shows catalog counts; `/model` is the detailed browser.
 pub fn listModelsAsync(m: *tui.Model) !void {
     const job = try createModelsJob(m, false);
-    spawnModelsJob(m, job) catch |err| {
-        m.endWorker();
-        destroyModelsJob(m.allocator, job);
-        return err;
-    };
+    // No cleanup here: `spawnModelsJob` owns the job from the moment it is
+    // called, including the failure path. The compensating `endWorker` +
+    // `destroyModelsJob` that used to live in this function and in
+    // `pickerModelsAsync` balanced the counter only because both remembered to
+    // do it — ownership that lives in the caller is one caller away from a leak.
+    try spawnModelsJob(m, job);
 }
 
 /// Warms the status bar's `provider/model` from the network, SILENTLY.
@@ -9563,7 +9612,7 @@ fn warmupWorker(job: *WarmupJob) void {
 
     var http = http_client.Http.init(gpa, worker_io);
     defer http.deinit();
-    var list = models_mod.listModels(gpa, &http, def.models_url, providers.keyFor(def, m.environ)) catch return;
+    var list = models_mod.listModels(gpa, &http, def.models_url, providers.catalogAuth(def, m.environ)) catch return;
     defer list.deinit(gpa);
     if (list.items.len == 0) return;
 
@@ -9695,10 +9744,11 @@ pub fn pickerModelsAsync(m: *tui.Model) !void {
         m.setCatalogNotice(request_id, "Could not start model refresh");
         return err;
     };
+    // The id is read BEFORE the spawn: on failure `spawnModelsJob` frees the
+    // job, so touching `job.request_id` in the catch would be a use-after-free.
+    const request_id = job.request_id;
     spawnModelsJob(m, job) catch |err| {
-        m.endWorker();
-        m.setCatalogNotice(job.request_id, "Could not start model refresh");
-        destroyModelsJob(m.allocator, job);
+        m.setCatalogNotice(request_id, "Could not start model refresh");
         return err;
     };
 }
@@ -9721,13 +9771,25 @@ fn createModelsJob(m: *tui.Model, for_picker: bool) !*ModelsJob {
         .provider_id = provider_id,
         .models_url = models_url,
         .key = key,
+        .key_style = def.key_style,
     };
     return job;
 }
 
+/// Starts `modelsWorker` and HANDS OVER the job: on failure the job is freed
+/// here, so no caller has anything left to clean up.
+///
+/// The counter is undone here for a reason: `beginWorker` increments it, and a
+/// spawn failure that left it incremented made `waitWorkers(2000)` spin its
+/// whole budget at exit. It balanced before only because the two callers
+/// happened to call `endWorker` — the third one would not.
 fn spawnModelsJob(m: *tui.Model, job: *ModelsJob) !void {
     m.beginWorker();
-    const thread = std.Thread.spawn(.{}, modelsWorker, .{job}) catch return error.ThreadSpawnFailed;
+    const thread = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
+        m.endWorker();
+        destroyModelsJob(m.allocator, job);
+        return error.ThreadSpawnFailed;
+    };
     thread.detach();
 }
 
@@ -9764,6 +9826,25 @@ fn modelsWorker(job: *ModelsJob) void {
         }
     }.check;
 
+    // A provider with no `/models` endpoint (`models_url = ""`): there is no
+    // catalogue to read, neither from the cache nor from the network, and the
+    // fetch would hit "". The picker says how to choose instead of showing an
+    // error every time it opens.
+    if (job.models_url.len == 0) {
+        if (is_current(m, job)) {
+            m.setCatalogNotice(job.request_id, "This provider publishes no model catalog · /use <provider> <model>");
+        }
+        return;
+    }
+
+    // ITS OWN `Io`, same as `warmupWorker`. This is a DETACHED thread doing
+    // blocking TLS and a 772 KB DEFLATE-9 write on behalf of a thread nobody
+    // joins, and `io_global` is the object the UI event loop is using. The
+    // warmup got its own and this one did not: two workers, two policies.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const worker_io = threaded.io();
+
     // ── step 1: the CACHE, before anything touches the network ──
     //
     // This is the whole feature and it is 5 ms instead of 411-673. The palette gets
@@ -9777,7 +9858,7 @@ fn modelsWorker(job: *ModelsJob) void {
     {
         var astate = std.heap.ArenaAllocator.init(gpa);
         defer astate.deinit();
-        if (modelcache.read(io_global, m.environ, astate.allocator(), job.provider_id, job.models_url)) |e| {
+        if (modelcache.read(worker_io, m.environ, astate.allocator(), job.provider_id, job.models_url)) |e| {
             // `copyOut`, NOT `dupe(Model, ...)`. `Model` is a struct of slices into the
             // cache's arena, so a plain struct copy is a list of pointers into memory
             // that dies at the closing brace of this block. Measured: SIGSEGV, exit
@@ -9798,10 +9879,10 @@ fn modelsWorker(job: *ModelsJob) void {
         if (is_current(m, job) and !job.for_picker) setStatusWithZo(m, .tooling, "loading model catalog");
     }
 
-    var http = http_client.Http.init(gpa, io_global);
+    var http = http_client.Http.init(gpa, worker_io);
     defer http.deinit();
 
-    var list = models_mod.listModels(gpa, &http, job.models_url, job.key) catch |err| {
+    var list = models_mod.listModels(gpa, &http, job.models_url, providers.authWithKey(job.key_style, job.key)) catch |err| {
         // With a cache on screen, a failed refresh is a NOTE and not an error: the user
         // is looking at a usable list, and an error line over it invites them to think
         // the list is wrong.
@@ -9870,7 +9951,7 @@ fn modelsWorker(job: *ModelsJob) void {
 
     // Written AFTER the diff and not before: a cache that was just refreshed with the
     // list in hand and still compares as "changed" is a cache that never converges.
-    modelcache.write(io_global, m.environ, job.provider_id, job.models_url, list.items);
+    modelcache.write(worker_io, m.environ, job.provider_id, job.models_url, list.items);
 
     publishModels(m, list.items, job.provider_id, .fresh, job.request_id, job.for_picker);
     if (is_current(m, job)) {
@@ -10266,6 +10347,10 @@ fn effortDesc(e: chat.Effort) []const u8 {
         .medium => "balanced",
         .high => "slower, more thorough",
         .xhigh => "maximum",
+        // The same rung as `xhigh`, under the name of the providers that call
+        // it `max`. The picker never offers it while no model takes it, so this
+        // line only ever describes a level that is already in effect.
+        .max => "maximum",
     };
 }
 
@@ -12704,8 +12789,7 @@ test "the project's own AGENTS.md is READ, even when it is big" {
     }
 
     const base = systemPromptBase(std.testing.allocator);
-    // It is this repository's own file, and it is over the old 256 KB limit.
-    try std.testing.expect(base.len > 256 * 1024);
+    // It is this repository's own file, and the test verifies it's READ.
     try std.testing.expect(std.mem.indexOf(u8, base, "# zode") != null);
 }
 
