@@ -127,6 +127,15 @@ pub const Http = struct {
         return self.request(.GET, url, bearer, null, &.{}, null);
     }
 
+    /// `get` with the headers an API that has no Bearer needs.
+    ///
+    /// Anthropic is the one: `x-api-key` instead of `Authorization`, plus a
+    /// mandatory `anthropic-version`. Without this the catalogue request went
+    /// out with a Bearer it ignores and came back 401.
+    pub fn getWith(self: *Http, url: []const u8, bearer: ?[]const u8, extra: []const ExtraHeader) !JsonResult {
+        return self.request(.GET, url, bearer, null, extra, null);
+    }
+
     /// GET with its own headers.
     ///
     /// The web tool needs it: half the internet (Cloudflare, GitHub, Wikipedia)
