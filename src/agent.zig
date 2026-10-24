@@ -9990,6 +9990,7 @@ fn buildModelItems(m: *tui.Model, _: []models_mod.Model) ?[]palette.Item {
                         std.fmt.allocPrint(gpa, "{s} · {s}", .{d.id, hint}) catch gpa.dupe(u8, d.id) catch ""
                     else
                         gpa.dupe(u8, d.id) catch "",
+                    .provider = gpa.dupe(u8, d.id) catch "",
                     .ctx_tokens = mi.context_length,
                 };
                 i += 1;
@@ -10029,6 +10030,7 @@ fn buildModelItems(m: *tui.Model, _: []models_mod.Model) ?[]palette.Item {
                         std.fmt.allocPrint(gpa, "{s} · {s}", .{active_def.id, hint}) catch gpa.dupe(u8, active_def.id) catch ""
                     else
                         gpa.dupe(u8, active_def.id) catch "",
+                    .provider = gpa.dupe(u8, active_def.id) catch "",
                     .ctx_tokens = mi.context_length,
                 };
                 i += 1;
@@ -10149,6 +10151,7 @@ fn fallbackModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
                 std.fmt.allocPrint(gpa, "{s} · {s}", .{active_provider, hint}) catch gpa.dupe(u8, active_provider) catch ""
             else
                 gpa.dupe(u8, active_provider) catch "",
+            .provider = gpa.dupe(u8, active_provider) catch "",
             .ctx_tokens = mi.context_length,
         };
         i += 1;

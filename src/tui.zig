@@ -4566,6 +4566,10 @@ pub const Model = struct {
                 // The window goes with the model: it is what the compaction
                 // budget is computed from, and dropping it here is what kept the
                 // budget at 128k for every model.
+                // If the model belongs to a different provider, switch to it first.
+                if (mo.provider.len > 0 and !std.mem.eql(u8, mo.provider, agent.cur_provider_id)) {
+                    try agent.applyProvider(self, mo.provider);
+                }
                 try agent.applyModel(self, mo.id, mo.ctx_tokens);
                 return true;
             },

@@ -105,6 +105,14 @@ binary (1.9MB stripped).
 3. A real E2E against Anthropic with your own key (the wire format is already unit
    tested; OpenRouter serves Claude through OpenAI-compat).
 
+**Done (2026-10-23)**:
+- OpenRouter API headers (`HTTP-Referer`, `X-OpenRouter-Title`) added to all chat completion requests (main turn, subagents, summarization, headless mode)
+- Model cache TTL reduced from 14 days to 24 hours for fresher model lists
+- Ctrl+R shortcut in model picker (`/model` or `Ctrl+T`) to manually refresh model list (invalidates cache and re-fetches)
+- Footer hint updated to show "ctrl+r refresh"
+- Double-free bug fixed in `TurnStats.reset()` by clearing lists after deinit
+- Verified with real OpenRouter key: 471 models (19 free) fetched successfully
+
 ## Mascot: Zo
 
 - `mascot.zig`: Zo. A one-line face per mood (idle/thinking/tooling/done/warn) in

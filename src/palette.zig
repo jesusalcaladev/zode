@@ -48,6 +48,9 @@ pub const Item = struct {
     label: []const u8 = "",
     /// Right column: keyboard shortcut, "free", price…
     hint: []const u8 = "",
+    /// Provider ID for model items (e.g., "openrouter", "opencode").
+    /// Used to auto-switch provider when selecting a model from a different provider.
+    provider: []const u8 = "",
     /// Context window of a model, in tokens (0 = the provider does not publish
     /// it, or this is not a model row).
     ///
@@ -1199,13 +1202,13 @@ pub const Action = union(enum) {
     set_provider: []const u8,
     /// Open the guided provider connection list.
     open_connect,
-    /// Switch to this model, with its context window in tokens.
+    /// Switch to this model, with its context window in tokens and provider.
     ///
     /// A struct, not a bare `[]const u8`, because the window is what makes the
     /// compaction budget right for this model instead of a fixed 128k — and a
     /// bare string had no room for it, so the number that `buildModelItems` read
     /// out of the catalogue had nowhere to go.
-    set_model: struct { id: []const u8, ctx_tokens: u32 },
+    set_model: struct { id: []const u8, ctx_tokens: u32, provider: []const u8 },
     /// Connect a provider with this key. Both slices point at the palette's own
     /// buffers: whoever receives the action must copy them BEFORE closing the
     /// palette.
@@ -1347,7 +1350,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
                 }
                 break :blk Action{ .set_provider = it.label };
             },
-            .model => .{ .set_model = .{ .id = it.label, .ctx_tokens = it.ctx_tokens } },
+            .model => .{ .set_model = .{ .id = it.label, .ctx_tokens = it.ctx_tokens, .provider = it.provider } },
             .connect => .open_connect,
         };
     }
