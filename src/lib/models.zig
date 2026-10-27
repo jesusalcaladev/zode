@@ -1,13 +1,49 @@
 const std = @import("std");
 const http_client = @import("http_client.zig");
+const providers = @import("providers.zig");
 
+/// Diagnostics for the model catalog, OFF unless asked for.
+///
+/// This used to write up to 300 raw bytes of the server's response to stderr
+/// UNCONDITIONALLY, and `main.zig` set `dbg_io` on the TUI path — where stderr
+/// is the same terminal as the alternate screen. So an HTML error page from a
+/// `/models` fetch landed mid-frame with its ESC bytes intact, which the
+/// renderer then redrew over: the report was "moving the mouse makes weird
+/// things appear in the terminal". It fired at startup (`catalogWarmupAsync`)
+/// and on every Ctrl+T.
+///
+/// Two fixes, and the second is the one that matters: a gate like
+/// `chat.zig`'s `ZODE_DBG_ERR`, and **no raw bytes** — an escape sequence from
+/// a server is not diagnostics, it is a command to the terminal.
 pub var dbg_io: ?std.Io = null;
+pub var dbg_flag: bool = false;
+
+pub fn dbgInitEnv(env: ?*const std.process.Environ.Map) void {
+    const v = if (env) |e| e.get("ZODE_DBG_MODELS") else null;
+    dbg_flag = if (v) |x| x.len > 0 and x[0] != '0' else false;
+}
+
+/// Every byte below 0x20 (and 0x7f) becomes `.`. An ESC in here is the whole
+/// problem; the text around it is still useful.
+fn sanitizeForTerminal(text: []const u8, out: []u8) []const u8 {
+    var n: usize = 0;
+    for (text) |c| {
+        if (n == out.len) break;
+        out[n] = if (c < 0x20 or c == 0x7f) '.' else c;
+        n += 1;
+    }
+    return out[0..n];
+}
 
 pub fn dbg(comptime fmt: []const u8, args: anytype) void {
+    if (!dbg_flag) return;
     const io = dbg_io orelse return;
     var buf: [1024]u8 = undefined;
+    var line: [512]u8 = undefined;
+    const raw = std.fmt.bufPrint(&line, fmt, args) catch return;
+    const safe = sanitizeForTerminal(raw, &buf);
     var w = std.Io.File.stderr().writer(io, &buf);
-    w.interface.print(fmt, args) catch {};
+    w.interface.writeAll(safe) catch {};
     w.interface.flush() catch {};
 }
 
@@ -256,9 +292,28 @@ pub fn listModels(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
     url: []const u8,
-    bearer: ?[]const u8,
+    creds: providers.CatalogAuth,
 ) !ModelList {
-    const res = try http.get(url, bearer);
+    // A provider with no `/models` endpoint declares `models_url = ""` (Z.AI is
+    // one: its API reference has chat/completions, images, video, audio and
+    // nothing that lists models). `http.get("")` is a request to nowhere and
+    // the error it produces talks about a URL, not about the provider, so the
+    // empty URL answers before any socket is opened.
+    if (url.len == 0) return error.NoCatalog;
+
+    // The auth is per PROVIDER and the two styles are not interchangeable:
+    // Anthropic answers 401 to a Bearer and 400 to a request without
+    // `anthropic-version`. Both look like "no catalogue" from here, and the
+    // style is a column of the provider table, not a guess made at this depth.
+    var hdr_buf: [2]http_client.Http.ExtraHeader = undefined;
+    var hdr_len: usize = 0;
+    if (creds.x_api_key) |k| {
+        hdr_buf[hdr_len] = .{ .name = "x-api-key", .value = k };
+        hdr_len += 1;
+        hdr_buf[hdr_len] = .{ .name = "anthropic-version", .value = "2023-06-01" };
+        hdr_len += 1;
+    }
+    const res = try http.getWith(url, creds.bearer, hdr_buf[0..hdr_len]);
     defer http.freeBody(res.body);
     if (res.status != 200) {
         dbg("HTTP {d}: {s}\n", .{ res.status, res.body[0..@min(res.body.len, 300)] });
@@ -384,6 +439,18 @@ test "listModels parses OpenRouter's context_length and pricing" {
     // Model with no pricing: 0, not NaN.
     const no_price = data.array.items[1].object.get("pricing");
     try std.testing.expect(no_price == null);
+}
+
+test "listModels: an empty url is NoCatalog, and no request goes out" {
+    // The guard at the top of `listModels`. Without it the empty URL becomes a
+    // DNS/TLS error that reads like a broken network, which is the worst
+    // possible message for "this provider publishes no catalogue".
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var http = http_client.Http.init(std.testing.allocator, threaded.io());
+    defer http.deinit();
+
+    try std.testing.expectError(error.NoCatalog, listModels(std.testing.allocator, &http, "", .{}));
 }
 
 test "jsonNumber accepts float, integer and decimal string" {

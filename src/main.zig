@@ -8,18 +8,23 @@ const modelcache = @import("lib/modelcache.zig");
 const models_mod = models;
 const provider = @import("lib/provider.zig");
 const providers = @import("lib/providers.zig");
-const tools_mod = @import("tools/dispatch.zig");
+const tools_mod = @import("tools_root.zig");
 const cache_stats = @import("cache_stats.zig");
 const chat = @import("chat.zig");
 const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
 const compaction_mod = @import("compaction.zig");
-const mascot = @import("lib/mascot.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");
+const taskstore = @import("lib/taskstore.zig");
+const kittyKeyboardPush = @import("lib/termseq.zig").kittyKeyboardPush;
+const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
+const lsp_manager = @import("lsp/manager.zig");
+const mcp_manager = @import("mcp/manager.zig");
+const theme = @import("lib/theme.zig");
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = map orelse return null;
@@ -47,8 +52,12 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     agent.io_global = io;
     agent.environ_global = env;
     agent.gpa_global = gpa;
+    // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     agent.loadUserConfig();
     defer agent.shutdownUserConfig();
+    tools_mod.initMaxToolOutput(env);
+    tools_mod.initDiffLimit(env);
+    tools_mod.initGrepCapture(env);
 
     var http = http_client.Http.init(gpa, io);
     defer http.deinit();
@@ -75,6 +84,32 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     // helper that needed somewhere to put them.
     const url = def.models_url;
     const key = providers.keyFor(def, env);
+
+    // No catalogue endpoint (`models_url = ""`): `--models` is the command you
+    // run to see a list, and there is no list to fetch. What the provider
+    // DOCUMENTS is still what a person is after, so it is printed — labelled as
+    // what it is, because a suggestion that looks like a fetched catalogue is
+    // how a retired id gets picked a year from now.
+    if (url.len == 0) {
+        if (def.suggested_models.len == 0) {
+            std.debug.print(
+                "{s} publishes no model catalog: pick the model by hand (`/use {s} <model>` or ZODE_MODEL).\n",
+                .{ def.id, def.id },
+            );
+            return 1;
+        }
+        var ids_buf: [4096]u8 = undefined;
+        var ids_out = std.Io.File.stdout().writer(io, &ids_buf);
+        for (def.suggested_models) |id| {
+            try ids_out.interface.print("{s}\tdocumented\n", .{id});
+        }
+        try ids_out.interface.flush();
+        std.debug.print(
+            "{d} ids · {s} publishes no /models endpoint, so this is the documented list (a suggestion, not a catalog)\n",
+            .{ def.suggested_models.len, def.id },
+        );
+        return 0;
+    }
 
     // `--models` is the worst case for a cold network: 772 KB and a 400-800 ms round
     // trip, for a list that changes once a month. It reads the cache first, prints, and
@@ -117,7 +152,7 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     }
     if (printed) return 0;
 
-    var list = models.listModels(gpa, &http, url, key) catch |err| {
+    var list = models.listModels(gpa, &http, url, providers.authWithKey(def.key_style, key)) catch |err| {
         std.debug.print("error: {t}\n", .{err});
         return 1;
     };
@@ -161,7 +196,24 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     agent.gpa_global = gpa;
     agent.environ_global = env;
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
+    // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
+    tools_mod.initMaxToolOutput(env);
+    tools_mod.initDiffLimit(env);
+    tools_mod.initGrepCapture(env);
+    // The language servers. Started LAZILY (a server is spawned when a file of
+    // its language is asked about) but the manager has to exist before the
+    // config is read, because the config is what says which servers there are.
+    lsp_manager.init(gpa, io, env);
+    defer lsp_manager.shutdown();
+    // The MCP servers: same reason, same laziness.
+    mcp_manager.init(gpa, io, env);
+    defer mcp_manager.shutdown();
     agent.initProjectInfo(io, env); // cwd + repo root, before any prompt is composed
+    // The same session directory the TUI resolves: one project, one history.
+    // Without this `--chat` wrote `./sessions` (the compiled-in default) while
+    // the TUI wrote `<state>/sessions/<hash>`, so each side could not see the
+    // other's sessions in `/session`.
+    agent.resolveSessionsDirIn(gpa, env);
     chat.io_global = io;
     free_auto.attachIo(io); // el reloj de los cooldowns del free-auto
     models.dbg_io = io;
@@ -177,6 +229,17 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     else
         std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{def.base_url}) catch def.base_url;
     const key = providers.keyFor(def, env);
+
+    // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+    var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+    var extra_hdrs_len: usize = 0;
+    if (std.mem.eql(u8, def.id, "openrouter")) {
+        extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+        extra_hdrs_len += 1;
+        extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+        extra_hdrs_len += 1;
+    }
+    const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -203,7 +266,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // the file". Expanded HERE, on the session's own text, because the headless
     // runner has no per-iteration arena like `runOneTurn` has.
     const mentions_mod = @import("lib/mentions.zig");
-    const expanded = mentions_mod.expand(arena, io, text) catch
+    const expanded = mentions_mod.expand(io, text) catch
         mentions_mod.Expansion{ .text = text, .files = 0, .missing = 0 };
     try msgs.append(arena, .{ .role = "user", .content = expanded.text });
 
@@ -212,6 +275,13 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // also kills anything still running: a `zode --chat` that exits with an
     // orphaned build writing to a closed pipe is worse than waiting.
     var bg = bgproc.Registry{};
+    // The task graph of a headless run: real for the run, memory only.
+    //
+    // This runner has no session file (`--chat` is one run in one process), so there
+    // is nothing for the list to survive in. The tools still work, and the graph is
+    // what `task_list` reads back inside the run — which is the whole point of a task
+    // list during a turn. Nothing is written, so nothing can be half-written either.
+    var tasks = taskstore.Store{ .gpa = gpa };
     defer bg.deinit(io, gpa);
 
     // The headless model gets ASKED for too. Without this, `--chat` against a
@@ -228,7 +298,20 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // a provider with no `default_model` would send `"model": ""` and the
         // server error would say nothing about why.
         model_name = agent.resolveModelHeadless(gpa, &http, env) catch |err| {
-            std.debug.print("error: could not read {s}'s model catalog ({t}).\n", .{ def.id, err });
+            // Two different problems, two different sentences: a provider that
+            // publishes no catalogue at all (empty `models_url`) is not a broken
+            // network, and "could not read" would send the reader to fix the
+            // wrong thing.
+            if (def.models_url.len == 0) {
+                std.debug.print("error: {s} publishes no model catalog: there is no /models endpoint to ask.\n", .{def.id});
+                if (def.suggested_models.len > 0) {
+                    std.debug.print("       the ids it documents:", .{});
+                    for (def.suggested_models) |id| std.debug.print(" {s}", .{id});
+                    std.debug.print("\n", .{});
+                }
+            } else {
+                std.debug.print("error: could not read {s}'s model catalog ({t}).\n", .{ def.id, err });
+            }
             std.debug.print("       set ZODE_MODEL=<id> or add a model to ~/.config/zode/config.json.\n", .{});
             return error.NoModel;
         };
@@ -311,6 +394,8 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                         effort_pref,
                         cur[sum_from..upto],
                         arena,
+                        extra_headers,
+                        agent.outputCapFor(def, env),
                     )) |s| {
                         const note = try std.fmt.allocPrint(
                             arena,
@@ -344,7 +429,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                 wire = with;
             }
         }
-        const body = chat.buildBodyMessages(body_buf, model_name, wire, effort_pref, tools_mod.toolsJson(), kind) catch return error.BodyTooBig;
+        const body = chat.buildBodyMessagesCapped(body_buf, model_name, wire, effort_pref, tools_mod.toolsJson(), kind, agent.outputCapFor(def, env)) catch return error.BodyTooBig;
 
         const Cb = struct {
             fn onDelta(_: ?*anyopaque, delta: []const u8) void {
@@ -355,16 +440,25 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         const result = chat.streamChatCtx(gpa, &http, url, key, @constCast(body), .{
             .userdata = null,
             .onDelta = Cb.onDelta,
-        }, kind, true) catch |err| {
-            if (err == error.ServerError) {
-                models.dbg("\n[error server] {s}\n", .{chat.lastErrorBody()});
+        }, kind, true, extra_headers) catch |err| {
+            // The server's reason, for EVERY error and not only for a 5xx.
+            //
+            // A 401 is the case this matters most in and the one that used to
+            // print only `AuthFailed`: OpenRouter answers a dead key with
+            // `{"error":{"message":"User not found."}}` and an expired one with
+            // `API key expired`, and those two send you to different places
+            // (rotate the key / get a new one) while `AuthFailed` sends you to
+            // neither. The TUI has shown it since June; this runner did not.
+            const why = chat.lastErrorBody();
+            if (why.len > 0) {
+                models.dbg("\n[error] {t}: {s}\n", .{ err, why });
             } else {
                 models.dbg("\n[error] {t}\n", .{err});
             }
             return 1;
         };
         defer result.ctx.destroy();
-        cache_stats.session.record(chat.last_usage);
+        cache_stats.session.recordFor(chat.last_usage, kind);
 
         if (result.ctx.parts.items.len == 0) {
             // THE EXIT GATE, and it is here rather than after the loop for the same
@@ -427,7 +521,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         try msgs.append(arena, .{ .role = "assistant", .content = "", .tool_calls_json = tc_json });
         for (result.ctx.parts.items) |*p| {
             models.dbg("\n[tool {s}] {s}\n", .{ p.name.items, p.args.items });
-            const res = execHeadless(io, &bg, &pending_images, p.name.items, p.args.items, arena) catch |err| {
+            const res = execHeadless(io, &bg, &tasks, &pending_images, p.name.items, p.args.items, arena) catch |err| {
                 try msgs.append(arena, .{
                     .role = "tool",
                     .content = try std.fmt.allocPrint(arena, "error: {t}", .{err}),
@@ -552,6 +646,7 @@ fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.M
 fn execHeadless(
     io: std.Io,
     bg: *bgproc.Registry,
+    tasks: *taskstore.Store,
     images: *images_mod.Pending,
     name: []const u8,
     args: []const u8,
@@ -570,7 +665,7 @@ fn execHeadless(
     // cache would only be able to help within it. The headless agent is also where
     // a "you already have this" answer is most confusing to debug, because there
     // is no session on screen to compare against.
-    return tools_mod.execute(io, name, args, arena, bg, null);
+    return tools_mod.executeWith(io, name, args, arena, bg, null, tasks);
 }
 
 /// TUI mode: zode (no args)
@@ -593,6 +688,16 @@ fn runTui(init: std.process.Init) !u8 {
     const io = init.io;
     agent.bootStart(io, init.environ_map);
 
+    // What the terminal can do, BEFORE a single cell is painted.
+    //
+    // vaxis does not ask the terminal whether it speaks truecolor (its own
+    // `COLORTERM` sniffing is commented out in the library) and it does not
+    // convert rgb→256 either: it writes `38;2;r;g;b` whatever the terminal
+    // answered. So a terminal that does not speak truecolor got a byte
+    // sequence it does not understand. The app asks the environment instead,
+    // which is where every terminal documents the answer.
+    theme.caps = theme.detectCaps(init.environ_map);
+
     // 64 KiB instead of 1 MB (5.4 of the ROADMAP): the TTY buffer is PERMANENT
     // memory (it lives for the whole process) and 1 MB is paid for 99% of the
     // time without being written. With a token stream chunk by chunk it is plenty.
@@ -606,11 +711,24 @@ fn runTui(init: std.process.Init) !u8 {
     // still be counting.
     agent.startTermQueryCap(&app.vx, init.environ_map);
     defer agent.stopTermQueryCap();
+    // ── the keyboard mode ──
+    //
+    // `CSI > 1 u` (kitty "disambiguate") is what makes the terminal SEND
+    // `CSI 13;2u` for Shift+Enter. Without it, no terminal reports a modified
+    // Enter at all: every one of them sends a bare `\r`, so "Shift+Enter inserts
+    // a newline" — which `tui.editorKey` has always implemented — was code that
+    // could never be reached. The key was never woken up.
+    //
+    // `CSI < u` restores it, and it is registered AFTER so it runs BEFORE the
+    // `defer`s that free the writer underneath it.
+    kittyKeyboardPush(app.tty.writer());
+    defer kittyKeyboardPop(app.tty.writer());
     agent.bootMark("vxfw.App.init");
 
     var model = tui.Model.init(gpa);
     defer model.deinit();
     model.environ = init.environ_map;
+    agent.status_model_target = &model;
     model.attachIo(io); // for the activity strip clock
     model.attach();
 
@@ -622,6 +740,22 @@ fn runTui(init: std.process.Init) !u8 {
     agent.api_key_global = envGet(init.environ_map, "ZODE_API_KEY");
     agent.environ_global = init.environ_map;
     agent.gpa_global = init.gpa;
+    // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
+    tools_mod.initMaxToolOutput(init.environ_map);
+    tools_mod.initDiffLimit(init.environ_map);
+    tools_mod.initGrepCapture(init.environ_map);
+    // The language servers, before the config is read: the config says which
+    // servers there are, and the manager is what asks for them.
+    //
+    // Nothing is spawned here. A server is started when a file of its language
+    // is asked about, so a session that never uses `lsp` never pays for one.
+    lsp_manager.init(init.gpa, io, init.environ_map);
+    defer lsp_manager.shutdown();
+    // The MCP servers, for the same reason and with the same laziness: the
+    // manager has to exist before the config is read (the config says which
+    // servers there are) and nothing is spawned until a server is asked about.
+    mcp_manager.init(init.gpa, io, init.environ_map);
+    defer mcp_manager.shutdown();
     // The automatic typecheck reads `ZODE_AUTO_CHECK` off its OWN environment field,
     // not off the module global, so this is not optional: without it the flag silently
     // reads as "no environment" and every setting takes its default.
@@ -633,7 +767,15 @@ fn runTui(init: std.process.Init) !u8 {
     free_auto.attachIo(io);
     chat.io_global = io;
     chat.dbgInitEnv(init.environ_map);
-    agent.resume_on_start = std.mem.eql(u8, envGet(init.environ_map, "ZODE_RESUME") orelse "", "1");
+    // Same for the model catalog, whose diagnostics also land on the terminal.
+    models_mod.dbgInitEnv(init.environ_map);
+    // `ZODE_RESUME=1` turns the resume ON. It does NOT turn it OFF: the
+    // `--resume` FLAG has already set it by the time we get here (main
+    // dispatches it before calling `runTui`), and this line used to
+    // overwrite it with the environment's answer — so `zode --resume`
+    // silently started a NEW session and said "nothing to resume; starting a
+    // new session", which is exactly what the flag asks it not to do.
+    agent.resume_on_start = agent.shouldResume(agent.resume_on_start, init.environ_map);
     defer agent.shutdownUserConfig();
     defer agent.shutdownBuffers(); // the 1 MiB body buffer (see `bodyBuf`)
     agent.loadUserConfig();
@@ -657,6 +799,24 @@ fn runTui(init: std.process.Init) !u8 {
     agent.refreshUserCommandsModel(&model);
     agent.bootMark("userCommands");
     agent.initCheapRouterFromEnv(model.environ);
+    // The status row is `provider/model`, and the model's name only exists in
+    // the provider's catalogue: without this, the row says `opencode` for the
+    // whole of a session's first minute — the moment the user is deciding
+    // whether the app knows what it is doing. Silently warms the catalogue into
+    // the cache (`resolveStatusModel` reads it from there); no history line, no
+    // status change, so the hero is not interrupted.
+    tui.resolveStatusModel(&model);
+    if (model.status_model_len == 0) {
+        agent.catalogWarmupAsync(&model) catch {};
+    }
+
+    // Self-update check: a worker, its own `Io`, and an answer cached on disk for
+    // six hours — so a normal start reads ~60 bytes instead of opening TLS to
+    // GitHub. When a newer release exists it is SAID in the history
+    // (`v0.2.0 is available (minor) · /update`) instead of the binary being
+    // replaced behind the user's back, which is what `autoUpdate` used to do
+    // while the running process went on being the old build.
+    agent.startUpdateCheck(&model);
 
     agent.bootMark("app.run start");
 
@@ -719,6 +879,40 @@ fn runTui(init: std.process.Init) !u8 {
     agent.quitFast(&model, io);
 }
 
+/// One HTTPS request, and exit.
+///
+/// This exists for the UPDATER, and the reason is a real crash: `--version`
+/// proves the binary starts and does NOT prove it can do TLS. The 0.1.0 asset
+/// was built with the CI runner's CPU, answered `--version` perfectly, and
+/// trapped with SIGILL inside the TLS handshake seconds after its first frame.
+/// So `/update` runs the downloaded file with this flag before it replaces the
+/// binary that works.
+///
+/// The exit code is deliberately 0 for every UNCLEAN outcome (a network error,
+/// an unreachable host): the network is not the binary's fault and must not
+/// veto an update. Only a FAULT is a verdict, and the caller reads that from
+/// the process term (a signal), not from here.
+pub fn runSelftest(init: std.process.Init) u8 {
+    var threaded: std.Io.Threaded = .init(init.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var client: std.http.Client = .{ .allocator = init.gpa, .io = io };
+    defer client.deinit();
+
+    const uri = std.Uri.parse("https://api.github.com/") catch return 0;
+    var req = client.request(.GET, uri, .{ .headers = .{
+        .accept_encoding = .omit,
+        .user_agent = .{ .override = "zode-selftest" },
+    } }) catch return 0;
+    defer req.deinit();
+    req.sendBodiless() catch return 0;
+
+    var redirect_buf: [8192]u8 = undefined;
+    _ = req.receiveHead(&redirect_buf) catch return 0;
+    return 0;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     var it = std.process.Args.Iterator.init(init.minimal.args);
     _ = it.next(); // argv[0]
@@ -739,13 +933,26 @@ pub fn main(init: std.process.Init) !u8 {
             };
             return runChat(init.gpa, init.io, init.environ_map, text);
         }
+        if (std.mem.eql(u8, arg0, "--selftest")) {
+            return runSelftest(init);
+        }
+        if (std.mem.eql(u8, arg0, "--version")) {
+            const version = @import("build_options").version;
+            var buf: [128]u8 = undefined;
+            var out = std.Io.File.stdout().writer(init.io, &buf);
+            try out.interface.print("zode {s}\n", .{version});
+            try out.interface.flush();
+            return 0;
+        }
         if (std.mem.eql(u8, arg0, "--help")) {
             std.debug.print(
                 "zode — code agent harness\n\n" ++
-                    "  (no args)    Claude Code style TUI\n" ++
+                    "  (no args)    full TUI\n" ++
                     "  --models     list the models of the provider\n" ++
                     "  --chat TXT   send a message (streaming)\n" ++
                     "  --resume     resume the last session\n" ++
+                    "  --version    show version\n" ++
+                    "  --selftest   internal: one HTTPS request, for the updater\n" ++
                     "  --help       this help\n",
                 .{},
             );

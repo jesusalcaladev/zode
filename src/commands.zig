@@ -6,7 +6,14 @@ const compaction = @import("compaction.zig");
 const goal_mod = @import("lib/goal.zig");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
-const mascot = @import("lib/mascot.zig");
+const filesview = @import("lib/filesview.zig");
+const readcache = @import("lib/readcache.zig");
+const init_mod = @import("lib/init.zig");
+const cost_mod = @import("lib/cost.zig");
+const modelcache_mod = @import("lib/modelcache.zig");
+const session_mod = @import("session.zig");
+const sessionindex = @import("lib/sessionindex.zig");
+const sessionpath = @import("lib/sessionpath.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -29,16 +36,24 @@ const mascot = @import("lib/mascot.zig");
 /// and "what can I press". Before this there was only the first one, and only
 /// without the shortcut column, so half the keybindings were written down
 /// nowhere — you find them by hitting Ctrl+P and hoping.
-pub fn cmdHelp(m: *tui.Model) void {
+fn pushCommandList(m: *tui.Model, palette_visible: bool) void {
     const gpa = m.allocator;
-    agent.pushInfoOwned(m, gpa.dupe(u8, "commands") catch return);
     for (commands) |c| {
+        if (c.palette_visible != palette_visible) continue;
         const line = if (c.key_hint) |h|
             std.fmt.allocPrint(gpa, "{s: <14} {s}  ({s})", .{ c.key, c.desc, h }) catch continue
         else
             std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
         agent.pushInfoOwned(m, line);
     }
+}
+
+pub fn cmdHelp(m: *tui.Model) void {
+    const gpa = m.allocator;
+    agent.pushInfoOwned(m, gpa.dupe(u8, "commands") catch return);
+    pushCommandList(m, true);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "advanced · type these commands directly") catch return);
+    pushCommandList(m, false);
 
     // The user's own commands, refreshed so a file written a minute ago shows
     // up. They get their own block because they answer a different question:
@@ -106,18 +121,56 @@ pub fn cmdAllowlist(m: *tui.Model) void {
     agent.pushInfoOwned(m, msg);
 }
 
+/// `/permissions`: the RULES (Phase 6) and where they live.
+///
+/// The rules are the answer to "why did it ask / why did it refuse", and
+/// there is no other way to find out: a rule that lives in a file the user
+/// wrote and never sees again is a rule that surprises them.
+pub fn cmdPermissions(m: *tui.Model) void {
+    const gpa = m.allocator;
+    const set = agent.permRuleSet();
+
+    agent.pushInfoOwned(m, gpa.dupe(u8, "rules  ·  Tool(pattern) action  ·  allow | deny | ask") catch return);
+
+    if (set.rules.len == 0) {
+        agent.pushInfoOwned(m, gpa.dupe(u8, "  (none)") catch return);
+    } else {
+        for (set.rules) |r| {
+            const line = std.fmt.allocPrint(
+                gpa,
+                "  {s: <8} {s}",
+                .{ r.source.name(), r.text },
+            ) catch continue;
+            agent.pushInfoOwned(m, line);
+        }
+    }
+
+    // The two files, and the order they win in. The order IS the rule: a
+    // project rule beats a user rule, and a DENY beats any allow.
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    const files = std.fmt.allocPrint(
+        gpa,
+        "files  ·  {s} (project)  ·  ~/.config/zode/permissions.json (user)",
+        .{agent.project_rules_file},
+    ) catch return;
+    agent.pushInfoOwned(m, files);
+    agent.pushInfoOwned(
+        m,
+        gpa.dupe(u8, "order  ·  project > user  ·  a deny beats any allow  ·  the last rule of a file wins") catch return,
+    );
+}
+
 /// `/cache`: prompt cache hit-rate of the session.
 pub fn cmdCache(m: *tui.Model) void {
     const st = &cache_stats.session;
-    const line = std.fmt.allocPrint(
-        m.allocator,
+    agent.pushInfoFmt(
+        m,
         // WRITES are in the line because they are the expensive half: a high
         // hit-rate with a write on EVERY request means the prefix is being
         // rebuilt each turn, and no hit-rate alone can reveal that.
-        "cache [{s}] {d:.1}% hit-rate · {d} reqs with hit · {d} prompt / {d} cached / {d} written · {d} completion",
-        .{ agent.cur_provider_id, st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
-    ) catch "cache";
-    agent.pushInfoOwned(m, line);
+        "session cache · {d:.1}% hit-rate · {d} requests with hits · {d} input / {d} cached / {d} written · {d} output tokens",
+        .{ st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
+    );
 
     // WHY, because a rate with no cause is not actionable. The number alone was
     // 0.0% on a perfectly healthy setup for weeks.
@@ -145,6 +198,260 @@ pub fn cmdCache(m: *tui.Model) void {
             .{st.prompt_shrinks},
         ),
     }
+}
+
+/// `/usage`: provider-reported token totals for the active session.
+pub fn cmdUsage(m: *tui.Model) void {
+    const st = agent.cacheSessionStats();
+    if (st.requests == 0) {
+        agent.pushInfo(
+            m,
+            "Usage · no provider-reported token data yet. `/context` shows the current estimate.",
+        );
+        return;
+    }
+
+    const input = @max(st.prompt_tokens, 0);
+    const output = @max(st.completion_tokens, 0);
+    const total = input +| output;
+    const cached = @min(@max(st.cached_tokens, 0), input);
+    const uncached = input - cached;
+    const requests: i64 = @intCast(st.requests);
+    var input_buf: [32]u8 = undefined;
+    var output_buf: [32]u8 = undefined;
+    var total_buf: [32]u8 = undefined;
+    var cached_buf: [32]u8 = undefined;
+    var uncached_buf: [32]u8 = undefined;
+    var writes_buf: [32]u8 = undefined;
+    var avg_in_buf: [32]u8 = undefined;
+    var avg_out_buf: [32]u8 = undefined;
+    const msg = std.fmt.allocPrint(
+        m.allocator,
+        "Usage · {d} metered requests · {s} total tokens\n" ++
+            "  Input {s} · output {s} · average/request {s} in / {s} out\n" ++
+            "  Cache reads {s} ({d:.1}%) · cache writes {s} · uncached input {s}",
+        .{
+            st.requests,
+            formatTokenCount(&total_buf, total),
+            formatTokenCount(&input_buf, input),
+            formatTokenCount(&output_buf, output),
+            formatTokenCount(&avg_in_buf, @divTrunc(input, requests)),
+            formatTokenCount(&avg_out_buf, @divTrunc(output, requests)),
+            formatTokenCount(&cached_buf, cached),
+            st.hitRatePct(),
+            formatTokenCount(&writes_buf, @max(st.cache_write_tokens, 0)),
+            formatTokenCount(&uncached_buf, uncached),
+        },
+    ) catch return;
+    agent.pushInfoOwned(m, msg);
+}
+
+fn formatTokenCount(buf: []u8, value: i64) []const u8 {
+    // The grouping lives in `lib/cost.zig` now that `/cost` writes the same
+    // numbers: two renderings of a token count in two commands is how one of them
+    // ends up with a format the other does not have.
+    return cost_mod.groupDigits(buf, value);
+}
+
+/// `/cost`: what this session has spent, per model, in dollars.
+///
+/// ## Why per model and not one total
+///
+/// A session talks to several models: `free-auto` rotates when a pool model runs
+/// out of quota, the cheap router falls back to the user's own, and `/submodel`
+/// sends subagents somewhere else on purpose. One total multiplied by one price
+/// would be a number about a model that did not answer.
+///
+/// ## The prices come from the CACHED catalogue
+///
+/// Not from the network and not from a table in the binary: the provider
+/// publishes the price and `modelcache.zig` already has it on disk. A model nobody
+/// prices is `price unknown`, and the total says it is a floor — `$0.00` for a
+/// model with no published price is a bill that reads as free.
+pub fn cmdCost(m: *tui.Model) void {
+    const st = agent.cacheSessionStats();
+    if (st.requests == 0) {
+        agent.pushInfo(
+            m,
+            "cost \u{b7} no provider-reported usage yet: a turn has to finish before there are tokens to price.",
+        );
+        return;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const tr = &cost_mod.session;
+    var rows: std.ArrayList(cost_mod.Row) = .empty;
+    var i: usize = 0;
+    while (i < tr.len) : (i += 1) {
+        const e = &tr.entries[i];
+        rows.append(a, .{
+            .model = e.text(),
+            .prompt = e.prompt_tokens,
+            .completion = e.completion_tokens,
+            .price = priceForModel(m, a, e.text()),
+        }) catch break;
+    }
+    // What did not fit the table is one row and not a silence: a token count that
+    // disappears is a bill that is wrong.
+    if (tr.spill_requests > 0) {
+        rows.append(a, .{
+            .model = "other models",
+            .prompt = tr.spill_prompt,
+            .completion = tr.spill_completion,
+            .price = null,
+        }) catch {};
+    }
+
+    const text = cost_mod.report(m.allocator, rows.items, st.requests, st.prompt_tokens) catch {
+        m.pushError("could not build the cost report");
+        return;
+    };
+    agent.pushInfoOwned(m, text);
+}
+
+/// The published price of ONE model, from the cached catalogue of a provider that
+/// has a key.
+///
+/// Null means "nobody publishes a price for it", which the report renders as
+/// `price unknown`. A free model is a price of zero and NOT an unknown one: those
+/// two answers send the reader to different places.
+///
+/// The catalogue is read here and not held: `/cost` is typed by hand, so a handful
+/// of small file reads is cheaper than a cache with a lifetime to get wrong.
+fn priceForModel(m: *tui.Model, a: std.mem.Allocator, model_id: []const u8) ?cost_mod.Price {
+    // A `Model` built by a test has no `Io`, and reading a file through one is a
+    // jump through a garbage vtable, not an error.
+    if (!m.io_ready) return null;
+
+    var defs_arena_state = std.heap.ArenaAllocator.init(a);
+    defer defs_arena_state.deinit();
+    for (agent.allProviders(defs_arena_state.allocator())) |*d| {
+        if (!providers.hasKey(d, m.environ)) continue;
+        var cache_arena = std.heap.ArenaAllocator.init(a);
+        defer cache_arena.deinit();
+        const entry = modelcache_mod.read(m.io, m.environ, cache_arena.allocator(), d.id, d.models_url) orelse continue;
+        // The DECISION (free / unpriced / priced) lives in `lib/cost.zig` with the
+        // rest of the money, so it is tested without a catalogue on disk.
+        switch (cost_mod.priceOf(entry.models, model_id)) {
+            .missing => continue,
+            .found => |price| return price,
+        }
+    }
+    return null;
+}
+
+test "formatTokenCount groups digits from the right" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("0", formatTokenCount(&buf, 0));
+    try std.testing.expectEqualStrings("999", formatTokenCount(&buf, 999));
+    try std.testing.expectEqualStrings("1,000", formatTokenCount(&buf, 1_000));
+    try std.testing.expectEqualStrings("12,345", formatTokenCount(&buf, 12_345));
+    try std.testing.expectEqualStrings("1,234,567", formatTokenCount(&buf, 1_234_567));
+}
+
+test "cost command prices what it can and says what it cannot" {
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+    cost_mod.session.reset();
+    defer cost_mod.session.reset();
+
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 12_345, .cached = 0, .completion = 678 });
+    cost_mod.session.record("kimi-k2.6", 12_345, 678);
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    cmdCost(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "kimi-k2.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "12,345 in") != null);
+    // A test `Model` has no `Io`, so no catalogue was read. A price that could not
+    // be read is NOT a price of zero, and the report has to say so.
+    try std.testing.expect(std.mem.indexOf(u8, text, "no total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "$0.00") == null);
+}
+
+test "the cost command prices a model from the provider's cached catalogue" {
+    // The glue the two pure halves cannot cover: a HOME with the catalogue file
+    // `modelcache.write` leaves behind, a provider with a key, and a report that
+    // has to come out with real money in it.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, ".config/zode/models");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".config/zode/models/opencode.json",
+        .data =
+        \\{"version":1,"url":"https://opencode.ai/inference/v1/models","fetched_at":0,"models":[
+        \\ {"id":"kimi-k2.6","ctx":128000,"free":false,"by":"opencode","pp":0.000001,"pc":0.000002},
+        \\ {"id":"space-bunny-free","ctx":32000,"free":true,"by":"opencode","pp":0,"pc":0}
+        \\]}
+        ,
+    });
+    var pbuf: [512]u8 = undefined;
+    const np = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", pbuf[0..np]);
+    try env.put("ZODE_API_KEY", "test-key");
+
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+    cost_mod.session.reset();
+    defer cost_mod.session.reset();
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 1_000_000, .completion = 500_000 });
+    cost_mod.session.record("kimi-k2.6", 1_000_000, 500_000);
+    cost_mod.session.record("space-bunny-free", 2_000, 100);
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.environ = &env;
+    m.attachIo(io);
+    cmdCost(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    // 1M prompt tokens at $1/M + 500k completion at $2/M = $2.00.
+    try std.testing.expect(std.mem.indexOf(u8, text, "$2.00") != null);
+    // The free model is a PRICE of zero, not an unknown one.
+    try std.testing.expect(std.mem.indexOf(u8, text, "$0.00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "price unknown") == null);
+}
+
+test "cost command says there is nothing to price before the first turn" {
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    cmdCost(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no provider-reported usage yet") != null);
+}
+
+test "usage command reports provider totals and distinguishes estimates" {
+    agent.cacheSessionStatsForTest().* = .{};
+    defer agent.cacheSessionStatsForTest().* = .{};
+    agent.cacheSessionStatsForTest().record(.{ .prompt = 12_345, .cached = 10_000, .completion = 678 });
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    cmdUsage(&m);
+
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(std.testing.allocator);
+    for (m.pending.items) |item| try all.appendSlice(std.testing.allocator, item.text);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "Usage · 1 metered requests · 13,023 total tokens") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "Input 12,345 · output 678") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "Cache reads 10,000") != null);
 }
 
 /// `/compact [off|elide|full|default]`: what automatic compaction is allowed to do.
@@ -285,6 +592,22 @@ pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
     agent.pushInfoOwned(m, line);
 }
 
+/// `/init`: analyse the codebase and write AGENTS.md.
+///
+/// This runs the initialization prompt (see `lib/init.zig`) which has the model
+/// survey the repo, interview the user, and write AGENTS.md + CLAUDE.local.md.
+pub fn cmdInit(m: *tui.Model) void {
+    if (!m.io_ready) return;
+    const prompt = init_mod.prompt(m.allocator) catch {
+        m.pushError("could not load init prompt");
+        return;
+    };
+    defer m.allocator.free(prompt);
+    agent.startChat(m, prompt) catch |err| {
+        m.pushErrorFmt("could not start init: {t}", .{err});
+    };
+}
+
 /// `/context`: gauge of context used against the limit and the budget.
 pub fn cmdContext(m: *tui.Model) void {
     _ = agent.ensureSession(m, m.allocator);
@@ -419,23 +742,229 @@ pub fn cmdContext(m: *tui.Model) void {
     agent.refreshContextUsage(m);
 }
 
-/// `/session`: id, path and message count.
+/// `/session`: open a modal picker of this project's sessions, newest first.
+/// Enter resumes; F2 renames (sets the custom title that wins in the list).
+/// Only sessions that belong to THIS project are shown (29.6): sessions
+/// from other projects never leak into this project's list.
 pub fn cmdSession(m: *tui.Model) void {
-    const s = agent.ensureSession(m, m.allocator);
-    const l1 = std.fmt.allocPrint(
-        m.allocator,
-        "session {s} · {d} messages",
-        .{ s.id[0..], s.messages.items.len },
-    ) catch "session";
-    agent.pushInfoOwned(m, l1);
-    if (s.path) |p| {
-        m.pushInfoFmt("  {s}", .{p});
+    const gpa = m.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const project_root = agent.project_info.cwd();
+
+    const all_sessions = sessionindex.scan(arena, agent.io_global, session_mod.sessions_dir);
+
+    // Filter: only sessions that belong to this project (29.6).
+    var owned_count: usize = 0;
+    for (all_sessions) |s| {
+        if (sessionpath.sessionBelongsToProject(arena, agent.io_global, agent.environ_global, project_root, s.path)) {
+            owned_count += 1;
+        }
     }
+
+    if (owned_count == 0) {
+        agent.pushInfo(m, "no sessions in this project yet");
+        return;
+    }
+
+    // Free any entries left from a previous picker open.
+    for (m.session_picker_entries.items) |e| {
+        gpa.free(e.path);
+        if (e.name.len > 0) gpa.free(e.name);
+        if (e.model.len > 0) gpa.free(e.model);
+        if (e.custom_title.len > 0) gpa.free(e.custom_title);
+        if (e.ai_title.len > 0) gpa.free(e.ai_title);
+    }
+    m.session_picker_entries.deinit(gpa);
+    m.session_picker_entries = .empty;
+
+    // Free any paths left from a previous picker open.
+    m.session_picker_paths.deinit(gpa);
+    m.session_picker_paths = .empty;
+
+    const owned = gpa.alloc(sessionindex.Entry, owned_count) catch {
+        agent.pushInfo(m, "cannot open session picker");
+        return;
+    };
+    defer gpa.free(owned);
+
+    var idx: usize = 0;
+    for (all_sessions) |s| {
+        if (sessionpath.sessionBelongsToProject(arena, agent.io_global, agent.environ_global, project_root, s.path)) {
+            // Deep-copy the entry into gpa-owned strings (arena dies after cmdSession).
+            const e = sessionindex.Entry{
+                .path = gpa.dupe(u8, s.path) catch "",
+                .name = gpa.dupe(u8, s.name) catch "",
+                .model = gpa.dupe(u8, s.model) catch "",
+                .custom_title = gpa.dupe(u8, s.custom_title) catch "",
+                .ai_title = gpa.dupe(u8, s.ai_title) catch "",
+                .created_at = s.created_at,
+            };
+            if (e.path.len == 0) {
+                // Skip entries we couldn't copy.
+                continue;
+            }
+            _ = m.session_picker_entries.append(gpa, e) catch {};
+            owned[idx] = .{
+                .path = e.path,
+                .name = e.name,
+                .model = e.model,
+                .custom_title = e.custom_title,
+                .ai_title = e.ai_title,
+                .created_at = e.created_at,
+            };
+            idx += 1;
+        }
+    }
+
+    const owned_len = idx;
+
+    const items = gpa.alloc(tui.PickerItem, owned_len) catch {
+        agent.pushInfo(m, "cannot open session picker");
+        return;
+    };
+
+    const now = std.Io.Timestamp.now(agent.io_global, .real).toSeconds();
+    var buf: [64]u8 = undefined;
+    for (owned[0..owned_len], 0..) |s, i| {
+        const session_id = std.fs.path.basename(s.path);
+        // Resolved title: custom_title > ai_title > name > session id (Phase 30.1)
+        const title = s.title(session_id);
+        const age = sessionindex.ageLabel(now, s.created_at, &buf);
+        const is_cur = if (agent.session) |sess| sess.path != null and std.mem.eql(u8, s.path, sess.path.?) else false;
+        const label_full = if (is_cur)
+            (std.fmt.allocPrint(gpa, "{s}  (current)", .{title}) catch gpa.dupe(u8, title) catch "")
+        else
+            (gpa.dupe(u8, title) catch "");
+        items[i] = .{
+            .label = label_full,
+            .desc = gpa.dupe(u8, age) catch "",
+        };
+        _ = m.session_picker_paths.append(gpa, gpa.dupe(u8, s.path) catch "") catch {};
+    }
+
+    m.openPickerIdxRename(
+        tui.sessions_picker_tag,
+        "sesiones",
+        items,
+        agent.onSessionPick,
+        null,
+        agent.onSessionRename,
+    );
+}
+
+/// `/rename <name>`: set a custom title for the current session.
+/// The custom title wins over AI titles and session IDs in the session list,
+/// and is persisted to the session's Meta sidecar.
+pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
+    const name = arg orelse { agent.pushInfo(m, "usage: /rename <name>"); return; };
+    const trimmed = std.mem.trim(u8, name, " \t\r\n");
+    if (trimmed.len == 0) { agent.pushInfo(m, "rename: empty name"); return; }
+    if (trimmed.len > 64) { agent.pushInfo(m, "rename: name too long (max 64 chars)"); return; }
+
+    const s = agent.session orelse { agent.pushInfo(m, "no session to rename"); return; };
+
+    // Free old custom_title if any (replaced by the new one).
+    if (s.custom_title.len > 0) s.allocator.free(s.custom_title);
+    s.custom_title = s.allocator.dupe(u8, trimmed) catch {
+        agent.pushInfo(m, "rename: out of memory");
+        return;
+    };
+
+    // Persist to the Meta sidecar. Read the current Meta and rewrite with the
+    // new custom_title, keeping name/model/created_at/ai_title intact.
+    var arena_state = std.heap.ArenaAllocator.init(s.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const path = s.path orelse { agent.pushInfo(m, "rename: session has no path"); return; };
+    const meta = sessionindex.readMeta(arena, agent.io_global, path);
+    sessionindex.writeMeta(agent.io_global, arena, path, .{
+        .name = meta.name,
+        .model = meta.model,
+        .created_at = meta.created_at,
+        .custom_title = trimmed,
+        .ai_title = meta.ai_title,
+    }) catch |err| {
+        agent.pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
+        return;
+    };
+
+    agent.pushInfoFmt(m, "renamed to \"{s}\"", .{trimmed});
+}
+
+/// `/files`: what the model is looking at, and what it changed.
+///
+/// The question it answers is "what is the model looking at?", which is the
+/// question you ask when a turn goes sideways. The data was already there (the
+/// read cache) and NOTHING showed it.
+///
+/// Two lists, because they are two different facts:
+///
+/// - the files the model has READ, and whether their content is still in the
+///   context (a compacted-away read is not, and a model that thinks it has a
+///   file it does not have is how an agent quotes something it never saw);
+/// - the files the agent WROTE to, this session.
+///
+/// The read cache is read UNDER ITS OWN LOCK: a worker can be reading a file
+/// right now, and the entries are the fixed buffers it writes into.
+pub fn cmdFiles(m: *tui.Model) void {
+    const gpa = m.allocator;
+    var report = filesview.Report.init(gpa);
+    defer report.deinit();
+
+    const Collect = struct {
+        report: *filesview.Report,
+
+        fn take(self: *@This(), entries: []const readcache.Entry) void {
+            if (entries.len == 0) return;
+            // Most recent FIRST: "what is the model looking at" is a question
+            // about NOW, and the table's own order is the order of insertion.
+            var idx: [readcache.max_entries]usize = undefined;
+            for (entries, 0..) |_, i| idx[i] = i;
+            var i: usize = 1;
+            while (i < entries.len) : (i += 1) {
+                const key = idx[i];
+                var j = i;
+                while (j > 0 and entries[idx[j - 1]].used < entries[key].used) : (j -= 1) {
+                    idx[j] = idx[j - 1];
+                }
+                idx[j] = key;
+            }
+            for (idx[0..entries.len]) |k| {
+                const e = entries[k];
+                self.report.addRead(e.pathOf(), e.lines, e.in_context) catch return;
+            }
+        }
+    };
+    var collect = Collect{ .report = &report };
+    m.reads.withAll(&collect, Collect.take);
+
+    // The files the agent changed. The paths are borrowed from the Model's
+    // table, which outlives the report.
+    if (m.changed.count() > 0) {
+        report.addSection("changed") catch {};
+        var paths: [filesview.max_changed][]const u8 = undefined;
+        const n = m.changed.fill(&paths);
+        for (paths[0..n]) |p| {
+            report.addChanged(p) catch break;
+        }
+    }
+
+    const rc = m.reads.statsSnapshot();
+    const stats = filesview.Stats{ .hits = rc.hits, .misses = rc.misses, .saved = rc.saved };
+    report.bash_may_write = m.bash_may_write;
+    const text = report.finish(stats, m.changed.dropped) catch return;
+    agent.pushInfoOwned(m, text);
 }
 
 /// `/providers`: lists the providers with their key state.
 pub fn cmdProviders(m: *tui.Model) void {
-    for (agent.allProviders(m.allocator)) |*d| {
+    var defs_arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer defs_arena_state.deinit();
+    for (agent.allProviders(defs_arena_state.allocator())) |*d| {
         const key_state: []const u8 =
             if (d.key_env.len == 0) "sin key" else if (providers.keyFor(d, m.environ) != null) "key ok" else "SIN KEY";
         const active: []const u8 = if (std.mem.eql(u8, d.id, agent.cur_provider_id)) " ←" else "";
@@ -480,7 +1009,7 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "ctrl+u / ctrl+d", .desc = "scroll half a page" },
     .{ .key = "page up / down", .desc = "scroll a page" },
     .{ .key = "shift+enter", .desc = "newline (enter sends)" },
-    .{ .key = "shift+tab", .desc = "read-only mode: no writes, the agent asks you" },
+    .{ .key = "shift+tab", .desc = "cycle Build → accept-edits → Plan modes" },
     .{ .key = "esc", .desc = "stop the turn, kill a running command, or answer a question with \"you decide\"" },
     .{ .key = "tab", .desc = "complete a `/` command" },
     .{ .key = "↑ / ↓", .desc = "command history (empty line keeps the draft)" },
@@ -490,33 +1019,43 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
 /// `/help`.
 pub const commands = [_]Cmd{
     .{ .key = "/help", .desc = "show commands", .key_hint = "ctrl+p" },
-    .{ .key = "/models", .desc = "list the active provider models" },
+    .{ .key = "/models", .desc = "show catalog counts; use /model to browse" },
     .{ .key = "/model", .desc = "pick a model in a modal", .key_hint = "ctrl+p" },
     .{ .key = "/provider", .desc = "pick a provider in a modal" },
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/use", .desc = "switch provider/model", .key_hint = "provider modelo" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
+    .{ .key = "/color", .desc = "the diff palette: default | daltonized (no args: picker)" },
     .{ .key = "/submodel", .desc = "which model the SUBAGENTS use (no args: report | <model> | <provider> <model> | off)" },
-    .{ .key = "/reload-cmds", .desc = "reload user commands from disk" },
-    .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name" },
+    .{ .key = "/task-parallel", .desc = "simultaneous subagent limit: 1..8 | auto", .key_hint = "1..8 | auto", .palette_visible = false },
+    .{ .key = "/reload-cmds", .desc = "reload user commands from disk", .palette_visible = false },
+    .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name", .palette_visible = false },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
-    .{ .key = "/plan", .desc = "clear the visible task list" },
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
+    .{ .key = "/init", .desc = "analyse the codebase and write AGENTS.md" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
-    .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)" },
-    .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing" },
-    .{ .key = "/mode", .desc = "permission mode: default | accept-edits | read-only | bypass" },
+    .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
+    .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
+    .{ .key = "/mode", .desc = "set work mode: build | accept-edits | plan | bypass" },
     .{ .key = "/allowlist", .desc = "always-allowed tools + bash (persisted)" },
-    .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall" },
-    .{ .key = "/new", .desc = "new session" },
+    .{ .key = "/permissions", .desc = "the rules: Tool(pattern) allow | deny | ask" },
+    .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
+    .{ .key = "/new-session", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
+    .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
+    .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
+    .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
     .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
-    .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times" },
-    .{ .key = "/session", .desc = "session info" },
-    .{ .key = "/cache", .desc = "cache hit-rate for this session" },
-    .{ .key = "/ask", .desc = "on|off: read-only mode (shift+tab); the agent investigates and asks" },
+    .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
+    .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
+    .{ .key = "/rename", .desc = "set a custom title for the current session: /rename <name>" },
+    .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
+    .{ .key = "/cache", .desc = "cache hit-rate for this session", .palette_visible = false },
+    .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
+    .{ .key = "/style", .desc = "select an output style: default|explanatory|learning (no args: report | off)" },
+    .{ .key = "/copy", .desc = "copy an answer to the clipboard: /copy (the last one) | /copy N (N answers back)", .key_hint = "N" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
 };
 
@@ -527,4 +1066,77 @@ pub const Cmd = struct {
     /// Only ones that really exist are listed: putting a fake one would be worse
     /// than putting none.
     key_hint: ?[]const u8 = null,
+    /// Keep advanced maintenance and harness controls out of the default
+    /// command palette while preserving direct commands and `/help`.
+    palette_visible: bool = true,
 };
+
+// ── `/files` ──────────────────────────────────────────────────
+
+/// The text the command pushed, as one string.
+fn pendingText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
+    var all: std.ArrayList(u8) = .empty;
+    errdefer all.deinit(gpa);
+    for (m.pending.items) |item| try all.appendSlice(gpa, item.text);
+    return all.toOwnedSlice(gpa);
+}
+
+test "the files command names what the model read and what the agent changed" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 100), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    m.reads.record("src/tui.zig", stat, 0xabcd, 1, 100, 3420);
+    m.changed.note("src/agent.zig");
+
+    cmdFiles(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "src/tui.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "in context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "src/agent.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 changed") != null);
+}
+
+test "the files command says when there is nothing, instead of showing an empty list" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    cmdFiles(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "nothing read or written") != null);
+}
+
+test "the files command says a file is NOT in the context when it is not" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 100), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    m.reads.record("build.zig", stat, 0xabcd, 1, 100, 88);
+    // A write forgets the entry: the model does not have the OLD text any more.
+    m.reads.invalidate("build.zig");
+
+    cmdFiles(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "build.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "not in context") != null);
+}
+
+test "/update is offered in the palette, not hidden behind its name" {
+    // A command the user cannot find is a command that does not exist: the
+    // notice says "/update installs it", so the palette has to agree.
+    var found = false;
+    for (commands) |c| {
+        if (!std.mem.eql(u8, c.key, "/update")) continue;
+        found = true;
+        try std.testing.expect(c.palette_visible);
+        try std.testing.expect(std.mem.indexOf(u8, c.desc, "newest release") != null);
+    }
+    try std.testing.expect(found);
+}

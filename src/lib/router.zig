@@ -35,6 +35,12 @@ const std = @import("std");
 pub const cheap_env = "ZODE_CHEAP_TURN";
 pub const cheap_model_env = "ZODE_CHEAP_MODEL";
 
+/// Why a configured cheap model was skipped.
+pub const Why = enum {
+    gated,
+    unknown_model,
+};
+
 /// Once the cheap model has said no, it is not asked again this session.
 ///
 /// A session-long flag and not a per-turn one, on purpose: a model that is gated
@@ -50,6 +56,8 @@ pub const State = struct {
     attempts: u32 = 0,
     /// How many of those fell back.
     fallbacks: u32 = 0,
+    /// Most recent model-specific failure, for an accurate session report.
+    last_why: ?Why = null,
 };
 
 /// Whether the feature is on at all.
@@ -143,6 +151,7 @@ pub fn onFailure(st: *State, err: anyerror, detail: []const u8, active_model: []
     if (!disqualifies(err, detail)) return false;
     st.given_up = true;
     st.fallbacks += 1;
+    st.last_why = why(err, detail);
     // Falling back onto the model that just failed is a loop, not a fallback.
     return !(active_model.len > 0 and std.mem.eql(u8, st.cheap_model, active_model));
 }
@@ -154,13 +163,6 @@ pub fn onFailure(st: *State, err: anyerror, detail: []const u8, active_model: []
 /// does not know is fixed by fixing the name, while a gated model is fixed by
 /// picking a different one. Sending somebody to `/model` because of a typo is the
 /// kind of message that teaches people to ignore messages.
-pub const Why = enum {
-    /// 403: the provider will not serve it here. Pick another model.
-    gated,
-    /// 404: the provider does not know this id. Fix the name.
-    unknown_model,
-};
-
 /// The reason, which needs the body as well as the error for the two cases whose
 /// status does not say it: a 400 and a 5xx arrive for "no such model" as often as
 /// for a malformed request, and the difference is only in the text.
@@ -310,10 +312,15 @@ fn indexOfIgnoreCase(hay: []const u8, needle: []const u8) ?usize {
 /// never asked".
 pub fn report(st: *const State, gpa: std.mem.Allocator, cheap_model: []const u8) ?[]u8 {
     if (st.fallbacks > 0) {
+        const reason = st.last_why orelse .gated;
+        const why_text = switch (reason) {
+            .gated => "was not available to this account",
+            .unknown_model => "is not a model this provider recognizes",
+        };
         return std.fmt.allocPrint(
             gpa,
-            "cheap turn: {s} is not available on this account ({d}/{d} turns), so this one went to the model you picked. Set {s}=0 to stop trying.",
-            .{ cheap_model, st.fallbacks, st.attempts, cheap_env },
+            "cheap turn: {s} {s}; the selected model handled {d}/{d} turn(s). {s}. Set {s}=0 to stop trying.",
+            .{ cheap_model, why_text, st.fallbacks, st.attempts, remedy(reason), cheap_env },
         ) catch null;
     }
     if (st.attempts > 0) {

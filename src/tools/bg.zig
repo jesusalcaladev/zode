@@ -7,12 +7,27 @@ const common = @import("common.zig");
 const bgproc = @import("../bgproc.zig");
 const verify_mod = @import("../lib/verify.zig");
 
+/// The job id, as a `u32` — which is what the registry's slots are indexed by.
+///
+/// `getInt` returns `?i64`, and the NEGATIVE half was the only thing checked. An id
+/// above `maxInt(u32)` — a hallucinated `{"id": 99999999999}` — hit
+/// `thread panic: integer cast truncated bits`, and a panic on a worker thread
+/// calls `std.process.abort()`: the whole app died with SIGABRT and no error
+/// message, from the tool the model was told to use for exactly this.
+fn backgroundId(obj: std.json.ObjectMap) !u32 {
+    const id_i = common.getInt(obj, "id") orelse return error.MissingId;
+    if (id_i <= 0) return error.MissingId;
+    // Clamped, not cast: a bad id is a mistake to report, not a way to kill the
+    // process. The registry has a bounded number of slots, so the range it can
+    // actually address is far narrower than u32 anyway.
+    if (id_i > std.math.maxInt(u32)) return error.IdOutOfRange;
+    return @intCast(id_i);
+}
+
 /// `bash_output`: the new output plus the status.
 pub fn toolBashOutput(obj: std.json.ObjectMap, arena: std.mem.Allocator, reg: ?*bgproc.Registry) ![]const u8 {
     const r = reg orelse return error.NoBackgroundRegistry;
-    const id_i = common.getInt(obj, "id") orelse return error.MissingId;
-    if (id_i <= 0) return error.MissingId;
-    const id: u32 = @intCast(id_i);
+    const id = backgroundId(obj) catch return error.BadArgs;
 
     var out = bgproc.Output{};
     const text = bgproc.read(r, &out, id) catch |err| switch (err) {
@@ -42,9 +57,7 @@ pub fn toolBashKill(
     io: std.Io,
 ) ![]const u8 {
     const r = reg orelse return error.NoBackgroundRegistry;
-    const id_i = common.getInt(obj, "id") orelse return error.MissingId;
-    if (id_i <= 0) return error.MissingId;
-    const id: u32 = @intCast(id_i);
+    const id = backgroundId(obj) catch return error.BadArgs;
     if (bgproc.kill(r, io, id)) {
         return std.fmt.allocPrint(arena, "killed job {d}. You can still read what it printed with bash_output.", .{id});
     }
@@ -82,6 +95,9 @@ pub const Foreground = struct {
     term: ?std.process.Child.Term,
     /// The output was longer than the cap, so the child was KILLED at the cap.
     truncated: bool = false,
+    /// How many bytes of stdout+stderr were actually captured (before any cut).
+    /// Honest: this is what the model sees, not a guess about how much more there was.
+    bytes_read: usize = 0,
 
     fn deinit(self: Foreground, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -99,6 +115,28 @@ pub const foreground_truncation_notice =
     "\\n… (output cut at the tool's cap and the command was stopped; re-run it " ++
     "through `head` or a narrower scope to get the rest)\\n";
 
+
+/// What the model is told when a foreground command was cut short.
+///
+/// `shown_bytes` is how many bytes the model actually sees; `cap_bytes` is the
+/// tool's cap. The notice is written directly into `out`.
+pub fn foregroundTruncationNotice(
+    out: *std.ArrayList(u8),
+    arena: std.mem.Allocator,
+    shown_bytes: usize,
+    cap_bytes: usize,
+) !void {
+    const cap_kb = cap_bytes / 1024;
+    const shown_kb = shown_bytes / 1024;
+    try out.print(
+        arena,
+        "\\n… (output cut at {d} KB; tool cap is {d} KB. Command was stopped at the cap; "
+        ++ "re-run through `head` or a narrower scope to get the rest)\\\\n",
+        .{ shown_kb, cap_kb },
+    );
+}
+
+/// Runs a command in the FOREGROUND and returns what it printed.
 /// Runs a command in the FOREGROUND and returns what it printed.
 ///
 /// ## Why over the cap truncates instead of failing
@@ -127,9 +165,24 @@ pub fn runForeground(
     timeout_s: u64,
     out_limit: usize,
 ) !Foreground {
-    var argv = [_][]const u8{ "/bin/sh", "-c", command };
+    var plain = [_][]const u8{ "/bin/sh", "-c", command };
+    return runForegroundArgv(gpa, io, &plain, timeout_s, out_limit);
+}
+
+/// The same, with the ARGUMENT LIST the caller chose.
+///
+/// It is what the sandbox needs: the sandbox's own arguments come FIRST and
+/// the command is the last thing in the list, and a "command string" cannot
+/// express that without quoting the quoting.
+pub fn runForegroundArgv(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    timeout_s: u64,
+    out_limit: usize,
+) !Foreground {
     var child = try std.process.spawn(io, .{
-        .argv = &argv,
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -191,6 +244,7 @@ pub fn runForeground(
         .stderr = stderr_slice,
         .term = term,
         .truncated = truncated,
+        .bytes_read = stdout_slice.len + stderr_slice.len,
     };
 }
 

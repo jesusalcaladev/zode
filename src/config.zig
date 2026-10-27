@@ -1,6 +1,8 @@
 const std = @import("std");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
+const servers = @import("lsp/servers.zig");
+const mcp_servers = @import("mcp/servers.zig");
 
 /// User config: `~/.config/zode/config.json`.
 ///
@@ -40,6 +42,22 @@ pub const Config = struct {
     extra: []const providers.ProviderDef = &.{},
     /// Wire format of each extra provider: "openai" (default) or "anthropic".
     anthropic_extra: []const bool = &.{},
+    /// The user's own language servers (`lsp_servers`).
+    ///
+    /// A language for which zode ships no server, or a different binary for
+    /// one it does. The command is FIXED here and never chosen by the model:
+    /// that is what lets the `lsp` tool run without a permission dialog.
+    lsp_servers: []const servers.Server = &.{},
+    /// The user's MCP servers (`mcp_servers`).
+    ///
+    /// USER-level and not per project, on purpose: a server is a PROGRAM, and
+    /// a program the project chooses is remote code execution with the user's
+    /// credentials. The user's own config is the place where that decision
+    /// belongs, and a project that wants a server asks for one to be added.
+    ///
+    /// The command is FIXED here and never chosen by the model: that is what
+    /// lets the `mcp` tool read a server's catalogue without a dialog.
+    mcp_servers: []const mcp_servers.Server = &.{},
     /// Config path that was loaded (for diagnostics), or null.
     path: ?[]const u8 = null,
     pub const empty: Config = .{};
@@ -104,6 +122,34 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
     if (root.get("subagent_model")) |v| {
         if (v == .string) cfg.subagent_model = try arena.dupe(u8, v.string);
     }
+    // The user's language servers. A malformed entry is SKIPPED, not an error:
+    // one bad row must not take the whole config (and with it the provider
+    // that was working) down.
+    if (root.get("lsp_servers")) |v| {
+        if (v == .array) {
+            var list: std.ArrayList(servers.Server) = .empty;
+            for (v.array.items) |item| {
+                if (item != .object) continue;
+                const s = parseServer(arena, item.object) catch continue;
+                try list.append(arena, s);
+            }
+            cfg.lsp_servers = list.items;
+        }
+    }
+    // The user's MCP servers. Same rule as the language servers: a malformed
+    // entry is SKIPPED and not an error, because one bad row must not take the
+    // whole config (and with it the provider that was working) down.
+    if (root.get("mcp_servers")) |v| {
+        if (v == .array) {
+            var list: std.ArrayList(mcp_servers.Server) = .empty;
+            for (v.array.items) |item| {
+                if (item != .object) continue;
+                const s = parseMcpServer(arena, item.object) catch continue;
+                try list.append(arena, s);
+            }
+            cfg.mcp_servers = list.items;
+        }
+    }
 
     const pv = root.get("providers") orelse return cfg;
     if (pv != .array) return cfg;
@@ -158,6 +204,24 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
         else
             "";
 
+        const max_output_tokens = if (o.get("max_output_tokens")) |v|
+            (if (v == .integer and v.integer >= 0) @as(u32, @intCast(v.integer)) else 0)
+        else
+            0;
+
+        const preferred_models = if (o.get("preferred_models")) |v|
+            (if (v == .array) blk: {
+                var arr: std.ArrayList([]const u8) = .empty;
+                for (v.array.items) |m| {
+                    if (m == .string and m.string.len > 0) {
+                        arr.append(arena, try arena.dupe(u8, m.string)) catch {};
+                    }
+                }
+                break :blk arr.items;
+            } else &.{})
+        else
+            &.{};
+
         const kind_anthropic = blk: {
             const kv = o.get("kind") orelse break :blk false;
             break :blk kv == .string and std.mem.eql(u8, kv.string, "anthropic");
@@ -171,6 +235,12 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
             .key_env = keys.items,
             .default_model = model,
             .note = note,
+            .max_output_tokens = max_output_tokens,
+            .preferred_models = preferred_models,
+            // The same `kind` that says the chat path is the Anthropic Messages
+            // API says how its CATALOGUE expects the key: an anthropic proxy
+            // with `kind: "anthropic"` and no Bearer would list nothing.
+            .key_style = if (kind_anthropic) .x_api_key else .bearer,
         });
         try kinds.append(arena, kind_anthropic);
     }
@@ -178,6 +248,112 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
     cfg.extra = list.items;
     cfg.anthropic_extra = kinds.items;
     return cfg;
+}
+
+/// One `lsp_servers` entry.
+///
+/// `name`, `command` and `extensions` are required: without an extension the
+/// server is never picked, and without a command there is nothing to run.
+/// `language_id` defaults to the name, which is right for most servers (the
+/// name IS the language id in the table zode ships).
+fn parseServer(arena: std.mem.Allocator, o: std.json.ObjectMap) !servers.Server {
+    const name_v = o.get("name") orelse return error.BadServer;
+    if (name_v != .string or name_v.string.len == 0) return error.BadServer;
+    const name = try arena.dupe(u8, name_v.string);
+
+    const lang = if (o.get("language_id")) |lv|
+        (if (lv == .string and lv.string.len > 0) try arena.dupe(u8, lv.string) else name)
+    else
+        name;
+
+    const cmd_v = o.get("command") orelse return error.BadServer;
+    if (cmd_v != .array or cmd_v.array.items.len == 0) return error.BadServer;
+    var cmd: std.ArrayList([]const u8) = .empty;
+    for (cmd_v.array.items) |c| {
+        if (c != .string or c.string.len == 0) return error.BadServer;
+        try cmd.append(arena, try arena.dupe(u8, c.string));
+    }
+
+    const ext_v = o.get("extensions") orelse return error.BadServer;
+    if (ext_v != .array or ext_v.array.items.len == 0) return error.BadServer;
+    var ext: std.ArrayList([]const u8) = .empty;
+    for (ext_v.array.items) |e| {
+        if (e != .string or e.string.len == 0) continue;
+        try ext.append(arena, try arena.dupe(u8, e.string));
+    }
+    if (ext.items.len == 0) return error.BadServer;
+
+    return .{
+        .name = name,
+        .language_id = lang,
+        .command = cmd.items,
+        .extensions = ext.items,
+    };
+}
+
+/// One MCP server, as the user wrote it.
+///
+/// The shape is the obvious one:
+///
+///     { "name": "github", "command": ["npx", "-y", "server-github"],
+///       "env": { "GITHUB_TOKEN": "..." } }
+///
+/// `env` is an OBJECT (a name and a value), and also accepts an array of
+/// `{name, value}` objects, because both are what people write and the second
+/// one is what a generator emits.
+fn parseMcpServer(arena: std.mem.Allocator, o: std.json.ObjectMap) !mcp_servers.Server {
+    const name_v = o.get("name") orelse return error.BadServer;
+    if (name_v != .string or name_v.string.len == 0) return error.BadServer;
+    const name = try arena.dupe(u8, name_v.string);
+
+    const cmd_v = o.get("command") orelse return error.BadServer;
+    if (cmd_v != .array or cmd_v.array.items.len == 0) return error.BadServer;
+    var cmd: std.ArrayList([]const u8) = .empty;
+    for (cmd_v.array.items) |c| {
+        if (c != .string or c.string.len == 0) return error.BadServer;
+        try cmd.append(arena, try arena.dupe(u8, c.string));
+    }
+
+    var envs: std.ArrayList(mcp_servers.EnvVar) = .empty;
+    if (o.get("env")) |ev| {
+        switch (ev) {
+            .object => |map| {
+                var it = map.iterator();
+                while (it.next()) |kv| {
+                    const v = kv.value_ptr.*;
+                    if (v != .string) continue;
+                    // `Environ.Map.put` ASSERTS on a name with an `=` in it, and
+                    // an assert in the user's own configuration is a crash the
+                    // user cannot do anything about.
+                    if (!mcp_servers.validEnvName(kv.key_ptr.*)) continue;
+                    try envs.append(arena, .{
+                        .name = try arena.dupe(u8, kv.key_ptr.*),
+                        .value = try arena.dupe(u8, v.string),
+                    });
+                }
+            },
+            .array => |items| {
+                for (items.items) |item| {
+                    if (item != .object) continue;
+                    const n = item.object.get("name") orelse continue;
+                    const v = item.object.get("value") orelse continue;
+                    if (n != .string or v != .string) continue;
+                    if (!mcp_servers.validEnvName(n.string)) continue;
+                    try envs.append(arena, .{
+                        .name = try arena.dupe(u8, n.string),
+                        .value = try arena.dupe(u8, v.string),
+                    });
+                }
+            },
+            else => {},
+        }
+    }
+
+    return .{
+        .name = name,
+        .command = cmd.items,
+        .env = envs.items,
+    };
 }
 
 /// All providers: compiled + the ones from config.json.
@@ -235,6 +411,31 @@ test "parse: key_env accepts an array" {
     try std.testing.expectEqual(@as(usize, 2), cfg.extra[0].key_env.len);
     try std.testing.expectEqualStrings("A_KEY", cfg.extra[0].key_env[0]);
     try std.testing.expectEqualStrings("B_KEY", cfg.extra[0].key_env[1]);
+}
+
+test "parse: max_output_tokens and preferred_models come from config.json" {
+    // A user provider can bring the two fields the compiled ones carry: the
+    // output cap (per-model maxima are lower than `medium`'s 32768 on several
+    // hosted services) and the preference list (a catalog's first row is not a
+    // choice). Both are OPTIONAL and their absence is 0 / empty, not an error.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"providers":[
+        \\ {"id":"nim","base_url":"http://h/v1","max_output_tokens":16384,
+        \\  "preferred_models":["vendor/big","vendor/small"]},
+        \\ {"id":"bare","base_url":"http://h2/v1"}
+        \\]}
+    ;
+    const cfg = try parse(arena, json, "/tmp/c.json");
+    try std.testing.expectEqual(@as(usize, 2), cfg.extra.len);
+    try std.testing.expectEqual(@as(u32, 16384), cfg.extra[0].max_output_tokens);
+    try std.testing.expectEqual(@as(usize, 2), cfg.extra[0].preferred_models.len);
+    try std.testing.expectEqualStrings("vendor/big", cfg.extra[0].preferred_models[0]);
+    try std.testing.expectEqual(@as(u32, 0), cfg.extra[1].max_output_tokens);
+    try std.testing.expectEqual(@as(usize, 0), cfg.extra[1].preferred_models.len);
 }
 
 test "parse: kind anthropic marks the wire format" {
@@ -304,6 +505,108 @@ test "parse: the subagent's model is parsed where the active one is" {
     try std.testing.expectEqual(@as(usize, 0), weird.subagent_model.len);
 }
 
+test "parse: the user's language servers are parsed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"lsp_servers":[
+        \\ {"name":"my-zls","language_id":"zig","command":["my-lsp","--stdio"],"extensions":[".zig",".zon"]},
+        \\ {"name":"txtlsp","command":["txtlsp"],"extensions":[".txt"]}
+        \\]}
+    ;
+    const cfg = try parse(arena, json, "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 2), cfg.lsp_servers.len);
+    try std.testing.expectEqualStrings("my-zls", cfg.lsp_servers[0].name);
+    try std.testing.expectEqualStrings("zig", cfg.lsp_servers[0].language_id);
+    try std.testing.expectEqual(@as(usize, 2), cfg.lsp_servers[0].command.len);
+    try std.testing.expectEqualStrings("my-lsp", cfg.lsp_servers[0].command[0]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.lsp_servers[0].extensions.len);
+    // The language id defaults to the name: for most servers they are the same.
+    try std.testing.expectEqualStrings("txtlsp", cfg.lsp_servers[1].language_id);
+
+    // No servers configured is not an error and not an empty list of garbage.
+    const bare = try parse(arena, "{}", "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 0), bare.lsp_servers.len);
+}
+
+test "parse: a malformed language server is skipped, and the rest survives" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"provider":"vllm","lsp_servers":[
+        \\ {"name":"no-command","extensions":[".zig"]},
+        \\ {"name":"no-extensions","command":["x"]},
+        \\ {"command":["x"],"extensions":[".zig"]},
+        \\ {"name":"ok","command":["x"],"extensions":[".zig"]}
+        \\]}
+    ;
+    const cfg = try parse(arena, json, "/tmp/cfg.json");
+    // One bad row must not take the whole config (and with it the provider)
+    // down, and must not take the good row with it.
+    try std.testing.expectEqual(@as(usize, 1), cfg.lsp_servers.len);
+    try std.testing.expectEqualStrings("ok", cfg.lsp_servers[0].name);
+    // The provider is still there: that is the point of skipping.
+    try std.testing.expectEqualStrings("vllm", cfg.provider);
+}
+
+test "parse: the user's MCP servers are parsed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"mcp_servers":[
+        \\ {"name":"github","command":["npx","-y","server-github"],"env":{"GITHUB_TOKEN":"abc"}},
+        \\ {"name":"fs","command":["mcp-fs","/tmp"],"env":[{"name":"MODE","value":"ro"}]}
+        \\]}
+    ;
+    const cfg = try parse(arena, json, "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 2), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("github", cfg.mcp_servers[0].name);
+    try std.testing.expectEqual(@as(usize, 3), cfg.mcp_servers[0].command.len);
+    try std.testing.expectEqualStrings("npx", cfg.mcp_servers[0].command[0]);
+    // The environment is an object, and also an array: both are what people
+    // write, and the second one is what a generator emits.
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers[0].env.len);
+    try std.testing.expectEqualStrings("GITHUB_TOKEN", cfg.mcp_servers[0].env[0].name);
+    try std.testing.expectEqualStrings("abc", cfg.mcp_servers[0].env[0].value);
+    try std.testing.expectEqualStrings("MODE", cfg.mcp_servers[1].env[0].name);
+
+    // No servers configured is not an error and not an empty list of garbage.
+    const bare = try parse(arena, "{}", "/tmp/cfg.json");
+    try std.testing.expectEqual(@as(usize, 0), bare.mcp_servers.len);
+}
+
+test "parse: a malformed MCP server is skipped, and the rest survives" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const json =
+        \\{"provider":"vllm","mcp_servers":[
+        \\ {"name":"no-command"},
+        \\ {"name":"empty-command","command":[]},
+        \\ {"command":["x"]},
+        \\ {"name":"ok","command":["x"],"env":{"BAD=NAME":"v"}}
+        \\]}
+    ;
+    const cfg = try parse(arena, json, "/tmp/cfg.json");
+    // One bad row must not take the whole config (and with it the provider)
+    // down, and must not take the good row with it.
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    try std.testing.expectEqualStrings("ok", cfg.mcp_servers[0].name);
+    // And an environment variable whose NAME is not a name is dropped, not
+    // asserted on: `Environ.Map.put` asserts, and an assert in the user's own
+    // configuration is a crash the user cannot do anything about.
+    try std.testing.expectEqual(@as(usize, 0), cfg.mcp_servers[0].env.len);
+    // The provider is still there: that is the point of skipping.
+    try std.testing.expectEqualStrings("vllm", cfg.provider);
+}
+
 test "parse: corrupt JSON returns an error, not a panic" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -368,6 +671,12 @@ pub fn writeFileSecure(
         .permissions = @enumFromInt(0o600),
     });
     defer file.close(io);
+    // `permissions` above only applies when the file is CREATED. A
+    // `auth.json.tmp` left behind by a crashed write keeps whatever mode it had
+    // — and if that one was written 0644 (by an older zode, or by hand), the
+    // rename publishes it as `auth.json` at 0644 with the keys readable by every
+    // user on the machine. So the mode is set on the OPEN file, every time.
+    file.setPermissions(io, @enumFromInt(0o600)) catch {};
     // `File` has no writeAll in 0.16: build a writer with its own buffer.
     var wbuf: [4096]u8 = undefined;
     var fw = file.writer(io, &wbuf);
@@ -376,6 +685,28 @@ pub fn writeFileSecure(
     // The temp file is renamed to its final name: writing in place would leave
     // half of the key in a 0644 file if it failed midway.
     try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
+}
+
+/// Tightens an existing file to 0600 if it is looser.
+///
+/// The private mode is applied when zode WRITES `auth.json`, so a file written
+/// by an older zode, restored from a backup, or created with `echo … > auth.json`
+/// stays 0644 forever: the keys are readable by every user on the machine, and
+/// every start of the app reads them and does nothing about it. This is the
+/// check that makes "the file is 0600" a property of the FILE and not of the
+/// writer that happened to create it.
+///
+/// Best-effort, and deliberately silent: no file yet (nobody connected a
+/// provider), a read-only mount or a file owned by somebody else are not
+/// reasons to refuse to start. The caller keeps going, with or without keys.
+pub fn tightenPermissions(io: std.Io, path: []const u8) void {
+    if (path.len == 0) return;
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
+    defer file.close(io);
+    const st = file.stat(io) catch return;
+    // 0o077 is group+other: anything in there is someone else's read (or write).
+    if (@intFromEnum(st.permissions) & 0o077 == 0) return;
+    file.setPermissions(io, @enumFromInt(0o600)) catch {};
 }
 
 // ── minimal hand-written JSON ─────────────────────────────────
@@ -455,4 +786,74 @@ test "writeFileSecure: creates the directory and writes with 0600" {
     };
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("{\"a\":\"b\"}", got);
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
+}
+
+/// Mode bits of `path`, for the tests below. Read through an open file because
+/// `statFile` wants its own options struct and this is the same code either way.
+fn modeOf(io: std.Io, path: []const u8) !u32 {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const st = try f.stat(io);
+    // `Permissions` carries the file-type bits too (0100644 for a regular
+    // file), so only the mode itself is interesting here.
+    return @intFromEnum(st.permissions) & 0o7777;
+}
+
+test "writeFileSecure: a leftover 0644 temp file does not publish auth.json at 0644" {
+    // The hole this covers: `createFile(.permissions = 0o600)` only sets the
+    // mode when it CREATES. A `.tmp` from a crashed run kept its old mode, the
+    // rename published it under the real name, and the keys ended up readable by
+    // every user on the machine.
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const home: [:0]const u8 = "HOME=/tmp/zode-test-tmp-home\x00";
+    try env_map.putPosixBlock(.{ .slice = &.{home} });
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "/tmp/zode-test-tmp-home/.config/zode/auth.json";
+    std.Io.Dir.cwd().deleteTree(io, "/tmp/zode-test-tmp-home") catch {};
+    try std.Io.Dir.cwd().createDirPath(io, "/tmp/zode-test-tmp-home/.config/zode");
+
+    // A pre-existing temp file, forced to 0644 so the test does not depend on
+    // the umask of whoever runs it.
+    const tmp = path ++ ".tmp";
+    const stale = try std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true });
+    stale.setPermissions(io, @enumFromInt(0o644)) catch {};
+    stale.close(io);
+    try std.testing.expectEqual(@as(u32, 0o644), try modeOf(io, tmp));
+
+    try writeFileSecure(io, &env_map, path, "{\"k\":\"v\"}");
+
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
+}
+
+test "tightenPermissions: a 0644 auth.json becomes 0600, a private one is left alone" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = "/tmp/zode-test-perms";
+    const path = dir ++ "/auth.json";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+
+    // No file: not an error, nothing to do (nobody connected a provider yet).
+    tightenPermissions(io, path);
+    tightenPermissions(io, "");
+
+    const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    f.setPermissions(io, @enumFromInt(0o644)) catch {};
+    f.close(io);
+    try std.testing.expectEqual(@as(u32, 0o644), try modeOf(io, path));
+
+    tightenPermissions(io, path);
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
+
+    // Idempotent: calling it again cannot fail or change anything.
+    tightenPermissions(io, path);
+    try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
 }

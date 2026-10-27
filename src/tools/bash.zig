@@ -1,5 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
+const sandbox_mod = @import("../lib/sandbox.zig");
+const agent = @import("../agent.zig");
 const bg_tool = @import("bg.zig");
 const bgproc = @import("../bgproc.zig");
 
@@ -57,7 +59,34 @@ pub fn toolBash(
         , .{ id, id });
     }
 
-    const result = try bg_tool.runForeground(arena, io, command, timeout_s, common.max_tool_output);
+    // The SANDBOX, when the model asks for it and there is one.
+    //
+    // It is opt-IN and not a policy: a harness that sandboxes every command
+    // breaks every build (the home is read-only and `/tmp` is empty), and a
+    // sandbox that breaks the build is one the user turns off.
+    var sandbox_argv: ?[]const []const u8 = null;
+    if (common.getBool(obj, "sandbox")) {
+        // The PATH from the environment: a sandbox installed in
+        // `~/.local/bin` is a sandbox, and the usual places are the fallback.
+        const env = agent.environ_global;
+        const path = if (env) |e| e.get("PATH") else null;
+        const kind = sandbox_mod.detect(io, std.Io.Dir.cwd(), path);
+        if (kind == .none) {
+            return "sandbox: no sandbox is installed (looked for bwrap and firejail). Run the command without it, or install one.";
+        }
+        var cwd_buf: [1024]u8 = undefined;
+        const n = std.Io.Dir.cwd().realPath(io, &cwd_buf) catch 0;
+        const cwd = cwd_buf[0..n];
+        sandbox_argv = sandbox_mod.argv(kind, command, cwd, arena) catch null;
+        if (sandbox_argv == null) {
+            return "sandbox: the sandbox arguments could not be built.";
+        }
+    }
+
+    const result = if (sandbox_argv) |argv|
+        try bg_tool.runForegroundArgv(arena, io, argv, timeout_s, common.max_tool_output)
+    else
+        try bg_tool.runForeground(arena, io, command, timeout_s, common.max_tool_output);
 
     var out: std.ArrayList(u8) = .empty;
     // Null means WE stopped it at the cap, so there is no exit code to report and
@@ -90,7 +119,9 @@ pub fn toolBash(
     // output. A silent cut is the failure this replaces — with one, the model can
     // tell "that was everything" from "that was the first 16 KB", which is the whole
     // difference between rephrasing the request and repeating it.
-    if (result.truncated) try out.appendSlice(arena, bg_tool.foreground_truncation_notice);
+    if (result.truncated) {
+        try bg_tool.foregroundTruncationNotice(&out, arena, result.bytes_read, common.max_tool_output);
+    }
     return out.items;
 }
 

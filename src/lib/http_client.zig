@@ -29,6 +29,15 @@ pub const Http = struct {
         body: []u8, // the caller frees with `freeBody`
         /// Value of the `retry-after` header in seconds, if the server sent one.
         retry_after: ?u16 = null,
+        /// The `location` of a 3xx, COPIED into the caller's buffer. Null when
+        /// the answer was not a redirect, had no `location`, or did not fit.
+        ///
+        /// It has to be a copy for the same reason `content_type` is not a
+        /// field: `receiveHead` leaves the headers in the redirect buffer,
+        /// which is on the STACK and dies when `request` returns. A slice into
+        /// it is not a compile error, it is garbage the first time anybody
+        /// reads it.
+        location: ?[]const u8 = null,
     };
 
     // There is deliberately NO `content_type` here: `receiveHead` leaves the headers
@@ -115,7 +124,16 @@ pub const Http = struct {
 
     /// GET that returns the whole body (10MB limit).
     pub fn get(self: *Http, url: []const u8, bearer: ?[]const u8) !JsonResult {
-        return self.request(.GET, url, bearer, null, &.{});
+        return self.request(.GET, url, bearer, null, &.{}, null);
+    }
+
+    /// `get` with the headers an API that has no Bearer needs.
+    ///
+    /// Anthropic is the one: `x-api-key` instead of `Authorization`, plus a
+    /// mandatory `anthropic-version`. Without this the catalogue request went
+    /// out with a Bearer it ignores and came back 401.
+    pub fn getWith(self: *Http, url: []const u8, bearer: ?[]const u8, extra: []const ExtraHeader) !JsonResult {
+        return self.request(.GET, url, bearer, null, extra, null);
     }
 
     /// GET with its own headers.
@@ -124,13 +142,33 @@ pub const Http = struct {
     /// returns 403 to std's default `User-Agent`, which is `zig`, and a 403
     /// response says nothing about what was behind it.
     pub fn getWithHeaders(self: *Http, url: []const u8, headers: []const ExtraHeader) !JsonResult {
-        return self.request(.GET, url, null, null, headers);
+        return self.request(.GET, url, null, null, headers, null);
+    }
+
+    /// GET that ALSO reports where a 3xx points, copied into `redirect_buf`.
+    ///
+    /// It exists because `openRequest` sets `redirect_behavior = 3`, which in
+    /// std is `.not_allowed` with a countdown — redirects are NOT followed and a
+    /// 3xx arrives here as a status. That was the right default for the API
+    /// calls (a 307 from a gateway should not silently become a second request)
+    /// and the wrong one for `web_fetch`, where a redirect is most of the
+    /// internet: `http://` → `https://`, `example.com` → `www.example.com`, a
+    /// docs site with a moving blog.
+    ///
+    /// `redirect_buf` is the caller's, because the head dies with the call.
+    pub fn getInspect(
+        self: *Http,
+        url: []const u8,
+        headers: []const ExtraHeader,
+        redirect_buf: []u8,
+    ) !JsonResult {
+        return self.request(.GET, url, null, null, headers, redirect_buf);
     }
 
     /// POST with a JSON body. Returns the whole body (for SSE: `sendSse`).
     /// `body` must be mutable because of std's signature (`sendBodyComplete`).
     pub fn postJson(self: *Http, url: []const u8, bearer: ?[]const u8, body: []u8) !JsonResult {
-        return self.request(.POST, url, bearer, body, &.{});
+        return self.request(.POST, url, bearer, body, &.{}, null);
     }
 
     /// POST with extra headers (e.g: Anthropic's x-api-key).
@@ -140,7 +178,7 @@ pub const Http = struct {
         body: []u8,
         headers: []const ExtraHeader,
     ) !JsonResult {
-        return self.request(.POST, url, null, body, headers);
+        return self.request(.POST, url, null, body, headers, null);
     }
 
     /// Opens a request and sends the body. The caller does `deinit` + `destroy`.
@@ -211,6 +249,7 @@ pub const Http = struct {
         bearer: ?[]const u8,
         body: ?[]u8,
         extra_headers: []const ExtraHeader,
+        redirect_out: ?[]u8,
     ) !JsonResult {
         const req = try self.openRequest(method, url, bearer, body, extra_headers, false);
         defer req.deinit();
@@ -220,14 +259,25 @@ pub const Http = struct {
         var response = try req.receiveHead(&redirect_buf);
         const status: u16 = @intFromEnum(response.head.status);
         const retry_after = parseRetryAfter(response.head);
+        // Copied out while the head is still alive. Only when somebody asked:
+        // the API calls do not care and this is a scan of every header.
+        var location: ?[]const u8 = null;
+        if (redirect_out) |out| {
+            if (out.len > 0) location = parseLocation(response.head, out);
+        }
 
-        var transfer_buf: [64 * 1024]u8 = undefined;
+        var transfer_buf: [256 * 1024]u8 = undefined;
         const rd = response.reader(&transfer_buf);
-        const max = 10 * 1024 * 1024;
+        const max = 50 * 1024 * 1024;
         const alloc_body = try rd.allocRemaining(self.gpa, .limited(max));
         errdefer self.gpa.free(alloc_body);
 
-        return .{ .status = status, .body = alloc_body, .retry_after = retry_after };
+        return .{
+            .status = status,
+            .body = alloc_body,
+            .retry_after = retry_after,
+            .location = location,
+        };
     }
 };
 
@@ -237,6 +287,26 @@ fn parseRetryAfter(head: anytype) ?u16 {
     while (it.next()) |h| {
         if (!std.ascii.eqlIgnoreCase(h.name, "retry-after")) continue;
         return std.fmt.parseInt(u16, std.mem.trim(u8, h.value, " "), 10) catch null;
+    }
+    return null;
+}
+
+/// Copies the `location` header into `out`, or null: no redirect, no header, or
+/// a URL that does not fit the caller's buffer.
+///
+/// A location that does not fit is `null` and NOT truncated: half a URL is not
+/// a URL, and the caller reports "the redirect did not fit" instead of
+/// following a prefix of somebody else's path.
+fn parseLocation(head: anytype, out: []u8) ?[]const u8 {
+    const status: u16 = @intFromEnum(head.status);
+    if (status < 300 or status >= 400) return null;
+    var it = head.iterateHeaders();
+    while (it.next()) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "location")) continue;
+        const v = std.mem.trim(u8, h.value, " \t\r\n");
+        if (v.len == 0 or v.len > out.len) return null;
+        @memcpy(out[0..v.len], v);
+        return out[0..v.len];
     }
     return null;
 }

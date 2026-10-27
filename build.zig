@@ -2,7 +2,11 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // ReleaseSmall POR DEFECTO.
+
+    // Version - can be overridden at build time: `zig build -Dversion=v0.1.0`
+    const version = b.option([]const u8, "version", "Version string (default: dev)") orelse "dev";
+
+    // ReleaseSmall for Default.
     //
     // `zig build` used to produce a Debug binary (10.8 MB, 79 % of it debug
     // sections, with the `DebugAllocator` on the hot path). Then it became
@@ -55,11 +59,33 @@ pub fn build(b: *std.Build) void {
     // rebuild leaves another 49 MB in `.zig-cache/o`.
     const strip_tests = b.option(bool, "strip-tests", "Strip the test binary (default: true)") orelse true;
 
+    // The LIVE network tests (`web_fetch for real`, `web_search for real`, the
+    // offset round trip, `braveSearch for real`) are OFF by default and behind
+    // `zig build test -Dlive`.
+    //
+    // They are real requests to DuckDuckGo / Bing / example.com, and they fail
+    // for reasons that are not zode's: measured on 2026-10-23, both DuckDuckGo
+    // endpoints answered HTTP 202 (anomaly detection) for minutes at a time and
+    // the suite went red on a machine where nothing had changed.
+    //
+    // A red suite that is red because a scraper got rate-limited is how a suite
+    // gets ignored — and this one is IN the release workflow's test step, so a
+    // scrape mood would block a release. The gate is the same idea as `-De2e`:
+    // the tests stay reachable by hand (`zig build test -Dlive`), and they stop
+    // being a coin toss on every run.
+    const live = b.option(bool, "live", "run the live network tests (web fetch/search against the real internet)") orelse false;
+
+    // Build options module for passing version to code
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    const build_options_mod = build_options.createModule();
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("build_options", build_options_mod);
 
     const vaxis = b.dependency("vaxis", .{
         .target = target,
@@ -68,7 +94,13 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("vaxis", vaxis.module("vaxis"));
 
     // The strip goes on the MODULE (`root_module.strip`), not on the executable.
-    if (strip) exe_mod.strip = true;
+    //
+    // AND IT IS SET EXPLICITLY, in both directions: `strip = null` is NOT
+    // "unstripped", it is "use the default", and the default for ReleaseSmall
+    // and ReleaseFast is TO STRIP. So `if (strip) exe_mod.strip = true;` left
+    // `-Dstrip=false` as a no-op, and the binary came out stripped anyway.
+    // `false` has to be written down for it to mean anything.
+    exe_mod.strip = strip;
     const exe = b.addExecutable(.{
         .name = "zode",
         .root_module = exe_mod,
@@ -100,6 +132,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     debug_mod.addImport("vaxis", vaxis.module("vaxis"));
+    // `build_options` is NOT optional: `main.zig` and `lib/selfupdate.zig`
+    // import it for the version, and a module that does not have it cannot
+    // compile at all.
+    //
+    // It was missing here, so `zig build debug` — the step whose ENTIRE job is
+    // to be a trustworthy artifact for a crash — did not compile. The binary on
+    // disk was a leftover from some earlier `zig build`, byte-identical to the
+    // stripped release one: a file with a reassuring name and nothing behind it.
+    debug_mod.addImport("build_options", build_options_mod);
     const debug_exe = b.addExecutable(.{ .name = "zode-debug", .root_module = debug_mod });
     // Kept as well as `.Debug`, and both are needed: `.Debug` is what CREATES the
     // symbols and `strip = null` is what stops them being taken away again.
@@ -130,11 +171,17 @@ pub fn build(b: *std.Build) void {
     // `readcache`, `regex` and `verify` from `src/`. Rooted inside `src/tools/`
     // those would be imports from outside the module. It only re-exports the
     // dispatcher; `tool_test.zig` keeps importing a module named `tools`.
-    tt_mod.addImport("tools", b.createModule(.{
+    // The tools module needs its OWN `build_options` (with `live`): the live
+    // network tests live in `src/tools/web.zig`, which is compiled here too.
+    const tools_opts = b.addOptions();
+    tools_opts.addOption(bool, "live", live);
+    const tools_mod_root = b.createModule(.{
         .root_source_file = b.path("src/tools_root.zig"),
         .target = target,
         .optimize = optimize,
-    }));
+    });
+    tools_mod_root.addImport("build_options", tools_opts.createModule());
+    tt_mod.addImport("tools", tools_mod_root);
     const tt = b.addExecutable(.{ .name = "tool_test", .root_module = tt_mod });
     const tt_run = b.addRunArtifact(tt);
     if (b.args) |args| tt_run.addArgs(args);
@@ -189,6 +236,24 @@ pub fn build(b: *std.Build) void {
     const roster_probe_step = b.step("roster-probe", "Shows the pool of free models of every provider");
     roster_probe_step.dependOn(&roster_probe_run.step);
 
+    // The LSP probe: it asks a REAL language server about a real file and
+    // prints what comes back. The companion of `tools/fake_lsp.py`, which
+    // proves the wire and this one proves the server.
+    //
+    // Same placement reason as `roster_probe`: the module's path is the
+    // directory, and the probe needs `lsp/` from `src/`.
+    const lsp_probe_mod = b.createModule(.{
+        .root_source_file = b.path("src/lsp_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lsp_probe_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const lsp_probe = b.addExecutable(.{ .name = "lsp_probe", .root_module = lsp_probe_mod });
+    const lsp_probe_run = b.addRunArtifact(lsp_probe);
+    if (b.args) |args| lsp_probe_run.addArgs(args);
+    const lsp_probe_step = b.step("lsp-probe", "Asks a real language server about a real file");
+    lsp_probe_step.dependOn(&lsp_probe_run.step);
+
     // Tests that need vaxis (markdown/highlight test styles).
     // ALWAYS in Debug: the binary already comes out ReleaseSafe+strip, but
     // compiling the suite in ReleaseSafe takes 2 minutes and finds no MORE bug —
@@ -223,6 +288,8 @@ pub fn build(b: *std.Build) void {
     const e2e = b.option(bool, "e2e", "run the network E2E tests (needs a provider key)") orelse false;
     const opts = b.addOptions();
     opts.addOption(bool, "e2e", e2e);
+    opts.addOption(bool, "live", live);
+    opts.addOption([]const u8, "version", version);
     test_mod.addImport("build_options", opts.createModule());
     // `zig build test -- <filter>` runs only the tests whose name contains the
     // filter. Zig 0.16's runner has no `--test-filter`, so the filter is applied
@@ -232,6 +299,31 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // ── the design harness ────────────────────────────────────────────
+    //
+    // Renders scripted scenes of the TUI and prints them as ANSI text:
+    // `zig build ui-frame -- turn 100 34`, `-- --flat all` for plain text.
+    //
+    // It exists because neither existing check can judge a DESIGN. The
+    // `drawTest` unit tests compare a row against a string, so they prove a word
+    // is there and say nothing about whether the frame is composed. The pty
+    // smoke sees the truth about vaxis, but it needs a terminal, a timing
+    // budget and (for a real turn) a key.
+    //
+    // Same placement reason as `check_probe`: a module rooted in `src/bin/`
+    // cannot import files above it, and this needs `tui.zig`.
+    const ui_frame_mod = b.createModule(.{
+        .root_source_file = b.path("src/ui_frame.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ui_frame_mod.addImport("vaxis", vaxis.module("vaxis"));
+    const ui_frame = b.addExecutable(.{ .name = "ui_frame", .root_module = ui_frame_mod });
+    const ui_frame_run = b.addRunArtifact(ui_frame);
+    if (b.args) |args| ui_frame_run.addArgs(args);
+    const ui_frame_step = b.step("ui-frame", "Render scripted TUI scenes as ANSI text (design review)");
+    ui_frame_step.dependOn(&ui_frame_run.step);
 
     // ── pty checks: the only verification that sees what vaxis renders ──
     //
@@ -259,4 +351,12 @@ pub fn build(b: *std.Build) void {
     run_scroll.has_side_effects = true;
     pty_check.dependOn(&run_smoke.step);
     pty_check.dependOn(&run_scroll.step);
+    // `/copy`: the command, the picker and the file, in a real pty, with a
+    // session that has an answer in it. It sets NO api key on purpose: the
+    // ReleaseSmall build stops answering keys when the active provider has
+    // one (the open bug in AGENTS.md), and `/copy` needs no provider.
+    const run_copy = b.addSystemCommand(&.{ "python3", "tools/copy_smoke.py" });
+    run_copy.setName("copy_smoke");
+    run_copy.has_side_effects = true;
+    pty_check.dependOn(&run_copy.step);
 }

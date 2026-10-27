@@ -16,9 +16,12 @@
 //! one works in the other. Both are scanned in the cwd, and both are scanned again
 //! in the repository root when zode was launched below it — which is the whole
 //! reason `project.zig` exists.
+//!
+//! Bundled skills are appended AFTER on-disk skills so they can be shadowed.
 
 const std = @import("std");
 const skills = @import("skills.zig");
+const bundled = @import("bundled_skills.zig");
 
 const store = @This();
 
@@ -40,7 +43,7 @@ pub const Loader = struct {
     agents_dir: []const u8 = skills.agents_dir,
     /// Absolute path of the git repository root, when zode was launched BELOW it.
     ///
-    /// This is the fix for "cd src && zode sees no project skills at all": the
+    /// This is the fix for "cd src && zode sees no skills at all": the
     /// project's skills live in the root, and the root is a fact git already
     /// knows. It is `null` when the cwd IS the root (nothing to add) or when there
     /// is no repository.
@@ -114,7 +117,23 @@ pub const Loader = struct {
         return out[0..home.len];
     }
 
-    /// Walks both roots and returns the entries, project first, deduplicated by
+    /// Source for a root index (used for tagging skills).
+    fn sourceForRoot(self: *Loader, root_index: usize) skills.Source {
+        // Roots order: project_dir, agents_dir, [repo_project_dir, repo_agents_dir], user_dir
+        // The bundled skills are added separately after all disk roots.
+        if (root_index == 0) return .project;
+        if (root_index == 1) return .agents;
+        if (self.repo_root) |_| {
+            if (root_index == 2) return .project;
+            if (root_index == 3) return .agents;
+            if (root_index == 4) return .user;
+        } else {
+            if (root_index == 2) return .user;
+        }
+        return .user; // fallback
+    }
+
+    /// Walks disk roots and returns the entries, project first, deduplicated by
     /// name.
     ///
     /// The caller OWNS the returned slice AND every string in it (all gpa), and
@@ -128,7 +147,7 @@ pub const Loader = struct {
         var paths: [max_roots][]const u8 = undefined;
         const root_count = self.roots(&bufs, &paths);
 
-        for (paths[0..root_count]) |dir_path| {
+        for (paths[0..root_count], 0..) |dir_path, root_idx| {
             var d = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch continue;
             defer d.close(self.io);
 
@@ -179,10 +198,74 @@ pub const Loader = struct {
                     self.gpa.free(desc_copy);
                     continue;
                 };
-                out[n] = .{ .name = name_copy, .description = desc_copy, .path = path_copy };
+                const when_copy = self.gpa.dupe(u8, meta.when_to_use) catch {
+                    self.gpa.free(name_copy);
+                    self.gpa.free(desc_copy);
+                    self.gpa.free(path_copy);
+                    continue;
+                };
+                errdefer self.gpa.free(when_copy);
+                const source = self.sourceForRoot(root_idx);
+                out[n] = .{
+                    .name = name_copy,
+                    .description = desc_copy,
+                    .path = path_copy,
+                    .body = null,
+                    .source = source,
+                    .context = meta.context,
+                    .when_to_use = when_copy,
+                };
                 n += 1;
             }
         }
+
+        // Append bundled skills (they can be shadowed by on-disk skills)
+        const bundled_entries = bundled.bundled_skills;
+        for (bundled_entries) |bs| {
+            if (n >= cap) break;
+            // Only add if not already shadowed by a disk skill
+            if (alreadyIn(out[0..n], bs.name)) continue;
+            const name_copy = self.gpa.dupe(u8, bs.name) catch continue;
+            errdefer self.gpa.free(name_copy);
+            const desc_copy = self.gpa.dupe(u8, bs.description) catch {
+                self.gpa.free(name_copy);
+                continue;
+            };
+            errdefer self.gpa.free(desc_copy);
+            var path_buf: [128]u8 = undefined;
+            const path_str = std.fmt.bufPrint(path_buf[0..], "bundled://{s}", .{bs.name}) catch {
+                self.gpa.free(name_copy);
+                self.gpa.free(desc_copy);
+                continue;
+            };
+            const path_copy = self.gpa.dupe(u8, path_str) catch {
+                self.gpa.free(name_copy);
+                self.gpa.free(desc_copy);
+                continue;
+            };
+            errdefer self.gpa.free(path_copy);
+            const when_copy = self.gpa.dupe(u8, bs.when_to_use) catch {
+                self.gpa.free(name_copy);
+                self.gpa.free(desc_copy);
+                self.gpa.free(path_copy);
+                continue;
+            };
+            errdefer self.gpa.free(when_copy);
+            out[n] = .{
+                .name = name_copy,
+                .description = desc_copy,
+                .path = path_copy,
+                // The body travels WITH the entry: a bundled skill's body is
+                // in the binary, and its path is not a file at all. Carrying
+                // it is what lets `load` answer without opening anything.
+                .body = bs.body,
+                .source = .bundled,
+                .context = bs.context,
+                .when_to_use = when_copy,
+            };
+            n += 1;
+        }
+
         return out[0..n];
     }
 
@@ -207,6 +290,22 @@ pub const Loader = struct {
         entry: skills.Entry,
         out: []u8,
     ) ?[]const u8 {
+        // A body that came WITH the entry never opens a file.
+        //
+        // That is what the bundled skills are: their body is in the binary and
+        // their path (`bundled://name`) is not a file at all. A loader that
+        // opened the disk for them would fail, and the body it was already
+        // holding would be thrown away with the failure.
+        if (entry.body) |b| {
+            return skills.formatSkill(entry.name, entry.description, b, out);
+        }
+        // Bundled skills: body is in the embedded data
+        if (std.mem.startsWith(u8, entry.path, "bundled://")) {
+            const name = entry.path["bundled://".len..];
+            const bundled_skill = bundled.getBundled(name) orelse return null;
+            return bundled.formatBundledSkill(bundled_skill, null, out);
+        }
+
         // `max_body` on the READ, so a 500 KB "skill" cannot make the TUI allocate
         // 500 KB to then complain about it.
         const text = std.Io.Dir.cwd().readFileAlloc(
@@ -218,6 +317,53 @@ pub const Loader = struct {
         defer self.gpa.free(text);
         const fm = skills.splitFrontmatter(text);
         const body = if (fm) |f| f.body else text;
+        return skills.formatSkill(entry.name, entry.description, body, out);
+    }
+
+    /// Load a skill with optional arguments ($ARGUMENTS substitution).
+    pub fn loadWithArgs(
+        self: *Loader,
+        entry: skills.Entry,
+        args: ?[]const u8,
+        out: []u8,
+    ) ?[]const u8 {
+        // The body that came with the entry: same rule as `load`, and the
+        // substitution happens on it.
+        if (entry.body) |b| {
+            if (args) |a| {
+                const trimmed = std.mem.trim(u8, a, " \t\r\n");
+                if (trimmed.len > 0) {
+                    var buf: [8192]u8 = undefined;
+                    const substituted = bundled.substituteArguments(b, trimmed, &buf);
+                    return skills.formatSkill(entry.name, entry.description, substituted, out);
+                }
+            }
+            return skills.formatSkill(entry.name, entry.description, b, out);
+        }
+        if (std.mem.startsWith(u8, entry.path, "bundled://")) {
+            const name = entry.path["bundled://".len..];
+            const bundled_skill = bundled.getBundled(name) orelse return null;
+            return bundled.formatBundledSkill(bundled_skill, args, out);
+        }
+
+        const text = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            entry.path,
+            self.gpa,
+            .limited(skills.max_body),
+        ) catch return null;
+        defer self.gpa.free(text);
+        const fm = skills.splitFrontmatter(text);
+        const body = if (fm) |f| f.body else text;
+        // Substitute $ARGUMENTS if args provided
+        if (args) |a| {
+            const trimmed = std.mem.trim(u8, a, " \t\r\n");
+            if (trimmed.len > 0) {
+                var buf: [8192]u8 = undefined;
+                const substituted = bundled.substituteArguments(body, trimmed, &buf);
+                return skills.formatSkill(entry.name, entry.description, substituted, out);
+            }
+        }
         return skills.formatSkill(entry.name, entry.description, body, out);
     }
 };
@@ -397,6 +543,7 @@ test "scan: finds a skill from the PROJECT and reads its frontmatter" {
         \\---
         \\name: pty-tests
         \\description: after any change to tui.zig drawing code
+        \\when_to_use: when you touch drawing code
         \\---
         \\# Verifying a TUI
         \\
@@ -405,17 +552,27 @@ test "scan: finds a skill from the PROJECT and reads its frontmatter" {
 
     var loader = store.Loader.init(gpa, std.testing.io, null);
     loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
-    var buf: [8]skills.Entry = undefined;
+    var buf: [16]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
 
-    try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expectEqualStrings("pty-tests", found[0].name);
-    try std.testing.expectEqualStrings("after any change to tui.zig drawing code", found[0].description);
+    // 1 project skill + 5 bundled skills
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+    // Find the project skill
+    var found_pty = false;
     for (found) |e| {
+        if (std.mem.eql(u8, e.name, "pty-tests")) {
+            found_pty = true;
+            try std.testing.expectEqualStrings("after any change to tui.zig drawing code", e.description);
+            try std.testing.expectEqualStrings("when you touch drawing code", e.when_to_use);
+            try std.testing.expect(e.source == .project);
+            try std.testing.expect(e.context == .inline_mode);
+        }
         gpa.free(e.name);
         gpa.free(e.description);
         gpa.free(e.path);
+        gpa.free(e.when_to_use);
     }
+    try std.testing.expect(found_pty);
 }
 
 test "scan: the PROJECT shadows the user's one with the same name (they do not merge)" {
@@ -450,16 +607,25 @@ test "scan: the PROJECT shadows the user's one with the same name (they do not m
 
     var loader = store.Loader.init(gpa, std.testing.io, &env_map);
     loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
-    var buf: [8]skills.Entry = undefined;
+    var buf: [16]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
 
-    try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expectEqualStrings("the project's own version", found[0].description);
+    // 1 project skill + 5 bundled skills
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+    // Find the project skill
+    var found_mine = false;
     for (found) |e| {
+        if (std.mem.eql(u8, e.name, "mine")) {
+            found_mine = true;
+            try std.testing.expectEqualStrings("the project's own version", e.description);
+            try std.testing.expect(e.source == .project);
+        }
         gpa.free(e.name);
         gpa.free(e.description);
         gpa.free(e.path);
+        gpa.free(e.when_to_use);
     }
+    try std.testing.expect(found_mine);
 }
 
 test "scan: ignores loose files, dotted directories and impossible names" {
@@ -485,16 +651,25 @@ test "scan: ignores loose files, dotted directories and impossible names" {
 
     var loader = store.Loader.init(gpa, std.testing.io, null);
     loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
-    var buf: [8]skills.Entry = undefined;
+    var buf: [16]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
 
-    try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expectEqualStrings("bueno", found[0].name);
+    // 1 project skill + 5 bundled skills
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+    // Find the project skill
+    var found_bueno = false;
     for (found) |e| {
+        if (std.mem.eql(u8, e.name, "bueno")) {
+            found_bueno = true;
+            try std.testing.expectEqualStrings("este si", e.description);
+            try std.testing.expect(e.source == .project);
+        }
         gpa.free(e.name);
         gpa.free(e.description);
         gpa.free(e.path);
+        gpa.free(e.when_to_use);
     }
+    try std.testing.expect(found_bueno);
 }
 
 test "load: the body arrives framed and WITHOUT the frontmatter" {
@@ -517,12 +692,22 @@ test "load: the body arrives framed and WITHOUT the frontmatter" {
 
     var loader = store.Loader.init(gpa, std.testing.io, null);
     loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
-    var buf: [8]skills.Entry = undefined;
+    var buf: [16]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
-    try std.testing.expectEqual(@as(usize, 1), found.len);
+    // 1 project skill + 5 bundled skills
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+
+    // Find the project skill
+    var guia_entry: ?skills.Entry = null;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "guia")) {
+            guia_entry = e;
+        }
+    }
+    try std.testing.expect(guia_entry != null);
 
     var out: [8192]u8 = undefined;
-    const text = loader.load(found[0], &out) orelse return error.TestUnexpectedResult;
+    const text = loader.load(guia_entry.?, &out) orelse return error.TestUnexpectedResult;
     // The name and the "when to use it" are in, because without them the model
     // does not know what it is reading nor when to apply it.
     try std.testing.expect(std.mem.indexOf(u8, text, "=== skill: guia ===") != null);
@@ -536,6 +721,7 @@ test "load: the body arrives framed and WITHOUT the frontmatter" {
         gpa.free(e.name);
         gpa.free(e.description);
         gpa.free(e.path);
+        gpa.free(e.when_to_use);
     }
 }
 
@@ -551,22 +737,34 @@ test "load: a skill without frontmatter works too (it is markdown and a dot)" {
 
     var loader = store.Loader.init(gpa, std.testing.io, null);
     loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
-    var buf: [8]skills.Entry = undefined;
+    var buf: [16]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
-    try std.testing.expectEqual(@as(usize, 1), found.len);
+    // 1 project skill + 5 bundled skills
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+
+    // Find the project skill
+    var simple_entry: ?skills.Entry = null;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "simple")) {
+            simple_entry = e;
+        }
+    }
+    try std.testing.expect(simple_entry != null);
     // With no description, the name comes from the DIRECTORY (that is what really
     // exists on disk) and it is marked in the prompt as "(no description)".
-    try std.testing.expectEqualStrings("simple", found[0].name);
-    try std.testing.expectEqualStrings("", found[0].description);
+    try std.testing.expectEqualStrings("simple", simple_entry.?.name);
+    try std.testing.expectEqualStrings("", simple_entry.?.description);
+    try std.testing.expect(simple_entry.?.source == .project);
 
     var out: [8192]u8 = undefined;
-    const text = loader.load(found[0], &out) orelse return error.TestUnexpectedResult;
+    const text = loader.load(simple_entry.?, &out) orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, text, "instrucciones") != null);
 
     for (found) |e| {
         gpa.free(e.name);
         gpa.free(e.description);
         gpa.free(e.path);
+        gpa.free(e.when_to_use);
     }
 }
 
@@ -644,18 +842,159 @@ test "scan: .agents/skills is read too, and .zode wins when both are present" {
     var loader = store.Loader.init(gpa, std.testing.io, null);
     loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
     loader.agents_dir = try skillRootOf(gpa, root, ".agents/skills");
-    var buf: [8]skills.Entry = undefined;
+    var buf: [16]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
 
-    try std.testing.expectEqual(@as(usize, 2), found.len);
-    try std.testing.expectEqualStrings("shared", found[0].name);
-    try std.testing.expectEqualStrings("del propio harness", found[0].description);
-    try std.testing.expectEqualStrings("solo-agents", found[1].name);
+    // 2 project/agents skills + 5 bundled skills = 7
+    try std.testing.expectEqual(@as(usize, 7), found.len);
+    // Find the project skill (should win over agents)
+    var found_shared = false;
+    var found_solo = false;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "shared")) {
+            found_shared = true;
+            try std.testing.expectEqualStrings("del propio harness", e.description);
+            try std.testing.expect(e.source == .project);
+        }
+        if (std.mem.eql(u8, e.name, "solo-agents")) {
+            found_solo = true;
+            try std.testing.expect(e.source == .agents);
+        }
+        gpa.free(e.name);
+        gpa.free(e.description);
+        gpa.free(e.path);
+        gpa.free(e.when_to_use);
+    }
+    try std.testing.expect(found_shared);
+    try std.testing.expect(found_solo);
+}
+
+test "scan: bundled skills are appended and can be shadowed" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var root_buf: [256]u8 = undefined;
+    const root = try tmpRoot(&root_buf);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    // Create a disk skill that shadows a bundled one (simplify)
+    try writeFixture(root, ".zode/skills/simplify/SKILL.md",
+        \\---
+        \\description: my custom simplify
+        \\---
+        \\custom body
+    );
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
+    var buf: [16]skills.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+
+    // Should have 5 bundled + 0 (shadowed) = 5, but simplify is from project
+    try std.testing.expect(found.len >= 5);
+    var found_simplify = false;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "simplify")) {
+            found_simplify = true;
+            try std.testing.expectEqualStrings("my custom simplify", e.description);
+            try std.testing.expect(e.source == .project);
+        }
+        if (e.source == .bundled) {
+            try std.testing.expect(e.name.len > 0);
+        }
+        gpa.free(e.name);
+        gpa.free(e.description);
+        gpa.free(e.path);
+        gpa.free(e.when_to_use);
+    }
+    try std.testing.expect(found_simplify);
+}
+
+test "load: an entry that carries its body never opens a file" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+
+    // The path does not exist, ON PURPOSE. A loader that went to the disk
+    // for this body would answer null, and the body it was already holding
+    // would be thrown away with the failure: the skill would look broken
+    // exactly when it is the one that cannot be broken.
+    const entry = skills.Entry{
+        .name = "embedded",
+        .description = "a skill whose body is already here",
+        .path = "/tmp/zode-skill-that-does-not-exist/SKILL.md",
+        .body = "# The rules\n\nOne rule per paragraph.",
+    };
+
+    var out: [8192]u8 = undefined;
+    const text = loader.load(entry, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, text, "One rule per paragraph.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "=== skill: embedded ===") != null);
+}
+
+test "load: a bundled entry carries its body, so nothing is read from the disk" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    var buf: [16]skills.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+
+    var bundled_body: ?[]const u8 = null;
+    var bundled_name: []const u8 = "";
+    for (found) |e| {
+        if (e.source == .bundled and e.body != null) {
+            bundled_body = e.body;
+            bundled_name = e.name;
+        }
+    }
+    try std.testing.expect(bundled_body != null);
+    try std.testing.expect(bundled_name.len > 0);
+
+    // And it loads: the body is in the binary, so the path is never opened.
+    var verify_entry: ?skills.Entry = null;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "verify")) verify_entry = e;
+    }
+    try std.testing.expect(verify_entry != null);
+    try std.testing.expect(verify_entry.?.body != null);
+
+    var out: [16384]u8 = undefined;
+    const text = loader.load(verify_entry.?, &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(text.len > 0);
+}
+
+test "loadWithArgs: substitutes $ARGUMENTS in bundled skills" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    var buf: [16]skills.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+
+    // Find the verify skill
+    var verify_entry: ?skills.Entry = null;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "verify")) {
+            verify_entry = e;
+        }
+    }
+    try std.testing.expect(verify_entry != null);
+
+    var out: [16384]u8 = undefined;
+    const text = loader.loadWithArgs(verify_entry.?, "test argument", &out) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, text, "test argument") != null);
 
     for (found) |e| {
         gpa.free(e.name);
         gpa.free(e.description);
         gpa.free(e.path);
+        gpa.free(e.when_to_use);
     }
 }
 
@@ -705,7 +1044,14 @@ test "scan: a directory that does not exist is not an error (0 skills, no noise)
     loader.project_dir = ".zode/no-existe-esto";
     var buf: [8]skills.Entry = undefined;
     const found = loader.scan(&buf, buf.len);
-    try std.testing.expectEqual(@as(usize, 0), found.len);
+    // Bundled skills are always available even if no project skills exist
+    try std.testing.expectEqual(@as(usize, 5), found.len);
+    for (found) |e| {
+        gpa.free(e.name);
+        gpa.free(e.description);
+        gpa.free(e.path);
+        gpa.free(e.when_to_use);
+    }
 }
 
 test "scan: respects the entry cap (it does not grow without limit)" {
@@ -739,5 +1085,6 @@ test "scan: respects the entry cap (it does not grow without limit)" {
         gpa.free(e.name);
         gpa.free(e.description);
         gpa.free(e.path);
+        gpa.free(e.when_to_use);
     }
 }

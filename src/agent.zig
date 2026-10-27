@@ -7997,7 +7997,14 @@ fn execOneCall(
     // In READ-ONLY mode a command that only reads does not ask: the mode is
     // the user saying "look, do not touch", and a dialog about `ls` is the
     // mode asking the question it was meant to settle.
-    const no_dialog = read_only and reads_only;
+    //
+    // That same scanner-decided read-only-ness is a seat at the read-only
+    // table in ANY mode (Phase 25.4): a `bash` command the scanner found
+    // nothing to flag (`git status`, `ls`, `rg foo`) only reads, so it never
+    // reaches the permission dialog. `reads_only` is `false` for every tool
+    // but `bash`, so nothing else changes — the scanner in `lib/cmdsafety.zig`
+    // decides, not the static flag on the registry row.
+    const no_dialog = reads_only;
     if (!yolo and !auto_allowed and !risky_allowed and !rule_allowed and !no_dialog and permNeedsDialog(perm_tools)) {
         var dbuf: [384]u8 = undefined;
         // A batch's dialog says WHICH FILES it would touch: the user is being
@@ -15762,6 +15769,43 @@ test "a command that only reads is not a write, and the plan mode lets it run" {
     try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"weird-tool --x\"}", a));
     // Another tool is not a command at all.
     try std.testing.expect(!callReadsOnly("write", "{\"path\":\"a.zig\"}", a));
+}
+
+test "execOneCall: `bash` that only reads runs without asking" {
+    // Phase 25.4: with `/yolo` off, no persisted prefix and no permission
+    // rules, `execOneCall` shows the dialog for anything that needs it — and
+    // the dialog blocks until an answer arrives. A command the scanner found
+    // nothing to flag (`ls`) only reads, so it never gets there: the call
+    // runs and the dialog is never opened. If this ever starts asking again,
+    // this test blocks instead of finishing.
+    const saved_yolo = yolo;
+    defer yolo = saved_yolo;
+    yolo = false;
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    const saved_gpa = gpa_global;
+    io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+    defer { io_global = saved_io; gpa_global = saved_gpa; }
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const call = TurnCtx.Call{ .id = "c1", .name = "bash", .args_json = "{\"command\":\"ls\"}" };
+    var denied: usize = 0;
+    var budget: ResultBudget = .{};
+    const ran = execOneCall(&m, &s, call, arena, &denied, &budget);
+    try std.testing.expectEqual(@as(usize, 1), ran);
+    try std.testing.expectEqual(@as(usize, 0), denied);
 }
 
 // ── `/files`: the session's file state ─────────────────────────

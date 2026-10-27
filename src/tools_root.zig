@@ -1,4 +1,8 @@
 const std = @import("std");
+const common = @import("tools/common.zig");
+const git_tool = @import("tools/git.zig");
+const grep_tool = @import("tools/grep.zig");
+const tools = @import("tools/dispatch.zig");
 
 /// The tool dispatcher, exposed as a module rooted at `src/`.
 ///
@@ -17,16 +21,28 @@ const std = @import("std");
 ///
 /// It only re-exports the dispatcher, so the binary keeps importing a module
 /// named `tools` and nothing in `src/tools/` has to change shape.
-const tools = @import("tools/dispatch.zig");
-
 pub const defs = tools.defs;
 pub const isParallelSafe = tools.isParallelSafe;
 pub const toolsJson = tools.toolsJson;
 pub const needsPermission = tools.needsPermission;
 pub const execute = tools.execute;
+pub const executeWith = tools.executeWith;
 pub const describeError = tools.describeError;
 pub const setAutoBackground = tools.setAutoBackground;
-pub const max_tool_output = tools.max_tool_output;
+pub var max_tool_output = common.max_tool_output;
+pub fn initMaxToolOutput(env: ?*const std.process.Environ.Map) void {
+    common.initMaxToolOutput(env);
+}
+
+/// Initialise the `git` diff caps from the environment.
+pub fn initDiffLimit(env: ?*const std.process.Environ.Map) void {
+    git_tool.initDiffLimit(env);
+}
+
+/// Initialise the `grep` capture cap from the environment.
+pub fn initGrepCapture(env: ?*const std.process.Environ.Map) void {
+    grep_tool.initGrepCapture(env);
+}
 
 test {
     try std.testing.expect(tools.defs.len > 0);

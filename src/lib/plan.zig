@@ -12,8 +12,8 @@ const std = @import("std");
 ///
 /// ## Semantics: full replacement AND in-place patches
 ///
-/// `items` replaces the whole list, which is what Claude Code does with
-/// `TodoWrite` and what models are trained to emit. It stays the base form.
+/// `items` replaces the whole list, which is the shape models are trained to
+/// emit. It stays the base form.
 ///
 /// On top of it, `update`, `remove` and `add` address single steps by their
 /// 1-based position. They exist because replacement has a cost that only shows up
@@ -175,6 +175,18 @@ pub const Plan = struct {
             self.len,
             if (self.currentIndex()) |i| self.items[i].textOf() else "",
         }) catch "plan updated";
+    }
+
+    /// The complete plan for tool results and conversation history.
+    pub fn details(self: *const Plan, arena: std.mem.Allocator) []const u8 {
+        if (self.len == 0) return "plan cleared";
+        var text = std.Io.Writer.Allocating.init(arena);
+        const w = &text.writer;
+        w.print("Implementation plan ({d}/{d} done):", .{ self.doneCount(), self.len }) catch return "plan updated";
+        for (self.items[0..self.len], 0..) |step, i| {
+            w.print("\n{s} {d}. {s}", .{ step.status.glyph(), i + 1, step.textOf() }) catch return "plan updated";
+        }
+        return text.written();
     }
 };
 
@@ -583,6 +595,21 @@ test "the summary says what is missing, not a percentage" {
 
     p.clear();
     try std.testing.expectEqualStrings("plan cleared", p.summary(arena));
+}
+
+test "details lists every plan step with its status" {
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    var p = Plan.init();
+    const items = try three("inspect files", "implement change", "run tests", .done, .in_progress, .pending);
+    _ = p.apply(&items, 3);
+
+    const details = p.details(arena);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Implementation plan (1/3 done)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "☑ 1. inspect files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "◐ 2. implement change") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "☐ 3. run tests") != null);
 }
 
 // ── test helpers ──────────────────────────────────────────────

@@ -27,6 +27,7 @@
 ///   3. **RIGHT TEXT, NEVER EXISTED.** The model invented it. Nothing to offer, and the
 ///      message has to say so plainly rather than implying the file is close.
 const std = @import("std");
+const diff_tokenizer = @import("diff_tokenizer.zig");
 
 pub const max_snippet: usize = 900;
 /// How many lines of context around the best guess.
@@ -56,12 +57,19 @@ pub fn hintFor(arena: std.mem.Allocator, file: []const u8, old_string: []const u
     // Nothing to search for: a patch made only of blank lines, or empty.
     if (probe.len < 4) return .{ .text = "" };
 
+    // The tokens of every line are thrown away as soon as the line is
+    // scored: the scratch arena is reset on every row, so a file with ten
+    // thousand lines does not leave ten thousand token lists behind.
+    var scratch_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch_state.deinit();
+
     var best: Best = .{};
     var it = std.mem.splitScalar(u8, file, '\n');
     var line_no: usize = 0;
     while (it.next()) |line| {
         line_no += 1;
-        const score = similarity(std.mem.trimEnd(u8, line, "\r"), probe);
+        const score = similarity(scratch_state.allocator(), std.mem.trimEnd(u8, line, "\r"), probe);
+        _ = scratch_state.reset(.retain_capacity);
         if (score > best.score) {
             best = .{ .score = score, .line = line_no, .offset = offsetOfLine(file, line_no) };
         }
@@ -109,42 +117,19 @@ fn firstMeaningfulLine(old_string: []const u8) []const u8 {
     return best;
 }
 
-/// Jaccard over WHITESPACE-separated tokens.
+/// The Jaccard similarity of two texts over the SHARED tokens.
 ///
 /// Not characters: character overlap rewards a line of the right LENGTH and not the
 /// right content, which is the commonest false positive here — `}`, `});` and `});`
 /// score 1.0 against each other.
 ///
-/// Not punctuation-aware tokenizing either, which the first version did and which is
-/// wrong for code: `+=`, `=>` and `!=` are made entirely of delimiters, so a line whose
-/// tokens are `x += 1;` came back with NO tokens at all and every score was zero. In
-/// source, operators are words.
-fn similarity(line: []const u8, probe: []const u8) f64 {
-    var ps = std.ArrayList([]const u8).empty;
-    defer ps.deinit(std.heap.page_allocator);
-    var ls = std.ArrayList([]const u8).empty;
-    defer ls.deinit(std.heap.page_allocator);
-    splitWords(probe, &ps) catch return 0;
-    splitWords(line, &ls) catch return 0;
-    if (ps.items.len == 0) return 0;
-
-    var inter: usize = 0;
-    for (ps.items) |w| {
-        for (ls.items) |lw| {
-            if (std.mem.eql(u8, w, lw)) {
-                inter += 1;
-                break;
-            }
-        }
-    }
-    const total = ps.items.len + ls.items.len - inter;
-    if (total == 0) return 0;
-    return @as(f64, @floatFromInt(inter)) / @as(f64, @floatFromInt(total));
-}
-
-fn splitWords(text: []const u8, out: *std.ArrayList([]const u8)) !void {
-    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
-    while (it.next()) |w| try out.append(std.heap.page_allocator, w);
+/// The tokens are the diff's tokens (`diff_tokenizer`), and that is the point:
+/// one tokenizer or the two disagree about what a word is in code. `+=`, `=>`
+/// and `!=` are made entirely of delimiters, so a tokenizing that dropped the
+/// punctuation gave a line whose tokens are `x += 1;` NO tokens at all and
+/// every score zero. In source, operators are words.
+fn similarity(arena: std.mem.Allocator, line: []const u8, probe: []const u8) f64 {
+    return diff_tokenizer.jaccardIn(arena, line, probe);
 }
 
 fn tokensOf(line: []const u8) []const u8 {

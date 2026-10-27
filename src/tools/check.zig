@@ -151,7 +151,11 @@ pub fn toolCheck(
     _ = &gpa; // the registry owns its allocator now; kept for the dispatcher's shape
     // With an id, this is the second half: read what the job printed.
     if (common.getInt(obj, "id")) |id_i| {
+        // Clamped, not cast: an out-of-range id is a mistake to report, not a
+        // `thread panic: integer cast truncated bits` on a worker thread, which
+        // aborts the whole process. See `backgroundId` in bg.zig.
         if (id_i <= 0) return error.MissingId;
+        if (id_i > std.math.maxInt(u32)) return error.IdOutOfRange;
         return report(arena, reg orelse return error.NoBackgroundRegistry, @intCast(id_i));
     }
 

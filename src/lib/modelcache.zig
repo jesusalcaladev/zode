@@ -44,7 +44,7 @@ pub const version: u32 = 1;
 /// Past this age the cache is used AND refreshed anyway. The TTL decides whether the
 /// refresh is URGENT, not whether the data is usable: a month-old list of model ids is
 /// still a useful thing to show while the network is down.
-pub const max_age_hours: u32 = 24 * 14;
+pub const max_age_hours: u32 = 24;
 
 pub const Entry = struct {
     fetched_at: i64 = 0,

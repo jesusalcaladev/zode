@@ -126,6 +126,17 @@ def drive(keys, budget: float = 8.0):
     return out, strip_ansi(out)
 
 
+def footer_repaints(out: bytes) -> int:
+    """How many times the pty was told to put the cursor on the footer's row.
+
+    vaxis renders DIFFERENTIALLY: a beat that changes one eye cell writes one
+    cell, so counting the face's text in the stream finds only the first paint.
+    The cursor move before that cell names the row, and the footer is the LAST
+    row of the window.
+    """
+    return len(re.findall(rb"\x1b\[%d;" % ROWS, out))
+
+
 def check(name: str, ok: bool, text: str) -> bool:
     print(f"  {'OK  ' if ok else 'FAIL'} {name}")
     return ok
@@ -165,21 +176,62 @@ def main() -> int:
     out, t = drive([b"hola mundo", b"\r"])
     ok = True
     print(f"smoke: {len(out)} bytes through the pty")
-    ok &= check("banner: first row of the wordmark", "######  ####  ####   ######" in t, t)
-    ok &= check("banner: third row", "   ##  ##  ## ##   # ###" in t, t)
-    ok &= check("input box (╭ ╰ borders)", "╭" in t and "╰" in t, t)
-    ok &= check("status bar", "esc interrupts" in t, t)
+    # The ASCII is gone. What replaced it is type: a wordmark, a tagline, and
+    # the four commands worth knowing in the first thirty seconds. A pty check
+    # for "␣ ######" would now fail on a REDESIGN, which is what a check pinned
+    # to pixels does — it stops watching the thing it watched.
+    # The wordmark is the ASCII ART again (it was the word "zode" in a colour
+    # for a while, and the art was in the tree but nobody drew it). The check
+    # looks for the DRAWING and not for pixels of it: the art's own test
+    # pins the rows, and this one pins that it is ON THE SCREEN.
+    ok &= check("hero: the wordmark is on screen", "######  ####" in t, t)
+    ok &= check("hero: the tagline is on screen", "a code agent in your terminal" in t, t)
+    ok &= check("hero: the command grid is on screen", "choose a model" in t, t)
+    # No box around the input: a hairline above it and an accent bar on the
+    # left. Four keys that no longer appear are asserted ABSENT, because the
+    # frame is the claim and "no ╭" is the part that can regress silently.
+    ok &= check("input: no box borders", "╭" not in t and "╰" not in t, t)
+    ok &= check("input: the accent bar is there", "▌" in t, t)
+    # The composer's footer: the mascot, its legend and the model.
+    #
+    # This check used to look for "esc interrupts" in the status row — a
+    # string the app stopped saying a long time ago, so it had been failing
+    # on a green suite for nobody to notice. A check nobody reads is a check
+    # that stops watching the thing it watched, which is the reason it has to
+    # name the CURRENT design and not a remembered one.
+    ok &= check("footer: the mascot is there", "( o o )" in t, t)
+    ok &= check("footer: the legend is there", "ready" in t, t)
     ok &= check("the user prompt echoes", "hola mundo" in t, t)
     ok &= check("no panic", "panic" not in t.lower(), t)
     ok &= check("no 'Invalid free'", "invalid free" not in t.lower(), t)
 
     # 2) Ctrl+P: the modal palette has to open AND close. This is the path that
     #    broke most often (dangling items, double free of the allocator).
-    out2, t2 = drive([b"\x10", b"esc"])
-    ok &= check("ctrl+p opens the palette", "Switch model" in t2 or "Connect" in t2, t2)
-    ok &= check("esc closes the palette", "Switch model" not in t2, t2)
+    out2, t2 = drive([b"\x10", b"esc", b"after palette", b"\r"])
+    ok &= check("ctrl+p opens the command palette", "Commands" in t2, t2)
+    ok &= check("esc closes the palette and restores input", "after palette" in t2, t2)
 
-    # 3) Ctrl+L (clear) and the REAL scroll keys: they must not take the app
+    # 2b) `?` on an empty input opens the shortcut list.
+    #
+    #    A command can be perfect and still do nothing when it is TYPED, and
+    #    this one is a key: the unit test opens the picker directly, which
+    #    proves nothing about the key that is supposed to open it.
+    out2b, t2b = drive([b"?", b"\x1b"])
+    ok &= check("? opens the shortcut list", "keyboard shortcuts" in t2b, t2b)
+    # And the legend of the permission glyphs travels with it: a glyph with
+    # no legend is a glyph nobody can read.
+    ok &= check("the shortcut list carries the mode legend", "accept-edits" in t2b, t2b)
+    ok &= check("no panic after ?", "panic" not in t2b.lower(), t2b)
+    ok &= check("no 'Invalid free' after ?", "invalid free" not in t2b.lower(), t2b)
+
+    # 3) Connecting is a guided flow: choose a provider, back out of the key
+    #    field to the provider list, then close. Escape must not change the modal
+    #    into the unrelated model picker.
+    out_connect, t_connect = drive([b"\x01", b"\r", b"\x1b", b"\x1b"])
+    ok &= check("connect opens the provider list and key prompt", "Connect a provider" in t_connect and "Add API key" in t_connect, t_connect)
+    ok &= check("back from key entry stays in Connect", "Choose a model" not in t_connect, t_connect)
+
+    # 4) Ctrl+L (clear) and the REAL scroll keys: they must not take the app
     #    down.
     #
     #    This used to send `\x1b[B` twice and call it "scroll". That is the DOWN
@@ -211,7 +263,7 @@ def main() -> int:
     ok &= check("arrows, Home/End and page keys scroll without breaking", "panic" not in t3.lower(), t3)
     ok &= check("no 'Invalid free' after scrolling", "invalid free" not in t3.lower(), t3)
 
-    # 4) `/clean`: a cleanup command that runs in the TUI without asking anything
+    # 5) `/clean`: a cleanup command that runs in the TUI without asking anything
     #    has to work ALWAYS, and without `yes` it must not delete. What is checked
     #    is the dry-run TEXT, not that something got deleted: the smoke HOME may
     #    hold no empty session at all, and a test that depends on there being junk
@@ -231,7 +283,7 @@ def main() -> int:
     )
     ok &= check("/clean does not break anything", "panic" not in t4.lower(), t4)
 
-    # 5) `/context` says WHERE the work is happening. It is the line that answers
+    # 6) `/context` says WHERE the work is happening. It is the line that answers
     #    "is it really reading the files from here?", and it appears nowhere else
     #    on screen.
     # TWO enters: the first is taken by the autocompletion (which is open because
@@ -299,6 +351,59 @@ def main() -> int:
     ok &= check("/which-cmd says not found for a file that is not there", "not found: /zode-no-such" in t9, t9)
     ok &= check("the new commands do not break anything", "panic" not in t9.lower(), t9)
 
+    # 10) `/files`: the command that answers "what is the model looking at?".
+    #
+    #     The unit test drives the command directly; this one types it, because
+    #     a command can be perfect and still do nothing when it is TYPED (the
+    #     `/free-auto` lesson). Two enters: the first is taken by the
+    #     autocompletion popup (the input is a command prefix) and the second
+    #     sends it.
+    #
+    #     The answer is one of two shapes: nothing has been read yet (the
+    #     empty session) or there is a list with a count. Both are accepted,
+    #     because what is being checked is that the command ANSWERS.
+    out10, t10 = drive([b"/files", b"\r", b"\r"], budget=9.0)
+    ok &= check(
+        "/files answers",
+        "nothing read or written" in t10 or "changed this session" in t10,
+        t10,
+    )
+    ok &= check("/files does not break anything", "panic" not in t10.lower(), t10)
+
+    # 11) `/cost`: the money, per model. It prices from the CACHED catalogue, so in
+    #     the smoke's HOME (no catalogue, no key) the honest answer is that there is
+    #     nothing to price yet. What is checked is that the command ANSWERS when it
+    #     is typed, and that it never turns "I could not read a price" into a
+    #     `$0.00` total: a bill that reads as free is the one failure a cost display
+    #     must not have.
+    out11, t11 = drive([b"/cost", b"\r", b"\r"], budget=9.0)
+    ok &= check(
+        "/cost answers",
+        "no provider-reported usage yet" in t11 or "cost \u00b7" in t11,
+        t11,
+    )
+    ok &= check("/cost does not break anything", "panic" not in t11.lower(), t11)
+
+    # 12) The mascot ANIMATES at rest.
+    #
+    #     A still frame proves nothing about an animation, and this is the one
+    #     defect the eye cannot catch in a screenshot: the clock used to be read
+    #     in SECONDS (`toSeconds() * 1000`), so every beat of every track (70 ms
+    #     to 520 ms) rounded to the same instant and the keyframes never ran. The
+    #     renderer is DIFFERENTIAL, so a beat that changes one eye cell is one
+    #     cell in this byte stream — counting full faces finds nothing. What is
+    #     counted is how often the pty was told to move the cursor on the
+    #     FOOTER's row, which is what a repaint of the face looks like from the
+    #     wire.
+    #
+    #     6 s of the idle track (~7.9 s for the whole loop) holds about five
+    #     beats that change the drawing; three is the floor that still fails on
+    #     a frozen face.
+    out12, t12 = drive([], budget=6.0)
+    beats = footer_repaints(out12)
+    ok &= check(f"footer: the mascot animates at rest ({beats} beats in 6 s)", beats >= 3, t12)
+    ok &= check("the animated footer does not break anything", "panic" not in t12.lower(), t12)
+
     if not ok:
         print("\n--- plain text (truncated) ---")
         for line in t.splitlines()[:40]:
@@ -309,5 +414,16 @@ def main() -> int:
     return 0 if ok else 1
 
 
+def _run_with_timeout():
+    """Wrapper that ensures clean exit even if something hangs."""
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(_run_with_timeout())
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"smoke test crashed: {e}")
+        sys.exit(1)

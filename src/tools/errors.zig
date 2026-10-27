@@ -22,13 +22,18 @@ pub fn describeError(arena: std.mem.Allocator, err: anyerror, name: []const u8, 
             error.MissingCommand => "the bash call needs a \"command\" argument with the command line to run.",
             error.FileNotFound => "the command was not found by the shell (exit 127 usually). Use a path that exists, or a binary that is installed.",
             error.StreamTooLong => "the output was longer than the cap, so the read stopped. Re-run it with something narrower: a pipe through head, or a smaller scope.",
+            // Its own message because the default one is actively wrong here: there IS
+            // no exit status (the command was killed) and there is nothing to "fix" —
+            // the cause is that the command is slow, and the answer is a longer
+            // `timeout_seconds` or the background, not a different command line.
+            error.Timeout => "the command was still running at timeout_seconds and was killed. If it is genuinely slow (a build, a suite, an install), pass run_in_background: true and poll it with bash_output, or give it a larger timeout_seconds.",
             else => "the command failed. Its exit status and output are above; fix the cause instead of retrying the same line.",
         };
     }
     if (err == error.UnknownTool) {
         return std.fmt.allocPrint(
             arena,
-            "there is no tool called \"{s}\". The tools you have are: read, write, edit, bash, glob, grep, list_files, web_fetch, web_search, think, todo, ask, skill, task, bash_output, bash_kill. Use one of those names exactly.",
+            "there is no tool called \"{s}\". The tools you have are: read, write, edit, notebook_edit, bash, glob, grep, refs, rename, check, git_status, git_diff, git_log, git_branch, git_add, git_commit, git_stash, list_files, web_fetch, web_search, think, todo, task_create, task_get, task_list, task_update, task_stop, ask, lsp, skill, task, review, goal, bash_output, bash_kill, sleep, mcp, batch. Use one of those names exactly.",
             .{name},
         ) catch "there is no tool with that name.";
     }
@@ -39,7 +44,7 @@ pub fn describeError(arena: std.mem.Allocator, err: anyerror, name: []const u8, 
             .{ name, clipForError(arena, args_json) },
         ) catch "the arguments were not valid JSON.";
     }
-    if (err == error.MissingPath or err == error.MissingCommand or err == error.MissingQuery or err == error.MissingUrl) {
+    if (err == error.MissingPath or err == error.MissingCommand or err == error.MissingQuery or err == error.MissingUrl or err == error.MissingPattern) {
         return std.fmt.allocPrint(
             arena,
             "`{s}` needs its required argument and it was not there. Check the schema: the first property of `parameters.required` is the one that was missing.",
@@ -56,8 +61,49 @@ pub fn describeError(arena: std.mem.Allocator, err: anyerror, name: []const u8, 
         error.TooManyHunks => "too many hunks in one edit. Split it into two edits.",
         error.TooManyOptions => "too many options in that call. Fewer, and put the recommendation first.",
         error.EmptyOption => "one of the options was an empty string.",
+        // The task graph. Each of these is a closed loop: the message says which
+        // call fixes it and what to put in it, because a refusal that only names the
+        // rule costs the round trip it was supposed to save.
+        error.NoTaskStore => "this runner has no task list (there is no session to keep one in). Do the work and describe it in your answer; `todo` is the on-screen plan and works everywhere.",
+        error.UnknownTask => "there is no task with that id. task_list prints the ids that exist; ids are never reused.",
+        error.MissingTaskId => "that call needs an `id`: the number task_create returned, or the one task_list prints at the start of the line.",
+        error.EmptySubject => "the task needs a `subject`: a short imperative title of what will be true when it is done.",
+        error.SubjectTooLong => "the subject is longer than 160 characters. It is a title — put the detail in `description`, which has room.",
+        error.DescriptionTooLong => "the description is longer than 4000 characters. Split it into more than one task, or write the detail to a file and name it here.",
+        error.TooManyTasks => "the task list already has 64 tasks, which is the cap for one session. Complete or stop the ones that are done instead of adding more.",
+        error.OwnerRequired => "starting a task needs an `owner` in the SAME call: send status in_progress together with owner. Use `main` for your own work, and a teammate name when someone else takes it.",
+        error.BlockedByOpen => "that task still waits on a task that is not done, so it cannot be completed. Finish the one it waits on first, or remove it with task_stop.",
+        error.SelfEdge => "a task cannot depend on itself. Name a different task, or set the dependency on the other one.",
+        error.BadIds => "add_blocks and add_blocked_by take task ids (numbers), not names or titles. Get them from task_list.",
+        error.BadStatus => "that status is not one of the four: pending, in_progress, completed, deleted. Use task_stop (or deleted) to take a task off the list.",
+        // Waiting.
+        error.MissingSeconds => "sleep needs `seconds`: how long to wait, as a number. Use bash_output to check a background job instead of waiting on a timer.",
+        error.BadSeconds => "`seconds` must be a number of seconds (a fraction is fine). Nothing was waited for.",
+        error.SleepTooLong => "that is longer than the 300-second ceiling, and nothing was waited for. Sleep once for what you need and then look; or end the turn and let the user come back.",
+        // Notebooks.
+        error.NotANotebook => "that file is not a readable Jupyter notebook (no JSON `cells` array). If it is a .ipynb that is corrupt, say so; if you meant a source file, use read or edit.",
+        // notebook_edit composes its own message for this one (WITH the line and
+        // column), and `read` falls back to the raw bytes — so this arm is only
+        // reached by a future caller that lets it through, and it must still say
+        // something actionable instead of "internal error".
+        error.NotebookSyntax => "the notebook's JSON does not parse, so nothing was written. View the raw file with bash (`cat`) to find the break, fix that line with edit, then call again.",
+        error.BadCellNumber => "cell_number is a 0-based index and cannot be negative. read the .ipynb first: it prints the index of every cell.",
+        error.MissingCellNumber => "notebook_edit needs `cell_number`: the 0-based index of the cell. read the .ipynb first and use one of the indices it prints.",
+        error.CellOutOfRange => "there is no cell at that index, and the file was NOT touched. read the .ipynb again and use one of the indices it prints; for an insert, an index equal to the cell count appends.",
+        error.BadEditMode => "edit_mode must be replace, insert or delete.",
+        error.BadCellType => "cell_type must be code or markdown. A notebook has no other kind of cell.",
         error.MissingSymbol => "`refs` needs a `symbol`: a plain identifier like `main` or `CacheStats`. For a pattern or a piece of text use `grep`.",
         error.BadQuestion => "the question was empty. Ask something with content in it.",
+        // glob's arguments. `glob.parseArgs` is the only producer of this error,
+        // and the message repeats its contract verbatim: a rejection that does not
+        // name the accepted values costs the same round trip as the silent default
+        // it replaced. `args_json` echoes what arrived, so the model sees which
+        // value was out of range without having to re-read its own call.
+        error.BadGlobArg => std.fmt.allocPrint(
+            arena,
+            "glob's arguments were out of range, so nothing ran: pattern is a non-empty glob, subdir is a non-empty directory, limit is an integer from 1 to 200 (default 200), sort is one of newest, oldest, name. What arrived was: {s}",
+            .{clipForError(arena, args_json)},
+        ) catch "glob's limit must be an integer from 1 to 200 and sort must be newest, oldest or name; resend them within those values.",
         error.OutOfMemory => "there was not enough memory to answer that. Ask for less at once.",
         else => "the call failed with an internal error. Do not retry it unchanged: simplify what you asked for.",
     };
@@ -84,8 +130,16 @@ test "describeError: no message is a bare Zig error name" {
         .{ .err = error.UnknownTool, .name = "serch", .must = "there is no tool called" },
         .{ .err = error.BadArgs, .name = "read", .must = "not a JSON object" },
         .{ .err = error.MissingPath, .name = "read", .must = "required argument" },
+        // A missing `pattern` reaches the SAME message: glob and grep both return
+        // `MissingPattern`, and before it fell into the `else`, which told the
+        // model to treat an internal error as if it had sent something wrong.
+        .{ .err = error.MissingPattern, .name = "grep", .must = "required argument" },
+        .{ .err = error.BadGlobArg, .name = "glob", .must = "1 to 200" },
         .{ .err = error.FileNotFound, .name = "read", .must = "glob or list_files" },
         .{ .err = error.StreamTooLong, .name = "grep", .must = "Narrow the request" },
+        // A timeout is not a failure to fix: the message must not send the model back
+        // to a command line that was going to be slow no matter how it was written.
+        .{ .err = error.Timeout, .name = "bash", .must = "was still running" },
     };
     for (cases) |c| {
         const msg = describeError(a, c.err, c.name, "{\"path\":\"x\"}");
@@ -103,7 +157,7 @@ test "describeError: the unknown tool lists the tools that DO exist" {
     const msg = describeError(arena_state.allocator(), error.UnknownTool, "serch", "{}");
     // The single most useful thing in that message: the name was wrong, and here
     // is the vocabulary.
-    for ([_][]const u8{ "grep", "read", "task", "web_search" }) |t| {
+    for ([_][]const u8{ "grep", "read", "task", "task_create", "task_list", "task_update", "web_search", "lsp" }) |t| {
         try std.testing.expect(std.mem.indexOf(u8, msg, t) != null);
     }
 }

@@ -28,6 +28,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const symbols = @import("../lib/symbols.zig");
 const refs_tool = @import("refs.zig");
+const pathsafe = @import("../lib/pathsafe.zig");
 
 /// How many replacements one `rename` may make.
 ///
@@ -120,12 +121,23 @@ pub fn toolRename(
         const rebuilt = replaceInCode(arena, original, mask, from, to) catch continue;
         if (std.mem.eql(u8, rebuilt, original)) continue;
 
+        const n = countInPath(occurrences, path);
+        // The SENSITIVE-PATH rule, and it is the only tool that needs it
+        // here: `rename` finds its own files, so its arguments NEVER name
+        // them. It cannot ask (a tool has no `Model` and cannot see a
+        // dialog), so it refuses and says why — and the model can then edit
+        // the file by hand.
+        const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, path);
+        if (verdict != .ok) {
+            try out.print(arena, "  SKIPPED {s}: {s}\n", .{ path, pathsafe.refusalText(arena, verdict) });
+            skipped += 1;
+            continue;
+        }
         dir.writeFile(io, .{ .sub_path = path, .data = rebuilt }) catch |err| {
             try out.print(arena, "  FAILED {s}: {t}\n", .{ path, err });
             skipped += 1;
             continue;
         };
-        const n = countInPath(occurrences, path);
         try out.print(arena, "  {s}: {d} replacement(s)\n", .{ path, n });
         done += n;
     }

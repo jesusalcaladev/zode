@@ -232,6 +232,9 @@ pub fn worthChecking(path: []const u8) bool {
         ".zig", ".ts",  ".tsx",  ".mts", ".cts",   ".js", ".jsx", ".mjs",
         ".cjs", ".rs",  ".go",   ".py",  ".c",     ".h",  ".cc",  ".cpp",
         ".hpp", ".cxx", ".java", ".kt",  ".swift", ".rb", ".php", ".scala",
+        // A notebook is code in the projects that have one: the exit gate asks
+        // for a check after `notebook_edit` the same way it does after `edit`.
+        ".ipynb",
     };
     for (interesting) |e| {
         if (std.mem.eql(u8, ext, e)) return true;
@@ -346,7 +349,7 @@ test "planFor: an unknown project is null, and null means the model runs bash" {
 }
 
 test "worthChecking: code yes, formatting and lockfiles no" {
-    for ([_][]const u8{ "src/a.zig", "a.ts", "a.go", "x.py", "main.c", "lib.rs", "Makefile", "a.hpp" }) |p| {
+    for ([_][]const u8{ "src/a.zig", "a.ts", "a.go", "x.py", "main.c", "lib.rs", "Makefile", "a.hpp", "nb.ipynb" }) |p| {
         try std.testing.expect(worthChecking(p));
     }
     for ([_][]const u8{ "README.md", "notes.txt", "build.lock", "package-lock.json", "a.png", "" }) |p| {

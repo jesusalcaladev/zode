@@ -7,7 +7,12 @@ const tui = @import("tui.zig");
 
 const Painter = tui.Painter;
 
-/// Modal palette of commands and models, in the style of opencode / Claude Code.
+/// Modal palette of commands and models, in the style of opencode.
+///
+/// It answers to the mouse as well as the keyboard: motion selects the row
+/// under the pointer and a click activates it (`handleMouse`, `hitTest`). The
+/// geometry used for that is the SAME one the drawing uses, so the row the
+/// pointer highlights is always the row that is painted there.
 ///
 /// Two modes:
 ///   - `.commands`: grouped list of commands with the shortcut on the right.
@@ -48,6 +53,9 @@ pub const Item = struct {
     label: []const u8 = "",
     /// Right column: keyboard shortcut, "free", price…
     hint: []const u8 = "",
+    /// Provider ID for model items (e.g., "openrouter", "opencode").
+    /// Used to auto-switch provider when selecting a model from a different provider.
+    provider: []const u8 = "",
     /// Context window of a model, in tokens (0 = the provider does not publish
     /// it, or this is not a model row).
     ///
@@ -94,6 +102,7 @@ pub const Palette = struct {
 
     /// `.key_prompt` mode.
     key_item: u32 = 0,
+    key_return_mode: Mode = .connect,
     key_input: [max_key]u8 = undefined,
     key_len: usize = 0,
     key_msg: [96]u8 = undefined,
@@ -101,14 +110,54 @@ pub const Palette = struct {
     /// Whether `key_msg` is an error, set by whoever set it. See
     /// `keyMessageIsError`.
     key_msg_error: bool = false,
+    /// Custom title for models mode (e.g., to show current mode like free-auto, plan, etc.)
+    custom_title: []const u8 = "",
 
     pub fn init(gpa: std.mem.Allocator) Palette {
         return .{ .gpa = gpa };
     }
 
+    test "key prompt escape returns to the palette it came from" {
+        var pal = Palette.init(t.allocator);
+        defer pal.deinit();
+        const items = [_]Item{
+            .{ .kind = .provider, .label = "openrouter" },
+        };
+        pal.mode = .connect;
+        pal.active = true;
+        pal.setItems(&items, &.{});
+
+        _ = handleKey(&pal, .{ .codepoint = 13 });
+        try t.expectEqual(Mode.key_prompt, pal.mode);
+        _ = handleKey(&pal, .{ .codepoint = 27 });
+        try t.expectEqual(Mode.connect, pal.mode);
+
+        pal.mode = .models;
+        pal.key_return_mode = .models;
+        pal.mode = .key_prompt;
+        _ = handleKey(&pal, .{ .codepoint = 27 });
+        try t.expectEqual(Mode.models, pal.mode);
+    }
+
+    test "model palette connect item opens the provider connection flow" {
+        var pal = Palette.init(t.allocator);
+        defer pal.deinit();
+        const items = [_]Item{
+            .{ .kind = .connect, .label = "+ connect" },
+        };
+        pal.mode = .models;
+        pal.setItems(&items, &.{});
+        pal.col = 0;
+        try t.expect(std.meta.activeTag(handleKey(&pal, .{ .codepoint = 13 })) == .open_connect);
+    }
+
     pub fn deinit(self: *Palette) void {
         self.filtered[0].deinit(self.gpa);
         self.filtered[1].deinit(self.gpa);
+        if (self.custom_title.len > 0) {
+            self.gpa.free(self.custom_title);
+            self.custom_title = "";
+        }
     }
 
     pub fn queryText(self: *const Palette) []const u8 {
@@ -268,13 +317,24 @@ pub const Palette = struct {
         self.sel[c] = @intCast(next);
     }
 
-    /// Keeps the highlighted item inside the `rows` window.
-    pub fn clampScroll(self: *Palette, c: usize, rows: usize) void {
-        if (rows == 0) return;
-        if (self.sel[c] < self.scroll[c]) self.scroll[c] = self.sel[c];
-        if (self.sel[c] >= self.scroll[c] + rows) self.scroll[c] = self.sel[c] - rows + 1;
-        const n = self.filtered[c].items.len;
-        if (n > rows and self.scroll[c] > n - rows) self.scroll[c] = n - rows;
+    /// Keeps the selected row inside the window.
+    ///
+    /// The scroll is in ROWS (the list is drawn with the group headers inside
+    /// it, so an item's row is not its index) and `sel_row` is the row of the
+    /// selected item in that space. `total_rows` is how many rows the whole
+    /// column has.
+    ///
+    /// The old version clamped on the ITEM index against a window measured in
+    /// rows, and the mismatch showed up as a highlight that vanished one row
+    /// before the end of the list.
+    pub fn clampScrollRows(self: *Palette, c: usize, total_rows: usize, visible: usize, sel_row: ?usize) void {
+        if (visible == 0) return;
+        const sr = sel_row orelse return;
+        if (sr < self.scroll[c]) self.scroll[c] = sr;
+        if (sr >= self.scroll[c] + visible) self.scroll[c] = sr - visible + 1;
+        if (total_rows > visible and self.scroll[c] > total_rows - visible) {
+            self.scroll[c] = total_rows - visible;
+        }
     }
 
     /// Frees the owned items (labels and hints) and empties the list.
@@ -294,6 +354,7 @@ pub const Palette = struct {
         self.key_len = 0;
         self.key_msg_len = 0;
         self.key_msg_error = false;
+        self.custom_title = "";
         self.col = 1;
         self.sel = .{ 0, 0 };
         self.scroll = .{ 0, 0 };
@@ -335,7 +396,111 @@ pub fn matches(item: Item, groups: []const Group, q: []const u8) bool {
     for (groups, 0..) |g, i| {
         if (i + 1 == item.group and containsIgnoreCase(g.name, q)) return true;
     }
+    // The FUZZY fallback: the query as a subsequence of the label.
+    //
+    // It is what the reference implementation's picker does, and it is the
+    // difference between a search box and a search box that forgives: "cs4"
+    // finds "claude-sonnet-4-5".
+    //
+    // It is LAST, on purpose: an exact match always wins, so the item the
+    // user meant is never pushed down by a lucky subsequence.
+    var buf: [64]u32 = undefined;
+    if (fuzzyMatch(item.label, q, &buf) != null) return true;
     return false;
+}
+
+// ── fuzzy matching ────────────────────────────────────────────
+
+/// How much wider than the query the matched window may be.
+///
+/// The rule exists because a subsequence match with no width limit matches
+/// almost everything: "abc" is a subsequence of half a model catalogue, and a
+/// filter that returns half the list is a filter that does not filter.
+///
+/// The window is generous (three times the query, plus eight) because what
+/// is searched is a model id with a provider prefix and a version suffix:
+/// "cs4" has to reach "claude-sonnet-4-5" and that is 15 characters wide.
+pub const fuzzy_window_slack: usize = 8;
+
+/// Matches the query as a SUBSEQUENCE of the label and says WHICH
+/// characters matched.
+///
+/// The positions are BYTE offsets into the label, written into `buf`; the
+/// return value is how many there are, or null when the query is not a
+/// subsequence of the label.
+///
+/// Two decisions that are not obvious:
+///
+/// * **Leftmost.** The scan starts where the previous match ended, so a
+///   scattered match never beats an earlier one. The user typed the
+///   characters in an order and the first place they appear is the one they
+///   meant.
+/// * **Runs win.** A run of consecutive characters is taken whole, and it is
+///   the substring when there is one. "bc" in "a-xbc" highlights "bc" and
+///   not "b" alone with a lonely "c" four columns away.
+pub fn fuzzyMatch(label: []const u8, q: []const u8, buf: []u32) ?usize {
+    if (q.len == 0) return 0;
+    if (q.len > buf.len) return null;
+    var n: usize = 0;
+    var li: usize = 0;
+    var qi: usize = 0;
+    while (qi < q.len) {
+        // The first occurrence of this character at or after the last match.
+        var j = li;
+        while (j < label.len) : (j += 1) {
+            if (std.ascii.toLower(label[j]) == std.ascii.toLower(q[qi])) break;
+        }
+        if (j >= label.len) return null;
+        // And the run that starts there, taken whole.
+        var run: usize = 1;
+        while (qi + run < q.len and j + run < label.len and
+            std.ascii.toLower(label[j + run]) == std.ascii.toLower(q[qi + run])) : (run += 1)
+        {}
+        for (0..run) |k| {
+            buf[n] = @intCast(j + k);
+            n += 1;
+        }
+        li = j + run;
+        qi += run;
+    }
+    // The WINDOW: the matched characters have to fit in a span that is not
+    // much wider than the query. Without it the fuzzy fallback is noise.
+    const span = buf[n - 1] - buf[0] + 1;
+    if (span > q.len * 3 + fuzzy_window_slack) return null;
+    return n;
+}
+
+/// The positions to HIGHLIGHT in the label, for the given query.
+///
+/// It prefers the contiguous substring (the common case, and the one the eye
+/// reads as "the match") and falls back to the fuzzy positions.
+pub fn highlightPositions(label: []const u8, q: []const u8, buf: []u32) ?usize {
+    if (q.len == 0) return null;
+    if (label.len > 0 and startsWithIgnoreCase(label, q)) {
+        for (q, 0..) |_, i| buf[i] = @intCast(i);
+        return q.len;
+    }
+    if (containsIgnoreCase(label, q)) {
+        const at = indexOfIgnoreCase(label, q) orelse return null;
+        for (q, 0..) |_, i| buf[i] = @intCast(at + i);
+        return q.len;
+    }
+    return fuzzyMatch(label, q, buf);
+}
+
+/// The first position of `needle` in `hay`, ignoring the case.
+///
+/// `std.mem` has no case-insensitive index in this Zig version, and writing
+/// it here is four lines: the ASCII comparison is the same one
+/// `containsIgnoreCase` already uses.
+pub fn indexOfIgnoreCase(hay: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > hay.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return i;
+    }
+    return null;
 }
 
 pub fn startsWithIgnoreCase(hay: []const u8, needle: []const u8) bool {
@@ -497,23 +662,45 @@ test "move: does not go past the ends" {
     try t.expectEqual(@as(usize, 0), pal.sel[0]);
 }
 
-test "clampScroll: the selection is always visible" {
+test "the selected row is always visible, even with a group header in the window" {
+    // The scroll is in ROWS and the window is in ROWS, because the list is
+    // drawn with the group headers inside it: an item's row is not its index.
+    // The old version clamped the ITEM index against a window measured in
+    // rows, and the highlight vanished one row before the end of the list.
     var pal = Palette.init(t.allocator);
     defer pal.deinit();
     var items: [10]Item = undefined;
-    for (&items) |*it| {
-        it.* = .{ .kind = .command, .label = "x" };
+    for (&items, 0..) |*it, i| {
+        // Two groups: the header and the blank line before it take two rows
+        // that are not items.
+        it.* = .{ .kind = .command, .label = "x", .group = if (i < 5) 1 else 2 };
     }
-    pal.setItems(&items, &.{});
+    pal.setItems(&items, &.{.{ .name = "one" }, .{ .name = "two" }});
+    pal.refilter();
 
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const rows = try columnRows(&pal, 0, arena_state.allocator());
+    // 10 items + 2 headers + 1 blank between the groups = 13 rows.
+    try t.expectEqual(@as(usize, 13), rows.len);
+
+    const visible: usize = 5;
+    // The LAST item: with the item-index clamp it landed on a row the
+    // headers had pushed out of the window.
     pal.sel[0] = 9;
-    pal.clampScroll(0, 4);
-    try t.expect(pal.sel[0] >= pal.scroll[0]);
-    try t.expect(pal.sel[0] < pal.scroll[0] + 4);
+    pal.clampScrollRows(0, rows.len, visible, selectedRow(&pal, 0, rows));
+    const sel_row = selectedRow(&pal, 0, rows).?;
+    try t.expect(sel_row >= pal.scroll[0]);
+    try t.expect(sel_row < pal.scroll[0] + visible);
 
+    // And back to the top: the selection is visible again. The scroll is not
+    // necessarily ZERO (the group's header is a row of its own and the window
+    // starts on the item), so the assertion is the INVARIANT and not a number.
     pal.sel[0] = 0;
-    pal.clampScroll(0, 4);
-    try t.expectEqual(@as(usize, 0), pal.scroll[0]);
+    pal.clampScrollRows(0, rows.len, visible, selectedRow(&pal, 0, rows));
+    const top_row = selectedRow(&pal, 0, rows).?;
+    try t.expect(top_row >= pal.scroll[0]);
+    try t.expect(top_row < pal.scroll[0] + visible);
 }
 
 // ── drawing ───────────────────────────────────────────────────
@@ -559,11 +746,18 @@ pub const Box = struct {
 
 /// Computes the modal's size. Models mode: two columns; commands: one.
 pub fn boxFor(pal: *const Palette, width: u16, height: u16) Box {
-    const w: u16 = @min(width -| 4, 76);
+    // The modal was 76 columns wide and the model ids are 40: the names were
+    // cut, the "openrouter · free" hints collided with them, and the whole
+    // thing looked cramped on a wide terminal. It takes what the terminal has
+    // (minus a margin) up to 110 columns, which is where a model id and its
+    // hint fit side by side.
+    const w: u16 = @min(width -| 4, 110);
     const h: u16 = @min(height -| 4, 24);
     // The key prompt needs more height: it has a field, a message and two hints.
     const hh: u16 = if (pal.mode == .key_prompt) @min(height -| 4, 12) else h;
     const two_cols = pal.mode == .models and pal.countIn(0) > 0;
+    // The providers column is a third: it holds short names and a key state,
+    // and the models column is the one that has to fit a 40-character id.
     const col_w: u16 = if (two_cols) @max(18, w / 3) else w;
     // h = border(1) + title(1) + search(1) + items + footer(1) + border(1)
     const list_rows: usize = if (hh > 7) @as(usize, hh) - 5 else 1;
@@ -587,13 +781,20 @@ pub fn draw(
     pal: *Palette,
     width: u16,
     height: u16,
+    notice: []const u8,
 ) void {
     const box = boxFor(pal, width, height);
     if (box.w < 24 or box.h < 8) return;
 
     // ── background and borders ──
+    //
+    // The wide cells of the row are split FIRST: a cell that claims many
+    // columns (the rule under the hero is one) makes the renderer skip the
+    // columns it covers, and the modal would be EATEN by the history behind
+    // it: the border disappears and the interior shows the rule.
     var y: u16 = 0;
     while (y < box.h) : (y += 1) {
+        tui.expandWideCells(p.surface, box.y + y, width);
         p.fillRange(box.x, box.x + box.w, box.y + y, " ", .{});
     }
     p.fillRange(box.x + 1, box.x + box.w - 1, box.y, "─", theme.brand_faint);
@@ -611,18 +812,18 @@ pub fn draw(
     // ── title (left) and "esc" (right) ──
     const title = switch (pal.mode) {
         .commands => "Commands",
-        .models => "Switch model",
-        .connect => "Connect",
-        .key_prompt => "Connect",
+        .models => if (pal.custom_title.len > 0) pal.custom_title else "Choose a model",
+        .connect => "Connect a provider",
+        .key_prompt => "Add API key",
     };
-    var tb: [32]u8 = undefined;
+    var tb: [128]u8 = undefined;
     const t1 = std.fmt.bufPrint(&tb, " {s}", .{title}) catch " ";
     _ = p.putText(box.x + 2, box.y + 1, t1, theme.brand_bold);
     _ = p.putText(box.x + box.w - 4, box.y + 1, "esc", theme.brand_soft);
 
     if (pal.mode == .key_prompt) {
         drawKeyPrompt(p, pal, box);
-        drawFooter(p, pal, box);
+        drawFooter(p, pal, box, notice);
         surface.cursor = .{
             .row = box.y + 4,
             .col = box.x + 3 + @as(u16, @intCast(pal.key_len)),
@@ -634,10 +835,16 @@ pub fn draw(
     const sy = box.y + 2;
     _ = p.putText(box.x + 2, sy, "▌", theme.brand_bold);
     const q = pal.queryText();
+    const placeholder: []const u8 = switch (pal.mode) {
+        .commands => "search commands",
+        .models => if (pal.column() == 0) "filter providers" else "filter models",
+        .connect => "filter providers",
+        .key_prompt => "",
+    };
     if (q.len > 0) {
         _ = p.putText(box.x + 3, sy, q, theme.brand);
     } else {
-        _ = p.putText(box.x + 3, sy, "search", theme.brand_faint);
+        _ = p.putText(box.x + 3, sy, placeholder, theme.brand_faint);
     }
     surface.cursor = .{ .row = sy, .col = box.x + 3 + @as(u16, @intCast(q.len)) };
 
@@ -648,104 +855,324 @@ pub fn draw(
         while (ry < box.h - 2) : (ry += 1) {
             p.putStable(box.x + box.col_w, box.y + ry, "│", 1, theme.brand_faint);
         }
-        drawColumn(p, pal, box, 0, box.x + 1, box.col_w - 1);
-        drawColumn(p, pal, box, 1, box.x + box.col_w + 1, box.w - box.col_w - 2);
+        // The models column keeps ONE column for the scrollbar: the list is
+        // cut (464 models, 19 rows) and a cut list with no sign that it goes
+        // on is a list that looks COMPLETE — the user reads "these are the
+        // models" and stops.
+        const r0 = drawColumn(p, pal, box, 0, box.x + 1, box.col_w - 1, "");
+        const r1 = drawColumn(p, pal, box, 1, box.x + box.col_w + 1, box.w - box.col_w - 3, notice);
+        drawColumnScrollbar(p, pal, box, box.x + box.w - 2, if (pal.column() == 0) r0 else r1);
     } else {
-        drawColumn(p, pal, box, 0, box.x + 1, box.w - 2);
+        // One column less: the scrollbar has its own column, so the hint on
+        // the right of a row is not painted under it.
+        const r0 = drawColumn(p, pal, box, 0, box.x + 1, box.w - 3, "");
+        drawColumnScrollbar(p, pal, box, box.x + box.w - 2, r0);
     }
 
     // ── footer ──
-    drawFooter(p, pal, box);
+    drawFooter(p, pal, box, notice);
+}
+
+/// One row of a column: an item, a group header, or the blank line between
+/// two groups.
+const Row = struct {
+    kind: enum { item, group, blank },
+    /// The index into `filtered[c].items` (only for `.item`).
+    item: usize,
+    /// The group (only for `.group`).
+    group: u8,
+};
+
+/// Walks the rows of a column in order: group headers, the blank line between
+/// two groups, and the items.
+///
+/// It is a WALKER and not a stored list because two very different callers need
+/// the same sequence: the drawing, which allocates every row of the column, and
+/// the mouse hit test, which needs exactly ONE row and cannot afford to build
+/// 464 of them on every motion event. Two copies of this loop is how the
+/// pointer ends up selecting the row above the one under it.
+///
+/// The scroll is measured in ROWS and not in items, and that is the whole
+/// point: the list is drawn with the headers INSIDE it, so an item's row is
+/// not its index. A scroll measured in items left the selected row BELOW
+/// the last visible one as soon as a header was in the window — the list
+/// looked cut and the highlight was nowhere.
+const RowWalker = struct {
+    pal: *const Palette,
+    c: usize,
+    /// Next index into `filtered[c].items`.
+    i: usize = 0,
+    last_group: u8 = 0,
+    /// Has any row been produced yet? It decides whether a group change needs
+    /// the blank line: there is nothing to separate at the very top.
+    any: bool = false,
+    /// A header whose blank line was just emitted.
+    pending_group: u8 = 0,
+
+    fn next(self: *RowWalker) ?Row {
+        if (self.pending_group != 0) {
+            const g = self.pending_group;
+            self.pending_group = 0;
+            return .{ .kind = .group, .item = 0, .group = g };
+        }
+        const filtered = self.pal.filtered[self.c].items;
+        while (self.i < filtered.len) {
+            const it = self.pal.items[filtered[self.i]];
+            if (it.group != 0 and it.group != self.last_group) {
+                self.last_group = it.group;
+                // A blank line between the groups (like opencode), and then
+                // the header itself.
+                if (self.any) {
+                    self.pending_group = it.group;
+                    return .{ .kind = .blank, .item = 0, .group = 0 };
+                }
+                self.any = true;
+                return .{ .kind = .group, .item = 0, .group = it.group };
+            }
+            self.any = true;
+            const slot = self.i;
+            self.i += 1;
+            return .{ .kind = .item, .item = slot, .group = 0 };
+        }
+        return null;
+    }
+};
+
+/// The rows of a column, with the group headers and the blank lines between
+/// them. For the drawing.
+fn columnRows(pal: *const Palette, c: usize, arena: std.mem.Allocator) ![]Row {
+    var walker = RowWalker{ .pal = pal, .c = c };
+    var rows: std.ArrayList(Row) = .empty;
+    while (walker.next()) |r| try rows.append(arena, r);
+    return rows.toOwnedSlice(arena);
+}
+
+/// Row number `target` of a column, or null when the column has fewer rows.
+///
+/// Same sequence as `columnRows` (it IS the same walker), without allocating:
+/// the hit test runs on every mouse motion.
+fn rowAt(pal: *const Palette, c: usize, target: usize) ?Row {
+    var walker = RowWalker{ .pal = pal, .c = c };
+    var i: usize = 0;
+    while (walker.next()) |r| {
+        if (i == target) return r;
+        i += 1;
+    }
+    return null;
+}
+
+/// The row of the selected item of a column, or null when there is none.
+fn selectedRow(pal: *const Palette, c: usize, rows: []const Row) ?usize {
+    const sel = pal.sel[c];
+    for (rows, 0..) |r, i| {
+        if (r.kind == .item and r.item == sel) return i;
+    }
+    return null;
 }
 
 /// A column of items, with group header, scroll and highlight.
-fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16) void {
+fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, notice: []const u8) usize {
     const filtered = pal.filtered[c].items;
     if (filtered.len == 0) {
-        const msg: []const u8 = if (pal.mode == .connect) "no providers" else "no matches";
-        _ = p.putText(x0 + 2, box.y + 3, msg, theme.brand_faint);
+        const msg: []const u8 = if (pal.mode == .connect)
+            "no providers"
+        else if (pal.mode == .models and c == 1 and notice.len > 0 and pal.queryText().len == 0)
+            notice
+        else
+            "no matches";
+        _ = p.putClipped(x0 + 2, box.y + 3, msg, w -| 4, theme.hint);
+        return 0;
+    }
+    const rows = columnRows(pal, c, p.arena) catch return 0;
+    pal.clampScrollRows(c, rows.len, box.list_rows, selectedRow(pal, c, rows));
+
+    for (rows, 0..) |r, ri| {
+        if (ri < pal.scroll[c]) continue;
+        const shown = ri - pal.scroll[c];
+        if (shown >= box.list_rows) break;
+        const row = box.y + 3 + @as(u16, @intCast(shown));
+        switch (r.kind) {
+            .blank => {},
+            .group => {
+                const gname = groupName(pal, r.group);
+                if (gname.len > 0 and w > 2) {
+                    _ = p.putText(x0 + 1, row, gname, theme.group);
+                }
+            },
+            .item => {
+                const it = pal.items[filtered[r.item]];
+
+                // Only the FOCUSED column really highlights. Before, both
+                // painted their selection alike and there was no way to know
+                // which one was active: you pressed the arrows and the models
+                // list did not move, which is exactly what makes you think
+                // the list does not exist.
+                const is_sel = r.item == pal.sel[c];
+                const focused = c == pal.column();
+                if (is_sel and focused) p.fillRange(x0, x0 + w, row, " ", theme.selected);
+                // In the unfocused column, the chosen row is marked with a ▸ in
+                // dim blue: you can see which one it is without it looking
+                // focused.
+                if (is_sel and !focused) _ = p.putText(x0, row, "\u{25b8}", theme.brand_soft);
+                putLabelHighlighted(
+                    p,
+                    x0 + 1,
+                    row,
+                    it.label,
+                    pal.queryText(),
+                    if (is_sel) theme.item_sel else if (focused) theme.item else theme.dim,
+                    if (is_sel) theme.brand_bold else theme.brand,
+                );
+
+                // Right column aligned to the edge: shortcut, "free", price…
+                //
+                // Only if both LABEL and hint fit with a gap in between.
+                // Before, only whether the hint itself fit was checked, and in
+                // the narrow providers column the hint was painted ON TOP of
+                // the label and you read "anthrclaude-sonnet-4-5". The label
+                // wins: that is what you select.
+                const label_w = displayWidth(it.label);
+                const hint_w = displayWidth(it.hint);
+                if (hint_w > 0 and label_w + hint_w + 3 <= w) {
+                    _ = p.putText(
+                        x0 + w - 1 - @as(u16, @intCast(hint_w)),
+                        row,
+                        it.hint,
+                        if (is_sel) theme.item_sel else theme.brand_faint,
+                    );
+                }
+            },
+        }
+    }
+    return rows.len;
+}
+
+/// Paints a label with the MATCHED characters in the accent colour.
+///
+/// This is the reference implementation's "the matched characters are
+/// highlighted" (its fuzzy picker), and it is the half of the fuzzy search
+/// that the user actually sees: the list says WHICH part of
+/// "anthropic/claude-sonnet-4-5" answered the query.
+///
+/// The positions are BYTE offsets and the painting walks GRAPHEMES, so the
+/// two meet at the grapheme's first byte: a match that lands inside a
+/// multi-byte character highlights the whole character, which is the only
+/// thing that can be painted.
+fn putLabelHighlighted(
+    p: *Painter,
+    col: u16,
+    row: u16,
+    label: []const u8,
+    query: []const u8,
+    base: vaxis.Style,
+    hl: vaxis.Style,
+) void {
+    if (label.len == 0) return;
+    var positions: [64]u32 = undefined;
+    const n = highlightPositions(label, query, &positions) orelse 0;
+    if (n == 0) {
+        _ = p.putText(col, row, label, base);
         return;
     }
-    pal.clampScroll(c, box.list_rows);
-
-    var shown: usize = 0;
-    var last_group: u8 = 0;
-    var i = pal.scroll[c];
-    while (i < filtered.len and shown < box.list_rows) : (i += 1) {
-        const it = pal.items[filtered[i]];
-
-        // Group header, with a blank line before it (like opencode).
-        if (it.group != 0 and it.group != last_group) {
-            last_group = it.group;
-            if (shown > 0) {
-                shown += 1; // separator between groups
-                if (shown >= box.list_rows) break;
+    // The label is copied into the frame arena, like `putText` does: a pointer
+    // to a stack temporary reaches the renderer as garbage.
+    const stable = p.arena.dupe(u8, label) catch {
+        _ = p.putText(col, row, label, base);
+        return;
+    };
+    var it = vaxis.unicode.graphemeIterator(stable);
+    var c = col;
+    var off: usize = 0;
+    while (it.next()) |g| {
+        const b = g.bytes(stable);
+        const gw = p.measure(b);
+        if (c + gw > p.width) break;
+        // Is the grapheme's first byte one of the matched ones?
+        var matched = false;
+        for (positions[0..n]) |pos| {
+            if (pos == off) {
+                matched = true;
+                break;
             }
-            const gname = groupName(pal, it.group);
-            if (gname.len > 0 and w > 2) {
-                _ = p.putText(x0 + 1, box.y + 3 + @as(u16, @intCast(shown)), gname, theme.group);
-            }
-            shown += 1;
-            if (shown >= box.list_rows) break;
         }
-
-        // CAREFUL: the row is computed AFTER the group block. If it were
-        // computed before, the label came out one row too high and the header
-        // ate its spot (the list looked out of order).
-        const row = box.y + 3 + @as(u16, @intCast(shown));
-        // Only the FOCUSED column really highlights. Before, both painted their
-        // selection alike and there was no way to know which one was active:
-        // you pressed the arrows and the models list did not move, which is
-        // exactly what makes you think the list does not exist.
-        const is_sel = i == pal.sel[c];
-        const focused = c == pal.column();
-        if (is_sel and focused) p.fillRange(x0, x0 + w, row, " ", theme.selected);
-        // In the unfocused column, the chosen row is marked with a ▸ in dim
-        // blue: you can see which one it is without it looking focused.
-        if (is_sel and !focused) _ = p.putText(x0, row, "▸", theme.brand_soft);
-        _ = p.putText(
-            x0 + 1,
-            row,
-            it.label,
-            if (is_sel) theme.item_sel else if (focused) theme.item else theme.dim,
-        );
-
-        // Right column aligned to the edge: shortcut, "free", price…
-        //
-        // Only if both LABEL and hint fit with a gap in between. Before, only
-        // whether the hint itself fit was checked, and in the narrow providers
-        // column the hint was painted ON TOP of the label and you read
-        // "anthrclaude-sonnet-4-5". The label wins: that is what you select.
-        const label_w = displayWidth(it.label);
-        const hint_w = displayWidth(it.hint);
-        if (hint_w > 0 and label_w + hint_w + 3 <= w) {
-            _ = p.putText(
-                x0 + w - 1 - @as(u16, @intCast(hint_w)),
-                row,
-                it.hint,
-                if (is_sel) theme.item_sel else theme.brand_faint,
-            );
-        }
-        shown += 1;
+        p.putStable(c, row, b, gw, if (matched) hl else base);
+        c += gw;
+        off += b.len;
     }
 }
 
-fn drawFooter(p: *Painter, pal: *const Palette, box: Box) void {
+/// The scrollbar of the column that has the focus, on the right edge of the
+/// modal.
+///
+/// The list is CUT: 464 models do not fit in 19 rows, and the only sign that
+/// there are more is the scrollbar. Without it the list looks complete, and
+/// "complete" is a lie the user cannot see through.
+fn drawColumnScrollbar(p: *Painter, pal: *const Palette, box: Box, x: u16, total_rows: usize) void {
+    const c = pal.column();
+    const visible = box.list_rows;
+    // Everything fits: no scrollbar, and no thumb that lies about there being
+    // more.
+    if (total_rows <= visible) return;
+    const max_offset = total_rows - visible;
+    const metrics = tui.scrollbarThumb(visible, max_offset);
+    const first = @min(pal.scroll[c], max_offset);
+    const thumb_top = if (metrics.travel == 0)
+        0
+    else
+        metrics.travel * first / max_offset;
+    var row: usize = 0;
+    while (row < visible) : (row += 1) {
+        const in_thumb = row >= thumb_top and row < thumb_top + metrics.size;
+        p.putStable(
+            x,
+            box.y + 3 + @as(u16, @intCast(row)),
+            if (in_thumb) "\u{2588}" else "\u{2502}",
+            1,
+            if (in_thumb) theme.brand else theme.rule,
+        );
+    }
+}
+
+fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) void {
     const fy = box.y + box.h - 2;
+    // The mouse is named in the footer because a list that answers to the
+    // pointer and does not say so is a list nobody clicks.
     const hint: []const u8 = switch (pal.mode) {
-        .commands => "↑↓ move · enter run · esc close",
-        .models => "↑↓ move · tab switch column · enter use",
-        .connect => "↑↓ move · enter choose · esc back",
+        .commands => "↑↓ move · enter or click run · esc close",
+        .models => "↑↓ move · click select · tab switch · ctrl+r refresh",
+        .connect => "↑↓ move · click add / replace key",
         .key_prompt => "",
     };
-    if (hint.len > 0 and hint.len + 4 < box.w) {
-        _ = p.putText(box.x + box.w - 2 - @as(u16, @intCast(hint.len)), fy, hint, theme.brand_soft);
+    const hint_width: u16 = @intCast(displayWidth(hint));
+    const hint_x = box.x + box.w - 2 -| hint_width;
+    if (hint.len > 0 and hint_width + 4 < box.w) {
+        _ = p.putText(hint_x, fy, hint, theme.brand_soft);
+    }
+    // How far down the list we are, and how many there are. The scrollbar
+    // says "there is more"; this says "how much", and a number is what makes
+    // a cut list legible instead of mysterious.
+    {
+        const c = pal.column();
+        const total = pal.filtered[c].items.len;
+        if (total > 0) {
+            var cb: [32]u8 = undefined;
+            const counter = std.fmt.bufPrint(&cb, "{d}/{d}", .{ pal.sel[c] + 1, total }) catch "";
+            const cw: u16 = @intCast(displayWidth(counter));
+            if (cw > 0 and cw + 2 < box.w) {
+                const cx = if (hint_x > cw + 2) hint_x - cw - 2 else box.x + 2;
+                _ = p.putText(cx, fy, counter, theme.hint);
+            }
+        }
     }
     if (pal.mode == .models) {
         // Shortcut to connect without having to reach the item at the bottom.
         const left = "ctrl+a connect";
         if (left.len + 4 < box.w) {
             _ = p.putText(box.x + 2, fy, left, theme.brand);
+            const notice_x = box.x + 2 + @as(u16, @intCast(displayWidth(left))) + 2;
+            if (notice.len > 0 and hint_x > notice_x + 1) {
+                _ = p.putClipped(notice_x, fy, notice, hint_x - notice_x - 1, theme.hint);
+            }
         }
     }
 }
@@ -832,20 +1259,190 @@ pub const Action = union(enum) {
     run_command: []const u8,
     /// Switch to this provider.
     set_provider: []const u8,
-    /// Switch to this model, with its context window in tokens.
+    /// Open the guided provider connection list.
+    open_connect,
+    /// Switch to this model, with its context window in tokens and provider.
     ///
     /// A struct, not a bare `[]const u8`, because the window is what makes the
     /// compaction budget right for this model instead of a fixed 128k — and a
     /// bare string had no room for it, so the number that `buildModelItems` read
     /// out of the catalogue had nowhere to go.
-    set_model: struct { id: []const u8, ctx_tokens: u32 },
+    set_model: struct { id: []const u8, ctx_tokens: u32, provider: []const u8 },
     /// Connect a provider with this key. Both slices point at the palette's own
     /// buffers: whoever receives the action must copy them BEFORE closing the
     /// palette.
     connect: struct { provider: []const u8, key: []const u8 },
+    /// Refresh the model list (invalidate cache and re-fetch).
+    refresh_models,
     /// Close.
     close,
 };
+
+// ── mouse ─────────────────────────────────────────────────────
+
+/// What the pointer is over.
+pub const Hit = struct {
+    /// Column: 0 = providers/left, 1 = models/right.
+    col: usize,
+    /// Index into `filtered[col]`, which is what `sel[col]` counts.
+    slot: usize,
+    /// Index into `items`. It is what survives a `refilter` (the slots shift
+    /// when the focus — and with it the filtered column — changes), so it is
+    /// what the click resolves the action from.
+    item: u32,
+};
+
+/// Translates a screen cell into the list row under it, or null when the cell
+/// is not on an item (the title, the search line, a border, a group header, or
+/// outside the box).
+///
+/// The box comes from `boxFor` and the rows from the same walker the drawing
+/// uses, so the pointer cannot disagree with what is painted: there is one
+/// geometry and one row sequence, not two that are kept in sync by hand.
+///
+/// `width`/`height` are the terminal's: a mouse event carries a screen cell and
+/// nothing else, and the modal's position depends on the frame size.
+pub fn hitTest(pal: *const Palette, width: u16, height: u16, row: u16, col: u16) ?Hit {
+    if (!pal.active or pal.mode == .key_prompt) return null;
+    const box = boxFor(pal, width, height);
+    if (box.w < 24 or box.h < 8) return null;
+    if (row < box.y + 3) return null;
+    const shown: usize = row - (box.y + 3);
+    if (shown >= box.list_rows) return null;
+
+    // The same two-column test the drawing uses, and the same x ranges: left
+    // column from the inner border to the separator, right column from after
+    // the separator to the scrollbar. The border and the scrollbar are not
+    // clickable.
+    const two_cols = pal.mode == .models and pal.countIn(0) > 0;
+    var c: usize = 0;
+    if (two_cols) {
+        const sep = box.x + box.col_w;
+        if (col >= box.x + 1 and col < sep) {
+            c = 0;
+        } else if (col > sep and col < box.x + box.w - 2) {
+            c = 1;
+        } else return null;
+    } else {
+        if (col < box.x + 1 or col >= box.x + box.w - 2) return null;
+    }
+
+    const r = rowAt(pal, c, pal.scroll[c] + shown) orelse return null;
+    if (r.kind != .item) return null;
+    return .{ .col = c, .slot = r.item, .item = pal.filtered[c].items[r.item] };
+}
+
+/// The slot of an item inside a column's filtered list, or null when the filter
+/// leaves it out.
+fn slotOf(pal: *const Palette, c: usize, item: u32) ?usize {
+    for (pal.filtered[c].items, 0..) |it, i| {
+        if (it == item) return i;
+    }
+    return null;
+}
+
+/// What a mouse event did, so the caller only repaints when something changed
+/// (a motion event over the same row is not news, and the terminal sends those
+/// continuously while the pointer moves).
+pub const MouseResult = struct {
+    action: Action = .{ .none = {} },
+    changed: bool = false,
+};
+
+/// Translates a mouse event into a selection change and, on a click, an action.
+///
+/// The rules, and they are the ones a list in a terminal can keep:
+///
+/// * **Motion selects the row under the pointer.** Not a separate hover
+///   highlight: the highlighted row is the one Enter would run, so what the
+///   pointer shows and what the keyboard confirms can never disagree. The
+///   focused COLUMN does not follow the pointer — clicking is what moves the
+///   focus — so sweeping across the separator cannot silently change what the
+///   search box is filtering.
+/// * **A left click selects AND activates**, the same as hitting Enter on that
+///   row: a click that only selected would need a second click to do anything,
+///   and a picker whose rows do nothing when clicked reads as broken.
+/// * **The wheel moves the selection**, which is what scrolls the list (the
+///   selection is the scroll anchor). It goes to the FOCUSED column, and while
+///   the modal is open the history behind it does not move at all.
+///
+/// Release and drag are ignored on purpose: a drag that started on a row would
+/// otherwise be indistinguishable from a text selection, and the transcript's
+/// selection must not start under a modal.
+pub fn handleMouse(pal: *Palette, width: u16, height: u16, m: vaxis.Mouse) MouseResult {
+    if (!pal.active) return .{};
+    if (m.row < 0 or m.col < 0) return .{};
+    const row: u16 = @intCast(m.row);
+    const col: u16 = @intCast(m.col);
+
+    switch (m.type) {
+        .motion => {
+            const hit = hitTest(pal, width, height, row, col) orelse return .{};
+            if (pal.sel[hit.col] == hit.slot) return .{};
+            pal.sel[hit.col] = hit.slot;
+            return .{ .changed = true };
+        },
+        .press => switch (m.button) {
+            .left => {
+                const hit = hitTest(pal, width, height, row, col) orelse return .{};
+                // The click focuses the column it landed on, and that refilters:
+                // the item is looked up AGAIN by index afterwards, because the
+                // slots of the newly focused column change under the pointer.
+                if (pal.mode == .models and pal.col != @as(u8, @intCast(hit.col))) {
+                    pal.col = @intCast(hit.col);
+                    pal.refilter();
+                }
+                if (slotOf(pal, hit.col, hit.item)) |slot| pal.sel[hit.col] = slot;
+                // The row may have scrolled out of existence (a filter that no
+                // longer contains it): do not activate a row nobody sees.
+                if (pal.sel[hit.col] >= pal.filtered[hit.col].items.len) {
+                    return .{ .changed = true };
+                }
+                return .{ .action = activateItem(pal, hit.item), .changed = true };
+            },
+            .wheel_up, .wheel_down => {
+                const c = pal.column();
+                const before = pal.sel[c];
+                pal.move(c, if (m.button == .wheel_up) -3 else 3);
+                return .{ .changed = pal.sel[c] != before };
+            },
+            else => return .{},
+        },
+        else => return .{},
+    }
+}
+
+/// What happens to an item when it is chosen, wherever the choice came from.
+///
+/// ONE place for Enter and for a click, on purpose: two switches over the same
+/// item kinds is how "clicking the provider does something different from
+/// pressing Enter on it" gets written, and nothing on screen would explain it.
+fn activateItem(pal: *Palette, item_index: u32) Action {
+    if (item_index >= pal.items.len) return .{ .none = {} };
+    const it = pal.items[item_index];
+    return switch (it.kind) {
+        // "Connect" comes out as `run_command` and the model handles it, as it
+        // is the one that knows how to open the providers list. If it were
+        // resolved here (switching `mode` to `.connect` without changing
+        // `items`) the list would still be the commands one with the Connect
+        // title.
+        .command => .{ .run_command = it.label },
+        .provider => blk: {
+            if (pal.mode == .connect) {
+                pal.key_item = item_index;
+                pal.key_return_mode = .connect;
+                pal.mode = .key_prompt;
+                pal.key_len = 0;
+                pal.key_msg_len = 0;
+                pal.setKeyMessage("paste the key and press enter", false);
+                break :blk Action{ .none = {} };
+            }
+            break :blk Action{ .set_provider = it.label };
+        },
+        .model => .{ .set_model = .{ .id = it.label, .ctx_tokens = it.ctx_tokens, .provider = it.provider } },
+        .connect => .open_connect,
+    };
+}
 
 /// Translates a key into the corresponding action.
 ///
@@ -856,7 +1453,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
     // ── key prompt ──
     if (pal.mode == .key_prompt) {
         if (key.matches(vaxis.Key.escape, .{})) {
-            pal.mode = .models;
+            pal.mode = pal.key_return_mode;
             pal.key_len = 0;
             pal.key_msg_len = 0;
             return .{ .none = {} };
@@ -921,6 +1518,10 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
             pal.refilter();
             return .{ .none = {} };
         }
+        // Ctrl+R: refresh model list
+        if (key.matches('r', .{ .ctrl = true })) {
+            return .{ .refresh_models = {} };
+        }
     }
 
     // ── search ──
@@ -950,38 +1551,9 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
 
     // ── confirm ──
     if (key.matches(vaxis.Key.enter, .{})) {
-        const filtered_index = if (pal.sel[c] < pal.filtered[c].items.len)
-            pal.filtered[c].items[pal.sel[c]]
-        else
-            return Action{ .none = {} };
-        const it = pal.items[filtered_index];
-        return switch (it.kind) {
-            // "Connect" comes out as `run_command` and the model handles it, as
-            // it is the one that knows how to open the providers list. If it
-            // were resolved here (switching `mode` to `.connect` without
-            // changing `items`) the list would still be the commands one with
-            // the Connect title.
-            .command => .{ .run_command = it.label },
-            .provider => blk: {
-                if (pal.mode == .connect) {
-                    pal.key_item = filtered_index;
-                    pal.mode = .key_prompt;
-                    pal.key_len = 0;
-                    pal.key_msg_len = 0;
-                    pal.setKeyMessage("paste the key and press enter", false);
-                    break :blk Action{ .none = {} };
-                }
-                break :blk Action{ .set_provider = it.label };
-            },
-            .model => .{ .set_model = .{ .id = it.label, .ctx_tokens = it.ctx_tokens } },
-            .connect => blk: {
-                pal.mode = .key_prompt;
-                pal.key_len = 0;
-                pal.key_msg_len = 0;
-                pal.setKeyMessage("choose a provider first", false);
-                break :blk Action{ .none = {} };
-            },
-        };
+        const slot = pal.sel[c];
+        if (slot >= pal.filtered[c].items.len) return .{ .none = {} };
+        return activateItem(pal, pal.filtered[c].items[slot]);
     }
     return .{ .none = {} };
 }
@@ -1199,7 +1771,7 @@ test "draw: models mode paints both columns and the footer" {
 
     const s = try tui.drawTest(&m, arena_state.allocator(), 90, 26);
     const all = tui.allText(s);
-    try t.expect(std.mem.indexOf(u8, all, "Switch model") != null);
+    try t.expect(std.mem.indexOf(u8, all, "Choose a model") != null);
     try t.expect(std.mem.indexOf(u8, all, "openrouter") != null);
     try t.expect(std.mem.indexOf(u8, all, "deepseek-chat") != null);
     try t.expect(std.mem.indexOf(u8, all, "free") != null);
@@ -1407,4 +1979,240 @@ test "the key message carries whether it is an error, instead of the drawing gue
     pal.close();
     try t.expect(!pal.keyMessageIsError());
     try t.expectEqualStrings("", pal.keyMessage());
+}
+
+test "fuzzy: the query is a subsequence of the label, and the positions say which" {
+    var buf: [64]u32 = undefined;
+
+    // The ordinary case: a model id with a provider prefix and a version.
+    const n = fuzzyMatch("anthropic/claude-sonnet-4-5", "cs4", &buf).?;
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(u32, 8), buf[0]); // the 'c' of "claude"
+    try std.testing.expectEqual(@as(u32, 17), buf[1]); // the 's' of "sonnet"
+    try std.testing.expectEqual(@as(u32, 24), buf[2]); // the '4'
+
+    // Case does not matter: it is a search box, not a compiler.
+    try std.testing.expect(fuzzyMatch("Claude-Sonnet", "son", &buf) != null);
+
+    // Not a subsequence: no match, and the caller has to say so.
+    try std.testing.expect(fuzzyMatch("claude-sonnet", "zzz", &buf) == null);
+}
+
+test "fuzzy: a run of consecutive characters wins over a scattered one" {
+    // "bc" in "a-xbc": the highlight has to be the RUN, because a "b" alone
+    // with a lonely "c" four columns away does not read as a match.
+    var buf: [64]u32 = undefined;
+    const n = fuzzyMatch("a-xbc", "bc", &buf).?;
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u32, 3), buf[0]);
+    try std.testing.expectEqual(@as(u32, 4), buf[1]);
+}
+
+test "fuzzy: the window keeps the fallback from matching everything" {
+    // Without a width limit, "abc" is a subsequence of half a catalogue, and
+    // a filter that returns half the list is a filter that does not filter.
+    var buf: [64]u32 = undefined;
+    try std.testing.expect(fuzzyMatch("a-very-long-label-that-goes-on-and-on", "abc", &buf) == null);
+    // …and the same query on a tight label does match.
+    try std.testing.expect(fuzzyMatch("abc", "abc", &buf) != null);
+}
+
+test "matches: the fuzzy fallback finds what the substring does not" {
+    const groups = [_]Group{.{ .name = "Models" }};
+    const item = Item{ .kind = .command, .label = "anthropic/claude-sonnet-4-5" };
+
+    // The substring finds it.
+    try std.testing.expect(matches(item, &groups, "sonnet"));
+    // The fuzzy finds the abbreviation.
+    try std.testing.expect(matches(item, &groups, "cs4"));
+    // And something that is not there at all does not.
+    try std.testing.expect(!matches(item, &groups, "qqq"));
+}
+
+test "highlightPositions: the substring is preferred over the fuzzy positions" {
+    var buf: [64]u32 = undefined;
+    // "sonnet" in "claude-sonnet-4-5": the CONTIGUOUS run, not the first
+    // scattered one.
+    const n = highlightPositions("claude-sonnet-4-5", "sonnet", &buf).?;
+    try std.testing.expectEqual(@as(usize, 6), n);
+    try std.testing.expectEqual(@as(u32, 7), buf[0]);
+    try std.testing.expectEqual(@as(u32, 12), buf[5]);
+}
+
+// ── mouse ───────────────────────────────────────────────────────
+//
+// The row math is the whole feature: a click on the third visible line has to
+// activate the third item, with group headers and a scrolled window in the way.
+// These tests pin the screen cell → item mapping, and that a click and Enter
+// cannot do two different things.
+
+test "hitTest: rows map to the item under the cell, group headers included" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    const groups = [_]Group{ .{ .name = "One" }, .{ .name = "Two" } };
+    const items = [_]Item{
+        .{ .kind = .command, .group = 1, .label = "a" },
+        .{ .kind = .command, .group = 1, .label = "b" },
+        .{ .kind = .command, .group = 2, .label = "c" },
+    };
+    pal.setItems(&items, &groups);
+    pal.active = true;
+
+    // Commands mode is one column. The list starts at box.y + 3: border, title,
+    // search line.
+    const box = boxFor(&pal, 100, 30);
+    const x = box.x + 2;
+    const first = box.y + 3;
+
+    // group "One" (row 0) · a (1) · b (2) · blank (3) · group "Two" (4) · c (5)
+    try t.expect(hitTest(&pal, 100, 30, first, x) == null); // header
+    try t.expectEqual(@as(usize, 0), hitTest(&pal, 100, 30, first + 1, x).?.slot);
+    try t.expectEqual(@as(usize, 1), hitTest(&pal, 100, 30, first + 2, x).?.slot);
+    try t.expect(hitTest(&pal, 100, 30, first + 3, x) == null); // blank line
+    try t.expect(hitTest(&pal, 100, 30, first + 4, x) == null); // second header
+    try t.expectEqual(@as(usize, 2), hitTest(&pal, 100, 30, first + 5, x).?.slot);
+
+    // Outside the list: the title row, the left border, below the box.
+    try t.expect(hitTest(&pal, 100, 30, box.y, x) == null);
+    try t.expect(hitTest(&pal, 100, 30, first + 1, box.x) == null);
+    try t.expect(hitTest(&pal, 100, 30, box.y + box.h, x) == null);
+
+    // Scrolled: the cells mean different ROWS, and the item is read through
+    // `scroll`. A hit test that ignored it would click three items too high.
+    pal.scroll[0] = 4;
+    try t.expect(hitTest(&pal, 100, 30, first, x) == null); // header "Two"
+    try t.expectEqual(@as(usize, 2), hitTest(&pal, 100, 30, first + 1, x).?.slot);
+}
+
+test "handleMouse: a click selects the row under the pointer and activates it" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    pal.mode = .models;
+    pal.active = true;
+    const groups = [_]Group{ .{ .name = "Models" }, .{ .name = "" } };
+    const items = [_]Item{
+        .{ .kind = .model, .group = 1, .label = "gpt-5", .hint = "openai", .provider = "openai", .ctx_tokens = 400_000 },
+        .{ .kind = .model, .group = 1, .label = "sonnet", .hint = "anthropic", .provider = "anthropic", .ctx_tokens = 200_000 },
+        .{ .kind = .connect, .group = 2, .label = "+ connect" },
+    };
+    pal.setItems(&items, &groups);
+    // Two columns: the "+ connect" item is the left one, the models the right.
+    try t.expectEqual(@as(usize, 1), pal.countIn(0));
+    try t.expectEqual(@as(usize, 2), pal.countIn(1));
+
+    const box = boxFor(&pal, 110, 30);
+    const x: u16 = box.x + box.col_w + 2;
+    // Right column: group "Models" (0) · gpt-5 (1) · sonnet (2).
+    const r = handleMouse(&pal, 110, 30, .{
+        .col = @intCast(x),
+        .row = @intCast(box.y + 3 + 2),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    });
+    try t.expect(r.changed);
+    try t.expectEqual(@as(usize, 1), pal.sel[1]);
+    switch (r.action) {
+        .set_model => |mo| {
+            try t.expectEqualStrings("sonnet", mo.id);
+            try t.expectEqualStrings("anthropic", mo.provider);
+            try t.expectEqual(@as(u32, 200_000), mo.ctx_tokens);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The left column activates its own item AND takes the focus. Rows there:
+    // group "" (0) · "+ connect" (1).
+    const left = handleMouse(&pal, 110, 30, .{
+        .col = @intCast(box.x + 2),
+        .row = @intCast(box.y + 3 + 1),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    });
+    try t.expect(std.meta.activeTag(left.action) == .open_connect);
+    try t.expectEqual(@as(u8, 0), pal.col);
+}
+
+test "handleMouse: moving the pointer selects the row under it without activating" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    const items = [_]Item{
+        .{ .kind = .command, .label = "/a" },
+        .{ .kind = .command, .label = "/b" },
+        .{ .kind = .command, .label = "/c" },
+    };
+    pal.setItems(&items, &.{});
+    pal.active = true;
+
+    const box = boxFor(&pal, 100, 30);
+    const x: u16 = box.x + 2;
+    const row: u16 = box.y + 3 + 2;
+    const r = handleMouse(&pal, 100, 30, .{
+        .col = @intCast(x),
+        .row = @intCast(row),
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    });
+    try t.expect(std.meta.activeTag(r.action) == .none);
+    try t.expect(r.changed);
+    try t.expectEqual(@as(usize, 2), pal.sel[0]);
+
+    // The same cell again is not news: no repaint, no work.
+    const again = handleMouse(&pal, 100, 30, .{
+        .col = @intCast(x),
+        .row = @intCast(row),
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    });
+    try t.expect(!again.changed);
+
+    // The title is not a row, so moving over it leaves the selection alone.
+    const title = handleMouse(&pal, 100, 30, .{
+        .col = @intCast(x),
+        .row = @intCast(box.y),
+        .button = .none,
+        .mods = .{},
+        .type = .motion,
+    });
+    try t.expect(!title.changed);
+    try t.expectEqual(@as(usize, 2), pal.sel[0]);
+}
+
+test "handleMouse: the wheel scrolls the list by moving its selection" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    var items: [10]Item = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = .{ .kind = .command, .label = if (i % 2 == 0) "even" else "odd" };
+    }
+    pal.setItems(&items, &.{});
+    pal.active = true;
+
+    const down = handleMouse(&pal, 100, 30, .{ .col = 0, .row = 0, .button = .wheel_down, .mods = .{}, .type = .press });
+    try t.expect(down.changed);
+    try t.expectEqual(@as(usize, 3), pal.sel[0]);
+
+    const up = handleMouse(&pal, 100, 30, .{ .col = 0, .row = 0, .button = .wheel_up, .mods = .{}, .type = .press });
+    try t.expect(up.changed);
+    try t.expectEqual(@as(usize, 0), pal.sel[0]);
+
+    // Already at the top: the wheel reports nothing to repaint.
+    const stuck = handleMouse(&pal, 100, 30, .{ .col = 0, .row = 0, .button = .wheel_up, .mods = .{}, .type = .press });
+    try t.expect(!stuck.changed);
+}
+
+test "handleMouse: a closed palette ignores the pointer" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    const items = [_]Item{.{ .kind = .command, .label = "/a" }};
+    pal.setItems(&items, &.{});
+    pal.active = false;
+
+    const r = handleMouse(&pal, 100, 30, .{ .col = 20, .row = 10, .button = .left, .mods = .{}, .type = .press });
+    try t.expect(!r.changed);
+    try t.expect(std.meta.activeTag(r.action) == .none);
+    try t.expect(hitTest(&pal, 100, 30, 10, 20) == null);
 }

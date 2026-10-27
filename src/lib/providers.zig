@@ -26,7 +26,57 @@ pub const ProviderDef = struct {
     note: []const u8 = "",
     /// Whether the provider exposes pricing/context in /models.
     has_pricing: bool = false,
+    /// How the provider wants its key when it LISTS its catalogue.
+    ///
+    /// Not cosmetic, and not the chat path (`chat.streamRaw` builds its own
+    /// headers). `models.listModels` used to send `Authorization: Bearer` and
+    /// nothing else, and Anthropic has no Bearer at all: its catalogue answers
+    /// 401 `invalid x-api-key`, which `resolveModel` reports as "the catalog
+    /// could not be read". Anthropic therefore had no pickable models and the
+    /// only way to use it was to type the name by hand.
+    key_style: KeyStyle = .bearer,
+    /// The model ids the provider DOCUMENTS, for the providers that publish no
+    /// `/models` endpoint (their `models_url` is empty, so there is nothing to
+    /// fetch and the picker would be an empty box).
+    ///
+    /// This is NOT `default_model` and it is not a guess about which one to use:
+    /// zode still refuses to pick by itself and the choice stays with the user.
+    /// It is the list the picker SHOWS, so the user can point at one instead of
+    /// typing its name. It will age — that is why it is only ever a suggestion
+    /// and never written to the catalogue cache (a retired id fails loudly at
+    /// the first request instead of silently becoming the session's model).
+    suggested_models: []const []const u8 = &.{},
+    /// Hard cap on max_tokens/max_completion_tokens sent to this provider.
+    /// 0 = no provider-specific cap (use effort's outputCeiling).
+    /// NVIDIA NIM documents per-model maxima as low as 4096; 16384 is a safe
+    /// default that covers Nemotron/DeepSeek/Kimi/GLM without hitting the
+    /// legacy models' limits.
+    max_output_tokens: u32 = 0,
+    /// Preferred model IDs, in order. Used by resolveModel when the catalogue
+    /// contains them. Empty = no preference (first free / first model).
+    preferred_models: []const []const u8 = &.{},
 };
+
+pub const KeyStyle = enum { bearer, x_api_key };
+
+/// The credentials one request to a catalogue needs. A value produced by
+/// `authWithKey` / `catalogAuth`, so no caller has to remember which provider
+/// uses which header.
+pub const CatalogAuth = struct {
+    bearer: ?[]const u8 = null,
+    x_api_key: ?[]const u8 = null,
+};
+
+pub fn authWithKey(style: KeyStyle, key: ?[]const u8) CatalogAuth {
+    return switch (style) {
+        .bearer => .{ .bearer = key },
+        .x_api_key => .{ .x_api_key = key },
+    };
+}
+
+pub fn catalogAuth(def: *const ProviderDef, env: ?*const std.process.Environ.Map) CatalogAuth {
+    return authWithKey(def.key_style, keyFor(def, env));
+}
 
 pub const defs = [_]ProviderDef{
     .{
@@ -53,6 +103,9 @@ pub const defs = [_]ProviderDef{
         .models_url = "https://api.anthropic.com/v1/models",
         .key_env = &.{"ZODE_ANTHROPIC_KEY"},
         .note = "native Messages API with prompt caching",
+        // x-api-key, and NOT Bearer: verified with curl, `GET /v1/models` with
+        // `Authorization: Bearer …` answers 401 `invalid x-api-key`.
+        .key_style = .x_api_key,
     },
     .{
         .id = "openai",
@@ -86,6 +139,103 @@ pub const defs = [_]ProviderDef{
         .key_env = &.{},
         .note = "no key · overrides via config.json",
     },
+    .{
+        .id = "mistral",
+        .name = "Mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .models_url = "https://api.mistral.ai/v1/models",
+        .key_env = &.{"ZODE_MISTRAL_KEY"},
+        .note = "fast and capable models",
+    },
+    .{
+        .id = "command-code",
+        .name = "CommandCode",
+        .base_url = "https://api.commandcode.ai/provider/v1",
+        .models_url = "https://api.commandcode.ai/provider/v1/models",
+        .key_env = &.{"ZODE_COMMAND_CODE_KEY"},
+        .note = "code-focused models",
+    },
+    .{
+        .id = "github-copilot",
+        .name = "GitHub Copilot",
+        // NOT `/models`: `base_url` is the PREFIX and `/chat/completions` is
+        // appended to it, so this used to send every request to
+        // `…/models/chat/completions`. The catalogue endpoint needs the suffix;
+        // the chat base must not have it.
+        .base_url = "https://api.githubcopilot.com",
+        .models_url = "https://api.githubcopilot.com/models",
+        .key_env = &.{"ZODE_GITHUB_COPILOT_KEY"},
+        .note = "code completion and chat · the chat API also wants its own headers",
+    },
+    .{
+        .id = "xai",
+        .name = "xAI",
+        .base_url = "https://api.x.ai/v1",
+        .models_url = "https://api.x.ai/v1/models",
+        .key_env = &.{"ZODE_XAI_KEY"},
+        .note = "Grok models",
+    },
+    .{
+        .id = "zai",
+        .name = "Z.AI",
+        // The OpenAI-compatible path. `/api/v1` is their Responses API and
+        // `/api/anthropic` their Messages API; zode speaks chat/completions.
+        .base_url = "https://api.z.ai/api/paas/v4",
+        // EMPTY ON PURPOSE, and verified against their OpenAPI document: the
+        // only paths are chat/completions, images, videos, audio, tokenizer,
+        // web_search, reader and files. Nothing lists models, so the empty URL
+        // says "publishes no catalogue" and the picker falls back to
+        // `suggested_models`.
+        .models_url = "",
+        .key_env = &.{ "ZODE_ZAI_KEY", "ZAI_API_KEY" },
+        .note = "GLM · 1M context · no model list: /model shows the documented ids",
+        .suggested_models = &.{ "glm-5.3", "glm-5.3-flash", "glm-5.3-flashx", "glm-5.2", "glm-4.7" },
+    },
+    .{
+        .id = "zai-coding",
+        .name = "Z.AI Coding Plan",
+        // The subscription endpoint: same chat/completions shape, quota instead
+        // of per-token billing.
+        .base_url = "https://api.z.ai/api/coding/paas/v4",
+        .models_url = "",
+        // A SEPARATE key from the API one (their guide: the two are managed
+        // apart since 2026-10-16). A plan key at the standard endpoint is a 401
+        // that says nothing about which key went to which URL, so the two rows
+        // exist instead of one row plus a footnote.
+        .key_env = &.{"ZODE_ZAI_CODING_KEY"},
+        .note = "subscription quota · key is NOT the API key",
+        .suggested_models = &.{ "glm-5.3", "glm-5.3-flash", "glm-5.2" },
+    },
+    .{
+        .id = "nvidia",
+        .name = "NVIDIA NIM",
+        .base_url = "https://integrate.api.nvidia.com/v1",
+        .models_url = "https://integrate.api.nvidia.com/v1/models",
+        .key_env = &.{ "ZODE_NVIDIA_KEY", "NVIDIA_API_KEY" },
+        .note = "hosted NIM · key from build.nvidia.com",
+        .max_output_tokens = 16384,
+        // ORDER MATTERS: `agent.resolveModel` takes the first id here that the
+        // catalog publishes. The list is not a wish list — it is the answer for
+        // a user who has not picked anything, and the first element is the model
+        // every one of them gets on the first turn.
+        //
+        // GLM-5.3 leads because it is the one verified end to end against the
+        // hosted API (streaming, `stream_options`, tool calls, `reasoning_effort`
+        // — all 200). The Nemotron/Kimi/DeepSeek rows stay as fallbacks: they are
+        // in the catalog and several accounts can use them, while a catalog
+        // entry is not a promise of access (`Function '<uuid>': Not found for
+        // account` is what a 404 looks like when it is not).
+        .preferred_models = &.{
+            "z-ai/glm-5.3",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3.5-bolt-e4b",
+            "moonshotai/kimi-k2.6",
+            "deepseek-ai/deepseek-v4.1-flash",
+            "z-ai/glm-5.3-flash",
+        },
+    },
 };
 
 pub fn byId(id: []const u8) ?*const ProviderDef {
@@ -105,16 +255,19 @@ pub fn activeDef(env: ?*const std.process.Environ.Map) *const ProviderDef {
 /// They live in memory (loaded from `~/.config/zode/auth.json` at startup and
 /// updated on save) because `keyFor` runs on every request and cannot afford to
 /// read a file from disk each time. `setup` fills it once.
-var saved_keys: ?*std.StringHashMapUnmanaged([]const u8) = null;
+/// ATOMIC because multiple threads (UI + workers) read it concurrently with
+/// the initial write in `loadAuthKeys`. In ReleaseSmall the compiler can
+/// otherwise cache the null value in a register and never see the update.
+var saved_keys: std.atomic.Value(?*std.StringHashMapUnmanaged([]const u8)) = .init(null);
 
 /// Stores the key map from `auth.json` (or null if there is none).
 pub fn setSavedKeys(map: ?*std.StringHashMapUnmanaged([]const u8)) void {
-    saved_keys = map;
+    saved_keys.store(map, .release);
 }
 
 /// Key stored by the user for this provider (without looking at the env).
 pub fn savedKeyFor(id: []const u8) ?[]const u8 {
-    const m = saved_keys orelse return null;
+    const m = saved_keys.load(.acquire) orelse return null;
     return m.get(id);
 }
 
@@ -189,6 +342,56 @@ test "keyFor: with nothing it returns null" {
     try std.testing.expect(!hasKey(def, null));
 }
 
+test "catalogAuth: anthropic authenticates with x-api-key, everyone else with the bearer" {
+    // The two styles are not interchangeable. Sending Anthropic a Bearer is a
+    // 401 that reads as "no catalogue", which is the bug this field fixes.
+    const anthropic = authWithKey(byId("anthropic").?.key_style, "sk-ant-x");
+    try std.testing.expect(anthropic.bearer == null);
+    try std.testing.expectEqualStrings("sk-ant-x", anthropic.x_api_key.?);
+
+    const openai = authWithKey(byId("openai").?.key_style, "sk-x");
+    try std.testing.expect(openai.x_api_key == null);
+    try std.testing.expectEqualStrings("sk-x", openai.bearer.?);
+
+    // No key is not an error here: the request goes out and the provider says
+    // 401, which is the honest answer for a provider nobody connected.
+    const none = authWithKey(.x_api_key, null);
+    try std.testing.expect(none.x_api_key == null);
+}
+
+test "a provider with no catalog ships the ids the picker can show" {
+    // An empty `models_url` with no suggestions is a provider the user can only
+    // reach by typing a model name from memory: the picker opens on "+ connect"
+    // and nothing else. The two fields go together.
+    for (&defs) |d| {
+        if (d.models_url.len != 0) continue;
+        if (d.suggested_models.len == 0) {
+            std.debug.print("provider {s} publishes no catalogue and suggests no models\n", .{d.id});
+            return error.TestUnexpectedResult;
+        }
+        for (d.suggested_models) |id| {
+            if (id.len == 0) return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "no provider's chat base is a models (or chat) endpoint" {
+    // `base_url` is a PREFIX: `main.zig`, `agent.zig` and `lib/provider.zig` all
+    // append `/chat/completions` to it. A base that already ends in `/models`
+    // therefore sends every request to `…/models/chat/completions`, and the
+    // failure reads as "the provider is down" — github-copilot shipped like
+    // that. HTTPS on port 443 for all of them, so the test is on the PATH only.
+    for (&defs) |d| {
+        if (std.mem.endsWith(u8, d.base_url, "/models") or
+            std.mem.endsWith(u8, d.base_url, "/chat/completions") or
+            std.mem.endsWith(u8, d.base_url, "/messages"))
+        {
+            std.debug.print("provider {s} has base_url = \"{s}\": /chat/completions is appended to it\n", .{ d.id, d.base_url });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "no built-in provider ships with a default model" {
     // The reason the field exists and is EMPTY in all of them: a model name
     // written in the code is a clockwork time bomb. When the provider retires it
@@ -204,4 +407,18 @@ test "no built-in provider ships with a default model" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "nvidia provider has correct config" {
+    const nvidia = byId("nvidia").?;
+    try std.testing.expectEqualStrings("https://integrate.api.nvidia.com/v1", nvidia.base_url);
+    try std.testing.expectEqualStrings("https://integrate.api.nvidia.com/v1/models", nvidia.models_url);
+    try std.testing.expectEqualStrings("ZODE_NVIDIA_KEY", nvidia.key_env[0]);
+    try std.testing.expectEqualStrings("NVIDIA_API_KEY", nvidia.key_env[1]);
+    try std.testing.expectEqualStrings("hosted NIM · key from build.nvidia.com", nvidia.note);
+    try std.testing.expect(nvidia.max_output_tokens == 16384);
+    try std.testing.expect(nvidia.preferred_models.len == 8);
+    // The first one is the answer for a user who picked nothing: it has to be a
+    // model that was actually verified against the hosted API.
+    try std.testing.expect(std.mem.eql(u8, nvidia.preferred_models[0], "z-ai/glm-5.3"));
 }

@@ -26,6 +26,20 @@ const std = @import("std");
 
 pub const repeat_limit: u8 = 3;
 
+/// The bounded response to a repeated tool call.
+pub const Recovery = struct {
+    nudged: bool = false,
+
+    pub const Action = enum { nudge, stop };
+
+    /// Offer one corrective prompt, then stop if the same loop returns.
+    pub fn onRepeat(self: *Recovery) Action {
+        if (self.nudged) return .stop;
+        self.nudged = true;
+        return .nudge;
+    }
+};
+
 /// Whether the repetition guard is blind to this tool.
 ///
 /// ## The criterion, and why it is not a list of conveniences
@@ -92,3 +106,39 @@ pub const Repeats = struct {
         self.* = .{};
     }
 };
+
+test "repetition recovery nudges once and then stops" {
+    var recovery: Recovery = .{};
+    try std.testing.expectEqual(Recovery.Action.nudge, recovery.onRepeat());
+    try std.testing.expectEqual(Recovery.Action.stop, recovery.onRepeat());
+}
+
+test "repeats: noteGuarded counts identical calls, resets on different" {
+    var r: Repeats = .{};
+    const args = "{\"path\":\"x\"}";
+    try std.testing.expect(r.noteGuarded("write", args) == null);
+    try std.testing.expect(r.noteGuarded("write", args) == null);
+    try std.testing.expectEqualStrings("write", r.noteGuarded("write", args).?);
+    // Different args reset
+    try std.testing.expect(r.noteGuarded("write", "{\"path\":\"y\"}") == null);
+    try std.testing.expect(r.noteGuarded("write", "{\"path\":\"y\"}") == null);
+    try std.testing.expectEqualStrings("write", r.noteGuarded("write", "{\"path\":\"y\"}").?);
+}
+
+test "repeats: reset clears state" {
+    var r: Repeats = .{};
+    const args = "{}";
+    _ = r.noteGuarded("bash", args);
+    _ = r.noteGuarded("bash", args);
+    r.reset();
+    try std.testing.expect(r.noteGuarded("bash", args) == null);
+}
+
+test "repeats: exemptions never trigger" {
+    var r: Repeats = .{};
+    for (0..5) |_| {
+        try std.testing.expect(r.noteGuarded("read", "{}") == null);
+        try std.testing.expect(r.noteGuarded("bash_output", "{}") == null);
+    }
+}
+

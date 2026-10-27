@@ -22,7 +22,14 @@
 const std = @import("std");
 
 pub const max_hits = 120;
-pub const max_files = 400;
+/// Files one search may open.
+///
+/// 2000 and not 400, and the difference matters: with `git ls-files` as the list (see
+/// `common.gitFiles`) this is a guard against a pathological tree, not a budget. At 400
+/// a repository of 500 project files answered "no declaration in the files searched"
+/// while the declaration sat in the half it never opened — which reads as "the symbol
+/// is not here", and is the worst thing a search tool can say.
+pub const max_files = 2000;
 
 pub const Kind = enum {
     definition,
@@ -53,7 +60,12 @@ pub const Result = struct {
     /// How many hits existed before the caps. A count that says 500 with 120 shown
     /// is the difference between "I looked at a bit of this" and "there are more".
     total: usize,
+    /// Too many hits to show. The search FINISHED.
     truncated: bool,
+    /// The search ran out of `max_files` and stopped mid-tree. Different from
+    /// `truncated` and it has to read differently: this one means a hit that is not in
+    /// the answer may simply never have been looked for.
+    stopped_early: bool = false,
 };
 
 /// How a symbol is DECLARED in this language.
@@ -413,6 +425,12 @@ pub fn render(arena: std.mem.Allocator, name: []const u8, res: Result) ![]const 
             if (h.kind == .definition) continue;
             try out.print(arena, "  [{s}] {s}:{d}  {s}\n", .{ h.kind.label(), h.path, h.line, h.text });
         }
+    }
+    if (res.stopped_early) {
+        // Its own sentence, because this is not "there were too many hits": the search
+        // never finished, and a reader who is told "0 hits existed" will conclude the
+        // symbol is not in the project. That is how a blind tool reads as an answer.
+        try out.print(arena, "\n(the search stopped after {d} files and did NOT finish. Narrow it with `subdir`.)", .{max_files});
     }
     if (res.truncated) {
         try out.print(arena, "\n(cut: {d} hits existed and {d} are shown. Narrow it with `subdir`, or grep for one file.)", .{ res.total, res.hits.len });

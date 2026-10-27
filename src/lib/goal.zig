@@ -312,6 +312,24 @@ pub fn blockedRetryText(gpa: std.mem.Allocator) ![]u8 {
     );
 }
 
+// The PROMPT half of the same refusal.
+//
+// `blockedRetryText` goes to the user (the history, as an error row) and this
+// one goes to the model (the next turn's `user` message). They were ONE
+// buffer, which meant two owners: `pushErrorOwned` takes ownership and so
+// does the turn loop's `owned`, and freeing it through either one left the
+// other pointing at released memory — a use-after-free in the draw, and a
+// double free at teardown. Two buffers, one refusal.
+pub fn blockedRetryPrompt() []const u8 {
+    return
+    \\That `blocked` was not accepted because this turn has not run a single
+    \\tool yet, so there is no evidence for it. Do the obvious first thing now:
+    \\read the file, run the command, search for the answer. If it is genuinely
+    \\still impossible, call `goal` again with status blocked and
+    \\what_would_unblock, and that one will be accepted.
+    ;
+}
+
 test "a `blocked` with nothing behind it is sent back once, then accepted" {
     // The failure this pins: `what_would_unblock` is a field the model FILLS IN, so
     // "the network is down" was as acceptable as "here is the key", and a model that
@@ -374,6 +392,33 @@ test "the retry text gives an instruction, not a dead end" {
     try std_test.expect(std.mem.indexOf(u8, text, "call `goal` with status blocked again") != null);
     // And it promises the second one lands, so the model can trust the way out.
     try std_test.expect(std.mem.indexOf(u8, text, "it will be accepted") != null);
+}
+
+test "the refusal and the prompt are TWO buffers, because there are two owners" {
+    // The crash: `blockedRetryText` was ONE allocation handed to BOTH
+    // `pushErrorOwned` (which takes ownership — the drain moves the pointer
+    // into `paras` and `Model.deinit` frees it) AND the turn loop's `owned`
+    // (which frees the previous prompt through it). One buffer, two owners: a
+    // use-after-free while the UI painted the paragraph, and a double free at
+    // teardown.
+    //
+    // The two halves say different things to different readers, which is why
+    // they cannot be one string again: the text is what the USER sees in the
+    // history, the prompt is what the MODEL reads as the next turn's message.
+    const text = try blockedRetryText(std_test.allocator);
+    defer std_test.allocator.free(text);
+
+    // The prompt is a plain `[]const u8` and NOT heap: it is a static string,
+    // so it can never be freed by the loop that owns `owned`. That is the
+    // property that makes one owner safe. (`pushInfoOwned` on a literal is the
+    // "Invalid free" this repo has paid for repeatedly.)
+    const prompt = blockedRetryPrompt();
+    try std_test.expect(prompt.len > 0);
+
+    // It is an instruction, and it keeps the way out open.
+    try std_test.expect(std.mem.indexOf(u8, prompt, "read the file") != null);
+    try std_test.expect(std.mem.indexOf(u8, prompt, "what_would_unblock") != null);
+    try std_test.expect(std.mem.indexOf(u8, prompt, "will be accepted") != null);
 }
 
 test "the refusal counter is not the checkpoint counter" {

@@ -70,6 +70,19 @@ pub fn main(init: std.process.Init) !u8 {
     const rp = try tools.execute(init.io, "read", "{\"paths\":[\"src/cache_stats.zig\",\"src/compaction.zig\"]}", arena, null, null);
     try out.interface.print("READ-PATHS: {d} bytes, {d} file(s)\n", .{ rp.len, std.mem.count(u8, rp, "\n--- ") + 1 });
 
+    // The batch: FOUR files, ONE call, on this repository. The point of the
+    // tool is the round trip it saves, and the log is where that saving is
+    // said out loud.
+    const bt = try tools.execute(init.io, "batch",
+        \\{"steps":[
+        \\ {"op":"read_many","paths":["src/cache_stats.zig","src/compaction.zig","src/session.zig","src/config.zig"]},
+        \\ {"op":"map","field":"lines"},
+        \\ {"op":"select","fields":["path","lines"]},
+        \\ {"op":"count"}
+        \\]}
+    , arena, null, null);
+    try out.interface.print("BATCH:\n{s}\n", .{bt});
+
     try out.interface.flush();
     return 0;
 }

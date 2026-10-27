@@ -87,9 +87,14 @@ pub fn contextLimitFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64
 pub fn estimateTokens(msgs: []const chat.ChatMessage) i64 {
     var total: i64 = 0;
     for (msgs) |m| {
-        total += @intCast(m.content.len / 4 + 4);
-        if (m.tool_calls_json) |tj| total += @intCast(tj.len / 4 + 8);
+        total += messageTokens(m);
     }
+    return total;
+}
+
+fn messageTokens(m: chat.ChatMessage) i64 {
+    var total: i64 = @intCast(m.content.len / 4 + 4);
+    if (m.tool_calls_json) |tj| total += @intCast(tj.len / 4 + 8);
     return total;
 }
 
@@ -212,18 +217,21 @@ pub fn elideTier(
     const window = recentWindow(env);
     const protect_from: usize = if (out.len > window) out.len - window else 0;
 
+    var estimated = estimateTokens(out);
     var i: usize = 1; // skip system
     while (i < protect_from) : (i += 1) {
-        if (estimateTokens(out) <= budget) break;
+        if (estimated <= budget) break;
         const m = &out[i];
         if (!std.mem.eql(u8, m.role, "tool")) continue;
         if (m.content.len < 256) continue; // not worth it
+        const before = messageTokens(m.*);
         const marker = try std.fmt.allocPrint(
             arena,
             "[tool result elided: {d} bytes — re-run the tool if you need it]",
             .{m.content.len},
         );
         m.content = marker;
+        estimated -= before - messageTokens(m.*);
         elided += 1;
         try elided_at.append(arena, i);
     }
@@ -234,7 +242,7 @@ pub fn elideTier(
     // call sites that would each have to remember. A mode of `elide` still returns
     // the elided view (it is free and it is what keeps the prefix cacheable); it
     // just never spends a request to go further.
-    if (estimateTokens(out) > budget and compaction_mode == .full) {
+    if (estimated > budget and compaction_mode == .full) {
         res.needs_summary = true;
         // Suggest summarizing everything after system and before the window.
         res.summary_upto = protect_from;
@@ -252,25 +260,90 @@ pub fn nothingElided(msgs: []chat.ChatMessage) Compacted {
     return .{ .msgs = msgs };
 }
 
-/// Builds the summarize prompt for tier 2 (caller sends it to the LLM).
+const summary_input_limit: usize = 16 * 1024;
+const summary_message_limit: usize = 2 * 1024;
+const summary_header =
+    \\Summarize this portion of a coding session for a future agent in compact bullets (under 250 words).
+    \\Preserve the user's goal, decisions, exact file paths, useful tool findings, and unfinished work.
+    \\Separate confirmed facts from uncertainty. Do not invent missing details.
+    \\Assistant tool calls may be included as JSON.
+    \\
+    \\CONVERSATION:
+    \\
+;
+const summary_omitted = "\n[older middle messages omitted to fit the summary budget]\n";
+
+const SummaryPart = struct {
+    content_len: usize,
+    calls_len: usize,
+};
+
+fn safePrefixLen(text: []const u8, limit: usize) usize {
+    var end = @min(text.len, limit);
+    while (end > 0 and end < text.len and (text[end] & 0xC0) == 0x80) end -= 1;
+    return end;
+}
+
+fn summaryPart(m: chat.ChatMessage) SummaryPart {
+    const calls = m.tool_calls_json orelse return .{
+        .content_len = safePrefixLen(m.content, summary_message_limit),
+        .calls_len = 0,
+    };
+    const calls_reserve = @min(calls.len, 512);
+    const content_len = safePrefixLen(m.content, summary_message_limit - calls_reserve);
+    const calls_len = safePrefixLen(calls, summary_message_limit - content_len);
+    return .{ .content_len = content_len, .calls_len = calls_len };
+}
+
+fn summaryRecordBytes(m: chat.ChatMessage) usize {
+    const part = summaryPart(m);
+    return "[".len + m.role.len + "] ".len + part.content_len + "\n".len +
+        (if (m.tool_calls_json != null) "tool_calls: ".len + part.calls_len + "\n".len else 0) +
+        (if (part.content_len < m.content.len) " [content clipped]".len else 0) +
+        (if (m.tool_calls_json) |calls| if (part.calls_len < calls.len) " [tool calls clipped]".len else 0 else 0);
+}
+
+fn appendSummaryRecord(out: *std.ArrayList(u8), arena: std.mem.Allocator, m: chat.ChatMessage) !void {
+    const part = summaryPart(m);
+    try out.appendSlice(arena, "[");
+    try out.appendSlice(arena, m.role);
+    try out.appendSlice(arena, "] ");
+    try out.appendSlice(arena, m.content[0..part.content_len]);
+    if (part.content_len < m.content.len) try out.appendSlice(arena, " [content clipped]");
+    try out.append(arena, '\n');
+    if (m.tool_calls_json) |calls| {
+        try out.appendSlice(arena, "tool_calls: ");
+        try out.appendSlice(arena, calls[0..part.calls_len]);
+        if (part.calls_len < calls.len) try out.appendSlice(arena, " [tool calls clipped]");
+        try out.append(arena, '\n');
+    }
+}
+
+/// Builds a bounded summary prompt, preserving the start and newest messages.
 pub fn summaryPrompt(arena: std.mem.Allocator, msgs: []const chat.ChatMessage) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena,
-        \\Summarize this portion of a coding session for a future agent.
-        \\Focus on: user goals, decisions made, files touched (paths), tool
-        \\results that still matter, and pending work. Be terse (under 300
-        \\words). Output only the summary.
-        \\
-        \\CONVERSATION:
-        \\
-    );
-    for (msgs) |m| {
-        try out.appendSlice(arena, "[");
-        try out.appendSlice(arena, m.role);
-        try out.appendSlice(arena, "] ");
-        try out.appendSlice(arena, m.content[0..@min(m.content.len, 2000)]);
-        try out.appendSlice(arena, "\n");
+    try out.appendSlice(arena, summary_header);
+    const prefix_end = @min(msgs.len, 2);
+    var used = summary_header.len;
+    for (msgs[0..prefix_end]) |m| used += summaryRecordBytes(m);
+
+    var suffix_start = msgs.len;
+    if (msgs.len > prefix_end) {
+        used += summary_omitted.len;
+        while (suffix_start > prefix_end) {
+            const record_bytes = summaryRecordBytes(msgs[suffix_start - 1]);
+            if (record_bytes > summary_input_limit - used) break;
+            used += record_bytes;
+            suffix_start -= 1;
+        }
     }
+
+    for (msgs[0..prefix_end]) |m| try appendSummaryRecord(&out, arena, m);
+    if (suffix_start > prefix_end) {
+        try out.appendSlice(arena, summary_omitted);
+        for (msgs[suffix_start..]) |m| try appendSummaryRecord(&out, arena, m);
+    }
+
     return out.items;
 }
 
@@ -285,8 +358,42 @@ test "summaryPrompt includes the roles and truncates long messages" {
     const p = try summaryPrompt(arena, &msgs);
     try std.testing.expect(std.mem.indexOf(u8, p, "[user] hola") != null);
     try std.testing.expect(std.mem.indexOf(u8, p, "[tool] ") != null);
-    // Every message is truncated to 2000 chars.
-    try std.testing.expect(p.len < 6000);
+    try std.testing.expect(p.len <= summary_input_limit);
+    try std.testing.expect(std.mem.indexOf(u8, p, "[content clipped]") != null);
+}
+
+test "summaryPrompt is globally bounded and keeps the task start and latest work" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const msgs = try arena.alloc(chat.ChatMessage, 40);
+    msgs[0] = .{ .role = "user", .content = "original task goal" };
+    for (1..39) |i| {
+        msgs[i] = .{ .role = "tool", .content = "x" ** 5000 };
+    }
+    msgs[39] = .{
+        .role = "assistant",
+        .content = "pending final verification",
+        .tool_calls_json = "{\"name\":\"check\"}",
+    };
+
+    const prompt = try summaryPrompt(arena, msgs);
+    try std.testing.expect(prompt.len <= summary_input_limit);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "original task goal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "pending final verification") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "tool_calls: {\"name\":\"check\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "messages omitted") != null);
+}
+
+test "summaryPrompt truncates only at UTF-8 boundaries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const content = try std.mem.concat(arena, u8, &.{ "a" ** 2047, "é", "tail" });
+    const msgs = [_]chat.ChatMessage{.{ .role = "user", .content = content }};
+    const prompt = try summaryPrompt(arena, &msgs);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(prompt));
 }
 
 test "estimate tokens" {
@@ -318,6 +425,7 @@ test "elide shrinks the tool dumps but protects the recent ones" {
     const res = try elideTier(arena, msgs, @divTrunc(before, 4), null, .full); // very low budget
     try std.testing.expect(res.elided > 0);
     try std.testing.expect(estimateTokens(res.msgs) < before);
+    try std.testing.expectEqual(estimateTokens(res.msgs) > @divTrunc(before, 4), res.needs_summary);
 
     // The last ones (recent_window) were NOT elided. With an assistant(odd)/tool(even)
     // alternation, the last even index (len-2) is a tool.
@@ -340,6 +448,7 @@ test "no summary needed when eliding is enough" {
     }
     const res = try elideTier(arena, msgs, 9000, null, .full);
     try std.testing.expect(!res.needs_summary);
+    try std.testing.expect(estimateTokens(res.msgs) <= 9000);
     try std.testing.expect(res.elided > 0);
 }
 

@@ -36,6 +36,15 @@ pub const Effort = enum {
     high,
     /// Above `high`. Only some models take it (OpenAI gpt-5.1+, OpenRouter).
     xhigh,
+    /// The same rung as `xhigh` under the name Z.AI uses for its top level
+    /// (`reasoning_effort: "max"`, which is also its default).
+    ///
+    /// It is a member of its own and not `xhigh` renamed because the WORD is the
+    /// contract: a model that only knows `max` answers 400 to `xhigh`, and the
+    /// other way around. No ladder in `effortSupport` offers it yet, so asking
+    /// for it lands on the model's top rung and `"max"` never reaches a provider
+    /// that did not ask for it.
+    max,
 
     pub fn parse(s: []const u8) ?Effort {
         const eq = std.ascii.eqlIgnoreCase;
@@ -44,7 +53,8 @@ pub const Effort = enum {
         if (eq(s, "low")) return .low;
         if (eq(s, "medium") or eq(s, "med")) return .medium;
         if (eq(s, "high")) return .high;
-        if (eq(s, "xhigh") or eq(s, "max")) return .xhigh;
+        if (eq(s, "xhigh")) return .xhigh;
+        if (eq(s, "max")) return .max;
         return null;
     }
 
@@ -62,6 +72,7 @@ pub const Effort = enum {
             .medium => .low,
             .high => .medium,
             .xhigh => .high,
+            .max => .xhigh,
         };
     }
 
@@ -77,6 +88,7 @@ pub const Effort = enum {
             .medium => 32768,
             .high => 65536,
             .xhigh => 65536,
+            .max => 65536,
         };
     }
 
@@ -91,6 +103,7 @@ pub const Effort = enum {
             .medium => 8192,
             .high => 16384,
             .xhigh => 24576,
+            .max => 24576,
         };
     }
 };
@@ -186,6 +199,14 @@ pub const EffortSupport = enum {
     /// `medium` would receive `medium` for being the middle rung of a ladder
     /// that nobody looked up.
     no_medium,
+    /// `low | high | max`. The Z.AI GLM-5.2/5.3 family (docs: `reasoning_effort`
+    /// takes exactly `low`, `high` and `max`, default `max`, and for GLM-5.3 any
+    /// OTHER value is an error, not a degradation).
+    ///
+    /// It is the only ladder whose TOP is called `max` instead of `xhigh`, and
+    /// the only one where "do not think" has to come out as `low` because
+    /// `thinking.type = disabled` is refused by GLM-5.3/5.3-FLASH.
+    low_high_max,
 };
 
 pub fn effortSupport(model: []const u8) EffortSupport {
@@ -206,6 +227,10 @@ pub fn effortSupport(model: []const u8) EffortSupport {
     // they take, and `medium` is the only level that could surprise us (it is
     // documented as unsupported on 3-pro-preview), so that one degrades high.
     if (containsAny(model, &.{"gemini"})) return .basic;
+    // Z.AI's GLM-5.2 and 5.3. `reasoning_effort` only exists from 5.2 up (their
+    // Deep Thinking page: "supported by GLM-5.2 and above"), so 5/5.1/4.7 stay
+    // in `.none`: no field at all, and the model uses its own default.
+    if (containsAny(model, &.{ "glm-5.3", "glm-5.2" })) return .low_high_max;
     if (containsAny(model, &.{ "gpt-5", "gpt5", "o3", "o4", "o1" })) return .basic;
     return .none;
 }
@@ -226,28 +251,43 @@ pub fn effortFor(model: []const u8, want: Effort) ?Effort {
         .basic => switch (want) {
             .none, .minimal, .low => .low,
             .medium => .medium,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
         },
         .gpt51 => switch (want) {
             .none => .none,
             .minimal => .minimal,
             .low => .low,
             .medium => .medium,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
         },
-        .codex_max => want,
+        // OpenAI's vocabulary tops at `xhigh`: sending it the word `max` is a
+        // 400, so the wish for "more than high" lands on the rung it does have.
+        .codex_max => switch (want) {
+            .max => .xhigh,
+            else => want,
+        },
         // Gemini has no `none`: its floor is `minimal`.
         .gemini3_minimal => switch (want) {
             .none, .minimal => .minimal,
             .low => .low,
             .medium => .medium,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
         },
         // No `medium`: degrade towards `low` (the requested level is more than
         // the model can do, and `low` is the nearest one below it).
         .no_medium => switch (want) {
             .none, .minimal, .low, .medium => .low,
-            .high, .xhigh => .high,
+            .high, .xhigh, .max => .high,
+        },
+        // Three rungs, and the top one is SPELLED `max`. "Do not think" lands on
+        // `low` because `thinking.type: disabled` is an error on GLM-5.3 (their
+        // migration note says exactly this: turn `disabled` into `low`). Asking
+        // for more than `high` is `max`, because `xhigh` is not a word this
+        // family knows.
+        .low_high_max => switch (want) {
+            .none, .minimal, .low => .low,
+            .medium, .high => .high,
+            .xhigh, .max => .max,
         },
     };
 }
@@ -269,6 +309,7 @@ pub fn reasoningEffortString(model: []const u8, want: Effort) ?[]const u8 {
         .medium => "medium",
         .high => "high",
         .xhigh => "xhigh",
+        .max => "max",
     };
 }
 
@@ -281,6 +322,7 @@ pub fn maxEffortFor(model: []const u8) Effort {
     return switch (effortSupport(model)) {
         .none, .basic, .gpt51, .gemini3_minimal, .no_medium => .high,
         .codex_max => .xhigh,
+        .low_high_max => .max,
     };
 }
 
@@ -297,6 +339,7 @@ pub fn effortLevels(model: []const u8) []const Effort {
         .codex_max => &.{ .none, .minimal, .low, .medium, .high, .xhigh },
         .gemini3_minimal => &.{ .minimal, .low, .medium, .high },
         .no_medium => &.{ .low, .high },
+        .low_high_max => &.{ .low, .high, .max },
     };
 }
 
@@ -456,24 +499,48 @@ pub var main_err: ErrBuf = .{};
 
 fn setServerMessageRaw(out: *ErrBuf, body: []const u8) void {
     out.len = 0;
+    // Try "message" first (OpenAI, Anthropic, OpenRouter, etc.)
     const key = "\"message\"";
-    const at = std.mem.indexOf(u8, body, key) orelse return;
-    var i = at + key.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':')) i += 1;
-    if (i >= body.len or body[i] != '"') return;
-    i += 1;
-
-    var n: usize = 0;
-    while (i < body.len and body[i] != '"') : (i += 1) {
-        // Only the backslash and the quote are unescaped: a nested \uXXXX is
-        // not worth it, and this is error text, not content.
-        if (body[i] == '\\' and i + 1 < body.len) i += 1;
-        if (n + 1 >= out.buf.len) break;
-        out.buf[n] = body[i];
-        n += 1;
+    var at = std.mem.indexOf(u8, body, key);
+    if (at) |pos| {
+        var i = pos + key.len;
+        while (i < body.len and (body[i] == ' ' or body[i] == ':')) i += 1;
+        if (i < body.len and body[i] == '"') {
+            i += 1;
+            var n: usize = 0;
+            while (i < body.len and body[i] != '"') : (i += 1) {
+                if (body[i] == '\\' and i + 1 < body.len) i += 1;
+                if (n + 1 >= out.buf.len) break;
+                out.buf[n] = body[i];
+                n += 1;
+            }
+            if (n > 0) {
+                out.len = n;
+                return;
+            }
+        }
     }
-    if (n == 0) return;
-    out.len = n;
+    // Fallback: "detail" (NVIDIA NIM uses problem+json with "detail" field)
+    const detail_key = "\"detail\"";
+    at = std.mem.indexOf(u8, body, detail_key);
+    if (at) |pos| {
+        var i = pos + detail_key.len;
+        while (i < body.len and (body[i] == ' ' or body[i] == ':')) i += 1;
+        if (i < body.len and body[i] == '"') {
+            i += 1;
+            var n: usize = 0;
+            while (i < body.len and body[i] != '"') : (i += 1) {
+                if (body[i] == '\\' and i + 1 < body.len) i += 1;
+                if (n + 1 >= out.buf.len) break;
+                out.buf[n] = body[i];
+                n += 1;
+            }
+            if (n > 0) {
+                out.len = n;
+                return;
+            }
+        }
+    }
 }
 
 /// How many bytes of the last error message are valid.
@@ -547,6 +614,10 @@ pub var last_usage: Usage = .{};
 // ── layer 1: internal stream events ──────────────────────────
 const Event = union(enum) {
     delta: []const u8,
+    /// Reasoning text (`reasoning_content` on OpenAI-compatible gateways,
+    /// `thinking_delta` on Anthropic). It is BUFFERED, not shown: the only use is
+    /// the fallback at the end of the stream (see `StreamCtx.finish`).
+    reasoning: []const u8,
     /// Tool call fragment (indexed, arrives incrementally).
     tool_frag: struct {
         index: usize,
@@ -696,6 +767,12 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
                     }
                     return;
                 }
+                if (std.mem.eql(u8, dt.string, "thinking_delta")) {
+                    if (d.object.get("thinking")) |v| {
+                        if (v == .string and v.string.len > 0) dispatch(userdata, .{ .reasoning = v.string });
+                    }
+                    return;
+                }
                 if (std.mem.eql(u8, dt.string, "input_json_delta")) {
                     if (d.object.get("partial_json")) |v| {
                         if (v == .string and v.string.len > 0) {
@@ -777,10 +854,20 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
         }
     }
 
-    const content = delta.object.get("content") orelse return;
-    if (content != .string) return;
-    if (content.string.len == 0) return;
-    dispatch(userdata, .{ .delta = content.string });
+    const content = delta.object.get("content");
+    if (content) |c| {
+        if (c == .string and c.string.len > 0) {
+            dispatch(userdata, .{ .delta = c.string });
+            return;
+        }
+    }
+    // `content` empty or null and the text is in `reasoning_content`: NVIDIA NIM
+    // does this on some reasoning models (the final answer arrives there with
+    // `content: null`). It is BUFFERED and only used if no `content` ever came;
+    // see `StreamCtx.finish`.
+    if (delta.object.get("reasoning_content")) |rc| {
+        if (rc == .string and rc.string.len > 0) dispatch(userdata, .{ .reasoning = rc.string });
+    }
 }
 
 // ── layer 2: StreamCtx (tool_call accumulation, de-dup) ───────
@@ -796,6 +883,15 @@ pub const StreamCtx = struct {
     saw_done: bool = false,
     /// The request was cut short with ESC: there is partial text, and it is kept.
     partial: bool = false,
+    /// Reasoning text seen on this stream, and whether any real `content` did.
+    ///
+    /// The pair is the fallback for providers that put the visible answer in
+    /// `reasoning_content` with `content: null` (NVIDIA NIM does this on some
+    /// reasoning models). Emitting it AS IT ARRIVES would duplicate the answer
+    /// on every model that streams both, so it is buffered here and released
+    /// only at the end, when nothing else was ever said.
+    thinking: std.ArrayList(u8) = .empty,
+    content_seen: bool = false,
     /// First bytes of the response body. On a 200 that is the SSE preamble
     /// (never read), but on a 4xx/5xx it is the server's error JSON, which is
     /// the only thing that explains the failure ("Insufficient account funds",
@@ -849,6 +945,7 @@ pub const StreamCtx = struct {
         }
         self.parts.deinit(self.gpa);
         self.line_buf.deinit(self.gpa);
+        self.thinking.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -875,6 +972,14 @@ pub const StreamCtx = struct {
         if (self.line_buf.items.len > 0) {
             try self.handleLine(self.line_buf.items);
             self.line_buf.clearRetainingCapacity();
+        }
+        // The reasoning fallback (see the `thinking` field). Only when NOTHING
+        // else was said: a model that thought and then called a tool said what
+        // it had to say with the call, and pasting its reasoning in front of the
+        // call would put the same paragraph in the history on every turn.
+        if (!self.content_seen and self.thinking.items.len > 0 and self.parts.items.len == 0) {
+            self.user.onDelta(self.user.userdata, self.thinking.items);
+            self.content_seen = true; // `finish` can be called twice; say it once
         }
     }
 
@@ -944,7 +1049,11 @@ pub const StreamCtx = struct {
                 if (self.mirror_globals) last_usage = self.usage;
                 if (u.cache_write > 0) last_usage.cache_write = u.cache_write;
             },
-            .delta => |d| self.user.onDelta(self.user.userdata, d),
+            .delta => |d| {
+                self.content_seen = true;
+                self.user.onDelta(self.user.userdata, d);
+            },
+            .reasoning => |t| self.thinking.appendSlice(self.gpa, t) catch {},
             .finish => |r| {
                 self.finish_count += 1;
                 // Only the first finish matters; servers sometimes
@@ -1044,6 +1153,7 @@ pub fn streamChatCtx(
     user_cb: Callbacks,
     kind: ProviderKind,
     mirror_globals: bool,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !StreamResult {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = user_cb, .kind = kind, .mirror_globals = mirror_globals };
@@ -1052,7 +1162,7 @@ pub fn streamChatCtx(
     // `destroy` is the one that frees them; a plain `gpa.destroy(ctx)` without
     // it leaked both on every 429/5xx.
     errdefer ctx.destroy();
-    try streamRaw(gpa, http, url, bearer, body, ctx);
+    try streamRaw(gpa, http, url, bearer, body, ctx, extra_headers);
     return .{ .ctx = ctx, .partial = ctx.partial };
 }
 
@@ -1063,6 +1173,7 @@ fn streamRaw(
     bearer: ?[]const u8,
     body: []u8,
     ctx: *StreamCtx,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !void {
     _ = gpa; // the parser lives in the ctx (line_buf)
     // Fresh per request: do not carry over fields from the previous turn.
@@ -1084,7 +1195,8 @@ fn streamRaw(
     }
 
     const Hdr = http_client.Http.ExtraHeader;
-    var hdrs_buf: [2]Hdr = undefined;
+    // Capacity: 2 for Anthropic (x-api-key, anthropic-version) + extra_headers
+    var hdrs_buf: [8]Hdr = undefined;
     var n: usize = 0;
     // Anthropic does not use Bearer: x-api-key + API version.
     var auth: ?[]const u8 = bearer;
@@ -1096,6 +1208,12 @@ fn streamRaw(
         hdrs_buf[n] = .{ .name = "anthropic-version", .value = "2023-06-01" };
         n += 1;
         auth = null;
+    }
+    // Append any extra headers (e.g., OpenRouter's HTTP-Referer, X-OpenRouter-Title)
+    for (extra_headers) |h| {
+        if (n >= hdrs_buf.len) break;
+        hdrs_buf[n] = h;
+        n += 1;
     }
 
     const Feed = struct {
@@ -1126,11 +1244,13 @@ fn streamRaw(
         }
         // Each status gets its own error because the ACTION to take differs,
         // and "HTTP 403" says nothing:
-        //   400  bad request    -> do not retry (repeating it does not fix it)
-        //   401  invalid key    -> do not retry, check the key
-        //   402  no credits     -> do not retry (it used to retry 3 times!)
-        //   403  access denied  -> almost always the MODEL, not the key
-        //   429/503 transient   -> retry
+        //   400  bad request          -> do not retry (repeating it does not fix it)
+        //   401  invalid key          -> do not retry, check the key
+        //   402  no credits           -> do not retry (it used to retry 3 times!)
+        //   403  access denied        -> almost always the MODEL, not the key
+        //   410  gone (model retired) -> do not retry, model removed
+        //   422  unprocessable entity -> do not retry, validation error
+        //   429/503 transient         -> retry
         const err: anyerror = switch (res.status) {
             429 => error.RateLimited,
             503 => error.Overloaded,
@@ -1141,6 +1261,10 @@ fn streamRaw(
             // account does not have it)". Retrying 3 times is waiting for
             // nothing.
             404 => error.ModelNotFound,
+            // 410: model retired (NVIDIA NIM returns this with a detail message).
+            410 => error.ModelNotFound,
+            // 422: validation error (NVIDIA NIM returns this for unsupported params).
+            422 => error.BadRequest,
             // 400: the REQUEST is wrong. Retrying the same thing 3 times is
             // 3.5 s of clock and a turn that looks hung. With free-auto on,
             // `noteTurnFailure` drops that pair so the next turn starts
@@ -1228,11 +1352,12 @@ pub fn streamChat(
     cb: Callbacks,
     kind: ProviderKind,
     mirror_globals: bool,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !void {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind, .mirror_globals = mirror_globals };
     defer ctx.destroy(); // frees parts and destroys the struct
-    try streamRaw(gpa, http, url, bearer, body, ctx);
+    try streamRaw(gpa, http, url, bearer, body, ctx, extra_headers);
 }
 
 /// `streamChat`, but the server's own error text comes back in a buffer the
@@ -1256,11 +1381,12 @@ pub fn streamChatDetail(
     kind: ProviderKind,
     mirror_globals: bool,
     err_out: *ErrBuf,
+    extra_headers: []const http_client.Http.ExtraHeader,
 ) !void {
     const ctx = try gpa.create(StreamCtx);
     ctx.* = .{ .gpa = gpa, .user = cb, .kind = kind, .mirror_globals = mirror_globals };
     defer ctx.destroy();
-    streamRaw(gpa, http, url, bearer, body, ctx) catch |err| {
+    streamRaw(gpa, http, url, bearer, body, ctx, extra_headers) catch |err| {
         err_out.* = ctx.err; // ErrBuf is a fixed-size struct: nothing to free here
         return err;
     };
@@ -1277,9 +1403,23 @@ pub fn buildBodyMessages(
     tools_json: []const u8,
     kind: ProviderKind,
 ) ![]u8 {
+    return buildBodyMessagesCapped(buf, model, messages, effort, tools_json, kind, 0);
+}
+
+/// Same as `buildBodyMessages` but clamps the output ceiling to `max_output_tokens`
+/// when non-zero. 0 = no cap (use effort's outputCeiling).
+pub fn buildBodyMessagesCapped(
+    buf: []u8,
+    model: []const u8,
+    messages: []const ChatMessage,
+    effort: Effort,
+    tools_json: []const u8,
+    kind: ProviderKind,
+    max_output_tokens: u32,
+) ![]u8 {
     return switch (kind) {
-        .openai => buildBodyOpenAI(buf, model, messages, effort, tools_json),
-        .anthropic => buildBodyAnthropic(buf, model, messages, effort, tools_json),
+        .openai => buildBodyOpenAICapped(buf, model, messages, effort, tools_json, max_output_tokens),
+        .anthropic => buildBodyAnthropicCapped(buf, model, messages, effort, tools_json, max_output_tokens),
     };
 }
 
@@ -1290,6 +1430,18 @@ fn buildBodyOpenAI(
     messages: []const ChatMessage,
     effort: Effort,
     tools_json: []const u8,
+) ![]u8 {
+    return buildBodyOpenAICapped(buf, model, messages, effort, tools_json, 0);
+}
+
+/// OpenAI format with optional output token cap.
+fn buildBodyOpenAICapped(
+    buf: []u8,
+    model: []const u8,
+    messages: []const ChatMessage,
+    effort: Effort,
+    tools_json: []const u8,
+    max_output_tokens: u32,
 ) ![]u8 {
     var w: std.Io.Writer = .fixed(buf);
     try w.writeAll("{\"model\":\"");
@@ -1369,14 +1521,15 @@ fn buildBodyOpenAI(
     // `max_completion_tokens`) and do not accept `temperature`. Sending the
     // wrong field is an instant 400, so branch by family.
     const fam = familyForModel(model);
+    const ceiling = if (max_output_tokens != 0) @min(effort.outputCeiling(), max_output_tokens) else effort.outputCeiling();
     switch (fam) {
         .openai_reasoning => {
             try w.writeAll(",\"max_completion_tokens\":");
-            try w.print("{d}", .{effort.outputCeiling()});
+            try w.print("{d}", .{ceiling});
         },
         else => {
             try w.writeAll(",\"max_tokens\":");
-            try w.print("{d}", .{effort.outputCeiling()});
+            try w.print("{d}", .{ceiling});
         },
     }
 
@@ -1394,7 +1547,7 @@ pub fn buildBody(buf: []u8, model: []const u8, user_text: []const u8, effort: Ef
 
 /// Anthropic Messages API format:
 ///  - system and tools go at root level, with `cache_control` breakpoints
-///    (Claude Code style prompt caching: the stable prefix —tools+system+
+///    (prompt caching as other harnesses do it: the stable prefix —tools+system+
 ///    history— is served from the server's cache between turns).
 ///  - assistant.tool_calls (OpenAI format) → `tool_use` blocks.
 ///  - runs of role=tool messages → ONE user message with `tool_result` blocks.
@@ -1404,6 +1557,17 @@ fn buildBodyAnthropic(
     messages: []const ChatMessage,
     effort: Effort,
     tools_json: []const u8,
+) ![]u8 {
+    return buildBodyAnthropicCapped(buf, model, messages, effort, tools_json, 0);
+}
+
+fn buildBodyAnthropicCapped(
+    buf: []u8,
+    model: []const u8,
+    messages: []const ChatMessage,
+    effort: Effort,
+    tools_json: []const u8,
+    max_output_tokens: u32,
 ) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -1420,7 +1584,7 @@ fn buildBodyAnthropic(
     // budget on a small ceiling), so the clamp lives HERE and not in the caller:
     // this is the one place that knows the two numbers go out in the same
     // request, and a 400 here is invisible until a turn dies mid-stream.
-    const ceiling = effort.outputCeiling();
+    const ceiling = if (max_output_tokens != 0) @min(effort.outputCeiling(), max_output_tokens) else effort.outputCeiling();
     const want_budget = effort.thinkingBudget();
     const think_budget: u32 = if (want_budget == 0) 0 else @min(want_budget, ceiling -| 1);
     try w.print("\",\"max_tokens\":{d},\"stream\":true", .{ceiling});
@@ -1602,7 +1766,6 @@ fn buildBodyAnthropic(
     try w.writeAll("]}");
     return w.buffered();
 }
-
 /// Serializes std.json.Value to compact JSON (own subset, without depending on
 /// std's stringify API).
 fn writeJsonValue(w: *std.Io.Writer, v: std.json.Value) !void {
@@ -1689,6 +1852,104 @@ test "scanSse joins deltas and ends on [DONE]" {
 
     try scanSse(std.testing.allocator, sse, ctx);
     try std.testing.expectEqualStrings("Hola mundo", col.text.items);
+}
+
+test "scanSse: a reasoning-only answer is delivered instead of nothing (NVIDIA NIM)" {
+    // Some NIM reasoning models put the visible text in `reasoning_content`
+    // with `content: null`. Without the fallback the turn ends with an empty
+    // answer and no error, which is the worst failure shape: it looks like the
+    // model had nothing to say.
+    const sse =
+        "data: {\"choices\":[{\"delta\":{\"content\":null,\"reasoning_content\":\"La \"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"respuesta\"}}]}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    const Collector = struct {
+        text: std.ArrayList(u8) = .empty,
+        fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            self.text.appendSlice(std.testing.allocator, delta) catch {};
+        }
+    };
+    var col = Collector{};
+    defer col.text.deinit(std.testing.allocator);
+
+    const ctx = try std.testing.allocator.create(StreamCtx);
+    ctx.* = .{
+        .gpa = std.testing.allocator,
+        .user = .{ .userdata = &col, .onDelta = Collector.onDelta },
+    };
+    defer ctx.destroy();
+
+    try scanSse(std.testing.allocator, sse, ctx);
+    try std.testing.expectEqualStrings("La respuesta", col.text.items);
+}
+
+test "scanSse: reasoning is NOT duplicated when a real content answer arrives" {
+    const sse =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking...\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\"the answer\"}}]}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    const Collector = struct {
+        text: std.ArrayList(u8) = .empty,
+        fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            self.text.appendSlice(std.testing.allocator, delta) catch {};
+        }
+    };
+    var col = Collector{};
+    defer col.text.deinit(std.testing.allocator);
+
+    const ctx = try std.testing.allocator.create(StreamCtx);
+    ctx.* = .{
+        .gpa = std.testing.allocator,
+        .user = .{ .userdata = &col, .onDelta = Collector.onDelta },
+    };
+    defer ctx.destroy();
+
+    try scanSse(std.testing.allocator, sse, ctx);
+    try std.testing.expectEqualStrings("the answer", col.text.items);
+}
+
+test "scanSse: reasoning is NOT pasted in front of a tool call" {
+    // A reasoning model that thinks and then calls a tool said what it had to
+    // say with the call, and the reasoning is not the answer: it also must not
+    // become the assistant message the next turn re-sends.
+    const sse =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"I should read the file.\"}}]}\n" ++
+        "\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a\\\"}\"}}]}}]}\n" ++
+        "\n" ++
+        "data: [DONE]\n" ++
+        "\n";
+
+    const Collector = struct {
+        text: std.ArrayList(u8) = .empty,
+        fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            self.text.appendSlice(std.testing.allocator, delta) catch {};
+        }
+    };
+    var col = Collector{};
+    defer col.text.deinit(std.testing.allocator);
+
+    const ctx = try std.testing.allocator.create(StreamCtx);
+    ctx.* = .{
+        .gpa = std.testing.allocator,
+        .user = .{ .userdata = &col, .onDelta = Collector.onDelta },
+    };
+    defer ctx.destroy();
+
+    try scanSse(std.testing.allocator, sse, ctx);
+    try std.testing.expectEqual(@as(usize, 0), col.text.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.parts.items.len);
 }
 
 test "a fragmented tool_call accumulates and is emitted once" {
@@ -2001,6 +2262,80 @@ test "buildBodyOpenAI: o-series uses max_completion_tokens + reasoning_effort" {
     try std.testing.expect(std.mem.indexOf(u8, xh3, "\"reasoning_effort\":\"high\"") != null);
 }
 
+test "max is its own level, and no model is told a word it does not know" {
+    // Z.AI's top rung is called `max` (and is its default); OpenAI's is `xhigh`.
+    // They are the same rung, and the WORD is the contract: a model that only
+    // knows `max` 400s on `xhigh` and the other way around. `max` exists as a
+    // level so a family that speaks it can ask for it; until one does, the wish
+    // lands on the top rung of the model that is running.
+    try std.testing.expectEqual(Effort.max, Effort.parse("max").?);
+    try std.testing.expectEqual(Effort.xhigh, Effort.parse("xhigh").?);
+
+    var buf: [64 * 1024]u8 = undefined;
+    const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
+
+    // codex-max is the one model with `xhigh`; it has no `max`.
+    const cm = try buildBodyMessages(&buf, "gpt-5.1-codex-max", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, cm, "\"reasoning_effort\":\"xhigh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cm, "\"reasoning_effort\":\"max\"") == null);
+
+    // Every other ladder degrades it to `high`.
+    const p51 = try buildBodyMessages(&buf, "gpt-5.1", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, p51, "\"reasoning_effort\":\"high\"") != null);
+
+    const basic = try buildBodyMessages(&buf, "o3-mini", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, basic, "\"reasoning_effort\":\"high\"") != null);
+
+    // A model with no knob at all still gets no field.
+    const none = try buildBodyMessages(&buf, "kimi-k2.6", &msgs, .max, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, none, "reasoning_effort") == null);
+
+    // The ceiling `max` asks for is the top one, so a turn that thinks this
+    // hard is not cut off by a 32k limit.
+    try std.testing.expectEqual(@as(u32, 65536), Effort.max.outputCeiling());
+    try std.testing.expectEqual(Effort.xhigh, Effort.max.degrade());
+    try std.testing.expectEqual(Effort.xhigh, clampEffort("gpt-5.1-codex-max", .max));
+}
+
+test "GLM: low/high/max with the top rung spelled max, and no thinking block" {
+    // Verified against Z.AI's GLM-5.3 page: `reasoning_effort` takes exactly
+    // `low`, `high` and `max` (default `max`), and `thinking.type` may only be
+    // `enabled` — `disabled` is an ERROR there, not a no-op. zode sends neither
+    // `thinking` nor `budget_tokens` on the OpenAI path, which is what makes
+    // 5.3 work without a provider special case.
+    var buf: [64 * 1024]u8 = undefined;
+    const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
+
+    try std.testing.expectEqual(Effort.max, maxEffortFor("glm-5.3"));
+    try std.testing.expectEqual(Effort.high, defaultEffort("glm-5.3"));
+    try std.testing.expectEqualSlices(Effort, &[_]Effort{ .low, .high, .max }, effortLevels("glm-5.3"));
+
+    // There is no `medium` on this ladder: it lands on `high`, a level they know.
+    const mid = try buildBodyMessages(&buf, "glm-5.3", &msgs, .medium, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, mid, "\"reasoning_effort\":\"high\"") != null);
+
+    // The top is `max`, never `xhigh`.
+    const top = try buildBodyMessages(&buf, "glm-5.3", &msgs, .xhigh, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, top, "\"reasoning_effort\":\"max\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "\"reasoning_effort\":\"xhigh\"") == null);
+
+    // "Do not think" cannot be asked for: the cheapest rung they have is `low`.
+    const off = try buildBodyMessages(&buf, "glm-5.3", &msgs, .none, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, off, "\"reasoning_effort\":\"low\"") != null);
+
+    // The Anthropic-shaped block never goes out on this path.
+    try std.testing.expect(std.mem.indexOf(u8, top, "\"thinking\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, top, "budget_tokens") == null);
+
+    // Same family, same ladder.
+    try std.testing.expectEqual(Effort.max, maxEffortFor("glm-5.3-flash"));
+
+    // GLM-5.1 and 4.7 have no `reasoning_effort` at all (docs: 5.2 and above),
+    // so no field goes out: an unknown level there is a 400.
+    const old = try buildBodyMessages(&buf, "glm-5.1", &msgs, .high, "", .openai);
+    try std.testing.expect(std.mem.indexOf(u8, old, "reasoning_effort") == null);
+}
+
 test "buildBodyOpenAI: a normal model keeps max_tokens" {
     var buf: [64 * 1024]u8 = undefined;
     const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
@@ -2010,6 +2345,38 @@ test "buildBodyOpenAI: a normal model keeps max_tokens" {
     try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
     // A model WITHOUT the knob does not get the field: sending it is a 400.
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "buildBodyMessagesCapped: the provider cap lowers the ceiling, it never raises it" {
+    // NVIDIA NIM documents per-model maxima as low as 4096, and `medium` sends
+    // 32768: the request dies with a 400 before a single token arrives. The cap
+    // clamps the effort's ceiling, and a cap ABOVE the ceiling changes nothing:
+    // the effort is still the user's choice.
+    var buf: [64 * 1024]u8 = undefined;
+    const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
+
+    const capped = try buildBodyMessagesCapped(&buf, "nvidia/nemotron-3-super-120b-a12b", &msgs, .medium, "", .openai, 16384);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "\"max_tokens\":16384") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "32768") == null);
+
+    // A cap higher than the effort's ceiling does NOT hand out more tokens.
+    const higher = try buildBodyMessagesCapped(&buf, "kimi-k2.6", &msgs, .low, "", .openai, 1_000_000);
+    try std.testing.expect(std.mem.indexOf(u8, higher, "\"max_tokens\":32768") != null);
+
+    // 0 is "no provider cap": the plain path, byte for byte.
+    const plain = try buildBodyMessages(&buf, "kimi-k2.6", &msgs, .low, "", .openai);
+    const none = try buildBodyMessagesCapped(&buf, "kimi-k2.6", &msgs, .low, "", .openai, 0);
+    try std.testing.expectEqualStrings(plain, none);
+}
+
+test "buildBodyAnthropic: the cap also clamps max_tokens and the thinking budget" {
+    // Anthropic requires `budget_tokens` to stay BELOW `max_tokens`; capping one
+    // without the other is a 400 the moment thinking is on.
+    var buf: [64 * 1024]u8 = undefined;
+    const msgs = [_]ChatMessage{.{ .role = "user", .content = "hi" }};
+    const body = try buildBodyMessagesCapped(&buf, "claude-test", &msgs, .high, "", .anthropic, 8192);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"budget_tokens\":8191") != null);
 }
 
 test "buildBodyOpenAI: a model with more levels gets them (Gemini, gpt-5.1)" {
@@ -2395,6 +2762,29 @@ test "setServerMessage: survives garbage without overflowing" {
 test "setServerMessage: unescapes quote and backslash" {
     setServerMessage("{\"message\":\"say \\\"hi\\\" \\\\o/\"}");
     try std.testing.expectEqualStrings("say \"hi\" \\o/", lastErrorBody());
+}
+
+test "setServerMessage: falls back to \"detail\" for problem+json (NVIDIA NIM)" {
+    // NVIDIA answers errors as RFC 9457 problem+json: no "message" at all.
+    // Without this the user saw "HTTP 403" and nothing about the retired model
+    // or the bad key that the body was holding.
+    setServerMessage(
+        \\{"status":403,"title":"Forbidden","detail":"Authorization failed"}
+    );
+    try std.testing.expectEqualStrings("Authorization failed", lastErrorBody());
+
+    // 410 Gone: the model was retired. `detail` is the only place that says so.
+    setServerMessage(
+        \\{"status":410,"title":"Gone","detail":"The model meta/llama-3.1-8b-instruct has reached its end of life and is no longer available."}
+    );
+    try std.testing.expect(std.mem.startsWith(u8, lastErrorBody(), "The model meta/llama-3.1-8b-instruct"));
+
+    // "message" still wins when both are present: it is the OpenAI shape and
+    // the one every other provider sends.
+    setServerMessage(
+        \\{"message":"real message","detail":"decoration"}
+    );
+    try std.testing.expectEqualStrings("real message", lastErrorBody());
 }
 
 test "noteRaw: keeps only the first bytes, without overflowing" {
