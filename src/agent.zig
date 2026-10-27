@@ -1,12 +1,20 @@
 const std = @import("std");
+const posix = std.posix;
 const sleepz = @import("lib/sleep.zig");
 const vaxis = @import("vaxis");
 const builtin = @import("builtin");
 const tui = @import("tui.zig");
+const theme = @import("lib/theme.zig");
 const providers = @import("lib/providers.zig");
+const md = @import("lib/markdown.zig");
 const chat = @import("chat.zig");
 const http_client = @import("lib/http_client.zig");
 const tools_mod = @import("tools/dispatch.zig");
+// The `mcp` tool's own module, for the ONE thing the timeline needs from it:
+// the qualified name of the tool a call is about. The dispatcher does not
+// re-export it because nothing else wants it, and a re-export would be a
+// second name for the same thing.
+const mcp_tool = @import("tools/mcp.zig");
 const roster_mod = @import("roster.zig");
 const free_auto = @import("free_auto.zig");
 const router_mod = @import("lib/router.zig");
@@ -15,12 +23,16 @@ const goal_mod = @import("lib/goal.zig");
 const modelcache = @import("lib/modelcache.zig");
 const clean_mod = @import("lib/clean.zig");
 const usercmds_mod = @import("lib/usercmds.zig");
+const pathsafe = @import("lib/pathsafe.zig");
+const permrules = @import("lib/permrules.zig");
+const cmdsafety = @import("lib/cmdsafety.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
 const cache_stats = @import("cache_stats.zig");
+const cost_mod = @import("lib/cost.zig");
+const selfupdate = @import("lib/selfupdate.zig");
 const compaction = @import("compaction.zig");
-const mascot = @import("lib/mascot.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
 
@@ -34,15 +46,28 @@ const images_mod = @import("lib/images.zig");
 const bench_mod = @import("lib/bench.zig");
 const skills = @import("lib/skills.zig");
 const skillstore = @import("lib/skillstore.zig");
+const outputstyles = @import("lib/outputstyles.zig");
+const outputstyle_store = @import("lib/outputstyle_store.zig");
 const project = @import("lib/project.zig");
+const sessionpath = @import("lib/sessionpath.zig");
+const sessionindex = @import("lib/sessionindex.zig");
+const taskstore = @import("lib/taskstore.zig");
+const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
+const textcap = @import("lib/textcap.zig");
+const resultcap = @import("lib/resultcap.zig");
+const tools_registry = @import("tools/registry.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
+const copytext = @import("lib/copytext.zig");
+const clipboard = @import("clipboard.zig");
 const commands_mod = @import("commands.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeats.zig");
 const build_options = @import("build_options");
 const autochk = @import("autochk.zig");
+const lsp_manager = @import("lsp/manager.zig");
+const mcp_manager = @import("mcp/manager.zig");
 const review_mod = @import("lib/review.zig");
 
 // The `/help` tables live with the commands they document. Re-exported because
@@ -61,6 +86,8 @@ pub var gpa_global: std.mem.Allocator = undefined;
 // the tests that assert on it keep reading `agent.default_system_prompt` and no
 // import outside this file changes.
 pub const default_system_prompt = prompt_mod.default_system_prompt;
+pub const default_system_prompt_core = prompt_mod.default_system_prompt_core;
+pub const coding_rules = prompt_mod.coding_rules;
 pub const tool_routing_prompt = prompt_mod.tool_routing_prompt;
 pub const verification_prompt = prompt_mod.verification_prompt;
 
@@ -107,6 +134,14 @@ pub var project_info: project.Info = .{};
 pub fn initProjectInfo(io: std.Io, env: ?*const std.process.Environ.Map) void {
     if (project_info.cwd_len != 0) return;
     project.detect(io, env, &project_info);
+}
+
+/// Resolves the sessions directory for the current project, using gpa for
+/// allocation. Stores nothing globally — the caller uses the returned path.
+/// Idempotent: safe to call multiple times (each call allocates).
+pub fn resolveSessionsDirIn(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
+    const project_root = project_info.cwd();
+    _ = sessionpath.resolveSessionsDir(gpa, io_global, env, project_root) catch {};
 }
 
 /// Fills `project_info` from a given directory. For tests only.
@@ -199,6 +234,120 @@ pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.M
     skills_cache = fresh;
     stampSkills(gpa, env);
     return fresh;
+}
+
+/// Output styles found on disk, cached like skills (same reasons: the list goes
+/// into the system prompt, rebuilt for every request).
+///
+/// The styles list is small (a handful of entries), so the rescan cap and freshness
+/// check mirror skills but with smaller numbers.
+var styles_cache: ?[]outputstyles.Entry = null;
+var styles_stamps: [outputstyle_store.max_roots]outputstyle_store.Stamp = undefined;
+var styles_stamp_len: usize = 0;
+const styles_rescan_max: usize = 4;
+var styles_rescans: usize = 0;
+var styles_lock: std.atomic.Mutex = .unlocked;
+
+/// The styles on disk, or an empty list. BORROWED: do not free.
+pub fn discoverStyles(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []const outputstyles.Entry {
+    while (styles_lock.tryLock()) {}
+    defer styles_lock.unlock();
+
+    if (styles_cache != null and stylesFresh(gpa, env)) return styles_cache.?;
+    if (styles_rescans >= styles_rescan_max) return styles_cache orelse &.{};
+    styles_rescans += 1;
+
+    const fresh = loadStylesNow(gpa, env);
+    freeStylesCacheLocked();
+    styles_cache = fresh;
+    stampStyles(gpa, env);
+    return fresh;
+}
+
+/// Walks the roots right now and allocates the entries. The caller owns them.
+fn loadStylesNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []outputstyles.Entry {
+    var loader = stylesLoader(gpa, env);
+    var buf: [64]outputstyles.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+    const copy = gpa.dupe(outputstyles.Entry, found) catch {
+        // Out of memory: no styles rather than a half-built list.
+        for (found) |e| {
+            gpa.free(e.name);
+            gpa.free(e.description);
+            gpa.free(e.path);
+        }
+        return &.{};
+    };
+    return copy;
+}
+
+/// The loader, with its roots made ABSOLUTE.
+fn stylesLoader(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) outputstyle_store.Loader {
+    var loader = outputstyle_store.Loader.init(gpa, io_global, env);
+    const proj = &project_info;
+    const cwd = proj.cwd();
+    if (cwd.len == 0) return loader;
+
+    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    loader.project_dir = std.fmt.bufPrint(&bufs[0], "{s}/{s}", .{ cwd, outputstyles.project_dir }) catch loader.project_dir;
+
+    if (proj.root()) |root| {
+        if (!std.mem.eql(u8, root, cwd)) loader.repo_root = root;
+    }
+    return loader;
+}
+
+fn stampStyles(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
+    styles_stamp_len = 0;
+    var loader = stylesLoader(gpa, env);
+    var bufs: [outputstyle_store.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [outputstyle_store.max_roots][]const u8 = undefined;
+    const root_count = loader.roots(&bufs, &paths);
+    for (paths[0..root_count]) |p| addStyleStamp(p);
+    if (styles_cache) |list| {
+        for (list) |e| addStyleStamp(e.path);
+    }
+}
+
+fn addStyleStamp(path: []const u8) void {
+    if (styles_stamp_len >= styles_stamps.len) return;
+    if (!outputstyle_store.stampPath(io_global, path, &styles_stamps[styles_stamp_len])) return;
+    styles_stamp_len += 1;
+}
+
+fn stylesFresh(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) bool {
+    var loader = stylesLoader(gpa, env);
+    var bufs: [outputstyle_store.max_roots][std.fs.max_path_bytes]u8 = undefined;
+    var paths: [outputstyle_store.max_roots][]const u8 = undefined;
+    const root_count = loader.roots(&bufs, &paths);
+
+    for (paths[0..root_count]) |p| if (!styleStampUnchanged(p)) return false;
+    if (styles_cache) |list| {
+        for (list) |e| if (!styleStampUnchanged(e.path)) return false;
+    }
+    return true;
+}
+
+fn styleStampUnchanged(path: []const u8) bool {
+    for (styles_stamps[0..styles_stamp_len]) |*st| {
+        if (!std.mem.eql(u8, st.pathOf(), path)) continue;
+        var now: outputstyle_store.Stamp = .{};
+        if (!outputstyle_store.stampPath(io_global, path, &now)) return false;
+        return st.sameAs(&now);
+    }
+    return false;
+}
+
+fn freeStylesCacheLocked() void {
+    if (styles_cache) |list| {
+        for (list) |e| {
+            gpa_global.free(e.name);
+            gpa_global.free(e.description);
+            gpa_global.free(e.path);
+        }
+        if (list.len > 0) gpa_global.free(list);
+    }
+    styles_cache = null;
 }
 
 /// Walks the roots right now and allocates the entries. The caller owns them.
@@ -322,8 +471,9 @@ fn freeSkillsCacheLocked() void {
             gpa.free(e.name);
             gpa.free(e.description);
             gpa.free(e.path);
+            if (e.when_to_use.len > 0) gpa.free(e.when_to_use);
         }
-        gpa.free(list);
+        if (list.len > 0) gpa.free(list);
         skills_cache = null;
     }
     skills_stamp_len = 0;
@@ -342,28 +492,92 @@ fn freeSkillsCacheLocked() void {
 ///   - it got no verification rules, so a task took three times as long;
 ///   - it got no `todo` or `refs` guidance, so neither was used.
 ///
-/// And it was invisible from the TUI, where all of it works. Two prompts for the
-/// same agent, one of them a subset of the other, is not a configuration: it is a
-/// second definition of how the harness wants to be used.
-///
-/// So there is ONE composition now. The headless runner calls this.
+/// Test-only: reset the skills cache and stamps. Uses the lock internally.
+pub fn resetSkillsCacheForTest() void {
+    while (skills_lock.tryLock()) {}
+    defer skills_lock.unlock();
+    freeSkillsCacheLocked();
+    skills_stamp_len = 0;
+    skills_rescans = 0;
+}
+
+/// Test-only: reset the styles cache and stamps. Uses the lock internally.
+pub fn resetStylesCacheForTest() void {
+    while (styles_lock.tryLock()) {}
+    defer styles_lock.unlock();
+    freeStylesCacheLocked();
+    styles_stamp_len = 0;
+    styles_rescans = 0;
+}
 pub fn buildSystemPromptFor(
     gpa: std.mem.Allocator,
     env: ?*const std.process.Environ.Map,
 ) ![]u8 {
     var buf: [16 * 1024]u8 = undefined;
-    return gpa.dupe(u8, buildSystemPrompt(gpa, &buf, env));
+    return gpa.dupe(u8, buildSystemPrompt(gpa, &buf, env, true));
 }
 
-fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process.Environ.Map) []const u8 {
-    const base = systemPromptBase(gpa);
-    const entries = discoverSkills(gpa, env);
+/// The room the SKILLS LISTING has, in characters.
+///
+/// 1% of the context window: `ZODE_CONTEXT_LIMIT` when it is set, the 128k
+/// default when it is not.
+///
+/// Two decisions worth writing down, because both of them are about the cache:
+///
+/// 1. **The MODEL's window is not part of it.** The board says "1% of
+///    `ZODE_CONTEXT_LIMIT`", and that is also the only stable answer: the
+///    free-auto rotation changes the active model on every turn, and a budget
+///    that moved with the model would rewrite the system prompt — and
+///    invalidate the provider's cache for the whole request — on every turn.
+/// 2. **The environment comes from `environ_global` when the caller has none.**
+///    The prompt is composed TWICE with two different arguments
+///    (`buildSystemPromptFor` gets the real environment, `syncSystemPrompt`
+///    gets `null`), and a budget that differed between the two would make the
+///    two prompts differ — the same cache bust, one step later.
+fn skillListingBudget(env: ?*const std.process.Environ.Map) usize {
+    const e = env orelse environ_global;
+    return skills.budgetCharsFor(compaction.contextLimitFor(e, 0));
+}
 
-    var list_buf: [8 * 1024]u8 = undefined;
-    const section = skills.systemPromptSection(entries, &list_buf);
+/// Builds the skills-listing section text for the prompt.
+/// Returns an empty slice when there are no skills or the budget is zero.
+fn skillsSectionText(
+    gpa: std.mem.Allocator,
+    env: ?*const std.process.Environ.Map,
+    list_buf: []u8,
+) []const u8 {
+    const entries = discoverSkills(gpa, env);
+    return skills.systemPromptSection(entries, skillListingBudget(env), list_buf);
+}
+
+fn buildSystemPrompt(
+    gpa: std.mem.Allocator,
+    out: []u8,
+    env: ?*const std.process.Environ.Map,
+    include_skills: bool,
+) []const u8 {
+    const base = systemPromptBase(gpa);
+
+    var list_buf: [16 * 1024]u8 = undefined;
+    const section = if (include_skills) skillsSectionText(gpa, env, &list_buf) else "";
 
     var loc_buf: [512]u8 = undefined;
     const location = project_info.promptLines(&loc_buf);
+
+    // --- Output style: injected at the END of the prompt ---
+    // Discover styles and find the currently selected one.
+    const style_entries = discoverStyles(gpa, env);
+    var style_entry: ?outputstyles.Entry = null;
+    if (current_style) |name| {
+        for (style_entries) |e| {
+            if (std.mem.eql(u8, e.name, name)) { style_entry = e; break; }
+        }
+    }
+    // When the selected style says keep_coding_instructions = false, the base
+    // prompt loses the "How to work" coding rules — the style replaces them.
+    const effective_base: []const u8 = if (style_entry) |s| (
+        if (!s.keep_coding_instructions) prompt_mod.default_system_prompt_core else base
+    ) else base;
 
     // The routing table goes in its OWN slot, right after the base, and is
     // emitted whether the base came from `AGENTS.md` or from the built-in text.
@@ -376,9 +590,11 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     // model has to know before it decides what to call, or it plans a `write`
     // and then gets an error, which it reads as a bug and works around.
     const mode_note: []const u8 = if (read_only)
-        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line — and end your turn: the user will be asked to approve it. On approval zode switches itself to default mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
+        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line. Zode displays the complete numbered checklist in the scrollable history; end your turn so the user can review and approve it. On approval zode switches itself to Build mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
     else if (accept_edits)
         "ACCEPT-EDITS MODE is on (shift+tab to cycle): file edits (write, edit, rename) run without asking, but bash still asks for permission. Ask the user with `ask` before running anything destructive.\n\n"
+    else if (yolo)
+        "YOLO MODE is on (shift+tab or /mode to cycle): nothing asks for permission, and your `ask` questions are NOT shown to anyone — the harness takes your own recommendation (the FIRST option) or leaves the question OPEN. Either way, MENTION it in your final summary: what you decided, or what question is still open for the user. An unmentioned decision is a decision the user cannot check.\n\n"
     else
         "";
 
@@ -392,52 +608,49 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
     //   base (per project) · routing (constant) · ask guidance (constant)
     //   · skills (per session) · location (per project)
     //   · read-only note (EVERY keypress of shift+tab, mid-turn)
+    //   · OUTPUT STYLE (last — selected by the user, changes rarely)
     const blocks_len = routing.len + verification_prompt.len + ask.guidance.len +
         section.len + location.len + mode_note.len;
-    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}", .{
-        base,
+    var style_block_len: usize = 0;
+    var style_buf: [8 * 1024]u8 = undefined;
+    if (style_entry) |s| {
+        const body = if (s.body) |b| b else "";
+        const framed = outputstyles.formatStyle(s.name, s.description, body, &style_buf);
+        style_block_len = framed.len;
+    }
+    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}", .{
+        effective_base,
         routing,
         verification_prompt,
         ask.guidance,
         section,
         location,
         mode_note,
+        if (style_entry) |s| outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf) else "",
     }) catch blk: {
-        // It did not fit, and the old answer was `catch return base`: the WHOLE
-        // prompt became the project's own text, with no routing table, no
-        // verification rule, no ask guidance, no skills and no location — silently,
-        // for every project whose instruction file is bigger than the buffer.
-        //
-        // That is the exact symptom this table was written for. Asked to find a
-        // games page, the model ran `bash curl`, because there was no rule saying
-        // not to; here it happens to any project with a 30 KB `AGENTS.md`, and it
-        // looks like "the model ignored my instructions" instead of "the harness
-        // dropped its own".
-        //
-        // So the CONSTANT blocks are the ones that survive and the per-project text
-        // is what gets trimmed — and it says so, because a project that cannot see
-        // half of its own instructions should be told rather than left to guess.
-        // The slack has to cover the note AND the separators. With 64 bytes the
-        // retry overflowed too and the answer was `catch routing`, which drops the
-        // verification rules and the ask guidance — the same class of loss as the
-        // bug being fixed, one function deeper.
-        const note = "[the project instructions above were truncated to fit; the rest is in the project's instruction file]";
-        const overhead = note.len + 16;
+        // It did not fit... same fallback logic as before.
+        const note_lead = "[the project instructions above were truncated to fit";
+        const note_tail = "; the rest is in the project's instruction file]";
+        const overhead = note_lead.len + note_tail.len + 48;
         if (out.len <= blocks_len + overhead) break :blk routing;
         const room = out.len - blocks_len - overhead;
-        const keep = @min(base.len, room);
+        const fit = prompt_mod.fitPrefix(effective_base, room);
         break :blk std.fmt.bufPrint(
             out,
-            "{s}\n{s}\n{s}\n{s}{s}{s}{s}\n{s}",
+            "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}",
             .{
-                base[0..keep],
-                note,
+                fit,
+                note_lead,
+                fit.len,
+                base.len,
+                note_tail,
                 routing,
                 verification_prompt,
                 ask.guidance,
                 section,
                 location,
                 mode_note,
+                if (style_entry) |s| outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf) else "",
             },
         ) catch routing;
     };
@@ -456,7 +669,7 @@ fn buildSystemPrompt(gpa: std.mem.Allocator, out: []u8, env: ?*const std.process
 pub fn syncSystemPrompt(s: *session_mod.Session) void {
     const gpa = s.allocator;
     var buf: [16 * 1024]u8 = undefined;
-    const want = buildSystemPrompt(gpa, &buf, null);
+    const want = buildSystemPrompt(gpa, &buf, null, false);
     for (s.messages.items) |m| {
         if (m.role != .system) continue;
         if (std.mem.eql(u8, m.content, want)) return;
@@ -567,10 +780,32 @@ fn readAgentsIn(gpa: std.mem.Allocator, dir: ?[]const u8) ?[]u8 {
 fn readAgentsAt(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ?[]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return null;
-    return std.Io.Dir.cwd().readFileAlloc(io_global, path, gpa, .limited(256 * 1024)) catch null;
+    // The limit is 1 MB, and it was 256 KB, and THAT WAS A BUG that only
+    // showed up because this repository's own `AGENTS.md` crossed the line:
+    //
+    // `readFileAlloc` with `.limited(n)` returns `error.FileTooBig` for a file
+    // over `n`, and the caller does `catch null`, and `null` means "this
+    // project has no instruction file". So a project whose `AGENTS.md` was a
+    // little too big got the BUILT-IN prompt instead of its own, with no
+    // error anywhere: the harness silently stopped reading the project's
+    // rules, and the symptom was "the model ignored my instructions".
+    //
+    // The size does not matter much: the base is trimmed to the prompt buffer
+    // (16 KB) before it is sent, so a megabyte of instructions is read, cached
+    // and cut down to what fits.
+    return std.Io.Dir.cwd().readFileAlloc(io_global, path, gpa, .limited(1024 * 1024)) catch null;
 }
 
 pub var current_effort: chat.Effort = .medium;
+
+/// The currently selected output style name, or null when none is selected.
+///
+/// Set with `/style <name>`, cleared with `/style off` or `/style clear`.
+/// The buffer is static for the same reason as `cur_model_buf`: the string
+/// comes from the input line and dies with the next redraw.
+pub var current_style: ?[]const u8 = null;
+pub var current_style_buf: [128]u8 = undefined;
+pub var current_style_len: usize = 0;
 
 /// Permission mode: false = asks before write/edit/bash, true = auto.
 pub var yolo: bool = false;
@@ -625,7 +860,7 @@ pub fn currentPermMode() PermMode {
 /// The mode as one word, for the status bar and `/mode`.
 pub fn permModeName() []const u8 {
     return switch (currentPermMode()) {
-        .default => "default",
+        .default => "build",
         .accept_edits => "accept-edits",
         // "plan" and not "read-only": it is what the mode IS for (investigate,
         // write the plan, get it approved) and what the cycle and `/mode` have
@@ -648,8 +883,7 @@ pub fn setPermMode(m: *tui.Model, mode: PermMode) void {
     m.accept_edits = accept_edits;
 }
 
-/// shift+tab: cycles the modes that ASK.
-/// default → accept-edits → plan → default.
+/// shift+tab: cycle Build → accept-edits → Plan → Build.
 ///
 /// Bypass (`/yolo`) is deliberately not in the cycle: it is the "stop
 /// asking me anything" switch, and cycling out of it lands on default,
@@ -663,29 +897,34 @@ pub fn cyclePermMode(m: *tui.Model) void {
     };
     setPermMode(m, next);
     setStatusWithZoFmt(m, if (next == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
-    pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
 }
 
-/// `/ask [on|off]`: read-only (plan) mode, by its old name.
+/// `/ask [on|off]`: Plan mode, retained as a command alias.
 fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
     if (arg) |a| {
         const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
         const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
         if (on) {
             setPermMode(m, .read_only);
-            pushInfo(m, "read-only (plan) mode ON: the agent investigates and asks you with `ask`.");
+            const msg = "Plan mode ON: investigate first; writes are blocked pending approval.";
+            setStatusWithZo(m, .warn, msg);
+            pushInfo(m, msg);
             return;
         }
         if (off) {
             setPermMode(m, .default);
-            pushInfo(m, "read-only mode OFF");
+            const msg = "Build mode ON";
+            setStatusWithZo(m, .idle, msg);
+            pushInfo(m, msg);
             return;
         }
         pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (read_only) "on" else "off"});
         return;
     }
     // No argument: toggle, as it always did.
-    setPermMode(m, if (read_only) .default else .read_only);
+    const next: PermMode = if (read_only) .default else .read_only;
+    setPermMode(m, next);
+    setStatusWithZoFmt(m, if (next == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
 }
 
 // ── plan approval: the developer says yes or no ────────────
@@ -700,7 +939,7 @@ pub const revise_option = "Revise — change the plan first";
 /// What the model is told after the developer approved. Owned by the caller.
 pub const plan_gate_approved_text =
     "The user APPROVED the plan, and zode has already switched itself out of plan mode " ++
-    "(you are in default mode: edits and commands are allowed). Implement the plan now: " ++
+    "(you are in Build mode: edits and commands are allowed). Implement the plan now: " ++
     "work through the steps, verify as you go, and report what changed when done. Do not " ++
     "ask for approval again — it has been given.";
 
@@ -818,6 +1057,33 @@ fn cmdBench(m: *tui.Model) void {
     }
 }
 
+/// `/task-parallel [1..8|auto]`: tune simultaneous subagent requests for this
+/// session. `auto` returns to the environment/default value.
+fn cmdTaskParallel(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |raw| {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(value, "auto")) {
+            m.setTaskParallelLimit(0);
+        } else {
+            const parsed = std.fmt.parseInt(u8, value, 10) catch {
+                m.pushInfo("usage: /task-parallel [1..8|auto]");
+                return;
+            };
+            if (parsed < 1 or parsed > 8) {
+                m.pushInfo("usage: /task-parallel [1..8|auto]");
+                return;
+            }
+            m.setTaskParallelLimit(parsed);
+        }
+    }
+    const override = m.taskParallelLimit();
+    const effective = if (override > 0) override else taskParallelLimit(m);
+    m.pushInfoFmt(
+        "subagent parallelism: {d} at a time{s}",
+        .{ effective, if (override > 0) " (session override)" else " (auto: ZODE_TASK_PARALLEL or default)" },
+    );
+}
+
 /// `/skills`: what is loadable, and from where.
 fn cmdSkills(m: *tui.Model) void {
     const entries = discoverSkills(m.allocator, m.environ);
@@ -830,13 +1096,415 @@ fn cmdSkills(m: *tui.Model) void {
         if (entries.len == 1) @as([]const u8, "") else @as([]const u8, "s"),
     });
     for (entries) |e| {
-        const line = std.fmt.allocPrint(m.allocator, "  {s}: {s}", .{
+        const source_tag = switch (e.source) {
+            .project => "[project]",
+            .agents => "[agents]",
+            .user => "[user]",
+            .bundled => "[bundled]",
+        };
+        // The `when to use it` goes with the description, because a description
+        // says WHAT the skill is and the `when` says WHEN to reach for it: a
+        // list that only says what is a list of things the model cannot
+        // choose between.
+        const line = std.fmt.allocPrint(m.allocator, "  {s} {s}: {s}{s}", .{
+            source_tag,
             e.name,
             if (e.description.len > 0) e.description else "(no description)",
+            if (e.when_to_use.len > 0)
+                std.fmt.allocPrint(m.allocator, " — {s}", .{e.when_to_use}) catch ""
+            else
+                "",
         }) catch continue;
         pushInfoOwned(m, line);
     }
 }
+
+/// `/style <name>`: select an output style. No args reports the current one;
+/// `off`/`clear` clears it. The style block is injected at the end of the system
+/// prompt on the next request.
+fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
+    const trimmed = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (trimmed.len == 0) {
+        // Report current style
+        if (current_style) |name| {
+            const entries = discoverStyles(m.allocator, m.environ);
+            var found: ?[]const u8 = null;
+            var found_desc: []const u8 = "";
+            var found_keep: bool = true;
+            for (entries) |e| {
+                if (std.mem.eql(u8, e.name, name)) {
+                    found = e.name;
+                    found_desc = e.description;
+                    found_keep = e.keep_coding_instructions;
+                    break;
+                }
+            }
+            if (found) |n| {
+                const keep_note = if (found_keep) "" else " (coding rules replaced by this style)";
+                m.pushInfoFmt("output style: {s}{s} — {s}", .{n, keep_note, found_desc});
+            } else {
+                m.pushInfoFmt("output style: {s} (not found — was it removed?)", .{name});
+            }
+        } else {
+            pushInfo(m, "no output style selected. /style <name> picks one; /style off clears it.");
+        }
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "off") or std.ascii.eqlIgnoreCase(trimmed, "clear")) {
+        current_style = null;
+        current_style_len = 0;
+        pushInfo(m, "output style cleared. The base prompt (with coding rules) is used.");
+        return;
+    }
+
+    // Validate the name exists
+    const entries = discoverStyles(m.allocator, m.environ);
+    var found: ?[]const u8 = null;
+    var found_keep: bool = true;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.name, trimmed)) {
+            found = e.name;
+            found_keep = e.keep_coding_instructions;
+            break;
+        }
+    }
+    if (found == null) {
+        pushInfoFmt(m, "unknown output style '{s}'. Available: {s}", .{
+            trimmed,
+            if (entries.len > 0) styleNames(entries) else "none",
+        });
+        return;
+    }
+
+    // Copy into the static buffer (same rule as cur_model_buf)
+    const n = @min(trimmed.len, current_style_buf.len);
+    std.mem.copyForwards(u8, current_style_buf[0..n], trimmed[0..n]);
+    current_style_len = n;
+    current_style = current_style_buf[0..n];
+
+    const keep_note = if (found_keep) "" else " — this style replaces the coding rules";
+    pushInfoFmt(m, "output style: {s}{s}", .{trimmed, keep_note});
+}
+
+/// Should the app reopen the last session at startup?
+///
+/// The `--resume` FLAG and the `ZODE_RESUME=1` variable both turn it ON, and
+/// neither of them turns it OFF.
+///
+/// That asymmetry is the whole point: the flag is dispatched BEFORE the
+/// environment is read, so a line that ASSIGNED the environment's answer
+/// over it made `zode --resume` start a new session and answer "nothing to
+/// resume; starting a new session" — which is exactly what the flag asks it
+/// not to do. The environment can only add a resume, never remove one.
+pub fn shouldResume(flag: bool, env: ?*const std.process.Environ.Map) bool {
+    if (flag) return true;
+    return std.mem.eql(u8, envGet(env, "ZODE_RESUME") orelse "", "1");
+}
+
+/// Joins style names with ", " for an error message.
+fn styleNames(entries: []const outputstyles.Entry) []const u8 {
+    // Reuse a static buffer for the list
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var first: bool = true;
+    for (entries) |e| {
+        if (!first) w.writeAll(", ") catch {};
+        first = false;
+        w.writeAll(e.name) catch {};
+    }
+    return w.buffered();
+}
+
+// ── `/copy`: taking the answer with you ───────────────────────────────────
+//
+// The shape of the command comes from the reference implementation's `/copy`.
+// What is ported is written next to each piece; what is not:
+//
+// - `config.copyFullResponse` as a global setting: here it is a SESSION flag
+//   (`Model.copy_always_full`), because a session flag is enough until
+//   somebody asks for more.
+// - The `w` shortcut (write to file without copying): the file is written
+//   ALWAYS, so there is nothing left for a second key to do.
+// - The analytics.
+//
+// The three things this has to get right, and why:
+//
+// 1. **The arithmetic.** `/copy N` reaches back N-1 answers. A refusal says
+//    what to do ("Only 3 assistant messages available to copy"), because a
+//    refusal the user cannot act on is a dead end.
+// 2. **The order.** Newest first, and only the turns that SAID something: a
+//    tool-only turn has no text.
+// 3. **The honesty.** The clipboard has three rungs and they are not equally
+//    reliable, so the message names the one that was used, and the file is
+//    written every time: a copy confirmation you cannot check is not a
+//    confirmation.
+
+/// The tag of the `/copy` picker.
+const copy_picker_tag: u32 = 0x0c0;
+
+/// The assistant texts of the session, newest first.
+///
+/// Only the turns that said something: a tool-only turn has no text, and an
+/// API error is a history notice, not an assistant message.
+fn collectAssistantTexts(s: *session_mod.Session, out: *[copytext.max_lookback][]const u8) usize {
+    var n: usize = 0;
+    var i = s.messages.items.len;
+    while (i > 0 and n < copytext.max_lookback) : (i -= 1) {
+        const msg = s.messages.items[i - 1];
+        if (msg.role != .assistant) continue;
+        if (msg.content.len == 0) continue;
+        out[n] = msg.content;
+        n += 1;
+    }
+    return n;
+}
+
+/// `/copy [N]`: the answer, on the clipboard and in a file.
+fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
+    const s = session orelse {
+        pushInfo(m, copytext.no_messages_msg);
+        return;
+    };
+    var texts: [copytext.max_lookback][]const u8 = undefined;
+    const n = collectAssistantTexts(s, &texts);
+    if (n == 0) {
+        pushInfo(m, copytext.no_messages_msg);
+        return;
+    }
+
+    const sel = copytext.select(texts[0..n], arg);
+    const index: usize = switch (sel) {
+        .found => |i| i,
+        .no_messages => {
+            pushInfo(m, copytext.no_messages_msg);
+            return;
+        },
+        .usage, .too_few => {
+            var buf: [256]u8 = undefined;
+            pushInfo(m, copytext.formatRefusal(&buf, sel, arg));
+            return;
+        },
+    };
+
+    var ctx = copytext.buildCtx(m.allocator, texts[index]) catch {
+        pushInfo(m, "the answer could not be prepared for copying");
+        return;
+    };
+
+    // Nothing to choose (no code blocks) or the user asked for the full
+    // response always: there is no picker to open.
+    if (ctx.blocks.len == 0 or m.copy_always_full) {
+        defer ctx.deinit();
+        performCopy(m, &ctx, 0);
+        return;
+    }
+
+    const items = buildCopyItems(m, &ctx);
+    if (items.len == 0) {
+        ctx.deinit();
+        pushInfo(m, copytext.no_messages_msg);
+        return;
+    }
+    m.setCopyCtx(ctx);
+    m.openPickerIdx(copy_picker_tag, "Copy", items, copyPickerChosen, copyPickerCancelled);
+}
+
+/// The rows of the `/copy` picker: the whole answer, one per code block, and
+/// the row that remembers the choice.
+///
+/// The labels are the code's OWN first lines (that is what the user
+/// recognises), cut to 60 columns. Two blocks that start with the same line
+/// get a counter, because a picker with two identical rows is a picker where
+/// the user cannot tell what they are about to copy.
+fn buildCopyItems(m: *tui.Model, ctx: *const copytext.Ctx) []tui.PickerItem {
+    const gpa = m.allocator;
+    var items: std.ArrayList(tui.PickerItem) = .empty;
+
+    var full_buf: [128]u8 = undefined;
+    const full_text = copytext.formatFullLabel(
+        &full_buf,
+        copytext.countChars(ctx.full),
+        copytext.countLines(ctx.full),
+    );
+    const full_label = gpa.dupe(u8, full_text) catch return items.toOwnedSlice(gpa) catch return &.{};
+    items.append(gpa, .{ .label = full_label, .desc = "" }) catch {
+        gpa.free(full_label);
+        return items.toOwnedSlice(gpa) catch return &.{};
+    };
+
+    var label_buf: [copytext.label_buf_len]u8 = undefined;
+    var base_buf: [copytext.label_buf_len]u8 = undefined;
+    var desc_buf: [96]u8 = undefined;
+    for (ctx.blocks, 0..) |b, bi| {
+        // The base label is COPIED out of the scratch buffer: the loop below
+        // uses the same buffer, and a label that changes under the comparison
+        // is a label that matches the wrong row.
+        const base = copytext.truncateToCols(b.code, copytext.label_max_cols, &label_buf);
+        @memcpy(base_buf[0..base.len], base);
+        const base_label = base_buf[0..base.len];
+        // How many EARLIER rows already say the same thing? Only the earlier
+        // ones: counting the later ones too would give three identical blocks
+        // the same "(3)" and the picker three rows that look the same.
+        var same: usize = 0;
+        for (ctx.blocks[0..bi]) |prev| {
+            if (prev.code.len == b.code.len and std.mem.eql(u8, prev.code, b.code)) continue;
+            const prev_label = copytext.truncateToCols(prev.code, copytext.label_max_cols, &label_buf);
+            if (std.mem.eql(u8, prev_label, base_label)) same += 1;
+        }
+        const label = copytext.uniqueLabel(gpa, base_label, same) catch continue;
+        const desc_text = copytext.formatBlockDesc(&desc_buf, b.lang, b.code);
+        // An EMPTY desc is a literal, not an allocation: `closePicker` only
+        // frees a desc that is not empty, so an allocated "" would leak.
+        const desc = if (desc_text.len == 0) "" else (gpa.dupe(u8, desc_text) catch "");
+        items.append(gpa, .{ .label = label, .desc = desc }) catch {
+            gpa.free(label);
+            if (desc.len > 0) gpa.free(desc);
+            continue;
+        };
+    }
+
+    const always = gpa.dupe(u8, copytext.always_label) catch return items.toOwnedSlice(gpa) catch return &.{};
+    const always_desc = gpa.dupe(u8, copytext.always_desc) catch "";
+    items.append(gpa, .{ .label = always, .desc = always_desc }) catch {
+        gpa.free(always);
+        if (always_desc.len > 0) gpa.free(always_desc);
+    };
+    return items.toOwnedSlice(gpa) catch return &.{};
+}
+
+/// The picker chose a row.
+///
+/// Index 0 is the whole answer, 1..n are the code blocks, and the row after
+/// them is "always copy the full response" (which copies the answer AND
+/// remembers not to ask again).
+fn copyPickerChosen(m: *tui.Model, tag: u32, index: usize) void {
+    _ = tag;
+    var ctx = m.takeCopyCtx() orelse return;
+    defer ctx.deinit();
+    const always = index > ctx.blocks.len;
+    if (always) {
+        m.copy_always_full = true;
+        performCopy(m, &ctx, 0);
+        return;
+    }
+    performCopy(m, &ctx, index);
+}
+
+/// The picker was closed with ESC: a cancel is not an error.
+fn copyPickerCancelled(m: *tui.Model, tag: u32) void {
+    _ = tag;
+    if (m.takeCopyCtx()) |ctx| {
+        var c = ctx;
+        c.deinit();
+    }
+    pushInfo(m, copytext.cancelled_msg);
+}
+
+/// The copy itself: the clipboard first, then the file, then the message.
+fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
+    const text = ctx.textAt(index) orelse return;
+    const chars = copytext.countChars(text);
+    const lines = copytext.countLines(text);
+
+    // The clipboard FIRST, and the file after: upstream learned that the
+    // clipboard call is the one that can be slow (waiting for tmux), and the
+    // message that says "copied" should not arrive after the file.
+    const decision = copyToClipboard(m, text);
+
+    // Toast: show the confirmation in the top-right corner for ~1 second.
+    // At 40 ms/tick when busy, 25 ticks = 1000 ms.
+    var tb: [64]u8 = undefined;
+    m.copy_toast_text = std.fmt.bufPrint(&tb, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
+    m.copy_toast_frames = 25;
+
+    var name_buf: [64]u8 = undefined;
+    const filename = copyFileName(index, ctx, &name_buf);
+    const path = writeCopyFile(m, text, filename);
+
+    var msg_buf: [512]u8 = undefined;
+    if (path) |p| {
+        defer m.allocator.free(p);
+        pushInfo(m, copytext.formatCopiedVia(&msg_buf, chars, lines, decision.method.phrase(), p));
+    } else {
+        // The file could not be written: said out loud, not swallowed. The
+        // clipboard half may still have worked.
+        pushInfo(m, copytext.formatCopiedNoFile(&msg_buf, chars, lines, decision.method.phrase()));
+    }
+}
+
+/// The name of the file the copy is written to.
+///
+/// The whole answer is `response.md`; a block is `copy<ext>`, with the
+/// extension taken from the fence's language. A language tag is MODEL OUTPUT
+/// and a path is a FILESYSTEM, so the tag is sanitised (`copytext`).
+fn copyFileName(index: usize, ctx: *const copytext.Ctx, buf: []u8) []const u8 {
+    if (index == 0) return copytext.full_filename;
+    const block = ctx.blocks[index - 1];
+    return copytext.filenameForBlock(block.lang, buf);
+}
+
+/// The clipboard, with the ladder.
+///
+/// The decision (which rung) is made BEFORE anything is spawned, and the
+/// message names the rung that was used. The last rung is OSC 52, which goes
+/// through the RENDER: the TUI owns the escape sequence, because a sequence
+/// written outside the render is one the next frame paints over.
+fn copyToClipboard(m: *tui.Model, text: []const u8) clipboard.Decision {
+    const env = m.environ orelse {
+        m.setCopyPending(text);
+        return .{ .method = .osc52 };
+    };
+    if (!m.io_ready) {
+        m.setCopyPending(text);
+        return .{ .method = .osc52 };
+    }
+    const plan = clipboard.planFor(m.io, env);
+    const decision = clipboard.copy(m.io, plan, text);
+    if (decision.method == .osc52) {
+        m.setCopyPending(text);
+    }
+    return decision;
+}
+
+/// The file the copy is ALSO written to.
+///
+/// It is written ALWAYS: the clipboard is best-effort by nature (a terminal
+/// that ignores OSC 52, a tool that is not there), and a file is not.
+///
+/// The file is 0600 in a 0700 directory: it holds the model's answer, and
+/// `/tmp` is world-readable.
+fn writeCopyFile(m: *tui.Model, text: []const u8, filename: []const u8) ?[]const u8 {
+    if (!m.io_ready) return null;
+    const gpa = m.allocator;
+    const tmp = clipboard.copyDir(m.environ);
+    const dir_path = std.fmt.allocPrint(gpa, "{s}/zode", .{tmp}) catch return null;
+    defer gpa.free(dir_path);
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, filename }) catch return null;
+
+    var dir = std.Io.Dir.cwd().openDir(m.io, ".", .{}) catch return null;
+    defer dir.close(m.io);
+    // The directory is 0700 and the file 0600: it holds the model's answer and
+    // `/tmp` is world-readable. The mode goes on the OPEN file, not after the
+    // write: a `create` + `chmod` leaves a window in which the file exists
+    // world-readable.
+    _ = dir.createDirPathStatus(m.io, dir_path, copy_dir_mode) catch {};
+    var file = dir.createFile(m.io, path, .{ .truncate = true }) catch {
+        gpa.free(path);
+        return null;
+    };
+    defer file.close(m.io);
+    file.setPermissions(m.io, copy_file_mode) catch {};
+    file.writeStreamingAll(m.io, text) catch {
+        gpa.free(path);
+        return null;
+    };
+    return path;
+}
+
+/// 0700 for the directory of copies, 0600 for the file itself.
+const copy_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
+const copy_file_mode: std.Io.File.Permissions = @enumFromInt(0o600);
 
 /// `/bg`: the background jobs, and the two ways to stop them.
 fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
@@ -1052,6 +1720,25 @@ pub fn setProviderId(id: []const u8) void {
     std.mem.copyForwards(u8, cur_provider_buf[0..n], id[0..n]);
     cur_provider_id = cur_provider_buf[0..n];
 }
+/// Key state of the active provider's API key.
+///
+/// `verified` means the key has been tested and works.
+/// `saved` means the key is stored in `auth.json` but has not been verified.
+/// `invalid` means the key is known to be bad (e.g., auth error received).
+pub var cur_key_state: u8 = 0; // 0=unknown, 1=verified, 2=saved, 3=invalid
+/// Key state buffer for safe copying (avoids dangling slices).
+pub var cur_key_state_buf: [4]u8 = undefined;
+
+/// Maps key state enum values to display strings.
+pub fn keyStateString(s: u8) []const u8 {
+    switch (s) {
+        1 => "● verified",
+        2 => "○ saved",
+        3 => "✗ invalid",
+        else => "",
+    }
+}
+
 var cur_model: []const u8 = "";
 
 /// Active session (`null` until the first message). The worker creates it, not
@@ -1213,7 +1900,12 @@ fn addBashPatternNoSave(pat: []const u8) bool {
 /// everything". Plan (read-only) and bypass are handled BEFORE
 /// this is consulted: plan blocks writes outright and bypass
 /// skips the dialog, so neither reaches here.
-fn permAutoAllowed(name: []const u8, arg: []const u8) bool {
+fn permAutoAllowed(name: []const u8, arg: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    // A batch is covered by accept-edits when it WRITES: the standing "I trust
+    // the file edits" is about the edits, and a batch's write step is one.
+    if (std.mem.eql(u8, name, "batch")) {
+        return accept_edits and tools_mod.callWrites(name, args_json, arena);
+    }
     return (accept_edits and isEditTool(name)) or bashPatternAllowed(name, arg);
 }
 
@@ -1385,6 +2077,143 @@ fn readFileTo(arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
     return std.Io.Dir.cwd().readFileAlloc(io_global, path, arena, .limited(1 << 20)) catch null;
 }
 
+/// The same, with the `Io` as an argument.
+///
+/// The global one reads `io_global`, which is `undefined` in a test: a file
+/// read through an uninitialised `Io` is a jump through a garbage vtable.
+fn readFileToWith(io: std.Io, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch null;
+}
+
+// ── the permission rules (Phase 6) ─────────────────────────────────────────
+
+/// The rules of every source, and the arena that owns them.
+///
+/// The rules are read on EVERY call that needs a decision, so they are
+/// cached and the cache is what the hot path reads. The arena lives until
+/// the process exits: a worker can be reading the rules while the config is
+/// reloaded, and a rule set that is freed under a reader is a use-after-free
+/// (the same rule as the saved keys).
+pub var perm_rules: permrules.Set = .{};
+var perm_rules_arena: ?std.heap.ArenaAllocator = null;
+
+/// The project-level rules file, relative to the working directory.
+pub const project_rules_file = ".zode/permissions.json";
+
+/// Loads the rules: the project file and the user file.
+///
+/// The ORDER is the precedence — the strongest source first — and
+/// `permrules.decide` picks the first that matches. A `deny` beats any
+/// `allow` from any source, and that is decided inside `decide`.
+///
+/// The project file is the one that answers the question this whole
+/// mechanism exists for: a project that wants `.vscode/` written without a
+/// question says so in ITS OWN file, and the file travels with the project.
+pub fn loadPermRules() void {
+    var pbuf: [512]u8 = undefined;
+    var rbuf: [640]u8 = undefined;
+    // The PROJECT ROOT, and not the working directory: the file travels with
+    // the project, and a run from a subdirectory has to find the same rules.
+    const project_path = if (project_info.root()) |root|
+        std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file
+    else
+        project_rules_file;
+    if (perm_rules_arena == null) {
+        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
+    }
+    loadPermRulesInto(
+        perm_rules_arena.?.allocator(),
+        io_global,
+        project_path,
+        permissionsFilePath(&pbuf),
+    );
+}
+
+/// The rules, loaded from the two files.
+///
+/// The paths are PARAMETERS and not read from the environment here, for one
+/// reason: a test has to be able to point them at a fixture. "The rules of
+/// this machine" and "the rules of a file" are the same code with a different
+/// argument.
+pub fn loadPermRulesFrom(io: std.Io, project_path: ?[]const u8, user_path: ?[]const u8) void {
+    if (perm_rules_arena == null) {
+        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
+    }
+    loadPermRulesInto(perm_rules_arena.?.allocator(), io, project_path, user_path);
+}
+
+/// The rules, loaded into a GIVEN arena.
+///
+/// The allocator is an argument because the global one does not exist in a
+/// test, and a test that cannot load a rule file cannot test a rule.
+pub fn loadPermRulesInto(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_path: ?[]const u8,
+    user_path: ?[]const u8,
+) void {
+    const a = arena;
+
+    var all: std.ArrayList(permrules.Rule) = .empty;
+
+    // The PROJECT file: `.zode/permissions.json`, next to the code.
+    if (project_path) |path| {
+        if (readFileToWith(io, a, path)) |data| {
+            if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
+                for (permrules.parseJson(parsed, .project, a)) |r| all.append(a, r) catch {};
+            } else |_| {}
+        }
+    }
+
+    // The USER file: `~/.config/zode/permissions.json`, next to the keys.
+    if (user_path) |path| {
+        if (readFileToWith(io, a, path)) |data| {
+            if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
+                for (permrules.parseJson(parsed, .user, a)) |r| all.append(a, r) catch {};
+            } else |_| {}
+        }
+    }
+
+    perm_rules = .{ .rules = all.items };
+}
+
+/// The rules, as they stand.
+pub fn permRuleSet() permrules.Set {
+    return perm_rules;
+}
+
+/// The decision for a call: `allow`, `deny`, `ask` or nothing.
+///
+/// The SUBJECTS are the things the call acts on: the paths for a file tool,
+/// the command for `bash`. A rule with a pattern matches if it matches ANY
+/// of them, and a rule with no pattern matches any subject.
+pub fn permDecision(tool: []const u8, subjects: []const []const u8) ?permrules.Decision {
+    if (permrules.decide(perm_rules.rules, tool, subjects)) |d| return d;
+
+    // The POLICY: the built-in sensitive table. Its action is ASK, and that
+    // is the whole point of it: the built-in table does not REFUSE (a project
+    // with a `.vscode/` the user wants edited is blocked forever by a
+    // refusal), it asks, and a rule in a file can answer "allow" for it.
+    for (subjects) |sub| {
+        const v = pathsafe.checkWrite(sub);
+        if (v == .ok) continue;
+        return .{
+            .action = .ask,
+            .rule = .{
+                .tool = tool,
+                .pattern = sub,
+                .action = .ask,
+                .source = .policy,
+                .text = switch (v) {
+                    .dangerous => |d| d.what,
+                    else => "a protected file",
+                },
+            },
+        };
+    }
+    return null;
+}
+
 // ── environment and history notices ───────────────────────────
 
 /// An env var read as a boolean, with a default.
@@ -1501,6 +2330,7 @@ pub fn resetCheapRouter(m: *tui.Model) void {
     cheap_router.given_up = false;
     cheap_router.attempts = 0;
     cheap_router.fallbacks = 0;
+    cheap_router.last_why = null;
 }
 
 /// What the cheap router has been doing, for `/bench`.
@@ -1540,6 +2370,24 @@ pub fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
     m.pushInfoOwned(text);
 }
 
+/// Replays the session messages into the TUI history so they are visible
+/// when a session is resumed. The session messages are stored in the session
+/// file but the TUI's history (`paras`) is separate and needs to be populated
+/// from the session messages on resume.
+pub fn replaySessionMessages(m: *tui.Model, s: *session_mod.Session) void {
+    for (s.messages.items) |sm| {
+        const kind = switch (sm.role) {
+            .user => md.Kind.user,
+            .assistant => md.Kind.assistant,
+            .tool => md.Kind.tool_res,
+            .system => md.Kind.info,
+        };
+        m.pushKind(kind, sm.content);
+    }
+    // Drain the pending queue so the paragraphs are in `paras` immediately
+    m.drainPending();
+}
+
 /// Error to the history, in RED (`md.Kind.error_msg`, `✗` prefix).
 ///
 /// The Kind and the prefix existed from the start, and NO caller used it:
@@ -1555,7 +2403,7 @@ fn pushErrorOwned(m: *tui.Model, text: []const u8) void {
 /// embedded and it came out duplicated and in the same grey as everything else
 /// (which is precisely the complaint that "you can't tell by the color").
 /// [roster] `pub` so `free_auto.zig` can use it.
-pub fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void {
+pub fn setStatusWithZo(m: *tui.Model, mood: tui.StatusKind, text: []const u8) void {
     m.setStatusWithMood(mood, text);
 }
 
@@ -1566,7 +2414,7 @@ pub fn setStatusWithZo(m: *tui.Model, mood: mascot.Mood, text: []const u8) void 
 /// the tempting alternative is `allocPrint(m.allocator, …)` + `pushInfoOwned`,
 /// which on an out-of-memory path hands a LITERAL to a function that frees it.
 /// Composing and copying in one call makes that mistake unrepresentable.
-pub fn setStatusWithZoFmt(m: *tui.Model, mood: mascot.Mood, comptime fmt: []const u8, args: anytype) void {
+pub fn setStatusWithZoFmt(m: *tui.Model, mood: tui.StatusKind, comptime fmt: []const u8, args: anytype) void {
     m.setStatusFmt(mood, fmt, args);
 }
 
@@ -1594,7 +2442,38 @@ pub fn activeProviderDef(env: ?*const std.process.Environ.Map) *const providers.
     return providers.byId(cur_provider_id) orelse providers.activeDef(env);
 }
 
-/// API key of the active provider: first the one saved in `auth.json`, then
+/// Key state of the active provider's API key.
+/// 
+/// `verified` means the key has been tested and works (recent auth success).
+/// `saved` means the key is stored in `auth.json` but has not been verified.
+/// `invalid` means the key is known to be bad (e.g., auth error received).
+/// `unknown` means no key is configured.
+///
+/// Takes the provider's environment to determine the key source.
+pub fn keyState(env: *const std.process.Environ.Map) u8 {
+    // Check saved keys first (from auth.json)
+    const def = activeProviderDef(env);
+    if (def.key_env.len > 0) {
+        // If there are saved keys, the key is at least "saved"
+        // Check if it also works via the environment
+        if (providers.keyFor(def, env) != null) return 1; // verified
+        return 2; // saved
+    }
+    // Check environment
+    const env_key = envGet(env, "ZODE_API_KEY");
+    if (env_key) |_| return 1; // verified (we assume it works if env has it)
+    return 0; // unknown
+}
+
+// Helper to compute the env var name for a provider's key
+fn providerKeyEnvName(def: *const providers.ProviderDef) []const u8 {
+    // Use the provider's key_env field if available, otherwise fall back to
+    // the generic ZODE_API_KEY
+    if (def.key_env.len > 0) return def.key_env[0];
+    return "ZODE_API_KEY";
+}
+
+// API key of the active provider: first the one saved in `auth.json`, then
 /// the environment variable, then the generic one.
 fn curKey(m: *tui.Model) ?[]const u8 {
     if (providers.keyFor(activeProviderDef(m.environ), m.environ)) |k| return k;
@@ -1653,9 +2532,37 @@ pub fn loadUserConfig() void {
             }
         }
         loadAllowlist();
+        // The permission RULES (Phase 6): the project file and the user file.
+        // They are read here, next to the allowlist they live with, and the
+        // hot path reads the cached set.
+        loadPermRules();
         loadAuthKeys(cfg_arena_state.?.allocator());
+
+        // The user's language servers. The manager COPIES them into its own
+        // memory, because this arena is freed on the next reload (connecting a
+        // provider reloads the config) and a server list that pointed into it
+        // would be a dangling pointer from then on.
+        lsp_manager.setServers(user_config.lsp_servers) catch {};
+
+        // The user's MCP servers. The same reason as the language servers: the
+        // manager COPIES them into its own memory, because this arena is freed
+        // on the next reload (connecting a provider reloads the config).
+        mcp_manager.setServers(user_config.mcp_servers) catch {};
+
+        // The status bar's `provider/model`, resolved now that the provider is
+        // known. It reads the CACHED catalogue and never the network, so this is
+        // safe to do on the startup path.
+        if (status_model_target) |m| tui.resolveStatusModel(m);
     }
 }
+
+/// The Model whose status bar row `loadUserConfig` refreshes.
+///
+/// It is a global and not a parameter for the reason every other startup hook
+/// here is: `loadUserConfig` is called from four places, two of them before the
+/// Model exists, and threading a pointer through all four is how the call ends
+/// up missing from the one that matters.
+pub var status_model_target: ?*tui.Model = null;
 
 /// Reads `~/.config/zode/auth.json` and hands it to `providers` so `keyFor`
 /// uses it. Without this, connecting a provider from the palette saved the key
@@ -1676,6 +2583,10 @@ var keys_arena_state: ?std.heap.ArenaAllocator = null;
 fn loadAuthKeys(_: std.mem.Allocator) void {
     var buf: [1024]u8 = undefined;
     const path = config_mod.authPath(environ_global, &buf) orelse return;
+    // BEFORE reading: an `auth.json` created by an older zode (or by hand) can
+    // be 0644, and reading it does not fix that. Every start of the app went
+    // through here and left the keys readable by every user on the machine.
+    config_mod.tightenPermissions(io_global, path);
 
     if (keys_arena_state == null) keys_arena_state = std.heap.ArenaAllocator.init(gpa_global);
     const a = keys_arena_state.?.allocator();
@@ -1719,6 +2630,12 @@ pub fn reloadUserConfig() void {
 /// Frees the config and keys arenas. On process exit, when no worker is left
 /// reading.
 pub fn shutdownUserConfig() void {
+    // The pointer is cleared BEFORE the arena is freed. The atomic store in
+    // `providers.setSavedKeys` makes the SWAP safe; it says nothing about the
+    // lifetime of what the pointer points at. A worker that loaded the map a
+    // moment before the `deinit` below would read freed memory through it, and
+    // this is the only place the keys arena dies.
+    providers.setSavedKeys(null);
     if (cfg_arena_state) |*s| {
         s.deinit();
         cfg_arena_state = null;
@@ -1727,12 +2644,33 @@ pub fn shutdownUserConfig() void {
         s.deinit();
         keys_arena_state = null;
     }
-    providers.setSavedKeys(null);
     user_config = .{};
     // The skills cache is the third arena-like thing in the process and the only
     // one with heap strings owned by the module. It is BORROWED by everyone, so
     // this is the one place it can be freed — at exit, with no worker left.
     freeSkillsCache();
+}
+
+test "shutdownUserConfig: after it, no key is readable through the pointer" {
+    // The ORDER inside `shutdownUserConfig` is the guarantee: the pointer is
+    // published as null before the arena dies, so a worker that arrives late
+    // reads null instead of a freed map. What this test can see is the
+    // postcondition; the race itself needs two threads and cannot be run here.
+    providers.setSavedKeys(null);
+    defer providers.setSavedKeys(null);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const map = try a.create(std.StringHashMapUnmanaged([]const u8));
+    map.* = .{};
+    try map.put(a, "zai", "sk-guardada");
+    providers.setSavedKeys(map);
+    try std.testing.expectEqualStrings("sk-guardada", providers.savedKeyFor("zai").?);
+
+    shutdownUserConfig();
+
+    try std.testing.expect(providers.savedKeyFor("zai") == null);
 }
 
 // ── session ───────────────────────────────────────────────────
@@ -1752,9 +2690,11 @@ pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Sessi
         const s = m.allocator.create(session_mod.Session) catch @panic("out of memory for the session");
         s.* = session_mod.Session.init(m.allocator);
         session = s;
+        cache_stats.session = .{};
         return s;
     };
     session = fresh;
+    cache_stats.session = .{};
     return fresh;
 }
 
@@ -1772,13 +2712,32 @@ fn langFromPath(path: []const u8) []const u8 {
     return base[dot + 1 ..];
 }
 
+/// The per-session file state: the read cache and the changed list.
+///
+/// A new session's context is EMPTY, so an entry that says "the model has this
+/// file" is a lie from that moment on: the next `read` would take the fast
+/// path, answer "it is already in your context" WITHOUT sending the body, and
+/// the model would be working from a file it cannot see.
+///
+/// It is its own function so that a test can drive it without a session (and
+/// without the `Io` that creating one needs).
+pub fn resetSessionFiles(m: *tui.Model) void {
+    m.reads.clear();
+    m.changed.clear();
+    m.bash_may_write = false;
+}
+
 /// Creates a new session and discards the current one.
 pub fn newSession(m: *tui.Model) void {
     if (session) |old| {
         m.allocator.destroy(old);
         session = null;
     }
+    cache_stats.session.reset();
     const s = ensureSession(m, m.allocator);
+    // Limpia el output/transcript visible para que la nueva sesión empiece
+    // sin restos de la anterior en pantalla.
+    m.clearHistory();
     m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
     resetSummaries();
@@ -1786,6 +2745,95 @@ pub fn newSession(m: *tui.Model) void {
     // session changes it. These are the only two moments that can: everything else in a
     // session happens inside the same tree.
     forgetGitRepoProbe();
+    // The read cache and the changed list are about THIS session: a new
+    // session's context is EMPTY, so an entry that says "the model has this
+    // file" would make the next `read` skip the body — and the model would
+    // be working from a file it cannot see.
+    resetSessionFiles(m);
+}
+
+/// Callback for the `/session` picker: resumes the session at `index`.
+pub fn onSessionPick(m: *tui.Model, _: u32, index: usize) void {
+    if (index >= m.session_picker_paths.items.len) return;
+    const path = m.session_picker_paths.items[index];
+
+    if (session) |old| {
+        m.allocator.destroy(old);
+        session = null;
+    }
+    cache_stats.session.reset();
+
+    if (session_mod.Session.resumePath(m.allocator, io_global, path)) |s| {
+        session = s;
+        cache_stats.session = s.usage_stats;
+        const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
+            "session resumed";
+        pushInfoOwned(m, msg);
+        resetSessionFiles(m);
+    } else |err| {
+        pushInfoFmt(m, "could not resume {s}: {t}", .{ path, err });
+    }
+}
+
+/// Callback for F2 rename in the session picker.
+/// `m.picker_rename_target` holds the session path (set by the TUI's F2 handler).
+/// Renames the session by setting its custom_title and persisting to the Meta sidecar.
+pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
+    const path = m.picker_rename_target orelse {
+        pushInfo(m, "rename: could not find session path");
+        return;
+    };
+
+    // The label may have " (current)" appended; strip it for display only.
+    const display = if (std.mem.endsWith(u8, label, "  (current)"))
+        label[0..label.len - "  (current)".len]
+    else
+        label;
+
+    const s = session orelse {
+        pushInfoFmt(m, "rename: no active session to rename {s}", .{display});
+        return;
+    };
+
+    // Only rename if this picker item is the current session.
+    if (s.path != null and std.mem.eql(u8, path, s.path.?)) {
+        // Rename the current session to the label (stripped of " (current)").
+        const trimmed = std.mem.trim(u8, display, " \t\r\n");
+        if (trimmed.len == 0) {
+            pushInfo(m, "rename: empty name");
+            return;
+        }
+        if (trimmed.len > 64) {
+            pushInfo(m, "rename: name too long (max 64 chars)");
+            return;
+        }
+
+        if (s.custom_title.len > 0) s.allocator.free(s.custom_title);
+        s.custom_title = s.allocator.dupe(u8, trimmed) catch {
+            pushInfo(m, "rename: out of memory");
+            return;
+        };
+
+        var arena_state = std.heap.ArenaAllocator.init(s.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const meta = sessionindex.readMeta(arena, io_global, path);
+        sessionindex.writeMeta(io_global, arena, path, .{
+            .name = meta.name,
+            .model = meta.model,
+            .created_at = meta.created_at,
+            .custom_title = trimmed,
+            .ai_title = meta.ai_title,
+        }) catch |err| {
+            pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
+            return;
+        };
+
+        pushInfoFmt(m, "renamed to \"{s}\"", .{trimmed});
+    } else {
+        pushInfoFmt(m, "rename: {s} is not the current session (use /rename <name>)", .{display});
+    }
 }
 
 // ── turn stats (ROADMAP phase 3) ──────────────────────────────
@@ -1808,6 +2856,15 @@ pub const TurnStats = struct {
     /// worth seeing as a number rather than as an absence: "0 reviews" reads as a fact
     /// and a missing line reads as something nobody looked for.
     reviews: usize = 0,
+    /// Questions the harness answered on its own because nobody was going to
+    /// answer them (YOLO mode).
+    yolo_auto: usize = 0,
+    /// The questions that were LEFT OPEN (YOLO mode, nothing to take).
+    ///
+    /// They are kept because the summary has to name them: a question nobody
+    /// was asked and nobody mentions is a question that is lost, and the user
+    /// is the only one who can answer it.
+    yolo_open: std.ArrayList([]const u8) = .empty,
     /// Files touched, in order of appearance, without repeats.
     files: std.ArrayList([]const u8) = .empty,
     lines_added: usize = 0,
@@ -1826,11 +2883,44 @@ pub const TurnStats = struct {
     }
 
     pub fn deinit(self: *TurnStats) void {
-        // `files.capacity == 0` = list with no memory of its own: there is nothing
-        // to free and `gpa` may be uninitialized.
-        if (self.files.capacity == 0) return;
-        for (self.files.items) |f| self.gpa.free(f);
-        self.files.deinit(self.gpa);
+        // `capacity == 0` = list with no memory of its own: there is nothing
+        // to free and `gpa` may be uninitialized. Each list is checked on its
+        // OWN: one early return for the files used to skip the open questions,
+        // and they leaked.
+        if (self.files.capacity > 0) {
+            for (self.files.items) |f| self.gpa.free(f);
+            self.files.deinit(self.gpa);
+        }
+        if (self.yolo_open.capacity > 0) {
+            for (self.yolo_open.items) |q| self.gpa.free(q);
+            self.yolo_open.deinit(self.gpa);
+        }
+        // FORGET BOTH LISTS, and this is the half that was missing.
+        //
+        // `chatWorker` calls `reset()` at the start of every turn and
+        // `deinit()` in a `defer` at the end, so the sequence for the SECOND
+        // turn is deinit (turn 1) → reset → deinit AGAIN. Without these two
+        // lines the second `deinit` still saw `capacity > 0` over freed memory
+        // and freed the same pointers again — a double free that showed up as
+        // a general protection exception at `self.gpa.free(f)` in a WORKER
+        // thread, which is exactly the shape of the open crash this repo has
+        // been hunting: silent in ReleaseSmall, immediate in a debug build.
+        //
+        // Reproduced (2026-10-23) with two turns in one session, the second
+        // one after a turn that had written a file: `tools/stress_tui.py`.
+        // Only turns that TOUCHED a file (or asked a question) have a non-empty
+        // list, which is why it looked random instead of every second turn.
+        self.files = .empty;
+        self.yolo_open = .empty;
+    }
+
+    /// Records a question that nobody answered and nobody will.
+    pub fn noteYoloOpen(self: *TurnStats, question: []const u8) void {
+        const copy = self.gpa.dupe(u8, question) catch return;
+        self.yolo_open.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return;
+        };
     }
 
     /// Records a touched file with its diff. If it was already there, it only adds
@@ -1887,6 +2977,18 @@ pub const TurnStats = struct {
         try w.writeAll("\u{23ba} Done \u{b7} ");
         try w.print("{d} tool{s}", .{ self.tools, if (self.tools == 1) "" else "s" });
         if (self.denied > 0) try w.print(" \u{b7} {d} denied", .{self.denied});
+        if (self.yolo_auto > 0) {
+            try w.print(" \u{b7} {d} question{s} answered for you", .{
+                self.yolo_auto,
+                if (self.yolo_auto == 1) "" else "s",
+            });
+        }
+        if (self.yolo_open.items.len > 0) {
+            try w.print(" \u{b7} {d} question{s} still OPEN", .{
+                self.yolo_open.items.len,
+                if (self.yolo_open.items.len == 1) "" else "s",
+            });
+        }
         if (self.files.items.len > 0) {
             try w.print(" \u{b7} {d} file{s} changed", .{
                 self.files.items.len,
@@ -1917,6 +3019,23 @@ pub const TurnStats = struct {
             if (!first) try w.writeAll(" \u{b7} ");
             first = false;
             try w.writeAll(f);
+        }
+        return w.buffered();
+    }
+
+    /// The questions that are still open, one per line.
+    ///
+    /// They are the user's to answer, and the summary says there are some: a
+    /// number ("1 question still OPEN") says that something needs a human,
+    /// and the TEXT of the question is what lets them answer it.
+    pub fn yoloOpenLine(self: *const TurnStats, buf: []u8) ![]const u8 {
+        if (self.yolo_open.items.len == 0) return "";
+        var w: std.Io.Writer = .fixed(buf);
+        try w.writeAll("still open (nobody was asked): ");
+        const q = self.yolo_open.items[0];
+        try w.writeAll(if (q.len > 120) q[0..120] else q);
+        if (self.yolo_open.items.len > 1) {
+            try w.print(" (+{d} more)", .{self.yolo_open.items.len - 1});
         }
         return w.buffered();
     }
@@ -2022,13 +3141,37 @@ test "TurnStats: a 0-line diff invents no files" {
 
 /// Empties the current session's history without creating a new one.
 pub fn resetSession(m: *tui.Model) void {
+    cache_stats.session.reset();
+    // The money is per session like the tokens are: a `/new` that kept the cost
+    // of the old one would show a bill for a conversation that no longer exists.
+    cost_mod.session.reset();
     if (session) |s| {
         s.messages.clearRetainingCapacity();
+        s.appendUsageSnapshot(cache_stats.session) catch |err| {
+            m.pushErrorFmt("could not reset session usage: {t}", .{err});
+        };
         s.flush();
     }
     session_elided = 0;
     resetSummaries();
     m.pushInfoFmt("session reset", .{});
+}
+
+/// Records one finished request against the session: tokens for `/usage`, and the
+/// same tokens against the MODEL for `/cost`.
+///
+/// `model` is the one that ANSWERED and not `curModel()`: the free-auto rotation
+/// and the cheap router both swap the target mid-turn, and a cost attributed to the
+/// model the user picked instead of the one that replied is a number about the
+/// wrong bill.
+fn recordSessionUsage(m: *tui.Model, usage: chat.Usage, kind: chat.ProviderKind, model: []const u8) void {
+    cache_stats.session.recordFor(usage, kind);
+    cost_mod.session.record(model, cache_stats.totalInputTokens(usage, kind), usage.completion);
+    if (session) |s| {
+        s.appendUsageSnapshot(cache_stats.session) catch |err| {
+            m.pushErrorFmt("could not save session usage: {t}", .{err});
+        };
+    }
 }
 
 /// Opens the session at startup: the most recent one if it was asked for
@@ -2044,6 +3187,7 @@ pub fn bootstrapSession(m: *tui.Model) void {
         if (latest) |path| {
             if (session_mod.Session.resumePath(m.allocator, io_global, path)) |s| {
                 session = s;
+                cache_stats.session = s.usage_stats;
                 const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
                     "session resumed";
                 pushInfoOwned(m, msg);
@@ -2141,12 +3285,12 @@ pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
 /// shows the mode that applies; turning it off returns to default.
 fn cmdYolo(m: *tui.Model) void {
     setPermMode(m, if (yolo) .default else .bypass);
-    const msg = if (yolo) "yolo ON: no confirmations" else "yolo OFF: asks for permission";
+    const msg = if (yolo) "yolo ON: no confirmations, and no questions (your questions are answered for you and said in the summary)" else "yolo OFF: asks for permission";
     pushInfo(m, msg);
     setStatusWithZo(m, if (yolo) .warn else .idle, msg);
 }
 
-/// `/mode [default|accept-edits|plan|bypass]`, or the current
+/// `/mode [build|accept-edits|plan|bypass]`, or the current
 /// mode with no argument.
 ///
 /// Selective permissions: the user picks how much the agent asks,
@@ -2160,7 +3304,7 @@ fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
             pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
             return;
         }
-        pushInfo(m, "/mode: default|accept-edits|plan|bypass");
+        pushInfo(m, "/mode: build|accept-edits|plan|bypass");
         return;
     }
     pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
@@ -2169,7 +3313,7 @@ fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
 /// The mode a `/mode` argument names, or null when it names none.
 /// Case-insensitive, and tolerant of the spellings people type.
 fn parsePermMode(a: []const u8) ?PermMode {
-    if (std.ascii.eqlIgnoreCase(a, "default")) return .default;
+    if (std.ascii.eqlIgnoreCase(a, "build") or std.ascii.eqlIgnoreCase(a, "default")) return .default;
     if (std.ascii.eqlIgnoreCase(a, "accept-edits") or
         std.ascii.eqlIgnoreCase(a, "accept_edits") or
         std.ascii.eqlIgnoreCase(a, "edits")) return .accept_edits;
@@ -2253,12 +3397,14 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         openModelPaletteAsync(m);
     } else if (std.mem.eql(u8, cmd, "effort")) {
         cmdEffort(m, arg);
+    } else if (std.mem.eql(u8, cmd, "color")) {
+        cmdColor(m, arg);
     } else if (std.mem.eql(u8, cmd, "submodel")) {
         cmdSubmodel(m, arg);
+    } else if (std.mem.eql(u8, cmd, "task-parallel")) {
+        cmdTaskParallel(m, arg);
     } else if (std.mem.eql(u8, cmd, "use")) {
         commands_mod.cmdUse(m, arg);
-    } else if (std.mem.eql(u8, cmd, "plan")) {
-        cmdPlan(m);
     } else if (std.mem.eql(u8, cmd, "undo")) {
         cmdUndo(m);
     } else if (std.mem.eql(u8, cmd, "clean")) {
@@ -2277,14 +3423,26 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
         commands_mod.cmdAllowlist(m);
+    } else if (std.mem.eql(u8, cmd, "permissions")) {
+        commands_mod.cmdPermissions(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
+    } else if (std.mem.eql(u8, cmd, "usage")) {
+        commands_mod.cmdUsage(m);
+    } else if (std.mem.eql(u8, cmd, "cost")) {
+        commands_mod.cmdCost(m);
+    } else if (std.mem.eql(u8, cmd, "update")) {
+        cmdUpdate(m);
     } else if (std.mem.eql(u8, cmd, "compact")) {
         commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "goal")) {
         commands_mod.cmdGoal(m, rest);
+    } else if (std.mem.eql(u8, cmd, "init")) {
+        commands_mod.cmdInit(m);
     } else if (std.mem.eql(u8, cmd, "session")) {
         commands_mod.cmdSession(m);
+    } else if (std.mem.eql(u8, cmd, "files")) {
+        commands_mod.cmdFiles(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {
         commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
@@ -2293,6 +3451,10 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdAskMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "skills")) {
         cmdSkills(m);
+    } else if (std.mem.eql(u8, cmd, "style")) {
+        cmdStyle(m, arg);
+    } else if (std.mem.eql(u8, cmd, "copy")) {
+        cmdCopy(m, arg);
     } else if (std.mem.eql(u8, cmd, "reload-cmds") or std.mem.eql(u8, cmd, "reloadcmds") or std.mem.eql(u8, cmd, "reloadcmd")) {
         if (m.io_ready) {
             refreshUserCommandsForce(m.allocator, m.io, m.environ, true);
@@ -2340,10 +3502,12 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         } else {
             m.pushInfo("usage: /which-cmd <name>");
         }
-    } else if (std.mem.eql(u8, cmd, "new")) {
+    } else if (std.mem.eql(u8, cmd, "new-session")) {
         newSession(m);
     } else if (std.mem.eql(u8, cmd, "resume")) {
         resumeLatest(m);
+    } else if (std.mem.eql(u8, cmd, "rename")) {
+        commands_mod.cmdRename(m, arg);
     } else {
         // An unknown token is where a USER command lives: refresh first, so a
         // file created while zode was open runs without a restart.
@@ -2377,7 +3541,7 @@ var uc_roots_n: usize = 0;
 /// Last mtime (ns) of each root directory at scan time; 0 = the directory did
 /// not exist. A missing directory stores 0, so CREATING it later is a non-zero
 /// mtime and invalidates the cache exactly like a new file would.
-var uc_root_mtime_ns: [2]i128 = .{0, 0};
+var uc_root_mtime_ns: [2]i128 = .{ 0, 0 };
 /// A scan has happened at least once. Without it the very first call would
 /// compare against uninitialised roots and could decide "unchanged" over
 /// garbage: an empty list, forever, with no error anywhere.
@@ -2826,12 +3990,17 @@ fn cmdClean(m: *tui.Model, aplicar: bool) void {
     // The failure count goes in the output on purpose: `apply` swallows the
     // per-file error so one unreadable file does not abort the rest, and
     // without this line "deleted 23" would be a lie when 24 were candidates.
-    const tail: []const u8 = if (rep.failed == 0)
-        std.fmt.allocPrint(gpa, "  deleted {d} files", .{deleted}) catch "  done"
-    else
-        std.fmt.allocPrint(gpa, "  deleted {d}, {d} could NOT be removed", .{ deleted, rep.failed }) catch
-            "  done (with failures)";
-    pushInfoOwned(m, tail);
+    // `pushInfoFmt` and not `allocPrint … catch "literal"`: on OOM the literal
+    // fallback is a pointer into `.rodata`, and `pushInfoOwned` takes ownership
+    // of it — `Model.deinit` then frees static memory. That is the "Invalid
+    // free" this repo has paid for repeatedly, and it only shows up when the
+    // allocator is already failing, which is exactly when you cannot diagnose
+    // it. `pushInfoFmt` composes AND owns, so the mistake cannot be written.
+    if (rep.failed == 0) {
+        m.pushInfoFmt("  deleted {d} files", .{ deleted });
+    } else {
+        m.pushInfoFmt("  deleted {d}, {d} could NOT be removed", .{ deleted, rep.failed });
+    }
 }
 
 /// `/resume`: reopens the most recent session by mtime.
@@ -2854,15 +4023,17 @@ fn resumeLatest(m: *tui.Model) void {
         return;
     };
     session = s;
+    cache_stats.session = s.usage_stats;
     session_elided = 0;
     resetSummaries();
     forgetGitRepoProbe();
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "session resumed: {s} · {d} messages",
-        .{ path, s.messages.items.len },
-    ) catch "session resumed";
-    pushInfoOwned(m, msg);
+    // The resumed session's context is the one in the FILE, and the read cache
+    // does not know what is in it: an entry that says "the model has this
+    // file" is a guess. Clearing it costs a re-read and buys a truth.
+    resetSessionFiles(m);
+    // Replay session messages into TUI history so they are visible
+    replaySessionMessages(m, s);
+    m.pushInfoFmt("session resumed: {s} · {d} messages", .{ path, s.messages.items.len });
     refreshContextUsage(m);
 }
 
@@ -2877,9 +4048,19 @@ pub const ChatJob = struct {
     text: []const u8,
 };
 
-fn startChat(m: *tui.Model, input: []const u8) !void {
+pub fn startChat(m: *tui.Model, input: []const u8) !void {
     const s = ensureSession(m, m.allocator);
-    const copy = try m.allocator.dupe(u8, input);
+    // Truncate long inputs for UI display, keep full text for model
+    const TRUNCATE_SIZE = 200;
+    var display_input = input;
+    var full_input = input;
+    if (input.len > TRUNCATE_SIZE) {
+        display_input = input[0..TRUNCATE_SIZE] ++ " ...";
+        full_input = input;
+    }
+    // Replace image references with [image.ext] placeholders for UI display
+    display_input = replaceImagePlaceholders(display_input);
+    const copy = try m.allocator.dupe(u8, full_input);
     errdefer m.allocator.free(copy);
 
     // If a turn is already in flight, QUEUE it instead of launching a worker in
@@ -2921,6 +4102,80 @@ fn startChat(m: *tui.Model, input: []const u8) !void {
         return error.ThreadSpawnFailed;
     };
     th.detach();
+}
+
+/// Replace image references with [image.ext] placeholders for UI display.
+/// Called on the truncated display input to keep the UI compact.
+pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
+    // Common image extensions
+    const image_exts = &[_][]const u8{"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"};
+    
+    // Find @image.ext patterns and replace them with [image.ext]
+    var result: [512]u8 = undefined;
+    var ri: usize = 0;
+    var li: usize = 0;
+    
+    while (li < text.len) {
+        // Look for @ followed by potential image filename
+        if (text[li] == '@' and li + 1 < text.len) {
+            li += 1;
+            // Collect the filename part (up to space, newline, tab, or end)
+            var fe: usize = li;
+            while (fe < text.len and text[fe] != ' ' and text[fe] != '\n' and text[fe] != '\t' and text[fe] != '@') {
+                fe += 1;
+            }
+            const filename = text[li .. fe];
+            // Check if it has an image extension (the part after the last dot)
+            const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse continue;
+            // Extension must not be at the start (like .gitignore) and must exist
+            if (dot >= filename.len - 1) {
+                // No valid extension found, copy @ as-is
+                if (ri + 1 > result.len) break;
+                result[ri] = '@';
+                ri += 1;
+                li += 1;
+                continue;
+            }
+            const ext = filename[dot + 1 .. fe];
+            var is_image = false;
+            var ei: usize = 0;
+            while (ei < image_exts.len) {
+                if (ext.len == image_exts[ei].len) {
+                    var match = true;
+                    var ci: usize = 0;
+                    while (ci < ext.len) {
+                        if (std.ascii.toLower(ext[ci]) != std.ascii.toLower(image_exts[ei][ci])) {
+                            match = false;
+                            break;
+                        }
+                        ci += 1;
+                    }
+                    if (match) {
+                        is_image = true;
+                        break;
+                    }
+                }
+                ei += 1;
+            }
+            if (is_image) {
+                // Replace @image.ext with [image.ext]
+                var repl_buf: [32]u8 = undefined;
+                const repl_slice = std.fmt.bufPrint(repl_buf[0..], "[image.{s}]", .{ext}) catch break;
+                const repl_len = repl_slice.len;
+                if (ri + repl_len > 512) break;
+                @memcpy(result[ri .. ri + repl_len], repl_buf[0..repl_len]);
+                ri += repl_len;
+                li = fe;
+                continue;
+            }
+        }
+        // Copy normal character
+        if (ri + 1 > result.len) break;
+        result[ri] = text[li];
+        ri += 1;
+        li += 1;
+    }
+    return result[0..ri];
 }
 
 /// The worker: one turn of conversation with the API, with tools.
@@ -2997,6 +4252,7 @@ fn chatWorker(job: *ChatJob) void {
     const hard = if (had_goal) goalHardLimit() else soft;
 
     m.repeats.reset();
+    var repeat_recovery: repeats_mod.Recovery = .{};
     var checkpointed = false;
     // How many times this turn has shown the plan-approval dialog. Bounded so
     // "reject → revise → re-present" can cycle once but a turn that keeps being
@@ -3076,6 +4332,37 @@ fn chatWorker(job: *ChatJob) void {
             }
         }
 
+        if (m.loop_repeated) |which| {
+            m.loop_repeated = null;
+            if (again) |answer| m.allocator.free(answer);
+            switch (repeat_recovery.onRepeat()) {
+                .nudge => {
+                    pushErrorFmt(
+                        m,
+                        "repeated `{s}` with the same arguments {d} times. I have not run it again. Change the approach or arguments, inspect the result, or explain why another action is needed.",
+                        .{ which, repeats_mod.repeat_limit },
+                    );
+                    m.repeats.reset();
+                    const nudge = m.allocator.dupe(
+                        u8,
+                        "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.",
+                    ) catch break;
+                    if (owned) |o| m.allocator.free(o);
+                    owned = nudge;
+                    last_user = nudge;
+                    continue;
+                },
+                .stop => {
+                    pushErrorFmt(
+                        m,
+                        "stopped: `{s}` repeated with the same arguments after the harness already asked for a different approach. No automatic retry was performed.",
+                        .{which},
+                    );
+                    break;
+                },
+            }
+        }
+
         const text = again orelse {
             // ── PLAN APPROVAL: the turn may not end with a plan nobody answered on ──
             //
@@ -3108,13 +4395,13 @@ fn chatWorker(job: *ChatJob) void {
                     break;
                 }
                 if (m.plan_touched_this_turn and !m.plan.isEmpty() and plan_gate_asks < 2) {
-                plan_gate_asks += 1;
-                if (planApprovalNudge(m)) |nudge| {
-                    if (owned) |o| m.allocator.free(o);
-                    owned = nudge;
-                    last_user = nudge;
-                    continue;
-                }
+                    plan_gate_asks += 1;
+                    if (planApprovalNudge(m)) |nudge| {
+                        if (owned) |o| m.allocator.free(o);
+                        owned = nudge;
+                        last_user = nudge;
+                        continue;
+                    }
                 }
             }
             break;
@@ -3122,19 +4409,6 @@ fn chatWorker(job: *ChatJob) void {
         if (owned) |o| m.allocator.free(o);
         owned = text;
         last_user = text;
-
-        // 1. The model ran the same call three times running. Stopped HERE, and not at
-        //    the limit, because the limit costs twelve iterations first and the user
-        //    sees a normal-looking turn that ends for no stated reason.
-        if (m.loop_repeated) |which| {
-            m.loop_repeated = null;
-            pushErrorFmt(
-                m,
-                "stopped: `{s}` ran with the same arguments three times in a row. Something is not moving; tell me what to try instead.",
-                .{which},
-            );
-            break;
-        }
 
         // 1. The goal was decided. The model said so, and it is the only thing that
         //    ends a goal turn early.
@@ -3188,11 +4462,19 @@ fn chatWorker(job: *ChatJob) void {
         if (!goal_mod.verdictCredible(&m.goal, turn_stats.tools)) {
             m.goal.blocked_refusals += 1;
             m.goal.status = goal_mod.Status.none;
-            const why = goal_mod.blockedRetryText(m.allocator) catch break;
-            pushErrorOwned(m, why);
+            // The refusal and the prompt are TWO buffers. `pushErrorOwned` takes
+            // ownership (the drain moves the pointer into `paras` and
+            // `Model.deinit` frees it), so handing the same slice to `owned`
+            // made it a second owner: a use-after-free while the UI painted the
+            // paragraph, and a double free at teardown. It was `owned = why`
+            // right after `pushErrorOwned(m, why)`. `exitGate`'s refusal 150
+            // lines up has the right shape: the error gets its buffer, the
+            // prompt gets its own.
+            pushErrorOwned(m, goal_mod.blockedRetryText(m.allocator) catch break);
+            const nudge = m.allocator.dupe(u8, goal_mod.blockedRetryPrompt()) catch break;
             if (owned) |o| m.allocator.free(o);
-            owned = why;
-            last_user = why;
+            owned = nudge;
+            last_user = nudge;
             continue;
         }
 
@@ -3452,11 +4734,22 @@ fn pushTurnSummary(m: *tui.Model) void {
     const line = s.summaryLine(&line_buf, ms, ctx_used, cacheHitPct()) catch return;
     pushInfo(m, line);
 
-    if (s.files.items.len == 0) return;
+    if (s.files.items.len == 0 and s.yolo_open.items.len == 0) return;
     var detail_buf: [512]u8 = undefined;
     const detail = s.detailLine(&detail_buf) catch return;
-    if (detail.len == 0) return;
-    pushInfo(m, detail);
+    if (detail.len > 0) pushInfo(m, detail);
+
+    // The questions nobody answered, in the summary.
+    //
+    // The model is TOLD to mention them in its own answer, and it usually
+    // does. But "usually" is not a guarantee, and the one thing the user has
+    // to act on is exactly the thing the model might forget: a question that
+    // nobody was asked and nobody mentions is a question that is lost.
+    if (s.yolo_open.items.len > 0) {
+        var ybuf: [256]u8 = undefined;
+        const y = s.yoloOpenLine(&ybuf) catch return;
+        if (y.len > 0) pushInfo(m, y);
+    }
 }
 
 /// Cache hit-rate of the session, rounded (0 = no data).
@@ -3669,6 +4962,36 @@ fn pickTarget(m: *tui.Model) Target {
     if (free_auto.poolSize() == 0) return active;
     const cand = free_auto.rosterGet(m.allocator).active(free_auto.nowMs()) orelse return active;
     return targetForCandidate(m, cand) orelse active;
+}
+
+/// Updates `cur_model_ctx` from the roster candidate if the pick comes from free-auto.
+/// This ensures the compaction budget uses the correct context window when free-auto
+/// rotates to a model with a different (typically smaller) context window.
+fn updateModelContextFromPick(pick: Target) void {
+    if (pick.from_roster) |cand| {
+        setModelCtx(pick.model, cand.ctx);
+    }
+}
+
+/// How many output tokens this request may ask for: the provider's cap, and the
+/// user's ceiling on top of it.
+///
+/// Two numbers because they answer different questions. The provider cap
+/// (`max_output_tokens` in the provider table) exists because a hosted service
+/// validates `max_tokens` per MODEL and some of its models top out at 4096:
+/// `medium` sends 32768 and the turn dies before the first token. A user can
+/// SURPASS that by picking a model with a lower limit still (NVIDIA's catalog
+/// mixes 4096 and 32768), which is why `ZODE_MAX_OUTPUT_TOKENS` is a hard
+/// ceiling on top instead of a replacement: the smaller of the two wins, and 0
+/// means "no opinion".
+pub fn outputCapFor(def: *const providers.ProviderDef, env: ?*const std.process.Environ.Map) u32 {
+    const from_env: u32 = blk: {
+        const raw = envGet(env, "ZODE_MAX_OUTPUT_TOKENS") orelse break :blk 0;
+        break :blk std.fmt.parseInt(u32, raw, 10) catch 0;
+    };
+    if (from_env == 0) return def.max_output_tokens;
+    if (def.max_output_tokens == 0) return from_env;
+    return @min(def.max_output_tokens, from_env);
 }
 
 // ── /submodel: which model the SUBAGENTS run on ──────────────
@@ -4022,15 +5345,26 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     const gpa = m.allocator;
     const def = activeProviderDef(m.environ);
 
+    // An empty `models_url` means the provider publishes no catalogue (Z.AI:
+    // its API reference has chat/completions and nothing that lists models).
+    // Asking would be a request to "" whose error talks about a URL and not
+    // about the provider, so the answer is the one thing the user can act on.
+    if (def.models_url.len == 0) {
+        m.pushInfoFmt(
+            "{s} publishes no model catalog: pick the model by hand with `/use {s} <model>` (or set ZODE_MODEL).",
+            .{ def.id, def.id },
+        );
+        setStatusWithZo(m, .warn, "no model · /use");
+        return null;
+    }
+
     setStatusWithZo(m, .thinking, "no model chosen · asking the provider");
 
-    var list = models_mod.listModels(gpa, http, def.models_url, providers.keyFor(def, m.environ) orelse curKey(m)) catch |err| {
-        const msg = std.fmt.allocPrint(
-            gpa,
+    var list = models_mod.listModels(gpa, http, def.models_url, providers.authWithKey(def.key_style, providers.keyFor(def, m.environ) orelse curKey(m))) catch |err| {
+        m.pushInfoFmt(
             "no model chosen, and {s}'s catalog could not be read ({t}). Open /model to pick one.",
             .{ def.id, err },
-        ) catch "no model chosen: the catalog could not be read";
-        pushInfoOwned(m, msg);
+        );
         setStatusWithZo(m, .warn, "no model · /model");
         return null;
     };
@@ -4042,25 +5376,17 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
         return null;
     }
 
-    var best: ?models_mod.Model = null;
-    for (list.items) |info| {
-        if (!isFree(info)) continue;
-        if (best == null or std.mem.lessThan(u8, info.id, best.?.id)) best = info;
-    }
-    const chosen = best orelse list.items[0];
+    const choice = chooseCatalogModel(def, list.items) orelse unreachable;
+    const chosen = choice.model;
 
     // The window comes with the choice: this function downloaded the catalogue
     // to make the decision and threw `context_length` away on the way out, so
     // the budget stayed at 128k for a model that publishes 200k.
     setModelCtx(chosen.id, chosen.context_length);
-    const why = if (chosen.is_free)
-        "the first free model in its catalog"
-    else
-        "the first model in its catalog (it publishes no free ones)";
     // WHICH and WHY, in the history and not only in the status bar: a silent
     // choice is indistinguishable from a hardcoded default, which is the thing
     // this exists to replace.
-    pushInfoFmt(m, "model → {s} ({s}; /model to change it)", .{ chosen.id, why });
+    pushInfoFmt(m, "model → {s} ({s}; /model to change it)", .{ chosen.id, choice.why });
     setStatusWithZo(m, .done, chosen.id);
     refreshContextUsage(m);
     return curModel();
@@ -4079,20 +5405,58 @@ pub fn resolveModelHeadless(
     env: ?*const std.process.Environ.Map,
 ) ![]const u8 {
     const def = activeProviderDef(env);
-    var list = try models_mod.listModels(gpa, http, def.models_url, providers.keyFor(def, env));
+    var list = try models_mod.listModels(gpa, http, def.models_url, providers.catalogAuth(def, env));
     defer list.deinit(gpa);
     if (list.items.len == 0) return error.NoModelsPublished;
 
-    var best: ?models_mod.Model = null;
-    for (list.items) |info| {
-        if (!isFree(info)) continue;
-        if (best == null or std.mem.lessThan(u8, info.id, best.?.id)) best = info;
-    }
-    const chosen = best orelse list.items[0];
+    const chosen = (chooseCatalogModel(def, list.items) orelse return error.NoModelsPublished).model;
     // Into the static buffer: the caller keeps this for the whole run and the
     // list is freed on the way out.
     setModelCtx(chosen.id, chosen.context_length);
     return curModel();
+}
+
+/// The catalog choice for a provider the user has NOT picked a model for.
+///
+/// ONE function and not two, because the TUI (`resolveModel`) and `--chat`
+/// (`resolveModelHeadless`) must not disagree: two pickers that each decide "the
+/// first free model" drift the day one of them learns a new rule, and the drift
+/// only shows up as a bug report about `--chat` behaving differently against the
+/// same provider.
+const CatalogChoice = struct {
+    model: models_mod.Model,
+    /// The sentence that says WHY, for the history: a silent choice is
+    /// indistinguishable from a hardcoded default.
+    why: []const u8,
+};
+
+fn chooseCatalogModel(def: *const providers.ProviderDef, list: []const models_mod.Model) ?CatalogChoice {
+    if (list.len == 0) return null;
+
+    // 1. The provider's OWN preference list, in the order the provider wrote it.
+    //
+    // NVIDIA publishes 85 models and the first one is `01-ai/yi-large`, long
+    // retired: "the first entry in the catalog" is not a choice there, it is the
+    // oldest row. The preference list is a suggestion (a retired id fails loudly
+    // at the first request), and anything not present in the catalog is skipped
+    // instead of guessed.
+    for (def.preferred_models) |want| {
+        for (list) |info| {
+            if (std.mem.eql(u8, info.id, want)) {
+                return .{ .model = info, .why = "one of its preferred models" };
+            }
+        }
+    }
+
+    // 2. The first free model (alphabetical, so the answer is stable between
+    //    runs), else the first entry the catalog listed.
+    var best: ?models_mod.Model = null;
+    for (list) |info| {
+        if (!isFree(info)) continue;
+        if (best == null or std.mem.lessThan(u8, info.id, best.?.id)) best = info;
+    }
+    if (best) |b| return .{ .model = b, .why = "the first free model in its catalog" };
+    return .{ .model = list[0], .why = "the first model in its catalog (it publishes no free ones)" };
 }
 
 /// The model the USER chose, or `""`.
@@ -4157,20 +5521,15 @@ fn targetForCandidate(m: *tui.Model, cand: roster_mod.Candidate) ?Target {
 fn pushSwitchNotice(m: *tui.Model, sw: free_auto.Switch, to: Target) void {
     const to_c = to.from_roster orelse return;
     const reason = if (sw.prev_reason.len > 0) sw.prev_reason else "quota gone";
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "quota gone on {s}/{s} ({s}) → {s}/{s} (free-auto {d}/{d})",
-        .{
-            sw.prev_provider,
-            sw.prev_model,
-            reason,
-            to_c.provider_id,
-            to_c.model_id,
-            free_auto.rosterGet(m.allocator).idx + 1,
-            free_auto.poolSize(),
-        },
-    ) catch "free-auto: switched model";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("quota gone on {s}/{s} ({s}) → {s}/{s} (free-auto {d}/{d})", .{
+        sw.prev_provider,
+        sw.prev_model,
+        reason,
+        to_c.provider_id,
+        to_c.model_id,
+        free_auto.rosterGet(m.allocator).idx + 1,
+        free_auto.poolSize(),
+    });
     // The status stays short: it is a segmented line and it already carries the
     // model and the provider. The detail (the why) is in the line above, which
     // does not get cropped.
@@ -4213,12 +5572,13 @@ fn noteTurnFailure(m: *tui.Model, err: anyerror, pick: Target) void {
     if (err == error.AuthFailed or err == error.Cancelled) return;
     const sw = free_auto.switchTo(m.allocator, .failed, chat.lastErrorBody()) orelse return;
     const c = sw.cand;
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "{s}/{s} failed: {s} → next turn starts with {s}/{s}",
-        .{ sw.prev_provider, sw.prev_model, errPhrase(err), c.provider_id, c.model_id },
-    ) catch "free-auto: the pair failed";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("{s}/{s} failed: {s} → next turn starts with {s}/{s}", .{
+        sw.prev_provider,
+        sw.prev_model,
+        errPhrase(err),
+        c.provider_id,
+        c.model_id,
+    });
 }
 
 /// How many files went in with the prompt, and how many of the mentioned ones
@@ -4262,7 +5622,7 @@ fn withMentions(
     }
     const li = last orelse return msgs;
 
-    const exp = mentions.expand(arena, io_global, msgs[li].content) catch return msgs;
+    const exp = mentions.expand(io_global, msgs[li].content) catch return msgs;
     if (exp.files == 0) return msgs;
     count.files = exp.files;
     count.missing = exp.missing;
@@ -4320,6 +5680,40 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // (read-only mode, the skill list), so it is synced AFTER the append.
     syncSystemPrompt(s);
 
+    // Phase 2.2: attach the skill listing ONCE per session, at the end of the
+    // prompt, outside the cacheable system prefix. `syncSystemPrompt` above no
+    // longer puts skills in the system message (they would bloat the stable
+    // prefix on every turn); instead they go here as a user message, once.
+    // Reset on config reload via `Session.resetSkillsSent`. Not persisted to
+    // disk, so a resumed session re-sends them on its first turn.
+    if (!s.skills_sent) {
+        var already = false;
+        for (s.messages.items) |mm| {
+            if (mm.role == .user and std.mem.startsWith(u8, mm.content, "[Skills]")) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) {
+            var buf: [16 * 1024]u8 = undefined;
+            const section = skillsSectionText(s.allocator, null, &buf);
+            if (section.len > 0) {
+                const owned = s.allocator.dupe(u8, section) catch null;
+                if (owned) |text| {
+                    const note = std.fmt.allocPrint(
+                        s.allocator,
+                        "[Skills] {s}",
+                        .{ text },
+                    ) catch null;
+                    if (note) |n| {
+                        s.append(.user, n) catch {};
+                        s.skills_sent = true;
+                    }
+                }
+            }
+        }
+    }
+
     // The automatic typecheck's verdict, IF it has finished.
     //
     // Here and not in `execToolCalls` because the timing is the whole point: the
@@ -4360,6 +5754,11 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // screenshot and `/resume` would bring the pictures back. They are consumed
     // here — one message, one request — and the base64 dies with this turn's arena.
     const msgs0 = withPendingImages(m, arena, msgs1);
+
+    // Pick the target model BEFORE compaction so the budget uses the correct
+    // context window (critical when free-auto rotates to a model with a smaller window).
+    var pick = pickTarget(m);
+    updateModelContextFromPick(pick);
 
     // `ZODE_COMPACT=off` is a branch HERE, not inside `elideTier`, so it cannot be
     // half-applied: with it on, nothing is elided and nothing is summarized, and the
@@ -4454,6 +5853,18 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             const sp = pickTarget(m);
             var surl_buf: [1024]u8 = undefined;
             const surl = targetUrl(&surl_buf, sp);
+
+            // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+            var sum_extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+            var sum_extra_hdrs_len: usize = 0;
+            if (std.mem.eql(u8, sp.def.id, "openrouter")) {
+                sum_extra_hdrs_buf[sum_extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+                sum_extra_hdrs_len += 1;
+                sum_extra_hdrs_buf[sum_extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+                sum_extra_hdrs_len += 1;
+            }
+            const sum_extra_headers = sum_extra_hdrs_buf[0..sum_extra_hdrs_len];
+
             if (summarizeTurns(
                 gpa,
                 &sum_http,
@@ -4466,6 +5877,8 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
                 chat.effectiveEffort(sp.model, current_effort),
                 comp.msgs[sum_from..upto],
                 arena,
+                sum_extra_headers,
+                outputCapFor(sp.def, environ_global),
             )) |summary| {
                 noteSummarized(iteration);
                 pushInfoFmt(m, "\u{b7} older turns summarized ({d} chars, was {d} messages)", .{
@@ -4511,11 +5924,13 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // With no model chosen, the provider is asked BEFORE composing anything. And if
     // that is not possible, the turn is cut here: not answering is better than
     // answering oneself with a 403 that does not explain its cause.
-    if (pickTarget(m).model.len == 0) {
+    if (pick.model.len == 0) {
         _ = resolveModel(m, &http);
+        // Re-pick after resolveModel may have set a model.
+        pick = pickTarget(m);
+        updateModelContextFromPick(pick);
     }
 
-    var pick = pickTarget(m);
     if (pick.model.len == 0) {
         m.streamEnd();
         pushInfo(m, "no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
@@ -4600,7 +6015,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         // NOT freed between attempts: `buildBodyMessages` overwrites it and the
         // pointer is only used while the request is in flight.
         const body_buf = try bodyBuf(gpa);
-        const body = try chat.buildBodyMessages(
+        const body = try chat.buildBodyMessagesCapped(
             body_buf,
             pick.model,
             // `msgs_wire`, not `comp.msgs`: it is the same list with the old
@@ -4614,8 +6029,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             // moved to a smaller one. It is the same `Target` the rest of the
             // rotation path talks about.
             chat.effectiveEffort(pick.model, current_effort),
-            tools_mod.toolsJson(),
+            if (read_only) tools_mod.toolsJsonReadOnly() else tools_mod.toolsJson(),
             pick.kind,
+            outputCapFor(pick.def, environ_global),
         );
 
         // CAREFUL: `streamChat` expects the FULL URL, not just the provider's
@@ -4633,6 +6049,17 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         // only set x-api-key `if (bearer) |k|`, and there was no k.
         const bearer: ?[]const u8 = pick.key;
 
+        // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+        var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+        var extra_hdrs_len: usize = 0;
+        if (std.mem.eql(u8, pick.def.id, "openrouter")) {
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+            extra_hdrs_len += 1;
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+            extra_hdrs_len += 1;
+        }
+        const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
+
         chat.streamChat(
             gpa,
             &http,
@@ -4647,6 +6074,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             },
             pick.kind,
             true, // the turn the user watches: publishes usage/errors/cancel
+            extra_headers,
         ) catch |err| {
             // The cheap router falls back BEFORE anything else touches the error,
             // because this is the one case where the failure is a fact about the
@@ -4694,6 +6122,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
                         if (targetForCandidate(m, sw.cand)) |next| {
                             rotations += 1;
                             pick = next;
+                            updateModelContextFromPick(pick);
                             pushSwitchNotice(m, sw, pick);
                             continue; // <- the turn carries on by itself
                         }
@@ -4722,7 +6151,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // The provider's own completion count when it sent one: the same window of
     // time, the real tokenizer (see `finishTps`).
     finishTps(tstate.chars, tstate.stream_start_ns, chat.last_usage.completion);
-    cache_stats.session.record(chat.last_usage);
+    recordSessionUsage(m, chat.last_usage, pick.kind, pick.model);
 
     // Closes the streaming paragraph: what arrived stays in the history.
     m.streamEnd();
@@ -4797,21 +6226,6 @@ fn maybeAnnounceCompaction(m: *tui.Model, comp_needs_summary: bool) void {
     pushInfoOwned(m, msg);
 }
 
-/// `/plan`: clears the visible task list.
-///
-/// It exists because the plan belongs to the TURN and sometimes gets stuck
-/// half-done (the model ran out of steps, or the user wants to start over
-/// without a new session). Without it, the only way to empty it is the model
-/// sending an empty list, which is never going to happen on its own.
-fn cmdPlan(m: *tui.Model) void {
-    if (m.planCopy().isEmpty()) {
-        pushInfo(m, "the plan is already empty");
-        return;
-    }
-    m.clearPlan();
-    pushInfo(m, "plan cleared");
-}
-
 /// `/undo`: puts the files back the way they were before the last turn.
 ///
 /// It undoes FILES, not messages. The session is an append-only JSONL and
@@ -4881,6 +6295,9 @@ fn cmdUndo(m: *tui.Model) void {
             undone,
             if (undone == 1) "" else "s",
         }) catch "undo: done";
+    // `pushInfoFmt` COPIES, so a literal fallback is safe here — which is the
+    // whole difference from `pushInfoOwned`, where the same literal is an
+    // "Invalid free" at teardown.
 
     m.pushInfoFmt("{s} · from: {s}", .{ head_buf, cp.labelOf() });
     if (w.buffered().len > 0) {
@@ -4889,11 +6306,10 @@ fn cmdUndo(m: *tui.Model) void {
         m.pushInfoFmt("{s}", .{w.buffered()});
     }
     if (skipped > 0 or failed > 0) {
-        const warn = std.fmt.allocPrint(m.allocator, "{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
+        m.pushInfoFmt("{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
             skipped,
             failed,
-        }) catch "some files were skipped";
-        pushInfoOwned(m, warn);
+        });
     }
     if (undone > 0) setStatusWithZo(m, .done, "undone");
 }
@@ -5127,7 +6543,11 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
     const line = applyPlanTo(&snapshot, args_json, arena) orelse return;
     m.plan_touched_this_turn = true;
     m.replacePlan(snapshot);
-    m.pushInfoFmt("{s}", .{line});
+    if (snapshot.isEmpty()) {
+        m.pushInfoFmt("{s}", .{line});
+    } else {
+        m.pushInfoFmt("{s}\n{s}", .{ line, snapshot.details(arena) });
+    }
     if (snapshot.allDone()) setStatusWithZo(m, .done, "all plan steps done");
 }
 
@@ -5289,6 +6709,53 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
     m.asks_this_turn += 1;
     m.bench.asks += 1;
 
+    // ── YOLO: nobody is going to answer ──
+    //
+    // `/yolo` exists so the app does not stop to wait for the human, and a
+    // question that opens a dialog stops the app exactly as much as a
+    // permission dialog does. So the question is NOT shown to anybody:
+    //
+    // - With OPTIONS, the harness takes the model's OWN recommendation (the
+    //   schema tells it to put the recommendation FIRST, so the first option
+    //   IS the recommendation) and carries on.
+    // - Without options there is nothing to take, so the question stays OPEN
+    //   and the model has to decide by itself.
+    //
+    // In BOTH cases the model is told to SAY it in its final summary: a
+    // decision the user never saw is a decision the user cannot check, and an
+    // open question nobody mentions is a question that is lost.
+    const decision = ask.decide(currentPermMode() == .bypass, question.options.len > 0);
+    if (decision != .ask) {
+        m.pushToolStart("ask", question.question);
+        var ybuf: [ask.yolo_buf_len]u8 = undefined;
+        var sum_buf: [96]u8 = undefined;
+        var sum: []const u8 = "yolo";
+        const res: []const u8 = switch (decision) {
+            .take_recommendation => blk: {
+                const opt = question.options[0];
+                m.bench.asks_auto += 1;
+                const head = if (opt.len > 48) opt[0..48] else opt;
+                sum = std.fmt.bufPrint(&sum_buf, "answered for you (yolo): {s}{s}", .{
+                    head,
+                    if (opt.len > 48) "…" else "",
+                }) catch "answered for you (yolo)";
+                break :blk ask.formatYoloTaken(&ybuf, opt);
+            },
+            .leave_open => blk: {
+                m.bench.asks_open += 1;
+                turn_stats.noteYoloOpen(question.question);
+                sum = std.fmt.bufPrint(&sum_buf, "left open (yolo): {s}", .{
+                    if (question.header.len > 0) question.header else "the question",
+                }) catch "left open (yolo)";
+                break :blk ask.formatYoloDeferred(&ybuf);
+            },
+            .ask => unreachable,
+        };
+        m.pushToolDone("ask", sum, 0, res);
+        s.appendToolResult(call.id, "ask", res) catch {};
+        return 1;
+    }
+
     // The header shows the question, so that is what goes into the history next
     // to `ask(...)`. A history that says `ask(Which database?)` is the difference
     // between being able to scroll back and understanding what happened.
@@ -5324,6 +6791,80 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
     return 1;
 }
 
+/// Cap on the output of a `!cmd` run from inside a skill. A skill is a set of
+/// instructions, not a script runner, and a command that prints megabytes drowns
+/// the skill itself.
+const skill_cmd_cap = 16 * 1024;
+
+/// Expands `!cmd` lines inside a skill body: each command is run (behind Phase 6
+/// bash permissions) and its stdout replaces the `!cmd` line.
+///
+/// Returns `body` unchanged when there is no `!cmd` line (no copy, no alloc).
+/// Otherwise returns a slice allocated in `arena`; the caller consumes it
+/// immediately and the tool result copies it, so the slice outliving this call
+/// is not a problem.
+fn expandSkillCommands(
+    body: []const u8,
+    io: std.Io,
+    arena: std.mem.Allocator,
+) ![]const u8 {
+    // Fast path: no `!` at the start of any line.
+    var i: usize = 0;
+    var has_cmd = false;
+    while (i < body.len) {
+        if (body[i] == '!' and (i == 0 or body[i - 1] == '\n')) {
+            has_cmd = true;
+            break;
+        }
+        i += 1;
+    }
+    if (!has_cmd) return body;
+
+    var out: std.ArrayList(u8) = .empty;
+    // Buffer lives in `arena`; no deinit here so the returned slice stays valid
+    // until the caller's arena dies (the tool result copies it).
+    var expanded = false;
+    var last: usize = 0;
+    i = 0;
+    while (i < body.len) {
+        if (body[i] == '!' and (i == 0 or body[i - 1] == '\n')) {
+            var j = i + 1;
+            while (j < body.len and body[j] != '\n') j += 1;
+            const cmd_line = body[i + 1..j];
+            const cmd = std.mem.trim(u8, cmd_line, " \t\r\n");
+            if (last < i) try out.appendSlice(arena, body[last..i]);
+            expanded = true;
+            // Phase 6 permissions: the command runs only if bash is always
+            // allowed or this exact command matches a persisted prefix.
+            const allowed = isAlwaysAllowed("bash") or bashPatternAllowed("bash", cmd);
+            if (allowed) {
+                const fg = bg_tool.runForeground(arena, io, cmd, 30, skill_cmd_cap) catch {
+                    try out.appendSlice(arena, "[command failed: ");
+                    try out.appendSlice(arena, cmd);
+                    try out.appendSlice(arena, "]\n");
+                    last = j + 1;
+                    i = last;
+                    continue;
+                };
+                try out.appendSlice(arena, fg.stdout);
+                // `fg.stdout`/`fg.stderr` live in `arena`, reclaimed when the
+                // caller's arena dies; no separate deinit here.
+            } else {
+                try out.appendSlice(arena, "[permission required: ");
+                try out.appendSlice(arena, cmd);
+                try out.appendSlice(arena, "]\n");
+            }
+            last = j + 1;
+            i = last;
+            continue;
+        }
+        i += 1;
+    }
+    if (last < body.len) try out.appendSlice(arena, body[last..]);
+    if (!expanded) return body;
+    return out.items;
+}
+
 /// `skill`: load a skill's body on demand.
 ///
 /// This is the tool that makes a library of skills affordable: the prompt carries
@@ -5341,9 +6882,13 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
         return 1;
     };
     var want: []const u8 = "";
+    var args: ?[]const u8 = null;
     if (v == .object) {
         if (v.object.get("name")) |nv| {
             if (nv == .string) want = std.mem.trim(u8, nv.string, " \t\r\n");
+        }
+        if (v.object.get("args")) |av| {
+            if (av == .string) args = av.string;
         }
     }
 
@@ -5379,16 +6924,56 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
 
     var loader = skillstore.Loader.init(m.allocator, io_global, m.environ);
     var body: [skills.max_inline + 1024]u8 = undefined;
-    const text = loader.load(entry, &body) orelse {
+    const text = loader.loadWithArgs(entry, args, &body) orelse {
         const bad = std.fmt.allocPrint(arena, "the skill \"{s}\" could not be read ({s}). Continue without it.", .{ entry.name, entry.path }) catch "the skill could not be read";
         m.pushToolDone("skill", "unreadable", 0, bad);
         s.appendToolResult(call.id, "skill", bad) catch {};
         return 1;
     };
 
-    m.pushToolDone("skill", entry.name, 0, text);
-    s.appendToolResult(call.id, "skill", text) catch {};
+    // Phase 2.4: `context: fork` runs the skill as a subagent (effort low,
+    // read-only, disposable 24k window) and hands the main turn the report.
+    // Nothing of the subagent's window enters the main context, and the parent
+    // message list is unchanged.
+    if (entry.context == .fork) {
+        var rep = subagent_mod.Report{};
+        const task = subagent_mod.Task{
+            .description = entry.name,
+            .prompt = text,
+        };
+        const report = runSubagent(m, task, &rep);
+        m.pushToolDone("skill", entry.name, 0, report);
+        s.appendToolResult(call.id, "skill", report) catch {};
+        return 1;
+    }
+
+    // Phase 2.5: `!cmd` inside a skill — run the command (behind Phase 6
+    // permissions) and substitute its output inline. On any failure fall back to
+    // the unexpanded body so a `!cmd` never breaks a skill that otherwise loads.
+    const final_text = expandSkillCommands(text, io_global, arena) catch text;
+    m.pushToolDone("skill", entry.name, 0, final_text);
+    s.appendToolResult(call.id, "skill", final_text) catch {};
     return 1;
+}
+
+test "expandSkillCommands: no !cmd returns the body untouched (no copy)" {
+    const body: []const u8 = "just some instructions";
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const got = try expandSkillCommands(body, std.testing.io, arena_state.allocator());
+    try std.testing.expect(got.ptr == body.ptr);
+}
+
+test "expandSkillCommands: !cmd without bash permission shows the marker and does not run" {
+    const body = "!cat /tmp/does-not-exist-marker.txt\nand continue\n";
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const got = try expandSkillCommands(body, std.testing.io, arena_state.allocator());
+    // When bash is not permitted the raw command line is replaced by a marker
+    // and nothing is executed. (If the test environment happens to have bash
+    // always-allowed, this assertion reflects that configuration instead.)
+    try std.testing.expect(std.mem.indexOf(u8, got, "!cat") == null or std.mem.indexOf(u8, got, "[permission required") != null or std.mem.indexOf(u8, got, "[command failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "and continue") != null);
 }
 
 /// `task`: a read-only investigation in its own context.
@@ -5559,7 +7144,10 @@ pub const default_task_parallel: usize = 3;
 /// through three backoffs that the other two are also sitting in.
 pub const subagent_retry_attempts: usize = 2;
 
-fn taskParallelLimit(env: ?*const std.process.Environ.Map) usize {
+fn taskParallelLimit(m: *tui.Model) usize {
+    const override = m.taskParallelLimit();
+    if (override > 0) return override;
+    const env = m.environ;
     const v = envGet(env, "ZODE_TASK_PARALLEL") orelse return default_task_parallel;
     const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " "), 10) catch return default_task_parallel;
     return @max(1, @min(n, 8));
@@ -5585,12 +7173,7 @@ fn runTaskBatch(
     arena: std.mem.Allocator,
 ) struct { ok: usize, denied: usize } {
     const n = to - from;
-    const limit = taskParallelLimit(m.environ);
-
-    for (t.calls.items[from..to]) |call| {
-        const arg = toolArgSummary(call.name, call.args_json, arena);
-        m.pushToolStart(call.name, arg);
-    }
+    const limit = taskParallelLimit(m);
     var lbl: [96]u8 = undefined;
     const label = if (n == 1)
         std.fmt.bufPrint(&lbl, "1 search in a subagent", .{}) catch "searching"
@@ -5604,7 +7187,7 @@ fn runTaskBatch(
         text: []const u8 = "",
         err: bool = false,
     };
-    var results = arena.alloc(Job, n) catch {
+    const results = arena.alloc(Job, n) catch {
         // No memory for the slots: serial, which is slow but correct.
         var ok: usize = 0;
         for (t.calls.items[from..to]) |call| ok += taskCall(m, s, call, arena);
@@ -5616,24 +7199,31 @@ fn runTaskBatch(
         call: TurnCtx.Call,
         out: *Job,
         m: *tui.Model,
-        pending: *std.atomic.Value(usize),
         task: subagent_mod.Task,
-        ok_slot: *std.atomic.Value(usize),
+        wave_running: ?*std.atomic.Value(usize) = null,
     };
-    var ctxs = arena.alloc(Ctx, n) catch return .{ .ok = 0, .denied = 0 };
-    var pending = std.atomic.Value(usize).init(0);
-    var done_count = std.atomic.Value(usize).init(0);
+    const ctxs = arena.alloc(Ctx, n) catch {
+        var ok: usize = 0;
+        for (t.calls.items[from..to]) |call| ok += taskCall(m, s, call, arena);
+        return .{ .ok = ok, .denied = 0 };
+    };
     var malformed: usize = 0;
+    for (t.calls.items[from..to]) |call| {
+        const arg = toolArgSummary(call.name, call.args_json, arena);
+        m.pushToolStart(call.name, arg);
+    }
+    m.beginTaskBatch(n);
+    defer m.endTaskBatch();
     for (t.calls.items[from..to], 0..) |call, k| {
         // Parsed HERE, on the turn thread, so a malformed task does not need a
         // thread and its message is not reordered by the race below.
         const parsed = subagent_mod.parseTask(arena, call.args_json) catch {
             malformed += 1;
-            ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending, .task = .{ .description = "" }, .ok_slot = &done_count };
+            ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .task = .{ .description = "" } };
+            m.taskBatchFinished();
             continue;
         };
-        ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending, .task = parsed, .ok_slot = &done_count };
-        _ = pending.fetchAdd(1, .seq_cst);
+        ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .task = parsed };
     }
 
     const Runner = struct {
@@ -5642,12 +7232,17 @@ fn runTaskBatch(
             // the `Io` they are using (the detached-worker trap).
             ctx.m.beginWorker();
             defer ctx.m.endWorker();
-            defer _ = ctx.pending.fetchSub(1, .seq_cst);
+            const wave_running = ctx.wave_running;
+            defer if (wave_running) |running| {
+                _ = running.fetchSub(1, .seq_cst);
+            };
+            ctx.m.taskBatchStarted();
+            defer ctx.m.taskBatchFinished();
             if (ctx.task.description.len == 0) {
                 ctx.out.err = true;
                 return;
             }
-            _ = ctx.ok_slot.fetchAdd(1, .seq_cst);
+            _ = ctx.m.bench.subagents.fetchAdd(1, .seq_cst);
             // Each one has its OWN Report (a fixed 8 KB buffer) and its own
             // arena: sharing either between two threads is a silent data race.
             var rep = subagent_mod.Report{};
@@ -5658,8 +7253,8 @@ fn runTaskBatch(
         }
     };
 
-    // `limit` at a time: the semaphore is the pending counter itself, and the
-    // threads are spawned in waves so at most `limit` are ever in flight.
+    // Spawn fixed-size waves so at most `limit` threads are in flight. Each wave
+    // has a local completion counter; no global worker count is used as a semaphore.
     var spawned: usize = 0;
     while (spawned < n) {
         const wave = @min(limit, n - spawned);
@@ -5668,6 +7263,7 @@ fn runTaskBatch(
         while (k < wave) : (k += 1) {
             const idx = spawned + k;
             if (ctxs[idx].task.description.len == 0) continue; // malformed: no thread
+            ctxs[idx].wave_running = &running;
             _ = running.fetchAdd(1, .seq_cst);
             const th = std.Thread.spawn(.{}, Runner.run, .{&ctxs[idx]}) catch {
                 Runner.run(&ctxs[idx]);
@@ -5701,7 +7297,12 @@ fn runTaskBatch(
         m.pushToolDone(call.name, "report", 0, r.text);
         s.appendToolResult(call.id, call.name, r.text) catch {};
     }
-    m.pushInfoFmt("{d} subagent{s} in parallel", .{ ok, if (ok == 1) "" else "s" });
+    m.pushInfoFmt("{d}/{d} subagent{s} completed (parallel limit {d})", .{
+        ok,
+        n - malformed,
+        if (ok == 1) "" else "s",
+        limit,
+    });
     return .{ .ok = ok, .denied = 0 };
 }
 
@@ -5731,7 +7332,7 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
 /// Refusals are RESULTS and not errors: a subagent that cannot run still has to
 /// leave the turn able to continue, and the main agent needs to know it has to do
 /// the search itself.
-fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report) []const u8 {
+pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report) []const u8 {
     // `gpa` is the MODEL's allocator and it is only for the things that outlive this
     // call — the `Report` belongs to the caller. Everything that belongs to the subagent
     // and nobody else goes through `sarena` below, which is why that arena exists.
@@ -5841,7 +7442,7 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens, m.environ, cmode) catch
                 compaction.nothingElided(msgs.items);
 
-        const body = chat.buildBodyMessages(
+        const body = chat.buildBodyMessagesCapped(
             &body_buf,
             pick.model,
             comp.msgs,
@@ -5851,6 +7452,7 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             .low,
             tools_json,
             pick.kind,
+            outputCapFor(pick.def, environ_global),
         ) catch {
             cstate.deinit();
             return subagent_mod.refused("the request was too large", rep);
@@ -5873,6 +7475,18 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
         if (pick.key == null and pick.def.key_env.len > 0)
             return subagent_mod.refused("no api key for this provider", rep);
         const bearer: ?[]const u8 = pick.key;
+
+        // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
+        var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+        var extra_hdrs_len: usize = 0;
+        if (std.mem.eql(u8, pick.def.id, "openrouter")) {
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+            extra_hdrs_len += 1;
+            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+            extra_hdrs_len += 1;
+        }
+        const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
+
         // `streamChatDetail` returns `void`: it owns the StreamCtx and destroys
         // it, and hands back the server's error text in `err_detail` on the way
         // out (the model fallback below needs the body, not just the status).
@@ -5897,6 +7511,7 @@ fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Report
             // the user set with ESC.
             false,
             &err_detail,
+            extra_headers,
         ) catch |err| {
             cstate.deinit();
             // A cancelled subagent returns what it found, if anything. Treating
@@ -6165,10 +7780,26 @@ pub const max_asks_per_turn = 3;
 /// loop, and the cap is what saves you from it).
 pub const read_only_text =
     "plan (read-only) mode is on: the user asked zode to look before it touches anything, " ++
-    "so write/edit/bash did not run. Do NOT retry it. Read what you need and write the " ++
+    "so write/edit and the commands that CHANGE something did not run. The commands that only " ++
+    "read (git status, git diff, rg, ls, cat) still run, and they do not ask. Do NOT retry the " ++
+    "blocked one. Read what you need and write the " ++
     "IMPLEMENTATION PLAN with the `todo` tool, then end your turn — the user will be asked " ++
     "to approve it and zode will switch itself out of plan mode. For anything you need to " ++
     "know first, use `ask` — or say so in one line — the user can turn plan mode off with shift+tab.";
+
+/// Whether a call is a `bash` that only READS.
+///
+/// It is the table of `lib/cmdsafety.zig`: `git status`, `rg`, `ls`… read and
+/// change nothing, and a command we do not know is NOT read-only (the cost of
+/// asking is one dialog and the cost of guessing wrong is a file).
+fn callReadsOnly(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    if (!std.mem.eql(u8, name, "bash")) return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return false;
+    if (parsed != .object) return false;
+    const cmd = parsed.object.get("command") orelse return false;
+    if (cmd != .string) return false;
+    return cmdsafety.isReadOnly(cmd.string, arena);
+}
 
 /// ESC: kills the foreground command if there is one. Returns how many were
 /// killed. See `bgproc.killForeground` for why this is not a no-op.
@@ -6180,20 +7811,64 @@ pub fn killForeground() usize {
 ///
 /// This is the serial path: everything with side effects, and the single-call
 /// case for a read-only tool (a batch of one is not worth a thread).
+/// The budget for the tool results of ONE assistant message.
+///
+/// ## Why this exists
+///
+/// `resultcap.max_results_per_message_chars` was DEAD CODE. The module was
+/// written, the registry declared a per-tool cap that nobody read, and nothing
+/// capped the SUM — so the number existed in the source and in no request.
+///
+/// The per-tool caps alone do not bound a message. Five parallel greps at
+/// 16 KB each are 80 KB in a single user message; a turn that reads eight
+/// files at 2000 lines each is over a megabyte. The context is the expensive
+/// resource ("anything that goes into the LLM has to earn its place"), and this
+/// is the place where the size of a message is decided.
+///
+/// The rule is the one `resultcap` already had: cut the largest first. Here
+/// the results are appended one at a time, so the budget is a RUNNING one and
+/// the first results are the ones that get the room — which is the same
+/// outcome when the results are similar in size, and the only one available
+/// without rewriting the session.
+const ResultBudget = struct {
+    used: usize = 0,
+
+    /// The cap for the next result: the smaller of the tool's own cap and what
+    /// is left of the message.
+    ///
+    /// A tool with no cap of its own (`read`) is bounded by the message: that
+    /// is the backstop, and it is why `read` being unbounded is a decision
+    /// about the PER-TOOL cap and not about the message.
+    fn capFor(self: *const ResultBudget, per_tool: usize) usize {
+        const total = resultcap.max_results_per_message_chars;
+        const left = if (self.used < total) total - self.used else 0;
+        if (per_tool == 0) return left;
+        return @min(per_tool, left);
+    }
+
+    fn charge(self: *ResultBudget, n: usize) void {
+        self.used += n;
+    }
+};
+
 fn execOneCall(
     m: *tui.Model,
     s: *session_mod.Session,
     call: TurnCtx.Call,
     arena: std.mem.Allocator,
     denied: *usize,
+    budget: *ResultBudget,
 ) usize {
     const arg = toolArgSummary(call.name, call.args_json, arena);
-    m.pushToolStart(call.name, arg);
+    // The timeline may lead with WHAT IT IS FOR (`bash`'s description); the
+    // permission paths below keep `arg`, the command itself.
+    const label = toolTimelineLabel(call.name, call.args_json, arg, arena);
+    m.pushToolStart(call.name, label);
     // The status says WHAT is running, not a generic "working": with a slow `bash`
     // that is the difference between "working" and "hung". The text is
-    // copied to a fixed buffer, so the arg from the worker's arena can die
+    // copied to a fixed buffer, so the label from the worker's arena can die
     // without a problem.
-    setStatusWithZo(m, .tooling, arg);
+    setStatusWithZo(m, .tooling, label);
 
     // ── read-only mode ──
     //
@@ -6201,11 +7876,107 @@ fn execOneCall(
     // call is not going to happen, so asking "may I run this write?" and then
     // saying no is a dialog that lies. The user asked for "look, don't touch", and
     // a permission prompt for a write in that mode is a bug in the UI.
-    if (read_only and isWriteTool(call.name)) {
+    //
+    // A BATCH is decided by its steps: a batch of reads is a read, and a batch
+    // with a write step is a write. The static list of write tools cannot say
+    // that, and a batch that wrote in plan mode would be a hole in the mode.
+    //
+    // A `bash` that only READS is not a write: `git status`, `rg`, `ls` change
+    // nothing, and the mode is about not touching things. Blocking them would
+    // mean the agent cannot LOOK, and a plan written without looking is a
+    // plan written in the dark.
+    const reads_only = callReadsOnly(call.name, call.args_json, arena);
+    if (read_only and !reads_only and callIsWrite(call.name, call.args_json, arena)) {
         m.plan_write_blocked_this_turn = true;
         m.pushToolDone(call.name, "blocked by plan mode", 0, read_only_text);
         s.appendToolResult(call.id, call.name, read_only_text) catch {};
         return 0;
+    }
+
+    // ── the permission RULES (Phase 6) ──
+    //
+    // The rules come BEFORE the questions: a rule that says "allow" means the
+    // call does not ask at all, and a rule that says "deny" means it does
+    // not run at all. The questions are for the calls that no rule has an
+    // opinion about.
+    //
+    // The SUBJECTS are what the call acts on: the paths for a file tool, the
+    // command for `bash`. A rule with a pattern is about ONE of them.
+    const subjects = tools_mod.callSubjects(call.name, call.args_json, arena);
+    const rule_decision = permDecision(call.name, subjects);
+    var rule_allowed = false;
+    if (rule_decision) |d| {
+        switch (d.action) {
+            .allow => {
+                rule_allowed = true;
+            },
+            .deny => {
+                // The refusal NAMES the rule: "this is not allowed" is not an
+                // answer, "your own rule says so" is.
+                const msg = std.fmt.allocPrint(
+                    arena,
+                    "refused: the rule `{s}` ({s}) does not allow this.",
+                    .{ d.rule.text, d.rule.source.name() },
+                ) catch "refused: a permission rule does not allow this.";
+                m.pushToolDone(call.name, "refused by a rule", 0, msg);
+                s.appendToolResult(call.id, call.name, msg) catch {};
+                return 0;
+            },
+            .ask => {},
+        }
+    }
+
+    // ── the SENSITIVE-PATH question ──
+    //
+    // It comes BEFORE the general permission dialog, and it is a DIFFERENT
+    // question: not "may I run this tool" but "may I write IN HERE", where
+    // "here" is a place where writing is a bad idea (`.git/`, a hook, a
+    // shell config).
+    //
+    // The tool cannot ask: it has no `Model` and it cannot see a dialog. The
+    // dispatcher can, so the question happens here and the answer is handed
+    // to the tool as an approval of that one path.
+    //
+    // It asks ONCE and never offers "always allow": a rule that remembers
+    // "the agent may write inside .git/" is the opposite of the rule.
+    const risky = tools_mod.riskyPaths(call.name, call.args_json, arena);
+    var risky_allowed = false;
+    if (risky.len > 0 and !yolo and !rule_allowed) {
+        var asked = false;
+        for (risky) |p| {
+            const v = pathsafe.checkWrite(p);
+            if (v == .ok) continue;
+            if (asked) continue;
+            asked = true;
+            var dbuf: [384]u8 = undefined;
+            const detail = std.fmt.bufPrint(
+                &dbuf,
+                "{s} is not a place this tool writes: {s}",
+                .{ p, switch (v) { .dangerous => |d| d.why, else => "it is protected" } },
+            ) catch p;
+            switch (m.requestPermissionOnce(call.name, detail)) {
+                .allow => {
+                    pathsafe.approve(p);
+                    // The user has just approved THIS write, with the reason
+                    // in front of them. The general dialog would ask the same
+                    // question about the same file with the reason hidden, and
+                    // two dialogs for one write is a dialog too many.
+                    risky_allowed = true;
+                },
+                .allow_always => {
+                    pathsafe.approve(p);
+                    risky_allowed = true;
+                },
+                .deny, .none => {
+                    denied.* += 1;
+                    turn_stats.noteDenied();
+                    const msg = pathsafe.refusalText(arena, v);
+                    m.pushToolDone(call.name, "refused: sensitive path", 0, msg);
+                    s.appendToolResult(call.id, call.name, msg) catch {};
+                    return 0;
+                },
+            }
+        }
     }
 
     // ── permission ──
@@ -6215,13 +7986,46 @@ fn execOneCall(
     // Both are the user's standing "I trust this" — the selective
     // part of selective permissions — and everything else that
     // needs permission still asks, unless `/yolo` said not to.
-    const auto_allowed = permAutoAllowed(call.name, arg);
-    if (!yolo and !auto_allowed and tools_mod.needsPermission(call.name) and !isAlwaysAllowed(call.name)) {
+    //
+    // The permission set of a CALL is the union of the tools it calls, and for
+    // every tool but `batch` that union is the tool itself. A batch of reads
+    // asks for nothing; a batch with a write step asks for exactly what that
+    // write would have asked.
+    const perm_tools = tools_mod.callPermissionTools(call.name, call.args_json, arena);
+    const auto_allowed = permAutoAllowed(call.name, arg, call.args_json, arena);
+    //
+    // In READ-ONLY mode a command that only reads does not ask: the mode is
+    // the user saying "look, do not touch", and a dialog about `ls` is the
+    // mode asking the question it was meant to settle.
+    const no_dialog = read_only and reads_only;
+    if (!yolo and !auto_allowed and !risky_allowed and !rule_allowed and !no_dialog and permNeedsDialog(perm_tools)) {
         var dbuf: [384]u8 = undefined;
-        const detail = std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
+        // A batch's dialog says WHICH FILES it would touch: the user is being
+        // asked to approve a set of writes, and the set is the whole question.
+        var detail: []const u8 = if (std.mem.eql(u8, call.name, "batch"))
+            tools_mod.batchPermissionDetail(call.args_json, arena)
+        else
+            std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
+        // The RISK, in words, for a command that has one: "this deletes
+        // unreferenced files" beats `git clean -fdx` on its own.
+        //
+        // The user is being asked to approve a command they did not write,
+        // and the raw line is not a risk: it is a spelling.
+        if (std.mem.eql(u8, call.name, "bash") and cmdsafety.classify(arg, arena).why.len > 0) {
+            const why = cmdsafety.classify(arg, arena).why;
+            var both: [640]u8 = undefined;
+            const with_why = std.fmt.bufPrint(&both, "{s} — {s}", .{ detail, why }) catch detail;
+            detail = with_why;
+        }
         switch (m.requestPermission(call.name, detail)) {
             .allow => {},
-            .allow_always => allowAlwaysFor(m, call.name, arg),
+            .allow_always => {
+                allowAlwaysForCall(m, call.name, arg, perm_tools);
+                // And it learns the RULE, not only the tool: "always allow
+                // `Bash(git *)`" is what the user answered, and the flat list
+                // is a coarser memory of the same answer.
+                learnRuleForCall(m, call.name, call.args_json, arena);
+            },
             .deny, .none => {
                 // The denial is handed back to the model as a result
                 // so it changes strategy instead of retrying.
@@ -6242,8 +8046,17 @@ fn execOneCall(
     // exist" (permissions, a directory), NO snapshot is taken: `/undo` would
     // delete a file it never managed to read, which is the worst thing an undo
     // can do.
+    //
+    // A BATCH can touch SEVERAL files, and `/undo` has to be able to put all
+    // of them back. The snapshot is taken per file, exactly as it is for a
+    // direct call: a batch that wrote three files and snapshotted one would
+    // undo a third of the turn.
     var before: ?[]const u8 = null;
-    if (touchesFile(call.name)) {
+    if (std.mem.eql(u8, call.name, "batch")) {
+        for (tools_mod.callTouchedPaths(call.name, call.args_json, arena)) |pth| {
+            snapshotForUndo(m, pth, arena);
+        }
+    } else if (touchesFile(call.name)) {
         if (filePathOf(call.args_json, arena)) |pth| {
             if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
                 before = content;
@@ -6300,7 +8113,7 @@ fn execOneCall(
         applyGoalCall(m, call.args_json, arena);
     }
 
-    const res = tools_mod.execute(io_global, call.name, call.args_json, arena, &m.bg, &m.reads) catch |err| {
+    const res = tools_mod.executeWith(io_global, call.name, call.args_json, arena, &m.bg, &m.reads, &m.tasks) catch |err| {
         const ms = elapsedMs(call_t0);
         // What the MODEL is told is not the error name. See `describeError`.
         const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
@@ -6355,7 +8168,39 @@ fn execOneCall(
         }
     }
 
-    s.appendToolResult(call.id, call.name, res) catch {};
+    // [/files] The files this call WROTE to, for the session's list.
+    //
+    // It is the SUCCESS path and not the list of calls: a denied `edit`, a
+    // `write` to a path that could not be opened and an `edit` whose old
+    // string was not found ALL changed nothing, and a list that says "changed"
+    // about them is a list that lies.
+    //
+    // `callTouchedPaths` and not `filePathOf`: it knows the MULTI-FILE form of
+    // `edit` (`files: [{path,…}]`) and the writing steps of a `batch`, and
+    // those are the calls that touch more than one file. A `rename` is NOT
+    // here: it FINDS its own files and its arguments never name them, so
+    // there is nothing to read out of the call.
+    if (callIsWrite(call.name, call.args_json, arena)) {
+        for (tools_mod.callTouchedPaths(call.name, call.args_json, arena)) |pth| {
+            m.changed.note(pth);
+        }
+    }
+    // A `bash` that was NOT read-only may have changed files, and the paths
+    // are not in the arguments: a command is a string, not a list of files.
+    // The report says so instead of implying that the list is complete.
+    if (std.mem.eql(u8, call.name, "bash") and !reads_only) {
+        m.bash_may_write = true;
+    }
+
+    // The result that goes into the message is the one that was capped, and the
+    // cap is the SMALLER of the tool's own and what is left of the message.
+    //
+    // The cut carries its notice inside the budget, so the model is told the
+    // result is incomplete instead of believing it is the whole thing.
+    const capped = resultcap.capResult(arena, res, budget.capFor(tools_registry.resultCap(call.name))) catch
+        resultcap.Capped{ .text = res, .cut = false };
+    budget.charge(capped.text.len);
+    s.appendToolResult(call.id, call.name, capped.text) catch {};
     if (std.mem.eql(u8, call.name, "read")) {
         if (s.messages.items.len > 0) {
             const idx: u32 = @intCast(s.messages.items.len - 1);
@@ -6397,6 +8242,7 @@ fn runParallelBatch(
     from: usize,
     to: usize,
     arena: std.mem.Allocator,
+    budget: *ResultBudget,
 ) struct { ok: usize, denied: usize } {
     const n = to - from;
     const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
@@ -6430,7 +8276,7 @@ fn runParallelBatch(
         var ok: usize = 0;
         var denied: usize = 0;
         for (t.calls.items[from..to]) |call| {
-            ok += execOneCall(m, s, call, arena, &denied);
+            ok += execOneCall(m, s, call, arena, &denied, budget);
         }
         return .{ .ok = ok, .denied = denied };
     };
@@ -6464,15 +8310,21 @@ fn runParallelBatch(
             var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
             defer astate.deinit();
             const a = astate.allocator();
-            const text = tools_mod.execute(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads) catch |err| {
+            const text = tools_mod.executeWith(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads, &ctx.m.tasks) catch |err| {
                 ctx.out.err = true;
                 ctx.out.text = @constCast(@errorName(err));
                 ctx.out.ms = elapsedMs(call_t0);
                 return;
             };
-            // COPIED into the turn arena: `a` dies with this thread's defer and the
-            // text is read by the caller afterwards.
-            ctx.out.text = a.dupe(u8, text) catch "";
+            // COPIED OUT OF `a`: the arena dies with this thread's `defer`, and
+            // `waitForBatch` returns only when every `defer` has run, so a
+            // `results[k].text` pointing into `a` is a dangling pointer for
+            // EVERY call, not a race. It was `a.dupe` — allocating the copy in
+            // the same arena that is about to be freed — with a comment
+            // asserting the opposite. `ctx.m.allocator` is the model's
+            // allocator, which outlives the batch, exactly as `runTaskBatch`'s
+            // runner does it.
+            ctx.out.text = ctx.m.allocator.dupe(u8, text) catch "";
             ctx.out.ms = elapsedMs(call_t0);
         }
     };
@@ -6499,7 +8351,26 @@ fn runParallelBatch(
         turn_stats.noteTool();
         const summary = toolResultSummary(t.calls.items[from + k].name, r.text, arena);
         m.pushToolDone(t.calls.items[from + k].name, summary, r.ms, r.text);
-        s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, r.text) catch {};
+        // The same cap as the serial path: the budget belongs to the MESSAGE,
+        // not to the way the calls happened to be run.
+        const capped = resultcap.capResult(arena, r.text, budget.capFor(tools_registry.resultCap(t.calls.items[from + k].name))) catch
+            resultcap.Capped{ .text = r.text, .cut = false };
+        budget.charge(capped.text.len);
+        s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, capped.text) catch {};
+        // `r.text` is the caller's and both consumers above COPIED it
+        // (`pushToolDone` dupes for the paragraph and the Ctrl+R memo,
+        // `appendToolResult` dupes into the session), so this is ours to free.
+        //
+        // It was not, and the leak was invisible: the block is the size of one
+        // tool result, so a long session leaked in proportion to how much the
+        // model reads. It only became visible when the copy had to move out of
+        // the per-call arena (it used to be allocated there, so the arena freed
+        // it — while the pointer itself dangled).
+        //
+        // `err` marks a slot holding an `@errorName` LITERAL, which is not ours
+        // to free: `gpa.free` on `.rodata` is an "Invalid free", which is how a
+        // whole session used to die at quit.
+        if (!r.err) m.allocator.free(r.text);
     }
 
     // The batch's own clock: it is the number the user can compare against a
@@ -6555,14 +8426,38 @@ fn waitForBatch(pending: *std.atomic.Value(usize), deadline_ms: u64) void {
     }
 }
 
+/// Points the Model's task graph at this session's file.
+///
+/// Called once per iteration, and idempotent: `Store.bind` compares the path and
+/// returns immediately when it is the same one. Doing it HERE (the turn's thread, at
+/// the top of the tool batch) and not inside a tool is what makes it safe for the
+/// parallel batch to read the same store from several threads: the bind, which
+/// allocates and reloads, has already happened by then, and the batch only ever gets
+/// `task_list`/`task_get` (the three that write are not `isParallelSafe`).
+///
+/// The path is derived, never invented: `/new` and `--resume` change `s.path`, and the
+/// comparison is what makes this follow them instead of keeping the list of a session
+/// that is over.
+fn bindTasks(m: *tui.Model, s: *session_mod.Session) void {
+    const sp = s.path orelse return;
+    var buf: [512]u8 = undefined;
+    const path = taskstore.pathForSession(&buf, sp) catch return;
+    m.tasks.bind(io_global, path);
+}
+
 fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     const gpa = m.allocator;
+    bindTasks(m, s);
     var astate = std.heap.ArenaAllocator.init(gpa);
     defer astate.deinit();
     const arena = astate.allocator();
     const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
     var ran: usize = 0;
     var denied: usize = 0;
+    // The budget of THIS message: it is reset for every assistant message, and
+    // it is what stops a fan-out of reads from putting a megabyte in one turn.
+    var budget: ResultBudget = .{};
+    _ = &budget;
 
     var i: usize = 0;
     while (i < t.calls.items.len) {
@@ -6628,7 +8523,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         while (batch < t.calls.items.len and tools_mod.isParallelSafe(t.calls.items[batch].name)) batch += 1;
 
         if (batch - i > 1) {
-            const n = runParallelBatch(m, s, t, i, batch, arena);
+            const n = runParallelBatch(m, s, t, i, batch, arena, &budget);
             ran += n.ok;
             denied += n.denied;
             i = batch;
@@ -6636,7 +8531,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
         }
 
         i += 1;
-        ran += execOneCall(m, s, call, arena, &denied);
+        ran += execOneCall(m, s, call, arena, &denied, &budget);
     }
     // The repetition guard, fed HERE because this is the only place a tool call is
     // seen with its arguments. The loop checks the flag; it cannot count, because it
@@ -6864,10 +8759,66 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
     chat.cancel_current.store(true, .seq_cst);
     m.waitWorkers(60);
 
-    // 3. The session. One write, and it is the only reason any of this exists.
+    // 3. The language servers. They are children too, and they are NOT in the
+    // job registry: a `zls` that outlived the app would keep indexing a
+    // project nobody is looking at any more.
+    //
+    // AFTER the workers are asked to stop, and not before: a worker in the
+    // middle of a question holds the client, and the manager does not free a
+    // client somebody is inside (it kills the server instead, which is what
+    // matters at this point).
+    lsp_manager.shutdown();
+
+    // 3b. The MCP servers. They are children too, and they are NOT in the job
+    // registry either: an MCP server that outlived the app would keep running
+    // for nobody.
+    mcp_manager.shutdown();
+
+    // 4. The session. One write, and it is the only reason any of this exists.
     if (session) |s| s.flush();
 
+    // 5. The terminal. `std.process.exit` runs NO defer, and vaxis leaves the
+    // screen in the alternate buffer (`CSI ? 1049 h`) with the mouse captured
+    // and the cursor hidden. So the defers that would undo it never run, and
+    // ctrl+c left the app ON SCREEN: the last frame still there, the cursor
+    // hidden, the shell prompt nowhere. The user's "it closed but zode is still
+    // visible" is exactly this, and not a leaked process.
+    //
+    // We must write to /dev/tty (the controlling terminal) NOT stdout, because
+    // stdout may be redirected or not connected to the terminal (e.g. in tmux,
+    // script, or when piped). vaxis does the same: it opens /dev/tty and writes
+    // escape sequences there. We also restore the termios to exit raw mode,
+    // which the escape sequences alone cannot do.
+    {
+        // Open the controlling terminal directly
+        const tty_file = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch {
+            std.process.exit(0);
+        };
+        defer tty_file.close(io);
+        var tty_buf: [256]u8 = undefined;
+        var fw = tty_file.writerStreaming(io, &tty_buf);
+        termseq.restoreAll(&fw.interface);
+
+        // Also restore termios (exit raw mode). This is what vaxis does in its
+        // deinit via posix.tcsetattr. Without this, the terminal stays in raw
+        // mode and the user can't type after exit.
+        const fd = tty_file.handle;
+        restoreTermios(fd);
+    }
+
     std.process.exit(0);
+}
+
+fn restoreTermios(fd: posix.fd_t) void {
+    const termios = posix.tcgetattr(fd) catch return;
+    var termios_copy = termios;
+    termios_copy.lflag.ECHO = true;
+    termios_copy.lflag.ICANON = true;
+    termios_copy.lflag.ISIG = true;
+    termios_copy.oflag.OPOST = true;
+    termios_copy.iflag.ICRNL = true;
+    termios_copy.iflag.IXON = true;
+    _ = posix.tcsetattr(fd, .FLUSH, termios_copy) catch {};
 }
 
 /// Starts the startup probe: reads `ZODE_DBG_BOOT` and takes t0.
@@ -6990,7 +8941,247 @@ fn countDiagLines(s: []const u8) usize {
 
 /// Does this tool modify a file on disk?
 fn touchesFile(name: []const u8) bool {
-    return std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit");
+    return std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "edit") or
+        // A notebook edit rewrites a file whole, so `/undo` has to have the bytes it
+        // had before: this is the list that decides whether a snapshot is taken, and a
+        // tool missing from it is an edit nobody can take back.
+        std.mem.eql(u8, name, "notebook_edit");
+}
+
+/// Does this CALL modify a file?
+///
+/// A `batch` is decided by its steps: a batch of reads is a read, and a batch
+/// with a `write` or an `edit` step is a write. The static list of write
+/// tools cannot say that, and a batch that wrote in plan mode would be a
+/// hole in the mode.
+fn callIsWrite(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
+    if (std.mem.eql(u8, name, "batch")) return tools_mod.callWrites(name, args_json, arena);
+    // An MCP CALL can change the world: the tool behind it is the user's own
+    // and zode cannot know what it does, so plan mode blocks it. The `list`
+    // and `search` operations only read the catalogue and are allowed: a plan
+    // written without looking is a plan written in the dark.
+    if (std.mem.eql(u8, name, "mcp")) return tools_mod.callWrites(name, args_json, arena);
+    return isWriteTool(name);
+}
+
+/// The BEFORE snapshot of one file, for `/undo`.
+///
+/// `existed` is separate because "it was not there" and "it was empty" undo
+/// differently (delete vs write empty), and a `catch ""` does not tell them
+/// apart. A read that fails for any OTHER reason takes no snapshot at all:
+/// `/undo` would delete a file it never managed to read, which is the worst
+/// thing an undo can do.
+fn snapshotForUndo(m: *tui.Model, pth: []const u8, arena: std.mem.Allocator) void {
+    if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
+        m.snapshotFile(pth, content, true);
+    } else |err| {
+        switch (err) {
+            error.FileNotFound => m.snapshotFile(pth, "", false),
+            else => {},
+        }
+    }
+}
+
+/// Does this call need the permission dialog?
+///
+/// The permission set is the union of the tools the call is a call to, and a
+/// tool that is already on the allowlist does not ask again.
+fn permNeedsDialog(perm_tools: []const []const u8) bool {
+    for (perm_tools) |t| {
+        if (tools_mod.needsPermission(t) and !isAlwaysAllowed(t)) return true;
+    }
+    return false;
+}
+
+/// The `a` key on the permission dialog, for a call whose permission set is a
+/// UNION.
+///
+/// For a batch it remembers the TOOLS its steps are calls to, and not
+/// "batch": what the user approved, having just read a dialog that named the
+/// files, is the write. Remembering "batch" would make one approval cover
+/// every batch the model writes later, which is not what anybody answered.
+/// The rule the "always allow" answer would remember, as TEXT.
+///
+/// It is what the dialog shows and what the answer learns:
+///
+/// - a `bash` command becomes `Bash(git *) allow` — the FIRST WORD, and not
+///   the whole command: "always allow `git status`" would mean the next
+///   `git commit` asks again, and "always allow `git`" is the answer the
+///   user actually means when they approve a `git` command;
+/// - a tool that writes a file becomes `Write(src/main.zig) allow` — the file
+///   itself, because a directory is a bigger promise than the user made;
+/// - anything else becomes `<tool>(*) allow`.
+///
+/// It is a SUGGESTION and not a decision: the user reads it in the dialog
+/// before answering, and the answer is what is remembered.
+pub fn permSuggestion(call_name: []const u8, args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
+    if (std.mem.eql(u8, call_name, "bash")) {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
+        if (parsed != .object) return null;
+        const cmd = parsed.object.get("command") orelse return null;
+        if (cmd != .string) return null;
+        const first = firstWord(cmd.string);
+        if (first.len == 0) return null;
+        return std.fmt.allocPrint(arena, "Bash({s} *) allow", .{first}) catch null;
+    }
+    // An MCP call remembers the QUALIFIED name of the tool: `Mcp(github.create_issue)`.
+    //
+    // Not `Mcp(*)`: that would be every server the user ever configures, and
+    // the answer the user gives is about ONE tool whose name they just read.
+    if (std.mem.eql(u8, call_name, "mcp")) {
+        // The subject IS the qualified name, and it is empty when the call is
+        // not a call or its arguments do not parse: then there is nothing to
+        // suggest, and the dialog falls back to the generic one.
+        const q = tools_mod.callSubjects(call_name, args_json, arena);
+        if (q.len != 1 or q[0].len == 0) return null;
+        return std.fmt.allocPrint(arena, "Mcp({s}) allow", .{q[0]}) catch null;
+    }
+    const paths = tools_mod.callTouchedPaths(call_name, args_json, arena);
+    if (paths.len == 1 and paths[0].len > 0) {
+        return std.fmt.allocPrint(arena, "{s}({s}) allow", .{ call_name, paths[0] }) catch null;
+    }
+    return std.fmt.allocPrint(arena, "{s}(*) allow", .{call_name}) catch null;
+}
+
+/// The first word of a command, without the quotes.
+fn firstWord(command: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < command.len and (command[i] == ' ' or command[i] == '\t')) i += 1;
+    const start = i;
+    while (i < command.len and command[i] != ' ' and command[i] != '\t') i += 1;
+    return command[start..i];
+}
+
+/// Learns the rule of an "always allow" answer.
+///
+/// It goes in TWO places: the in-memory set (source `local`, the strongest,
+/// because the user just said it) and the USER file, so it survives the
+/// session. The project file is NOT touched: a rule the user just made is
+/// theirs, not the project's.
+fn learnRuleForCall(m: *tui.Model, call_name: []const u8, args_json: []const u8, arena: std.mem.Allocator) void {
+    const text = permSuggestion(call_name, args_json, arena) orelse return;
+    const rule = permrules.parseRule(text, .local, arena) orelse return;
+
+    // The in-memory set: the strongest source, so the rule the user just
+    // made wins over the ones in the files.
+    if (perm_rules_arena == null) {
+        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
+    }
+    const a = perm_rules_arena.?.allocator();
+    var all: std.ArrayList(permrules.Rule) = .empty;
+    for (perm_rules.rules) |r| all.append(a, r) catch {};
+    all.append(a, rule) catch {};
+    perm_rules = .{ .rules = all.items };
+
+    // And the file, so it is there tomorrow.
+    if (savePermRule(rule)) {
+        const msg = std.fmt.allocPrint(m.allocator, "always allowed: {s}", .{text}) catch return;
+        pushInfoOwned(m, msg);
+    }
+}
+
+/// Appends a rule to the USER's `permissions.json`.
+///
+/// The file is written WHOLE, and the parts this code does not know about
+/// are kept: it is hand-edited, it carries the allowlist too, and dropping
+/// what the user wrote by hand is the one thing a permission file must never
+/// do.
+fn savePermRule(rule: permrules.Rule) bool {
+    var pbuf: [512]u8 = undefined;
+    const path = permissionsFilePath(&pbuf) orelse return false;
+
+    var astate = std.heap.ArenaAllocator.init(gpa_global);
+    defer astate.deinit();
+    const a = astate.allocator();
+
+    // What is in there now: the tools, the bash patterns and the rules.
+    var names: [max_always][]const u8 = undefined;
+    var n: usize = 0;
+    var pats: [max_bash_patterns][]const u8 = undefined;
+    var np: usize = 0;
+    var rules: std.ArrayList([]const u8) = .empty;
+    if (readFileTo(a, path)) |data| {
+        if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
+            switch (parsed) {
+                .object => |o| {
+                    if (o.get("tools")) |tv| {
+                        if (tv == .array) for (tv.array.items) |v| {
+                            if (v == .string and n < names.len) {
+                                names[n] = v.string;
+                                n += 1;
+                            }
+                        };
+                    }
+                    if (o.get("bash")) |bv| {
+                        if (bv == .array) for (bv.array.items) |v| {
+                            if (v == .string and np < pats.len) {
+                                pats[np] = v.string;
+                                np += 1;
+                            }
+                        };
+                    }
+                    if (o.get("rules")) |rv| {
+                        if (rv == .array) for (rv.array.items) |v| {
+                            if (v == .string) rules.append(a, v.string) catch {};
+                        };
+                    }
+                },
+                .array => |arr| {
+                    // The old shape: a bare array is the tool allowlist.
+                    for (arr.items) |v| {
+                        if (v == .string and n < names.len) {
+                            names[n] = v.string;
+                            n += 1;
+                        }
+                    }
+                },
+                else => {},
+            }
+        } else |_| {}
+    }
+
+    // The new rule, as the STRING the grammar is written in: it is the shape
+    // a human reads, and the parser accepts it.
+    rules.append(a, rule.text) catch return false;
+
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{{\"tools\":", .{}) catch return false;
+    config_mod.writeStringArray(&w, gpa_global, names[0..n]) catch return false;
+    w.print(",\"bash\":", .{}) catch return false;
+    config_mod.writeStringArray(&w, gpa_global, pats[0..np]) catch return false;
+    w.print(",\"rules\":[", .{}) catch return false;
+    for (rules.items, 0..) |r, i| {
+        if (i > 0) w.print(",", .{}) catch return false;
+        config_mod.writeJsonString(&w, gpa_global, r) catch return false;
+    }
+    w.print("]}}", .{}) catch return false;
+    std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = w.buffered() }) catch return false;
+    return true;
+}
+
+fn allowAlwaysForCall(m: *tui.Model, name: []const u8, arg: []const u8, perm_tools: []const []const u8) void {
+    // An MCP call remembers the QUALIFIED name of the tool it is about
+    // (`github.create_issue`), and not the tool `mcp`: what the user approved,
+    // having just read a dialog that named the tool, is that one tool.
+    // Remembering `mcp` would make one approval cover every server the user
+    // ever configures, which is not what anybody answered.
+    if (std.mem.eql(u8, name, "mcp")) {
+        for (perm_tools) |t| {
+            if (!tools_mod.needsPermission(t)) continue;
+            setAlwaysAllowed(m, t);
+        }
+        return;
+    }
+    if (!std.mem.eql(u8, name, "batch")) {
+        allowAlwaysFor(m, name, arg);
+        return;
+    }
+    for (perm_tools) |t| {
+        if (!tools_mod.needsPermission(t)) continue;
+        setAlwaysAllowed(m, t);
+    }
 }
 
 /// Tools blocked in read-only mode.
@@ -7024,14 +9215,19 @@ pub fn isWriteTool(name: []const u8) bool {
 pub fn isEditTool(name: []const u8) bool {
     return std.mem.eql(u8, name, "write") or
         std.mem.eql(u8, name, "edit") or
-        std.mem.eql(u8, name, "rename");
+        std.mem.eql(u8, name, "rename") or
+        // A file edit: accept-edits may auto-allow it, and plan mode must refuse it.
+        std.mem.eql(u8, name, "notebook_edit");
 }
 
 /// Path of the file a writing tool touches (or null if it does not say).
 fn filePathOf(args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return null;
     if (parsed != .object) return null;
-    const v = parsed.object.get("path") orelse return null;
+    // `notebook_path` is the second spelling, and it is not decoration: without it a
+    // notebook edit would take NO snapshot (`/undo` would have nothing to restore) for
+    // the one kind of file where a bad edit is most destructive.
+    const v = parsed.object.get("path") orelse parsed.object.get("notebook_path") orelse return null;
     if (v != .string or v.string.len == 0) return null;
     return v.string;
 }
@@ -7040,6 +9236,26 @@ fn filePathOf(args_json: []const u8, arena: std.mem.Allocator) ?[]const u8 {
 fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) []const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return "";
     if (parsed != .object) return "";
+    // A batch's arguments are a LIST of steps: there is no single path to
+    // name, and the "first string wins" fallback below would find none (the
+    // strings are inside the steps). The COUNT is what one row can say, and
+    // it is the thing the user wants to know: how much this one call does.
+    if (std.mem.eql(u8, name, "batch")) {
+        const steps_v = parsed.object.get("steps") orelse return "steps";
+        if (steps_v != .array) return "steps";
+        return std.fmt.allocPrint(arena, "{d} steps", .{steps_v.array.items.len}) catch "steps";
+    }
+    // An MCP call's one interesting argument is the tool it is about:
+    // `mcp(call)` says nothing, and the line the user reads is the line they
+    // are approving. The qualified name is decided by the tool's own module,
+    // so the timeline and the permission rule cannot disagree about it.
+    if (std.mem.eql(u8, name, "mcp")) {
+        if (mcp_tool.qualifiedOf(parsed.object, arena)) |qualified| return qualified;
+        // A search names its query instead: there is no tool yet.
+        const query = parsed.object.get("query") orelse return "";
+        if (query != .string) return "";
+        return query.string;
+    }
     const wanted: []const u8 = if (std.mem.eql(u8, name, "read") or
         std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit") or
         std.mem.eql(u8, name, "list_files"))
@@ -7052,26 +9268,142 @@ fn toolArgSummary(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
         "url"
     else if (std.mem.eql(u8, name, "web_search"))
         "query"
+    else if (std.mem.eql(u8, name, "notebook_edit"))
+        // Named, not left to the "first string wins" fallback below: the timeline
+        // line should show WHICH notebook, and relying on field order for that is
+        // one schema reorder away from showing a cell index instead.
+        "notebook_path"
+    else if (std.mem.eql(u8, name, "lsp"))
+        ""
     else
         "";
-    if (wanted.len > 0) {
+    const raw: []const u8 = if (wanted.len > 0) blk: {
         if (parsed.object.get(wanted)) |v| {
-            if (v == .string) return v.string;
+            if (v == .string) break :blk v.string;
         }
-    }
+        break :blk "";
+    } else "";
     // Without the expected field, the first string there is will do.
-    var it = parsed.object.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.* == .string) return kv.value_ptr.*.string;
-    }
-    return "";
+    const fallback: []const u8 = if (raw.len > 0) raw else blk: {
+        var it = parsed.object.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* == .string) break :blk kv.value_ptr.*.string;
+        }
+        break :blk "";
+    };
+    // CLIPPED, and this is the fix for the timeline filling with garbage. A
+    // `bash` argument is whatever the model wrote, and a real one is a
+    // three-pipeline command of several hundred columns. Returned as is, it
+    // goes into the header `*bash*(<command>)` and into the status bar, and
+    // the header is a PARAGRAPH: it wraps. One long command was worth eight
+    // rows of the history and pushed the answer off screen.
+    //
+    // `arg_max_cols` is what one row can show before it stops being a header,
+    // and the clip is in COLUMNS (`textcap`), so a command with CJK or an emoji
+    // counts correctly rather than by bytes. The full command stays in the
+    // session and in Ctrl+R; this is what the human reads.
+    var buf: [textcap.scratchFor(arg_max_cols)]u8 = undefined;
+    const clipped = textcap.clipInto(fallback, arg_max_cols, &buf);
+    if (clipped.len == 0) return "";
+    return arena.dupe(u8, clipped) catch fallback;
 }
+
+/// What the TIMELINE shows for a tool call: the model's own one-line
+/// `description` when it sent one, else the argument summary.
+///
+/// `bash` gained an optional `description` (what the command is FOR), and the
+/// timeline leads with it: `⏺ bash(running the test suite)` is what the human
+/// reads at a glance, where a clipped three-pipeline command was noise. Only
+/// the FIRST line is used and control bytes become spaces — the timeline row
+/// is one line, and an interior newline painted raw is a bug this repo has
+/// already paid for (the ask panel).
+///
+/// **The two consumers of a call's text stay apart on purpose.** The
+/// permission dialog and the allowlist matching keep receiving `arg` (the
+/// COMMAND, from `toolArgSummary`): a permission matched against the model's
+/// own prose would be no permission at all — `description: "git status"` over
+/// `command: "rm -rf /"` must never ride the `git status` allowlist. The
+/// timeline reads intent; the machine reads the command.
+fn toolTimelineLabel(name: []const u8, args_json: []const u8, arg: []const u8, arena: std.mem.Allocator) []const u8 {
+    if (!std.mem.eql(u8, name, "bash")) return arg;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return arg;
+    if (parsed != .object) return arg;
+    const dv = parsed.object.get("description") orelse return arg;
+    if (dv != .string) return arg;
+    const line_end = std.mem.indexOfScalar(u8, dv.string, '\n') orelse dv.string.len;
+    var clean_buf: [textcap.scratchFor(arg_max_cols)]u8 = undefined;
+    var clen: usize = 0;
+    for (dv.string[0..line_end]) |c| {
+        // Over the scratch is clipped later anyway, and a cut mid-character is
+        // healed by `clipInto`'s walk back to a char start.
+        if (clen >= clean_buf.len) break;
+        clean_buf[clen] = if (c < 0x20) ' ' else c;
+        clen += 1;
+    }
+    const clean = std.mem.trim(u8, clean_buf[0..clen], " \t\r");
+    if (clean.len == 0) return arg;
+    var clip_buf: [textcap.scratchFor(arg_max_cols)]u8 = undefined;
+    const clipped = textcap.clipInto(clean, arg_max_cols, &clip_buf);
+    if (clipped.len == 0) return arg;
+    return arena.dupe(u8, clipped) catch arg;
+}
+
+/// Columns a tool argument gets in the header and the status row.
+///
+/// Chosen from the row, not from taste: a header is one visual row wide on the
+/// widest text the user can read, and past that it wraps and stops being a
+/// header. The command is what the model SENT, and the full text stays in the
+/// session and in Ctrl+R; this is what the human reads.
+pub const arg_max_cols: usize = 60;
 
 /// One-line summary of a tool's result (`⎿ Read 12 lines`).
 fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator) []const u8 {
     if (res.len == 0) return "";
     var it = std.mem.splitScalar(u8, res, '\n');
     const first = it.next() orelse return "";
+    if (std.mem.eql(u8, name, "bash")) {
+        const status = if (std.mem.indexOf(u8, first, "exit=")) |at|
+            first[at + "exit=".len ..]
+        else
+            first;
+        var summary: std.ArrayList(u8) = .empty;
+        summary.appendSlice(arena, "exit ") catch return first;
+        summary.appendSlice(arena, status) catch return first;
+
+        var section: enum { none, stdout, stderr } = .none;
+        var stdout_lines: usize = 0;
+        var stderr_lines: usize = 0;
+        var capped = false;
+        var lines = std.mem.splitScalar(u8, res, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.eql(u8, line, "--- stdout ---")) {
+                section = .stdout;
+                continue;
+            }
+            if (std.mem.eql(u8, line, "--- stderr ---")) {
+                section = .stderr;
+                continue;
+            }
+            if (std.mem.indexOf(u8, line, "output cut at the tool's cap") != null) {
+                capped = true;
+                continue;
+            }
+            if (std.mem.trim(u8, line, " \t\r").len == 0 or std.mem.startsWith(u8, line, "exit=")) continue;
+            switch (section) {
+                .stdout => stdout_lines += 1,
+                .stderr => stderr_lines += 1,
+                .none => {},
+            }
+        }
+        if (stdout_lines > 0) {
+            summary.print(arena, " · stdout {d} line{s}", .{ stdout_lines, if (stdout_lines == 1) "" else "s" }) catch return first;
+        }
+        if (stderr_lines > 0) {
+            summary.print(arena, " · stderr {d} line{s}", .{ stderr_lines, if (stderr_lines == 1) "" else "s" }) catch return first;
+        }
+        if (capped) summary.appendSlice(arena, " · output capped") catch return first;
+        return summary.items;
+    }
     // `write` says "wrote X (N bytes, M lines)" and then a preview. The one-line
     // summary is that first line: the preview is the tool result (what the
     // model sees) and shows up in the history under it.
@@ -7281,12 +9613,13 @@ fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
     const wait_ms = Retry.backoffMs(attempt);
 
     const detail: []const u8 = if (reason.len > 0) reason else "no details from the server";
-    const msg = std.fmt.allocPrint(
-        gpa,
-        "{s}: {s} · retrying in {d}.{d}s (attempt {d}/3)",
-        .{ errPhrase(err), detail, wait_ms / 1000, (wait_ms % 1000) / 100, attempt + 1 },
-    ) catch "retrying";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("{s}: {s} · retrying in {d}.{d}s (attempt {d}/3)", .{
+        errPhrase(err),
+        detail,
+        wait_ms / 1000,
+        (wait_ms % 1000) / 100,
+        attempt + 1,
+    });
 
     // The status stays short (it is a segmented line) but has the why, which is
     // what you read at a glance: "rate limited 2/3" and not "retrying…".
@@ -7356,75 +9689,69 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
             // is the ACCOUNT and not the key, and saying "key rejected" sends the user
             // off to rotate a key that is perfectly fine. `reason` is empty when the
             // server said nothing, and then the old wording is all there is.
-            const msg = if (reason.len > 0)
-                std.fmt.allocPrint(gpa, "auth failed on {s}: {s}\n  check {s} (/provider shows the state)", .{
-                    cur_provider_id, reason, names,
-                }) catch "auth failed"
-            else
-                std.fmt.allocPrint(gpa, "key rejected by {s}. check {s} (/provider shows the state)", .{
-                    cur_provider_id, names,
-                }) catch "key rejected";
-            pushErrorOwned(m, msg);
+            if (reason.len > 0) {
+                m.pushErrorFmt("auth failed on {s}: {s}\n  check {s} (/provider shows the state)", .{
+                    cur_provider_id,
+                    reason,
+                    names,
+                });
+            } else {
+                m.pushErrorFmt("key rejected by {s}. check {s} (/provider shows the state)", .{
+                    cur_provider_id,
+                    names,
+                });
+            }
         },
         // 402: the account has no balance. It is not a zode bug nor the key.
         error.NoCredits => {
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "out of credits on {s}: {s}\n  pick a `-free` model or switch with /provider",
-                .{ cur_provider_id, reason },
-            ) catch "out of credits";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("out of credits on {s}: {s}\n  pick a `-free` model or switch with /provider", .{
+                cur_provider_id,
+                reason,
+            });
         },
         // 404: the model does not exist on that provider. Almost always it is an old
         // HARDCODED id left over (which is why the default is changed when the
         // provider retires it) or a typo in /use.
         error.ModelNotFound => {
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "model `{s}` does not exist on {s}: {s}\n  /model for the ones you have",
-                .{ cur_model, cur_provider_id, reason },
-            ) catch "model does not exist";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("model `{s}` does not exist on {s}: {s}\n  /model for the ones you have", .{
+                cur_model,
+                cur_provider_id,
+                reason,
+            });
         },
         // 403: in practice it is almost always the MODEL that is not available for
         // this account, not the key. Saying that plainly saves hours of
         // debugging.
         error.Forbidden => {
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "`{s}` is not available on your {s} account: {s}\n  /model for your models, /provider to switch",
-                .{ cur_model, cur_provider_id, reason },
-            ) catch "access denied";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("`{s}` is not available on your {s} account: {s}\n  /model for your models, /provider to switch", .{
+                cur_model,
+                cur_provider_id,
+                reason,
+            });
         },
         error.BadRequest => {
             // 400: the server did not accept the request. With free-auto on, this pair is
             // already set aside for the next turn (`noteTurnFailure`), so all
             // that is left to say here is what it asked for and what it replied.
-            const msg = std.fmt.allocPrint(
-                gpa,
-                "{s} rejected the request for `{s}`: {s}",
-                .{ cur_provider_id, cur_model, reason },
-            ) catch "request rejected";
-            pushInfoOwned(m, msg);
+            m.pushInfoFmt("{s} rejected the request for `{s}`: {s}", .{
+                cur_provider_id,
+                cur_model,
+                reason,
+            });
         },
         error.RateLimited, error.Overloaded => {
             // `errPhrase`, not `@errorName`: a person reads this line and
             // "RateLimited" tells nobody anything. It is the same rule the retry
             // notices already follow, and they do it right.
-            const msg = std.fmt.allocPrint(gpa, "{s} after several attempts: {s}", .{ errPhrase(err), reason }) catch
-                "service saturated";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("{s} after several attempts: {s}", .{ errPhrase(err), reason });
         },
         else => {
             // `errPhrase` and not `@errorName`: this line is read by a person and
             // "ServerError" tells nobody anything. And it goes out as an ERROR
             // (red) because that is what it is.
-            const msg = std.fmt.allocPrint(gpa, "{s}: {s}", .{ errPhrase(err), reason }) catch "error";
-            pushErrorOwned(m, msg);
+            m.pushErrorFmt("{s}: {s}", .{ errPhrase(err), reason });
         },
     }
-    setStatusWithZo(m, .warn, errPhrase(err));
 }
 
 /// The environment variables that can hold the active provider's key, as a
@@ -7488,6 +9815,8 @@ pub fn summarizeTurns(
     effort: chat.Effort,
     msgs: []chat.ChatMessage,
     arena: std.mem.Allocator,
+    extra_headers: []const http_client.Http.ExtraHeader,
+    max_output_tokens: u32,
 ) ?[]const u8 {
     var ast = std.heap.ArenaAllocator.init(gpa);
     defer ast.deinit();
@@ -7500,7 +9829,7 @@ pub fn summarizeTurns(
     };
     const body_buf = bodyBuf(gpa) catch return null;
     const one = [_]chat.ChatMessage{.{ .role = "user", .content = prompt }};
-    const body = chat.buildBodyMessages(body_buf, model_name, &one, effort, "", kind) catch {
+    const body = chat.buildBodyMessagesCapped(body_buf, model_name, &one, effort, "", kind, max_output_tokens) catch {
         models_mod.dbg("[compaction] could not build the summary body\n", .{});
         return null;
     };
@@ -7519,7 +9848,7 @@ pub fn summarizeTurns(
     };
     // Not the user's turn: its usage is not the turn's, and its errors are not
     // the turn's either.
-    chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind, false) catch |err| {
+    chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind, false, extra_headers) catch |err| {
         models_mod.dbg("[compaction] el resumen fallo: {t}\n", .{err});
         return null;
     };
@@ -7539,25 +9868,291 @@ fn onEffortPick(m: *tui.Model, _: u32, label: []const u8) void {
     cmdEffort(m, label);
 }
 
-/// Job of the `/models` worker (list in the history) and of the picker.
+/// `/color`: the palette the diff is painted with.
+///
+/// The DEFAULT pair is green for an added row and red for a deleted one, and
+/// that pair is invisible to a reader with the most common colour-vision
+/// deficiency: green and red collapse into the same yellow, and a diff whose
+/// two halves are the same colour is a diff with no halves. The DALTONIZED
+/// pair is blue and orange, which survive it.
+///
+/// The choice is for the session, and it says what it did: a palette that
+/// changed without saying so is a palette the user cannot trust.
+fn cmdColor(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        if (std.mem.eql(u8, a, "default") or std.mem.eql(u8, a, "normal")) {
+            theme.caps.daltonized = false;
+            m.pushInfoFmt("diff palette → default (green / red)", .{});
+        } else if (std.mem.eql(u8, a, "daltonized") or std.mem.eql(u8, a, "daltonise") or
+            std.mem.eql(u8, a, "daltonize"))
+        {
+            theme.caps.daltonized = true;
+            m.pushInfoFmt("diff palette → daltonized (blue / orange)", .{});
+        } else {
+            m.pushInfoFmt("unknown palette: {s} (default | daltonized)", .{a});
+            return;
+        }
+        // The whole history is painted with the old palette, so it has to be
+        // laid out again.
+        m.clearSegCache();
+        m.dirty = true;
+        return;
+    }
+    openColorPicker(m);
+}
+
+/// The palette picker: the two pairs, with the active one marked.
+fn openColorPicker(m: *tui.Model) void {
+    const gpa = m.allocator;
+    const names = [_][]const u8{ "default", "daltonized" };
+    const items = gpa.alloc(tui.PickerItem, names.len) catch return;
+    for (names, 0..) |n, i| {
+        const desc = if ((i == 1) == theme.caps.daltonized)
+            gpa.dupe(u8, "← active") catch ""
+        else if (i == 1)
+            gpa.dupe(u8, "blue / orange") catch ""
+        else
+            gpa.dupe(u8, "green / red") catch "";
+        items[i] = .{ .label = gpa.dupe(u8, n) catch return, .desc = desc };
+    }
+    var title_buf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "diff palette · {s}", .{
+        if (theme.caps.no_color) "no color (NO_COLOR)" else if (theme.caps.daltonized) "daltonized" else "default",
+    }) catch "diff palette";
+    m.openPicker(4, title, items, onColorPick);
+}
+
+fn onColorPick(m: *tui.Model, _: u32, label: []const u8) void {
+    cmdColor(m, label);
+}
+
+/// Job of the `/models` catalog summary and the model picker.
 const ModelsJob = struct {
     model: *tui.Model,
     /// false = list in the history (`/models`); otherwise open the picker.
     for_picker: bool = false,
+    request_id: usize = 0,
+    provider_id: []u8,
+    models_url: []u8,
+    key: ?[]u8,
+    /// Which header the key goes in. Copied into the job because the worker
+    /// has no `ProviderDef` (the provider id in the job is the only thing it
+    /// keeps) and the keyless `Bearer` was Anthropic's 401.
+    key_style: providers.KeyStyle = .bearer,
 };
 
-/// `/models`: lists the active provider's models in the history.
+/// `/models` shows catalog counts; `/model` is the detailed browser.
 pub fn listModelsAsync(m: *tui.Model) !void {
-    const job = try m.allocator.create(ModelsJob);
+    const job = try createModelsJob(m, false);
+    // No cleanup here: `spawnModelsJob` owns the job from the moment it is
+    // called, including the failure path. The compensating `endWorker` +
+    // `destroyModelsJob` that used to live in this function and in
+    // `pickerModelsAsync` balanced the counter only because both remembered to
+    // do it — ownership that lives in the caller is one caller away from a leak.
+    try spawnModelsJob(m, job);
+}
+
+/// Warms the status bar's `provider/model` from the network, SILENTLY.
+///
+/// The row is `opencode/space-bunny-free` and not just `opencode`, and the only
+/// place a model name exists before the first turn is the provider's catalogue.
+/// A cached catalogue is read by `resolveStatusModel` in a millisecond; an
+/// uncached one is not on disk until somebody asks the provider, and the only
+/// thing that asks at startup used to be `/model` — which is the moment the
+/// status was already being read.
+///
+/// Silent is the whole point: this runs before the first frame, and the models
+/// worker's own path writes `Catalog updated · N models` into the history and
+/// changes the status line, both of which would land on top of the opening hero.
+/// Nothing here is reported, because nothing here is news — the catalogue is
+/// written to disk exactly as the other worker writes it, and the next
+/// `resolveStatusModel` reads it.
+///
+/// It resets `status_model_tried`, which is the flag the draw uses to avoid
+/// re-reading a file that was not there: without the reset the row would keep
+/// saying `opencode` for the whole session, because the lazy resolve had already
+/// run once and found nothing.
+pub fn catalogWarmupAsync(m: *tui.Model) !void {
+    const gpa = m.allocator;
+    // NO `errdefer` HERE, and that is deliberate: the spawn-failure branch
+    // below frees the job itself, so an `errdefer` would free it a SECOND time
+    // on the way out — a double free, and the two failures cancel out into
+    // "the app crashed and nobody knows why".
+    //
+    // The ownership is in the TYPE of the failure: the only error between the
+    // `create` and the `spawn` is the spawn, and that branch owns the job.
+    const job = gpa.create(WarmupJob) catch |e| return e;
+    job.* = .{ .model = m };
     m.beginWorker();
-    job.* = .{ .model = m, .for_picker = false };
-    m.models_for_picker = false;
-    const th = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
+    const thread = std.Thread.spawn(.{}, warmupWorker, .{job}) catch {
         m.endWorker();
-        m.allocator.destroy(job);
+        gpa.destroy(job);
         return error.ThreadSpawnFailed;
     };
-    th.detach();
+    thread.detach();
+}
+
+const WarmupJob = struct { model: *tui.Model };
+
+fn warmupWorker(job: *WarmupJob) void {
+    // THE ORDER OF THESE TWO DEFERS IS THE WHOLE FUNCTION.
+    //
+    // `defer` is LIFO: the LAST one registered runs FIRST. The two lines used
+    // to be in the other order, so the job was FREED and then
+    // `job.model.endWorker()` dereferenced the freed block to do its atomic
+    // RMW — a use-after-free that killed the app with SIGSEGV while it was
+    // warming the model catalogue.
+    //
+    // It was read as a HANG for a month ("ReleaseSmall + a saved key = the TUI
+    // stops answering"), and the A/B that said "it is not ours" was right about
+    // the regression and wrong about the bug: it was ours since the warmup was
+    // written.
+    //
+    // The pointer is copied into a local BEFORE anything can die, so the second
+    // defer never reads the job it is about to free. `modelsWorker` (a hundred
+    // lines away) already had the right order.
+    const m = job.model;
+    defer m.allocator.destroy(job); // registered first  -> runs LAST
+    defer m.endWorker(); // registered second -> runs FIRST
+    const gpa = m.allocator;
+    const def = activeProviderDef(m.environ);
+    if (def.models_url.len == 0) return;
+
+    // ITS OWN `Io`, and this is HARDENING, not a cure.
+    //
+    // The whole app used ONE `Io` for everything: the UI's event loop, vaxis's
+    // pty reader, and every worker's HTTP. A detached worker doing blocking TLS
+    // on the shared `Io` is exactly the shape AGENTS.md already has a
+    // use-after-free for, and isolating it is the right thing regardless of what
+    // it fixes today.
+    //
+    // Measured: it takes the no-key case from "answers nothing" to "answers every
+    // time". It is NOT the fix for the saved-key case — gating the warmup off
+    // entirely changes nothing there, which is why that bug is written up as OPEN
+    // in AGENTS.md with the A/B that proves it predates this session.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const worker_io = threaded.io();
+
+    var http = http_client.Http.init(gpa, worker_io);
+    defer http.deinit();
+    var list = models_mod.listModels(gpa, &http, def.models_url, providers.catalogAuth(def, m.environ)) catch return;
+    defer list.deinit(gpa);
+    if (list.items.len == 0) return;
+
+    // The cache write too: it is 772 KB through a DEFLATE-9, and on the shared
+    // `Io` it would be the same block the request was.
+    modelcache.write(worker_io, m.environ, def.id, def.models_url, list.items);
+    // The catalogue is on disk now; the draw may look again.
+    tui.allowStatusModelRetry(m);
+}
+
+// ── self-update ─────────────────────────────────────────────────
+
+/// Looks for a newer release at startup, in a worker, and says so if there is
+/// one. It says NOTHING when the build is current: a line on every start saying
+/// "you are up to date" is noise, and it is the same line that makes the real
+/// notice invisible.
+///
+/// The check costs a file read on almost every start: `selfupdate` caches the
+/// answer on disk for six hours, so the network is touched twice a day at most.
+pub fn startUpdateCheck(m: *tui.Model) void {
+    if (envGet(m.environ, "ZODE_NO_SELF_UPDATE") != null) return;
+    spawnUpdateJob(m, .check) catch {};
+}
+
+/// `/update`: installs the newest release. It runs in a WORKER because it
+/// downloads ~2 MB, and a download on the UI thread is the app frozen for as
+/// long as GitHub takes.
+fn cmdUpdate(m: *tui.Model) void {
+    spawnUpdateJob(m, .install) catch pushError(m, "could not start the update");
+}
+
+const UpdateMode = enum { check, install };
+const UpdateJob = struct { model: *tui.Model, mode: UpdateMode };
+
+fn spawnUpdateJob(m: *tui.Model, mode: UpdateMode) !void {
+    const gpa = m.allocator;
+    const job = try gpa.create(UpdateJob);
+    job.* = .{ .model = m, .mode = mode };
+    m.beginWorker();
+    const thread = std.Thread.spawn(.{}, updateWorker, .{job}) catch {
+        m.endWorker();
+        gpa.destroy(job);
+        return error.ThreadSpawnFailed;
+    };
+    thread.detach();
+}
+
+fn updateWorker(job: *UpdateJob) void {
+    const m = job.model;
+    const mode = job.mode;
+    // LIFO, and the order matters: the job is freed LAST, after `endWorker` has
+    // read the model's counter through the (still valid) job.
+    defer m.allocator.destroy(job);
+    defer m.endWorker();
+
+    // Its own `Io`: a detached worker doing blocking TLS on the UI's event loop
+    // is the shape that made the app look hung.
+    var threaded: std.Io.Threaded = .init(m.allocator, .{});
+    defer threaded.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+
+    const ctx: selfupdate.Context = .{
+        .io = threaded.io(),
+        .alloc = arena_state.allocator(),
+        .env = m.environ,
+    };
+
+    switch (mode) {
+        .check => {
+            const up = selfupdate.check(ctx, false) orelse return;
+            announceUpdate(m, up);
+            // Opt-in automatic install. The default is to TELL the user: a
+            // binary replaced behind their back is a change they cannot see and
+            // a restart they never asked for.
+            if (envGet(m.environ, "ZODE_AUTO_UPDATE") != null) installUpdateNow(m, ctx);
+        },
+        .install => installUpdateNow(m, ctx),
+    }
+}
+
+fn announceUpdate(m: *tui.Model, up: selfupdate.Update) void {
+    var buf: [160]u8 = undefined;
+    const phrase = selfupdate.phrase(&buf, up);
+    m.pushInfoFmt("zode {s} · /update installs it", .{phrase});
+    setStatusWithZoFmt(m, .warn, "{s} available · /update", .{up.version});
+}
+
+fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
+    m.pushInfoFmt("updating zode from {s}…", .{selfupdate.current_version});
+    const tag = selfupdate.installLatest(ctx) catch |err| switch (err) {
+        // Not a failure: there is simply nothing newer to install.
+        error.AlreadyNewest => {
+            m.pushInfoFmt("zode {s} is already the newest release", .{selfupdate.current_version});
+            return;
+        },
+        else => {
+            m.pushErrorFmt("update failed: {s}", .{updateErrorPhrase(err)});
+            return;
+        },
+    };
+    m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
+    setStatusWithZoFmt(m, .done, "updated to {s} · restart", .{tag});
+}
+
+/// What went wrong, in words the user can act on. "UpdateFailed" is not one:
+/// the three cases have three different fixes (wait, reinstall, sudo).
+fn updateErrorPhrase(err: selfupdate.InstallError) []const u8 {
+    return switch (err) {
+        error.AlreadyNewest => "already the newest release",
+        error.NoAssetForPlatform => "this platform has no release binary",
+        error.DownloadFailed => "could not download it (network, GitHub, or no release yet)",
+        error.BinaryDoesNotRun => "the downloaded binary does not run here; nothing was replaced",
+        error.NotWritable => "could not replace the running binary (permissions?)",
+        error.UnsupportedPlatform => "no releases for this OS/arch",
+    };
 }
 
 /// `/model` and Ctrl+T: the two-column model palette.
@@ -7567,16 +10162,66 @@ pub fn listModelsAsync(m: *tui.Model) !void {
 /// network), and the worker fills it in when it finishes. So there is no blank
 /// wait.
 pub fn pickerModelsAsync(m: *tui.Model) !void {
-    const job = try m.allocator.create(ModelsJob);
+    const job = createModelsJob(m, true) catch |err| {
+        const def = activeProviderDef(m.environ);
+        const request_id = m.beginCatalogRequest(def.id);
+        m.setCatalogNotice(request_id, "Could not start model refresh");
+        return err;
+    };
+    // The id is read BEFORE the spawn: on failure `spawnModelsJob` frees the
+    // job, so touching `job.request_id` in the catch would be a use-after-free.
+    const request_id = job.request_id;
+    spawnModelsJob(m, job) catch |err| {
+        m.setCatalogNotice(request_id, "Could not start model refresh");
+        return err;
+    };
+}
+
+fn createModelsJob(m: *tui.Model, for_picker: bool) !*ModelsJob {
+    const gpa = m.allocator;
+    const def = activeProviderDef(m.environ);
+    const provider_id = try gpa.dupe(u8, def.id);
+    errdefer gpa.free(provider_id);
+    const models_url = try gpa.dupe(u8, def.models_url);
+    errdefer gpa.free(models_url);
+    const key = if (curKey(m)) |value| try gpa.dupe(u8, value) else null;
+    errdefer if (key) |value| gpa.free(value);
+    const job = try gpa.create(ModelsJob);
+    errdefer gpa.destroy(job);
+    job.* = .{
+        .model = m,
+        .for_picker = for_picker,
+        .request_id = if (for_picker) m.beginCatalogRequest(def.id) else 0,
+        .provider_id = provider_id,
+        .models_url = models_url,
+        .key = key,
+        .key_style = def.key_style,
+    };
+    return job;
+}
+
+/// Starts `modelsWorker` and HANDS OVER the job: on failure the job is freed
+/// here, so no caller has anything left to clean up.
+///
+/// The counter is undone here for a reason: `beginWorker` increments it, and a
+/// spawn failure that left it incremented made `waitWorkers(2000)` spin its
+/// whole budget at exit. It balanced before only because the two callers
+/// happened to call `endWorker` — the third one would not.
+fn spawnModelsJob(m: *tui.Model, job: *ModelsJob) !void {
     m.beginWorker();
-    job.* = .{ .model = m, .for_picker = true };
-    m.models_for_picker = true;
-    const th = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
+    const thread = std.Thread.spawn(.{}, modelsWorker, .{job}) catch {
         m.endWorker();
-        m.allocator.destroy(job);
+        destroyModelsJob(m.allocator, job);
         return error.ThreadSpawnFailed;
     };
-    th.detach();
+    thread.detach();
+}
+
+fn destroyModelsJob(gpa: std.mem.Allocator, job: *ModelsJob) void {
+    gpa.free(job.provider_id);
+    gpa.free(job.models_url);
+    if (job.key) |key| gpa.free(key);
+    gpa.destroy(job);
 }
 
 /// Like `pickerModelsAsync` but with the Ctrl+T key.
@@ -7594,13 +10239,35 @@ pub fn openModelPaletteAsync(m: *tui.Model) void {
 }
 
 fn modelsWorker(job: *ModelsJob) void {
-    defer job.model.allocator.destroy(job);
+    defer destroyModelsJob(job.model.allocator, job);
     const m = job.model;
     const gpa = m.allocator;
     m.beginWorker();
     defer m.endWorker();
+    const is_current = struct {
+        fn check(model: *tui.Model, request: *const ModelsJob) bool {
+            return !request.for_picker or model.catalogRequestCurrent(request.request_id);
+        }
+    }.check;
 
-    const def = activeProviderDef(m.environ);
+    // A provider with no `/models` endpoint (`models_url = ""`): there is no
+    // catalogue to read, neither from the cache nor from the network, and the
+    // fetch would hit "". The picker says how to choose instead of showing an
+    // error every time it opens.
+    if (job.models_url.len == 0) {
+        if (is_current(m, job)) {
+            m.setCatalogNotice(job.request_id, "This provider publishes no model catalog · /use <provider> <model>");
+        }
+        return;
+    }
+
+    // ITS OWN `Io`, same as `warmupWorker`. This is a DETACHED thread doing
+    // blocking TLS and a 772 KB DEFLATE-9 write on behalf of a thread nobody
+    // joins, and `io_global` is the object the UI event loop is using. The
+    // warmup got its own and this one did not: two workers, two policies.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const worker_io = threaded.io();
 
     // ── step 1: the CACHE, before anything touches the network ──
     //
@@ -7615,7 +10282,7 @@ fn modelsWorker(job: *ModelsJob) void {
     {
         var astate = std.heap.ArenaAllocator.init(gpa);
         defer astate.deinit();
-        if (modelcache.read(io_global, m.environ, astate.allocator(), def.id, def.models_url)) |e| {
+        if (modelcache.read(worker_io, m.environ, astate.allocator(), job.provider_id, job.models_url)) |e| {
             // `copyOut`, NOT `dupe(Model, ...)`. `Model` is a struct of slices into the
             // cache's arena, so a plain struct copy is a list of pointers into memory
             // that dies at the closing brace of this block. Measured: SIGSEGV, exit
@@ -7625,39 +10292,71 @@ fn modelsWorker(job: *ModelsJob) void {
             from_cache = cached.len > 0;
         }
     }
+    defer if (cached.len > 0) modelcache.freeOut(gpa, cached);
     if (from_cache) {
-        publishModels(m, cached, def.id, .cached);
-        setStatusWithZo(m, .done, "models from cache");
+        publishModels(m, cached, job.provider_id, .cached, job.request_id, job.for_picker);
+        if (is_current(m, job)) {
+            m.setCatalogNotice(job.request_id, "Saved catalog · checking for updates...");
+            if (!job.for_picker) setStatusWithZo(m, .tooling, "refreshing model catalog");
+        }
     } else {
-        setStatusWithZo(m, .tooling, "listing models…");
+        if (is_current(m, job) and !job.for_picker) setStatusWithZo(m, .tooling, "loading model catalog");
     }
 
-    var http = http_client.Http.init(gpa, io_global);
+    var http = http_client.Http.init(gpa, worker_io);
     defer http.deinit();
 
-    const key = curKey(m);
-
-    var list = models_mod.listModels(gpa, &http, def.models_url, key) catch |err| {
+    var list = models_mod.listModels(gpa, &http, job.models_url, providers.authWithKey(job.key_style, job.key)) catch |err| {
         // With a cache on screen, a failed refresh is a NOTE and not an error: the user
         // is looking at a usable list, and an error line over it invites them to think
         // the list is wrong.
         if (from_cache) {
-            const msg = std.fmt.allocPrint(gpa, "could not refresh the model list ({t}); showing the last one saved", .{err}) catch "could not refresh the model list";
-            pushInfoOwned(m, msg);
+            if (is_current(m, job)) {
+                m.setCatalogNotice(job.request_id, "Offline · showing saved catalog");
+                if (!job.for_picker) setStatusWithZo(m, .warn, "saved model catalog available");
+                if (!job.for_picker) {
+                    m.pushInfoFmt("could not refresh {s}'s model catalog ({t}); keeping saved models", .{ job.provider_id, err });
+                }
+            }
             return;
         }
+        if (!is_current(m, job)) return;
         if (err == error.HttpError) {
-            m.pushInfoFmt("models: HTTP error at {s}", .{def.models_url});
+            if (!job.for_picker) m.pushInfoFmt("models: HTTP error at {s}", .{job.models_url});
         } else {
-            const msg = std.fmt.allocPrint(gpa, "models: {t}", .{err}) catch "models error";
-            pushInfoOwned(m, msg);
+            if (!job.for_picker) {
+                m.pushInfoFmt("models: {t}", .{ err });
+            }
         }
-        setStatusWithZo(m, .warn, "no models");
+        if (is_current(m, job)) {
+            m.setCatalogNotice(job.request_id, "Could not load models · retry with /model");
+            if (!job.for_picker) setStatusWithZo(m, .warn, "model catalog unavailable");
+        }
         return;
     };
 
     defer list.deinit(gpa);
 
+    if (list.items.len == 0) {
+        if (is_current(m, job)) {
+            const note: []const u8 = if (from_cache)
+                "Provider returned no models · kept saved catalog"
+            else
+                "Provider returned no models";
+            m.setCatalogNotice(job.request_id, note);
+            if (!job.for_picker) {
+                setStatusWithZo(m, .warn, "provider returned no models");
+                if (from_cache) {
+                    m.pushInfoFmt("{s} returned an empty model catalog; keeping the saved list", .{job.provider_id});
+                } else {
+                    m.pushInfoFmt("{s} returned an empty model catalog", .{job.provider_id});
+                }
+            }
+        }
+        return;
+    }
+
+    var catalog_changed = !from_cache;
     // ── step 2: what CHANGED ──
     //
     // Only when there was a cache. `describe` returns EMPTY when nothing moved, and the
@@ -7669,17 +10368,27 @@ fn modelsWorker(job: *ModelsJob) void {
         defer astate.deinit();
         const arena = astate.allocator();
         const d = modelcache.diff(cached, list.items);
+        catalog_changed = d.added > 0 or d.removed > 0 or d.changed > 0;
         const line = modelcache.describe(arena, d);
-        if (line.len > 0) pushInfoOwned(m, gpa.dupe(u8, line) catch line);
-        modelcache.freeOut(gpa, cached);
+        if (line.len > 0 and is_current(m, job)) pushInfoOwned(m, gpa.dupe(u8, line) catch line);
     }
 
     // Written AFTER the diff and not before: a cache that was just refreshed with the
     // list in hand and still compares as "changed" is a cache that never converges.
-    modelcache.write(io_global, m.environ, def.id, def.models_url, list.items);
+    modelcache.write(worker_io, m.environ, job.provider_id, job.models_url, list.items);
 
-    publishModels(m, list.items, def.id, .fresh);
-    setStatusWithZo(m, .done, "models ready");
+    publishModels(m, list.items, job.provider_id, .fresh, job.request_id, job.for_picker);
+    if (is_current(m, job)) {
+        const notice = std.fmt.allocPrint(
+            gpa,
+            "{s} · {d} models",
+            .{ if (catalog_changed) "Catalog updated" else "Catalog up to date", list.items.len },
+        ) catch "Model catalog refreshed";
+        m.setCatalogNotice(job.request_id, notice);
+        if (!job.for_picker) {
+            setStatusWithZo(m, .done, if (catalog_changed) "model catalog updated" else "model catalog current");
+        }
+    }
 }
 
 const ModelSource = enum { cached, fresh };
@@ -7690,7 +10399,14 @@ const ModelSource = enum { cached, fresh };
 /// One function because there were two copies of the "free first, then alphabetical"
 /// ordering and a cache makes it a third call site; three copies of an ordering is how
 /// the picker and `/models` end up disagreeing about which models exist.
-fn publishModels(m: *tui.Model, models: []const models_mod.Model, provider_id: []const u8, source: ModelSource) void {
+fn publishModels(
+    m: *tui.Model,
+    models: []const models_mod.Model,
+    provider_id: []const u8,
+    source: ModelSource,
+    request_id: usize,
+    for_picker: bool,
+) void {
     const gpa = m.allocator;
     const sorted = gpa.dupe(models_mod.Model, models) catch return;
     defer gpa.free(sorted);
@@ -7698,24 +10414,24 @@ fn publishModels(m: *tui.Model, models: []const models_mod.Model, provider_id: [
     // alphabetical within each group so the list is stable between runs.
     std.mem.sort(models_mod.Model, sorted, {}, freeFirst);
 
-    if (m.models_for_picker) {
+    if (for_picker) {
         // The palette is NOT touched here: this is the worker's thread and the UI thread
         // draws it without a lock, and that was a segfault. ITEMS already built with
         // their own strings are handed over: handing over the `Model`s and freeing the
         // list on exit left the ids dangling and the drawing blew up.
         const items = buildModelItems(m, sorted);
-        if (items) |it| m.setPendingItems(it);
+        if (items) |it| m.setPendingCatalogItems(request_id, it);
         return;
     }
+    var free_count: usize = 0;
     for (sorted) |info| {
-        const hint = if (isFree(info)) "free" else "";
-        const line = std.fmt.allocPrint(gpa, "{s:<44} {s}", .{ info.id, hint }) catch continue;
-        pushInfoOwned(m, line);
+        if (isFree(info)) free_count += 1;
     }
-    m.pushInfoFmt("{d} models on {s}{s}", .{
+    m.pushInfoFmt("{d} models · {d} free · {s}{s} · use /model to browse", .{
         sorted.len,
+        free_count,
         provider_id,
-        if (source == .cached) " (saved list; refreshing)" else "",
+        if (source == .cached) " · saved list; refreshing" else "",
     });
 }
 
@@ -7738,56 +10454,168 @@ fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
     return std.mem.lessThan(u8, a.id, b.id);
 }
 
-/// Opens the model palette in TWO COLUMNS: providers | the active one's models.
-///
-/// It reuses the list already downloaded from the active provider, so opening it
-/// costs no network call (and if there are no models yet, `pickerModelsAsync` is
-/// launched to have something to paint).
-/// Builds the model palette's items: providers first (with their key state) and
-/// then the models with their `free` flag or their context window. All strings
-/// are own copies from the model's allocator.
-fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
+/// Opens the model palette: a SINGLE flat list of all models from connected
+/// providers (providers that have a key), showing "Model Name    Provider · free/ctx".
+/// Reads from the cache of each connected provider, so it opens instantly.
+/// All strings are own copies from the model's allocator.
+fn buildModelItems(m: *tui.Model, _: []models_mod.Model) ?[]palette.Item {
     const gpa = m.allocator;
-    const defs = allProviders(gpa);
-    const n = defs.len + 1 + list.len; // +1 = "+ connect"
-    const items = gpa.alloc(palette.Item, n) catch return null;
-    var i: usize = 0;
-    for (defs) |*d| {
-        const active = std.mem.eql(u8, d.id, cur_provider_id);
-        const has_key = providers.hasKey(d, m.environ);
-        items[i] = .{
-            .kind = .provider,
-            .group = 1,
-            .label = gpa.dupe(u8, d.id) catch return null,
-            .hint = gpa.dupe(u8, if (active) "active" else if (has_key) "key ok" else "no key") catch "",
-        };
-        i += 1;
+    var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer defs_arena_state.deinit();
+    const defs = allProviders(defs_arena_state.allocator());
+
+    // First pass: count total models from all connected providers
+    var total_models: usize = 0;
+    for (defs) |d| {
+        if (providers.hasKey(&d, m.environ)) {
+            var cache_arena = std.heap.ArenaAllocator.init(gpa);
+            if (modelcache.read(io_global, m.environ, cache_arena.allocator(), d.id, d.models_url)) |entry| {
+                total_models += entry.models.len;
+            }
+            cache_arena.deinit();
+        }
     }
-    // CAREFUL: EVERY label/hint has to be an OWN copy. A literal
-    // ("+ connect") freed with `gpa.free` is an "Invalid free" that only shows
-    // up on app exit, when the palette is destroyed.
+
+    // If no models from connected providers, try the active provider's cache
+    // (the user might be browsing before connecting a key)
+    if (total_models == 0) {
+        const active_def = activeProviderDef(m.environ);
+        if (active_def.id.len > 0) {
+            var cache_arena = std.heap.ArenaAllocator.init(gpa);
+            if (modelcache.read(io_global, m.environ, cache_arena.allocator(), active_def.id, active_def.models_url)) |entry| {
+                total_models = entry.models.len;
+            }
+            cache_arena.deinit();
+        }
+    }
+
+    // If still no models, return null to trigger fallback
+    if (total_models == 0) {
+        return null;
+    }
+
+    const items = gpa.alloc(palette.Item, total_models + 1) catch return null; // +1 for "+ connect"
+    var i: usize = 0;
+
+    // Second pass: add models from each connected provider
+    for (defs) |d| {
+        if (!providers.hasKey(&d, m.environ)) continue;
+
+        var cache_arena = std.heap.ArenaAllocator.init(gpa);
+        if (modelcache.read(io_global, m.environ, cache_arena.allocator(), d.id, d.models_url)) |entry| {
+            for (entry.models) |mi| {
+                const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
+                    std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
+                else
+                    "";
+                items[i] = .{
+                    .kind = .model,
+                    .group = 1,
+                    .label = gpa.dupe(u8, mi.id) catch return null,
+                    .hint = if (hint.len > 0)
+                        std.fmt.allocPrint(gpa, "{s} · {s}", .{d.id, hint}) catch gpa.dupe(u8, d.id) catch ""
+                    else
+                        gpa.dupe(u8, d.id) catch "",
+                    .provider = gpa.dupe(u8, d.id) catch "",
+                    .ctx_tokens = mi.context_length,
+                };
+                i += 1;
+            }
+        }
+        cache_arena.deinit();
+    }
+
+    // If we got models from connected providers, we're done
+    if (i > 0) {
+        // "+ connect" item at the end
+        items[i] = .{
+            .kind = .connect,
+            .group = 2,
+            .label = gpa.dupe(u8, "+ connect") catch return null,
+            .hint = gpa.dupe(u8, "ctrl+a") catch return null,
+        };
+        return items;
+    }
+
+    // Fallback: active provider's models (if we got here, connected providers had no models
+    // but active provider did)
+    const active_def = activeProviderDef(m.environ);
+    if (active_def.id.len > 0) {
+        var cache_arena = std.heap.ArenaAllocator.init(gpa);
+        if (modelcache.read(io_global, m.environ, cache_arena.allocator(), active_def.id, active_def.models_url)) |entry| {
+            for (entry.models) |mi| {
+                const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
+                    std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
+                else
+                    "";
+                items[i] = .{
+                    .kind = .model,
+                    .group = 1,
+                    .label = gpa.dupe(u8, mi.id) catch return null,
+                    .hint = if (hint.len > 0)
+                        std.fmt.allocPrint(gpa, "{s} · {s}", .{active_def.id, hint}) catch gpa.dupe(u8, active_def.id) catch ""
+                    else
+                        gpa.dupe(u8, active_def.id) catch "",
+                    .provider = gpa.dupe(u8, active_def.id) catch "",
+                    .ctx_tokens = mi.context_length,
+                };
+                i += 1;
+            }
+        }
+        cache_arena.deinit();
+    }
+
+    // "+ connect" item at the end
     items[i] = .{
         .kind = .connect,
         .group = 2,
         .label = gpa.dupe(u8, "+ connect") catch return null,
         .hint = gpa.dupe(u8, "ctrl+a") catch return null,
     };
-    i += 1;
-    for (list) |mi| {
-        const hint = if (isFree(mi)) "free" else if (mi.context_length > 0)
-            std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
-        else
-            "";
-        items[i] = .{
-            .kind = .model,
-            .group = 3,
-            .label = gpa.dupe(u8, mi.id) catch return null,
-            .hint = if (hint.len > 0) (gpa.dupe(u8, hint) catch "") else "",
-            .ctx_tokens = mi.context_length,
-        };
-        i += 1;
-    }
+
     return items;
+}
+
+fn providerKeyHint(gpa: std.mem.Allocator, def: *const providers.ProviderDef, active: bool, has_key: bool) ?[]u8 {
+    const state: []const u8 = if (def.key_env.len == 0)
+        "no key needed"
+    else if (has_key)
+        "connected"
+    else
+        "key needed";
+    if (active) return std.fmt.allocPrint(gpa, "active · {s}", .{state}) catch null;
+    return gpa.dupe(u8, state) catch null;
+}
+
+/// Builds a mode indicator string for the model palette title.
+fn buildModeTitlePart(m: *tui.Model, buf: *[128]u8) []const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(m.allocator);
+
+    // Free-auto mode
+    if (free_auto.freeAutoOn()) {
+        const lbl = free_auto.freeAutoLabel(m.allocator);
+        if (lbl.len > 0) {
+            _ = parts.append(m.allocator, lbl) catch {};
+        } else {
+            _ = parts.append(m.allocator, "free-auto: building pool…") catch {};
+        }
+    }
+
+    // Permission mode (only when not default/accept_edits)
+    const perm_mode = currentPermMode();
+    if (perm_mode == .read_only or perm_mode == .bypass) {
+        _ = parts.append(m.allocator, permModeName()) catch {};
+    }
+
+    // Cheap router mode
+    if (router_mod.active(&cheap_router)) {
+        _ = parts.append(m.allocator, "cheap router") catch {};
+    }
+
+    if (parts.items.len == 0) return "";
+    const joined = std.mem.join(m.allocator, " · ", parts.items) catch return "";
+    return std.fmt.bufPrint(buf, "{s}", .{joined}) catch "";
 }
 
 fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
@@ -7795,7 +10623,14 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     // It delegates to `buildModelItems`: keeping TWO item constructors means
     // that as soon as one of them is not updated, loose literals show up (which
     // `freeItems` cannot free) and the app crashes on exit.
-    const items = buildModelItems(m, list) orelse return;
+    var items = buildModelItems(m, list);
+    if (items == null) {
+        // Fallback: no cached models from any connected provider.
+        // Build items from the active provider's list (passed as `list`).
+        items = fallbackModelItems(m, list);
+        if (items == null) return;
+    }
+    if (m.pal.mode == .models) m.invalidateCatalogRequest();
     // The mode goes BEFORE `setItemsOwned`: `resetSelection` computes the active
     // column from the mode. With the old mode, opening the model palette left
     // the PROVIDERS column active, the arrows did not move the model list and
@@ -7803,20 +10638,74 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     m.pal.mode = .models;
     m.pal.active = true;
     m.pal.query_len = 0;
-    m.pal.setItemsOwned(items, &model_groups);
+
+    // Set a custom title that includes the current mode, so the user knows what
+    // mode they are in when selecting a model. This mirrors how `openEffortPicker`
+    // shows the effort ladder in the title.
+    var title_buf: [128]u8 = undefined;
+    const mode_part = buildModeTitlePart(m, &title_buf);
+    if (mode_part.len > 0) {
+        const title = std.fmt.bufPrint(&title_buf, "Choose a model · {s}", .{mode_part}) catch "Choose a model";
+        m.pal.custom_title = m.allocator.dupe(u8, title) catch "";
+    } else {
+        m.pal.custom_title = "";
+    }
+
+    m.pal.setItemsOwned(items.?, &model_groups);
 }
 
-/// Groups of the model palette.
+/// Fallback: builds model items from the active provider's list only.
+/// Used when no connected provider has cached models.
+fn fallbackModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
+    const gpa = m.allocator;
+    const total_models = list.len;
+    const items = gpa.alloc(palette.Item, total_models + 1) catch return null; // +1 for "+ connect"
+    var i: usize = 0;
+
+    const active_provider = if (cur_provider_id.len > 0) cur_provider_id else "unknown";
+
+    for (list) |mi| {
+        const hint = if (isFree(mi)) "free" else if (mi.context_length > 0)
+            std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
+        else
+            "";
+        items[i] = .{
+            .kind = .model,
+            .group = 1,
+            .label = gpa.dupe(u8, mi.id) catch return null,
+            .hint = if (hint.len > 0)
+                std.fmt.allocPrint(gpa, "{s} · {s}", .{active_provider, hint}) catch gpa.dupe(u8, active_provider) catch ""
+            else
+                gpa.dupe(u8, active_provider) catch "",
+            .provider = gpa.dupe(u8, active_provider) catch "",
+            .ctx_tokens = mi.context_length,
+        };
+        i += 1;
+    }
+
+    // "+ connect" item at the end
+    items[i] = .{
+        .kind = .connect,
+        .group = 2,
+        .label = gpa.dupe(u8, "+ connect") catch return null,
+        .hint = gpa.dupe(u8, "ctrl+a") catch return null,
+    };
+
+    return items;
+}
+
+/// Groups of the model palette (single flat list of models).
 pub const model_groups = [_]palette.Group{
-    .{ .name = "Providers" },
-    .{ .name = "" }, // separator for the "Connect an integration" item
     .{ .name = "Models" },
+    .{ .name = "" }, // separator for the "Connect an integration" item
 };
 
 /// `/provider`: picker with all the providers and their key state.
 fn openProviderPicker(m: *tui.Model) void {
     const gpa = m.allocator;
-    const defs = allProviders(gpa);
+    var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer defs_arena_state.deinit();
+    const defs = allProviders(defs_arena_state.allocator());
     const items = gpa.alloc(tui.PickerItem, defs.len) catch return;
     for (defs, 0..) |*d, i| {
         const has_key = providers.hasKey(d, m.environ);
@@ -7882,6 +10771,10 @@ fn effortDesc(e: chat.Effort) []const u8 {
         .medium => "balanced",
         .high => "slower, more thorough",
         .xhigh => "maximum",
+        // The same rung as `xhigh`, under the name of the providers that call
+        // it `max`. The picker never offers it while no model takes it, so this
+        // line only ever describes a level that is already in effect.
+        .max => "maximum",
     };
 }
 
@@ -7923,7 +10816,7 @@ fn cmdGroup(key: []const u8) u8 {
     if (std.mem.eql(u8, k, "model") or std.mem.eql(u8, k, "models") or
         std.mem.eql(u8, k, "provider") or std.mem.eql(u8, k, "providers") or
         std.mem.eql(u8, k, "use") or std.mem.eql(u8, k, "effort") or
-        std.mem.eql(u8, k, "submodel")) return 4;
+        std.mem.eql(u8, k, "submodel") or std.mem.eql(u8, k, "task-parallel")) return 4;
     return 5;
 }
 
@@ -7934,7 +10827,9 @@ fn cmdGroup(key: []const u8) u8 {
 /// without having to go through the left column of the model palette.
 pub fn openConnectPalette(m: *tui.Model) void {
     const gpa = m.allocator;
-    const defs = allProviders(gpa);
+    var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer defs_arena_state.deinit();
+    const defs = allProviders(defs_arena_state.allocator());
     const items = gpa.alloc(palette.Item, defs.len) catch return;
     for (defs, 0..) |*d, i| {
         const active = std.mem.eql(u8, d.id, cur_provider_id);
@@ -7943,9 +10838,10 @@ pub fn openConnectPalette(m: *tui.Model) void {
             .kind = .provider,
             .group = 0,
             .label = gpa.dupe(u8, d.id) catch return,
-            .hint = gpa.dupe(u8, if (active) "active" else if (has_key) "key ok" else "no key") catch "",
+            .hint = providerKeyHint(gpa, d, active, has_key) orelse return,
         };
     }
+    if (m.pal.mode == .models) m.invalidateCatalogRequest();
     m.pal.mode = .connect;
     m.pal.active = true;
     m.pal.query_len = 0;
@@ -7965,31 +10861,38 @@ pub fn openCommandPalette(m: *tui.Model) void {
     const uc = userCommands();
     // +1 for the header's "Connect" item: it is the shortcut to connect a
     // provider without leaving the command palette.
-    const items = gpa.alloc(palette.Item, commands.len + 1 + uc.len) catch return;
+    var visible_count: usize = 0;
+    for (commands) |c| if (c.palette_visible) {
+        visible_count += 1;
+    };
+    const items = gpa.alloc(palette.Item, visible_count + 1 + uc.len) catch return;
     items[0] = .{
         .kind = .command,
         .group = 1,
         .label = gpa.dupe(u8, "Connect") catch return,
         .hint = gpa.dupe(u8, "add a provider API key") catch "",
     };
-    for (commands, 0..) |c, i| {
+    var item_idx: usize = 1;
+    for (commands) |c| {
+        if (!c.palette_visible) continue;
         // `/free-auto` carries its STATE in the hint: seeing "on · 3/8" next to it
         // in the palette is what tells you the rotation is running, without
         // having to go and ask for the status.
         const hint: []const u8 = if (std.mem.eql(u8, c.key, "/free-auto"))
             (if (freeAutoOn()) freeAutoLabel(gpa) else "rotate free models of every provider · off")
         else if (c.key_hint) |h| h else "";
-        items[i + 1] = .{
+        items[item_idx] = .{
             .kind = .command,
             .group = cmdGroup(c.key),
             .label = gpa.dupe(u8, c.key) catch return,
             .hint = gpa.dupe(u8, hint) catch "",
         };
+        item_idx += 1;
     }
     // The user's own commands, in "Yours" (the group AFTER `cmd_groups`'s
     // builtins, 1-based: index 5 → id 6 = `cmd_groups.len`).
     for (uc, 0..) |c, i| {
-        items[commands.len + 1 + i] = .{
+        items[visible_count + 1 + i] = .{
             .kind = .command,
             .group = @intCast(cmd_groups.len),
             .label = gpa.dupe(u8, c.key) catch return,
@@ -7999,6 +10902,7 @@ pub fn openCommandPalette(m: *tui.Model) void {
     // Stable order by group: otherwise the headers repeat and the list jumps from
     // "Model" to "Session" and back to "Suggested".
     std.mem.sort(palette.Item, items, {}, byGroupThenName);
+    if (m.pal.mode == .models) m.invalidateCatalogRequest();
     m.pal.mode = .commands;
     m.pal.active = true;
     m.pal.query_len = 0;
@@ -8028,12 +10932,10 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
     // And ONLY if the provider declares one of its own (the user's config.json)
     // is it used.
     if (def.default_model.len > 0) setModel(def.default_model);
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "provider → {s} · model {s}",
-        .{ def.id, if (cur_model.len > 0) cur_model else "(auto: picked from the catalog)" },
-    ) catch "provider";
-    pushInfoOwned(m, msg);
+    m.pushInfoFmt("provider → {s} · model {s}", .{
+        def.id,
+        if (cur_model.len > 0) cur_model else "(auto: picked from the catalog)",
+    });
     if (had_model and def.default_model.len == 0) {
         // The model of the PREVIOUS provider is not valid here, and staying
         // silent about it means the next turn spends itself on a 400 that says
@@ -8072,6 +10974,7 @@ pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
         openConnectPalette(m);
         return;
     }
+    m.pal.key_return_mode = if (m.pal.mode == .models) .models else .connect;
     if (provider_idx) |idx| {
         if (idx >= m.pal.items.len) return;
         if (m.pal.items[idx].kind != .provider) return;
@@ -8279,6 +11182,85 @@ test "the announced backoff is the one actually waited" {
     // The jitter does not break the backoff's monotonicity (2x is more than the
     // jitter).
     try std.testing.expect(a1 > a0 and a2 > a1);
+}
+
+test "chooseCatalogModel: the preferred list wins over the first catalog row" {
+    // NVIDIA publishes 85 models and the first is `01-ai/yi-large`, long
+    // retired. "First entry in the catalog" is not a choice there: it is the
+    // oldest row, and the request dies with a 410 on the first turn.
+    const def = providers.byId("nvidia").?;
+    const list = [_]models_mod.Model{
+        .{ .id = "01-ai/yi-large", .owned_by = "nvidia" },
+        .{ .id = "nvidia/nemotron-3-super-120b-a12b", .owned_by = "nvidia" },
+        .{ .id = "z-ai/glm-5.3", .owned_by = "nvidia" },
+    };
+    const choice = chooseCatalogModel(def, &list) orelse return error.TestUnexpectedResult;
+    // The PREFERENCE LIST is the priority, not the catalog's row order: the
+    // first preferred id present here is GLM-5.3, even though Nemotron is
+    // published before it.
+    try std.testing.expectEqualStrings("z-ai/glm-5.3", choice.model.id);
+    try std.testing.expect(std.mem.indexOf(u8, choice.why, "preferred") != null);
+}
+
+test "chooseCatalogModel: a preferred id absent from the catalog is skipped, not guessed" {
+    const def = providers.byId("nvidia").?;
+    const list = [_]models_mod.Model{
+        .{ .id = "some/other-model", .owned_by = "nvidia" },
+        .{ .id = "nvidia/nemotron-3.5-lightning-30b-a3b", .owned_by = "nvidia" },
+    };
+    const choice = chooseCatalogModel(def, &list) orelse return error.TestUnexpectedResult;
+    // GLM leads the preference list but is not in THIS catalog, so the answer is
+    // the next preferred id that is, not a guess and not the first row.
+    try std.testing.expectEqualStrings("nvidia/nemotron-3.5-lightning-30b-a3b", choice.model.id);
+}
+
+test "chooseCatalogModel: without a preference list, the first free, else the first entry" {
+    const def = providers.byId("groq").?;
+    const list = [_]models_mod.Model{
+        .{ .id = "z-model", .owned_by = "groq" },
+        .{ .id = "a-model", .owned_by = "groq", .is_free = true },
+    };
+    const choice = chooseCatalogModel(def, &list) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("a-model", choice.model.id);
+    const paid = [_]models_mod.Model{.{ .id = "z-model", .owned_by = "groq" }};
+    const fallback = chooseCatalogModel(def, &paid) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("z-model", fallback.model.id);
+}
+
+test "outputCapFor: the provider cap and the user's ceiling, smaller wins" {
+    // The provider cap alone is not enough: NVIDIA's catalog mixes models whose
+    // per-model maxima are 4096 and 32768, so the value that works for the
+    // preferred model can still be a 400 on the one the user picked by hand.
+    // `ZODE_MAX_OUTPUT_TOKENS` is the escape hatch, and it can only LOWER.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    const nvidia = providers.byId("nvidia").?;
+
+    // No variable: the provider's own cap.
+    try std.testing.expectEqual(@as(u32, 16384), outputCapFor(nvidia, null));
+
+    // Lower than the provider cap: the user's number wins.
+    const low: [:0]const u8 = "ZODE_MAX_OUTPUT_TOKENS=4096\x00";
+    try env.putPosixBlock(.{ .slice = &.{low} });
+    try std.testing.expectEqual(@as(u32, 4096), outputCapFor(nvidia, &env));
+
+    // Higher: the provider cap still protects the request.
+    var env2 = std.process.Environ.Map.init(std.testing.allocator);
+    defer env2.deinit();
+    const high: [:0]const u8 = "ZODE_MAX_OUTPUT_TOKENS=65536\x00";
+    try env2.putPosixBlock(.{ .slice = &.{high} });
+    try std.testing.expectEqual(@as(u32, 16384), outputCapFor(nvidia, &env2));
+
+    // A provider with no cap of its own takes the user's ceiling as-is.
+    const groq = providers.byId("groq").?;
+    try std.testing.expectEqual(@as(u32, 65536), outputCapFor(groq, &env2));
+
+    // Garbage or 0 means "no opinion", not "send zero tokens".
+    var env3 = std.process.Environ.Map.init(std.testing.allocator);
+    defer env3.deinit();
+    const bad: [:0]const u8 = "ZODE_MAX_OUTPUT_TOKENS=not-a-number\x00";
+    try env3.putPosixBlock(.{ .slice = &.{bad} });
+    try std.testing.expectEqual(@as(u32, 16384), outputCapFor(nvidia, &env3));
 }
 
 /// Save/restore the free-auto state in the tests (see
@@ -8906,6 +11888,109 @@ test "toolCallsJsonFromCalls: the assistant message carries the tool_calls" {
     try std.testing.expect(toolCallsJsonFromCalls(astate.allocator(), &[_]TurnCtx.Call{}) == null);
 }
 
+test "a tool argument is clipped so one row cannot fill the timeline" {
+    // The timeline-filling garbage. A `bash` argument is whatever the model
+    // wrote, and a real one is a three-pipeline command of several hundred
+    // columns. It went into the header `*bash*(<command>)`, and a header is a
+    // PARAGRAPH: it wraps. One long command was worth eight rows of history and
+    // pushed the answer off screen.
+    //
+    // The clip is measured in COLUMNS, not bytes: a command with CJK or an emoji
+    // counts correctly, and a byte-sized clip would come out mid-character.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const long_bash =
+        \\{"command":"zig build test --summary all && zig build -p /tmp/opencode/x && cat /very/long/path/to/some/directory/that/goes/on/and/on/forever/and/ever/file.zig"}
+    ;
+    const arg = toolArgSummary("bash", long_bash, arena);
+    try std.testing.expect(textcap.fits(arg, arg_max_cols));
+    // And it ends with the ellipsis, so a clipped command is visibly clipped
+    // rather than silently truncated to another command.
+    try std.testing.expect(std.mem.endsWith(u8, arg, textcap.ellipsis));
+
+    // A short one is returned whole, which is the common case.
+    const short = toolArgSummary("bash", "{\"command\":\"ls -la\"}", arena);
+    try std.testing.expectEqualStrings("ls -la", short);
+
+    // A path is clipped by the same rule.
+    const deep = toolArgSummary("read", "{\"path\":\"src/some/very/deep/nested/directory/structure/that/never/ends/file.zig\"}", arena);
+    try std.testing.expect(textcap.fits(deep, arg_max_cols));
+
+    // A multi-byte command is not cut mid-character: invalid UTF-8 would reach
+    // the markdown parser, the renderer and the session file.
+    const wide = toolArgSummary("bash", "{\"command\":\"日本語のとても長いコマンドをここに書きます。これはテストです。\"}", arena);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(wide));
+    try std.testing.expect(textcap.fits(wide, arg_max_cols));
+
+    // An MCP call names the TOOL it is about, because that is the line the
+    // user reads and the line they are approving. `mcp(call)` says nothing.
+    const mcp_call = toolArgSummary(
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"github\",\"tool\":\"create_issue\",\"arguments\":{\"title\":\"x\"}}",
+        arena,
+    );
+    try std.testing.expectEqualStrings("github.create_issue", mcp_call);
+    // And a search names its query: there is no tool yet.
+    const mcp_search = toolArgSummary("mcp", "{\"operation\":\"search\",\"query\":\"issue\"}", arena);
+    try std.testing.expectEqualStrings("issue", mcp_search);
+}
+
+
+test "toolTimelineLabel: the timeline reads the description, the permission reads the command" {
+    // The `bash` `description` field is a HUMAN label ("running the test
+    // suite"), and the timeline shows it instead of a clipped pipeline. The
+    // half that matters is what it must NOT reach: `permAutoAllowed` and the
+    // dialog keep receiving the COMMAND (`toolArgSummary`), because a prefix
+    // allowlist matched against model-written prose would let
+    // `description: "git status"` ride `rm -rf /` unattended.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const with_desc = "{\"command\":\"zig build test --summary all\",\"description\":\"running the test suite\"}";
+    const arg = toolArgSummary("bash", with_desc, arena);
+    // The permission path keeps seeing the command, description or no
+    // description: this is the whole safety argument of the feature.
+    try std.testing.expectEqualStrings("zig build test --summary all", arg);
+    const label = toolTimelineLabel("bash", with_desc, arg, arena);
+    try std.testing.expectEqualStrings("running the test suite", label);
+
+    // No description: the timeline falls back to the command, exactly as
+    // before the field existed.
+    const bare = "{\"command\":\"ls -la\"}";
+    const bare_arg = toolArgSummary("bash", bare, arena);
+    try std.testing.expectEqualStrings("ls -la", toolTimelineLabel("bash", bare, bare_arg, arena));
+
+    // A call the parser cannot read degrades to the command, never to nothing.
+    try std.testing.expectEqualStrings("ls -la", toolTimelineLabel("bash", "not json", bare_arg, arena));
+
+    // Only the FIRST line: the timeline row is one row, and an interior
+    // newline painted raw has already been a bug in this repo (the ask panel).
+    const multiline = "{\"command\":\"make\",\"description\":\"build the release\\nand then some\"}";
+    try std.testing.expectEqualStrings("build the release", toolTimelineLabel("bash", multiline, "make", arena));
+
+    // An empty (or whitespace-only) description is no description: it falls
+    // back to the command instead of painting an empty argument.
+    const blank = "{\"command\":\"make\",\"description\":\"   \"}";
+    try std.testing.expectEqualStrings("make", toolTimelineLabel("bash", blank, "make", arena));
+
+    // A description longer than the row is clipped with the ellipsis, in
+    // columns, and stays valid UTF-8 — the same rules as any argument.
+    const long_desc = "{\"command\":\"make\",\"description\":\"this description is far longer than any timeline row should ever be and keeps going and going\"}";
+    const long_label = toolTimelineLabel("bash", long_desc, "make", arena);
+    try std.testing.expect(textcap.fits(long_label, arg_max_cols));
+    try std.testing.expect(std.mem.endsWith(u8, long_label, textcap.ellipsis));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long_label));
+
+    // A tool other than bash ignores a stray description: `read` shows its
+    // path, because the field belongs to bash alone.
+    const read_args = "{\"path\":\"src/x.zig\",\"description\":\"whatever\"}";
+    try std.testing.expectEqualStrings("src/x.zig", toolArgSummary("read", read_args, arena));
+    try std.testing.expectEqualStrings("src/x.zig", toolTimelineLabel("read", read_args, "src/x.zig", arena));
+}
+
 test "toolArgSummary and toolResultSummary know the web tools" {
     // `⏺ web_fetch(ziglang.org/…)` and `⎿ 412 lines · 78 KB` are useful feedback;
     // without this the first loose string came out and just "web_fetch".
@@ -8922,6 +12007,11 @@ test "toolArgSummary and toolResultSummary know the web tools" {
     try std.testing.expect(std.mem.indexOf(u8, res, "3 lines") != null);
     const hits = toolResultSummary("web_search", "1. One\n   https://a.example\n   snip\n\n2. Two\n   https://b.example\n   snip\n", arena);
     try std.testing.expectEqualStrings("2 results", hits);
+
+    const bash = toolResultSummary("bash", "exit=0\n--- stdout ---\nfirst\nsecond\n--- stderr ---\nwarning\n", arena);
+    try std.testing.expectEqualStrings("exit 0 · stdout 2 lines · stderr 1 line", bash);
+    const capped = toolResultSummary("bash", "exit=(stopped at the tool's output cap)\n--- stdout ---\npartial\n… (output cut at the tool's cap and the command was stopped)\n", arena);
+    try std.testing.expectEqualStrings("exit (stopped at the tool's output cap) · stdout 1 line · output capped", capped);
 }
 
 test "cmdAllowlist lists what is there and warns if it is empty" {
@@ -9116,7 +12206,167 @@ test "ask: the per-turn cap is 3, and it is in the guidance" {
 
 test "skills: with no directories the prompt section is EMPTY (0 tokens)" {
     var buf: [512]u8 = undefined;
-    try std.testing.expectEqualStrings("", skills.systemPromptSection(&.{}, &buf));
+    try std.testing.expectEqualStrings("", skills.systemPromptSection(&.{}, 1024, &buf));
+}
+
+test "the skills listing budget comes from ZODE_CONTEXT_LIMIT, and not from the model" {
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZODE_CONTEXT_LIMIT", "6000");
+    // 1% of 6000 tokens is 60 tokens, which is 240 characters.
+    try std.testing.expectEqual(@as(usize, 240), skillListingBudget(&map));
+
+    // The MODEL's window is not part of it. The free-auto rotation changes the
+    // active model on every turn, and a budget that moved with the model would
+    // rewrite the system prompt — and invalidate the provider's cache for the
+    // whole request — on every turn.
+    const saved_ctx = cur_model_ctx;
+    defer cur_model_ctx = saved_ctx;
+    cur_model_ctx = 1_000_000;
+    try std.testing.expectEqual(@as(usize, 240), skillListingBudget(&map));
+    cur_model_ctx = 0;
+
+    // And with no environment at all, the default window: 1% of 128k.
+    const saved = environ_global;
+    environ_global = null;
+    defer environ_global = saved;
+    try std.testing.expectEqual(@as(usize, 5120), skillListingBudget(null));
+}
+
+/// The environment a prompt-building test needs, and the teardown that puts the
+/// module globals back.
+///
+/// It is a helper and not a copy in each test because the globals ARE the trap:
+/// an `Io` that is `undefined` until startup assigns it (a file read through it
+/// is a GPF, not a zero), a project directory that must not be the repository of
+/// whoever runs the suite, and two caches that outlive the test's arena.
+///
+/// The caches are DROPPED and not freed: a rescan frees the previous list with
+/// `gpa_global`, and the list was allocated with this test's arena. Freeing it
+/// here is an "Invalid free"; dropping the reference lets the arena have it.
+const PromptTestEnv = struct {
+    arena_state: std.heap.ArenaAllocator,
+    threaded: std.Io.Threaded,
+    saved_io: std.Io,
+    saved_gpa: std.mem.Allocator,
+    saved_env: ?*const std.process.Environ.Map,
+    saved_agents: ?[]u8,
+
+    fn init() PromptTestEnv {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer arena_state.deinit();
+        var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+        errdefer threaded.deinit();
+
+        const saved_agents = agents_md_cache;
+        agents_md_cache = null;
+        styles_cache = null;
+        styles_stamp_len = 0;
+        styles_rescans = 0;
+        skills_cache = null;
+        skills_stamp_len = 0;
+        skills_rescans = 0;
+
+        io_global = threaded.io();
+        gpa_global = std.testing.allocator;
+        setProjectInfoForTest(io_global, "/tmp");
+
+        return .{
+            .arena_state = arena_state,
+            .threaded = threaded,
+            .saved_io = io_global,
+            .saved_gpa = gpa_global,
+            .saved_env = environ_global,
+            .saved_agents = saved_agents,
+        };
+    }
+
+    fn deinit(self: *PromptTestEnv) void {
+        styles_cache = null;
+        styles_stamp_len = 0;
+        styles_rescans = 0;
+        skills_cache = null;
+        skills_stamp_len = 0;
+        skills_rescans = 0;
+        agents_md_cache = self.saved_agents;
+        gpa_global = self.saved_gpa;
+        io_global = self.saved_io;
+        environ_global = self.saved_env;
+        self.threaded.deinit();
+        self.arena_state.deinit();
+    }
+
+    fn allocator(self: *PromptTestEnv) std.mem.Allocator {
+        return self.arena_state.allocator();
+    }
+};
+
+test "the skills listing in the PROMPT goes under a tight budget" {
+    // The wiring: the budget has to reach the prompt and not only the pure
+    // function. A budget that is computed and never used is a comment.
+    var env = PromptTestEnv.init();
+    defer env.deinit();
+
+    var map = std.process.Environ.Map.init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZODE_CONTEXT_LIMIT", "6000");
+
+    var buf: [16 * 1024]u8 = undefined;
+    const tight = buildSystemPrompt(env.allocator(), &buf, &map, true);
+    // The bundled skills are there, but only their NAMES: 1% of a 6000-token
+    // window is 240 characters, and that is not a description.
+    try std.testing.expect(std.mem.indexOf(u8, tight, "- simplify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tight, "Review a diff for reuse") == null);
+}
+
+test "the skills listing in the PROMPT keeps the descriptions when there is room" {
+    // A budget that quietly emptied the list would look like a feature.
+    var env = PromptTestEnv.init();
+    defer env.deinit();
+
+    var buf: [16 * 1024]u8 = undefined;
+    const roomy = buildSystemPrompt(env.allocator(), &buf, null, true);
+    try std.testing.expect(std.mem.indexOf(u8, roomy, "- simplify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roomy, "Review a diff for reuse") != null);
+}
+
+// Phase 2.2: the system prompt built without skills does not contain the
+// skills listing — it is attached once per session as a separate message.
+test "buildSystemPrompt without skills leaves the cacheable prefix clean" {
+    var env = PromptTestEnv.init();
+    defer env.deinit();
+
+    var buf: [16 * 1024]u8 = undefined;
+    const prompt = buildSystemPrompt(env.allocator(), &buf, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "- simplify") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Review a diff for reuse") == null);
+    // Everything else is still there.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "NEVER use bash") != null);
+}
+
+// Phase 2.2: `skillsSectionText` builds the skills listing that gets attached.
+test "skillsSectionText produces the bundled skill names" {
+    var env = PromptTestEnv.init();
+    defer env.deinit();
+
+    var buf: [16 * 1024]u8 = undefined;
+    const section = skillsSectionText(env.allocator(), null, &buf);
+    try std.testing.expect(section.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, section, "- simplify") != null);
+}
+
+// Phase 2.2: `Session.resetSkillsSent` clears the flag so the listing is re-sent.
+test "Session.resetSkillsSent clears the flag" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var s = session_mod.Session.init(gpa);
+    try std.testing.expect(!s.skills_sent);
+    s.skills_sent = true;
+    try std.testing.expect(s.skills_sent);
+    s.resetSkillsSent();
+    try std.testing.expect(!s.skills_sent);
 }
 
 test "prompt: the routing guide survives the project's AGENTS.md" {
@@ -9134,7 +12384,11 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     // in the same way in both cases.
     const saved_cache = agents_md_cache;
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     defer {
+        resetStylesCacheForTest();
+        resetSkillsCacheForTest();
+        gpa_global = saved_gpa;
         agents_md_cache = saved_cache;
         io_global = saved_io;
     }
@@ -9155,6 +12409,8 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
     const fake_agents = try std.testing.allocator.dupe(u8, "# proyecto\nNo hagas esto.");
     defer std.testing.allocator.free(fake_agents);
     agents_md_cache = fake_agents;
@@ -9164,7 +12420,7 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     // shorter prompt, not like a broken test. The prompt is the biggest stable prefix
     // in every request, so its length is worth pinning generously.
     var out: [16 * 1024]u8 = undefined;
-    const composed = buildSystemPrompt(std.testing.allocator, &out, null);
+    const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
     try std.testing.expect(composed.len < out.len); // it FIT: nothing was truncated
     try std.testing.expect(std.mem.indexOf(u8, composed, "No hagas esto.") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "web_search = you do NOT have the URL") != null);
@@ -9186,21 +12442,22 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     const saved_io = io_global;
     const saved_info = project_info;
     const saved_agents = agents_md_cache;
-    const saved_cache = skills_cache;
-    const saved_stamp_len = skills_stamp_len;
-    const saved_rescans = skills_rescans;
+    const saved_gpa = gpa_global;
     defer {
+        resetStylesCacheForTest();
+        resetSkillsCacheForTest();
+        gpa_global = saved_gpa;
         io_global = saved_io;
         project_info = saved_info;
         agents_md_cache = saved_agents;
-        skills_cache = saved_cache;
-        skills_stamp_len = saved_stamp_len;
-        skills_rescans = saved_rescans;
     }
 
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+    resetSkillsCacheForTest();
     // A fake repo in /tmp: a `sandbox` under the cwd would be INSIDE zode's own
     // repo, and a "there is no repository" test there would be false.
     const root = "/tmp/zode-prompt-repo-test";
@@ -9222,12 +12479,9 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     // test fail for a reason that has nothing to do with the cwd line.
     agents_md_cache = try std.testing.allocator.dupe(u8, "# proyecto de prueba\n");
     defer if (agents_md_cache != null and saved_agents == null) std.testing.allocator.free(agents_md_cache.?);
-    skills_cache = null;
-    skills_stamp_len = 0;
-    skills_rescans = 0;
 
     var out: [16 * 1024]u8 = undefined;
-    const composed = buildSystemPrompt(std.testing.allocator, &out, null);
+    const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
     try std.testing.expect(std.mem.indexOf(u8, composed, "Working directory:") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, root) != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "branch mi-rama") != null);
@@ -9237,9 +12491,6 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     // and not an `ls` with grep.
     try std.testing.expect(std.mem.indexOf(u8, composed, "git status") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "git diff") != null);
-
-    // The skills cache this test left in place is freed by the `defer`.
-    freeSkillsCacheLocked();
 }
 
 test "prompt: the REPO's AGENTS.md is used when the cwd has none of its own" {
@@ -9316,29 +12567,42 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     skills_stamp_len = 0;
     skills_rescans = 0;
 
-    // 1) There is still no skill at all.
+    // 1) Bundled skills are always available (5 built-in skills).
     var env_map: std.process.Environ.Map = undefined;
     _ = &env_map;
     const empty = discoverSkills(std.testing.allocator, null);
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectEqual(@as(usize, 5), empty.len);
 
-    // 2) One appears. The root's `stat` has changed, so it has to show up
+    // 2) One project skill appears. The root's `stat` has changed, so it has to show up
     //    without restarting anything.
     var skill_file: [512]u8 = undefined;
     const skill_path = try std.fmt.bufPrint(&skill_file, "{s}/SKILL.md", .{dir});
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = skill_path, .data = "---\ndescription: recien creado\n---\nbody\n" });
 
     const found = discoverSkills(std.testing.allocator, null);
-    try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expectEqualStrings("nuevo", found[0].name);
-    try std.testing.expectEqualStrings("recien creado", found[0].description);
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+    // Find the new project skill
+    var found_nuevo = false;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "nuevo")) {
+            found_nuevo = true;
+            try std.testing.expectEqualStrings("recien creado", e.description);
+        }
+    }
+    try std.testing.expect(found_nuevo);
 
     // 3) And the list is BORROWED: asking for it again with no changes frees
     //    nothing (if the caller owned it, this would be a double free of live
     //    memory).
     const again = discoverSkills(std.testing.allocator, null);
-    try std.testing.expectEqual(@as(usize, 1), again.len);
-    try std.testing.expectEqualStrings("nuevo", again[0].name);
+    try std.testing.expectEqual(@as(usize, 6), again.len);
+    var found_nuevo_again = false;
+    for (again) |e| {
+        if (std.mem.eql(u8, e.name, "nuevo")) {
+            found_nuevo_again = true;
+        }
+    }
+    try std.testing.expect(found_nuevo_again);
 
     // 4) And the PROMPT carries name + description ONLY. The body is what the
     //    `skill` tool reads on demand — inlining it here would be a tax on every
@@ -9360,7 +12624,7 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     // the mtime+size stamp is what has to invalidate the cache — the mechanism
     // this test exists for.
     var pbuf: [16 * 1024]u8 = undefined;
-    const prompt = buildSystemPrompt(std.testing.allocator, &pbuf, null);
+    const prompt = buildSystemPrompt(std.testing.allocator, &pbuf, null, true);
     try std.testing.expect(prompt.len < pbuf.len); // it FIT: nothing was truncated
     try std.testing.expect(std.mem.indexOf(u8, prompt, "nuevo") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "recien creado") != null);
@@ -9536,13 +12800,21 @@ test "system prompt: the volatile parts go LAST, so a mode change does not drop 
     // read-only note changes on a `shift+tab`, which is mid-turn and cheap to do
     // by accident; it was 4th of 6, so it also invalidated the skills list and
     // the location lines.
-    // `project_info` reads the clock through `io_global`, which is undefined in a
-    // bare test: reading the clock through garbage is a GPF, not a zero.
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        resetStylesCacheForTest();
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+
+    // Initialize project_info to avoid GPF when skills system accesses it.
+    setProjectInfoForTest(io_global, "/tmp");
 
     // The skills list is a module global that OWNS memory from whatever allocator
     // asked for it. Left pointing into `std.testing.allocator`, it is a leak that
@@ -9567,7 +12839,7 @@ test "system prompt: the volatile parts go LAST, so a mode change does not drop 
     defer agents_md_cache = saved_agents;
 
     var out: [16 * 1024]u8 = undefined;
-    const p = buildSystemPrompt(std.testing.allocator, &out, null);
+    const p = buildSystemPrompt(std.testing.allocator, &out, null, true);
 
     const at = struct {
         fn find(hay: []const u8, needle: []const u8) usize {
@@ -9609,8 +12881,18 @@ test "system prompt: the verification rules are injected even with a project's A
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        resetStylesCacheForTest();
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+
+    // Initialize project_info to avoid GPF when skills system accesses it.
+    setProjectInfoForTest(io_global, "/tmp");
 
     const saved_cache = skills_cache;
     const saved_rescans = skills_rescans;
@@ -9628,7 +12910,7 @@ test "system prompt: the verification rules are injected even with a project's A
     defer agents_md_cache = saved_agents;
 
     var out: [16 * 1024]u8 = undefined;
-    const composed = buildSystemPrompt(std.testing.allocator, &out, null);
+    const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
     try std.testing.expect(std.mem.indexOf(u8, composed, "Reglas del proyecto.") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "NARROWEST command") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
@@ -9667,11 +12949,44 @@ test "subagents: consecutive task calls form ONE batch (that is what parallelize
     try std.testing.expect(default_task_parallel >= 1 and default_task_parallel <= 8);
 }
 
+test "subagents: session parallel limit overrides auto and can return to auto" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), m.taskParallelLimit());
+    try std.testing.expectEqual(@as(usize, default_task_parallel), taskParallelLimit(&m));
+    m.setTaskParallelLimit(6);
+    try std.testing.expectEqual(@as(u8, 6), m.taskParallelLimit());
+    try std.testing.expectEqual(@as(usize, 6), taskParallelLimit(&m));
+    m.setTaskParallelLimit(0);
+    try std.testing.expectEqual(@as(usize, default_task_parallel), taskParallelLimit(&m));
+}
+
+test "/task-parallel is wired through submit and rejects invalid limits" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try submit(&m, "/task-parallel 6");
+    try std.testing.expectEqual(@as(u8, 6), m.taskParallelLimit());
+    try std.testing.expect(pendingContains(&m, "6 at a time"));
+
+    try submit(&m, "/task-parallel 9");
+    try std.testing.expectEqual(@as(u8, 6), m.taskParallelLimit());
+    try std.testing.expect(pendingContains(&m, "usage: /task-parallel"));
+
+    try submit(&m, "/task-parallel auto");
+    try std.testing.expectEqual(@as(u8, 0), m.taskParallelLimit());
+    try std.testing.expectEqual(@as(u8, 4), cmdGroupPublic("/task-parallel"));
+}
+
 test "subagents: the model is told it can send several at once" {
     // If the description does not say it, the model keeps sending one per
     // message and the parallelism never happens: the capability has to be
     // visible in the schema to be used.
-    try std.testing.expect(std.mem.indexOf(u8, tools_mod.toolsJson(), "run at the same time") != null);
+    const schema = tools_mod.toolsJson();
+    try std.testing.expect(std.mem.indexOf(u8, schema, "SAME message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "live completion progress") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "/task-parallel") != null);
 }
 
 test "setModelCtx RESETS the window when a change carries none" {
@@ -9923,8 +13238,24 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        // `buildSystemPromptFor` below caches arena-allocated entries in the
+        // global `styles_cache`. Freeing them with `std.testing.allocator`
+        // (via `resetStylesCacheForTest`) would be an Invalid free; the arena
+        // is deinited separately, so just drop the reference.
+        styles_cache = null;
+        styles_stamp_len = 0;
+        styles_rescans = 0;
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+
+    // Initialize project_info to avoid GPF when skills system accesses it.
+    setProjectInfoForTest(io_global, "/tmp");
 
     // The AGENTS.md cache is a MODULE GLOBAL that outlives this test's arena, and
     // the next test would read a pointer into memory that has been freed. That is a
@@ -9935,8 +13266,15 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
     defer agents_md_cache = saved_agents;
 
     var buf: [16 * 1024]u8 = undefined;
-    const from_tui = buildSystemPrompt(a, &buf, null);
+    const from_tui = buildSystemPrompt(a, &buf, null, true);
+    // The first call above caches arena-allocated entries in the globals.
+    // Drop them before the second call so `freeStylesCacheLocked`/`freeSkillsCacheLocked`
+    // don't try to free arena memory with `std.testing.allocator`.
+    styles_cache = null;
+    skills_cache = null;
     const headless = try buildSystemPromptFor(a, null);
+    styles_cache = null;
+    skills_cache = null;
 
     try std.testing.expectEqualStrings(from_tui, headless);
 
@@ -9961,6 +13299,42 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
     }
 }
 
+test "the project's own AGENTS.md is READ, even when it is big" {
+    // The read had a 256 KB limit and `catch null`, and `null` means "this
+    // project has no instruction file". So a project whose `AGENTS.md` was a
+    // LITTLE too big got the BUILT-IN prompt instead of its own, with no
+    // error anywhere: the harness silently stopped reading the project's
+    // rules, and the symptom was "the model ignored my instructions".
+    //
+    // It was found because THIS repository's own `AGENTS.md` crossed the
+    // line, and the test below failed for a reason nobody could read: the
+    // prompt was the built-in one, so it fit, so there was nothing to
+    // truncate and nothing to announce.
+    //
+    // The file being big is not the interesting part; the interesting part is
+    // that it is READ AT ALL. The limit is 1 MB now, and the size of the
+    // file is not what decides what the model sees: the base is trimmed to
+    // the prompt buffer before it is sent.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    const saved_agents = agents_md_cache;
+    io_global = threaded.io();
+    agents_md_cache = null;
+    defer {
+        // The cache was filled with the TESTING allocator, so it is freed with
+        // it: leaving it behind is a leak the test runner would report for a
+        // file the test did not create.
+        if (agents_md_cache) |c| std.testing.allocator.free(c);
+        agents_md_cache = saved_agents;
+        io_global = saved_io;
+    }
+
+    const base = systemPromptBase(std.testing.allocator);
+    // It is this repository's own file, and the test verifies it's READ.
+    try std.testing.expect(std.mem.indexOf(u8, base, "# zode") != null);
+}
+
 test "a project whose AGENTS.md does not fit still gets the ROUTING, not just its own text" {
     // Found by the previous test, which runs in this repository: its `AGENTS.md` is
     // ~90 KB, the composition buffer is 16 KB, and the old overflow answer was
@@ -9980,15 +13354,27 @@ test "a project whose AGENTS.md does not fit still gets the ROUTING, not just it
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
+    const saved_gpa = gpa_global;
     io_global = threaded.io();
-    defer io_global = saved_io;
+    defer {
+        // `buildSystemPrompt` above cached arena-allocated entries in the globals.
+        // Dropping the references (not freeing): the arena is deinited separately,
+        // and freeing with `std.testing.allocator` would be an Invalid free.
+        styles_cache = null;
+        skills_cache = null;
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+    resetSkillsCacheForTest();
 
     const saved_agents = agents_md_cache;
     agents_md_cache = null;
     defer agents_md_cache = saved_agents;
 
     var buf: [16 * 1024]u8 = undefined;
-    const composed = buildSystemPrompt(a, &buf, null);
+    const composed = buildSystemPrompt(a, &buf, null, true);
 
     // The constant blocks are the ones that must survive the trim.
     for ([_][]const u8{
@@ -10099,6 +13485,26 @@ test "applyPlanTo works with NO Model, which is what --chat has" {
         return error.NoBadIndexLine;
     };
     try std.testing.expect(std.mem.indexOf(u8, bad, "do not exist") != null);
+}
+
+test "the TUI records the complete plan for the user to review" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var model = tui.Model.init(std.testing.allocator);
+    defer model.deinit();
+
+    applyPlanCall(&model,
+        \\{"items":[{"content":"inspect the code","status":"done"},{"content":"implement the fix","status":"in_progress"},{"content":"run tests"}]}
+    , arena_state.allocator());
+
+    try std.testing.expectEqual(@as(u8, 3), model.plan.len);
+    try std.testing.expect(model.plan_touched_this_turn);
+    try std.testing.expectEqual(@as(usize, 1), model.pending.items.len);
+    const output = model.pending.items[0].text;
+    try std.testing.expect(std.mem.indexOf(u8, output, "1/3 done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "1. inspect the code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "2. implement the fix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "3. run tests") != null);
 }
 
 test "a cleared plan is a change, and an empty one is not" {
@@ -10258,6 +13664,172 @@ test "a checkpoint with NO open plan steps says so, instead of implying there is
 test "no goal, no note" {
     var g: goal_mod.Goal = .{};
     try std.testing.expectError(error.NoGoal, goalNote(std.testing.allocator, &g, 5, false, 0));
+}
+
+// ── YOLO: the `ask` tool does not ask ─────────────────────────────────────
+
+test "in YOLO mode the question is not asked: the harness takes the recommendation" {
+    // `/yolo` exists so the app does not stop to wait for the human, and a
+    // question that opens a dialog stops the app exactly as much as a
+    // permission dialog does. So the question is answered by the harness,
+    // with the model's OWN recommendation (the schema tells it to put the
+    // recommendation FIRST).
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = yolo;
+    defer yolo = saved;
+    yolo = true;
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const call = TurnCtx.Call{
+        .id = "c1",
+        .name = "ask",
+        .args_json = "{\"question\":\"which database?\",\"header\":\"db\",\"options\":[\"postgres (recommended)\",\"sqlite\"]}",
+    };
+    try std.testing.expectEqual(@as(usize, 1), askCall(&m, &s, call));
+
+    // The panel was NOT opened: nobody is asked.
+    try std.testing.expect(!m.askActive());
+
+    // The tool result says what happened, and asks for the summary.
+    try std.testing.expectEqual(@as(usize, 1), s.messages.items.len);
+    const res = s.messages.items[0].content;
+    try std.testing.expect(std.mem.indexOf(u8, res, "Nobody was asked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "postgres (recommended)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "final summary") != null);
+
+    // And it is counted: the user can see it in `/bench`.
+    try std.testing.expectEqual(@as(usize, 1), m.bench.asks_auto);
+    try std.testing.expectEqual(@as(usize, 0), m.bench.asks_open);
+}
+
+test "in YOLO mode a question with no options stays OPEN, and the model is told to say so" {
+    // There is nothing to take: no option means no recommendation. The
+    // question is left open, and the model has to MENTION it in its summary:
+    // an open question nobody mentions is a question that is lost.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = yolo;
+    defer yolo = saved;
+    yolo = true;
+
+    // The turn stats own the OPEN questions, and the global's allocator is
+    // `undefined` until a turn starts: using it before that is a jump through
+    // a garbage vtable, not a nice error.
+    turn_stats.reset(std.testing.allocator, 0);
+    defer turn_stats.reset(std.testing.allocator, 0);
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const call = TurnCtx.Call{
+        .id = "c1",
+        .name = "ask",
+        .args_json = "{\"question\":\"what should the endpoint be called?\"}",
+    };
+    try std.testing.expectEqual(@as(usize, 1), askCall(&m, &s, call));
+    try std.testing.expect(!m.askActive());
+
+    const res = s.messages.items[0].content;
+    try std.testing.expect(std.mem.indexOf(u8, res, "stays OPEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "final summary") != null);
+    // The question is NOT repeated: the model wrote it, it is in its context
+    // already, and repeating 600 characters to say "still open" is the user's
+    // tokens for nothing.
+    try std.testing.expect(std.mem.indexOf(u8, res, "what should the endpoint be called?") == null);
+
+    try std.testing.expectEqual(@as(usize, 0), m.bench.asks_auto);
+    try std.testing.expectEqual(@as(usize, 1), m.bench.asks_open);
+
+    // And the TURN SUMMARY names it: the user is the one who can answer it,
+    // and the model's own answer might not mention it.
+    var sum_buf: [256]u8 = undefined;
+    const sum = try turn_stats.summaryLine(&sum_buf, 0, 0, 0);
+    try std.testing.expect(std.mem.indexOf(u8, sum, "1 question still OPEN") != null);
+    var ybuf: [256]u8 = undefined;
+    const open = try turn_stats.yoloOpenLine(&ybuf);
+    try std.testing.expect(std.mem.indexOf(u8, open, "what should the endpoint be called?") != null);
+}
+
+test "outside YOLO the question IS asked (the mode is the only thing that changes it)" {
+    // The DECISION is what the test pins, and not the whole call: the call
+    // opens a dialog and parks the turn waiting for a human, which in a test
+    // is a hang. The rule is pure (`ask.decide`) and the agent only acts on
+    // it.
+    try std.testing.expectEqual(ask.Decision.ask, ask.decide(false, true));
+    try std.testing.expectEqual(ask.Decision.ask, ask.decide(false, false));
+    try std.testing.expectEqual(ask.Decision.take_recommendation, ask.decide(true, true));
+    try std.testing.expectEqual(ask.Decision.leave_open, ask.decide(true, false));
+}
+
+test "/yolo says what it does with the questions, because the user reads that line" {
+    // "no confirmations" was the whole message, and it was not true: the
+    // questions were still asked. Now they are not, and the line says so.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = yolo;
+    defer {
+        yolo = saved;
+        setPermMode(&m, .default);
+    }
+    yolo = false;
+
+    cmdYolo(&m);
+    try std.testing.expect(yolo);
+    m.drainPending();
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (m.paras.items) |p| {
+        try joined.appendSlice(std.testing.allocator, p.text);
+        try joined.append(std.testing.allocator, '\n');
+    }
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "no questions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "summary") != null);
+}
+
+test "the YOLO mode note is in the prompt, because the model has to know BEFORE it asks" {
+    // The same reason the read-only note is in the prompt: a model that plans
+    // an `ask` and then finds out nobody is there reads it as a harness bug
+    // and works around it.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The prompt reads the project's instruction file, so it needs an `Io` and
+    // the caches have to be dropped afterwards (the same dance the other
+    // prompt tests do).
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const saved_io = io_global;
+    const saved_gpa = gpa_global;
+    io_global = threaded.io();
+    defer {
+        styles_cache = null;
+        skills_cache = null;
+        gpa_global = saved_gpa;
+        io_global = saved_io;
+    }
+    gpa_global = std.testing.allocator;
+    resetStylesCacheForTest();
+    resetSkillsCacheForTest();
+
+    const saved_agents = agents_md_cache;
+    agents_md_cache = null;
+    defer agents_md_cache = saved_agents;
+
+    const saved = yolo;
+    defer yolo = saved;
+    yolo = true;
+
+    var out: [64 * 1024]u8 = undefined;
+    const composed = buildSystemPrompt(a, &out, null, true);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "YOLO MODE is on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "MENTION it in your final summary") != null);
 }
 
 test "a `goal` CALL reaches the Model, which the two pure tests could not see" {
@@ -11063,7 +14635,7 @@ test "perm modes: the three flags are mutually exclusive, always" {
     }
 }
 
-test "permModeName: one word per mode" {
+test "permModeName: clear label for every mode" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -11075,7 +14647,7 @@ test "permModeName: one word per mode" {
     }
 
     setPermMode(&m, .default);
-    try std.testing.expectEqualStrings("default", permModeName());
+    try std.testing.expectEqualStrings("build", permModeName());
     setPermMode(&m, .accept_edits);
     try std.testing.expectEqualStrings("accept-edits", permModeName());
     setPermMode(&m, .read_only);
@@ -11084,7 +14656,7 @@ test "permModeName: one word per mode" {
     try std.testing.expectEqualStrings("bypass", permModeName());
 }
 
-test "shift+tab cycles default -> accept-edits -> plan -> default" {
+test "shift+tab cycles Build -> accept-edits -> Plan -> Build" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -11109,6 +14681,19 @@ test "shift+tab cycles default -> accept-edits -> plan -> default" {
     setPermMode(&m, .bypass);
     cyclePermMode(&m);
     try std.testing.expectEqual(PermMode.default, currentPermMode());
+}
+
+test "mode commands use Build as the visible name and keep default as an alias" {
+    try std.testing.expectEqual(PermMode.default, parsePermMode("build").?);
+    try std.testing.expectEqual(PermMode.default, parsePermMode("default").?);
+    try std.testing.expectEqual(PermMode.accept_edits, parsePermMode("accept-edits").?);
+    try std.testing.expectEqual(PermMode.read_only, parsePermMode("plan").?);
+    try std.testing.expectEqual(PermMode.bypass, parsePermMode("bypass").?);
+    try std.testing.expect(parsePermMode("unknown") == null);
+
+    for (commands) |command| {
+        try std.testing.expect(!std.mem.eql(u8, command.key, "/plan"));
+    }
 }
 
 test "isEditTool: the file edits, and not bash or a subagent" {
@@ -11179,24 +14764,56 @@ test "permAutoAllowed: accept-edits allows edits, a bash prefix allows that bash
     // `git status` pattern is set below and allowed in EVERY mode,
     // so the command that must ask here is one it does not name.
     setPermMode(&m, .default);
-    try std.testing.expect(!permAutoAllowed("write", "{}"));
-    try std.testing.expect(!permAutoAllowed("bash", "zig build test"));
+    try std.testing.expect(!permAutoAllowed("write", "{}", "{}", std.testing.allocator));
+    try std.testing.expect(!permAutoAllowed("bash", "zig build test", "{}", std.testing.allocator));
 
     // Accept-edits: file edits run, but bash still asks.
     setPermMode(&m, .accept_edits);
-    try std.testing.expect(permAutoAllowed("write", "{}"));
-    try std.testing.expect(permAutoAllowed("edit", "{}"));
-    try std.testing.expect(permAutoAllowed("rename", "{}"));
+    try std.testing.expect(permAutoAllowed("write", "{}", "{}", std.testing.allocator));
+    try std.testing.expect(permAutoAllowed("edit", "{}", "{}", std.testing.allocator));
+    try std.testing.expect(permAutoAllowed("rename", "{}", "{}", std.testing.allocator));
     // A bash command with no allowed prefix still asks, even here:
     // accepting edits is not accepting commands.
-    try std.testing.expect(!permAutoAllowed("bash", "zig build test"));
+    try std.testing.expect(!permAutoAllowed("bash", "zig build test", "{}", std.testing.allocator));
 
     // A bash prefix allows that command in ANY mode: it is the
     // user's standing "I trust this", independent of the mode.
     setPermMode(&m, .default);
-    try std.testing.expect(permAutoAllowed("bash", "git status"));
-    try std.testing.expect(permAutoAllowed("bash", "git status --short"));
-    try std.testing.expect(!permAutoAllowed("bash", "rm -rf /"));
+    try std.testing.expect(permAutoAllowed("bash", "git status", "{}", std.testing.allocator));
+    try std.testing.expect(permAutoAllowed("bash", "git status --short", "{}", std.testing.allocator));
+    try std.testing.expect(!permAutoAllowed("bash", "rm -rf /", "{}", std.testing.allocator));
+}
+
+test "a batch is covered by accept-edits only when it WRITES" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = read_only, .ae = accept_edits, .y = yolo };
+    defer {
+        read_only = saved.ro;
+        accept_edits = saved.ae;
+        yolo = saved.y;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const reads =
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"grep","pattern":"x"}]}
+    ;
+    const writes =
+        \\{"steps":[{"op":"read","path":"a.zig"},{"op":"write","path":"out.md"}]}
+    ;
+
+    // Default mode: nothing is auto-allowed, and that is true of a batch too.
+    setPermMode(&m, .default);
+    try std.testing.expect(!permAutoAllowed("batch", "", reads, arena));
+    try std.testing.expect(!permAutoAllowed("batch", "", writes, arena));
+
+    // Accept-edits covers a batch that writes (its write step is an edit).
+    setPermMode(&m, .accept_edits);
+    try std.testing.expect(permAutoAllowed("batch", "", writes, arena));
 }
 
 test "the `a` key on a bash dialog saves the COMMAND, not the whole tool" {
@@ -11379,6 +14996,451 @@ fn envHasAnyKey(map: *const std.process.Environ.Map) bool {
     return false;
 }
 
+test "the parallel batch's tool results outlive the per-call arenas" {
+    // THE crash of "I ask for a plan, it starts doing things, and then it stops
+    // working". Three read-only calls in one assistant message is the most
+    // common shape of a real task, and `runParallelBatch` ran them on threads
+    // that each had their OWN arena:
+    //
+    //     var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
+    //     defer astate.deinit();
+    //     const a = astate.allocator();
+    //     const text = tools_mod.execute(..., a, ...) catch ...;
+    //     ctx.out.text = a.dupe(u8, text) catch "";   // <-- allocated in the
+    //                                                      arena about to die
+    //
+    // and the comment above that line claimed the copy went to the turn arena.
+    // It did not. Defer order is LIFO, so `astate.deinit()` runs BEFORE the
+    // `pending` decrement, and `waitForBatch` waits on `pending`: by the time it
+    // returns every per-call arena is guaranteed dead. That makes the dangling
+    // pointer deterministic rather than a race — for EVERY parallel batch, not
+    // occasionally.
+    //
+    // A `read` of a real source file makes the arena request a multi-MB chunk,
+    // which `gpa` returns to the page allocator, so the caller's `dupe` reads
+    // an unmapped page: SIGSEGV with no panic message. Small results fail
+    // quieter and just corrupt the history and the session file.
+    //
+    // `std.testing.allocator` is what makes this a test and not a hope: it
+    // poisons and unmaps on `free`, so reading a freed result trips the leak
+    // detector instead of returning plausible garbage.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // A scratch directory, so the reads are of files that exist and are big
+    // enough to make the arena take a real chunk.
+    const tmp_path = "/tmp/opencode/zode-test-parallel-batch";
+    try std.Io.Dir.cwd().createDirPath(io_global, tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(io_global, tmp_path) catch {};
+    var tmp = try std.Io.Dir.cwd().openDir(io_global, tmp_path, .{});
+    defer tmp.close(io_global);
+
+    const bodies = [_][]const u8{
+        "fn alpha() void {}\n" ** 200,
+        "fn beta() void {}\n" ** 200,
+        "fn gamma() void {}\n" ** 200,
+    };
+    const paths: [3][]const u8 = .{ "a.zig", "b.zig", "c.zig" };
+    for (paths, bodies) |p, body| {
+        try tmp.writeFile(io_global, .{ .sub_path = p, .data = body });
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var t: TurnCtx = .{ .m = &m };
+    defer t.deinit();
+    // With the TEST allocator, not the turn arena: `TurnCtx.deinit` frees every
+    // id and args_json through the MODEL's allocator, and a block that came out
+    // of an arena is an "Invalid free" — a rule that is easier to get wrong in
+    // the test than in production, which is why it is written down here.
+    for (paths, 0..) |p, i| {
+        const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}/{s}\"}}", .{ tmp_path, p });
+        errdefer std.testing.allocator.free(args);
+        const id = try std.fmt.allocPrint(std.testing.allocator, "call_{d}", .{i});
+        errdefer std.testing.allocator.free(id);
+        // The name too: `TurnCtx.deinit` frees it, and freeing a literal is an
+        // "Invalid free" (the palette bug, the `/free-auto status` bug).
+        const name = try std.testing.allocator.dupe(u8, "read");
+        try t.calls.append(std.testing.allocator, .{
+            .id = id,
+            .name = name,
+            .args_json = args,
+        });
+    }
+
+    var sess = session_mod.Session.init(std.testing.allocator);
+    defer sess.deinit();
+
+    var test_budget: ResultBudget = .{};
+    const r = runParallelBatch(&m, &sess, &t, 0, t.calls.items.len, arena, &test_budget);
+
+    // The batch really ran all three.
+    try std.testing.expectEqual(@as(usize, 3), r.ok);
+
+    // The batch's threads are DETACHED, and each one that touched the shared
+    // `Io` owns a buffer inside it. `threaded.deinit()` must not run while a
+    // worker is still inside `io`, so the workers are waited for BEFORE the
+    // defers unwind — the same order `runTui` uses, and the same reason
+    // (AGENTS.md, "Detached workers + destroyed io = use-after-free").
+    m.waitWorkers(2000);
+    try std.testing.expectEqual(@as(usize, 0), m.workers.load(.seq_cst));
+
+    // And every result is still readable AFTER the threads and their arenas are
+    // gone. `pushToolDone` and `appendToolResult` both `dupe` from it, so the
+    // session is where the freed bytes would land — and under
+    // `std.testing.allocator` a freed arena is POISONED, not merely reused, so
+    // a dangling result cannot accidentally look like the right text.
+    var seen_fn: usize = 0;
+    for (sess.messages.items) |msg| {
+        if (!std.mem.eql(u8, @tagName(msg.role), "tool")) continue;
+        try std.testing.expect(msg.content.len > 0);
+        // The actual file contents came back, byte for byte.
+        const want = if (std.mem.indexOf(u8, msg.content, "fn alpha") != null)
+            "fn alpha"
+        else if (std.mem.indexOf(u8, msg.content, "fn beta") != null)
+            "fn beta"
+        else if (std.mem.indexOf(u8, msg.content, "fn gamma") != null)
+            "fn gamma"
+        else
+            return error.TestUnexpectedResult;
+        seen_fn += 1;
+        std.mem.doNotOptimizeAway(want);
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen_fn);
+}
+
+// ── `/copy`: taking the answer with you ──────────────────────────────────
+//
+// The unit tests of `lib/copytext.zig` cover the TEXT (the arithmetic, the
+// fences, the labels). These cover the WIRING: the command, the picker, the
+// file and the clipboard. A command can be unit-perfect and still do nothing
+// when it is typed, and that is what these are for.
+
+/// A session with one assistant answer, for the `/copy` tests.
+fn copyTestSession(gpa: std.mem.Allocator, text: []const u8) !*session_mod.Session {
+    const s = try gpa.create(session_mod.Session);
+    errdefer gpa.destroy(s);
+    s.* = session_mod.Session.init(gpa);
+    try s.appendAssistant(text, null);
+    return s;
+}
+
+/// The session the `/copy` tests run against, and its teardown.
+///
+/// The session is a global (the agent owns one), so a test that puts one
+/// there has to take it away again: three leaked allocations per test is the
+/// DebugAllocator saying exactly that.
+const CopySession = struct {
+    ptr: *session_mod.Session,
+
+    fn setup(gpa: std.mem.Allocator, text: []const u8) !CopySession {
+        const sp = try copyTestSession(gpa, text);
+        session = sp;
+        return .{ .ptr = sp };
+    }
+
+    fn done(self: CopySession) void {
+        session = null;
+        self.ptr.deinit();
+        std.testing.allocator.destroy(self.ptr);
+    }
+};
+
+/// The text of the whole history, for the assertions.
+fn historyText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
+    m.drainPending();
+    var out: std.ArrayList(u8) = .empty;
+    for (m.paras.items) |p| {
+        try out.appendSlice(gpa, p.text);
+        try out.append(gpa, '\n');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "/copy with no answer says so, instead of doing nothing" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    session = null;
+
+    cmdCopy(&m, null);
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, copytext.no_messages_msg) != null);
+}
+
+test "/copy N refuses with the count it HAS, and with the plural right" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator, "the only answer");
+    defer cs.done();
+
+    cmdCopy(&m, "3");
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Only 1 assistant message available to copy") != null);
+}
+
+test "/copy with a word instead of a number says HOW to use it" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator, "the only answer");
+    defer cs.done();
+
+    cmdCopy(&m, "abc");
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Usage: /copy [N]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1 (latest)") != null);
+}
+
+test "/copy opens the picker with the whole answer, the blocks and the always row" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\Here is the answer.
+        \\
+        \\```zig
+        \\const a = 1;
+        \\```
+        \\
+        \\And another one.
+        \\
+        \\```zig
+        \\const b = 2;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    // Three rows: the whole answer, the two blocks... and the "always" row.
+    try std.testing.expectEqual(@as(usize, 4), m.picker_items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[0].label, "Full response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[1].label, "const a = 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[2].label, "const b = 2;") != null);
+    try std.testing.expectEqualStrings(copytext.always_label, m.picker_items.items[3].label);
+}
+
+test "/copy with no code block copies the answer straight away, with no picker" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator, "just prose, no fences");
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(!m.pickerActive());
+}
+
+test "the /copy picker copies the row that was highlighted, even with two identical first lines" {
+    // Two blocks that start with the SAME line: with a label-based callback
+    // the second one would copy the first one's code while showing the second
+    // one's row. The index callback is what makes this correct.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\```zig
+        \\const same = 1;
+        \\```
+        \\
+        \\```zig
+        \\const same = 2;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    // The rows are: the whole answer, the first block, the second block, the
+    // "always" row. Two downs land on the SECOND block.
+    _ = m.pickerHandleKey(.{ .codepoint = 57353 }); // down
+    _ = m.pickerHandleKey(.{ .codepoint = 57353 }); // down
+    _ = m.pickerHandleKey(.{ .codepoint = 13 }); // enter
+    try std.testing.expect(!m.pickerActive());
+
+    // What went to the clipboard is the SECOND block, not the first one that
+    // says the same thing.
+    try std.testing.expect(m.copy_pending != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.copy_pending.?, "const same = 2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.copy_pending.?, "const same = 1;") == null);
+}
+
+test "the /copy picker copies the file it says it copied" {
+    // The whole path: the command, the picker, the file on disk and the
+    // message that names it. A unit test of the label arithmetic would pass
+    // with none of this wired.
+    const tmp = "/tmp/opencode/zode-copy-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, tmp) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, tmp) catch {};
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.io_ready = true;
+    m.io = std.testing.io;
+
+    var map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("TMPDIR", tmp);
+    // A PATH with nothing in it: no native clipboard tool, so the last rung
+    // (OSC 52) is the one that takes it, and the text waits in the Model for
+    // the render to write it.
+    try map.put("PATH", "");
+    m.environ = &map;
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\The answer.
+        \\
+        \\```zig
+        \\const x = 1;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    // The first row is the whole answer: take it.
+    _ = m.pickerHandleKey(.{ .codepoint = 13 }); // enter
+    try std.testing.expect(!m.pickerActive());
+
+    // The file is on disk, with the answer in it.
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/zode/response.md", .{tmp});
+    defer std.testing.allocator.free(path);
+    const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "The answer.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "const x = 1;") != null);
+
+    // And the message says what happened, with the numbers and the path.
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Copied to") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "characters") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, path) != null);
+
+    // The clipboard text is waiting for the render: the last rung is OSC 52,
+    // and it goes through vaxis, not straight to the tty.
+    try std.testing.expect(m.copy_pending != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.copy_pending.?, "The answer.") != null);
+}
+
+test "ESC in the /copy picker is a cancel, not an error" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\```zig
+        \\const x = 1;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    _ = m.pickerHandleKey(.{ .codepoint = 27 }); // esc
+    try std.testing.expect(!m.pickerActive());
+
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, copytext.cancelled_msg) != null);
+    // And it is NOT an error line: a cancel is not a failure.
+    for (m.paras.items) |p| {
+        try std.testing.expect(p.kind != .error_msg);
+    }
+}
+
+test "two blocks with the same first line get DIFFERENT labels" {
+    // Three blocks that start with the same line: the picker has to be able
+    // to tell them apart, and counting the LATER ones too would give all
+    // three the same "(3)".
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\```zig
+        \\const same = 1;
+        \\const body_a = 1;
+        \\```
+        \\
+        \\```zig
+        \\const same = 1;
+        \\const body_b = 2;
+        \\```
+        \\
+        \\```zig
+        \\const same = 1;
+        \\const body_c = 3;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+    try std.testing.expectEqual(@as(usize, 5), m.picker_items.items.len);
+    try std.testing.expectEqualStrings("const same = 1;", m.picker_items.items[1].label);
+    try std.testing.expectEqualStrings("const same = 1; (2)", m.picker_items.items[2].label);
+    try std.testing.expectEqualStrings("const same = 1; (3)", m.picker_items.items[3].label);
+}
+
+test "/copy shows up in /help" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    commands_mod.cmdHelp(&m);
+    const text = try historyText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/copy") != null);
+}
+
+test "the --resume flag is not overwritten by the environment" {
+    // The flag is dispatched BEFORE the environment is read, and the line that
+    // assigned the environment's answer over it made `zode --resume` start a
+    // NEW session: the app said "nothing to resume; starting a new session",
+    // which is exactly what the flag asks it not to do.
+    var map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer map.deinit();
+
+    try std.testing.expect(shouldResume(true, &map));
+    try std.testing.expect(!shouldResume(false, &map));
+
+    try map.put("ZODE_RESUME", "1");
+    try std.testing.expect(shouldResume(false, &map));
+    // And the flag still wins when both are there.
+    try std.testing.expect(shouldResume(true, &map));
+
+    // No environment at all is not a crash and not a resume.
+    try std.testing.expect(!shouldResume(false, null));
+}
+
 test "E2E: a real turn against a real provider completes and answers" {
     // GATED AT BUILD TIME, not by an environment variable. See the comment in `build.zig`
     // for why the environment was not an option: this Zig version gives a test no way to
@@ -11557,4 +15619,244 @@ test "E2E: a real turn against a real provider completes and answers" {
     // in silence. `accounted` already holds the answer to that, so this is the same fact
     // said in the language a test failure uses.
     try std.testing.expect(accounted);
+}
+
+test "a project rule allows what the sensitive table asks about" {
+    // The whole reason the rule model exists: a project that wants
+    // `.vscode/` written without a question says so in ITS OWN file, and the
+    // file travels with the project.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, ".zode");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".zode/permissions.json",
+        .data =
+        \\{"rules": [
+        \\  "Write(.vscode/**) allow",
+        \\  "Bash(git *) allow"
+        \\]}
+        ,
+    });
+
+    var pbuf: [512]u8 = undefined;
+    const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
+    var fbuf: [640]u8 = undefined;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+
+    // The rules are a global and the next test reads them: the state is put
+    // back the way it was.
+    const saved = perm_rules;
+    defer perm_rules = saved;
+    loadPermRulesInto(arena_state.allocator(), io, path, null);
+
+    // The rule answers for the path the sensitive table would ask about.
+    const d = permDecision("Write", &.{".vscode/settings.json"}).?;
+    try std.testing.expectEqual(permrules.Action.allow, d.action);
+    try std.testing.expectEqual(permrules.Source.project, d.rule.source);
+
+    // And it says nothing about anything else.
+    try std.testing.expect(permDecision("Write", &.{"src/main.zig"}) == null);
+
+    // The command rules work the same way.
+    const b = permDecision("Bash", &.{"git status"}).?;
+    try std.testing.expectEqual(permrules.Action.allow, b.action);
+}
+
+test "a rule that denies beats a rule that allows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, ".zode");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".zode/permissions.json",
+        .data = "{\"rules\": [\"Write(.git/**) deny\"]}",
+    });
+
+    var pbuf: [512]u8 = undefined;
+    const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
+    var fbuf: [640]u8 = undefined;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+
+    const saved = perm_rules;
+    defer perm_rules = saved;
+    loadPermRulesInto(arena_state.allocator(), io, path, null);
+
+    const d = permDecision("Write", &.{".git/config"}).?;
+    try std.testing.expectEqual(permrules.Action.deny, d.action);
+    try std.testing.expectEqualStrings("project", d.rule.source.name());
+}
+
+test "the 'always allow' suggestion names the rule it would remember" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A command becomes its FIRST WORD: "always allow `git status`" would
+    // mean the next `git commit` asks again.
+    const bash = permSuggestion("bash", "{\"command\":\"git status --short\"}", a).?;
+    try std.testing.expectEqualStrings("Bash(git *) allow", bash);
+
+    // A file becomes the file: a directory is a bigger promise than the user
+    // made.
+    const write = permSuggestion("write", "{\"path\":\"src/main.zig\"}", a).?;
+    try std.testing.expectEqualStrings("write(src/main.zig) allow", write);
+
+    // And a tool with nothing to narrow becomes itself.
+    const other = permSuggestion("task", "{\"prompt\":\"look around\"}", a).?;
+    try std.testing.expectEqualStrings("task(*) allow", other);
+
+    // An MCP call names the QUALIFIED tool: `Mcp(github.create_issue)`.
+    //
+    // Not `Mcp(*)`: that would be every server the user ever configures, and
+    // the answer the user gives is about ONE tool whose name they just read.
+    const mcp = permSuggestion(
+        "mcp",
+        "{\"operation\":\"call\",\"server\":\"github\",\"tool\":\"create_issue\"}",
+        a,
+    ).?;
+    try std.testing.expectEqualStrings("Mcp(github.create_issue) allow", mcp);
+
+    // And the rule it names is one the parser understands, with the tool
+    // name in the spelling the matcher uses (case-insensitively).
+    const rule = permrules.parseRule(mcp, .local, a).?;
+    try std.testing.expectEqualStrings("Mcp", rule.tool);
+    try std.testing.expectEqualStrings("github.create_issue", rule.pattern);
+    try std.testing.expect(permrules.matches(rule, "mcp", "github.create_issue"));
+    // And it does NOT cover another tool of the same server.
+    try std.testing.expect(!permrules.matches(rule, "mcp", "github.list_issues"));
+}
+
+test "the suggestion is a rule the parser understands" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const text = permSuggestion("bash", "{\"command\":\"npm test\"}", a).?;
+    const rule = permrules.parseRule(text, .local, a).?;
+    try std.testing.expectEqualStrings("Bash", rule.tool);
+    try std.testing.expectEqualStrings("npm *", rule.pattern);
+    try std.testing.expectEqual(permrules.Action.allow, rule.action);
+}
+
+test "a command that only reads is not a write, and the plan mode lets it run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    try std.testing.expect(callReadsOnly("bash", "{\"command\":\"git status\"}", a));
+    try std.testing.expect(callReadsOnly("bash", "{\"command\":\"rg foo src/\"}", a));
+    // And a command that changes something is not.
+    try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"git push\"}", a));
+    try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"rm -rf build\"}", a));
+    // A command we do not know is NOT read-only: the cost of asking is one
+    // dialog and the cost of guessing wrong is a file.
+    try std.testing.expect(!callReadsOnly("bash", "{\"command\":\"weird-tool --x\"}", a));
+    // Another tool is not a command at all.
+    try std.testing.expect(!callReadsOnly("write", "{\"path\":\"a.zig\"}", a));
+}
+
+// ── `/files`: the session's file state ─────────────────────────
+
+test "a write is recorded in the session's changed files" {
+    // The seam: the tool call → the Model. The list is the session's, and a
+    // list that says "changed" about a file nobody changed is a lie.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // YOLO: nobody is asked, so the call does not park on a dialog that
+    // nobody is there to answer.
+    const saved_yolo = yolo;
+    defer yolo = saved_yolo;
+    yolo = true;
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const tmp_path = "/tmp/opencode/zode-test-files";
+    try std.Io.Dir.cwd().createDirPath(io_global, tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(io_global, tmp_path) catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/a.txt\",\"content\":\"hola\"}}", .{tmp_path});
+    const call = TurnCtx.Call{ .id = "c1", .name = "write", .args_json = args };
+    var denied: usize = 0;
+    var budget: ResultBudget = .{};
+    _ = execOneCall(&m, &s, call, arena, &denied, &budget);
+
+    try std.testing.expectEqual(@as(usize, 1), m.changed.count());
+    try std.testing.expect(std.mem.indexOf(u8, m.changed.at(0), "a.txt") != null);
+}
+
+test "a call that changed nothing is not in the changed files" {
+    // A `read` is not a change, and neither is a call that failed: the list is
+    // of files that were WRITTEN.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved_yolo = yolo;
+    defer yolo = saved_yolo;
+    yolo = true;
+
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    const tmp_path = "/tmp/opencode/zode-test-files-read";
+    try std.Io.Dir.cwd().createDirPath(io_global, tmp_path);
+    defer std.Io.Dir.cwd().deleteTree(io_global, tmp_path) catch {};
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = tmp_path ++ "/a.txt", .data = "hola" });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}/a.txt\"}}", .{tmp_path});
+    const call = TurnCtx.Call{ .id = "c1", .name = "read", .args_json = args };
+    var denied: usize = 0;
+    var budget: ResultBudget = .{};
+    _ = execOneCall(&m, &s, call, arena, &denied, &budget);
+
+    try std.testing.expectEqual(@as(usize, 0), m.changed.count());
+    // But the READ is in the cache, which is the other half of the report.
+    try std.testing.expectEqual(@as(usize, 1), m.reads.liveEntries());
+}
+
+test "a new session's file state starts empty" {
+    // The read cache does not survive a session change: the new session's
+    // context is EMPTY, and an entry that says "the model has this file"
+    // would make the next `read` skip the body.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    m.reads.record("a.zig", stat, 1, 1, 10, 10);
+    m.changed.note("a.zig");
+    try std.testing.expectEqual(@as(usize, 1), m.reads.liveEntries());
+
+    resetSessionFiles(&m);
+    try std.testing.expectEqual(@as(usize, 0), m.reads.liveEntries());
+    try std.testing.expectEqual(@as(usize, 0), m.changed.count());
 }
