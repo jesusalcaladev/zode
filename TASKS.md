@@ -29,10 +29,10 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [ ] 🔴 **Sprint A3 — Phase 34** (the machinery the reference implementation has and we do not): sixteen
       mechanisms that no phase owned, of which **34.1 (path-scoped permissions)** is
       the one that should not wait — today `write` writes any path it is handed.
-- [ ] 🔴 **Sprint B — Phase 2** (skill listing budget + named args + `context: fork`):
-      `max_listed = 40` is still a constant and `context: fork` is parsed and never read.
+- [x] 🔴 **Sprint B — Phase 2** (skill listing budget + named args + `context: fork`):
       **2.1 done** (budget listing); **2.2 done** (skills once per session at end of prompt);
-      2.5 remains.
+      **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
+      **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
 - [ ] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety)
 - [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
@@ -63,8 +63,8 @@ state, the open bug and the quality bar).
 - [x] **2.1** Listing under a budget ⚡ — **DONE 2026-10-21** (`src/lib/skills.zig`): the budget is **1% of `ZODE_CONTEXT_LIMIT`** in characters (at the same ~4 chars/token the compaction estimate uses), the per-entry cap is **250 columns**, a **bundled** entry is never truncated, and the ladder when it does not fit is: everything in full → the bundled ones keep their description and the rest degrade to their **name** → everything degrades to its name → entries are left out from the end and the note says how many. The fixed `max_listed = 40` is **gone**.
 - [x] **2.2** Send the listing **once per session** as an attachment at the END of the prompt (cacheable prefix untouched); dedupe per session; reset on config reload, NOT on compaction — **DONE** (`src/agent.zig` `skillsSectionText` + `buildSystemPrompt` with `include_skills`; `Session.skills_sent` + `resetSkillsSent`). Skills no longer bloat the stable system-prefix on every turn; they are attached once as a `[Skills] …` user message.
 - [x] **2.4** `context: fork` runs the skill via `lib/subagent.zig` (effort low, read-only, disposable window) and returns the result to the main turn — **DONE** (`src/agent.zig` `skillCall` takes the `.fork` branch and runs `runSubagent`; nothing of the subagent's window enters the main context, parent message list unchanged)
-- [ ] **2.5** `!cmd` inside a skill: run the command, substitute its output (behind Phase 6 permissions)
-- [ ] Tests: budget caps total size ✓ · bundled survive a tight budget while others degrade to names ✓ · args substituted ✓ · fork skill runs via subagent and leaves the parent message list unchanged
+- [x] **2.5** `!cmd` inside a skill: run the command, substitute its output (behind Phase 6 permissions) — **DONE** (`src/agent.zig` `expandSkillCommands`: runs only when bash is allowed or matches a persisted prefix, else `[permission required]` / `[command failed]`)
+- [x] Tests: budget caps total size ✓ · bundled survive a tight budget while others degrade to names ✓ · args substituted ✓ · fork skill runs via subagent and leaves the parent message list unchanged ✓ · `!cmd` output substituted behind permissions ✓
 
 ---
 
