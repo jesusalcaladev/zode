@@ -13,7 +13,6 @@ $ zode
   ##   ##  ## ##   # ##
 ######  ####  ####   ######
 ────────────────────────────────────────
-❯ read src/tui.zig and tell me why the scroll does not follow
 ```
 
 ---
