@@ -29,7 +29,6 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [ ] 🔴 **Sprint A3 — Phase 34** (the machinery the reference implementation has and we do not): sixteen
       mechanisms that no phase owned, of which **34.1 (path-scoped permissions)** is
       the one that should not wait — today `write` writes any path it is handed.
-- [x] 🔴 **Sprint B — Phase 2** (skill listing budget + named args + `context: fork`):
       **2.1 done** (budget listing); **2.2 done** (skills once per session at end of prompt);
       **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
       **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
@@ -60,11 +59,6 @@ state, the open bug and the quality bar).
 
 `✨ feature · 🔴 · depends on 1`
 
-- [x] **2.1** Listing under a budget ⚡ — **DONE 2026-10-21** (`src/lib/skills.zig`): the budget is **1% of `ZODE_CONTEXT_LIMIT`** in characters (at the same ~4 chars/token the compaction estimate uses), the per-entry cap is **250 columns**, a **bundled** entry is never truncated, and the ladder when it does not fit is: everything in full → the bundled ones keep their description and the rest degrade to their **name** → everything degrades to its name → entries are left out from the end and the note says how many. The fixed `max_listed = 40` is **gone**.
-- [x] **2.2** Send the listing **once per session** as an attachment at the END of the prompt (cacheable prefix untouched); dedupe per session; reset on config reload, NOT on compaction — **DONE** (`src/agent.zig` `skillsSectionText` + `buildSystemPrompt` with `include_skills`; `Session.skills_sent` + `resetSkillsSent`). Skills no longer bloat the stable system-prefix on every turn; they are attached once as a `[Skills] …` user message.
-- [x] **2.4** `context: fork` runs the skill via `lib/subagent.zig` (effort low, read-only, disposable window) and returns the result to the main turn — **DONE** (`src/agent.zig` `skillCall` takes the `.fork` branch and runs `runSubagent`; nothing of the subagent's window enters the main context, parent message list unchanged)
-- [x] **2.5** `!cmd` inside a skill: run the command, substitute its output (behind Phase 6 permissions) — **DONE** (`src/agent.zig` `expandSkillCommands`: runs only when bash is allowed or matches a persisted prefix, else `[permission required]` / `[command failed]`)
-- [x] Tests: budget caps total size ✓ · bundled survive a tight budget while others degrade to names ✓ · args substituted ✓ · fork skill runs via subagent and leaves the parent message list unchanged ✓ · `!cmd` output substituted behind permissions ✓
 
 ---
 
@@ -74,7 +68,6 @@ state, the open bug and the quality bar).
 
 > Blind elision loses detail. Storage loses it *on purpose* — and the model can get it back.
 
-- [x] **3.1** `src/lib/toolstore.zig` — large result → file + preview + path — **DONE 2026-10-28**: `toolstore.zig` module (storeResult, summarize, env-overridable constants) complete and tested; wired into `agent.zig` so large non-unbounded tool results are spilled to `sessions/<id>/tool-results/<n>.txt` and the model receives a preview + path instead of blind truncation. `read` stays unbounded. Verified with `zig build test` and `zig build`.
 
 ---
 
@@ -119,18 +112,11 @@ state, the open bug and the quality bar).
 
 `⚡ tokens · 🟡 · independent · pairs with /cache`
 
-- [x] Compare the prefix actually sent with the previous one; warn when it broke and **which block** — **DONE 2026-10-28**: `src/lib/cachebreak.zig` (pure) with `Blocks`, `firstDiff`, `describeBreak`, `hashBlock`, `blockOffsets`; wired into `buildSystemPrompt` in `src/agent.zig` to track block hashes across calls; `cache_break_last_block` / `cache_break_last_pos` exposed for the warning; surfaced in `runOneTurn` after `syncSystemPrompt`.
-- [x] Target signal: `writes_per_request > 0.5` in a long session = unstable prefix — `cacheBreakUnstable()` in `src/agent.zig` reads `cache_stats.session.writesPerRequest()`.
-- [x] Pure tests: stable prefix reports no break · change in skills block reports block and position — 6 tests in `cachebreak.zig`.
 
 ## Phase 9 — Agent definitions on disk
 
 `✨ feature · 🟡 · independent · basis for 26`
 
-- [x] `.zode/agents/*.md` frontmatter: `name`, `description`, `tools`, `model`, `effort` — **DONE 2026-10-28**
-- [x] A `task` call can name a definition; without one it uses the current defaults — **DONE 2026-10-28**: discovery from `.zode/agents/` (project, shadows) and `~/.config/zode/agents/` (user); unknown definition falls back to defaults with an info message.
-- [x] Keep the existing safety floor: read-only tools, effort `low`, depth 1, 24k window — **DONE 2026-10-28**: `toolsAreReadOnly` validates against `subagent.tool_names`; non-read-only definitions are skipped at discovery and refused at call time.
-- [x] Pure tests: discovery with shadowing · unknown definition falls back to the default · a definition's tool list must be a subset of the read-only set — **DONE 2026-10-28**: tests in `agentdefs.zig`.
 
 ---
 
@@ -167,12 +153,6 @@ state, the open bug and the quality bar).
 
 `✨ feature · 🟢 · independent`
 
-- [x] `notebook_edit`: address a cell by index — replace its source, insert before/after, delete (editing `.ipynb` via `edit` means matching a JSON string with escaped newlines)
-- [x] The round-trip preserves everything else: outputs, metadata, cell id, format version — a tool that rewrites an ipynb into a "clean" one destroys the outputs the user was looking at
-- [x] The source is the cell's text (join of its lines), not its JSON encoding; the tool encodes on write
-- [x] It is a write: same permission, same undo snapshot as `write`/`edit`
-- [x] `read` on a `.ipynb` shows cell boundaries and indices, so the model knows the numbering before it edits
-- [x] Pure tests (fixture notebooks): replace by index · insert before/after · delete · out-of-range index is a named error, not corruption · outputs and metadata survive · a malformed ipynb is refused with the parse location
 
 ---
 
@@ -198,11 +178,9 @@ state, the open bug and the quality bar).
 
 > The harness has a clock but no way for the model to wait on purpose.
 
-- [x] `sleep {seconds}`: waits without holding a shell process, ESC-interruptible; the prompt says it costs one API call per wake-up so it is not used where a `bash_output` poll would do
 - [ ] Periodic ticks while a turn is parked: a short check-in ("anything useful to do while you wait?") instead of silence — off by default, a session flag turns it on
 - [ ] `schedule {cron, prompt}`: recurring prompt for this project ("every Monday, run the flaky test and report"), plus `schedule list` / `schedule remove`; stored next to the session, delivered as a user message when it fires
 - [ ] Scheduled prompts obey the same permissions as typed ones (a scheduled prompt that wants to write still asks)
-- [x] Pure tests: a `sleep` is interruptible (ESC) and reports how long it actually waited
 - [ ] Pure tests (waiting on ticks + schedule): cron parsing (5-field, ranges, steps, names) · a `once` schedule fires once and is removed · a tick is suppressed while a tool is running
 
 ## Phase 20 — Team mode: persistent collaborators
@@ -273,10 +251,6 @@ state, the open bug and the quality bar).
 
 > Phase 6 decides *whether* to ask; this decides *what is dangerous*. A dialog is useless if one line hides an `rm -rf` behind a pipe.
 
-- [x] **25.1** `lib/cmdsafety.zig` (pure): split a command into its parts (pipelines, `&&`/`||`/`;`, substitutions); flag the ones that write, delete, exfiltrate, or chain into a shell (`curl … | sh`), naming the **exact dangerous fragment** — **DONE 2026-10-21** (as part of Phase 6's read-only table): the splitter knows the separators, the redirections and the substitutions, and the verdict is the WORST of the parts
-- [x] **25.2** The classifier is **data, not a heuristic**: command families + the flags that change them — `git status` is quiet and `git clean -fdx` is not; a new family is one row — **DONE 2026-10-21**: `git branch` LISTS and `git branch x` CREATES, and `git config` READS with `--get` and WRITES without
-- [x] **25.3** The dialog shows the risk in words, not the raw line: "this deletes unreferenced files" beats `git clean -fdx` — **DONE 2026-10-21**
-- [x] **25.4** Phase 6's read-only table reuses it: a command is only "read-only" if the scanner found nothing to flag — **DONE 2026-10-27**: `execOneCall` skips the permission dialog for a `bash` command `lib/cmdsafety.zig` found nothing to flag (`git status`, `ls`, `rg foo`); `reads_only` is `false` for every other tool, so nothing else changes — the scanner decides, not the static registry flag. Tests: `cmdsafety` (read-only decided by the scanner; redirects, pipes into shells and unknown programs are not read-only) and `execOneCall` (`bash ls` runs with `/yolo` off, no persisted prefix, no rules, and the dialog is never opened).
 - [ ] Optional sandbox: if `bwrap` exists, offer a sandboxed `bash` for flagged commands — a dialog is not the only answer
 - [ ] Pure tests: the parser splits quoted separators correctly (a `;` inside a string is not a separator) · a pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution
 
@@ -304,24 +278,17 @@ state, the open bug and the quality bar).
 
 > The part worth stealing is not the colours, it is the **order of the pipeline**. Measured today: the diff has NO background at all (`diff_add_bg`/`diff_del_bg` are declared and never painted) and no line numbers.
 
-- [x] **27.1** Word-level diff — which words changed, not which lines
   - [x] Per hunk, in order: (1) assign marker + line number via two counters (`+`→new, `-`→old, context shows the new one) · (2) pair a `-` run with the following `+` run positionally; pure insertions/deletions stay unpaired and get NO word diff · (3) tokenize + token-level LCS → byte ranges · (4) the noise guard · (5) split segments at the range boundaries
   - [x] The tokenizer is **shared with `edit_hint.zig`** — one tokenizer or the two diffs disagree: a `[\p{L}\p{N}_]` run = 1 token, whitespace run = 1 token, **everything else one token per codepoint** (`x += 1` = 5 tokens; in code, `+=`/`=>`/`!=` are words)
   - [x] `CHANGE_THRESHOLD = 0.4`: above 40% changed → discard the word ranges, flat line colour (a rewrite is not information, it is confetti — the same call as edit_hint's 0.50 Jaccard)
   - [x] Word diff skipped entirely when the block is `dim` (collapsed preview / collapsed Ctrl+R — highlights inside a quiet box are noise)
   - [x] Forced change: `diffSegments` must call `highlightLineState` with the state threaded down the hunk (a changed line is often the middle of a block comment or a multiline string) and reset at each `@@`
-- [x] **27.2** Gutter: marker + right-aligned line number; width = digits of the hunk's max line **per hunk** (not per file); wrapped continuation rows get blank gutter cells and never a second copy of the number
 
-- [x] **27.3** Colour capability ladder 🐛
   - [x] vaxis does NOT convert rgb→256 (`Vaxis.zig:626-630`): every one of the 32 `rgb()`/`bg()` literals in `theme.zig` ships as `38;2;r;g;b` even when DA1 said no truecolor. Ladder: `caps.rgb` true → palette as-is · false → `.index` colours via a ported `ansi256FromRgb` · `no_color` → `+`/`-` in **bold** and nothing else
   - [x] `ansi256FromRgb`: the grey ramp is a **competitor**, not a fallback — quantize to the cube, build BOTH candidates (cube + ramp), pick the closer in RGB distance; beyond the ramp's range the cube corner is the only option
   - [x] Lives in `theme.zig` behind the existing `rgb()`/`bg()` helpers — 38 call sites, one change; `no_color` is a single early return
-- [x] **27.4** Colour-vision-safe palette 🔒
   - [x] `ZODE_DALTONIZED=1` (+ a `/color daltonized` picker entry) → blue/orange pair instead of green/red (the most common deficiency, and the axis most monitors collapse)
   - [x] A test asserts the add/delete pair differs in **hue** via `hueSat`, not only lightness (precedent: `theme.zig:439`)
-- [x] **27.5** NOT ported on purpose: `asTerminalEscaped`/`colorToEscape`/the `{r,g,b,a}` sentinel struct (~120 lines — vaxis paints cells, escape generation is its job), the highlight.js integration, the `BAT_THEME` stub, the lazy loader. `ColorFile` (plain file view with line numbers) deferred to a future `/file`
-- [x] **27.6** Pure tests: `x += 1` is 5 tokens · a pure deletion stays unpaired · a line 50% changed gets no ranges · a line 10% changed does (not vacuous) · ranges split a segment into three · **the segments of a diffed line concatenate to the original line** · ansi256 picks the cube for a saturated colour and the ramp for a grey · every theme colour survives the 256 round trip (no colour becomes "terminal default") · the daltonized pair differs in hue · drawTest: only the changed token carries the word background
-- [x] Plus one `zig build ui-frame` scene (a `write` of a 600-line file) so the *composition* is judged — the question only that harness can answer
 
 **Acceptance**: green suite + the scene reads as designed at 80x24 and 200x50.
 
@@ -412,16 +379,9 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 `✨ feature + 🐛 fix · 🟡 · independent; writes what 29 reads`
 
-- [x] **30.1** Two title keys on disk, so precedence is structural: `customTitle` (`/rename`, never overwritten) vs `aiTitle` (generated, ephemeral, safe to regenerate). A single `title` with a `source` flag is the same idea implemented worse — **DONE** (`sessionindex.zig` `Meta.custom_title`/`Meta.ai_title` + `Entry.title()` resolution; `session.zig` `Session.custom_title`/`Session.ai_title` loaded from Meta on resume, persisted via `writeMeta` on create)
-- [x] **30.2** Derive now, upgrade later, guard the upgrade — **DONE** (`cmdRename` sets `custom_title` directly via `/rename <name>`; F2 in session picker renames via `onSessionRename`; titles persisted via `sessionindex.writeMeta`)
 - [ ] **30.3** A running summary for the list — not yet (write-time summary line every N steps)
 - [ ] **30.4** `/branch` — fork is not `/new` — not yet (copy JSONL, rewrite session id, provenance chain)
-- [x] **29.1** Two-phase rows — **DONE** (`sessionindex.scan` uses `stat` for mtime/size, then `readMeta` for titles; picker opens with zero per-session JSON parsing)
-- [x] **29.2** Bug fix: unreadable head session — **DONE** (sessions with unreadable head are still listed; title falls back to session id)
-- [x] **29.3** The row format — **DONE** (`<title>  (current)` + age desc)
-- [x] **29.4** Interaction — **DONE** (Enter resumes via `onSessionPick`; F2 renames via `onSessionRename`; Esc cancels via picker's built-in cancel)
 - [ ] **29.5** Search in three tiers — not yet (title substring, transcript fuzzy, semantic)
-- [x] **29.6** Resume directory check — **DONE** (`sessionpath.sessionBelongsToProject()` resolves the project's sessions dir and verifies each session path starts with it; `cmdSession` filters out sessions from other projects so they never leak into this project's list)
 - [ ] **30.5** Resume restores more than messages — not yet (plan hydration, cost state, tags)
   - [ ] Turn 1: a title derived from the first prompt — synchronously, free
   - [ ] Turn 3: the AI upgrade via a `task` subagent (effort `low`) over the **last 1000 characters** of the conversation (recent context wins, input bounded); patched only while three things hold: the generation counter matches (a cheap turn-1 request resolving late must not clobber a richer turn-3 one), the session is unchanged, and there is no custom title (the `/rename` race)
@@ -494,21 +454,17 @@ Ctrl+R turns them on. That is the same rule with a different name.
 > question the user actually has. A decorative port is a port that costs
 > frames and buys nothing.
 
-- [x] **33.1** The footer says the state that decides the next tool call — **DONE 2026-10-21**
   - [x] The **effective** effort level (`chat.effortSupport` decides whether there is a knob at all) — the preference is not the same thing, and showing it would be a lie: the footer would say `xhigh` while the wire carries `high`
   - [x] The permission-mode **glyph** (`○ ◐ ● ◉`, the four shapes the reference implementation uses) — a word costs 12 columns in a footer that has to survive an 80-column terminal
   - [x] …and with it, `accept edits` becomes visible again: the test that pins "the normal permission modes cost NOTHING on the row" is a decision about COLUMNS, and a glyph is one column. **The test was rewritten on purpose** (the default still costs nothing; a deviation costs ONE column) and the legend of the glyphs lives in the shortcut list (`?`)
-- [x] **33.2** The "N new" counter — **DONE 2026-10-21**
   - [x] Counts assistant **turns**, not entries (the reference implementation counts them the same way): a tool line is not an answer the reader is missing
   - [x] The baseline moves with the reader: leaving the bottom starts a count, reaching it ends the one that was running
   - [x] The **pill** over the transcript: a centred "3 new messages" that floats over the scrollback. It covers the last row on purpose — a control on its own row would move the transcript every time it appeared
-- [x] **33.3** The sticky prompt header — **DONE 2026-10-21, as an OVERLAY**
   - [x] It names the turn you are reading: the last `.user` paragraph at or above the anchor
   - [x] It goes OVER the transcript's first row and **only when the reader is away from the bottom**. A reserved row was tried FIRST and it moved the text under the reader's eyes (10 tests and a crash in the click/selection math): a header that appears and disappears takes a row away exactly when the reader is looking
   - [x] The editor's own convention: a sticky line covers the content under it
 - [ ] **33.4** The transcript screen (`ctrl+o`) — a VIEW of our own history, not new content; `ctrl+e` shows all
 - [ ] **33.5** The bottom-anchored modal pane with a `▔` divider — a pane that keeps 2 transcript rows visible beats a centred box that hides the context
-- [x] **33.6** The fuzzy picker with the matched characters highlighted — **DONE 2026-10-21**
   - [x] The query as a **subsequence** of the label, with a WINDOW (three times the query plus eight) so the fallback does not match half the catalogue
   - [x] Leftmost and **runs win**: "bc" in "a-xbc" highlights the run and not a scattered "b"
   - [x] The matched characters are painted in the accent colour, and the positions are BYTE offsets joined to the painting at the grapheme's first byte
@@ -516,7 +472,6 @@ Ctrl+R turns them on. That is the same rule with a different name.
   - [ ] The list is still in the provider's order, and the reference implementation sorts by score. Ours is deliberate (the free models first), so sorting is a decision and not a port
 - [ ] **33.7** The picker with a **preview pane** (at the bottom or at the right) — the model preview (context window, price, free) is the most useful picker addition we do not have
   - [ ] It has to be a **bottom pane**, not a third column: at 110 columns there is no room for a third one
-- [x] **33.8** Markdown tables — **DONE 2026-10-21**: a boxed table, cells padded to the column width, shrinking to fit and **wrapping inside the cell** instead of being clipped; a table that does not fit at all degrades to `name: value` rows. 11 pure tests, and the invariant that every cell's text survives the rendering
   - [x] The parser receives the WIDTH (`DiffOpts.width`), because "does it fit" is a question only the width can answer
 - [ ] **33.9** The notifications channel — a transient queue for "the updater restarted", "the IDE connected", "the token budget is nearly gone"; absolutely positioned, so nothing shifts
 - [ ] **33.10** The context visualisation — we compute the numbers; the reference implementation draws a proportional chart per category (system, tools, messages, skills, compaction reserve)
@@ -524,12 +479,9 @@ Ctrl+R turns them on. That is the same rule with a different name.
 - [ ] **33.12** The per-message actions — `shift+↑` targets the message under the cursor; ours has `/copy N` and no per-message targeting
 - [ ] **33.13** The transcript search (`/` and `n`/`N`) — our paragraphs are already segmented, so the scan is over the segments, not the cells
 - [ ] **33.14** OSC 8 hyperlinks — the paths and the URLs as real links; the detection is ~30 lines and vaxis exposes the cell attributes
-- [x] **33.15** The shortcut help in the footer (`? for shortcuts`) — **DONE 2026-10-21**: `?` on an empty input opens the list, and the list carries the LEGEND of the permission glyphs. The hint in the footer only appears when the state has room for it
 - [ ] **33.16** The external editor (`ctrl+g`) and the image paste (`ctrl+v`) — the image path already exists (`src/lib/images.zig`)
-- [x] **33.17** The focus detection (dim the caret when the window is not focused) — vaxis reports focus events — **DONE 2026-10-27**: `Model.focused` tracks `focus_in`/`focus_out`; the composer's accent bar (the caret mark) is painted dimmed while the window is unfocused. Two draw tests pin the flag flip and the dimming.
 - [ ] **33.18** The modal diff viewer — only worth it once a turn can produce multi-file diffs
 - [ ] **33.19** The compact-summary line — after a tier-2 compaction the transcript loses history **silently**; one honest line says what was summarised
-- [x] **33.20** The queued prompts' **text**, not just the count — **DONE 2026-10-21**: "2 queued · arregla los tests" instead of "2 queued", truncated with an ellipsis (a half-line that looks complete is a lie about what is queued)
 - [ ] **33.21** The permission dialog with the **rule** explanation — which rule matched, and the rule the user could accept instead of a bare "always allow"
 
 **What we deliberately do NOT copy** (and why) — the reasoning is in
@@ -565,12 +517,9 @@ permanent CPU cost for a decoration).
   - Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call
   - [x] A `Caps` state (result id → the cut that was made), persisted next to the session and reloaded on resume — **DONE 2026-10-27**: Added `CutRecord` and `Caps` structs in `src/lib/resultcap.zig` with `find`/`record`, `frozenCapResult`/`frozenCapAggregate` that re-apply previous cuts verbatim, and `serializeCaps`/`deserializeCaps` for JSON persistence next to the session. 6 pure tests (frozen cut reuse, no-cut reuse, aggregate stability, serialize/deserialize round trip, empty serialization). The `Caps` state is held in memory by the caller (session layer integration left as a thin wiring step).
   - [x] Why it matters covered: a session that compacts differently on resume silently loses its cached prefix — the frozen cut prevents this by re-applying the same cut.
-- [x] **34.3** `deny` and `ask` as real permission behaviours — Phase 6 says "deny/allow/ask" but never the **precedence** — **DONE 2026-10-27**: `deny` removes the tool's schema from the request via `toolsJsonFiltered()` in `src/tools/registry.zig`, used in `agent.zig`'s request loop so a denied tool is never offered to the model (incl. `deny` with `*` = deny all). Precedence (deny > allow > ask, source priority, last-match-wins) was already implemented in `permrules.decide` and is pinned by existing tests ("a DENY beats any allow", "the strongest source wins"), plus 3 new `toolsJsonFiltered` tests. `blob` stays comptime; filtering is runtime since deny rules come from user-editable permission files.
-- [x] **34.4** The dangerous-allow-rule warning and the shadowed-rule detection — **DONE 2026-10-27**
   - `permrules.Action` gained `dontAsk` (34.12) and now `dangerous_patterns` + `isDangerousPattern()` flag bare interpreters with broad patterns (`bash(*)`, `python(*)`, …). `shadowedRule()` detects when an `allow` rule can never fire because another rule covers it (deny beats allow always; stronger source or later same-source rule wins; `ask`/`dontAsk` never shadow).
   - `agent.zig`: `setAlwaysAllowed` and `allowAlwaysFor` now warn once per session about dangerous broad allows (bash `*` or empty, or any interpreter tool with `*` pattern), via `warnDangerousAllowOnce()`. Warning is informational, not a refusal.
   - 9 new pure tests in `permrules.zig` (isDangerousPattern, shadowedRule allow/deny/same-source/ask).
-- [x] **34.5** A **cost** number, per model — **DONE 2026-10-22**
   - The reference implementation: a cost tracker that multiplies the token counts by the model's price, and a `/cost` command that prints the total and the per-model breakdown
   - Ours was tokens and hit-rate (`src/cache_stats.zig`), no money
   - [x] `src/lib/cost.zig` (pure, tested) over the price `src/lib/models.zig` already parses. `/cost` reads the price from the **cached** catalogue (`modelcache.zig`), never the network
@@ -585,13 +534,7 @@ permanent CPU cost for a decoration).
   - The reference implementation: the agent tool can run a whole agent in the background; Phase 10 is about `bgproc`
   - [ ] `run_in_background: bool` on the `task` tool, and a **notification to the model** when it lands
 - [ ] **34.9** The atomic task claiming — **NOT COVERED** (the reference implementation has a `claim` operation): three parallel agents must not take the same task
-- [x] **34.10** The enforcement of a skill's `allowed_tools` / `model` / `effort` — **NOT COVERED** — **DONE 2026-10-27**: Carried the three frontmatter fields into `skills.Entry` and `skillstore.scan()`; `subagent.skillAllowedTools()` validates a forked skill's `allowed_tools` against the read-only set (a skill naming `write`/`edit`/`bash` is refused — cannot escalate); `agent.zig` skillCall passes `allowed_tools`/`model`/`effort` into `runSubagent`, which builds the tool list from them, resolves the skill's model, and clamps its effort to the model's ladder. 5 pure tests in subagent.zig + 1 scan carry-over test in skillstore.zig.
-- [x] **34.11** The conditional skills by path — **NOT COVERED** (a `paths:` field in the frontmatter) — **DONE 2026-10-27**: Added `paths` to `skills.Meta`/`Entry` (parsed from frontmatter, carried through `skillstore.scan()`); `skillAppliesHere()` matches a skill against the project root (empty `paths` = applies everywhere; a path-conditional skill with no project root does not apply); `skillsSectionText` filters the listing to matching skills. 5 pure tests in skills.zig.
-- [x] **34.12** The `dontAsk` permission mode — **NOT COVERED** (a third state, not a bool: `ask` becomes "answer for yourself") — **DONE 2026-10-27**: Added `.dontAsk` to `permrules.Action` (parse: "dontask"/"dont_ask"); `decide()` tracks it separately with precedence deny > allow > dontAsk > ask; agent.zig sets `rule_allowed = true` for `.dontAsk` (no dialog, model self-authorizes). 7 pure tests (6 in permrules, 1 in agent).
-- [x] **34.13** The circuit breaker keyed on **consecutive failures**, not on a budget — **DONE 2026-10-28**: `SummaryBreaker` in `src/agent.zig` trips after `max_consecutive` (3) consecutive summarizer failures and `summarizeTurns` stops spending requests on it (`maySummarize` returns false, `summarizeTurns` returns null without attempting). Any success resets the counter; `/new`/`/resume` reset it via `resetSummaries`. Wired into every `summarizeTurns` failure path and the success path, so both call sites (main.zig and agent.zig) are protected from "request-per-turn forever". Pure tests in agent.zig; verified with `zig build test`.
 - [ ] **34.14** The `PermissionRequest` hook path for the headless runs
-- [x] **34.15** The "the model was told to stop and did not" mechanism — **DONE 2026-10-28**: `StopHook` in `src/lib/autochk.zig` — a user-written callback that can refuse to end a turn, the user-written version of our exit gate. Composition rule is explicit and ordered: the gate (`exitGate`) runs FIRST; if it refuses (code is bad, turn cannot end), the hook is not consulted. Only when the gate passes does `stopHookCheck` run — they never both claim the turn. Wired into both runners: TUI (`chatWorker` in agent.zig) and headless (`--chat` in main.zig). Pure tests in autochk.zig; verified with `zig build test`.
-- [x] **34.16** The per-session price/usage table that `/context` can show — **DONE 2026-10-28**: `/context` now prints a compact per-session price/usage summary next to the token gauge, reusing `lib/cost.zig` (`Tracker`, per-model price lookup, `totalOf`/`formatUsd`/`unpricedCount`). Honest "price unknown"/floor semantics; a resumed session's tokens are noted, not priced. Pure tests in cost.zig; verified with `zig build test` and `zig build`.
 
 **Where we are BETTER than the reference implementation** (so nobody ports it
 backwards) — `docs/analysis/harness.md` §4 lists ten: the exit gate, the
@@ -610,8 +553,6 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 > home. The ~30 commands that are Anthropic-account or marketplace surface are
 > **not** gaps and are listed as such, so nobody goes looking for them.
 
-- [x] **35.1** `/files` — **DONE 2026-10-21**: the files the model has READ (and whether their content is still in the context) and the files the agent WROTE to, this session. It is the answer to "what is the model looking at?", which is the question you ask when a turn goes sideways. It also found a bug: the read cache survived `/new`, so the new session's first `read` of a file the previous session had read answered "it is already in your context" WITHOUT sending the body — the model would have been working from a file it could not see
-- [x] **35.2** `/init` — **M** for the prompt, **L** with the interview phase. The highest-value missing command: without it a new project has no `AGENTS.md` and the harness silently runs with the built-in prompt only. Port the reference implementation's prompt text **verbatim** and let the model do the work — **DONE 2026-10-22**
 - [ ] **35.3** `/rename` + the `#tag` + the session title — **S** each, and together they are the readability layer of the session list. Phase 30.1 has the design; the command is 20 lines
 - [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic command we lack. Both are prompt commands whose text is the reference implementation's, and Phase 31.1 already has the `` !`cmd` `` substitution
 - [ ] **35.5** `/clear` (with the cache reset) and the `/exit` alias — **S**. `/new` exists but leaves the read cache, the skills-sent marker and the user commands stale
@@ -689,14 +630,10 @@ unit-perfect and still do nothing when it is typed).
 > the parent commit showed base and current behaving identically. It was a
 > use-after-free, and it was ours since the warmup was written.
 
-- [x] **36.1** The use-after-free in the catalogue warmup — **DONE 2026-10-21**
   - [x] `src/agent.zig` `warmupWorker`: the two `defer`s were in the wrong order, and `defer` is LIFO — the job was **freed** and then `job.model.endWorker()` dereferenced the freed block to do its atomic RMW. A SIGSEGV in a detached worker, which is exactly the "the app stops answering" symptom
   - [x] The pointer is copied into a local before anything can die
   - [x] The double free next to it: the `errdefer` in `catalogWarmupAsync` freed the job a second time on the spawn-failure path
   - [x] A test that the warmup's job lifetime is correct
-- [x] **36.2** `zig build debug` did not compile — **DONE 2026-10-21**: `debug_mod` was missing the `build_options` import, so the step whose ENTIRE job is to be a trustworthy artifact for a crash produced no artifact at all, and the `zode-debug` on disk was a leftover from some earlier build, byte-identical to the stripped release one
-- [x] **36.3** `-Dstrip=false` did not disable the stripping — **DONE 2026-10-21**: `strip = null` is not "unstripped", it is "use the default", and the default for ReleaseSmall is TO STRIP. The option has to be written down for it to mean anything
-- [x] **36.4** The permission dialog painted NOTHING on a terminal with no room for the box — **DONE 2026-10-21**: the dialog BLOCKS the turn, so an invisible dialog is a turn that can never be answered, and the app looks exactly like the "it stopped answering" bug. There is now a compact two-row form
 - [ ] **36.5** The `endWorker`/`destroy` lifetime is a CLASS, not an incident: every detached worker in the tree needs the same audit (the model worker, the self-update thread, the background reader, the subagents)
 - [ ] **36.6** The self-update thread is neither counted as a worker nor isolated from the shared `Io` (`src/main.zig:737-747`) — the same shape as the crash of 36.1
 
@@ -704,11 +641,6 @@ unit-perfect and still do nothing when it is typed).
 
 ## 🔧 Tool upgrades (independent, one registry row each, no permission changes)
 
-- [x] **`grep`** + context lines (`-A/-B/-C`), a `glob`/`type` filter, an output mode (`content` / `files_with_matches` / `count`), and a `head_limit` — today the model compensates with more calls — shipped 2026-10-16
-- [x] **`bash`** + a `description` field: one line for the timeline ("running the test suite") so the user reads what a command is FOR — shipped 2026-10-16 (the timeline and the status bar show the description; the permission dialog and the allowlist keep matching the COMMAND, so prose can never ride an allowed prefix)
-- [x] **`read`** + PDF page ranges (the image path already exists), so a spec handed to the agent is readable without shelling out to a converter — shipped 2026-10-20
-- [x] **`glob`** + a `subdir` and a `limit`, so "the 20 newest `.zig` under `src/`" is one call (plus `sort: newest|oldest|name`, which is what makes "newest" true — shipped 2026-10-16)
-- [x] One pure test per row on the argument parsing
 
 ---
 
