@@ -50,6 +50,8 @@ pub const pathsafe = @import("lib/pathsafe.zig");
 pub const filesview = @import("lib/filesview.zig");
 pub const cost = @import("lib/cost.zig");
 pub const session_search = @import("lib/session_search.zig");
+pub const cachebreak = @import("lib/cachebreak.zig");
+pub const agentdefs = @import("lib/agentdefs.zig");
 
 // The language server. It was in its own aggregator (`src/lsp_test.zig`) that
 // no build step referenced: 33 test blocks written, and 32 of them not even

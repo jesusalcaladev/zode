@@ -62,6 +62,8 @@ const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
 const copytext = @import("lib/copytext.zig");
 const clipboard = @import("clipboard.zig");
+const agentdefs = @import("lib/agentdefs.zig");
+const cachebreak = @import("lib/cachebreak.zig");
 const commands_mod = @import("commands.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeats.zig");
@@ -94,6 +96,109 @@ pub const verification_prompt = prompt_mod.verification_prompt;
 
 // ── system prompt: the project's AGENTS.md (cached) ──────────
 var agents_md_cache: ?[]u8 = null;
+
+/// Cache-break detection: previous block hashes, set on the first call to
+/// `buildSystemPrompt` and compared on every later call. When a block changes,
+/// `cache_break_last_block` names it and `cache_break_last_pos` gives its byte
+/// offset in the composed prefix.
+var cache_break_prev: ?[8]u64 = null;
+var cache_break_last_block: ?[]const u8 = null;
+var cache_break_last_pos: usize = 0;
+
+/// Resets the cache-break tracker (for tests and session rotation).
+pub fn resetCacheBreak() void {
+    cache_break_prev = null;
+    cache_break_last_block = null;
+    cache_break_last_pos = 0;
+}
+
+/// True when the cache write rate suggests the prefix is unstable:
+/// `writes_per_request > 0.5` over a long session means the prefix is being
+/// re-written every turn instead of being read from the provider's cache.
+pub fn cacheBreakUnstable() bool {
+    return cache_stats.session.writesPerRequest() > 0.5;
+}
+
+/// Cached discovered agent definitions (`.zode/agents/` + `~/.config/zode/agents/`).
+var agent_defs_cache: ?[]agentdefs.Entry = null;
+
+/// Discovers and caches agent definitions, or returns the cached list.
+pub fn ensureAgentDefs(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) []const agentdefs.Entry {
+    if (agent_defs_cache) |defs| return defs;
+    var roots: std.ArrayList([]u8) = .empty;
+    defer roots.deinit(gpa);
+    var proj_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const proj_path = std.fmt.bufPrint(&proj_buf, "{s}/{s}", .{ project_info.cwd(), agentdefs.project_dir }) catch "";
+    if (proj_path.len > 0) {
+        const proj_copy = gpa.dupe(u8, proj_path) catch null;
+        if (proj_copy) |pc| {
+            roots.append(gpa, pc) catch {};
+        }
+    }
+    if (env) |e| {
+        if (e.get("HOME")) |home| {
+            if (home.len > 0) {
+                var user_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const user_path = std.fmt.bufPrint(&user_buf, "{s}/{s}/{s}", .{ home, ".config", agentdefs.user_subdir }) catch "";
+                if (user_path.len > 0) {
+                    const user_copy = gpa.dupe(u8, user_path) catch null;
+                    if (user_copy) |uc| {
+                        roots.append(gpa, uc) catch {};
+                    }
+                }
+            }
+        }
+    }
+    var entries: std.ArrayList(agentdefs.Entry) = .empty;
+    defer entries.deinit(gpa);
+    var seen: std.ArrayList([]u8) = .empty;
+    defer seen.deinit(gpa);
+    for (roots.items) |root| {
+        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+            var already = false;
+            for (seen.items) |s| {
+                if (std.mem.eql(u8, s, entry.name)) { already = true; break; }
+            }
+            if (already) continue;
+            const name_copy = gpa.dupe(u8, entry.name) catch continue;
+            seen.append(gpa, name_copy) catch { gpa.free(name_copy); continue; };
+            var file_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const file_path = std.fmt.bufPrint(&file_buf, "{s}/{s}/AGENT.md", .{ root, entry.name }) catch { gpa.free(name_copy); continue; };
+            const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, gpa, .limited(64 * 1024)) catch { gpa.free(name_copy); continue; };
+            const fm = agentdefs.splitFrontmatter(text) orelse { gpa.free(text); gpa.free(name_copy); continue; };
+            var tools: [][]const u8 = &[_][]const u8{};
+            if (fm.meta.tools.len > 0) {
+                tools = agentdefs.parseTools(fm.meta.tools, gpa) catch { gpa.free(text); gpa.free(name_copy); continue; };
+            }
+            if (!agentdefs.toolsAreReadOnly(tools)) { gpa.free(text); gpa.free(name_copy); continue; }
+            const desc_dup = gpa.dupe(u8, fm.meta.description) catch { gpa.free(text); gpa.free(name_copy); continue; };
+            const model_dup = if (fm.meta.model.len > 0) gpa.dupe(u8, fm.meta.model) catch { gpa.free(text); gpa.free(name_copy); gpa.free(desc_dup); continue; } else "";
+            const effort_dup = if (fm.meta.effort.len > 0) gpa.dupe(u8, fm.meta.effort) catch { gpa.free(text); gpa.free(name_copy); gpa.free(desc_dup); gpa.free(model_dup); continue; } else "";
+            entries.append(gpa, agentdefs.Entry{
+                .name = name_copy,
+                .description = desc_dup,
+                .tools = tools,
+                .model = model_dup,
+                .effort = effort_dup,
+                .path = file_path,
+                .source = if (std.mem.eql(u8, root[0..], project_info.cwd())) "project" else "user",
+            }) catch { gpa.free(text); gpa.free(name_copy); gpa.free(desc_dup); if (model_dup.len > 0) gpa.free(model_dup); if (effort_dup.len > 0) gpa.free(effort_dup); continue; };
+            gpa.free(text);
+        }
+    }
+    agent_defs_cache = entries.toOwnedSlice(gpa) catch null;
+    return agent_defs_cache.?;
+}
+
+/// Resets the agent definitions cache (for config reload).
+pub fn resetAgentDefs() void {
+    agent_defs_cache = null;
+}
 
 /// Releases the AGENTS.md cache.
 ///
@@ -575,6 +680,8 @@ fn buildSystemPrompt(
     env: ?*const std.process.Environ.Map,
     include_skills: bool,
 ) []const u8 {
+    cache_break_last_block = null;
+    cache_break_last_pos = 0;
     const base = systemPromptBase(gpa);
 
     var list_buf: [16 * 1024]u8 = undefined;
@@ -637,6 +744,37 @@ fn buildSystemPrompt(
         const framed = outputstyles.formatStyle(s.name, s.description, body, &style_buf);
         style_block_len = framed.len;
     }
+    const style_block: []const u8 = if (style_entry) |s|
+        outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf)
+    else "";
+    const blocks = cachebreak.Blocks{
+        .base = effective_base,
+        .routing = routing,
+        .verification = verification_prompt,
+        .ask_guidance = ask.guidance,
+        .skills = section,
+        .location = location,
+        .mode_note = mode_note,
+        .style = style_block,
+    };
+    var hashes: [8]u64 = undefined;
+    for (&[_][]const u8{
+        blocks.base, blocks.routing, blocks.verification, blocks.ask_guidance,
+        blocks.skills, blocks.location, blocks.mode_note, blocks.style,
+    }, 0..) |block, i| {
+        hashes[i] = cachebreak.hashBlock(block);
+    }
+    if (cache_break_prev) |prev| {
+        const offs = cachebreak.blockOffsets(&blocks);
+        for (prev, 0..) |ph, i| {
+            if (ph != hashes[i]) {
+                cache_break_last_block = cachebreak.block_names[i];
+                cache_break_last_pos = offs[i];
+                break;
+            }
+        }
+    }
+    cache_break_prev = hashes;
     const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}", .{
         effective_base,
         routing,
@@ -5784,6 +5922,14 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // (read-only mode, the skill list), so it is synced AFTER the append.
     syncSystemPrompt(s);
 
+    // Phase 8: warn when the stable prefix broke (which block changed) or when
+    // the write rate suggests the prefix is unstable (writes_per_request > 0.5).
+    if (cache_break_last_block) |name| {
+        m.pushInfoFmt("prompt cache broke: {s} block changed at byte {d}", .{name, cache_break_last_pos});
+    } else if (cacheBreakUnstable()) {
+        m.pushInfo("prompt cache: writes per request above 0.5 — prefix may be unstable");
+    }
+
     // Phase 2.2: attach the skill listing ONCE per session, at the end of the
     // prompt, outside the cacheable system prefix. `syncSystemPrompt` above no
     // longer puts skills in the system message (they would bloat the stable
@@ -7437,11 +7583,42 @@ const subagentBadArgsText =
     "The `task` call needs a \"description\" (one line: what to find out) and may have a \"prompt\" (the full question). Nothing was searched. Do it yourself with grep/glob/read, or call `task` again with a description.";
 
 fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator) usize {
-    const task = subagent_mod.parseTask(arena, call.args_json) catch {
+    var task = subagent_mod.parseTask(arena, call.args_json) catch {
         m.pushToolDone("task", "malformed arguments", 0, subagentBadArgsText);
         s.appendToolResult(call.id, "task", subagentBadArgsText) catch {};
         return 1;
     };
+
+    // Phase 9: if the task names an agent definition, look it up and apply its
+    // tools/model/effort. The definition's tools must be read-only — a
+    // definition cannot escalate.
+    if (task.definition.len > 0) {
+        const defs = ensureAgentDefs(m.allocator, io_global, m.environ);
+        if (agentdefs.find(defs, task.definition)) |def| {
+            if (!agentdefs.toolsAreReadOnly(def.tools)) {
+                m.pushToolDone("task", "definition not accepted", 0, "agent definition names tools outside the read-only set");
+                s.appendToolResult(call.id, "task", "agent definition names tools outside the read-only set") catch {};
+                return 1;
+            }
+            if (def.tools.len > 0) {
+                var tools_json_buf: [512]u8 = undefined;
+                var w: std.Io.Writer = .fixed(&tools_json_buf);
+                w.writeByte('[') catch {};
+                for (def.tools, 0..) |t, j| {
+                    if (j > 0) w.writeByte(',') catch {};
+                    w.writeAll("\"") catch {};
+                    w.writeAll(t) catch {};
+                    w.writeAll("\"") catch {};
+                }
+                w.writeByte(']') catch {};
+                task.allowed_tools = w.buffered();
+            }
+            if (def.model.len > 0) task.model = def.model;
+            if (def.effort.len > 0) task.effort = def.effort;
+        } else {
+            m.pushInfoFmt("unknown agent definition '{s}', using defaults", .{task.definition});
+        }
+    }
 
     m.pushToolStart("task", task.description);
     _ = m.bench.subagents.fetchAdd(1, .seq_cst);

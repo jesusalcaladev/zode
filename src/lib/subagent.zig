@@ -290,6 +290,10 @@ pub const Task = struct {
     model: []const u8 = "",
     /// The skill's declared effort, or empty to use `low`.
     effort: []const u8 = "",
+    /// Name of an agent definition from `.zode/agents/` or
+    /// `~/.config/zode/agents/`. When set, the definition's tools/model/effort
+    /// override the defaults (the definition's tools must still be read-only).
+    definition: []const u8 = "",
 };
 
 pub const ParseError = error{
@@ -320,7 +324,12 @@ pub fn parseTask(arena: std.mem.Allocator, args_json: []const u8) ParseError!Tas
         if (v == .string) prompt = std.mem.trim(u8, v.string, " \t\r\n");
     }
 
-    return .{ .description = description, .prompt = prompt };
+    var definition: []const u8 = "";
+    if (obj.get("definition")) |v| {
+        if (v == .string) definition = std.mem.trim(u8, v.string, " \t\r\n");
+    }
+
+    return .{ .description = description, .prompt = prompt, .definition = definition };
 }
 
 /// What the subagent's final message becomes, for the main agent.

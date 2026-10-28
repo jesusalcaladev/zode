@@ -119,18 +119,18 @@ state, the open bug and the quality bar).
 
 `⚡ tokens · 🟡 · independent · pairs with /cache`
 
-- [ ] Compare the prefix actually sent with the previous one; warn when it broke and **which block**
-- [ ] Target signal: `writes_per_request > 0.5` in a long session = unstable prefix
-- [ ] Pure tests: a stable prefix reports no break · a change in the skills block reports the block and the position
+- [x] Compare the prefix actually sent with the previous one; warn when it broke and **which block** — **DONE 2026-10-28**: `src/lib/cachebreak.zig` (pure) with `Blocks`, `firstDiff`, `describeBreak`, `hashBlock`, `blockOffsets`; wired into `buildSystemPrompt` in `src/agent.zig` to track block hashes across calls; `cache_break_last_block` / `cache_break_last_pos` exposed for the warning; surfaced in `runOneTurn` after `syncSystemPrompt`.
+- [x] Target signal: `writes_per_request > 0.5` in a long session = unstable prefix — `cacheBreakUnstable()` in `src/agent.zig` reads `cache_stats.session.writesPerRequest()`.
+- [x] Pure tests: stable prefix reports no break · change in skills block reports block and position — 6 tests in `cachebreak.zig`.
 
 ## Phase 9 — Agent definitions on disk
 
 `✨ feature · 🟡 · independent · basis for 26`
 
-- [ ] `.zode/agents/*.md` frontmatter: `name`, `description`, `tools`, `model`, `effort`
-- [ ] A `task` call can name a definition; without one it uses the current defaults
-- [ ] Keep the existing safety floor: read-only tools, effort `low`, depth 1, 24k window
-- [ ] Pure tests: discovery with shadowing · an unknown definition falls back to the default · a definition's tool list must be a subset of the read-only set (a definition cannot escalate)
+- [x] `.zode/agents/*.md` frontmatter: `name`, `description`, `tools`, `model`, `effort` — **DONE 2026-10-28**
+- [x] A `task` call can name a definition; without one it uses the current defaults — **DONE 2026-10-28**: discovery from `.zode/agents/` (project, shadows) and `~/.config/zode/agents/` (user); unknown definition falls back to defaults with an info message.
+- [x] Keep the existing safety floor: read-only tools, effort `low`, depth 1, 24k window — **DONE 2026-10-28**: `toolsAreReadOnly` validates against `subagent.tool_names`; non-read-only definitions are skipped at discovery and refused at call time.
+- [x] Pure tests: discovery with shadowing · unknown definition falls back to the default · a definition's tool list must be a subset of the read-only set — **DONE 2026-10-28**: tests in `agentdefs.zig`.
 
 ---
 
