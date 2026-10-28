@@ -52,13 +52,20 @@ pub const Action = enum {
     deny,
     /// The call goes through without asking.
     allow,
-    /// The call asks, the way it asks without any rule.
+    /// The call does not ask the user: the model answers for itself.
+    /// A `dontAsk` rule means "do not open a dialog about this; the model
+    /// decides on its own". It is weaker than an explicit `allow` (the user
+    /// pre-approved it) and stronger than `ask` (the user would be asked).
+    dontAsk,
+    /// The call asks the user via the permission dialog.
     ask,
 
     pub fn parse(text: []const u8) ?Action {
         if (std.ascii.eqlIgnoreCase(text, "allow")) return .allow;
         if (std.ascii.eqlIgnoreCase(text, "deny")) return .deny;
         if (std.ascii.eqlIgnoreCase(text, "ask")) return .ask;
+        if (std.ascii.eqlIgnoreCase(text, "dontask") or std.ascii.eqlIgnoreCase(text, "dont_ask"))
+            return .dontAsk;
         return null;
     }
 
@@ -210,6 +217,7 @@ pub fn matches(rule: Rule, tool: []const u8, subject: []const u8) bool {
 /// 3. Otherwise the matching `ask` with the strongest source wins.
 pub fn decide(rules: []const Rule, tool: []const u8, subjects: []const []const u8) ?Decision {
     var best_allow: ?Decision = null;
+    var best_dont_ask: ?Decision = null;
     var best_ask: ?Decision = null;
 
     for (rules) |r| {
@@ -230,6 +238,11 @@ pub fn decide(rules: []const Rule, tool: []const u8, subjects: []const []const u
                     best_allow = d;
                 }
             },
+            .dontAsk => {
+                if (best_dont_ask == null or stronger(r.source, best_dont_ask.?.rule.source)) {
+                    best_dont_ask = d;
+                }
+            },
             .ask => {
                 if (best_ask == null or stronger(r.source, best_ask.?.rule.source)) {
                     best_ask = d;
@@ -237,7 +250,7 @@ pub fn decide(rules: []const Rule, tool: []const u8, subjects: []const []const u
             },
         }
     }
-    return best_allow orelse best_ask;
+    return best_allow orelse best_dont_ask orelse best_ask;
 }
 
 /// A decision and the rule behind it.
@@ -481,4 +494,98 @@ test "permrules: a line that does not parse does not cost the others" {
     try t.expectEqual(@as(usize, 2), rules.len);
     try t.expectEqualStrings("Write", rules[0].tool);
     try t.expectEqualStrings("Bash", rules[1].tool);
+}
+
+test "permrules: parses the dontAsk action" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const r = parseRule("Write(.git/**) dontask", .user, a).?;
+    try t.expectEqual(Action.dontAsk, r.action);
+    try t.expectEqualStrings("dontAsk", r.action.name());
+
+    // The underscore spelling also works.
+    const r2 = parseRule("Write(.git/**) dont_ask", .user, a).?;
+    try t.expectEqual(Action.dontAsk, r2.action);
+}
+
+test "permrules: dontAsk beats ask from a weaker source" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .ask, .source = .policy },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .user },
+    };
+    const d = decide(&rules, "Write", &.{".git/config"}).?;
+    try t.expectEqual(Action.dontAsk, d.action);
+    try t.expectEqual(Source.user, d.rule.source);
+}
+
+test "permrules: allow beats dontAsk from any source" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .user },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .allow, .source = .policy },
+    };
+    const d = decide(&rules, "Write", &.{".git/config"}).?;
+    try t.expectEqual(Action.allow, d.action);
+}
+
+test "permrules: deny beats dontAsk from any source" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .local },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .deny, .source = .policy },
+    };
+    const d = decide(&rules, "Write", &.{".git/config"}).?;
+    try t.expectEqual(Action.deny, d.action);
+}
+
+test "permrules: dontAsk from same source, last rule wins" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+
+    // dontAsk is a stronger category than ask: it wins regardless of order.
+    const same = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .ask, .source = .project },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .project },
+    };
+    const d = decide(&same, "Write", &.{".git/config"}).?;
+    try t.expectEqual(Action.dontAsk, d.action);
+
+    const same2 = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .project },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .ask, .source = .project },
+    };
+    const d2 = decide(&same2, "Write", &.{".git/config"}).?;
+    // dontAsk still wins: category precedence, not order.
+    try t.expectEqual(Action.dontAsk, d2.action);
+
+    // Two dontAsk rules of the same source: the first one wins (same as allow).
+    const same3 = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .project },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .project },
+    };
+    const d3 = decide(&same3, "Write", &.{".git/config"}).?;
+    try t.expectEqual(Action.dontAsk, d3.action);
+    try t.expectEqualStrings(".git/**", d3.rule.pattern);
+}
+
+test "permrules: dontAsk without ask means no dialog is needed" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+
+    // Only a dontAsk rule: the model answers for itself, so decide returns it
+    // instead of falling through to "no opinion" / ask.
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .dontAsk, .source = .project },
+    };
+    const d = decide(&rules, "Write", &.{".git/config"}).?;
+    try t.expectEqual(Action.dontAsk, d.action);
 }

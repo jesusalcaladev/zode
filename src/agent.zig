@@ -7910,6 +7910,12 @@ fn execOneCall(
             .allow => {
                 rule_allowed = true;
             },
+            .dontAsk => {
+                // dontAsk: no dialog, the model answers for itself. The call
+                // proceeds as if allowed, but the user did not pre-approve it
+                // — the model decided on its own.
+                rule_allowed = true;
+            },
             .deny => {
                 // The refusal NAMES the rule: "this is not allowed" is not an
                 // answer, "your own rule says so" is.
@@ -15708,6 +15714,39 @@ test "a rule that denies beats a rule that allows" {
     try std.testing.expectEqual(permrules.Action.deny, d.action);
     try std.testing.expectEqualStrings("project", d.rule.source.name());
 }
+
+test "a dontAsk rule means the model answers for itself, no dialog" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, ".zode");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".zode/permissions.json",
+        .data = "{\"rules\": [\"Write(.git/**) dontask\"]}",
+    });
+
+    var pbuf: [512]u8 = undefined;
+    const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
+    var fbuf: [640]u8 = undefined;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+
+    const saved = perm_rules;
+    defer perm_rules = saved;
+    loadPermRulesInto(arena_state.allocator(), io, path, null);
+
+    // dontAsk: no dialog is needed, the model decides on its own.
+    const d = permDecision("Write", &.{".git/config"}).?;
+    try std.testing.expectEqual(permrules.Action.dontAsk, d.action);
+    try std.testing.expectEqualStrings("project", d.rule.source.name());
+
+    // And it says nothing about anything else.
+    try std.testing.expect(permDecision("Write", &.{"src/main.zig"}) == null);
+}
+
 
 test "the 'always allow' suggestion names the rule it would remember" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

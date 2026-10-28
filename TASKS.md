@@ -592,7 +592,7 @@ permanent CPU cost for a decoration).
 - [ ] **34.10** The enforcement of a skill's `allowed_tools` / `model` / `effort` — **NOT COVERED**
   - Phase 1 put the three fields in the frontmatter; **nothing reads them**. A skill that says `allowed_tools: read` can still call `write`
 - [ ] **34.11** The conditional skills by path — **NOT COVERED** (a `paths:` field in the frontmatter)
-- [ ] **34.12** The `dontAsk` permission mode — **NOT COVERED** (a third state, not a bool: `ask` becomes "answer for yourself")
+- [x] **34.12** The `dontAsk` permission mode — **NOT COVERED** (a third state, not a bool: `ask` becomes "answer for yourself") — **DONE 2026-10-27**: Added `.dontAsk` to `permrules.Action` (parse: "dontask"/"dont_ask"); `decide()` tracks it separately with precedence deny > allow > dontAsk > ask; agent.zig sets `rule_allowed = true` for `.dontAsk` (no dialog, model self-authorizes). 7 pure tests (6 in permrules, 1 in agent).
 - [ ] **34.13** The circuit breaker keyed on **consecutive failures**, not on a budget — Phase 7 has the budget
 - [ ] **34.14** The `PermissionRequest` hook path for the headless runs
 - [ ] **34.15** The "the model was told to stop and did not" mechanism — the reference implementation's `Stop` hook is the user-written version of our exit gate
