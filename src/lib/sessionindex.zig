@@ -87,9 +87,22 @@ pub fn metaPath(arena: std.mem.Allocator, session_path: []const u8) ![]u8 {
 /// truncated JSON) is "no metadata", never an error: a session whose name
 /// cannot be read still has to appear in the list, with its path and its age.
 pub fn readMeta(arena: std.mem.Allocator, io: std.Io, session_path: []const u8) Meta {
-    const mp = metaPath(arena, session_path) catch return .{};
-    const data = std.Io.Dir.cwd().readFileAlloc(io, mp, arena, .limited(8 * 1024)) catch return .{};
-    return parseMeta(arena, data);
+    // Use a throwaway ArenaAllocator on page_allocator for all temporary
+    // allocations (meta path, file data, JSON tree). Everything that must
+    // outlive this function is copied into `arena` below.
+    var tmp_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer tmp_state.deinit();
+    const tmp = tmp_state.allocator();
+    const mp = metaPath(tmp, session_path) catch return .{};
+    const data = std.Io.Dir.cwd().readFileAlloc(io, mp, tmp, .limited(8 * 1024)) catch return .{};
+    const parsed = parseMeta(tmp, data);
+    var result = Meta{};
+    if (parsed.name.len > 0) result.name = arena.dupe(u8, parsed.name) catch "";
+    if (parsed.model.len > 0) result.model = arena.dupe(u8, parsed.model) catch "";
+    result.created_at = parsed.created_at;
+    if (parsed.custom_title.len > 0) result.custom_title = arena.dupe(u8, parsed.custom_title) catch "";
+    if (parsed.ai_title.len > 0) result.ai_title = arena.dupe(u8, parsed.ai_title) catch "";
+    return result;
 }
 
 /// The pure half of `readMeta`, so the parsing has a test that does not need a
@@ -128,7 +141,9 @@ pub fn parseMeta(arena: std.mem.Allocator, data: []const u8) Meta {
 /// is that the API should not make that mistake expressible.
 pub fn writeMeta(io: std.Io, arena: std.mem.Allocator, session_path: []const u8, meta: Meta) !void {
     const path = try metaPath(arena, session_path);
+    defer arena.free(path);
     const tmp = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
+    defer arena.free(tmp);
     var file = std.Io.Dir.cwd().createFile(io, tmp, .{
         .truncate = true,
         .permissions = sessionpath.session_mode,

@@ -389,12 +389,13 @@ pub const Session = struct {
 
     fn persistUsageSnapshot(self: *Session) !void {
         const file_writer = &(self.fw orelse return).interface;
+        var buffer: [512]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buffer);
         const json = try std.json.Stringify.valueAlloc(
-            self.allocator,
+            fba.allocator(),
             .{ .event = "usage", .stats = self.usage_stats },
             .{},
         );
-        defer self.allocator.free(json);
         try file_writer.writeAll(json);
         try file_writer.writeByte('\n');
         try file_writer.flush();
@@ -604,10 +605,8 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
 }
 
 fn parseUsageSnapshot(gpa: std.mem.Allocator, line: []const u8) ?cache_stats.CacheStats {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return null;
+    _ = gpa;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, line, .{}) catch return null;
     if (parsed != .object) return null;
     const event = parsed.object.get("event") orelse return null;
     const stats_value = parsed.object.get("stats") orelse return null;
@@ -640,11 +639,9 @@ fn getUsize(obj: std.json.ObjectMap, key: []const u8) ?usize {
 }
 
 fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Message {
-    // Arena ONLY for the JSON tree; the returned data is copied into the gpa.
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
+    // JSON tree parsing uses a FixedBufferAllocator with a stack buffer;
+    // the returned data is copied into the gpa.
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, line, .{});
     if (parsed != .object) return error.Bad;
     const obj = parsed.object;
     const role_str = obj.get("role") orelse return error.Bad;
