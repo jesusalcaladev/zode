@@ -61,6 +61,31 @@ pub fn allowsTool(name: []const u8) bool {
     return false;
 }
 
+/// Validates a forked skill's declared `allowed_tools` JSON array: every named
+/// tool must be in the subagent's read-only set (`tool_names`). A skill cannot
+/// escalate beyond read-only tools.
+///
+/// Returns the validated tool names (slices into `allowed_json`, which the
+/// caller must keep alive for the duration of the run) or an error. An empty
+/// array is valid and means "use the default read-only set" — but that case is
+/// handled by the caller before calling this.
+pub fn skillAllowedTools(arena: std.mem.Allocator, allowed_json: []const u8) !std.ArrayList([]const u8) {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, allowed_json, .{}) catch return error.InvalidAllowedTools;
+    if (root != .array) return error.InvalidAllowedTools;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (root.array.items) |v| {
+        if (v != .string) return error.InvalidAllowedTools;
+        const name = v.string;
+        var ok = false;
+        for (tool_names) |tn| {
+            if (std.mem.eql(u8, tn, name)) { ok = true; break; }
+        }
+        if (!ok) return error.ToolNotReadOnly;
+        try out.append(arena, name);
+    }
+    return out;
+}
+
 /// Iterations a subagent gets. Lower than the main loop on purpose: a search
 /// that needs 10 steps is a search that should have been two greps.
 pub const max_iterations = 8;
@@ -257,11 +282,24 @@ pub const Task = struct {
     description: []const u8,
     /// Longer instructions, if the caller has any.
     prompt: []const u8 = "",
+    /// A forked skill's declared `allowed_tools` (JSON array). Each named tool
+    /// must be read-only: a skill cannot escalate beyond the subagent's
+    /// read-only set. Empty = the default read-only set.
+    allowed_tools: []const u8 = "",
+    /// The skill's declared model, or empty to use the default subagent target.
+    model: []const u8 = "",
+    /// The skill's declared effort, or empty to use `low`.
+    effort: []const u8 = "",
 };
 
 pub const ParseError = error{
     OutOfMemory,
     BadDescription,
+    /// The skill's `allowed_tools` was not a JSON array of strings.
+    InvalidAllowedTools,
+    /// The skill's `allowed_tools` named a tool outside the read-only set: a
+    /// skill cannot escalate.
+    ToolNotReadOnly,
 };
 
 /// Reads the `task` arguments.
@@ -386,6 +424,55 @@ test "allowsTool: read-only only, and `ask` left out on purpose" {
     // `ask` is the reason this list exists: a subagent that asks from a thread
     // that is not the turn's leaves the user not knowing who is asking.
     try std.testing.expect(!allowsTool("ask"));
+}
+
+test "skillAllowedTools: a read-only list passes through" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const allowed = try skillAllowedTools(a, "[\"read\", \"grep\", \"glob\"]");
+    try std.testing.expectEqual(@as(usize, 3), allowed.items.len);
+    try std.testing.expectEqualStrings("read", allowed.items[0]);
+    try std.testing.expectEqualStrings("grep", allowed.items[1]);
+    try std.testing.expectEqualStrings("glob", allowed.items[2]);
+}
+
+test "skillAllowedTools: an empty list is valid" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const allowed = try skillAllowedTools(a, "[]");
+    try std.testing.expectEqual(@as(usize, 0), allowed.items.len);
+}
+
+test "skillAllowedTools: a non-read-only tool refuses the run" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // `write` is not in the subagent's read-only set: the skill cannot escalate.
+    const err = skillAllowedTools(a, "[\"read\", \"write\"]") catch |err| err;
+    try std.testing.expectEqual(subagent.ParseError.ToolNotReadOnly, err);
+}
+
+test "skillAllowedTools: a non-array is invalid" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const err = skillAllowedTools(a, "\"read\"") catch |err| err;
+    try std.testing.expectEqual(subagent.ParseError.InvalidAllowedTools, err);
+}
+
+test "skillAllowedTools: malformed JSON is invalid" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const err = skillAllowedTools(a, "[\"read\",") catch |err| err;
+    try std.testing.expectEqual(subagent.ParseError.InvalidAllowedTools, err);
 }
 
 test "filterTools: keeps the read ones and drops the rest" {

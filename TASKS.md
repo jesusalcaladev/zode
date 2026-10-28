@@ -589,8 +589,7 @@ permanent CPU cost for a decoration).
   - The reference implementation: the agent tool can run a whole agent in the background; Phase 10 is about `bgproc`
   - [ ] `run_in_background: bool` on the `task` tool, and a **notification to the model** when it lands
 - [ ] **34.9** The atomic task claiming — **NOT COVERED** (the reference implementation has a `claim` operation): three parallel agents must not take the same task
-- [ ] **34.10** The enforcement of a skill's `allowed_tools` / `model` / `effort` — **NOT COVERED**
-  - Phase 1 put the three fields in the frontmatter; **nothing reads them**. A skill that says `allowed_tools: read` can still call `write`
+- [x] **34.10** The enforcement of a skill's `allowed_tools` / `model` / `effort` — **NOT COVERED** — **DONE 2026-10-27**: Carried the three frontmatter fields into `skills.Entry` and `skillstore.scan()`; `subagent.skillAllowedTools()` validates a forked skill's `allowed_tools` against the read-only set (a skill naming `write`/`edit`/`bash` is refused — cannot escalate); `agent.zig` skillCall passes `allowed_tools`/`model`/`effort` into `runSubagent`, which builds the tool list from them, resolves the skill's model, and clamps its effort to the model's ladder. 5 pure tests in subagent.zig + 1 scan carry-over test in skillstore.zig.
 - [ ] **34.11** The conditional skills by path — **NOT COVERED** (a `paths:` field in the frontmatter)
 - [x] **34.12** The `dontAsk` permission mode — **NOT COVERED** (a third state, not a bool: `ask` becomes "answer for yourself") — **DONE 2026-10-27**: Added `.dontAsk` to `permrules.Action` (parse: "dontask"/"dont_ask"); `decide()` tracks it separately with precedence deny > allow > dontAsk > ask; agent.zig sets `rule_allowed = true` for `.dontAsk` (no dialog, model self-authorizes). 7 pure tests (6 in permrules, 1 in agent).
 - [ ] **34.13** The circuit breaker keyed on **consecutive failures**, not on a budget — Phase 7 has the budget

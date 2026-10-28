@@ -472,6 +472,9 @@ fn freeSkillsCacheLocked() void {
             gpa.free(e.description);
             gpa.free(e.path);
             if (e.when_to_use.len > 0) gpa.free(e.when_to_use);
+            if (e.allowed_tools.len > 0) gpa.free(e.allowed_tools);
+            if (e.model.len > 0) gpa.free(e.model);
+            if (e.effort.len > 0) gpa.free(e.effort);
         }
         if (list.len > 0) gpa.free(list);
         skills_cache = null;
@@ -6937,9 +6940,14 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call) usize {
     // message list is unchanged.
     if (entry.context == .fork) {
         var rep = subagent_mod.Report{};
+        // Phase 34.10: enforce the skill's declared allowed_tools / model /
+        // effort. allowed_tools must be read-only — a skill cannot escalate.
         const task = subagent_mod.Task{
             .description = entry.name,
             .prompt = text,
+            .allowed_tools = entry.allowed_tools,
+            .model = entry.model,
+            .effort = entry.effort,
         };
         const report = runSubagent(m, task, &rep);
         m.pushToolDone("skill", entry.name, 0, report);
@@ -7337,6 +7345,11 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     // call — the `Report` belongs to the caller. Everything that belongs to the subagent
     // and nobody else goes through `sarena` below, which is why that arena exists.
     const gpa = m.allocator;
+    // The subagent's throwaway arena: its history, the validated tool list and
+    // any notes all die here when the run ends.
+    var sstate = std.heap.ArenaAllocator.init(gpa);
+    defer sstate.deinit();
+    const sarena = sstate.allocator();
 
     // Permission: a subagent spends the user's tokens and reads the whole repo.
     // `task` IS in `needsPermission`, so the dialog has already been shown by
@@ -7346,6 +7359,24 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     // will run on, or why the pick was not usable — goes into the Report HERE,
     // because this is the last moment that knows before the first request.
     var on_submodel = applySubmodel(m, &pick, rep);
+    // A forked skill's declared model: run the subagent on it. When the
+    // developer overrode the subagent model with /submodel, that override wins.
+    if (task.model.len > 0 and !on_submodel) {
+        var reason_buf: [400]u8 = undefined;
+        const sp: SubPick = .{ .provider = "", .model = task.model, .source = "skill" };
+        switch (submodelTarget(m, sp, &reason_buf)) {
+            .ok => |t| pick = t,
+            .why => |why_not| {
+                var nbuf: [440]u8 = undefined;
+                const note = std.fmt.bufPrint(
+                    &nbuf,
+                    "[subagent note: the skill's model {s} was not used ({s}). Running on the default target.]",
+                    .{ task.model, why_not },
+                ) catch "[subagent note: the skill's model was not used.]";
+                rep.setNote(note);
+            },
+        }
+    }
 
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
@@ -7354,7 +7385,30 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     var w: std.Io.Writer = .fixed(&json_buf);
     w.writeByte('[') catch return subagent_mod.refused("no memory for the tool list", rep);
     var kept: usize = 0;
-    for (subagent_mod.tool_names) |tn| {
+    var tool_list: []const []const u8 = undefined;
+    if (task.allowed_tools.len > 0) {
+        // A forked skill's declared `allowed_tools`: every named tool must be
+        // read-only — a skill cannot escalate to `write`/`edit`/`bash`. The
+        // validation note (and any refusal) goes into the Report.
+        const allowed = subagent_mod.skillAllowedTools(sarena, task.allowed_tools) catch |err| {
+            var nbuf: [440]u8 = undefined;
+            var note_text: []const u8 = "[subagent note: the skill's allowed_tools was not valid.]";
+            if (err == subagent_mod.ParseError.ToolNotReadOnly) {
+                const n = std.fmt.bufPrint(
+                    &nbuf,
+                    "[subagent note: the skill asked for tools outside the read-only set, so it cannot run.]",
+                    .{}
+                ) catch "[subagent note: the skill's tools were not accepted.]";
+                note_text = n;
+            }
+            rep.setNote(note_text);
+            return subagent_mod.refused("the skill's tools were not accepted", rep);
+        };
+        tool_list = allowed.items;
+    } else {
+        tool_list = &subagent_mod.tool_names;
+    }
+    for (tool_list) |tn| {
         // Reuse the MAIN schemas verbatim: a second hand-written copy of `read`'s
         // schema is a second thing to keep correct, and the day they diverge the
         // subagent calls a tool with arguments the main loop would not accept.
@@ -7386,9 +7440,6 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     // reclaims all of it is the same argument that keeps the subagent out of the main
     // context. What crosses the boundary is the REPORT, and `formatReport` already
     // copies it into the caller's fixed buffer.
-    var sstate = std.heap.ArenaAllocator.init(gpa);
-    defer sstate.deinit();
-    const sarena = sstate.allocator();
 
     var msgs: std.ArrayList(chat.ChatMessage) = .empty;
     var tstate = SubTurn{ .m = m };
@@ -7427,6 +7478,10 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     // a shared counter would be one subagent's 429 resetting another's budget.
     var sub_attempt: usize = 0;
     var sub_retries: usize = 0;
+    // The skill's declared effort, clamped to what the model actually accepts
+    // on each request (the model fallback can swap the target mid-subagent).
+    var effort_pref: chat.Effort = .low;
+    if (task.effort.len > 0) effort_pref = chat.Effort.parse(task.effort) orelse .low;
     while (iteration < subagent_mod.max_iterations) : (iteration += 1) {
         // Budget enforcement on the SUBCOMPACTED view: the subagent's window is
         // small by design, and letting it grow past `budget_tokens` would mean
@@ -7446,10 +7501,9 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             &body_buf,
             pick.model,
             comp.msgs,
-            // LOW effort, always: this is a bounded search, not a design, and
-            // there is nobody to impress. This is where most of the money is
-            // saved and no quality is lost.
-            .low,
+            // The skill's declared effort, clamped to the model's ladder:
+            // `low` by default, honoured only where the model offers it.
+            chat.effectiveEffort(pick.model, effort_pref),
             tools_json,
             pick.kind,
             outputCapFor(pick.def, environ_global),

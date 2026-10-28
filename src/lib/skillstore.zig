@@ -205,6 +205,33 @@ pub const Loader = struct {
                     continue;
                 };
                 errdefer self.gpa.free(when_copy);
+                const allowed_copy = self.gpa.dupe(u8, meta.allowed_tools) catch {
+                    self.gpa.free(name_copy);
+                    self.gpa.free(desc_copy);
+                    self.gpa.free(path_copy);
+                    self.gpa.free(when_copy);
+                    continue;
+                };
+                errdefer self.gpa.free(allowed_copy);
+                const model_copy = self.gpa.dupe(u8, meta.model) catch {
+                    self.gpa.free(name_copy);
+                    self.gpa.free(desc_copy);
+                    self.gpa.free(path_copy);
+                    self.gpa.free(when_copy);
+                    self.gpa.free(allowed_copy);
+                    continue;
+                };
+                errdefer self.gpa.free(model_copy);
+                const effort_copy = self.gpa.dupe(u8, meta.effort) catch {
+                    self.gpa.free(name_copy);
+                    self.gpa.free(desc_copy);
+                    self.gpa.free(path_copy);
+                    self.gpa.free(when_copy);
+                    self.gpa.free(allowed_copy);
+                    self.gpa.free(model_copy);
+                    continue;
+                };
+                errdefer self.gpa.free(effort_copy);
                 const source = self.sourceForRoot(root_idx);
                 out[n] = .{
                     .name = name_copy,
@@ -214,6 +241,9 @@ pub const Loader = struct {
                     .source = source,
                     .context = meta.context,
                     .when_to_use = when_copy,
+                    .allowed_tools = allowed_copy,
+                    .model = model_copy,
+                    .effort = effort_copy,
                 };
                 n += 1;
             }
@@ -251,6 +281,33 @@ pub const Loader = struct {
                 continue;
             };
             errdefer self.gpa.free(when_copy);
+            const allowed_copy = self.gpa.dupe(u8, bs.allowed_tools) catch {
+                self.gpa.free(name_copy);
+                self.gpa.free(desc_copy);
+                self.gpa.free(path_copy);
+                self.gpa.free(when_copy);
+                continue;
+            };
+            errdefer self.gpa.free(allowed_copy);
+            const model_copy = self.gpa.dupe(u8, bs.model) catch {
+                self.gpa.free(name_copy);
+                self.gpa.free(desc_copy);
+                self.gpa.free(path_copy);
+                self.gpa.free(when_copy);
+                self.gpa.free(allowed_copy);
+                continue;
+            };
+            errdefer self.gpa.free(model_copy);
+            const effort_copy = self.gpa.dupe(u8, bs.effort) catch {
+                self.gpa.free(name_copy);
+                self.gpa.free(desc_copy);
+                self.gpa.free(path_copy);
+                self.gpa.free(when_copy);
+                self.gpa.free(allowed_copy);
+                self.gpa.free(model_copy);
+                continue;
+            };
+            errdefer self.gpa.free(effort_copy);
             out[n] = .{
                 .name = name_copy,
                 .description = desc_copy,
@@ -262,6 +319,9 @@ pub const Loader = struct {
                 .source = .bundled,
                 .context = bs.context,
                 .when_to_use = when_copy,
+                .allowed_tools = allowed_copy,
+                .model = model_copy,
+                .effort = effort_copy,
             };
             n += 1;
         }
@@ -571,8 +631,57 @@ test "scan: finds a skill from the PROJECT and reads its frontmatter" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
     try std.testing.expect(found_pty);
+}
+
+test "scan: carries allowed_tools, model and effort into the Entry" {
+    var gpa_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+
+    var root_buf: [256]u8 = undefined;
+    const root = try tmpRoot(&root_buf);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try writeFixture(root, ".zode/skills/carry-tools/SKILL.md",
+        \\---
+        \\name: carry-tools
+        \\description: a skill that declares constraints
+        \\allowed_tools: ["read", "grep"]
+        \\model: kimi-k2.6
+        \\effort: medium
+        \\---
+        \\# body
+        \\
+    );
+
+    var loader = store.Loader.init(gpa, std.testing.io, null);
+    loader.project_dir = try skillRootOf(gpa, root, ".zode/skills");
+    var buf: [16]skills.Entry = undefined;
+    const found = loader.scan(&buf, buf.len);
+
+    // 1 project skill + 5 bundled skills
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+    var found_carry = false;
+    for (found) |e| {
+        if (std.mem.eql(u8, e.name, "carry-tools")) {
+            found_carry = true;
+            try std.testing.expectEqualStrings("[\"read\", \"grep\"]", e.allowed_tools);
+            try std.testing.expectEqualStrings("kimi-k2.6", e.model);
+            try std.testing.expectEqualStrings("medium", e.effort);
+        }
+        gpa.free(e.name);
+        gpa.free(e.description);
+        gpa.free(e.path);
+        gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
+    }
+    try std.testing.expect(found_carry);
 }
 
 test "scan: the PROJECT shadows the user's one with the same name (they do not merge)" {
@@ -624,6 +733,9 @@ test "scan: the PROJECT shadows the user's one with the same name (they do not m
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
     try std.testing.expect(found_mine);
 }
@@ -668,6 +780,9 @@ test "scan: ignores loose files, dotted directories and impossible names" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
     try std.testing.expect(found_bueno);
 }
@@ -722,6 +837,9 @@ test "load: the body arrives framed and WITHOUT the frontmatter" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
 }
 
@@ -765,6 +883,9 @@ test "load: a skill without frontmatter works too (it is markdown and a dot)" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
 }
 
@@ -864,6 +985,9 @@ test "scan: .agents/skills is read too, and .zode wins when both are present" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
     try std.testing.expect(found_shared);
     try std.testing.expect(found_solo);
@@ -907,6 +1031,9 @@ test "scan: bundled skills are appended and can be shadowed" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
     try std.testing.expect(found_simplify);
 }
@@ -995,6 +1122,9 @@ test "loadWithArgs: substitutes $ARGUMENTS in bundled skills" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
 }
 
@@ -1051,6 +1181,9 @@ test "scan: a directory that does not exist is not an error (0 skills, no noise)
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
 }
 
@@ -1086,5 +1219,8 @@ test "scan: respects the entry cap (it does not grow without limit)" {
         gpa.free(e.description);
         gpa.free(e.path);
         gpa.free(e.when_to_use);
+        gpa.free(e.allowed_tools);
+        gpa.free(e.model);
+        gpa.free(e.effort);
     }
 }

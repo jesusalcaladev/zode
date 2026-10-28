@@ -265,6 +265,14 @@ pub const Entry = struct {
     context: Context = .inline_mode,
     /// Detailed "when to use" for the listing.
     when_to_use: []const u8 = "",
+    /// The skill's declared `allowed_tools` (JSON array of tool names). A forked
+    /// skill may only use these, and only if they are read-only: a skill cannot
+    /// escalate beyond the subagent's read-only set. Empty = the default set.
+    allowed_tools: []const u8 = "",
+    /// The skill's declared model, or empty to use the default subagent target.
+    model: []const u8 = "",
+    /// The skill's declared effort, or empty to use `low`.
+    effort: []const u8 = "",
 };
 
 /// Text for the `skill` tool: the body, framed so the model knows what it has.
