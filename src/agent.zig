@@ -8024,6 +8024,13 @@ fn execOneCall(
             const with_why = std.fmt.bufPrint(&both, "{s} — {s}", .{ detail, why }) catch detail;
             detail = with_why;
         }
+        // Name the rule the "always allow" answer would remember, so the user
+        // answers with their eyes open ("always allow `Bash(git *)`", not a
+        // blind "always allow"). learnRuleForCall re-derives this from the
+        // call itself; here we only tell the dialog what to show.
+        if (permSuggestion(call.name, call.args_json, arena)) |sugg| {
+            m.setPermSuggestion(sugg);
+        }
         switch (m.requestPermission(call.name, detail)) {
             .allow => {},
             .allow_always => {
@@ -15752,6 +15759,26 @@ test "the suggestion is a rule the parser understands" {
     try std.testing.expectEqualStrings("Bash", rule.tool);
     try std.testing.expectEqualStrings("npm *", rule.pattern);
     try std.testing.expectEqual(permrules.Action.allow, rule.action);
+}
+
+test "an always-allow suggestion scopes to the tool and pattern, not a flat name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // "always allow write(src/main.zig)" must not become "always allow write"
+    // (which would cover every file the tool ever touches).
+    const text = permSuggestion("write", "{\"path\":\"src/main.zig\"}", a).?;
+    try std.testing.expectEqualStrings("write(src/main.zig) allow", text);
+    const rule = permrules.parseRule(text, .local, a).?;
+    try std.testing.expectEqualStrings("write", rule.tool);
+    try std.testing.expectEqualStrings("src/main.zig", rule.pattern);
+    try std.testing.expectEqual(permrules.Action.allow, rule.action);
+    try std.testing.expect(permrules.matches(rule, "write", "src/main.zig"));
+    // The same tool on a different path is NOT covered.
+    try std.testing.expect(!permrules.matches(rule, "write", "src/other.zig"));
+    // A different tool is NOT covered either.
+    try std.testing.expect(!permrules.matches(rule, "edit", "src/main.zig"));
 }
 
 test "a command that only reads is not a write, and the plan mode lets it run" {

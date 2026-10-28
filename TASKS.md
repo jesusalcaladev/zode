@@ -561,7 +561,7 @@ permanent CPU cost for a decoration).
   - [x] The multi-file form of `edit` (`files: [{path,…}]`) is in the permission detail AND in the risky-path question: the dialog used to name NO file for a call that touches eight
   - [x] **The path it RESOLVES to is checked too** (2026-10-21): a symlink with an innocent name (`ln -s .git/hooks hooks`) is a path whose NAME says nothing and whose TARGET is exactly what the rule protects. The resolver is component by component and in PURE ZIG (`readLink`), not `realpath(3)`: this project has no libc dependency
   - [x] The `Tool(pattern)` grammar — **DONE 2026-10-21**: `src/lib/permrules.zig` (pure) parses `Tool(pattern) action` (`allow` / `deny` / `ask`, the action optional and defaulting to `allow`), matches the pattern as a glob over the thing the call acts on (the PATH for a file tool, the COMMAND for `bash`), and decides by precedence. The rules live in `.zode/permissions.json` (the project) and `~/.config/zode/permissions.json` (the user), and `/permissions` prints them
-  - [ ] The "always allow" answer still remembers the TOOL and not a pattern: "always allow `Bash(git *)`" is the rule the user would want, and the flat list is a coarser answer
+  - [x] The "always allow" answer still remembers the TOOL and not a pattern: "always allow `Bash(git *)`" is the rule the user would want, and the flat list is a coarser answer
 - [ ] **34.2** The **frozen decision** of the result cap — **NOT COVERED**
   - The reference implementation: the cap layer keeps a **frozen decision** — a cut is re-applied verbatim on every later turn instead of being recomputed — and it rebuilds that state from the transcript on resume
   - Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call
