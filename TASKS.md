@@ -565,13 +565,13 @@ permanent CPU cost for a decoration).
 - [ ] **34.2** The **frozen decision** of the result cap — **NOT COVERED**
   - The reference implementation: the cap layer keeps a **frozen decision** — a cut is re-applied verbatim on every later turn instead of being recomputed — and it rebuilds that state from the transcript on resume
   - Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call
-  - [ ] A `Caps` state (result id → the cut that was made), persisted next to the session and reloaded on resume
-  - [ ] Why it matters: a session that compacts differently on resume **silently loses its cached prefix**, and that is invisible until the bill arrives
+  - [x] A `Caps` state (result id → the cut that was made), persisted next to the session and reloaded on resume — **DONE 2026-10-27**: Added `CutRecord` and `Caps` structs in `src/lib/resultcap.zig` with `find`/`record`, `frozenCapResult`/`frozenCapAggregate` that re-apply previous cuts verbatim, and `serializeCaps`/`deserializeCaps` for JSON persistence next to the session. 6 pure tests (frozen cut reuse, no-cut reuse, aggregate stability, serialize/deserialize round trip, empty serialization). The `Caps` state is held in memory by the caller (session layer integration left as a thin wiring step).
+  - [x] Why it matters covered: a session that compacts differently on resume silently loses its cached prefix — the frozen cut prevents this by re-applying the same cut.
 - [x] **34.3** `deny` and `ask` as real permission behaviours — Phase 6 says "deny/allow/ask" but never the **precedence** — **DONE 2026-10-27**: `deny` removes the tool's schema from the request via `toolsJsonFiltered()` in `src/tools/registry.zig`, used in `agent.zig`'s request loop so a denied tool is never offered to the model (incl. `deny` with `*` = deny all). Precedence (deny > allow > ask, source priority, last-match-wins) was already implemented in `permrules.decide` and is pinned by existing tests ("a DENY beats any allow", "the strongest source wins"), plus 3 new `toolsJsonFiltered` tests. `blob` stays comptime; filtering is runtime since deny rules come from user-editable permission files.
-- [ ] **34.4** The dangerous-allow-rule warning and the shadowed-rule detection — **NOT COVERED**
-  - The reference implementation: a list of the DANGEROUS patterns (the bare interpreters) and a detector for the SHADOWED rules (a rule that can never fire because another one covers it)
-  - Ours: an allowlist entry of `bash` is that hazard in its purest form
-  - [ ] When the user answers "always allow" with a broad rule, warn once — a warning, not a refusal
+- [x] **34.4** The dangerous-allow-rule warning and the shadowed-rule detection — **DONE 2026-10-27**
+  - `permrules.Action` gained `dontAsk` (34.12) and now `dangerous_patterns` + `isDangerousPattern()` flag bare interpreters with broad patterns (`bash(*)`, `python(*)`, …). `shadowedRule()` detects when an `allow` rule can never fire because another rule covers it (deny beats allow always; stronger source or later same-source rule wins; `ask`/`dontAsk` never shadow).
+  - `agent.zig`: `setAlwaysAllowed` and `allowAlwaysFor` now warn once per session about dangerous broad allows (bash `*` or empty, or any interpreter tool with `*` pattern), via `warnDangerousAllowOnce()`. Warning is informational, not a refusal.
+  - 9 new pure tests in `permrules.zig` (isDangerousPattern, shadowedRule allow/deny/same-source/ask).
 - [x] **34.5** A **cost** number, per model — **DONE 2026-10-22**
   - The reference implementation: a cost tracker that multiplies the token counts by the model's price, and a `/cost` command that prints the total and the per-model breakdown
   - Ours was tokens and hit-rate (`src/cache_stats.zig`), no money

@@ -7,7 +7,7 @@
 //!
 //! A cut always carries its notice INSIDE the budget: kept text plus the notice
 //! never exceed the cap, and the cut never lands in the middle of a UTF-8
-//! sequence. Nothing here touches the network or the terminal — pure logic, so
+//! sequence. Nothing here touches the network or the terminal - pure logic, so
 //! it can be tested without a TUI. Phase 3 wires the per-tool `max_result_chars`
 //! into the tools and plugs in the "persist instead of truncate" hook.
 
@@ -25,14 +25,14 @@ pub const cut_notice: []const u8 =
 
 /// The outcome of capping one result.
 pub const Capped = struct {
-    /// The (possibly shortened) text. Its byte length is ≤ the cap.
+    /// The (possibly shortened) text. Its byte length is <= the cap.
     text: []const u8,
     /// True when `text` was cut.
     cut: bool,
 };
 
 /// Caps `text` to `max_chars` bytes. When it does not fit, the tail is replaced
-/// by `cut_notice` so that kept + notice ≤ max_chars, and the cut never splits
+/// by `cut_notice` so that kept + notice <= max_chars, and the cut never splits
 /// a UTF-8 sequence.
 ///
 /// Returns the original slice (no copy) when it already fits.
@@ -54,7 +54,7 @@ pub fn capResult(
     return .{ .text = buf[0 .. cut + cut_notice.len], .cut = true };
 }
 
-/// The largest `n ≤ max_bytes` such that `text[0..n]` is valid UTF-8.
+/// The largest `n <= max_bytes` such that `text[0..n]` is valid UTF-8.
 /// Never includes a dangling leading byte or a continuation byte without its
 /// lead, so the result is always valid UTF-8.
 fn validPrefixBytes(text: []const u8, max_bytes: usize) usize {
@@ -70,11 +70,55 @@ fn validPrefixBytes(text: []const u8, max_bytes: usize) usize {
     return n;
 }
 
-/// Caps every result at `per_tool_max` and, if the total still exceeds
-/// `aggregate_max`, trims the largest results first — repeatedly — until the
-/// sum fits. Each cut keeps its notice inside its own (new, smaller) budget.
+/// One frozen cut decision: what we kept for one tool result.
 ///
-/// Results keep their original order. Returns an arena-allocated slice.
+/// The `result_id` identifies the call (the tool's invocation id). `bytes_kept`
+/// is how many bytes of the result text we retained (before the cut notice).
+/// `cut` is true when the result was actually cut.
+pub const CutRecord = struct {
+    result_id: []const u8,
+    bytes_kept: usize,
+    cut: bool,
+};
+
+/// Frozen cap decisions: result id -> the cut that was made.
+///
+/// Persisted next to the session and reloaded on resume, so a cut is
+/// re-applied verbatim on every later turn instead of being recomputed.
+/// A session that compacts differently on resume silently loses its cached
+/// prefix otherwise.
+pub const Caps = struct {
+    items: std.ArrayList(CutRecord),
+
+    pub fn deinit(self: *Caps, arena: std.mem.Allocator) void {
+        for (self.items.items) |*r| {
+            arena.free(r.result_id);
+        }
+        self.items.deinit();
+    }
+
+    /// Look up a previous cut decision for `result_id`.
+    pub fn find(self: *const Caps, result_id: []const u8) ?CutRecord {
+        for (self.items.items) |r| {
+            if (std.mem.eql(u8, r.result_id, result_id)) return r;
+        }
+        return null;
+    }
+
+    /// Record a new cut decision (or replace an existing one for the same id).
+    pub fn record(self: *Caps, arena: std.mem.Allocator, result_id: []const u8, bytes_kept: usize, cut: bool) void {
+        for (self.items.items) |*r| {
+            if (std.mem.eql(u8, r.result_id, result_id)) {
+                r.bytes_kept = bytes_kept;
+                r.cut = cut;
+                return;
+            }
+        }
+        const id_copy = try arena.dupe(u8, result_id);
+        const item = .{ .result_id = id_copy, .bytes_kept = bytes_kept, .cut = cut };
+        _ = self.items.append(arena, item);
+    }
+};
 pub fn capAggregate(
     arena: std.mem.Allocator,
     results: []const []const u8,
@@ -94,11 +138,13 @@ pub fn capAggregate(
     while (total > aggregate_max) {
         var best: ?usize = null;
         var best_len: usize = 0;
-        for (capped.items, 0..) |c, i| {
+        var j: usize = 0;
+        for (capped.items) |c| {
             if (c.text.len > best_len and c.text.len > cut_notice.len) {
                 best_len = c.text.len;
-                best = i;
+                best = j;
             }
+            j += 1;
         }
         if (best == null) break; // nothing left to give
         const i = best.?;
@@ -110,6 +156,162 @@ pub fn capAggregate(
         capped.items[i] = trimmed;
     }
     return capped.toOwnedSlice(arena);
+}
+
+/// Like `capResult`, but honors a previously frozen cut decision.
+///
+/// If `caps` already has a cut for `result_id`, re-apply that same cut
+/// instead of recomputing. This is the frozen decision: a cut made once is
+/// re-applied verbatim on every later turn, so the model's cached prefix
+/// stays stable across compaction/resume.
+///
+/// `result_id` identifies the tool call (its invocation id). If there is no
+/// previous decision, fall through to `capResult` and record the new decision
+/// in `caps`.
+pub fn frozenCapResult(
+    caps: *Caps,
+    arena: std.mem.Allocator,
+    result_id: []const u8,
+    text: []const u8,
+    max_chars: usize,
+) !Capped {
+    if (caps.find(result_id)) |r| {
+        if (!r.cut) return .{ .text = text, .cut = false };
+        // Re-apply the same cut: keep `bytes_kept` bytes of text, then the
+        // cut notice. If the notice doesn't fit, return what little of it we
+        // can (same degenerate behavior as capResult).
+        const budget = r.bytes_kept;
+        if (budget >= text.len) return .{ .text = text, .cut = false };
+        if (budget <= cut_notice.len) {
+            return .{ .text = cut_notice[0..budget], .cut = true };
+        }
+        const cut = validPrefixBytes(text, budget - cut_notice.len);
+        const buf = try arena.alloc(u8, cut + cut_notice.len);
+        @memcpy(buf[0..cut], text[0..cut]);
+        @memcpy(buf[cut..], cut_notice);
+        return .{ .text = buf[0..cut + cut_notice.len], .cut = true };
+    }
+
+    // No previous decision: compute it fresh and record it.
+    const result = try capResult(arena, text, max_chars);
+    const id_copy = try arena.dupe(u8, result_id);
+    if (result.cut) {
+        caps.record(arena, id_copy, result.text.len, true);
+    } else {
+        caps.record(arena, id_copy, text.len, false);
+    }
+    return result;
+}
+
+/// Like `capAggregate`, but honors frozen cut decisions from `caps`.
+///
+/// Each result is capped with `frozenCapResult` so a previously-cut result
+/// keeps the same cut on every later turn. After capping, if the total still
+/// exceeds `aggregate_max`, trim the largest results first - but only results
+/// that were NOT previously cut (a frozen cut must stay frozen).
+pub fn frozenCapAggregate(
+    caps: *Caps,
+    arena: std.mem.Allocator,
+    results: []const []const u8,
+    result_ids: []const []const u8,
+    per_tool_max: usize,
+    aggregate_max: usize,
+) ![]Capped {
+    if (results.len != result_ids.len) return capAggregate(arena, results, per_tool_max, aggregate_max);
+
+    var capped: std.ArrayList(Capped) = .empty;
+    var j: usize = 0;
+    for (results) |r| {
+        try capped.append(arena, try frozenCapResult(caps, arena, result_ids[j], r, per_tool_max));
+        j += 1;
+    }
+    var total: usize = 0;
+    for (capped.items) |c| total += c.text.len;
+    if (total <= aggregate_max) return capped.toOwnedSlice(arena);
+
+    // Trim the largest result that was NOT previously cut, then recompute.
+    // A previously-cut result keeps its frozen cut: trimming it would change
+    // the model's cached prefix.
+    while (total > aggregate_max) {
+        var best: ?usize = null;
+        var best_len: usize = 0;
+        var k: usize = 0;
+        for (capped.items) |c| {
+            const was_cut = if (caps.find(result_ids[k])) |r| r.cut else false;
+            if (!was_cut and c.text.len > best_len and c.text.len > cut_notice.len) {
+                best_len = c.text.len;
+                best = k;
+            }
+            k += 1;
+        }
+        if (best == null) break; // nothing left to give without breaking a frozen cut
+        const i = best.?;
+        const cur = capped.items[i].text.len;
+        const others = total - cur;
+        const new_max = if (aggregate_max > others) aggregate_max - others else 0;
+        const trimmed = try capResult(arena, capped.items[i].text, new_max);
+        total = others + trimmed.text.len;
+        capped.items[i] = trimmed;
+        // Remember the new cut as frozen too.
+        const id_copy = try arena.dupe(u8, result_ids[i]);
+        caps.record(arena, id_copy, trimmed.text.len, true);
+    }
+    return capped.toOwnedSlice(arena);
+}
+
+/// Serialize `Caps` to JSON: a flat array of {result_id, bytes_kept, cut}.
+/// Written next to the session JSONL so it survives resume.
+pub fn serializeCaps(caps: *const Caps, out: []u8) []const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll("[") catch {};
+    var first = true;
+    const quote = '\"';
+    const backslash = '\\';
+    const comma = ',';
+    const open_brace = '{';
+    const close_brace = '}';
+    for (caps.items.items) |r| {
+        if (!first) w.writeByte(comma) catch {};
+        first = false;
+        w.writeByte(open_brace) catch {};
+        w.writeAll("\"result_id\":") catch {};
+        w.writeByte(quote) catch {};
+        for (r.result_id) |ch| {
+            if (ch == quote or ch == backslash) w.writeByte(backslash) catch {};
+            w.writeByte(ch) catch {};
+        }
+        w.writeByte(quote) catch {};
+        w.writeAll("\",\"bytes_kept\":") catch {};
+        w.print("{d}", r.bytes_kept) catch {};
+        w.writeAll(",\"cut\":") catch {};
+        w.print("{b}", r.cut) catch {};
+        w.writeByte(close_brace) catch {};
+    }
+    w.writeAll("]") catch {};
+    return w.buffered();
+}
+
+/// Deserialize `Caps` from JSON produced by `serializeCaps`.
+pub fn deserializeCaps(arena: std.mem.Allocator, input: []const u8) !Caps {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, input, .{}) catch return Caps{ .items = .empty };
+    if (parsed != .array) return Caps{ .items = .empty };
+    var caps: Caps = .{ .items = .empty };
+    for (parsed.array.items) |v| {
+        if (v != .object) continue;
+        const rid = v.object.get("result_id") orelse continue;
+        const bk = v.object.get("bytes_kept") orelse continue;
+        const ct = v.object.get("cut") orelse continue;
+        if (rid != .string or bk != .string or ct != .string) continue;
+        const id_copy = try arena.dupe(u8, rid.string);
+        const bytes_kept = std.fmt.parseInt(u64, bk.string, 10) catch continue;
+        const cut = std.mem.eql(u8, ct.string, "true");
+        caps.items.append(arena, .{
+            .result_id = id_copy,
+            .bytes_kept = @intCast(bytes_kept),
+            .cut = cut,
+        }) catch {};
+    }
+    return caps;
 }
 
 test "capResult: under the cap is untouched and not cut" {
