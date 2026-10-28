@@ -4,33 +4,15 @@
 const std = @import("std");
 const resultcap = @import("resultcap.zig");
 
-pub var default_max_result_chars: usize = 50_000;
 pub var max_result_bytes: usize = 400_000;
-pub var max_results_per_message_chars: usize = 200_000;
 pub var summary_max_len: usize = 50;
 pub var preview_bytes: usize = 2 * 1024;
 
-pub fn initFromEnv(env: ?*const std.process.Environ.Map) void {
-    if (env) |e| {
-        if (e.get("ZODE_MAX_RESULT_CHARS")) |s| {
-            const n = std.fmt.parseInt(usize, s, 10) catch 0;
-            if (n > 0) default_max_result_chars = n;
-        }
-        if (e.get("ZODE_MAX_RESULT_BYTES")) |s| {
-            const n = std.fmt.parseInt(usize, s, 10) catch 0;
-            if (n > 0) max_result_bytes = n;
-        }
-        if (e.get("ZODE_MAX_RESULTS_PER_MESSAGE_CHARS")) |s| {
-            const n = std.fmt.parseInt(usize, s, 10) catch 0;
-            if (n > 0) max_results_per_message_chars = n;
-        }
-        if (e.get("ZODE_SUMMARY_MAX_LEN")) |s| {
-            const n = std.fmt.parseInt(usize, s, 10) catch 0;
-            if (n > 0) summary_max_len = n;
-        }
-    }
-}
-
+/// The per-tool and per-message caps live in `resultcap` (the single cap
+/// layer); this store only owns what persistence adds: how much of an
+/// oversized result is written to disk (`max_result_bytes`), the preview size
+/// shown to the model (`preview_bytes`) and the stored-summary length
+/// (`summary_max_len`).
 const tool_results_subdir: []const u8 = "tool-results";
 const stored_notice: []const u8 = "\n… (result stored at {s}; read the part you need)\n";
 
@@ -48,7 +30,7 @@ pub fn storeResult(
     index: usize,
     result: []const u8,
 ) Stored {
-    if (result.len <= default_max_result_chars) {
+    if (result.len <= resultcap.default_max_result_chars) {
         return .{ .text = result, .cut = false, .stored = false };
     }
 
@@ -107,8 +89,8 @@ pub fn storeResult(
 }
 
 fn capResultFallback(arena: std.mem.Allocator, text: []const u8) Stored {
-    const capped = resultcap.capResult(arena, text, default_max_result_chars) catch {
-        return .{ .text = text[0..@min(text.len, default_max_result_chars)], .cut = true, .stored = false };
+    const capped = resultcap.capResult(arena, text, resultcap.default_max_result_chars) catch {
+        return .{ .text = text[0..@min(text.len, resultcap.default_max_result_chars)], .cut = true, .stored = false };
     };
     return .{
         .text = capped.text,
@@ -151,7 +133,7 @@ test "storeResult: over cap falls back to inline truncation when no Io handle" {
     // The inline truncation notice should be present.
     try std.testing.expect(std.mem.find(u8, out.text, "… (result cut at the tool's cap") != null);
     // Output must be within the per-tool cap.
-    try std.testing.expect(out.text.len <= default_max_result_chars);
+    try std.testing.expect(out.text.len <= resultcap.default_max_result_chars);
     // Output must be valid UTF-8.
     try std.testing.expect(std.unicode.utf8ValidateSlice(out.text));
 }
@@ -169,7 +151,7 @@ test "storeResult: hard cap truncates before writing" {
     try std.testing.expect(out.cut);
     try std.testing.expect(!out.stored);
     try std.testing.expect(out.path == null);
-    try std.testing.expect(out.text.len <= default_max_result_chars);
+    try std.testing.expect(out.text.len <= resultcap.default_max_result_chars);
 }
 
 test "storeResult: unique index never collides" {
@@ -214,14 +196,3 @@ test "summarize: long path is clipped to summary_max_len" {
     try std.testing.expect(s.len <= summary_max_len);
 }
 
-test "initFromEnv: overrides defaults from environment" {
-    var e = std.process.Environ.Map.init(std.testing.allocator);
-    defer e.deinit();
-    try e.put("ZODE_MAX_RESULT_CHARS", "1000");
-    try e.put("ZODE_MAX_RESULT_BYTES", "5000");
-    try e.put("ZODE_SUMMARY_MAX_LEN", "10");
-    initFromEnv(&e);
-    try std.testing.expectEqual(1000, default_max_result_chars);
-    try std.testing.expectEqual(5000, max_result_bytes);
-    try std.testing.expectEqual(10, summary_max_len);
-}

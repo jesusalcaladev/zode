@@ -4,9 +4,8 @@
 //! count. `text[0..n]` with `n` landing on a UTF-8 continuation byte produces a
 //! slice that is not valid UTF-8, and everything downstream — the markdown
 //! parser, vaxis's grapheme iterator, the session JSON — either loses text or
-//! crashes on it. Two call sites already walked back to a character start by
-//! hand (`subagent.capResult`, `usercmds`); this is that loop, once, with the
-//! tests it never had.
+//! crashes on it. Call sites used to walk back to a character start by hand;
+//! this is that loop, once, with the tests it never had.
 //!
 //! # Columns, not bytes
 //!

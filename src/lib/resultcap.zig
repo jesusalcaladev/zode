@@ -14,9 +14,12 @@
 const std = @import("std");
 
 /// Default per-tool cap, in bytes (like the rest of the result caps, e.g. the
-/// 16 KB foreground cap). `read` is unbounded.
+/// 16 KB foreground cap). `read` is unbounded. This is THE cap: every tool
+/// result in the tree is cut against this number, and nothing else defines it.
 pub const default_max_result_chars: usize = 50_000;
 /// Aggregate budget for all tool results in a single assistant message.
+/// Every result of one message together must fit in this; the cut of each
+/// result carries its notice inside the budget.
 pub const max_results_per_message_chars: usize = 200_000;
 
 /// The notice appended to a cut result. It counts toward the budget.

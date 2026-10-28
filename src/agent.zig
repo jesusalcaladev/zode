@@ -8014,13 +8014,16 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
                 msgs.append(sarena, .{ .role = "tool", .content = emsg, .tool_call_id = call.id }) catch break;
                 continue;
             };
-            // The per-result cap is the subagent's own, tighter one: 16 KB of grep
-            // in a 24k budget is two thirds of the window in a single call.
-            // `capResult` and not a raw slice: it cuts at a line and UTF-8
-            // boundary and says that it cut, so a fragment cannot be mistaken
-            // for the whole output.
-            const capped = subagent_mod.capResult(sarena, res_text);
-            msgs.append(sarena, .{ .role = "tool", .content = capped, .tool_call_id = call.id }) catch break;
+            // The per-result cap is the subagent's own, tighter one: 4 KB of grep
+            // in a 24k budget is a sixth of the window in a single call.
+            // `resultcap.capResult` cuts at a UTF-8 boundary and appends its
+            // notice inside the budget, so a fragment cannot be mistaken for
+            // the whole output. One place caps every result: `resultcap`.
+            const capped = resultcap.capResult(sarena, res_text, subagent_mod.max_tool_output) catch resultcap.Capped{
+                .text = res_text,
+                .cut = false,
+            };
+            msgs.append(sarena, .{ .role = "tool", .content = capped.text, .tool_call_id = call.id }) catch break;
         }
         tstate.clearCalls(gpa);
         tstate.text.clearRetainingCapacity();

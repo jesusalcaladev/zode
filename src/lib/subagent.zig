@@ -109,49 +109,14 @@ pub const max_tool_output = 4 * 1024;
 /// report, not for the file.
 pub const max_report = 8 * 1024;
 
-/// What a capped result says at the cut. Without it the model cannot tell
-/// "that was everything" from "that was the first 4 KB", and it reads a fragment
-/// as the whole answer — the exact failure this replaces.
-pub const cut_notice =
-    "\n… (the tool's output was cut at the subagent's 4 KB budget; ask for a narrower result to get the rest)\n";
-
-/// Caps a tool result for the subagent's window.
+/// Capping a tool result now happens in `resultcap.capResult` (the single cap
+/// layer: UTF-8-safe cut, and the notice travels inside the budget so kept +
+/// notice never exceed the cap). `max_tool_output` above is the subagent's
+/// tighter cap value, handed to `capResult` at the call site in `agent.zig`.
 ///
-/// The old code was `res_text[0..max_tool_output]`, and three things were wrong
-/// with it in one line:
-///
-/// 1. **It cut mid-line**, so a fragment looked exactly like a complete answer.
-///    Every other cut in this repo reserves room for a notice (`bgproc`,
-///    `git diff`, `bash`), because a silent cut is the failure it exists for.
-/// 2. **It could cut mid-UTF-8**: byte `N` of a multi-byte grapheme is a
-///    continuation byte, and the message then carries invalid UTF-8 into the
-///    wire format.
-/// 3. **It ate the tail of every "continue with X" note**, `web_fetch`'s
-///    `pass offset=N` among them. The fix for that one is in `web.excerpt`
-///    (the instruction now also rides at the TOP of the window, which is what
-///    every cap preserves); the fix for the first two is here.
-///
-/// Text under the cap comes back as the SAME slice: no copy, no allocation, and
-/// the common case pays nothing.
-pub fn capResult(arena: std.mem.Allocator, text: []const u8) []const u8 {
-    if (text.len <= max_tool_output) return text;
-    // The notice is inside the budget, not on top of it: the cap is the cap.
-    const room: usize = if (cut_notice.len < max_tool_output)
-        max_tool_output - cut_notice.len
-    else
-        0;
-    var cut = room;
-    // A line boundary, so the fragment ends where a line ended. Kept only if it
-    // leaves a worthwhile amount — a 100 KB single-line JSON would otherwise be
-    // cut at byte 0.
-    if (std.mem.lastIndexOfScalar(u8, text[0..room], '\n')) |nl| {
-        if (nl + 1 >= room / 2) cut = nl + 1;
-    }
-    // And a UTF-8 boundary: if the byte we stopped on is a continuation byte we
-    // are in the middle of a character, so walk back until it is not.
-    while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
-    return std.fmt.allocPrint(arena, "{s}{s}", .{ text[0..cut], cut_notice }) catch text[0..cut];
-}
+/// The old code cut `res_text[0..max_tool_output]` raw: mid-line, possibly
+/// mid-UTF-8, and with no notice — so a fragment read as the whole answer,
+/// which is exactly the failure the cap exists to prevent.
 
 /// The tool definitions sent to the subagent, built from the main list.
 ///
@@ -641,82 +606,3 @@ test "the system prompt explicitly says it cannot ask" {
     try std.testing.expect(std.mem.indexOf(u8, subagent.system_prompt, "complete and useful") != null);
 }
 
-test "capResult: under the cap it is the SAME slice, no copy" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const small = "short result";
-    const got = subagent.capResult(arena, small);
-    // Identity, not equality: the common case must not allocate.
-    try std.testing.expect(got.ptr == small.ptr);
-}
-
-test "capResult: a cut result says so, ends at a line boundary and fits the cap" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // 1000 lines of 40 bytes: a line boundary always exists inside the room.
-    var text: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) {
-        try text.appendSlice(arena, "0123456789012345678901234567890123456789\n");
-    }
-    const got = subagent.capResult(arena, text.items);
-    // The budget is the budget, notice included.
-    try std.testing.expect(got.len <= subagent.max_tool_output);
-    // The notice is the LAST thing: anything after it reads as part of the output.
-    try std.testing.expect(std.mem.endsWith(u8, got, subagent.cut_notice));
-    // A fragment that looks complete is the failure this replaces.
-    try std.testing.expect(std.mem.indexOf(u8, got, "cut at the subagent's 4 KB budget") != null);
-    // Cut at a whole line: the last byte of content before the notice is a newline.
-    const body = got[0 .. got.len - subagent.cut_notice.len];
-    try std.testing.expect(body.len > 0);
-    try std.testing.expect(body[body.len - 1] == '\n');
-}
-
-test "capResult: never cuts mid-UTF-8, and a single giant line still gets a notice" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // "ñ" is 2 bytes (0xC3 0xB1): a byte cut at an odd position lands between
-    // them and the message then carries invalid UTF-8 onto the wire.
-    var multibyte: std.ArrayList(u8) = .empty;
-    while (multibyte.items.len < subagent.max_tool_output + 100) {
-        try multibyte.appendSlice(arena, "añ\n");
-    }
-    const got = subagent.capResult(arena, multibyte.items);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(got));
-
-    // One line, 64 KB, no newline anywhere: the line-boundary cut cannot find
-    // one, so it hard-cuts — but the notice still has to be there, because a
-    // silent cut is the bug, not the cut.
-    const oneline = try arena.alloc(u8, 64 * 1024);
-    @memset(oneline, 'x');
-    const got2 = subagent.capResult(arena, oneline);
-    try std.testing.expect(std.mem.endsWith(u8, got2, subagent.cut_notice));
-    try std.testing.expect(got2.len <= subagent.max_tool_output);
-}
-
-test "capResult: web_fetch's promise to continue SURVIVES the cap" {
-    // The composition this all exists for: `web.excerpt` puts `pass offset=N` at
-    // the TOP of the window and the cap keeps the head. Before either change the
-    // note was at the tail of a 16 KB result capped to 4 KB — always cut, so a
-    // subagent re-fetched the same first window forever and reported the page as
-    // read when it had seen 4 KB of it.
-    const web = @import("web.zig");
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const page = try arena.alloc(u8, 40 * 1024);
-    @memset(page, 'a');
-    @memcpy(page[0..9], "line one\n");
-
-    const window = web.excerpt(arena, page, 0, 16 * 1024);
-    const capped = subagent.capResult(arena, window);
-    try std.testing.expect(window.len > subagent.max_tool_output);
-    try std.testing.expect(std.mem.indexOf(u8, capped, "pass offset=") != null);
-}
