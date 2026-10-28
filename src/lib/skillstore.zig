@@ -232,6 +232,17 @@ pub const Loader = struct {
                     continue;
                 };
                 errdefer self.gpa.free(effort_copy);
+                const paths_copy = self.gpa.dupe(u8, meta.paths) catch {
+                    self.gpa.free(name_copy);
+                    self.gpa.free(desc_copy);
+                    self.gpa.free(path_copy);
+                    self.gpa.free(when_copy);
+                    self.gpa.free(allowed_copy);
+                    self.gpa.free(model_copy);
+                    self.gpa.free(effort_copy);
+                    continue;
+                };
+                errdefer self.gpa.free(paths_copy);
                 const source = self.sourceForRoot(root_idx);
                 out[n] = .{
                     .name = name_copy,
@@ -244,6 +255,7 @@ pub const Loader = struct {
                     .allowed_tools = allowed_copy,
                     .model = model_copy,
                     .effort = effort_copy,
+                    .paths = paths_copy,
                 };
                 n += 1;
             }
@@ -634,6 +646,7 @@ test "scan: finds a skill from the PROJECT and reads its frontmatter" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
     try std.testing.expect(found_pty);
 }
@@ -680,6 +693,7 @@ test "scan: carries allowed_tools, model and effort into the Entry" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
     try std.testing.expect(found_carry);
 }
@@ -736,6 +750,7 @@ test "scan: the PROJECT shadows the user's one with the same name (they do not m
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
     try std.testing.expect(found_mine);
 }
@@ -783,6 +798,7 @@ test "scan: ignores loose files, dotted directories and impossible names" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
     try std.testing.expect(found_bueno);
 }
@@ -840,6 +856,7 @@ test "load: the body arrives framed and WITHOUT the frontmatter" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
 }
 
@@ -886,6 +903,7 @@ test "load: a skill without frontmatter works too (it is markdown and a dot)" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
 }
 
@@ -988,6 +1006,7 @@ test "scan: .agents/skills is read too, and .zode wins when both are present" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
     try std.testing.expect(found_shared);
     try std.testing.expect(found_solo);
@@ -1034,6 +1053,7 @@ test "scan: bundled skills are appended and can be shadowed" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
     try std.testing.expect(found_simplify);
 }
@@ -1125,6 +1145,7 @@ test "loadWithArgs: substitutes $ARGUMENTS in bundled skills" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
 }
 
@@ -1184,6 +1205,7 @@ test "scan: a directory that does not exist is not an error (0 skills, no noise)
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
 }
 
@@ -1222,5 +1244,6 @@ test "scan: respects the entry cap (it does not grow without limit)" {
         gpa.free(e.allowed_tools);
         gpa.free(e.model);
         gpa.free(e.effort);
+        gpa.free(e.paths);
     }
 }

@@ -550,7 +550,22 @@ fn skillsSectionText(
     list_buf: []u8,
 ) []const u8 {
     const entries = discoverSkills(gpa, env);
-    return skills.systemPromptSection(entries, skillListingBudget(env), list_buf);
+    // Phase 34.11: keep only skills whose declared `paths` apply to the
+    // current project (empty `paths` applies everywhere). Entries are borrowed
+    // from the skills cache, so we copy the struct (slices point at the cache,
+    // which stays alive for this call).
+    var filtered: std.ArrayList(skills.Entry) = .empty;
+    blk: for (entries) |e| {
+        if (skills.skillAppliesHere(e, project_info.root())) {
+            // Out of memory mid-filter is catastrophic; stop adding entries
+            // but keep the ones already collected.
+            if (filtered.append(gpa, e)) |_| {} else |err| switch (err) {
+                error.OutOfMemory => break :blk,
+            }
+        }
+    }
+    defer filtered.deinit(gpa);
+    return skills.systemPromptSection(filtered.items, skillListingBudget(env), list_buf);
 }
 
 fn buildSystemPrompt(

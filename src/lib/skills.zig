@@ -143,6 +143,11 @@ pub const Meta = struct {
     allowed_tools: []const u8 = "",
     model: []const u8 = "",
     effort: []const u8 = "",
+    /// The project paths this skill applies to, as a JSON array of prefixes
+    /// (e.g. `["src/", "packages/web/"]`). Empty means the skill applies to
+    /// every project. A non-empty list means the skill is only listed when the
+    /// current project root starts with one of the prefixes.
+    paths: []const u8 = "",
     context: Context = .inline_mode,
 };
 
@@ -208,6 +213,8 @@ pub fn splitFrontmatter(text: []const u8) ?struct { meta: Meta, body: []const u8
             meta.model = val;
         } else if (std.mem.eql(u8, key, "effort")) {
             meta.effort = val;
+        } else if (std.mem.eql(u8, key, "paths")) {
+            meta.paths = val;
         } else if (std.mem.eql(u8, key, "context")) {
             if (std.mem.eql(u8, val, "fork")) {
                 meta.context = .fork;
@@ -273,6 +280,9 @@ pub const Entry = struct {
     model: []const u8 = "",
     /// The skill's declared effort, or empty to use `low`.
     effort: []const u8 = "",
+    /// See `Meta.paths`: the project paths this skill applies to. Carried into
+    /// the entry so the caller can filter which skills are listed.
+    paths: []const u8 = "",
 };
 
 /// Text for the `skill` tool: the body, framed so the model knows what it has.
@@ -347,9 +357,6 @@ const note_scratch = 96;
 
 /// The paragraph the system prompt carries, under a budget.
 ///
-/// Empty when there are no skills: an empty "## Skills" heading with nothing
-/// under it is 4 tokens per request forever for no information.
-///
 /// `budget_chars` is the room the ENTRIES have; the header is on top of it (see
 /// `header_text`). The ladder when it does not fit is, in order:
 ///
@@ -364,6 +371,64 @@ const note_scratch = 96;
 /// The cap of `max_desc_chars` does NOT apply to a bundled entry: those
 /// descriptions are ours and truncating them would hide the one thing the model
 /// has to read to decide.
+pub fn skillAppliesHere(entry: Entry, project_root: ?[]const u8) bool {
+    // An empty `paths` means the skill applies to every project.
+    if (entry.paths.len == 0) return true;
+    // Not inside a git repository: a path-conditional skill cannot be
+    // confirmed to apply, so it does not.
+    const root = project_root orelse return false;
+
+    // `paths` is a JSON array of path prefixes, e.g. `["src/", "packages/web/"]`.
+    const arena = std.heap.page_allocator;
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, entry.paths, .{}) catch return false;
+    if (doc != .array) return false;
+    for (doc.array.items) |v| {
+        if (v != .string) continue;
+        const prefix = v.string;
+        if (prefix.len == 0) continue;
+        // Strip a trailing slash: "src/" becomes "src".
+        const stripped = if (prefix[prefix.len - 1] == '/') prefix[0..prefix.len - 1] else prefix;
+        // The skill applies when the project root IS the prefix, or ends with
+        // "/<prefix>" (e.g. root "/home/user/proj/src" matches prefix "src/").
+        if (std.mem.eql(u8, root, stripped)) return true;
+        if (root.len > stripped.len and root[root.len - stripped.len - 1] == '/' and
+            std.mem.eql(u8, root[root.len - stripped.len ..], stripped))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+test "skillAppliesHere: empty paths applies everywhere" {
+    const e = skills.Entry{ .paths = "" };
+    try std.testing.expect(skillAppliesHere(e, "/home/user/proj"));
+    try std.testing.expect(skillAppliesHere(e, null));
+}
+
+test "skillAppliesHere: non-empty paths with no project root does not apply" {
+    const e = skills.Entry{ .paths = "[\"src/\"]" };
+    try std.testing.expect(!skillAppliesHere(e, null));
+}
+
+test "skillAppliesHere: project root under a trailing-slash prefix applies" {
+    const e = skills.Entry{ .paths = "[\"src/\", \"packages/web/\"]" };
+    try std.testing.expect(skillAppliesHere(e, "/home/user/proj/src"));
+    try std.testing.expect(skillAppliesHere(e, "/home/user/proj/packages/web"));
+    try std.testing.expect(!skillAppliesHere(e, "/home/user/proj/lib"));
+}
+
+test "skillAppliesHere: project root exactly matching a prefix applies" {
+    const e = skills.Entry{ .paths = "[\"/home/user/proj\"]" };
+    try std.testing.expect(skillAppliesHere(e, "/home/user/proj"));
+    try std.testing.expect(!skillAppliesHere(e, "/home/user/proj2"));
+}
+
+test "skillAppliesHere: malformed paths JSON does not apply" {
+    const e = skills.Entry{ .paths = "[\"src/\"," };
+    try std.testing.expect(!skillAppliesHere(e, "/home/user/proj/src"));
+}
+
 pub fn systemPromptSection(entries: []const Entry, budget_chars: usize, out: []u8) []const u8 {
     if (entries.len == 0) return "";
     const plan = planListing(entries, budget_chars);
