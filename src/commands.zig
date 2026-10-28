@@ -1082,6 +1082,8 @@ pub const commands = [_]Cmd{
     .{ .key = "/style", .desc = "select an output style: default|explanatory|learning (no args: report | off)" },
     .{ .key = "/copy", .desc = "copy an answer to the clipboard: /copy (the last one) | /copy N (N answers back)", .key_hint = "N" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
+    .{ .key = "/clear", .desc = "clear the screen and reset the session caches (read list, changed list, skills)" },
+    .{ .key = "/exit", .desc = "alias of /quit" },
 };
 
 pub const Cmd = struct {

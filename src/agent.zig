@@ -3491,7 +3491,7 @@ pub const PaletteCmd = enum {
 /// The command echoes itself in the history (like the input) so you can see
 /// what was run, not just what happened.
 pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
-    if (std.mem.eql(u8, cmd, "/quit")) return .quit;
+    if (std.mem.eql(u8, cmd, "/quit") or std.mem.eql(u8, cmd, "/exit")) return .quit;
     if (std.mem.eql(u8, cmd, "/use")) return .needs_args;
     m.pushKind(.user, cmd);
     submit(m, cmd) catch {};
@@ -3515,6 +3515,19 @@ fn cmdYolo(m: *tui.Model) void {
     const msg = if (yolo) "yolo ON: no confirmations, and no questions (your questions are answered for you and said in the summary)" else "yolo OFF: asks for permission";
     pushInfo(m, msg);
     setStatusWithZo(m, if (yolo) .warn else .idle, msg);
+}
+
+/// `/clear`: clear the visible transcript and reset the per-session caches
+/// (the read list, the changed list, and the "skills already attached" flag
+/// so the listing is re-attached on the next turn). Like `/new` this buys a
+/// truth: after clearing, the model no longer pretends it has files it has
+/// not seen in this session. It does NOT create a new session — use `/new`
+/// for that.
+fn cmdClear(m: *tui.Model) void {
+    resetSessionFiles(m);
+    m.clearHistory();
+    if (session) |s| s.resetSkillsSent();
+    m.pushInfo("screen cleared · read cache + changed list reset · skills listing re-attached next turn");
 }
 
 /// `/mode [build|accept-edits|plan|bypass]`, or the current
@@ -3610,6 +3623,10 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdHelp(m);
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // the TUI handles it
+    } else if (std.mem.eql(u8, cmd, "exit")) {
+        // alias of /quit — the TUI handles it
+    } else if (std.mem.eql(u8, cmd, "clear")) {
+        cmdClear(m);
     } else if (std.mem.eql(u8, cmd, "models")) {
         listModelsAsync(m) catch pushError(m, "error starting /models");
     } else if (std.mem.eql(u8, cmd, "providers")) {
@@ -12779,6 +12796,24 @@ test "Session.resetSkillsSent clears the flag" {
     try std.testing.expect(s.skills_sent);
     s.resetSkillsSent();
     try std.testing.expect(!s.skills_sent);
+}
+
+// Phase 35.5: `/clear` clears the transcript and resets the per-session caches
+// (read list, changed list, and the skills-sent flag) without creating a new
+// session. `session` is null in a test, so the skills branch is skipped — the
+// point is that the command is wired and does not panic.
+test "cmdClear clears the screen and resets the session caches" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.io = std.testing.io;
+    m.io_ready = true;
+    m.environ = null;
+
+    cmdClear(&m);
+
+    try std.testing.expect(pendingContains(&m, "screen cleared"));
+    try std.testing.expect(pendingContains(&m, "read cache + changed list reset"));
+    try std.testing.expect(pendingContains(&m, "skills listing re-attached next turn"));
 }
 
 test "prompt: the routing guide survives the project's AGENTS.md" {
