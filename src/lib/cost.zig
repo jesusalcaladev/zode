@@ -318,6 +318,59 @@ fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
     return if (n == 1) one else many;
 }
 
+/// A compact cost summary for `/context`: total spent plus the honesty notes
+/// (`price unknown`, resumed tokens) that `/cost` also prints. `/cost` keeps
+/// the detailed per-model table; this is the one-line summary that fits in the
+/// context dashboard.
+pub fn costSummaryText(
+    gpa: std.mem.Allocator,
+    rows: []const Row,
+    requests: usize,
+    session_prompt: i64,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    const unpriced = unpricedCount(rows);
+    var money_buf: [32]u8 = undefined;
+
+    if (rows.len == 0) {
+        try appendFmt(&out, gpa, "cost \u{b7} {d} {s} \u{b7} no per-model breakdown in this process\n", .{
+            requests,
+            plural(requests, "request", "requests"),
+        });
+    } else if (unpriced == rows.len) {
+        try appendFmt(&out, gpa, "cost \u{b7} {d} {s} \u{b7} no published price for the models used, so there is no total\n", .{
+            requests,
+            plural(requests, "request", "requests"),
+        });
+    } else {
+        try appendFmt(&out, gpa, "cost \u{b7} {d} {s} \u{b7} {s} counted\n", .{
+            requests,
+            plural(requests, "request", "requests"),
+            formatUsd(&money_buf, totalOf(rows)),
+        });
+        if (unpriced > 0) {
+            try appendFmt(&out, gpa, "  total counted {s} \u{b7} {d} {s} with no published price, so the real bill is higher\n", .{
+                formatUsd(&money_buf, totalOf(rows)),
+                unpriced,
+                plural(unpriced, "model", "models"),
+            });
+        }
+    }
+
+    var seen_prompt: i64 = 0;
+    for (rows) |r| seen_prompt += @max(r.prompt, 0);
+    if (session_prompt > seen_prompt) {
+        var missing_buf: [32]u8 = undefined;
+        try appendFmt(&out, gpa, "  {s} prompt tokens of this session were counted before this process (resumed); they are not in this breakdown\n", .{
+            groupDigits(&missing_buf, session_prompt - seen_prompt),
+        });
+    }
+
+    return out.toOwnedSlice(gpa);
+}
+
 // ── tests ─────────────────────────────────────────────────────
 
 test "cost: the same model accumulates into one row, different models do not" {
@@ -471,4 +524,41 @@ test "cost: groupDigits is the same arithmetic /usage prints" {
     try std.testing.expectEqualStrings("999", groupDigits(&buf, 999));
     try std.testing.expectEqualStrings("1,000", groupDigits(&buf, 1_000));
     try std.testing.expectEqualStrings("1,234,567", groupDigits(&buf, 1_234_567));
+}
+
+test "costSummaryText: priced models show the total counted" {
+    const rows = [_]Row{
+        .{ .model = "kimi-k2.6", .prompt = 1_000_000, .completion = 0, .price = .{ .prompt = 0.000001, .completion = 0.0 } },
+    };
+    const text = try costSummaryText(std.testing.allocator, &rows, 3, 1_000_000);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "$1.00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "counted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "resumed") == null);
+}
+
+test "costSummaryText: all unpriced reports no total and never $0.00" {
+    const rows = [_]Row{
+        .{ .model = "free:model", .prompt = 100, .completion = 10, .price = null },
+    };
+    const text = try costSummaryText(std.testing.allocator, &rows, 2, 100);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no published price") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "$0.00") == null);
+}
+
+test "costSummaryText: no rows reports no per-model breakdown" {
+    const text = try costSummaryText(std.testing.allocator, &[_]Row{}, 0, 0);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no per-model breakdown in this process") != null);
+}
+
+test "costSummaryText: resumed tokens beyond the rows are noted, not priced" {
+    const rows = [_]Row{
+        .{ .model = "m", .prompt = 100, .completion = 10, .price = .{ .prompt = 0.000001, .completion = 0.0 } },
+    };
+    const text = try costSummaryText(std.testing.allocator, &rows, 1, 1000);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "900 prompt tokens of this session") != null);
 }

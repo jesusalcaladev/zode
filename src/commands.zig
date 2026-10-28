@@ -739,6 +739,31 @@ pub fn cmdContext(m: *tui.Model) void {
     const loc = agent.project_info.oneLine(&loc_buf);
     if (loc.len > 0) agent.pushInfoFmt(m, "  {s}", .{loc});
 
+    // Price/usage: what this session has spent, per model, shown next to the
+    // token gauge. `/cost` owns the detailed per-model table; this is the
+    // compact summary that fits in the context dashboard (34.16).
+    const tr = &cost_mod.session;
+    if (tr.len > 0) {
+        const a = astate.allocator();
+        var rows: std.ArrayList(cost_mod.Row) = .empty;
+        var i: usize = 0;
+        while (i < tr.len) : (i += 1) {
+            const e = &tr.entries[i];
+            rows.append(a, .{
+                .model = e.text(),
+                .prompt = e.prompt_tokens,
+                .completion = e.completion_tokens,
+                .price = priceForModel(m, a, e.text()),
+            }) catch break;
+        }
+        const st = agent.cacheSessionStats();
+        if (cost_mod.costSummaryText(m.allocator, rows.items, st.requests, st.prompt_tokens)) |text| {
+            agent.pushInfoOwned(m, text);
+        } else |err| {
+            m.pushErrorFmt("could not build the cost summary: {s}", .{@errorName(err)});
+        }
+    }
+
     agent.refreshContextUsage(m);
 }
 

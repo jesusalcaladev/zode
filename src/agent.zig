@@ -1609,21 +1609,61 @@ pub const summary_max: usize = 3;
 var summaries_done: usize = 0;
 var summarized_at_iteration: usize = 0;
 
+/// Circuit breaker keyed on **consecutive** summarization failures.
+///
+/// Tier 2 is best-effort: when the model cannot summarize, the caller carries on
+/// without a summary. Without a breaker, a summarizer that keeps failing is retried
+/// every iteration — "request-per-turn forever". After `max_consecutive` failures in
+/// a row the breaker trips and `summarizeTurns` stops trying; any successful summary
+/// resets the counter.
+pub const SummaryBreaker = struct {
+    consecutive: usize = 0,
+    /// Three failures in a row is enough: the model is not going to summarize this
+    /// session, and spending a request on it every turn is pure waste.
+    max_consecutive: usize = 3,
+
+    /// Record a failed attempt.
+    pub fn noteFailure(self: *SummaryBreaker) void {
+        self.consecutive += 1;
+    }
+
+    /// Record a successful summary: the counter resets.
+    pub fn noteSuccess(self: *SummaryBreaker) void {
+        self.consecutive = 0;
+    }
+
+    /// True once the breaker has tripped and tier 2 must not run again this session.
+    pub fn tripped(self: *SummaryBreaker) bool {
+        return self.consecutive >= self.max_consecutive;
+    }
+
+    /// Reset for a new session (`/new`, `/resume`, bootstrap).
+    pub fn reset(self: *SummaryBreaker) void {
+        self.consecutive = 0;
+    }
+};
+
+/// One breaker for the session, next to the other summarization state.
+var summary_breaker: SummaryBreaker = .{};
+
 /// May tier 2 run right now, at `iteration`?
 ///
 /// It returns true on the first trigger of a session and then at most once every
-/// `summary_gap` iterations, up to `summary_max` times.
+/// `summary_gap` iterations, up to `summary_max` times. A tripped breaker always
+/// returns false.
 pub fn maySummarize(iteration: usize) bool {
+    if (summary_breaker.tripped()) return false;
     if (summaries_done >= summary_max) return false;
     if (summaries_done == 0) return true;
     return iteration >= summarized_at_iteration + summary_gap;
 }
 
 /// Records that a summary was just made. Separate from `maySummarize` so the call is
-/// visible at the one place that spends a request.
+/// visible at the one place that spends a request. A success also resets the breaker.
 fn noteSummarized(iteration: usize) void {
     summaries_done += 1;
     summarized_at_iteration = iteration;
+    summary_breaker.noteSuccess();
 }
 
 /// A new session gets the whole budget back. `/new`, `/resume` and the bootstrap all
@@ -1631,6 +1671,7 @@ fn noteSummarized(iteration: usize) void {
 fn resetSummaries() void {
     summaries_done = 0;
     summarized_at_iteration = 0;
+    summary_breaker.reset();
 }
 
 /// Tok/s of the in-flight stream (status bar) and of the last finished stream.
@@ -9953,18 +9994,26 @@ pub fn summarizeTurns(
     extra_headers: []const http_client.Http.ExtraHeader,
     max_output_tokens: u32,
 ) ?[]const u8 {
+    // Breaker open: stop spending requests on a summarizer that cannot summarize.
+    if (summary_breaker.tripped()) return null;
+
     var ast = std.heap.ArenaAllocator.init(gpa);
     defer ast.deinit();
     const a = ast.allocator();
 
     // A single user message with the conversation to summarize + the instruction.
     const prompt = compaction.summaryPrompt(a, msgs) catch {
+        summary_breaker.noteFailure();
         models_mod.dbg("[compaction] could not build the summary prompt\n", .{});
         return null;
     };
-    const body_buf = bodyBuf(gpa) catch return null;
+    const body_buf = bodyBuf(gpa) catch {
+        summary_breaker.noteFailure();
+        return null;
+    };
     const one = [_]chat.ChatMessage{.{ .role = "user", .content = prompt }};
     const body = chat.buildBodyMessagesCapped(body_buf, model_name, &one, effort, "", kind, max_output_tokens) catch {
+        summary_breaker.noteFailure();
         models_mod.dbg("[compaction] could not build the summary body\n", .{});
         return null;
     };
@@ -9984,10 +10033,15 @@ pub fn summarizeTurns(
     // Not the user's turn: its usage is not the turn's, and its errors are not
     // the turn's either.
     chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind, false, extra_headers) catch |err| {
+        summary_breaker.noteFailure();
         models_mod.dbg("[compaction] el resumen fallo: {t}\n", .{err});
         return null;
     };
-    if (sink.buf.items.len == 0) return null;
+    if (sink.buf.items.len == 0) {
+        summary_breaker.noteFailure();
+        return null;
+    }
+    summary_breaker.noteSuccess();
     return arena.dupe(u8, sink.buf.items) catch null;
 }
 
@@ -16084,4 +16138,56 @@ test "a new session's file state starts empty" {
     resetSessionFiles(&m);
     try std.testing.expectEqual(@as(usize, 0), m.reads.liveEntries());
     try std.testing.expectEqual(@as(usize, 0), m.changed.count());
+}
+
+test "SummaryBreaker: not tripped before reaching the threshold" {
+    var b: SummaryBreaker = .{};
+    try std.testing.expect(!b.tripped());
+    b.noteFailure();
+    b.noteFailure(); // one short of max_consecutive
+    try std.testing.expect(!b.tripped());
+}
+
+test "SummaryBreaker: trips after max_consecutive failures and stops" {
+    var b: SummaryBreaker = .{};
+    try std.testing.expectEqual(@as(usize, 0), b.consecutive);
+    b.noteFailure();
+    b.noteFailure();
+    b.noteFailure(); // third consecutive failure
+    try std.testing.expectEqual(@as(usize, 3), b.consecutive);
+    try std.testing.expect(b.tripped());
+    // A fourth failure does not un-trip it.
+    b.noteFailure();
+    try std.testing.expect(b.tripped());
+}
+
+test "SummaryBreaker: a success resets the counter" {
+    var b: SummaryBreaker = .{};
+    b.noteFailure();
+    b.noteFailure();
+    try std.testing.expect(!b.tripped());
+    b.noteSuccess();
+    try std.testing.expectEqual(@as(usize, 0), b.consecutive);
+    try std.testing.expect(!b.tripped());
+    // And it can fail again from a clean slate.
+    b.noteFailure();
+    b.noteFailure();
+    b.noteFailure();
+    try std.testing.expect(b.tripped());
+}
+
+test "SummaryBreaker: reset clears a tripped breaker" {
+    var b: SummaryBreaker = .{};
+    b.noteFailure();
+    b.noteFailure();
+    b.noteFailure();
+    try std.testing.expect(b.tripped());
+    b.reset();
+    try std.testing.expectEqual(@as(usize, 0), b.consecutive);
+    try std.testing.expect(!b.tripped());
+}
+
+test "SummaryBreaker: max_consecutive is three" {
+    const b: SummaryBreaker = .{};
+    try std.testing.expectEqual(@as(usize, 3), b.max_consecutive);
 }
