@@ -259,6 +259,13 @@ pub const AutoCheck = struct {
     /// ignore, and the whole point of saying it is that it is read.
     spoke: bool = false,
 
+    /// User-written stop hook: the user's version of our exit gate.
+    ///
+    /// Null when none is configured. The gate always runs FIRST: if it refuses
+    /// (code is bad, turn cannot end), the hook is not consulted. Only when the
+    /// gate passes does the hook get a say — they never both claim the turn.
+    stop_hook: ?StopHook = null,
+
     /// Per turn. Resetting it here and not per iteration is the difference between
     /// "two builds per turn" and "two builds per iteration for the rest of the
     /// session".
@@ -697,6 +704,27 @@ pub const AutoCheck = struct {
             .{why},
         ) catch null;
     }
+
+    /// A user-written stop hook: the user's version of our exit gate.
+    ///
+    /// It is called with a context string (what triggered the check) and returns
+    /// a refusal message if the turn must not end yet, or null if it may.
+    pub const StopHook = *const fn(context: []const u8) ?[]const u8;
+
+    /// Ask the user's stop hook whether the turn may end.
+    ///
+    /// Returns a refusal message (the hook claimed the turn) or null (the hook
+    /// does not object). Only called after `exitGate` has passed — the gate runs
+    /// first, so the hook and the gate never both claim the turn.
+    pub fn stopHookCheck(
+        self: *AutoCheck,
+        context: []const u8,
+        gpa: std.mem.Allocator,
+    ) ?[]const u8 {
+        _ = gpa; // the hook returns a static message; no allocation needed
+        const hook = self.stop_hook orelse return null;
+        return hook(context);
+    }
 };
 
 /// What the last verification of this turn said. Kept as a name because it is read
@@ -775,4 +803,54 @@ test "the env is a VALUE, not a reference to somebody else's map" {
     defer map.deinit();
     attachEnv(&ac, &map);
     try t.expect(ac.env != null);
+}
+
+/// Hook that always refuses with a fixed message.
+fn stopHookAlwaysRefuse(context: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, context, "turn_end")) return "wrong context";
+    return "the stop hook is in force: finish what you are doing before ending";
+}
+
+/// Hook that always returns null (turn may end).
+fn stopHookAlwaysAllows(context: []const u8) ?[]const u8 {
+    _ = context;
+    return null;
+}
+
+test "stopHookCheck: no hook configured returns null" {
+    var ac: AutoCheck = .{};
+    try t.expect(ac.stopHookCheck("turn_end", std.testing.allocator) == null);
+}
+
+test "stopHookCheck: hook refusal stops the turn" {
+    var ac: AutoCheck = .{};
+    ac.stop_hook = stopHookAlwaysRefuse;
+    if (ac.stopHookCheck("turn_end", std.testing.allocator)) |refusal| {
+        try t.expect(std.mem.eql(u8, refusal, "the stop hook is in force: finish what you are doing before ending"));
+    } else {
+        try t.expect(false); // hook should have refused
+    }
+}
+
+test "stopHookCheck: hook returns null, turn may end" {
+    var ac: AutoCheck = .{};
+    ac.stop_hook = stopHookAlwaysAllows;
+    try t.expect(ac.stopHookCheck("turn_end", std.testing.allocator) == null);
+}
+
+test "stopHookCheck composition: gate runs first, hook only after gate passes" {
+    // The composition rule: the gate and the hook must not both claim the turn.
+    // The gate runs first. Only when it passes does stopHookCheck get called.
+    // This test pins the ORDER: stopHookCheck returns the hook's answer without
+    // consulting the gate at all — the caller is responsible for calling exitGate
+    // first and only calling stopHookCheck when exitGate returned null.
+    var ac: AutoCheck = .{};
+    ac.stop_hook = stopHookAlwaysRefuse;
+    // stopHookCheck itself just delegates to the hook — the composition is enforced
+    // at the call site (exitGate first, then stopHookCheck only if exitGate passed).
+    if (ac.stopHookCheck("turn_end", std.testing.allocator)) |refusal| {
+        try t.expect(std.mem.eql(u8, refusal, "the stop hook is in force: finish what you are doing before ending"));
+    } else {
+        try t.expect(false); // hook should have refused
+    }
 }

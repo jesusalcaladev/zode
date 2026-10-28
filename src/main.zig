@@ -486,6 +486,16 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                 // turn and says so.
                 continue;
             }
+            // Gate passed: the user's stop hook can now claim the turn.
+            // The gate ran first (above), so they never both claim the turn.
+            if (auto_check.stopHookCheck("turn_end", gpa)) |refusal| {
+                models.dbg("\n[not done] {s}\n", .{refusal});
+                try msgs.append(arena, .{
+                    .role = "user",
+                    .content = "The harness will not end this run yet: a stop hook is in force. Resolve it and end the run, or remove the hook.",
+                });
+                continue;
+            }
             const s = &cache_stats.session;
             models.dbg("\n[cache] {d:.1}% hit-rate · {d} prompt / {d} cached tokens", .{ s.hitRatePct(), s.prompt_tokens, s.cached_tokens });
             // WHY, because a rate with no cause is not actionable, and this is

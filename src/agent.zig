@@ -4420,6 +4420,21 @@ fn chatWorker(job: *ChatJob) void {
             }
         }
 
+        // Gate passed: the user's stop hook can now claim the turn.
+        // The gate ran FIRST (above), so the hook and the gate never both
+        // claim the turn — if the gate refused, this is not reached.
+        if (m.auto_check.stopHookCheck("turn_end", m.allocator)) |refusal| {
+            pushError(m, refusal);
+            const nudge = m.allocator.dupe(
+                u8,
+                "The harness will not end this turn yet: a stop hook is in force. Resolve it and end the turn, or remove the hook.",
+            ) catch break;
+            if (owned) |o| m.allocator.free(o);
+            owned = nudge;
+            last_user = nudge;
+            continue;
+        }
+
         if (m.loop_repeated) |which| {
             m.loop_repeated = null;
             if (again) |answer| m.allocator.free(answer);
