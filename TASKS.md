@@ -567,9 +567,7 @@ permanent CPU cost for a decoration).
   - Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call
   - [ ] A `Caps` state (result id → the cut that was made), persisted next to the session and reloaded on resume
   - [ ] Why it matters: a session that compacts differently on resume **silently loses its cached prefix**, and that is invisible until the bill arrives
-- [ ] **34.3** `deny` and `ask` as real permission behaviours — Phase 6 says "deny/allow/ask" but never the **precedence**
-  - [ ] A `deny` rule removes the tool's schema from the request (the reference implementation filters the tools by the deny rules before composing them) — `src/tools/registry.zig`'s `blob` is where the filter goes
-  - [ ] The precedence table written down and pinned by a test, the way `src/lib/exitgate.zig:190` `decide` pins the exit rule
+- [x] **34.3** `deny` and `ask` as real permission behaviours — Phase 6 says "deny/allow/ask" but never the **precedence** — **DONE 2026-10-27**: `deny` removes the tool's schema from the request via `toolsJsonFiltered()` in `src/tools/registry.zig`, used in `agent.zig`'s request loop so a denied tool is never offered to the model (incl. `deny` with `*` = deny all). Precedence (deny > allow > ask, source priority, last-match-wins) was already implemented in `permrules.decide` and is pinned by existing tests ("a DENY beats any allow", "the strongest source wins"), plus 3 new `toolsJsonFiltered` tests. `blob` stays comptime; filtering is runtime since deny rules come from user-editable permission files.
 - [ ] **34.4** The dangerous-allow-rule warning and the shadowed-rule detection — **NOT COVERED**
   - The reference implementation: a list of the DANGEROUS patterns (the bare interpreters) and a detector for the SHADOWED rules (a rule that can never fire because another one covers it)
   - Ours: an allowlist entry of `bash` is that hazard in its purest form

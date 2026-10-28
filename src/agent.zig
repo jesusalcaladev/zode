@@ -6019,6 +6019,16 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // turn: 3 per turn is the ceiling that stops it from going in circles when
     // the problem is configuration and not quota.
     var rotations: u8 = 0;
+    // Tools a `deny` rule strips from the schema sent to the model: the model
+    // cannot call a tool it cannot see. Built once per turn from the live
+    // permission rules (they can change between turns, but not mid-turn).
+    var denied_names: std.ArrayList([]const u8) = .empty;
+    for (perm_rules.rules) |r| {
+        if (r.action == .deny) {
+            try denied_names.append(gpa, r.tool);
+        }
+    }
+    const denied = try denied_names.toOwnedSlice(gpa);
     while (true) : (attempt += 1) {
         // The body is composed INSIDE the loop, and not before.
         //
@@ -6033,6 +6043,13 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         // NOT freed between attempts: `buildBodyMessages` overwrites it and the
         // pointer is only used while the request is in flight.
         const body_buf = try bodyBuf(gpa);
+        // Tools denied by a permission rule are stripped from the schema the
+        // model sees: it cannot call a tool it cannot see. Built in a throwaway
+        // arena per iteration because the schema is recomputed each rotation
+        // (and `read_only` keeps its own static slice).
+        var sarena = std.heap.ArenaAllocator.init(gpa);
+        defer sarena.deinit();
+        const schema = if (read_only) tools_registry.toolsJsonReadOnly() else try tools_registry.toolsJsonFiltered(sarena.allocator(), denied);
         const body = try chat.buildBodyMessagesCapped(
             body_buf,
             pick.model,
@@ -6047,7 +6064,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             // moved to a smaller one. It is the same `Target` the rest of the
             // rotation path talks about.
             chat.effectiveEffort(pick.model, current_effort),
-            if (read_only) tools_mod.toolsJsonReadOnly() else tools_mod.toolsJson(),
+            schema,
             pick.kind,
             outputCapFor(pick.def, environ_global),
         );

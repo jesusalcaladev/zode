@@ -960,6 +960,46 @@ pub fn toolsJson() []const u8 {
 pub fn toolsJsonReadOnly() []const u8 {
     return toolsJsonReadOnlyBlob;
 }
+
+/// The JSON array of the tools, with every tool a `deny` permission rule
+/// matches removed from the schema sent to the model. A `deny` rule with tool
+/// `*` removes every tool.
+///
+/// Built at RUNTIME from `defs` because the deny rules come from permission
+/// files the user can edit mid-session; the comptime `blob` above cannot see
+/// them. The returned slice is owned by `gpa`.
+pub fn toolsJsonFiltered(gpa: std.mem.Allocator, denied: []const []const u8) ![]u8 {
+    var deny_all = false;
+    for (denied) |dn| {
+        if (std.mem.eql(u8, dn, "*")) {
+            deny_all = true;
+            break;
+        }
+    }
+    if (deny_all) {
+        const empty = try gpa.dupe(u8, "[]");
+        return empty;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(gpa, "[");
+    var first = true;
+    for (defs) |d| {
+        var is_denied = false;
+        for (denied) |dn| {
+            if (std.mem.eql(u8, d.name, dn)) {
+                is_denied = true;
+                break;
+            }
+        }
+        if (is_denied) continue;
+        if (!first) try out.appendSlice(gpa, ",");
+        first = false;
+        try out.appendSlice(gpa, d.schema);
+    }
+    try out.appendSlice(gpa, "]");
+    return out.toOwnedSlice(gpa);
+}
 test "needsPermission" {
     try std.testing.expect(needsPermission("bash"));
     try std.testing.expect(needsPermission("check"));
@@ -1351,4 +1391,46 @@ test "toolActivity: unknown tool returns its name" {
     const arena = arena_state.allocator();
     const s = toolActivity(arena, "nonexistent_tool", "{}");
     try std.testing.expectEqualStrings("nonexistent_tool", s);
+}
+
+test "toolsJsonFiltered: with no denies it returns every tool" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const filtered = try toolsJsonFiltered(arena, &[_][]const u8{});
+    defer arena.free(filtered);
+
+    try std.testing.expect(std.mem.eql(u8, filtered, toolsJson()));
+    // A couple of known tools are present.
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"bash\"") != null);
+}
+
+test "toolsJsonFiltered: a denied tool is removed from the schema" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const filtered = try toolsJsonFiltered(arena, &[_][]const u8{ "write" });
+    defer arena.free(filtered);
+
+    // write is gone.
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"name\":\"write\"") == null);
+    // Everything else remains.
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"name\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"name\":\"bash\"") != null);
+}
+
+test "toolsJsonFiltered: a deny-all star removes every tool" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const filtered = try toolsJsonFiltered(arena, &[_][]const u8{ "*" });
+    defer arena.free(filtered);
+
+    try std.testing.expectEqualStrings("[]", filtered);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "\"read\"") == null);
 }
