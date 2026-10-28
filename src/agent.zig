@@ -56,6 +56,7 @@ const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const textcap = @import("lib/textcap.zig");
 const resultcap = @import("lib/resultcap.zig");
+const toolstore = @import("lib/toolstore.zig");
 const tools_registry = @import("tools/registry.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
@@ -8383,13 +8384,28 @@ fn execOneCall(
         m.bash_may_write = true;
     }
 
-    // The result that goes into the message is the one that was capped, and the
-    // cap is the SMALLER of the tool's own and what is left of the message.
-    //
-    // The cut carries its notice inside the budget, so the model is told the
-    // result is incomplete instead of believing it is the whole thing.
-    const capped = resultcap.capResult(arena, res, budget.capFor(tools_registry.resultCap(call.name))) catch
-        resultcap.Capped{ .text = res, .cut = false };
+    // Phase 3.1: large results are spilled to `sessions/<id>/tool-results/<n>.txt`
+    // and the model receives a preview + path instead of blind truncation.
+    // Unbounded tools (`read`, cap == 0) keep their full result; anything over
+    // its per-tool cap is written to disk once and a short preview is sent.
+    // The cut carries its notice inside the budget.
+    const tool_cap = tools_registry.resultCap(call.name);
+    var result_text: []const u8 = res;
+    if (tool_cap != 0 and res.len > tool_cap) {
+        if (s.path) |spath| {
+            const tool_dir = std.fs.path.dirname(spath) orelse "/";
+            const stored = toolstore.storeResult(
+                arena, io_global, tool_dir, s.tool_result_next, res
+            );
+            s.tool_result_next += 1;
+            if (stored.stored) {
+                result_text = stored.text;
+            }
+        }
+    }
+    const capped = resultcap.capResult(
+        arena, result_text, budget.capFor(tool_cap)
+    ) catch resultcap.Capped{ .text = result_text, .cut = false };
     budget.charge(capped.text.len);
     s.appendToolResult(call.id, call.name, capped.text) catch {};
     if (std.mem.eql(u8, call.name, "read")) {
@@ -8544,8 +8560,23 @@ fn runParallelBatch(
         m.pushToolDone(t.calls.items[from + k].name, summary, r.ms, r.text);
         // The same cap as the serial path: the budget belongs to the MESSAGE,
         // not to the way the calls happened to be run.
-        const capped = resultcap.capResult(arena, r.text, budget.capFor(tools_registry.resultCap(t.calls.items[from + k].name))) catch
-            resultcap.Capped{ .text = r.text, .cut = false };
+        const tool_cap = tools_registry.resultCap(t.calls.items[from + k].name);
+        var result_text: []const u8 = r.text;
+        if (tool_cap != 0 and r.text.len > tool_cap) {
+            if (s.path) |spath| {
+                const tool_dir = std.fs.path.dirname(spath) orelse "/";
+                const stored = toolstore.storeResult(
+                    arena, io_global, tool_dir, s.tool_result_next, r.text
+                );
+                s.tool_result_next += 1;
+                if (stored.stored) {
+                    result_text = stored.text;
+                }
+            }
+        }
+        const capped = resultcap.capResult(
+            arena, result_text, budget.capFor(tool_cap)
+        ) catch resultcap.Capped{ .text = result_text, .cut = false };
         budget.charge(capped.text.len);
         s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, capped.text) catch {};
         // `r.text` is the caller's and both consumers above COPIED it

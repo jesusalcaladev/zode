@@ -78,6 +78,11 @@ pub const Session = struct {
     /// sessionindex Meta sidecar.
     ai_title: []const u8 = "",
 
+    /// Next index for a stored tool result (`sessions/<id>/tool-results/<n>.txt`).
+    /// Per session: each session id gets its own tool-results directory, so a
+    /// counter starting at zero never collides within a session.
+    tool_result_next: usize = 0,
+
     pub fn init(allocator: std.mem.Allocator) Session {
         return .{
             .allocator = allocator,

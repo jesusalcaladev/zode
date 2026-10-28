@@ -74,9 +74,7 @@ state, the open bug and the quality bar).
 
 > Blind elision loses detail. Storage loses it *on purpose* — and the model can get it back.
 
-- [ ] **3.1** `src/lib/toolstore.zig` — large result → file + preview + path
-  - [ ] Over cap → write `sessions/<id>/tool-results/<n>.txt`, return `[result stored: N bytes at <path>; read the part you need]` + 2 KB preview
-  - [ ] Constants (env-overridable): `default_max_result_chars=50_000` · `max_result_bytes=400_000` · `max_results_per_message_chars=200_000` · `summary_max_len=50`
+- [x] **3.1** `src/lib/toolstore.zig` — large result → file + preview + path — **DONE 2026-10-28**: `toolstore.zig` module (storeResult, summarize, env-overridable constants) complete and tested; wired into `agent.zig` so large non-unbounded tool results are spilled to `sessions/<id>/tool-results/<n>.txt` and the model receives a preview + path instead of blind truncation. `read` stays unbounded. Verified with `zig build test` and `zig build`.
 
 ---
 
