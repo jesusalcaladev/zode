@@ -928,6 +928,12 @@ pub const PromptDot = struct {
 pub const Model = struct {
     allocator: std.mem.Allocator,
 
+    /// Whether the terminal window currently has focus. `true` at startup;
+    /// `focus_in`/`focus_out` from vaxis flip it, and the composer's caret is
+    /// dimmed while it is `false` so the reader sees at a glance that typing
+    /// here does nothing until the window is focused again.
+    focused: bool = true,
+
     /// Own input: `vxfw.TextField` is single-line and has no history, so the
     /// prompt is edited with `editor.Editor`.
     ed: ed.Editor,
@@ -6410,6 +6416,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             try self.armTick(ctx);
         },
         .focus_in => {
+            self.focused = true;
             ctx.redraw = true;
             try self.armTick(ctx);
         },
@@ -6425,6 +6432,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
         // text drag could never start a selection again and the first drag
         // anywhere jumped the scroll to wherever the pointer happened to be.
         .focus_out => {
+            self.focused = false;
             self.cancelMouseGestures();
             ctx.redraw = true;
         },
@@ -7181,10 +7189,14 @@ fn drawInput(
     // The accent bar: one cell per well row, in the left margin. `▌` and NOT
     // `│`: a half-block is the "here" mark in every editor and a pipe reads as
     // a border. Color changes with state: normal=input_bar, busy=brand, ask=warn.
+    // The caret is dimmed when the window does not have focus: typing here does
+    // nothing until the window is focused again, and the reader should see that.
     {
+        var bs = bar_style;
+        if (!self.focused) bs.dim = true;
         var i: u16 = 0;
         while (i < well_h and top + i < p.height) : (i += 1) {
-            p.putStable(0, top + i, "▌", 1, bar_style);
+            p.putStable(0, top + i, "▌", 1, bs);
         }
     }
 
@@ -9518,6 +9530,60 @@ test "input: accent bar is brand when tool is running (ui-frame running scene)" 
     const input_row = h - 2;
     const bar_cell = s.readCell(0, input_row);
     try std.testing.expectEqual(theme.brand.fg, bar_cell.style.fg);
+}
+
+test "focus: the window starts focused and focus_in/focus_out flip it" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try std.testing.expect(m.focused);
+
+    var ctx = testCtx();
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    // Losing focus flips the flag (no timer registration involved).
+    try typeErasedEventHandler(&m, &ctx, .focus_out);
+    try std.testing.expect(!m.focused);
+
+    // Regaining focus flips it back. `tick_armed` is set so `armTick` does not
+    // try to register a timer against the test's undefined `Io` (`Tick.in`
+    // calls `std.Io.Timestamp.now` which needs a real `Io`): the flag flip is
+    // what is under test here.
+    m.tick_armed = true;
+    try typeErasedEventHandler(&m, &ctx, .focus_in);
+    try std.testing.expect(m.focused);
+}
+
+test "focus: the accent bar is dimmed when the window is not focused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const w: u16 = 80;
+    const h: u16 = 30;
+    const input_row = h - 2;
+
+    var ctx = testCtx();
+    defer ctx.cmds.deinit(ctx.alloc);
+
+    const s = try drawTest(&m, arena, w, h);
+    try std.testing.expect(!s.readCell(0, input_row).style.dim);
+
+    try typeErasedEventHandler(&m, &ctx, .focus_out);
+    try std.testing.expect(!m.focused);
+
+    const dimmed = try drawTest(&m, arena, w, h);
+    try std.testing.expect(dimmed.readCell(0, input_row).style.dim);
+
+    m.tick_armed = true;
+    try typeErasedEventHandler(&m, &ctx, .focus_in);
+    try std.testing.expect(m.focused);
+
+    const lit = try drawTest(&m, arena, w, h);
+    try std.testing.expect(!lit.readCell(0, input_row).style.dim);
 }
 
 test "input: rows scrolled out above are announced instead of silently hidden" {

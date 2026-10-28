@@ -528,7 +528,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 - [ ] **33.14** OSC 8 hyperlinks — the paths and the URLs as real links; the detection is ~30 lines and vaxis exposes the cell attributes
 - [x] **33.15** The shortcut help in the footer (`? for shortcuts`) — **DONE 2026-10-21**: `?` on an empty input opens the list, and the list carries the LEGEND of the permission glyphs. The hint in the footer only appears when the state has room for it
 - [ ] **33.16** The external editor (`ctrl+g`) and the image paste (`ctrl+v`) — the image path already exists (`src/lib/images.zig`)
-- [ ] **33.17** The focus detection (dim the caret when the window is not focused) — vaxis reports focus events
+- [x] **33.17** The focus detection (dim the caret when the window is not focused) — vaxis reports focus events — **DONE 2026-10-27**: `Model.focused` tracks `focus_in`/`focus_out`; the composer's accent bar (the caret mark) is painted dimmed while the window is unfocused. Two draw tests pin the flag flip and the dimming.
 - [ ] **33.18** The modal diff viewer — only worth it once a turn can produce multi-file diffs
 - [ ] **33.19** The compact-summary line — after a tier-2 compaction the transcript loses history **silently**; one honest line says what was summarised
 - [x] **33.20** The queued prompts' **text**, not just the count — **DONE 2026-10-21**: "2 queued · arregla los tests" instead of "2 queued", truncated with an ellipsis (a half-line that looks complete is a lie about what is queued)
