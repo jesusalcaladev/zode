@@ -107,6 +107,83 @@ pub const Set = struct {
     }
 };
 
+/// Dangerous patterns: bare interpreters that can run arbitrary commands.
+/// An `allow` for `bash` is not "allow this command", it is "allow the shell
+/// to run anything", which is `/yolo` with extra steps. These are the patterns
+/// a broad `always allow` should warn about.
+pub const dangerous_patterns: []const []const u8 = &[_][]const u8{
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+};
+
+/// Whether a rule's tool+pattern is one of the dangerous bare interpreters.
+/// A bare interpreter with a broad pattern (`bash(*)`, `python(*)`) lets the
+/// model run any command through it, so an `always allow` on it is a hazard.
+pub fn isDangerousPattern(tool: []const u8, pattern: []const u8) bool {
+    for (dangerous_patterns) |dp| {
+        if (std.ascii.eqlIgnoreCase(tool, dp)) {
+            // A pattern of `*` or `*` with anything after it covers everything
+            // the interpreter can run. `*` alone, or `* ` with args, is broad.
+            if (std.mem.eql(u8, pattern, "*")) return true;
+            // `bash -c *` also runs anything: the first word is the
+            // interpreter, the rest is the command it will execute.
+            if (std.mem.startsWith(u8, pattern, "*")) return true;
+            return false;
+        }
+    }
+    return false;
+}
+
+/// Whether `super` covers everything `sub` covers: same tool (or `*` in super),
+/// and super's pattern matches sub's pattern (or super's pattern is `*`).
+fn covers(super: Rule, sub: Rule) bool {
+    if (!std.ascii.eqlIgnoreCase(super.tool, sub.tool) and !std.mem.eql(u8, super.tool, "*"))
+        return false;
+    if (std.mem.eql(u8, super.pattern, "*")) return true;
+    if (std.mem.eql(u8, sub.pattern, "*")) return false; // sub is broader than super
+    return matchesPattern(super.pattern, sub.pattern);
+}
+
+/// Whether a rule is shadowed: another rule covers everything it covers,
+/// with a definitive action (`allow`/`deny`, not `ask`/`dontAsk`), and
+/// equal or stronger precedence (stronger source, or same source and later
+/// in the list since the last rule of a file wins).
+pub fn shadowedRule(rules: []const Rule, index: usize) bool {
+    const sub = rules[index];
+    // Only `allow` can be shadowed: `deny` wins over everything, and `ask`/
+    // `dontAsk` still ask the user so they don't remove the need for a rule.
+    if (sub.action != .allow) return false;
+    for (rules, 0..) |other, i| {
+        if (i == index) continue;
+        // A deny from any source shadows an allow — deny beats allow always.
+        if (other.action == .deny) {
+            if (covers(other, sub)) return true;
+            continue;
+        }
+        // An allow from an equal or stronger source shadows an allow.
+        if (other.action != .allow) continue;
+        if (!covers(other, sub)) continue;
+        const other_stronger = @intFromEnum(other.source) < @intFromEnum(sub.source);
+        const same_source = other.source == sub.source;
+        const later_in_file = same_source and i > index;
+        if (other_stronger or later_in_file) return true;
+    }
+    return false;
+}
+
 /// Parses ONE rule: `Tool(pattern) action`.
 ///
 /// The action is optional and defaults to `allow`. The pattern may contain
@@ -588,4 +665,92 @@ test "permrules: dontAsk without ask means no dialog is needed" {
     };
     const d = decide(&rules, "Write", &.{".git/config"}).?;
     try t.expectEqual(Action.dontAsk, d.action);
+}
+
+test "permrules: isDangerousPattern flags bare interpreters with broad patterns" {
+    try t.expect(isDangerousPattern("bash", "*"));
+    try t.expect(isDangerousPattern("bash", "* "));
+    try t.expect(isDangerousPattern("sh", "*"));
+    try t.expect(isDangerousPattern("python", "*"));
+    try t.expect(isDangerousPattern("node", "*"));
+    // Narrow patterns are not dangerous: they cover one command, not everything.
+    try t.expect(!isDangerousPattern("bash", "git status"));
+    try t.expect(!isDangerousPattern("bash", "git *"));
+    try t.expect(!isDangerousPattern("python", "script.py"));
+    // Non-interpreter tools are never dangerous.
+    try t.expect(!isDangerousPattern("write", "*"));
+    try t.expect(!isDangerousPattern("read", "*"));
+    try t.expect(!isDangerousPattern("bash", ""));
+}
+
+test "permrules: shadowedRule finds a rule covered by a stronger allow" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const rules = [_]Rule{
+        .{ .tool = "Bash", .pattern = "git *", .action = .allow, .source = .user, .text = a.dupe(u8, "Bash(git *) allow") catch "" },
+        .{ .tool = "Bash", .pattern = "git status", .action = .allow, .source = .policy, .text = a.dupe(u8, "Bash(git status) allow") catch "" },
+    };
+    // The user rule for `git *` (stronger source) shadows the policy rule for `git status`.
+    try t.expect(shadowedRule(&rules, 1));
+    // The user rule is not shadowed.
+    try t.expect(!shadowedRule(&rules, 0));
+}
+
+test "permrules: shadowedRule finds a rule covered by a deny" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .allow, .source = .user, .text = a.dupe(u8, "Write(.git/**) allow") catch "" },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .deny, .source = .policy, .text = a.dupe(u8, "Write(.git/**) deny") catch "" },
+    };
+    // The user allow is shadowed by the policy deny (deny beats allow).
+    try t.expect(shadowedRule(&rules, 0));
+    // The policy deny is not shadowed.
+    try t.expect(!shadowedRule(&rules, 1));
+}
+
+test "permrules: shadowedRule does not flag ask rules" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .ask, .source = .policy, .text = a.dupe(u8, "Write(.git/**) ask") catch "" },
+        .{ .tool = "Write", .pattern = ".git/config", .action = .ask, .source = .user, .text = a.dupe(u8, "Write(.git/config) ask") catch "" },
+    };
+    // ask rules don't shadow: the user still gets asked for both.
+    try t.expect(!shadowedRule(&rules, 1));
+}
+
+test "permrules: shadowedRule does not flag same-source earlier rule" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/**", .action = .allow, .source = .project, .text = a.dupe(u8, "Write(.git/**) allow") catch "" },
+        .{ .tool = "Write", .pattern = ".git/config", .action = .allow, .source = .project, .text = a.dupe(u8, "Write(.git/config) allow") catch "" },
+    };
+    // Same source, earlier rule: not shadowed (last rule of a file wins, but
+    // the earlier one still applies to paths not covered by the later one).
+    try t.expect(!shadowedRule(&rules, 0));
+}
+
+test "permrules: shadowedRule flags same-source later rule" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const rules = [_]Rule{
+        .{ .tool = "Write", .pattern = ".git/config", .action = .allow, .source = .project, .text = a.dupe(u8, "Write(.git/config) allow") catch "" },
+        .{ .tool = "Write", .pattern = ".git/**", .action = .allow, .source = .project, .text = a.dupe(u8, "Write(.git/**) allow") catch "" },
+    };
+    // Same source, later rule covers the earlier: earlier is shadowed.
+    try t.expect(shadowedRule(&rules, 0));
+    // The later broad rule is not shadowed.
+    try t.expect(!shadowedRule(&rules, 1));
 }

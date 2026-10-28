@@ -1971,7 +1971,14 @@ fn allowAlwaysFor(m: *tui.Model, name: []const u8, arg: []const u8) void {
         return;
     }
     const cmd = std.mem.trim(u8, arg, " \t\r\n");
-    if (cmd.len == 0) return;
+    if (cmd.len == 0) {
+        warnDangerousAllowOnce(m, "bash (*)");
+        return;
+    }
+    // 34.4: warn once about a broad bash allow (bash * runs anything)
+    if (std.mem.eql(u8, cmd, "*") or std.mem.startsWith(u8, cmd, "* ")) {
+        warnDangerousAllowOnce(m, "bash (*)");
+    }
     if (addBashPatternNoSave(cmd)) {
         saveAllowlist();
         const msg = std.fmt.allocPrint(m.allocator, "bash allowed: {s}", .{cmd}) catch return;
@@ -1983,11 +1990,29 @@ fn allowAlwaysFor(m: *tui.Model, name: []const u8, arg: []const u8) void {
     }
 }
 
+/// Warns once about a broad "always allow" on a dangerous bare interpreter.
+/// It is a warning, not a refusal: the user can still approve, but they should
+/// know what they are approving.
+fn warnDangerousAllowOnce(m: *tui.Model, what: []const u8) void {
+    if (warned_dangerous_allow.load(.seq_cst)) return;
+    warned_dangerous_allow.store(true, .seq_cst);
+    const msg = std.fmt.allocPrint(
+        m.allocator,
+        "warning: always allowing {s} lets the model run arbitrary commands through it — a broad permission, like /yolo for that tool.",
+        .{what},
+    ) catch return;
+    pushInfoOwned(m, msg);
+}
+
 fn setAlwaysAllowed(m: *tui.Model, name: []const u8) void {
     if (setAlwaysAllowedNoSave(name)) {
         saveAllowlist();
         const msg = std.fmt.allocPrint(m.allocator, "always allowed: {s}", .{name}) catch return;
         pushInfoOwned(m, msg);
+        // 34.4: warn once about dangerous broad allows
+        if (permrules.isDangerousPattern(name, "*")) {
+            warnDangerousAllowOnce(m, name);
+        }
     }
 }
 
@@ -2114,6 +2139,10 @@ fn readFileToWith(io: std.Io, arena: std.mem.Allocator, path: []const u8) ?[]con
 /// (the same rule as the saved keys).
 pub var perm_rules: permrules.Set = .{};
 var perm_rules_arena: ?std.heap.ArenaAllocator = null;
+
+/// Whether the dangerous-allow warning has already been shown this session.
+/// It fires once: repeating it every turn would train the user to dismiss it.
+pub var warned_dangerous_allow: std.atomic.Value(bool) = .init(false);
 
 /// The project-level rules file, relative to the working directory.
 pub const project_rules_file = ".zode/permissions.json";
