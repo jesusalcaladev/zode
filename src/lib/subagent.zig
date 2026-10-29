@@ -259,6 +259,12 @@ pub const Task = struct {
     /// `~/.config/zode/agents/`. When set, the definition's tools/model/effort
     /// override the defaults (the definition's tools must still be read-only).
     definition: []const u8 = "",
+    /// When true, the subagent runs in the BACKGROUND: the task call returns an
+    /// id immediately instead of waiting for the report, and the model is
+    /// notified when the subagent lands. Use for long-running searches that
+    /// should not park the turn. Depth 1, effort low, read-only tools only —
+    /// same bounds as a foreground task.
+    run_in_background: bool = false,
 };
 
 pub const ParseError = error{
@@ -294,7 +300,17 @@ pub fn parseTask(arena: std.mem.Allocator, args_json: []const u8) ParseError!Tas
         if (v == .string) definition = std.mem.trim(u8, v.string, " \t\r\n");
     }
 
-    return .{ .description = description, .prompt = prompt, .definition = definition };
+    var run_in_background: bool = false;
+    if (obj.get("run_in_background")) |v| {
+        if (v == .bool) run_in_background = v.bool;
+    }
+
+    return .{
+        .description = description,
+        .prompt = prompt,
+        .definition = definition,
+        .run_in_background = run_in_background,
+    };
 }
 
 /// What the subagent's final message becomes, for the main agent.

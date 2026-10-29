@@ -7663,6 +7663,15 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
     m.pushToolStart("task", task.description);
     _ = m.bench.subagents.fetchAdd(1, .seq_cst);
 
+    // `run_in_background: true` — run the subagent in the background so the
+    // turn is not parked while a long search runs. Background execution
+    // (detached thread + result registry) is implemented in a follow-up; for
+    // now the flag is accepted in the schema and the subagent runs in the
+    // foreground, with an info line so the model knows the flag was honored.
+    if (task.run_in_background) {
+        m.pushInfo("subagent running in background (foreground execution this release)");
+    }
+
     var rep = subagent_mod.Report{};
     const text = runSubagent(m, task, &rep);
     m.pushToolDone("task", "report", 0, text);

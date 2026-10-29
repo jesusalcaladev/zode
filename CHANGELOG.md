@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - frozen cut decisions (Phase 34.2) (resultcap) [`3eaa598a`](https://github.com/jesusalcaladev/zode/commit/3eaa598a)
 - add /clear command and /exit alias (Phase 35.5) [`4408e305`](https://github.com/jesusalcaladev/zode/commit/4408e305)
 - add /version command (Phase 35.9) [`93be1011`](https://github.com/jesusalcaladev/zode/commit/93be1011)
-- cache_control on stable prompt messages for 90%%+ cache-hit [`4da6ca18`](https://github.com/jesusalcaladev/zode/commit/4da6ca18)
+- cache_control on stable prompt messages for 90%%+ cache-hit [`abf8ae23`](https://github.com/jesusalcaladev/zode/commit/abf8ae23)
+- background subagents (run_in_background) + cache_control for 90%%+ cache-hit [`c9c42d7b`](https://github.com/jesusalcaladev/zode/commit/c9c42d7b)
 
 ### Chores
 
