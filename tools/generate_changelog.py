@@ -19,7 +19,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.getcwd()  # run from repo root; the hook runs in the repo root too
 
 GITHUB_BASE = "https://github.com/jesusalcaladev/zode/commit/"
 
@@ -83,13 +83,13 @@ def get_git_log() -> list[dict]:
         if not block:
             continue
         parts = block.split("\x1f")
-        if len(parts) < 4:
+        # A commit with an empty body produces only 3 fields (hash, date,
+        # subject) because git omits the trailing field separator when %b is
+        # empty. Accept 3+ fields; body is "" when there is no 4th field.
+        if len(parts) < 3:
             continue
         hsh, date, subject = parts[0], parts[1], parts[2]
-        body = "\x1f".join(parts[3:]) if len(parts) > 4 else parts[3]
-
-        if is_noise(subject):
-            continue
+        body = "\x1f".join(parts[3:]) if len(parts) > 3 else ""
 
         if is_noise(subject):
             continue
@@ -112,7 +112,6 @@ def get_git_log() -> list[dict]:
             "breaking": is_breaking,
         })
     return commits
-
 
 def render_changelog(commits: list[dict]) -> str:
     lines: list[str] = []
@@ -176,6 +175,7 @@ def write_changelog(output: str) -> int:
     content = render_changelog(commits)
     with open(output, "w", encoding="utf-8") as f:
         f.write(content)
+    print(f"Wrote {output} ({len(commits)} commits)")
     print(f"Wrote {output} ({len(commits)} commits)")
     return 0
 
