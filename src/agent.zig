@@ -3517,6 +3517,12 @@ fn cmdYolo(m: *tui.Model) void {
     setStatusWithZo(m, if (yolo) .warn else .idle, msg);
 }
 
+/// `/version`: show the running zode version.
+/// Phase 35.9: a one-liner over `src/lib/selfupdate.zig` (`current_version`).
+fn cmdVersion(m: *tui.Model) void {
+    m.pushInfoFmt("zode {s}", .{selfupdate.current_version});
+}
+
 /// `/clear`: clear the visible transcript and reset the per-session caches
 /// (the read list, the changed list, and the "skills already attached" flag
 /// so the listing is re-attached on the next turn). Like `/new` this buys a
@@ -3679,6 +3685,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdUpdate(m);
     } else if (std.mem.eql(u8, cmd, "compact")) {
         commands_mod.cmdCompact(m, rest);
+    } else if (std.mem.eql(u8, cmd, "version")) {
+        cmdVersion(m);
     } else if (std.mem.eql(u8, cmd, "goal")) {
         commands_mod.cmdGoal(m, rest);
     } else if (std.mem.eql(u8, cmd, "init")) {
@@ -12817,6 +12825,20 @@ test "cmdClear clears the screen and resets the session caches" {
     try std.testing.expect(pendingContains(&m, "screen cleared"));
     try std.testing.expect(pendingContains(&m, "read cache + changed list reset"));
     try std.testing.expect(pendingContains(&m, "skills listing re-attached next turn"));
+}
+
+test "cmdVersion shows the running zode version" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.io = std.testing.io;
+    m.io_ready = true;
+    m.environ = null;
+
+    cmdVersion(&m);
+
+    // `current_version` is injected at build time ("dev" for a local build),
+    // so the message always starts with "zode ".
+    try std.testing.expect(pendingContains(&m, "zode "));
 }
 
 test "prompt: the routing guide survives the project's AGENTS.md" {
