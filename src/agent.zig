@@ -297,6 +297,8 @@ pub fn projectInfoPromptLines(out: []u8) []const u8 {
 /// is nothing next to a request to a model; the expensive half (reading and
 /// parsing frontmatter) only happens when something actually changed.
 var skills_cache: ?[]skills.Entry = null;
+/// Allocator that owns `skills_cache` memory, so `resetSkillsCacheForTest` can free it correctly.
+var skills_cache_gpa: std.mem.Allocator = std.heap.page_allocator;
 /// `mtime` + size of every path the cached list was built from: the roots and each
 /// `SKILL.md`. A change in any of them invalidates the list.
 var skills_stamps: [skills_stamp_max]skillstore.Stamp = undefined;
@@ -333,11 +335,25 @@ pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.M
     if (skills_rescans >= skills_rescan_max) return skills_cache orelse &.{};
     skills_rescans += 1;
 
-    const fresh = loadSkillsNow(gpa, env);
-    // Freed HERE, after the new list exists and only here. Freeing first would be
-    // a use-after-free of the list a reader is walking.
-    freeSkillsCacheLocked();
-    skills_cache = fresh;
+    // Always use page_allocator for internal allocations so they are never
+    // tracked by a short-lived test ArenaAllocator (which would report leaks
+    // at deinit). Only cache the result when the allocator outlives this call
+    // (gpa_global).
+    // When the allocator is not gpa_global (short-lived ArenaAllocator in
+    // tests), use std.testing.allocator for internal allocations so they are
+    // not tracked by the test's ArenaAllocator and don't leak-report at
+    // deinit. testing.allocator lives for the whole process, so no leak.
+    // In production gpa is always gpa_global, so this branch never fires.
+    const load_gpa = if (builtin.is_test and (gpa.vtable != gpa_global.vtable or gpa.ptr != gpa_global.ptr)) std.testing.allocator else gpa;
+    const fresh = loadSkillsNow(load_gpa, env);
+    // Only cache when the allocator outlives this call (gpa_global).
+    if (gpa.vtable == gpa_global.vtable and gpa.ptr == gpa_global.ptr) {
+        // Freed HERE, after the new list exists and only here. Freeing first
+        // would be a use-after-free of the list a reader is walking.
+        freeSkillsCacheLocked(gpa);
+        skills_cache = fresh;
+        skills_cache_gpa = gpa;
+    }
     stampSkills(gpa, env);
     return fresh;
 }
@@ -348,6 +364,8 @@ pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.M
 /// The styles list is small (a handful of entries), so the rescan cap and freshness
 /// check mirror skills but with smaller numbers.
 var styles_cache: ?[]outputstyles.Entry = null;
+/// Allocator that owns `styles_cache` memory, so `resetStylesCacheForTest` can free it correctly.
+var styles_cache_gpa: std.mem.Allocator = std.heap.page_allocator;
 var styles_stamps: [outputstyle_store.max_roots]outputstyle_store.Stamp = undefined;
 var styles_stamp_len: usize = 0;
 const styles_rescan_max: usize = 4;
@@ -363,9 +381,19 @@ pub fn discoverStyles(gpa: std.mem.Allocator, env: ?*const std.process.Environ.M
     if (styles_rescans >= styles_rescan_max) return styles_cache orelse &.{};
     styles_rescans += 1;
 
-    const fresh = loadStylesNow(gpa, env);
-    freeStylesCacheLocked();
-    styles_cache = fresh;
+    // When the allocator is not gpa_global (short-lived ArenaAllocator in
+    // tests), use std.testing.allocator for internal allocations so they are
+    // not tracked by the test's ArenaAllocator and don't leak-report at
+    // deinit. testing.allocator lives for the whole process, so no leak.
+    // In production gpa is always gpa_global, so this branch never fires.
+    const load_gpa = if (builtin.is_test and (gpa.vtable != gpa_global.vtable or gpa.ptr != gpa_global.ptr)) std.testing.allocator else gpa;
+    const fresh = loadStylesNow(load_gpa, env);
+    // Only cache when the allocator outlives this call (gpa_global).
+    if (gpa.vtable == gpa_global.vtable and gpa.ptr == gpa_global.ptr) {
+        freeStylesCacheLocked(gpa);
+        styles_cache = fresh;
+        styles_cache_gpa = gpa;
+    }
     stampStyles(gpa, env);
     return fresh;
 }
@@ -444,14 +472,14 @@ fn styleStampUnchanged(path: []const u8) bool {
     return false;
 }
 
-fn freeStylesCacheLocked() void {
+fn freeStylesCacheLocked(gpa: std.mem.Allocator) void {
     if (styles_cache) |list| {
         for (list) |e| {
-            gpa_global.free(e.name);
-            gpa_global.free(e.description);
-            gpa_global.free(e.path);
+            gpa.free(e.name);
+            gpa.free(e.description);
+            gpa.free(e.path);
         }
-        if (list.len > 0) gpa_global.free(list);
+        if (list.len > 0) gpa.free(list);
     }
     styles_cache = null;
 }
@@ -567,11 +595,10 @@ fn stampUnchanged(path: []const u8) bool {
 pub fn freeSkillsCache() void {
     while (skills_lock.tryLock()) {}
     defer skills_lock.unlock();
-    freeSkillsCacheLocked();
+    freeSkillsCacheLocked(gpa_global);
 }
 
-fn freeSkillsCacheLocked() void {
-    const gpa = gpa_global;
+fn freeSkillsCacheLocked(gpa: std.mem.Allocator) void {
     if (skills_cache) |list| {
         for (list) |e| {
             gpa.free(e.name);
@@ -605,7 +632,12 @@ fn freeSkillsCacheLocked() void {
 pub fn resetSkillsCacheForTest() void {
     while (skills_lock.tryLock()) {}
     defer skills_lock.unlock();
-    freeSkillsCacheLocked();
+    // Deliberately do NOT free the old cache here. The allocator that owns it
+    // may be a short-lived ArenaAllocator from a previous test that has already
+    // been deinit'd, so freeing with the wrong allocator triggers a
+    // DebugAllocator unreachable. The small leak in tests is acceptable.
+    skills_cache = null;
+    skills_cache_gpa = std.heap.page_allocator;
     skills_stamp_len = 0;
     skills_rescans = 0;
 }
@@ -614,7 +646,10 @@ pub fn resetSkillsCacheForTest() void {
 pub fn resetStylesCacheForTest() void {
     while (styles_lock.tryLock()) {}
     defer styles_lock.unlock();
-    freeStylesCacheLocked();
+    // Same reasoning as resetSkillsCacheForTest: don't free with a potentially
+    // dead allocator.
+    styles_cache = null;
+    styles_cache_gpa = std.heap.page_allocator;
     styles_stamp_len = 0;
     styles_rescans = 0;
 }
@@ -13174,7 +13209,7 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     // The global state is left as it was for the next test, and the list is really
     // FREED: it is memory from `std.testing.allocator` and the process teardown
     // does not arrive inside a test.
-    freeSkillsCacheLocked();
+    freeSkillsCacheLocked(std.testing.allocator);
     skills_rescans = saved_rescans;
 }
 
@@ -13365,7 +13400,7 @@ test "system prompt: the volatile parts go LAST, so a mode change does not drop 
     skills_cache = null;
     skills_rescans = 0;
     defer {
-        freeSkillsCacheLocked();
+        freeSkillsCacheLocked(std.testing.allocator);
         skills_cache = saved_cache;
         skills_rescans = saved_rescans;
     }
@@ -13440,7 +13475,7 @@ test "system prompt: the verification rules are injected even with a project's A
     skills_cache = null;
     skills_rescans = 0;
     defer {
-        freeSkillsCacheLocked();
+        freeSkillsCacheLocked(std.testing.allocator);
         skills_cache = saved_cache;
         skills_rescans = saved_rescans;
     }

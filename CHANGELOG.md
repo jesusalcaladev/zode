@@ -27,7 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scroll state serializable for session resume (scroll infinito) [`21d4ab70`](https://github.com/jesusalcaladev/zode/commit/21d4ab70)
 - input byte cap rejects over-limit edits instead of truncating [`6bf19da7`](https://github.com/jesusalcaladev/zode/commit/6bf19da7)
 - images evict oldest first, named in the note, short-lived per turn [`ba0c9975`](https://github.com/jesusalcaladev/zode/commit/ba0c9975)
-- images capped with clear refusal, named file, harness custody [`1b4e2101`](https://github.com/jesusalcaladev/zode/commit/1b4e2101)
+- images capped with clear refusal, named file, harness custody [`9f35a288`](https://github.com/jesusalcaladev/zode/commit/9f35a288)
+
+### Bug Fixes
+
+- input byte cap rejects over-limit edits instead of truncating [`f1e600ad`](https://github.com/jesusalcaladev/zode/commit/f1e600ad)
 
 ### Chores
 
@@ -35,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove sess [`85e3ad7d`](https://github.com/jesusalcaladev/zode/commit/85e3ad7d)
 - remove completed tasks from TASKS.md board [`ad2f42ab`](https://github.com/jesusalcaladev/zode/commit/ad2f42ab)
 - mark memory block tasks as done in TASKS.md [`eb3a7201`](https://github.com/jesusalcaladev/zode/commit/eb3a7201)
+- release 0.2.0 [`c79c2f4f`](https://github.com/jesusalcaladev/zode/commit/c79c2f4f)
 
 ### Documentation
 
