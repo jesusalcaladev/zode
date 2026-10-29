@@ -419,7 +419,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // once: the same screenshot in four consecutive requests is four times the
         // tokens for information the model already has.
         var wire = msgs.items;
-        defer pending_images.clear();
+        defer pending_images.clear(gpa);
         if (!pending_images.isEmpty()) {
             const note = images_mod.wireNote(arena, &pending_images) catch "";
             if (note.len > 0) {

@@ -5613,6 +5613,10 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     // Echo of the user in the history, before dispatching.
     self.pushKind(.user, trimmed);
 
+    // A new message from the user starts a new turn: images read in previous
+    // turns do not ride along (short life, not cached between turns).
+    self.pending_images.clear(self.allocator);
+
     agent.submit(self, owned) catch |err| {
         // `pushInfoFmt` and NOT `allocPrint(ctx.alloc, …) + pushInfoOwned`: the
         // frame arena is reset at the end of the frame and is NOT the model's

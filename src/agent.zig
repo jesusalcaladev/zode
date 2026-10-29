@@ -9077,7 +9077,9 @@ pub const syntheticUserText = "Continue with the tool results above.";
 /// OpenAI's shape, which is the whole reason they live in the harness instead of
 /// in `read`'s result.
 fn withPendingImages(m: *tui.Model, arena: std.mem.Allocator, msgs: []chat.ChatMessage) []chat.ChatMessage {
-    defer m.pending_images.clear();
+    // Images live in `pending_images` and are re-sent on EVERY request of the
+    // same turn. They are cleared when the user sends a new message (see
+    // `submitInput` / `prepareImageFor`'s eviction), never cached or persisted.
     if (m.pending_images.isEmpty()) return msgs;
 
     const note = images_mod.wireNote(arena, &m.pending_images) catch return msgs;
@@ -9149,8 +9151,20 @@ pub fn prepareImageFor(
     defer p.deinit(gpa);
 
     if (p.image_b64) |b64| {
+        // Make room when full: evict the OLDEST image first so the request
+        // always carries the newest ones (short life, no accumulation).
+        if (pending.len >= images_mod.max_images) {
+            const evicted = pending.images[0].path;
+            if (evicted.len > 0) gpa.free(evicted);
+            for (0..pending.len - 1) |i| {
+                pending.images[i] = pending.images[i + 1];
+            }
+            pending.len -= 1;
+            pending.refused += 1;
+        }
         const slot = &pending.images[pending.len];
-        slot.* = .{ .mime = mime, .data_b64 = b64 };
+        const path_copy = gpa.dupe(u8, path) catch "";
+        slot.* = .{ .mime = mime, .data_b64 = b64, .path = path_copy };
         pending.len += 1;
     }
     return p.text;

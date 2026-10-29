@@ -42,11 +42,13 @@ pub const max_bytes = 1024 * 1024;
 pub const Pending = struct {
     images: [max_images]chat.Image = undefined,
     len: u8 = 0,
-    /// Bytes refused because of the caps, so the message can say so instead of the
-    /// model believing it saw everything.
+    /// Bytes refused because of the caps (including images evicted to make room),
+    /// so the message can say so instead of the model believing it saw everything.
     refused: u8 = 0,
-
-    pub fn clear(self: *Pending) void {
+    pub fn clear(self: *Pending, gpa: std.mem.Allocator) void {
+        for (self.images[0..self.len]) |img| {
+            if (img.path.len > 0) gpa.free(img.path);
+        }
         self.len = 0;
         self.refused = 0;
     }
@@ -156,8 +158,10 @@ pub fn wireNote(gpa: std.mem.Allocator, pending: *const Pending) ![]const u8 {
             names[n + 1] = ' ';
             n += 2;
         }
-        const written = @min(img.mime.len, names.len -| n);
-        @memcpy(names[n .. n + written], img.mime[0..written]);
+        // Name the saved file so the model knows which image is which.
+        const label = if (img.path.len > 0) std.fs.path.basename(img.path) else img.mime;
+        const written = @min(label.len, names.len -| n);
+        @memcpy(names[n .. n + written], label[0..written]);
         n += written;
     }
     var text = std.Io.Writer.Allocating.init(gpa);
@@ -281,4 +285,31 @@ test "wireNote: it says the image is the FILE, not a screenshot of the terminal"
     try std.testing.expect(std.mem.indexOf(u8, note2, "images above") != null);
     try std.testing.expect(std.mem.indexOf(u8, note2, "image/jpeg") != null);
     try std.testing.expect(std.mem.indexOf(u8, note2, "1 more image could not be attached") != null);
+}
+
+test "wireNote: names the saved file, not just the mime" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var p = Pending{};
+    p.images[0] = .{
+        .mime = "image/png",
+        .data_b64 = "AAAA",
+        .path = try gpa.dupe(u8, "/home/user/shots/screenshot.png"),
+    };
+    p.images[1] = .{
+        .mime = "image/jpeg",
+        .data_b64 = "BBBB",
+        .path = try gpa.dupe(u8, "/tmp/photo.JPG"),
+    };
+    p.len = 2;
+    defer p.clear(gpa);
+
+    const note = try wireNote(gpa, &p);
+    // The note names each saved file by basename.
+    try std.testing.expect(std.mem.indexOf(u8, note, "screenshot.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "photo.JPG") != null);
+    // Case preserved: the real file name, not lowercased.
+    try std.testing.expect(std.mem.indexOf(u8, note, "JPG") != null);
 }

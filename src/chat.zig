@@ -413,6 +413,10 @@ fn startsWithAny(haystack: []const u8, prefixes: []const []const u8) bool {
 pub const Image = struct {
     mime: []const u8,
     data_b64: []const u8,
+    /// Nombre del archivo del que vino la imagen (basename), para nombrarlo
+    /// en la nota que acompaña al request. Vida del request; NO se envía al
+    /// wire — solo `mime` y `data_b64` van en el cuerpo HTTP.
+    path: []const u8 = "",
 };
 
 /// An image that has not been encoded yet, which is how `read` leaves it.
