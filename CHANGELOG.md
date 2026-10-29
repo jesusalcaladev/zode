@@ -23,17 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cache_control on stable prompt messages for 90%%+ cache-hit [`abf8ae23`](https://github.com/jesusalcaladev/zode/commit/abf8ae23)
 - background subagents (run_in_background) + cache_control for 90%%+ cache-hit [`302d9fd9`](https://github.com/jesusalcaladev/zode/commit/302d9fd9)
 - add /doctor, /status, /compact now; clean project root [`2207d5b9`](https://github.com/jesusalcaladev/zode/commit/2207d5b9)
-- unify /config + /status + /usage into one panel (Phase 35.7) [`4838b918`](https://github.com/jesusalcaladev/zode/commit/4838b918)
+- unify /config + /status + /usage into one panel (Phase 35.7) [`c6fe48be`](https://github.com/jesusalcaladev/zode/commit/c6fe48be)
 
 ### Chores
 
 - updated README [`ce026748`](https://github.com/jesusalcaladev/zode/commit/ce026748)
 - remove sess [`85e3ad7d`](https://github.com/jesusalcaladev/zode/commit/85e3ad7d)
 - remove completed tasks from TASKS.md board [`ad2f42ab`](https://github.com/jesusalcaladev/zode/commit/ad2f42ab)
+- mark memory block tasks as done in TASKS.md [`eb3a7201`](https://github.com/jesusalcaladev/zode/commit/eb3a7201)
 
 ### Documentation
 
 - the tree split, and the two things the docs got wrong [`ce444934`](https://github.com/jesusalcaladev/zode/commit/ce444934)
+- add memory block tasks to CHANGELOG [`59935b38`](https://github.com/jesusalcaladev/zode/commit/59935b38)
 
 ### Refactors
 
