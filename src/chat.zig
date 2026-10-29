@@ -428,6 +428,15 @@ pub const ChatMessage = struct {
     tool_calls_json: ?[]const u8 = null,
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
+    /// When true, the body writer emits `cache_control: {"type":"ephemeral"}` on
+    /// this message so the provider serves it from its prompt cache instead of
+    /// re-writing it every turn. Set on messages that are stable across turns
+    /// (the system prompt, old history) and left false on the newest 1-2 messages
+    /// that carry the user's latest input and the model's pending answer.
+    /// Honored by Anthropic (native) and by OpenAI-compatible providers that
+    /// implement prefix caching (DeepSeek, NVIDIA NIM, ...). Providers that do
+    /// not understand it simply ignore the field.
+    cache_control: bool = false,
     /// Images that go WITH this message, as content blocks.
     ///
     /// Only a `user` message may carry them, and that is a property of the
@@ -1502,6 +1511,9 @@ fn buildBodyOpenAICapped(
                 try w.writeAll(tj);
             }
         }
+        if (m.cache_control) {
+            try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+        }
         try w.writeAll("}");
     }
     try w.writeAll("],\"stream\":true,\"stream_options\":{\"include_usage\":true}");
@@ -1674,15 +1686,10 @@ fn buildBodyAnthropicCapped(
                 try w.writeAll("\",\"content\":\"");
                 try jsonEscape(&w, messages[i].content);
                 try w.writeAll("\"");
-                // Two breakpoints here, not one, and the second one is the
-                // ROLLING one. With a single breakpoint on the last message, the
-                // prefix from `system` to the end has to be re-written on every
-                // turn, because it changed: the cache is read at the breakpoints,
-                // not continuously. Anchoring one a message earlier leaves the
-                // older half of the history sitting at a breakpoint that the next
-                // turn still hits, so the provider READS it and only writes the
-                // newest segment.
-                if (i + 1 >= messages.len - 1) try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+                // cache_control on the tool_result block of a stable message:
+                // the provider reads the cache up to here and only writes what
+                // comes after.
+                if (m.cache_control) try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
                 try w.writeAll("}");
             }
             try w.writeAll("]}");
@@ -1735,10 +1742,10 @@ fn buildBodyAnthropicCapped(
                             }
                         }
                         if (!input_written) try w.writeAll("{}");
-                        // The rolling pair again (see the tool_result branch):
-                        // the last tool_use of the last message, and of the one
-                        // before it.
-                        if (ti == pv.array.items.len - 1 and i + 1 >= messages.len - 1) {
+                        // cache_control on the last tool_use of a message that is
+                        // marked stable: the provider reads the cache up to here
+                        // and only writes what comes after.
+                        if (ti == pv.array.items.len - 1 and m.cache_control) {
                             try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
                         }
                         try w.writeAll("}");
@@ -1749,9 +1756,9 @@ fn buildBodyAnthropicCapped(
                 try w.writeAll("{\"type\":\"text\",\"text\":\"\"}");
             }
             try w.writeAll("]");
-        } else if (i + 1 >= messages.len - 1) {
-            // Last message (and the one before it): block form, to anchor the two
-            // rolling cache breakpoints.
+        } else if (m.cache_control) {
+            // Block form with cache_control: this message is stable across turns
+            // and served from the provider's prompt cache.
             try w.writeAll("[{\"type\":\"text\",\"text\":\"");
             try jsonEscape(&w, m.content);
             try w.writeAll("\",\"cache_control\":{\"type\":\"ephemeral\"}}]");
@@ -2077,8 +2084,8 @@ test "buildBodyAnthropic converts tool_calls/results and anchors cache_control" 
     var buf: [2048]u8 = undefined;
     const msgs = [_]ChatMessage{
         .{ .role = "system", .content = "be terse" },
-        .{ .role = "user", .content = "busca foo" },
-        .{ .role = "assistant", .content = "", .tool_calls_json = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{\\\"pattern\\\":\\\"foo\\\"}\"}}]" },
+        .{ .role = "user", .content = "busca foo", .cache_control = true },
+        .{ .role = "assistant", .content = "", .tool_calls_json = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"grep\",\"arguments\":\"{\\\"pattern\\\":\\\"foo\\\"}\"}}]", .cache_control = true },
         .{ .role = "tool", .content = "src/a.zig:1:foo", .tool_call_id = "c1" },
     };
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]";
@@ -2094,14 +2101,10 @@ test "buildBodyAnthropic converts tool_calls/results and anchors cache_control" 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":32768") != null);
     // The role "tool" does not exist in Anthropic: they go as tool_result in user.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") == null);
-    // 4 breakpoints, which is Anthropic's ceiling: the last tool, the system
-    // block, and the ROLLING pair on the last two messages.
-    //
-    // The rolling one is the whole point. With a single breakpoint at the end,
-    // every turn changes the region between the system breakpoint and the end, so
-    // the whole history is re-WRITTEN each turn. With one a message earlier, the
-    // older half sits at a breakpoint the next request still reaches: it is read,
-    // and only the newest segment is written.
+    // 4 breakpoints: the tools schema (last tool), the system block, and the two
+    // stable conversation messages (user + assistant). Only the tool_result is
+    // intentionally NOT marked cache_control — it changes every turn and must be
+    // re-written.
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
 }
 
@@ -2893,3 +2896,47 @@ test "a user message with no images is byte-for-byte what it was" {
     // The array shape did not leak in.
     try std.testing.expect(std.mem.indexOf(u8, body, "[{\"type\"") == null);
 }
+
+
+test "buildBodyOpenAI: cache_control emitted when flagged" {
+    const msgs = [_]ChatMessage{
+        .{ .role = "user", .content = "old stable message", .cache_control = true },
+        .{ .role = "user", .content = "newest message", .cache_control = false },
+    };
+    var buf: [8192]u8 = undefined;
+    const body = try buildBodyOpenAI(buf[0..], "m", &msgs, .medium, "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "old stable message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "newest message") != null);
+}
+
+test "buildBodyOpenAI: cache_control absent when not flagged" {
+    const msgs = [_]ChatMessage{
+        .{ .role = "user", .content = "plain message" },
+    };
+    var buf: [8192]u8 = undefined;
+    const body = try buildBodyOpenAI(buf[0..], "m", &msgs, .medium, "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+}
+
+test "buildBodyAnthropic: cache_control on flagged message uses block form" {
+    const msgs = [_]ChatMessage{
+        .{ .role = "user", .content = "old stable message", .cache_control = true },
+        .{ .role = "user", .content = "newest message", .cache_control = false },
+    };
+    var buf: [8192]u8 = undefined;
+    const body = try buildBodyAnthropic(buf[0..], "m", &msgs, .medium, "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "old stable message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "newest message") != null);
+}
+
+test "buildBodyAnthropic: cache_control absent on unflagged message" {
+    const msgs = [_]ChatMessage{
+        .{ .role = "user", .content = "plain message" },
+    };
+    var buf: [8192]u8 = undefined;
+    const body = try buildBodyAnthropic(buf[0..], "m", &msgs, .medium, "");
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+}
+

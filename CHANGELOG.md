@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - frozen cut decisions (Phase 34.2) (resultcap) [`3eaa598a`](https://github.com/jesusalcaladev/zode/commit/3eaa598a)
 - add /clear command and /exit alias (Phase 35.5) [`4408e305`](https://github.com/jesusalcaladev/zode/commit/4408e305)
 - add /version command (Phase 35.9) [`93be1011`](https://github.com/jesusalcaladev/zode/commit/93be1011)
+- cache_control on stable prompt messages for 90%%+ cache-hit [`4da6ca18`](https://github.com/jesusalcaladev/zode/commit/4da6ca18)
 
 ### Chores
 
@@ -35,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - consolidate tool-result caps into single layer (resultcap) [`c51fe9a1`](https://github.com/jesusalcaladev/zode/commit/c51fe9a1)
 - regenerate CHANGELOG from full history and add post-commit hook [`db4e1ee4`](https://github.com/jesusalcaladev/zode/commit/db4e1ee4)
-- regenerate CHANGELOG from full history (fixes empty-body commits) and add post-commit hook [`191fdc95`](https://github.com/jesusalcaladev/zode/commit/191fdc95)
+- regenerate CHANGELOG from full history (fixes empty-body commits) and add post-commit hook [`f2ecced9`](https://github.com/jesusalcaladev/zode/commit/f2ecced9)
 
 ### Other
 
