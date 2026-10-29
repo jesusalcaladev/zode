@@ -31,7 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- input byte cap rejects over-limit edits instead of truncating [`f1e600ad`](https://github.com/jesusalcaladev/zode/commit/f1e600ad)
+- input byte cap rejects over-limit edits instead of truncating [`48c6ec60`](https://github.com/jesusalcaladev/zode/commit/48c6ec60)
+- CI test crash - unreachable in cache reset functions [`ee4e9ca6`](https://github.com/jesusalcaladev/zode/commit/ee4e9ca6)
 
 ### Chores
 
