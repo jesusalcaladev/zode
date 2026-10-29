@@ -21,19 +21,19 @@ pub const bundled_styles: []const BundledStyle = &[_]BundledStyle{
         .name = "default",
         .description = "Standard zode behavior — concise, direct, code-first",
         .keep_coding_instructions = true,
-        .body = @embedFile("../output_styles/default.md"),
+        .body = @embedFile("output_styles/default.md"),
     },
     .{
         .name = "explanatory",
         .description = "Explain every step before taking it; show your reasoning",
         .keep_coding_instructions = true,
-        .body = @embedFile("../output_styles/explanatory.md"),
+        .body = @embedFile("output_styles/explanatory.md"),
     },
     .{
         .name = "learning",
         .description = "Teach as you work — explain concepts and trade-offs along the way",
         .keep_coding_instructions = true,
-        .body = @embedFile("../output_styles/learning.md"),
+        .body = @embedFile("output_styles/learning.md"),
     },
 };
 

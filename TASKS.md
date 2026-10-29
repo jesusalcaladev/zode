@@ -272,26 +272,6 @@ state, the open bug and the quality bar).
 
 ---
 
-## Phase 27 — The diff you can read — **DONE 2026-10-21**
-
-`✨ feature + 🐛 fix · 🔴 · independent · a complete colour-diff implementation to port (native TypeScript, ~1000 lines)`
-
-> The part worth stealing is not the colours, it is the **order of the pipeline**. Measured today: the diff has NO background at all (`diff_add_bg`/`diff_del_bg` are declared and never painted) and no line numbers.
-
-  - [x] Per hunk, in order: (1) assign marker + line number via two counters (`+`→new, `-`→old, context shows the new one) · (2) pair a `-` run with the following `+` run positionally; pure insertions/deletions stay unpaired and get NO word diff · (3) tokenize + token-level LCS → byte ranges · (4) the noise guard · (5) split segments at the range boundaries
-  - [x] The tokenizer is **shared with `edit_hint.zig`** — one tokenizer or the two diffs disagree: a `[\p{L}\p{N}_]` run = 1 token, whitespace run = 1 token, **everything else one token per codepoint** (`x += 1` = 5 tokens; in code, `+=`/`=>`/`!=` are words)
-  - [x] `CHANGE_THRESHOLD = 0.4`: above 40% changed → discard the word ranges, flat line colour (a rewrite is not information, it is confetti — the same call as edit_hint's 0.50 Jaccard)
-  - [x] Word diff skipped entirely when the block is `dim` (collapsed preview / collapsed Ctrl+R — highlights inside a quiet box are noise)
-  - [x] Forced change: `diffSegments` must call `highlightLineState` with the state threaded down the hunk (a changed line is often the middle of a block comment or a multiline string) and reset at each `@@`
-
-  - [x] vaxis does NOT convert rgb→256 (`Vaxis.zig:626-630`): every one of the 32 `rgb()`/`bg()` literals in `theme.zig` ships as `38;2;r;g;b` even when DA1 said no truecolor. Ladder: `caps.rgb` true → palette as-is · false → `.index` colours via a ported `ansi256FromRgb` · `no_color` → `+`/`-` in **bold** and nothing else
-  - [x] `ansi256FromRgb`: the grey ramp is a **competitor**, not a fallback — quantize to the cube, build BOTH candidates (cube + ramp), pick the closer in RGB distance; beyond the ramp's range the cube corner is the only option
-  - [x] Lives in `theme.zig` behind the existing `rgb()`/`bg()` helpers — 38 call sites, one change; `no_color` is a single early return
-  - [x] `ZODE_DALTONIZED=1` (+ a `/color daltonized` picker entry) → blue/orange pair instead of green/red (the most common deficiency, and the axis most monitors collapse)
-  - [x] A test asserts the add/delete pair differs in **hue** via `hueSat`, not only lightness (precedent: `theme.zig:439`)
-
-**Acceptance**: green suite + the scene reads as designed at 80x24 and 200x50.
-
 ### What was done, and what it cost to find out (2026-10-21)
 
 The three pieces (the word diff, the gutter, the colour ladder) were **written and
@@ -556,9 +536,9 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 - [ ] **35.3** `/rename` + the `#tag` + the session title — **S** each, and together they are the readability layer of the session list. Phase 30.1 has the design; the command is 20 lines
 - [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic command we lack. Both are prompt commands whose text is the reference implementation's, and Phase 31.1 already has the `` !`cmd` `` substitution
 - [ ] **35.5** `/clear` (with the cache reset) and the `/exit` alias — **S**. `/new` exists but leaves the read cache, the skills-sent marker and the user commands stale
-- [ ] **35.6** `/doctor` — **M**: the one command you run when zode behaves strangely. Half the checks (the key state, the config, the session dir's permissions) we already compute elsewhere
+- [x] **35.6** `/doctor` — **M**: the one command you run when zode behaves strangely. Half the checks (the key state, the config, the session dir's permissions) we already compute elsewhere — implemented: version, model, context window, effort, output style, permission mode (+yolo/read-only/accept-edits), API key (set/not set, never the value), compaction mode/threshold/limit/budget, session dir, elided results.
 - [ ] **35.7** `/config` + `/status` + `/usage` as ONE panel — **M**: six scattered commands become one "what is my configuration?" screen, assembled from the functions the commands already call, so it cannot drift
-- [ ] **35.8** `/compact` on demand — **S-M**: the machinery is done, the trigger and the argument are missing
+- [x] **35.8** `/compact` on demand — **S-M**: implemented `/compact now` — runs tier-1 elision immediately on the live session, reports elided count and new estimate, and tells when tier-2 summary will trigger next turn.
 - [ ] **35.9** `/release-notes` + `/version` — **S**: two one-liners over `src/lib/selfupdate.zig`, which already runs at startup with nobody told
 - [ ] **35.10** `/diff` — **M**: a diff dialog shows the uncommitted changes and the per-turn diffs; the renderer exists (`src/lib/diffview.zig`), the command is the missing half
 - [ ] **35.11** `/permissions` (the rule editor) · `/hooks` (the hook editor) · `/agents` (the subagent definitions) — **M** each, and each one is a panel over a mechanism another phase builds. **They wait for it**: a UI over a rule engine that does not exist yet is how a command ends up promising something the engine does not do
@@ -720,7 +700,7 @@ Tareas de alta prioridad para portar el comportamiento del harness de referencia
 - [ ] 🔴 **Memoria: capa única de capado de resultados** — un solo lugar que límite cada resultado de herramienta (tope por herramienta) y el total de todos los resultados de un mensaje (tope agregado). Cuando un resultado se corta, el aviso de corte viaja dentro del presupuesto (texto retenido + aviso nunca superan el tope). Nunca cortar en medio de un carácter multi-byte.
 - [ ] 🔴 **Memoria: compacción del contexto en dos niveles** — primero, reemplazar resultados de herramientas antiguos por un marcador que nombre dónde quedó guardado (nada se pierde, solo se mueve); segundo, si sigue sobre presupuesto, pedir al modelo que resuma los turnos más antiguos en una nota y reemplazar esos turnos por la nota. Cada turno y cada llamada a herramienta con su resultado se guardan íntegros con identificador, para buscarlos o abrirlos después. Desde la segunda compacción, la anterior se guarda entera y sale de la vista; un resumen escrito por el modelo sustituye a todos los turnos previos.
 - [ ] 🔴 **Memoria: presupuesto de contexto** — la compacción automática arranca cuando una request alcanza un porcentaje configurable del usable input del modelo (rango 10–80 %, valor por defecto 80 %). Después de compactar, la request completa usa como máximo una quinta parte del usable; los turnos nuevos conservados usan como máximo el 40 % del espacio del compactado (hasta cuatro turnos). El historial completo se conserva; solo la vista enviada al modelo se compacta.
-- [ ] 🔴 **Entrada: admisión segura de texto** — leer byte a byte formando caracteres UTF-8 completos de forma atómica; descartar bytes inválidos o caracteres incompletos sin retener basura; si cambia el contexto del escritor, descartar lo pendiente nombrando el contexto anterior.
+- [x] 🔴 **Entrada: admisión segura de texto** — leer byte a byte formando caracteres UTF-8 completos de forma atómica; descartar bytes inválidos o caracteres incompletos sin retener basura; si cambia el contexto del escritor, descartar lo pendiente nombrando el contexto anterior.
 - [ ] 🔴 **Entrada: límite de visualización** — cuando el texto escrito supere un tope de bytes, rechazar la edición con un mensaje claro que nombre el límite y pida repintar solo la zona afectada. Nunca cortar un carácter UTF-8 por la mitad.
 - [ ] 🔴 **Imágenes: custodia por el harness** — las imágenes leídas por una herramienta las guarda el harness, no la herramienta, y se adjuntan al siguiente mensaje del usuario (donde el protocolo lo permite).
 - [ ] 🔴 **Imágenes: topes y rechazo con motivo** — cantidad máxima de imágenes por mensaje, bytes máximos por imagen, bytes totales por mensaje, cantidad máxima por request y bytes máximos de request. Si una imagen excede un tope, rechazarla diciendo por qué y nombrando el archivo guardado donde está la copia.

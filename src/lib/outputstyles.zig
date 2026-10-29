@@ -4,13 +4,19 @@
 //! The style block is injected at the END of the composed prompt, after every
 //! other block. A style's body is loaded on demand.
 //!
-//! An output style is a directory with an `OUTPUT_STYLE.md`:
+//! A style is EITHER a flat markdown file, which is what the docs promise:
+//!
+//! ```text
+//! .zode/output-styles/explanatory.md
+//! ```
+//!
+//! or a directory with an `OUTPUT_STYLE.md`, which allows extra files next to it:
 //!
 //! ```text
 //! .zode/output-styles/explanatory/OUTPUT_STYLE.md
 //! ```
 //!
-//! with optional frontmatter:
+//! Both layouts are discovered. With optional frontmatter:
 //!
 //! ```markdown
 //! ---
@@ -24,7 +30,8 @@
 //!
 //! `keep_coding_instructions` controls whether the harness's own coding rules
 //! (the "How to work" section of the base prompt) are kept alongside the style.
-//! When `false`, the style replaces them entirely.
+//! When `false`, the style replaces them entirely. Both spellings are accepted:
+//! `keep_coding_instructions` and `keep-coding-instructions`.
 //!
 //! Search order is project-first and it is not a merge: a project style shadows
 //! a user style with the same name. Bundled styles ship with the binary and can
@@ -34,8 +41,11 @@ const std = @import("std");
 
 const outputstyles = @This();
 
-/// File that holds a style.
+/// File that holds a style when it is a directory.
 pub const filename = "OUTPUT_STYLE.md";
+
+/// Extension of a flat style file.
+pub const extension = ".md";
 
 /// Directories, in order. The first one that has a style wins for that name.
 pub const project_dir = ".zode/output-styles";
@@ -97,11 +107,24 @@ pub fn splitFrontmatter(text: []const u8) ?struct { meta: Meta, body: []const u8
             meta.name = val;
         } else if (std.mem.eql(u8, key, "description")) {
             meta.description = val;
-        } else if (std.mem.eql(u8, key, "keep_coding_instructions")) {
+        } else if (keyIs(key, "keep_coding_instructions")) {
             meta.keep_coding_instructions = std.ascii.eqlIgnoreCase(val, "true");
         }
     }
     return null; // unterminated frontmatter
+}
+
+/// `true` when two frontmatter keys mean the same thing. YAML-ish keys are
+/// written both ways in the wild (`keep-coding-instructions` in the docs,
+/// `keep_coding_instructions` in older files), and silently ignoring one of them
+/// turns a style into a no-op with no error anywhere.
+fn keyIs(key: []const u8, want: []const u8) bool {
+    if (key.len != want.len) return false;
+    for (key, want) |a, b| {
+        const norm: u8 = if (a == '-') '_' else a;
+        if (norm != b) return false;
+    }
+    return true;
 }
 
 /// A valid name: lowercase letters, digits, `-`, `_`.
@@ -113,10 +136,20 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
-/// The name to use when the frontmatter does not give one: the DIRECTORY name.
+/// The name to use when the frontmatter does not give one: the directory name,
+/// or the file stem for a flat `name.md` style.
 pub fn nameFor(meta: Meta, dir_name: []const u8) []const u8 {
     if (meta.name.len > 0 and validName(meta.name)) return meta.name;
     return dir_name;
+}
+
+/// `name.md` → `name`, when `name` is a usable style name. `null` for anything
+/// else, so discovery can skip `README.md`, dotfiles and stray notes.
+pub fn stemOf(file_name: []const u8) ?[]const u8 {
+    if (!std.mem.endsWith(u8, file_name, extension)) return null;
+    const stem = file_name[0 .. file_name.len - extension.len];
+    if (!validName(stem)) return null;
+    return stem;
 }
 
 /// Style source for shadowing precedence.
@@ -247,6 +280,29 @@ test "validName: accepts lowercase digits dash underscore" {
     try std.testing.expect(!outputstyles.validName("UpperCase"));
     try std.testing.expect(!outputstyles.validName("has space"));
     try std.testing.expect(!outputstyles.validName("has/slash"));
+}
+
+test "splitFrontmatter: the hyphenated key is the same key" {
+    const text =
+        \\---
+        \\name: terse
+        \\description: docs spelling
+        \\keep-coding-instructions: false
+        \\---
+        \\no lecturing
+    ;
+    const r = outputstyles.splitFrontmatter(text) orelse return error.NoFrontmatter;
+    try std.testing.expectEqualStrings("terse", r.meta.name);
+    try std.testing.expect(!r.meta.keep_coding_instructions);
+}
+
+test "stemOf: flat style files, and nothing else" {
+    try std.testing.expectEqualStrings("explanatory", outputstyles.stemOf("explanatory.md").?);
+    try std.testing.expectEqualStrings("my-style_2", outputstyles.stemOf("my-style_2.md").?);
+    try std.testing.expect(outputstyles.stemOf("README.md") == null);
+    try std.testing.expect(outputstyles.stemOf("notes.txt") == null);
+    try std.testing.expect(outputstyles.stemOf(".hidden.md") == null);
+    try std.testing.expect(outputstyles.stemOf("UpperCase.md") == null);
 }
 
 test "nameFor: valid frontmatter name wins over directory name" {

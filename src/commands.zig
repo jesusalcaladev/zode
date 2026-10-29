@@ -14,6 +14,7 @@ const modelcache_mod = @import("lib/modelcache.zig");
 const session_mod = @import("session.zig");
 const sessionindex = @import("lib/sessionindex.zig");
 const sessionpath = @import("lib/sessionpath.zig");
+const build_options = @import("build_options");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -485,6 +486,46 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
         return;
     }
 
+    if (std.ascii.eqlIgnoreCase(arg, "now")) {
+        const s = agent.session orelse {
+            agent.pushInfoOwned(m, "no active session: nothing to compact. Start a chat first.");
+            return;
+        };
+        var astate = std.heap.ArenaAllocator.init(m.allocator);
+        defer astate.deinit();
+        const arena = astate.allocator();
+        const msgs = agent.snapshotMsgs(arena);
+        if (msgs.len == 0) {
+            agent.pushInfoOwned(m, "session is empty: nothing to compact.");
+            return;
+        }
+        const budget = compaction.budgetFor(m.environ, agent.curModelContext());
+        const chosen_mode = if (m.compact_mode == null) compaction.mode(m.environ) else m.compact_mode.?;
+        const comp: compaction.Compacted = compaction.elideTier(arena, msgs, budget, m.environ, chosen_mode) catch compaction.nothingElided(msgs);
+        if (comp.elided == 0 and !comp.needs_summary) {
+            agent.pushInfoOwned(m, std.fmt.allocPrint(m.allocator, "already under budget (est. {d} tokens vs budget {d}). Nothing to compact.", .{ compaction.estimateTokens(msgs), budget }) catch "compaction");
+            return;
+        }
+        var applied: usize = 0;
+        for (comp.elided_at) |idx| {
+            if (idx >= s.messages.items.len) continue;
+            const mm = &s.messages.items[idx];
+            const new_text = comp.msgs[idx].content;
+            if (std.mem.eql(u8, mm.content, new_text)) continue;
+            const owned = s.allocator.dupe(u8, new_text) catch continue;
+            s.allocator.free(mm.content);
+            mm.content = owned;
+            mm.tool_calls_json = null;
+            applied += 1;
+        }
+        agent.session_elided = comp.elided;
+        agent.pushInfoOwned(m, std.fmt.allocPrint(m.allocator, "compacted now: {d} result(s) elided (applied {d}), est. {d} tokens -> budget {d}.", .{ comp.elided, applied, compaction.estimateTokens(comp.msgs), budget }) catch "compaction");
+        if (comp.needs_summary) {
+            agent.pushInfoOwned(m, "after tier-1 elision still over budget: tier-2 (LLM summary) will run on the next turn.");
+        }
+        return;
+    }
+
     if (std.ascii.eqlIgnoreCase(arg, "default") or std.ascii.eqlIgnoreCase(arg, "env")) {
         m.compact_mode = null;
         const eff = compaction.effectiveMode(m.environ, null);
@@ -501,7 +542,7 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
         if (std.ascii.eqlIgnoreCase(arg, "full") or std.ascii.eqlIgnoreCase(arg, "on")) break :blk .full;
         const line = std.fmt.allocPrint(
             m.allocator,
-            "unknown compaction mode '{s}': use off | elide | full | default (off = never compact, elide = free tier only, full = also summarize)",
+            "unknown compaction mode '{s}': use off | elide | full | now | default (off = never compact, elide = free tier only, full = also summarize)",
             .{arg},
         ) catch "unknown compaction mode";
         agent.pushInfoOwned(m, line);
@@ -521,6 +562,56 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
 ///
 /// With text it sets the objective and sends nothing: the next thing you type is the
 /// task, and it is worked with the objective attached. That ordering is deliberate.
+/// `/status`: unified panel — model, effort, style, permissions, key, compaction,
+/// usage, session. Everything the user wants to know in one screen.
+pub fn cmdStatus(m: *tui.Model) void {
+    const gpa = m.allocator;
+    const version = build_options.version;
+    const cur_model = agent.curModel();
+    const ctx = agent.curModelContext();
+    const effort_label = chat.Effort.label(agent.current_effort);
+    const style = if (agent.current_style) |s| s else "none";
+    const perm = agent.permModeName();
+    const key_state = if (agent.api_key_global) |_| "set" else "not set";
+    const eff = compaction.effectiveMode(m.environ, m.compact_mode);
+    const pct = compaction.targetPct(m.environ);
+    const limit = compaction.contextLimitFor(m.environ, ctx);
+    const budget = compaction.budgetFor(m.environ, ctx);
+
+    // Usage numbers
+    const st = agent.cacheSessionStats();
+    const input = @max(st.prompt_tokens, 0);
+    const output = @max(st.completion_tokens, 0);
+    const total = input +| output;
+    const cached = @min(@max(st.cached_tokens, 0), input);
+    const uncached = input - cached;
+    const requests: i64 = @intCast(st.requests);
+    var total_buf: [32]u8 = undefined;
+    var input_buf: [32]u8 = undefined;
+    var output_buf: [32]u8 = undefined;
+    var cached_buf: [32]u8 = undefined;
+    var uncached_buf: [32]u8 = undefined;
+
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "zode {s} — status", .{version}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  model: {s} (ctx {d} tokens) · effort: {s} · style: {s}", .{cur_model, ctx, effort_label, style}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  permissions: {s}", .{perm}) catch return);
+    if (agent.yolo) agent.pushInfoOwned(m, gpa.dupe(u8, "    yolo: on") catch return);
+    if (agent.read_only) agent.pushInfoOwned(m, gpa.dupe(u8, "    read-only: on") catch return);
+    if (agent.accept_edits) agent.pushInfoOwned(m, gpa.dupe(u8, "    accept-edits: on") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    api key: {s} (value never printed)", .{key_state}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  compaction: {s} · threshold {d}% · limit {d} → budget {d} tokens", .{@tagName(eff), pct, limit, budget}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  usage: {d} requests · {s} total tokens · {s} input · {s} output", .{requests, formatTokenCount(&total_buf, total), formatTokenCount(&input_buf, input), formatTokenCount(&output_buf, output)}) catch return);
+    if (cached > 0) {
+        agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    cache reads {s} ({d:.1}%) · uncached input {s}", .{formatTokenCount(&cached_buf, cached), st.hitRatePct(), formatTokenCount(&uncached_buf, uncached)}) catch return);
+    }
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  session: elided results {d} · dir: ./sessions/", .{agent.session_elided}) catch return);
+}
+
 /// `/goal` on its own would have to invent a task, and a prompt like "make the package
 /// weigh under 10 KB" alone is not yet a task — it is a goal.
 ///
@@ -529,6 +620,49 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
 /// With NO argument it reports, because a goal you cannot see is a goal you cannot
 /// tell the model apart from: "why did it stop" is unanswerable unless the objective is
 /// on screen with its state.
+
+/// `/doctor`: one-screen diagnosis of why zode is behaving the way it is.
+/// Phase 35.6: the command you run when zode feels strange. The checks (key
+/// state, permission mode, compaction, model, session dir) are already computed
+/// elsewhere; this assembles them on one screen so you do not have to hunt them
+/// down. No secrets are printed: a credential-backed key answers "set" or
+/// "not set", never the value.
+pub fn cmdDoctor(m: *tui.Model) void {
+    const gpa = m.allocator;
+    const version = build_options.version;
+    const cur_model = agent.curModel();
+    const ctx = agent.curModelContext();
+    const effort_label = chat.Effort.label(agent.current_effort);
+    const style = if (agent.current_style) |s| s else "none";
+    const perm = agent.permModeName();
+    const key_state = if (agent.api_key_global) |_| "set" else "not set";
+    const eff = compaction.effectiveMode(m.environ, m.compact_mode);
+    const pct = compaction.targetPct(m.environ);
+    const limit = compaction.contextLimitFor(m.environ, ctx);
+    const budget = compaction.budgetFor(m.environ, ctx);
+
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "zode {s} — doctor", .{version}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  model: {s} (context window {d} tokens)", .{cur_model, ctx}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  effort: {s}", .{effort_label}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  output style: {s}", .{style}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  permissions:") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    mode: {s}", .{perm}) catch return);
+    if (agent.yolo) agent.pushInfoOwned(m, gpa.dupe(u8, "      yolo: on") catch return);
+    if (agent.read_only) agent.pushInfoOwned(m, gpa.dupe(u8, "      read-only: on") catch return);
+    if (agent.accept_edits) agent.pushInfoOwned(m, gpa.dupe(u8, "      accept-edits: on") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    api key: {s} (value never printed)", .{key_state}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  compaction:") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    mode: {s} (threshold {d}%)", .{@tagName(eff), pct}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    limit: {d} → budget: {d} tokens", .{limit, budget}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  sessions:") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "    dir: ./sessions/") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    elided results this session: {d}", .{agent.session_elided}) catch return);
+}
+
 pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
     const trimmed = std.mem.trim(u8, arg, " \t\r\n");
 
@@ -1068,10 +1202,12 @@ pub const commands = [_]Cmd{
     .{ .key = "/new-session", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
+    .{ .key = "/doctor", .desc = "diagnosis: model, effort, style, permissions, key, compaction, sessions" },
+    .{ .key = "/status", .desc = "unified panel: model, effort, style, permissions, compaction, usage, session" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
     .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
-    .{ .key = "/compact", .desc = "off|elide|full: automatic compaction (no args: report)", .key_hint = "off|elide|full" },
+    .{ .key = "/compact", .desc = "off|elide|full|now: automatic compaction (no args: report, now = compact immediately)", .key_hint = "off|elide|full|now" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
     .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
     .{ .key = "/rename", .desc = "set a custom title for the current session: /rename <name>" },
@@ -1167,4 +1303,30 @@ test "/update is offered in the palette, not hidden behind its name" {
         try std.testing.expect(std.mem.indexOf(u8, c.desc, "newest release") != null);
     }
     try std.testing.expect(found);
+}
+
+test "/doctor is in the command table" {
+    var found = false;
+    for (commands) |c| {
+        if (!std.mem.eql(u8, c.key, "/doctor")) continue;
+        found = true;
+        try std.testing.expect(c.palette_visible);
+        try std.testing.expect(std.mem.indexOf(u8, c.desc, "diagnosis") != null);
+    }
+    try std.testing.expect(found);
+}
+
+test "cmdDoctor runs without crashing and names itself" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    cmdDoctor(&m);
+
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "model:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "permissions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "compaction:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sessions:") != null);
 }
