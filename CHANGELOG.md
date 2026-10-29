@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add /version command (Phase 35.9) [`93be1011`](https://github.com/jesusalcaladev/zode/commit/93be1011)
 - cache_control on stable prompt messages for 90%%+ cache-hit [`abf8ae23`](https://github.com/jesusalcaladev/zode/commit/abf8ae23)
 - background subagents (run_in_background) + cache_control for 90%%+ cache-hit [`302d9fd9`](https://github.com/jesusalcaladev/zode/commit/302d9fd9)
-- add /doctor, /status, /compact now; clean project root [`928ef617`](https://github.com/jesusalcaladev/zode/commit/928ef617)
+- add /doctor, /status, /compact now; clean project root [`2207d5b9`](https://github.com/jesusalcaladev/zode/commit/2207d5b9)
+- unify /config + /status + /usage into one panel (Phase 35.7) [`4838b918`](https://github.com/jesusalcaladev/zode/commit/4838b918)
 
 ### Chores
 

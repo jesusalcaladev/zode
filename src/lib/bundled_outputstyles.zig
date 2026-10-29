@@ -52,7 +52,7 @@ pub fn substituteArguments(body: []const u8, args: []const u8, out: []u8) []cons
     var w: std.Io.Writer = .fixed(out);
     w.writeAll(body[0..idx]) catch return body;
     w.writeAll(args) catch return body;
-    w.writeAll(body[idx + needle.len..]) catch return body;
+    w.writeAll(body[idx + needle.len ..]) catch return body;
     return w.buffered();
 }
 

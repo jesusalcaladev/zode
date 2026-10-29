@@ -11590,12 +11590,12 @@ test "picking a command in the palette EXECUTES it (not puts it in the input)" {
     try std.testing.expect(!m.pal.active);
     try std.testing.expectEqualStrings("", std.mem.trim(u8, m.ed.text(), " "));
 
-    // And the command really ran: `/usage` reports missing provider data.
+    // And the command really ran: `/usage` shows the unified panel.
     const s = try drawTest(&m, arena_state.allocator(), 92, 20);
     var found = false;
     for (0..s.size.height) |row| {
         var rb: [512]u8 = undefined;
-        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "no provider-reported token data") != null) found = true;
+        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "usage:") != null) found = true;
     }
     try std.testing.expect(found);
 }

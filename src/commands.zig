@@ -201,52 +201,6 @@ pub fn cmdCache(m: *tui.Model) void {
     }
 }
 
-/// `/usage`: provider-reported token totals for the active session.
-pub fn cmdUsage(m: *tui.Model) void {
-    const st = agent.cacheSessionStats();
-    if (st.requests == 0) {
-        agent.pushInfo(
-            m,
-            "Usage · no provider-reported token data yet. `/context` shows the current estimate.",
-        );
-        return;
-    }
-
-    const input = @max(st.prompt_tokens, 0);
-    const output = @max(st.completion_tokens, 0);
-    const total = input +| output;
-    const cached = @min(@max(st.cached_tokens, 0), input);
-    const uncached = input - cached;
-    const requests: i64 = @intCast(st.requests);
-    var input_buf: [32]u8 = undefined;
-    var output_buf: [32]u8 = undefined;
-    var total_buf: [32]u8 = undefined;
-    var cached_buf: [32]u8 = undefined;
-    var uncached_buf: [32]u8 = undefined;
-    var writes_buf: [32]u8 = undefined;
-    var avg_in_buf: [32]u8 = undefined;
-    var avg_out_buf: [32]u8 = undefined;
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "Usage · {d} metered requests · {s} total tokens\n" ++
-            "  Input {s} · output {s} · average/request {s} in / {s} out\n" ++
-            "  Cache reads {s} ({d:.1}%) · cache writes {s} · uncached input {s}",
-        .{
-            st.requests,
-            formatTokenCount(&total_buf, total),
-            formatTokenCount(&input_buf, input),
-            formatTokenCount(&output_buf, output),
-            formatTokenCount(&avg_in_buf, @divTrunc(input, requests)),
-            formatTokenCount(&avg_out_buf, @divTrunc(output, requests)),
-            formatTokenCount(&cached_buf, cached),
-            st.hitRatePct(),
-            formatTokenCount(&writes_buf, @max(st.cache_write_tokens, 0)),
-            formatTokenCount(&uncached_buf, uncached),
-        },
-    ) catch return;
-    agent.pushInfoOwned(m, msg);
-}
-
 fn formatTokenCount(buf: []u8, value: i64) []const u8 {
     // The grouping lives in `lib/cost.zig` now that `/cost` writes the same
     // numbers: two renderings of a token count in two commands is how one of them
@@ -438,7 +392,7 @@ test "cost command says there is nothing to price before the first turn" {
     try std.testing.expect(std.mem.indexOf(u8, text, "no provider-reported usage yet") != null);
 }
 
-test "usage command reports provider totals and distinguishes estimates" {
+test "usage command shows unified panel with usage info" {
     agent.cacheSessionStatsForTest().* = .{};
     defer agent.cacheSessionStatsForTest().* = .{};
     agent.cacheSessionStatsForTest().record(.{ .prompt = 12_345, .cached = 10_000, .completion = 678 });
@@ -450,9 +404,13 @@ test "usage command reports provider totals and distinguishes estimates" {
     var all: std.ArrayList(u8) = .empty;
     defer all.deinit(std.testing.allocator);
     for (m.pending.items) |item| try all.appendSlice(std.testing.allocator, item.text);
-    try std.testing.expect(std.mem.indexOf(u8, all.items, "Usage · 1 metered requests · 13,023 total tokens") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all.items, "Input 12,345 · output 678") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all.items, "Cache reads 10,000") != null);
+    // Unified panel shows version, model, permissions, compaction, usage, session
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "12,345") != null);  // input tokens
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "678") != null);    // output tokens
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "10,000") != null); // cache reads
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "permissions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "compaction:") != null);
 }
 
 /// `/compact [off|elide|full|default]`: what automatic compaction is allowed to do.
@@ -562,9 +520,10 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
 ///
 /// With text it sets the objective and sends nothing: the next thing you type is the
 /// task, and it is worked with the objective attached. That ordering is deliberate.
-/// `/status`: unified panel — model, effort, style, permissions, key, compaction,
-/// usage, session. Everything the user wants to know in one screen.
-pub fn cmdStatus(m: *tui.Model) void {
+/// `renderStatusPanel`: shared rendering for /status, /config, /usage, and /doctor.
+/// Everything the user wants to know about their zode session in one screen.
+/// `title` is the word after the em-dash ("status", "config", "usage", "doctor").
+pub fn renderStatusPanel(m: *tui.Model, title: []const u8) void {
     const gpa = m.allocator;
     const version = build_options.version;
     const cur_model = agent.curModel();
@@ -592,7 +551,7 @@ pub fn cmdStatus(m: *tui.Model) void {
     var cached_buf: [32]u8 = undefined;
     var uncached_buf: [32]u8 = undefined;
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "zode {s} — status", .{version}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "zode {s} — {s}", .{version, title}) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  model: {s} (ctx {d} tokens) · effort: {s} · style: {s}", .{cur_model, ctx, effort_label, style}) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
@@ -612,6 +571,23 @@ pub fn cmdStatus(m: *tui.Model) void {
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  session: elided results {d} · dir: ./sessions/", .{agent.session_elided}) catch return);
 }
 
+/// `/status`: unified panel — model, effort, style, permissions, key,
+/// compaction, usage, session. Everything the user wants to know in one screen.
+pub fn cmdStatus(m: *tui.Model) void {
+    renderStatusPanel(m, "status");
+}
+
+/// `/config`: same unified panel as /status. Your configuration in one place.
+pub fn cmdConfig(m: *tui.Model) void {
+    renderStatusPanel(m, "config");
+}
+
+/// `/usage`: same unified panel as /status. Your session's token usage.
+pub fn cmdUsage(m: *tui.Model) void {
+    renderStatusPanel(m, "usage");
+}
+
+
 /// `/goal` on its own would have to invent a task, and a prompt like "make the package
 /// weigh under 10 KB" alone is not yet a task — it is a goal.
 ///
@@ -622,46 +598,24 @@ pub fn cmdStatus(m: *tui.Model) void {
 /// on screen with its state.
 
 /// `/doctor`: one-screen diagnosis of why zode is behaving the way it is.
-/// Phase 35.6: the command you run when zode feels strange. The checks (key
-/// state, permission mode, compaction, model, session dir) are already computed
-/// elsewhere; this assembles them on one screen so you do not have to hunt them
-/// down. No secrets are printed: a credential-backed key answers "set" or
-/// "not set", never the value.
+/// Phase 35.6: the command you run when zode feels strange. Starts from the
+/// same unified panel as /status, then adds the details that matter for
+/// troubleshooting. No secrets are printed: a credential-backed key answers
+/// "set" or "not set", never the value.
 pub fn cmdDoctor(m: *tui.Model) void {
+    renderStatusPanel(m, "doctor");
     const gpa = m.allocator;
-    const version = build_options.version;
-    const cur_model = agent.curModel();
-    const ctx = agent.curModelContext();
-    const effort_label = chat.Effort.label(agent.current_effort);
-    const style = if (agent.current_style) |s| s else "none";
-    const perm = agent.permModeName();
-    const key_state = if (agent.api_key_global) |_| "set" else "not set";
-    const eff = compaction.effectiveMode(m.environ, m.compact_mode);
-    const pct = compaction.targetPct(m.environ);
-    const limit = compaction.contextLimitFor(m.environ, ctx);
-    const budget = compaction.budgetFor(m.environ, ctx);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "zode {s} — doctor", .{version}) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  model: {s} (context window {d} tokens)", .{cur_model, ctx}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  effort: {s}", .{effort_label}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  output style: {s}", .{style}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  permissions:") catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    mode: {s}", .{perm}) catch return);
-    if (agent.yolo) agent.pushInfoOwned(m, gpa.dupe(u8, "      yolo: on") catch return);
-    if (agent.read_only) agent.pushInfoOwned(m, gpa.dupe(u8, "      read-only: on") catch return);
-    if (agent.accept_edits) agent.pushInfoOwned(m, gpa.dupe(u8, "      accept-edits: on") catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    api key: {s} (value never printed)", .{key_state}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  compaction:") catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    mode: {s} (threshold {d}%)", .{@tagName(eff), pct}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    limit: {d} → budget: {d} tokens", .{limit, budget}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  diagnosis:") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    mode: {s} · compact threshold {d}% · budget {d} tokens", .{agent.permModeName(), compaction.targetPct(m.environ), compaction.budgetFor(m.environ, agent.curModelContext())}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    yolo: {s} · read-only: {s} · accept-edits: {s}", .{ if (agent.yolo) "on" else "off", if (agent.read_only) "on" else "off", if (agent.accept_edits) "on" else "off" }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    api key: {s} (value never printed)", .{ if (agent.api_key_global) |_| "set" else "not set" }) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  sessions:") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "    dir: ./sessions/") catch return);
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "    elided results this session: {d}", .{agent.session_elided}) catch return);
 }
+
 
 pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
     const trimmed = std.mem.trim(u8, arg, " \t\r\n");
@@ -1203,6 +1157,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
     .{ .key = "/doctor", .desc = "diagnosis: model, effort, style, permissions, key, compaction, sessions" },
+    .{ .key = "/config", .desc = "unified panel: model, effort, style, permissions, compaction, usage, session" },
     .{ .key = "/status", .desc = "unified panel: model, effort, style, permissions, compaction, usage, session" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },

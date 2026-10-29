@@ -16,6 +16,13 @@ pub const Loader = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     env: ?*const std.process.Environ.Map,
+    /// The project directory; `<project_root>/<project_dir>` is the first root.
+    /// Stored as the ROOT (and joined inside `roots`, into the caller's buffer)
+    /// because a `Loader` is returned by value: a slice formatted into this
+    /// struct's own field would point at the stack slot it was built in.
+    project_root: ?[]const u8 = null,
+    /// Absolute override for the project root, used by tests and by callers that
+    /// already resolved the path.
     project_dir: []const u8 = styles.project_dir,
     repo_root: ?[]const u8 = null,
     /// Absolute user root. When null the root is derived from `$HOME`. Tests set
@@ -29,8 +36,13 @@ pub const Loader = struct {
     pub fn roots(self: *Loader, bufs: *[max_roots][std.fs.max_path_bytes]u8, paths: *[max_roots][]const u8) usize {
         var n: usize = 0;
 
-        // project_dir is already set to absolute path by the caller (stylesLoader)
-        if (self.project_dir.len > 0) {
+        // The project root: `<cwd>/.zode/output-styles`.
+        if (self.project_root) |root| {
+            const pp = std.fmt.bufPrint(&bufs[n], "{s}/{s}", .{ root, styles.project_dir }) catch "";
+            paths[n] = pp;
+            n += 1;
+        } else if (self.project_dir.len > 0) {
+            // Already absolute (tests): used as is.
             @memcpy(bufs[n][0..self.project_dir.len], self.project_dir);
             paths[n] = bufs[n][0..self.project_dir.len];
             n += 1;
@@ -352,10 +364,16 @@ test "scan: project shadows repo and user, both layouts and bundled styles are f
     const found = loader.scan(&buf, buf.len);
     defer deinitEntries(a, found);
 
-    // Project first, then repo, then user, then bundled last.
-    const names: []const []const u8 = &.{ "mine", "repoonly", "useronly", "learning", "default", "explanatory" };
-    try std.testing.expectEqual(names.len, found.len);
-    for (names, found) |want, got| try std.testing.expectEqualStrings(want, got.name);
+    // Precedence is fixed even though the order INSIDE a root is not: project
+    // first, then repo, then user, then the bundled styles last.
+    try std.testing.expectEqual(@as(usize, 6), found.len);
+    try std.testing.expectEqualStrings("mine", found[0].name);
+    try std.testing.expectEqualStrings("repoonly", found[1].name);
+    try std.testing.expectEqualStrings("default", found[4].name);
+    try std.testing.expectEqualStrings("explanatory", found[5].name);
+    // The user root's two files are both present, in either order.
+    try std.testing.expect(findEntry(found, "useronly") != null);
+    try std.testing.expect(findEntry(found, "learning") != null);
 
     // Shadowing, not merging: the project's `mine` wins whole, description included.
     try std.testing.expectEqualStrings("from project", findEntry(found, "mine").?.description);

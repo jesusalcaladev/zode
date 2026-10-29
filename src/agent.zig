@@ -3681,6 +3681,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdUsage(m);
     } else if (std.mem.eql(u8, cmd, "cost")) {
         commands_mod.cmdCost(m);
+    } else if (std.mem.eql(u8, cmd, "config")) {
+        commands_mod.cmdConfig(m);
     } else if (std.mem.eql(u8, cmd, "status")) {
         commands_mod.cmdStatus(m);
     } else if (std.mem.eql(u8, cmd, "update")) {

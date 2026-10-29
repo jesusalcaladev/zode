@@ -68,7 +68,8 @@ src/lib/ pure/testable modules (no TUI, no network): readcache, project,
          prompt, sleep, skills, skillstore, mentions, markdown, highlight,
          web, models, providers, provider, http_client, subagent, ask,
          plan, checkpoint, editor, bench, clean, regex, mascot, theme,
-         zjsonl, verify, exitgate, cost, review, diffview
+         zjsonl, verify, exitgate, cost, review, diffview,
+         outputstyles, outputstyle_store, bundled_outputstyles
 ```
 
 `src/lib/` describes **how it is tested**, not what it does. Moving modules together does not change internal imports (paths are relative to the file).

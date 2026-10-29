@@ -45,7 +45,8 @@ rich frontmatter) · Phase 12 (MCP over stdio + deferred tool loading) · Phase 
 Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19.1 (`sleep`) · Phase 25.1 (bash safety classify) ·
 Phase 27 (diff with gutter + word diff + colour ladder) · Phase 28 (`/copy`) · **Phase 2.1** (skill listing
 budget) · **Phase 2.2** (skills once per session at end of prompt) · Phase 35.1 (`/files`) ·
-Phase 35.2 (`/init`) · **Phase 36** (use-after-free crash + two broken build steps) · Tool upgrades
+Phase 35.2 (`/init`) · **Phase 36** (use-after-free crash + two broken build steps) · **Phase 4** (output
+styles: project/user discovery with shadowing, both layouts, `/style`, bundled `default`/`explanatory`/`learning`) · Tool upgrades
 (grep context, bash description, read PDF, glob subdir).
 
 **The analysis behind the new phases** lives in `docs/analysis/`:
@@ -68,17 +69,6 @@ state, the open bug and the quality bar).
 
 > Blind elision loses detail. Storage loses it *on purpose* — and the model can get it back.
 
-
----
-
-## Phase 4 — Output styles
-
-`✨ feature · 🟡 · independent`
-
-- [ ] `.zode/output-styles/*.md` (project) + `~/.config/zode/output-styles/*.md` (user); frontmatter `name`, `description`, `keep-coding-instructions`
-- [ ] Style injected as a block **at the end** of the prompt; selected with `/style [name]`
-- [ ] Ship `default`, `explanatory`, `learning`
-- [ ] Pure tests: discovery with shadowing · the style block is present when selected and absent otherwise · `keep-coding-instructions` controls whether the coding rules are kept alongside the style
 
 ---
 
@@ -537,7 +527,7 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 - [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic command we lack. Both are prompt commands whose text is the reference implementation's, and Phase 31.1 already has the `` !`cmd` `` substitution
 - [ ] **35.5** `/clear` (with the cache reset) and the `/exit` alias — **S**. `/new` exists but leaves the read cache, the skills-sent marker and the user commands stale
 - [x] **35.6** `/doctor` — **M**: the one command you run when zode behaves strangely. Half the checks (the key state, the config, the session dir's permissions) we already compute elsewhere — implemented: version, model, context window, effort, output style, permission mode (+yolo/read-only/accept-edits), API key (set/not set, never the value), compaction mode/threshold/limit/budget, session dir, elided results.
-- [ ] **35.7** `/config` + `/status` + `/usage` as ONE panel — **M**: six scattered commands become one "what is my configuration?" screen, assembled from the functions the commands already call, so it cannot drift
+- [x] **35.7** `/config` + `/status` + `/usage` as ONE panel — **M**: implemented `renderStatusPanel` shared helper; `/config`, `/status`, `/usage` all render the same unified panel (version, model, context, effort, style, permissions, key, compaction, usage, session). `/doctor` builds on it with extra diagnosis details.
 - [x] **35.8** `/compact` on demand — **S-M**: implemented `/compact now` — runs tier-1 elision immediately on the live session, reports elided count and new estimate, and tells when tier-2 summary will trigger next turn.
 - [ ] **35.9** `/release-notes` + `/version` — **S**: two one-liners over `src/lib/selfupdate.zig`, which already runs at startup with nobody told
 - [ ] **35.10** `/diff` — **M**: a diff dialog shows the uncommitted changes and the per-turn diffs; the renderer exists (`src/lib/diffview.zig`), the command is the missing half

@@ -170,6 +170,7 @@ pub const Entry = struct {
 };
 
 /// Text for a selected style: the body, framed so the model knows what it has.
+/// Writes what fits in `out`; a body larger than the buffer is truncated.
 pub fn formatStyle(
     name: []const u8,
     description: []const u8,

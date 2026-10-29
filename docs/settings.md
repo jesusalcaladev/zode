@@ -24,7 +24,7 @@ set -a && source .env && set +a
 | Sessions | `./sessions/zode-<id>.jsonl` | Compressed JSONL, `drwx------` / `-rw-------` |
 | Skills | `.zode/skills/<name>/SKILL.md`, `.agents/skills/…`, `~/.config/zode/skills/…` | Project first, no merge |
 | Slash commands | `.zode/commands`, `~/.config/zode/commands` | Markdown files |
-| Output styles | `.zode/output-styles`, `~/.config/zode/output-styles` | Selected with `/style` |
+| Output styles | `.zode/output-styles/<name>.md` (or `<name>/OUTPUT_STYLE.md`), same under `~/.config/zode` | Selected with `/style <name>`; `default`, `explanatory` and `learning` ship built in |
 
 ---
 
