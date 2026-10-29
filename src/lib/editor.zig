@@ -52,19 +52,18 @@ pub const Editor = struct {
         return self.buf.items.len == 0;
     }
 
-    /// Inserts UTF-8 text at the cursor. Truncates if `s` doesn't fit whole (a
-    /// huge paste must neither bring down the TUI nor lose what was already typed).
+    /// Inserts UTF-8 text at the cursor.
+    ///
+    /// The whole text is inserted or nothing: if it would exceed `max_bytes`
+    /// the edit is rejected with `error.InputTooLong` and the buffer is left
+    /// untouched. Truncating a prefix could cut a UTF-8 character in half, so
+    /// there is no truncation at all — the caller shows a message naming the
+    /// limit and repaints only the input zone.
     pub fn insert(self: *Editor, s: []const u8) !void {
         if (s.len == 0) return;
-        if (self.cursor + s.len > max_bytes) {
-            const room = max_bytes -| self.cursor;
-            if (room == 0) return error.InputTooLong;
-            try self.buf.insertSlice(self.gpa, self.cursor, s[0..room]);
-            self.cursor += room;
-        } else {
-            try self.buf.insertSlice(self.gpa, self.cursor, s);
-            self.cursor += s.len;
-        }
+        if (self.buf.items.len + s.len > max_bytes) return error.InputTooLong;
+        try self.buf.insertSlice(self.gpa, self.cursor, s);
+        self.cursor += s.len;
         self.hist_idx = -1;
         self.draft.clearRetainingCapacity();
         self.recountLines();
@@ -564,6 +563,84 @@ test "insert does not split multibyte graphemes when deleting" {
     // And back again, by inserting in the middle.
     e.deleteAfter();
     try std.testing.expectEqualStrings("a", e.text());
+}
+
+test "insert beyond max_bytes is rejected and the buffer is untouched" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+
+    // Filling exactly up to the cap is fine.
+    var buf: [1024]u8 = undefined;
+    @memset(&buf, 'a');
+    var filled: usize = 0;
+    while (filled < max_bytes) : (filled += buf.len) {
+        const chunk = buf[0..@min(buf.len, max_bytes - filled)];
+        try e.insert(chunk);
+    }
+    try std.testing.expectEqual(@as(usize, max_bytes), e.text().len);
+    try std.testing.expectEqual(@as(usize, max_bytes), e.cursor);
+
+    // One byte past the cap: the edit is rejected, nothing changes.
+    if (e.insert("x")) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.InputTooLong, err);
+    }
+    try std.testing.expectEqual(@as(usize, max_bytes), e.text().len);
+    try std.testing.expectEqual(@as(usize, max_bytes), e.cursor);
+}
+
+test "insert beyond max_bytes never splits a UTF-8 grapheme" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+
+    // Leave exactly one byte of room, then try a 2-byte grapheme (ñ = 0xc3 0xb1).
+    var buf: [1024]u8 = undefined;
+    @memset(&buf, 'a');
+    var filled: usize = 0;
+    const target = max_bytes - 1;
+    while (filled < target) : (filled += buf.len) {
+        const chunk = buf[0..@min(buf.len, target - filled)];
+        try e.insert(chunk);
+    }
+    try std.testing.expectEqual(@as(usize, target), e.text().len);
+
+    if (e.insert("ñ")) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.InputTooLong, err);
+    }
+    // Buffer unchanged: all 'a', valid UTF-8, no dangling continuation byte.
+    try std.testing.expectEqual(@as(usize, target), e.text().len);
+    for (e.text()) |c| try std.testing.expect(c == 'a');
+    try std.testing.expect(e.text()[e.text().len - 1] != 0x80);
+
+    // A single byte still fits exactly at the cap.
+    try e.insertChar('b');
+    try std.testing.expectEqual(@as(usize, max_bytes), e.text().len);
+}
+
+test "insert in the middle beyond max_bytes is rejected and untouched" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+
+    var buf: [1024]u8 = undefined;
+    @memset(&buf, 'a');
+    var filled: usize = 0;
+    const target = max_bytes - 1;
+    while (filled < target) : (filled += buf.len) {
+        const chunk = buf[0..@min(buf.len, target - filled)];
+        try e.insert(chunk);
+    }
+    e.moveToStart();
+
+    if (e.insert("xx")) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        try std.testing.expectEqual(error.InputTooLong, err);
+    }
+    try std.testing.expectEqual(@as(usize, target), e.text().len);
+    try std.testing.expectEqual(@as(usize, 0), e.cursor);
 }
 
 test "word movement" {

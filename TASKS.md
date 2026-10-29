@@ -687,7 +687,7 @@ unit-perfect and still do nothing when it is typed).
 
 Tareas de alta prioridad para portar el comportamiento del harness de referencia. Cada una es independiente y se puede tickear en cualquier orden.
 
-- [ ] 🔴 **Entrada: límite de visualización** — cuando el texto escrito supere un tope de bytes, rechazar la edición con un mensaje claro que nombre el límite y pida repintar solo la zona afectada. Nunca cortar un carácter UTF-8 por la mitad.
+- [x] 🔴 **Entrada: límite de visualización** — cuando el texto escrito supere un tope de bytes, rechazar la edición con un mensaje claro que nombre el límite y pida repintar solo la zona afectada. Nunca cortar un carácter UTF-8 por la mitad.
 - [ ] 🔴 **Imágenes: custodia por el harness** — las imágenes leídas por una herramienta las guarda el harness, no la herramienta, y se adjuntan al siguiente mensaje del usuario (donde el protocolo lo permite).
 - [ ] 🔴 **Imágenes: topes y rechazo con motivo** — cantidad máxima de imágenes por mensaje, bytes máximos por imagen, bytes totales por mensaje, cantidad máxima por request y bytes máximos de request. Si una imagen excede un tope, rechazarla diciendo por qué y nombrando el archivo guardado donde está la copia.
 - [ ] 🔴 **Imágenes: imágenes viejas fuera del request y vida breve** — cada request re-envía todas las imágenes previas; dejar fuera las más antiguas primero hasta que quepa el límite, cada una con una nota que apunte a su archivo guardado. El historial no se modifica. Los búferes de imagen se liberan tan pronto sale el mensaje; no se cachean ni persisten entre turnos.

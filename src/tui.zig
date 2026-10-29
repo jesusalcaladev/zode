@@ -938,6 +938,15 @@ pub const Model = struct {
     /// prompt is edited with `editor.Editor`.
     ed: ed.Editor,
 
+    /// Transient "input too long" note: an edit was rejected because it would
+    /// exceed `ed.max_bytes`. The message names the limit; it is painted inside
+    /// the composer zone (the affected zone) by `drawInput` and cleared on the
+    /// next keystroke. The buffer itself is never touched by a rejected edit
+    /// and no UTF-8 grapheme is ever split.
+    input_err_buf: [160]u8 = undefined,
+    input_err: []const u8 = "",
+    input_too_long: bool = false,
+
     /// Raw paragraphs (owned). The parse into blocks is on-demand in draw,
     /// with an arena: the memory lives for one frame, we don't accumulate
     /// styles.
@@ -5703,7 +5712,10 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     // mods, which is the order that works for a key that means two things.
     if (k.codepoint == vaxis.Key.enter) {
         if (k.mods.shift or k.mods.alt) {
-            try self.ed.insertChar('\n');
+            if (self.ed.insertChar('\n')) |_| {
+            } else |err| {
+                if (std.mem.eql(u8, @errorName(err), "InputTooLong")) inputTooLongRejected(self);
+            }
             syncAutocomplete(self);
             ctx.redraw = true;
             return true;
@@ -5796,7 +5808,10 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     // Any other printable character (key.text decodes UTF-8).
     if (k.text) |txt| {
         if (txt.len > 0 and !ctrl) {
-            self.ed.insert(txt) catch {};
+            if (self.ed.insert(txt)) |_| {
+            } else |err| {
+                if (std.mem.eql(u8, @errorName(err), "InputTooLong")) inputTooLongRejected(self);
+            }
             syncAutocomplete(self);
             ctx.redraw = true;
             return true;
@@ -6108,6 +6123,22 @@ fn acceptAutocomplete(self: *Model) bool {
     return true;
 }
 
+/// Names the byte cap in a clear message: what the limit is, how many bytes
+/// are already typed, and what to do. The buffer was not modified by the
+/// rejected edit, so the message is accurate at paint time.
+fn inputTooLongRejected(self: *Model) void {
+    const text_len = self.ed.text().len;
+    const msg = std.fmt.bufPrint(&self.input_err_buf,
+        "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.",
+        .{ ed.max_bytes, text_len }) catch {
+        self.input_err = "Input too long: shorten the text.";
+        self.input_too_long = true;
+        return;
+    };
+    self.input_err = msg;
+    self.input_too_long = true;
+}
+
 // ── root widget handlers ─────────────────────────────────
 fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
     const self: *Model = @ptrCast(@alignCast(ud));
@@ -6118,6 +6149,10 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
     self.flushCopyPending(ctx);
     switch (event) {
         .key_press => |key| {
+            // A rejected-input note refers to the buffer as it was; once the
+            // user presses another key it is stale.
+            self.input_too_long = false;
+            self.input_err = "";
             // Ctrl+C: first clears the input, the second press exits (so
             // half-typed text is never lost in one go).
             if (key.matches('c', .{ .ctrl = true })) {
@@ -6489,7 +6524,12 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // Our own editor has no paste callback: we insert by hand. A paste
             // with line breaks creates a real multiline prompt.
             if (!self.pickerActive() and !self.permActive()) {
-                self.ed.insert(data) catch {};
+                if (self.ed.insert(data)) |_| {
+                    self.input_too_long = false;
+                    self.input_err = "";
+                } else |err| {
+                    if (std.mem.eql(u8, @errorName(err), "InputTooLong")) inputTooLongRejected(self);
+                }
                 syncAutocomplete(self);
             }
             ctx.redraw = true;
@@ -7304,6 +7344,23 @@ fn drawInput(
             .bg = theme.well_bg.bg,
         };
         _ = p.putClipped(3, row, piece.bytes, ed_w, text_style);
+    }
+
+    // The edit was rejected because it would exceed the byte cap: paint the
+    // note inside the composer zone itself (the affected zone), so the
+    // transcript above does not move and nothing else on screen changes.
+    // The well rows are refilled every frame, so a cleared note disappears
+    // on the next draw; the note is cleared on the next keystroke.
+    if (self.input_too_long) {
+        const err_row = if (total_rows <= input_h)
+            top + @as(u16, @intCast(total_rows))
+        else
+            top + input_h - 1;
+        if (err_row < p.height) {
+            var est = theme.warn_bold;
+            est.bg = theme.well_bg.bg;
+            _ = p.putClipped(3, err_row, self.input_err, ed_w, est);
+        }
     }
 
     // The terminal cursor, at its VISUAL row and column. Only when not
@@ -9441,6 +9498,61 @@ test "input: a wrapped line fills several rows and the cursor stays on screen" {
     // The LAST input row is `h - 2` itself: the status moved to `h - 1` and the
     // box's bottom border is gone, so the prompt now owns that row.
     try std.testing.expect(cur.row <= h - 2);
+}
+
+test "input: over the byte cap, the edit is rejected and the limit is named" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const w: u16 = 80;
+    const h: u16 = 24;
+
+    // Fill the buffer exactly up to the byte cap.
+    var buf: [1024]u8 = undefined;
+    @memset(&buf, 'x');
+    var filled: usize = 0;
+    while (filled < ed.max_bytes) : (filled += buf.len) {
+        const chunk = buf[0..@min(buf.len, ed.max_bytes - filled)];
+        try m.ed.insert(chunk);
+    }
+    try std.testing.expectEqual(@as(usize, ed.max_bytes), m.ed.text().len);
+
+    // One more byte: the edit is rejected and the buffer is left untouched.
+    if (m.ed.insert("y")) |_| {
+        try std.testing.expect(false);
+    } else |err| {
+        // editor.zig's error set; match by name since error sets are per-file.
+        try std.testing.expect(std.mem.eql(u8, @errorName(err), "InputTooLong"));
+    }
+    try std.testing.expectEqual(@as(usize, ed.max_bytes), m.ed.text().len);
+
+    // The rejection note: painted inside the composer zone (the affected
+    // zone), naming the limit. The key handler sets this exact state.
+    m.input_too_long = true;
+    const msg = std.fmt.bufPrint(&m.input_err_buf,
+        "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.",
+        .{ ed.max_bytes, m.ed.text().len }) catch {
+        m.input_err = "Input too long: shorten the text.";
+        return;
+    };
+    m.input_err = msg;
+
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+    const row = findRow(s, "Input too long") orelse return error.TestUnexpectedResult;
+
+    // The note lives in the composer zone: between the top of the input well
+    // and the last row above the footer (`h - 2`).
+    const input_h = @min(m.ed.displayLines(w - 4, testEditorMeasurer()), 8);
+    const top = h - 1 - input_h;
+    try std.testing.expect(row >= top);
+    try std.testing.expect(row <= h - 2);
+
+    // The limit itself is named in the painted message.
+    var line: [128]u8 = undefined;
+    const painted = std.mem.trim(u8, rowText(s, row, &line), " ");
+    try std.testing.expect(std.mem.indexOf(u8, painted, "262144-byte cap") != null);
 }
 
 test "input: composer surface is a well_bg sunken panel behind the text" {
