@@ -1,0 +1,28 @@
+#!/bin/sh
+# post-commit hook: regenerate CHANGELOG.md automatically on feat/fix/refactor/docs/perf/test/build/ci commits.
+# Folds the regenerated changelog into the same commit via `git commit --amend --no-verify`.
+# The ZODE_CHANGELOG_HOOK env var prevents infinite recursion on amend.
+
+if [ "${ZODE_CHANGELOG_HOOK:-0}" = "1" ]; then
+    exit 0
+fi
+export ZODE_CHANGELOG_HOOK=1
+
+subject="$(git log -1 --format=%s)"
+
+# Parse conventional commit type: feat(scope): desc  ->  feat
+ctype="$(printf '%s' "$subject" | sed -E 's/^([a-zA-Z]+)(\([^)]+\))?!?:.*/\1/')"
+
+case "$ctype" in
+    feat|fix|refactor|docs|perf|test|build|ci)
+        if [ -f tools/generate_changelog.py ]; then
+            python3 tools/generate_changelog.py >/dev/null 2>&1
+            if ! git diff --quiet -- CHANGELOG.md; then
+                git add CHANGELOG.md
+                git commit --amend --no-verify --no-edit
+            fi
+        fi
+        ;;
+    *)
+        ;;
+esac

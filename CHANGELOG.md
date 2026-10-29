@@ -2,24 +2,117 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Features
+
+- Phase 25.4 — read-only bash skips the permission dialog [`ddb3ed72`](https://github.com/jesusalcaladev/zode/commit/ddb3ed72)
+- name the rule the 'always allow' answer will remember (permissions) [`75488458`](https://github.com/jesusalcaladev/zode/commit/75488458)
+- dim the caret when the window loses focus (Phase 33.17) (tui) [`0a54e974`](https://github.com/jesusalcaladev/zode/commit/0a54e974)
+- add dontAsk mode — the model answers for itself (Phase 34.12) (permissions) [`17aca8fa`](https://github.com/jesusalcaladev/zode/commit/17aca8fa)
+- enforce a skill's allowed_tools / model / effort (Phase 34.10) (skills) [`07c799bb`](https://github.com/jesusalcaladev/zode/commit/07c799bb)
+- enforce conditional skills by path (Phase 34.11) (skills) [`0b1b4b8b`](https://github.com/jesusalcaladev/zode/commit/0b1b4b8b)
+- enforce `deny` rules by stripping tool schemas (Phase 34.3) (permissions) [`2afe5113`](https://github.com/jesusalcaladev/zode/commit/2afe5113)
+- dangerous-allow warning + shadowed-rule detection (Phase 34.4) (permissions) [`3a600622`](https://github.com/jesusalcaladev/zode/commit/3a600622)
+- frozen cut decisions (Phase 34.2) (resultcap) [`3eaa598a`](https://github.com/jesusalcaladev/zode/commit/3eaa598a)
+- add /clear command and /exit alias (Phase 35.5) [`4408e305`](https://github.com/jesusalcaladev/zode/commit/4408e305)
+
+### Chores
+
+- remove completed tasks from TASKS.md board [`ad2f42ab`](https://github.com/jesusalcaladev/zode/commit/ad2f42ab)
+
+### Documentation
+
+- the tree split, and the two things the docs got wrong [`ce444934`](https://github.com/jesusalcaladev/zode/commit/ce444934)
+
+### Refactors
+
+- consolidate tool-result caps into single layer (resultcap) [`c51fe9a1`](https://github.com/jesusalcaladev/zode/commit/c51fe9a1)
+
 ### Other
 
--  baseline: state of the project before the free-auto worktree [`26ec9d47`]
-
-## [0.2.0] - 2026-10-28
-
-### Changed
-
-- Consolidated every tool-result cap into a single layer (`src/lib/resultcap.zig`): per-tool cap (`default_max_result_chars`), per-message aggregate budget (`max_results_per_message_chars`), UTF-8-safe cuts, and the cut notice kept inside the budget. Previously this logic lived in three places.
-- Removed the duplicated cap code from `src/lib/subagent.zig` (its own `capResult` + `cut_notice` + tests). Subagent results now go through `resultcap.capResult` with the subagent's tighter cap.
-- Removed the dead `toolstore.initFromEnv` and its duplicated constants from `src/lib/toolstore.zig`; the store now reads its cap from `resultcap`.
-- Dropped the now-stale `subagent.capResult` reference from `src/lib/textcap.zig` docs.
-
-### Fixed
-
-- Subagent tool results now carry a cut notice instead of silent mid-line / mid-UTF-8 fragments, so a fragment can no longer be mistaken for the whole output.
+- src/tools/: one file per tool, and the headless tool binary works again [`b8b39498`](https://github.com/jesusalcaladev/zode/commit/b8b39498)
+- lib/prompt.zig: the system prompt text, out of agent.zig [`e6bc7332`](https://github.com/jesusalcaladev/zode/commit/e6bc7332)
+- commands.zig: the /commands, out of agent.zig [`aef35368`](https://github.com/jesusalcaladev/zode/commit/aef35368)
+- acp_bridge.zig: the delegated turn, out of agent.zig [`35f6d79b`](https://github.com/jesusalcaladev/zode/commit/35f6d79b)
+- remove the zombie src/tools.zig [`8983b65e`](https://github.com/jesusalcaladev/zode/commit/8983b65e)
+- remove ACP: the mode that handed the turn to another agent [`e6b96ac6`](https://github.com/jesusalcaladev/zode/commit/e6b96ac6)
+- README in English, and without ACP [`83b82fab`](https://github.com/jesusalcaladev/zode/commit/83b82fab)
+- ROADMAP in English [`1eb0979b`](https://github.com/jesusalcaladev/zode/commit/1eb0979b)
+- AGENTS.md in English, and four UI strings that reached the screen in Spanish [`ae175d46`](https://github.com/jesusalcaladev/zode/commit/ae175d46)
+- a hunk that another hunk had already rewritten is refused, not ignored [`11e4632c`](https://github.com/jesusalcaladev/zode/commit/11e4632c)
+- the compaction budget is the model's window, not a constant 128k [`110a2813`](https://github.com/jesusalcaladev/zode/commit/110a2813)
+- git_status, git_diff and git_log: no argument reaches git [`7b85c85c`](https://github.com/jesusalcaladev/zode/commit/7b85c85c)
+- a cheap model for the main turn, off by default and given up on the first no [`b61d31a4`](https://github.com/jesusalcaladev/zode/commit/b61d31a4)
+- diagnose the prompt cache from the evidence: 0% was a router, and it says so [`13ac303f`](https://github.com/jesusalcaladev/zode/commit/13ac303f)
+- read takes several paths at once, and the router verdict stops lying [`8c4f3422`](https://github.com/jesusalcaladev/zode/commit/8c4f3422)
+- a rate limit is a skip, not a red suite [`30fdc948`](https://github.com/jesusalcaladev/zode/commit/30fdc948)
+- teach the model to batch reads, and stop blaming DDG's captcha on our scraper [`d392eec6`](https://github.com/jesusalcaladev/zode/commit/d392eec6)
+- where a symbol is defined and where it is used, in one call [`9941aa14`](https://github.com/jesusalcaladev/zode/commit/9941aa14)
+- write/edit take several files at once, and the failing one is named [`c03e96f4`](https://github.com/jesusalcaladev/zode/commit/c03e96f4)
+- ZODE_MODEL was ignored by the TUI, and the router finally has an end-to-end test [`09a86697`](https://github.com/jesusalcaladev/zode/commit/09a86697)
+- the system prompt: drop the second tool list, and say the rules instead [`ea51d58e`](https://github.com/jesusalcaladev/zode/commit/ea51d58e)
+- a symbol everywhere it is CODE, in one call, with every file reported [`eea4cc51`](https://github.com/jesusalcaladev/zode/commit/eea4cc51)
+- build.zig and a pty script were still in Spanish; my check never looked at them [`d4adefe8`](https://github.com/jesusalcaladev/zode/commit/d4adefe8)
+- the project's own typecheck, in the background, on its own after an edit [`2219a533`](https://github.com/jesusalcaladev/zode/commit/2219a533)
+- change one step without resending the whole list [`6d81a257`](https://github.com/jesusalcaladev/zode/commit/6d81a257)
+- read on a picture returns an IMAGE, and only for a model that can see one [`4fb689d5`](https://github.com/jesusalcaladev/zode/commit/4fb689d5)
+- measure whether it grows, and /context says where the bytes are [`15e82dfc`](https://github.com/jesusalcaladev/zode/commit/15e82dfc)
+- the cheap router's fallback, verified end to end — and two real bugs it found [`3b6a0787`](https://github.com/jesusalcaladev/zode/commit/3b6a0787)
+- --chat had NO routing rules at all, and a check that failed reported success [`8ba2158e`](https://github.com/jesusalcaladev/zode/commit/8ba2158e)
+- trigger on finishing a step, not on counting them [`0232b957`](https://github.com/jesusalcaladev/zode/commit/0232b957)
+- the automatic typecheck now works in --chat, and its result survives the turn [`2aebbf9f`](https://github.com/jesusalcaladev/zode/commit/2aebbf9f)
+- the plan is applied in --chat, and a patch that changes nothing says nothing [`408cb595`](https://github.com/jesusalcaladev/zode/commit/408cb595)
+- exit in 40 ms instead of 767 ms, and kill on the way out [`0913b7cb`](https://github.com/jesusalcaladev/zode/commit/0913b7cb)
+- configurable automatic compaction: ZODE_COMPACT, ZODE_COMPACT_PCT, /compact [`42b52259`](https://github.com/jesusalcaladev/zode/commit/42b52259)
+- measure where the 1 second actually is, and bound it (1018 ms -> 273 ms) [`f89e928f`](https://github.com/jesusalcaladev/zode/commit/f89e928f)
+- output over the cap is cut with a notice, not a failed tool call [`394fc858`](https://github.com/jesusalcaladev/zode/commit/394fc858)
+- sessions at 0600, and web_fetch refuses the credential endpoints [`26c5c53d`](https://github.com/jesusalcaladev/zode/commit/26c5c53d)
+- router smoke: the check was asserting on a substring that only exists by luck [`1ada8646`](https://github.com/jesusalcaladev/zode/commit/1ada8646)
+- a failed patch comes back with the nearest line, not just "not found" [`5fc6456e`](https://github.com/jesusalcaladev/zode/commit/5fc6456e)
+- /goal: the turn may not stop short of the objective, and has to declare how it ended [`53a2f05a`](https://github.com/jesusalcaladev/zode/commit/53a2f05a)
+- the list comes off disk first and refreshes behind you (1144 ms -> 118 ms) [`0de498e1`](https://github.com/jesusalcaladev/zode/commit/0de498e1)
+- git that writes, and check/verify tables that know more languages [`715db0e0`](https://github.com/jesusalcaladev/zode/commit/715db0e0)
+- Wire applyGoalCall: the verdict reached the tool's text and not the Model [`9a06fdbd`](https://github.com/jesusalcaladev/zode/commit/9a06fdbd)
+- The repetition guard cannot see waiting, only doing [`6ffe0b7e`](https://github.com/jesusalcaladev/zode/commit/6ffe0b7e)
+- A test that looks for the garbage length, not for the allocation failure [`d3ed19b8`](https://github.com/jesusalcaladev/zode/commit/d3ed19b8)
+- Pin the segment-cache eviction path against the same crash, and fail to reproduce it [`661c29e5`](https://github.com/jesusalcaladev/zode/commit/661c29e5)
+- Name the exit, always, on stderr [`7263424a`](https://github.com/jesusalcaladev/zode/commit/7263424a)
+- The harness was telling the model to stop, and asking it to grade itself [`d070cf28`](https://github.com/jesusalcaladev/zode/commit/d070cf28)
+- AGENTS.md: the harness was telling the model to stop, and fish refusing to parse $? [`42eccc40`](https://github.com/jesusalcaladev/zode/commit/42eccc40)
+- The red-build rule was dead code on the path that matters [`d94fdd1c`](https://github.com/jesusalcaladev/zode/commit/d94fdd1c)
+- The status bar reported a budget the turn did not have [`40563b69`](https://github.com/jesusalcaladev/zode/commit/40563b69)
+- AGENTS.md: the death was a SIGSEGV, and the OutOfMemory was never about memory [`3506d204`](https://github.com/jesusalcaladev/zode/commit/3506d204)
+- `zig build debug` built nothing, and promised symbols it never had [`f4a64559`](https://github.com/jesusalcaladev/zode/commit/f4a64559)
+- AGENTS.md: a build step whose description was the promise it did not keep [`14669466`](https://github.com/jesusalcaladev/zode/commit/14669466)
+- The background reader thread was freeing through the TURN's arena [`c49623fe`](https://github.com/jesusalcaladev/zode/commit/c49623fe)
+- AGENTS.md: the crash was the background reader freeing through the TURN's arena [`37ee4aee`](https://github.com/jesusalcaladev/zode/commit/37ee4aee)
+- `met` with open plan steps: the model contradicting itself, machine-detected [`7edf40b3`](https://github.com/jesusalcaladev/zode/commit/7edf40b3)
+- `Child.kill` reaps, so `bash_kill` and the reader were racing for the same child [`d28911f2`](https://github.com/jesusalcaladev/zode/commit/d28911f2)
+- AGENTS.md: Child.kill reaps, so bash_kill and the reader raced for one child [`9cc0e02f`](https://github.com/jesusalcaladev/zode/commit/9cc0e02f)
+- The exit gate: a turn may not end on code nobody checked [`3f3ca988`](https://github.com/jesusalcaladev/zode/commit/3f3ca988)
+- Prompt polish: rules that decide, not rules that decorate [`711f379a`](https://github.com/jesusalcaladev/zode/commit/711f379a)
+- The four holes after the exit gate: the seam, `blocked`, compaction, the cap [`adf86087`](https://github.com/jesusalcaladev/zode/commit/adf86087)
+- reset blocked_refusals per turn: the evidence check was a one-shot for the session [`73744cd9`](https://github.com/jesusalcaladev/zode/commit/73744cd9)
+- A review step the gate requires, and the 4s hole closed [`42548b36`](https://github.com/jesusalcaladev/zode/commit/42548b36)
+- the window leak, and the 429s they caused themselves [`d355e0a1`](https://github.com/jesusalcaladev/zode/commit/d355e0a1)
+- Split agent.zig along the seams that already existed [`da110683`](https://github.com/jesusalcaladev/zode/commit/da110683)
+- --models could only ever describe opencode [`b450cbaa`](https://github.com/jesusalcaladev/zode/commit/b450cbaa)
+- The first E2E test of chatWorker, and two production bugs it found [`f2585915`](https://github.com/jesusalcaladev/zode/commit/f2585915)
+- The E2E test reads the key from .env, and two more dangling globals [`c29fcaae`](https://github.com/jesusalcaladev/zode/commit/c29fcaae)
+- Selective permissions: permission modes and scoped bash approval [`49adabfb`](https://github.com/jesusalcaladev/zode/commit/49adabfb)
+- web_fetch pages with a real offset, and web_search gets a real index [`a1543826`](https://github.com/jesusalcaladev/zode/commit/a1543826)
+- Priority 3: subagent model router + Anthropic auth fix [`bf1e7c36`](https://github.com/jesusalcaladev/zode/commit/bf1e7c36)
+- web_fetch paging the model can follow: the rule in the prompt, the offset at the top, and a cap that stops eating it [`29b3bf8c`](https://github.com/jesusalcaladev/zode/commit/29b3bf8c)
+- Token counter that says what it counted, 12-line diff previews with ctrl+r, and the router verified live [`78e3d865`](https://github.com/jesusalcaladev/zode/commit/78e3d865)
+- Fine-tuning: slash commands robustness, faster/robust search, and minor UX improvements [`a38435df`](https://github.com/jesusalcaladev/zode/commit/a38435df)
+- Fine-tuning: ignore dotfiles in slash commands, case-insensitive sort, add --hidden to rg [`86d1ca75`](https://github.com/jesusalcaladev/zode/commit/86d1ca75)
+- Improve TUI scrolling and activity feedback [`2e7ac9e1`](https://github.com/jesusalcaladev/zode/commit/2e7ac9e1)
+- Phase 34: circuit breaker for summarization + price/usage in /context [`e83cddde`](https://github.com/jesusalcaladev/zode/commit/e83cddde)
+- Phase 34.15: Stop hook with explicit gate/hook composition [`eca6d29b`](https://github.com/jesusalcaladev/zode/commit/eca6d29b)
+- Phase 3.1: spill large tool results to disk with preview + path [`a24eac6e`](https://github.com/jesusalcaladev/zode/commit/a24eac6e)
+- Phase 8 + Phase 9: Prompt-cache break detection + Agent definitions [`bd6defa2`](https://github.com/jesusalcaladev/zode/commit/bd6defa2)
+- Fix session memory leaks in DebugAllocator tests [`1393aa33`](https://github.com/jesusalcaladev/zode/commit/1393aa33)
