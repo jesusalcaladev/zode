@@ -9131,6 +9131,7 @@ pub fn prepareImageFor(
     const mime = images_mod.mimeForPath(path) orelse return null;
 
     const vision = models_mod.isVision(model);
+    const name = std.fs.path.basename(path);
 
     // Read it even when it cannot be attached: the size is information, and a
     // missing file is an error the model needs to hear about rather than a picture
@@ -9140,32 +9141,45 @@ pub fn prepareImageFor(
         return std.fmt.allocPrint(
             gpa,
             "{s}: could not read the image ({t}). Check the path with glob or list_files.",
-            .{ std.fs.path.basename(path), err },
+            .{ name, err },
         ) catch null;
     };
     defer gpa.free(bytes);
 
-    if (vision and pending.len >= images_mod.max_images) pending.refused += 1;
+    // ── refusals by cap, each one naming the file and saying why ──
+    if (vision and pending.len >= images_mod.max_images) {
+        pending.refused += 1;
+        return std.fmt.allocPrint(
+            gpa,
+            "{s}: an image of {d} bytes. Too many images already waiting ({d} max) — this one was NOT attached. Read it again after the earlier ones go out, or drop one.",
+            .{ name, bytes.len, images_mod.max_images },
+        ) catch null;
+    }
+    if (bytes.len > images_mod.max_bytes) {
+        return std.fmt.allocPrint(
+            gpa,
+            "{s}: an image of {d} bytes, over the {d} KB limit for attaching one image, so it was NOT sent. Shrink it, crop it, or read it in pieces.",
+            .{ name, bytes.len, images_mod.max_bytes / 1024 },
+        ) catch null;
+    }
+    if (pending.total_bytes + bytes.len > images_mod.max_total_bytes_per_request) {
+        pending.refused += 1;
+        return std.fmt.allocPrint(
+            gpa,
+            "{s}: an image of {d} bytes. Total image bytes for this request would exceed the {d} KB cap, so it was NOT attached. Drop an earlier image or shrink this one.",
+            .{ name, bytes.len, images_mod.max_total_bytes_per_request / 1024 },
+        ) catch null;
+    }
 
     const p = images_mod.prepare(gpa, path, bytes, mime, vision) catch return null;
     defer p.deinit(gpa);
 
     if (p.image_b64) |b64| {
-        // Make room when full: evict the OLDEST image first so the request
-        // always carries the newest ones (short life, no accumulation).
-        if (pending.len >= images_mod.max_images) {
-            const evicted = pending.images[0].path;
-            if (evicted.len > 0) gpa.free(evicted);
-            for (0..pending.len - 1) |i| {
-                pending.images[i] = pending.images[i + 1];
-            }
-            pending.len -= 1;
-            pending.refused += 1;
-        }
         const slot = &pending.images[pending.len];
         const path_copy = gpa.dupe(u8, path) catch "";
         slot.* = .{ .mime = mime, .data_b64 = b64, .path = path_copy };
         pending.len += 1;
+        pending.total_bytes += bytes.len;
     }
     return p.text;
 }
@@ -16528,4 +16542,116 @@ test "SummaryBreaker: reset clears a tripped breaker" {
 test "SummaryBreaker: max_consecutive is three" {
     const b: SummaryBreaker = .{};
     try std.testing.expectEqual(@as(usize, 3), b.max_consecutive);
+}
+
+test "prepareImageFor: a small image on a vision model is attached and names the file" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    defer io_global = undefined;
+
+    // Write a tiny image file.
+    try std.Io.Dir.cwd().writeFile(io_global, .{
+        .sub_path = "prepare_image_small.png",
+        .data = "iVBORw0KGgo", // not a real PNG, just bytes
+    });
+    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_small.png") catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var pending = images_mod.Pending{};
+    defer pending.clear(gpa);
+
+    const args_small = "{\"path\":\"prepare_image_small.png\"}";
+
+    const res = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args_small) orelse return;
+    try std.testing.expect(std.mem.indexOf(u8, res, "It is attached to this message") != null);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expect(std.mem.eql(u8, pending.images[0].path, "prepare_image_small.png"));
+    try std.testing.expect(pending.images[0].data_b64.len > 0);
+}
+
+test "prepareImageFor: an image over max_bytes is refused naming the file and the limit" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    defer io_global = undefined;
+
+    // Write an image just over the per-image cap.
+    const over = try std.testing.allocator.alloc(u8, images_mod.max_bytes + 1);
+    defer std.testing.allocator.free(over);
+    @memset(over, 0);
+
+    try std.Io.Dir.cwd().writeFile(io_global, .{
+        .sub_path = "prepare_image_over.png",
+        .data = over[0..images_mod.max_bytes + 1],
+    });
+    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_over.png") catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var pending = images_mod.Pending{};
+    defer pending.clear(gpa);
+
+    const args_over = "{\"path\":\"prepare_image_over.png\"}";
+    const res = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args_over) orelse return;
+    // Refused with a clear message naming the file and the limit.
+    try std.testing.expect(std.mem.indexOf(u8, res, "prepare_image_over.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "over the") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "1024 KB limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "NOT sent") != null);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+}
+
+test "prepareImageFor: too many images already waiting is refused naming the file" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    defer io_global = undefined;
+
+    // Fill pending up to max_images with small images.
+    const first_two = [_][]const u8{"prepare_image_a.png", "prepare_image_b.png"};
+    for (first_two) |path| {
+        try std.Io.Dir.cwd().writeFile(io_global, .{
+            .sub_path = path,
+            .data = "iVBORw0KGgo",
+        });
+    }
+    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_a.png") catch {};
+    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_b.png") catch {};
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var pending = images_mod.Pending{};
+    defer pending.clear(gpa);
+
+    // Attach the first two.
+    for (first_two) |path| {
+        const args = try std.fmt.allocPrint(gpa, "{{ \"path\": \"{s}\" }}", .{path});
+        const res = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args) orelse return;
+        _ = res;
+        gpa.free(args);
+    }
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+
+    // A third image should be refused by the count cap.
+    try std.Io.Dir.cwd().writeFile(io_global, .{
+        .sub_path = "prepare_image_c.png",
+        .data = "iVBORw0KGgo",
+    });
+    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_c.png") catch {};
+
+    const args_c = "{\"path\":\"prepare_image_c.png\"}";
+    const res = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args_c) orelse return;
+    try std.testing.expect(std.mem.indexOf(u8, res, "prepare_image_c.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "Too many images already waiting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "NOT attached") != null);
+    // Still only 2 held.
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
 }

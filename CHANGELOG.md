@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - unify /config + /status + /usage into one panel (Phase 35.7) [`c6fe48be`](https://github.com/jesusalcaladev/zode/commit/c6fe48be)
 - scroll state serializable for session resume (scroll infinito) [`21d4ab70`](https://github.com/jesusalcaladev/zode/commit/21d4ab70)
 - input byte cap rejects over-limit edits instead of truncating [`6bf19da7`](https://github.com/jesusalcaladev/zode/commit/6bf19da7)
-- images evict oldest first, named in the note, short-lived per turn [`2e0e8a67`](https://github.com/jesusalcaladev/zode/commit/2e0e8a67)
+- images evict oldest first, named in the note, short-lived per turn [`ba0c9975`](https://github.com/jesusalcaladev/zode/commit/ba0c9975)
+- images capped with clear refusal, named file, harness custody [`1b4e2101`](https://github.com/jesusalcaladev/zode/commit/1b4e2101)
 
 ### Chores
 

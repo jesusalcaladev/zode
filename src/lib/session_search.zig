@@ -284,6 +284,7 @@ test "sessionProse: extracts user + assistant content only" {
             ++ "{\"role\":\"tool\",\"content\":\"tool result noise\"}\n"
             ++ "{\"role\":\"assistant\",\"content\":\"hi there\"}\n",
     });
+    defer std.Io.Dir.cwd().deleteFile(io, "sess_prose_test.jsonl") catch {};
 
     const entry = sessionindex.Entry{
         .path = "sess_prose_test.jsonl",
@@ -350,6 +351,7 @@ test "searchSessions: combines title and transcript tiers" {
         .data = "{\"role\":\"user\",\"content\":\"distributed systems design\"}\n"
             ++ "{\"role\":\"assistant\",\"content\":\"here is the design\"}\n",
     });
+    defer std.Io.Dir.cwd().deleteFile(io, "sess_combined_test.jsonl") catch {};
 
     var entries = try a.alloc(sessionindex.Entry, 2);
     defer a.free(entries);

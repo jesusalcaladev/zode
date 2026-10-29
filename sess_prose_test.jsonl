@@ -1,4 +1,0 @@
-{"role":"system","content":"system instruction"}
-{"role":"user","content":"hello world"}
-{"role":"tool","content":"tool result noise"}
-{"role":"assistant","content":"hi there"}

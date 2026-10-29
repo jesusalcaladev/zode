@@ -39,18 +39,26 @@ pub const max_images = 2;
 /// image properly needs a decoder and this is not one.
 pub const max_bytes = 1024 * 1024;
 
+/// Total bytes of images allowed in one request. Two screenshots at most; any
+/// more and the request is refused rather than bloating the context forever.
+pub const max_total_bytes_per_request = max_images * max_bytes;
+
 pub const Pending = struct {
     images: [max_images]chat.Image = undefined,
     len: u8 = 0,
     /// Bytes refused because of the caps (including images evicted to make room),
     /// so the message can say so instead of the model believing it saw everything.
     refused: u8 = 0,
+    /// Total bytes of images currently held, so a request that would exceed
+    /// `max_total_bytes_per_request` can be refused before it is assembled.
+    total_bytes: usize = 0,
     pub fn clear(self: *Pending, gpa: std.mem.Allocator) void {
         for (self.images[0..self.len]) |img| {
             if (img.path.len > 0) gpa.free(img.path);
         }
         self.len = 0;
         self.refused = 0;
+        self.total_bytes = 0;
     }
 
     pub fn isEmpty(self: *const Pending) bool {
