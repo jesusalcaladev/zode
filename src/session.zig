@@ -51,6 +51,52 @@ pub const Message = struct {
     pub const Role = enum { system, user, assistant, tool };
 };
 
+/// Scroll state of the transcript, serializable so the reader's position
+/// survives a session resume. All fields are primitives (no allocations),
+/// so the struct is trivial to copy and to persist as a single JSONL record.
+pub const ScrollState = struct {
+    /// Absolute line of the top of the view (0 = top of history).
+    anchor_line: usize = 0,
+    /// Pinned to the bottom: new text follows the reader down.
+    follow_bottom: bool = true,
+    /// Index of the first paragraph that existed when the reader scrolled away;
+    /// baseline for the "N unread" counter.
+    unseen_base_para: usize = 0,
+    /// Whether the reader is currently away from the bottom.
+    was_away: bool = false,
+
+    /// Serializes to the JSON object fields of a scroll-state record.
+    /// Written inline by `persistScrollState`; no separate buffer needed.
+    pub fn writeFields(self: *const ScrollState, w: *std.Io.Writer) !void {
+        try w.writeAll("{\"event\":\"scroll\",\"anchor_line\":");
+        try w.print("{d}", .{self.anchor_line});
+        try w.writeAll(",\"follow_bottom\":");
+        try w.writeAll(if (self.follow_bottom) "true" else "false");
+        try w.writeAll(",\"unseen_base_para\":");
+        try w.print("{d}", .{self.unseen_base_para});
+        try w.writeAll(",\"was_away\":");
+        try w.writeAll(if (self.was_away) "true" else "false");
+        try w.writeAll("}");
+    }
+
+    /// Parses one scroll-state JSONL record into `self`. Returns null when the
+    /// line is not a scroll event or is malformed; a missing record is not an
+    /// error — defaults are used and the reader starts at the bottom.
+    pub fn parseFromLine(line: []const u8) ?ScrollState {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, line, .{}) catch return null;
+        if (parsed != .object) return null;
+        const obj = parsed.object;
+        const event = obj.get("event") orelse return null;
+        if (event != .string or !std.mem.eql(u8, event.string, "scroll")) return null;
+        var result = ScrollState{};
+        if (obj.get("anchor_line")) |v| { if (v == .integer) { result.anchor_line = @intCast(v.integer); } }
+        if (obj.get("follow_bottom")) |v| { if (v == .bool) { result.follow_bottom = v.bool; } }
+        if (obj.get("unseen_base_para")) |v| { if (v == .integer) { result.unseen_base_para = @intCast(v.integer); } }
+        if (obj.get("was_away")) |v| { if (v == .bool) { result.was_away = v.bool; } }
+        return result;
+    }
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
     io: std.Io = undefined,
@@ -67,6 +113,11 @@ pub const Session = struct {
     /// Provider-reported usage for this session, persisted as metadata records
     /// in the JSONL and never sent back to the model.
     usage_stats: cache_stats.CacheStats = .{},
+    /// Scroll state of the TUI transcript, serializable so the reader's
+    /// position survives a session resume. `anchor_line` is the absolute line
+    /// of the top of the view; `follow_bottom` pins the view to new text;
+    /// `unseen_base_para` / `was_away` drive the "N unread" counter.
+    scroll_state: ScrollState = .{},
     /// The skill listing has been attached to this session's prompt (once per
     /// session, at the end, outside the cacheable system prefix). Reset on
     /// config reload; not persisted to disk.
@@ -335,6 +386,7 @@ pub const Session = struct {
             try s.persist(m);
         }
         if (s.usage_stats.requests > 0) try s.persistUsageSnapshot();
+        try s.persistScrollState();
         try s.fw.?.interface.flush();
         return s;
     }
@@ -399,6 +451,27 @@ pub const Session = struct {
         try file_writer.writeAll(json);
         try file_writer.writeByte('\n');
         try file_writer.flush();
+    }
+
+    /// Persists the current scroll state as a JSONL record. Called when the
+    /// session is rewritten (on resume) and when the session is about to be
+    /// replaced, so the reader's position survives.
+    pub fn persistScrollState(self: *Session) !void {
+        const file_writer = &(self.fw orelse return).interface;
+        try self.scroll_state.writeFields(file_writer);
+        try file_writer.writeByte('\n');
+        try file_writer.flush();
+    }
+
+    /// Returns a copy of the current scroll state.
+    pub fn getScrollState(self: *Session) ScrollState {
+        return self.scroll_state;
+    }
+
+    /// Replaces the scroll state. Called by the TUI when the reader scrolls or
+    /// when new text arrives while following.
+    pub fn setScrollState(self: *Session, state: ScrollState) void {
+        self.scroll_state = state;
     }
 };
 
@@ -598,6 +671,10 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
             s.usage_stats = stats;
             continue;
         }
+        if (ScrollState.parseFromLine(line)) |st| {
+            s.scroll_state = st;
+            continue;
+        }
         const m = parseLine(allocator, line) catch continue;
         try s.messages.append(allocator, m);
     }
@@ -795,4 +872,91 @@ test "create: an ABSOLUTE sessions_dir is created, and the file lands inside it"
     try std.testing.expectEqual(std.Io.File.Kind.file, st.kind);
     // The repo-relative dir was NOT created as a side effect.
     try std.testing.expect(!std.mem.startsWith(u8, path, "sessions/"));
+}
+
+test "ScrollState: defaults are follow-the-bottom at line zero" {
+    const s = ScrollState{};
+    try std.testing.expectEqual(@as(usize, 0), s.anchor_line);
+    try std.testing.expect(s.follow_bottom);
+    try std.testing.expectEqual(@as(usize, 0), s.unseen_base_para);
+    try std.testing.expect(!s.was_away);
+}
+
+test "ScrollState: writeFields produces valid JSON" {
+    const orig = ScrollState{
+        .anchor_line = 1234,
+        .follow_bottom = false,
+        .unseen_base_para = 7,
+        .was_away = true,
+    };
+    var buf: [128]u8 = undefined;
+    buf[0] = 0; // touch the buffer so the compiler sees it as mutable
+    var written_len: usize = 0;
+    var w: std.Io.Writer = .fixed(&buf);
+    try orig.writeFields(&w);
+    // Find the end of the written JSON: the FixedBufferWriter doesn't expose
+    // the length, so scan for the closing brace.
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] == '}') { written_len = i + 1; break; }
+    }
+    try std.testing.expect(written_len > 0);
+    const written = buf[0..written_len];
+    // Should look like a JSON object with event=scroll.
+    try std.testing.expect(std.mem.startsWith(u8, written, "{\"event\":\"scroll\""));
+    try std.testing.expect(std.mem.endsWith(u8, written, "}"));
+
+    const parsed = ScrollState.parseFromLine(written) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(orig.anchor_line, parsed.anchor_line);
+    try std.testing.expectEqual(orig.follow_bottom, parsed.follow_bottom);
+    try std.testing.expectEqual(orig.unseen_base_para, parsed.unseen_base_para);
+    try std.testing.expectEqual(orig.was_away, parsed.was_away);
+}
+
+test "ScrollState: parseFromLine rejects non-scroll events" {
+    // A usage-snapshot record must not be mistaken for scroll state.
+    const not_scroll = "{\"event\":\"usage\",\"stats\":{}}";
+    try std.testing.expect(ScrollState.parseFromLine(not_scroll) == null);
+    // Garbage is null, not an error.
+    try std.testing.expect(ScrollState.parseFromLine("not json at all") == null);
+    try std.testing.expect(ScrollState.parseFromLine("") == null);
+}
+
+test "ScrollState: parseFromLine missing fields uses defaults" {
+    const partial = "{\"event\":\"scroll\",\"anchor_line\":42}";
+    const parsed = ScrollState.parseFromLine(partial) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 42), parsed.anchor_line);
+    // Missing fields fall back to defaults.
+    try std.testing.expect(parsed.follow_bottom);
+    try std.testing.expectEqual(@as(usize, 0), parsed.unseen_base_para);
+    try std.testing.expect(!parsed.was_away);
+}
+
+test "Session: scroll state persists across resume" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var used_path: []const u8 = "";
+    {
+        const s = try Session.create(alloc, io);
+        defer { s.deinit(); alloc.destroy(s); }
+        used_path = try alloc.dupe(u8, s.path.?);
+        // Set a non-default scroll state and persist it to disk so resume can read it.
+        s.setScrollState(.{
+            .anchor_line = 99,
+            .follow_bottom = false,
+            .unseen_base_para = 5,
+            .was_away = true,
+        });
+        try s.persistScrollState();
+        // resumePath truncates and rewrites, re-persisting the scroll state.
+        const s2 = try Session.resumePath(alloc, io, used_path);
+        defer { s2.deinit(); alloc.destroy(s2); }
+        try std.testing.expectEqual(@as(usize, 99), s2.getScrollState().anchor_line);
+        try std.testing.expectEqual(false, s2.getScrollState().follow_bottom);
+        try std.testing.expectEqual(@as(usize, 5), s2.getScrollState().unseen_base_para);
+        try std.testing.expectEqual(true, s2.getScrollState().was_away);
+    }
+    // Clean up: delete the file first (needs the path), then free the path string.
+    defer alloc.free(used_path);
+    defer std.Io.Dir.cwd().deleteFile(io, used_path) catch {};
 }

@@ -1009,6 +1009,10 @@ pub const Model = struct {
     /// teardown.
     workers: std.atomic.Value(usize) = .init(0),
 
+    /// Back-pointer to the owning Session, so scroll-state changes are
+    /// persisted for resume. Set by agent.zig on create/resume; null in tests.
+    session: ?*session_mod.Session = null,
+
     /// `/` command autocompletion: visible + selection.
     ac: Autocomplete = .{},
 
@@ -5048,6 +5052,47 @@ pub const Model = struct {
         // the previous frame's number while waiting for one.
         self.first_visible = first;
         self.max_offset = mo;
+        self.persistScrollState();
+    }
+
+    /// Persists the current scroll state to the owning Session, so it survives
+    /// a resume. No-op when there is no session (tests).
+    fn persistScrollState(self: *Model) void {
+        if (self.session) |s| {
+            s.setScrollState(self.getScrollState());
+        }
+    }
+
+    /// Returns the current scroll state as a serializable `ScrollState`, so the
+    /// reader's position can be persisted with the session and restored on
+    /// resume. `anchor` is the absolute line of the top of the view.
+    pub fn getScrollState(self: *const Model) session_mod.ScrollState {
+        return .{
+            .anchor_line = self.anchor,
+            .follow_bottom = self.follow_bottom,
+            .unseen_base_para = self.unseen_base_para,
+            .was_away = self.was_away,
+        };
+    }
+
+    /// Applies a previously saved scroll state to this Model. `anchor_line` is
+    /// re-derived into (paragraph, offset) through `setAnchorLine`, so it stays
+    /// correct even if paragraph heights changed (different terminal width).
+    /// A missing or zero state defaults to following the bottom.
+    pub fn applyScrollState(self: *Model, state: session_mod.ScrollState) void {
+        self.ensureParaHeights();
+        self.follow_bottom = state.follow_bottom;
+        self.was_away = state.was_away;
+        self.unseen_base_para = state.unseen_base_para;
+        if (state.follow_bottom) {
+            // At the bottom: the anchor is re-derived on the next frame when
+            // computeVisible sees first >= max_offset.
+            self.anchor = 0;
+        } else {
+            self.setAnchorLine(state.anchor_line);
+            self.anchor = state.anchor_line;
+        }
+        self.diff_needs_full_redraw = true;
     }
 
     // ── the prompt rail ─────────────────────────────────────
@@ -10224,6 +10269,57 @@ test "scrollBy: the wheel cannot underflow at the top" {
     _ = try drawTest(&m, arena_state.allocator(), 80, 24);
     try std.testing.expectEqual(@as(usize, 0), m.first_visible);
     try std.testing.expect(m.anchor <= m.max_offset);
+}
+
+test "scroll state: get and apply round trip preserves position" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // Build a real history so there is something to scroll.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) m.pushInfo("linea de historia");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+    const bottom = m.max_offset;
+
+    // Scroll up and capture the state.
+    m.scrollBy(10);
+    const saved = m.getScrollState();
+    try std.testing.expectEqual(bottom - 10, saved.anchor_line);
+    try std.testing.expect(!saved.follow_bottom);
+
+    // Move somewhere else, then restore.
+    m.scrollTo(0);
+    try std.testing.expectEqual(@as(usize, 0), m.anchor);
+    m.applyScrollState(saved);
+    try std.testing.expectEqual(bottom - 10, m.anchor);
+    try std.testing.expect(!m.follow_bottom);
+}
+
+test "scroll state: apply follow_bottom goes to the bottom" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) m.pushInfo("linea de historia");
+    _ = try drawTest(&m, arena_state.allocator(), 80, 24);
+
+    // Scroll up, then apply a follow-bottom state.
+    m.scrollBy(10);
+    try std.testing.expect(!m.follow_bottom);
+    m.applyScrollState(.{});
+    try std.testing.expect(m.follow_bottom);
+    try std.testing.expectEqual(@as(usize, 0), m.anchor);
+}
+
+test "scroll state: default state follows the bottom" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expect(m.follow_bottom);
+    try std.testing.expectEqual(@as(usize, 0), m.anchor);
 }
 
 test "the tool clock takes the lock, so a fast tool cannot free it under the reader" {

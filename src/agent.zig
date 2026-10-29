@@ -2909,7 +2909,7 @@ test "shutdownUserConfig: after it, no key is readable through the pointer" {
 /// without chatting does not leave an empty `sessions/zode-*.jsonl` lying
 /// around.
 pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
-    if (session) |s| return s;
+    if (session) |s| { m.session = s; return s; }
     _ = arena;
     const fresh = session_mod.Session.create(m.allocator, io_global) catch {
         // Without disk it carries on: that is degradation, not a fatal error. The
@@ -2917,10 +2917,12 @@ pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Sessi
         const s = m.allocator.create(session_mod.Session) catch @panic("out of memory for the session");
         s.* = session_mod.Session.init(m.allocator);
         session = s;
+        m.session = s;
         cache_stats.session = .{};
         return s;
     };
     session = fresh;
+    m.session = fresh;
     cache_stats.session = .{};
     return fresh;
 }
@@ -2957,6 +2959,8 @@ pub fn resetSessionFiles(m: *tui.Model) void {
 /// Creates a new session and discards the current one.
 pub fn newSession(m: *tui.Model) void {
     if (session) |old| {
+        // Persist the old session's scroll state before it is destroyed.
+        old.persistScrollState() catch {};
         m.allocator.destroy(old);
         session = null;
     }
@@ -2977,6 +2981,8 @@ pub fn newSession(m: *tui.Model) void {
     // file" would make the next `read` skip the body — and the model would
     // be working from a file it cannot see.
     resetSessionFiles(m);
+    // A new session starts at the bottom, following new text.
+    m.applyScrollState(.{});
 }
 
 /// Callback for the `/session` picker: resumes the session at `index`.
@@ -2985,6 +2991,10 @@ pub fn onSessionPick(m: *tui.Model, _: u32, index: usize) void {
     const path = m.session_picker_paths.items[index];
 
     if (session) |old| {
+        // Persist the old session's scroll state before it is destroyed, so the
+        // reader's position survives the switch. A write failure here is not
+        // fatal: the worst case is the reader starts at the bottom next time.
+        old.persistScrollState() catch {};
         m.allocator.destroy(old);
         session = null;
     }
@@ -2992,11 +3002,14 @@ pub fn onSessionPick(m: *tui.Model, _: u32, index: usize) void {
 
     if (session_mod.Session.resumePath(m.allocator, io_global, path)) |s| {
         session = s;
+        m.session = s;
         cache_stats.session = s.usage_stats;
         const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
             "session resumed";
         pushInfoOwned(m, msg);
         resetSessionFiles(m);
+        // Restore the reader's scroll position from the saved session state.
+        m.applyScrollState(s.getScrollState());
     } else |err| {
         pushInfoFmt(m, "could not resume {s}: {t}", .{ path, err });
     }

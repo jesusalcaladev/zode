@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - background subagents (run_in_background) + cache_control for 90%%+ cache-hit [`302d9fd9`](https://github.com/jesusalcaladev/zode/commit/302d9fd9)
 - add /doctor, /status, /compact now; clean project root [`2207d5b9`](https://github.com/jesusalcaladev/zode/commit/2207d5b9)
 - unify /config + /status + /usage into one panel (Phase 35.7) [`c6fe48be`](https://github.com/jesusalcaladev/zode/commit/c6fe48be)
+- scroll state serializable for session resume (scroll infinito) [`dfa13132`](https://github.com/jesusalcaladev/zode/commit/dfa13132)
 
 ### Chores
 
@@ -35,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - the tree split, and the two things the docs got wrong [`ce444934`](https://github.com/jesusalcaladev/zode/commit/ce444934)
-- add memory block tasks to CHANGELOG [`59935b38`](https://github.com/jesusalcaladev/zode/commit/59935b38)
+- add memory block tasks to CHANGELOG [`4124992a`](https://github.com/jesusalcaladev/zode/commit/4124992a)
 
 ### Refactors
 
