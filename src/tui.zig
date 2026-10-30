@@ -1135,6 +1135,9 @@ pub const Model = struct {
     prompt_dot_len: usize = 0,
     prompt_dot_col: u16 = 0,
     prompt_dot_hover: ?usize = null,
+    /// Show the prompt rail dots (the right-margin timeline). Disabled by
+    /// default: not polished enough yet. Re-enable when finished.
+    show_prompt_dots: bool = false,
 
 
     /// Paragraph cache: 1 arena per closed paragraph, with the lines ALREADY
@@ -6983,10 +6986,10 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     self.diff_last_live_active = live_active;
     self.diff_needs_full_redraw = false;
     drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
-    // ── prompt rail (dots) ── DISABLED BY DEFAULT.
-    // Not polished enough yet: the dots overlap, hover state never clears,
-    // and the column competes with the scrollbar. Re-enable when finished.
-    // self.refreshPromptDots(width, history_h);
+    // ── prompt rail (dots) ── computed every frame so the mouse handler has
+    // current data, but only painted when show_prompt_dots is enabled (off by
+    // default: not polished enough yet).
+    self.refreshPromptDots(width, history_h);
     // The sticky header and the pill go OVER the transcript, and that is the
     // editor's own convention (a sticky line covers the content under it).
     // Reserving a row for them would move the text under the reader's eyes
@@ -6994,7 +6997,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     drawStickyHeader(&p, self, width, ctx.arena);
     drawNewMessagesPill(&p, self, width, history_h);
     try self.snapshotSelectableHistory(surface, history_h);
-    // drawPromptTimeline(&p, self);  // dots disabled by default
+    drawPromptTimeline(&p, self);
     self.paintTextSelection(surface);
 
     // The session's numbers are NOT painted here any more: they live in the
@@ -7740,6 +7743,7 @@ fn drawHistoryScrollbar(
 /// the one the sticky header names. The two together answer "where am I"
 /// without covering a line of the transcript.
 fn drawPromptTimeline(p: *Painter, self: *const Model) void {
+    if (!self.show_prompt_dots) return;
     if (self.prompt_dot_len == 0 or self.prompt_dot_col == 0) return;
     const active = stickyPromptPara(self);
     for (self.prompt_dots[0..self.prompt_dot_len]) |d| {
@@ -11967,8 +11971,8 @@ test "the prompt rail keeps the last six prompts, newest at the bottom" {
         m.pushKind(.user, try std.fmt.bufPrint(&text, "prompt {d}", .{i}));
         m.pushKind(.assistant, "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten");
     }
+    m.show_prompt_dots = true;
     const s = try drawTest(&m, arena_state.allocator(), 80, 24);
-
     // Capped at six, and the OLDEST ones fell off: the rail is "my recent
     // prompts", so the newest is the one that must never be missing.
     try std.testing.expectEqual(timeline_max_dots, m.prompt_dot_len);
@@ -12050,6 +12054,7 @@ test "the prompt rail acknowledges the pointer and forgets it when it leaves" {
     m.pushKind(.assistant, "answer");
     m.pushKind(.user, "second");
     m.pushKind(.assistant, "answer");
+    m.show_prompt_dots = true;
     _ = try drawTest(&m, arena_state.allocator(), 80, 24);
     try std.testing.expectEqual(@as(usize, 2), m.prompt_dot_len);
 

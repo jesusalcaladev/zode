@@ -33,7 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - input byte cap rejects over-limit edits instead of truncating [`48c6ec60`](https://github.com/jesusalcaladev/zode/commit/48c6ec60)
 - CI test crash - unreachable in cache reset functions [`a01fc9b2`](https://github.com/jesusalcaladev/zode/commit/a01fc9b2)
-- black holes in transcript + disable prompt dots by default [`12bced0f`](https://github.com/jesusalcaladev/zode/commit/12bced0f)
+- black holes in transcript + disable prompt dots by default [`8efd2841`](https://github.com/jesusalcaladev/zode/commit/8efd2841)
+- black holes in transcript + disable prompt dots by default + fix tests [`20de34e0`](https://github.com/jesusalcaladev/zode/commit/20de34e0)
 
 ### Chores
 
