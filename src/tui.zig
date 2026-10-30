@@ -6939,13 +6939,14 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     self.max_offset = vis.max_offset;
     self.live_h = if (live_active) live_lines.len else 0;
 
-    // Always fill the transcript area with well_bg so there are never black
-    // holes between the last message and the composer. The old code only did
-    // this on full redraw and with an empty style (no background), so empty
-    // rows showed the terminal's raw black.
+    // Always fill the transcript area AND the gap up to the hairline with
+    // well_bg so there are never black holes between the last message and
+    // the composer. history_h = rule_row - ac_rows - plan_rows, so when a
+    // plan or autocomplete row is visible, history_h stops short of rule_row
+    // and the gap would show the terminal's raw black.
     {
         var clear_row: u16 = 0;
-        while (clear_row < history_h) : (clear_row += 1) {
+        while (clear_row < rule_row) : (clear_row += 1) {
             p.fillRange(0, width, clear_row, " ", theme.well_bg);
         }
     }
