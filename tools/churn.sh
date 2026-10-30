@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CSDIR="$ROOT/.changesets"
+CSDIR="$ROOT/.churn"
 CMD="${1:-help}"
 case "$CMD" in
   add)
