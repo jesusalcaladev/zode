@@ -62,14 +62,78 @@ zig build -Doptimize=ReleaseSmall   # ~1.3 MB stripped binary
 ./zig-out/bin/zode --models         # list available models
 ```
 
-Build flags:
-- `-Doptimize=ReleaseSmall` (default) — smallest binary (~1.3 MB).
-- `-Doptimize=ReleaseSafe` — safer, slightly larger (~2.2 MB).
-- `-Dstrip=true` (default) — strips debug sections.
-- `-Dversion=v0.1.0` — embeds a version string (`--version`).
-- `-Dcpu=baseline` — **required for a binary you distribute**. Without it the binary targets THIS machine's CPU and dies with `Illegal instruction` on older ones.
+## Build Flags
 
-For a debuggable build with symbols: `zig build -Doptimize=Debug` (`-Dstrip=false` alone does **not** produce symbols on ReleaseSmall/ReleaseSafe).
+### Optimization Levels
+
+| Flag | Description | Size | Use Case |
+|------|-------------|------|----------|
+| `-Doptimize=ReleaseSmall` (default) | Optimized for size | ~1.3 MB | Distribution, production |
+| `-Doptimize=ReleaseSafe` | Optimized for safety, larger | ~2.2 MB | Production where bugs matter |
+| `-Doptimize=Debug` | No optimizations, symbols included | ~6-8 MB | Debugging, development |
+
+### Binary Stripping
+
+| Flag | Description | When to Use |
+|------|-------------|-------------|
+| `-Dstrip=true` (default) | Removes debug sections (`.symtab`, `.debug_info`) | Production builds |
+| `-Dstrip=false` | Keeps symbols for debugging | Debug builds (with `-Doptimize=Debug`) |
+
+**⚠️ Important**: `-Dstrip=false` alone does **NOT** produce symbols on ReleaseSmall/ReleaseSafe. Use it **only** with `-Doptimize=Debug`.
+
+### Version Embedding
+
+```bash
+-Dversion=v0.1.0
+```
+- Embeds version string in binary (`--version` command)
+- Useful for tracking deployed versions
+
+### CPU Target (Critical for Distribution)
+
+```bash
+-Dcpu=baseline
+```
+- **REQUIRED** for any binary you distribute
+- Without it, the binary targets **THIS machine's CPU**
+- Older hardware gets `Illegal instruction` crashes
+- Baseline targets x86_64, ARMv7, and other common architectures
+
+### Common Build Combinations
+
+#### Production (Recommended)
+```bash
+zig build -Doptimize=ReleaseSmall -Dcpu=baseline
+# Result: ~1.3 MB, universally compatible
+```
+
+#### Production with Debug Symbols
+```bash
+zig build -Doptimize=ReleaseSafe -Dstrip=false -Dcpu=baseline
+# Result: ~2.2 MB, debuggable, universal
+```
+
+#### Development
+```bash
+zig build -Doptimize=Debug -Dstrip=false
+# Result: ~6-8 MB, full symbols, current CPU only
+```
+
+### Quick Reference Table
+
+| Build Type | Command | Size | Compatible | Debuggable |
+|------------|---------|------|------------|------------|
+| **ReleaseSmall** | `zig build -Doptimize=ReleaseSmall` | 1.3 MB | ✅ Universal | ❌ |
+| **ReleaseSafe** | `zig build -Doptimize=ReleaseSafe` | 2.2 MB | ✅ Universal | ❌ |
+| **Debug** | `zig build -Doptimize=Debug` | 6-8 MB | ❌ Current CPU only | ✅ |
+
+### Best Practices
+
+1. **Always use `-Dcpu=baseline`** for any build you plan to share
+2. **Use ReleaseSmall** for production releases (smallest size)
+3. **Keep Debug builds locally** - they're large and CPU-specific
+4. **Symbol requirement**: Debug builds get symbols automatically; release builds do **not** get them even with `-Dstrip=false`
+5. **Default flags**: `-Doptimize=ReleaseSmall` and `-Dstrip=true` are already the defaults
 
 ---
 

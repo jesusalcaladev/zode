@@ -6936,17 +6936,14 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     self.max_offset = vis.max_offset;
     self.live_h = if (live_active) live_lines.len else 0;
 
-    // ── differential render: decide what needs clearing/repainting ──
-    // If nothing changed since last frame and we're not streaming, skip
-    // clearing/repainting entirely. If scrolling or first frame, do full redraw.
-    const needs_full_redraw = self.diff_needs_full_redraw
-        or (first_visible != self.diff_last_first)
-        or (last_visible != self.diff_last_last)
-        or (live_active != self.diff_last_live_active);
-    if (needs_full_redraw) {
+    // Always fill the transcript area with well_bg so there are never black
+    // holes between the last message and the composer. The old code only did
+    // this on full redraw and with an empty style (no background), so empty
+    // rows showed the terminal's raw black.
+    {
         var clear_row: u16 = 0;
         while (clear_row < history_h) : (clear_row += 1) {
-            p.fillRange(0, width, clear_row, " ", .{});
+            p.fillRange(0, width, clear_row, " ", theme.well_bg);
         }
     }
 
@@ -6986,10 +6983,10 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     self.diff_last_live_active = live_active;
     self.diff_needs_full_redraw = false;
     drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
-    // The rail is computed from the same frame the dots are painted in: the
-    // mouse handler reads `prompt_dots`, and a stale rail is a click that
-    // jumps somewhere else.
-    self.refreshPromptDots(width, history_h);
+    // ── prompt rail (dots) ── DISABLED BY DEFAULT.
+    // Not polished enough yet: the dots overlap, hover state never clears,
+    // and the column competes with the scrollbar. Re-enable when finished.
+    // self.refreshPromptDots(width, history_h);
     // The sticky header and the pill go OVER the transcript, and that is the
     // editor's own convention (a sticky line covers the content under it).
     // Reserving a row for them would move the text under the reader's eyes
@@ -6997,8 +6994,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     drawStickyHeader(&p, self, width, ctx.arena);
     drawNewMessagesPill(&p, self, width, history_h);
     try self.snapshotSelectableHistory(surface, history_h);
-    // After the snapshot, on purpose: see `drawPromptTimeline`.
-    drawPromptTimeline(&p, self);
+    // drawPromptTimeline(&p, self);  // dots disabled by default
     self.paintTextSelection(surface);
 
     // The session's numbers are NOT painted here any more: they live in the
