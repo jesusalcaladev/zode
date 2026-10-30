@@ -1,0 +1,17 @@
+{
+  "package": "zode",
+  "baseVersion": "0.2.0-beta",
+  "versionTypes": {
+    "breaking": "major",
+    "feature": "minor",
+    "fix": "patch",
+    "perf": "patch",
+    "refactor": "patch",
+    "docs": "patch",
+    "chore": "patch",
+    "beta": "prerelease",
+    "next": "major"
+  },
+  "changelogFile": "CHANGELOG.md",
+  "autoGenerateChangelog": true
+}

@@ -359,4 +359,18 @@ pub fn build(b: *std.Build) void {
     run_copy.setName("copy_smoke");
     run_copy.has_side_effects = true;
     pty_check.dependOn(&run_copy.step);
+
+    // change_manager: Zig-native changeset tool for version bumps and changelogs.
+    const cm_mod = b.createModule(.{
+        .root_source_file = b.path("tools/change_manager.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const cm = b.addExecutable(.{ .name = "change_manager", .root_module = cm_mod });
+    const cm_step = b.step("change_manager", "Change manager: add/release/changelog/version");
+    cm_step.dependOn(&cm.step);
+    const cm_run = b.addRunArtifact(cm);
+    cm_run.setName("change_manager_run");
+    cm_run.has_side_effects = true;
+    cm_step.dependOn(&cm_run.step);
 }

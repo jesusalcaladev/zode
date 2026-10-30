@@ -1,0 +1,6 @@
+{
+  "type": "fix",
+  "scope": "tui",
+  "description": "Fix black holes in transcript area",
+  "breaking": false
+}

@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - input byte cap rejects over-limit edits instead of truncating [`6bf19da7`](https://github.com/jesusalcaladev/zode/commit/6bf19da7)
 - images evict oldest first, named in the note, short-lived per turn [`ba0c9975`](https://github.com/jesusalcaladev/zode/commit/ba0c9975)
 - images capped with clear refusal, named file, harness custody [`9f35a288`](https://github.com/jesusalcaladev/zode/commit/9f35a288)
+- add change_manager tool for changeset-driven versioning [`39143f4a`](https://github.com/jesusalcaladev/zode/commit/39143f4a)
 
 ### Bug Fixes
 
@@ -35,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI test crash - unreachable in cache reset functions [`a01fc9b2`](https://github.com/jesusalcaladev/zode/commit/a01fc9b2)
 - black holes in transcript + disable prompt dots by default [`8efd2841`](https://github.com/jesusalcaladev/zode/commit/8efd2841)
 - black holes in transcript + disable prompt dots by default + fix tests [`1c149573`](https://github.com/jesusalcaladev/zode/commit/1c149573)
-- fill transcript area up to hairline to eliminate black holes [`1a6fdce8`](https://github.com/jesusalcaladev/zode/commit/1a6fdce8)
+- fill transcript area up to hairline to eliminate black holes [`fa91e910`](https://github.com/jesusalcaladev/zode/commit/fa91e910)
 
 ### Chores
 
