@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - images evict oldest first, named in the note, short-lived per turn [`ba0c9975`](https://github.com/jesusalcaladev/zode/commit/ba0c9975)
 - images capped with clear refusal, named file, harness custody [`9f35a288`](https://github.com/jesusalcaladev/zode/commit/9f35a288)
 - add change_manager tool for changeset-driven versioning [`fc15b12b`](https://github.com/jesusalcaladev/zode/commit/fc15b12b)
-- rename changeset system to churn (.churn) [`7984c37d`](https://github.com/jesusalcaladev/zode/commit/7984c37d)
+- rename changeset system to churn (.churn) [`9e6692b0`](https://github.com/jesusalcaladev/zode/commit/9e6692b0)
+- release 0.2.1-beta.1 via churn [`71be7a0b`](https://github.com/jesusalcaladev/zode/commit/71be7a0b)
 
 ### Bug Fixes
 
