@@ -7814,21 +7814,67 @@ pub fn shellOutputArrived(m: *tui.Model, so: tui.ShellOut) void {
 
 /// A JSON string literal, for building tool arguments by hand.
 fn jsonString(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out = try std.ArrayList(u8).initCapacity(gpa, s.len + 8);
-    errdefer out.deinit(gpa);
-    try out.append(gpa, '"');
+    // Sized exactly, and that is not a micro-optimization. The caller FREES the
+    // result, and 0.17's SafeAllocator compares the length handed to `free`
+    // against the length of the allocation: an `ArrayList` buffer is the capacity
+    // it was grown to, `out.items` is the length filled in, and the two are not
+    // the same number. `!echo zode-shell-ok` asked for 20 bytes of a 26-byte block
+    // and the release binary died with "free of invalid memory … or corrupted
+    // metadata" on the shell thread. Every escape is two bytes, so the total is
+    // known before the copy and there is nothing to grow.
+    var n: usize = 2;
+    for (s) |c| n += switch (c) {
+        '"', '\\', '\n', '\t', '\r' => @as(usize, 2),
+        else => @as(usize, 1),
+    };
+    const out = try gpa.alloc(u8, n);
+    errdefer gpa.free(out);
+    var i: usize = 1;
+    out[0] = '"';
     for (s) |c| {
-        switch (c) {
-            '"' => try out.appendSlice(gpa, "\\\""),
-            '\\' => try out.appendSlice(gpa, "\\\\"),
-            '\n' => try out.appendSlice(gpa, "\\n"),
-            '\t' => try out.appendSlice(gpa, "\\t"),
-            '\r' => try out.appendSlice(gpa, "\\r"),
-            else => try out.append(gpa, c),
+        const esc: ?u8 = switch (c) {
+            '"' => '"',
+            '\\' => '\\',
+            '\n' => 'n',
+            '\t' => 't',
+            '\r' => 'r',
+            else => null,
+        };
+        if (esc) |e| {
+            out[i] = '\\';
+            out[i + 1] = e;
+            i += 2;
+        } else {
+            out[i] = c;
+            i += 1;
         }
     }
-    try out.append(gpa, '"');
-    return out.items;
+    out[i] = '"';
+    return out;
+}
+
+test "jsonString: the result is freeable with its own length" {
+    // The bug was not the string, it was the SIZE of the allocation behind it: an
+    // `ArrayList` grows in jumps, so `items.len` (what a caller frees) was
+    // smaller than the block. A `free` of the result is the part that crashed, so
+    // this test does one — and it is the shell path (`startShell`) that does it.
+    const gpa = std.testing.allocator;
+    // The PARSE leaks on purpose (`parseFromSliceLeaky`), so it parses into an
+    // arena and not into the testing allocator, which reports every byte left.
+    var ap = std.heap.ArenaAllocator.init(gpa);
+    defer ap.deinit();
+    const cases = [_][]const u8{ "", "echo zode-shell-ok", "a\"b\\c\nd\te\rf", "ünïcödé" };
+    for (cases) |s| {
+        const q = try jsonString(gpa, s);
+        defer gpa.free(q);
+        try std.testing.expectEqual(@as(u8, '"'), q[0]);
+        try std.testing.expectEqual(@as(u8, '"'), q[q.len - 1]);
+        // Parsed back by the tool dispatcher: what came out must be the input.
+        const back = std.json.parseFromSliceLeaky(std.json.Value, ap.allocator(), q, .{}) catch {
+            std.debug.panic("jsonString produced invalid JSON for {s}", .{s});
+        };
+        try std.testing.expectEqualStrings(s, back.string);
+    }
 }
 
 fn taskBatchEnd(calls: []const TurnCtx.Call, from: usize) usize {
