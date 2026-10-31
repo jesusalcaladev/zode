@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - protect goal/plan/summary from tier-2 summarization (compaction) [`feb19952`](https://github.com/jesusalcaladev/zode/commit/feb19952)
 - distinct status panels with context progress bar (ui) [`bf2b68cc`](https://github.com/jesusalcaladev/zode/commit/bf2b68cc)
 - adaptive budget and thresholds by window size (compaction) [`4ecf16dc`](https://github.com/jesusalcaladev/zode/commit/4ecf16dc)
-- read cache scales with model context window (cache) [`23b7eb50`](https://github.com/jesusalcaladev/zode/commit/23b7eb50)
+- read cache scales with model context window (cache) [`db3c1727`](https://github.com/jesusalcaladev/zode/commit/db3c1727)
 
 ### Bug Fixes
 
@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fill transcript area up to hairline to eliminate black holes [`fa91e910`](https://github.com/jesusalcaladev/zode/commit/fa91e910)
 - keep skill listing in the system message so compaction never drops it (skills) [`d0acb3d3`](https://github.com/jesusalcaladev/zode/commit/d0acb3d3)
 - kill layout holes, echo prompts instantly, sync plan indicator, refresh catalog silently (tui) [`37e0215b`](https://github.com/jesusalcaladev/zode/commit/37e0215b)
+- heap-allocate the read table; repair and test the adaptive commits (cache) [`35ae3e77`](https://github.com/jesusalcaladev/zode/commit/35ae3e77)
 
 ### Chores
 

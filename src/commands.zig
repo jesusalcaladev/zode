@@ -458,7 +458,7 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
         }
         const budget = compaction.budgetFor(m.environ, agent.curModelContext());
         const chosen_mode = if (m.compact_mode == null) compaction.mode(m.environ) else m.compact_mode.?;
-        const comp: compaction.Compacted = compaction.elideTier(arena, msgs, budget, m.environ, chosen_mode) catch compaction.nothingElided(msgs);
+        const comp: compaction.Compacted = compaction.elideTier(arena, msgs, budget, m.environ, agent.curModelContext(), chosen_mode) catch compaction.nothingElided(msgs);
         if (comp.elided == 0 and !comp.needs_summary) {
             agent.pushInfoOwned(m, std.fmt.allocPrint(m.allocator, "already under budget (est. {d} tokens vs budget {d}). Nothing to compact.", .{ compaction.estimateTokens(msgs), budget }) catch "compaction");
             return;
@@ -584,8 +584,8 @@ pub fn cmdConfig(m: *tui.Model) void {
     const budget = compaction.budgetFor(m.environ, ctx);
     const pct = compaction.targetPct(m.environ);
     const eff = compaction.effectiveMode(m.environ, m.compact_mode);
-    const bg_pct = compaction.bgPct(m.environ);
-    const hot_pct = compaction.hotPct(m.environ);
+    const bg_pct = compaction.bgPct(m.environ, ctx);
+    const hot_pct = compaction.hotPct(m.environ, ctx);
     const src = compaction.limitSource(m.environ, ctx);
 
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "┌─ zode {s} — config", .{build_options.version}) catch return);
@@ -1121,7 +1121,7 @@ pub fn cmdFiles(m: *tui.Model) void {
             if (entries.len == 0) return;
             // Most recent FIRST: "what is the model looking at" is a question
             // about NOW, and the table's own order is the order of insertion.
-            var idx: [readcache.max_entries]usize = undefined;
+            var idx: [readcache.max_entries_physical]usize = undefined;
             for (entries, 0..) |_, i| idx[i] = i;
             var i: usize = 1;
             while (i < entries.len) : (i += 1) {

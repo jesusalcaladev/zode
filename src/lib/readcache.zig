@@ -177,8 +177,16 @@ pub const Stats = struct {
 };
 
 pub const Cache = struct {
-    entries: [max_entries_physical]Entry = undefined,
-    /// How many entries are actually in use. Scaled by `configure(model_ctx)`:
+    /// The table is a HEAP array sized by `configure`. The `Model` carries this
+    /// cache BY VALUE, so the old inline `[512]Entry` was ~1.2 MB of RSS from
+    /// the first frame of every session (the entry grew with `path_max` and
+    /// `max_ranges`, and the physical array grew with the 1M-window ladder —
+    /// the multiplication is what the pre-allocation comment warned about).
+    /// Now the header is a slice: an unconfigured cache costs nothing, and the
+    /// memory is paid only for the window size actually in use.
+    entries: []Entry = &.{},
+    gpa: ?std.mem.Allocator = null,
+    /// How many entries are actually in use. Scaled by `configure(gpa, model_ctx)`:
     /// bigger window = more files remembered = fewer re-reads.
     max_entries_active: usize = max_entries_default,
     len: usize = 0,
@@ -204,11 +212,38 @@ pub const Cache = struct {
         return self.clock;
     }
 
-    /// Scale the active entry count by the model's context window. Bigger
-    /// window = more files remembered = fewer re-reads on long sessions.
-    /// Called when the model is chosen or rotated.
-    pub fn configure(self: *Cache, model_ctx: u32) void {
-        self.max_entries_active = if (model_ctx >= 1_000_000) 512 else if (model_ctx >= 256_000) 256 else 128;
+    /// Scale the entry table by the model's context window and allocate it in
+    /// `gpa`. Bigger window = more files remembered = fewer re-reads on long
+    /// sessions. Called on `Model.init` (the default ladder step) and from
+    /// `runOneTurn` when the model is chosen or rotated.
+    ///
+    /// Re-sizing MIGRATES the live entries; re-sizing to the same capacity is a
+    /// no-op, so calling it every turn costs nothing. If the allocation fails
+    /// the cache simply stays disabled: `push` refuses, every `read` goes the
+    /// long way, and nothing else notices.
+    pub fn configure(self: *Cache, gpa: std.mem.Allocator, model_ctx: u32) void {
+        const want: usize = if (model_ctx >= 1_000_000) 512 else if (model_ctx >= 256_000) 256 else 128;
+        self.max_entries_active = want;
+        if (self.entries.len == want) return;
+        const fresh = gpa.alloc(Entry, want) catch return;
+        const keep = @min(self.len, want);
+        @memcpy(fresh[0..keep], self.entries[0..keep]);
+        // The entries are fixed buffers: no internal pointers, so the copy above
+        // IS the migration and the old table can go straight back.
+        if (self.entries.len > 0) {
+            if (self.gpa) |op| op.free(self.entries);
+        }
+        self.entries = fresh;
+        self.gpa = gpa;
+        self.len = keep;
+    }
+
+    /// Frees the heap table. The `Model` owns the cache and calls this on exit.
+    pub fn deinit(self: *Cache) void {
+        if (self.gpa) |g| if (self.entries.len > 0) g.free(self.entries);
+        self.entries = &.{};
+        self.gpa = null;
+        self.len = 0;
     }
 
     /// The entry for `path`, or null. The caller holds the lock.
@@ -219,8 +254,13 @@ pub const Cache = struct {
         return null;
     }
 
-    fn push(self: *Cache) *Entry {
-        if (self.len < self.max_entries_active) {
+    /// The slot for a new (or evicted) entry. Null when the cache was never
+    /// configured — a miss, not an error: reading without a cache is just
+    /// reading.
+    fn push(self: *Cache) ?*Entry {
+        if (self.entries.len == 0) return null;
+        const cap = @min(self.max_entries_active, self.entries.len);
+        if (self.len < cap) {
             const e = &self.entries[self.len];
             self.len += 1;
             return e;
@@ -229,7 +269,7 @@ pub const Cache = struct {
         // (every find bumps it), so entry 0 is a safe starting victim.
         var victim: usize = 0;
         var oldest = self.entries[0].used;
-        for (self.entries[1..self.len], 1..) |*e, i| {
+        for (self.entries[1..cap], 1..) |*e, i| {
             if (e.used < oldest) {
                 oldest = e.used;
                 victim = i;
@@ -298,7 +338,7 @@ pub const Cache = struct {
         if (path.len == 0 or path.len > path_max) return;
         self.lockIt();
         defer self.unlockIt();
-        const e = self.push();
+        const e = self.push() orelse return; // unconfigured cache: forget it
         e.* = .{};
         @memcpy(e.path[0..path.len], path);
         e.path_len = @intCast(path.len);
@@ -484,6 +524,8 @@ test "addRange: the table stays at max_ranges and does not grow" {
 
 test "cache: an identical stat does NOT re-read (fast path, no hash)" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     defer c.invalidate("f.txt");
     const stat = .{ .inode = @as(u64, 42), .size = @as(u64, 100), .mtime = .{ .nanoseconds = @as(i128, 1000) } };
 
@@ -499,6 +541,8 @@ test "cache: the SAME mtime with different content does NOT fool it (hence the h
     // The case that kills a cache made only of mtime: a `sed -i` of the same
     // length inside the same clock tick.
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 500) } };
     c.record("f.txt", stat, hashBytes("hola-----"), 1, 10, 10);
 
@@ -526,6 +570,8 @@ test "cache: the SAME mtime with different content does NOT fool it (hence the h
 
 test "cache: an uncovered range is sent again even when the stat is identical" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 200), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 100, 200);
     try std.testing.expect(c.check("f.txt", stat, 1, 100) == .already_sent);
@@ -537,6 +583,8 @@ test "cache: an uncovered range is sent again even when the stat is identical" {
 
 test "cache: force (an already read range but requested with force) ignores it" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 10, 10);
     // `force` is resolved in the tool, but the cache has to be able to answer yes
@@ -547,6 +595,8 @@ test "cache: force (an already read range but requested with force) ignores it" 
 
 test "cache: invalidate after a write makes the next read send the body" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 10, 10);
     try std.testing.expect(c.check("f.txt", stat, 1, 10) == .already_sent);
@@ -560,6 +610,8 @@ test "cache: invalidate after a write makes the next read send the body" {
 
 test "cache: markDroppedAt undoes what compaction took" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 10, 10);
     c.setMessageIndex("f.txt", 12);
@@ -578,6 +630,8 @@ test "cache: markDroppedAt undoes what compaction took" {
 
 test "cache: the renamed file is re-read (another inode, another name)" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const a = .{ .inode = @as(u64, 1), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     const b = .{ .inode = @as(u64, 2), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("a.zig", a, 1, 1, 10, 10);
@@ -589,17 +643,69 @@ test "cache: the renamed file is re-read (another inode, another name)" {
 
 test "cache: the table fills up and keeps answering (eviction, not a crash)" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     var i: usize = 0;
     var name_buf: [32]u8 = undefined;
     const stat = .{ .inode = @as(u64, 1), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
-    while (i < max_entries + 20) : (i += 1) {
+    while (i < max_entries_default + 20) : (i += 1) {
         const name = try std.fmt.bufPrint(&name_buf, "f{d}.zig", .{i});
         c.record(name, stat, 1, 1, 10, 10);
     }
-    try std.testing.expectEqual(max_entries, c.len);
+    try std.testing.expectEqual(max_entries_default, c.len);
     // It keeps working: it is a cache, not a chain.
-    const name = try std.fmt.bufPrint(&name_buf, "f{d}.zig", .{max_entries + 19});
+    const name = try std.fmt.bufPrint(&name_buf, "f{d}.zig", .{max_entries_default + 19});
     try std.testing.expect(c.check(name, stat, 1, 10) == .already_sent);
+}
+
+test "cache: the Model carries only the header, the table is heap" {
+    // The table used to live inside the `Model` BY VALUE, and when the entry
+    // and the physical count both grew, that became ~1.2 MB of startup RSS for
+    // every session. `configure` allocates it lazily; the header must stay a
+    // slice, an allocator and a few counters.
+    try std.testing.expect(@sizeOf(Cache) <= 512);
+}
+
+test "configure: the table scales with the model's window" {
+    // A 1M model carries the content of hundreds of files; with the old fixed
+    // 128 it evicted re-reads it could have answered from cache. The ladder
+    // (128 / 256 / 512) is the contract, and the table stays usable at the top.
+    var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
+    try std.testing.expectEqual(max_entries_default, c.max_entries_active);
+    c.configure(std.testing.allocator, 128_000);
+    try std.testing.expectEqual(@as(usize, 128), c.max_entries_active);
+    try std.testing.expectEqual(@as(usize, 128), c.entries.len);
+    c.configure(std.testing.allocator, 256_000);
+    try std.testing.expectEqual(@as(usize, 256), c.max_entries_active);
+    try std.testing.expectEqual(@as(usize, 256), c.entries.len);
+    c.configure(std.testing.allocator, 1_000_000);
+    try std.testing.expectEqual(@as(usize, 512), c.max_entries_active);
+    try std.testing.expectEqual(@as(usize, 512), c.entries.len);
+    // Re-sizing to the same capacity is a no-op, and shrinking migrates what
+    // still fits instead of losing the whole cache on a model rotation.
+    const stat0 = .{ .inode = @as(u64, 1), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    c.record("keep.zig", stat0, 1, 1, 10, 10);
+    try std.testing.expectEqual(@as(usize, 1), c.len);
+    c.configure(std.testing.allocator, 128_000);
+    try std.testing.expectEqual(@as(usize, 128), c.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), c.len);
+    try std.testing.expect(c.check("keep.zig", stat0, 1, 10) == .already_sent);
+
+    // And it really fills past the old fixed cap: 200 entries live, and the
+    // first one is still findable (no eviction at 200) at the 1M ladder step.
+    c.configure(std.testing.allocator, 1_000_000);
+    c.clear();
+    const stat = .{ .inode = @as(u64, 1), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
+    var name_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const name = try std.fmt.bufPrint(&name_buf, "g{d}.zig", .{i});
+        c.record(name, stat, 1, 1, 10, 10);
+    }
+    try std.testing.expectEqual(@as(usize, 200), c.len);
+    try std.testing.expect(c.check("g0.zig", stat, 1, 10) == .already_sent);
 }
 
 test "hashBytes: same content, same hash" {
@@ -613,6 +719,8 @@ test "cache: clear forgets everything, and a new session has nothing in its cont
     // has this file", the next `read` takes the fast path and does NOT send
     // the body, and the model works from a file it cannot see.
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("f.txt", stat, 1, 1, 10, 10);
     try std.testing.expectEqual(@as(usize, 1), c.liveEntries());
@@ -628,6 +736,8 @@ test "cache: clear forgets everything, and a new session has nothing in its cont
 
 test "cache: withAll hands the table to the callback, and the counters come back" {
     var c: Cache = .{};
+    c.configure(std.testing.allocator, 0);
+    defer c.deinit();
     const stat = .{ .inode = @as(u64, 7), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     c.record("a.txt", stat, 1, 1, 10, 10);
     c.record("b.txt", stat, 1, 1, 20, 20);

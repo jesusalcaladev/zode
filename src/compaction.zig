@@ -667,7 +667,7 @@ test "elide shrinks the tool dumps but protects the recent ones" {
     }
 
     const before = estimateTokens(msgs);
-    const res = try elideTier(arena, msgs, @divTrunc(before, 4), null, .full); // very low budget
+    const res = try elideTier(arena, msgs, @divTrunc(before, 4), null, 0, .full); // very low budget
     try std.testing.expect(res.elided > 0);
     try std.testing.expect(estimateTokens(res.msgs) < before);
     try std.testing.expectEqual(estimateTokens(res.msgs) > @divTrunc(before, 4), res.needs_summary);
@@ -691,7 +691,7 @@ test "no summary needed when eliding is enough" {
     for (1..12) |i| {
         msgs[i] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c" };
     }
-    const res = try elideTier(arena, msgs, 9000, null, .full);
+    const res = try elideTier(arena, msgs, 9000, null, 0, .full);
     try std.testing.expect(!res.needs_summary);
     try std.testing.expect(estimateTokens(res.msgs) <= 9000);
     try std.testing.expect(res.elided > 0);
@@ -716,7 +716,7 @@ test "elideTier says WHICH messages it took, not only how many" {
         try msgs.append(arena, .{ .role = "tool", .content = "x" ** 4000 });
     }
 
-    const res = try elideTier(arena, msgs.items, 1000, null, .full);
+    const res = try elideTier(arena, msgs.items, 1000, null, 0, .full);
     try std.testing.expect(res.elided > 0);
     try std.testing.expectEqual(res.elided, res.elided_at.len);
 
@@ -736,7 +736,7 @@ test "elideTier reports nothing when it elides nothing" {
         .{ .role = "system", .content = "system" },
         .{ .role = "user", .content = "hola" },
     };
-    const res = try elideTier(arena, &msgs, 1_000_000, null, .full);
+    const res = try elideTier(arena, &msgs, 1_000_000, null, 0, .full);
     try std.testing.expectEqual(@as(usize, 0), res.elided);
     try std.testing.expectEqual(@as(usize, 0), res.elided_at.len);
 }
@@ -779,11 +779,11 @@ test "a wider window protects more of the tail verbatim" {
         });
     }
 
-    const narrow = try elideTier(arena, msgs.items, 1000, null, .full);
+    const narrow = try elideTier(arena, msgs.items, 1000, null, 0, .full);
     var wide_env = std.process.Environ.Map.init(std.testing.allocator);
     defer wide_env.deinit();
     try wide_env.put("ZODE_RECENT_WINDOW", "30");
-    const wide = try elideTier(arena, msgs.items, 1000, &wide_env, .full);
+    const wide = try elideTier(arena, msgs.items, 1000, &wide_env, 0, .full);
 
     // A wider window protects more, so FEWER messages are elided.
     try std.testing.expect(wide.elided < narrow.elided);
@@ -803,9 +803,10 @@ test "the context limit is the model's own window, not the 128k constant" {
     try std.testing.expectEqual(@as(i64, 200_000), contextLimitFor(&env, 200_000));
     try std.testing.expectEqual(@as(i64, 1_000_000), contextLimitFor(&env, 1_000_000));
 
-    // And the budget follows at 80%.
+    // And the budget follows, scaled by the window: 80% under 256k, 98% at 1M
+    // (tier 2 never fires up there — see `may_summarize`).
     try std.testing.expectEqual(@as(i64, 160_000), budgetFor(&env, 200_000));
-    try std.testing.expectEqual(@as(i64, 800_000), budgetFor(&env, 1_000_000));
+    try std.testing.expectEqual(@as(i64, 980_000), budgetFor(&env, 1_000_000));
 }
 
 test "ZODE_CONTEXT_LIMIT still overrides the model's number" {
@@ -819,7 +820,78 @@ test "ZODE_CONTEXT_LIMIT still overrides the model's number" {
 
     try std.testing.expectEqual(@as(i64, 6000), contextLimitFor(&env, 0));
     try std.testing.expectEqual(@as(i64, 6000), contextLimitFor(&env, 1_000_000));
+    // The budget scales by the MODEL's window even when the limit is overridden:
+    // 98% of 6000 for a 1M model.
+    try std.testing.expectEqual(@as(i64, 5880), budgetFor(&env, 1_000_000));
+    // And `ZODE_COMPACT_PCT` overrides the whole ladder when it is set.
+    try env.put("ZODE_COMPACT_PCT", "80");
     try std.testing.expectEqual(@as(i64, 4800), budgetFor(&env, 1_000_000));
+}
+
+test "the budget, warm and hot thresholds scale by window; env vars still win" {
+    // The ladder: small windows keep the old 80/80/90, big ones compact later
+    // and summarize not at all. If a number moves here, `/config` reports a
+    // budget nothing obeys — so the table IS the contract and this test holds
+    // it to the letter.
+    try std.testing.expectEqual(@as(i64, 80), budgetPctFor(null, 128_000));
+    try std.testing.expectEqual(@as(i64, 90), budgetPctFor(null, 256_000));
+    try std.testing.expectEqual(@as(i64, 98), budgetPctFor(null, 1_000_000));
+
+    try std.testing.expectEqual(@as(i64, 80), bgPct(null, 128_000));
+    try std.testing.expectEqual(@as(i64, 85), bgPct(null, 256_000));
+    try std.testing.expectEqual(@as(i64, 90), bgPct(null, 1_000_000));
+
+    try std.testing.expectEqual(@as(i64, 90), hotPct(null, 128_000));
+    try std.testing.expectEqual(@as(i64, 92), hotPct(null, 256_000));
+    try std.testing.expectEqual(@as(i64, 95), hotPct(null, 1_000_000));
+
+    // The explicit env vars override the ladder at every window size.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_COMPACT_PCT", "50");
+    try env.put("ZODE_COMPACT_BG_PCT", "60");
+    try env.put("ZODE_COMPACT_HOT_PCT", "70");
+    try std.testing.expectEqual(@as(i64, 50), budgetPctFor(&env, 1_000_000));
+    try std.testing.expectEqual(@as(i64, 60), bgPct(&env, 1_000_000));
+    try std.testing.expectEqual(@as(i64, 70), hotPct(&env, 1_000_000));
+}
+
+test "tier-2 summarization never fires for windows of 256k or more" {
+    // Summarizing is LOSSY, and a big window can keep nearly everything
+    // verbatim: the request spent and the information dropped buy nothing
+    // there. Under 256k the old behavior stands (the `needs_summary` tests
+    // above cover that branch).
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // recent_window=2 so there IS a range outside it to elide; with the
+    // default 8 a six-message list is entirely protected and tier 1 is a
+    // no-op on any window size.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_RECENT_WINDOW", "2");
+
+    var msgs = try arena.alloc(chat.ChatMessage, 6);
+    msgs[0] = .{ .role = "system", .content = "sys" };
+    var i: usize = 1;
+    while (i < 6) : (i += 1) {
+        msgs[i] = .{ .role = "tool", .content = "x" ** 4000, .tool_call_id = "c" };
+    }
+
+    // Budget a tenth of the content: tier 1 alone cannot reach it, so the
+    // small window asks for the summary and the big one refuses.
+    const tiny = try elideTier(arena, msgs, 100, &env, 128_000, .full);
+    try std.testing.expect(tiny.needs_summary);
+
+    const big = try elideTier(arena, msgs, 100, &env, 256_000, .full);
+    try std.testing.expect(!big.needs_summary);
+    // Tier 1 still works there: eliding is free and it is what keeps the
+    // prefix cacheable.
+    try std.testing.expect(big.elided > 0);
+
+    const huge = try elideTier(arena, msgs, 100, &env, 1_000_000, .full);
+    try std.testing.expect(!huge.needs_summary);
 }
 
 test "with no model and no env var the limit is EXACTLY what it was before" {
@@ -1000,8 +1072,8 @@ test "elide mode still elides (it is free) but never asks for a summary" {
     // A budget LOW enough that eliding alone is not enough: with a budget the elided
     // markers already fit in, `needs_summary` is false for `full` too and the test
     // would be comparing two identical results and calling it a pass.
-    const full = try elideTier(arena, &list, 50, null, .full);
-    const elide = try elideTier(arena, &list, 50, null, .elide);
+    const full = try elideTier(arena, &list, 50, null, 0, .full);
+    const elide = try elideTier(arena, &list, 50, null, 0, .elide);
 
     // Both tiers elide: tier 1 costs no request, so `elide` does not throw it away.
     try std.testing.expect(full.elided > 0);
@@ -1050,7 +1122,7 @@ test "elideTier: critical messages are never elided even under a tiny budget" {
     msgs[7] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c5" };
 
     // Budget so low that everything non-critical should be elided.
-    const res = try elideTier(arena, msgs, 100, &env, .full);
+    const res = try elideTier(arena, msgs, 100, &env, 0, .full);
     // Tier 1 works on a COPY of the wire view; `msgs` never changes. Assert on
     // `res.msgs`, which is the view the model would actually see.
     // msgs[2] (goal) and msgs[4] (plan) are not tools, never elided by tier 1.

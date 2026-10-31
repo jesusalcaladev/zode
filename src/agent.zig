@@ -6379,7 +6379,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     const hot_pct = compaction.hotPct(m.environ, cur_ctx);
     // Scale the read cache by window size: bigger window = more files
     // remembered = fewer re-reads on long sessions.
-    m.reads.configure(cur_ctx);
+    m.reads.configure(m.allocator, cur_ctx);
 
     // 1. Lanzar compactación en background cuando cruzamos el umbral "warm".
     // No bloquea al usuario; el hilo trabaja mientras el turno sigue.
@@ -8244,7 +8244,7 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
         const comp = if (cmode == .off)
             compaction.nothingElided(msgs.items)
         else
-            compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens, m.environ, cmode) catch
+            compaction.elideTier(carena, msgs.items, subagent_mod.budget_tokens, m.environ, curModelContext(), cmode) catch
                 compaction.nothingElided(msgs.items);
 
         const body = chat.buildBodyMessagesCapped(

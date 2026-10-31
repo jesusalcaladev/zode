@@ -1762,10 +1762,18 @@ pub const Model = struct {
         m.tasks.gpa = allocator;
         // Empty initial status; real content appears once there's a model/turn.
         m.setStatusText("");
+        // The read cache's table is heap-allocated (it is ~300 KB by VALUE at
+        // the default ladder step and 1.2 MB for a 1M-window model; the Model
+        // is carried everywhere, so the header stays a slice). `runOneTurn`
+        // re-sizes it per model; this is the floor that makes `read` work from
+        // the first moment, headless or TUI.
+        m.reads.configure(allocator, 0);
         return m;
     }
 
     pub fn deinit(self: *Model) void {
+        // The read cache's table is heap memory of the model's allocator.
+        self.reads.deinit();
         // The task graph holds its own strings and its file path.
         self.tasks.deinit();
         // `/copy`: the pending clipboard text and the picker's context are

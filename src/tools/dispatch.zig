@@ -650,6 +650,8 @@ test "read: the SECOND read of the same thing does not repeat the file" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-test.txt";
@@ -684,6 +686,8 @@ test "read: if the file changes, it is sent whole again" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-change-test.txt";
@@ -710,6 +714,8 @@ test "read: the same content with another timestamp is NOT resent" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-touch-test.txt";
@@ -733,6 +739,8 @@ test "read: force:true returns it all even if nothing changed" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-force-test.txt";
@@ -756,6 +764,8 @@ test "read: a range that was never read IS sent" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-range-test.txt";
@@ -776,6 +786,8 @@ test "read: invalidate sends the new content even if the stat did not move" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-invalidate-test.txt";
@@ -797,6 +809,8 @@ test "read: markDroppedAt undoes the cache when compaction takes the result away
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
     try std.Io.Dir.cwd().createDirPath(std.testing.io, "/tmp/opencode");
 
     const path = "/tmp/opencode/readcache-dropped-test.txt";
@@ -1097,6 +1111,8 @@ test "read: `paths` reads SEVERAL files in ONE call, and each is cached on its o
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var cache: readcache.Cache = .{};
+    cache.configure(std.testing.allocator, 0);
+    defer cache.deinit();
 
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = "/tmp/opencode/multi-a.txt",
