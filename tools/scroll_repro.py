@@ -89,8 +89,14 @@ class Term:
     def __init__(self):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            # Color PINNED on, exactly as in `pty_smoke.py`: `zig build pty-check`
+            # hands every step `NO_COLOR=1`, and a colorless frame is a different
+            # BYTE stream (vaxis skips the blank cells a colored run would have to
+            # paint), so checks that read the screen failed only inside the build.
+            os.environ.pop("NO_COLOR", None)
             os.environ.update(
                 TERM="xterm-256color",
+                COLORTERM="truecolor",
                 HOME=SANDBOX_HOME,
                 ZODE_RESUME="0",
                 LINES=str(ROWS),
@@ -166,10 +172,12 @@ def main() -> int:
     # Startup: the hero, the composer and its footer.
     t.pump(2.0)
     s0 = t.screen()
-    # The check used to look for "######", the ASCII wordmark of a hero that is
-    # no longer drawn. It had been failing on a green suite, which is worse
-    # than no check: it looks like it is watching the startup.
-    ok &= check("app started", "zode" in s0)
+    # The startup screen is the ASCII wordmark and the composer, and that is what
+    # this asserts — the same two anchors `pty_smoke` pins. It used to look for
+    # the literal "zode", which is never painted: the wordmark is DRAWN in `#`
+    # glyphs, not spelled in letters. A check that fails on a green suite is worse
+    # than no check, and this one had been failing for a redesign's whole life.
+    ok &= check("app started", "######  ####" in s0 and "Ask anything" in s0)
 
     # A history to scroll through. The banner plus the prompt is all the app
     # has on its own, and with 43 rows of history that does not scroll at all

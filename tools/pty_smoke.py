@@ -60,8 +60,19 @@ def drive(keys, budget: float = 8.0):
 
     pid, fd = pty.fork()
     if pid == 0:
+        # The color is PINNED, and `zig build pty-check` is why. `zig build` puts
+        # `NO_COLOR=1` in the environment of every step it runs, so the app came up
+        # colorless here and in color in a shell — and that changes the BYTES, not
+        # just the palette: a colored run has to paint the spaces inside it to carry
+        # the attribute, a colorless one lets vaxis skip cells that are already
+        # blank. So the wordmark arrived as one 81-`#` bar with no gaps, and every
+        # check that reads the stream as text failed on the hero, the palette, the
+        # shortcut list and half the commands. This smoke judges what a person sees,
+        # so it asks for what a person gets.
+        os.environ.pop("NO_COLOR", None)
         os.environ.update(
             TERM="xterm-256color",
+            COLORTERM="truecolor",
             HOME=SANDBOX_HOME,
             ZODE_RESUME="0",
             LINES=str(ROWS),

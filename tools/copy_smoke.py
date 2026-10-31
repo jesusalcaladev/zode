@@ -87,9 +87,15 @@ def run(env, feed, cols=160, rows=44, settle=1.5):
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(CWD)
+        # Color pinned on, as in `pty_smoke.py`: `zig build pty-check` gives every
+        # step `NO_COLOR=1`, and a colorless frame is a different BYTE stream, not
+        # merely a grey one — the checks read the stream as text, so they failed
+        # inside the build and passed in a shell.
+        os.environ.pop("NO_COLOR", None)
         os.environ.update(env)
         os.environ["HOME"] = HOME
         os.environ["TERM"] = "xterm-256color"
+        os.environ["COLORTERM"] = "truecolor"
         try:
             os.execv(BIN, [BIN, "--resume"])
         finally:

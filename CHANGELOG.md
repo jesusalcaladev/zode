@@ -62,13 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - the tree split, and the two things the docs got wrong [`ce444934`](https://github.com/jesusalcaladev/zode/commit/ce444934)
 - add memory block tasks to CHANGELOG [`4124992a`](https://github.com/jesusalcaladev/zode/commit/4124992a)
-- write down what the 0.17 migration actually changed [`b494be3a`](https://github.com/jesusalcaladev/zode/commit/b494be3a)
+- write down what the 0.17 migration actually changed [`2804d991`](https://github.com/jesusalcaladev/zode/commit/2804d991)
 
 ### Refactors
 
 - consolidate tool-result caps into single layer (resultcap) [`c51fe9a1`](https://github.com/jesusalcaladev/zode/commit/c51fe9a1)
 - regenerate CHANGELOG from full history and add post-commit hook [`db4e1ee4`](https://github.com/jesusalcaladev/zode/commit/db4e1ee4)
 - regenerate CHANGELOG from full history (fixes empty-body commits) and add post-commit hook [`f2ecced9`](https://github.com/jesusalcaladev/zode/commit/f2ecced9)
+
+### Tests
+
+- pin the color so the checks judge what a person sees (pty) [`21613faf`](https://github.com/jesusalcaladev/zode/commit/21613faf)
 
 ### Build
 
