@@ -242,12 +242,63 @@ pub fn initProjectInfo(io: std.Io, env: ?*const std.process.Environ.Map) void {
     project.detect(io, env, &project_info);
 }
 
-/// Resolves the sessions directory for the current project, using gpa for
-/// allocation. Stores nothing globally — the caller uses the returned path.
+/// Resolves the sessions directory for the current project and INSTALLS it as
+/// the base for every session path. Storing nothing globally was the bug: the
+/// picker scanned the relative `sessions` default while ownership was decided
+/// against the absolute resolved dir, so no session ever matched and `/session`
+/// said "no sessions" with twenty files on disk.
 /// Idempotent: safe to call multiple times (each call allocates).
 pub fn resolveSessionsDirIn(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
     const project_root = project_info.cwd();
-    _ = sessionpath.resolveSessionsDir(gpa, io_global, env, project_root) catch {};
+    const dir = sessionpath.resolveSessionsDir(gpa, io_global, env, project_root) catch return;
+    defer gpa.free(dir);
+    // `setSessionsDir` copies into a static buffer, so the gpa allocation dies here.
+    session_mod.setSessionsDir(dir);
+}
+
+test "resolveSessionsDirIn installs the resolved dir as the sessions base" {
+    // The wiring IS the feature: with the resolved path discarded, `/session`
+    // scanned the relative `sessions` default while ownership was decided
+    // against the absolute dir, and the picker answered "no sessions" with
+    // every session file on disk.
+    const saved_io = io_global;
+    const saved_info = project_info;
+    const saved_dir = try std.testing.allocator.dupe(u8, session_mod.sessions_dir);
+    defer {
+        io_global = saved_io;
+        project_info = saved_info;
+        session_mod.setSessionsDir(saved_dir);
+        std.testing.allocator.free(saved_dir);
+    }
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    const root = "/tmp/zode-sessionsdir-test";
+    std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_global, root ++ "/sessions");
+    setProjectInfoForTest(io_global, root);
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", root);
+
+    resolveSessionsDirIn(std.testing.allocator, &env);
+    try std.testing.expectEqualStrings(root ++ "/sessions", session_mod.sessions_dir);
+
+    // And the ownership guard that rejected everything now accepts: a session
+    // of the project starts with the resolved dir.
+    var guard_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer guard_arena_state.deinit();
+    try std.testing.expect(sessionpath.sessionBelongsToProject(
+        guard_arena_state.allocator(),
+        io_global,
+        &env,
+        root,
+        root ++ "/sessions/zode-x.jsonl",
+    ));
 }
 
 /// Fills `project_info` from a given directory. For tests only.
@@ -861,7 +912,7 @@ fn buildSystemPrompt(
 pub fn syncSystemPrompt(s: *session_mod.Session) void {
     const gpa = s.allocator;
     var buf: [16 * 1024]u8 = undefined;
-    const want = buildSystemPrompt(gpa, &buf, null, false);
+    const want = buildSystemPrompt(gpa, &buf, null, true);
     for (s.messages.items) |m| {
         if (m.role != .system) continue;
         if (std.mem.eql(u8, m.content, want)) return;
@@ -1088,7 +1139,9 @@ pub fn cyclePermMode(m: *tui.Model) void {
         .bypass => PermMode.default,
     };
     setPermMode(m, next);
-    setStatusWithZoFmt(m, if (next == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
+    // The transcript says it, and the footer's RIGHT group shows the mode: the
+    // mascot's legend belongs to the agent's work and nothing else.
+    pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
 }
 
 /// `/ask [on|off]`: Plan mode, retained as a command alias.
@@ -1099,14 +1152,12 @@ fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
         if (on) {
             setPermMode(m, .read_only);
             const msg = "Plan mode ON: investigate first; writes are blocked pending approval.";
-            setStatusWithZo(m, .warn, msg);
             pushInfo(m, msg);
             return;
         }
         if (off) {
             setPermMode(m, .default);
             const msg = "Build mode ON";
-            setStatusWithZo(m, .idle, msg);
             pushInfo(m, msg);
             return;
         }
@@ -1116,7 +1167,7 @@ fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
     // No argument: toggle, as it always did.
     const next: PermMode = if (read_only) .default else .read_only;
     setPermMode(m, next);
-    setStatusWithZoFmt(m, if (next == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
+    pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
 }
 
 // ── plan approval: the developer says yes or no ────────────
@@ -2008,7 +2059,7 @@ pub fn setModel(name: []const u8) void {
 /// `setModel` plus the model's context window, in tokens.
 ///
 /// **It RESETS to 0 when called without one**, on purpose. That is not a
-/// default: a `setModel("")` (switching provider, `setModel(name)` from a `/use`)
+/// default: a `setModel("")` (switching provider, `setModel(name)` from a picker)
 /// must NOT keep the previous model's window, or a 200k model followed by a
 /// provider whose catalogue does not publish one would keep budgeting 200k and
 /// never compact. Zero means "the provider does not say", and `contextLimit`
@@ -2782,7 +2833,13 @@ pub fn loadUserConfig() void {
         }
         if (user_config.model.len > 0 and cur_model.len == 0) {
             setModel(user_config.model);
-        } else if (cur_model.len == 0) {
+        }
+        // The last model the person actually used, restored BEFORE the
+        // provider's default: remembering what was working beats guessing. An
+        // explicit `ZODE_MODEL` or `config.json` model still wins — those are
+        // instructions, the memory is a habit.
+        if (cur_model.len == 0) restoreLastModel(cfg_arena_state.?.allocator());
+        if (cur_model.len == 0) {
             // The provider's `default_model` is NOT set here, and not out of laziness: a
             // model name in the code stops existing the day the provider
             // withdraws it, and then EVERY request fails with a 403 that says
@@ -2816,6 +2873,144 @@ pub fn loadUserConfig() void {
         // safe to do on the startup path.
         if (status_model_target) |m| tui.resolveStatusModel(m);
     }
+}
+
+// ── last-used model: ~/.config/zode/last_model ───────────────
+
+/// Where the habit lives. Not in `config.json`: that file is the person's
+/// (hand-written, meant to be versioned) — zode writing its own state into it
+/// would rewrite what the user edits.
+fn lastModelFilePath(buf: []u8) ?[]const u8 {
+    const env = environ_global orelse return null;
+    const home = env.get("HOME") orelse return null;
+    if (home.len == 0) return null;
+    return std.fmt.bufPrint(buf, "{s}/.config/zode/last_model", .{home}) catch null;
+}
+
+/// The file's two lines: provider, then model. An empty model line is honest —
+/// "the provider changed and no model is resolved yet" — and `parseLastModel`
+/// restores nothing for it.
+fn lastModelText(buf: []u8, provider: []const u8, model: []const u8) ?[]const u8 {
+    if (provider.len == 0) return null;
+    return std.fmt.bufPrint(buf, "{s}\n{s}\n", .{ provider, model }) catch null;
+}
+
+/// The other half of the round trip. Anything malformed answers "nothing to
+/// restore", which is the same degradation as no file at all.
+fn parseLastModel(data: []const u8) struct { provider: []const u8, model: []const u8 } {
+    var it = std.mem.tokenizeScalar(u8, data, '\n');
+    const provider = it.next() orelse return .{ .provider = "", .model = "" };
+    const model = it.next() orelse return .{ .provider = "", .model = "" };
+    if (provider.len == 0 or model.len == 0) return .{ .provider = "", .model = "" };
+    return .{ .provider = provider, .model = model };
+}
+
+/// Remembers the active provider/model for the next start. Best effort: losing
+/// the memory is an inconvenience at startup, never something to say out loud.
+fn persistLastModel() void {
+    var pbuf: [512]u8 = undefined;
+    const path = lastModelFilePath(&pbuf) orelse return;
+    var tbuf: [296]u8 = undefined;
+    const text = lastModelText(&tbuf, cur_provider_id, cur_model) orelse return;
+    config_mod.writeFileSecure(io_global, environ_global, path, text) catch {};
+}
+
+/// Puts the habit back when nothing explicit asked for another model. When the
+/// provider WAS pinned elsewhere (config.json or `ZODE_PROVIDER`), the saved
+/// model only applies if it belongs to that provider: one provider's id on
+/// another's endpoint is the 400 that says nothing.
+fn restoreLastModel(arena: std.mem.Allocator) void {
+    var pbuf: [512]u8 = undefined;
+    const path = lastModelFilePath(&pbuf) orelse return;
+    const data = std.Io.Dir.cwd().readFileAlloc(io_global, path, arena, .limited(4096)) catch return;
+    const last = parseLastModel(data);
+    if (last.model.len == 0) return;
+    const provider_pinned = user_config.provider.len > 0 or
+        envGet(environ_global, "ZODE_PROVIDER") != null;
+    if (!provider_pinned) {
+        if (last.provider.len > 0 and
+            (config_mod.find(user_config, last.provider) != null or providers.byId(last.provider) != null))
+        {
+            setProviderId(last.provider);
+        }
+        setModel(last.model);
+        return;
+    }
+    if (std.mem.eql(u8, last.provider, cur_provider_id)) setModel(last.model);
+}
+
+test "lastModelText/parseLastModel: the round trip, and the garbage it refuses" {
+    var buf: [296]u8 = undefined;
+    const text = lastModelText(&buf, "opencode", "kimi-k2.6").?;
+    const back = parseLastModel(text);
+    try std.testing.expectEqualStrings("opencode", back.provider);
+    try std.testing.expectEqualStrings("kimi-k2.6", back.model);
+
+    // No model line: nothing to restore.
+    try std.testing.expectEqualStrings("", parseLastModel("opencode\n\n").model);
+    // Half a file is not a file.
+    try std.testing.expectEqualStrings("", parseLastModel("opencode").model);
+    try std.testing.expectEqualStrings("", parseLastModel("").model);
+    // No provider is refused at the door.
+    try std.testing.expect(lastModelText(&buf, "", "x") == null);
+}
+
+test "persistLastModel/restoreLastModel: what left is what comes back" {
+    const saved_io = io_global;
+    const saved_env = environ_global;
+    defer {
+        io_global = saved_io;
+        environ_global = saved_env;
+    }
+    const saved_provider = std.testing.allocator.dupe(u8, cur_provider_id) catch unreachable;
+    defer {
+        setProviderId(saved_provider);
+        std.testing.allocator.free(saved_provider);
+    }
+    const saved_model = std.testing.allocator.dupe(u8, cur_model) catch unreachable;
+    defer {
+        setModel(saved_model);
+        std.testing.allocator.free(saved_model);
+    }
+    // The original slice is owned by the config arena or by `.rodata`; only the
+    // pointer is moved back, never freed.
+    const saved_cfg_provider = user_config.provider;
+    defer user_config.provider = saved_cfg_provider;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    const home = "/tmp/zode-last-model-test";
+    std.Io.Dir.cwd().deleteTree(io_global, home) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_global, home) catch {};
+    try env.put("HOME", home);
+    environ_global = &env;
+    user_config.provider = "";
+
+    setProviderId("opencode");
+    setModel("model-of-the-night");
+    persistLastModel();
+
+    // Leave, come back: the memory is what gets restored, provider and model.
+    setProviderId("anthropic");
+    setModel("");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    restoreLastModel(arena_state.allocator());
+    try std.testing.expectEqualStrings("opencode", cur_provider_id);
+    try std.testing.expectEqualStrings("model-of-the-night", curModel());
+
+    // A pinned provider that does not match the memory keeps the provider and
+    // refuses the model: it belongs to another endpoint.
+    user_config.provider = "openrouter";
+    setProviderId("openrouter");
+    setModel("");
+    restoreLastModel(arena_state.allocator());
+    try std.testing.expectEqualStrings("openrouter", cur_provider_id);
+    try std.testing.expectEqualStrings("", curModel());
 }
 
 /// The Model whose status bar row `loadUserConfig` refreshes.
@@ -3001,8 +3196,8 @@ pub fn newSession(m: *tui.Model) void {
     }
     cache_stats.session.reset();
     const s = ensureSession(m, m.allocator);
-    // Limpia el output/transcript visible para que la nueva sesión empiece
-    // sin restos de la anterior en pantalla.
+    // Clears the visible transcript so the new session starts on screen
+    // without leftovers from the previous one — including the plan block.
     m.clearHistory();
     m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
@@ -3043,6 +3238,9 @@ pub fn onSessionPick(m: *tui.Model, _: u32, index: usize) void {
             "session resumed";
         pushInfoOwned(m, msg);
         resetSessionFiles(m);
+        // The plan block belongs to the session it was written in: a resumed
+        // session must not inherit the checklist of the one it replaced.
+        m.clearPlan();
         // Restore the reader's scroll position from the saved session state.
         m.applyScrollState(s.getScrollState());
     } else |err| {
@@ -3518,9 +3716,6 @@ pub fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
 pub const PaletteCmd = enum {
     /// Executed right here, right now.
     done,
-    /// Needs arguments: the label goes to the input and the user types what is
-    /// missing.
-    needs_args,
     /// Leave the app. The TUI handles it (it is who owns `ctx.quit`).
     quit,
 };
@@ -3532,15 +3727,10 @@ pub const PaletteCmd = enum {
 /// and in a TUI where keys get eaten along the way it read as "it did
 /// nothing".
 ///
-/// The EXCEPTION is the commands that need arguments: `/use provider model`
-/// cannot be run blind. Those go back to the input with the label in place,
-/// which is exactly what whoever picks them wants.
-///
 /// The command echoes itself in the history (like the input) so you can see
 /// what was run, not just what happened.
 pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
     if (std.mem.eql(u8, cmd, "/quit") or std.mem.eql(u8, cmd, "/exit")) return .quit;
-    if (std.mem.eql(u8, cmd, "/use")) return .needs_args;
     m.pushKind(.user, cmd);
     submit(m, cmd) catch {};
     return .done;
@@ -3560,9 +3750,13 @@ pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
 /// shows the mode that applies; turning it off returns to default.
 fn cmdYolo(m: *tui.Model) void {
     setPermMode(m, if (yolo) .default else .bypass);
+    // The HISTORY gets the explanation and the footer's YOLO chip next to the
+    // face says the mode (see `drawStateFooter`). Nothing goes to the mascot's
+    // legend: the whole sentence used to, it took the row, pushed the model and
+    // the context gauge off the right end, and turning `/yolo` on looked like
+    // the status bar disappearing.
     const msg = if (yolo) "yolo ON: no confirmations, and no questions (your questions are answered for you and said in the summary)" else "yolo OFF: asks for permission";
     pushInfo(m, msg);
-    setStatusWithZo(m, if (yolo) .warn else .idle, msg);
 }
 
 /// `/version`: show the running zode version.
@@ -3594,7 +3788,8 @@ fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
         const mode = parsePermMode(a);
         if (mode) |mm| {
             setPermMode(m, mm);
-            setStatusWithZoFmt(m, if (mm == .read_only) .warn else .idle, "mode: {s}", .{permModeName()});
+            // The transcript and the footer's right group say the mode; the
+            // mascot's legend is the agent's work, not the settings.
             pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
             return;
         }
@@ -3681,8 +3876,6 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         // alias of /quit — the TUI handles it
     } else if (std.mem.eql(u8, cmd, "clear")) {
         cmdClear(m);
-    } else if (std.mem.eql(u8, cmd, "models")) {
-        listModelsAsync(m) catch pushError(m, "error starting /models");
     } else if (std.mem.eql(u8, cmd, "providers")) {
         commands_mod.cmdProviders(m);
     } else if (std.mem.eql(u8, cmd, "provider")) {
@@ -3701,8 +3894,6 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         cmdSubmodel(m, arg);
     } else if (std.mem.eql(u8, cmd, "task-parallel")) {
         cmdTaskParallel(m, arg);
-    } else if (std.mem.eql(u8, cmd, "use")) {
-        commands_mod.cmdUse(m, arg);
     } else if (std.mem.eql(u8, cmd, "undo")) {
         cmdUndo(m);
     } else if (std.mem.eql(u8, cmd, "clean")) {
@@ -3727,6 +3918,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "usage")) {
         commands_mod.cmdUsage(m);
+    } else if (std.mem.eql(u8, cmd, "doctor")) {
+        commands_mod.cmdDoctor(m);
     } else if (std.mem.eql(u8, cmd, "cost")) {
         commands_mod.cmdCost(m);
     } else if (std.mem.eql(u8, cmd, "config")) {
@@ -4335,6 +4528,8 @@ fn resumeLatest(m: *tui.Model) void {
     // does not know what is in it: an entry that says "the model has this
     // file" is a guess. Clearing it costs a re-read and buys a truth.
     resetSessionFiles(m);
+    // The plan block belongs to the session that wrote it, not to this one.
+    m.clearPlan();
     // Replay session messages into TUI history so they are visible
     replaySessionMessages(m, s);
     m.pushInfoFmt("session resumed: {s} · {d} messages", .{ path, s.messages.items.len });
@@ -4563,7 +4758,25 @@ fn chatWorker(job: *ChatJob) void {
     // rejected ends on the ordinary ceiling instead of asking forever.
     var plan_gate_asks: u8 = 0;
 
+    // A NEW turn starts un-cancelled: ESC belongs to the turn it interrupted.
+    chat.cancel_current.store(false, .seq_cst);
+
     while (iterations < hard) : (iterations += 1) {
+        // ESC is a STOP, not a "skip this answer".
+        //
+        // The key handler sets `chat.cancel_current`, which aborts the request
+        // in flight, kills the foreground command and the background jobs — and
+        // then the loop went on to the next iteration, `runOneTurn` cleared the
+        // flag and the agent kept working. From the user's side ESC did nothing:
+        // the answer stopped and the work did not. Checked BEFORE the request,
+        // so the flag is still the one they set.
+        if (chat.cancel_current.load(.seq_cst)) {
+            chat.cancel_current.store(false, .seq_cst);
+            pushInfo(m, "stopped (esc)");
+            m.streamEnd();
+            pushTurnSummary(m);
+            return;
+        }
         turn_stats.iterations = iterations + 1;
         const again = runOneTurn(m, last_user, iterations) catch |err| {
             reportErr(m, err);
@@ -5053,6 +5266,13 @@ fn pushTurnSummary(m: *tui.Model) void {
     const line = s.summaryLine(&line_buf, ms, ctx_used, cacheHitPct()) catch return;
     pushInfo(m, line);
 
+    // A finished checklist has done its job: it goes off the row above the
+    // input, and the history keeps the full list. Without this the block stayed
+    // for the rest of the session — "the plan is always there" — and it is the
+    // one row of chrome that survives a completed task on its own.
+    const plan_now = m.planCopy();
+    if (plan_now.allDone()) m.clearPlan();
+
     if (s.files.items.len == 0 and s.yolo_open.items.len == 0) return;
     var detail_buf: [512]u8 = undefined;
     const detail = s.detailLine(&detail_buf) catch return;
@@ -5316,7 +5536,7 @@ pub fn outputCapFor(def: *const providers.ProviderDef, env: ?*const std.process.
 // ── /submodel: which model the SUBAGENTS run on ──────────────
 //
 // Three ways to say it, in this order — the same shape as the active model's
-// own (`/use` beats config.json beats the environment):
+// own (`/submodel` beats config.json beats the environment):
 //
 //   1. `/submodel` in this session: unset (inherit), set, or `off` (force none)
 //   2. `subagent_provider` / `subagent_model` in config.json
@@ -5670,10 +5890,9 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     // about the provider, so the answer is the one thing the user can act on.
     if (def.models_url.len == 0) {
         m.pushInfoFmt(
-            "{s} publishes no model catalog: pick the model by hand with `/use {s} <model>` (or set ZODE_MODEL).",
-            .{ def.id, def.id },
+            "{s} publishes no model catalog: set ZODE_MODEL to choose the model by hand.",
+            .{ def.id },
         );
-        setStatusWithZo(m, .warn, "no model · /use");
         return null;
     }
 
@@ -5684,14 +5903,12 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
             "no model chosen, and {s}'s catalog could not be read ({t}). Open /model to pick one.",
             .{ def.id, err },
         );
-        setStatusWithZo(m, .warn, "no model · /model");
         return null;
     };
     defer list.deinit(gpa);
 
     if (list.items.len == 0) {
         pushInfoFmt(m, "{s} publishes no models. Open /model to check the base URL.", .{def.id});
-        setStatusWithZo(m, .warn, "no models published");
         return null;
     }
 
@@ -5706,8 +5923,12 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     // choice is indistinguishable from a hardcoded default, which is the thing
     // this exists to replace.
     pushInfoFmt(m, "model → {s} ({s}; /model to change it)", .{ chosen.id, choice.why });
-    setStatusWithZo(m, .done, chosen.id);
     refreshContextUsage(m);
+    // Remembered: the next start does not ask the catalogue again, it puts back
+    // the model that actually worked here. (Free-auto ROTATIONS are not
+    // remembered on purpose: the wheel moves every turn, and a memory that
+    // churns is not a habit — the explicit picks are.)
+    persistLastModel();
     return curModel();
 }
 
@@ -5959,6 +6180,43 @@ fn withMentions(
 /// have to be expanded on every iteration (the model needs the file contents in
 /// every request) but the notice in the history only on the first: otherwise a
 /// turn with three tools prints the same "@file: 1 inlined" three times.
+/// Puts the CURRENT plan into the conversation when it differs from the last
+/// one that went in.
+///
+/// The problem it solves: in plan mode the model writes the checklist with
+/// `todo`, the turn ends, the developer switches to Build and says "do the
+/// plan" — and the checklist it is being told to follow is a tool result from
+/// several messages back that compaction is allowed to elide. `[Plan]` is the
+/// same trick as `[Skills]`: a user message, after the cacheable prefix, with
+/// the exact thing "the plan" names.
+fn attachPlanContext(m: *tui.Model, s: *session_mod.Session) void {
+    const plan = m.planCopy();
+    if (plan.isEmpty()) return;
+    // `details` allocates (a Writer over an arena); one arena per turn, because
+    // the text is copied into the session right after.
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const details = plan.details(arena_state.allocator());
+    const text = std.fmt.allocPrint(
+        s.allocator,
+        "[Plan] The todo list on screen right now. Act on it when the user asks for it, and keep the steps in order.\n{s}",
+        .{details},
+    ) catch return;
+    defer s.allocator.free(text); // `append` COPIES it.
+
+    // Already in context? Compare against the LAST plan message: the same list
+    // twice is tokens for nothing, and a new one only when a step changed.
+    var i = s.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const msg = s.messages.items[i];
+        if (msg.role != .user or !std.mem.startsWith(u8, msg.content, "[Plan]")) continue;
+        if (std.mem.eql(u8, msg.content, text)) return;
+        break;
+    }
+    s.append(.user, text) catch {};
+}
+
 fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     _ = user_text;
     const gpa = m.allocator;
@@ -6007,39 +6265,23 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         m.pushInfo("prompt cache: writes per request above 0.5 — prefix may be unstable");
     }
 
-    // Phase 2.2: attach the skill listing ONCE per session, at the end of the
-    // prompt, outside the cacheable system prefix. `syncSystemPrompt` above no
-    // longer puts skills in the system message (they would bloat the stable
-    // prefix on every turn); instead they go here as a user message, once.
-    // Reset on config reload via `Session.resetSkillsSent`. Not persisted to
-    // disk, so a resumed session re-sends them on its first turn.
-    if (!s.skills_sent) {
-        var already = false;
-        for (s.messages.items) |mm| {
-            if (mm.role == .user and std.mem.startsWith(u8, mm.content, "[Skills]")) {
-                already = true;
-                break;
-            }
-        }
-        if (!already) {
-            var buf: [16 * 1024]u8 = undefined;
-            const section = skillsSectionText(s.allocator, null, &buf);
-            if (section.len > 0) {
-                const owned = s.allocator.dupe(u8, section) catch null;
-                if (owned) |text| {
-                    const note = std.fmt.allocPrint(
-                        s.allocator,
-                        "[Skills] {s}",
-                        .{ text },
-                    ) catch null;
-                    if (note) |n| {
-                        s.append(.user, n) catch {};
-                        s.skills_sent = true;
-                    }
-                }
-            }
-        }
-    }
+    // The skill listing is now inside the system message (built by
+    // `syncSystemPrompt` above). It lives at index 0, which compaction never
+    // touches, so skills survive long sessions instead of being elided into a
+    // "[earlier conversation summarized]" note and forgotten. `skills_sent` is
+    // kept for `Session.resetSkillsSent` (screen clear) but no longer gates a
+    // separate user message — that would duplicate the skills on the wire.
+
+    // The plan goes into the CONTEXT of the turn, not only onto the screen.
+    //
+    // Plan mode ends with the checklist and a summary; the developer then
+    // switches to Build and types "do the plan". "The plan" has to resolve: the
+    // `todo` tool result that carried the steps is a tool result, and tier-1
+    // compaction replaces old ones with a marker (a resumed session may not
+    // carry it at all), so the CURRENT list is attached as its own message. It
+    // is attached only when it changed, so the cost is one short message per
+    // edit of the plan and not one per turn.
+    attachPlanContext(m, s);
 
     // The automatic typecheck's verdict, IF it has finished.
     //
@@ -6907,7 +7149,13 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
     } else {
         m.pushInfoFmt("{s}\n{s}", .{ line, snapshot.details(arena) });
     }
-    if (snapshot.allDone()) setStatusWithZo(m, .done, "all plan steps done");
+    if (snapshot.allDone()) {
+        setStatusWithZo(m, .done, "all plan steps done");
+        // The plan is finished: the block above the input goes away NOW, not
+        // at turn end. A ticked-off checklist that never leaves is noise, and
+        // the completed lines are already in the transcript.
+        m.clearPlan();
+    }
 }
 
 /// Runs a turn's tool calls and returns the synthesized text for the next one
@@ -9206,10 +9454,14 @@ pub fn prepareImageFor(
         ) catch null;
     }
 
-    const p = images_mod.prepare(gpa, path, bytes, mime, vision) catch return null;
+    var p = images_mod.prepare(gpa, path, bytes, mime, vision) catch return null;
     defer p.deinit(gpa);
 
     if (p.image_b64) |b64| {
+        // OWNERSHIP MOVES to `pending`: without the null-out, the `deinit`
+        // below frees the base64 the slot has just taken, and the request
+        // reads freed memory on every image a `read` left behind.
+        p.image_b64 = null;
         const slot = &pending.images[pending.len];
         const path_copy = gpa.dupe(u8, path) catch "";
         slot.* = .{ .mime = mime, .data_b64 = b64, .path = path_copy };
@@ -9217,6 +9469,108 @@ pub fn prepareImageFor(
         pending.total_bytes += bytes.len;
     }
     return p.text;
+}
+
+/// Ctrl+V: put the clipboard's image on the draft, waiting for the next
+/// message.
+///
+/// The terminal's own paste cannot carry image bytes (bracketed paste is a
+/// text protocol), so the read goes through the platform clipboard helpers:
+/// `wl-paste -t image/<fmt>` on Wayland, `xclip -t image/<fmt> -o` on X11.
+/// Whichever answers first with bytes wins; a clipboard with no image is an
+/// info line, not an error.
+pub fn attachClipboardImage(m: *tui.Model) void {
+    if (!m.io_ready) return;
+    const io = m.io;
+    const gpa = m.allocator;
+
+    const formats = [_]struct { mime: []const u8, ext: []const u8 }{
+        .{ .mime = "image/png", .ext = "png" },
+        .{ .mime = "image/jpeg", .ext = "jpg" },
+        .{ .mime = "image/webp", .ext = "webp" },
+    };
+    for (formats) |f| {
+        if (clipboardBytes(gpa, io, &.{ "wl-paste", "-t", f.mime })) |bytes| {
+            defer gpa.free(bytes);
+            if (bytes.len > 0) return stageClipboardImage(m, f.mime, f.ext, bytes);
+        }
+        if (clipboardBytes(gpa, io, &.{ "xclip", "-selection", "clipboard", "-t", f.mime, "-o" })) |bytes| {
+            defer gpa.free(bytes);
+            if (bytes.len > 0) return stageClipboardImage(m, f.mime, f.ext, bytes);
+        }
+    }
+    m.pushInfo("· no image on the clipboard: copy one (a screenshot tool's copy, e.g.) and press Ctrl+V again");
+}
+
+/// Runs one clipboard reader. `null` = the tool is missing, failed or the
+/// clipboard does not hold that format (exit != 0). An exit 0 with no bytes
+/// is returned as an empty slice; the caller decides.
+fn clipboardBytes(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]const u8 {
+    const res = std.process.run(gpa, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(images_mod.max_bytes + 1),
+        .stderr_limit = .limited(1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } },
+    }) catch return null;
+    defer gpa.free(res.stderr);
+    switch (res.term) {
+        .exited => |code| {
+            if (code == 0) return res.stdout; // ownership moves to the caller
+            gpa.free(res.stdout);
+            return null;
+        },
+        else => {
+            gpa.free(res.stdout);
+            return null;
+        },
+    }
+}
+
+/// The cap gauntlet, then into `draft_images` and not `pending_images`: the
+/// message these belong to has not been sent yet, and Ctrl+C must be able to
+/// throw the draft away without orphaning a megabyte of base64 in the next
+/// turn.
+fn stageClipboardImage(m: *tui.Model, mime: []const u8, ext: []const u8, bytes: []const u8) void {
+    const gpa = m.allocator;
+    if (!models_mod.isVision(curAnswering())) {
+        m.pushInfo("· clipboard image NOT staged: the current model cannot see images (Ctrl+T lists the ones with vision)");
+        return;
+    }
+    if (m.draft_images.len >= images_mod.max_images) {
+        m.pushInfoFmt("· clipboard image NOT staged: {d} already waiting with this draft", .{images_mod.max_images});
+        return;
+    }
+    if (bytes.len > images_mod.max_bytes) {
+        m.pushInfoFmt(
+            "· clipboard image is {d} KB, over the {d} KB limit for attaching one — NOT staged",
+            .{ (bytes.len + 1023) / 1024, images_mod.max_bytes / 1024 },
+        );
+        return;
+    }
+    if (m.draft_images.total_bytes + bytes.len > images_mod.max_total_bytes_per_request) {
+        m.pushInfo("· clipboard image NOT staged: the message's total image bytes would exceed the cap");
+        return;
+    }
+    const name = std.fmt.allocPrint(gpa, "clipboard.{s}", .{ext}) catch return;
+    defer gpa.free(name);
+    var p = images_mod.prepare(gpa, name, bytes, mime, true) catch |err| {
+        m.pushInfoFmt("· clipboard image could not be prepared ({t})", .{err});
+        return;
+    };
+    defer p.deinit(gpa);
+    const b64 = p.image_b64 orelse {
+        m.pushInfo("· clipboard image NOT staged");
+        return;
+    };
+    p.image_b64 = null; // OWNERSHIP MOVES to `draft_images`
+    const slot = &m.draft_images.images[m.draft_images.len];
+    slot.* = .{ .mime = mime, .data_b64 = b64, .path = gpa.dupe(u8, name) catch "" };
+    m.draft_images.len += 1;
+    m.draft_images.total_bytes += bytes.len;
+    m.draft_images.user_attached = true;
+    m.pushInfoFmt("· image staged ({s}, {d} KB) — it goes with your next message", .{
+        name, (bytes.len + 1023) / 1024,
+    });
 }
 
 /// The TUI's half: same function, with the `Model`'s pieces.
@@ -10242,7 +10596,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
         },
         // 404: the model does not exist on that provider. Almost always it is an old
         // HARDCODED id left over (which is why the default is changed when the
-        // provider retires it) or a typo in /use.
+        // provider retires it) or a typed model id that never existed.
         error.ModelNotFound => {
             m.pushErrorFmt("model `{s}` does not exist on {s}: {s}\n  /model for the ones you have", .{
                 cur_model,
@@ -10470,11 +10824,9 @@ fn onColorPick(m: *tui.Model, _: u32, label: []const u8) void {
     cmdColor(m, label);
 }
 
-/// Job of the `/models` catalog summary and the model picker.
+/// Job of the model picker's catalog refresh.
 const ModelsJob = struct {
     model: *tui.Model,
-    /// false = list in the history (`/models`); otherwise open the picker.
-    for_picker: bool = false,
     request_id: usize = 0,
     provider_id: []u8,
     models_url: []u8,
@@ -10484,17 +10836,6 @@ const ModelsJob = struct {
     /// keeps) and the keyless `Bearer` was Anthropic's 401.
     key_style: providers.KeyStyle = .bearer,
 };
-
-/// `/models` shows catalog counts; `/model` is the detailed browser.
-pub fn listModelsAsync(m: *tui.Model) !void {
-    const job = try createModelsJob(m, false);
-    // No cleanup here: `spawnModelsJob` owns the job from the moment it is
-    // called, including the failure path. The compensating `endWorker` +
-    // `destroyModelsJob` that used to live in this function and in
-    // `pickerModelsAsync` balanced the counter only because both remembered to
-    // do it — ownership that lives in the caller is one caller away from a leak.
-    try spawnModelsJob(m, job);
-}
 
 /// Warms the status bar's `provider/model` from the network, SILENTLY.
 ///
@@ -10666,7 +11007,6 @@ fn announceUpdate(m: *tui.Model, up: selfupdate.Update) void {
     var buf: [160]u8 = undefined;
     const phrase = selfupdate.phrase(&buf, up);
     m.pushInfoFmt("zode {s} · /update installs it", .{phrase});
-    setStatusWithZoFmt(m, .warn, "{s} available · /update", .{up.version});
 }
 
 fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
@@ -10683,7 +11023,6 @@ fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
         },
     };
     m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
-    setStatusWithZoFmt(m, .done, "updated to {s} · restart", .{tag});
 }
 
 /// What went wrong, in words the user can act on. "UpdateFailed" is not one:
@@ -10706,7 +11045,7 @@ fn updateErrorPhrase(err: selfupdate.InstallError) []const u8 {
 /// network), and the worker fills it in when it finishes. So there is no blank
 /// wait.
 pub fn pickerModelsAsync(m: *tui.Model) !void {
-    const job = createModelsJob(m, true) catch |err| {
+    const job = createModelsJob(m) catch |err| {
         const def = activeProviderDef(m.environ);
         const request_id = m.beginCatalogRequest(def.id);
         m.setCatalogNotice(request_id, "Could not start model refresh");
@@ -10721,7 +11060,7 @@ pub fn pickerModelsAsync(m: *tui.Model) !void {
     };
 }
 
-fn createModelsJob(m: *tui.Model, for_picker: bool) !*ModelsJob {
+fn createModelsJob(m: *tui.Model) !*ModelsJob {
     const gpa = m.allocator;
     const def = activeProviderDef(m.environ);
     const provider_id = try gpa.dupe(u8, def.id);
@@ -10734,8 +11073,7 @@ fn createModelsJob(m: *tui.Model, for_picker: bool) !*ModelsJob {
     errdefer gpa.destroy(job);
     job.* = .{
         .model = m,
-        .for_picker = for_picker,
-        .request_id = if (for_picker) m.beginCatalogRequest(def.id) else 0,
+        .request_id = m.beginCatalogRequest(def.id),
         .provider_id = provider_id,
         .models_url = models_url,
         .key = key,
@@ -10790,7 +11128,7 @@ fn modelsWorker(job: *ModelsJob) void {
     defer m.endWorker();
     const is_current = struct {
         fn check(model: *tui.Model, request: *const ModelsJob) bool {
-            return !request.for_picker or model.catalogRequestCurrent(request.request_id);
+            return model.catalogRequestCurrent(request.request_id);
         }
     }.check;
 
@@ -10800,7 +11138,7 @@ fn modelsWorker(job: *ModelsJob) void {
     // error every time it opens.
     if (job.models_url.len == 0) {
         if (is_current(m, job)) {
-            m.setCatalogNotice(job.request_id, "This provider publishes no model catalog · /use <provider> <model>");
+            m.setCatalogNotice(job.request_id, "This provider publishes no model catalog · set ZODE_MODEL to choose by hand");
         }
         return;
     }
@@ -10838,44 +11176,27 @@ fn modelsWorker(job: *ModelsJob) void {
     }
     defer if (cached.len > 0) modelcache.freeOut(gpa, cached);
     if (from_cache) {
-        publishModels(m, cached, job.provider_id, .cached, job.request_id, job.for_picker);
+        publishModels(m, cached, job.request_id);
         if (is_current(m, job)) {
             m.setCatalogNotice(job.request_id, "Saved catalog · checking for updates...");
-            if (!job.for_picker) setStatusWithZo(m, .tooling, "refreshing model catalog");
         }
-    } else {
-        if (is_current(m, job) and !job.for_picker) setStatusWithZo(m, .tooling, "loading model catalog");
     }
 
     var http = http_client.Http.init(gpa, worker_io);
     defer http.deinit();
 
-    var list = models_mod.listModels(gpa, &http, job.models_url, providers.authWithKey(job.key_style, job.key)) catch |err| {
+    var list = models_mod.listModels(gpa, &http, job.models_url, providers.authWithKey(job.key_style, job.key)) catch {
         // With a cache on screen, a failed refresh is a NOTE and not an error: the user
         // is looking at a usable list, and an error line over it invites them to think
         // the list is wrong.
         if (from_cache) {
             if (is_current(m, job)) {
                 m.setCatalogNotice(job.request_id, "Offline · showing saved catalog");
-                if (!job.for_picker) setStatusWithZo(m, .warn, "saved model catalog available");
-                if (!job.for_picker) {
-                    m.pushInfoFmt("could not refresh {s}'s model catalog ({t}); keeping saved models", .{ job.provider_id, err });
-                }
             }
             return;
         }
         if (!is_current(m, job)) return;
-        if (err == error.HttpError) {
-            if (!job.for_picker) m.pushInfoFmt("models: HTTP error at {s}", .{job.models_url});
-        } else {
-            if (!job.for_picker) {
-                m.pushInfoFmt("models: {t}", .{ err });
-            }
-        }
-        if (is_current(m, job)) {
-            m.setCatalogNotice(job.request_id, "Could not load models · retry with /model");
-            if (!job.for_picker) setStatusWithZo(m, .warn, "model catalog unavailable");
-        }
+        m.setCatalogNotice(job.request_id, "Could not load models · retry with /model");
         return;
     };
 
@@ -10888,14 +11209,6 @@ fn modelsWorker(job: *ModelsJob) void {
             else
                 "Provider returned no models";
             m.setCatalogNotice(job.request_id, note);
-            if (!job.for_picker) {
-                setStatusWithZo(m, .warn, "provider returned no models");
-                if (from_cache) {
-                    m.pushInfoFmt("{s} returned an empty model catalog; keeping the saved list", .{job.provider_id});
-                } else {
-                    m.pushInfoFmt("{s} returned an empty model catalog", .{job.provider_id});
-                }
-            }
         }
         return;
     }
@@ -10921,7 +11234,7 @@ fn modelsWorker(job: *ModelsJob) void {
     // list in hand and still compares as "changed" is a cache that never converges.
     modelcache.write(worker_io, m.environ, job.provider_id, job.models_url, list.items);
 
-    publishModels(m, list.items, job.provider_id, .fresh, job.request_id, job.for_picker);
+    publishModels(m, list.items, job.request_id);
     if (is_current(m, job)) {
         const notice = std.fmt.allocPrint(
             gpa,
@@ -10929,27 +11242,18 @@ fn modelsWorker(job: *ModelsJob) void {
             .{ if (catalog_changed) "Catalog updated" else "Catalog up to date", list.items.len },
         ) catch "Model catalog refreshed";
         m.setCatalogNotice(job.request_id, notice);
-        if (!job.for_picker) {
-            setStatusWithZo(m, .done, if (catalog_changed) "model catalog updated" else "model catalog current");
-        }
     }
 }
 
-const ModelSource = enum { cached, fresh };
-
-/// Hands a list of models to whoever is waiting: the picker gets items, the plain
-/// `/models` gets lines.
+/// Hands a list of models to the model picker.
 ///
 /// One function because there were two copies of the "free first, then alphabetical"
-/// ordering and a cache makes it a third call site; three copies of an ordering is how
-/// the picker and `/models` end up disagreeing about which models exist.
+/// ordering and a cache made it a third call site; three copies of an ordering is how
+/// call sites end up disagreeing about which models exist.
 fn publishModels(
     m: *tui.Model,
     models: []const models_mod.Model,
-    provider_id: []const u8,
-    source: ModelSource,
     request_id: usize,
-    for_picker: bool,
 ) void {
     const gpa = m.allocator;
     const sorted = gpa.dupe(models_mod.Model, models) catch return;
@@ -10958,25 +11262,12 @@ fn publishModels(
     // alphabetical within each group so the list is stable between runs.
     std.mem.sort(models_mod.Model, sorted, {}, freeFirst);
 
-    if (for_picker) {
-        // The palette is NOT touched here: this is the worker's thread and the UI thread
-        // draws it without a lock, and that was a segfault. ITEMS already built with
-        // their own strings are handed over: handing over the `Model`s and freeing the
-        // list on exit left the ids dangling and the drawing blew up.
-        const items = buildModelItems(m, sorted);
-        if (items) |it| m.setPendingCatalogItems(request_id, it);
-        return;
-    }
-    var free_count: usize = 0;
-    for (sorted) |info| {
-        if (isFree(info)) free_count += 1;
-    }
-    m.pushInfoFmt("{d} models · {d} free · {s}{s} · use /model to browse", .{
-        sorted.len,
-        free_count,
-        provider_id,
-        if (source == .cached) " · saved list; refreshing" else "",
-    });
+    // The palette is NOT touched here: this is the worker's thread and the UI thread
+    // draws it without a lock, and that was a segfault. ITEMS already built with
+    // their own strings are handed over: handing over the `Model`s and freeing the
+    // list on exit left the ids dangling and the drawing blew up.
+    const items = buildModelItems(m, sorted);
+    if (items) |it| m.setPendingCatalogItems(request_id, it);
 }
 
 /// Is this model free?
@@ -11357,9 +11648,9 @@ fn cmdGroup(key: []const u8) u8 {
     if (std.mem.eql(u8, k, "help") or std.mem.eql(u8, k, "new") or
         std.mem.eql(u8, k, "resume") or std.mem.eql(u8, k, "yolo")) return 2;
     if (std.mem.eql(u8, k, "free-auto") or std.mem.eql(u8, k, "free")) return 3;
-    if (std.mem.eql(u8, k, "model") or std.mem.eql(u8, k, "models") or
+    if (std.mem.eql(u8, k, "model") or
         std.mem.eql(u8, k, "provider") or std.mem.eql(u8, k, "providers") or
-        std.mem.eql(u8, k, "use") or std.mem.eql(u8, k, "effort") or
+        std.mem.eql(u8, k, "effort") or
         std.mem.eql(u8, k, "submodel") or std.mem.eql(u8, k, "task-parallel")) return 4;
     return 5;
 }
@@ -11458,7 +11749,7 @@ fn byGroupThenName(_: void, a: palette.Item, b: palette.Item) bool {
     return std.mem.lessThan(u8, a.label, b.label);
 }
 
-/// Applies a provider chosen in the palette (or in `/use`).
+/// Applies a provider chosen in the palette.
 pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
     const def = config_mod.find(user_config, id) orelse providers.byId(id) orelse {
         const msg = std.fmt.allocPrint(m.allocator, "unknown provider: {s}", .{id}) catch return;
@@ -11486,8 +11777,8 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
         // nothing about the cause.
         pushInfo(m, "that model was from another provider; /model picks one from this provider's catalog");
     }
-    setStatusWithZo(m, .done, def.id);
     refreshContextUsage(m);
+    persistLastModel();
 }
 
 /// Applies a model chosen in the palette (or in `/model`).
@@ -11503,8 +11794,8 @@ pub fn applyModel(m: *tui.Model, name: []const u8, ctx_tokens: u32) !void {
     routerWarnOnce(m, name);
     resetCheapRouter(m);
     m.pushInfoFmt("model → {s}", .{name});
-    setStatusWithZo(m, .done, name);
     refreshContextUsage(m);
+    persistLastModel();
 }
 
 /// Opens the prompt for a provider's API key.
@@ -14082,6 +14373,89 @@ test "the TUI records the complete plan for the user to review" {
     try std.testing.expect(std.mem.indexOf(u8, output, "3. run tests") != null);
 }
 
+test "the plan block disappears the moment the last step is ticked" {
+    // The bug this pins: a finished checklist stayed above the input forever
+    // (until the turn ended AND every item was done). A completed plan is
+    // noise: its lines are already in the transcript.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    applyPlanCall(&m,
+        \\{"items":[{"content":"a","status":"pending"},{"content":"b","status":"pending"}]}
+    , arena_state.allocator());
+    try std.testing.expectEqual(@as(u8, 2), m.plan.len);
+
+    // One step done: the block stays, it is still a live checklist.
+    applyPlanCall(&m, "{\"update\":[{\"index\":1,\"status\":\"done\"}]}", arena_state.allocator());
+    try std.testing.expectEqual(@as(u8, 2), m.plan.len);
+
+    // The last one: gone immediately, no turn end required.
+    applyPlanCall(&m, "{\"update\":[{\"index\":2,\"status\":\"done\"}]}", arena_state.allocator());
+    try std.testing.expect(m.plan.isEmpty());
+}
+
+test "mode, yolo and ask switches never speak through the mascot" {
+    // The mascot is the agent's work: what it writes and runs. A mode switch,
+    // a `/yolo` or a `/ask` is TEXT for the transcript and a chip in the
+    // footer's right group, and none of them may rewrite the legend next to
+    // the face — that was the "the mascot changes whenever it feels like it".
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // A word from the harness, so the legend is not trivially empty.
+    m.setStatusText("done");
+
+    cmdMode(&m, "plan");
+    cmdMode(&m, "build");
+    cyclePermMode(&m);
+    cmdAskMode(&m, "on");
+    cmdAskMode(&m, "off");
+    cmdYolo(&m);
+    cmdYolo(&m);
+
+    try std.testing.expectEqualStrings("done", m.status());
+}
+
+test "plan context: the checklist travels with the turn, once per change" {
+    // Plan mode ends with the list on screen; the developer then switches to
+    // Build and types "do the plan". The `todo` result that carried the steps is
+    // a tool result — compaction can elide it and a resumed session may not have
+    // it — so the current list is attached as its own message, and only when it
+    // changed.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    var s = session_mod.Session.init(std.testing.allocator);
+    defer s.deinit();
+
+    applyPlanCall(&m,
+        \\{"items":[{"content":"inspect the code","status":"pending"},{"content":"implement the fix","status":"pending"}]}
+    , arena_state.allocator());
+
+    attachPlanContext(&m, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.messages.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, s.messages.items[0].content, "[Plan]"));
+    try std.testing.expect(std.mem.indexOf(u8, s.messages.items[0].content, "inspect the code") != null);
+
+    // The same list does not go in twice: it is in context already.
+    attachPlanContext(&m, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.messages.items.len);
+
+    // A step marked done IS a change: the next turn has to see the progress.
+    applyPlanCall(&m, "{\"update\":[{\"index\":1,\"status\":\"done\"}]}", arena_state.allocator());
+    attachPlanContext(&m, &s);
+    try std.testing.expectEqual(@as(usize, 2), s.messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, s.messages.items[1].content, "1/2 done") != null);
+
+    // No plan, nothing to attach.
+    m.clearPlan();
+    attachPlanContext(&m, &s);
+    try std.testing.expectEqual(@as(usize, 2), s.messages.items.len);
+}
+
 test "a cleared plan is a change, and an empty one is not" {
     // The model repeats "plan cleared" on every call if an empty list over an empty
     // plan counts as a change, and it looks like noise on the screen.
@@ -15814,6 +16188,71 @@ test "/copy opens the picker with the whole answer, the blocks and the always ro
     try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[1].label, "const a = 1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, m.picker_items.items[2].label, "const b = 2;") != null);
     try std.testing.expectEqualStrings(copytext.always_label, m.picker_items.items[3].label);
+}
+
+test "the /copy picker paints every row, including the last one, on a 160x44 screen" {
+    // The pty smoke found this: the picker SAID (1/4) and painted three rows,
+    // so the "always" row was unreachable with the mouse of the eye — the row
+    // existed, the footer counted it, and it was never on screen. The items
+    // test above only checks the array; this one paints the frame and reads the
+    // cells back, which is what the user actually sees.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = session;
+    defer session = saved;
+    const cs = try CopySession.setup(std.testing.allocator,
+        \\Here is the answer.
+        \\
+        \\```zig
+        \\const a = 1;
+        \\```
+        \\
+        \\And another one.
+        \\
+        \\```zig
+        \\const b = 2;
+        \\```
+    );
+    defer cs.done();
+
+    cmdCopy(&m, null);
+    try std.testing.expect(m.pickerActive());
+
+    // The banner, because THAT is what the bug needs: on a 160x44 terminal the
+    // modal's fourth row lands exactly on the banner's rule, and the rule won —
+    // the row was never painted, so the "always" row counted in (1/4) was
+    // nowhere on screen. Without the banner above it the test passes blind.
+    var m2 = tui.Model.init(std.testing.allocator);
+    defer m2.deinit();
+    m2.pushInfo("· session resumed: sessions/zode-smoke1.jsonl");
+    m2.pushHeader(.idle);
+    m2.pushKind(.user, "/copy");
+    cmdCopy(&m2, null);
+    try std.testing.expect(m2.pickerActive());
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const s = try tui.drawTest(&m2, arena_state.allocator(), 160, 44);
+
+    var buf: [512]u8 = undefined;
+    var full_seen = false;
+    var always_seen = false;
+    var rows_with_text: usize = 0;
+    var r: u16 = 0;
+    while (r < s.size.height) : (r += 1) {
+        const txt = tui.rowText(s, r, &buf);
+        if (std.mem.indexOf(u8, txt, "Full response") != null) full_seen = true;
+        if (std.mem.indexOf(u8, txt, copytext.always_label) != null) always_seen = true;
+        if (std.mem.indexOf(u8, txt, "const a = 1;") != null) rows_with_text += 1;
+    }
+    // The bug: the banner's rule sits ON the picker's fourth row and wins —
+    // the row is never painted, so (1/4) counted a row nobody can see. The
+    // smoke checked 30/24/16/12 before the 44-row failure, so this must hold
+    // for every height the modal can ever be drawn at.
+    try std.testing.expect(full_seen);
+    try std.testing.expect(always_seen);
+    try std.testing.expect(rows_with_text > 0);
 }
 
 test "/copy with no code block copies the answer straight away, with no picker" {

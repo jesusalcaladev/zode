@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - images capped with clear refusal, named file, harness custody [`9f35a288`](https://github.com/jesusalcaladev/zode/commit/9f35a288)
 - add change_manager tool for changeset-driven versioning [`fc15b12b`](https://github.com/jesusalcaladev/zode/commit/fc15b12b)
 - rename changeset system to churn (.churn) [`9e6692b0`](https://github.com/jesusalcaladev/zode/commit/9e6692b0)
-- release 0.2.1-beta.1 via churn [`71be7a0b`](https://github.com/jesusalcaladev/zode/commit/71be7a0b)
+- release 0.2.1-beta.1 via churn [`61f8adbd`](https://github.com/jesusalcaladev/zode/commit/61f8adbd)
 
 ### Bug Fixes
 
@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - black holes in transcript + disable prompt dots by default [`8efd2841`](https://github.com/jesusalcaladev/zode/commit/8efd2841)
 - black holes in transcript + disable prompt dots by default + fix tests [`1c149573`](https://github.com/jesusalcaladev/zode/commit/1c149573)
 - fill transcript area up to hairline to eliminate black holes [`fa91e910`](https://github.com/jesusalcaladev/zode/commit/fa91e910)
+- keep skill listing in the system message so compaction never drops it (skills) [`9c9053b3`](https://github.com/jesusalcaladev/zode/commit/9c9053b3)
 
 ### Chores
 
