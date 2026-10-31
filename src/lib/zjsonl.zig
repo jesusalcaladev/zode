@@ -1,4 +1,5 @@
 const std = @import("std");
+const repeat = @import("repeat.zig");
 
 /// Adds a "z" prefix marker to each JSONL line. Compressed payloads use
 /// Zig's std.compress.flate (raw DEFLATE, level 9). Repeated JSONL content
@@ -68,7 +69,7 @@ test "round trip compresses and decompresses" {
     const alloc = std.testing.allocator;
     const payload =
         "{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"" ++
-        "const std = @import(\"std\");\n" ** 40 ++
+        repeat.rep("const std = @import(\"std\");\n", 40) ++
         "\"}";
     var buf: [8192]u8 = undefined;
     const line = compressLine(&buf, payload) orelse return error.TestUnexpectedResult;

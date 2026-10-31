@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fill transcript area up to hairline to eliminate black holes [`fa91e910`](https://github.com/jesusalcaladev/zode/commit/fa91e910)
 - keep skill listing in the system message so compaction never drops it (skills) [`d0acb3d3`](https://github.com/jesusalcaladev/zode/commit/d0acb3d3)
 - kill layout holes, echo prompts instantly, sync plan indicator, refresh catalog silently (tui) [`37e0215b`](https://github.com/jesusalcaladev/zode/commit/37e0215b)
-- heap-allocate the read table; repair and test the adaptive commits (cache) [`35ae3e77`](https://github.com/jesusalcaladev/zode/commit/35ae3e77)
+- heap-allocate the read table; repair and test the adaptive commits (cache) [`cb3f2c10`](https://github.com/jesusalcaladev/zode/commit/cb3f2c10)
 
 ### Chores
 
@@ -66,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - consolidate tool-result caps into single layer (resultcap) [`c51fe9a1`](https://github.com/jesusalcaladev/zode/commit/c51fe9a1)
 - regenerate CHANGELOG from full history and add post-commit hook [`db4e1ee4`](https://github.com/jesusalcaladev/zode/commit/db4e1ee4)
 - regenerate CHANGELOG from full history (fixes empty-body commits) and add post-commit hook [`f2ecced9`](https://github.com/jesusalcaladev/zode/commit/f2ecced9)
+
+### Build
+
+- migrate the tree to zig 0.17 (zig) [`2fa725b7`](https://github.com/jesusalcaladev/zode/commit/2fa725b7)
 
 ### Other
 

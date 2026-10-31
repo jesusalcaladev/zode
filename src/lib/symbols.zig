@@ -20,6 +20,7 @@
 /// makes the difference between "here is the definition" and "here are 400
 /// occurrences of a word that happens to have that name".
 const std = @import("std");
+const repeat = @import("repeat.zig");
 
 pub const max_hits = 120;
 /// Files one search may open.
@@ -526,7 +527,7 @@ test "validSymbol: a pattern is refused, so this cannot become a grep with extra
     // input it could have handled.
     try std.testing.expect(validSymbol("fn"));
     // Too long to be a symbol: it is a pasted line.
-    try std.testing.expect(!validSymbol("a" ** 200));
+    try std.testing.expect(!validSymbol(&repeat.rep("a", 200)));
 }
 
 test "Lang: the extension is the only thing consulted" {

@@ -72,10 +72,7 @@ pub const Op = enum {
     }
 
     pub fn fromName(s: []const u8) ?Op {
-        inline for (@typeInfo(Op).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-        }
-        return null;
+        return std.meta.stringToEnum(Op, s);
     }
 
     /// The tool this step is a call to, when it is one.

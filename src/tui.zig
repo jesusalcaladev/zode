@@ -37,6 +37,7 @@ const filesearch = @import("lib/filesearch.zig");
 const mascot = @import("lib/mascot.zig");
 const sessionindex = @import("lib/sessionindex.zig");
 const session_search = @import("lib/session_search.zig");
+const repeat = @import("lib/repeat.zig");
 
 /// The kind of the status: what color the face is and what phase the app is in.
 /// Replaces `StatusKind`; lives here so `agent.zig` can reference it as
@@ -174,7 +175,7 @@ fn bannerRow(comptime r: usize) []const u8 {
         if (i > 0) out = out ++ " ";
         if (i + 1 < wordmark.len) {
             const missing = letter.w - letter.rows[r].len;
-            const filler = " " ** missing;
+            const filler = repeat.rep(" ", missing);
             out = out ++ letter.rows[r] ++ filler;
         } else {
             out = out ++ letter.rows[r];
@@ -3171,7 +3172,7 @@ pub const Model = struct {
         // `3,4,5,6,7,8,0,1,2`, so paragraphs 0-2 were painted at the line where
         // paragraph 8 ended. The banner appeared twice, in the middle of a
         // conversation, and a resized window scrambled a long turn. Measured on
-        // `tools/ui_frame` (`zig build ui-frame -- --layout turn 96 30`) and
+        // `tools/ui_frame` (`zig build ui-frame -Drun-args="--layout turn 96 30"`) and
         // caught by the red test "correcting a paragraph's height does not move
         // the text under the reader", which had been failing since the window
         // became a window.
@@ -9705,7 +9706,7 @@ test "input: a wrapped line fills several rows and the cursor stays on screen" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    m.ed.insert("a" ** 200) catch {};
+    m.ed.insert(&repeat.rep("a", 200)) catch {};
 
     const w: u16 = 40;
     const h: u16 = 20;
@@ -9835,7 +9836,7 @@ test "layout: the height estimate counts the wrap per line" {
     try std.testing.expectEqual(@as(usize, 44), m.estHeight(text.items));
 
     // One 300-byte line is 4 rows at 95 columns, and no more.
-    const long_line = "x" ** 300;
+    const long_line = &repeat.rep("x", 300);
     try std.testing.expectEqual(@as(usize, 4), m.estHeight(long_line));
 }
 
@@ -13250,7 +13251,7 @@ test "a code line wider than the box wraps inside it instead of pushing the bord
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    const long = "x" ** 120;
+    const long = &repeat.rep("x", 120);
     m.streamStart();
     m.streamDelta("```zig\n" ++ long ++ "\n```");
     m.streamEnd();
@@ -13280,7 +13281,7 @@ test "the gutter does not eat text: the column invariant holds" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    const long = "x" ** 200;
+    const long = &repeat.rep("x", 200);
     m.streamStart();
     m.streamDelta("```zig\n" ++ long ++ "\n```");
     m.streamEnd();
@@ -13305,7 +13306,7 @@ test "a line wrapped to the width carries a continuation indent" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    const msg = "la primera parte de la frase es larga " ** 3;
+    const msg = &repeat.rep("la primera parte de la frase es larga ", 3);
     m.streamStart();
     m.streamDelta(msg);
     m.streamEnd();
@@ -13470,7 +13471,7 @@ test "prune: compress and rehydrate is byte-exact with repetitive and unicode co
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    const payload = "const std = @import(\"std\"); // \u{00f1}\u{2713}\u{2500}\n" ** 200;
+    const payload = &repeat.rep("const std = @import(\"std\"); // \u{00f1}\u{2713}\u{2500}\n", 200);
     _ = a;
 
     var m = Model.init(std.testing.allocator);
@@ -14807,8 +14808,8 @@ test "a big diff paragraph plus scrolling does not walk the frame arena away" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    const before = "line\n" ** 900;
-    const after = "changed line\n" ** 900;
+    const before = &repeat.rep("line\n", 900);
+    const after = &repeat.rep("changed line\n", 900);
     _ = m.pushDiff(before, after);
     // Drain it into the history the way the draw does.
     m.drainPending();
@@ -14854,8 +14855,8 @@ test "no painted cell carries a grapheme with an absurd length" {
     // One of everything a real turn produces at once, at the sizes a real turn
     // produces them: a 500-line write (the diff), its tool result, the tool header, a
     // long assistant paragraph and a live stream on top.
-    const many = "    if x_ == 42 { return \"y\"; } else { print z_ + 1; }\n" ** 480;
-    _ = m.pushDiff("old\n" ** 480, many);
+    const many = &repeat.rep("    if x_ == 42 { return \"y\"; } else { print z_ + 1; }\n", 480);
+    _ = m.pushDiff(&repeat.rep("old\n", 480), many);
     m.pushToolStart("write", "minilang.py");
     m.pushToolDone("write", "minilang.py", 120, many);
     m.pushKind(.assistant, many);
@@ -14908,7 +14909,7 @@ test "scrolling past the segment cache cap leaves no cell pointing at a freed ar
     var i: usize = 0;
     while (i < 400) : (i += 1) {
         var line: [160]u8 = undefined;
-        const text = std.fmt.bufPrint(&line, "paragraph {d}: the quick brown fox jumps over the lazy dog " ++ "again " ** 8, .{i}) catch "";
+        const text = std.fmt.bufPrint(&line, "paragraph {d}: the quick brown fox jumps over the lazy dog " ++ repeat.rep("again ", 8), .{i}) catch "";
         m.pushKind(if (i % 2 == 0) .assistant else .tool_res, text);
     }
     m.drainPending();

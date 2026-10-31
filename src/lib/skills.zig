@@ -47,6 +47,7 @@
 
 const std = @import("std");
 const textcap = @import("textcap.zig");
+const repeat = @import("repeat.zig");
 
 const skills = @This();
 
@@ -687,7 +688,7 @@ test "validName: what can go into a path and into a tool call" {
     try std.testing.expect(!skills.validName("../escape"));
     try std.testing.expect(!skills.validName("with space"));
     try std.testing.expect(!skills.validName("with/slash"));
-    try std.testing.expect(!skills.validName("a" ** 65));
+    try std.testing.expect(!skills.validName(&repeat.rep("a", 65)));
 }
 
 test "nameFor: the directory wins when the frontmatter is unusable" {

@@ -33,6 +33,7 @@
 //! here in a fixed table that the `Model` owns.
 
 const std = @import("std");
+const repeat = @import("repeat.zig");
 
 /// The read cache's counters, as `/files` shows them.
 pub const Stats = struct {
@@ -315,7 +316,7 @@ test "Changed: the table stops at the cap and says how many were left out" {
 test "Changed: a path that does not fit is dropped, not truncated" {
     var c = Changed{};
     var buf: [path_max + 10]u8 = undefined;
-    const long = try std.fmt.bufPrint(&buf, "{s}", .{"x" ** (path_max + 5)});
+    const long = try std.fmt.bufPrint(&buf, "{s}", .{&repeat.rep("x", (path_max + 5))});
     c.note(long);
     try testing.expectEqual(@as(usize, 0), c.count());
     try testing.expectEqual(@as(usize, 1), c.dropped);

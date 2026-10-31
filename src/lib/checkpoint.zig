@@ -1,4 +1,5 @@
 const std = @import("std");
+const repeat = @import("repeat.zig");
 
 /// Photos of file contents, per TURN, so that they can be undone.
 ///
@@ -280,7 +281,7 @@ test "an oversized file is flagged, it does not swallow the memory" {
     defer st.deinit();
     st.begin("reescribir un fichero enorme");
 
-    const big = [_]u8{'x'} ** (file_max + 1);
+    const big = repeat.rep("x", (file_max + 1));
     try std.testing.expectEqual(Checkpoint.Added.too_big, st.items[0].addFile(gpa, "enorme.txt", &big, true));
     try std.testing.expect(st.items[0].files[0].truncated);
     try std.testing.expectEqual(@as(u8, 0), st.items[0].undoable());
@@ -296,7 +297,7 @@ test "the file cap truncates, and the byte cap warns" {
     defer st.deinit();
     st.begin("muchos ficheros");
 
-    const chunk = [_]u8{'y'} ** (200 * 1024);
+    const chunk = repeat.rep("y", (200 * 1024));
     var i: u8 = 0;
     while (i < max_files) : (i += 1) {
         var name: [32]u8 = undefined;
@@ -360,7 +361,7 @@ test "summary: how many files, from which turn, and what cannot be undone" {
 
     // With a file that does not fit, the summary says so instead of promising an
     // undo that would leave the repo half-done.
-    const big = [_]u8{'x'} ** (file_max + 1);
+    const big = repeat.rep("x", (file_max + 1));
     _ = st.items[0].addFile(std.testing.allocator, "enorme.txt", &big, true);
     const s2 = st.last().?.summary(arena);
     try std.testing.expect(std.mem.indexOf(u8, s2, "undo: 1 of 2 files") != null);

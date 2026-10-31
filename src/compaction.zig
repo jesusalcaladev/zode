@@ -1,5 +1,6 @@
 const std = @import("std");
 const chat = @import("chat.zig");
+const repeat = @import("lib/repeat.zig");
 const compaction = @This();
 
 /// Context management: keep the wire view under budget so the stable prefix
@@ -598,7 +599,7 @@ test "summaryPrompt includes the roles and truncates long messages" {
     const arena = arena_state.allocator();
     const msgs = [_]chat.ChatMessage{
         .{ .role = "user", .content = "hola" },
-        .{ .role = "tool", .content = "x" ** 5000 },
+        .{ .role = "tool", .content = &repeat.rep("x", 5000) },
     };
     const p = try summaryPrompt(arena, &msgs);
     try std.testing.expect(std.mem.indexOf(u8, p, "[user] hola") != null);
@@ -615,7 +616,7 @@ test "summaryPrompt is globally bounded and keeps the task start and latest work
     const msgs = try arena.alloc(chat.ChatMessage, 40);
     msgs[0] = .{ .role = "user", .content = "original task goal" };
     for (1..39) |i| {
-        msgs[i] = .{ .role = "tool", .content = "x" ** 5000 };
+        msgs[i] = .{ .role = "tool", .content = &repeat.rep("x", 5000) };
     }
     msgs[39] = .{
         .role = "assistant",
@@ -635,7 +636,7 @@ test "summaryPrompt truncates only at UTF-8 boundaries" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const content = try std.mem.concat(arena, u8, &.{ "a" ** 2047, "é", "tail" });
+    const content = try std.mem.concat(arena, u8, &.{ &repeat.rep("a", 2047), "é", "tail" });
     const msgs = [_]chat.ChatMessage{.{ .role = "user", .content = content }};
     const prompt = try summaryPrompt(arena, &msgs);
     try std.testing.expect(std.unicode.utf8ValidateSlice(prompt));
@@ -643,7 +644,7 @@ test "summaryPrompt truncates only at UTF-8 boundaries" {
 
 test "estimate tokens" {
     const msgs = [_]chat.ChatMessage{
-        .{ .role = "system", .content = "x" ** 400 }, // 104
+        .{ .role = "system", .content = &repeat.rep("x", 400) }, // 104
         .{ .role = "user", .content = "hello" }, // 5
     };
     const t = estimateTokens(&msgs);
@@ -655,7 +656,7 @@ test "elide shrinks the tool dumps but protects the recent ones" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const big_tool = "a" ** 4000;
+    const big_tool = &repeat.rep("a", 4000);
     var msgs = try arena.alloc(chat.ChatMessage, 12);
     msgs[0] = .{ .role = "system", .content = "sys" };
     for (1..12) |i| {
@@ -685,7 +686,7 @@ test "no summary needed when eliding is enough" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const big_tool = "a" ** 4000;
+    const big_tool = &repeat.rep("a", 4000);
     var msgs = try arena.alloc(chat.ChatMessage, 12);
     msgs[0] = .{ .role = "system", .content = "sys" };
     for (1..12) |i| {
@@ -713,7 +714,7 @@ test "elideTier says WHICH messages it took, not only how many" {
     var i: usize = 0;
     while (i < 6) : (i += 1) {
         try msgs.append(arena, .{ .role = "assistant", .content = "a" });
-        try msgs.append(arena, .{ .role = "tool", .content = "x" ** 4000 });
+        try msgs.append(arena, .{ .role = "tool", .content = &repeat.rep("x", 4000) });
     }
 
     const res = try elideTier(arena, msgs.items, 1000, null, 0, .full);
@@ -775,7 +776,7 @@ test "a wider window protects more of the tail verbatim" {
     while (i < 40) : (i += 1) {
         try msgs.append(arena, .{
             .role = "tool",
-            .content = "x" ** 400,
+            .content = &repeat.rep("x", 400),
         });
     }
 
@@ -876,7 +877,7 @@ test "tier-2 summarization never fires for windows of 256k or more" {
     msgs[0] = .{ .role = "system", .content = "sys" };
     var i: usize = 1;
     while (i < 6) : (i += 1) {
-        msgs[i] = .{ .role = "tool", .content = "x" ** 4000, .tool_call_id = "c" };
+        msgs[i] = .{ .role = "tool", .content = &repeat.rep("x", 4000), .tool_call_id = "c" };
     }
 
     // Budget a tenth of the content: tier 1 alone cannot reach it, so the
@@ -1059,7 +1060,7 @@ test "elide mode still elides (it is free) but never asks for a summary" {
     // and a window of 8 `protect_from` is 0 and the loop below it never runs. A test
     // with a short list does not check that eliding works, it checks that it correctly
     // does nothing.
-    const fat = "x" ** 4000;
+    const fat = &repeat.rep("x", 4000);
     var list: [12]chat.ChatMessage = undefined;
     list[0] = .{ .role = "system", .content = "sys" };
     for (1..12) |i| {
@@ -1110,7 +1111,7 @@ test "elideTier: critical messages are never elided even under a tiny budget" {
     defer env.deinit();
     try env.put("ZODE_RECENT_WINDOW", "2");
 
-    const big_tool = "x" ** 4000;
+    const big_tool = &repeat.rep("x", 4000);
     var msgs = try arena.alloc(chat.ChatMessage, 8);
     msgs[0] = .{ .role = "system", .content = "sys" };
     msgs[1] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c1" };

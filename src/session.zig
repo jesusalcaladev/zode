@@ -36,6 +36,7 @@ pub const goal_note_marker = "\u{1}ZODE-GOAL\u{1}";
 const chat = @import("chat.zig");
 const cache_stats = @import("cache_stats.zig");
 const zjsonl = @import("lib/zjsonl.zig");
+const repeat = @import("lib/repeat.zig");
 
 /// A conversation message. Efficient design:
 /// - `content` is the plain text (what goes in and out of the LLM).
@@ -773,7 +774,7 @@ test "round trip: session compressed on disk" {
         defer alloc.destroy(s); // LIFO: runs AFTER deinit
         defer s.deinit();
         used_path = try alloc.dupe(u8, s.path.?);
-        const big = "const std = @import(\"std\");\n" ** 100; // ~2.8KB
+        const big = &repeat.rep("const std = @import(\"std\");\n", 100); // ~2.8KB
         try s.appendToolResult("call_1", "read", big);
         try s.append(.user, "hola");
         var stats: cache_stats.CacheStats = .{};
@@ -798,7 +799,7 @@ test "round trip: session compressed on disk" {
     defer alloc.destroy(s2); // LIFO: runs AFTER deinit
     defer s2.deinit();
     try std.testing.expectEqual(@as(usize, 2), s2.messages.items.len);
-    const expected = "const std = @import(\"std\");\n" ** 100;
+    const expected = &repeat.rep("const std = @import(\"std\");\n", 100);
     try std.testing.expectEqualStrings(expected, s2.messages.items[0].content);
     try std.testing.expectEqualStrings("hola", s2.messages.items[1].content);
     try std.testing.expectEqual(@as(usize, 2), s2.messages.items.len);

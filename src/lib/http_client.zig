@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// JSON HTTP client on top of std.http.Client (Zig 0.16).
+/// JSON HTTP client on top of std.http.Client (Zig 0.17).
 ///
 /// NOTE: `Request` is heap-allocated because `receiveHead` and `bodyReader`
 /// keep internal pointers to the request.

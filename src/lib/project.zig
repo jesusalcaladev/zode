@@ -316,13 +316,13 @@ fn rel_buf_len(rel: []const u8) usize {
 /// up from a relative path. Two buffers, because each path that survives another
 /// call needs its own — the `sb.path` trap from the fuzzer round.
 fn sandbox(rel: []u8, abs: []u8) ![]const u8 {
-    // `bufPrintZ`, NOT `bufPrint`: the name has to be NUL terminated in `rel`,
+    // `printSentinel`, NOT `print`: the name has to be NUL terminated in `rel`,
     // because that is the only thing `rel_buf_len` has to recover the length
     // from. `bufPrint` leaves no terminator, so `rel_buf_len` fell back to the
     // whole 512-byte buffer, the delete was handed a path with garbage in it,
     // and the `catch {}` swallowed the failure: the fixture was created and
     // never removed, which is the very bug this move is fixing.
-    const name = try std.fmt.bufPrintZ(rel, ".zig-cache/zode-project-test-{d}", .{std.testing.random_seed});
+    const name = try std.mem.printSentinel(rel, ".zig-cache/zode-project-test-{d}", .{std.testing.random_seed}, 0);
     std.Io.Dir.cwd().deleteTree(std.testing.io, name) catch {};
     try std.Io.Dir.cwd().createDirPath(std.testing.io, name);
 
@@ -529,7 +529,7 @@ test "the fixtures live under .zig-cache, not in the repo the user is looking at
     //    with `bufPrint` (no NUL terminator) while `rel_buf_len` recovered the
     //    length by looking for the NUL. The length came back as the whole
     //    512-byte buffer, `deleteTree` got a path with garbage in it, and the
-    //    `catch {}` hid it. Fixed with `bufPrintZ`.
+    //    `catch {}` hid it. Fixed with `printSentinel`.
     //
     // So this test checks both: the path is under `.zig-cache`, AND it can
     // actually be deleted afterwards (which is the part that was silently broken).

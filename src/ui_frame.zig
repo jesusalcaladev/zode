@@ -21,7 +21,7 @@
 /// `roster_probe.zig` do: a module rooted in `src/bin/` cannot import files
 /// above it, and this needs `tui.zig`.
 ///
-/// Usage: `zig build ui-frame -- [scene] [width] [height]`
+/// Usage: `zig build ui-frame -Drun-args="[scene] [width] [height]"`
 /// Scenes: welcome · turn · tools · bash · diff · ask · perm · palette ·
 ///         plan · long · all
 const std = @import("std");
@@ -526,7 +526,7 @@ fn scenePlan(m: *tui.Model) void {
     m.pushHeader(.idle);
     m.pushKind(.user, "reescribe el tema");
     m.pushInfo("Voy a tocar el theme y los tests de contraste.");
-    var items = [_]plan_mod.Item{.{}} ** 3;
+    var items = @as([3]plan_mod.Item, @splat(.{}));
     planItem(&items[0], "New ramp of 4 levels in theme.zig", .pending);
     planItem(&items[1], "Re-theme the syntax colors", .in_progress);
     planItem(&items[2], "Contrast test for every pair", .done);

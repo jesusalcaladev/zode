@@ -1,6 +1,7 @@
 const std = @import("std");
 const http_client = @import("lib/http_client.zig");
 const sleep = @import("lib/sleep.zig");
+const repeat = @import("lib/repeat.zig");
 
 /// Io set up by the TUI/CLI at startup.
 ///
@@ -2761,7 +2762,7 @@ test "setServerMessage: survives garbage without overflowing" {
     setServerMessage("{\"message\": 42}");
     try std.testing.expectEqual(@as(usize, 0), lastErrorLen());
 
-    const huge = "{\"message\":\"" ++ "x" ** 900 ++ "\"}";
+    const huge = "{\"message\":\"" ++ repeat.rep("x", 900) ++ "\"}";
     setServerMessage(huge);
     try std.testing.expect(lastErrorLen() > 0 and lastErrorLen() < lastErrorCap());
 }

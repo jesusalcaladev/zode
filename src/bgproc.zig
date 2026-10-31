@@ -27,6 +27,7 @@
 const std = @import("std");
 const sleep = @import("lib/sleep.zig");
 const builtin = @import("builtin");
+const repeat = @import("lib/repeat.zig");
 
 pub const Registry = @This();
 
@@ -895,7 +896,7 @@ test "the output cap warns ONCE, not on every chunk" {
     defer reg.deinit(undefined, std.testing.allocator);
     reg.slots[0] = .{ .state = .running, .id = 1 };
     const j = &reg.slots[0];
-    const big = [_]u8{'x'} ** 1024;
+    const big = repeat.rep("x", 1024);
     var i: usize = 0;
     while (i < 200) : (i += 1) bgproc.appendLocked(j, std.testing.allocator, &big);
     // What was lost is everything that did not fit, and what fit leaves room for

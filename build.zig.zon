@@ -1,12 +1,12 @@
 .{
     .name = .zode,
     .version = "0.2.1-beta.1",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x5a04288de80c5733,
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#173a890d1394946b5d7623c66cd34bcd36d8eeb8",
-            .hash = "vaxis-0.6.0-BWNV_OybDABnzf12gCPzy_IgAjkKkonDJF-2O_7XyLtD",
+            .url = "git+https://github.com/rockorager/libvaxis.git#0620b34e091deaa6f64608922be3814147128dfb",
+            .hash = "vaxis-0.6.0-BWNV_LoTDQCQSGhvBbu_-fOf3I2P3TIiGaUzCDniO12E",
         },
     },
     .paths = .{

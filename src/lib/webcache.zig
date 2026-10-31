@@ -38,6 +38,7 @@
 //! would be one more byte per call that the model reads and cannot use.
 
 const std = @import("std");
+const repeat = @import("repeat.zig");
 
 /// How long a page stays. A documentation page does not change in fifteen
 /// minutes and a session usually does not either; past that, a re-fetch is
@@ -228,7 +229,7 @@ test "a page bigger than the entry limit is not stored" {
     // over `max_entry_bytes`, and the doc says the same), so a page of exactly
     // `max_entry_bytes` is not "bigger than the entry limit" and must be
     // stored: the construction has to match the name of the test.
-    const big = "x" ** (max_entry_bytes + 1);
+    const big = &repeat.rep("x", (max_entry_bytes + 1));
     c.put("https://a.example/", "small", 0);
     c.put("https://big.example/", big, 0);
     try std.testing.expectEqual(@as(usize, 1), c.count());
@@ -246,14 +247,14 @@ test "the byte budget evicts the least recently USED page, not the oldest" {
     // Three pages of 1000 bytes each: the first is the oldest AND the one a
     // `get` was NOT used on. Evicting by insertion order would be right by
     // accident here, so make the newest the stale one.
-    c.put("https://a/", "a" ** 1000, 0);
-    c.put("https://b/", "b" ** 1000, 1);
-    c.put("https://c/", "c" ** 1000, 2);
+    c.put("https://a/", &repeat.rep("a", 1000), 0);
+    c.put("https://b/", &repeat.rep("b", 1000), 1);
+    c.put("https://c/", &repeat.rep("c", 1000), 2);
     // Touch `a`, so `b` is now the least recently used.
     _ = c.get("https://a/", 3);
 
     const before = c.usedBytes();
-    c.put("https://d/", "d" ** 1000, 4);
+    c.put("https://d/", &repeat.rep("d", 1000), 4);
     try std.testing.expect(before + 1000 <= c.usedBytes() + 1000);
     try std.testing.expect(c.get("https://b/", 5) == null);
     try std.testing.expect(c.get("https://a/", 5) != null);
@@ -283,7 +284,7 @@ test "the budget is enforced: a page cannot be served past it" {
     var buf: [64]u8 = undefined;
     for (0..200) |i| {
         const url = try std.fmt.bufPrint(&buf, "https://e{d}.example/", .{i});
-        c.put(url, "y" ** 4096, @intCast(i));
+        c.put(url, &repeat.rep("y", 4096), @intCast(i));
     }
     try std.testing.expect(c.usedBytes() <= budget_bytes);
     try std.testing.expect(c.count() <= max_entries);

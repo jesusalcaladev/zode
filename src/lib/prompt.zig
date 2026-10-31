@@ -1,5 +1,6 @@
 const std = @import("std");
 const tools_mod = @import("../tools/dispatch.zig");
+const repeat = @import("repeat.zig");
 
 /// The text zode sends as the system prompt.
 ///
@@ -226,18 +227,18 @@ test "fitPrefix keeps valid UTF-8 even with no newline to cut on" {
     // A single long line with no `\n` before the cap: the line rule cannot help,
     // so the codepoint walk-back is the only thing between the model and a broken
     // byte. 42 bytes, no newline, and `room` lands inside the two-byte `é`.
-    const text = ("a" ** 20) ++ "\u{e9}" ++ ("b" ** 20);
+    const text = (repeat.rep("a", 20)) ++ "\u{e9}" ++ (repeat.rep("b", 20));
     const cut = fitPrefix(text, 21);
     try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
-    try std.testing.expectEqualStrings("a" ** 20, cut);
+    try std.testing.expectEqualStrings(&repeat.rep("a", 20), cut);
 }
 
 test "fitPrefix does not throw away most of the room for one early newline" {
     // "cut on a line" must not become "cut at almost nothing": a file whose only
     // early newline is way before the cap still gets the codepoint-safe cut.
-    const text = "hi\n" ++ ("x" ** 200);
+    const text = "hi\n" ++ repeat.rep("x", 200);
     const cut = fitPrefix(text, 100);
-    try std.testing.expectEqualStrings(("hi\n" ++ ("x" ** 97)), cut);
+    try std.testing.expectEqualStrings(("hi\n" ++ repeat.rep("x", 97)), cut);
 }
 
 test "fitPrefix on zero room returns empty, not a panic" {

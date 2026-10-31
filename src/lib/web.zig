@@ -1,4 +1,5 @@
 const std = @import("std");
+const repeat = @import("repeat.zig");
 
 /// What the `web_fetch` / `web_search` tool needs to turn a page
 /// into something a model can read: HTML to text, and search results into
@@ -1354,7 +1355,7 @@ test "search snippets are concise and remain valid UTF-8" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const long = "documentation résumé " ** 20;
+    const long = &repeat.rep("documentation résumé ", 20);
     const snippet = compactSnippet(arena, long);
     try std.testing.expect(snippet.len <= 243);
     try std.testing.expect(std.unicode.utf8ValidateSlice(snippet));
@@ -1720,7 +1721,7 @@ test "braveResults compacts long snippets without splitting UTF-8" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const description = "résumé " ** 80;
+    const description = &repeat.rep("résumé ", 80);
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"web\":{{\"results\":[{{\"title\":\"Result\",\"url\":\"https://example.com/\",\"description\":\"{s}\"}}]}}}}",
@@ -1753,7 +1754,7 @@ test "parseHttpUrl takes the parts apart and refuses what it cannot vouch for" {
     try std.testing.expectError(error.SingleLabelHost, parseHttpUrl("http://intranet/x"));
     try std.testing.expectError(error.BadHost, parseHttpUrl("https://exa mple.com/"));
     try std.testing.expectError(error.BadHost, parseHttpUrl("https://example..com/"));
-    try std.testing.expectError(error.TooLong, parseHttpUrl("https://example.com/" ++ "a" ** max_url_len));
+    try std.testing.expectError(error.TooLong, parseHttpUrl("https://example.com/" ++ repeat.rep("a", max_url_len)));
 }
 
 test "parseHttpUrl takes an IPv6 literal apart without losing the host" {

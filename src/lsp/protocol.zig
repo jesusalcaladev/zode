@@ -229,10 +229,7 @@ pub const Operation = enum {
     diagnostics,
 
     pub fn parse(s: []const u8) ?Operation {
-        inline for (std.meta.fields(Operation)) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-        }
-        return null;
+        return std.meta.stringToEnum(Operation, s);
     }
 
     /// The `textDocument/*` method, or null for the ones that are not a

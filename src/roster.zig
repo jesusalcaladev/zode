@@ -3,6 +3,7 @@ const models = @import("lib/models.zig");
 const providers = @import("lib/providers.zig");
 const config_mod = @import("config.zig");
 const http_client = @import("lib/http_client.zig");
+const repeat = @import("lib/repeat.zig");
 
 /// The pool of free models from EVERY provider that has a key, and the wheel that
 /// hands turns out among them.
@@ -764,7 +765,7 @@ test "noteDead with an overlong detail does not overflow" {
     var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer astate.deinit();
     var r = fakeRoster(astate.allocator(), 1);
-    const huge = "x" ** 4096;
+    const huge = &repeat.rep("x", 4096);
     r.noteDead(0, 0, .rate_limited, huge);
     try std.testing.expect(r.deadReason(0).len <= r.dead[0].reason.len);
     try std.testing.expect(r.deadReason(0).len > 0);

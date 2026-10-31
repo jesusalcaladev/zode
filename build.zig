@@ -36,7 +36,16 @@ pub fn build(b: *std.Build) void {
         std.builtin.OptimizeMode,
         "optimize",
         "Optimize mode (default: ReleaseSmall)",
-    ) orelse .ReleaseSmall;
+    ) orelse .small;
+    // Zig 0.17 removed `b.args` (the `--` passthrough into the build script), so
+    // the extra arguments a runnable step takes come from one option instead:
+    // `zig build ui-frame -Drun-args="turn 100 34"`, split on spaces.
+    var run_args_list: std.ArrayList([]const u8) = .empty;
+    if (b.option([]const u8, "run-args", "arguments passed to the step's program (space-separated)")) |s| {
+        var it = std.mem.tokenizeScalar(u8, s, ' ');
+        while (it.next()) |part| run_args_list.append(b.allocator, part) catch @panic("OOM");
+    }
+    const run_args: []const []const u8 = run_args_list.items;
     // Strip is ON by default because it takes the binary from 10.78 MB to 1.89 MB
     // (measured), and zode is I/O-bound so it costs nothing at runtime.
     //
@@ -129,7 +138,7 @@ pub fn build(b: *std.Build) void {
     const debug_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     debug_mod.addImport("vaxis", vaxis.module("vaxis"));
     // `build_options` is NOT optional: `main.zig` and `lib/selfupdate.zig`
@@ -184,7 +193,7 @@ pub fn build(b: *std.Build) void {
     tt_mod.addImport("tools", tools_mod_root);
     const tt = b.addExecutable(.{ .name = "tool_test", .root_module = tt_mod });
     const tt_run = b.addRunArtifact(tt);
-    if (b.args) |args| tt_run.addArgs(args);
+    tt_run.addArgs(run_args);
     const tt_step = b.step("tool-test", "Prueba las tools headless");
     tt_step.dependOn(&tt_run.step);
 
@@ -208,7 +217,7 @@ pub fn build(b: *std.Build) void {
     check_probe_mod.addImport("vaxis", vaxis.module("vaxis"));
     const check_probe = b.addExecutable(.{ .name = "check_probe", .root_module = check_probe_mod });
     const check_probe_run = b.addRunArtifact(check_probe);
-    if (b.args) |args| check_probe_run.addArgs(args);
+    check_probe_run.addArgs(run_args);
     const check_probe_step = b.step("check-probe", "Runs the automatic typecheck against a project with a deliberate error");
     check_probe_step.dependOn(&check_probe_run.step);
 
@@ -220,7 +229,7 @@ pub fn build(b: *std.Build) void {
     shell_mod.addImport("vaxis", vaxis.module("vaxis"));
     const shell_probe = b.addExecutable(.{ .name = "shell_probe", .root_module = shell_mod });
     const shell_probe_run = b.addRunArtifact(shell_probe);
-    if (b.args) |args| shell_probe_run.addArgs(args);
+    shell_probe_run.addArgs(run_args);
     const shell_probe_step = b.step("shell-probe", "Measures what a bash tool call costs in the harness, against the child alone");
     shell_probe_step.dependOn(&shell_probe_run.step);
 
@@ -232,7 +241,7 @@ pub fn build(b: *std.Build) void {
     roster_mod.addImport("vaxis", vaxis.module("vaxis"));
     const roster_probe = b.addExecutable(.{ .name = "roster_probe", .root_module = roster_mod });
     const roster_probe_run = b.addRunArtifact(roster_probe);
-    if (b.args) |args| roster_probe_run.addArgs(args);
+    roster_probe_run.addArgs(run_args);
     const roster_probe_step = b.step("roster-probe", "Shows the pool of free models of every provider");
     roster_probe_step.dependOn(&roster_probe_run.step);
 
@@ -250,7 +259,7 @@ pub fn build(b: *std.Build) void {
     lsp_probe_mod.addImport("vaxis", vaxis.module("vaxis"));
     const lsp_probe = b.addExecutable(.{ .name = "lsp_probe", .root_module = lsp_probe_mod });
     const lsp_probe_run = b.addRunArtifact(lsp_probe);
-    if (b.args) |args| lsp_probe_run.addArgs(args);
+    lsp_probe_run.addArgs(run_args);
     const lsp_probe_step = b.step("lsp-probe", "Asks a real language server about a real file");
     lsp_probe_step.dependOn(&lsp_probe_run.step);
 
@@ -262,7 +271,7 @@ pub fn build(b: *std.Build) void {
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_all.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
         // The test binary in Debug weighs ~49 MB (almost all vaxis debug
         // sections) and `.zig-cache/o` keeps ONE PER REBUILD: 44 of them
         // accumulated once, which is 1.4 GB. The tests are not debugged with gdb,
@@ -291,10 +300,16 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "live", live);
     opts.addOption([]const u8, "version", version);
     test_mod.addImport("build_options", opts.createModule());
-    // `zig build test -- <filter>` runs only the tests whose name contains the
-    // filter. Zig 0.16's runner has no `--test-filter`, so the filter is applied
-    // AT COMPILE TIME (it does not reach the binary's args).
-    const filters: []const []const u8 = if (b.args) |args| args else &.{};
+    // `zig build test -Dtest-filter=name` runs only the tests whose name contains
+    // the filter (comma-separated for several). The runner has no
+    // `--test-filter`, so the filter is applied AT COMPILE TIME (it does not
+    // reach the binary's args).
+    var filter_list: std.ArrayList([]const u8) = .empty;
+    if (b.option([]const u8, "test-filter", "only run tests whose name contains this (comma-separated)")) |s| {
+        var fit = std.mem.tokenizeAny(u8, s, ", ");
+        while (fit.next()) |f| filter_list.append(b.allocator, f) catch @panic("OOM");
+    }
+    const filters: []const []const u8 = filter_list.items;
     const tests = b.addTest(.{ .root_module = test_mod, .filters = filters });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
@@ -303,7 +318,8 @@ pub fn build(b: *std.Build) void {
     // ── the design harness ────────────────────────────────────────────
     //
     // Renders scripted scenes of the TUI and prints them as ANSI text:
-    // `zig build ui-frame -- turn 100 34`, `-- --flat all` for plain text.
+    // `zig build ui-frame -Drun-args="turn 100 34"`, `-Drun-args="--flat all"` for
+    // plain text.
     //
     // It exists because neither existing check can judge a DESIGN. The
     // `drawTest` unit tests compare a row against a string, so they prove a word
@@ -326,7 +342,7 @@ pub fn build(b: *std.Build) void {
     ui_frame_mod.addImport("build_options", build_options_mod);
     const ui_frame = b.addExecutable(.{ .name = "ui_frame", .root_module = ui_frame_mod });
     const ui_frame_run = b.addRunArtifact(ui_frame);
-    if (b.args) |args| ui_frame_run.addArgs(args);
+    ui_frame_run.addArgs(run_args);
     const ui_frame_step = b.step("ui-frame", "Render scripted TUI scenes as ANSI text (design review)");
     ui_frame_step.dependOn(&ui_frame_run.step);
 
@@ -369,7 +385,7 @@ pub fn build(b: *std.Build) void {
     const cm_mod = b.createModule(.{
         .root_source_file = b.path("tools/churn.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     const cm = b.addExecutable(.{ .name = "churn", .root_module = cm_mod });
     const cm_step = b.step("churn", "Churn: add/release/changelog/version");

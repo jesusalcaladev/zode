@@ -58,6 +58,7 @@ const textcap = @import("lib/textcap.zig");
 const resultcap = @import("lib/resultcap.zig");
 const toolstore = @import("lib/toolstore.zig");
 const tools_registry = @import("tools/registry.zig");
+const repeat = @import("lib/repeat.zig");
 const sleep = @import("lib/sleep.zig");
 const prompt_mod = @import("lib/prompt.zig");
 const copytext = @import("lib/copytext.zig");
@@ -15708,7 +15709,7 @@ test "`met` with open plan steps is refused once, and the model has to answer" {
     m.goal.len = obj.len;
 
     // Two steps done, one open.
-    var items = [_]plan_mod.Item{.{}} ** 3;
+    var items = @as([3]plan_mod.Item, @splat(.{}));
     const labels = [_][]const u8{ "write it", "run it", "verify the output" };
     for (&items, labels, 0..) |*it, lbl, i| {
         @memcpy(it.text[0..lbl.len], lbl);
@@ -16208,9 +16209,9 @@ test "the parallel batch's tool results outlive the per-call arenas" {
     defer tmp.close(io_global);
 
     const bodies = [_][]const u8{
-        "fn alpha() void {}\n" ** 200,
-        "fn beta() void {}\n" ** 200,
-        "fn gamma() void {}\n" ** 200,
+        &repeat.rep("fn alpha() void {}\n", 200),
+        &repeat.rep("fn beta() void {}\n", 200),
+        &repeat.rep("fn gamma() void {}\n", 200),
     };
     const paths: [3][]const u8 = .{ "a.zig", "b.zig", "c.zig" };
     for (paths, bodies) |p, body| {

@@ -462,9 +462,9 @@ test "lsp: an extension with no server lists the extensions that have one" {
 test "lsp: the operation list and the method table agree on every name" {
     // A name in `operations_help` that `Operation.parse` does not know is a
     // documented operation that answers "unknown operation".
-    inline for (std.meta.fields(Op)) |f| {
-        try testing.expect(std.mem.indexOf(u8, operations_help, f.name) != null);
-        try testing.expect(Op.parse(f.name) != null);
+    inline for (@typeInfo(Op).@"enum".field_names) |name| {
+        try testing.expect(std.mem.indexOf(u8, operations_help, name) != null);
+        try testing.expect(Op.parse(name) != null);
     }
 }
 

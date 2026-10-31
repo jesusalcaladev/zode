@@ -688,10 +688,15 @@ pub fn looksLikeHtml(body: []const u8) bool {
     if (head[0] == '{' or head[0] == '[') return false;
     const trimmed = std.mem.trimStart(u8, head, " \t\r\n\u{feff}");
     if (std.mem.startsWith(u8, trimmed, "#!")) return false;
-    return std.ascii.indexOfIgnoreCase(trimmed, "<!doctype html") != null or
-        std.ascii.indexOfIgnoreCase(trimmed, "<html") != null or
-        std.ascii.indexOfIgnoreCase(trimmed, "<head") != null or
-        std.ascii.indexOfIgnoreCase(trimmed, "<body") != null;
+    // Case-insensitive contains, over a lowercase copy of the head: 0.17 dropped
+    // `std.ascii.indexOfIgnoreCase`, and this is the only place that used it.
+    var lower: [1024]u8 = undefined;
+    const n = @min(trimmed.len, lower.len);
+    const flat = std.ascii.lowerString(&lower, trimmed[0..n]);
+    return std.mem.indexOf(u8, flat, "<!doctype html") != null or
+        std.mem.indexOf(u8, flat, "<html") != null or
+        std.mem.indexOf(u8, flat, "<head") != null or
+        std.mem.indexOf(u8, flat, "<body") != null;
 }
 
 /// `true` if the error is a network error (and the test is skipped) instead of a real failure.
