@@ -6374,8 +6374,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     }
 
     const cmode = compaction.effectiveMode(m.environ, m.compact_mode);
-    const bg_pct = compaction.bgPct(m.environ);
-    const hot_pct = compaction.hotPct(m.environ);
+    const cur_ctx = curModelContext();
+    const bg_pct = compaction.bgPct(m.environ, cur_ctx);
+    const hot_pct = compaction.hotPct(m.environ, cur_ctx);
 
     // 1. Lanzar compactación en background cuando cruzamos el umbral "warm".
     // No bloquea al usuario; el hilo trabaja mientras el turno sigue.
@@ -6410,8 +6411,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
                 comp = compaction.elideTier(
                     arena,
                     msgs0,
-                    compaction.budgetFor(m.environ, curModelContext()),
+                    compaction.budgetFor(m.environ, cur_ctx),
                     m.environ,
+                    cur_ctx,
                     cmode,
                 ) catch compaction.nothingElided(msgs0);
             }
@@ -6428,8 +6430,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             comp = compaction.elideTier(
                 arena,
                 msgs0,
-                compaction.budgetFor(m.environ, curModelContext()),
+                compaction.budgetFor(m.environ, cur_ctx),
                 m.environ,
+                cur_ctx,
                 cmode,
             ) catch compaction.nothingElided(msgs0);
         }

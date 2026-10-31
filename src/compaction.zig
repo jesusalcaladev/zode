@@ -99,35 +99,77 @@ fn messageTokens(m: chat.ChatMessage) i64 {
     return total;
 }
 
-/// How much of the context window compaction aims to stay under.
+/// How much of the context window compaction aims to stay under, scaled by
+/// window size. A model with a 1M window does not need to compact to 80%
+/// (800k) — that throws away useful context. With a huge window we keep
+/// almost everything verbatim and only elide the oldest, biggest tool dumps.
+///
+/// The cut points: under 256k we budget 80% (the old behavior); 256k–1M we
+/// budget 90%; over 1M we budget 98% — practically "infinite", compaction is
+/// almost a no-op and tier-2 summarization never fires.
+///
+/// `ZODE_COMPACT_PCT` overrides everything when set.
+pub fn budgetPctFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
+    // The explicit override always wins.
+    if (env) |m| {
+        if (m.get("ZODE_COMPACT_PCT")) |s| {
+            const n = std.fmt.parseInt(i64, s, 10) catch return 80;
+            return @max(min_target_pct, @min(n, max_target_pct));
+        }
+    }
+    // No override: scale by window size.
+    if (model_ctx >= 1_000_000) return 98;
+    if (model_ctx >= 256_000) return 90;
+    return 80;
+}
+
+/// The budget: `budgetPctFor`% of the context limit. Replaces the old
+/// fixed-80% `targetPct` for the adaptive path. `targetPct` is kept for the
+/// `/config` display (it reports the *configured* value, not the effective one).
 pub const target_pct: i64 = 80;
 
 /// The "warm" threshold: when the context reaches this %, background
 /// compaction is launched so it finishes before the critical point.
-/// Overridden by `ZODE_COMPACT_BG_PCT`. Default 80.
+/// Scaled by window: big windows launch later (less compaction needed).
+/// Overridden by `ZODE_COMPACT_BG_PCT`.
 pub const bg_pct_default: i64 = 80;
 pub const min_bg_pct: i64 = 10;
 pub const max_bg_pct: i64 = 95;
 
-pub fn bgPct(env: ?*const std.process.Environ.Map) i64 {
-    const m = env orelse return bg_pct_default;
-    const s = m.get("ZODE_COMPACT_BG_PCT") orelse return bg_pct_default;
-    const n = std.fmt.parseInt(i64, s, 10) catch return bg_pct_default;
+pub fn bgPct(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
+    const m = env orelse return defaultBgPct(model_ctx);
+    const s = m.get("ZODE_COMPACT_BG_PCT") orelse return defaultBgPct(model_ctx);
+    const n = std.fmt.parseInt(i64, s, 10) catch return defaultBgPct(model_ctx);
     return @max(min_bg_pct, @min(n, max_bg_pct));
+}
+
+/// Default warm threshold by window size.
+fn defaultBgPct(model_ctx: u32) i64 {
+    if (model_ctx >= 1_000_000) return 90;
+    if (model_ctx >= 256_000) return 85;
+    return 80;
 }
 
 /// The "hot" threshold: when the context reaches this %, compaction should
 /// already be done (by the background thread). If not, it runs synchronously
-/// (fallback). Overridden by `ZODE_COMPACT_HOT_PCT`. Default 90.
+/// (fallback). Scaled by window.
+/// Overridden by `ZODE_COMPACT_HOT_PCT`.
 pub const hot_pct_default: i64 = 90;
 pub const min_hot_pct: i64 = 10;
 pub const max_hot_pct: i64 = 99;
 
-pub fn hotPct(env: ?*const std.process.Environ.Map) i64 {
-    const m = env orelse return hot_pct_default;
-    const s = m.get("ZODE_COMPACT_HOT_PCT") orelse return hot_pct_default;
-    const n = std.fmt.parseInt(i64, s, 10) catch return hot_pct_default;
+pub fn hotPct(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
+    const m = env orelse return defaultHotPct(model_ctx);
+    const s = m.get("ZODE_COMPACT_HOT_PCT") orelse return defaultHotPct(model_ctx);
+    const n = std.fmt.parseInt(i64, s, 10) catch return defaultHotPct(model_ctx);
     return @max(min_hot_pct, @min(n, max_hot_pct));
+}
+
+/// Default hot threshold by window size.
+fn defaultHotPct(model_ctx: u32) i64 {
+    if (model_ctx >= 1_000_000) return 95;
+    if (model_ctx >= 256_000) return 92;
+    return 90;
 }
 
 /// A tier-1 compaction result, ready to put on the wire.
@@ -170,9 +212,10 @@ pub fn elideForBudget(
     msgs: []const chat.ChatMessage,
     budget: i64,
     env: ?*const std.process.Environ.Map,
+    model_ctx: u32,
     cmode: Mode,
 ) CompactBgResult {
-    const comp = elideTier(arena, msgs, budget, env, cmode) catch {
+    const comp = elideTier(arena, msgs, budget, env, model_ctx, cmode) catch {
         return .{
             // The fallback returns the input untouched. `Compacted.msgs` is
             // mutable only because `elideTier` allocates a new slice; nothing
@@ -206,7 +249,7 @@ pub fn compactBgFn(c: *CompactBgCtx) void {
     defer gpa.destroy(c);
     const budget = budgetFor(c.env, c.model_ctx);
     const cmode = effectiveMode(c.env, null);
-    const res = elideForBudget(gpa, c.msgs, budget, c.env, cmode);
+    const res = elideForBudget(gpa, c.msgs, budget, c.env, c.model_ctx, cmode);
 
     while (!c.state.mtx.tryLock()) std.Thread.yield() catch {};
     c.state.result = res;
@@ -359,13 +402,15 @@ pub fn describe(m: Mode) []const u8 {
     };
 }
 
-/// The compaction budget: `ZODE_COMPACT_PCT`% of the limit.
+/// The compaction budget: `budgetPctFor`% of the limit, scaled by window size.
+/// For a 1M model this is ~98% (practically no compaction); for a 128k model
+/// it stays 80%.
 pub fn budgetTokens(env: ?*const std.process.Environ.Map) i64 {
     return budgetFor(env, 0);
 }
 
 pub fn budgetFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
-    return @divTrunc(contextLimitFor(env, model_ctx) * targetPct(env), 100);
+    return @divTrunc(contextLimitFor(env, model_ctx) * budgetPctFor(env, model_ctx), 100);
 }
 
 pub const Compacted = struct {
@@ -395,6 +440,7 @@ pub fn elideTier(
     msgs: []const chat.ChatMessage,
     budget: i64,
     env: ?*const std.process.Environ.Map,
+    model_ctx: u32,
     compaction_mode: Mode,
 ) !Compacted {
     const out = try arena.alloc(chat.ChatMessage, msgs.len);
@@ -432,12 +478,11 @@ pub fn elideTier(
     }
 
     var res = Compacted{ .msgs = out, .elided = elided, .elided_at = elided_at.items };
-    // `needs_summary` is what ASKS for the second tier, so this is where the mode
-    // decides it — and the decision is not the caller's, because the caller has two
-    // call sites that would each have to remember. A mode of `elide` still returns
-    // the elided view (it is free and it is what keeps the prefix cacheable); it
-    // just never spends a request to go further.
-    if (estimated > budget and compaction_mode == .full) {
+    // Tier 2 (LLM summary) never fires for big windows: a 256k+ model keeps
+    // almost everything verbatim. Summarizing is lossy and only worth it when
+    // the window is small enough that compaction actually saves money.
+    const may_summarize = model_ctx < 256_000;
+    if (estimated > budget and compaction_mode == .full and may_summarize) {
         res.needs_summary = true;
         // Suggest summarizing everything after system and before the window,
         // but never include a critical message (goal, plan, prior summary) in

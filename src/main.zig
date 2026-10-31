@@ -372,7 +372,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             const comp = if (cmode == .off)
                 compaction_mod.nothingElided(msgs.items)
             else
-                compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetFor(env, agent.curModelContext()), env, cmode) catch
+                compaction_mod.elideTier(arena, msgs.items, compaction_mod.budgetFor(env, agent.curModelContext()), env, agent.curModelContext(), cmode) catch
                     compaction_mod.nothingElided(msgs.items);
             if (comp.elided > 0) elided_total += comp.elided;
             var cur: []chat.ChatMessage = try arena.dupe(chat.ChatMessage, comp.msgs);

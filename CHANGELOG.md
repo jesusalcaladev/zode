@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - double-threshold background compaction (compaction) [`83e6e75b`](https://github.com/jesusalcaladev/zode/commit/83e6e75b)
 - protect goal/plan/summary from tier-2 summarization (compaction) [`feb19952`](https://github.com/jesusalcaladev/zode/commit/feb19952)
 - distinct status panels with context progress bar (ui) [`bf2b68cc`](https://github.com/jesusalcaladev/zode/commit/bf2b68cc)
+- adaptive budget and thresholds by window size (compaction) [`65568deb`](https://github.com/jesusalcaladev/zode/commit/65568deb)
 
 ### Bug Fixes
 
@@ -43,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - black holes in transcript + disable prompt dots by default + fix tests [`1c149573`](https://github.com/jesusalcaladev/zode/commit/1c149573)
 - fill transcript area up to hairline to eliminate black holes [`fa91e910`](https://github.com/jesusalcaladev/zode/commit/fa91e910)
 - keep skill listing in the system message so compaction never drops it (skills) [`d0acb3d3`](https://github.com/jesusalcaladev/zode/commit/d0acb3d3)
-- kill layout holes, echo prompts instantly, sync plan indicator, refresh catalog silently (tui) [`f17a3daa`](https://github.com/jesusalcaladev/zode/commit/f17a3daa)
+- kill layout holes, echo prompts instantly, sync plan indicator, refresh catalog silently (tui) [`37e0215b`](https://github.com/jesusalcaladev/zode/commit/37e0215b)
 
 ### Chores
 
