@@ -6708,21 +6708,14 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         var sarena = std.heap.ArenaAllocator.init(gpa);
         defer sarena.deinit();
         const schema = if (read_only) tools_registry.toolsJsonReadOnly() else try tools_registry.toolsJsonFiltered(sarena.allocator(), denied);
-        // Mark old messages as cache-stable so the provider serves them from
-        // its prompt cache instead of re-writing them every turn. Skip the
-        // system message (index 0): Anthropic handles it separately at root
-        // level; OpenAI-compat providers that don't understand cache_control
-        // simply ignore the field. Everything except the last 2 messages
-        // (the user's latest input and the pending assistant answer) is stable
-        // across turns and eligible for the cache.
-        var cache_start: usize = 0;
-        if (msgs_wire.len > 0 and std.mem.eql(u8, msgs_wire[0].role, "system")) {
-            cache_start = 1;
-        }
-        var ci: usize = cache_start;
-        while (ci < msgs_wire.len - 2) : (ci += 1) {
-            msgs_wire[ci].cache_control = true;
-        }
+        // Mark the end of the stable prefix so the provider serves it from its
+        // prompt cache instead of re-writing it every turn. One breakpoint, not
+        // one per old message: Anthropic caps a request at four `cache_control`
+        // markers and the system prompt plus the tool schemas already use two.
+        // The last 2 messages stay unmarked (the user's latest input and the
+        // answer still being written). Providers that do not understand the
+        // field ignore it.
+        chat.markCachePrefix(msgs_wire, 2);
         const body = try chat.buildBodyMessagesCapped(
             body_buf,
             pick.model,

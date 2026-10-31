@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep skill listing in the system message so compaction never drops it (skills) [`d0acb3d3`](https://github.com/jesusalcaladev/zode/commit/d0acb3d3)
 - kill layout holes, echo prompts instantly, sync plan indicator, refresh catalog silently (tui) [`37e0215b`](https://github.com/jesusalcaladev/zode/commit/37e0215b)
 - heap-allocate the read table; repair and test the adaptive commits (cache) [`cb3f2c10`](https://github.com/jesusalcaladev/zode/commit/cb3f2c10)
+- one prompt-cache breakpoint at the end of the stable prefix (cache) [`a525e442`](https://github.com/jesusalcaladev/zode/commit/a525e442)
 
 ### Chores
 
@@ -69,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Build
 
-- migrate the tree to zig 0.17 (zig) [`2fa725b7`](https://github.com/jesusalcaladev/zode/commit/2fa725b7)
+- migrate the tree to zig 0.17 (zig) [`c37c76eb`](https://github.com/jesusalcaladev/zode/commit/c37c76eb)
 
 ### Other
 

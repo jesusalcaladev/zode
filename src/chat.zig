@@ -1437,6 +1437,30 @@ pub fn buildBodyMessagesCapped(
     };
 }
 
+/// Mark the end of the stable prefix so the provider serves everything up to it
+/// from its prompt cache.
+///
+/// ONE breakpoint, on the last message that will not change again (`keep_recent`
+/// messages back from the end). Prompt caching is a PREFIX cache: a breakpoint
+/// marks "cache everything before this point", so a second breakpoint further up
+/// the same prefix buys nothing. Marking every old message instead — which is
+/// what an earlier version of this path did — breaks Anthropic outright: the
+/// Messages API allows at most four `cache_control` breakpoints per request, and
+/// the tool schemas and the system prompt already take two of them. Any
+/// conversation of five messages or more went over the limit and came back as a
+/// 400.
+///
+/// Marks are cleared on every other message, because the array is reused across
+/// the turns of one iteration: history only grows, so the breakpoint moves and
+/// the previous one has to be unset.
+pub fn markCachePrefix(messages: []ChatMessage, keep_recent: usize) void {
+    if (messages.len <= keep_recent) return;
+    const breakpoint = messages.len - keep_recent - 1;
+    for (messages, 0..) |*m, i| {
+        m.cache_control = i == breakpoint;
+    }
+}
+
 /// OpenAI format (chat/completions). No alloc deps.
 fn buildBodyOpenAI(
     buf: []u8,
@@ -2943,5 +2967,90 @@ test "buildBodyAnthropic: cache_control absent on unflagged message" {
     var buf: [8192]u8 = undefined;
     const body = try buildBodyAnthropic(buf[0..], "m", &msgs, .medium, "");
     try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+}
+
+test "markCachePrefix: one breakpoint, at the end of the stable prefix" {
+    var msgs = [_]ChatMessage{
+        .{ .role = "system", .content = "be terse" },
+        .{ .role = "user", .content = "one" },
+        .{ .role = "assistant", .content = "two" },
+        .{ .role = "user", .content = "three" },
+        .{ .role = "assistant", .content = "four" },
+        .{ .role = "user", .content = "five" },
+    };
+    markCachePrefix(&msgs, 2);
+    var marked: usize = 0;
+    for (msgs, 0..) |m, i| {
+        if (m.cache_control) {
+            marked += 1;
+            // The last message that will not change again: everything before it
+            // is inside the cached prefix, the two after it are not.
+            try std.testing.expectEqual(@as(usize, 3), i);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), marked);
+}
+
+test "markCachePrefix: a history no longer than the tail marks nothing" {
+    // The loop this replaced computed `len - 2` on an unsigned length, which
+    // wrapped around to a huge bound on a 0- or 1-message history.
+    var empty = [_]ChatMessage{};
+    markCachePrefix(&empty, 2);
+    var one = [_]ChatMessage{.{ .role = "system", .content = "be terse" }};
+    markCachePrefix(&one, 2);
+    try std.testing.expect(!one[0].cache_control);
+    var two = [_]ChatMessage{
+        .{ .role = "system", .content = "be terse" },
+        .{ .role = "user", .content = "hello" },
+    };
+    markCachePrefix(&two, 2);
+    try std.testing.expect(!two[0].cache_control);
+    try std.testing.expect(!two[1].cache_control);
+}
+
+test "markCachePrefix: the breakpoint moves as the history grows" {
+    var msgs = [_]ChatMessage{
+        .{ .role = "system", .content = "be terse" },
+        .{ .role = "user", .content = "one" },
+        .{ .role = "assistant", .content = "two" },
+        .{ .role = "user", .content = "three" },
+    };
+    markCachePrefix(&msgs, 2);
+    try std.testing.expect(msgs[1].cache_control);
+    // The next turn: two messages more, marked again. The mark on index 1 has to
+    // go, or the request carries two breakpoints in the same prefix.
+    var grown = [_]ChatMessage{
+        .{ .role = "system", .content = "be terse" },
+        .{ .role = "user", .content = "one" },
+        .{ .role = "assistant", .content = "two" },
+        .{ .role = "user", .content = "three" },
+        .{ .role = "assistant", .content = "four" },
+        .{ .role = "user", .content = "five" },
+    };
+    markCachePrefix(&grown, 2);
+    try std.testing.expect(!grown[1].cache_control);
+    var marked: usize = 0;
+    for (grown) |m| {
+        if (m.cache_control) marked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), marked);
+}
+
+test "Anthropic body: a long conversation stays under the four-breakpoint ceiling" {
+    // The Messages API rejects a request with more than four cache_control
+    // breakpoints, and the tool schemas plus the system block already take two.
+    var msgs: [12]ChatMessage = undefined;
+    msgs[0] = .{ .role = "system", .content = "be terse" };
+    for (1..msgs.len) |i| {
+        msgs[i] = .{
+            .role = if (i % 2 == 1) "user" else "assistant",
+            .content = "message body",
+        };
+    }
+    markCachePrefix(&msgs, 2);
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"d\",\"parameters\":{\"type\":\"object\"}}}]";
+    var buf: [16384]u8 = undefined;
+    const body = try buildBodyMessages(&buf, "claude-test", &msgs, .low, tools, .anthropic);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
 }
 
