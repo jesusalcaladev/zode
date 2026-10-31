@@ -11,7 +11,46 @@ A code harness in pure Zig (no C deps), focused on speed and saving tokens.
 - **No TODOs** in code — `AGENTS.md` forbids them; a placeholder is a decision deferred.
 - **Every file that touches the model has a test** — pure modules (`src/lib/`) are testable without TUI or network; TUI-heavy code uses `drawTest` + `tools/pty_smoke.py`. A feature without a passing test is not done.
 
-## Zig 0.16 — traps worth remembering
+## Zig 0.17 — traps worth remembering
+
+The tree moved from 0.16 to 0.17 (`minimum_zig_version`, vendored `zig-pkg`, and
+`build.zig` are all 0.17 now). What the migration actually changed:
+
+- **`**` array multiplication is GONE.** `"x" ** 5000` does not compile, in any
+  spacing. Test data uses `src/lib/repeat.zig`: `&repeat.rep("x", 5000)` where a
+  slice is wanted, bare `repeat.rep("x", 5)` inside `++` (concat takes arrays, not
+  pointers), and `@as([N]T, @splat(v))` for a non-byte element type.
+- **`std.meta.fields` is a `@compileError`**: `@typeInfo(T).@"struct".fields` (with
+  `.name`/`.type` per field) and for enums `@typeInfo(E).@"enum".field_names` plus
+  `field_values` — the enum shape is TWO parallel arrays now, there is no per-field
+  struct, and `field.value` does not exist. `std.meta.eql`, `activeTag`,
+  `stringToEnum` and `fieldInfo` all still exist.
+- **`std.fmt.bufPrintZ` is gone** → `std.mem.printSentinel(buf, fmt, args, 0)`.
+  `std.fmt.bufPrint` still works but is marked deprecated in favor of `std.mem.print`.
+- **`std.ascii.indexOfIgnoreCase` is gone**: only `eqlIgnoreCase` and
+  `startsWithIgnoreCase` remain. Lowercase into a buffer and use `std.mem.indexOf`.
+- **`std.Build.args` (the `--` passthrough) is gone.** Build scripts see only `-D`
+  options: tests filter with `-Dtest-filter=name`, and the runnable steps
+  (`ui-frame`, the probes, `tool-test`) take `-Drun-args="turn 100 34"`.
+- Optimize modes are lowercase in code (`.debug .safe .fast .small`), and the
+  `std.lang.Optimize` enum literal that 0.16 code wrote as `.ReleaseSmall` no longer
+  resolves there (`std.builtin.OptimizeMode.ReleaseSmall` does, and
+  `-Doptimize=ReleaseSmall` on the command line still works as a deprecated alias —
+  measured, both spellings build the same binary).
+- `std.testing.expectEqual` takes TWO arguments (`@as(usize), 3, i` was the old
+  three-argument form and does not compile).
+- **`free` now checks the LENGTH, not just the address.** The safe allocator (the
+  `gpa` in `.debug` and `.safe`) aborts with `free of invalid memory [addr…, len: 20
+  (0x14) align: 1] or corrupted metadata` when the slice handed to `gpa.free` is
+  SHORTER than the block behind it — which is exactly what `gpa.free(list.items)` is
+  for an `ArrayList` that grew (`items.len` < `capacity`). 0.16 only matched the
+  address, so "return `out.items`, let the caller free it" was silently legal. It
+  was not: `jsonString` did it and the first `!echo` of the session killed the
+  release binary on the shell thread, with `zig build test` green all the while
+  (no test freed the result). Hand back `list.toOwnedSlice(gpa)` — it resizes to
+  the length — or an exact `gpa.alloc` / `gpa.dupe`.
+
+Everything below carried over from 0.16 unchanged:
 
 - `main` receives `std.process.Init` (`init.gpa`, `init.io`, `init.environ_map`, `init.arena`, `init.minimal.args`).
 - Args: `std.process.Args.Iterator.init(init.minimal.args)` + `.next()`.
@@ -68,7 +107,7 @@ src/lib/ pure/testable modules (no TUI, no network): readcache, project,
          prompt, sleep, skills, skillstore, mentions, markdown, highlight,
          web, models, providers, provider, http_client, subagent, ask,
          plan, checkpoint, editor, bench, clean, regex, mascot, theme,
-         zjsonl, verify, exitgate, cost, review, diffview,
+         zjsonl, verify, exitgate, cost, review, diffview, repeat,
          outputstyles, outputstyle_store, bundled_outputstyles
 ```
 
@@ -87,7 +126,8 @@ src/lib/ pure/testable modules (no TUI, no network): readcache, project,
 
 - **SSE streaming is really incremental**: `streamPost()` delivers chunks via `response.reader`; `StreamCtx.feed()` dispatches each `data:` line as soon as complete. ESC cuts via `chat.cancel_current` (`std.atomic.Value(bool)`), and partial text is kept (`result.partial`).
 - **Tool calls do not get stuck**: `tryEmitTool` validates JSON; `flushPendingTools()` forces emission at `finish`. Empty args = `{}`.
-- **Compaction is 2-tier**: Tier 1 (`elideTier`) replaces old tool results (>256B, outside `recent_window=8`) with a marker; Tier 2 (`summarizeTurns`) makes one LLM call with `summaryPrompt()` capped at 16 KB, replacing old turns with `[earlier conversation summarized...]`. Budget = 80% of `ZODE_CONTEXT_LIMIT`. Tier 1 tracks running estimates so long history is scanned once.
+- **Compaction is 2-tier**: Tier 1 (`elideTier`) replaces old tool results (>256B, outside `recent_window=8`) with a marker; Tier 2 (`summarizeTurns`) makes one LLM call with `summaryPrompt()` capped at 16 KB, replacing old turns with `[earlier conversation summarized...]`. Budget = `budgetPctFor`% of `ZODE_CONTEXT_LIMIT` — 80% under 256k, 90% at 256k+, 98% at 1M (`ZODE_COMPACT_PCT` overrides). **Tier 2 never fires at 256k or above**: a big window keeps history verbatim, and a summary is lossy. Tier 1 tracks running estimates so long history is scanned once.
+- **Prompt caching is one breakpoint**: `chat.markCachePrefix` marks the END of the stable prefix (2 messages from the end) and nothing else. Anthropic allows 4 `cache_control` markers per request and the system block + tool schemas already take 2, so marking every old message 400s any conversation of 5+ messages. The warm/hot thresholds (`bgPct`/`hotPct`) scale the same way: 80/90 under 256k, 85/92 at 256k, 90/95 at 1M.
 - **Session file format is zjsonl**: append-only JSONL in `./sessions/zode-<id>.jsonl`; lines ≥512 bytes compressed with raw DEFLATE level 9 (`z` prefix + base64). Round-trip tested byte-for-byte. `File.Writer` uses `Writer.initStreaming`; positional mode creates 0xFF holes.
 - **Compressed session architecture**: session create/resume returns heap `*Session`; the File.Writer references `write_buf` inside the struct — never move by value.
 - **Permission flow**: `model.requestPermission()` blocks worker thread (spin + yield) until UI answers. Priority: `/yolo` (global) > persisted allowlist (`~/.config/zode/permissions.json`, 0600) > dialog. Denied answers feed back as `tool_result "denied: permission required"`. `lsp` asks NO permission (spawns from fixed table, never model). `batch` asks union of step permissions.

@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - kill layout holes, echo prompts instantly, sync plan indicator, refresh catalog silently (tui) [`37e0215b`](https://github.com/jesusalcaladev/zode/commit/37e0215b)
 - heap-allocate the read table; repair and test the adaptive commits (cache) [`cb3f2c10`](https://github.com/jesusalcaladev/zode/commit/cb3f2c10)
 - one prompt-cache breakpoint at the end of the stable prefix (cache) [`13cbbf86`](https://github.com/jesusalcaladev/zode/commit/13cbbf86)
-- allocate jsonString at its exact length (agent) [`ec77621b`](https://github.com/jesusalcaladev/zode/commit/ec77621b)
+- allocate jsonString at its exact length (agent) [`02b4c302`](https://github.com/jesusalcaladev/zode/commit/02b4c302)
 
 ### Chores
 
@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - the tree split, and the two things the docs got wrong [`ce444934`](https://github.com/jesusalcaladev/zode/commit/ce444934)
 - add memory block tasks to CHANGELOG [`4124992a`](https://github.com/jesusalcaladev/zode/commit/4124992a)
+- write down what the 0.17 migration actually changed [`b494be3a`](https://github.com/jesusalcaladev/zode/commit/b494be3a)
 
 ### Refactors
 

@@ -4,7 +4,7 @@ Thanks for your interest in `zode`. It is a pure Zig code harness, built to be f
 
 ## Before you start
 
-- This project uses **Zig 0.16**. Make sure `zig` is in your `PATH`.
+- This project uses **Zig 0.17**. Make sure `zig` is in your `PATH`.
 - All code lives under `src/`; tests run with `zig build test`.
 - There is no required `CMake`, `Make`, or `npm`: only `zig build`, `zig test`, and `zig build -Doptimize=ReleaseSafe`.
 
@@ -26,7 +26,7 @@ Thanks for your interest in `zode`. It is a pure Zig code harness, built to be f
 
 ## Code rules
 
-- `std.ArrayList` is **unmanaged** in Zig 0.16: `.empty` + `append(gpa, x)`.
+- `std.ArrayList` is **unmanaged** in Zig 0.17: `.empty` + `append(gpa, x)`.
 - `Mutex`: `std.atomic.Mutex`; `std.Thread.Mutex` no longer exists.
 - `sendBodyComplete` requires a mutable `[]u8`; JSON bodies are built in stack buffers and passed with `@constCast`.
 - `Writer.fixed` does not write to the terminal; use `File.Writer` + flush.

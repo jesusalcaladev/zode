@@ -46,7 +46,7 @@ src/lib/               # Pure modules (testable without TUI/network)
 └── ...
 ```
 
-`src/lib/` = modules testable without TUI or network. `src/tools/` = tools split per file; dispatcher holds `Model` deps. `AGENTS.md` = code conventions + why each Zig 0.16 trap was paid for.
+`src/lib/` = modules testable without TUI or network. `src/tools/` = tools split per file; dispatcher holds `Model` deps. `AGENTS.md` = code conventions + why each Zig 0.17 trap was paid for.
 
 ## SSE streaming is incremental
 
@@ -58,10 +58,10 @@ src/lib/               # Pure modules (testable without TUI/network)
 
 ## Compaction is two-tier
 
-Budget = 80 % of `ZODE_CONTEXT_LIMIT` (clamped 10–95), derived from `ZODE_CONTEXT_LIMIT` > the model's own window > 128000 fallback.
+Budget = `budgetPctFor`% of `ZODE_CONTEXT_LIMIT` (clamped 10–95), derived from `ZODE_CONTEXT_LIMIT` > the model's own window > 128000 fallback. The percentage scales with the window: 80% under 256k, 90% from 256k, 98% from 1M.
 
 1. **Elide** (`elide`, `full`): old tool results >256 B outside `recent_window=8` become a marker. No request, no tokens; the session file keeps the original. Tier 1 tracks running estimates so long history is scanned once.
-2. **Summarize** (`full` only): one LLM call with `summaryPrompt()` capped at 16 KB replaces old turns with `[earlier conversation summarized...]`.
+2. **Summarize** (`full` only, and only under 256k): one LLM call with `summaryPrompt()` capped at 16 KB replaces old turns with `[earlier conversation summarized...]`. A 256k+ window keeps history verbatim — a lossy summary is not worth it there.
 
 `off` does neither; the provider eventually rejects an over-long request.
 

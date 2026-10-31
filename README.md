@@ -51,7 +51,7 @@ The check is cached in `~/.cache/zode/update.json` for six hours. `ZODE_NO_SELF_
 
 ### Build from source
 
-Requires **Zig 0.16.0** (the only dependency besides libvaxis, which is fetched by `build.zig.zon`).
+Requires **Zig 0.17.0** (the only dependency besides libvaxis, which is fetched by `build.zig.zon`).
 
 ```bash
 git clone https://github.com/jesusalcaladev/zode.git
@@ -197,7 +197,7 @@ Title resolution order: `custom_title` > `ai_title` > `name` > session id.
 
 ## Contributing / Public repo files
 
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (Zig 0.16, pure std, tests)
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (Zig 0.17, pure std, tests)
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting, scope
 - [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community conduct
 - [`.github/ISSUE_TEMPLATE/bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md) — bug template
