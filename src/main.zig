@@ -93,8 +93,8 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     if (url.len == 0) {
         if (def.suggested_models.len == 0) {
             std.debug.print(
-                "{s} publishes no model catalog: pick the model by hand (`/use {s} <model>` or ZODE_MODEL).\n",
-                .{ def.id, def.id },
+                "{s} publishes no model catalog: pick the model by hand (ZODE_MODEL, or /model in the TUI).\n",
+                .{def.id},
             );
             return 1;
         }
@@ -381,7 +381,12 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             if (comp.needs_summary and comp.summary_upto > 0) {
                 const upto = @min(comp.summary_upto, cur.len);
                 const starts_sys = cur.len > 0 and std.mem.eql(u8, cur[0].role, "system");
-                const sum_from: usize = if (starts_sys) 1 else 0;
+                var sum_from: usize = if (starts_sys) 1 else 0;
+                // Never start the summary stretch on a critical message (goal,
+                // plan, prior summary): keep those verbatim in the wire.
+                while (sum_from < upto and compaction.isCriticalMessage(cur[sum_from])) {
+                    sum_from += 1;
+                }
                 if (upto > sum_from) {
                     models.dbg("[compaction] summarizing old turns…\n", .{});
                     if (agent.summarizeTurns(
@@ -774,6 +779,12 @@ fn runTui(init: std.process.Init) !u8 {
     // and the skills roots are both derived from it.
     agent.initProjectInfo(io, init.environ_map);
     agent.bootMark("initProjectInfo");
+    // Where THIS project's sessions live, before any session is created or
+    // resumed: without it the TUI wrote to the relative default while `/session`
+    // decided ownership against the absolute resolved dir, so the picker came up
+    // empty on a project with sessions on disk.
+    agent.resolveSessionsDirIn(init.gpa, init.environ_map);
+    agent.bootMark("resolveSessionsDir");
     free_auto.attachIo(io);
     chat.io_global = io;
     chat.dbgInitEnv(init.environ_map);

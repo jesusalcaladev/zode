@@ -31,7 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add change_manager tool for changeset-driven versioning [`fc15b12b`](https://github.com/jesusalcaladev/zode/commit/fc15b12b)
 - rename changeset system to churn (.churn) [`9e6692b0`](https://github.com/jesusalcaladev/zode/commit/9e6692b0)
 - release 0.2.1-beta.1 via churn [`61f8adbd`](https://github.com/jesusalcaladev/zode/commit/61f8adbd)
-- double-threshold background compaction (compaction) [`52f058f8`](https://github.com/jesusalcaladev/zode/commit/52f058f8)
+- double-threshold background compaction (compaction) [`83e6e75b`](https://github.com/jesusalcaladev/zode/commit/83e6e75b)
+- protect goal/plan/summary from tier-2 summarization (compaction) [`8b42fcb9`](https://github.com/jesusalcaladev/zode/commit/8b42fcb9)
 
 ### Bug Fixes
 

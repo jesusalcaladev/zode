@@ -6480,8 +6480,13 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // that fits.
     var msgs_wire: []chat.ChatMessage = comp.msgs;
     if (comp.needs_summary and comp.summary_upto > 1 and maySummarize(iteration)) {
-        const sum_from: usize = 1; // never the system message
         const upto = @min(comp.summary_upto, comp.msgs.len);
+        // Never start the summary stretch on a critical message (goal, plan,
+        // prior summary): keep those verbatim in the wire.
+        var sum_from: usize = 1; // never the system message
+        while (sum_from < upto and compaction.isCriticalMessage(comp.msgs[sum_from])) {
+            sum_from += 1;
+        }
         if (upto > sum_from + 1) {
             // Tell the cache statistics that the history is about to get shorter,
             // so the next prompt count going DOWN is not mistaken for a router

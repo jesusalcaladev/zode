@@ -421,8 +421,13 @@ pub fn elideTier(
     // just never spends a request to go further.
     if (estimated > budget and compaction_mode == .full) {
         res.needs_summary = true;
-        // Suggest summarizing everything after system and before the window.
+        // Suggest summarizing everything after system and before the window,
+        // but never include a critical message (goal, plan, prior summary) in
+        // the stretch the model is asked to summarize — those stay verbatim.
         res.summary_upto = protect_from;
+        while (res.summary_upto > 1 and isCriticalMessage(out[res.summary_upto - 1])) {
+            res.summary_upto -= 1;
+        }
     }
     return res;
 }
@@ -941,4 +946,55 @@ test "elide mode still elides (it is free) but never asks for a summary" {
     // And the only difference is the request that `elide` refuses to spend.
     try std.testing.expect(full.needs_summary);
     try std.testing.expect(!elide.needs_summary);
+}
+
+test "isCriticalMessage: goal note, plan, and prior summary are critical" {
+    const goal = .{ .role = "user", .content = "\u{1}ZODE-GOAL\u{1}build something" };
+    try std.testing.expect(compaction.isCriticalMessage(goal));
+
+    const plan = .{ .role = "user", .content = "[Plan] do this then that" };
+    try std.testing.expect(compaction.isCriticalMessage(plan));
+
+    const summary = .{ .role = "user", .content = "[earlier conversation summarized to fit the context budget]" };
+    try std.testing.expect(compaction.isCriticalMessage(summary));
+
+    const ordinary = .{ .role = "user", .content = "just a regular message" };
+    try std.testing.expect(!compaction.isCriticalMessage(ordinary));
+
+    const empty = .{ .role = "user", .content = "" };
+    try std.testing.expect(!compaction.isCriticalMessage(empty));
+}
+
+test "elideTier: critical messages are never elided even under a tiny budget" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // recent_window=2 so that protect_from > 0 and tier 1 actually runs.
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_RECENT_WINDOW", "2");
+
+    const big_tool = "x" ** 4000;
+    var msgs = try arena.alloc(chat.ChatMessage, 8);
+    msgs[0] = .{ .role = "system", .content = "sys" };
+    msgs[1] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c1" };
+    msgs[2] = .{ .role = "user", .content = "\u{1}ZODE-GOAL\u{1}the goal must survive" };
+    msgs[3] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c2" };
+    msgs[4] = .{ .role = "user", .content = "[Plan] step one, step two" };
+    msgs[5] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c3" };
+    msgs[6] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c4" };
+    msgs[7] = .{ .role = "tool", .content = big_tool, .tool_call_id = "c5" };
+
+    // Budget so low that everything non-critical should be elided.
+    const res = try elideTier(arena, msgs, 100, &env, .full);
+    // msgs[2] (goal) and msgs[4] (plan) are not tools, never elided by tier 1.
+    // msgs[1] and [3] are tools but NOT critical → should be elided.
+    // msgs[6] and [7] are in the recent window (last 2) → never elided.
+    try std.testing.expectEqual(2, res.elided);
+    try std.testing.expect(std.mem.eql(u8, msgs[1].content, "[tool result elided"));
+    try std.testing.expect(std.mem.eql(u8, msgs[3].content, "[tool result elided"));
+    // Recent window ones stay verbatim.
+    try std.testing.expect(std.mem.eql(u8, msgs[6].content, big_tool));
+    try std.testing.expect(std.mem.eql(u8, msgs[7].content, big_tool));
 }
