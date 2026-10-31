@@ -1802,6 +1802,12 @@ fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
 /// Tool results elided in the session (for /context).
 pub var session_elided: usize = 0;
 
+/// Compactación en background: se lanza cuando el contexto alcanza el umbral
+/// "warm" (`ZODE_COMPACT_BG_PCT`, default 80%) y su resultado está listo antes
+/// de llegar al umbral "hot" (`ZODE_COMPACT_HOT_PCT`, default 90%), así el
+/// usuario no espera la compactación síncrona.
+pub var compact_bg: compaction.CompactBgState = .{};
+
 /// Has the TUI already summarized the old turns in this session?
 ///
 /// Tier 2 compaction: the LLM request that summarizes the old stretch.
@@ -3149,11 +3155,13 @@ pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Sessi
         session = s;
         m.session = s;
         cache_stats.session = .{};
+        compact_bg = .{};
         return s;
     };
     session = fresh;
     m.session = fresh;
     cache_stats.session = .{};
+    compact_bg = .{};
     return fresh;
 }
 
@@ -6219,6 +6227,8 @@ fn attachPlanContext(m: *tui.Model, s: *session_mod.Session) void {
 
 fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     _ = user_text;
+    // Refresh ctx_pct so the background-compaction thresholds see a real number.
+    refreshContextUsage(m);
     const gpa = m.allocator;
     const s = ensureSession(m, gpa);
     // Clock of the TURN (not of the stream): it is what is painted in
@@ -6344,16 +6354,81 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     }
 
     const cmode = compaction.effectiveMode(m.environ, m.compact_mode);
-    const comp: compaction.Compacted = if (cmode == .off)
-        compaction.nothingElided(msgs0)
-    else
-        compaction.elideTier(
-            arena,
+    const bg_pct = compaction.bgPct(m.environ);
+    const hot_pct = compaction.hotPct(m.environ);
+
+    // 1. Lanzar compactación en background cuando cruzamos el umbral "warm".
+    // No bloquea al usuario; el hilo trabaja mientras el turno sigue.
+    if (cmode != .off and ctx_pct >= bg_pct) {
+        _ = compaction.tryLaunchBg(
+            &compact_bg,
+            gpa,
             msgs0,
-            compaction.budgetFor(m.environ, curModelContext()),
             m.environ,
-            cmode,
-        ) catch compaction.nothingElided(msgs0);
+            curModelContext(),
+        );
+    }
+
+    // 2. Umbral "hot": si ya cruzamos el crítico, necesitamos el resultado
+    // YA. Usamos el del background si está listo; si no, fallback síncrono.
+    // 3. Incluso por debajo de hot, si hay un resultado de background listo,
+    //    lo aplicamos para mantener el contexto bajo antes de llegar al crítico.
+    var used_bg = false;
+    var comp = compaction.nothingElided(msgs0);
+    if (cmode != .off) {
+        if (ctx_pct >= hot_pct) {
+            if (compaction.tryCollectBg(&compact_bg)) |bg| {
+                used_bg = true;
+                comp = compaction.Compacted{
+                    .msgs = bg.msgs,
+                    .elided = bg.elided,
+                    .elided_at = bg.elided_at,
+                    .needs_summary = bg.needs_summary,
+                    .summary_upto = bg.summary_upto,
+                };
+            } else {
+                comp = compaction.elideTier(
+                    arena,
+                    msgs0,
+                    compaction.budgetFor(m.environ, curModelContext()),
+                    m.environ,
+                    cmode,
+                ) catch compaction.nothingElided(msgs0);
+            }
+        } else if (compaction.tryCollectBg(&compact_bg)) |bg| {
+            used_bg = true;
+            comp = compaction.Compacted{
+                .msgs = bg.msgs,
+                .elided = bg.elided,
+                .elided_at = bg.elided_at,
+                .needs_summary = bg.needs_summary,
+                .summary_upto = bg.summary_upto,
+            };
+        } else {
+            comp = compaction.elideTier(
+                arena,
+                msgs0,
+                compaction.budgetFor(m.environ, curModelContext()),
+                m.environ,
+                cmode,
+            ) catch compaction.nothingElided(msgs0);
+        }
+    }
+
+    // Si usamos el resultado del background, sus buffers viven en el gpa del
+    // hilo y no en el arena del turno: no podemos marcarlos como elided_at
+    // para el read cache (no son del mismo allocador). Solo marcamos cuando
+    // la compactación fue síncrona (arena del turno).
+    if (!used_bg) {
+        if (comp.elided > session_elided) {
+            session_elided = comp.elided;
+            const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
+            pushInfoOwned(m, msg);
+        }
+        // [readcache] What compaction took away is NOT in the context anymore,
+        // so the read cache has to forget it.
+        for (comp.elided_at) |idx| m.reads.markDroppedAt(idx);
+    }
     // Which files went in with the prompt. Without this line the user sees the
     // model "knowing" something nobody showed it, and with a 30 KB file that
     // also changes the context spend without any prior notice.
@@ -17080,51 +17155,45 @@ test "prepareImageFor: an image over max_bytes is refused naming the file and th
     try std.testing.expectEqual(@as(usize, 0), pending.len);
 }
 
-test "prepareImageFor: too many images already waiting is refused naming the file" {
+test "prepareImageFor: a full waiting list is refused naming the file" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     io_global = threaded.io();
     defer io_global = undefined;
 
-    // Fill pending up to max_images with small images.
-    const first_two = [_][]const u8{"prepare_image_a.png", "prepare_image_b.png"};
-    for (first_two) |path| {
-        try std.Io.Dir.cwd().writeFile(io_global, .{
-            .sub_path = path,
-            .data = "iVBORw0KGgo",
-        });
-    }
-    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_a.png") catch {};
-    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_b.png") catch {};
-
+    // Fill pending to the brim and then one more. Every count comes from
+    // `max_images`, so the test says the same thing whatever the cap is.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
+    const n_total = images_mod.max_images + 1;
+    var names: [n_total][]const u8 = undefined;
+    var i: usize = 0;
+    while (i < n_total) : (i += 1) {
+        names[i] = try std.fmt.allocPrint(gpa, "prepare_image_{d}.png", .{i});
+        try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = names[i], .data = "iVBORw0KGgo" });
+    }
+    defer for (names) |nm| std.Io.Dir.cwd().deleteFile(io_global, nm) catch {};
+
     var pending = images_mod.Pending{};
     defer pending.clear(gpa);
 
-    // Attach the first two.
-    for (first_two) |path| {
+    // Fill it exactly.
+    for (names[0..images_mod.max_images]) |path| {
         const args = try std.fmt.allocPrint(gpa, "{{ \"path\": \"{s}\" }}", .{path});
-        const res = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args) orelse return;
-        _ = res;
+        _ = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args) orelse return;
         gpa.free(args);
     }
-    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqual(images_mod.max_images, pending.len);
 
-    // A third image should be refused by the count cap.
-    try std.Io.Dir.cwd().writeFile(io_global, .{
-        .sub_path = "prepare_image_c.png",
-        .data = "iVBORw0KGgo",
-    });
-    defer std.Io.Dir.cwd().deleteFile(io_global, "prepare_image_c.png") catch {};
-
-    const args_c = "{\"path\":\"prepare_image_c.png\"}";
-    const res = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args_c) orelse return;
-    try std.testing.expect(std.mem.indexOf(u8, res, "prepare_image_c.png") != null);
+    // The one that does not fit is refused BY NAME, and holds nothing.
+    const over = names[images_mod.max_images];
+    const args_over = try std.fmt.allocPrint(gpa, "{{ \"path\": \"{s}\" }}", .{over});
+    defer gpa.free(args_over);
+    const res = prepareImageFor(gpa, io_global, &pending, "gpt-4o", args_over) orelse return;
+    try std.testing.expect(std.mem.indexOf(u8, res, over) != null);
     try std.testing.expect(std.mem.indexOf(u8, res, "Too many images already waiting") != null);
     try std.testing.expect(std.mem.indexOf(u8, res, "NOT attached") != null);
-    // Still only 2 held.
-    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqual(images_mod.max_images, pending.len);
 }
