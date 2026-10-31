@@ -54,17 +54,18 @@ const store = @This();
 /// carry around: at 1024 the 256 entries were 288 KB INSIDE the model, which is
 /// zeroed on every `Model.init` and shows up in the RSS (`tools/measure.py` went
 /// from 5.2 MB to 8.4 MB before this was cut).
-pub const path_max = 512;
+pub const path_max = 2048;
 /// Line ranges per file. Real sessions re-read a handful of places in the same
 /// file; 8 is enough and keeps the entry small.
-pub const max_ranges = 8;
+pub const max_ranges = 32;
 /// Files remembered. Past this the least recently used one is dropped, which is
 /// a cache miss and not an error.
 ///
-/// 128 and not 256 for the same reason as `path_max`: the table lives inside the
-/// `Model`, by value, and a turn of real work touches maybe twenty files. The
-/// entry is 640 bytes, so this is 80 KB the app carries instead of 160.
-pub const max_entries = 128;
+/// The physical array is `max_entries_physical` (512). The *active* count is
+/// `Cache.max_entries_active`, scaled by the model's context window via
+/// `Cache.configure`. Default is `max_entries_default` (128) for small windows.
+pub const max_entries_physical: usize = 512;
+pub const max_entries_default: usize = 128;
 
 pub const Range = struct {
     /// 1-indexed, inclusive, like the `read` tool's own `offset`.
@@ -176,7 +177,10 @@ pub const Stats = struct {
 };
 
 pub const Cache = struct {
-    entries: [max_entries]Entry = undefined,
+    entries: [max_entries_physical]Entry = undefined,
+    /// How many entries are actually in use. Scaled by `configure(model_ctx)`:
+    /// bigger window = more files remembered = fewer re-reads.
+    max_entries_active: usize = max_entries_default,
     len: usize = 0,
     stats: Stats = .{},
     /// The clock for `used`, so LRU does not need a real timestamp. A counter is
@@ -200,6 +204,13 @@ pub const Cache = struct {
         return self.clock;
     }
 
+    /// Scale the active entry count by the model's context window. Bigger
+    /// window = more files remembered = fewer re-reads on long sessions.
+    /// Called when the model is chosen or rotated.
+    pub fn configure(self: *Cache, model_ctx: u32) void {
+        self.max_entries_active = if (model_ctx >= 1_000_000) 512 else if (model_ctx >= 256_000) 256 else 128;
+    }
+
     /// The entry for `path`, or null. The caller holds the lock.
     pub fn find(self: *Cache, path: []const u8) ?*Entry {
         for (self.entries[0..self.len]) |*e| {
@@ -209,7 +220,7 @@ pub const Cache = struct {
     }
 
     fn push(self: *Cache) *Entry {
-        if (self.len < max_entries) {
+        if (self.len < self.max_entries_active) {
             const e = &self.entries[self.len];
             self.len += 1;
             return e;

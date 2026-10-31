@@ -34,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - double-threshold background compaction (compaction) [`83e6e75b`](https://github.com/jesusalcaladev/zode/commit/83e6e75b)
 - protect goal/plan/summary from tier-2 summarization (compaction) [`feb19952`](https://github.com/jesusalcaladev/zode/commit/feb19952)
 - distinct status panels with context progress bar (ui) [`bf2b68cc`](https://github.com/jesusalcaladev/zode/commit/bf2b68cc)
-- adaptive budget and thresholds by window size (compaction) [`65568deb`](https://github.com/jesusalcaladev/zode/commit/65568deb)
+- adaptive budget and thresholds by window size (compaction) [`4ecf16dc`](https://github.com/jesusalcaladev/zode/commit/4ecf16dc)
+- read cache scales with model context window (cache) [`23b7eb50`](https://github.com/jesusalcaladev/zode/commit/23b7eb50)
 
 ### Bug Fixes
 

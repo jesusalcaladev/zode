@@ -6377,6 +6377,9 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     const cur_ctx = curModelContext();
     const bg_pct = compaction.bgPct(m.environ, cur_ctx);
     const hot_pct = compaction.hotPct(m.environ, cur_ctx);
+    // Scale the read cache by window size: bigger window = more files
+    // remembered = fewer re-reads on long sessions.
+    m.reads.configure(cur_ctx);
 
     // 1. Lanzar compactación en background cuando cruzamos el umbral "warm".
     // No bloquea al usuario; el hilo trabaja mientras el turno sigue.
