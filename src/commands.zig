@@ -392,7 +392,7 @@ test "cost command says there is nothing to price before the first turn" {
     try std.testing.expect(std.mem.indexOf(u8, text, "no provider-reported usage yet") != null);
 }
 
-test "usage command shows unified panel with usage info" {
+test "usage command shows the usage panel with token info" {
     agent.cacheSessionStatsForTest().* = .{};
     defer agent.cacheSessionStatsForTest().* = .{};
     agent.cacheSessionStatsForTest().record(.{ .prompt = 12_345, .cached = 10_000, .completion = 678 });
@@ -404,13 +404,12 @@ test "usage command shows unified panel with usage info" {
     var all: std.ArrayList(u8) = .empty;
     defer all.deinit(std.testing.allocator);
     for (m.pending.items) |item| try all.appendSlice(std.testing.allocator, item.text);
-    // Unified panel shows version, model, permissions, compaction, usage, session
+    // The usage panel: version header, request totals, token breakdown.
     try std.testing.expect(std.mem.indexOf(u8, all.items, "usage") != null);
     try std.testing.expect(std.mem.indexOf(u8, all.items, "12,345") != null); // input tokens
     try std.testing.expect(std.mem.indexOf(u8, all.items, "678") != null); // output tokens
     try std.testing.expect(std.mem.indexOf(u8, all.items, "10,000") != null); // cache reads
-    try std.testing.expect(std.mem.indexOf(u8, all.items, "permissions:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all.items, "compaction:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "requests:") != null);
 }
 
 /// `/compact [off|elide|full|default]`: what automatic compaction is allowed to do.
@@ -522,8 +521,8 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
 /// task, and it is worked with the objective attached. That ordering is deliberate.
 /// Draws a horizontal progress bar: 20 cells wide, █ = filled, ░ = empty.
 /// `pct` is 0..100. Returns the rendered bytes (no trailing newline).
-fn renderProgressBar(m: *tui.Model, pct: u8, out: []u8) []const u8 {
-    const filled = @min(20, @max(0, @intFromFloat(@as(f64, @floatFromInt(pct)) / 5.0)));
+fn renderProgressBar(pct: u8, out: []u8) []const u8 {
+    const filled: usize = @min(@as(usize, 20), @as(usize, @intFromFloat(@as(f64, @floatFromInt(pct)) / 5.0)));
     var gi: usize = 0;
     var i: usize = 0;
     while (i < filled) : (i += 1) {
@@ -567,12 +566,12 @@ pub fn cmdStatus(m: *tui.Model) void {
     defer astate.deinit();
     const msgs = agent.snapshotMsgs(astate.allocator());
     const used = compaction.estimateTokens(msgs);
-    const pct_used = @intFromFloat(@as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(@max(1, limit))) * 100.0);
+    const pct_used: f64 = @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(@max(1, limit))) * 100.0;
     var gauge_buf: [64]u8 = undefined;
-    const bar = renderProgressBar(m, pct_used, &gauge_buf);
+    const bar = renderProgressBar(@intFromFloat(@min(@as(f64, 100.0), @max(@as(f64, 0.0), pct_used))), &gauge_buf);
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   [{s}] ~{d} / {d} tokens ({d:.1}% of limit)", .{ bar, used, limit, pct_used }) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
-    agent.pushInfoOwned(m, "") catch return;
+    agent.pushInfoOwned(m, "");
 }
 
 /// `/config`: configuration that is actually in effect — env vars, compaction
@@ -607,7 +606,7 @@ pub fn cmdConfig(m: *tui.Model) void {
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ hot threshold (sync): {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct}) catch return);
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ recent window:        {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)}) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
-    agent.pushInfoOwned(m, "") catch return;
+    agent.pushInfoOwned(m, "");
 }
 
 /// `/usage`: session token usage — requests, input/output, cache hits, read
@@ -649,7 +648,7 @@ pub fn cmdUsage(m: *tui.Model) void {
     }
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ elided this session: {d} tool results", .{agent.session_elided}) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
-    agent.pushInfoOwned(m, "") catch return;
+    agent.pushInfoOwned(m, "");
 }
 
 /// `/goal` on its own would have to invent a task, and a prompt like "make the package
@@ -686,7 +685,7 @@ pub fn cmdDoctor(m: *tui.Model) void {
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   dir:   {s}/", .{session_mod.sessions_dir}) catch return);
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   elided results this session: {d}", .{agent.session_elided}) catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
-    agent.pushInfoOwned(m, "") catch return;
+    agent.pushInfoOwned(m, "");
 }
 
 pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
@@ -1228,8 +1227,8 @@ pub const commands = [_]Cmd{
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
     .{ .key = "/doctor", .desc = "diagnosis: model, effort, style, permissions, key, compaction, sessions" },
-    .{ .key = "/config", .desc = "unified panel: model, effort, style, permissions, compaction, usage, session" },
-    .{ .key = "/status", .desc = "unified panel: model, effort, style, permissions, compaction, usage, session" },
+    .{ .key = "/config", .desc = "effective configuration: limits, budgets, compact thresholds, recent window" },
+    .{ .key = "/status", .desc = "session status: model, effort, perms, compaction, context gauge", .key_hint = "context gauge" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
     .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
@@ -1351,10 +1350,10 @@ test "cmdDoctor runs without crashing and names itself" {
     const text = try pendingText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "doctor") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "model:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "permissions:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "compaction:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "sessions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mode:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "yolo:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "compact:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sessions") != null);
 }
 
 test "/usage and /doctor are dispatched by submit, not just listed" {
@@ -1378,6 +1377,6 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         const text = try pendingText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
         try std.testing.expect(std.mem.indexOf(u8, text, "— doctor") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "diagnosis:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "yolo:") != null);
     }
 }

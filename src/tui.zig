@@ -612,29 +612,35 @@ fn buildCodeBlockLines(
 ) ![]const PLine {
     // ── first pass: build every line's cells and find the max width ─────────
     var raw_lines: std.ArrayList([]const CellRun) = .empty;
-    var max_w: u16 = 0;
+    var max_w: usize = 0;
     for (blk.lines) |src| {
         var cells: std.ArrayList(CellRun) = .empty;
+        // Display COLUMNS, not grapheme count: one full-width glyph used to
+        // shift the whole right border a column left of where it is painted.
+        var ln_w: usize = 0;
         for (src) |seg| {
             var it = vaxis.unicode.graphemeIterator(seg.text);
             while (it.next()) |g| {
                 const b = g.bytes(seg.text);
+                const gw = theme.graphemeWidth(ctx, b);
                 try cells.append(pa, .{
                     .text = b,
-                    .w = theme.graphemeWidth(ctx, b),
+                    .w = gw,
                     .style = seg.style,
                 });
+                ln_w += gw;
             }
         }
         try raw_lines.append(pa, cells.items);
-        const ln_w: u16 = @intCast(cells.items.len);
         if (ln_w > max_w) max_w = ln_w;
     }
 
-    // Inner width: code text + left gutter `│ ` + right gutter ` │`
-    const inner_w: u16 = if (max_w > 0) max_w else 0;
-    const box_w: u16 = if (inner_w + 4 > width) width else inner_w + 4;
-    const text_w: u16 = if (box_w > 4) box_w - 4 else 0;
+    // Inner width: code text + left gutter `│ ` + right gutter ` │`. A line
+    // wider than that WRAPS inside the box (third pass), so `max_w` sizes the
+    // box but never pushes it past the terminal.
+    const inner_w: u16 = @intCast(@min(max_w, std.math.maxInt(u16)));
+    const box_w: u16 = @min(inner_w + 4, width);
+    const text_w: u16 = box_w -| 4;
 
     var lines: std.ArrayList(PLine) = .empty;
 
@@ -643,7 +649,7 @@ fn buildCodeBlockLines(
         var cells: std.ArrayList(CellRun) = .empty;
         try cells.append(pa, .{ .text = "╭", .w = 1, .style = theme.code_border });
         var i: u16 = 1;
-        while (i < box_w - 1) : (i += 1) {
+        while (i < box_w -| 1) : (i += 1) {
             try cells.append(pa, .{ .text = "─", .w = 1, .style = theme.code_border });
         }
         try cells.append(pa, .{ .text = "╮", .w = 1, .style = theme.code_border });
@@ -655,20 +661,28 @@ fn buildCodeBlockLines(
         var cells: std.ArrayList(CellRun) = .empty;
         try cells.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
         try cells.append(pa, .{ .text = "▚ ", .w = 2, .style = theme.code_lang });
+        var lang_w: u16 = 0;
         var it = vaxis.unicode.graphemeIterator(blk.lang);
         while (it.next()) |g| {
             const b = g.bytes(blk.lang);
+            const gw = theme.graphemeWidth(ctx, b);
+            // A lang longer than the box is CLIPPED, not allowed to push the
+            // closing ` │` past the border: the box width is what the code
+            // lines say it is.
+            if (4 + lang_w + gw + 2 > box_w) break;
+            lang_w += gw;
             try cells.append(pa, .{
                 .text = b,
-                .w = theme.graphemeWidth(ctx, b),
+                .w = gw,
                 .style = theme.code_lang,
             });
         }
-        // pad to fill the box width
-        var used: u16 = 4; // │ ▚ + lang
-        for (blk.lang) |_| { used += 1; } // approx; grapheme width would be better
-        // simpler: fill rest with background
-        const pad: u16 = if (box_w > used) box_w - used else 0;
+        // `│ ` + `▚ ` + lang + pad + ` │` = box_w, the same width the code
+        // rows get. It used to be computed from the BYTE length of the lang
+        // and then the closing ` │` was added on top: the chip row hung two
+        // columns past the borders while every code row fell two short.
+        const used: u16 = 4 + lang_w;
+        const pad: u16 = box_w -| used -| 2;
         var i: u16 = 0;
         while (i < pad) : (i += 1) {
             try cells.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
@@ -677,25 +691,32 @@ fn buildCodeBlockLines(
         try lines.append(pa, .{ .cells = cells.items, .w = box_w });
     }
 
-    // ── code lines ──────────────────────────────────────────────────────────
-    for (raw_lines.items) |cells| {
-        var out: std.ArrayList(CellRun) = .empty;
-        try out.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
-        for (cells) |c| {
-            var st = c.style;
-            st.bg = theme.code_bg.bg;
-            try out.append(pa, .{ .text = c.text, .w = c.w, .style = st });
+    // ── code lines, wrapped to `text_w` columns inside the box ──────────────
+    for (raw_lines.items) |src| {
+        var i: usize = 0;
+        while (true) {
+            var out: std.ArrayList(CellRun) = .empty;
+            try out.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
+            var used: u16 = 0;
+            while (i < src.len) : (i += 1) {
+                const c = src[i];
+                if (used + c.w > text_w) break;
+                var st = c.style;
+                st.bg = theme.code_bg.bg;
+                try out.append(pa, .{ .text = c.text, .w = c.w, .style = st });
+                used += c.w;
+            }
+            // A box this narrow fits no cell at all: drop the rest of the
+            // line, or the chunk loop below never advances.
+            if (text_w == 0) i = src.len;
+            var pad: u16 = text_w -| used;
+            while (pad > 0) : (pad -= 1) {
+                try out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
+            }
+            try out.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
+            try lines.append(pa, .{ .cells = out.items, .w = box_w });
+            if (i >= src.len) break;
         }
-        // pad to text_w
-        var used: u16 = 2;
-        for (cells) |c| used += c.w;
-        const pad: u16 = if (text_w > used) text_w - used else 0;
-        var i: u16 = 0;
-        while (i < pad) : (i += 1) {
-            try out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
-        }
-        try out.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
-        try lines.append(pa, .{ .cells = out.items, .w = box_w });
     }
 
     // ── bottom border ───────────────────────────────────────────────────────
@@ -703,7 +724,7 @@ fn buildCodeBlockLines(
         var cells: std.ArrayList(CellRun) = .empty;
         try cells.append(pa, .{ .text = "╰", .w = 1, .style = theme.code_border });
         var i: u16 = 1;
-        while (i < box_w - 1) : (i += 1) {
+        while (i < box_w -| 1) : (i += 1) {
             try cells.append(pa, .{ .text = "─", .w = 1, .style = theme.code_border });
         }
         try cells.append(pa, .{ .text = "╯", .w = 1, .style = theme.code_border });
@@ -786,69 +807,6 @@ fn buildLinesBase(
         return one;
     }
     return lines.items;
-}
-
-/// Row with the language chip, above the code block.
-///
-/// `▚ zig` in the dim style. Before there was nothing: the ```zig fence
-/// disappeared and there was no way to tell which language the code was in.
-fn appendChip(
-    pa: std.mem.Allocator,
-    ctx: vxfw.DrawContext,
-    lines: *std.ArrayList(PLine),
-    lang: []const u8,
-) !void {
-    var cells: std.ArrayList(CellRun) = .empty;
-    try cells.append(pa, .{ .text = "▚ ", .w = 2, .style = theme.code_gutter });
-    var it = vaxis.unicode.graphemeIterator(lang);
-    while (it.next()) |g| {
-        const b = g.bytes(lang);
-        try cells.append(pa, .{
-            .text = b,
-            .w = theme.graphemeWidth(ctx, b),
-            .style = theme.code_lang,
-        });
-    }
-    try wrapCells(pa, lines, cells.items, 0xffff, 0);
-}
-
-/// Puts the `│` gutter in front of the block's lines and gives them a
-/// background.
-///
-/// The background is applied to the cell of EVERY grapheme, which is the only
-/// way to make the surface paint it: a `bg` in a style paints nothing if the
-/// cell is not written with that style.
-fn applyCodeGutter(
-    pa: std.mem.Allocator,
-    lines: []PLine,
-    width: u16,
-) void {
-    for (lines) |*ln| {
-        if (ln.cells.len == 0) continue; // blank line: no gutter
-        // The text already comes wrapped to `width - 2` (the gutter was
-        // reserved before), so the background is filled with whatever is
-        // missing up to the border.
-        const used: u16 = @intCast(@min(ln.w + 2, width));
-        const pad: u16 = if (width > used) width - used else 0;
-
-        var out: std.ArrayList(CellRun) = .empty;
-        // `│` + space in front: the block reads as a block.
-        out.append(pa, .{ .text = "\u{2502} ", .w = 2, .style = theme.code_gutter }) catch return;
-        // The background goes BEHIND THE CODE, not only on the trailing pad. With
-        // only the pad painted, the block was a dark stripe whose width changed
-        // from row to row on any terminal whose background is not exactly
-        // #1a1b26, and the doc comment claimed a background it never drew.
-        for (ln.cells) |c| {
-            var st = c.style;
-            st.bg = theme.code_bg.bg;
-            out.append(pa, .{ .text = c.text, .w = c.w, .style = st }) catch return;
-        }
-        var i: u16 = 0;
-        while (i < pad) : (i += 1) {
-            out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg }) catch return;
-        }
-        ln.* = .{ .cells = out.items, .w = @min(used + pad, width) };
-    }
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -947,6 +905,18 @@ pub const Model = struct {
     input_err: []const u8 = "",
     input_too_long: bool = false,
 
+    /// Bracketed-paste aggregation.
+    ///
+    /// vaxis forwards `paste_start`/`paste_end` as boundary markers and parses
+    /// everything between them as ordinary key events. Without aggregation a
+    /// 40-line paste submits 40 prompts: every Enter inside the paste reaches
+    /// `submitInput` like a real keypress, each line echoes as its own `›`
+    /// paragraph and queues behind the worker the first line started. While
+    /// `pasting` is set, key events accumulate in `paste_buf` and go into the
+    /// editor in one insert when the paste ends.
+    pasting: bool = false,
+    paste_buf: std.ArrayList(u8) = .empty,
+
     /// Raw paragraphs (owned). The parse into blocks is on-demand in draw,
     /// with an arena: the memory lives for one frame, we don't accumulate
     /// styles.
@@ -959,8 +929,8 @@ pub const Model = struct {
     /// Without this, sending a second prompt while the first one was working
     /// launched ANOTHER worker and the two fought over the session and the
     /// streaming state: the input froze, the history got cut off and there was
-    /// no way to tell whether it was working. Now they are queued and the
-    /// worker pulls them out as it finishes its turn.
+    /// no way to tell whether it was working. Now they are queued and the UI
+    /// tick starts them as soon as no turn is in flight.
     queue: std.ArrayList([]u8) = .empty,
 
     /// The visible plan (the `todo` tool). The worker writes it from another
@@ -992,6 +962,9 @@ pub const Model = struct {
     /// Moment the current turn started, in nanoseconds, for the footer's
     /// clock. 0 = no turn. Written by `streamStart`.
     busy_started_ns: i128 = 0,
+    /// ESC stopped the turn in flight. The face says `warn` until the next turn
+    /// starts: a cancelled harness did not finish, and `done` would be a lie.
+    cancelled: bool = false,
     /// Time until the FIRST token of the last stream (ms), and whether the
     /// stream in progress already has text.
     ///
@@ -1297,6 +1270,11 @@ pub const Model = struct {
     /// same reason — and because a cached image prefix is a permanently uncacheable
     /// tail on every subsequent iteration.
     pending_images: images_mod.Pending = .{},
+    /// Images the USER staged for the message being typed (Ctrl+V off the
+    /// clipboard). They move to `pending_images` at submit and die with a
+    /// Ctrl+C'd draft: a staged image belongs to the text it was pasted next
+    /// to, and the two must never disagree about what is being sent.
+    draft_images: images_mod.Pending = .{},
     /// The automatic typecheck the harness starts after a write tool touches code.
     ///
     /// It is a struct and not three fields because the headless runner keeps one on
@@ -1461,7 +1439,7 @@ pub const Model = struct {
     ///
     /// It is resolved from the provider's CACHED catalogue (never from the
     /// network: the draw runs at 60 fps and must not block on a socket), and
-    /// re-resolved on `/use`, `/provider` and `/model`. `0` means "not yet", not
+    /// re-resolved on `/provider` and `/model`. `0` means "not yet", not
     /// "empty", because "not yet" is the one that should look up again.
     status_model_len: usize = 0,
     status_model_buf: [128]u8 = undefined,
@@ -1528,8 +1506,6 @@ pub const Model = struct {
     const max_cached_paras = 64;
 
     const SelectionPoint = struct { row: u16, col: u16 };
-    /// Range of absolute history lines that are visible on screen for a paragraph.
-    const VisibleRange = struct { start: usize, end: usize };
 
     const Para = struct {
         kind: md.Kind,
@@ -1805,6 +1781,7 @@ pub const Model = struct {
         // leaks on exit.
         self.clearQueue();
         self.queue.deinit(self.allocator);
+        self.paste_buf.deinit(self.allocator);
         for (self.shell_out.items) |so| {
             self.allocator.free(so.cmd);
             self.allocator.free(so.text);
@@ -1872,7 +1849,7 @@ pub const Model = struct {
 
     // ── modal picker ──────────────────────────────────
     /// Opens the picker. Takes ownership of `items` (labels/descs gpa-owned).
-    /// Thread-safe: called by the /models worker.
+    /// Thread-safe: called by the model catalog worker.
     pub fn openPicker(self: *Model, tag: u32, title: []const u8, items: []PickerItem, cb: PickerCb) void {
         self.openPickerInner(tag, title, items);
         self.lock();
@@ -2784,30 +2761,74 @@ pub const Model = struct {
 
     fn estHeight(self: *const Model, text: []const u8) usize {
         const per_line: usize = @intCast(self.wrap_w);
-        const nl = std.mem.count(u8, text, "\n");
-        const wrapped = if (per_line > 0) (text.len -| nl) / per_line else 0;
-        // A fence costs three rows the line count cannot see: a blank row, the
-        // language chip and another blank row. Counting them here is what stops
-        // the scroll range from growing as you scroll down through a history
-        // full of code.
-        const fences = std.mem.count(u8, text, "```") + std.mem.count(u8, text, "~~~");
-        // Saturating arithmetic: a pathological text cannot overflow usize.
-        const fence_cost: usize = satMul(3, fences);
-        return @max(1, satAdd(satAdd(satAdd(nl, 1), wrapped), fence_cost));
+        // The wrap is counted PER LINE, not as "every line is as wide as the
+        // terminal".
+        //
+        // It used to be `(text.len - nl) / per_line` added to `nl + 1`, which
+        // charges every line the extra rows of a FULL line. Prose is the shape
+        // that breaks it: a 2.5 KB answer in 43 short lines estimated 70 rows
+        // for a paragraph that renders in 48, and the overshoot is not
+        // cosmetic — the estimate holds the scroll until the parse corrects it,
+        // and the bigger the gap, the bigger the jump the reader feels (this
+        // was the era of "it finished and left an empty space").
+        //
+        // A line of `n` bytes takes `ceil(n / per_line)` rows and never fewer
+        // than one. Bytes stand in for columns: this is an estimate, and a
+        // multi-byte character only makes it a little bigger, never smaller.
+        var rows: usize = 0;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            const line_rows: usize = if (per_line == 0 or line.len <= per_line)
+                1
+            else
+                line.len / per_line + @intFromBool(line.len % per_line != 0);
+            rows = satAdd(rows, line_rows);
+        }
+        // A fenced block adds rows the line count cannot see, but NOT the
+        // three-per-marker this used to charge: the fence LINES themselves
+        // become the top and bottom borders (1:1 with the rows already
+        // counted), and the only extra row a closed block draws is its
+        // language chip. Charging 3 per marker made a code-heavy answer
+        // estimate six rows too tall per block, and an over-estimate is what
+        // paints the black holes: above the lazy-parse threshold the
+        // paragraph keeps this number as its height, so the scroll reserves
+        // rows the text never fills.
+        //
+        // Walking the lines (and not counting "```" occurrences) keeps the
+        // open/close state honest: an UNCLOSED fence (mid-stream) has no
+        // closing line to become the bottom border, so it adds one more row
+        // than a closed one.
+        var extra: usize = 0;
+        var in_block = false;
+        var fit = std.mem.splitScalar(u8, text, '\n');
+        while (fit.next()) |line| {
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (!std.mem.startsWith(u8, t, "```") and !std.mem.startsWith(u8, t, "~~~")) continue;
+            if (in_block) {
+                in_block = false; // the closing fence became the bottom border
+            } else {
+                in_block = true;
+                if (t.len > 3) extra += 1; // ```zig -> the chip row
+            }
+        }
+        if (in_block) extra += 1; // unclosed: a bottom border with no line behind it
+        return @max(1, satAdd(rows, extra));
     }
 
     /// Parses and wraps a paragraph, and puts it in the cache with its height.
     ///
-    /// When `visible_range` is provided (lazy parsing for very long paragraphs),
-    /// only the lines whose absolute positions fall within `[start, end)` are
-    /// wrapped. The paragraph's height is set to the full estimate so scroll
-    /// math stays correct, but only visible lines consume render memory.
+    /// ALWAYS the whole paragraph. An earlier version wrapped only the visible
+    /// lines of long ones and kept the ESTIMATE as the height forever, and that
+    /// was the last systematic hole in the transcript: an over-estimate reserved
+    /// rows the text never filled (the black space), an under-estimate clipped
+    /// the tail nobody had laid out (the erased output). The height is now,
+    /// always, whatever the painter actually produced, so the two cannot
+    /// disagree.
     fn layoutOne(
         self: *Model,
         ctx: vxfw.DrawContext,
         idx: usize,
         width: u16,
-        visible_range: ?Model.VisibleRange,
     ) !void {
         const p_ = &self.paras.items[idx];
 
@@ -2821,54 +2842,7 @@ pub const Model = struct {
         // Rehydrate if the paragraph was pruned to its compressed form.
         _ = p_.textLive(self.allocator);
 
-        // ── Lazy parsing: for very long paragraphs, only wrap visible lines ──
-        var para_for_layout = self.paras.items[idx];
-        if (visible_range) |vr| {
-            const para_start = self.heightPrefix(idx);
-            const para_end = self.heightPrefix(idx + 1);
-            // Clamp the requested range to this paragraph's actual lines.
-            const range_start = @max(vr.start, para_start);
-            const range_end = @min(vr.end, para_end);
-            if (range_end > range_start) {
-                // Extract only the visible lines from the text.
-                const text = p_.text;
-                // The list is created and grown from the SAME allocator it is
-                // handed to at the end: `toOwnedSlice` remaps the buffer, and a
-                // buffer from one allocator remapped through another is a jump
-                // through a vtable that has nothing to do with it (the arena one
-                // panics on its first empty node).
-                const vis_alloc = para_arena.allocator();
-                var visible_lines: std.ArrayList(u8) = .empty;
-                var line_start: usize = 0;
-                var line_idx: usize = 0;
-                var in_range = false;
-                // `indexOfScalar` answers an offset RELATIVE to `line_start`, so
-                // it has to be added back: read as an absolute position it made
-                // `line_end < line_start`, and `line_end - line_start` is then an
-                // integer overflow (the panic in the prune tests) that turns into
-                // a wrong slice in a Release build. And the loop ends at
-                // `line_start == text.len`, not after: past it there is no line,
-                // and `line_len` of 0 never advances.
-                while (line_start < text.len) {
-                    const nl = std.mem.indexOfScalar(u8, text[line_start..], '\n');
-                    const line_end = if (nl) |at| line_start + at else text.len;
-                    const line_len = if (nl != null) line_end - line_start + 1 else line_end - line_start;
-                    if (line_idx >= range_start and line_idx < range_end) {
-                        in_range = true;
-                        try visible_lines.appendSlice(vis_alloc, text[line_start..line_start + line_len]);
-                    } else if (in_range) {
-                        break;
-                    }
-                    line_start += line_len;
-                    line_idx += 1;
-                }
-                if (visible_lines.items.len > 0) {
-                    const visible_text = try visible_lines.toOwnedSlice(vis_alloc);
-                    para_for_layout.text = visible_text;
-                }
-            }
-        }
-        var lines = try buildLinesBase(para_arena.allocator(), ctx, &para_for_layout, width);
+        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_, width);
         // A blank row BETWEEN paragraphs: without it the history is a wall of
         // text and you can't see where one response ends and another begins.
         //
@@ -3084,7 +3058,19 @@ pub const Model = struct {
         var lines_used: usize = 0;
         var p = lo;
         while (p < self.para_heights.items.len and lines_used < viewport_rows) {
-            lines_used += self.para_heights.items[p];
+            // Only the rows of this paragraph that are INSIDE the window.
+            //
+            // It used to add the whole height, including the lines above
+            // `first_visible` of the paragraph that straddles the top. Those
+            // rows are not on screen, so they made the window look full one
+            // paragraph too early and the last visible paragraph was never
+            // parsed — it painted nothing, and its rows came out blank (the
+            // turn summary under an answer, for one).
+            const para_start = self.heightPrefix(p);
+            const para_end = satAdd(para_start, self.para_heights.items[p]);
+            const from = @max(para_start, first_visible);
+            const to = @min(para_end, last_visible);
+            lines_used = satAdd(lines_used, to -| from);
             visible_para_count += 1;
             p += 1;
         }
@@ -3151,36 +3137,15 @@ pub const Model = struct {
                 self.layout_overflow = true;
                 return;
             }
-            // ── Lazy parsing: for very long paragraphs, only wrap visible lines ──
-            const para_est_h = self.para_heights.items[idx];
-            const para_start = self.heightPrefix(idx);
-            const para_end = self.heightPrefix(idx + 1);
-            var visible_range: ?Model.VisibleRange = null;
-            if (para_est_h > 50) {
-                visible_range = Model.VisibleRange{
-                    .start = @max(first_visible, para_start),
-                    .end = @min(last_visible, para_end),
-                };
-            }
-            try self.layoutOne(ctx, idx, width, visible_range);
+            // The whole paragraph, always: the height the parse leaves behind
+            // (see `layoutOne`) is the painter's own line count, so the scroll
+            // math and the screen cannot disagree — which is exactly what the
+            // old lazy path, keeping the estimate above a row threshold, could
+            // not guarantee (holes when over, clipped text when under).
+            try self.layoutOne(ctx, idx, width);
             // Mark as recently used.
             if (self.seg_cache.items.len > 0) {
                 self.seg_cache.items[self.seg_cache.items.len - 1].last_frame_used = self.frame_counter;
-            }
-            // When lazy-parsing, lines.len is only the visible subset. Keep the
-            // full estimate in para_heights so scroll math stays correct.
-            if (visible_range == null) {
-                if (idx < self.para_heights.items.len) {
-                    self.para_heights.items[idx] = self.seg_cache.items[self.seg_cache.items.len - 1].height;
-                    self.setHeightTreeValue(idx, self.seg_cache.items[self.seg_cache.items.len - 1].height);
-                }
-                self.paras.items[idx].known_lines = self.seg_cache.items[self.seg_cache.items.len - 1].height;
-            } else {
-                // Lazy-parsed: keep the estimate, don't overwrite with partial height.
-                if (idx < self.para_heights.items.len) {
-                    self.setHeightTreeValue(idx, para_est_h);
-                }
-                self.paras.items[idx].known_lines = para_est_h;
             }
         }
 
@@ -3880,6 +3845,18 @@ pub const Model = struct {
         return first;
     }
 
+    /// Takes the next queued prompt ONLY when it is time to run one: the
+    /// queue is not empty and no turn is in flight. The caller starts it.
+    ///
+    /// The gate lives here, and not inline in the tick, because the starting
+    /// (`agent.startChat`) spawns threads and writes the session — nothing a
+    /// unit test can call — while the GATE is exactly what regresses when a
+    /// queued prompt is shown in the footer and never runs.
+    pub fn takeQueuedWhenIdle(self: *Model) ?[]u8 {
+        if (self.isBusy()) return null;
+        return self.takeQueued();
+    }
+
     /// The text of the NEXT queued prompt, without taking it out.
     ///
     /// It is what the footer shows: the count says there is a queue, and the
@@ -4135,6 +4112,7 @@ pub const Model = struct {
         defer self.unlock();
         self.streaming = true;
         self.busy = true;
+        self.cancelled = false;
         self.busy_started_ns = if (self.io_ready)
             std.Io.Timestamp.now(self.io, .real).nanoseconds
         else
@@ -4864,7 +4842,9 @@ pub const Model = struct {
     }
 
     /// Empties the visible history (Ctrl+L). The cached paragraphs are freed
-    /// and the on-disk session is left alone.
+    /// and the on-disk session is left alone. The plan block goes with the
+    /// transcript: a checklist written next to paragraphs that no longer
+    /// exist is orphaned noise above the input.
     pub fn clearHistory(self: *Model) void {
         self.clearSegCache();
         for (self.paras.items) |p| freePara(self.allocator, p);
@@ -4873,6 +4853,9 @@ pub const Model = struct {
         self.anchor_para = 0;
         self.anchor_off = 0;
         self.follow_bottom = true;
+        self.lock();
+        defer self.unlock();
+        self.plan.clear();
     }
 
     /// "There is work pending" snapshot under a single lock (the getters take
@@ -5420,13 +5403,6 @@ pub const Model = struct {
                 self.closePalette();
                 switch (agent.runPaletteCommand(self, cmd)) {
                     .done => {},
-                    .needs_args => {
-                        // Needs arguments: to the input, with the slash in
-                        // place.
-                        self.ed.clear();
-                        self.ed.insert(cmd) catch {};
-                        self.ed.insertChar(' ') catch {};
-                    },
                     .quit => ctx.quit = true,
                 }
                 ctx.redraw = true;
@@ -5602,6 +5578,13 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     if (trimmed.len == 0) {
         self.ed.clear();
         self.ac = .{};
+        if (!self.draft_images.isEmpty()) {
+            // Enter on an empty box with a staged image is not a message: the
+            // model gets bytes and no question. Say the image is still waiting
+            // instead of letting it ride on a message nobody typed.
+            self.pushInfo("· message is empty — the staged image goes with your next message");
+            ctx.redraw = true;
+        }
         return;
     }
     if (std.mem.eql(u8, trimmed, "/quit")) {
@@ -5619,6 +5602,12 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     // A new message from the user starts a new turn: images read in previous
     // turns do not ride along (short life, not cached between turns).
     self.pending_images.clear(self.allocator);
+    // Images the user staged with Ctrl+V DO ride along: they were pasted for
+    // this very message.
+    if (!self.draft_images.isEmpty()) {
+        self.pending_images = self.draft_images;
+        self.draft_images = .{};
+    }
 
     agent.submit(self, owned) catch |err| {
         // `pushInfoFmt` and NOT `allocPrint(ctx.alloc, …) + pushInfoOwned`: the
@@ -5659,18 +5648,21 @@ fn openShortcutsPicker(self: *Model) void {
     };
     const n = agent.shortcuts.len + modes.len;
     const items = gpa.alloc(PickerItem, n) catch return;
+    // The legend goes FIRST: the picker shows one page, and a legend appended
+    // after twenty-odd shortcuts is a legend nobody sees. It is also what the
+    // reader needs most — the shortcuts have their own keys printed on screen.
+    for (modes, 0..) |m, i| {
+        items[i] = .{
+            .label = gpa.dupe(u8, m[0]) catch return,
+            .desc = gpa.dupe(u8, m[1]) catch return,
+        };
+    }
     for (agent.shortcuts, 0..) |s, i| {
         // The palette OWNS the labels and frees them when it closes: a literal
         // here is an "Invalid free" on exit.
-        items[i] = .{
+        items[modes.len + i] = .{
             .label = gpa.dupe(u8, s.key) catch return,
             .desc = gpa.dupe(u8, s.desc) catch return,
-        };
-    }
-    for (modes, 0..) |m, i| {
-        items[agent.shortcuts.len + i] = .{
-            .label = gpa.dupe(u8, m[0]) catch return,
-            .desc = gpa.dupe(u8, m[1]) catch return,
         };
     }
     self.openPicker(9, "keyboard shortcuts", items, onShortcutPick);
@@ -5829,6 +5821,16 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
 
 /// Opens/updates the autocompletion based on what is in the input.
 fn syncAutocomplete(self: *Model) void {
+    // Every edit is a NEW query, so the list starts at its best match.
+    //
+    // The selection used to survive an edit: type `/mo`, arrow down to `/mode`,
+    // then keep typing, and the highlight stayed on whatever item now happened
+    // to hold that index — Enter accepted a command the user had not looked at.
+    // The arrows do not come through here, so browsing with them still keeps
+    // the selection where the reader put it.
+    self.ac.sel = 0;
+    self.ac.first = 0;
+
     if (Autocomplete.queryFor(self.ed.text())) |q| {
         setAcMode(self, .command, q.prefix_len);
         recomputeMatches(self);
@@ -5973,10 +5975,10 @@ fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return true;
 }
 
-/// Command name without the slash: "/use <prov> [model]" → "use".
+/// Command name without the slash: "/effort none|minimal|low|…" → "effort".
 ///
 /// Autocompletion matches against this and not against the whole line: with
-/// the whole line, "/mod" would match "/use <prov> [model]".
+/// the whole line, "/e" would match the argument vocabulary too.
 fn commandToken(key: []const u8) []const u8 {
     var k = key;
     if (k.len > 0 and k[0] == '/') k = k[1..];
@@ -6022,15 +6024,54 @@ fn acPrefix(self: *const Model) ?[]const u8 {
     };
 }
 
+/// How well a command answers the query, as a rank the list is built from.
+///
+///   0  the NAME starts with it                    (`/mo` → `/model`)
+///   1  the name contains it                       (`del` → `/submodel`)
+///   2  the name holds it as a SUBSEQUENCE         (`cp` → `/copy`)
+///   3  only the DESCRIPTION contains it           (`always` → `/allowlist`)
+///   4  no match
+///
+/// Rank 3 exists because the popup said it was a search and behaved like a
+/// completion: a word the user remembers from a description matched nothing.
+/// It is a FALLBACK, and that detail is the whole design: with descriptions in
+/// the same pass as names, `/mod` returned thirteen commands — the three
+/// `/mod*` ones buried in ten that merely mention "model" — and a filter that
+/// returns half the table is a filter that does not filter.
+///
+/// Rank 2 is the same subsequence matcher the palettes use (`lib/fuzzy.zig`,
+/// window and all), so the popup answers the abbreviations the modal answers.
+fn commandTier(c: anytype, q: []const u8) u8 {
+    const token = commandToken(c.key);
+    if (startsWithIgnoreCase(token, q)) return 0;
+    if (containsIgnoreCase(token, q)) return 1;
+    var buf: [64]u32 = undefined;
+    if (fuzzy.matchPositions(token, q, &buf) != null) return 2;
+    if (containsIgnoreCase(c.desc, q)) return 3;
+    return 4;
+}
+
+/// Is the description tier the only one with hits? Then — and only then — it is
+/// shown: "always" finds `/allowlist`, "mod" stays the three names it names.
+fn commandDescTierOn(q: []const u8) bool {
+    var i: usize = 0;
+    while (agent.commandAt(i)) |c| : (i += 1) {
+        if (commandTier(c, q) < 3) return false;
+    }
+    return true;
+}
+
 /// Number of items matching the current prefix.
 fn matchCount(self: *const Model) usize {
     return switch (self.ac.mode) {
         .command => blk: {
             const prefix = acPrefix(self) orelse break :blk 0;
+            const desc_on = commandDescTierOn(prefix);
             var n: usize = 0;
             var i: usize = 0;
             while (agent.commandAt(i)) |c| : (i += 1) {
-                if (startsWithIgnoreCase(commandToken(c.key), prefix)) n += 1;
+                const tier = commandTier(c, prefix);
+                if (tier < 3 or (tier == 3 and desc_on)) n += 1;
             }
             break :blk n;
         },
@@ -6046,12 +6087,19 @@ fn matchLabel(self: *const Model, n: usize) ?[]const u8 {
     return switch (self.ac.mode) {
         .command => blk: {
             const prefix = acPrefix(self) orelse break :blk null;
+            const desc_on = commandDescTierOn(prefix);
             var seen: usize = 0;
-            var i: usize = 0;
-            while (agent.commandAt(i)) |c| : (i += 1) {
-                if (!startsWithIgnoreCase(commandToken(c.key), prefix)) continue;
-                if (seen == n) break :blk c.key;
-                seen += 1;
+            // Walks the ranks in order, so the list reads "best match first"
+            // without scoring or sorting anything.
+            var rank: u8 = 0;
+            while (rank < 4) : (rank += 1) {
+                if (rank == 3 and !desc_on) break;
+                var i: usize = 0;
+                while (agent.commandAt(i)) |c| : (i += 1) {
+                    if (commandTier(c, prefix) != rank) continue;
+                    if (seen == n) break :blk c.key;
+                    seen += 1;
+                }
             }
             break :blk null;
         },
@@ -6079,9 +6127,9 @@ fn isExactMatch(self: *Model) bool {
     // builtins AND the user's own (`commandAt` walks both), so Enter on a
     // completed `/review` submits instead of re-completing.
     //
-    // Comparing only with the highlighted one broke "/model": the popup sorted
-    // "/models" first, so it was not an exact match and Enter completed to
-    // "/models". Now: if what is typed IS a command it is sent as-is; if it is
+    // Comparing only with the highlighted one broke "/model": another command
+    // sorted first in the popup, so it was not an exact match and Enter
+    // completed to THAT one. Now: if what is typed IS a command it is sent as-is; if it is
     // partial ("mod"), it is completed.
     var ac_i: usize = 0;
     while (agent.commandAt(ac_i)) |c| : (ac_i += 1) {
@@ -6146,6 +6194,50 @@ fn inputTooLongRejected(self: *Model) void {
     self.input_too_long = true;
 }
 
+/// One insert path for every bulk text that lands in the input: an OSC-52
+/// `.paste` event and an aggregated bracketed paste both come through here, so
+/// the modals keep their guard and the cap keeps its message.
+fn insertIntoInput(self: *Model, data: []const u8) void {
+    if (data.len == 0) return;
+    if (self.pickerActive() or self.permActive()) return;
+    if (self.ed.insert(data)) |_| {
+        self.input_too_long = false;
+        self.input_err = "";
+    } else |err| {
+        if (std.mem.eql(u8, @errorName(err), "InputTooLong")) inputTooLongRejected(self);
+    }
+    syncAutocomplete(self);
+}
+
+/// Accumulates one key event that arrived between `paste_start` and
+/// `paste_end`. The bytes of a paste reach us as ordinary keys, so the only
+/// thing to decide per key is which text it carries: `key.text` when the
+/// terminal reports it, the codepoint otherwise, and Enter as a newline.
+fn capturePasteKey(self: *Model, k: vaxis.Key) void {
+    // A newline inside a paste reaches us twice over: terminals that report
+    // Enter send the enter codepoint, and the raw 0x0A byte of a multi-line
+    // selection is parsed as Ctrl+J (vaxis Parser: `0x0A => 'j' + ctrl`).
+    // Both mean a line break HERE — during a paste there is no hand to press
+    // the key.
+    if (k.codepoint == vaxis.Key.enter or
+        (k.codepoint == 'j' and k.mods.ctrl and (k.text == null or k.text.?.len == 0)))
+    {
+        self.paste_buf.append(self.allocator, '\n') catch {};
+        return;
+    }
+    if (k.text) |txt| {
+        if (txt.len > 0 and !k.mods.ctrl) {
+            self.paste_buf.appendSlice(self.allocator, txt) catch {};
+        }
+        return;
+    }
+    if (!k.mods.ctrl and !k.mods.alt and k.codepoint >= 32) {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(k.codepoint), &buf) catch return;
+        self.paste_buf.appendSlice(self.allocator, buf[0..n]) catch {};
+    }
+}
+
 // ── root widget handlers ─────────────────────────────────
 fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
     const self: *Model = @ptrCast(@alignCast(ud));
@@ -6156,6 +6248,12 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
     self.flushCopyPending(ctx);
     switch (event) {
         .key_press => |key| {
+            // Between `paste_start` and `paste_end` a key is CONTENT, not a
+            // command: no submit, no shortcut, no modal navigation.
+            if (self.pasting) {
+                capturePasteKey(self, key);
+                return;
+            }
             // A rejected-input note refers to the buffer as it was; once the
             // user presses another key it is stale.
             self.input_too_long = false;
@@ -6166,6 +6264,9 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 if (self.hasInput()) {
                     self.ed.clear();
                     self.ac = .{};
+                    // The draft dies whole: an image staged for a discarded
+                    // message must not ride on the next one.
+                    self.draft_images.clear(self.allocator);
                     ctx.redraw = true;
                 } else {
                     ctx.quit = true;
@@ -6219,6 +6320,15 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     self.cache_from = 0;
                     ctx.redraw = true;
                 }
+                return;
+            }
+            // Ctrl+V: stage the clipboard's IMAGE for the next message. The
+            // terminal's own paste is text-only (bracketed paste carries no
+            // bytes), so the read goes through the clipboard helpers on the
+            // agent side.
+            if (key.matches('v', .{ .ctrl = true })) {
+                agent.attachClipboardImage(self);
+                ctx.redraw = true;
                 return;
             }
             // Ctrl+P palette open: captures ALL input, scroll included.
@@ -6291,8 +6401,8 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 // "/help" + Enter only rewrote "/help " and sent nothing, so
                 // you had to press it twice and it looked like the scroll had
                 // nothing to show. And the other way round didn't either:
-                // "/model" completed to "/models" because the popup sorted
-                // "/models" first and the match was only looked for there.
+                // "/model" completed to a different command because the popup
+                // sorted that one first and the match was only looked for there.
                 //
                 // In FILE mode Enter always accepts (a path is never "complete
                 // enough to send": it is a mention inside a sentence).
@@ -6380,6 +6490,10 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     });
                 }
                 chat.cancel_current.store(true, .seq_cst);
+                // The face follows the fact: a cancelled turn is `warn`, not
+                // `done`. Set here (the UI thread) and cleared by the next
+                // `streamStart`, so the mark belongs to THIS turn.
+                self.cancelled = true;
                 // Background jobs go too: ESC means "stop", and leaving a build
                 // running in the background after the user pressed ESC is how you
                 // get a laptop that is warm for the next ten minutes. Before,
@@ -6394,6 +6508,11 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                         bg_killed,
                         if (bg_killed == 1) @as([]const u8, "") else @as([]const u8, "s"),
                     });
+                }
+                // Nothing to kill but a turn in flight: the legend says the ESC
+                // landed, so the key never looks like it did nothing.
+                if (killed == 0 and bg_killed == 0 and self.isBusyFlag()) {
+                    agent.setStatusWithZo(self, .warn, "stopping\u{2026}");
                 }
                 ctx.redraw = true;
                 try self.armTick(ctx);
@@ -6496,6 +6615,23 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             if (asked or a.busy or a.dirty or a.perm or a.picker or self.pal.active or self.mascotMoved()) {
                 ctx.redraw = true;
             }
+            // The queue is drained here and not by the worker: `startChat`
+            // enqueues when busy, and the worker thread has no `EventContext`
+            // to start the next turn with, so until now a queued prompt was
+            // shown in the footer and never ran. The tick is the UI thread
+            // waking up anyway, and the turn has just ended by then.
+            if (self.takeQueuedWhenIdle()) |prompt| {
+                agent.startChat(self, prompt) catch |err| {
+                    self.pushInfoFmt("error: {t}", .{err});
+                };
+                self.allocator.free(prompt);
+                ctx.redraw = true;
+            }
+            // The model catalogue on disk refreshes itself, quietly, about
+            // every quarter hour — only while idle, by the worker that already
+            // does the startup warmup. The palette never waits on the network
+            // for a list the user expected to be current.
+            agent.maybeRefreshCatalog(self);
             try self.armTick(ctx);
         },
         .init => {
@@ -6527,18 +6663,21 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             self.cancelMouseGestures();
             ctx.redraw = true;
         },
-        .paste => |data| {
+        .paste_start => {
+            self.pasting = true;
+            self.paste_buf.clearRetainingCapacity();
+        },
+        .paste_end => {
+            self.pasting = false;
             // Our own editor has no paste callback: we insert by hand. A paste
             // with line breaks creates a real multiline prompt.
-            if (!self.pickerActive() and !self.permActive()) {
-                if (self.ed.insert(data)) |_| {
-                    self.input_too_long = false;
-                    self.input_err = "";
-                } else |err| {
-                    if (std.mem.eql(u8, @errorName(err), "InputTooLong")) inputTooLongRejected(self);
-                }
-                syncAutocomplete(self);
-            }
+            insertIntoInput(self, self.paste_buf.items);
+            self.paste_buf.clearRetainingCapacity();
+            ctx.redraw = true;
+        },
+        .paste => |data| {
+            // OSC-52 clipboard paste (the terminal already aggregated it).
+            insertIntoInput(self, data);
             ctx.redraw = true;
         },
         .mouse => |m| {
@@ -6939,15 +7078,20 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     self.max_offset = vis.max_offset;
     self.live_h = if (live_active) live_lines.len else 0;
 
-    // Always fill the transcript area AND the gap up to the hairline with
-    // well_bg so there are never black holes between the last message and
-    // the composer. history_h = rule_row - ac_rows - plan_rows, so when a
-    // plan or autocomplete row is visible, history_h stops short of rule_row
-    // and the gap would show the terminal's raw black.
+    // Clear the transcript area up to the hairline, INCLUDING the rows a plan
+    // or autocomplete popup reserves (history_h stops short of `rule_row`
+    // there), so no row keeps the previous frame's pixels.
+    //
+    // On the TERMINAL's background and not on `well_bg`: a panel that is
+    // almost black looks like a second, wrong black next to the terminal's
+    // own, and on a black terminal the whole transcript read as a gray block
+    // with the user's own background nowhere in sight. The history is the
+    // page; only a well that MEANS something (a tool result, a code block, a
+    // modal) is allowed to be a surface.
     {
         var clear_row: u16 = 0;
         while (clear_row < rule_row) : (clear_row += 1) {
-            p.fillRange(0, width, clear_row, " ", theme.well_bg);
+            p.fillRange(0, width, clear_row, " ", .{});
         }
     }
 
@@ -6972,6 +7116,9 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
         const para_abs_start = self.heightPrefix(c.para_idx);
         if (para_abs_start >= last_visible) break;
         if (para_abs_start + c.height <= first_visible) continue;
+        // The cached entry is the WHOLE paragraph (separator row counted in
+        // already, see `layoutOne`), so its first line sits exactly at the
+        // paragraph's absolute start.
         drawLines(&p, c.lines, para_abs_start, first_visible, history_h, pad, hero.x_off);
     }
     // ── paint live paragraph ──
@@ -7019,7 +7166,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // ── `ask`: the model asked something ──
     //
     // The picker is opened HERE, on the UI thread, and not by the worker that
-    // raised the question. That is not a style choice: the worker of `/models` once
+    // raised the question. That is not a style choice: the model catalog worker once
     // filled the palette while the UI thread was drawing it, with no lock on the
     // palette's own state, and the app segfaulted. The worker leaves the question
     // in the `Model`; the draw is what turns it into a picker.
@@ -7263,15 +7410,20 @@ fn drawInput(
     // doing.
     const well_h: u16 = input_h;
 
-    // The composer surface: a subtle `well_bg` fill behind the input rows so
-    // the composer reads as a SUNKEN SURFACE, distinct from the transcript
-    // above (which sits on the terminal's default background). This is the
-    // same trick that makes tool output wells legible — depth, not a border.
-    // Zero extra rows: the surface lives inside the rows the input already owns.
+    // The input rows are CLEARED every frame, on the terminal's own background.
+    //
+    // They used to be filled with `well_bg` so the composer read as a sunken
+    // surface. On a black terminal that fill is a second black that does not
+    // match the first: the composer, the transcript and the empty rows between
+    // them came out as three shades of almost-black, which is what the user
+    // meant by "the background changed color, it is not the terminal's black".
+    // The accent bar and the prompt glyph already say "this is the input"; a
+    // panel colour under them was saying it twice and wrong.
+    // Zero extra rows: the clear lives inside the rows the input already owns.
     {
         var i: u16 = 0;
         while (i < well_h and top + i < p.height) : (i += 1) {
-            p.fillRange(1, width, top + i, " ", theme.well_bg);
+            p.fillRange(1, width, top + i, " ", .{});
         }
     }
 
@@ -7308,7 +7460,6 @@ fn drawInput(
     const prompt_style: vaxis.Style = .{
         .bold = true,
         .fg = prompt_fg,
-        .bg = theme.well_bg.bg,
     };
     _ = p.putText(1, top, prompt_glyph, prompt_style);
     const ed_w: u16 = if (width > 4) width - 4 else 1;
@@ -7327,10 +7478,41 @@ fn drawInput(
         inputDisplayText(p.arena, full_text, max_input_display_bytes) catch full_text
     else
         full_text;
-    // Wrap the (possibly truncated) text into rows. RowIter is public in editor.zig.
     const truncated = full_text.len > max_input_display_bytes;
+
+    // The staged images announce themselves HERE, as `[name]` tags on a row of
+    // their own above the text: an image that lives only in the outgoing
+    // message and nowhere on your screen is an image you forget you attached,
+    // and then you wonder what the model is looking at.
+    var tags: std.ArrayList(u8) = .empty;
+    var tag_count: usize = 0;
+    {
+        var i: usize = 0;
+        while (i < self.draft_images.len) : (i += 1) {
+            const img = self.draft_images.images[i];
+            const base = if (img.path.len > 0) std.fs.path.basename(img.path) else "image";
+            tags.appendSlice(p.arena, "[") catch {};
+            tags.appendSlice(p.arena, base) catch {};
+            tags.appendSlice(p.arena, "] ") catch {};
+            tag_count += 1;
+        }
+    }
+    const tag_text: []const u8 = if (tag_count == 0) "" else tags.items;
+    var disp_all: []const u8 = disp_text;
+    if (tag_count > 0) {
+        const sep: []const u8 = if (disp_text.len > 0) "\n" else "";
+        disp_all = std.mem.concat(p.arena, u8, &.{ tag_text, sep, disp_text }) catch disp_text;
+    }
+    // Rows the tag block costs, for the cursor mapping: the tags wrap too at
+    // narrow widths, and the typed text starts one row after wherever they end.
+    var tag_rows: usize = 0;
+    if (tag_count > 0) {
+        var tri = ed.RowIter.init(tag_text, ed_w, meas);
+        while (tri.next() != null) tag_rows += 1;
+    }
+    // Wrap the (possibly truncated) text into rows. RowIter is public in editor.zig.
     var rows_buf: std.ArrayList(ed.Row) = .empty;
-    var rit = ed.RowIter.init(disp_text, ed_w, meas);
+    var rit = ed.RowIter.init(disp_all, ed_w, meas);
     while (rit.next()) |r| {
         rows_buf.append(p.arena, r) catch continue;
     }
@@ -7343,10 +7525,7 @@ fn drawInput(
         const row = top + @as(u16, @intCast(i));
         if (i >= input_h) break;
         if (piece.bytes.len == 0) continue;
-        const text_style: vaxis.Style = .{
-            .fg = theme.input_text.fg,
-            .bg = theme.well_bg.bg,
-        };
+        const text_style: vaxis.Style = .{ .fg = theme.input_text.fg };
         _ = p.putClipped(3, row, piece.bytes, ed_w, text_style);
     }
 
@@ -7361,8 +7540,7 @@ fn drawInput(
         else
             top + input_h - 1;
         if (err_row < p.height) {
-            var est = theme.warn_bold;
-            est.bg = theme.well_bg.bg;
+            const est = theme.warn_bold;
             _ = p.putClipped(3, err_row, self.input_err, ed_w, est);
         }
     }
@@ -7371,10 +7549,13 @@ fn drawInput(
     // truncated: for truncated input the cursor would point at the wrong place.
     if (!truncated) {
         const cc = self.ed.cursorRowCol(ed_w, meas);
-        if (cc.row >= first and cc.row < first + shown.len) {
+        // The typed text sits `tag_rows` below the top of the box: the visual
+        // row of the cursor is the editor's row PLUS the tag block.
+        const vrow = cc.row + tag_rows;
+        if (vrow >= first and vrow < first + shown.len) {
             const col = 3 + @min(cc.col, ed_w - 1);
             surface.cursor = .{
-                .row = top + @as(u16, @intCast(cc.row - first)),
+                .row = top + @as(u16, @intCast(vrow - first)),
                 .col = col,
             };
         }
@@ -7390,7 +7571,7 @@ fn drawInput(
         }
     }
 
-    if (self.ed.isEmpty()) {
+    if (self.ed.isEmpty() and tag_count == 0) {
         // With a question open this box IS the answer field (the free-text path),
         // so the placeholder has to say so: it used to invite a prompt, which is
         // not what pressing Enter there does.
@@ -7398,12 +7579,9 @@ fn drawInput(
             "your answer\u{2026} \u{b7} enter sends it \u{b7} esc: you decide"
         else
             "Ask anything\u{2026} \u{b7} / for commands";
-        // The placeholder must sit ON the well_bg surface, not overwrite it with
-        // .default. Combine the placeholder foreground with the well background.
-        const ph_style: vaxis.Style = .{
-            .fg = theme.placeholder.fg,
-            .bg = theme.well_bg.bg,
-        };
+        // The placeholder carries the dim foreground and NOTHING else: the rows
+        // under it are the terminal's own background (see the clear above).
+        const ph_style: vaxis.Style = .{ .fg = theme.placeholder.fg };
         _ = p.putClipped(3, top, ph, ed_w, ph_style);
     }
 }
@@ -8643,12 +8821,33 @@ fn drawStateFooter(
     // activity is what is TRUE right now. A tool running is `.tooling`, and a
     // question or a permission is `.warn` — the two states where the app has
     // stopped and is waiting on the human.
+    // The face reports the HARNESS — thinking, writing, running a tool, done,
+    // waiting on a human — and nothing else.
+    //
+    // It used to fall back to `self.mood()`, the mood of the last
+    // `setStatusWithZo`, and a mode change (shift+tab), a model switch and
+    // `/yolo` all wrote one. The mascot therefore changed expression when the
+    // user pressed shift+tab: a face that moves when nothing is running is a
+    // face that means nothing, and the state it was advertising (which mode is
+    // set) is text, not a mood. Those switches no longer write a status at all
+    // — the transcript line and the footer's right group say them — and even
+    // if one did, the face here would ignore it.
     const mood: StatusKind = if (act.ask or act.perm)
         .warn
-    else if (running_tool)
+    else if (running_tool or act.subagent_completed < act.subagent_total)
         .tooling
+    else if (act.streaming or act.busy)
+        .thinking
+    else if (self.cancelled)
+        // The turn was stopped by ESC: it did not finish, and the face says so
+        // until the next turn starts.
+        .warn
+    else if (self.busy_started_ns != 0)
+        // A turn has run and nothing is running now: `done` until the next one
+        // starts, whatever else the status says in between.
+        .done
     else
-        self.mood();
+        .idle;
 
     // Convert tui.StatusKind -> mascot.StatusKind (same variant order, safe cast).
     const m_kind: mascot.StatusKind = switch (mood) {
@@ -8740,11 +8939,15 @@ fn drawStateFooter(
         }
     }
 
-    // How much room the left group's CORE needs, in columns: the face and the
-    // legend. The DETAIL is not part of it, because the detail is the first
-    // thing that may go: the model on the right says who is answering, and
-    // that outlives the name of the tool that happens to be running.
-    const left_core: u16 = face_width + 2 + @as(u16, @intCast(columnsOf(p, legend)));
+    // How much room the left group's CORE needs, in columns: the face ONLY.
+    //
+    // It used to include the whole legend, and the legend is whatever the last
+    // status said. `/yolo` writes a sentence, so turning it on made `room` zero
+    // and the right group — the model, the context gauge — was dropped from the
+    // row: the status bar "disappeared". The face and the right group are what
+    // the row cannot do without; the legend is text, and `putClipped` truncates
+    // it to whatever is left.
+    const left_core: u16 = face_width + 2;
 
     // ── the RIGHT group: the session's own numbers ──
     //
@@ -8876,6 +9079,14 @@ fn drawStateFooter(
     self.face_painted_dx = pose.dx;
     if (face_text.len == self.face_painted_text.len) @memcpy(&self.face_painted_text, face_text);
     var col: u16 = 1 + face_width + 2;
+    // `YOLO` in the accent colour, next to the face: the mode is a state of the
+    // harness and two words say it, without spending the row. The old /yolo
+    // sentence went into the legend and pushed the status bar off the right
+    // end; the bar stays and this is the mark.
+    if (agent.currentPermMode() == .bypass and col + 5 <= left_limit) {
+        _ = p.putClipped(col, row, "YOLO", left_limit -| col, theme.brand_bold);
+        col += 5;
+    }
     if (legend.len > 0) {
         // The legend is WHITE and the face is COLOURED, on purpose: with both
         // in the theme's teal the face and its own label read as one smudge
@@ -8883,7 +9094,14 @@ fn drawStateFooter(
         // mood). The face carries the mood; the word carries the phase.
         var legend_style = theme.ink;
         legend_style.bold = true;
-        col = p.putClipped(col, row, legend, left_limit -| col, legend_style);
+        // Clipped WITH an ellipsis: the legend is whatever the last status said,
+        // it can outgrow the room left after the right group, and a word cut in
+        // half reads as a typo. The budget is inside the columns, so the row
+        // never grows and the status bar keeps its space.
+        const avail = left_limit -| col;
+        var lbuf: [textcap.scratchFor(192)]u8 = undefined;
+        const shown = textcap.clipInto(legend, avail, &lbuf);
+        col = p.putClipped(col, row, shown, avail, legend_style);
     }
     if (detail.len > 0) {
         // The detail is painted WHOLE or not at all: a clipped "B" at the end
@@ -8925,12 +9143,11 @@ fn drawStateFooter(
     }
     var rcol: u16 = right_start;
     for (right_segs) |sg| {
-        // The well's background has to be put back on every cell of the right
-        // group: `putStable` REPLACES the cell, so a segment that carries no
-        // background of its own lands on the terminal's default one, and the
-        // footer's right end came out as a bright strip on a dark block.
-        var st = sg.style;
-        st.bg = theme.well_bg.bg;
+        // The segment's own style, and NOT the well's background: the footer's
+        // row sits on the terminal's background (like the face on its left),
+        // and forcing a panel colour here painted the right half of the row as
+        // a strip of a different black.
+        const st = sg.style;
         var it = vaxis.unicode.graphemeIterator(sg.text);
         while (it.next()) |g| {
             const b = g.bytes(sg.text);
@@ -8968,33 +9185,30 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
         out.append(arena, .{ .text = shown_model, .style = theme.ink2 }) catch return null;
     }
 
-    // Permission mode: only show when NOT default (read-only/bypass are deviations).
+    // Permission mode: only show when NOT default (read-only is a deviation).
     //
     // `accept_edits` is shown as a GLYPH, and that is the point: the mode
     // decides whether the next tool call asks, and the only way to know is to
     // look. A word costs twelve columns in a footer that has to survive an
     // eighty-column terminal; a glyph costs one.
     //
-    // The four shapes are the ones the reference implementation uses: `○` for
-    // the default, `◐` for accept-edits, `●` for read-only and `◉` for the
-    // bypass. The DEFAULT shows nothing, because there is a test that pins
-    // "the normal permission modes cost NOTHING on the row" and it is right:
-    // a footer that repeats the default in every row of every session is a
-    // footer nobody reads.
+    // The shapes are the ones the reference implementation uses: `◐` for
+    // accept-edits and `●` for read-only. The DEFAULT and BYPASS show nothing:
+    // the default is the default, and bypass is marked ONCE, by the `YOLO` chip
+    // next to the face — two marks for one mode read as two different states.
     switch (agent.currentPermMode()) {
-        .read_only, .bypass, .accept_edits => {
+        .read_only, .accept_edits => {
             if (out.items.len > 0) {
                 out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
             }
             const glyph = switch (agent.currentPermMode()) {
                 .accept_edits => "◐",
                 .read_only => "●",
-                .bypass => "◉",
-                .default => "",
+                .bypass, .default => "",
             };
             out.append(arena, .{ .text = glyph, .style = theme.warn }) catch return null;
         },
-        .default => {},
+        .bypass, .default => {},
     }
 
     // The EFFECTIVE effort level: the one that goes on the wire, after the
@@ -9086,6 +9300,16 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
     if (box_w < 20 or box_h < 6) return;
     const x0 = (width - box_w) / 2;
     const y0 = (height - box_h) / 4; // a bit above the center
+
+    // A wide cell behind the box is a hole in the modal: the renderer writes
+    // the wide cell and jumps `width - 1` columns, so every picker cell under
+    // it is skipped and the rule wins the row (the /copy bug: the "always"
+    // row counted in (1/4) and was never on screen). Split them before
+    // painting, like every other overlay does.
+    var wr: u16 = 0;
+    while (wr < box_h) : (wr += 1) {
+        expandWideCells(p.surface, y0 + wr, width);
+    }
 
     drawRoundedBox(p, x0, y0, box_w, box_h, .{}, theme.accent);
 
@@ -9560,50 +9784,158 @@ test "input: over the byte cap, the edit is rejected and the limit is named" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "262144-byte cap") != null);
 }
 
-test "input: composer surface is a well_bg sunken panel behind the text" {
-    // Phase 1 of the input polish: the composer must read as a SURFACE, not
-    // just text floating on the terminal background. The well_bg fill is what
-    // separates it from the transcript above without spending a border row.
+test "history: the transcript sits on the terminal's own background" {
+    // A `well_bg` panel behind the whole transcript is a second black that does
+    // not match the terminal's: on a black terminal the page came out as a gray
+    // block, and the empty space under a short answer read as a painted hole.
+    // The history is the page, so it is the terminal's background.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    const w: u16 = 40;
-    const h: u16 = 14;
+    const w: u16 = 80;
+    const h: u16 = 24;
     const s = try drawTest(&m, arena_state.allocator(), w, h);
-
-    // The input row is h-2 (status is h-1). A cell just past the prompt glyph
-    // but before the placeholder text must carry the well_bg background,
-    // proving the surface is painted. Column 5 is past the accent bar (0),
-    // prompt (1-2), and placeholder start (3+), but still inside the fill.
-    const cell = s.readCell(5, h - 2);
-    try std.testing.expect(cell.style.bg != .default);
-    const cell_bg = cell.style.bg;
-    const well_bg = theme.well_bg.bg;
-    try std.testing.expect(switch (cell_bg) {
-        .rgb => |c| switch (well_bg) {
-            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
-            else => false,
-        },
-        else => false,
-    });
-    // The accent bar cell keeps its own color on top of the surface.
-    const bar = s.readCell(0, h - 2);
-    try std.testing.expectEqual(theme.input_bar.fg, bar.style.fg);
-    // The prompt glyph sits on the well surface too.
-    const prompt = s.readCell(1, h - 2);
-    const prompt_bg = prompt.style.bg;
-    try std.testing.expect(switch (prompt_bg) {
-        .rgb => |c| switch (well_bg) {
-            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
-            else => false,
-        },
-        else => false,
-    });
+    // Row `h - 4` is inside the transcript (the composer owns the last rows).
+    const cell = s.readCell(w / 2, h - 4);
+    try std.testing.expectEqual(vaxis.Color.default, cell.style.bg);
+    // …and so is the input's own row: no panel colour under the prompt either.
+    const input_cell = s.readCell(5, h - 2);
+    try std.testing.expectEqual(vaxis.Color.default, input_cell.style.bg);
 }
 
-test "input: placeholder and text sit on well_bg surface with correct fg" {
+test "layout: the height estimate counts the wrap per line" {
+    // The estimate holds the scroll until the parse corrects it, and every
+    // over-count was a jump the reader felt. Counting a full extra line per
+    // line for prose (which is what `(len - nl) / width` does) estimated 70
+    // rows for a paragraph that renders in 48 (an earlier lazy path even
+    // kept such an estimate forever: the black space).
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.wrap_w = 95;
+
+    // 43 short lines: no line wraps, so 43 rows plus the trailing empty one.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    var i: usize = 0;
+    while (i < 43) : (i += 1) {
+        text.appendSlice(std.testing.allocator, "**Purpose:** reviews the diff to find reuse opportunities") catch
+            return error.OutOfMemory;
+        text.append(std.testing.allocator, '\n') catch return error.OutOfMemory;
+    }
+    try std.testing.expectEqual(@as(usize, 44), m.estHeight(text.items));
+
+    // One 300-byte line is 4 rows at 95 columns, and no more.
+    const long_line = "x" ** 300;
+    try std.testing.expectEqual(@as(usize, 4), m.estHeight(long_line));
+}
+
+test "layout: a paragraph past the old lazy threshold gets its EXACT height" {
+    // The old lazy path kept a byte-based ESTIMATE forever for paragraphs over
+    // ~50 rows, and the estimate never matched the painted block exactly — the
+    // difference was the black hole. The lazy path is gone; a 120-row block is
+    // laid out like any other, and its LAST row is paintable with one row of
+    // separator above the composer, not a canyon.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    var i: usize = 0;
+    while (i < 120) : (i += 1) {
+        const line = std.fmt.allocPrint(std.testing.allocator, "row {d} of the long answer", .{i}) catch return error.OutOfMemory;
+        defer std.testing.allocator.free(line);
+        text.appendSlice(std.testing.allocator, line) catch return error.OutOfMemory;
+        if (i + 1 < 120) text.append(std.testing.allocator, '\n') catch return error.OutOfMemory;
+    }
+    m.pushKind(.assistant, text.items);
+    m.pushInfo("\u{23ba} Done \u{b7} 0 tools \u{b7} 1.0s");
+
+    const s = try drawTest(&m, arena_state.allocator(), 100, 40);
+    var buf: [256]u8 = undefined;
+
+    // The tail of the block is real rows, and the summary sits one separator
+    // under it — an estimate-sized gap would put the Done line nowhere near.
+    var done_row: ?u16 = null;
+    var last_text_row: ?u16 = null;
+    var row: u16 = 0;
+    while (row < s.size.height) : (row += 1) {
+        const line = rowText(s, row, &buf);
+        if (std.mem.indexOf(u8, line, "0 tools") != null) done_row = row;
+        if (std.mem.indexOf(u8, line, "row 119 of the long answer") != null) last_text_row = row;
+    }
+    const dr = done_row orelse return error.DoneNotPainted;
+    const lt = last_text_row orelse return error.TailNotPainted;
+    // The Done line comes after the text in the transcript; at the bottom of
+    // the view both are on screen with the separator between them.
+    try std.testing.expect(dr >= lt);
+    try std.testing.expect(dr - lt <= 2);
+}
+
+test "layout: a long prose answer has no empty block before its summary" {
+    // The reported bug: ask a question, the answer arrives, and the turn
+    // summary under it sits twenty rows lower with a block of nothing in
+    // between — and the answer's own beginning is scrolled off the top.
+    //
+    // One row of air between them (the paragraph separator) is the whole
+    // budget: that is what "the answer ends" looks like.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    var i: usize = 0;
+    while (i < 43) : (i += 1) {
+        text.appendSlice(std.testing.allocator, "**Purpose:** reviews the diff to find reuse opportunities") catch
+            return error.OutOfMemory;
+        if (i + 1 < 43) text.append(std.testing.allocator, '\n') catch return error.OutOfMemory;
+    }
+    m.pushKind(.user, "dame el resumen de las skills");
+    m.pushKind(.assistant, text.items);
+    m.pushInfo("\u{23ba} Done \u{b7} 0 tools \u{b7} 5.4s \u{b7} ~15k tokens");
+
+    const h: u16 = 47;
+    const s = try drawTest(&m, arena_state.allocator(), 100, h);
+
+    var buf: [256]u8 = undefined;
+    var summary_row: ?u16 = null;
+    var row: u16 = 0;
+    while (row < h) : (row += 1) {
+        const line = std.mem.trim(u8, rowText(s, row, &buf), " ");
+        if (std.mem.indexOf(u8, line, "0 tools") != null) summary_row = row;
+    }
+    const sr = summary_row orelse return error.SummaryNotPainted;
+    try std.testing.expect(sr > 0);
+
+    // A row counts as blank when it carries no TEXT: the scrollbar's cell at the
+    // right edge is chrome and can be a full block on a row with nothing on it.
+    const blankAt = struct {
+        fn f(surf: vxfw.Surface, at: u16, b: []u8) bool {
+            const line = std.mem.trim(u8, rowText(surf, at, b), " ");
+            var it = vaxis.unicode.graphemeIterator(line);
+            while (it.next()) |g| {
+                const glyph = g.bytes(line);
+                if (!std.mem.eql(u8, glyph, "\u{2588}") and !std.mem.eql(u8, glyph, "\u{2502}")) return false;
+            }
+            return true;
+        }
+    }.f;
+
+    // Exactly ONE blank row directly above the summary: the separator.
+    try std.testing.expect(sr >= 2);
+    try std.testing.expect(blankAt(s, sr - 1, &buf));
+    try std.testing.expect(!blankAt(s, sr - 2, &buf));
+}
+
+test "input: the accent bar and the prompt glyph are the input's own mark" {
+    // The composer has no panel colour any more, so what says "this is the
+    // input" is the bar in the margin and the glyph inside it. Both are the
+    // accent, and both still have to be there.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -9613,29 +9945,36 @@ test "input: placeholder and text sit on well_bg surface with correct fg" {
     const h: u16 = 14;
     const s = try drawTest(&m, arena_state.allocator(), w, h);
 
-    const well_bg = theme.well_bg.bg;
-    // Placeholder text starts at column 3. Check it has well_bg bg AND placeholder fg.
+    // The input row is h-2 (status is h-1).
+    const bar = s.readCell(0, h - 2);
+    try std.testing.expectEqual(theme.input_bar.fg, bar.style.fg);
+    const prompt = s.readCell(1, h - 2);
+    try std.testing.expectEqual(theme.input_prompt.fg, prompt.style.fg);
+    const cell = s.readCell(5, h - 2);
+    try std.testing.expectEqual(vaxis.Color.default, cell.style.bg);
+}
+
+test "input: placeholder and text carry their foreground on the terminal's background" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const w: u16 = 40;
+    const h: u16 = 14;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    // Placeholder text starts at column 3. It has the dim foreground and the
+    // terminal's own background (no panel colour under it).
     const ph_cell = s.readCell(5, h - 2); // "k" in "Ask"
-    try std.testing.expect(switch (ph_cell.style.bg) {
-        .rgb => |c| switch (well_bg) {
-            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
-            else => false,
-        },
-        else => false,
-    });
+    try std.testing.expectEqual(vaxis.Color.default, ph_cell.style.bg);
     try std.testing.expectEqual(theme.placeholder.fg, ph_cell.style.fg);
 
     // Now add some text and check the editor text style
     m.ed.insert("hola") catch {};
     const s2 = try drawTest(&m, arena_state.allocator(), w, h);
     const text_cell = s2.readCell(3, h - 2); // "h" at column 3
-    try std.testing.expect(switch (text_cell.style.bg) {
-        .rgb => |c| switch (well_bg) {
-            .rgb => |w_bg| c[0] == w_bg[0] and c[1] == w_bg[1] and c[2] == w_bg[2],
-            else => false,
-        },
-        else => false,
-    });
+    try std.testing.expectEqual(vaxis.Color.default, text_cell.style.bg);
     try std.testing.expectEqual(theme.input_text.fg, text_cell.style.fg);
 }
 
@@ -9805,6 +10144,89 @@ test "input: large tool result + running tool + draw does not crash" {
     // If we got here without segfault/ASan error, the path is sound
 }
 
+test "autocomplete: a word from a description finds the command" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    // No command NAME contains "always", so the description tier is the only
+    // one with hits and it is shown: `/allowlist` says "always-allowed".
+    m.ed.insert("/always") catch {};
+    syncAutocomplete(&m);
+    try std.testing.expect(m.ac.active);
+    var found = false;
+    var i: usize = 0;
+    while (i < matchCount(&m)) : (i += 1) {
+        const key = matchLabel(&m, i) orelse continue;
+        if (std.mem.eql(u8, key, "/allowlist")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "autocomplete: an edit puts the selection back on the best match" {
+    // Typing narrows the list; a highlight left at the old index would point at
+    // an item the reader never looked at, and Escape/Enter act on THAT one.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.ed.insert("/mo") catch {};
+    syncAutocomplete(&m);
+    try std.testing.expect(matchCount(&m) >= 3);
+
+    // The reader browsed down two rows...
+    m.ac.sel = 2;
+    m.ac.first = 1;
+
+    // ...and typed one more character: a NEW query starts at the top again.
+    m.ed.insert("d") catch {};
+    syncAutocomplete(&m);
+    try std.testing.expectEqual(@as(usize, 0), m.ac.sel);
+    try std.testing.expectEqual(@as(usize, 0), m.ac.first);
+    // The best match is the first row: a NAME-prefix hit, not a substring one.
+    const first = matchLabel(&m, 0) orelse return error.NoBestMatch;
+    try std.testing.expect(startsWithIgnoreCase(commandToken(first), "mod"));
+    try std.testing.expectEqualStrings("/mod", std.mem.trim(u8, m.ed.text(), " "));
+}
+
+test "footer: a cancelled turn shows the warn mood, not done" {
+    // ESC stopped the harness, so the face must NOT celebrate the turn as
+    // finished: `done` after a cancel is the mascot telling the user something
+    // that did not happen.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushHeader(.idle);
+
+    const h: u16 = 20;
+    const idle = try drawTest(&m, arena_state.allocator(), 80, h);
+    const idle_fg = idle.readCell(1, h - 1).style.fg;
+
+    // A turn ran, and it was stopped.
+    m.busy_started_ns = 1;
+    m.cancelled = true;
+    const stopped = try drawTest(&m, arena_state.allocator(), 80, h);
+    const stopped_fg = stopped.readCell(1, h - 1).style.fg;
+    try std.testing.expect(!std.meta.eql(idle_fg, stopped_fg));
+}
+
+test "footer: a mode change does not change the mascot's mood" {
+    // The face reports the HARNESS. It used to take its colour from the last
+    // status, so shift+tab (and a model switch, and /yolo) changed the mascot's
+    // expression while nothing was running.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushHeader(.idle);
+
+    const h: u16 = 20;
+    const before = try drawTest(&m, arena_state.allocator(), 80, h);
+    const face_before = before.readCell(1, h - 1).style.fg;
+
+    m.setStatusWithMood(.warn, "mode: plan");
+    const after = try drawTest(&m, arena_state.allocator(), 80, h);
+    const face_after = after.readCell(1, h - 1).style.fg;
+    try std.testing.expectEqual(face_before, face_after);
+}
+
 test "autocomplete: filters by prefix and accepts with tab" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
@@ -9812,43 +10234,34 @@ test "autocomplete: filters by prefix and accepts with tab" {
     m.ed.insert("/mo") catch {};
     syncAutocomplete(&m);
     try std.testing.expect(m.ac.active);
-    // /model, /models and /mode, all three against the real list
-    // (/memory does not exist). A prefix filter, not an exact one.
+    // /model and /mode, both against the real list (/memory does not
+    // exist). A prefix filter, not an exact one.
     const n_mo = matchCount(&m);
-    try std.testing.expect(n_mo >= 3);
+    try std.testing.expect(n_mo >= 2);
     var has_model = false;
-    var has_models = false;
     var has_mode = false;
     for (0..n_mo) |i| {
         const k = matchLabel(&m, i).?;
         if (std.mem.eql(u8, k, "/model")) has_model = true;
-        if (std.mem.eql(u8, k, "/models")) has_models = true;
         if (std.mem.eql(u8, k, "/mode")) has_mode = true;
     }
     try std.testing.expect(has_model);
-    try std.testing.expect(has_models);
     try std.testing.expect(has_mode);
 
-    // "/models" leaves only /models (the longer prefix wins)
-    m.ed.clear();
-    m.ed.insert("/models") catch {};
-    syncAutocomplete(&m);
-    try std.testing.expectEqual(@as(usize, 1), matchCount(&m));
-    try std.testing.expectEqualStrings("/models", matchLabel(&m, 0).?);
-
-    // "/mod" leaves /models, /model and /mode, in table order:
-    // /models precedes /model in the command table, which is why
-    // index 0 below is /models and not the alphabetically-first one.
+    // "/mod" leaves the two prefix hits in table order (/model before /mode)
+    // and any name that merely CONTAINS "mod" (/submodel) after them: the
+    // ranks decide the order, so the prefix hits are on screen first.
     m.ed.clear();
     m.ed.insert("/mod") catch {};
     syncAutocomplete(&m);
     try std.testing.expectEqual(@as(usize, 3), matchCount(&m));
     m.ac.sel = 0;
-    try std.testing.expectEqualStrings("/models", matchLabel(&m, 0).?);
+    try std.testing.expectEqualStrings("/model", matchLabel(&m, 0).?);
+    try std.testing.expectEqualStrings("/mode", matchLabel(&m, 1).?);
 
     // Tab completes the selected command and adds the space.
     try std.testing.expect(acceptAutocomplete(&m));
-    try std.testing.expectEqualStrings("/models ", m.ed.text());
+    try std.testing.expectEqualStrings("/model ", m.ed.text());
     try std.testing.expect(!m.ac.active);
 
     // With the selection on the second match, that one is completed.
@@ -9857,7 +10270,25 @@ test "autocomplete: filters by prefix and accepts with tab" {
     syncAutocomplete(&m);
     m.ac.sel = 1;
     try std.testing.expect(acceptAutocomplete(&m));
-    try std.testing.expectEqualStrings("/model ", m.ed.text());
+    try std.testing.expectEqualStrings("/mode ", m.ed.text());
+}
+
+test "autocomplete: a subsequence of a name matches, like in the palettes" {
+    // "/cp" is neither a prefix nor a substring of "/copy", and the modal
+    // palette would find it — the popup answering "no matches" to the same
+    // abbreviation the palette answers with a row is two searchers in one app.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.ed.insert("/cp") catch {};
+    syncAutocomplete(&m);
+    try std.testing.expect(m.ac.active);
+    const n = matchCount(&m);
+    var found = false;
+    for (0..n) |i| {
+        if (std.mem.eql(u8, matchLabel(&m, i).?, "/copy")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "autocomplete: not offered with spaces nor without the slash" {
@@ -10246,7 +10677,7 @@ test "status: the DEFAULT permission mode costs NOTHING on the row, and a deviat
     }
 
     // A DEVIATION: the glyph, and only the glyph.
-    for ([_]agent.PermMode{ .accept_edits, .read_only, .bypass }) |pm| {
+    for ([_]agent.PermMode{ .accept_edits, .read_only }) |pm| {
         agent.setPermMode(&m, pm);
         const segs = sessionInfo(&m, arena_state.allocator()) orelse return error.TestUnexpectedResult;
         var joined: std.ArrayList(u8) = .empty;
@@ -10254,13 +10685,31 @@ test "status: the DEFAULT permission mode costs NOTHING on the row, and a deviat
         for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
         // The glyph is there...
         try std.testing.expect(std.mem.indexOf(u8, joined.items, "◐") != null or
-            std.mem.indexOf(u8, joined.items, "●") != null or
-            std.mem.indexOf(u8, joined.items, "◉") != null);
+            std.mem.indexOf(u8, joined.items, "●") != null);
         // ...and it is ONE column wide: no word, no provider, no path.
         try std.testing.expect(std.mem.indexOf(u8, joined.items, "opencode") == null);
         try std.testing.expect(std.mem.indexOf(u8, joined.items, "/") == null);
         try std.testing.expect(std.mem.indexOf(u8, joined.items, "read-only") == null);
         try std.testing.expect(std.mem.indexOf(u8, joined.items, "bypass") == null);
+    }
+
+    // BYPASS is marked ONCE, next to the face (`YOLO`), and costs nothing here:
+    // two marks for one mode read as two different states.
+    agent.setPermMode(&m, .bypass);
+    {
+        const segs = sessionInfo(&m, arena_state.allocator()) orelse return error.TestUnexpectedResult;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(std.testing.allocator);
+        for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, "◉") == null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.items, " · ") == null);
+    }
+    // …and the chip is in the composer's footer, on the left, in the accent.
+    {
+        const s = try drawTest(&m, arena_state.allocator(), 80, 20);
+        var buf: [256]u8 = undefined;
+        const last = std.mem.trim(u8, rowText(s, 19, &buf), " ");
+        try std.testing.expect(std.mem.indexOf(u8, last, "YOLO") != null);
     }
 }
 
@@ -10978,11 +11427,11 @@ test "cmdGroup-like: an empty key does not blow up" {
     try std.testing.expectEqual(@as(u8, 5), agent.cmdGroupPublic("nope"));
 }
 
-test "autocomplete: /model sends /model and does not complete to /models" {
+test "autocomplete: /model with Enter sends /model, it does not rewrite" {
     // Regression: the exact match was only looked for against the highlighted
-    // item, and the popup sorted "/models" before "/model". Typing "/model"
-    // and pressing Enter ended up sending "/models", which is a different
-    // command (it lists the models instead of opening the selector).
+    // item, so a popup that sorted another command first made Enter rewrite
+    // the typed command into the highlighted one. Typing a COMPLETE command
+    // must send exactly what is typed.
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
@@ -11213,10 +11662,11 @@ test "the mascot is BELOW the input's well, not inside it" {
     const bar = s.readCell(0, last);
     try std.testing.expect(bar.char.grapheme.len == 0 or !std.mem.eql(u8, bar.char.grapheme, "▌"));
 
-    // The row above it is the prompt, and IT is on the well.
+    // The row above it is the prompt, and it sits on the terminal's own
+    // background like everything else that is not a well of its own.
     const prompt_cell = s.readCell(1, last - 1);
     try std.testing.expectEqualStrings("›", prompt_cell.char.grapheme);
-    try std.testing.expectEqual(theme.well_bg.bg, prompt_cell.style.bg);
+    try std.testing.expectEqual(vaxis.Color.default, prompt_cell.style.bg);
     // And the well's accent bar stops with the well.
     const prompt_bar = s.readCell(0, last - 1);
     try std.testing.expectEqualStrings("▌", prompt_bar.char.grapheme);
@@ -11803,12 +12253,12 @@ test "picking a command in the palette EXECUTES it (not puts it in the input)" {
     try std.testing.expect(!m.pal.active);
     try std.testing.expectEqualStrings("", std.mem.trim(u8, m.ed.text(), " "));
 
-    // And the command really ran: `/usage` shows the unified panel.
+    // And the command really ran: `/usage` shows the usage panel.
     const s = try drawTest(&m, arena_state.allocator(), 92, 20);
     var found = false;
     for (0..s.size.height) |row| {
         var rb: [512]u8 = undefined;
-        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "usage:") != null) found = true;
+        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "requests:") != null) found = true;
     }
     try std.testing.expect(found);
 }
@@ -11821,28 +12271,6 @@ test "/effort with no args opens the picker (no 'unknown effort')" {
     defer m.deinit();
     try agent.submit(&m, "/effort");
     try std.testing.expect(m.pickerActive());
-}
-
-test "a command that needs arguments goes back to the input (not run blindly)" {
-    // `/use provider model` cannot run without arguments: running it blindly
-    // would leave the agent on some arbitrary provider. Those go to the input
-    // with the slash in place, which is what whoever picks them wants.
-    var m = Model.init(std.testing.allocator);
-    defer m.deinit();
-
-    agent.openCommandPalette(&m);
-    var ctx = testCtx();
-    for ([_]vaxis.Key{
-        .{ .codepoint = 'u', .text = "u" },
-        .{ .codepoint = 's', .text = "s" },
-        .{ .codepoint = 'e', .text = "e" },
-    }) |k| {
-        _ = try m.paletteKey(&ctx, k);
-    }
-    _ = try m.paletteKey(&ctx, .{ .codepoint = 13 });
-
-    try std.testing.expect(!m.pal.active);
-    try std.testing.expectEqualStrings("/use ", m.ed.text());
 }
 
 test "model catalog requests discard stale results and keep the latest status" {
@@ -12765,6 +13193,75 @@ test "a code block has a gutter, a language chip and separation" {
     try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, code_row, " "), "\u{2502}"));
     // And there is separation before and after the block.
     try std.testing.expect(hasBlankRowBetween(s, "antes", "const n"));
+}
+
+test "a code block's rows all end on the same column" {
+    // The chip row padded with the BYTE length of the language and then
+    // appended its closing ` │` on top of the full width, while every code
+    // row counted the left gutter twice inside its padding: the label hung
+    // two columns past the borders and the code fell two short — the
+    // misaligned box, visible on every fenced block.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.streamDelta("```javascript\nclass MiniReact {\n  constructor() {}\n}\n```");
+    m.streamEnd();
+    const s = try drawTest(&m, arena_state.allocator(), 60, 24);
+
+    var buf: [256]u8 = undefined;
+    var box_w: ?usize = null;
+    var box_rows: usize = 0;
+    var r: u16 = 0;
+    while (r < 24) : (r += 1) {
+        const row = std.mem.trim(u8, rowText(s, r, &buf), " ");
+        const is_box = std.mem.indexOf(u8, row, "\u{256D}") != null or // ╭
+            std.mem.indexOf(u8, row, "\u{2570}") != null or // ╰
+            std.mem.endsWith(u8, row, "\u{2502}"); // │ (chip row, code rows)
+        if (!is_box) continue;
+        // COLUMNS, not bytes: the borders are three-byte characters and the
+        // code is ASCII, so byte length compares nothing. Everything inside
+        // these rows (ASCII code, box-drawing, the `▚` chip) is one column
+        // per grapheme, which is what the count below relies on.
+        var cols: usize = 0;
+        var git = vaxis.unicode.graphemeIterator(row);
+        while (git.next()) |_| cols += 1;
+        if (box_w == null) box_w = cols;
+        try std.testing.expectEqual(box_w.?, cols);
+        box_rows += 1;
+    }
+    // Top border, chip, three code rows, bottom border.
+    try std.testing.expectEqual(@as(usize, 6), box_rows);
+}
+
+test "a code line wider than the box wraps inside it instead of pushing the border" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const long = "x" ** 120;
+    m.streamStart();
+    m.streamDelta("```zig\n" ++ long ++ "\n```");
+    m.streamEnd();
+    const s = try drawTest(&m, arena_state.allocator(), 40, 24);
+
+    var buf: [256]u8 = undefined;
+    var wrapped_rows: usize = 0;
+    var r: u16 = 0;
+    while (r < 24) : (r += 1) {
+        const row = rowText(s, r, &buf);
+        if (std.mem.indexOf(u8, row, "x") == null) continue;
+        // Every row of x's is a box row: `│ ` + x's + pad + ` │`, all inside
+        // the terminal width.
+        try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, row, " "), "\u{2502}"));
+        try std.testing.expect(std.mem.endsWith(u8, std.mem.trim(u8, row, " "), "\u{2502}"));
+        wrapped_rows += 1;
+    }
+    // 120 columns of x into a 36-column interior is four rows, not one clipped.
+    try std.testing.expectEqual(@as(usize, 4), wrapped_rows);
 }
 
 test "the gutter does not eat text: the column invariant holds" {
@@ -13936,6 +14433,31 @@ test "timeline: a code block has a background behind the code, not only after it
     try std.testing.expect(std.mem.eql(u8, &code_bg_rgb, &want_bg_rgb));
 }
 
+test "estHeight: a fenced block is charged the rows it actually adds" {
+    // It used to charge THREE rows per fence marker — six per closed block,
+    // for a layout that adds one (the chip). The over-estimate is what
+    // painted the black holes: past the lazy-parse threshold a paragraph
+    // keeps the estimate as its height, so the scroll reserved rows the text
+    // never fills.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.wrap_w = 80;
+
+    // Four raw lines (open, two code, close) render as five rows: the fence
+    // lines become the borders 1:1 and only the `zig` chip is extra.
+    const closed = "```zig\nconst a = 1;\nconst b = 2;\n```";
+    try std.testing.expectEqual(@as(usize, 5), m.estHeight(closed));
+
+    // A block with no language adds nothing: both borders replace a fence line.
+    const bare = "```\nconst a = 1;\n```";
+    try std.testing.expectEqual(@as(usize, 3), m.estHeight(bare));
+
+    // Mid-stream, an unclosed fence is one raw line that renders as top
+    // border + chip + bottom border: two extras.
+    const open = "```zig\nconst a = 1;";
+    try std.testing.expectEqual(@as(usize, 4), m.estHeight(open));
+}
+
 test "scroll: correcting a paragraph's height does not move the text under the reader" {
     // The bug: the top of the view was an ABSOLUTE line number, and a paragraph's
     // height is an estimate until it is parsed. Parsing replaces the estimate
@@ -14484,6 +15006,104 @@ test "wire: CSI 13;2u arrives as enter+shift and inserts a newline" {
     // anything, so an empty queue proves nothing.
     try std.testing.expect(!m.ed.isEmpty());
     try std.testing.expectEqualStrings("\n", m.ed.text());
+}
+
+test "paste: a bracketed multi-line paste becomes ONE draft, not N prompts" {
+    // vaxis forwards `paste_start`/`paste_end` as boundary markers and parses
+    // EVERYTHING between them as ordinary key events. Without aggregation a
+    // three-line paste submitted three prompts: each Enter reached
+    // `submitInput`, each line echoed as its own `›` paragraph, and the last
+    // two queued behind the worker the first had started.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(arena);
+    defer m.deinit();
+    var ctx = testCtx();
+    ctx.alloc = arena;
+    ctx.cmds = .empty;
+
+    var parser: vaxis.Parser = .{};
+    // The exact bytes a bracketed-paste terminal puts on the wire: the 0x0A
+    // of the pasted newlines arrives as Ctrl+J (Parser `0x0A => 'j' + ctrl`),
+    // which during a paste means a line break and not "submit".
+    const wire = "\x1b[200~line one\nline two\nline three\x1b[201~";
+    var i: usize = 0;
+    while (i < wire.len) {
+        const res = try parser.parse(wire[i..], arena);
+        if (res.event) |ev| {
+            const mapped: vxfw.Event = switch (ev) {
+                .paste_start => .paste_start,
+                .paste_end => .paste_end,
+                .key_press => |k| .{ .key_press = k },
+                else => continue,
+            };
+            try typeErasedEventHandler(&m, &ctx, mapped);
+        }
+        if (res.n == 0) break;
+        i += res.n;
+    }
+
+    try std.testing.expectEqualStrings("line one\nline two\nline three", m.ed.text());
+    // Nothing was sent: no queue, and no `›` user paragraph in the history
+    // (`pushKind` lands in `pending` until the next draw moves it to `paras`).
+    try std.testing.expectEqual(@as(usize, 0), m.queuedCount());
+    for (m.paras.items) |p| try std.testing.expect(p.kind != .user);
+    for (m.pending.items) |p| try std.testing.expect(p.kind != .user);
+}
+
+test "input: staged images show as [name] tags inside the composer" {
+    // The image lives in `draft_images`, which is not text you can see: without
+    // a mark in the box itself, an empty-looking input sending a picture is a
+    // thing people press Enter on by accident and then cannot explain.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.draft_images.images[0] = .{
+        .mime = "image/png",
+        .data_b64 = "AAAA",
+        .path = "clipboard.png",
+    };
+    m.draft_images.images[1] = .{
+        .mime = "image/jpeg",
+        .data_b64 = "BBBB",
+        .path = "screenshot.jpg",
+    };
+    m.draft_images.len = 2;
+
+    const s = try drawTest(&m, arena, 60, 20);
+    // Both tags are painted, and they are painted in the INPUT area: below the
+    // transcript, so on the last rows of the surface.
+    try std.testing.expect(findRow(s, "[clipboard.png]") != null);
+    try std.testing.expect(findRow(s, "[screenshot.jpg]") != null);
+}
+
+test "queue: a queued prompt is taken when no turn is in flight, and only then" {
+    // The footer has always shown "⏳ queued (N waiting)" and nothing ever
+    // ran them: `takeQueued` had no production caller. The tick asks
+    // `takeQueuedWhenIdle`, whose gate is exactly this.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const a = m.allocator.dupe(u8, "the queued prompt") catch unreachable;
+    _ = m.enqueuePrompt(a);
+
+    // A turn in flight: `startChat` calls `isBusy`, which reads the streaming
+    // flags, so that is the state the gate must refuse.
+    m.streamStart();
+    try std.testing.expect(m.takeQueuedWhenIdle() == null);
+    try std.testing.expectEqual(@as(usize, 1), m.queuedCount());
+
+    m.streamEnd(); // the turn just ended: it is time
+    const got = m.takeQueuedWhenIdle().?;
+    defer m.allocator.free(got);
+    try std.testing.expectEqualStrings("the queued prompt", got);
+    try std.testing.expect(m.takeQueuedWhenIdle() == null);
 }
 
 /// Dots after "thinking": 0 to `ellipsis_max`.

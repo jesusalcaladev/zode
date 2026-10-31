@@ -29,18 +29,19 @@ const chat = @import("../chat.zig");
 
 /// Images attached to one message.
 ///
-/// 2, not 4: the point is to let the model look at a screenshot or a diagram next
-/// to the question about it, and a request with four full-resolution images is
-/// slow and expensive for no extra insight into a coding task.
-pub const max_images = 2;
+/// 4: enough for the two-screenshots-and-a-diagram case the question about them
+/// actually comes with. The total request is still capped by
+/// `max_total_bytes_per_request`, so a fifth full-size image is refused by the
+/// byte gate long before the count matters.
+pub const max_images = 4;
 
 /// Bytes of image per attachment. 1 MB is a screenshot; a photograph is bigger and
 /// is refused with a message rather than silently resized, because resizing an
 /// image properly needs a decoder and this is not one.
 pub const max_bytes = 1024 * 1024;
 
-/// Total bytes of images allowed in one request. Two screenshots at most; any
-/// more and the request is refused rather than bloating the context forever.
+/// Total bytes of images allowed in one request. Any more than this and the
+/// request is refused rather than bloating the context forever.
 pub const max_total_bytes_per_request = max_images * max_bytes;
 
 pub const Pending = struct {
@@ -52,6 +53,10 @@ pub const Pending = struct {
     /// Total bytes of images currently held, so a request that would exceed
     /// `max_total_bytes_per_request` can be refused before it is assembled.
     total_bytes: usize = 0,
+    /// True when the USER staged these (Ctrl+V), not the model via `read`. The
+    /// wire note says so: "a file you read" would send the model looking for
+    /// a file that does not exist, and a pasted screenshot is not one.
+    user_attached: bool = false,
     pub fn clear(self: *Pending, gpa: std.mem.Allocator) void {
         for (self.images[0..self.len]) |img| {
             if (img.path.len > 0) gpa.free(img.path);
@@ -59,6 +64,7 @@ pub const Pending = struct {
         self.len = 0;
         self.refused = 0;
         self.total_bytes = 0;
+        self.user_attached = false;
     }
 
     pub fn isEmpty(self: *const Pending) bool {
@@ -174,10 +180,19 @@ pub fn wireNote(gpa: std.mem.Allocator, pending: *const Pending) ![]const u8 {
     }
     var text = std.Io.Writer.Allocating.init(gpa);
     const w = &text.writer;
-    try w.print(
-        "The image{s} above ({s}) came from a file you read. It is not a screenshot of the terminal: it is the file's contents.",
-        .{ if (pending.len == 1) "" else "s", names[0..n] },
-    );
+    if (pending.user_attached) {
+        // The user pasted these with Ctrl+V: there is no file to read, and a
+        // model told "a file you read" wastes an iteration looking for one.
+        try w.print(
+            "The image{s} above ({s}) was attached by the USER to this message. It is not a screenshot of the terminal and not a file you read: it is the user's own paste — look at it.",
+            .{ if (pending.len == 1) "" else "s", names[0..n] },
+        );
+    } else {
+        try w.print(
+            "The image{s} above ({s}) came from a file you read. It is not a screenshot of the terminal: it is the file's contents.",
+            .{ if (pending.len == 1) "" else "s", names[0..n] },
+        );
+    }
     if (pending.refused > 0) {
         try w.print(
             " {d} more image{s} could not be attached (limit: {d} at a time, {d} KB each).",
@@ -320,4 +335,31 @@ test "wireNote: names the saved file, not just the mime" {
     try std.testing.expect(std.mem.indexOf(u8, note, "photo.JPG") != null);
     // Case preserved: the real file name, not lowercased.
     try std.testing.expect(std.mem.indexOf(u8, note, "JPG") != null);
+}
+
+test "wireNote: a user-pasted image says it is the user's paste, not a read file" {
+    // Ctrl+V images have no file behind them. Told "came from a file you
+    // read", the model goes looking for one that does not exist.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const gpa = arena_state.allocator();
+
+    var p = Pending{};
+    p.images[0] = .{
+        .mime = "image/png",
+        .data_b64 = "AAAA",
+        .path = try gpa.dupe(u8, "clipboard.png"),
+    };
+    p.len = 1;
+    p.user_attached = true;
+
+    const note = try wireNote(gpa, &p);
+    try std.testing.expect(std.mem.indexOf(u8, note, "attached by the USER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "came from a file you read") == null);
+    try std.testing.expect(std.mem.indexOf(u8, note, "clipboard.png") != null);
+
+    // `clear` forgets the flag with everything else: the next message's
+    // images start as whatever produced them, not as leftovers of a paste.
+    p.clear(gpa);
+    try std.testing.expect(!p.user_attached);
 }

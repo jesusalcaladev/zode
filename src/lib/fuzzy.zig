@@ -7,9 +7,12 @@
 //! Three rules keep a subsequence from matching half the catalogue, which is what a
 //! filter that does not filter looks like:
 //!
-//! 1. **Leftmost.** The scan starts where the previous match ended, so the user gets
-//!    the first place the characters appear, not a scattered later one.
-//! 2. **Runs win.** A run of consecutive characters is taken whole: `bc` in `a-xbc`
+//! 1. **Tightest window.** Every place the first character occurs is tried, and
+//!    the SMALLEST span that still holds the query wins (leftmost on a tie). A
+//!    pure leftmost scan rejected `abc` against `a--b--c·····abc` because the
+//!    scattered first hit was wide, even though a tight match existed later.
+//! 2. **Runs win.** A run of consecutive characters is the smallest window
+//!    there is, so the tightest-window rule takes it whole: `bc` in `a-xbc`
 //!    highlights `bc`, not `b` with a lonely `c` four columns away.
 //! 3. **A window.** The matched characters have to fit in a span at most
 //!    `3 * query + 8` wide. Without it `abc` is a subsequence of almost everything.
@@ -33,32 +36,52 @@ pub const fuzzy_window_slack: usize = 8;
 
 /// Matches `q` as a subsequence of `label`, writing the matched BYTE offsets into
 /// `buf`. Returns how many there are, or null when it does not match.
+///
+/// The chosen match is the TIGHTEST window: each occurrence of the first
+/// character is a candidate start, the greedy walk from it gives that start's
+/// earliest end, and the smallest span wins (leftmost on a tie). Greedy from a
+/// start is maximal — if it cannot finish the query, no later start can either —
+/// so the walk stops at the first failure.
 pub fn matchPositions(label: []const u8, q: []const u8, buf: []u32) ?usize {
     if (q.len == 0) return 0;
     if (q.len > buf.len) return null;
-    var n: usize = 0;
-    var li: usize = 0;
-    var qi: usize = 0;
-    while (qi < q.len) {
-        var j = li;
-        while (j < label.len) : (j += 1) {
-            if (std.ascii.toLower(label[j]) == std.ascii.toLower(q[qi])) break;
+    var best_start: usize = label.len;
+    var best_end: usize = label.len;
+    var qs: usize = 0;
+    while (qs < label.len) : (qs += 1) {
+        if (std.ascii.toLower(label[qs]) != std.ascii.toLower(q[0])) continue;
+        var qi: usize = 1;
+        var end = qs;
+        var i = qs + 1;
+        while (i < label.len and qi < q.len) : (i += 1) {
+            if (std.ascii.toLower(label[i]) == std.ascii.toLower(q[qi])) {
+                end = i;
+                qi += 1;
+            }
         }
-        if (j >= label.len) return null;
-        // The run that starts there, taken whole.
-        var run: usize = 1;
-        while (qi + run < q.len and j + run < label.len and
-            std.ascii.toLower(label[j + run]) == std.ascii.toLower(q[qi + run])) : (run += 1)
-        {}
-        for (0..run) |k| {
-            buf[n] = @intCast(j + k);
-            n += 1;
+        if (qi < q.len) break;
+        if (best_start >= label.len or end - qs < best_end - best_start) {
+            best_start = qs;
+            best_end = end;
+            if (best_end - best_start + 1 == q.len) break; // cannot get tighter
         }
-        li = j + run;
-        qi += run;
     }
-    const span = buf[n - 1] - buf[0] + 1;
+    if (best_start >= label.len) return null;
+    const span = best_end - best_start + 1;
     if (span > q.len * 3 + fuzzy_window_slack) return null;
+    // Re-walk the winning window to record the positions in order.
+    var n: usize = 0;
+    buf[n] = @intCast(best_start);
+    n += 1;
+    var qi: usize = 1;
+    var i = best_start + 1;
+    while (i <= best_end and qi < q.len) : (i += 1) {
+        if (std.ascii.toLower(label[i]) == std.ascii.toLower(q[qi])) {
+            buf[n] = @intCast(i);
+            n += 1;
+            qi += 1;
+        }
+    }
     return n;
 }
 
@@ -83,6 +106,7 @@ pub fn score(label: []const u8, q: []const u8, n: usize, positions: []const u32)
     var s: i32 = 0;
     var last: ?usize = null;
     var run: i32 = 0;
+    var all_boundaries: bool = n > 1;
 
     for (positions[0..n]) |p32| {
         const p: usize = p32;
@@ -96,15 +120,24 @@ pub fn score(label: []const u8, q: []const u8, n: usize, positions: []const u32)
                 s -= @intCast(@min(p - l, 50));
             }
         }
-        // Start of a word: the beginning of the label or right after a separator.
-        if (p == 0 or isSeparator(label[p - 1])) s += 100;
-        // A camelCase hump: "cs" reaching sonnet's S and 4 is not a hump, but
-        // "claudeSonnet" has two and the humps are where humans abbreviate.
-        if (p > 0 and std.ascii.isUpper(label[p]) and !std.ascii.isUpper(label[p - 1])) {
-            s += 50;
-        }
+        // Start of a word: the beginning of the label, right after a
+        // separator, or on a camelCase hump ("claudeSonnet" has two humps and
+        // the humps are where humans abbreviate).
+        const boundary = p == 0 or isSeparator(label[p - 1]);
+        const hump = !boundary and p > 0 and std.ascii.isUpper(label[p]) and !std.ascii.isUpper(label[p - 1]);
+        if (boundary) {
+            s += 100;
+        } else if (hump) s += 50;
+        if (!boundary and !hump) all_boundaries = false;
         last = p;
     }
+
+    // The whole query is an ACRONYM: every character landed on a word start
+    // (separator or camelCase hump), which is how people abbreviate
+    // "claude-sonnet-4" as "cs4". Modest on purpose: a substring must still
+    // beat a scatter, and every boundary ALREADY pays its +100 — a bigger
+    // bonus here let "s-o-nnet" outscore "claude-sonnet" for "son".
+    if (all_boundaries) s += 50;
 
     if (startsWithIgnoreCase(label, q)) {
         s += 500;
@@ -207,6 +240,32 @@ test "matchPositions: the window rejects a scatter that is not a match" {
     try t.expect(matchPositions("a---------------b---------------c", "abc", &buf) == null);
     // The same three characters in a short label do match.
     try t.expect(matchPositions("a-b-c", "abc", &buf) != null);
+}
+
+test "matchPositions: a tight later match wins over a wide early one" {
+    var buf: [64]u32 = undefined;
+    // The leftmost scan took a@0, b@16, c@32: a 33-wide window, over the limit,
+    // so the label was REJECTED even though "abc" sits contiguously at the end.
+    // The tightest window finds it.
+    const n = matchPositions("a---------------b---------------cabc", "abc", &buf).?;
+    try t.expectEqual(@as(usize, 3), n);
+    try t.expectEqual(@as(u32, 33), buf[0]);
+    try t.expectEqual(@as(u32, 34), buf[1]);
+    try t.expectEqual(@as(u32, 35), buf[2]);
+    // Equal windows tie-break leftmost, so the scan stays predictable.
+    const m = matchPositions("xbc-abc", "bc", &buf).?;
+    try t.expectEqual(@as(usize, 2), m);
+    try t.expectEqual(@as(u32, 1), buf[0]);
+    try t.expectEqual(@as(u32, 2), buf[1]);
+}
+
+test "score: an acronym beats a scatter that hits the same letters mid-word" {
+    var ba: [64]u32 = undefined;
+    var bb: [64]u32 = undefined;
+    const q = "cs4";
+    const na = matchPositions("claude-sonnet-4-5", q, &ba).?;
+    const nb = matchPositions("xrcyasz4", q, &bb).?;
+    try t.expect(score("claude-sonnet-4-5", q, na, &ba) > score("xrcyasz4", q, nb, &bb));
 }
 
 test "matchPositions: case-insensitive, and the query longer than the label is null" {

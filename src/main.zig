@@ -384,7 +384,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                 var sum_from: usize = if (starts_sys) 1 else 0;
                 // Never start the summary stretch on a critical message (goal,
                 // plan, prior summary): keep those verbatim in the wire.
-                while (sum_from < upto and compaction.isCriticalMessage(cur[sum_from])) {
+                while (sum_from < upto and compaction_mod.isCriticalMessage(cur[sum_from])) {
                     sum_from += 1;
                 }
                 if (upto > sum_from) {

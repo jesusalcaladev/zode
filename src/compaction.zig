@@ -1,5 +1,6 @@
 const std = @import("std");
 const chat = @import("chat.zig");
+const compaction = @This();
 
 /// Context management: keep the wire view under budget so the stable prefix
 /// (system + tools + early turns) stays cacheable and requests don't explode.
@@ -101,9 +102,9 @@ fn messageTokens(m: chat.ChatMessage) i64 {
 /// How much of the context window compaction aims to stay under.
 pub const target_pct: i64 = 80;
 
-/// Umbral de "warm": cuando el contexto llega a este %, se dispara la
-/// compactación en background para que termine antes de llegar al crítico.
-/// `ZODE_COMPACT_BG_PCT` lo overridea. Default 80.
+/// The "warm" threshold: when the context reaches this %, background
+/// compaction is launched so it finishes before the critical point.
+/// Overridden by `ZODE_COMPACT_BG_PCT`. Default 80.
 pub const bg_pct_default: i64 = 80;
 pub const min_bg_pct: i64 = 10;
 pub const max_bg_pct: i64 = 95;
@@ -115,9 +116,9 @@ pub fn bgPct(env: ?*const std.process.Environ.Map) i64 {
     return @max(min_bg_pct, @min(n, max_bg_pct));
 }
 
-/// Umbral de "hot": cuando el contexto llega a este %, la compactación debe
-/// ya estar hecha (por el background). Si no, se hace síncrona (fallback).
-/// `ZODE_COMPACT_HOT_PCT` lo overridea. Default 90.
+/// The "hot" threshold: when the context reaches this %, compaction should
+/// already be done (by the background thread). If not, it runs synchronously
+/// (fallback). Overridden by `ZODE_COMPACT_HOT_PCT`. Default 90.
 pub const hot_pct_default: i64 = 90;
 pub const min_hot_pct: i64 = 10;
 pub const max_hot_pct: i64 = 99;
@@ -129,28 +130,31 @@ pub fn hotPct(env: ?*const std.process.Environ.Map) i64 {
     return @max(min_hot_pct, @min(n, max_hot_pct));
 }
 
-/// Resultado de una compactación (tier 1) listo para usar en el wire.
+/// A tier-1 compaction result, ready to put on the wire.
 pub const CompactBgResult = struct {
     msgs: []chat.ChatMessage,
     elided: usize = 0,
+    /// Indices (into `msgs`) of the results that were elided, so the caller can
+    /// say WHICH ones the wire lost — same job `Compacted.elided_at` does.
+    elided_at: []const usize = &.{},
     needs_summary: bool = false,
     summary_upto: usize = 0,
     estimated: i64 = 0,
 };
 
-/// Estado de compactación en background. El hilo de background escribe
-/// aquí; el hilo del turno lee. El mutex protege las dos operaciones.
+/// Background compaction state. The background thread writes here; the turn
+/// thread reads. The mutex guards both.
 pub const CompactBgState = struct {
-    mtx: std.atomic.Mutex = .{},
-    /// Resultado de la última compactación en background, si hay uno.
+    mtx: std.atomic.Mutex = .unlocked,
+    /// The last background compaction result, if one is ready.
     result: ?CompactBgResult = null,
-    /// Verdadero si el hilo está corriendo ahora (para no lanzar dos).
+    /// True while the thread is running, so two are never launched.
     running: bool = false,
-    /// El hilo mismo, para poder join al salir.
+    /// The thread itself, so it can be joined on exit.
     thread: ?std.Thread = null,
 };
 
-/// Ctx del hilo de background (asignado en gpa para que sobreviva al spawn).
+/// Background thread context (allocated in gpa so it survives the spawn).
 const CompactBgCtx = struct {
     state: *CompactBgState,
     gpa: std.mem.Allocator,
@@ -159,9 +163,8 @@ const CompactBgCtx = struct {
     model_ctx: u32,
 };
 
-/// Ejecuta tier 1 (elide) sobre `msgs` con el presupuesto dado.
-/// Devuelve un CompactBgResult. Usado tanto por el hilo de background
-/// como por el fallback síncrono.
+/// Runs tier 1 (elide) over `msgs` with the given budget and returns a
+/// CompactBgResult. Used by both the background thread and the sync fallback.
 pub fn elideForBudget(
     arena: std.mem.Allocator,
     msgs: []const chat.ChatMessage,
@@ -171,8 +174,12 @@ pub fn elideForBudget(
 ) CompactBgResult {
     const comp = elideTier(arena, msgs, budget, env, cmode) catch {
         return .{
-            .msgs = msgs,
+            // The fallback returns the input untouched. `Compacted.msgs` is
+            // mutable only because `elideTier` allocates a new slice; nothing
+            // downstream ever writes through it.
+            .msgs = @constCast(msgs.ptr)[0..msgs.len],
             .elided = 0,
+            .elided_at = &.{},
             .needs_summary = false,
             .summary_upto = 0,
             .estimated = estimateTokens(msgs),
@@ -181,19 +188,25 @@ pub fn elideForBudget(
     return .{
         .msgs = comp.msgs,
         .elided = comp.elided,
+        .elided_at = comp.elided_at,
         .needs_summary = comp.needs_summary,
         .summary_upto = comp.summary_upto,
         .estimated = estimateTokens(comp.msgs),
     };
 }
 
-/// Función que ejecuta el hilo de background. Llama a `elideForBudget` con
-/// el presupuesto del umbral bg y guarda el resultado en `state`.
-pub fn compactBgFn(ctx: *anyopaque) void {
-    const c = @ptrCast(*CompactBgCtx, ctx);
+/// The function the background thread runs: `elideForBudget` at the bg
+/// threshold's budget, with the result stored into `state`.
+///
+/// The result buffers live in `c.gpa` and the caller of `tryCollectBg` takes
+/// ownership of them — so nothing here may free them, and the ctx itself is
+/// destroyed only after the result has been handed to `state`.
+pub fn compactBgFn(c: *CompactBgCtx) void {
+    const gpa = c.gpa;
+    defer gpa.destroy(c);
     const budget = budgetFor(c.env, c.model_ctx);
     const cmode = effectiveMode(c.env, null);
-    const res = elideForBudget(c.gpa, c.msgs, budget, c.env, cmode);
+    const res = elideForBudget(gpa, c.msgs, budget, c.env, cmode);
 
     while (!c.state.mtx.tryLock()) std.Thread.yield() catch {};
     c.state.result = res;
@@ -201,8 +214,8 @@ pub fn compactBgFn(ctx: *anyopaque) void {
     c.state.mtx.unlock();
 }
 
-/// Intenta lanzar la compactación en background. Devuelve true si se lanzó,
-/// false si ya hay una corriendo o si ya hay un resultado listo.
+/// Tries to launch background compaction. True if it launched; false when one
+/// is already running or a result is already waiting.
 pub fn tryLaunchBg(
     state: *CompactBgState,
     gpa: std.mem.Allocator,
@@ -218,7 +231,12 @@ pub fn tryLaunchBg(
     state.running = true;
     state.mtx.unlock();
 
-    const ctx_ptr = try gpa.create(CompactBgCtx);
+    const ctx_ptr = gpa.create(CompactBgCtx) catch {
+        while (!state.mtx.tryLock()) std.Thread.yield() catch {};
+        state.running = false;
+        state.mtx.unlock();
+        return false;
+    };
     ctx_ptr.* = .{
         .state = state,
         .gpa = gpa,
@@ -226,21 +244,21 @@ pub fn tryLaunchBg(
         .env = env,
         .model_ctx = model_ctx,
     };
-    const t = std.Thread.spawn(.{}, compactBgFn, ctx_ptr) catch |err| {
+    const t = std.Thread.spawn(.{}, compactBgFn, .{ctx_ptr}) catch {
         gpa.destroy(ctx_ptr);
-        state.mtx.lock();
+        while (!state.mtx.tryLock()) std.Thread.yield() catch {};
         state.running = false;
         state.mtx.unlock();
         return false;
     };
-    state.mtx.lock();
+    while (!state.mtx.tryLock()) std.Thread.yield() catch {};
     state.thread = t;
     state.mtx.unlock();
     return true;
 }
 
-/// Intenta recoger el resultado del background. Devuelve null si no está listo.
-/// El caller toma ownership de los buffers del resultado (viven en gpa del hilo).
+/// Tries to collect the background result. Null when it is not ready.
+/// The caller takes ownership of the result buffers (they live in the thread's gpa).
 pub fn tryCollectBg(state: *CompactBgState) ?CompactBgResult {
     while (!state.mtx.tryLock()) std.Thread.yield() catch {};
     const running = state.running;
@@ -264,9 +282,9 @@ pub fn tryCollectBg(state: *CompactBgState) ?CompactBgResult {
     return null;
 }
 
-/// Devuelve true si un mensaje es "crítico": no debe ser eludido ni resumido
-/// porque contiene el objetivo, el plan o referencias de archivos que el
-/// modelo necesita tener a mano.
+/// True when a message is "critical": it must not be elided or summarized
+/// because it carries the goal, the plan, or file references the model needs
+/// to keep at hand.
 pub fn isCriticalMessage(m: chat.ChatMessage) bool {
     const c = m.content;
     if (std.mem.indexOf(u8, c, "\u{1}ZODE-GOAL\u{1}") != null) return true;
@@ -949,19 +967,19 @@ test "elide mode still elides (it is free) but never asks for a summary" {
 }
 
 test "isCriticalMessage: goal note, plan, and prior summary are critical" {
-    const goal = .{ .role = "user", .content = "\u{1}ZODE-GOAL\u{1}build something" };
+    const goal = chat.ChatMessage{ .role = "user", .content = "\u{1}ZODE-GOAL\u{1}build something" };
     try std.testing.expect(compaction.isCriticalMessage(goal));
 
-    const plan = .{ .role = "user", .content = "[Plan] do this then that" };
+    const plan = chat.ChatMessage{ .role = "user", .content = "[Plan] do this then that" };
     try std.testing.expect(compaction.isCriticalMessage(plan));
 
-    const summary = .{ .role = "user", .content = "[earlier conversation summarized to fit the context budget]" };
+    const summary = chat.ChatMessage{ .role = "user", .content = "[earlier conversation summarized to fit the context budget]" };
     try std.testing.expect(compaction.isCriticalMessage(summary));
 
-    const ordinary = .{ .role = "user", .content = "just a regular message" };
+    const ordinary = chat.ChatMessage{ .role = "user", .content = "just a regular message" };
     try std.testing.expect(!compaction.isCriticalMessage(ordinary));
 
-    const empty = .{ .role = "user", .content = "" };
+    const empty = chat.ChatMessage{ .role = "user", .content = "" };
     try std.testing.expect(!compaction.isCriticalMessage(empty));
 }
 
@@ -988,13 +1006,21 @@ test "elideTier: critical messages are never elided even under a tiny budget" {
 
     // Budget so low that everything non-critical should be elided.
     const res = try elideTier(arena, msgs, 100, &env, .full);
+    // Tier 1 works on a COPY of the wire view; `msgs` never changes. Assert on
+    // `res.msgs`, which is the view the model would actually see.
     // msgs[2] (goal) and msgs[4] (plan) are not tools, never elided by tier 1.
-    // msgs[1] and [3] are tools but NOT critical → should be elided.
+    // msgs[1], [3] and [5] are tools outside the window → all elided.
     // msgs[6] and [7] are in the recent window (last 2) → never elided.
-    try std.testing.expectEqual(2, res.elided);
-    try std.testing.expect(std.mem.eql(u8, msgs[1].content, "[tool result elided"));
-    try std.testing.expect(std.mem.eql(u8, msgs[3].content, "[tool result elided"));
+    try std.testing.expectEqual(3, res.elided);
+    try std.testing.expect(std.mem.startsWith(u8, res.msgs[1].content, "[tool result elided"));
+    try std.testing.expect(std.mem.startsWith(u8, res.msgs[3].content, "[tool result elided"));
+    try std.testing.expect(std.mem.startsWith(u8, res.msgs[5].content, "[tool result elided"));
+    // The critical messages survive verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, res.msgs[2].content, "ZODE-GOAL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.msgs[4].content, "[Plan]") != null);
     // Recent window ones stay verbatim.
-    try std.testing.expect(std.mem.eql(u8, msgs[6].content, big_tool));
-    try std.testing.expect(std.mem.eql(u8, msgs[7].content, big_tool));
+    try std.testing.expect(std.mem.eql(u8, res.msgs[6].content, big_tool));
+    try std.testing.expect(std.mem.eql(u8, res.msgs[7].content, big_tool));
+    // And the input is untouched: eliding must never mutate the live history.
+    try std.testing.expect(std.mem.eql(u8, msgs[1].content, big_tool));
 }

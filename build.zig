@@ -319,6 +319,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ui_frame_mod.addImport("vaxis", vaxis.module("vaxis"));
+    // The harness renders the REAL `drawFn`, and `tui.zig` pulls in
+    // `lib/selfupdate.zig` and `commands.zig`, which read the version from
+    // `build_options`. Without it the step does not compile at all, which is
+    // worse than no harness: the design check silently stops existing.
+    ui_frame_mod.addImport("build_options", build_options_mod);
     const ui_frame = b.addExecutable(.{ .name = "ui_frame", .root_module = ui_frame_mod });
     const ui_frame_run = b.addRunArtifact(ui_frame);
     if (b.args) |args| ui_frame_run.addArgs(args);

@@ -1119,11 +1119,19 @@ pub fn permModeName() []const u8 {
 /// the others would leave the status bar advertising a mode that does
 /// not apply, which is worse than no mode at all.
 pub fn setPermMode(m: *tui.Model, mode: PermMode) void {
+    const was_plan = read_only;
     read_only = (mode == .read_only);
     accept_edits = (mode == .accept_edits);
     yolo = (mode == .bypass);
     m.read_only = read_only;
     m.accept_edits = accept_edits;
+    // The plan block above the input is the face of PLAN mode. Leaving plan
+    // — approval, shift+tab, `/mode build` — takes the indicator with you:
+    // what sits over the input always describes the mode you are actually in,
+    // and the checklist of an abandoned draft does not haunt a build session.
+    // (When approval starts an implementation, the model's first `todo` call
+    // opens a fresh plan; that one belongs to build and stays.)
+    if (was_plan and mode != .read_only) m.clearPlan();
 }
 
 /// shift+tab: cycle Build → accept-edits → Plan → Build.
@@ -4556,7 +4564,6 @@ pub const ChatJob = struct {
 };
 
 pub fn startChat(m: *tui.Model, input: []const u8) !void {
-    const s = ensureSession(m, m.allocator);
     // Truncate long inputs for UI display, keep full text for model
     const TRUNCATE_SIZE = 200;
     var display_input = input;
@@ -4580,8 +4587,10 @@ pub fn startChat(m: *tui.Model, input: []const u8) !void {
         return;
     }
 
-    s.append(.user, copy) catch {};
-    s.flush();
+    // The user line goes into the session file in the WORKER, not here: the
+    // append is a DEFLATE and `write(2)` with the whole history behind it, and
+    // doing it on the UI thread is exactly the wait between pressing Enter and
+    // seeing your own prompt on the screen.
 
     // [undo] One snapshot per TURN, not per tool: the user thinks in turns
     // ("undo that"), and the checkpoint is named after the prompt so the
@@ -4697,6 +4706,17 @@ fn chatWorker(job: *ChatJob) void {
     // BEFORE destroying the `Io` (see `Model.waitWorkers`).
     m.beginWorker();
     defer m.endWorker();
+
+    // The user line of the turn lands in the session file HERE: this is the
+    // first thing the turn does, so the order in the file is unchanged (user
+    // line, then whatever the iterations append), and the UI thread is free to
+    // paint your prompt the moment you press Enter instead of waiting on a
+    // DEFLATE and a `write(2)`.
+    {
+        const s = ensureSession(m, m.allocator);
+        s.append(.user, user_text) catch {};
+        s.flush();
+    }
 
     // The automatic typecheck's budget is PER TURN, and any job left over from the
     // previous one is killed rather than orphaned. Both live in `resetTurn` so the
@@ -10959,6 +10979,71 @@ pub fn catalogWarmupAsync(m: *tui.Model) !void {
 
 const WarmupJob = struct { model: *tui.Model };
 
+/// Quiet catalogue refresh, driven by the UI's `.tick`.
+///
+/// Between the startup warmup and a palette opening, nothing refreshed the
+/// disk cache: a session left open for hours kept answering ctrl+t from a
+/// file as old as the session. Every quarter hour, and ONLY while idle — no
+/// turn in flight, no picker on screen — the same silent warmup worker runs
+/// again. It never touches the UI (that is what makes it unnoticed): it writes
+/// the disk cache, and the next palette simply opens on a fresh file.
+var catalog_refresh_in_flight: std.atomic.Value(bool) = .init(false);
+var catalog_refresh_last_ms: std.atomic.Value(i64) = .init(0);
+
+const catalog_refresh_interval_ms: i64 = 15 * 60 * 1000;
+
+fn wallClockMs() i64 {
+    const ts = std.Io.Timestamp.now(io_global, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+pub fn maybeRefreshCatalog(m: *tui.Model) void {
+    if (m.isBusy()) return;
+    if (m.pickerActive() or m.permActive() or m.askActive()) return;
+    const now = wallClockMs();
+    if (now - catalog_refresh_last_ms.load(.acquire) < catalog_refresh_interval_ms) return;
+    if (catalog_refresh_in_flight.cmpxchgStrong(false, true, .seq_cst, .seq_cst) != null) return;
+    catalogWarmupAsync(m) catch {
+        catalog_refresh_in_flight.store(false, .release);
+    };
+}
+
+test "maybeRefreshCatalog: the silent refresh never interrupts the app" {
+    // Every gate must refuse BEFORE anything is launched: a refresh that
+    // fires during a turn, under an open picker, or twice inside the interval
+    // is the "it noticed me refreshing" the whole feature exists to avoid.
+    // (The launch path itself spawns a network worker and is not tested here
+    // on purpose — the gates are the contract.)
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    // `wallClockMs` reads through `io_global`, which only the real binary has
+    // set; a test has to hand it an Io like any other test here does.
+    const saved_io = io_global;
+    defer io_global = saved_io;
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+
+    // A turn running: refused, no matter how old the last refresh is.
+    catalog_refresh_last_ms.store(0, .release);
+    m.busy = true;
+    maybeRefreshCatalog(&m);
+    try std.testing.expectEqual(false, catalog_refresh_in_flight.load(.acquire));
+    m.busy = false;
+
+    // An open permission dialog: refused.
+    m.perm_active = true;
+    maybeRefreshCatalog(&m);
+    try std.testing.expectEqual(false, catalog_refresh_in_flight.load(.acquire));
+    m.perm_active = false;
+
+    // Inside the interval: refused.
+    catalog_refresh_last_ms.store(wallClockMs(), .release);
+    maybeRefreshCatalog(&m);
+    try std.testing.expectEqual(false, catalog_refresh_in_flight.load(.acquire));
+}
+
 fn warmupWorker(job: *WarmupJob) void {
     // THE ORDER OF THESE TWO DEFERS IS THE WHOLE FUNCTION.
     //
@@ -10979,6 +11064,13 @@ fn warmupWorker(job: *WarmupJob) void {
     const m = job.model;
     defer m.allocator.destroy(job); // registered first  -> runs LAST
     defer m.endWorker(); // registered second -> runs FIRST
+    // The refresh clock and the in-flight flag close with the worker, success
+    // or not: a failed fetch must not re-arm the tick to hammer the endpoint
+    // every 120 ms, and it owes the next quarter hour the same chance.
+    defer {
+        catalog_refresh_last_ms.store(wallClockMs(), .release);
+        catalog_refresh_in_flight.store(false, .release);
+    }
     const gpa = m.allocator;
     const def = activeProviderDef(m.environ);
     if (def.models_url.len == 0) return;
@@ -15710,6 +15802,45 @@ test "shift+tab cycles Build -> accept-edits -> Plan -> Build" {
     setPermMode(&m, .bypass);
     cyclePermMode(&m);
     try std.testing.expectEqual(PermMode.default, currentPermMode());
+}
+
+test "leaving plan mode clears the plan block above the input" {
+    // The block over the composer is the FACE of plan mode: if it survived the
+    // switch to build (approval, shift+tab, `/mode build`), the UI would keep
+    // advertising a mode that no longer applies and the checklist of an
+    // abandoned draft would haunt the implementation session.
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved = .{ .ro = read_only, .ae = accept_edits, .y = yolo };
+    defer {
+        read_only = saved.ro;
+        accept_edits = saved.ae;
+        yolo = saved.y;
+    }
+
+    var items: [plan_mod.max_items]plan_mod.Item = undefined;
+    for (0..2) |i| {
+        var it = plan_mod.Item{ .status = .pending };
+        const t = if (i == 0) "step one" else "step two";
+        @memcpy(it.text[0..t.len], t);
+        it.len = @intCast(t.len);
+        items[i] = it;
+    }
+    _ = m.applyPlan(&items, 2);
+
+    setPermMode(&m, .read_only); // entering plan keeps the block
+    try std.testing.expect(!m.plan.isEmpty());
+
+    setPermMode(&m, .default); // leaving plan takes the indicator with you
+    try std.testing.expect(m.plan.isEmpty());
+    try std.testing.expect(!m.read_only);
+
+    // And a plan made while NOT in plan mode is never stomped by the switch:
+    // `todo` opens it, shift+tab into plan keeps it.
+    _ = m.applyPlan(&items, 2);
+    setPermMode(&m, .read_only);
+    try std.testing.expect(!m.plan.isEmpty());
 }
 
 test "mode commands use Build as the visible name and keep default as an alias" {

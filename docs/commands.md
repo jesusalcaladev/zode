@@ -57,6 +57,8 @@ Wipe the conversation. Alias for `/new`.
 
 Open the **model palette**: every model of every connected provider, with its context window and whether it is free. Keyboard (`↑↓`, `tab`, `enter`), mouse (move to highlight, click to choose), and wheel (scroll) all work. Picking a model adopts **its** context window for the token budget, unless `ZODE_CONTEXT_LIMIT` says otherwise. Also reachable with `Ctrl+T`.
 
+What you pick is **remembered**: the next time you open zode it comes back with the same provider and model, unless `ZODE_MODEL` or a `model` in `config.json` says otherwise (an explicit instruction beats the habit). The memory lives in `~/.config/zode/last_model`.
+
 ### `/providers`
 
 List all providers with their key state — which ones have a key configured and which is active.
@@ -64,16 +66,6 @@ List all providers with their key state — which ones have a key configured and
 ### `/submodel`
 
 Show which model subagents run on. Precedence: session > `config.json` > env > off.
-
-### `/use <provider> [model]`
-
-Quick switch provider and/or model by name. Omit the model to keep the current one.
-
-Examples:
-```text
-/use openrouter
-/use anthropic claude-3-5-sonnet
-```
 
 ### `/effort`
 
@@ -169,26 +161,9 @@ Search the web (DuckDuckGo / Brave / … depending on config).
 
 ## Permissions
 
-### `/mode`
-
-Set the permission mode. Cycles: `accept edits on` -> `plan` -> `read-only` -> `bypass` (`/yolo`). Also reachable with `Shift+Tab`.
-
-- `accept edits on` — normal: asks per the rules below
-- `plan` — refuses every write
-- `read-only` — read tools only
-- `bypass` (`/yolo`) — asks nothing
-
-### `/allowlist`
-
-List allowed tools and commands (the persisted answers from the permission dialog).
-
 ### `/permissions`
 
 Show every permission rule in force and which file each rule came from (`local` > `project` > `user` > `policy`; `deny` beats any `allow`).
-
-### `/ask`
-
-Toggle ask mode: whether the model may ask the user questions.
 
 **Permission flow:** `model.requestPermission()` blocks until the UI answers. Priority:
 1. `/yolo` (global bypass) — asks nothing
@@ -197,7 +172,9 @@ Toggle ask mode: whether the model may ask the user questions.
 
 Denied answers feed back as `tool_result "denied: permission required"`. `lsp` asks NO permission (spawns from a fixed table, read-only only). `batch` asks the union of step permissions.
 
----
+### `/ask`
+
+Toggle ask mode (on | off) — whether the model may ask the user questions. When off the model cannot interrupt with questions and every tool runs at full speed.
 
 ## Subagents & skills
 
@@ -217,10 +194,6 @@ List available skills from `.zode/skills/<name>/SKILL.md` (project) and `~/.conf
 
 Load a skill. Only the skill's name + description enter the prompt (budget = 1% of `ZODE_CONTEXT_LIMIT`). Project overrides global; no merge.
 
----
-
-## Session & history
-
 ### `/goal <text>`
 
 Set a task goal, which enables a ceiling at 60 iterations.
@@ -228,10 +201,6 @@ Set a task goal, which enables a ceiling at 60 iterations.
 ### `/todo`
 
 Manage the visible todo list.
-
----
-
-## System
 
 ### `/help`
 

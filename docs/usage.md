@@ -42,14 +42,7 @@ See `docs/settings.md` §1–§2 for the full provider table and `config.json` s
 
 ## 3. Pick a model
 
-`/model` (or `Ctrl+T`) opens the model palette: every model of every connected provider, with context window and whether it is free. Pick one to switch provider and/or model.
-
-Quick switch by name:
-
-```text
-/use openrouter
-/use anthropic claude-3-5-sonnet
-```
+`/model` (or `Ctrl+T`) opens the model palette: every model of every connected provider, with context window and whether it is free. Pick one to switch provider and/or model. The last one you used comes back automatically on the next start — `ZODE_MODEL` and `config.json` still win over it.
 
 Effort (reasoning rung) via `/effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (default `medium`).
 

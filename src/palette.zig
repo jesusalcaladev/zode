@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const theme = @import("lib/theme.zig");
+const fuzzy = @import("lib/fuzzy.zig");
 const tui = @import("tui.zig");
 
 const Painter = tui.Painter;
@@ -410,116 +411,18 @@ pub fn matches(item: Item, groups: []const Group, q: []const u8) bool {
 }
 
 // ── fuzzy matching ────────────────────────────────────────────
+//
+// ONE matcher for every list in zode. This used to be a private copy of
+// `lib/fuzzy.zig` and the two drifted: the shared module got the tightest-
+// window scan, the palette stayed on the leftmost one, and "cs4" found
+// "claude-sonnet-4-5" in the picker but not in the modal. Aliases, so a fix
+// to the matcher lands on both searchers at once.
 
-/// How much wider than the query the matched window may be.
-///
-/// The rule exists because a subsequence match with no width limit matches
-/// almost everything: "abc" is a subsequence of half a model catalogue, and a
-/// filter that returns half the list is a filter that does not filter.
-///
-/// The window is generous (three times the query, plus eight) because what
-/// is searched is a model id with a provider prefix and a version suffix:
-/// "cs4" has to reach "claude-sonnet-4-5" and that is 15 characters wide.
-pub const fuzzy_window_slack: usize = 8;
-
-/// Matches the query as a SUBSEQUENCE of the label and says WHICH
-/// characters matched.
-///
-/// The positions are BYTE offsets into the label, written into `buf`; the
-/// return value is how many there are, or null when the query is not a
-/// subsequence of the label.
-///
-/// Two decisions that are not obvious:
-///
-/// * **Leftmost.** The scan starts where the previous match ended, so a
-///   scattered match never beats an earlier one. The user typed the
-///   characters in an order and the first place they appear is the one they
-///   meant.
-/// * **Runs win.** A run of consecutive characters is taken whole, and it is
-///   the substring when there is one. "bc" in "a-xbc" highlights "bc" and
-///   not "b" alone with a lonely "c" four columns away.
-pub fn fuzzyMatch(label: []const u8, q: []const u8, buf: []u32) ?usize {
-    if (q.len == 0) return 0;
-    if (q.len > buf.len) return null;
-    var n: usize = 0;
-    var li: usize = 0;
-    var qi: usize = 0;
-    while (qi < q.len) {
-        // The first occurrence of this character at or after the last match.
-        var j = li;
-        while (j < label.len) : (j += 1) {
-            if (std.ascii.toLower(label[j]) == std.ascii.toLower(q[qi])) break;
-        }
-        if (j >= label.len) return null;
-        // And the run that starts there, taken whole.
-        var run: usize = 1;
-        while (qi + run < q.len and j + run < label.len and
-            std.ascii.toLower(label[j + run]) == std.ascii.toLower(q[qi + run])) : (run += 1)
-        {}
-        for (0..run) |k| {
-            buf[n] = @intCast(j + k);
-            n += 1;
-        }
-        li = j + run;
-        qi += run;
-    }
-    // The WINDOW: the matched characters have to fit in a span that is not
-    // much wider than the query. Without it the fuzzy fallback is noise.
-    const span = buf[n - 1] - buf[0] + 1;
-    if (span > q.len * 3 + fuzzy_window_slack) return null;
-    return n;
-}
-
-/// The positions to HIGHLIGHT in the label, for the given query.
-///
-/// It prefers the contiguous substring (the common case, and the one the eye
-/// reads as "the match") and falls back to the fuzzy positions.
-pub fn highlightPositions(label: []const u8, q: []const u8, buf: []u32) ?usize {
-    if (q.len == 0) return null;
-    if (label.len > 0 and startsWithIgnoreCase(label, q)) {
-        for (q, 0..) |_, i| buf[i] = @intCast(i);
-        return q.len;
-    }
-    if (containsIgnoreCase(label, q)) {
-        const at = indexOfIgnoreCase(label, q) orelse return null;
-        for (q, 0..) |_, i| buf[i] = @intCast(at + i);
-        return q.len;
-    }
-    return fuzzyMatch(label, q, buf);
-}
-
-/// The first position of `needle` in `hay`, ignoring the case.
-///
-/// `std.mem` has no case-insensitive index in this Zig version, and writing
-/// it here is four lines: the ASCII comparison is the same one
-/// `containsIgnoreCase` already uses.
-pub fn indexOfIgnoreCase(hay: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > hay.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= hay.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return i;
-    }
-    return null;
-}
-
-pub fn startsWithIgnoreCase(hay: []const u8, needle: []const u8) bool {
-    if (needle.len > hay.len) return false;
-    for (needle, 0..) |nc, i| {
-        if (std.ascii.toLower(hay[i]) != std.ascii.toLower(nc)) return false;
-    }
-    return true;
-}
-
-pub fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > hay.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= hay.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
+pub const fuzzyMatch = fuzzy.matchPositions;
+pub const highlightPositions = fuzzy.highlightPositions;
+pub const indexOfIgnoreCase = fuzzy.indexOfIgnoreCase;
+pub const startsWithIgnoreCase = fuzzy.startsWithIgnoreCase;
+pub const containsIgnoreCase = fuzzy.containsIgnoreCase;
 
 // ── tests ─────────────────────────────────────────────────────
 
@@ -1985,9 +1888,11 @@ test "fuzzy: the query is a subsequence of the label, and the positions say whic
     var buf: [64]u32 = undefined;
 
     // The ordinary case: a model id with a provider prefix and a version.
+    // The tightest window starts at the 'c' of "claude" (10), not the 'c' of
+    // "anthropic" (8): same s and 4, a narrower span.
     const n = fuzzyMatch("anthropic/claude-sonnet-4-5", "cs4", &buf).?;
     try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqual(@as(u32, 8), buf[0]); // the 'c' of "claude"
+    try std.testing.expectEqual(@as(u32, 10), buf[0]); // the 'c' of "claude"
     try std.testing.expectEqual(@as(u32, 17), buf[1]); // the 's' of "sonnet"
     try std.testing.expectEqual(@as(u32, 24), buf[2]); // the '4'
 
