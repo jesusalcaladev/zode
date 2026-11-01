@@ -105,7 +105,10 @@ jobs:
           files: ${{ steps.binary.outputs.asset_name }}
           generate_release_notes: true
           draft: false
-          prerelease: false
+          # A semver prerelease tag (v0.2.1-beta.2) is published AS a prerelease:
+          # GitHub's "latest release" is what install.sh and the self-update check
+          # ask for, and a beta must never take that slot from the last stable.
+          prerelease: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
