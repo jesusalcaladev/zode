@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.2.1-beta.2] - 2026-10-31
+
 ### Features
 
 - Phase 25.4 — read-only bash skips the permission dialog [`ddb3ed72`](https://github.com/jesusalcaladev/zode/commit/ddb3ed72)

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Generate CHANGELOG.md from git history using conventional commits.
 
-Reads `git log`, filters out housekeeping noise (cline checkpoints, "index on"
-commits, untracked-file commits), classifies each remaining commit by its
-conventional type (feat, fix, refactor, chore, docs, ...), and writes a Keep a
-Changelog formatted CHANGELOG.md with everything under a single [Unreleased]
-section grouped by type.
+Reads `git log` since the last release tag, filters out housekeeping noise
+(cline checkpoints, "index on" commits, untracked-file commits), classifies each
+remaining commit by its conventional type (feat, fix, refactor, chore, docs,
+...), and writes a Keep a Changelog formatted CHANGELOG.md: the new commits
+under [Unreleased], grouped by type, followed by the sections of the releases
+that already shipped (everything from the first `## [x.y.z]` heading down).
+
+Cutting a release is therefore two edits: rename `## [Unreleased]` to
+`## [x.y.z] - <date>` and start a fresh [Unreleased] above it. Tag the commit;
+the next regeneration measures from that tag and leaves the section alone.
 
 Usage:
     python3 tools/generate_changelog.py [output_path]
@@ -69,11 +74,20 @@ def is_noise(subject: str) -> bool:
     return any(low.startswith(p) for p in NOISE_PREFIXES)
 
 
+def last_release_tag() -> str:
+    """The newest tag reachable from HEAD, or "" when nothing was released yet."""
+    return run(["git", "describe", "--tags", "--abbrev=0"])
+
+
 def get_git_log() -> list[dict]:
-    """Return list of meaningful commits with hash, date, type, scope, description, breaking."""
+    """Return list of meaningful commits since the last release, with hash, date, type, scope, description, breaking."""
     # %x1e = record separator (RS), %x1f = field separator (US)
-    raw = run(["git", "log", "--reverse",
-               "--format=%H%x1f%ad%x1f%s%x1f%b%x1e", "--date=short"])
+    rev = ["git", "log", "--reverse",
+           "--format=%H%x1f%ad%x1f%s%x1f%b%x1e", "--date=short"]
+    tag = last_release_tag()
+    if tag:
+        rev.append(f"{tag}..HEAD")
+    raw = run(rev)
     if not raw:
         return []
 
@@ -170,12 +184,30 @@ def render_changelog(commits: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def released_sections(existing: str) -> str:
+    """Return the shipped-release part of an existing changelog, verbatim.
+
+    The generator owns the [Unreleased] block; every ``## [x.y.z]`` heading below
+    it is history that already went out. Keeping it means a feat/fix commit
+    regenerating the unreleased list cannot erase the sections of past releases.
+    """
+    for i, line in enumerate(existing.splitlines()):
+        if line.startswith("## [") and not line.startswith("## [Unreleased]"):
+            return "\n".join(existing.splitlines()[i:]).rstrip() + "\n"
+    return ""
+
+
 def write_changelog(output: str) -> int:
     commits = get_git_log()
-    content = render_changelog(commits)
+    section = render_changelog(commits)
+    existing = ""
+    if os.path.exists(output):
+        with open(output, encoding="utf-8") as f:
+            existing = f.read()
+    shipped = released_sections(existing)
+    content = section + ("\n" + shipped if shipped else "")
     with open(output, "w", encoding="utf-8") as f:
         f.write(content)
-    print(f"Wrote {output} ({len(commits)} commits)")
     print(f"Wrote {output} ({len(commits)} commits)")
     return 0
 
