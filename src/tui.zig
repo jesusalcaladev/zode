@@ -1174,6 +1174,13 @@ pub const Model = struct {
     perm_detail: [384]u8 = undefined,
     perm_detail_len: usize = 0,
     perm_active: bool = false,
+    /// The rule that matched and caused this permission question.
+    ///
+    /// Shown as its own line in the dialog so the user sees WHY they are
+    /// being asked ("your rule `Write(.git/**) deny` blocks this"), not just
+    /// a blind "may I run this?".
+    perm_rule: [128]u8 = undefined,
+    perm_rule_len: usize = 0,
     /// The rule the "always allow" option would remember.
     ///
     /// It is shown IN the dialog, because the user is answering "allow this
@@ -2480,6 +2487,7 @@ pub const Model = struct {
         self.permLock();
         const a = self.perm_answer;
         self.perm_active = false;
+        self.perm_rule_len = 0;
         self.permUnlock();
         return a;
     }
@@ -2519,6 +2527,22 @@ pub const Model = struct {
         self.permLock();
         defer self.permUnlock();
         return self.perm_suggestion[0..self.perm_suggestion_len];
+    }
+
+    /// The rule that caused this permission question, or "" when none matched.
+    pub fn setPermRule(self: *Model, text: []const u8) void {
+        self.permLock();
+        defer self.permUnlock();
+        const n = @min(text.len, self.perm_rule.len);
+        @memcpy(self.perm_rule[0..n], text[0..n]);
+        self.perm_rule_len = n;
+    }
+
+    /// The rule that caused this permission question, or "" when none matched.
+    pub fn permRule(self: *Model) []const u8 {
+        self.permLock();
+        defer self.permUnlock();
+        return self.perm_rule[0..self.perm_rule_len];
     }
 
     /// Whether the open dialog offers "always allow".
@@ -7236,6 +7260,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             height,
             perm_tool,
             perm_detail,
+            self.permRule(),
             self.permAllowAlways(),
             self.permSuggestion(),
         );
@@ -8191,6 +8216,7 @@ fn drawPermissionModal(
     height: u16,
     tool: []const u8,
     detail: []const u8,
+    rule: []const u8,
     allow_always: bool,
     suggestion: []const u8,
 ) void {
@@ -8227,9 +8253,19 @@ fn drawPermissionModal(
 
     // Detail, clipped to the box's width.
     const max_d = @as(usize, w - 6);
+    var dy: u16 = y + 5;
     if (detail.len > 0) {
         const d: []const u8 = if (detail.len > max_d) detail[0..max_d] else detail;
-        _ = p.putText(x + 3, y + 5, d, theme.dim);
+        _ = p.putText(x + 3, dy, d, theme.dim);
+        dy += 1;
+    }
+
+    // The rule that matched: why this permission question exists at all.
+    if (rule.len > 0) {
+        const max_r = @as(usize, w - 6);
+        const r: []const u8 = if (rule.len > max_r) rule[0..max_r] else rule;
+        _ = p.putText(x + 3, dy, r, theme.warn);
+        dy += 1;
     }
 
     // Options, each with its key in large type. The first one (y) is the one
@@ -8254,14 +8290,14 @@ fn drawPermissionModal(
     const suggestion_label_text = suggestion_label(suggestion, &suggestion_buf);
     var ox: u16 = x + 3;
     for (opts, 0..) |o, i| {
-        _ = p.putText(ox, y + 7, o.key, theme.brand_bold);
+        _ = p.putText(ox, dy, o.key, theme.brand_bold);
         const adv: u16 = @as(u16, @intCast(o.key.len)) + 1;
         ox += adv;
         // The "A" row carries the rule it would remember.
         const label: []const u8 = if (i == 1 and suggestion_label_text.len > 0) suggestion_label_text else o.label;
-        ox = p.putText(ox, y + 7, label, if (i == 0) theme.brand else theme.brand_soft);
+        ox = p.putText(ox, dy, label, if (i == 0) theme.brand else theme.brand_soft);
         if (i + 1 < opts.len and ox + 4 < x + w) {
-            ox = p.putText(ox, y + 7, "   ", theme.brand_faint);
+            ox = p.putText(ox, dy, "   ", theme.brand_faint);
         }
     }
 }
@@ -11914,6 +11950,44 @@ test "permissions: the modal is centered and shows the 4 options" {
     try std.testing.expect(std.mem.indexOf(u8, all, "N deny") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "ESC cancel") != null);
     m.perm_active = false;
+}
+
+test "permissions: the matched rule is shown in the dialog" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    m.perm_tool = undefined;
+    @memcpy(m.perm_tool[0..5], "write");
+    m.perm_tool_len = 5;
+    @memcpy(m.perm_detail[0..7], "hola.js");
+    m.perm_detail_len = 7;
+    m.perm_active = true;
+    m.setPermRule("Write(.git/**) deny");
+
+    try std.testing.expectEqualStrings("Write(.git/**) deny", m.permRule());
+
+    const s = try drawTest(&m, arena_state.allocator(), 92, 26);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Write(.git/**) deny") != null);
+    m.perm_active = false;
+}
+
+test "permissions: permRule resets when the dialog closes" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.setPermRule("Write(.git/**) deny");
+    try std.testing.expectEqualStrings("Write(.git/**) deny", m.permRule());
+
+    m.perm_active = true;
+    m.perm_answer = .allow;
+    // Simulate what requestPermission does when the dialog closes.
+    m.perm_active = false;
+    m.perm_rule_len = 0;
+    try std.testing.expectEqualStrings("", m.permRule());
 }
 
 test "the mascot IS the state indicator: the face sits next to the label" {

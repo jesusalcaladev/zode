@@ -8752,6 +8752,7 @@ fn execOneCall(
     const subjects = tools_mod.callSubjects(call.name, call.args_json, arena);
     const rule_decision = permDecision(call.name, subjects);
     var rule_allowed = false;
+    var rule_match_text: []const u8 = "";
     if (rule_decision) |d| {
         switch (d.action) {
             .allow => {
@@ -8775,7 +8776,11 @@ fn execOneCall(
                 s.appendToolResult(call.id, call.name, msg) catch {};
                 return 0;
             },
-            .ask => {},
+            .ask => {
+                // The rule that matched: show it in the dialog so the user
+                // sees WHY they are being asked, not a blind "may I?".
+                rule_match_text = d.rule.text;
+            },
         }
     }
 
@@ -8883,6 +8888,11 @@ fn execOneCall(
         // call itself; here we only tell the dialog what to show.
         if (permSuggestion(call.name, call.args_json, arena)) |sugg| {
             m.setPermSuggestion(sugg);
+        }
+        // Tell the dialog WHICH rule matched, so it can show "your rule
+        // `Write(.git/**) deny` blocks this" instead of a blind "may I?".
+        if (rule_match_text.len > 0) {
+            m.setPermRule(rule_match_text);
         }
         switch (m.requestPermission(call.name, detail)) {
             .allow => {},

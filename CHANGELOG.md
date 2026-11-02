@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
-- Phase 34.1 path-scoped permissions for file-writing tools (permissions) [`7c4216a6`](https://github.com/jesusalcaladev/zode/commit/7c4216a6)
+- Phase 34.1 path-scoped permissions for file-writing tools (permissions) [`ca77972f`](https://github.com/jesusalcaladev/zode/commit/ca77972f)
+- Phase 33.21 permission dialog shows the matched rule (tui) [`0218a828`](https://github.com/jesusalcaladev/zode/commit/0218a828)
 
 ## [0.2.1-beta.2] - 2026-10-31
 
