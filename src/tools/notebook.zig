@@ -31,6 +31,7 @@
 const std = @import("std");
 const pathsafe = @import("../lib/pathsafe.zig");
 const common = @import("common.zig");
+const permrules = @import("../lib/permrules.zig");
 
 const max_notebook_bytes = 32 * 1024 * 1024;
 /// After this many cells the outline stops printing them and says how many are
@@ -172,12 +173,12 @@ fn setCellType(arena: std.mem.Allocator, cell: *std.json.ObjectMap, kind: []cons
 }
 
 /// The whole `notebook_edit` call.
-pub fn toolNotebookEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+pub fn toolNotebookEdit(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const path = common.getStr(obj, "notebook_path") orelse common.getStr(obj, "path") orelse return error.MissingPath;
 
     // The same rule as `write` and `edit`: a notebook is a file, and there are
     // places this tool does not write.
-    const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, path);
+    const verdict = pathsafe.checkWritePermitted(perm_rules, "NotebookEdit", std.Io.Dir.cwd(), io, arena, path);
     if (verdict != .ok) return pathsafe.refusalText(arena, verdict);
     if (!std.mem.endsWith(u8, path, ".ipynb")) return error.NotANotebook;
     const index_raw = common.getInt(obj, "cell_number") orelse common.getInt(obj, "cell_index") orelse return error.MissingCellNumber;
@@ -409,7 +410,7 @@ fn readFixture(arena: std.mem.Allocator) !std.json.Value {
 fn call(arena: std.mem.Allocator, comptime fmt: []const u8, a: anytype) ![]const u8 {
     const text = try std.fmt.allocPrint(arena, fmt, a);
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
-    return toolNotebookEdit(testing.io, v.object, arena);
+    return toolNotebookEdit(null, testing.io, v.object, arena);
 }
 
 test "notebook_edit: replace rewrites the source and keeps the outputs" {

@@ -8980,7 +8980,7 @@ fn execOneCall(
         applyGoalCall(m, call.args_json, arena);
     }
 
-    const res = tools_mod.executeWith(io_global, call.name, call.args_json, arena, &m.bg, &m.reads, &m.tasks) catch |err| {
+    const res = tools_mod.executeWith(io_global, call.name, call.args_json, arena, &m.bg, &m.reads, &m.tasks, perm_rules) catch |err| {
         const ms = elapsedMs(call_t0);
         // What the MODEL is told is not the error name. See `describeError`.
         const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
@@ -9192,7 +9192,7 @@ fn runParallelBatch(
             var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
             defer astate.deinit();
             const a = astate.allocator();
-            const text = tools_mod.executeWith(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads, &ctx.m.tasks) catch |err| {
+            const text = tools_mod.executeWith(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads, &ctx.m.tasks, perm_rules) catch |err| {
                 ctx.out.err = true;
                 ctx.out.text = @constCast(@errorName(err));
                 ctx.out.ms = elapsedMs(call_t0);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const pathsafe = @import("../lib/pathsafe.zig");
+const permrules = @import("../lib/permrules.zig");
 
 /// How many files one `write {files:[...]}` call may carry.
 ///
@@ -16,12 +17,23 @@ pub const max_files_per_call = 8;
 /// name they did not read. A `.git/hooks/pre-commit` passes that, because the
 /// name looks like a path and not like code that runs on every commit.
 ///
+/// `perm_rules` are the session's permission rules (from `.zode/permissions.json`
+/// and `~/.config/zode/permissions.json`). When present, they are consulted
+/// first: a rule that says `allow` writes even to a dangerous path, and a
+/// rule that says `deny` refuses even to a safe one. Only when no rule has an
+/// opinion does the dangerous-path table decide.
+///
 /// The refusal NAMES what writing there would do, and it names the way out
 /// (`bash`, which goes through the permission dialog with the user's eyes on
 /// it). A refusal without a way forward is a wall, and a model answers a wall
 /// by trying the next tool until one of them works.
-pub fn writeAllowed(io: std.Io, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    const v = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, path);
+pub fn writeAllowed(
+    perm_rules: ?permrules.Set,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    path: []const u8,
+) ?[]const u8 {
+    const v = pathsafe.checkWritePermitted(perm_rules, "Write", std.Io.Dir.cwd(), io, arena, path);
     return switch (v) {
         .ok => null,
         else => pathsafe.refusalText(arena, v),
@@ -29,7 +41,7 @@ pub fn writeAllowed(io: std.Io, arena: std.mem.Allocator, path: []const u8) ?[]c
 }
 
 // ── write ────────────────────────────────────────────────────
-pub fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+pub fn toolWrite(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     // `files: [{path, content}, ...]` FIRST, because it changes the shape of the
     // answer: one call with N files is ONE round trip instead of N.
     //
@@ -67,7 +79,7 @@ pub fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
             // is a git hook writes the other three and says why it did not
             // write the fourth. Refusing the whole call would make one bad path
             // lose the three good ones.
-            if (writeAllowed(io, arena, p)) |why| {
+            if (writeAllowed(perm_rules, io, arena, p)) |why| {
                 out.print(arena, "  refused {s}: {s}\n", .{ p, why }) catch {};
                 continue;
             }
@@ -86,7 +98,7 @@ pub fn toolWrite(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
     const path = common.getStr(obj, "path") orelse return error.MissingPath;
     const content = common.getStr(obj, "content") orelse return error.MissingContent;
 
-    if (writeAllowed(io, arena, path)) |why| return why;
+    if (writeAllowed(perm_rules, io, arena, path)) |why| return why;
 
     var dir = std.Io.Dir.cwd();
     dir.writeFile(io, .{

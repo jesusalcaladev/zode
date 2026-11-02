@@ -6,6 +6,7 @@ const std = @import("std");
 const registry = @import("registry.zig");
 const bgproc = @import("../bgproc.zig");
 const readcache = @import("../lib/readcache.zig");
+const permrules = @import("../lib/permrules.zig");
 const read_tool = @import("read.zig");
 const write_tool = @import("write.zig");
 const edit_tool = @import("edit.zig");
@@ -212,6 +213,11 @@ pub const callSubjects = registry.callSubjects;
 /// lives in the `Model`, `read` runs in parallel with other reads so the lock is
 /// inside the cache, and `null` (which is what the tests pass) means every read
 /// sends its body as always — the behaviour we want to be able to test both ways.
+///
+/// `perm_rules` are the session's permission rules. When present, file-writing
+/// tools consult them before the dangerous-path table, so a rule can allow or
+/// deny a specific path. `null` means "no rules", which is what tests and the
+/// single-entry `execute` use.
 pub fn execute(
     io: std.Io,
     name: []const u8,
@@ -220,7 +226,7 @@ pub fn execute(
     bg: ?*bgproc.Registry,
     cache: ?*readcache.Cache,
 ) ![]const u8 {
-    return executeWith(io, name, args_json, arena, bg, cache, null);
+    return executeWith(io, name, args_json, arena, bg, cache, null, null);
 }
 
 /// `execute` plus the session's task graph.
@@ -236,6 +242,8 @@ pub fn execute(
 /// `null` means "this caller has no task list", which the five task tools answer with
 /// `error.NoTaskStore` and a sentence, never with an empty list that looks like a
 /// real one.
+///
+/// `perm_rules` are the session's permission rules, consulted by file-writing tools.
 pub fn executeWith(
     io: std.Io,
     name: []const u8,
@@ -244,6 +252,7 @@ pub fn executeWith(
     bg: ?*bgproc.Registry,
     cache: ?*readcache.Cache,
     tasks: ?*taskstore.Store,
+    perm_rules: ?permrules.Set,
 ) ![]const u8 {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
     if (parsed != .object) return error.BadArgs;
@@ -252,11 +261,11 @@ pub fn executeWith(
     if (std.mem.eql(u8, name, "read")) {
         return read_tool.toolRead(io, obj, arena, cache);
     } else if (std.mem.eql(u8, name, "write")) {
-        return write_tool.toolWrite(io, obj, arena);
+        return write_tool.toolWrite(perm_rules, io, obj, arena);
     } else if (std.mem.eql(u8, name, "edit")) {
-        return edit_tool.toolEdit(io, obj, arena);
+        return edit_tool.toolEdit(perm_rules, io, obj, arena);
     } else if (std.mem.eql(u8, name, "notebook_edit")) {
-        return notebook_tool.toolNotebookEdit(io, obj, arena);
+        return notebook_tool.toolNotebookEdit(perm_rules, io, obj, arena);
     } else if (std.mem.eql(u8, name, "bash")) {
         return bash_tool.toolBash(io, obj, arena, bg);
     } else if (std.mem.eql(u8, name, "glob")) {
@@ -266,7 +275,7 @@ pub fn executeWith(
     } else if (std.mem.eql(u8, name, "refs")) {
         return refs_tool.toolRefs(io, obj, arena);
     } else if (std.mem.eql(u8, name, "rename")) {
-        return rename_tool.toolRename(io, obj, arena);
+        return rename_tool.toolRename(perm_rules, io, obj, arena);
     } else if (std.mem.eql(u8, name, "check")) {
         return check_tool.toolCheck(io, obj, arena, bg, arena);
     } else if (std.mem.eql(u8, name, "git_status")) {

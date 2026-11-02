@@ -29,6 +29,7 @@ const common = @import("common.zig");
 const symbols = @import("../lib/symbols.zig");
 const refs_tool = @import("refs.zig");
 const pathsafe = @import("../lib/pathsafe.zig");
+const permrules = @import("../lib/permrules.zig");
 
 /// How many replacements one `rename` may make.
 ///
@@ -47,6 +48,7 @@ pub const Outcome = struct {
 };
 
 pub fn toolRename(
+    perm_rules: ?permrules.Set,
     io: std.Io,
     obj: std.json.ObjectMap,
     arena: std.mem.Allocator,
@@ -127,7 +129,7 @@ pub fn toolRename(
         // them. It cannot ask (a tool has no `Model` and cannot see a
         // dialog), so it refuses and says why — and the model can then edit
         // the file by hand.
-        const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, path);
+        const verdict = pathsafe.checkWritePermitted(perm_rules, "Rename", std.Io.Dir.cwd(), io, arena, path);
         if (verdict != .ok) {
             try out.print(arena, "  SKIPPED {s}: {s}\n", .{ path, pathsafe.refusalText(arena, verdict) });
             skipped += 1;

@@ -37,6 +37,7 @@
 //! question about a STRING, which is what makes it testable without a TUI.
 
 const std = @import("std");
+const permrules = @import("permrules.zig");
 
 /// The directory names that are never written into, and why.
 ///
@@ -389,6 +390,48 @@ pub fn checkWriteApproved(
     return checkWriteResolved(dir, io, arena, path);
 }
 
+/// The verdict for a write, HONOURING both the permission rules and the
+/// dangerous-path table.
+///
+/// The rules come first: a rule that says `allow` means the tool may write
+/// here even if the path is on the dangerous table (a `.vscode/` the project
+/// wants edited), and a rule that says `deny` means it may not even if the
+/// path is otherwise safe. Only when no rule has an opinion does the
+/// dangerous-path table decide, and then the user's recorded approval.
+///
+/// `tool` is the tool name the rule is matched against (`Write`, `Edit`,
+/// `Rename`, `NotebookEdit`).
+pub fn checkWritePermitted(
+    rules: ?permrules.Set,
+    tool: []const u8,
+    dir: std.Io.Dir,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    path: []const u8,
+) Verdict {
+    // The permission rules, if any, have the first word.
+    if (rules) |r| {
+        const subjects = &[_][]const u8{ path };
+        if (permrules.decide(r.rules, tool, subjects)) |d| {
+            switch (d.action) {
+                .deny => return .{
+                    .dangerous = .{
+                        .what = path,
+                        .why = "a permission rule does not allow writing here",
+                    },
+                },
+                .allow => return .ok,
+                .dontAsk => return .ok,
+                .ask => {}, // no definitive opinion: fall through to pathsafe
+            }
+        }
+    }
+
+    // No rule decided, or it said "ask": the dangerous-path table and the
+    // user's recorded approval decide as before.
+    return checkWriteApproved(dir, io, arena, path);
+}
+
 /// The sentence the model reads when a write is refused.
 ///
 /// It names the file, says what writing there WOULD DO, and says where the
@@ -565,4 +608,127 @@ test "pathsafe: a symlink into .git/ is caught by its TARGET, not by its name" {
 
     // And the whole verdict says it too.
     try std.testing.expect(checkWriteResolved(tmp.dir, io, arena, "hooks/pre-commit") != .ok);
+}
+
+test "pathsafe: a permit rule allows writing even to a dangerous path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rules = permrules.Set{
+        .rules = &.{
+            permrules.Rule{
+                .tool = "Write",
+                .pattern = ".git/**",
+                .action = .allow,
+                .source = .project,
+                .text = arena.dupe(u8, "Write(.git/**) allow") catch "",
+            },
+        },
+    };
+
+    const dir = std.Io.Dir.cwd();
+    const io = std.testing.io;
+
+    // Without the rule, this is refused.
+    try std.testing.expect(checkWrite(".git/hooks/pre-commit") != .ok);
+
+    // With the rule, it is allowed.
+    try std.testing.expectEqual(
+        Verdict{ .ok = {} },
+        checkWritePermitted(rules, "Write", dir, io, arena, ".git/hooks/pre-commit"),
+    );
+}
+
+test "pathsafe: a deny rule refuses even to an ordinary path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rules = permrules.Set{
+        .rules = &.{
+            permrules.Rule{
+                .tool = "Write",
+                .pattern = "src/main.zig",
+                .action = .deny,
+                .source = .project,
+                .text = arena.dupe(u8, "Write(src/main.zig) deny") catch "",
+            },
+        },
+    };
+
+    const dir = std.Io.Dir.cwd();
+    const io = std.testing.io;
+
+    // Without the rule, this is fine.
+    try std.testing.expectEqual(Verdict{ .ok = {} }, checkWrite("src/main.zig"));
+
+    // With the rule, it is refused.
+    const v = checkWritePermitted(rules, "Write", dir, io, arena, "src/main.zig");
+    switch (v) {
+        .dangerous => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "pathsafe: dontAsk behaves like allow (no refusal)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rules = permrules.Set{
+        .rules = &.{
+            permrules.Rule{
+                .tool = "Write",
+                .pattern = ".git/**",
+                .action = .dontAsk,
+                .source = .project,
+                .text = arena.dupe(u8, "Write(.git/**) dontask") catch "",
+            },
+        },
+    };
+
+    const dir = std.Io.Dir.cwd();
+    const io = std.testing.io;
+
+    try std.testing.expectEqual(
+        Verdict{ .ok = {} },
+        checkWritePermitted(rules, "Write", dir, io, arena, ".git/hooks/pre-commit"),
+    );
+}
+
+test "pathsafe: null rules fall back to checkWriteApproved" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = std.Io.Dir.cwd();
+    const io = std.testing.io;
+
+    try std.testing.expect(checkWritePermitted(null, "Write", dir, io, arena, ".git/config") != .ok);
+    try std.testing.expectEqual(Verdict{ .ok = {} }, checkWritePermitted(null, "Write", dir, io, arena, "src/main.zig"));
+}
+
+test "pathsafe: ask rule falls back to pathsafe (refuses dangerous path)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rules = permrules.Set{
+        .rules = &.{
+            permrules.Rule{
+                .tool = "Write",
+                .pattern = ".git/**",
+                .action = .ask,
+                .source = .project,
+                .text = arena.dupe(u8, "Write(.git/**) ask") catch "",
+            },
+        },
+    };
+
+    const dir = std.Io.Dir.cwd();
+    const io = std.testing.io;
+
+    // An "ask" rule is not definitive: the dangerous table still refuses.
+    try std.testing.expect(checkWritePermitted(rules, "Write", dir, io, arena, ".git/config") != .ok);
 }

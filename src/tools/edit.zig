@@ -2,6 +2,7 @@ const std = @import("std");
 const pathsafe = @import("../lib/pathsafe.zig");
 const common = @import("common.zig");
 const hint_lib = @import("../lib/edit_hint.zig");
+const permrules = @import("../lib/permrules.zig");
 
 pub const max_hunks = 16;
 
@@ -20,7 +21,7 @@ pub const Hunk = struct {
 };
 
 // ── edit: single hunk (compat) or multi-hunk via `edits: [...]` ─
-pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
+pub fn toolEdit(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     // `files: [{path, old_string, new_string}, ...]` — one call, several FILES.
     //
     // It is the shape a rename takes: every file that names the symbol, in one
@@ -63,12 +64,12 @@ pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
             // The same rule as `write`: a path that is not a place this tool
             // writes is refused PER FILE, so one bad path does not lose the
             // three good ones in the same call.
-            const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, p);
+            const verdict = pathsafe.checkWritePermitted(perm_rules, "Edit", std.Io.Dir.cwd(), io, arena, p);
             if (verdict != .ok) {
                 try out.print(arena, "  refused {s}: {s}\n", .{ p, pathsafe.refusalText(arena, verdict) });
                 continue;
             }
-            const one = toolEdit(io, item.object, arena) catch |err| {
+            const one = toolEdit(perm_rules, io, item.object, arena) catch |err| {
                 // One file failing does not lose the rest: a rename that landed
                 // in nine of ten files is visible in this list, and the tenth is
                 // named. Swallowing them all would be a silent half-rename.
@@ -85,7 +86,7 @@ pub fn toolEdit(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     // A path that is not a place this tool writes. The reason is in the
     // refusal: a `.git/hooks/pre-commit` is code that runs on every commit, and
     // a file name in a permission dialog does not look like that.
-    const verdict = pathsafe.checkWriteApproved(std.Io.Dir.cwd(), io, arena, path);
+    const verdict = pathsafe.checkWritePermitted(perm_rules, "Edit", std.Io.Dir.cwd(), io, arena, path);
     if (verdict != .ok) return pathsafe.refusalText(arena, verdict);
 
     // Collect hunks: `edits: [{old_string,new_string},...]` or a single pair.

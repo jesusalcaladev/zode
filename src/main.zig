@@ -680,7 +680,7 @@ fn execHeadless(
     // cache would only be able to help within it. The headless agent is also where
     // a "you already have this" answer is most confusing to debug, because there
     // is no session on screen to compare against.
-    return tools_mod.executeWith(io, name, args, arena, bg, null, tasks);
+    return tools_mod.executeWith(io, name, args, arena, bg, null, tasks, null);
 }
 
 /// TUI mode: zode (no args)
