@@ -597,11 +597,7 @@ pub const AutoCheck = struct {
             // "nothing was checked" as a footnote and "code is NOT verified" as a
             // headline is reading two different reports, and the headline is the one
             // they act on.
-            .nothing => std.fmt.allocPrint(
-                gpa,
-                "· NOT verified: this turn's code has no check behind it ({s}) — this project has no typecheck the harness knows how to run",
-                .{typecheck_mod.proofWord(.nothing)},
-            ) catch null,
+            .nothing => null,
             .types => std.fmt.allocPrint(
                 gpa,
                 "· {s} {s} the code you just wrote. That is the compiler, not the tests — the project's test suite is the model's to run.",
@@ -664,7 +660,10 @@ pub const AutoCheck = struct {
         }
         switch (self.decideNow(reg, io)) {
             .end => return null,
-            .cannot_verify => return self.sayUnverified(gpa, self.whyNotChecked()),
+            // `.cannot_verify` means "no typecheck this harness knows". That is not a
+            // reason to cage the turn: the user may be writing a language or project
+            // the harness does not recognize. Say nothing and let the turn end.
+            .cannot_verify => return null,
             .still_running => return std.fmt.allocPrint(
                 gpa,
                 "Your turn cannot end yet: {s} is STILL RUNNING as job {d} and its verdict is unknown. Poll it with `bash_output` (that is what it is for) and carry on working while it goes. Do not end the turn on an unknown verdict.",

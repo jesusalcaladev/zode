@@ -11,7 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Phase 34.1 path-scoped permissions for file-writing tools (permissions) [`ca77972f`](https://github.com/jesusalcaladev/zode/commit/ca77972f)
 - Phase 33.21 permission dialog shows the matched rule (tui) [`d94a22af`](https://github.com/jesusalcaladev/zode/commit/d94a22af)
-- the staged task pipeline + crash hardening (pipeline) [`c9ba1ff`](https://github.com/jesusalcaladev/zode/commit/c9ba1ff)
+- the staged task pipeline + crash hardening (pipeline) [`c9ba1ff4`](https://github.com/jesusalcaladev/zode/commit/c9ba1ff4)
+- remove hard iteration ceiling, compaction off by default, stop lecturing about missing typecheck (loop) [`8d64dd5d`](https://github.com/jesusalcaladev/zode/commit/8d64dd5d)
+
+### Chores
+
+- changelog points to the actual pipeline commit (release) [`12c35dd7`](https://github.com/jesusalcaladev/zode/commit/12c35dd7)
 
 ## [0.2.1-beta.2] - 2026-10-31
 

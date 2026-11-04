@@ -366,17 +366,20 @@ pub fn targetPct(env: ?*const std.process.Environ.Map) i64 {
 /// a long read-only session wants `elide`, a coding session wants `full`, and
 /// someone who would rather see the provider complain wants `off`.
 ///
-/// `ZODE_COMPACT` = `off` | `elide` | `full` (the default).
+/// `ZODE_COMPACT` = `off` | `elide` | `full` (`off` is the default: history is
+/// kept verbatim, nothing is elided or summarized).
 pub const Mode = enum { off, elide, full };
 
 pub fn mode(env: ?*const std.process.Environ.Map) Mode {
-    const m = env orelse return .full;
-    const s = m.get("ZODE_COMPACT") orelse return .full;
+    const m = env orelse return .off;
+    const s = m.get("ZODE_COMPACT") orelse return .off;
     if (std.ascii.eqlIgnoreCase(s, "off") or std.ascii.eqlIgnoreCase(s, "never") or
         std.ascii.eqlIgnoreCase(s, "false") or std.ascii.eqlIgnoreCase(s, "0")) return .off;
     if (std.ascii.eqlIgnoreCase(s, "elide") or std.ascii.eqlIgnoreCase(s, "tier1") or
         std.ascii.eqlIgnoreCase(s, "free")) return .elide;
-    return .full;
+    if (std.ascii.eqlIgnoreCase(s, "full") or std.ascii.eqlIgnoreCase(s, "on") or
+        std.ascii.eqlIgnoreCase(s, "yes")) return .full;
+    return .off;
 }
 
 /// The mode that is actually in force: what `/compact` set, else `ZODE_COMPACT`.
@@ -995,12 +998,12 @@ test "ZODE_COMPACT_PCT sets the threshold, and the clamps hold" {
     try std.testing.expectEqual(target_pct, targetPct(&e));
 }
 
-test "ZODE_COMPACT picks the mode, and the default is full" {
+test "ZODE_COMPACT picks the mode, and the default is off" {
     const E = std.process.Environ.Map;
     var e = E.init(std.testing.allocator);
     defer e.deinit();
 
-    try std.testing.expectEqual(Mode.full, mode(null));
+    try std.testing.expectEqual(Mode.off, mode(null));
     for ([_][]const u8{ "off", "OFF", "never", "false", "0" }) |v| {
         try e.put("ZODE_COMPACT", v);
         try std.testing.expectEqual(Mode.off, mode(&e));
@@ -1009,11 +1012,15 @@ test "ZODE_COMPACT picks the mode, and the default is full" {
         try e.put("ZODE_COMPACT", v);
         try std.testing.expectEqual(Mode.elide, mode(&e));
     }
-    // Anything else is `full`, on purpose: a typo must not silently DISABLE
-    // compaction, which is the direction that costs tokens until the request 400s.
-    for ([_][]const u8{ "full", "on", "yes", "banana", "" }) |v| {
+    for ([_][]const u8{ "full", "on", "yes" }) |v| {
         try e.put("ZODE_COMPACT", v);
         try std.testing.expectEqual(Mode.full, mode(&e));
+    }
+    // Anything unrecognized is `off`, on purpose: a typo must not silently
+    // compact or summarize history the user did not ask for.
+    for ([_][]const u8{ "banana", "" }) |v| {
+        try e.put("ZODE_COMPACT", v);
+        try std.testing.expectEqual(Mode.off, mode(&e));
     }
 }
 

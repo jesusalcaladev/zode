@@ -4871,26 +4871,15 @@ fn runAgentLoop(m: *tui.Model) TurnOutcome {
     if (had_goal) {
         m.goal.status = goal_mod.Status.none;
         m.goal.checkpoints = 0;
-        // `blocked_refusals` goes here too, and it was MISSING when the field was added,
-        // which made the evidence check a one-shot for the whole SESSION instead of one
-        // per turn.
-        //
-        // The consequence is small on the surface and bad underneath: a model that
-        // declared `blocked` on the first iteration of turn one had its refusal spent,
-        // and on turn two a shrug with no tools behind it was accepted immediately —
-        // which is the entire failure the field was added for, resurrected after one
-        // turn. The state is per turn because the evidence is per turn: "did THIS turn
-        // look before it said it is impossible" is a different question every time, and
-        // answering it with the previous turn's answer is the "a stale red is worse than
-        // no red" bug in a new place.
         m.goal.blocked_refusals = 0;
     }
-    const soft = iterationLimit();
-    const hard = if (had_goal) goalHardLimit() else soft;
 
+    // NO HARD CEILING: the turn ends when the model stops asking for tools
+    // (`again` is null), when the user presses ESC, or on error. Iteration
+    // limits (`ZODE_MAX_ITER`, `ZODE_GOAL_MAX`) are kept for the status bar
+    // only; they never kill a long-running task mid-loop anymore.
     m.repeats.reset();
     var repeat_recovery: repeats_mod.Recovery = .{};
-    var checkpointed = false;
     // How many times this turn has shown the plan-approval dialog. Bounded so
     // "reject → revise → re-present" can cycle once but a turn that keeps being
     // rejected ends on the ordinary ceiling instead of asking forever.
@@ -4899,7 +4888,7 @@ fn runAgentLoop(m: *tui.Model) TurnOutcome {
     // A NEW turn starts un-cancelled: ESC belongs to the turn it interrupted.
     chat.cancel_current.store(false, .seq_cst);
 
-    while (iterations < hard) : (iterations += 1) {
+    while (true) : (iterations += 1) {
         // ESC is a STOP, not a "skip this answer".
         //
         // The key handler sets `chat.cancel_current`, which aborts the request
@@ -5108,72 +5097,11 @@ fn runAgentLoop(m: *tui.Model) TurnOutcome {
         if (m.goal.status != goal_mod.Status.none) break;
 
         // 2. The model stopped asking for tools, or it answered in prose while the goal
-        //    is still open, which means it thinks it is finished without having declared.
-        //    Give it the checkpoint rather than ending the turn on a shrug.
-        if (checkpointed) {
-            // 3. It had its checkpoint and still did not declare. That is the answer:
-            //    it wants more room, so give it, until the hard ceiling.
-        } else if (iterations + 1 >= soft and m.goal.isOpen()) {
-            checkpointed = true;
-            var g2 = m.goal;
-            g2.checkpoints += 1;
-            m.goal = g2;
-            pushInfoFmt(
-                m,
-                "{d}/{d} iterations: the soft target is reached. Asking whether the goal is done. {d} more available.",
-                .{ iterations + 1, soft, hard - (iterations + 1) },
-            );
-            appendHarnessPrompt(m,
-                "The iteration budget for the soft target is reached. Your goal is still open. If it is reached, call `goal` with status met; if it cannot be finished here, call `goal` with status blocked and what_would_unblock; otherwise carry on.");
-            m.repeats.reset();
-            // Next iteration carries the question to the wire; the loop does it.
-            continue;
-        }
+        //    is still open. That is the natural end of the turn: break out of the loop
+        // and let endTurn print the summary.
+        break;
     }
-    // ── the ceiling: the tools are dead, the answer still has to come ──
-    //
-    // Reaching the ceiling means the turn ran out of room, not that the task is
-    // done, and the model knows where it stopped better than any harness does.
-    // It is asked for one final word with NO tools (they are removed from the
-    // schema for this reply), which means it cannot write, edit or run
-    // anything: all it can do is say what it did and where it left the work.
-    // Without this, a turn that hit the limit ended silently and the user was
-    // left staring at a pile of tool calls with no verdict attached.
-    const exhausted = iterations >= hard;
-    if (exhausted) {
-        appendHarnessPrompt(m,
-            "The iteration budget for this session is exhausted. Tools are disabled for this reply — no code can be written now. Write a plain summary of at most 10 lines: what was actually done, what remains unfinished or unverified, which files were touched and the single next step. Do not apologize for stopping.");
-        m.deny_all_tools = true;
-        _ = runOneTurn(m, iterations) catch |err| reportErr(m, err);
-        m.deny_all_tools = false;
-    }
-    const capped = exhausted and m.goal.isOpen();
-    if (exhausted) {
-        // UNFINISHED, first word. Reaching the ceiling means the turn ran out
-        // of room, not that the task is done, and the one thing the user must
-        // not be left guessing is which of the two it is — with a goal, the
-        // reason it was never declared; without one, just the fact.
-        const open_steps = m.plan.openCount();
-        const unresolved = if (open_steps > 0)
-            std.fmt.allocPrint(m.allocator, "{d} plan steps still open", .{open_steps}) catch "plan steps still open"
-        else
-            m.allocator.dupe(u8, "the objective is simply unverified") catch
-                "the objective is unverified";
-        defer m.allocator.free(unresolved);
-
-        if (had_goal and m.goal.status == goal_mod.Status.none) {
-            pushErrorFmt(
-                m,
-                "UNFINISHED after {d} iterations ({s}). The goal was never declared: {s}",
-                .{ hard, unresolved, m.goal.objective() },
-            );
-        } else if (m.goal.isOpen()) {
-            pushErrorFmt(m, "UNFINISHED after {d} iterations ({s}).", .{ hard, unresolved });
-        } else {
-            pushInfoFmt(m, "iteration limit reached ({d}); the reply above says where things stand — say `continue` to go on.", .{hard});
-        }
-    }
-    return .{ .iterations = iterations, .capped = capped };
+    return .{ .iterations = iterations, .capped = false };
 }
 
 /// The end-of-turn tail, shared by the normal turn and the pipeline stages:
@@ -5241,17 +5169,9 @@ pub fn finishAutoCheck(m: *tui.Model) void {
     }
 
     // Nothing red. Is that because everything passed, or because nothing was ever
-    // checked? The two used to look identical on screen, and only the second one is a
-    // lie the user has to be told about.
-    if (m.auto_check.gate.decide() == .cannot_verify and !m.auto_check.spoke) {
-        m.auto_check.spoke = true;
-        pushInfoFmt(
-            m,
-            "· the code you wrote is NOT verified: this project has no check the harness knows how to run",
-            .{},
-        );
-    }
-
+    // checked? The harness does not lecture the user about a missing typecheck on
+    // every turn; that is what the proof line (below) is for, and only when there
+    // is something to report.
     // And what WAS proved, in the word that is true of it. This is the last line of the
     // turn and it is the one a user reads before deciding whether to open the diff.
     if (m.auto_check.gate.wroteCode()) {
@@ -15454,11 +15374,10 @@ test "the end of a turn reports the narrowest thing that was actually proved" {
     // typecheck as a green suite.
     try std.testing.expect(std.mem.indexOf(u8, line, "tests") != null);
 
-    // No check at all: the line says so instead of claiming anything.
+    // No check at all: nothing is claimed. `proofLine` returns null because the
+    // harness does not lecture the user about a missing typecheck on every turn.
     var none: AutoCheck = .{};
-    const nol = none.proofLine(a) orelse return error.NoLine;
-    defer a.free(nol);
-    try std.testing.expect(std.mem.indexOf(u8, nol, "NOT") != null);
+    try std.testing.expectEqual(null, none.proofLine(a));
 }
 
 test "the gate's own check does not consult the turn's quota, and the quota does not consume the gate's" {
