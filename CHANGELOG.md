@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 33.21 permission dialog shows the matched rule (tui) [`d94a22af`](https://github.com/jesusalcaladev/zode/commit/d94a22af)
 - the staged task pipeline + crash hardening (pipeline) [`c9ba1ff4`](https://github.com/jesusalcaladev/zode/commit/c9ba1ff4)
 - remove hard iteration ceiling, compaction off by default, stop lecturing about missing typecheck (loop) [`4636a301`](https://github.com/jesusalcaladev/zode/commit/4636a301)
-- wrap diffs in rounded code block box (tui) [`6d47e3d8`](https://github.com/jesusalcaladev/zode/commit/6d47e3d8)
+- wrap diffs in rounded code block box (tui) [`87d459e4`](https://github.com/jesusalcaladev/zode/commit/87d459e4)
+- nudge model to complete tasks; Zo shows pipeline stage (loop) [`2cf73d69`](https://github.com/jesusalcaladev/zode/commit/2cf73d69)
 
 ### Chores
 

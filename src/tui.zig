@@ -1195,6 +1195,10 @@ pub const Model = struct {
     /// the model is asked for its final word with every tool removed from
     /// the schema.
     deny_all_tools: bool = false,
+    /// Which pipeline stage is active right now: "explorer", "investigator",
+    /// "implementer", "tester", "reviewer", or null when not in a pipeline.
+    /// Zo paints this so the user always knows what the harness is doing.
+    pipeline_stage: ?[]const u8 = null,
     /// Set true when a real allocation failure stopped stream_buf growth.
     stream_truncated: bool = false,
 
@@ -9088,7 +9092,23 @@ fn drawStateFooter(
     var detail: []const u8 = "";
     var detail_buf: [96]u8 = undefined;
 
-    if (act.ask) {
+    // ── pipeline stage: Zo tells you WHAT the harness is doing ──
+    //
+    // When a pipeline stage is active, the face says THAT stage, not the
+    // generic activity. The user never has to guess whether zode is
+    // investigating, writing code, running tests or reviewing.
+    if (self.pipeline_stage) |stage| {
+        const stage_en = if (std.mem.eql(u8, stage, "explorer")) "exploring"
+        else if (std.mem.eql(u8, stage, "investigator")) "investigating"
+        else if (std.mem.eql(u8, stage, "implementer")) "implementing"
+        else if (std.mem.eql(u8, stage, "tester")) "testing"
+        else if (std.mem.eql(u8, stage, "verify")) "verifying"
+        else if (std.mem.eql(u8, stage, "reviewer")) "reviewing"
+        else if (std.mem.eql(u8, stage, "done")) "done"
+        else stage;
+        legend = stage_en;
+        // No detail for pipeline stages: the stage name IS the message.
+    } else if (act.ask) {
         legend = "waiting for your answer";
         const ms = self.askMillis();
         detail = std.fmt.bufPrint(&detail_buf, "· {d}s to answer", .{ms / 1000}) catch "";

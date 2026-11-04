@@ -4841,7 +4841,7 @@ fn chatWorker(job: *ChatJob) void {
     turn_stats.reset(m.allocator, std.Io.Timestamp.now(io_global, .real).nanoseconds);
     defer turn_stats.deinit();
 
-    const outcome = runAgentLoop(m);
+    const outcome = runAgentLoop(m, user_text);
     m.streamEnd();
     endTurn(m, outcome.iterations, outcome.capped);
 }
@@ -4849,12 +4849,43 @@ fn chatWorker(job: *ChatJob) void {
 /// What the loop ended with.
 pub const TurnOutcome = struct { iterations: usize, capped: bool };
 
+/// Case-insensitive substring search (Zig 0.17 removed std.ascii.indexOfIgnoreCase).
+fn idxIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+/// Did the user's prompt ask for something to be implemented (code, files,
+/// changes)? Used to decide whether to nudge the model when it stops after
+/// only exploring.
+fn user_wants_implementation(text: []const u8) bool {
+    const impl_signals = [_][]const u8{
+        "implement",  "implementa", "implementar",
+        "create",     "crea",       "crear",
+        "write",      "escribe",    "escribir",
+        "build",      "construir",
+        "fix",        "corrige",    "corregir",   "arregla",   "arreglar",
+        "add",        "agrega",     "agregar",
+        "feature",    "funcionalidad",
+        "component",  "componente",
+        "stack",      "pilas",
+    };
+    for (impl_signals) |s| {
+        if (idxIgnoreCase(text, s) != null) return true;
+    }
+    return false;
+}
+
 /// The agent loop shared by the normal turn and the pipeline's stages.
 ///
 /// Returns what the ceiling did to the loop. The caller owns the final
 /// steps (`streamEnd` + `endTurn`), which is what lets the pipeline run the
 /// stages without printing the "Done" line after each one.
-fn runAgentLoop(m: *tui.Model) TurnOutcome {
+fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
     var iterations: usize = 0;
 
     // ── the loop, and the three things that decide when it stops ──
@@ -5030,6 +5061,17 @@ fn runAgentLoop(m: *tui.Model) TurnOutcome {
                         continue;
                     }
                 }
+            }
+            // ── NUDGE: model gave up too early ──
+            //
+            // If the user asked to implement something but no files were written,
+            // nudge the model to continue instead of ending the turn after just
+            // exploring. This is what makes zode finish tasks instead of stopping
+            // after the first `list_files`.
+            if (turn_stats.files.items.len == 0 and user_wants_implementation(user_text)) {
+                appendHarnessPrompt(m,
+                    "The task asks you to implement something, but no files have been created or modified yet. You have only explored — please continue and implement the complete solution, do not stop after just looking at the files.");
+                continue;
             }
             break;
         }
@@ -17786,7 +17828,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
     }) catch return;
     appendHarnessPrompt(m, seed);
     pipeline_active = true;
-    _ = runAgentLoop(m);
+    _ = runAgentLoop(m, task_text);
     pipeline_active = false;
 
     // ── 4. The implementer may not touch existing tests ──
@@ -17797,7 +17839,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
         const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The existing tests changed during your work:\n{s}\nRestore them exactly as they were. Do not re-add your version of them by hand in any other file — the point is the ORIGINAL tests, byte for byte.", .{detail}) catch return;
         appendHarnessPrompt(m, reprimand);
         pipeline_active = true;
-        _ = runAgentLoop(m);
+        _ = runAgentLoop(m, task_text);
         pipeline_active = false;
         const left = verifyZigTests(arena, io, snaps) catch &.{};
         if (left.len > 0) {
@@ -17847,7 +17889,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
                 const repair = std.fmt.allocPrint(arena, verify_repair_prompt, .{ plan.label, suite.tail }) catch break;
                 appendHarnessPrompt(m, repair);
                 pipeline_active = true;
-                _ = runAgentLoop(m);
+                _ = runAgentLoop(m, task_text);
                 pipeline_active = false;
                 const touch = verifyZigTests(arena, io, snaps) catch &.{};
                 if (touch.len > 0) {
@@ -17856,7 +17898,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
                     const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The repair pass changed existing tests:\n{s}\nRestore them exactly as they were.", .{detail}) catch break;
                     appendHarnessPrompt(m, reprimand);
                     pipeline_active = true;
-                    _ = runAgentLoop(m);
+                    _ = runAgentLoop(m, task_text);
                     pipeline_active = false;
                 }
             }
@@ -17880,7 +17922,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
             const repair = std.fmt.allocPrint(arena, review_repair_prompt, .{report}) catch "";
             appendHarnessPrompt(m, repair);
             pipeline_active = true;
-            _ = runAgentLoop(m);
+            _ = runAgentLoop(m, task_text);
             pipeline_active = false;
             if (!verdict.omit_tests) {
                 if (testplan_mod.planAt(io, ".")) |plan| {
