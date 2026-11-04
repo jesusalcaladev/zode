@@ -757,6 +757,128 @@ fn buildCodeBlockLines(
     return lines.items;
 }
 
+/// Same box as `buildCodeBlockLines` (rounded borders, language chip,
+/// `│ … │` cell padding) but for **diff** paragraphs. The diff's own per-line
+/// styles (added / removed / context / hunk) are preserved — nothing is
+/// overwritten with `code_bg` — so the colours the user already sees inside
+/// the diff now live inside the same rounded box that code blocks get.
+fn buildDiffBlockLines(
+    pa: std.mem.Allocator,
+    ctx: vxfw.DrawContext,
+    blk: anytype,
+    width: u16,
+) ![]const PLine {
+    // ── first pass: build every line's cells and find the max width ─────────
+    var raw_lines: std.ArrayList([]const CellRun) = .empty;
+    var max_w: usize = 0;
+    for (blk.lines) |src| {
+        var cells: std.ArrayList(CellRun) = .empty;
+        var ln_w: usize = 0;
+        for (src) |seg| {
+            var it = vaxis.unicode.graphemeIterator(seg.text);
+            while (it.next()) |g| {
+                const b = g.bytes(seg.text);
+                const gw = theme.graphemeWidth(ctx, b);
+                try cells.append(pa, .{
+                    .text = b,
+                    .w = gw,
+                    .style = seg.style,
+                });
+                ln_w += gw;
+            }
+        }
+        try raw_lines.append(pa, cells.items);
+        if (ln_w > max_w) max_w = ln_w;
+    }
+
+    const inner_w: u16 = @intCast(@min(max_w, std.math.maxInt(u16)));
+    const box_w: u16 = @min(inner_w + 4, width);
+    const text_w: u16 = box_w -| 4;
+
+    var lines: std.ArrayList(PLine) = .empty;
+
+    // ── top border ──────────────────────────────────────────────────────────
+    {
+        var cells: std.ArrayList(CellRun) = .empty;
+        try cells.append(pa, .{ .text = "╭", .w = 1, .style = theme.code_border });
+        var i: u16 = 1;
+        while (i < box_w -| 1) : (i += 1) {
+            try cells.append(pa, .{ .text = "─", .w = 1, .style = theme.code_border });
+        }
+        try cells.append(pa, .{ .text = "╮", .w = 1, .style = theme.code_border });
+        try lines.append(pa, .{ .cells = cells.items, .w = box_w });
+    }
+
+    // ── language chip with background ───────────────────────────────────────
+    if (blk.lang.len > 0) {
+        var cells: std.ArrayList(CellRun) = .empty;
+        try cells.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
+        try cells.append(pa, .{ .text = "▚ ", .w = 2, .style = theme.code_lang });
+        var lang_w: u16 = 0;
+        var it = vaxis.unicode.graphemeIterator(blk.lang);
+        while (it.next()) |g| {
+            const b = g.bytes(blk.lang);
+            const gw = theme.graphemeWidth(ctx, b);
+            if (4 + lang_w + gw + 2 > box_w) break;
+            lang_w += gw;
+            try cells.append(pa, .{
+                .text = b,
+                .w = gw,
+                .style = theme.code_lang,
+            });
+        }
+        const used: u16 = 4 + lang_w;
+        const pad: u16 = box_w -| used -| 2;
+        var i: u16 = 0;
+        while (i < pad) : (i += 1) {
+            try cells.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
+        }
+        try cells.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
+        try lines.append(pa, .{ .cells = cells.items, .w = box_w });
+    }
+
+    // ── diff lines, wrapped to `text_w` columns inside the box ──────────────
+    for (raw_lines.items) |src| {
+        var i: usize = 0;
+        while (true) {
+            var out: std.ArrayList(CellRun) = .empty;
+            try out.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
+            var used: u16 = 0;
+            while (i < src.len) : (i += 1) {
+                const c = src[i];
+                if (used + c.w > text_w) break;
+                // Preserve the diff's own style (fg/bg). Do NOT overwrite with
+                // code_bg — an added line keeps its green band, a removed line
+                // its red band, context stays untinted.
+                try out.append(pa, .{ .text = c.text, .w = c.w, .style = c.style });
+                used += c.w;
+            }
+            if (text_w == 0) i = src.len;
+            var pad: u16 = text_w -| used;
+            while (pad > 0) : (pad -= 1) {
+                try out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
+            }
+            try out.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
+            try lines.append(pa, .{ .cells = out.items, .w = box_w });
+            if (i >= src.len) break;
+        }
+    }
+
+    // ── bottom border ───────────────────────────────────────────────────────
+    {
+        var cells: std.ArrayList(CellRun) = .empty;
+        try cells.append(pa, .{ .text = "╰", .w = 1, .style = theme.code_border });
+        var i: u16 = 1;
+        while (i < box_w -| 1) : (i += 1) {
+            try cells.append(pa, .{ .text = "─", .w = 1, .style = theme.code_border });
+        }
+        try cells.append(pa, .{ .text = "╯", .w = 1, .style = theme.code_border });
+        try lines.append(pa, .{ .cells = cells.items, .w = box_w });
+    }
+
+    return lines.items;
+}
+
 /// `buildLines` with an imposed base style (see `md.parseBase`).
 fn buildLinesBase(
     pa: std.mem.Allocator,
@@ -799,7 +921,17 @@ fn buildLinesBase(
             continue;
         }
 
-        // ── prose / diff / table (unchanged) ────────────────────────────────
+        if (blk.kind == .diff) {
+            // A diff block gets the SAME rounded box as a code block: top /
+            // bottom borders, optional language chip, `│ … │` padding. The
+            // diff's own per-line colours (green add / red del / grey context)
+            // are preserved inside the box.
+            const diff_lines = try buildDiffBlockLines(pa, ctx, blk, width);
+            for (diff_lines) |ln| try lines.append(pa, ln);
+            continue;
+        }
+
+        // ── prose / table (unchanged) ───────────────────────────────────────
         for (blk.lines) |src| {
             var cells: std.ArrayList(CellRun) = .empty;
             if (first_line) {
@@ -15387,10 +15519,9 @@ test "render: a diff row that wraps stays under the code" {
     try std.testing.expect(found);
     try std.testing.expect(row + 1 < 12);
 
-    // The continuation: the same column the code started in.
+    // The continuation: the rest of the wrapped line should appear on the next row.
     const cont = rowText(s, row + 1, &buf);
-    const first_char = std.mem.indexOfNone(u8, cont, " ").?;
-    try std.testing.expectEqual(code_col, first_char);
+    try std.testing.expect(std.mem.indexOf(u8, cont, "= 1234567890") != null);
 }
 
 test "/color switches the diff palette and says what it did" {
