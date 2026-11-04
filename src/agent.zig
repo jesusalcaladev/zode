@@ -4840,6 +4840,10 @@ fn chatWorker(job: *ChatJob) void {
     // `chatWorker`, with its 8 iterations.
     turn_stats.reset(m.allocator, std.Io.Timestamp.now(io_global, .real).nanoseconds);
     defer turn_stats.deinit();
+    // Nudge counters reset every turn: a fresh user prompt gets a fresh budget
+    // of nudges so the model isn't nagged forever across turns.
+    m.implementation_nudges = 0;
+    m.empty_reply_nudges = 0;
 
     const outcome = runAgentLoop(m, user_text);
     m.streamEnd();
@@ -4934,7 +4938,7 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
             return .{ .iterations = iterations, .capped = false };
         }
         turn_stats.iterations = iterations + 1;
-        const again = runOneTurn(m, iterations) catch |err| {
+        const again = runOneTurn(m, user_text, iterations) catch |err| {
             reportErr(m, err);
             // With free-auto on, the pool's state IS the user's next question ("so what
             // now?"), and the answer fits on one line. Without this you see an
@@ -5061,17 +5065,6 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
                         continue;
                     }
                 }
-            }
-            // ── NUDGE: model gave up too early ──
-            //
-            // If the user asked to implement something but no files were written,
-            // nudge the model to continue instead of ending the turn after just
-            // exploring. This is what makes zode finish tasks instead of stopping
-            // after the first `list_files`.
-            if (turn_stats.files.items.len == 0 and user_wants_implementation(user_text)) {
-                appendHarnessPrompt(m,
-                    "The task asks you to implement something, but no files have been created or modified yet. You have only explored — please continue and implement the complete solution, do not stop after just looking at the files.");
-                continue;
             }
             break;
         }
@@ -6279,7 +6272,7 @@ fn attachPlanContext(m: *tui.Model, s: *session_mod.Session) void {
     s.append(.user, text) catch {};
 }
 
-fn runOneTurn(m: *tui.Model, iteration: usize) !bool {
+fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
     // Refresh ctx_pct so the background-compaction thresholds see a real number.
     refreshContextUsage(m);
     const gpa = m.allocator;
@@ -6923,8 +6916,46 @@ fn runOneTurn(m: *tui.Model, iteration: usize) !bool {
         std.mem.eql(u8, tstate.finish[0..tstate.finish_len], "length");
     if (partial) setStatusWithZo(m, .warn, "interrupted");
 
-    // No tool calls: the turn is over.
+    // No tool calls: the turn may be over, but first check if the model
+    // stalled (empty reply) or gave up too early (implementation task with
+    // no files written). fx-style nudge: don't end the turn, ask the model
+    // to continue.
     if (tstate.calls.items.len == 0) {
+        // ── EMPTY REPLY NUDGE (fx-style) ──
+        //
+        // If the model replied with no text and no tool call, it stalled
+        // mid-task. fx does not end the turn here — it asks the model to
+        // continue: "call the next tool you need, or give your final answer."
+        // This is what makes fx finish long tasks instead of stopping after
+        // a single `list_files`.
+        if (tstate.text.items.len == 0) {
+            if (m.empty_reply_nudges < 3) {
+                m.empty_reply_nudges += 1;
+                appendHarnessPrompt(m,
+                    "Your last reply had no text and no tool call. Continue the task: call the next tool you need, or give your final answer.");
+                refreshContextUsage(m);
+                return true; // continue the turn
+            }
+            // Nudge budget spent: let the turn end.
+        }
+
+        // ── NUDGE: model gave up too early ──
+        //
+        // If the user asked to implement something but no files were written,
+        // nudge the model to continue instead of ending the turn after just
+        // exploring. This is what makes zode finish tasks instead of stopping
+        // after the first `list_files`.
+        if (turn_stats.files.items.len == 0 and user_wants_implementation(user_text)) {
+            if (m.implementation_nudges < 3) {
+                m.implementation_nudges += 1;
+                appendHarnessPrompt(m,
+                    "The task asks you to implement something, but no files have been created or modified yet. You have only explored — please continue and implement the complete solution, do not stop after just looking at the files.");
+                refreshContextUsage(m);
+                return true; // continue the turn
+            }
+            // Nudge budget spent: let the turn end.
+        }
+
         // The ctx% is refreshed HERE too, not only on the tools path (which is
         // the one that calls `refreshContextUsage`): a turn without tools is the
         // NORMAL case and the counter stayed at the previous turn's value until

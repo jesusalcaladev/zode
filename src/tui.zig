@@ -1199,6 +1199,12 @@ pub const Model = struct {
     /// "implementer", "tester", "reviewer", or null when not in a pipeline.
     /// Zo paints this so the user always knows what the harness is doing.
     pipeline_stage: ?[]const u8 = null,
+    /// How many times the harness has nudged the model to implement instead of
+    // just exploring. Reset each turn; bounded to avoid endless nudges.
+    implementation_nudges: u8 = 0,
+    /// How many times the harness has nudged the model after an empty reply.
+    // Reset each turn; bounded to avoid endless nudges.
+    empty_reply_nudges: u8 = 0,
     /// Set true when a real allocation failure stopped stream_buf growth.
     stream_truncated: bool = false,
 
