@@ -48,6 +48,23 @@ pub fn kittyKeyboardPop(w: *std.Io.Writer) void {
     w.flush() catch {};
 }
 
+/// Everything that must be undone before the process leaves, as ONE byte
+/// string, for the two paths that cannot run `defer`s: `quitFast`, and the
+/// PANIC handler.
+///
+/// The panic path cannot go through `restoreAll(w: *std.Io.Writer)` (that
+/// needs an `Io` of the very process which is about to die and still has to
+/// hold the bytes in a buffer that may never flush), so both paths write the
+/// same constant — otherwise the crash path drifts from the clean-quit path
+/// and the terminal is left in exactly the state this whole feature exists
+/// to prevent. Add new escape codes HERE, not at the call sites.
+///
+/// `\x1b[?2004l` turns bracketed paste off (a shell glued to escape bytes of
+/// the previous app reads them as typed input, which is the "ESC soup" seen
+/// after a hard crash), `\x1b[0m` resets SGR so the shell is not left inside
+/// the dead app's color, and the rest of the sequence is unchanged.
+pub const restore_all = "\x1b[?2004l\x1b[?1002;1003;1004;1006;1016l\x1b[<u\x1b[0m\x1b[?1049l\x1b[?25h";
+
 /// Everything that must be undone before the process leaves, in the order the
 /// terminal expects it undone.
 ///
@@ -55,17 +72,16 @@ pub fn kittyKeyboardPop(w: *std.Io.Writer) void {
 /// front of each one because a terminal that has already been restored must
 /// not be sent a partial one.
 pub fn restoreAll(w: *std.Io.Writer) void {
-    w.writeAll("\x1b[?1002;1003;1004;1006;1016l") catch {}; // mouse off
-    w.writeAll("\x1b[<u") catch {}; // keyboard flags off
-    w.writeAll("\x1b[?1049l") catch {}; // leave the alt screen
-    w.writeAll("\x1b[?25h") catch {}; // show the cursor again
+    w.writeAll(restore_all) catch {};
     w.flush() catch {};
 }
 
 test "the sequences are the ones the terminal expects" {
     // These are not decoration: a typo in the final byte of the alt-screen
     // sequence is a terminal the user has to `reset` by hand. The tests name
-    // them so the strings are asserted and not assumed.
+    // them so the strings are asserted and not assumed. They are asserted
+    // through `restore_all`, the same constant the crash path writes, so the
+    // two cannot drift.
     var buf: [256]u8 = undefined;
     var fw = std.Io.Writer.fixed(&buf);
     kittyKeyboardPush(&fw);
@@ -75,8 +91,11 @@ test "the sequences are the ones the terminal expects" {
     try std.testing.expectEqualStrings("\x1b[<u", fw.buffered());
     fw.end = 0;
     restoreAll(&fw);
+    try std.testing.expectEqualStrings(restore_all, fw.buffered());
+    // The exact bytes, pinned: a reordered or missing escape leaves the
+    // terminal in raw mode / alt screen after a crash.
     try std.testing.expectEqualStrings(
-        "\x1b[?1002;1003;1004;1006;1016l\x1b[<u\x1b[?1049l\x1b[?25h",
-        fw.buffered(),
+        "\x1b[?2004l\x1b[?1002;1003;1004;1006;1016l\x1b[<u\x1b[0m\x1b[?1049l\x1b[?25h",
+        restore_all,
     );
 }

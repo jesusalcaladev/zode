@@ -10,6 +10,7 @@ const vxfw = vaxis.vxfw;
 const agent = @import("agent.zig");
 const chat = @import("chat.zig");
 const md = @import("lib/markdown.zig");
+const ansi = @import("lib/ansi.zig");
 const theme = @import("lib/theme.zig");
 const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
@@ -254,6 +255,18 @@ const PickerSnapshot = struct {
 // (`ctx.arena`, which is reset at the start of the NEXT frame).
 // (`ctx.arena`, which is reset at the start of the NEXT frame).
 
+/// True when a grapheme is a raw control byte (C0, DEL, or a C1 byte in
+/// UTF-8). Those never belong in a cell: vaxis writes cell bytes raw, so
+/// they come out as broken frames instead of text.
+pub fn isControlGrapheme(g: []const u8) bool {
+    if (g.len == 0) return false;
+    const b = g[0];
+    if (b < 0x20 or b == 0x7f) return true;
+    // UTF-8 lead byte of a C1 control (U+0080..U+009F = 0xC2 0x80..0x9F).
+    if (b == 0xc2 and g.len >= 2 and g[1] >= 0x80 and g[1] <= 0x9f) return true;
+    return false;
+}
+
 /// Sleeps `ms` milliseconds with a bare `nanosleep`, without going through the
 /// `Io`.
 ///
@@ -287,6 +300,15 @@ pub const Painter = struct {
     /// Writes an ALREADY stable grapheme (literal or arena that outlives the
     /// frame). Allocates no memory.
     pub fn putStable(self: *Painter, col: u16, row: u16, g: []const u8, w: u8, style: vaxis.Style) void {
+        // A control byte must NEVER reach a cell: vaxis emits grapheme bytes
+        // raw, so a `\r`, `\n`, ESC or DEL from tool output or streamed text
+        // breaks the frame (interleaved text, weird glyphs, broken layout).
+        // The width measured it as 1, so it slipped past the clipping below.
+        // Render it as a visible replacement instead of dropping it silently.
+        if (isControlGrapheme(g)) {
+            self.putStable(col, row, "\u{fffd}", 1, style);
+            return;
+        }
         if (col >= self.width or row >= self.height or col + w > self.width) return;
         self.surface.writeCell(col, row, .{
             .char = .{ .grapheme = g, .width = w },
@@ -749,7 +771,16 @@ fn buildLinesBase(
     // The two columns are the paragraph's prefix ("› "), which lands on the
     // first line: a table that OPENS a paragraph would otherwise be two
     // columns wider than the terminal and the TUI would wrap the box.
-    const blocks = try md.parseLang(pa, para.kind, para.text, para.base, para.mood, para.lang, .{
+    //
+    // The text is sanitized ONCE, here, before the parser ever sees it: every
+    // paragraph (streamed model output, tool output, diffs, shell lines) goes
+    // through this function, and an ANSI sequence in it used to paint as
+    // literal `[31m` next to a control glyph — the "caracteres raros" and the
+    // broken layout. `ansi.strip` is the only thing that removes a WHOLE
+    // sequence (parameters and tail), which the painter's control-byte
+    // backstop cannot do.
+    const clean_text = ansi.strip(pa, para.text) catch para.text;
+    const blocks = try md.parseLang(pa, para.kind, clean_text, para.base, para.mood, para.lang, .{
         .word_diff = para.word_diff,
         .width = width -| 2,
     });
@@ -1025,6 +1056,13 @@ pub const Model = struct {
     /// Streaming state: the assistant's last paragraph is still open.
     streaming: bool = false,
     stream_buf: std.ArrayList(u8) = .empty, // gpa-owned
+    /// ZODE_CRASH_TEST: panic inside the draw path (alt screen active), to
+    /// exercise the panic handler with something real to restore.
+    crash_test: bool = false,
+    /// No tools for the rest of this turn: used by the ceiling turn, where
+    /// the model is asked for its final word with every tool removed from
+    /// the schema.
+    deny_all_tools: bool = false,
     /// Set true when a real allocation failure stopped stream_buf growth.
     stream_truncated: bool = false,
 
@@ -6858,6 +6896,9 @@ fn firstPaintMark() void {
 
 fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     const self: *Model = @ptrCast(@alignCast(ud));
+    // ZODE_CRASH_TEST=1: die with the alternate screen ACTIVE (vaxis owns it
+    // by now), so the crash path runs with something real to give back.
+    if (self.crash_test) @panic("crash test requested (ZODE_CRASH_TEST)");
     if (!self.boot_painted) {
         self.boot_painted = true;
         firstPaintMark();
@@ -9430,6 +9471,38 @@ pub fn drawTest(model: *Model, arena: std.mem.Allocator, w: u16, h: u16) !vxfw.S
         .max = .{ .width = w, .height = h },
         .cell_size = .{ .width = 1, .height = 1 },
     });
+}
+
+test "render: control bytes never reach a cell" {
+    // Two layers, two behaviors. The painter's backstop (`isControlGrapheme`,
+    // asserted here) still catches any control byte that gets past the paragraph
+    // builder — it paints U+FFFD instead of a broken frame. The paragraph
+    // builder (`ansi.strip`) removes them entirely before parsing, so history text
+    // never carries them at all.
+    try std.testing.expect(isControlGrapheme("\x1b"));
+    try std.testing.expect(isControlGrapheme("\r"));
+    try std.testing.expect(isControlGrapheme("\x07"));
+    try std.testing.expect(isControlGrapheme("\x7f"));
+    try std.testing.expect(isControlGrapheme("\u{0085}"));
+    try std.testing.expect(!isControlGrapheme("a"));
+    try std.testing.expect(!isControlGrapheme("\xc3\xb1")); // ñ is not a control
+    try std.testing.expect(!isControlGrapheme(""));
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.pushInfo("a\x1bb\x07c\rd");
+
+    const s = try drawTest(&m, arena, 40, 12);
+    var buf: [128]u8 = undefined;
+    const row0 = rowText(s, 0, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, row0, "\x1b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, row0, "\x07") == null);
+    try std.testing.expect(std.mem.indexOf(u8, row0, "\r") == null);
+    try std.testing.expectEqualStrings("\u{b7} acd", std.mem.trim(u8, row0, " "));
 }
 
 test "render: an info paragraph shows up on row 0" {

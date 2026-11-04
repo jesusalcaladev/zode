@@ -186,6 +186,7 @@ project: a `grep` that dumps 4 MB is the bulk of the next request.
 | `ZODE_MAX_ITER` | `12` | Tool/answer iterations per turn. Clamped to `4..200`. `/bench` reports the percentage of turns that hit it — 0% means it could be lowered, 30% means real tasks are being cut. |
 | `ZODE_GOAL_MAX` | `max(ZODE_MAX_ITER * 3, 60)` | The hard ceiling a `/goal` turn may reach. |
 | `ZODE_TASK_PARALLEL` | `3` | Subagent requests in flight at once. `/task-parallel [1..8|auto]` overrides it for the session. |
+| `ZODE_PIPELINE` | `auto` | `auto` runs the staged task pipeline on code/install tasks (evidence → implement → tester → verify → review). `off` never auto-starts it (`/pipeline <task>` still works). `always` runs it for every top-level turn. Artifacts land in `.zode/pipeline/<id>/`. The harness runs the test suite itself (see the `testplan` table: zig/npm/cargo/go/pytest/mix/bundler) and the Tester/Implementer can never delete or weaken an existing test — the harness re-hashes them and stops the run. Say "omit tests" / "omit review" in the task to skip those stages. |
 
 Subagents run at effort `low` on a throwaway 24k window. Where they run is set
 by `/submodel`, then `subagent_provider` / `subagent_model` in `config.json`,

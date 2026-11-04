@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const tui = @import("tui.zig");
@@ -20,11 +21,132 @@ const plan_mod = @import("lib/plan.zig");
 const taskstore = @import("lib/taskstore.zig");
 const kittyKeyboardPush = @import("lib/termseq.zig").kittyKeyboardPush;
 const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
+const termseq = @import("lib/termseq.zig");
 const skills = @import("lib/skills.zig");
 const ask = @import("lib/ask.zig");
 const lsp_manager = @import("lsp/manager.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const theme = @import("lib/theme.zig");
+
+// ── crash handling ─────────────────────────────────────────────────────
+//
+// A panic used to mean: the process died, the terminal was left in the
+// alternate screen with the mouse captured and raw/keyboard flags still
+// active, and the shell typed garbage on the next keypress. `Cannot print
+// stack trace: stack tracing is disabled` was printed on top of that, which
+// is the state the user reported and the one screenshots cannot explain.
+//
+// `std.options.allow_stack_tracing` is what actually toggles the traces in
+// Zig: it defaults to `!builtin.strip_debug_info`, and zode ships stripped,
+// so the trace was always "disabled" and the release binary could never say
+// WHERE it died. Stripping the binary does not stop the unwinder from
+// running — it stops the SOURCE mapping — so enabling it costs bytes and
+// still reports the frames (as addresses, or as lines when a Debug build is
+// what crashed, see `zig build debug`).
+//
+// The panic handler cannot use `Io`, an allocator or any of this process's
+// own bookkeeping: the thing that just crashed is usually what touched that
+// state. It talks to the terminal and to a file with raw syscalls, in the
+// same shape `agent.quitFast` uses for the clean-exit path, and through the
+// same `termseq.restore_all` byte string.
+
+/// Enables stack-trace capture in Release builds. Stripping the binary still
+/// prevents symbolization, but the unwinder runs and the frames are printed.
+pub const std_options: std.Options = .{ .allow_stack_tracing = true };
+
+/// Root panic handler: give the terminal back, leave a crash log, then defer
+/// to the default handler (which prints the message and aborts).
+pub const panic = std.debug.FullPanic(zodePanic);
+
+/// Fixed path on purpose: panic time is not a moment to build directories or
+/// consult an environment map.
+const crash_log_path = "/tmp/zode-crash.log";
+
+fn zodePanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    if (builtin.os.tag == .linux) {
+        restoreTerminalForCrash();
+        writeCrashLog(msg, first_trace_addr);
+    }
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
+/// Write all of `bytes` to `fd`. Nothing to retry into, nothing to buffer: if
+/// the write fails the crash message in the terminal still carries the news.
+fn linuxWriteAll(fd: std.posix.fd_t, bytes: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = linux.write(fd, bytes.ptr + off, bytes.len - off);
+        switch (linux.errno(n)) {
+            .SUCCESS => off += n,
+            .INTR => continue,
+            else => return,
+        }
+    }
+}
+
+/// The terminal back into its NORMAL state. This is the half of the crash
+/// that the user actually sees: without it the shell prompt never returns
+/// and every key afterwards is raw input to a dead program.
+fn restoreTerminalForCrash() void {
+    if (builtin.os.tag != .linux) return;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, "/dev/tty", .{ .ACCMODE = .RDWR }, 0) catch return;
+    defer _ = std.os.linux.close(fd);
+    linuxWriteAll(fd, termseq.restore_all);
+    // Escape sequences cannot undo raw mode: termios carries it.
+    const termios = std.posix.tcgetattr(fd) catch return;
+    var copy = termios;
+    copy.lflag.ECHO = true;
+    copy.lflag.ICANON = true;
+    copy.lflag.ISIG = true;
+    copy.oflag.OPOST = true;
+    copy.iflag.ICRNL = true;
+    copy.iflag.IXON = true;
+    _ = std.posix.tcsetattr(fd, .FLUSH, copy) catch {};
+}
+
+/// Leave `/tmp/zode-crash.log` with the failure and the frames it could
+/// collect, for whoever picks the machine up afterwards. Appends.
+fn writeCrashLog(msg: []const u8, first_trace_addr: ?usize) void {
+    if (builtin.os.tag != .linux) return;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, crash_log_path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+    }, 0o600) catch return;
+    defer _ = std.os.linux.close(fd);
+
+    linuxWriteAll(fd, "zode crash\n");
+    var line_buf: [128]u8 = undefined;
+    if (std.fmt.bufPrint(&line_buf, "version: {s}\n", .{@import("build_options").version})) |s| {
+        linuxWriteAll(fd, s);
+    } else |_| {}
+    linuxWriteAll(fd, "pid: ");
+    if (std.fmt.bufPrint(&line_buf, "{d}\n", .{std.os.linux.getpid()})) |s| {
+        linuxWriteAll(fd, s);
+    } else |_| {}
+    linuxWriteAll(fd, "message: ");
+    linuxWriteAll(fd, msg);
+    linuxWriteAll(fd, "\n");
+
+    var addrs: [96]usize = undefined;
+    const trace = std.debug.captureCurrentStackTrace(.{
+        .first_address = first_trace_addr orelse @returnAddress(),
+        .allow_unsafe_unwind = true,
+    }, &addrs);
+    if (trace.return_addresses.len > 0) {
+        linuxWriteAll(fd, "frames:\n");
+        for (trace.return_addresses) |addr| {
+            if (std.fmt.bufPrint(&line_buf, "0x{x}\n", .{addr})) |s| {
+                linuxWriteAll(fd, s);
+            } else |_| {}
+        }
+    } else {
+        linuxWriteAll(fd, "frames: (unwinding failed)\n");
+    }
+    linuxWriteAll(fd, "----------------------------------------\n");
+}
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = map orelse return null;
@@ -598,6 +720,38 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     }
     printProofLine(&auto_check, gpa);
 
+    // ── the ceiling: the tools are dead, the answer still has to come ──
+    //
+    // Reaching the ceiling means the turn ran out of room, not that the task is
+    // finished, and the model knows where it stopped better than any harness
+    // does. It is asked for one final word with NO tools (the tools field is
+    // simply absent from this body), so it can only say what it did and what
+    // it left open. Without this, a capped run ended silently with tool calls
+    // and no verdict, which is a script waiting for an answer that never
+    // came.
+    try msgs.append(arena, .{
+        .role = "user",
+        .content = "The iteration budget for this session is exhausted. Tools are disabled for this reply — no code can be written now. Write a plain summary of at most 10 lines: what was actually done, what remains unfinished or unverified, which files were touched and the single next step. Do not apologize for stopping.",
+    });
+    const summary_body = chat.buildBodyMessagesCapped(body_buf, model_name, msgs.items, effort_pref, "", kind, agent.outputCapFor(def, env)) catch null;
+    if (summary_body) |sm_body| {
+        models.dbg("\n--- unfinished work summary (no tools) ---\n", .{});
+        const Cb = struct {
+            fn onDelta(_: ?*anyopaque, delta: []const u8) void {
+                models.dbg("{s}", .{delta});
+            }
+        };
+        if (chat.streamChatCtx(gpa, &http, url, key, @constCast(sm_body), .{
+            .userdata = null,
+            .onDelta = Cb.onDelta,
+        }, kind, true, extra_headers)) |res| {
+            res.ctx.destroy();
+            models.dbg("\n--- end of summary ---\n", .{});
+        } else |err| {
+            models.dbg("(the summary call failed: {t})\n", .{err});
+        }
+    }
+
     // UNFINISHED, and the first word, for the same reason the TUI says it that way:
     // a run that reached its ceiling ran out of room, which is not the same thing as
     // the task being finished, and the one thing a user of a script must not be left
@@ -859,6 +1013,10 @@ fn runTui(init: std.process.Init) !u8 {
     // a message on every ctrl+c would be noise the user learns to ignore, and the one
     // time they need to read it is the time it is missing.
     const exit_trace = envGet(init.environ_map, "ZODE_EXIT_TRACE") != null;
+
+    // The crash-test flag decides whether the TUI dies inside its first draw
+    // (alt screen active) instead of starting clean. See `Model.crash_test`.
+    model.crash_test = envGet(init.environ_map, "ZODE_CRASH_TEST") != null;
 
     app.run(model.widget(), .{}) catch |err| {
         // This is the branch that matters most and it used to be `try`, which printed

@@ -1234,6 +1234,8 @@ pub const commands = [_]Cmd{
     .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
     .{ .key = "/compact", .desc = "off|elide|full|now: automatic compaction (no args: report, now = compact immediately)", .key_hint = "off|elide|full|now" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
+    .{ .key = "/pipeline", .desc = "the staged pipeline for a task: evidence → implement → tester → verify → review", .key_hint = "<task>" },
+    .{ .key = "/code-review", .desc = "read-only review of the changes: /code-review (diff) | /code-review <paths>", .key_hint = "[paths]" },
     .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
     .{ .key = "/rename", .desc = "set a custom title for the current session: /rename <name>" },
     .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },

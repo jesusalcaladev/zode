@@ -54,6 +54,10 @@ const sessionindex = @import("lib/sessionindex.zig");
 const taskstore = @import("lib/taskstore.zig");
 const termseq = @import("lib/termseq.zig");
 const subagent_mod = @import("lib/subagent.zig");
+const pipeline_mod = @import("lib/pipeline.zig");
+const testguard_mod = @import("lib/testguard.zig");
+const testplan_mod = @import("lib/testplan.zig");
+const filesearch = @import("lib/filesearch.zig");
 const textcap = @import("lib/textcap.zig");
 const resultcap = @import("lib/resultcap.zig");
 const toolstore = @import("lib/toolstore.zig");
@@ -3961,6 +3965,20 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         cmdBench(m);
+    } else if (std.mem.eql(u8, cmd, "pipeline")) {
+        const task = std.mem.trim(u8, rest, " \t\r\n");
+        if (task.len == 0) {
+            m.pushInfo("usage: /pipeline <task> — the staged pipeline: evidence → implement → tester → verify → review");
+        } else {
+            startPipeline(m, task) catch |err| {
+                m.pushInfoFmt("pipeline: {t}", .{err});
+            };
+        }
+    } else if (std.mem.eql(u8, cmd, "code-review")) {
+        const paths = std.mem.trim(u8, rest, " \t\r\n");
+        startCodeReview(m, paths) catch |err| {
+            m.pushInfoFmt("code-review: {t}", .{err});
+        };
     } else if (std.mem.eql(u8, cmd, "ask")) {
         cmdAskMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "skills")) {
@@ -4562,9 +4580,32 @@ fn resumeLatest(m: *tui.Model) void {
 pub const ChatJob = struct {
     model: *tui.Model,
     text: []const u8,
+    /// What the worker runs: the free-running loop (normal), the staged
+    /// task pipeline (/pipeline, or the automatic classifier), or a read-only
+    /// code review (/code-review).
+    mode: Mode = .normal,
+
+    pub const Mode = enum { normal, pipeline, review };
 };
 
 pub fn startChat(m: *tui.Model, input: []const u8) !void {
+    return startChatImpl(m, input, .normal);
+}
+
+/// The immediate entry for `/pipeline <task>`: same queueing and busy rules
+/// as `startChat`, but the worker runs the staged pipeline instead of the
+/// free-running loop.
+pub fn startPipeline(m: *tui.Model, input: []const u8) !void {
+    return startChatImpl(m, input, .pipeline);
+}
+
+/// The immediate entry for `/code-review [paths...]`: a read-only review of
+/// the working tree's changes (or the given files) — no pipeline, no edits.
+pub fn startCodeReview(m: *tui.Model, input: []const u8) !void {
+    return startChatImpl(m, input, .review);
+}
+
+fn startChatImpl(m: *tui.Model, input: []const u8, mode: ChatJob.Mode) !void {
     // Truncate long inputs for UI display, keep full text for model
     const TRUNCATE_SIZE = 200;
     var display_input = input;
@@ -4609,7 +4650,7 @@ pub fn startChat(m: *tui.Model, input: []const u8) !void {
 
     const job = try m.allocator.create(ChatJob);
     m.beginWorker(); // the worker closes it; if the spawn fails, we close it here
-    job.* = .{ .model = m, .text = copy };
+    job.* = .{ .model = m, .text = copy, .mode = mode };
     const spawned = std.Thread.spawn(.{}, chatWorker, .{job}) catch null;
     const th = spawned orelse {
         m.endWorker();
@@ -4695,6 +4736,62 @@ pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
     return result[0..ri];
 }
 
+/// The harness-authored prompts (gate refusals, checkpoint notes, "continue")
+/// are APPENDED to the session as a `user` message.
+///
+/// ## Why this function exists, and what it fixes
+///
+/// The old loop treated these prompts as a parameter to `runOneTurn`, which
+/// discarded it: the message was built, marked for the next iteration and
+/// then never sent. Every refusal the exit gate emitted — "the code is not
+/// verified", "this is not done", "a stop hook is in force" — was a message
+/// the model could not read. The gate refused the turn; the model saw
+/// nothing; the user saw a machine that stops for reasons it never
+/// understands. The same silent drop hit the goal checkpoint question and
+/// the "repeated call" nudge.
+///
+/// The wire of every iteration IS the session, so the only correct place for
+/// a prompt is there. This helper is the one door; no copy is kept here.
+fn appendHarnessPrompt(m: *tui.Model, text: []const u8) void {
+    const s = ensureSession(m, m.allocator);
+    s.append(.user, text) catch |err| {
+        models_mod.dbg("harness prompt: could not be appended to the session ({t})\n", .{err});
+    };
+}
+
+/// The user line of the turn goes into the session file FIRST: the order in
+/// the file is user line, then whatever the iterations append, and the UI
+/// thread is free to paint the prompt instead of waiting on a DEFLATE.
+fn appendUserLine(m: *tui.Model, user_text: []const u8) void {
+    const s = ensureSession(m, m.allocator);
+    s.append(.user, user_text) catch {};
+    s.flush();
+}
+
+/// Per-turn harness budget. Both whoever drives the turn resets this: the
+/// normal turn and the pipeline (whose stages share one budget).
+fn resetTurnBudget(m: *tui.Model) void {
+    m.auto_check.resetTurn(&m.bg, io_global);
+    m.asks_this_turn = 0;
+    m.plan_touched_this_turn = false;
+    m.plan_write_blocked_this_turn = false;
+    m.plan_missing_nudges_this_turn = 0;
+    m.bg.cancel_all = false;
+}
+
+/// Should this prompt run the STAGED pipeline instead of the free-running
+/// loop? `ZODE_PIPELINE=auto` (default) triggers it on a code/install task;
+/// `always` forces it, `off` disables it (`/pipeline <task>` always works).
+fn pipelineApplies(m: *tui.Model, user_text: []const u8) bool {
+    _ = m;
+    const mode = pipeline_mod.modeFrom(envGet(environ_global, "ZODE_PIPELINE"));
+    return switch (mode) {
+        .off => false,
+        .always => true,
+        .auto => pipeline_mod.classify(user_text).wants_pipeline,
+    };
+}
+
 /// The worker: one turn of conversation with the API, with tools.
 fn chatWorker(job: *ChatJob) void {
     const m = job.model;
@@ -4708,45 +4805,57 @@ fn chatWorker(job: *ChatJob) void {
     m.beginWorker();
     defer m.endWorker();
 
+    // The task pipeline. A prompt that is a code task — or one the user sent
+    // through `/pipeline` — runs the staged flow (evidence → implement →
+    // tester → verify → review) instead of the free-running loop. ESC and
+    // the permission dialogs work the same; the difference is the order and
+    // the verification the harness performs on its own. `/code-review` does
+    // the review stage alone, read-only.
+    if (job.mode == .pipeline) {
+        runPipeline(m, user_text);
+        return;
+    }
+    if (job.mode == .review) {
+        runCodeReview(m, user_text);
+        return;
+    }
+    if (pipelineApplies(m, user_text)) {
+        runPipeline(m, user_text);
+        return;
+    }
+
     // The user line of the turn lands in the session file HERE: this is the
     // first thing the turn does, so the order in the file is unchanged (user
     // line, then whatever the iterations append), and the UI thread is free to
     // paint your prompt the moment you press Enter instead of waiting on a
     // DEFLATE and a `write(2)`.
-    {
-        const s = ensureSession(m, m.allocator);
-        s.append(.user, user_text) catch {};
-        s.flush();
-    }
+    appendUserLine(m, user_text);
 
     // The automatic typecheck's budget is PER TURN, and any job left over from the
     // previous one is killed rather than orphaned. Both live in `resetTurn` so the
     // headless runner gets the same behaviour from the same code.
-    m.auto_check.resetTurn(&m.bg, io_global);
+    resetTurnBudget(m);
 
     // The turn stats start here (not in `runOneTurn`): the turn is the whole
     // `chatWorker`, with its 8 iterations.
     turn_stats.reset(m.allocator, std.Io.Timestamp.now(io_global, .real).nanoseconds);
     defer turn_stats.deinit();
 
+    const outcome = runAgentLoop(m);
+    m.streamEnd();
+    endTurn(m, outcome.iterations, outcome.capped);
+}
+
+/// What the loop ended with.
+pub const TurnOutcome = struct { iterations: usize, capped: bool };
+
+/// The agent loop shared by the normal turn and the pipeline's stages.
+///
+/// Returns what the ceiling did to the loop. The caller owns the final
+/// steps (`streamEnd` + `endTurn`), which is what lets the pipeline run the
+/// stages without printing the "Done" line after each one.
+fn runAgentLoop(m: *tui.Model) TurnOutcome {
     var iterations: usize = 0;
-    var last_user: []const u8 = user_text;
-    var owned: ?[]u8 = null; // synthesized text of an iteration (owned)
-
-    // The per-turn question budget resets with the turn. Without the reset a
-    // long session would stop being able to ask anything after three questions
-    // EVER, which is a bug that only shows up an hour in.
-    m.asks_this_turn = 0;
-    m.plan_touched_this_turn = false;
-    m.plan_write_blocked_this_turn = false;
-    m.plan_missing_nudges_this_turn = 0;
-
-    // A NEW turn clears the ESC flag: ESC blocked spawns so that the turn in
-    // flight could not start anything else after the user said "stop", but if it
-    // stayed set forever every `run_in_background` of every later turn would die
-    // with `Cancelled` and nothing would ever say why. Same idea as the ask
-    // budget above: the state of one turn must not poison the next one.
-    m.bg.cancel_all = false;
 
     // ── the loop, and the three things that decide when it stops ──
     //
@@ -4802,20 +4911,16 @@ fn chatWorker(job: *ChatJob) void {
         if (chat.cancel_current.load(.seq_cst)) {
             chat.cancel_current.store(false, .seq_cst);
             pushInfo(m, "stopped (esc)");
-            m.streamEnd();
-            pushTurnSummary(m);
-            return;
+            return .{ .iterations = iterations, .capped = false };
         }
         turn_stats.iterations = iterations + 1;
-        const again = runOneTurn(m, last_user, iterations) catch |err| {
+        const again = runOneTurn(m, iterations) catch |err| {
             reportErr(m, err);
             // With free-auto on, the pool's state IS the user's next question ("so what
             // now?"), and the answer fits on one line. Without this you see an
             // error and nothing else.
             notePoolState(m);
-            m.streamEnd();
-            pushTurnSummary(m);
-            return;
+            return .{ .iterations = iterations, .capped = false };
         };
         // 0. THE EXIT GATE: may this turn end on the code as it is right now?
         //
@@ -4863,17 +4968,8 @@ fn chatWorker(job: *ChatJob) void {
                 // otherwise — is not something to resolve by trusting one of them.
                 if (m.goal.status == goal_mod.Status.met) m.goal.status = goal_mod.Status.none;
                 pushErrorOwned(m, refusal);
-
-                // The nudge is the prompt. `owned`, not a bare assignment: the loop frees
-                // the previous prompt through it, so a `last_user` set without it leaks a
-                // turn's worth of text every time the turn refuses to end.
-                const nudge = m.allocator.dupe(
-                    u8,
-                    "The harness will not end this turn yet: the code you wrote does not have a passing check behind it. Read the problems above, fix them, and let the check run again. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.",
-                ) catch break;
-                if (owned) |o| m.allocator.free(o);
-                owned = nudge;
-                last_user = nudge;
+                appendHarnessPrompt(m,
+                    "The harness will not end this turn yet: the code you wrote does not have a passing check behind it. Read the problems above, fix them, and let the check run again. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.");
                 continue;
             }
         }
@@ -4883,19 +4979,13 @@ fn chatWorker(job: *ChatJob) void {
         // claim the turn — if the gate refused, this is not reached.
         if (m.auto_check.stopHookCheck("turn_end", m.allocator)) |refusal| {
             pushError(m, refusal);
-            const nudge = m.allocator.dupe(
-                u8,
-                "The harness will not end this turn yet: a stop hook is in force. Resolve it and end the turn, or remove the hook.",
-            ) catch break;
-            if (owned) |o| m.allocator.free(o);
-            owned = nudge;
-            last_user = nudge;
+            appendHarnessPrompt(m,
+                "The harness will not end this turn yet: a stop hook is in force. Resolve it and end the turn, or remove the hook.");
             continue;
         }
 
         if (m.loop_repeated) |which| {
             m.loop_repeated = null;
-            if (again) |answer| m.allocator.free(answer);
             switch (repeat_recovery.onRepeat()) {
                 .nudge => {
                     pushErrorFmt(
@@ -4904,13 +4994,8 @@ fn chatWorker(job: *ChatJob) void {
                         .{ which, repeats_mod.repeat_limit },
                     );
                     m.repeats.reset();
-                    const nudge = m.allocator.dupe(
-                        u8,
-                        "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.",
-                    ) catch break;
-                    if (owned) |o| m.allocator.free(o);
-                    owned = nudge;
-                    last_user = nudge;
+                    appendHarnessPrompt(m,
+                        "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.");
                     continue;
                 },
                 .stop => {
@@ -4924,7 +5009,7 @@ fn chatWorker(job: *ChatJob) void {
             }
         }
 
-        const text = again orelse {
+        if (!again) {
             // ── PLAN APPROVAL: the turn may not end with a plan nobody answered on ──
             //
             // Plan mode's whole point is investigate → plan → the developer says
@@ -4940,16 +5025,9 @@ fn chatWorker(job: *ChatJob) void {
             if (currentPermMode() == .read_only) {
                 if (m.plan_write_blocked_this_turn and !m.plan_touched_this_turn and m.plan_missing_nudges_this_turn < 2) {
                     m.plan_missing_nudges_this_turn += 1;
-                    const nudge = m.allocator.dupe(
-                        u8,
-                        "Plan mode blocked a write because no implementation plan has been recorded yet. Use `todo` to show the complete, concrete plan to the user, then end your turn so they can approve or revise it. Do not retry the blocked write.",
-                    ) catch null;
-                    if (nudge) |next| {
-                        if (owned) |o| m.allocator.free(o);
-                        owned = next;
-                        last_user = next;
-                        continue;
-                    }
+                    appendHarnessPrompt(m,
+                        "Plan mode blocked a write because no implementation plan has been recorded yet. Use `todo` to show the complete, concrete plan to the user, then end your turn so they can approve or revise it. Do not retry the blocked write.");
+                    continue;
                 }
                 if (m.plan_write_blocked_this_turn and !m.plan_touched_this_turn) {
                     pushError(m, "plan mode is still active: no implementation plan was recorded, so no approval was requested and no write was allowed");
@@ -4958,18 +5036,14 @@ fn chatWorker(job: *ChatJob) void {
                 if (m.plan_touched_this_turn and !m.plan.isEmpty() and plan_gate_asks < 2) {
                     plan_gate_asks += 1;
                     if (planApprovalNudge(m)) |nudge| {
-                        if (owned) |o| m.allocator.free(o);
-                        owned = nudge;
-                        last_user = nudge;
+                        appendHarnessPrompt(m, nudge);
+                        m.allocator.free(nudge);
                         continue;
                     }
                 }
             }
             break;
-        };
-        if (owned) |o| m.allocator.free(o);
-        owned = text;
-        last_user = text;
+        }
 
         // 1. The goal was decided. The model said so, and it is the only thing that
         //    ends a goal turn early.
@@ -4997,13 +5071,8 @@ fn chatWorker(job: *ChatJob) void {
                 "you declared the goal MET but {d} of your own plan steps are still open ({d}/{d} done). Close them and declare again, or call `goal` with status blocked.",
                 .{ m.plan.openCount(), m.plan.doneCount(), m.plan.items.len },
             );
-            const nudge = m.allocator.dupe(
-                u8,
-                "The harness will not accept `met` yet: your plan still has open steps. Finish them, tick them with `todo`, and call `goal` again — or, if they genuinely cannot be finished here, call `goal` with status blocked and what_would_unblock.",
-            ) catch break;
-            if (owned) |o| m.allocator.free(o);
-            owned = nudge;
-            last_user = nudge;
+            appendHarnessPrompt(m,
+                "The harness will not accept `met` yet: your plan still has open steps. Finish them, tick them with `todo`, and call `goal` again — or, if they genuinely cannot be finished here, call `goal` with status blocked and what_would_unblock.");
             continue;
         }
 
@@ -5032,10 +5101,7 @@ fn chatWorker(job: *ChatJob) void {
             // lines up has the right shape: the error gets its buffer, the
             // prompt gets its own.
             pushErrorOwned(m, goal_mod.blockedRetryText(m.allocator) catch break);
-            const nudge = m.allocator.dupe(u8, goal_mod.blockedRetryPrompt()) catch break;
-            if (owned) |o| m.allocator.free(o);
-            owned = nudge;
-            last_user = nudge;
+            appendHarnessPrompt(m, goal_mod.blockedRetryPrompt());
             continue;
         }
 
@@ -5054,42 +5120,44 @@ fn chatWorker(job: *ChatJob) void {
             m.goal = g2;
             pushInfoFmt(
                 m,
-                "{d}/{d} iterations: stopping to ask whether the goal is reached. {d} more available.",
+                "{d}/{d} iterations: the soft target is reached. Asking whether the goal is done. {d} more available.",
                 .{ iterations + 1, soft, hard - (iterations + 1) },
             );
-            m.goal_checkpoint = true;
-            defer m.goal_checkpoint = false;
-            const again2 = runOneTurn(m, last_user, iterations) catch |err| {
-                reportErr(m, err);
-                m.streamEnd();
-                pushTurnSummary(m);
-                return;
-            };
-            if (again2) |t2| {
-                if (owned) |o| m.allocator.free(o);
-                owned = t2;
-                last_user = t2;
-            }
+            appendHarnessPrompt(m,
+                "The iteration budget for the soft target is reached. Your goal is still open. If it is reached, call `goal` with status met; if it cannot be finished here, call `goal` with status blocked and what_would_unblock; otherwise carry on.");
             m.repeats.reset();
-            if (m.goal.status != goal_mod.Status.none) break;
-            pushInfoFmt(m, "no verdict yet: continuing.", .{});
+            // Next iteration carries the question to the wire; the loop does it.
+            continue;
         }
     }
-    if (owned) |o| m.allocator.free(o);
-    const capped = iterations >= hard and m.goal.isOpen();
-    if (capped) {
-        // UNFINISHED, first word. The old text was "goal not declared after N
-        // iterations. Stopping here; say `continue` to go on." and it had two problems:
-        // it led with the harness's bookkeeping instead of the state of the work, and it
-        // ended by handing the user a chore — which is the sentence that started this
-        // whole feature. Reaching the ceiling means the turn ran out of room, not that
-        // the task is done, and the one thing the user must not be left guessing is which
-        // of the two it is.
+    // ── the ceiling: the tools are dead, the answer still has to come ──
+    //
+    // Reaching the ceiling means the turn ran out of room, not that the task is
+    // done, and the model knows where it stopped better than any harness does.
+    // It is asked for one final word with NO tools (they are removed from the
+    // schema for this reply), which means it cannot write, edit or run
+    // anything: all it can do is say what it did and where it left the work.
+    // Without this, a turn that hit the limit ended silently and the user was
+    // left staring at a pile of tool calls with no verdict attached.
+    const exhausted = iterations >= hard;
+    if (exhausted) {
+        appendHarnessPrompt(m,
+            "The iteration budget for this session is exhausted. Tools are disabled for this reply — no code can be written now. Write a plain summary of at most 10 lines: what was actually done, what remains unfinished or unverified, which files were touched and the single next step. Do not apologize for stopping.");
+        m.deny_all_tools = true;
+        _ = runOneTurn(m, iterations) catch |err| reportErr(m, err);
+        m.deny_all_tools = false;
+    }
+    const capped = exhausted and m.goal.isOpen();
+    if (exhausted) {
+        // UNFINISHED, first word. Reaching the ceiling means the turn ran out
+        // of room, not that the task is done, and the one thing the user must
+        // not be left guessing is which of the two it is — with a goal, the
+        // reason it was never declared; without one, just the fact.
         const open_steps = m.plan.openCount();
         const unresolved = if (open_steps > 0)
             std.fmt.allocPrint(m.allocator, "{d} plan steps still open", .{open_steps}) catch "plan steps still open"
         else
-            m.allocator.dupe(u8, "no open plan steps, so the objective is simply unverified") catch
+            m.allocator.dupe(u8, "the objective is simply unverified") catch
                 "the objective is unverified";
         defer m.allocator.free(unresolved);
 
@@ -5099,29 +5167,35 @@ fn chatWorker(job: *ChatJob) void {
                 "UNFINISHED after {d} iterations ({s}). The goal was never declared: {s}",
                 .{ hard, unresolved, m.goal.objective() },
             );
-        } else {
+        } else if (m.goal.isOpen()) {
             pushErrorFmt(m, "UNFINISHED after {d} iterations ({s}).", .{ hard, unresolved });
+        } else {
+            pushInfoFmt(m, "iteration limit reached ({d}); the reply above says where things stand — say `continue` to go on.", .{hard});
         }
     }
-    m.streamEnd();
+    return .{ .iterations = iterations, .capped = capped };
+}
+
+/// The end-of-turn tail, shared by the normal turn and the pipeline stages:
+/// bench sample, the automatic typecheck's report, and the summary line.
+///
+/// `turn_iterations` is the count of executed iterations (the loop's own
+/// counter for a normal turn, the accumulated total for a pipeline run).
+fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
     // The bench sample is taken HERE, once per turn, and not per iteration: a
     // turn is the unit the user thinks in ("that took 40 s"), and a per-iteration
     // sample would make the average turn time a fiction.
-    m.bench.noteTurn(iterations, turn_stats.elapsedMs(nowNs()), m.ttftMillis(), capped);
+    m.bench.noteTurn(turn_iterations, turn_stats.elapsedMs(nowNs()), m.ttftMillis(), capped);
     // The read cache's hit count, ONCE per turn: reading `m.reads.stats` from the
     // draw every frame would take the cache's lock 60 times a second for a number
     // that changes once per turn.
     m.bench.read_hits = m.reads.stats.hits;
     // The automatic typecheck, WAITED FOR.
     //
-    // Measured: with the result only read at the start of the next iteration, a turn
-    // that ends right after the edit collected nothing — the `zig build` it started
-    // was still running — and the next turn's reset killed it. So the feature
-    // produced nothing on exactly the turns it exists for.
-    //
-    // It waits, with a cap, at the END of a turn. That is the one moment blocking is
-    // free: the user is waiting for the answer anyway, and the alternative is
-    // answering "done" about code nobody has compiled yet.
+    // Measured: with the result only read at the start of the next turn, a turn
+    // that ends right after the edit collected nothing — the `zig build` it had
+    // started was still running — and the next turn's reset killed it. So the
+    // feature produced nothing on exactly the turns it exists for.
     finishAutoCheck(m);
     pushTurnSummary(m);
 }
@@ -5477,17 +5551,14 @@ fn toolCallsJsonFromCalls(gpa: std.mem.Allocator, calls: []const TurnCtx.Call) ?
 /// A turn: one request to the API with the history, its tools and, if the model
 /// asks for tools, their execution and the next turn.
 ///
-/// Returns the synthesized text to send in the next turn (normally null: if
-/// there were no tool calls, the turn is over).
-/// `user_text` is already in the session (`startChat` wrote it): here it is
-/// only used for the case of synthetic iterations, and the system prompt is
-/// injected once at the start of the conversation.
-/// CAREFUL: the return type is `[]u8` and not `[]const u8` ON PURPOSE. With
-/// `[]const u8` the compiler does not tell a literal from owned memory, and
-/// `chatWorker` freed the literal "Continue with the tool results above." ->
-/// `free` on `.rodata` -> "reached unreachable code" panic in ReleaseSafe,
-/// which means a turn with tools brought the app down ALWAYS. Zig literals are
-/// `[]const`, so now the compiler PREVENTS returning them here.
+/// Returns true when tool calls ran (the loop continues), false when the model
+/// answered without tools (the turn is over, and the caller decides what to do).
+///
+/// The prompts the harness writes (gate refusals, checkpoint notes, the "there
+/// are tool results above" note) are ALL in the session before this is called:
+/// that is the only place the wire reads, so it is the only place a message
+/// can be added. The system prompt is injected once at the start of the
+/// conversation.
 /// [roster] Who a turn is sent to.
 ///
 /// It exists so that `runOneTurn` does not have to decide between "the active
@@ -6246,8 +6317,7 @@ fn attachPlanContext(m: *tui.Model, s: *session_mod.Session) void {
     s.append(.user, text) catch {};
 }
 
-fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
-    _ = user_text;
+fn runOneTurn(m: *tui.Model, iteration: usize) !bool {
     // Refresh ctx_pct so the background-compaction thresholds see a real number.
     refreshContextUsage(m);
     const gpa = m.allocator;
@@ -6448,9 +6518,10 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     // la compactación fue síncrona (arena del turno).
     if (!used_bg) {
         if (comp.elided > session_elided) {
-            session_elided = comp.elided;
-            const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
-            pushInfoOwned(m, msg);
+            if (std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided})) |msg| {
+                session_elided = comp.elided;
+                pushInfoOwned(m, msg);
+            } else |_| {}
         }
         // [readcache] What compaction took away is NOT in the context anymore,
         // so the read cache has to forget it.
@@ -6482,9 +6553,10 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
     }
 
     if (comp.elided > session_elided) {
-        session_elided = comp.elided;
-        const msg = std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided}) catch return null;
-        pushInfoOwned(m, msg);
+        if (std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided})) |msg| {
+            session_elided = comp.elided;
+            pushInfoOwned(m, msg);
+        } else |_| {}
     }
     // [readcache] What compaction took away is NOT in the context anymore, so
     // the read cache has to forget it. Without this, the next `read` of one of
@@ -6611,7 +6683,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         m.streamEnd();
         pushInfo(m, "no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
         setStatusWithZo(m, .warn, "no model");
-        return null;
+        return false;
     }
 
     // The router warning, ONCE per session, on the first turn that uses one.
@@ -6707,7 +6779,10 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
         // (and `read_only` keeps its own static slice).
         var sarena = std.heap.ArenaAllocator.init(gpa);
         defer sarena.deinit();
-        const schema = if (read_only) tools_registry.toolsJsonReadOnly() else try tools_registry.toolsJsonFiltered(sarena.allocator(), denied);
+        // `deny_all_tools`: the schema is ABSENT, not empty-star, for the
+        // ceiling turn — the model gets no tool names at all, it cannot call
+        // anything and it cannot even try.
+        const schema = if (m.deny_all_tools) "" else if (read_only) tools_registry.toolsJsonReadOnly() else try tools_registry.toolsJsonFiltered(sarena.allocator(), denied);
         // Mark the end of the stable prefix so the provider serves it from its
         // prompt cache instead of re-writing it every turn. One breakpoint, not
         // one per old message: Anthropic caps a request at four `cache_control`
@@ -6835,7 +6910,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             }
             if (isRetryable(err) and attempt < 3) {
                 pushRetryNotice(m, err, attempt);
-                Retry.wait(attempt) catch return null; // ESC cuts it short
+                Retry.wait(attempt) catch return false; // ESC cuts it short
                 continue;
             }
             // [roster] The retries are gone and this pair still will not answer.
@@ -6903,12 +6978,12 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !?[]u8 {
             .{ turn_ms / 1000, (turn_ms % 1000) / 100 },
         ) catch "done";
         setStatusWithZo(m, .done, done_status);
-        return null;
+        return false;
     }
 
-    const exec = try execToolCalls(m, s, &tstate);
+    _ = try execToolCalls(m, s, &tstate);
     refreshContextUsage(m);
-    return exec;
+    return true;
 }
 
 /// Announces tier 2 compaction if the turn triggers it.
@@ -8195,6 +8270,10 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             return subagent_mod.refused("the skill's tools were not accepted", rep);
         };
         tool_list = allowed.items;
+    } else if (task.allow_writes) {
+        // The Tester: the read-only set plus exactly write and edit. Nothing
+        // else — no bash, no ask, no task recursion.
+        tool_list = &subagent_mod.tester_tool_names;
     } else {
         tool_list = &subagent_mod.tool_names;
     }
@@ -8463,10 +8542,32 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             // A tool the subagent is not allowed to use comes back as a tool
             // result, NOT as a crash: the model asked for something out of scope
             // and it should find out by being told, in the same turn.
-            if (!subagent_mod.allowsTool(call.name)) {
-                const denied = std.fmt.allocPrint(sarena, "the subagent may not use `{s}`. It can only search and read.", .{call.name}) catch "not allowed";
+            const tool_allowed = if (task.allow_writes)
+                std.mem.eql(u8, call.name, "write") or std.mem.eql(u8, call.name, "edit") or
+                    subagent_mod.allowsTool(call.name)
+            else
+                subagent_mod.allowsTool(call.name);
+            if (!tool_allowed) {
+                const denied = blk: {
+                    if (task.allow_writes) {
+                        break :blk std.fmt.allocPrint(sarena, "the tester may read, search and write/edit files — `{s}` is not available to it.", .{call.name}) catch "not allowed";
+                    }
+                    break :blk std.fmt.allocPrint(sarena, "the subagent may not use `{s}`. It can only search and read.", .{call.name}) catch "not allowed";
+                };
                 msgs.append(sarena, .{ .role = "tool", .content = denied, .tool_call_id = call.id }) catch break;
                 continue;
+            }
+            // The permission gate for the tester's writes, with the same
+            // rules as the main turn: deny rules are absolute, sensitive
+            // paths ask once, and the user keeps the final word everywhere
+            // else. The tester does not get to write silently.
+            if (task.allow_writes and
+                (std.mem.eql(u8, call.name, "write") or std.mem.eql(u8, call.name, "edit")))
+            {
+                if (pipelineWriteGate(m, sarena, call.name, call.args_json)) |refusal| {
+                    msgs.append(sarena, .{ .role = "tool", .content = refusal, .tool_call_id = call.id }) catch break;
+                    continue;
+                }
             }
             const res_text = tools_mod.execute(
                 io_global,
@@ -9352,7 +9453,12 @@ fn bindTasks(m: *tui.Model, s: *session_mod.Session) void {
     m.tasks.bind(io_global, path);
 }
 
-fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
+/// The doc used to say "returns the next turn's text"; it returns nothing now.
+/// The `user` message that carries the tool results is appended HERE, into
+/// the session, because that is the only place the next request reads from —
+/// the old return value was handed to `runOneTurn`, which dropped it, and the
+/// model never saw a word of what happened after its tools ran.
+fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
     const gpa = m.allocator;
     bindTasks(m, s);
     var astate = std.heap.ArenaAllocator.init(gpa);
@@ -9493,11 +9599,11 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !?[]u8 {
     ) catch "tools done";
     setStatusWithZo(m, .tooling, tools_status);
 
-    // The next turn needs a user message describing the results; without it, the
-    // model does not see what happened.
-    if (t.calls.items.len == 0) return null;
-    // Own copy, NEVER the literal: whoever receives it frees it.
-    return gpa.dupe(u8, syntheticUserText) catch null;
+    // NOTE: no synthetic user message is appended here. The next request is
+    // built from tool messages alone (that is how the headless runner always
+    // worked against both OpenAI and Anthropic), and the message used to be
+    // returned and then dropped silently — the wire is the session, not a
+    // return value.
 }
 
 /// The text sent as "user" so the model sees the tool results. It lives in a
@@ -17388,4 +17494,640 @@ test "prepareImageFor: a full waiting list is refused naming the file" {
     try std.testing.expect(std.mem.indexOf(u8, res, "Too many images already waiting") != null);
     try std.testing.expect(std.mem.indexOf(u8, res, "NOT attached") != null);
     try std.testing.expectEqual(images_mod.max_images, pending.len);
+}
+
+// ── the task pipeline ──────────────────────────────────────────────
+//
+// The staged pipeline: evidence → implement → tester → verify → review.
+//
+// The point is that "do the task" is NOT one free-running loop when the task
+// is real work: it is a fixed order with checks the model cannot wave past.
+// Every stage is here in code; the model works INSIDE a stage and never
+// decides whether the next one runs. Everything crosses the wire through
+// the session (same rule as every other harness prompt), the artifacts land
+// in `.zode/pipeline/<run>/`, and the harness runs the test suite itself
+// instead of asking the model whether it passes.
+//
+// Escape hatch is a plain one: `ZODE_PIPELINE=off` and `/pipeline` still
+// works when you want it explicitly.
+
+/// True while a pipeline run holds the turn. Prevents auto-triggering a
+/// second pipeline from inside a stage.
+var pipeline_active = false;
+
+const Snapshot = struct {
+    /// Path as reported by the walker (`/`-separated).
+    path: []const u8,
+    /// Test entries from BEFORE the stages run.
+    tests: []const testguard_mod.Entry,
+};
+
+/// Scan every tracked `.zig` file under `.` for inline tests. The snapshot
+/// is by value in the arena: the text each file had before anything ran.
+fn snapshotZigTests(arena: std.mem.Allocator, io: std.Io) ![]Snapshot {
+    var paths = std.ArrayList([]const u8).empty;
+    var root = std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true }) catch return error.NoRoot;
+    defer root.close(io);
+    var walker = root.walk(arena) catch return error.NoRoot;
+    defer walker.deinit();
+    while (try walker.next(io)) |e| {
+        switch (e.kind) {
+            .directory => {
+                if (filesearch.skipDir(e.basename)) walker.leave(io);
+            },
+            .file => {
+                if (!std.mem.endsWith(u8, e.path, ".zig")) continue;
+                try paths.append(arena, try arena.dupe(u8, e.path));
+            },
+            else => {},
+        }
+    }
+
+    var out = std.ArrayList(Snapshot).empty;
+    for (paths.items) |p| {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(4 * 1024 * 1024)) catch continue;
+        const tests = testguard_mod.scan(arena, text) catch continue;
+        try out.append(arena, .{ .path = p, .tests = tests });
+    }
+    return out.toOwnedSlice(arena);
+}
+
+const Violation = struct {
+    path: []const u8,
+    missing: []const []const u8,
+    changed: []const []const u8,
+};
+
+/// Re-scan every snapshotted file and report which baseline tests are gone
+/// or different. Files created during the pipeline are not in the baseline
+/// and are not verified — a new file cannot weaken an old test.
+fn verifyZigTests(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    snaps: []const Snapshot,
+) ![]Violation {
+    var out = std.ArrayList(Violation).empty;
+    for (snaps) |s| {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, s.path, arena, .limited(4 * 1024 * 1024)) catch {
+            // The file is GONE: every baseline test in it is missing.
+            const names = arena.alloc([]const u8, s.tests.len) catch continue;
+            for (s.tests, 0..) |t, i| names[i] = t.name;
+            try out.append(arena, .{ .path = s.path, .missing = names, .changed = &.{} });
+            continue;
+        };
+        const rep = testguard_mod.verify(arena, s.tests, text) catch {
+            // Malformed Zig after the stage: report every baseline entry as missing.
+            const names = arena.alloc([]const u8, s.tests.len) catch continue;
+            for (s.tests, 0..) |t, i| names[i] = t.name;
+            try out.append(arena, .{ .path = s.path, .missing = names, .changed = &.{} });
+            continue;
+        };
+        if (!rep.ok()) {
+            try out.append(arena, .{ .path = s.path, .missing = rep.missing, .changed = rep.changed });
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// A short, actionable list of what was violated — the model needs file and
+/// NAME, not a boolean.
+fn formatViolations(arena: std.mem.Allocator, violations: []const Violation) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (violations) |v| {
+        try out.print(arena, "{s}:\n", .{v.path});
+        for (v.missing) |name| {
+            try out.print(arena, "  missing test: {s}\n", .{name});
+        }
+        for (v.changed) |name| {
+            try out.print(arena, "  changed test: {s}\n", .{name});
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// The artifacts directory for this run. `.zode/pipeline/<unix>-<pid>`.
+fn pipelineRunDir(buf: []u8, io: std.Io) ?[]const u8 {
+    const ts = std.Io.Timestamp.now(io, .real).toSeconds();
+    const pid: usize = @intCast(std.os.linux.getpid());
+    var id_buf: [64]u8 = undefined;
+    const id = pipeline_mod.runIdBuf(&id_buf, ts, pid);
+    return std.fmt.bufPrint(buf, ".zode/pipeline/{s}", .{id}) catch null;
+}
+
+/// Best-effort write of one artifact. Never fails the run.
+fn writeArtifact(io: std.Io, run_dir: []const u8, name: []const u8, data: []const u8) void {
+    std.Io.Dir.cwd().createDirPath(io, run_dir) catch return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ run_dir, name }) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch {};
+}
+
+/// Run one pipeline subagent and write its report as an artifact.
+///
+/// `rep` belongs to the caller (it is ~9 KB on the stack); the report slice
+/// it returns points into it, so the caller copies what it needs.
+fn runPipelineSubagent(
+    m: *tui.Model,
+    rep: *subagent_mod.Report,
+    label: []const u8,
+    prompt: []const u8,
+    run_dir: []const u8,
+    artifact: []const u8,
+) []const u8 {
+    const task = subagent_mod.Task{
+        .description = label,
+        .prompt = prompt,
+        // The tester gets write/edit through its own flag; everyone else
+        // is read-only.
+        .allow_writes = std.mem.eql(u8, label, "tester"),
+        .effort = "low",
+    };
+    const out = runSubagent(m, task, rep);
+    writeArtifact(io_global, run_dir, artifact, out);
+    return out;
+}
+
+/// The combined output of the test suite, plus the verdict.
+const SuiteResult = struct {
+    passed: bool,
+    /// The last few KB of combined stdout+stderr, for the repair prompt.
+    tail: []const u8,
+};
+
+/// The harness runs the test suite ITSELF. The model never grades its own work.
+fn runTestSuite(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    plan: testplan_mod.Plan,
+) SuiteResult {
+    const result = std.process.run(arena, io, .{
+        .argv = plan.argv,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(15 * 60), .clock = .awake } },
+    }) catch |err| {
+        const msg = std.fmt.allocPrint(arena, "the test command could not start: {t}", .{err}) catch "";
+        return .{ .passed = false, .tail = msg };
+    };
+    const full = arena.alloc(u8, result.stdout.len + result.stderr.len + 1) catch
+        return .{ .passed = false, .tail = "(out of memory)" };
+    @memcpy(full[0..result.stdout.len], result.stdout);
+    full[result.stdout.len] = '\n';
+    @memcpy(full[result.stdout.len + 1 ..][0..result.stderr.len], result.stderr);
+    const tail_len = @min(full.len, 3000);
+    return .{ .passed = result.term.success(), .tail = full[full.len - tail_len ..] };
+}
+
+/// `git diff HEAD`, capped for the reviewer's prompt. Empty outside a repo.
+fn gitDiffHEAD(arena: std.mem.Allocator, io: std.Io) []const u8 {
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ "git", "diff", "HEAD" },
+        .stdout_limit = .limited(pipeline_mod.review_diff_cap * 2),
+        .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
+    }) catch return "";
+    const diff = result.stdout;
+    if (diff.len <= pipeline_mod.review_diff_cap) return diff;
+    const n = pipeline_mod.review_diff_cap;
+    const buf = arena.alloc(u8, n + 64) catch return diff[0..n];
+    @memcpy(buf[0..n], diff[0..n]);
+    const tail = std.fmt.bufPrint(buf[n..], "\n[diff truncated at {d} KB — ask for specific files]\n", .{n / 1024}) catch "";
+    return buf[0 .. n + tail.len];
+}
+
+/// `git status --short`, capped. Tells the reviewer which files are NEW.
+fn gitStatusShort(arena: std.mem.Allocator, io: std.Io) []const u8 {
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ "git", "status", "--short" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(1024),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    }) catch return "";
+    return result.stdout;
+}
+
+// ── prompts ─────────────────────────────────────────────────────
+const explorer_prompt =
+    "You are the EXPLORER stage of a strict pipeline. You map the territory; you do not change anything.\n" ++
+    "Task: {s}\n\n" ++
+    "Find: the files and symbols that matter for this task, the existing tests that cover them, the project's conventions for code like this, the likely touch-points and the risks. Use read, grep, glob, list_files — and nothing else.\n" ++
+    "Reply with a compact report of at most 800 words with these sections, in this order:\n" ++
+    "SCOPE: files/symbols this task touches, one line each with WHY.\n" ++
+    "TESTS: which existing tests exercise those paths, or NONE.\n" ++
+    "CONVENTIONS: the local style the change must match (naming, error handling, tests).\n" ++
+    "RISKS: what can break and where.\n" ++
+    "UNKNOWNS: what you could not determine. If you used a guess, say GUESS explicitly.\n";
+
+const investigator_prompt =
+    "You are the INVESTIGATOR stage of a strict pipeline. You verify claims about the outside world; you never invent.\n" ++
+    "Task: {s}\n\n" ++
+    "Explorer's findings:\n{s}\n\n" ++
+    "Use web_fetch / web_search (and anything local: installed packages, --help, the dependency's own source if present) to verify what the task or the findings leave uncertain: API names, versions, flags, package names, breaking changes.\n" ++
+    "Rules: every claim carries a source (URL or local path). If you cannot verify it, mark it UNVERIFIED — never fill the gap.\n" ++
+    "Reply with at most 800 words:\n" ++
+    "VERIFIED: <claim> — <source> (one line each)\n" ++
+    "UNVERIFIED: <claim> (one line each)\n" ++
+    "RECOMMENDATION: the one approach the evidence supports.\n";
+
+const tester_prompt =
+    "You are the TESTER stage of a strict pipeline. You write the tests the change needs — you do not fix production code.\n" ++
+    "Task: {s}\n\n" ++
+    "Evidence:\n{s}\n\n" ++
+    "Rules:\n" ++
+    "- Add tests for the NEW or CHANGED behavior only. Do not reorganize existing tests.\n" ++
+    "- NEVER modify or delete an existing test. The harness re-hashes the baseline and the pipeline stops if you touch one.\n" ++
+    "- Prefer the project's existing test style (in Zig: top-level test \"...\" blocks in the same file).\n" ++
+    "- If the implementation is broken, do NOT fix it: finish your part and report FAILING tests and why. The Implementer fixes the code.\n" ++
+    "- If the tests already cover it, add nothing and say so.\n" ++
+    "Reply with at most 400 words: what you added, and the result you expect.\n";
+
+const implementer_seed =
+    "[Pipeline evidence] This task comes with a pre-researched map from zode's pipeline. Use it; do not re-derive what it already found.\n\n" ++
+    "{s}\n\n" ++
+    "{s}\n\n" ++
+    "Do the work. The map is a starting point, not a boundary: if it missed something, go find it. Never weaken or delete an existing test — add, fix code, or say what is blocked.\n";
+
+const verify_repair_prompt =
+    "[Pipeline verification] The test suite does not pass. Fix the CODE — never the tests, never the expectations.\n" ++
+    "Command: {s}\n\n" ++
+    "Output (the last part of it):\n{s}\n\n" ++
+    "If a test asserts the OLD behavior and the task changed the behavior on purpose, the test must be UPDATED — but say that out loud in your answer and name the test. If you cannot make it pass without touching tests, call `goal` with status blocked and what_would_unblock.\n";
+
+const review_repair_prompt =
+    "[Pipeline review] The reviewer found high-severity problems in your diff. Fix the CODE; do not touch the tests.\n\n" ++
+    "{s}\n";
+
+const reviewer_prompt =
+    "You are the CODE-REVIEW stage of a strict pipeline. You are the skeptical senior engineer; you do not write code.\n" ++
+    "Review the diff below. Read any file you need through the tools.\n\n" ++
+    "Diff:\n{s}\n\n" ++
+    "New/changed files (untracked or staged):\n{s}\n\n" ++
+    "Report findings as lines, one per finding:\n" ++
+    "SEVERITY: high|medium|low — <file>:<line> — <what is wrong> — <why it matters>\n" ++
+    "End with `SEVERITY: none` if there is nothing to report.\n" ++
+    "Judge: correctness, error handling, edge cases, races, security, tests that assert nothing, dead code, and clarity. Do not comment on style the project already has — formatting and naming that match the file are not findings.\n";
+
+/// Whether this task touches anything from outside the repository, which is
+/// where hallucinated APIs and fake package names come from — the one part
+/// Explorer cannot check by reading local code.
+fn needsInvestigation(task_text: []const u8, evidence: []const u8) bool {
+    const external_signals = [_][]const u8{
+        "install",  "instal",   "dependenc", "dependencia", "dependency",
+        "api",      "package",  "library",   "npm",        "pip",
+        "cargo add", "go get",  "import",    "crate",      "endpoint",
+        "web_search", "web_fetch", "http",    "url",
+    };
+    for (external_signals) |s| {
+        if (indexOfIgnoreCase(task_text, s) != null) return true;
+    }
+    const unknown_signals = [_][]const u8{
+        "UNKNOWNS:",  "unverified",  "could not verify",  "not sure",
+        "GUESS",
+    };
+    for (unknown_signals) |s| {
+        if (indexOfIgnoreCase(evidence, s) != null) return true;
+    }
+    return false;
+}
+
+/// Case-insensitive substring (ASCII).
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return i;
+    }
+    return null;
+}
+
+/// The staged pipeline. Runs on the worker thread; never on the UI thread.
+///
+/// Stages in order: Explorer → Investigator? → Implementer → (test guard) →
+/// Tester? → harness-run suite (with repair passes) → Reviewer → (one
+/// repair if high-severity) → summary. The model works INSIDE a stage; the
+/// harness owns the order.
+fn runPipeline(m: *tui.Model, task_text: []const u8) void {
+    const gpa = m.allocator;
+    const io = io_global;
+    const verdict = pipeline_mod.classify(task_text);
+
+    // Announce, then do the same session bookkeeping every turn does.
+    pushInfo(m, "· pipeline started: evidence → implement → tester → verify → review");
+    appendUserLine(m, task_text);
+    resetTurnBudget(m);
+    turn_stats.reset(gpa, std.Io.Timestamp.now(io, .real).nanoseconds);
+    defer turn_stats.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var dir_buf: [512]u8 = undefined;
+    const run_dir = pipelineRunDir(&dir_buf, io) orelse {
+        pushError(m, "pipeline: could not create the artifacts directory");
+        return;
+    };
+
+    // ── baseline: the tests that exist BEFORE anything runs ──
+    const snaps = snapshotZigTests(arena, io) catch &.{};
+
+    // ── 1. Explorer ──
+    setStatusWithZo(m, .thinking, "pipeline · explorer");
+    const evidence = blk: {
+        var rep: subagent_mod.Report = undefined;
+        const prompt = std.fmt.allocPrint(arena, explorer_prompt, .{task_text}) catch {
+            pushError(m, "pipeline: could not compose the explorer prompt");
+            return;
+        };
+        const out = runPipelineSubagent(m, &rep, "explorer", prompt, run_dir, "evidence.md");
+        break :blk arena.dupe(u8, out) catch out;
+    };
+    pushInfo(m, "· pipeline: explorer — evidence in .zode/pipeline/");
+
+    // ── 2. Investigator (only when the task touches the outside world) ──
+    const notes: ?[]const u8 = if (needsInvestigation(task_text, evidence)) blk: {
+        setStatusWithZo(m, .thinking, "pipeline · investigator");
+        var rep: subagent_mod.Report = undefined;
+        const prompt = std.fmt.allocPrint(arena, investigator_prompt, .{ task_text, evidence }) catch break :blk null;
+        const out = runPipelineSubagent(m, &rep, "investigator", prompt, run_dir, "notes.md");
+        break :blk arena.dupe(u8, out) catch out;
+    } else null;
+    if (notes) |n| {
+        _ = n;
+        pushInfo(m, "· pipeline: investigator — notes in .zode/pipeline/");
+    } else {
+        pushInfo(m, "· pipeline: investigator — skipped (nothing outside the repo to verify)");
+    }
+
+    // ── 3. Implementer (the normal loop, seeded with evidence) ──
+    setStatusWithZo(m, .thinking, "pipeline · implementer");
+    const seed = std.fmt.allocPrint(arena, implementer_seed, .{
+        evidence,
+        if (notes) |n| n else "No investigation was needed for this task.",
+    }) catch return;
+    appendHarnessPrompt(m, seed);
+    pipeline_active = true;
+    _ = runAgentLoop(m);
+    pipeline_active = false;
+
+    // ── 4. The implementer may not touch existing tests ──
+    const violations = verifyZigTests(arena, io, snaps) catch &.{};
+    if (violations.len > 0) {
+        const detail = formatViolations(arena, violations) catch "existing tests were modified";
+        pushErrorFmt(m, "pipeline: existing tests were modified — this is not allowed:\n{s}\nRestoring them is required.", .{detail});
+        const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The existing tests changed during your work:\n{s}\nRestore them exactly as they were. Do not re-add your version of them by hand in any other file — the point is the ORIGINAL tests, byte for byte.", .{detail}) catch return;
+        appendHarnessPrompt(m, reprimand);
+        pipeline_active = true;
+        _ = runAgentLoop(m);
+        pipeline_active = false;
+        const left = verifyZigTests(arena, io, snaps) catch &.{};
+        if (left.len > 0) {
+            pushError(m, "pipeline: existing tests are still modified — stopping. The tree is left as it is; review the diff before deciding.");
+            m.streamEnd();
+            endTurn(m, turn_stats.iterations, false);
+            return;
+        }
+        pushInfo(m, "· pipeline: existing tests restored");
+    }
+
+    // ── 5. Tester (creates tests; may not weaken existing ones) ──
+    if (!verdict.omit_tests) {
+        setStatusWithZo(m, .thinking, "pipeline · tester");
+        var rep: subagent_mod.Report = undefined;
+        const prompt = std.fmt.allocPrint(arena, tester_prompt, .{ task_text, evidence }) catch return;
+        _ = runPipelineSubagent(m, &rep, "tester", prompt, run_dir, "tester-report.md");
+        pushInfo(m, "· pipeline: tester — report in .zode/pipeline/");
+        const violations2 = verifyZigTests(arena, io, snaps) catch &.{};
+        if (violations2.len > 0) {
+            const detail = formatViolations(arena, violations2) catch "existing tests were modified";
+            pushErrorFmt(m, "pipeline: the tester modified existing tests — refusing to trust its report:\n{s}", .{detail});
+        }
+    } else {
+        pushInfo(m, "· pipeline: tests omitted at the task's request");
+    }
+
+    // ── 6. The harness runs the suite ──
+    if (!verdict.omit_tests) {
+        setStatusWithZo(m, .tooling, "pipeline · running the test suite");
+        var tests_passed = false;
+        if (testplan_mod.planAt(io, ".")) |plan| {
+            var cycle: usize = 0;
+            while (cycle <= pipeline_mod.max_repair_cycles) {
+                const suite = runTestSuite(arena, io, plan);
+                if (suite.passed) {
+                    tests_passed = true;
+                    pushInfoFmt(m, "· pipeline: {s} — all tests pass", .{plan.label});
+                    break;
+                }
+                cycle += 1;
+                if (cycle > pipeline_mod.max_repair_cycles) {
+                    pushErrorFmt(m, "· pipeline: {s} is still failing after {d} repair passes — see the output", .{ plan.label, pipeline_mod.max_repair_cycles });
+                    break;
+                }
+                pushInfoFmt(m, "· pipeline: {s} failed — repair pass {d}/{d}", .{ plan.label, cycle, pipeline_mod.max_repair_cycles });
+                const repair = std.fmt.allocPrint(arena, verify_repair_prompt, .{ plan.label, suite.tail }) catch break;
+                appendHarnessPrompt(m, repair);
+                pipeline_active = true;
+                _ = runAgentLoop(m);
+                pipeline_active = false;
+                const touch = verifyZigTests(arena, io, snaps) catch &.{};
+                if (touch.len > 0) {
+                    const detail = formatViolations(arena, touch) catch "existing tests were modified";
+                    pushErrorFmt(m, "pipeline: a repair modified existing tests:\n{s}\nRestoring them is required.", .{detail});
+                    const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The repair pass changed existing tests:\n{s}\nRestore them exactly as they were.", .{detail}) catch break;
+                    appendHarnessPrompt(m, reprimand);
+                    pipeline_active = true;
+                    _ = runAgentLoop(m);
+                    pipeline_active = false;
+                }
+            }
+        } else {
+            pushInfo(m, "· pipeline: no test command known for this project — tests not run");
+        }
+        if (!tests_passed) setStatusWithZo(m, .warn, "pipeline · tests failing");
+    }
+
+    // ── 7. Code-Review (read-only) ──
+    if (!verdict.omit_review) {
+        setStatusWithZo(m, .thinking, "pipeline · reviewer");
+        var rep: subagent_mod.Report = undefined;
+        const diff = gitDiffHEAD(arena, io);
+        const status = gitStatusShort(arena, io);
+        const prompt = std.fmt.allocPrint(arena, reviewer_prompt, .{ diff, status }) catch "";
+        const report = runPipelineSubagent(m, &rep, "reviewer", prompt, run_dir, "review.md");
+        const counts = pipeline_mod.parseReviewReport(report);
+        if (counts.high > 0) {
+            pushErrorFmt(m, "· pipeline: review found {d} high-severity problem(s) — one repair pass", .{counts.high});
+            const repair = std.fmt.allocPrint(arena, review_repair_prompt, .{report}) catch "";
+            appendHarnessPrompt(m, repair);
+            pipeline_active = true;
+            _ = runAgentLoop(m);
+            pipeline_active = false;
+            if (!verdict.omit_tests) {
+                if (testplan_mod.planAt(io, ".")) |plan| {
+                    const suite = runTestSuite(arena, io, plan);
+                    pushInfo(m, if (suite.passed) "· pipeline: tests still pass after the repair" else "· pipeline: tests are RED after the repair");
+                }
+            }
+        }
+        pushInfoFmt(m, "· pipeline: review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
+    } else {
+        pushInfo(m, "· pipeline: review omitted at the task's request");
+    }
+
+    // ── 8. Summary ──
+    pushInfoFmt(m, "· pipeline: done — artifacts in {s}", .{run_dir});
+    m.streamEnd();
+    endTurn(m, turn_stats.iterations, false);
+}
+
+const review_files_prompt =
+    "You are the CODE-REVIEW role of zode's pipeline. You are the skeptical senior engineer; you do not write code.\n" ++
+    "Review these files. Read whatever you need through the tools.\n\n" ++
+    "{s}\n\n" ++
+    "Report findings as lines, one per finding:\n" ++
+    "SEVERITY: high|medium|low — <file>:<line> — <what is wrong> — <why it matters>\n" ++
+    "End with `SEVERITY: none` if there is nothing to report.\n" ++
+    "Judge: correctness, error handling, edge cases, races, security, tests that assert nothing, dead code, and clarity. Do not comment on style the project already has.\n";
+
+/// `/code-review [paths...]` — the review stage alone, on demand.
+///
+/// With no arguments it reviews the working tree's uncommitted diff (what the
+/// session changed). With paths it reviews exactly those files. Read-only:
+/// it changes nothing, writes nothing, and its findings are printed for the
+/// developer to act on.
+fn runCodeReview(m: *tui.Model, arg: []const u8) void {
+    const gpa = m.allocator;
+    const io = io_global;
+
+    pushInfo(m, "· code-review: analyzing the changes…");
+    // The command's raw argument line goes into the session like any other
+    // prompt, so `zode` knows this turn asked for a review and not a fix.
+    const session_line = if (arg.len > 0) arg else "/code-review";
+    appendUserLine(m, session_line);
+    resetTurnBudget(m);
+    turn_stats.reset(gpa, std.Io.Timestamp.now(io, .real).nanoseconds);
+    defer turn_stats.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var dir_buf: [512]u8 = undefined;
+    const run_dir = pipelineRunDir(&dir_buf, io) orelse ".zode/pipeline";
+
+    // ── build the review prompt ──
+    const trimmed = std.mem.trim(u8, arg, " \t\r\n");
+    const prompt = blk: {
+        if (trimmed.len == 0) {
+            const diff = gitDiffHEAD(arena, io);
+            const status = gitStatusShort(arena, io);
+            if (diff.len == 0 and status.len == 0) {
+                pushInfo(m, "· code-review: nothing to review — the working tree is clean");
+                m.streamEnd();
+                return;
+            }
+            break :blk std.fmt.allocPrint(arena, reviewer_prompt, .{ diff, status }) catch return;
+        }
+        // Explicit files: read each, cap each, embed. The reviewer can page
+        // anything else through the tools.
+        var files: std.ArrayList(u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+        while (it.next()) |path| {
+            const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024)) catch {
+                files.print(arena, "— {s}: could not read\n", .{path}) catch {};
+                continue;
+            };
+            files.print(arena, "— {s}:\n\n```\n{s}\n```\n\n", .{ path, text }) catch {};
+        }
+        const embedded = files.toOwnedSlice(arena) catch "";
+        break :blk std.fmt.allocPrint(arena, review_files_prompt, .{embedded}) catch return;
+    };
+
+    var rep: subagent_mod.Report = undefined;
+    const report = runPipelineSubagent(m, &rep, "reviewer", prompt, run_dir, "review.md");
+    const counts = pipeline_mod.parseReviewReport(report);
+    m.streamEnd();
+    setStatusWithZo(m, .done, "code-review done");
+    pushInfoFmt(m, "· code-review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
+    pushInfoFmt(m, "· the report is in {s}/review.md", .{run_dir});
+    if (counts.high > 0) {
+        pushInfo(m, "· to fix the high-severity findings, say so — the harness will not touch tests to make them pass");
+    }
+}
+
+/// The permission gate for the pipeline's TESTER subagent.
+///
+/// The main tool path (`execOneCall`) owns the full gate, tied to the turn's
+/// budget and dialog machinery. The tester needs the subset that must hold
+/// wherever code is written, in every mode:
+///   1. a `deny` rule means the call never runs;
+///   2. sensitive paths ask ONCE, and never remember;
+///   3. an `ask` rule names the rule in the dialog;
+///   4. otherwise the ordinary dialog applies (unless `/yolo`, a rule, the
+///      allowlist or accept-edits bought the call a pass).
+///
+/// Returns null when the call may run, or the refusal text to feed back as
+/// the tool result.
+fn pipelineWriteGate(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    call_name: []const u8,
+    args_json: []const u8,
+) ?[]const u8 {
+    if (yolo) return null;
+
+    const arg = toolArgSummary(call_name, args_json, arena);
+
+    // The rules. A deny is absolute; an allow/dontAsk waves the call through;
+    // an ask leaves the user the final word.
+    const subjects = tools_mod.callSubjects(call_name, args_json, arena);
+    var rule_allowed = false;
+    var rule_text: []const u8 = "";
+    if (permDecision(call_name, subjects)) |d| {
+        switch (d.action) {
+            .deny => {
+                return std.fmt.allocPrint(
+                    arena,
+                    "refused: the rule `{s}` does not allow this.",
+                    .{d.rule.text},
+                ) catch "refused: a permission rule does not allow this.";
+            },
+            .allow, .dontAsk => rule_allowed = true,
+            .ask => rule_text = d.rule.text,
+        }
+    }
+
+    // Sensitive paths ask ONCE, never remember.
+    if (!rule_allowed) {
+        const risky = tools_mod.riskyPaths(call_name, args_json, arena);
+        for (risky) |p| {
+            const v = pathsafe.checkWrite(p);
+            if (v == .ok) continue;
+            const detail = std.fmt.allocPrint(
+                arena,
+                "{s} is not a place this tool writes (tester — pipeline)",
+                .{p},
+            ) catch p;
+            switch (m.requestPermissionOnce(call_name, detail)) {
+                .allow, .allow_always => pathsafe.approve(p),
+                else => return "denied: the user refused this write.",
+            }
+        }
+    }
+
+    // The ordinary dialog.
+    const auto_allowed = permAutoAllowed(call_name, arg, args_json, arena);
+    if (rule_allowed or auto_allowed) return null;
+    var dbuf: [384]u8 = undefined;
+    const detail = std.fmt.bufPrint(&dbuf, "tester: {s} {s}", .{ call_name, arg }) catch call_name;
+    var with_rule: [512]u8 = undefined;
+    const full = if (rule_text.len > 0)
+        std.fmt.bufPrint(&with_rule, "{s} — your rule `{s}` matches", .{ detail, rule_text }) catch detail
+    else
+        detail;
+    return switch (m.requestPermission(call_name, full)) {
+        .allow, .allow_always => null,
+        else => "denied: the user refused this write.",
+    };
 }

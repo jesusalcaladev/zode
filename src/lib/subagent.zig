@@ -51,6 +51,11 @@ pub const tool_names = [_][]const u8{
     "lsp",
 };
 
+/// The Tester's tool set: the read-only set plus exactly the two writing
+/// tools, and nothing else. No bash — the harness runs the suite itself and
+/// the tester only WRITES tests; it never verifies them by executing.
+pub const tester_tool_names = tool_names ++ [_][]const u8{ "write", "edit" };
+
 /// `ask` is deliberately absent (see the header): a subagent that asked from a
 /// thread that is not the turn's would leave the user not knowing which of two
 /// agents is talking to them.
@@ -265,6 +270,11 @@ pub const Task = struct {
     /// should not park the turn. Depth 1, effort low, read-only tools only —
     /// same bounds as a foreground task.
     run_in_background: bool = false,
+    /// The Tester's escape hatch: adds exactly `write` and `edit` to the tool
+    /// set (see `tester_tool_names`). Everything else stays denied. The
+    /// presence of write access does NOT weaken the existing-tests guard —
+    /// the harness re-hashes the baseline after every writing stage.
+    allow_writes: bool = false,
 };
 
 pub const ParseError = error{

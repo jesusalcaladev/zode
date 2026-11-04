@@ -49,6 +49,30 @@ pub const auto_check_wait_ms: u32 = 4000;
 /// at all — the one moment it must be able to.
 pub const auto_check_per_turn: u32 = 2;
 
+/// Why a check did NOT start, recorded at the point of failure.
+///
+/// The gate's refusal used to say "no check is known for this project" for
+/// EVERY failure — including "the per-turn quota was spent" and "the two
+/// forced checks are spent", which are both facts about the harness's budget,
+/// not about the project. Telling a user their project has no checker when
+/// the truth is the harness gave up is a lie with a helpful tone.
+pub const StartFailure = enum {
+    /// No attempt failed yet (or the last one succeeded).
+    none,
+    /// `ZODE_AUTO_CHECK` disables the automatic check.
+    env_off,
+    /// The project markers describe no checker the harness knows.
+    plan_missing,
+    /// The per-turn quota was spent.
+    quota_spent,
+    /// The gate's two forced checks were spent.
+    forced_budget_spent,
+    /// A check was already running.
+    already_running,
+    /// The command could not be started (OOM, process limit, spawn error).
+    spawn_failed,
+};
+
 /// Counts non-empty lines. A diagnostic line is one line, and a build that fails in 40
 /// places has a 41st error that is noise.
 fn countDiagLines(s: []const u8) usize {
@@ -258,6 +282,8 @@ pub const AutoCheck = struct {
     /// Once, because a line repeated five times a turn is a line the user learns to
     /// ignore, and the whole point of saying it is that it is read.
     spoke: bool = false,
+    /// Why the last check did NOT start. See `StartFailure`.
+    last_start_failure: StartFailure = .none,
 
     /// User-written stop hook: the user's version of our exit gate.
     ///
@@ -365,14 +391,29 @@ pub const AutoCheck = struct {
         io: std.Io,
         forced: bool,
     ) bool {
-        if (!env_mod.truthyIn(self.env, "ZODE_AUTO_CHECK", true)) return false;
-        if (self.job != 0 and std.mem.eql(u8, bgproc.stateWord(reg, self.job), "running")) return false;
+        if (!env_mod.truthyIn(self.env, "ZODE_AUTO_CHECK", true)) {
+            self.last_start_failure = .env_off;
+            return false;
+        }
+        if (self.job != 0 and std.mem.eql(u8, bgproc.stateWord(reg, self.job), "running")) {
+            self.last_start_failure = .already_running;
+            return false;
+        }
         if (forced) {
-            if (!self.gate.canForce()) return false;
-        } else if (self.started_this_turn >= auto_check_per_turn) return false;
+            if (!self.gate.canForce()) {
+                self.last_start_failure = .forced_budget_spent;
+                return false;
+            }
+        } else if (self.started_this_turn >= auto_check_per_turn) {
+            self.last_start_failure = .quota_spent;
+            return false;
+        }
 
         if (self.command_len == 0) {
-            const plan = check_tool.planAt(io, ".") orelse return false;
+            const plan = check_tool.planAt(io, ".") orelse {
+                self.last_start_failure = .plan_missing;
+                return false;
+            };
             const c = @min(plan.command.len, self.command.len);
             @memcpy(self.command[0..c], plan.command[0..c]);
             self.command_len = c;
@@ -385,7 +426,11 @@ pub const AutoCheck = struct {
         }
         self.gate.checkable = true;
 
-        const id = bgproc.spawn(reg, io, self.command[0..self.command_len]) catch return false;
+        const id = bgproc.spawn(reg, io, self.command[0..self.command_len]) catch {
+            self.last_start_failure = .spawn_failed;
+            return false;
+        };
+        self.last_start_failure = .none;
         self.job = id;
         self.started_this_turn += 1;
         // What this check will be looking at. Writes after this are NOT covered by it,
@@ -511,6 +556,19 @@ pub const AutoCheck = struct {
         return self.label[0..self.label_len];
     }
 
+    /// Why no check ran, in the words that are TRUE of it. See `StartFailure`.
+    fn whyNotChecked(self: *const AutoCheck) []const u8 {
+        return switch (self.last_start_failure) {
+            .none => "no check is known for this project",
+            .env_off => "the automatic check is disabled (ZODE_AUTO_CHECK is off)",
+            .plan_missing => "this project has no typecheck the harness knows how to run",
+            .quota_spent => "the automatic check already ran twice this turn (per-turn quota), and the harness will not start a third",
+            .forced_budget_spent => "the harness already spent both of its forced checks this turn",
+            .already_running => "the check is still running in the background",
+            .spawn_failed => "the check could not be started (out of memory or a process limit)",
+        };
+    }
+
     /// What the last finished check proved, in the word that is actually true of it.
     pub fn proofPhrase(self: *const AutoCheck) ?[]const u8 {
         return switch (self.proof) {
@@ -606,7 +664,7 @@ pub const AutoCheck = struct {
         }
         switch (self.decideNow(reg, io)) {
             .end => return null,
-            .cannot_verify => return self.sayUnverified(gpa, "no check is known for this project"),
+            .cannot_verify => return self.sayUnverified(gpa, self.whyNotChecked()),
             .still_running => return std.fmt.allocPrint(
                 gpa,
                 "Your turn cannot end yet: {s} is STILL RUNNING as job {d} and its verdict is unknown. Poll it with `bash_output` (that is what it is for) and carry on working while it goes. Do not end the turn on an unknown verdict.",
@@ -625,11 +683,11 @@ pub const AutoCheck = struct {
                 // One more check of the CURRENT files, because the only way to turn an
                 // unchecked green into a checked one is to look at what is there now.
                 if (!self.maybeStart(reg, io, true)) {
-                    return self.sayUnverified(gpa, "no check is known for this project");
+                    return self.sayUnverified(gpa, self.whyNotChecked());
                 }
                 switch (self.decideNow(reg, io)) {
                     .end => return null,
-                    .cannot_verify => return self.sayUnverified(gpa, "no check is known for this project"),
+                    .cannot_verify => return self.sayUnverified(gpa, self.whyNotChecked()),
                     .still_running => return std.fmt.allocPrint(
                         gpa,
                         "Your turn cannot end yet: {s} is STILL RUNNING as job {d} and its verdict is unknown. Poll it with `bash_output` and carry on working while it goes.",

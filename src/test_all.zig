@@ -2,6 +2,10 @@
 pub const chat = @import("chat.zig");
 pub const bgproc = @import("bgproc.zig");
 pub const sleep = @import("lib/sleep.zig");
+pub const ansi = @import("lib/ansi.zig");
+pub const pipeline = @import("lib/pipeline.zig");
+pub const testguard = @import("lib/testguard.zig");
+pub const testplan = @import("lib/testplan.zig");
 pub const bench = @import("lib/bench.zig");
 pub const session = @import("session.zig");
 pub const tools = @import("tools/dispatch.zig");

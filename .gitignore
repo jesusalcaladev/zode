@@ -11,3 +11,6 @@ sessions/
 # .pyc files are per-interpreter-version binaries that do not belong in git.
 __pycache__/
 *.pyc
+
+# Pipeline artifacts: per-run evidence/reports; not part of the source tree.
+.zode/pipeline/
