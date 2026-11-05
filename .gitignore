@@ -6,7 +6,7 @@ sessions/
 
 # Local editor/agent settings: per-machine, never part of the project.
 .qoder/
-
+code-base/
 # Python bytecode: the pty scripts get imported by other scripts, and the
 # .pyc files are per-interpreter-version binaries that do not belong in git.
 __pycache__/
