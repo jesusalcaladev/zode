@@ -26,6 +26,11 @@ const std = @import("std");
 
 pub const repeat_limit: u8 = 3;
 
+/// Lecturas consecutivas sin una escritura nueva antes de que el harness
+/// fuerce un cambio de rumbo. Detecta el bucle "read-file → read-file → read-file"
+/// que nunca termina en un resumen.
+pub const repeat_read_limit: u8 = 5;
+
 /// The bounded response to a repeated tool call.
 pub const Recovery = struct {
     nudged: bool = false,
@@ -63,6 +68,9 @@ pub const Repeats = struct {
     run: u8 = 0,
     tool: [64]u8 = undefined,
     tool_len: usize = 0,
+    /// Lecturas consecutivas sin una escritura nueva (write/edit/notebook_edit).
+    /// Detecta el bucle "read-file → read-file → read-file" que nunca termina.
+    reads_since_write: u8 = 0,
 
     /// Feeds one call. Returns the tool name when this is the third identical one.
     pub fn note(self: *Repeats, name: []const u8, args_json: []const u8) ?[]const u8 {
@@ -100,6 +108,20 @@ pub const Repeats = struct {
     pub fn noteGuarded(self: *Repeats, name: []const u8, args_json: []const u8) ?[]const u8 {
         if (isRepeatExempt(name)) return null;
         return self.note(name, args_json);
+    }
+
+    /// Called when the model issues a `read`. Counts consecutive reads without
+    /// a write in between. Returns "read" when the read limit is reached,
+    /// signalling the loop to break out of a read-only spiral.
+    pub fn noteRead(self: *Repeats) ?[]const u8 {
+        self.reads_since_write += 1;
+        if (self.reads_since_write >= repeat_read_limit) return "read";
+        return null;
+    }
+
+    /// Called when the model writes or edits a file. Resets the read counter.
+    pub fn noteWrite(self: *Repeats) void {
+        self.reads_since_write = 0;
     }
 
     pub fn reset(self: *Repeats) void {
@@ -140,5 +162,39 @@ test "repeats: exemptions never trigger" {
         try std.testing.expect(r.noteGuarded("read", "{}") == null);
         try std.testing.expect(r.noteGuarded("bash_output", "{}") == null);
     }
+}
+
+test "repeats: noteRead triggers after repeat_read_limit consecutive reads" {
+    var r: Repeats = .{};
+    for (0..repeat_read_limit - 1) |_| {
+        try std.testing.expect(r.noteRead() == null);
+    }
+    try std.testing.expectEqualStrings("read", r.noteRead().?);
+}
+
+test "repeats: noteWrite resets the read counter" {
+    var r: Repeats = .{};
+    // Just under the limit
+    for (0..repeat_read_limit - 1) |_| {
+        try std.testing.expect(r.noteRead() == null);
+    }
+    r.noteWrite();
+    // After a write, reads start from zero again
+    for (0..repeat_read_limit - 1) |_| {
+        try std.testing.expect(r.noteRead() == null);
+    }
+    try std.testing.expectEqualStrings("read", r.noteRead().?);
+}
+
+test "repeats: mixed reads and writes do not trigger early" {
+    var r: Repeats = .{};
+    // read, write, read, write, read - no spiral
+    try std.testing.expect(r.noteRead() == null);
+    r.noteWrite();
+    try std.testing.expect(r.noteRead() == null);
+    r.noteWrite();
+    try std.testing.expect(r.noteRead() == null);
+    r.noteWrite();
+    try std.testing.expect(r.noteRead() == null);
 }
 

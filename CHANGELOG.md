@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - nudge model to complete tasks; Zo shows pipeline stage (loop) [`834ef308`](https://github.com/jesusalcaladev/zode/commit/834ef308)
 - empty reply nudge + implementation nudge; Zo shows pipeline stage (loop) [`0dae5701`](https://github.com/jesusalcaladev/zode/commit/0dae5701)
 - add pure taskloop module with budget ladder and completion contract (loop) [`c5e0082e`](https://github.com/jesusalcaladev/zode/commit/c5e0082e)
-- wire taskloop into runAgentLoop, auto-iteration, and /iter (loop) [`3ac6d6dd`](https://github.com/jesusalcaladev/zode/commit/3ac6d6dd)
+- wire taskloop into runAgentLoop, auto-iteration, and /iter (loop) [`5c26d629`](https://github.com/jesusalcaladev/zode/commit/5c26d629)
+- repetition guard detects read-only spiral (loop) [`d7d38a4e`](https://github.com/jesusalcaladev/zode/commit/d7d38a4e)
 
 ### Chores
 
