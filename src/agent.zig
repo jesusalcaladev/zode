@@ -72,6 +72,7 @@ const cachebreak = @import("lib/cachebreak.zig");
 const commands_mod = @import("commands.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeats.zig");
+const taskloop = @import("lib/taskloop.zig");
 const build_options = @import("build_options");
 const autochk = @import("autochk.zig");
 const lsp_manager = @import("lsp/manager.zig");
@@ -1310,6 +1311,40 @@ fn cmdBench(m: *tui.Model) void {
                 if (cs.given_up) @as([]const u8, " · out of play for the rest of the session") else @as([]const u8, ""),
             },
         );
+    }
+}
+
+/// `/iter [n]`: set the per-session iteration target.
+/// Minimum 8. Values below 32 warn — short tasks don't need that many, and
+/// a long task that is cut mid-work is exactly what this limit prevents.
+/// The model can also declare its own estimate (via plan/goal); this command
+/// overrides it when the developer wants a different number.
+pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |raw| {
+        const n = std.fmt.parseInt(usize, raw, 10) catch {
+            pushInfo(m, "/iter: expected a number (minimum 8)");
+            return;
+        };
+        if (n < 8) {
+            pushInfoFmt(m, "/iter: minimum is 8, you asked for {d}", .{n});
+            return;
+        }
+        if (n > 200) {
+            pushInfoFmt(m, "/iter: maximum is 200, you asked for {d}", .{n});
+            return;
+        }
+        if (n < 32) {
+            pushInfoFmt(m, "/iter: budget set to {d} iterations — low for a long task, fine for a short one", .{n});
+        } else {
+            pushInfoFmt(m, "/iter: budget set to {d} iterations for this session", .{n});
+        }
+        iter_limit_override = n;
+    } else {
+        const cur = iterationLimit();
+        const src = if (iter_limit_override > 0) "your /iter"
+            else if (model_requested_iter > 0) "the model's estimate"
+            else "ZODE_MAX_ITER / default";
+        pushInfoFmt(m, "/iter: current budget is {d} iterations ({s})", .{ cur, src });
     }
 }
 
@@ -3965,6 +4000,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         cmdBench(m);
+    } else if (std.mem.eql(u8, cmd, "iter")) {
+        cmdIter(m, rest);
     } else if (std.mem.eql(u8, cmd, "pipeline")) {
         const task = std.mem.trim(u8, rest, " \t\r\n");
         if (task.len == 0) {
@@ -4851,7 +4888,11 @@ fn chatWorker(job: *ChatJob) void {
 }
 
 /// What the loop ended with.
-pub const TurnOutcome = struct { iterations: usize, capped: bool };
+pub const TurnOutcome = struct {
+    iterations: usize,
+    capped: bool,
+    reason: taskloop.StopReason = .done,
+};
 
 /// Case-insensitive substring search (Zig 0.17 removed std.ascii.indexOfIgnoreCase).
 fn idxIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -4909,10 +4950,13 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
         m.goal.blocked_refusals = 0;
     }
 
-    // NO HARD CEILING: the turn ends when the model stops asking for tools
-    // (`again` is null), when the user presses ESC, or on error. Iteration
-    // limits (`ZODE_MAX_ITER`, `ZODE_GOAL_MAX`) are kept for the status bar
-    // only; they never kill a long-running task mid-loop anymore.
+    // Ceiling: a turn that keeps asking for tools must end, or a task like
+    // "summarise this project" becomes read-file → read-file forever. The
+    // limit is generous by default and overridable with ZODE_MAX_ITER /
+    // ZODE_GOAL_MAX; it only stops the pathological loop, never a real task.
+    // A turn that hits the ceiling gets one final reply with tools disabled
+    // so it can write its summary instead of ending in silence.
+    const limit = statusIterationLimit(m);
     m.repeats.reset();
     var repeat_recovery: repeats_mod.Recovery = .{};
     // How many times this turn has shown the plan-approval dialog. Bounded so
@@ -4923,7 +4967,20 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
     // A NEW turn starts un-cancelled: ESC belongs to the turn it interrupted.
     chat.cancel_current.store(false, .seq_cst);
 
-    while (true) : (iterations += 1) {
+    var capped: bool = false;
+    var gate_continue_count: u8 = 0;
+    // How many times the exit gate has forced `continue` this turn on a red build.
+    // Bounded so a build that keeps failing does not cage the turn forever.
+    const gate_continue_limit: u8 = 3;
+    // Task-scoped loop state: only active when ZODE_LOOP_V2=1.
+    var policy: ?taskloop.Policy = null;
+    var last_mark: ?LoopMark = null;
+    var reason: taskloop.StopReason = .done;
+    if (loopV2()) {
+        policy = taskloop.Policy{ .budget = loopBudget(m) };
+        last_mark = loopMark(m);
+    }
+    while (iterations < limit) : (iterations += 1) {
         // ESC is a STOP, not a "skip this answer".
         //
         // The key handler sets `chat.cancel_current`, which aborts the request
@@ -4935,8 +4992,40 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
         if (chat.cancel_current.load(.seq_cst)) {
             chat.cancel_current.store(false, .seq_cst);
             pushInfo(m, "stopped (esc)");
-            return .{ .iterations = iterations, .capped = false };
+            reason = .cancelled;
+            break;
         }
+
+        // ── Task-scoped budget checkpoint (ZODE_LOOP_V2 only) ─────────────────
+        // Only from iteration 1 on: iteration 0 never checkpoints.
+        if (loopV2() and iterations > 0) {
+            const mark = loopMark(m);
+            const changed = !std.meta.eql(mark, last_mark orelse mark);
+            if (policy) |*p| {
+                p.note(iterations, changed);
+                last_mark = mark;
+                switch (p.decide(iterations)) {
+                    .work => {},
+                    .checkpoint => {
+                        const prompt = std.fmt.allocPrint(
+                            m.allocator,
+                            "Checkpoint: {d} iterations used, {d} left before the next one. {s}. Keep going and finish what is open; do not restart work that is already done. If it genuinely cannot be finished here, call `goal` with status blocked and what_would_unblock.\n",
+                            .{ iterations, p.budget.soft - iterations, progressText(loopEvidence(m)) },
+                        ) catch null;
+                        if (prompt) |text| {
+                            appendHarnessPrompt(m, text);
+                            m.allocator.free(text);
+                        }
+                    },
+                    .stop => |why| {
+                        reason = why;
+                        break;
+                    },
+                }
+            }
+            if (reason != .done) break;
+        }
+
         turn_stats.iterations = iterations + 1;
         const again = runOneTurn(m, user_text, iterations) catch |err| {
             reportErr(m, err);
@@ -4992,6 +5081,11 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
                 // otherwise — is not something to resolve by trusting one of them.
                 if (m.goal.status == goal_mod.Status.met) m.goal.status = goal_mod.Status.none;
                 pushErrorOwned(m, refusal);
+                if (gate_continue_count >= gate_continue_limit) {
+                    pushErrorFmt(m, "exit gate refused {d} times on a red build; ending this turn anyway. If this task cannot be completed here, call `goal` with status blocked and what_would_unblock.", .{ gate_continue_limit });
+                    break;
+                }
+                gate_continue_count += 1;
                 appendHarnessPrompt(m,
                     "The harness will not end this turn yet: the code you wrote does not have a passing check behind it. Read the problems above, fix them, and let the check run again. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.");
                 continue;
@@ -5066,6 +5160,30 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
                     }
                 }
             }
+
+            // ── Completion contract (ZODE_LOOP_V2 only) ───────────────────────
+            // Before the turn may end naturally, the evidence must allow it.
+            if (loopV2()) {
+                const evidence = loopEvidence(m);
+                if (taskloop.endReason(evidence)) |why| {
+                    reason = why;
+                    break;
+                }
+                if (m.plan_touched_this_turn and m.plan.openCount() > 0 and plan_gate_asks < 2) {
+                    plan_gate_asks += 1;
+                    appendHarnessPrompt(m,
+                        "Your plan still has open steps. Continue the task and close them, or call `goal` with status blocked and what_would_unblock if they cannot be finished here.");
+                    continue;
+                }
+                if (m.goal.isOpen() and m.goal.checkpoints < 2) {
+                    m.goal.checkpoints += 1;
+                    appendHarnessPrompt(m,
+                        "The goal is still open. Keep going until it is met, or call `goal` with status blocked and what_would_unblock.");
+                    continue;
+                }
+                reason = .stalled;
+                break;
+            }
             break;
         }
 
@@ -5129,14 +5247,35 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
             continue;
         }
 
-        if (m.goal.status != goal_mod.Status.none) break;
+        if (m.goal.status != goal_mod.Status.none) {
+            reason = .done;
+            break;
+        }
 
         // 2. The model stopped asking for tools, or it answered in prose while the goal
         //    is still open. That is the natural end of the turn: break out of the loop
         // and let endTurn print the summary.
         break;
     }
-    return .{ .iterations = iterations, .capped = false };
+
+    // Ceiling reached: the model still wants tools but the budget is gone.
+    // Give it one final word with no tools — it can summarise what it did
+    // and where it left off, but it cannot write, edit or run anything.
+    if (iterations >= limit) {
+        capped = true;
+        reason = .ceiling;
+        m.deny_all_tools = true;
+        const ceiling_prompt = "The iteration budget for this turn is exhausted. Tools are disabled for this reply — no code can be written now. Write a plain summary of at most 10 lines: what was actually done, what remains unfinished or unverified, which files were touched, and the single next step. Do not apologise for stopping.";
+        appendHarnessPrompt(m, ceiling_prompt);
+        _ = runOneTurn(m, user_text, iterations) catch |err| reportErr(m, err);
+        m.deny_all_tools = false;
+    }
+
+    return .{
+        .iterations = iterations,
+        .capped = capped,
+        .reason = reason,
+    };
 }
 
 /// The end-of-turn tail, shared by the normal turn and the pipeline stages:
@@ -5226,12 +5365,47 @@ pub fn finishAutoCheck(m: *tui.Model) void {
 ///
 /// The floor matters: at 2 the agent cannot even read a file and act on it, and a
 /// turn that dies mid-way leaves the user with a half-changed tree.
+/// Per-session override of the iteration target, set with `/iter`.
+/// Minimum 8 — a short question never needs more than that, and a long task
+/// can ask for more. Values below 32 print a warning.
+pub var iter_limit_override: usize = 0;
+
+/// How many iterations the *model itself* asked for this session.
+/// The model reasons about task complexity and declares a number; the harness
+/// respects it as the soft target (task-scoped budget). Set through the plan
+/// or goal message, or applied by the user with `/iter`.
+pub var model_requested_iter: usize = 0;
+
+/// Returns the effective iteration target for this session:
+///   model_requested_iter  (the model's own estimate, if any)
+///   iter_limit_override   (the user's explicit /iter, if any)
+///   ZODE_MAX_ITER env     (the environment default)
+///   default_max_iterations (12, the compiled-in floor)
+///
+/// The model's estimate wins when it is higher — a long task must not be cut
+/// short because the user forgot to raise the limit. The user's /iter always
+/// wins when it is higher than both — the developer is in charge.
 pub fn iterationLimit() usize {
-    const raw = envGet(environ_global, "ZODE_MAX_ITER") orelse return default_max_iterations;
-    const n = std.fmt.parseInt(usize, raw, 10) catch return default_max_iterations;
-    if (n < 4) return 4;
-    if (n > 200) return 200;
-    return n;
+    var best: usize = default_max_iterations;
+    const raw = envGet(environ_global, "ZODE_MAX_ITER") orelse "";
+    if (raw.len > 0) {
+        const n = std.fmt.parseInt(usize, raw, 10) catch default_max_iterations;
+        if (n > best) best = n;
+    }
+    if (iter_limit_override > best) best = iter_limit_override;
+    if (model_requested_iter > best) best = model_requested_iter;
+    if (best < 8) best = 8;
+    if (best > 200) best = 200;
+    return best;
+}
+
+/// Lets the model (via the plan/goal message, parsed by the harness) declare
+/// how many iterations it estimates this task needs. Values below 8 are
+/// ignored; the floor is 8 so a short question never burns the whole budget.
+pub fn setModelRequestedIterations(n: usize) void {
+    if (n < 8) return;
+    if (n > 200) return;
+    model_requested_iter = n;
 }
 
 /// The CEILING, which only a `/goal` ever reaches.
@@ -5262,6 +5436,138 @@ pub fn goalHardLimit() usize {
     const raw = envGet(environ_global, "ZODE_GOAL_MAX") orelse return @max(iterationLimit() * 3, default_goal_hard);
     const n = std.fmt.parseInt(usize, raw, 10) catch return @max(iterationLimit() * 3, default_goal_hard);
     return @max(n, iterationLimit());
+}
+
+/// Whether the task-scoped loop (budget ladder + completion contract) is on.
+/// Default `0` during rollout: behaviour is byte-identical to before.
+pub fn loopV2() bool {
+    const raw = envGet(environ_global, "ZODE_LOOP_V2") orelse return false;
+    return std.mem.eql(u8, raw, "1")
+        or std.ascii.eqlIgnoreCase(raw, "on")
+        or std.ascii.eqlIgnoreCase(raw, "true");
+}
+
+/// Read a usize env var with a fallback.
+fn loopEnvUsize(name: []const u8, fallback: usize) usize {
+    const raw = envGet(environ_global, name) orelse return fallback;
+    return std.fmt.parseInt(usize, raw, 10) catch fallback;
+}
+
+/// The wall for an ordinary turn: `ZODE_LOOP_MAX`, or `max(3*soft, 60)`,
+/// clamped to `soft..400`. A `/goal` turn keeps `ZODE_GOAL_MAX`.
+pub fn loopHardLimit(m: *const tui.Model) usize {
+    if (m.goal.isOpen()) return goalHardLimit();
+    if (!loopV2()) return iterationLimit();
+    const fallback = @max(iterationLimit() * 3, default_goal_hard);
+    const raw = loopEnvUsize("ZODE_LOOP_MAX", fallback);
+    return @max(@min(raw, 400), iterationLimit());
+}
+
+/// The budget for a turn: soft target, hard wall, grant per extension.
+pub fn loopBudget(m: *const tui.Model) taskloop.Budget {
+    const soft = iterationLimit();
+    var b = taskloop.Budget.init(soft, loopHardLimit(m));
+    b.grant = loopEnvUsize("ZODE_LOOP_GRANT", soft);
+    b.max_extensions = @intCast(@min(loopEnvUsize("ZODE_LOOP_EXTENSIONS", 3), 16));
+    return b;
+}
+
+/// The budget for a headless turn: same ladder, no Model. `env` is used only
+/// to read `ZODE_LOOP_MAX`, `ZODE_LOOP_GRANT` and `ZODE_LOOP_EXTENSIONS`.
+pub fn loopBudgetFor(env: ?*const std.process.Environ.Map) taskloop.Budget {
+    const soft = iterationLimit();
+    const fallback = @max(soft * 3, default_goal_hard);
+    var b = taskloop.Budget.init(soft, fallback);
+    if (env) |e| {
+        const raw = e.get("ZODE_LOOP_MAX") orelse "";
+        const hard = std.fmt.parseInt(usize, raw, 10) catch fallback;
+        b.hard = @max(@min(hard, 400), soft);
+        b.grant = std.fmt.parseInt(usize, e.get("ZODE_LOOP_GRANT") orelse "", 10) catch soft;
+        b.max_extensions = @intCast(@min(std.fmt.parseInt(usize, e.get("ZODE_LOOP_EXTENSIONS") orelse "", 10) catch 3, 16));
+    }
+    return b;
+}
+
+/// Fingerprint of what changed since the last mark: files written, plan steps
+/// closed, verified writes. Reading files is work but is NOT progress that earns
+/// more budget.
+pub const LoopMark = struct {
+    files: usize,
+    plan_done: u8,
+    verified_writes: u32,
+};
+
+fn loopMark(m: *const tui.Model) LoopMark {
+    return .{
+        .files = turn_stats.files.items.len,
+        .plan_done = m.plan.doneCount(),
+        .verified_writes = m.auto_check.gate.verified_writes,
+    };
+}
+
+/// Headless equivalent: builds a LoopMark from the gate's counters.
+pub fn loopMarkFromGate(writes: usize, plan_done: u8, verified_writes: u32) LoopMark {
+    return .{
+        .files = writes,
+        .plan_done = plan_done,
+        .verified_writes = verified_writes,
+    };
+}
+
+/// Map the exit gate + plan + goal into a taskloop.Evidence. Values only, no
+/// Model: cheap to test.
+fn loopEvidence(m: *const tui.Model) taskloop.Evidence {
+    const gate = m.auto_check.gate;
+    const check_green = gate.verdict == .passed and gate.unverified() == 0;
+    return .{
+        .files_written = turn_stats.files.items.len,
+        .check_green = check_green,
+        .check_red = gate.verdict == .failed,
+        .checkable = gate.checkable,
+        .plan_open = m.plan.openCount(),
+        .plan_done = m.plan.doneCount(),
+        .tools_run = turn_stats.tools,
+        .verdict = switch (m.goal.status) {
+            .none => .none,
+            .met => .met,
+            .blocked => .blocked,
+        },
+        .blocked_credible = true, // the model declared it with tool evidence behind it
+    };
+}
+
+/// Map an exit gate + plan into a taskloop.Evidence, for the headless runner
+/// which has no `*tui.Model`. `files_written` comes from the gate's write
+/// counter; `tools_run` is 0 (the headless runner does not track it per-turn
+/// yet — the gate still works because `files_written > 0` is what matters).
+pub fn loopEvidenceFromGate(
+    gate: exitgate.Gate,
+    plan: plan_mod.Plan,
+) taskloop.Evidence {
+    const check_green = gate.verdict == .passed and gate.unverified() == 0;
+    return .{
+        .files_written = gate.writes,
+        .check_green = check_green,
+        .check_red = gate.verdict == .failed,
+        .checkable = gate.checkable,
+        .plan_open = plan.openCount(),
+        .plan_done = plan.doneCount(),
+        .tools_run = 0,
+        .verdict = .none,
+        .blocked_credible = false,
+    };
+}
+
+/// A one-line description of why the turn cannot end yet, for the checkpoint
+/// prompt. English only.
+fn progressText(e: taskloop.Evidence) []const u8 {
+    if (e.check_red) return "the last check is RED";
+    if (e.files_written > 0 and e.checkable and !e.check_green)
+        return "the files you wrote have no green check behind them";
+    if (e.plan_open > 0) return "the plan still has open steps";
+    if (e.verdict == .none and e.tools_run > 0)
+        return "the turn has not reached a verdict";
+    return "no change was recorded in the last iteration";
 }
 
 /// The same tool with the same arguments, three times running.
@@ -9557,6 +9863,18 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
             if (m.loop_repeated == null) {
                 m.loop_repeated = which;
             }
+        }
+        // No-progress guard: break out of a read-only spiral
+        // (read → read → read with no write in between). `read` is exempt from the
+        // identical-call guard, so count it separately; any write/edit resets it.
+        if (std.mem.eql(u8, c.name, "read")) {
+            if (m.repeats.noteRead()) |which| {
+                if (m.loop_repeated == null) {
+                    m.loop_repeated = which;
+                }
+            }
+        } else if (std.mem.eql(u8, c.name, "write") or std.mem.eql(u8, c.name, "edit") or std.mem.eql(u8, c.name, "notebook_edit")) {
+            m.repeats.noteWrite();
         }
     }
     // The automatic typecheck is started from the SUCCESS path of each call

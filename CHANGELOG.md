@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - wrap diffs in rounded code block box (tui) [`87d459e4`](https://github.com/jesusalcaladev/zode/commit/87d459e4)
 - nudge model to complete tasks; Zo shows pipeline stage (loop) [`834ef308`](https://github.com/jesusalcaladev/zode/commit/834ef308)
 - empty reply nudge + implementation nudge; Zo shows pipeline stage (loop) [`0dae5701`](https://github.com/jesusalcaladev/zode/commit/0dae5701)
-- add pure taskloop module with budget ladder and completion contract (loop) [`e57db90d`](https://github.com/jesusalcaladev/zode/commit/e57db90d)
+- add pure taskloop module with budget ladder and completion contract (loop) [`c5e0082e`](https://github.com/jesusalcaladev/zode/commit/c5e0082e)
+- wire taskloop into runAgentLoop, auto-iteration, and /iter (loop) [`3ac6d6dd`](https://github.com/jesusalcaladev/zode/commit/3ac6d6dd)
 
 ### Chores
 
