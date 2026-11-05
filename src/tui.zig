@@ -6496,10 +6496,10 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // way out was a key advertised as a scroll.
             //
             // Ctrl+C is the exit, which is what both places say.
-            // Ctrl+P: command palette. Ctrl+T: two-column models palette
-            // (provider | its models), like opencode.
+            // Ctrl+P: `/iter` — set the iteration budget for long tasks.
+            // Minimum 32; the model can ask for more when the task is long.
             if (key.matches('p', .{ .ctrl = true })) {
-                agent.openCommandPalette(self);
+                agent.cmdIter(self, null);
                 ctx.redraw = true;
                 try self.armTick(ctx);
                 return;
@@ -6773,7 +6773,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             const k = key;
             const page: usize = @max(3, self.hist_rows -| 1);
             const half: usize = @max(2, self.hist_rows / 2);
-            if (k.matches(vaxis.Key.page_up, .{}) or k.codepoint == 5 or
+            if (k.matches(vaxis.Key.page_up, .{}) or
                 (k.codepoint == 'k' and k.mods.shift) or
                 (k.matches('u', .{ .ctrl = true })))
             {

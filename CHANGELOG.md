@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add pure taskloop module with budget ladder and completion contract (loop) [`c5e0082e`](https://github.com/jesusalcaladev/zode/commit/c5e0082e)
 - wire taskloop into runAgentLoop, auto-iteration, and /iter (loop) [`5c26d629`](https://github.com/jesusalcaladev/zode/commit/5c26d629)
 - repetition guard detects read-only spiral (loop) [`5cec9878`](https://github.com/jesusalcaladev/zode/commit/5cec9878)
-- headless runner consumes taskloop policy (loop) [`e777eee4`](https://github.com/jesusalcaladev/zode/commit/e777eee4)
+- headless runner consumes taskloop policy (loop) [`95424820`](https://github.com/jesusalcaladev/zode/commit/95424820)
+- Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`5b5eeb70`](https://github.com/jesusalcaladev/zode/commit/5b5eeb70)
 
 ### Chores
 
