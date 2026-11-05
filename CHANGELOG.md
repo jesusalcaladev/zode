@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove hard iteration ceiling, compaction off by default, stop lecturing about missing typecheck (loop) [`4636a301`](https://github.com/jesusalcaladev/zode/commit/4636a301)
 - wrap diffs in rounded code block box (tui) [`87d459e4`](https://github.com/jesusalcaladev/zode/commit/87d459e4)
 - nudge model to complete tasks; Zo shows pipeline stage (loop) [`834ef308`](https://github.com/jesusalcaladev/zode/commit/834ef308)
-- empty reply nudge + implementation nudge; Zo shows pipeline stage (loop) [`2d3542d8`](https://github.com/jesusalcaladev/zode/commit/2d3542d8)
+- empty reply nudge + implementation nudge; Zo shows pipeline stage (loop) [`0dae5701`](https://github.com/jesusalcaladev/zode/commit/0dae5701)
+- add pure taskloop module with budget ladder and completion contract (loop) [`e57db90d`](https://github.com/jesusalcaladev/zode/commit/e57db90d)
 
 ### Chores
 
