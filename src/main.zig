@@ -15,6 +15,7 @@ const chat = @import("chat.zig");
 const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
 const compaction_mod = @import("compaction.zig");
+const taskloop = @import("lib/taskloop.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");
@@ -480,10 +481,43 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // Same root cause as the headless prompt: the headless path is a second, lesser
     // implementation of the same agent, and every place it diverges is a place
     // where `--chat` is quietly worse than the TUI.
-    const iter_limit = agent.iterationLimit();
+    // Task-scoped budget ladder, same policy as the TUI.
+    var policy = taskloop.Policy.init(agent.iterationLimit(), agent.loopBudgetFor(env).hard);
     var iteration: usize = 0;
     var elided_total: usize = 0;
-    while (iteration < iter_limit) : (iteration += 1) {
+    var gate_continues: u8 = 0;
+    const gate_continue_limit: u8 = 3;
+    var last_mark: ?agent.LoopMark = null;
+    var reason: taskloop.StopReason = .done;
+    while (policy.budget.allows(iteration)) : (iteration += 1) {
+        // Task-scoped budget checkpoint: only from iteration 1 on.
+        if (iteration > 0) {
+            const mark = agent.loopMarkFromGate(
+                auto_check.gate.writes,
+                plan.doneCount(),
+                auto_check.gate.verified_writes,
+            );
+            const changed = if (last_mark) |lm| !std.meta.eql(lm, mark) else true;
+            policy.note(iteration, changed);
+            last_mark = mark;
+            switch (policy.decide(iteration)) {
+                .work => {},
+                .checkpoint => {
+                    try msgs.append(arena, .{
+                        .role = "user",
+                        .content = std.fmt.allocPrint(arena,
+                            "Checkpoint: {d} iterations used, {d} left before the next one. Keep going and finish what is open; do not restart work that is already done.\n",
+                            .{ iteration, policy.budget.soft - iteration },
+                        ) catch continue,
+                    });
+                },
+                .stop => |why| {
+                    reason = why;
+                    break;
+                },
+            }
+        }
+        // Context under budget: elide old tool dumps (a wire view).
         // Context under budget: elide old tool dumps (a wire view).
         {
             // The same policy as the TUI, through the same two functions. This call
@@ -600,6 +634,14 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             if (auto_check.exitGate(&bg, gpa, io)) |refusal| {
                 defer gpa.free(refusal);
                 models.dbg("\n[not done] {s}\n", .{refusal});
+                if (gate_continues >= gate_continue_limit) {
+                    models.dbg(
+                        "\nexit gate refused {d} times on a red build; ending this run anyway.\n",
+                        .{ gate_continue_limit },
+                    );
+                    break;
+                }
+                gate_continues += 1;
                 // The model needs the diagnostics, not just the refusal: it is the only
                 // thing that can act on them, and the nudge is what makes it act.
                 if (auto_check.noteSlice().len > 0) {
@@ -609,8 +651,20 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                     .role = "user",
                     .content = "The harness will not end this run yet: the code you wrote does not have a passing check behind it. Fix the problems above and carry on.",
                 });
-                // The iterations left are counted by the `while` above, so this costs a
-                // turn and says so.
+                continue;
+            }
+            // Completion contract: before the run may end naturally, the evidence
+            // must allow it.
+            const evidence = agent.loopEvidenceFromGate(auto_check.gate, plan);
+            if (taskloop.endReason(evidence)) |why| {
+                reason = why;
+                break;
+            }
+            if (plan.doneCount() > 0 and plan.openCount() > 0) {
+                try msgs.append(arena, .{
+                    .role = "user",
+                    .content = "Your plan still has open steps. Continue the task and close them, or call `goal` with status blocked and what_would_unblock if they cannot be finished here.",
+                });
                 continue;
             }
             // Gate passed: the user's stop hook can now claim the turn.
@@ -760,10 +814,10 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     if (auto_check.gate.wroteCode()) {
         models.dbg(
             "\nUNFINISHED: {d} iterations and the code has no passing check behind it. {d} file write(s) with nothing green covering them.\n",
-            .{ iter_limit, auto_check.gate.unverified() },
+            .{ policy.budget.hard, auto_check.gate.unverified() },
         );
     }
-    models.dbg("\n[iteration limit reached after {d} iterations]\n", .{iter_limit});
+    models.dbg("\n[stopped: {s} after {d} iterations]\n", .{ @tagName(reason), iteration });
     return 0;
 }
 
