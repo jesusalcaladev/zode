@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - highlightPositions guard q.len > buf.len (fuzzy) [`58373754`](https://github.com/jesusalcaladev/zode/commit/58373754)
 - freeItems provider + empty guard, saturating key/query, zeroing (palette) [`87a11564`](https://github.com/jesusalcaladev/zode/commit/87a11564)
 - picker filtered for sessions, leak frees, ac reset, palette toggle, cache footer (tui) [`1ebf2f4c`](https://github.com/jesusalcaladev/zode/commit/1ebf2f4c)
-- separator guard sessions vs sessions2 (sessionpath) [`b2769015`](https://github.com/jesusalcaladev/zode/commit/b2769015)
+- separator guard sessions vs sessions2 (sessionpath) [`40b7451a`](https://github.com/jesusalcaladev/zode/commit/40b7451a)
+- tryLaunchBg deep copy to gpa (UAF) (compaction) [`4105f7ae`](https://github.com/jesusalcaladev/zode/commit/4105f7ae)
 
 ### Chores
 

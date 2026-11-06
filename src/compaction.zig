@@ -198,10 +198,13 @@ pub const CompactBgState = struct {
 };
 
 /// Background thread context (allocated in gpa so it survives the spawn).
+/// `msgs` is a gpa-owned deep copy kept on the ctx until the result lands,
+/// so a turn-arena that dies when `runOneTurn` returns cannot dangle the
+/// thread. Freed in compactBgFn after elideForBudget.
 const CompactBgCtx = struct {
     state: *CompactBgState,
     gpa: std.mem.Allocator,
-    msgs: []const chat.ChatMessage,
+    msgs: []chat.ChatMessage,
     env: ?*const std.process.Environ.Map,
     model_ctx: u32,
 };
@@ -248,6 +251,15 @@ pub fn elideForBudget(
 pub fn compactBgFn(c: *CompactBgCtx) void {
     const gpa = c.gpa;
     defer gpa.destroy(c);
+    defer {
+        for (c.msgs) |m| {
+            gpa.free(m.content);
+            if (m.tool_calls_json) |j| gpa.free(j);
+            if (m.tool_call_id) |v| gpa.free(v);
+            if (m.tool_name) |v| gpa.free(v);
+        }
+        gpa.free(c.msgs);
+    }
     const budget = budgetFor(c.env, c.model_ctx);
     const cmode = effectiveMode(c.env, null);
     const res = elideForBudget(gpa, c.msgs, budget, c.env, c.model_ctx, cmode);
@@ -281,10 +293,32 @@ pub fn tryLaunchBg(
         state.mtx.unlock();
         return false;
     };
+    // Deep copy the messages into gpa: the caller arena dies when the turn
+    // function returns while this thread is still running.
+    const msgs_owned = gpa.alloc(chat.ChatMessage, msgs.len) catch {
+        gpa.destroy(ctx_ptr);
+        while (!state.mtx.tryLock()) std.Thread.yield() catch {};
+        state.running = false;
+        state.mtx.unlock();
+        return false;
+    };
+    for (msgs, 0..) |m, i| {
+        const content = gpa.dupe(u8, m.content) catch m.content;
+        const tj = if (m.tool_calls_json) |j| gpa.dupe(u8, j) catch m.tool_calls_json else null;
+        const id = if (m.tool_call_id) |v| gpa.dupe(u8, v) catch m.tool_call_id else null;
+        const nm = if (m.tool_name) |v| gpa.dupe(u8, v) catch m.tool_name else null;
+        msgs_owned[i] = .{
+            .role = m.role,
+            .content = content,
+            .tool_calls_json = tj,
+            .tool_call_id = id,
+            .tool_name = nm,
+        };
+    }
     ctx_ptr.* = .{
         .state = state,
         .gpa = gpa,
-        .msgs = msgs,
+        .msgs = msgs_owned,
         .env = env,
         .model_ctx = model_ctx,
     };
