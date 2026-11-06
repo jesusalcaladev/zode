@@ -485,8 +485,11 @@ fn buildEnvLocked(spec: servers.Server) ?*const std.process.Environ.Map {
     const a = cat_arena.allocator();
     const map = a.create(std.process.Environ.Map) catch return null;
     map.* = std.process.Environ.Map.init(a);
+    const spawnenv = @import("../lib/spawnenv.zig");
     if (parent_env) |p| {
-        for (p.keys(), p.values()) |k, v| {
+        var child = spawnenv.buildChildEnv(a, p.*) catch std.process.Environ.Map.init(a);
+        defer child.deinit();
+        for (child.keys(), child.values()) |k, v| {
             map.put(k, v) catch {};
         }
     }
