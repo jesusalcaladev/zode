@@ -29,6 +29,7 @@ const subagent_mod = @import("lib/subagent.zig");
 const session_mod = @import("session.zig");
 const filesview = @import("lib/filesview.zig");
 const bench_mod = @import("lib/bench.zig");
+const cache_stats = @import("cache_stats.zig");
 const models_mod = @import("lib/models.zig");
 const modelcache = @import("lib/modelcache.zig");
 const zjsonl = @import("lib/zjsonl.zig");
@@ -2101,6 +2102,14 @@ pub const Model = struct {
     fn openPickerInner(self: *Model, tag: u32, title: []const u8, items: []PickerItem) void {
         self.lock();
         defer self.unlock();
+        // Re-opening without close must not leak the previous list.
+        for (self.picker_items.items) |it| {
+            self.allocator.free(it.label);
+            if (it.desc.len > 0) self.allocator.free(it.desc);
+        }
+        self.picker_items.clearRetainingCapacity();
+        for (self.session_picker_paths.items) |p| self.allocator.free(p);
+        self.session_picker_paths.clearRetainingCapacity();
         for (items) |it| {
             self.picker_items.append(self.allocator, it) catch {
                 self.allocator.free(it.label);
@@ -2212,6 +2221,7 @@ pub const Model = struct {
             }
             self.picker_items.clearRetainingCapacity();
             // Keep paths aligned with picker_items so onSessionPick resolves correctly.
+            for (self.session_picker_paths.items) |p| self.allocator.free(p);
             self.session_picker_paths.clearRetainingCapacity();
 
             const now = if (self.io_ready) std.Io.Timestamp.now(self.io, .real).toSeconds() else 0;
@@ -2229,7 +2239,8 @@ pub const Model = struct {
                         self.allocator.free(label);
                         if (desc.len > 0) self.allocator.free(desc);
                     };
-                    _ = self.session_picker_paths.append(self.allocator, self.allocator.dupe(u8, e.path) catch "") catch {};
+                    const pd = self.allocator.dupe(u8, e.path) catch "";
+                    _ = self.session_picker_paths.append(self.allocator, pd) catch self.allocator.free(pd);
                 }
             } else {
                 // Tier 3: semantic search — stateful, optional. When active,
@@ -2260,7 +2271,7 @@ pub const Model = struct {
                                 self.allocator.free(label);
                                 if (desc.len > 0) self.allocator.free(desc);
                             };
-                            _ = self.session_picker_paths.append(self.allocator, self.allocator.dupe(u8, e.path) catch "") catch {};
+                            const pd2 = self.allocator.dupe(u8, e.path) catch ""; _ = self.session_picker_paths.append(self.allocator, pd2) catch self.allocator.free(pd2);
                         }
                     }
                 } else {
@@ -2270,6 +2281,7 @@ pub const Model = struct {
                 // Tier 1: title substring — always runs, instant.
                 const title_hits: ?[]session_search.SessionHit = session_search.searchTitle(self.allocator, self.session_picker_entries.items, q) catch null;
                 if (title_hits) |h| {
+                    defer self.allocator.free(h);
                     for (h) |hit| { all_hits.append(self.allocator, hit) catch {}; }
                 }
 
@@ -2281,12 +2293,14 @@ pub const Model = struct {
                 if (debounce_ok) {
                     const transcript_hits: ?[]session_search.SessionHit = session_search.searchTranscript(self.allocator, self.io, self.session_picker_entries.items, q) catch null;
                     if (transcript_hits) |h| {
+                        defer self.allocator.free(h);
                         for (h) |hit| { all_hits.append(self.allocator, hit) catch {}; }
                     }
                 }
 
                 const ranked: ?[]session_search.SessionHit = session_search.rankHits(self.allocator, all_hits.items) catch null;
                 if (ranked) |h| {
+                    defer self.allocator.free(h);
                     // `ranked` may be empty on error; that's fine, shows nothing.
                     for (h) |hit| {
                         const session_id = std.fs.path.basename(hit.entry.path);
@@ -2296,7 +2310,7 @@ pub const Model = struct {
                         var desc_owned: ?[]u8 = null;
                         if (hit.tier == .transcript and hit.snippet.len > 0) {
                             desc_owned = self.allocator.dupe(u8, hit.snippet) catch null;
-                            desc = desc_owned.?;
+                            if (desc_owned) |d| desc = d;
                         } else {
                             const age = sessionindex.ageLabel(now, hit.entry.created_at, &now_buf);
                             desc_owned = self.allocator.dupe(u8, age) catch null;
@@ -2306,11 +2320,19 @@ pub const Model = struct {
                             self.allocator.free(label);
                             if (desc_owned) |d| self.allocator.free(d);
                         };
-                        _ = self.session_picker_paths.append(self.allocator, self.allocator.dupe(u8, hit.entry.path) catch "") catch {};
-                        if (desc_owned) |d| self.allocator.free(d);
+                        const pdupe = self.allocator.dupe(u8, hit.entry.path) catch "";
+                        _ = self.session_picker_paths.append(self.allocator, pdupe) catch self.allocator.free(pdupe);
                     }
                 }
             }
+            }
+            // The session branch rebuilds items, so the visible list must be
+            // rebuilt too. Without this `picker_filtered` stays empty and the
+            // picker opens blank: `/session` showed nothing even with sessions
+            // on disk. Paths stay aligned 1:1 with items so `onSessionPick`
+            // and F2 never see an index past the end (index 22 len 21).
+            for (0..self.picker_items.items.len) |ix| {
+                self.picker_filtered.append(self.allocator, ix) catch break;
             }
             } else {
             // Original behavior: filter picker_items by label match.
@@ -2351,7 +2373,10 @@ pub const Model = struct {
                 const cb_idx = self.picker_cb_idx;
                 const tag = self.picker_tag;
                 const label = if (ix) |i|
-                    self.allocator.dupe(u8, self.picker_items.items[i].label) catch null
+                    if (i < self.picker_items.items.len)
+                        self.allocator.dupe(u8, self.picker_items.items[i].label) catch null
+                    else
+                        null
                 else
                     null;
                 self.unlock();
@@ -2416,6 +2441,12 @@ pub const Model = struct {
                     null;
                 if (rename_cb) |f| {
                     if (ix) |i| {
+                        // Bounds guard: stale filtered indices after a rebuild
+                        // must not panic (index 22 len 21).
+                        if (i >= self.session_picker_paths.items.len or i >= self.picker_items.items.len) {
+                            self.unlock();
+                            return true;
+                        }
                         // Remember which session path is being renamed so the
                         // callback can look it up (the label alone is not enough
                         // — two sessions can share a title).
@@ -2548,13 +2579,17 @@ pub const Model = struct {
         var out_ix: usize = 0;
         var fi = start;
         while (fi < end) : (fi += 1) {
-            const it = self.picker_items.items[self.picker_filtered.items[fi]];
+            const target = self.picker_filtered.items[fi];
+            if (target >= self.picker_items.items.len) continue;
+            const it = self.picker_items.items[target];
             items[out_ix] = .{
                 .label = arena.dupe(u8, it.label) catch "",
                 .desc = arena.dupe(u8, it.desc) catch "",
             };
             out_ix += 1;
         }
+        // Trim if we skipped stale indices (keeps the snapshot from exposing
+        // uninitialized holes).
         return .{
             .title = arena.dupe(u8, self.picker_title[0..self.picker_title_len]) catch "",
             .query = arena.dupe(u8, self.picker_query[0..self.picker_query_len]) catch "",
@@ -2562,7 +2597,7 @@ pub const Model = struct {
             .first_visible = start,
             .total = total,
             .tag = self.picker_tag,
-            .items = items,
+            .items = items[0..out_ix],
             .semantic_searching = self.session_picker_semantic_searching,
         };
     }
@@ -3771,7 +3806,7 @@ pub const Model = struct {
             // "Other": not an answer, it hands the input box over.
             self.askBeginTyping();
             self.ed.clear();
-            self.ac = .{};
+            resetAutocomplete(self);
             return true;
         }
         self.askLock();
@@ -5769,7 +5804,7 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     if (trimmed.len > 1 and trimmed[0] == '!') {
         const cmd = std.mem.trim(u8, trimmed[1..], " \t");
         self.ed.clear();
-        self.ac = .{};
+        resetAutocomplete(self);
         if (cmd.len == 0) {
             self.pushInfo("! needs a command: !git status");
         } else {
@@ -5782,7 +5817,7 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
 
     if (self.askAnswerFromInput(trimmed)) {
         self.ed.clear();
-        self.ac = .{};
+        resetAutocomplete(self);
         ctx.redraw = true;
         try self.armTick(ctx);
         return;
@@ -5790,7 +5825,7 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
 
     if (trimmed.len == 0) {
         self.ed.clear();
-        self.ac = .{};
+        resetAutocomplete(self);
         if (!self.draft_images.isEmpty()) {
             // Enter on an empty box with a staged image is not a message: the
             // model gets bytes and no question. Say the image is still waiting
@@ -5833,7 +5868,7 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     };
 
     self.ed.commit(); // saves to history and clears
-    self.ac = .{};
+    resetAutocomplete(self);
     // `/copy` (and any other command) may have queued a clipboard write.
     self.flushCopyPending(ctx);
     ctx.redraw = true;
@@ -6083,6 +6118,24 @@ fn freeFileMatches(self: *Model) void {
     self.ac.file_matches.clearRetainingCapacity();
 }
 
+fn freeFilePool(self: *Model) void {
+    for (self.ac.file_pool.items) |p| self.allocator.free(p);
+    self.ac.file_pool.clearRetainingCapacity();
+    self.ac.file_pool_ready = false;
+}
+
+/// Reset autocomplete without leaking file_matches / file_pool. The old
+/// `self.ac = .{}` discarded owned strings without freeing them.
+fn resetAutocomplete(self: *Model) void {
+    freeFileMatches(self);
+    freeFilePool(self);
+    self.ac.active = false;
+    self.ac.mode = .none;
+    self.ac.prefix_len = 0;
+    self.ac.sel = 0;
+    self.ac.first = 0;
+}
+
 /// The `@token` under the cursor: where it starts and what it says, or null
 /// when the cursor is not on (or right after) an at-mention.
 ///
@@ -6121,13 +6174,6 @@ const file_pool_ttl_s: i64 = 10;
 /// scrolling within the list still works, and few enough that the per-keystroke
 /// refilter stays in the microseconds.
 const file_matches_max: usize = 40;
-
-/// Empties the cached project listing (`filesearch.collect` owns its strings).
-fn freeFilePool(self: *Model) void {
-    for (self.ac.file_pool.items) |p| self.allocator.free(p);
-    self.ac.file_pool.clearRetainingCapacity();
-    self.ac.file_pool_ready = false;
-}
 
 /// Walks the project ONCE per `file_pool_ttl_s` and keeps every path.
 ///
@@ -6364,7 +6410,7 @@ fn acceptAutocomplete(self: *Model) bool {
             self.ed.clear();
             self.ed.insert(cmd) catch return false;
             self.ed.insertChar(' ') catch {};
-            self.ac = .{};
+            resetAutocomplete(self);
             return true;
         },
         .file => blk: {
@@ -6387,7 +6433,7 @@ fn acceptAutocomplete(self: *Model) bool {
     self.ed.insert(repl) catch return false;
     // A file mention ends the token: close the popup (it reopens on the next
     // keystroke if the text still qualifies).
-    self.ac = .{};
+    resetAutocomplete(self);
     return true;
 }
 
@@ -6463,7 +6509,17 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
         .key_press => |key| {
             // Between `paste_start` and `paste_end` a key is CONTENT, not a
             // command: no submit, no shortcut, no modal navigation.
+            // Escape is the escape hatch: a lost `paste_end` (11-line pastes
+            // left the TUI swallowing every key, Ctrl+P included) would
+            // otherwise trap all input in the paste buffer forever.
             if (self.pasting) {
+                if (key.matches(vaxis.Key.escape, .{})) {
+                    self.pasting = false;
+                    insertIntoInput(self, self.paste_buf.items);
+                    self.paste_buf.clearRetainingCapacity();
+                    ctx.redraw = true;
+                    return;
+                }
                 capturePasteKey(self, key);
                 return;
             }
@@ -6476,7 +6532,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             if (key.matches('c', .{ .ctrl = true })) {
                 if (self.hasInput()) {
                     self.ed.clear();
-                    self.ac = .{};
+                    resetAutocomplete(self);
                     // The draft dies whole: an image staged for a discarded
                     // message must not ride on the next one.
                     self.draft_images.clear(self.allocator);
@@ -6496,15 +6552,28 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // way out was a key advertised as a scroll.
             //
             // Ctrl+C is the exit, which is what both places say.
-            // Ctrl+P: `/iter` — set the iteration budget for long tasks.
-            // Minimum 32; the model can ask for more when the task is long.
+            // Ctrl+P: command palette (commands and models in two columns).
+            // Toggle: pressing it while the commands palette is open closes it,
+            // so a stuck-open palette is escapable with the same key.
             if (key.matches('p', .{ .ctrl = true })) {
-                agent.cmdIter(self, null);
+                if (self.pal.active and self.pal.mode == .commands) {
+                    self.closePalette();
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                agent.openCommandPalette(self);
                 ctx.redraw = true;
                 try self.armTick(ctx);
                 return;
             }
             if (key.matches('t', .{ .ctrl = true })) {
+                if (self.pal.active and self.pal.mode == .models) {
+                    self.closePalette();
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
                 agent.openModelPaletteAsync(self);
                 ctx.redraw = true;
                 try self.armTick(ctx);
@@ -6628,7 +6697,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     // does the submit. With `return` it was lost: "/help" +
                     // Enter only rewrote "/help " and sent nothing.
                     if (plain_enter and isExactMatch(self)) {
-                        self.ac = .{};
+                        resetAutocomplete(self);
                         ctx.redraw = true;
                     } else {
                         if (acceptAutocomplete(self)) {
@@ -7465,9 +7534,17 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     //
     // Before drawing: if the worker left new models, the palette is reloaded
     // with them. This happens HERE, on the UI thread, which is the palette's
-    // only owner.
-    if (self.takePendingItems()) |items| {
-        self.pal.setItemsOwned(items, &agent.model_groups);
+    // only owner. Only in models mode: a late catalog worker must not clobber
+    // the commands list the user is looking at.
+    if (self.pal.active and self.pal.mode == .models) {
+        if (self.takePendingItems()) |items| {
+            self.pal.setItemsOwned(items, &agent.model_groups);
+        }
+    } else {
+        // Drop stale pending items so they do not leak into the next open.
+        if (self.takePendingItems()) |items| {
+            palette.freeItems(self.allocator, items);
+        }
     }
     if (self.pal.active) {
         palette.draw(&p, &surface, &self.pal, width, height, self.catalogNotice(ctx.arena));
@@ -9495,9 +9572,9 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
 }
 
 /// Context gauge segments for the footer: the context percentage.
-///
-/// Returns null when there is nothing to show (no context tracked yet).
 fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
+    // Genuinely missing context is not shown at all: no number is an answer
+    // ("not tracked yet"), a fake one is a lie the user has to detect.
     if (agent.ctx_used == 0 and !agent.ctx_real) return null;
     var out: std.ArrayList(InfoSeg) = .empty;
     const label = if (agent.ctx_real) "ctx" else "ctx~";
@@ -9515,7 +9592,22 @@ fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     // when it did not.
     const owned = arena.dupe(u8, pct_txt) catch return null;
     out.append(arena, .{ .text = owned, .style = theme.status }) catch return null;
+    // Cache-hit shown only with >=2 requests (first is always 0% cold).
+    if (cacheStats().requests >= 2) {
+        out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
+        out.append(arena, .{ .text = "cache", .style = theme.status }) catch return null;
+        out.append(arena, .{ .text = " ", .style = theme.status }) catch return null;
+        const hit = cacheStats().hitRatePct();
+        var hb: [8]u8 = undefined;
+        const hit_txt = std.fmt.bufPrint(&hb, "{d:.0}%", .{hit}) catch return out.items;
+        const owned_hit = arena.dupe(u8, hit_txt) catch return out.items;
+        out.append(arena, .{ .text = owned_hit, .style = theme.status }) catch return null;
+    }
     return out.items;
+}
+
+fn cacheStats() cache_stats.CacheStats {
+    return cache_stats.session;
 }
 
 /// Width in COLUMNS of a group of status segments.
@@ -12572,7 +12664,7 @@ test "picking a command in the palette EXECUTES it (not puts it in the input)" {
     var found = false;
     for (0..s.size.height) |row| {
         var rb: [512]u8 = undefined;
-        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "requests:") != null) found = true;
+        if (std.mem.indexOf(u8, rowText(s, @intCast(row), &rb), "requests") != null) found = true;
     }
     try std.testing.expect(found);
 }

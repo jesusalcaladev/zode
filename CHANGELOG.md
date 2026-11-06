@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - expand owned allocator, cap marker inside cap, path_max <= (mentions) [`8fad9f3b`](https://github.com/jesusalcaladev/zode/commit/8fad9f3b)
 - highlightPositions guard q.len > buf.len (fuzzy) [`58373754`](https://github.com/jesusalcaladev/zode/commit/58373754)
-- freeItems provider + empty guard, saturating key/query, zeroing (palette) [`f2b85e3e`](https://github.com/jesusalcaladev/zode/commit/f2b85e3e)
+- freeItems provider + empty guard, saturating key/query, zeroing (palette) [`87a11564`](https://github.com/jesusalcaladev/zode/commit/87a11564)
+- picker filtered for sessions, leak frees, ac reset, palette toggle, cache footer (tui) [`a92c5c30`](https://github.com/jesusalcaladev/zode/commit/a92c5c30)
 
 ### Chores
 
