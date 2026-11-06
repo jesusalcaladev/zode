@@ -221,8 +221,13 @@ pub const Session = struct {
     }
 
     /// Adds a message to memory and persists it (1 linear write).
+    /// Content is scrubbed for key shapes before persist (defense in depth:
+    /// a key leaked into a tool result must not reach disk verbatim).
     pub fn append(self: *Session, role: Message.Role, content: []const u8) !void {
-        const copy = try self.allocator.dupe(u8, content);
+        const redact = @import("lib/redact.zig").redact;
+        const scrubbed = redact(self.allocator, content, &.{}) catch content;
+        defer if (scrubbed.ptr != content.ptr) self.allocator.free(scrubbed);
+        const copy = try self.allocator.dupe(u8, scrubbed);
         errdefer self.allocator.free(copy);
         try self.messages.append(self.allocator, .{ .role = role, .content = copy });
         if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
@@ -313,7 +318,10 @@ pub const Session = struct {
         tool_name: []const u8,
         content: []const u8,
     ) !void {
-        const copy = try self.allocator.dupe(u8, content);
+        const redact = @import("lib/redact.zig").redact;
+        const scrubbed = redact(self.allocator, content, &.{}) catch content;
+        defer if (scrubbed.ptr != content.ptr) self.allocator.free(scrubbed);
+        const copy = try self.allocator.dupe(u8, scrubbed);
         errdefer self.allocator.free(copy);
         const id = try self.allocator.dupe(u8, tool_call_id);
         errdefer self.allocator.free(id);
