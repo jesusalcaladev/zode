@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`635d9542`](https://github.com/jesusalcaladev/zode/commit/635d9542)
 - usage pretty panel with bar, footer cache-hit, session root hash (commands) [`c41f0015`](https://github.com/jesusalcaladev/zode/commit/c41f0015)
 - always-injected anti-listing rule in tool_routing_prompt (prompt) [`79fba293`](https://github.com/jesusalcaladev/zode/commit/79fba293)
-- snapshotMsgs deep copy, buildModelItems single-pass sort, keychain-first load/store, image ext fix, wider impl signals, TurnStats.reads (agent) [`44712eb6`](https://github.com/jesusalcaladev/zode/commit/44712eb6)
+- snapshotMsgs deep copy, buildModelItems single-pass sort, keychain-first load/store, image ext fix, wider impl signals, TurnStats.reads (agent) [`dc304379`](https://github.com/jesusalcaladev/zode/commit/dc304379)
 
 ### Bug Fixes
 
@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - picker filtered for sessions, leak frees, ac reset, palette toggle, cache footer (tui) [`1ebf2f4c`](https://github.com/jesusalcaladev/zode/commit/1ebf2f4c)
 - separator guard sessions vs sessions2 (sessionpath) [`40b7451a`](https://github.com/jesusalcaladev/zode/commit/40b7451a)
 - tryLaunchBg deep copy to gpa (UAF) (compaction) [`04584f91`](https://github.com/jesusalcaladev/zode/commit/04584f91)
+- temp+rename atomic write (modelcache) [`dcbcc545`](https://github.com/jesusalcaladev/zode/commit/dcbcc545)
 
 ### Chores
 
@@ -44,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - zero auth_buf [`6dd6101d`](https://github.com/jesusalcaladev/zode/commit/6dd6101d)
 - scrubbed child env allowlist [`c5c96b3f`](https://github.com/jesusalcaladev/zode/commit/c5c96b3f)
 - prctl SET_DUMPABLE 0, scrubbed child env static [`f70f68b6`](https://github.com/jesusalcaladev/zode/commit/f70f68b6)
+- dir 0700, fail-closed chmod, symlink guard, fsync [`032ef4f9`](https://github.com/jesusalcaladev/zode/commit/032ef4f9)
 
 ## [0.2.1-beta.2] - 2026-10-31
 

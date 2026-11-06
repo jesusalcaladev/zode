@@ -94,8 +94,14 @@ pub fn write(
     defer dirh.close(io);
 
     var buf: [512 * 1024]u8 = undefined;
-    var f = dirh.createFile(io, std.fs.path.basename(path), .{ .truncate = true }) catch return;
-    defer f.close(io);
+    // Atomic: write a temp file then rename, so a concurrent reader never
+    // sees a truncated JSON (which previously forced a miss).
+    var tmp_buf: [512]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return;
+    const tmp_name = std.fs.path.basename(tmp_path);
+    var f = dirh.createFile(io, tmp_name, .{ .truncate = true }) catch return;
+    var f_closed = false;
+    defer if (!f_closed) f.close(io);
     var fw = f.writerStreaming(io, &buf);
     const w = &fw.interface;
 
@@ -127,6 +133,9 @@ pub fn write(
     }
     w.writeAll("]}") catch return;
     w.flush() catch {};
+    f.close(io);
+    f_closed = true;
+    dirh.rename(tmp_name, dirh, std.fs.path.basename(path), io) catch {};
 }
 
 /// Reads it. A missing file, a version mismatch, a truncated write, a provider whose
