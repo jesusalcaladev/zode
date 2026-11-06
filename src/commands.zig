@@ -409,7 +409,7 @@ test "usage command shows the usage panel with token info" {
     try std.testing.expect(std.mem.indexOf(u8, all.items, "12,345") != null); // input tokens
     try std.testing.expect(std.mem.indexOf(u8, all.items, "678") != null); // output tokens
     try std.testing.expect(std.mem.indexOf(u8, all.items, "10,000") != null); // cache reads
-    try std.testing.expect(std.mem.indexOf(u8, all.items, "requests:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "requests") != null);
 }
 
 /// `/compact [off|elide|full|default]`: what automatic compaction is allowed to do.
@@ -609,8 +609,7 @@ pub fn cmdConfig(m: *tui.Model) void {
     agent.pushInfoOwned(m, "");
 }
 
-/// `/usage`: session token usage — requests, input/output, cache hits, read
-/// cache savings. The command you run to see "how much has this cost?".
+/// `/usage`: unified pretty panel (tokens + cache + cost chord).
 pub fn cmdUsage(m: *tui.Model) void {
     const gpa = m.allocator;
     const st = agent.cacheSessionStats();
@@ -618,37 +617,40 @@ pub fn cmdUsage(m: *tui.Model) void {
     const output = @max(st.completion_tokens, 0);
     const total = input +| output;
     const cached = @min(@max(st.cached_tokens, 0), input);
-    const uncached = input - cached;
     const requests: i64 = @intCast(st.requests);
-
+    const hit = st.hitRatePct();
+    const bar = usageBar(hit);
     var total_buf: [32]u8 = undefined;
     var input_buf: [32]u8 = undefined;
     var output_buf: [32]u8 = undefined;
     var cached_buf: [32]u8 = undefined;
-    var uncached_buf: [32]u8 = undefined;
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "┌─ zode {s} — usage", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ requests: {d}", .{requests}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ total:    {s} tokens", .{formatTokenCount(&total_buf, total)}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   input:  {s}", .{formatTokenCount(&input_buf, input)}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   output: {s}", .{formatTokenCount(&output_buf, output)}) catch return);
-    if (cached > 0) {
-        agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ cache:    {s} reads ({d:.1}%) · uncached input {s}", .{
-            formatTokenCount(&cached_buf, cached),
-            st.hitRatePct(),
-            formatTokenCount(&uncached_buf, uncached),
-        }) catch return);
-    }
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "╭─ zode {s} · usage", .{build_options.version}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ requests  {d}", .{requests}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ total     {s} tokens", .{formatTokenCount(&total_buf, total)}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   input   {s}", .{formatTokenCount(&input_buf, input)}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   output  {s}", .{formatTokenCount(&output_buf, output)}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ cache     {s}  {s}  {d:.1}%", .{
+        formatTokenCount(&cached_buf, cached),
+        bar,
+        hit,
+    }) catch return);
     if (m.reads.stats.hits > 0 or m.reads.stats.misses > 0) {
-        agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ read cache: {d} re-reads avoided · ~{d} KB not re-sent ({d} files in context)", .{
+        agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ read      {d} re-reads avoided · ~{d} KB", .{
             m.reads.stats.hits,
             m.reads.stats.saved / 1024,
-            m.reads.liveEntries(),
         }) catch return);
     }
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ elided this session: {d} tool results", .{agent.session_elided}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ elided    {d} tool results", .{agent.session_elided}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "╰─ /cost per-model · /cache verdict") catch return);
     agent.pushInfoOwned(m, "");
+}
+
+fn usageBar(pct: f64) []const u8 {
+    if (pct >= 80) return "▓▓▓▓▓";
+    if (pct >= 40) return "▓▓▓░░";
+    if (pct > 0) return "▓░░░░";
+    return "░░░░░";
 }
 
 /// `/goal` on its own would have to invent a task, and a prompt like "make the package
@@ -936,7 +938,7 @@ pub fn cmdSession(m: *tui.Model) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const project_root = agent.project_info.cwd();
+    const project_root = agent.project_info.root() orelse agent.project_info.cwd();
 
     const all_sessions = sessionindex.scan(arena, agent.io_global, session_mod.sessions_dir);
 
@@ -964,7 +966,10 @@ pub fn cmdSession(m: *tui.Model) void {
     m.session_picker_entries.deinit(gpa);
     m.session_picker_entries = .empty;
 
-    // Free any paths left from a previous picker open.
+    // Free any paths left from a previous picker open. The strings are owned
+    // by the picker (pickerRefilter rebuilds them), so free each one; a bare
+    // deinit leaked on every /session open.
+    for (m.session_picker_paths.items) |p| gpa.free(p);
     m.session_picker_paths.deinit(gpa);
     m.session_picker_paths = .empty;
 
@@ -991,6 +996,12 @@ pub fn cmdSession(m: *tui.Model) void {
                 continue;
             }
             _ = m.session_picker_entries.append(gpa, e) catch {};
+            if (idx >= owned_count) {
+                // Stale count (dir flipped between passes): skip extra
+                // rather than overflowing `owned`.
+                gpa.free(e.path);
+                continue;
+            }
             owned[idx] = .{
                 .path = e.path,
                 .name = e.name,
@@ -1026,7 +1037,9 @@ pub fn cmdSession(m: *tui.Model) void {
             .label = label_full,
             .desc = gpa.dupe(u8, age) catch "",
         };
-        _ = m.session_picker_paths.append(gpa, gpa.dupe(u8, s.path) catch "") catch {};
+        // session_picker_paths is rebuilt by pickerRefilter from the entries;
+        // prefilling it here leaks the strings (the rebuild clears without
+        // freeing) and risks a double free if counts diverge.
     }
 
     m.openPickerIdxRename(
@@ -1216,6 +1229,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
     .{ .key = "/init", .desc = "analyse the codebase and write AGENTS.md" },
+    .{ .key = "/iter", .desc = "iteration budget: /iter [n] (min 8, max 200) or /iter to show current" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
     .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
@@ -1369,7 +1383,7 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         try agent.submit(&m, "/usage");
         const text = try pendingText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "— usage") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "· usage") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "requests") != null);
     }
     {
