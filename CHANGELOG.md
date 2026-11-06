@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - usage pretty panel with bar, footer cache-hit, session root hash (commands) [`c41f0015`](https://github.com/jesusalcaladev/zode/commit/c41f0015)
 - always-injected anti-listing rule in tool_routing_prompt (prompt) [`79fba293`](https://github.com/jesusalcaladev/zode/commit/79fba293)
 - snapshotMsgs deep copy, buildModelItems single-pass sort, keychain-first load/store, image ext fix, wider impl signals, TurnStats.reads (agent) [`dc304379`](https://github.com/jesusalcaladev/zode/commit/dc304379)
+- redact known keys + sk-/Bearer/_KEY shapes (redact) [`ddede12a`](https://github.com/jesusalcaladev/zode/commit/ddede12a)
 
 ### Bug Fixes
 
@@ -39,10 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - changelog points to the actual pipeline commit (release) [`12c35dd7`](https://github.com/jesusalcaladev/zode/commit/12c35dd7)
 - update gitignore and remove vendored code-base-fx reference [`6d3cd1db`](https://github.com/jesusalcaladev/zode/commit/6d3cd1db)
+- auth.json* ignored (gitignore) [`06a65a79`](https://github.com/jesusalcaladev/zode/commit/06a65a79)
 
 ### Tests
 
-- register redact/spawnenv/keychain [`22bce5d5`](https://github.com/jesusalcaladev/zode/commit/22bce5d5)
+- register redact/spawnenv/keychain [`3e683c17`](https://github.com/jesusalcaladev/zode/commit/3e683c17)
 
 ### Other
 
