@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - repetition guard detects read-only spiral (loop) [`5cec9878`](https://github.com/jesusalcaladev/zode/commit/5cec9878)
 - headless runner consumes taskloop policy (loop) [`95424820`](https://github.com/jesusalcaladev/zode/commit/95424820)
 - Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`635d9542`](https://github.com/jesusalcaladev/zode/commit/635d9542)
-- usage pretty panel with bar, footer cache-hit, session root hash (commands) [`aa8513d1`](https://github.com/jesusalcaladev/zode/commit/aa8513d1)
+- usage pretty panel with bar, footer cache-hit, session root hash (commands) [`c41f0015`](https://github.com/jesusalcaladev/zode/commit/c41f0015)
 
 ### Bug Fixes
 
@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - highlightPositions guard q.len > buf.len (fuzzy) [`58373754`](https://github.com/jesusalcaladev/zode/commit/58373754)
 - freeItems provider + empty guard, saturating key/query, zeroing (palette) [`87a11564`](https://github.com/jesusalcaladev/zode/commit/87a11564)
 - picker filtered for sessions, leak frees, ac reset, palette toggle, cache footer (tui) [`1ebf2f4c`](https://github.com/jesusalcaladev/zode/commit/1ebf2f4c)
+- separator guard sessions vs sessions2 (sessionpath) [`b2769015`](https://github.com/jesusalcaladev/zode/commit/b2769015)
 
 ### Chores
 

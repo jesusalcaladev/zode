@@ -158,7 +158,11 @@ pub fn sessionBelongsToProject(
     session_path: []const u8,
 ) bool {
     const sessions_dir = resolveSessionsDir(arena, io, env, project_root) catch return false;
-    return std.mem.startsWith(u8, session_path, sessions_dir);
+    // Exact match or dir + separator. Without the separator, `sessions2`
+    // matches `sessions` and foreign sessions leak into the picker.
+    if (std.mem.eql(u8, session_path, sessions_dir)) return true;
+    const with_sep = std.fmt.allocPrint(arena, "{s}/", .{sessions_dir}) catch return false;
+    return std.mem.startsWith(u8, session_path, with_sep);
 }
 
 // ── tests ─────────────────────────────────────────────────────
