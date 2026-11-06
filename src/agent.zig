@@ -255,7 +255,10 @@ pub fn initProjectInfo(io: std.Io, env: ?*const std.process.Environ.Map) void {
 /// said "no sessions" with twenty files on disk.
 /// Idempotent: safe to call multiple times (each call allocates).
 pub fn resolveSessionsDirIn(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
-    const project_root = project_info.cwd();
+    // Root, not cwd: the hash is of the project root. Launching from a
+    // subdirectory would otherwise create a different sessions hash and
+    // `/session` would look empty from the other launch point.
+    const project_root = project_info.root() orelse project_info.cwd();
     const dir = sessionpath.resolveSessionsDir(gpa, io_global, env, project_root) catch return;
     defer gpa.free(dir);
     // `setSessionsDir` copies into a static buffer, so the gpa allocation dies here.
@@ -2433,7 +2436,9 @@ fn saveAllowlist() void {
     w.print(",\"bash\":", .{}) catch return;
     config_mod.writeStringArray(&w, gpa_global, pats[0..np]) catch return;
     w.print("}}", .{}) catch return;
-    std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = w.buffered() }) catch {};
+    config_mod.writeFileSecure(io_global, environ_global, path, w.buffered()) catch {
+        std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = w.buffered() }) catch {};
+    };
 }
 
 fn readFileTo(arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
@@ -3102,16 +3107,42 @@ fn loadAuthKeys(_: std.mem.Allocator) void {
     if (keys_arena_state == null) keys_arena_state = std.heap.ArenaAllocator.init(gpa_global);
     const a = keys_arena_state.?.allocator();
 
-    const data = readFileTo(a, path) orelse return;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, data, .{}) catch return;
-    if (parsed != .object) return;
-
     var map = a.create(std.StringHashMapUnmanaged([]const u8)) catch return;
     map.* = .{};
+    // Keychain first: lookup per provider from OS secret store. If a
+    // provider is in the keychain it wins over auth.json (file fallback).
+    const keychain_mod = @import("lib/keychain.zig");
+    if (keychain_mod.available(io_global)) {
+        var arena_state = std.heap.ArenaAllocator.init(a);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        for (&providers.defs) |d| {
+            if (keychain_mod.lookup(arena, io_global, d.id)) |k| {
+                const duped = a.dupe(u8, k) catch continue;
+                map.put(a, d.id, duped) catch continue;
+            }
+        }
+    }
+
+    const data = readFileTo(a, path) orelse {
+        providers.setSavedKeys(map);
+        return;
+    };
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, data, .{}) catch {
+        providers.setSavedKeys(map);
+        return;
+    };
+    if (parsed != .object) {
+        providers.setSavedKeys(map);
+        return;
+    }
+
     var it = parsed.object.iterator();
     while (it.next()) |kv| {
         const v = kv.value_ptr.*;
         if (v != .string or v.string.len == 0) continue;
+        // Keychain wins: only add file key when provider not already present.
+        if (map.contains(kv.key_ptr.*)) continue;
         // The key is copied because the parser's string lives in the arena that was
         // just freed above.
         map.put(a, kv.key_ptr.*, a.dupe(u8, v.string) catch continue) catch continue;
@@ -3378,6 +3409,7 @@ pub const TurnStats = struct {
     gpa: std.mem.Allocator = undefined,
     iterations: usize = 0,
     tools: usize = 0,
+    reads: usize = 0,
     denied: usize = 0,
     /// How many times the model reviewed its own diff this turn.
     ///
@@ -3475,6 +3507,15 @@ pub const TurnStats = struct {
 
     pub fn noteTool(self: *TurnStats) void {
         self.tools += 1;
+    }
+
+    pub fn noteRead(self: *TurnStats) void {
+        self.reads += 1;
+    }
+
+    pub fn isReadOnlyTool(name: []const u8) bool {
+        const d = tools_registry.find(name) orelse return false;
+        return d.read_only;
     }
 
     pub fn noteDenied(self: *TurnStats) void {
@@ -3749,18 +3790,22 @@ fn allocPrint(m: *tui.Model, comptime fmt: []const u8, args: anytype) ![]const u
 
 /// Copies the session messages into a slice of `ChatMessage`.
 ///
-/// `tool` → role "tool" (as OpenAI's API expects), and `system` stays first.
-/// The memory comes from the arena the caller passes in.
+/// Deep copy: strings are arena-duped here, so a later `setGoalNote` (which
+/// frees the old goal note) cannot dangle the wire view for this iteration.
 pub fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
     const s = session orelse return &.{};
     const msgs = arena.alloc(chat.ChatMessage, s.messages.items.len) catch return &.{};
     for (s.messages.items, 0..) |sm, i| {
+        const content = arena.dupe(u8, sm.content) catch sm.content;
+        const tj = if (sm.tool_calls_json) |j| arena.dupe(u8, j) catch sm.tool_calls_json else null;
+        const id = if (sm.tool_call_id) |v| arena.dupe(u8, v) catch sm.tool_call_id else null;
+        const nm = if (sm.tool_name) |v| arena.dupe(u8, v) catch sm.tool_name else null;
         msgs[i] = .{
             .role = @tagName(sm.role),
-            .content = sm.content,
-            .tool_calls_json = sm.tool_calls_json,
-            .tool_call_id = sm.tool_call_id,
-            .tool_name = sm.tool_name,
+            .content = content,
+            .tool_calls_json = tj,
+            .tool_call_id = id,
+            .tool_name = nm,
         };
     }
     return msgs;
@@ -4644,15 +4689,7 @@ pub fn startCodeReview(m: *tui.Model, input: []const u8) !void {
 
 fn startChatImpl(m: *tui.Model, input: []const u8, mode: ChatJob.Mode) !void {
     // Truncate long inputs for UI display, keep full text for model
-    const TRUNCATE_SIZE = 200;
-    var display_input = input;
-    var full_input = input;
-    if (input.len > TRUNCATE_SIZE) {
-        display_input = input[0..TRUNCATE_SIZE] ++ " ...";
-        full_input = input;
-    }
-    // Replace image references with [image.ext] placeholders for UI display
-    display_input = replaceImagePlaceholders(display_input);
+    const full_input = input;
     const copy = try m.allocator.dupe(u8, full_input);
     errdefer m.allocator.free(copy);
 
@@ -4731,7 +4768,7 @@ pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
                 li += 1;
                 continue;
             }
-            const ext = filename[dot + 1 .. fe];
+            const ext = filename[dot + 1 ..];
             var is_image = false;
             var ei: usize = 0;
             while (ei < image_exts.len) {
@@ -4918,6 +4955,9 @@ fn user_wants_implementation(text: []const u8) bool {
         "feature",    "funcionalidad",
         "component",  "componente",
         "stack",      "pilas",
+        "refactor",   "migrate",    "update",       "change",     "delete",
+        "remove",     "rename",     "move",         "make",       "resolve",
+        "optimize",   "automate",
     };
     for (impl_signals) |s| {
         if (idxIgnoreCase(text, s) != null) return true;
@@ -6523,7 +6563,7 @@ fn withMentions(
     }
     const li = last orelse return msgs;
 
-    const exp = mentions.expand(io_global, msgs[li].content) catch return msgs;
+    const exp = mentions.expand(arena, io_global, msgs[li].content) catch return msgs;
     if (exp.files == 0) return msgs;
     count.files = exp.files;
     count.missing = exp.missing;
@@ -7260,6 +7300,25 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
                 return true; // continue the turn
             }
             // Nudge budget spent: let the turn end.
+        }
+
+        // ── NUDGE: stopped after one read-only tool with a stub reply ──
+        //
+        // `list_files` then a 2-word reply is the most common premature end:
+        // the model looked at the directory and reported nothing. One extra
+        // iteration costs one request; ending here wastes the whole turn.
+        // Gate: first two iterations only, short stub text, no files written.
+        if (iteration <= 1 and turn_stats.files.items.len == 0 and
+            turn_stats.tools >= 1 and turn_stats.tools <= 2 and
+            tstate.text.items.len > 0 and tstate.text.items.len < 200)
+        {
+            if (m.implementation_nudges < 3) {
+                m.implementation_nudges += 1;
+                appendHarnessPrompt(m,
+                    "You stopped after only exploring with a short reply and no file changes. If the task needs more work, keep going: read what you listed and act on it. If you are truly done, give the final answer with what you did and what you did not do.");
+                refreshContextUsage(m);
+                return true; // continue the turn
+            }
         }
 
         // The ctx% is refreshed HERE too, not only on the tools path (which is
@@ -9411,6 +9470,7 @@ fn execOneCall(
 
     const ms = elapsedMs(call_t0);
     turn_stats.noteTool();
+    if (TurnStats.isReadOnlyTool(call.name)) turn_stats.noteRead();
     if (std.mem.eql(u8, call.name, "bash") and startedBackground(res)) m.bench.bg_jobs += 1;
     const summary = toolResultSummary(call.name, res, arena);
     m.pushToolDone(call.name, summary, ms, res);
@@ -11769,7 +11829,6 @@ fn modelsWorker(job: *ModelsJob) void {
     defer destroyModelsJob(job.model.allocator, job);
     const m = job.model;
     const gpa = m.allocator;
-    m.beginWorker();
     defer m.endWorker();
     const is_current = struct {
         fn check(model: *tui.Model, request: *const ModelsJob) bool {
@@ -11938,121 +11997,109 @@ fn freeFirst(_: void, a: models_mod.Model, b: models_mod.Model) bool {
 /// providers (providers that have a key), showing "Model Name    Provider · free/ctx".
 /// Reads from the cache of each connected provider, so it opens instantly.
 /// All strings are own copies from the model's allocator.
-fn buildModelItems(m: *tui.Model, _: []models_mod.Model) ?[]palette.Item {
+fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
+    // A fresh network list wins over the disk cache. The old version ignored
+    // the argument and re-read the cache, so the worker's fetch was discarded
+    // and the palette never showed the update (it kept reading `io_global`
+    // from the worker thread too).
+    if (list.len > 0) return fallbackModelItems(m, list);
     const gpa = m.allocator;
     var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer defs_arena_state.deinit();
     const defs = allProviders(defs_arena_state.allocator());
 
-    // First pass: count total models from all connected providers
-    var total_models: usize = 0;
+    // Single pass into ArrayList: the old count-then-fill re-read the cache
+    // twice and could overflow `items` if a warmupWorker write landed
+    // between the passes (TOCTOU).
+    var models: std.ArrayList(palette.Item) = .empty;
+    defer models.deinit(gpa);
+    var any_connected = false;
     for (defs) |d| {
-        if (providers.hasKey(&d, m.environ)) {
-            var cache_arena = std.heap.ArenaAllocator.init(gpa);
-            if (modelcache.read(io_global, m.environ, cache_arena.allocator(), d.id, d.models_url)) |entry| {
-                total_models += entry.models.len;
+        if (!providers.hasKey(&d, m.environ)) continue;
+        any_connected = true;
+        var cache_arena = std.heap.ArenaAllocator.init(gpa);
+        defer cache_arena.deinit();
+        if (modelcache.read(io_global, m.environ, cache_arena.allocator(), d.id, d.models_url)) |entry| {
+            // Sort each provider's cache free-first for stable order.
+            const sorted = cache_arena.allocator().dupe(models_mod.Model, entry.models) catch continue;
+            defer cache_arena.allocator().free(sorted);
+            std.mem.sort(models_mod.Model, sorted, {}, freeFirst);
+            for (sorted) |mi| {
+                const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
+                    std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
+                else
+                    "";
+                const label = gpa.dupe(u8, mi.id) catch {
+                    if (hint.len > 0) gpa.free(hint);
+                    continue;
+                };
+                const hint_owned = if (hint.len > 0)
+                    std.fmt.allocPrint(gpa, "{s} · {s}", .{d.id, hint}) catch gpa.dupe(u8, d.id) catch ""
+                else
+                    gpa.dupe(u8, d.id) catch "";
+                if (hint.len > 0) gpa.free(hint);
+                const prov = gpa.dupe(u8, d.id) catch "";
+                const it: palette.Item = .{
+                    .kind = .model,
+                    .group = 1,
+                    .label = label,
+                    .hint = hint_owned,
+                    .provider = prov,
+                    .ctx_tokens = mi.context_length,
+                };
+                models.append(gpa, it) catch {
+                    gpa.free(label);
+                    if (hint_owned.len > 0) gpa.free(hint_owned);
+                    if (prov.len > 0) gpa.free(prov);
+                };
             }
-            cache_arena.deinit();
         }
     }
-
-    // If no models from connected providers, try the active provider's cache
-    // (the user might be browsing before connecting a key)
-    if (total_models == 0) {
+    // Fallback to active provider when no connected cache had models
+    if (models.items.len == 0 and !any_connected) {
         const active_def = activeProviderDef(m.environ);
         if (active_def.id.len > 0) {
             var cache_arena = std.heap.ArenaAllocator.init(gpa);
+            defer cache_arena.deinit();
             if (modelcache.read(io_global, m.environ, cache_arena.allocator(), active_def.id, active_def.models_url)) |entry| {
-                total_models = entry.models.len;
-            }
-            cache_arena.deinit();
-        }
-    }
-
-    // If still no models, return null to trigger fallback
-    if (total_models == 0) {
-        return null;
-    }
-
-    const items = gpa.alloc(palette.Item, total_models + 1) catch return null; // +1 for "+ connect"
-    var i: usize = 0;
-
-    // Second pass: add models from each connected provider
-    for (defs) |d| {
-        if (!providers.hasKey(&d, m.environ)) continue;
-
-        var cache_arena = std.heap.ArenaAllocator.init(gpa);
-        if (modelcache.read(io_global, m.environ, cache_arena.allocator(), d.id, d.models_url)) |entry| {
-            for (entry.models) |mi| {
-                const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
-                    std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
-                else
-                    "";
-                items[i] = .{
-                    .kind = .model,
-                    .group = 1,
-                    .label = gpa.dupe(u8, mi.id) catch return null,
-                    .hint = if (hint.len > 0)
-                        std.fmt.allocPrint(gpa, "{s} · {s}", .{d.id, hint}) catch gpa.dupe(u8, d.id) catch ""
+                const sorted = cache_arena.allocator().dupe(models_mod.Model, entry.models) catch return null;
+                defer cache_arena.allocator().free(sorted);
+                std.mem.sort(models_mod.Model, sorted, {}, freeFirst);
+                for (sorted) |mi| {
+                    const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
+                        std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
                     else
-                        gpa.dupe(u8, d.id) catch "",
-                    .provider = gpa.dupe(u8, d.id) catch "",
-                    .ctx_tokens = mi.context_length,
-                };
-                i += 1;
-            }
-        }
-        cache_arena.deinit();
-    }
-
-    // If we got models from connected providers, we're done
-    if (i > 0) {
-        // "+ connect" item at the end
-        items[i] = .{
-            .kind = .connect,
-            .group = 2,
-            .label = gpa.dupe(u8, "+ connect") catch return null,
-            .hint = gpa.dupe(u8, "ctrl+a") catch return null,
-        };
-        return items;
-    }
-
-    // Fallback: active provider's models (if we got here, connected providers had no models
-    // but active provider did)
-    const active_def = activeProviderDef(m.environ);
-    if (active_def.id.len > 0) {
-        var cache_arena = std.heap.ArenaAllocator.init(gpa);
-        if (modelcache.read(io_global, m.environ, cache_arena.allocator(), active_def.id, active_def.models_url)) |entry| {
-            for (entry.models) |mi| {
-                const hint = if (mi.is_free) "free" else if (mi.context_length > 0)
-                    std.fmt.allocPrint(gpa, "{d}k", .{mi.context_length / 1024}) catch ""
-                else
-                    "";
-                items[i] = .{
-                    .kind = .model,
-                    .group = 1,
-                    .label = gpa.dupe(u8, mi.id) catch return null,
-                    .hint = if (hint.len > 0)
+                        "";
+                    const label = gpa.dupe(u8, mi.id) catch continue;
+                    const hint_owned = if (hint.len > 0)
                         std.fmt.allocPrint(gpa, "{s} · {s}", .{active_def.id, hint}) catch gpa.dupe(u8, active_def.id) catch ""
                     else
-                        gpa.dupe(u8, active_def.id) catch "",
-                    .provider = gpa.dupe(u8, active_def.id) catch "",
-                    .ctx_tokens = mi.context_length,
-                };
-                i += 1;
+                        gpa.dupe(u8, active_def.id) catch "";
+                    if (hint.len > 0) gpa.free(hint);
+                    const prov = gpa.dupe(u8, active_def.id) catch "";
+                    models.append(gpa, .{
+                        .kind = .model,
+                        .group = 1,
+                        .label = label,
+                        .hint = hint_owned,
+                        .provider = prov,
+                        .ctx_tokens = mi.context_length,
+                    }) catch {};
+                }
             }
         }
-        cache_arena.deinit();
     }
-
-    // "+ connect" item at the end
-    items[i] = .{
+    if (models.items.len == 0) return null;
+    const items = gpa.alloc(palette.Item, models.items.len + 1) catch return null;
+    const count = models.items.len;
+    @memcpy(items[0..count], models.items[0..count]);
+    models.items.len = 0;
+    items[count] = .{
         .kind = .connect,
         .group = 2,
         .label = gpa.dupe(u8, "+ connect") catch return null,
         .hint = gpa.dupe(u8, "ctrl+a") catch return null,
     };
-
     return items;
 }
 
@@ -12124,6 +12171,7 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     // shows the effort ladder in the title.
     var title_buf: [128]u8 = undefined;
     const mode_part = buildModeTitlePart(m, &title_buf);
+    if (m.pal.custom_title.len > 0) m.allocator.free(m.pal.custom_title);
     if (mode_part.len > 0) {
         const title = std.fmt.bufPrint(&title_buf, "Choose a model · {s}", .{mode_part}) catch "Choose a model";
         m.pal.custom_title = m.allocator.dupe(u8, title) catch "";
@@ -12490,6 +12538,18 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
         return;
     }
     const trimmed = norm.key;
+
+    // Keychain first: store in OS secret store when available. Fallback to
+    // auth.json (0600) only when keychain is unavailable or store fails.
+    const keychain_mod = @import("lib/keychain.zig");
+    if (keychain_mod.store(m.allocator, io_global, provider, trimmed)) {
+        reloadUserConfig();
+        loadAuthKeys(m.allocator);
+        free_auto.rebuildPool(m);
+        openConnectPalette(m);
+        m.pal.setKeyMessagef("saved: {s} (keychain)", .{provider}, false);
+        return;
+    }
 
     const gpa = m.allocator;
 

@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - headless runner consumes taskloop policy (loop) [`95424820`](https://github.com/jesusalcaladev/zode/commit/95424820)
 - Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`635d9542`](https://github.com/jesusalcaladev/zode/commit/635d9542)
 - usage pretty panel with bar, footer cache-hit, session root hash (commands) [`c41f0015`](https://github.com/jesusalcaladev/zode/commit/c41f0015)
-- always-injected anti-listing rule in tool_routing_prompt (prompt) [`0e591e86`](https://github.com/jesusalcaladev/zode/commit/0e591e86)
+- always-injected anti-listing rule in tool_routing_prompt (prompt) [`79fba293`](https://github.com/jesusalcaladev/zode/commit/79fba293)
+- snapshotMsgs deep copy, buildModelItems single-pass sort, keychain-first load/store, image ext fix, wider impl signals, TurnStats.reads (agent) [`44712eb6`](https://github.com/jesusalcaladev/zode/commit/44712eb6)
 
 ### Bug Fixes
 
@@ -42,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - zero auth_buf [`6dd6101d`](https://github.com/jesusalcaladev/zode/commit/6dd6101d)
 - scrubbed child env allowlist [`c5c96b3f`](https://github.com/jesusalcaladev/zode/commit/c5c96b3f)
+- prctl SET_DUMPABLE 0, scrubbed child env static [`f70f68b6`](https://github.com/jesusalcaladev/zode/commit/f70f68b6)
 
 ## [0.2.1-beta.2] - 2026-10-31
 
