@@ -89,6 +89,7 @@ pub fn matchPositions(label: []const u8, q: []const u8, buf: []u32) ?usize {
 /// (that is what the eye reads as "the match"), and the fuzzy positions otherwise.
 pub fn highlightPositions(label: []const u8, q: []const u8, buf: []u32) ?usize {
     if (q.len == 0) return null;
+    if (q.len > buf.len) return null;
     if (startsWithIgnoreCase(label, q)) {
         for (q, 0..) |_, i| buf[i] = @intCast(i);
         return q.len;

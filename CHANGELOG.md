@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- expand owned allocator, cap marker inside cap, path_max <= (mentions) [`43700463`](https://github.com/jesusalcaladev/zode/commit/43700463)
+- expand owned allocator, cap marker inside cap, path_max <= (mentions) [`8fad9f3b`](https://github.com/jesusalcaladev/zode/commit/8fad9f3b)
+- highlightPositions guard q.len > buf.len (fuzzy) [`06f13a21`](https://github.com/jesusalcaladev/zode/commit/06f13a21)
 
 ### Chores
 
