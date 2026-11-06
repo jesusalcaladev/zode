@@ -72,7 +72,7 @@ pub fn scan(text: []const u8) !ScanResult {
             if (std.mem.eql(u8, mentions[prev].path[0..mentions[prev].len], path)) dup = true;
         }
         if (!dup) {
-            if (path.len < path_max) {
+            if (path.len <= path_max) {
                 mentions[n].len = @intCast(path.len);
                 @memcpy(mentions[n].path[0..path.len], path);
                 n += 1;
@@ -92,158 +92,83 @@ fn looksLikePath(token: []const u8) bool {
 }
 
 pub const Expansion = struct {
+    /// Owned by the caller-provided allocator (arena for the turn). The old
+    /// version returned a slice of a 256-byte stack buffer, so every caller
+    /// held a dangling pointer the moment `expand` returned.
     text: []const u8,
     files: u8,
     missing: u8,
 };
 
-pub fn highlightMatch(label: []const u8, positions: []const u32, n: usize) []const u8 {
-    if (n == 0 or positions.len == 0) return label;
-    var result: [256]u8 = undefined;
-    var ri: usize = 0;
-    var pi: usize = 0;
-    var li: usize = 0;
-    while (li < label.len and pi < n) {
-        const pos = positions[pi];
-        if (pos < li) { pi += 1; continue; }
-        if (pos > label.len) break;
-        if (pos > li) {
-            const copy = label[li..pos];
-            if (ri + copy.len > result.len) break;
-            @memcpy(result[ri .. ri + copy.len], copy);
-            ri += copy.len;
-        }
-        const match_end = @min(positions[pi + 1 - 1] + 1, label.len + 1);
-        const match_len = match_end - pos;
-        if (ri + match_len + 4 > result.len) break;
-        result[ri] = '*';
-        ri += 1;
-        @memcpy(result[ri .. ri + match_len], label[pos .. pos + match_len]);
-        ri += match_len;
-        result[ri] = '*';
-        ri += 1;
-        li = pos + match_len;
-        pi += 1;
-    }
-    if (li < label.len) {
-        const copy = label[li..];
-        if (ri + copy.len > result.len) {
-            @memcpy(result[ri ..], copy[0..result.len - ri - 4]); 
-            ri = result.len;
-        } else {
-            @memcpy(result[ri .. ri + copy.len], copy);
-            ri += copy.len;
-        }
-    }
-    if (ri > 0) return result[0..ri];
-    return label;
-}
+pub const expansion_cap = 256 * 1024;
 
-pub fn expand(io: std.Io, text: []const u8) !Expansion {
+pub fn expand(alloc: std.mem.Allocator, io: std.Io, text: []const u8) !Expansion {
     const scan_result = try scan(text);
 
-    var loaded_paths: [max_files][32]u8 = undefined;
-    var loaded_path_count: usize = 0;
-    var loaded_count: u8 = 0;
-
-    const max_to_load = if (scan_result.count < max_files) scan_result.count else max_files;
-
-    var file_storage: [max_files][file_max]u8 = undefined;
-    var file_texts: [max_files][]const u8 = undefined;
+    var loaded_contents: std.ArrayList([]u8) = .empty;
+    defer loaded_contents.deinit(alloc);
+    var loaded_idx_for_mention: [128]u8 = undefined;
+    // 255 = no content (missing or over cap). `scanned_max` is 8, so 128 is headroom.
+    for (0..128) |i| loaded_idx_for_mention[i] = 255;
     var missing_count: u8 = 0;
 
-    var handle_count: usize = 0;
-
+    const max_to_load = @min(@as(usize, scan_result.count), @as(usize, max_files));
     for (0..max_to_load) |i| {
-        const mention = scan_result.mentions[i];
-        const path = mention.pathOf();
-
-        var already_loaded = false;
-        for (0..loaded_path_count) |idx| {
-            if (std.mem.eql(u8, loaded_paths[idx][0..], path)) {
-                already_loaded = true;
-                break;
-            }
-        }
-
-        if (already_loaded) { continue; }
-
+        const path = scan_result.mentions[i].pathOf();
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
             missing_count += 1;
             continue;
         };
-
-        var buf: [file_max]u8 = undefined;
-        const n = file.readPositionalAll(io, buf[0..], 0) catch {
+        defer file.close(io);
+        var buf = try alloc.alloc(u8, file_max);
+        defer alloc.free(buf);
+        const n = file.readPositionalAll(io, buf, 0) catch {
             missing_count += 1;
             continue;
         };
-
-        if (handle_count < max_files) {
-            @memcpy(file_storage[handle_count][0..], buf[0..n]);
-            file_texts[handle_count] = file_storage[handle_count][0..n];
-        }
-
-        if (loaded_path_count < max_files) {
-            @memcpy(loaded_paths[loaded_path_count][0..path.len], path);
-            loaded_path_count += 1;
-        }
-
-        handle_count += 1;
-        loaded_count += 1;
+        const owned = try alloc.dupe(u8, buf[0..n]);
+        const idx: u8 = @intCast(loaded_contents.items.len);
+        try loaded_contents.append(alloc, owned);
+        loaded_idx_for_mention[i] = idx;
     }
+    defer for (loaded_contents.items) |c| alloc.free(c);
 
-    var result: [256]u8 = undefined;
-    var ri: usize = 0;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
     var li: usize = 0;
     var mention_idx: usize = 0;
-    var file_idx: usize = 0;
-
     while (li < text.len) {
         if (mention_idx < scan_result.count) {
             const mention_path = scan_result.mentions[mention_idx].pathOf();
             if (li + mention_path.len <= text.len and
-                std.mem.eql(u8, text[li..li + mention_path.len], mention_path)) {
-                var found_file = false;
-                for (0..handle_count) |fidx| {
-                    if (fidx == mention_idx) {
-                        const file_content = file_texts[fidx];
-                        const file_len = file_content.len;
-
-                        if (ri + file_len > result.len) {
-                            @memcpy(result[ri ..], file_content[0..result.len - ri - 4]); 
-                            ri = result.len;
-                        } else {
-                            @memcpy(result[ri .. ri + file_len], file_content);
-                            ri += file_len;
-                        }
-
-                        li += mention_path.len;
-                        mention_idx += 1;
-                        file_idx += 1;
-                        found_file = true;
-                        break;
+                std.mem.eql(u8, text[li .. li + mention_path.len], mention_path))
+            {
+                if (mention_idx < loaded_idx_for_mention.len and
+                    loaded_idx_for_mention[mention_idx] != 255)
+                {
+                    const content = loaded_contents.items[loaded_idx_for_mention[mention_idx]];
+                    if (out.items.len + content.len <= expansion_cap) {
+                        try out.appendSlice(alloc, content);
+                    } else {
+                        const marker = "\n... [mention truncated] ...";
+                        const room = expansion_cap -| out.items.len;
+                        const content_room = room -| marker.len;
+                        try out.appendSlice(alloc, content[0..@min(content_room, content.len)]);
+                        try out.appendSlice(alloc, marker);
                     }
                 }
-                if (!found_file) {
-                    li += mention_path.len;
-                    mention_idx += 1;
-                    continue;
-                }
+                li += mention_path.len;
+                mention_idx += 1;
                 continue;
             }
         }
-
-        if (ri < result.len) {
-            result[ri] = text[li];
-            ri += 1;
-        }
+        if (out.items.len < expansion_cap) try out.append(alloc, text[li]);
         li += 1;
     }
 
-    const result_len = @min(ri, result.len - 4);
-    if (result_len > 0) return Expansion{ .text = result[0..result_len], .files = loaded_count, .missing = missing_count };
-    return Expansion{ .text = result[0..0], .files = loaded_count, .missing = missing_count };
+    var loaded_count: u8 = @intCast(loaded_contents.items.len);
+    if (loaded_count > max_files) loaded_count = max_files;
+    return Expansion{ .text = try out.toOwnedSlice(alloc), .files = loaded_count, .missing = missing_count };
 }
 
 // ── tests ─────────────────────────────────────────────────────

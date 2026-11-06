@@ -20,11 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - wire taskloop into runAgentLoop, auto-iteration, and /iter (loop) [`5c26d629`](https://github.com/jesusalcaladev/zode/commit/5c26d629)
 - repetition guard detects read-only spiral (loop) [`5cec9878`](https://github.com/jesusalcaladev/zode/commit/5cec9878)
 - headless runner consumes taskloop policy (loop) [`95424820`](https://github.com/jesusalcaladev/zode/commit/95424820)
-- Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`5b5eeb70`](https://github.com/jesusalcaladev/zode/commit/5b5eeb70)
+- Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`635d9542`](https://github.com/jesusalcaladev/zode/commit/635d9542)
+
+### Bug Fixes
+
+- expand owned allocator, cap marker inside cap, path_max <= (mentions) [`43700463`](https://github.com/jesusalcaladev/zode/commit/43700463)
 
 ### Chores
 
 - changelog points to the actual pipeline commit (release) [`12c35dd7`](https://github.com/jesusalcaladev/zode/commit/12c35dd7)
+- update gitignore and remove vendored code-base-fx reference [`6d3cd1db`](https://github.com/jesusalcaladev/zode/commit/6d3cd1db)
 
 ## [0.2.1-beta.2] - 2026-10-31
 
