@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const list_files_tool = @import("list_files.zig");
+const pathsafe_mod = @import("../lib/pathsafe.zig");
 
 // ── grep: rg > git grep (in a repo) > grep -rn > internal fallback ──────
 //
@@ -227,7 +228,17 @@ pub fn toolGrep(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     const args = try parseArgs(obj, arena);
     const pattern = args.pattern;
     const subdir = args.subdir;
-
+    // Secret refusal: grep has no pathsafe blocklist, so a subdir of
+    // ~/.config/zode or a glob for auth.json would leak keys.
+    const verdict = pathsafe_mod.checkRead(subdir);
+    if (verdict != .ok) {
+        return arena.dupe(u8, "refused: this path names a credential file") catch "refused: credential";
+    }
+    if (args.glob) |g| {
+        if (pathsafe_mod.checkRead(g) != .ok) {
+            return arena.dupe(u8, "refused: this glob names a credential file") catch "refused: credential";
+        }
+    }
     // Build context args for native greps
     const context_args = buildContextArgs(args);
 
