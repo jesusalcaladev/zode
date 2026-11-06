@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - always-injected anti-listing rule in tool_routing_prompt (prompt) [`79fba293`](https://github.com/jesusalcaladev/zode/commit/79fba293)
 - snapshotMsgs deep copy, buildModelItems single-pass sort, keychain-first load/store, image ext fix, wider impl signals, TurnStats.reads (agent) [`dc304379`](https://github.com/jesusalcaladev/zode/commit/dc304379)
 - redact known keys + sk-/Bearer/_KEY shapes (redact) [`519a0ea3`](https://github.com/jesusalcaladev/zode/commit/519a0ea3)
-- allowlist + secret stripping (spawnenv) [`a6adf1e0`](https://github.com/jesusalcaladev/zode/commit/a6adf1e0)
+- allowlist + secret stripping (spawnenv) [`4346d1cd`](https://github.com/jesusalcaladev/zode/commit/4346d1cd)
+- secret-tool lookup/store fallback (keychain) [`af40417f`](https://github.com/jesusalcaladev/zode/commit/af40417f)
 
 ### Bug Fixes
 
