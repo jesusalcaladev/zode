@@ -33,12 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - picker filtered for sessions, leak frees, ac reset, palette toggle, cache footer (tui) [`1ebf2f4c`](https://github.com/jesusalcaladev/zode/commit/1ebf2f4c)
 - separator guard sessions vs sessions2 (sessionpath) [`40b7451a`](https://github.com/jesusalcaladev/zode/commit/40b7451a)
 - tryLaunchBg deep copy to gpa (UAF) (compaction) [`04584f91`](https://github.com/jesusalcaladev/zode/commit/04584f91)
-- temp+rename atomic write (modelcache) [`dcbcc545`](https://github.com/jesusalcaladev/zode/commit/dcbcc545)
+- temp+rename atomic write (modelcache) [`57a4a145`](https://github.com/jesusalcaladev/zode/commit/57a4a145)
 
 ### Chores
 
 - changelog points to the actual pipeline commit (release) [`12c35dd7`](https://github.com/jesusalcaladev/zode/commit/12c35dd7)
 - update gitignore and remove vendored code-base-fx reference [`6d3cd1db`](https://github.com/jesusalcaladev/zode/commit/6d3cd1db)
+
+### Tests
+
+- register redact/spawnenv/keychain [`22bce5d5`](https://github.com/jesusalcaladev/zode/commit/22bce5d5)
 
 ### Other
 
@@ -46,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - scrubbed child env allowlist [`c5c96b3f`](https://github.com/jesusalcaladev/zode/commit/c5c96b3f)
 - prctl SET_DUMPABLE 0, scrubbed child env static [`f70f68b6`](https://github.com/jesusalcaladev/zode/commit/f70f68b6)
 - dir 0700, fail-closed chmod, symlink guard, fsync [`032ef4f9`](https://github.com/jesusalcaladev/zode/commit/032ef4f9)
+- checkReadResolved for symlinks [`e117ffcc`](https://github.com/jesusalcaladev/zode/commit/e117ffcc)
+- redact on append/appendToolResult [`0f0165cc`](https://github.com/jesusalcaladev/zode/commit/0f0165cc)
+- use checkReadResolved [`f95a7545`](https://github.com/jesusalcaladev/zode/commit/f95a7545)
+- refuse credential paths [`0f651d5f`](https://github.com/jesusalcaladev/zode/commit/0f651d5f)
+- buildEnvLocked via allowlist [`33334d47`](https://github.com/jesusalcaladev/zode/commit/33334d47)
 
 ## [0.2.1-beta.2] - 2026-10-31
 
