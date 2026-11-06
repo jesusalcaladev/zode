@@ -180,6 +180,42 @@ pub fn checkRead(path: []const u8) Verdict {
     return .ok;
 }
 
+/// checkRead on the RESOLVED path: a symlink `notes.txt -> auth.json` must be
+/// refused as a read of `auth.json`, not as a read of `notes.txt`.
+pub fn checkReadResolved(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) Verdict {
+    const direct = checkRead(path);
+    if (direct != .ok) return direct;
+    const resolved = resolveSymlinks(dir, io, arena, path) orelse return .ok;
+    defer arena.free(resolved);
+    const resolved_verdict = checkRead(resolved);
+    if (resolved_verdict != .ok) return resolved_verdict;
+    // Also walk components: a symlinked dir segment (e.g. a link named `x`
+    // pointing into ~/.config/zode) must be secret even if the basename is
+    // innocent. resolveSymlinks already expanded it, so basename check above
+    // covers the final component; segments are covered by resolving again
+    // on each prefix (open components).
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(arena);
+    tmp.appendSlice(arena, "") catch return .ok;
+    var split = std.mem.splitScalar(u8, path, '/');
+    while (split.next()) |seg| {
+        if (seg.len == 0) continue;
+        const cur = std.fmt.allocPrint(arena, "{s}{s}", .{ tmp.items, seg }) catch return .ok;
+        defer arena.free(cur);
+        const r = resolveSymlinks(dir, io, arena, cur) orelse {
+            tmp.appendSlice(arena, seg) catch return .ok;
+            if (tmp.items.len > 0) tmp.append(arena, '/') catch {};
+            continue;
+        };
+        defer arena.free(r);
+        if (checkRead(r) != .ok) return checkRead(r);
+        tmp.clearRetainingCapacity();
+        tmp.appendSlice(arena, cur) catch return .ok;
+        tmp.append(arena, '/') catch return .ok;
+    }
+    return .ok;
+}
+
 // ── resolving the path ─────────────────────────────────────────────────────
 
 /// The path with its symlinks resolved, or null when it cannot be resolved.
