@@ -153,6 +153,10 @@ pub const Palette = struct {
     }
 
     pub fn deinit(self: *Palette) void {
+        @memset(self.key_input[0..], 0);
+        @memset(self.query[0..], 0);
+        self.key_len = 0;
+        self.query_len = 0;
         self.filtered[0].deinit(self.gpa);
         self.filtered[1].deinit(self.gpa);
         if (self.custom_title.len > 0) {
@@ -352,10 +356,15 @@ pub const Palette = struct {
         self.active = false;
         self.mode = .commands;
         self.query_len = 0;
+        @memset(self.query[0..], 0);
         self.key_len = 0;
+        @memset(self.key_input[0..], 0);
         self.key_msg_len = 0;
         self.key_msg_error = false;
-        self.custom_title = "";
+        if (self.custom_title.len > 0) {
+            self.gpa.free(self.custom_title);
+            self.custom_title = "";
+        }
         self.col = 1;
         self.sel = .{ 0, 0 };
         self.scroll = .{ 0, 0 };
@@ -621,13 +630,15 @@ fn displayWidth(text: []const u8) usize {
     return n;
 }
 
-/// Frees a list of items along with their strings. Each `label`/`hint` is an
-/// owned copy (dup), not a slice from the caller's allocator: if they were, the
-/// free would leave dangling pointers in the palette.
+/// Frees a list of items along with their strings. Each `label`/`hint`/`provider`
+/// is an owned copy (dup), not a slice from the caller's allocator: if they were,
+/// the free would leave dangling pointers in the palette.
+/// Empty strings are literals and must NOT be freed (Invalid free).
 pub fn freeItems(gpa: std.mem.Allocator, items: []const Item) void {
     for (items) |it| {
-        gpa.free(it.label);
-        gpa.free(it.hint);
+        if (it.label.len > 0) gpa.free(it.label);
+        if (it.hint.len > 0) gpa.free(it.hint);
+        if (it.provider.len > 0) gpa.free(it.provider);
     }
     gpa.free(@constCast(items));
 }
@@ -1368,13 +1379,16 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
             return .{ .connect = .{ .provider = provider, .key = pal.keyText() } };
         }
         if (key.matches(vaxis.Key.backspace, .{})) {
-            if (pal.key_len > 0) pal.key_len -= 1;
+            if (pal.key_len > 0) pal.key_len = backOneGrapheme(pal.key_input[0..pal.key_len]);
             return .{ .none = {} };
         }
         if (key.text) |txt| {
-            if (txt.len > 0 and pal.key_len < max_key) {
-                @memcpy(pal.key_input[pal.key_len .. pal.key_len + txt.len], txt);
-                pal.key_len += txt.len;
+            if (txt.len > 0) {
+                const room = max_key -| pal.key_len;
+                if (room == 0) return .{ .none = {} };
+                const n = @min(txt.len, room);
+                @memcpy(pal.key_input[pal.key_len .. pal.key_len + n], txt[0..n]);
+                pal.key_len += n;
             }
         }
         return .{ .none = {} };
@@ -1442,7 +1456,9 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
     if (key.text) |txt| {
         // Only printable text: keys with a modifier have already been filtered.
         if (txt.len > 0 and !key.mods.ctrl and !key.mods.alt) {
-            const n = @min(txt.len, max_query - pal.query_len);
+            const room = max_query -| pal.query_len;
+            if (room == 0) return .{ .none = {} };
+            const n = @min(txt.len, room);
             @memcpy(pal.query[pal.query_len .. pal.query_len + n], txt[0..n]);
             pal.query_len += n;
             pal.sel = .{ 0, 0 };
