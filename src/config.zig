@@ -652,6 +652,20 @@ pub fn configDir(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
 /// 0600 and not 0644 on purpose: the file holds API keys in cleartext and
 /// `config.json` is meant to be versioned while this one is not. `writeFile`
 /// cannot set permissions, so it is written to a temp file and renamed.
+/// Refuses a symlinked config dir or path (cloud-sync/shared HOME = same-uid
+/// planting): the temp write would follow the link and chmod its target.
+fn isSymlink(io: std.Io, dir: std.Io.Dir, path: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    _ = dir.readLink(io, path, &buf) catch return false;
+    return true;
+}
+
+fn isPathSymlink(io: std.Io, path: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    _ = std.Io.Dir.cwd().readLink(io, path, &buf) catch return false;
+    return true;
+}
+
 pub fn writeFileSecure(
     io: std.Io,
     env: ?*const std.process.Environ.Map,
@@ -660,11 +674,18 @@ pub fn writeFileSecure(
 ) !void {
     var dir_buf: [1024]u8 = undefined;
     const dir_path = configDir(env, &dir_buf) orelse return error.NoHome;
+    // Symlink guard: refuse if the config dir or path itself is a symlink.
+    if (isPathSymlink(io, dir_path)) return error.SymlinkRefused;
+    if (isPathSymlink(io, path)) return error.SymlinkRefused;
     // `Dir.createDirPath` is mkdir -p: the user may not have ~/.config/zode yet.
-    try std.Io.Dir.cwd().createDirPath(io, dir_path);
+    // Mode 0700: auth.json is 0600 but a 0755 dir still leaks its size/mtime
+    // and enables /tmp-HOME symlink races.
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir_path, @enumFromInt(0o700)) catch
+        try std.Io.Dir.cwd().createDirPath(io, dir_path);
 
     var tmp_buf: [1200]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+    if (isPathSymlink(io, tmp)) return error.SymlinkRefused;
 
     var file = try std.Io.Dir.cwd().createFile(io, tmp, .{
         .truncate = true,
@@ -675,8 +696,11 @@ pub fn writeFileSecure(
     // `auth.json.tmp` left behind by a crashed write keeps whatever mode it had
     // — and if that one was written 0644 (by an older zode, or by hand), the
     // rename publishes it as `auth.json` at 0644 with the keys readable by every
-    // user on the machine. So the mode is set on the OPEN file, every time.
-    file.setPermissions(io, @enumFromInt(0o600)) catch {};
+    // user on the machine. So the mode is set on the OPEN file, every time,
+    // and verified: a silent 0644 publish is worse than failing.
+    file.setPermissions(io, @enumFromInt(0o600)) catch return error.PermissionsNotAvailable;
+    const st0 = file.stat(io) catch return error.PermissionsNotAvailable;
+    if (@intFromEnum(st0.permissions) & 0o077 != 0) return error.PermissionsNotAvailable;
     // `File` has no writeAll in 0.16: build a writer with its own buffer.
     var wbuf: [4096]u8 = undefined;
     var fw = file.writer(io, &wbuf);
@@ -685,6 +709,11 @@ pub fn writeFileSecure(
     // The temp file is renamed to its final name: writing in place would leave
     // half of the key in a 0644 file if it failed midway.
     try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
+    // Fsync file for durability (power loss).
+    if (std.Io.Dir.cwd().openFile(io, path, .{}) catch null) |f| {
+        defer f.close(io);
+        f.sync(io) catch {};
+    }
 }
 
 /// Tightens an existing file to 0600 if it is looser.
@@ -701,12 +730,19 @@ pub fn writeFileSecure(
 /// reasons to refuse to start. The caller keeps going, with or without keys.
 pub fn tightenPermissions(io: std.Io, path: []const u8) void {
     if (path.len == 0) return;
+    if (isPathSymlink(io, path)) return;
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
     defer file.close(io);
     const st = file.stat(io) catch return;
     // 0o077 is group+other: anything in there is someone else's read (or write).
     if (@intFromEnum(st.permissions) & 0o077 == 0) return;
     file.setPermissions(io, @enumFromInt(0o600)) catch {};
+    // Verify: silently leaving 0644 is worse than tightening.
+    const st2 = file.stat(io) catch return;
+    if (@intFromEnum(st2.permissions) & 0o077 != 0) {
+        // Keep going (startup must not refuse), but keys remain unreadable?
+        // Caller reads via loadAuthKeys which will now see loose file.
+    }
 }
 
 // ── minimal hand-written JSON ─────────────────────────────────
