@@ -195,6 +195,7 @@ pub const Http = struct {
         const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
         var auth_buf: [512]u8 = undefined;
+        defer @memset(auth_buf[0..], 0);
         var auth_value: ?[]const u8 = null;
         if (bearer) |token| {
             auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch null;
