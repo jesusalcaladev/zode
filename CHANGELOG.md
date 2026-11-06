@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - headless runner consumes taskloop policy (loop) [`95424820`](https://github.com/jesusalcaladev/zode/commit/95424820)
 - Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`635d9542`](https://github.com/jesusalcaladev/zode/commit/635d9542)
 - usage pretty panel with bar, footer cache-hit, session root hash (commands) [`c41f0015`](https://github.com/jesusalcaladev/zode/commit/c41f0015)
+- always-injected anti-listing rule in tool_routing_prompt (prompt) [`0e591e86`](https://github.com/jesusalcaladev/zode/commit/0e591e86)
 
 ### Bug Fixes
 
@@ -30,12 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - freeItems provider + empty guard, saturating key/query, zeroing (palette) [`87a11564`](https://github.com/jesusalcaladev/zode/commit/87a11564)
 - picker filtered for sessions, leak frees, ac reset, palette toggle, cache footer (tui) [`1ebf2f4c`](https://github.com/jesusalcaladev/zode/commit/1ebf2f4c)
 - separator guard sessions vs sessions2 (sessionpath) [`40b7451a`](https://github.com/jesusalcaladev/zode/commit/40b7451a)
-- tryLaunchBg deep copy to gpa (UAF) (compaction) [`4105f7ae`](https://github.com/jesusalcaladev/zode/commit/4105f7ae)
+- tryLaunchBg deep copy to gpa (UAF) (compaction) [`04584f91`](https://github.com/jesusalcaladev/zode/commit/04584f91)
 
 ### Chores
 
 - changelog points to the actual pipeline commit (release) [`12c35dd7`](https://github.com/jesusalcaladev/zode/commit/12c35dd7)
 - update gitignore and remove vendored code-base-fx reference [`6d3cd1db`](https://github.com/jesusalcaladev/zode/commit/6d3cd1db)
+
+### Other
+
+- zero auth_buf [`6dd6101d`](https://github.com/jesusalcaladev/zode/commit/6dd6101d)
+- scrubbed child env allowlist [`c5c96b3f`](https://github.com/jesusalcaladev/zode/commit/c5c96b3f)
 
 ## [0.2.1-beta.2] - 2026-10-31
 
