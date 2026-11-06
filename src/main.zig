@@ -14,6 +14,7 @@ const cache_stats = @import("cache_stats.zig");
 const chat = @import("chat.zig");
 const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
+const spawnenv_mod = @import("lib/spawnenv.zig");
 const compaction_mod = @import("compaction.zig");
 const taskloop = @import("lib/taskloop.zig");
 const bgproc = @import("bgproc.zig");
@@ -28,6 +29,9 @@ const ask = @import("lib/ask.zig");
 const lsp_manager = @import("lsp/manager.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const theme = @import("lib/theme.zig");
+
+var child_env_static: std.process.Environ.Map = undefined;
+var child_env_live: bool = false;
 
 // ── crash handling ─────────────────────────────────────────────────────
 //
@@ -389,7 +393,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // the file". Expanded HERE, on the session's own text, because the headless
     // runner has no per-iteration arena like `runOneTurn` has.
     const mentions_mod = @import("lib/mentions.zig");
-    const expanded = mentions_mod.expand(io, text) catch
+    const expanded = mentions_mod.expand(arena, io, text) catch
         mentions_mod.Expansion{ .text = text, .files = 0, .missing = 0 };
     try msgs.append(arena, .{ .role = "user", .content = expanded.text });
 
@@ -952,10 +956,19 @@ fn runTui(init: std.process.Init) !u8 {
     defer model.deinit();
     model.environ = init.environ_map;
     agent.status_model_target = &model;
+    // Scrubbed child env: bash/bg tools inherit only safe vars, never keys.
+    if (spawnenv_mod.buildChildEnv(gpa, init.environ_map.*)) |ce| {
+        child_env_static = ce;
+        child_env_live = true;
+        model.bg.child_env = &child_env_static;
+    } else |_| {}
     model.attachIo(io); // for the activity strip clock
     model.attach();
 
     agent.io_global = io;
+    // No core dumps with secrets: keys arena + palette buffers + environ
+    // would otherwise land in a systemd-coredump. Suid-dumpable off.
+    _ = std.posix.prctl(.SET_DUMPABLE, .{@as(usize, 0)}) catch {};
     // Without this the `models.dbg` diagnostics (status + server body) do not
     // show up in the TUI: you only see "models: HTTP error at <url>" and
     // nothing else, which does not say whether it was a 401, a 403 or a 404.
