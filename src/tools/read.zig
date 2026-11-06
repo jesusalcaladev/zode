@@ -120,7 +120,7 @@ fn readOne(
     // A `.env` inside the project is NOT in it: that is a project file the
     // user may well want the agent to look at, and a rule that blocks the
     // ordinary case is a rule that gets switched off.
-    const secret = pathsafe.checkRead(path);
+    const secret = pathsafe.checkReadResolved(arena, io, std.Io.Dir.cwd(), path);
     if (secret != .ok) return pathsafe.refusalText(arena, secret);
 
     var dir = std.Io.Dir.cwd();
