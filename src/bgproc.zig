@@ -156,6 +156,8 @@ pub const Job = struct {
 
 slots: [max_jobs]Job = @splat(.{}),
 next_id: u32 = 1,
+/// Scrubbed parent env for children (allowlist, secret-stripped).
+child_env: ?*const std.process.Environ.Map = null,
 /// The allocator every job's memory comes from and goes back to.
 ///
 /// ## Why the registry owns it, and not the caller
@@ -554,8 +556,10 @@ pub fn spawn(
     // what makes `kill(-pid)` possible in `killGroup`, and without it a `sh -c
     // "a && b"` leaves `a`'s children alive when only the shell is killed — which
     // is a background build that keeps burning the CPU after `/bg kill`.
+    // Env is scrubbed: children get the allowlist (PATH/HOME/...), never keys.
     var child = std.process.spawn(io, .{
         .argv = &argv,
+        .environ_map = reg.child_env,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
