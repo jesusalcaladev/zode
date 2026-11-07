@@ -15,6 +15,7 @@ const chat = @import("chat.zig");
 const agent = @import("agent.zig");
 const free_auto = @import("free_auto.zig");
 const spawnenv_mod = @import("lib/spawnenv.zig");
+const env_mod = @import("lib/env.zig");
 const compaction_mod = @import("compaction.zig");
 const taskloop = @import("lib/taskloop.zig");
 const bgproc = @import("bgproc.zig");
@@ -57,11 +58,43 @@ var child_env_live: bool = false;
 
 /// Enables stack-trace capture in Release builds. Stripping the binary still
 /// prevents symbolization, but the unwinder runs and the frames are printed.
-pub const std_options: std.Options = .{ .allow_stack_tracing = true };
+///
+/// `enable_segfault_handler` is set EXPLICITLY because its default is
+/// `runtime_safety`: a ReleaseFast build (and any build with safety off) had no
+/// handler at all, so a bad pointer took the process down without a word.
+pub const std_options: std.Options = .{
+    .allow_stack_tracing = true,
+    .enable_segfault_handler = true,
+};
 
 /// Root panic handler: give the terminal back, leave a crash log, then defer
 /// to the default handler (which prints the message and aborts).
 pub const panic = std.debug.FullPanic(zodePanic);
+
+/// A real SIGSEGV (or SIGILL/SIGBUS/SIGFPE) never reaches `zodePanic`: the
+/// signal handler is a separate path. The default one prints to stderr and
+/// exits, which leaves the terminal in raw mode over the alternate screen —
+/// the shell then echoes every key as garbage, and there is no trace of what
+/// died. This override does the same two things the panic path does.
+pub const debug = struct {
+    pub fn handleSegfault(addr: ?usize, name: []const u8, ctx: ?std.debug.CpuContextPtr) noreturn {
+        if (builtin.os.tag == .linux) {
+            restoreTerminalForCrash();
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "{s} at address 0x{x}", .{ name, addr orelse 0 }) catch name;
+            // The faulting instruction is the frame worth keeping. Everything
+            // else is printed by the default handler below. `CpuContext` does
+            // not spell the register the same way on every architecture; the
+            // `getPc` helper is the portable door.
+            var pc: ?usize = null;
+            if (ctx) |c| {
+                if (@hasDecl(@TypeOf(c.*), "getPc")) pc = c.getPc();
+            }
+            writeSegfaultLog(msg, pc);
+        }
+        std.debug.defaultHandleSegfault(addr, name, ctx);
+    }
+};
 
 /// Fixed path on purpose: panic time is not a moment to build directories or
 /// consult an environment map.
@@ -111,17 +144,18 @@ fn restoreTerminalForCrash() void {
     _ = std.posix.tcsetattr(fd, .FLUSH, copy) catch {};
 }
 
-/// Leave `/tmp/zode-crash.log` with the failure and the frames it could
-/// collect, for whoever picks the machine up afterwards. Appends.
-fn writeCrashLog(msg: []const u8, first_trace_addr: ?usize) void {
-    if (builtin.os.tag != .linux) return;
-    const fd = std.posix.openat(std.posix.AT.FDCWD, crash_log_path, .{
+/// Opens the crash log for appending, or says why not by returning null. Panic
+/// time is not a moment to build directories: the path is fixed.
+fn openCrashLog() ?std.posix.fd_t {
+    if (builtin.os.tag != .linux) return null;
+    return std.posix.openat(std.posix.AT.FDCWD, crash_log_path, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
         .APPEND = true,
-    }, 0o600) catch return;
-    defer _ = std.os.linux.close(fd);
+    }, 0o600) catch null;
+}
 
+fn writeCrashHeader(fd: std.posix.fd_t, msg: []const u8) void {
     linuxWriteAll(fd, "zode crash\n");
     var line_buf: [128]u8 = undefined;
     if (std.fmt.bufPrint(&line_buf, "version: {s}\n", .{@import("build_options").version})) |s| {
@@ -134,7 +168,20 @@ fn writeCrashLog(msg: []const u8, first_trace_addr: ?usize) void {
     linuxWriteAll(fd, "message: ");
     linuxWriteAll(fd, msg);
     linuxWriteAll(fd, "\n");
+}
 
+fn writeCrashFooter(fd: std.posix.fd_t) void {
+    linuxWriteAll(fd, "----------------------------------------\n");
+}
+
+/// Leave `/tmp/zode-crash.log` with the failure and the frames it could
+/// collect, for whoever picks the machine up afterwards. Appends.
+fn writeCrashLog(msg: []const u8, first_trace_addr: ?usize) void {
+    const fd = openCrashLog() orelse return;
+    defer _ = std.os.linux.close(fd);
+    writeCrashHeader(fd, msg);
+
+    var line_buf: [128]u8 = undefined;
     var addrs: [96]usize = undefined;
     const trace = std.debug.captureCurrentStackTrace(.{
         .first_address = first_trace_addr orelse @returnAddress(),
@@ -150,7 +197,28 @@ fn writeCrashLog(msg: []const u8, first_trace_addr: ?usize) void {
     } else {
         linuxWriteAll(fd, "frames: (unwinding failed)\n");
     }
-    linuxWriteAll(fd, "----------------------------------------\n");
+    writeCrashFooter(fd);
+}
+
+/// The signal handler's log entry. It deliberately does NOT unwind: walking the
+/// stack from inside a signal handler is exactly the kind of read that can fault
+/// again, and a second SIGSEGV in the handler has nowhere left to go. The
+/// faulting program counter is the one frame that matters, and the default
+/// handler prints the full trace to the terminal right after this returns.
+fn writeSegfaultLog(msg: []const u8, pc: ?usize) void {
+    const fd = openCrashLog() orelse return;
+    defer _ = std.os.linux.close(fd);
+    writeCrashHeader(fd, msg);
+    var line_buf: [128]u8 = undefined;
+    if (pc) |addr| {
+        if (std.fmt.bufPrint(&line_buf, "pc: 0x{x}\n", .{addr})) |s| {
+            linuxWriteAll(fd, s);
+        } else |_| {}
+    } else {
+        linuxWriteAll(fd, "pc: (not reported by this platform)\n");
+    }
+    linuxWriteAll(fd, "frames: (printed by the default handler; not unwound in a signal)\n");
+    writeCrashFooter(fd);
 }
 
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
@@ -968,7 +1036,21 @@ fn runTui(init: std.process.Init) !u8 {
     agent.io_global = io;
     // No core dumps with secrets: keys arena + palette buffers + environ
     // would otherwise land in a systemd-coredump. Suid-dumpable off.
-    _ = std.posix.prctl(.SET_DUMPABLE, .{@as(usize, 0)}) catch {};
+    //
+    // `ZODE_CORE_DUMP=1` lifts it for the crash you are hunting: with it the
+    // whole heap — `auth.json`, tokens, palette text — is on disk under
+    // /var/lib/systemd/coredump, so it is opt-in and not the default. The
+    // rlimit has to be lifted too, or an `ulimit -c 0` from the caller's
+    // environment silently swallows the core again.
+    if (env_mod.truthyIn(init.environ_map, "ZODE_CORE_DUMP", false)) {
+        if (std.posix.getrlimit(.CORE)) |lim| {
+            if (lim.cur != lim.max) {
+                _ = std.posix.setrlimit(.CORE, .{ .cur = lim.max, .max = lim.max }) catch {};
+            }
+        } else |_| {}
+    } else {
+        if (builtin.os.tag == .linux) _ = std.posix.prctl(.SET_DUMPABLE, .{@as(usize, 0)}) catch {};
+    }
     // Without this the `models.dbg` diagnostics (status + server body) do not
     // show up in the TUI: you only see "models: HTTP error at <url>" and
     // nothing else, which does not say whether it was a 401, a 403 or a 404.

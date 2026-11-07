@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-07
+
+### Features
+
+- Recoverable session-isolated tool results with frozen per-tool/aggregate caps and explicit recovery paths (harness) [`6605a6d`](https://github.com/jesusalcaladev/zode/commit/6605a6d)
+- Compaction v2: recoverable microcompaction markers, compaction boundaries/summary state persisted for resume, preserved invoked skills and read files, and tier-2 summary circuit-breaker behavior (harness) [`e9c1f30`](https://github.com/jesusalcaladev/zode/commit/e9c1f30)
+
+### Fixes
+
+- Refuse TTY-interactive/forbidden bash commands before execution/dialogs and harden Bash permission/always-allow UX (safety) [`6605a6d`](https://github.com/jesusalcaladev/zode/commit/6605a6d)
+- Fix black holes in transcript area (tui)
+
+
 ### Features
 
 - Phase 34.1 path-scoped permissions for file-writing tools (permissions) [`ca77972f`](https://github.com/jesusalcaladev/zode/commit/ca77972f)

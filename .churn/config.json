@@ -1,6 +1,6 @@
 {
   "package": "zode",
-  "baseVersion": "0.2.0-beta",
+  "baseVersion": "0.2.0",
   "versionTypes": {
     "breaking": "major",
     "feature": "minor",
@@ -13,5 +13,6 @@
     "next": "major"
   },
   "changelogFile": "CHANGELOG.md",
-  "autoGenerateChangelog": true
+  "autoGenerateChangelog": true,
+  "base_version": "0.2.0"
 }

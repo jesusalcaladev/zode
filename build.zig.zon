@@ -1,6 +1,6 @@
 .{
     .name = .zode,
-    .version = "0.2.1-beta.2",
+    .version = "0.2.0",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0x5a04288de80c5733,
     .dependencies = .{

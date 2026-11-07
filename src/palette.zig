@@ -171,6 +171,13 @@ pub const Palette = struct {
     pub fn keyText(self: *const Palette) []const u8 {
         return self.key_input[0..self.key_len];
     }
+    /// Appends pasted/typed text to the key prompt buffer, filtering control
+    /// characters (including newlines) and respecting the key length limit.
+    pub fn appendKeyText(self: *Palette, text: []const u8) void {
+        const room = max_key -| self.key_len;
+        if (room == 0) return;
+        self.key_len += appendPrintable(self.key_input[self.key_len .. self.key_len + room], text);
+    }
     pub fn keyMessage(self: *const Palette) []const u8 {
         return self.key_msg[0..self.key_msg_len];
     }
@@ -755,12 +762,18 @@ pub fn draw(
         .connect => "filter providers",
         .key_prompt => "",
     };
+    // The cursor goes at the END OF WHAT IS ON SCREEN: `q.len` is a byte count,
+    // so with any multi-byte character (or a long query clipped by the box) it
+    // put the cursor past the text, and a query holding control bytes put it
+    // past the border. `putText` returns the column it stopped at.
+    var cursor_col = box.x + 3;
     if (q.len > 0) {
-        _ = p.putText(box.x + 3, sy, q, theme.brand);
+        cursor_col = p.putText(box.x + 3, sy, q, theme.brand);
     } else {
         _ = p.putText(box.x + 3, sy, placeholder, theme.brand_faint);
     }
-    surface.cursor = .{ .row = sy, .col = box.x + 3 + @as(u16, @intCast(q.len)) };
+    const max_col: u16 = if (box.w > 4) box.x + box.w - 2 else box.x;
+    surface.cursor = .{ .row = sy, .col = @min(cursor_col, max_col) };
 
     // ── list ──
     if (pal.mode == .models and pal.countIn(0) > 0) {
@@ -1386,8 +1399,7 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
             if (txt.len > 0) {
                 const room = max_key -| pal.key_len;
                 if (room == 0) return .{ .none = {} };
-                const n = @min(txt.len, room);
-                @memcpy(pal.key_input[pal.key_len .. pal.key_len + n], txt[0..n]);
+                const n = appendPrintable(pal.key_input[pal.key_len .. pal.key_len + room], txt);
                 pal.key_len += n;
             }
         }
@@ -1458,8 +1470,20 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
         if (txt.len > 0 and !key.mods.ctrl and !key.mods.alt) {
             const room = max_query -| pal.query_len;
             if (room == 0) return .{ .none = {} };
-            const n = @min(txt.len, room);
-            @memcpy(pal.query[pal.query_len .. pal.query_len + n], txt[0..n]);
+            // `text` is not guaranteed to be a character. Bracketed paste and
+            // terminal REPLIES (kitty's `CSI 13;129;3u`, an SGR mouse report)
+            // arrive as text with C0 bytes in it, and copying them into the
+            // query made the search line paint the tail of an escape sequence
+            // (`[13;129;3u`) while the cursor column was computed from bytes
+            // that are not on screen. A filter over labels takes printable
+            // text and nothing else: a sequence with a control byte in it is
+            // dropped whole, printable tail included.
+            if (!isPrintableText(txt)) return .{ .none = {} };
+            // `appendPrintable`, not `@memcpy`: when the query has room for
+            // one byte of a two-byte character, copying the byte alone leaves
+            // invalid UTF-8 in the filter.
+            const n = appendPrintable(pal.query[pal.query_len .. pal.query_len + room], txt);
+            if (n == 0) return .{ .none = {} };
             pal.query_len += n;
             pal.sel = .{ 0, 0 };
             pal.scroll = .{ 0, 0 };
@@ -1475,6 +1499,54 @@ pub fn handleKey(pal: *Palette, key: vaxis.Key) Action {
         return activateItem(pal, pal.filtered[c].items[slot]);
     }
     return .{ .none = {} };
+}
+
+/// True when `src` is text a human typed: valid UTF-8 with no C0, DEL or C1.
+/// A terminal REPLY (`CSI 13;129;3u`, an SGR mouse report) and a pasted
+/// newline both carry control bytes; their printable tail is not a character
+/// and must not reach a filter as if it were one.
+pub fn isPrintableText(src: []const u8) bool {
+    if (src.len == 0) return false;
+    var i: usize = 0;
+    while (i < src.len) {
+        const len = std.unicode.utf8ByteSequenceLength(src[i]) catch return false;
+        if (i + len > src.len) return false;
+        const cp = std.unicode.utf8Decode(src[i .. i + len]) catch return false;
+        if (cp < 0x20 or cp == 0x7f or (cp >= 0x80 and cp <= 0x9f)) return false;
+        i += len;
+    }
+    return true;
+}
+
+/// Copies the printable part of `src` into `dst` and returns how many bytes it
+/// wrote. C0, DEL, C1 and invalid UTF-8 are dropped; a multi-byte character is
+/// copied whole or not at all, so a truncated paste cannot leave half a
+/// sequence behind (that is no longer valid UTF-8, and the terminal would paint
+/// its replacement glyph inside the query).
+pub fn appendPrintable(dst: []u8, src: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        const len = std.unicode.utf8ByteSequenceLength(src[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > src.len) break;
+        const cp = std.unicode.utf8Decode(src[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        // C0 (ESC, CR, LF, TAB…), DEL and the C1 block: never text.
+        if (cp < 0x20 or cp == 0x7f or (cp >= 0x80 and cp <= 0x9f)) {
+            i += len;
+            continue;
+        }
+        if (n + len > dst.len) break;
+        @memcpy(dst[n .. n + len], src[i .. i + len]);
+        n += len;
+        i += len;
+    }
+    return n;
 }
 
 /// Index of the last complete UTF-8 character before `len`.
@@ -1532,6 +1604,75 @@ test "handleKey: typing filters and enter returns the action" {
     // Enter returns run_command with the item's label (not the prefix).
     const act = handleKey(&pal, .{ .codepoint = 13 });
     try t.expectEqualStrings("/model", act.run_command);
+}
+
+test "handleKey: escape sequences in key text never enter the query" {
+    // Terminal REPLIES reach the palette as key text: kitty's
+    // `CSI 13;129;3u`, an SGR mouse report `ESC [ < 35 ; 4 ; 5 M`, a pasted
+    // newline. Copying them into the query painted the tail of the sequence on
+    // the search line and moved the cursor to a column that has nothing on it.
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    const items = [_]Item{.{ .kind = .command, .label = "/help" }};
+    pal.setItems(&items, &.{});
+    pal.active = true;
+
+    for ([_][]const u8{
+        "\x1b[13;129;3u",
+        "\x1b[<35;4;5M",
+        "\r\n\x07\x7f",
+    }) |seq| {
+        _ = handleKey(&pal, .{ .codepoint = 0, .text = seq });
+        try t.expectEqualStrings("", pal.queryText());
+    }
+
+    // Printable text around a control byte goes with it: the tail of an escape
+    // sequence is not a query.
+    _ = handleKey(&pal, .{ .codepoint = 'a', .text = "a\x1b" });
+    try t.expectEqualStrings("", pal.queryText());
+
+    // And a normal query still works after all of that.
+    _ = handleKey(&pal, .{ .codepoint = 'a', .text = "a" });
+    _ = handleKey(&pal, .{ .codepoint = 'b', .text = "b" });
+    try t.expectEqualStrings("ab", pal.queryText());
+}
+
+test "handleKey: the key prompt rejects control bytes too" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    pal.mode = .key_prompt;
+    pal.active = true;
+
+    _ = handleKey(&pal, .{ .codepoint = 0, .text = "sk-abc\r\n\x1b[D" });
+    try t.expectEqualStrings("sk-abc[D", pal.keyText());
+}
+
+test "draw: the search cursor stays on the text with multi-byte characters" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    var m = tui.Model.init(t.allocator);
+    defer m.deinit();
+
+    const items = [_]Item{.{ .kind = .command, .label = "/help" }};
+    m.pal.setItems(&items, &.{});
+    m.pal.active = true;
+
+    // "ñ" is ONE column and TWO bytes. The cursor used to be `x + len`, so it
+    // landed one column past the text; with "x" (one byte) it landed correctly.
+    // Same columns in, same cursor column out.
+    const multi = "ñ";
+    @memcpy(m.pal.query[0..multi.len], multi);
+    m.pal.query_len = multi.len;
+    const a = try tui.drawTest(&m, arena_state.allocator(), 80, 24);
+    const cursor_multi = a.cursor.?;
+
+    m.pal.query[0] = 'x';
+    m.pal.query_len = 1;
+    const b = try tui.drawTest(&m, arena_state.allocator(), 80, 24);
+    const cursor_ascii = b.cursor.?;
+
+    try t.expectEqual(cursor_ascii.col, cursor_multi.col);
+    try t.expectEqual(cursor_ascii.row, cursor_multi.row);
 }
 
 test "handleKey: esc closes" {
