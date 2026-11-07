@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - snapshotMsgs deep copy, buildModelItems single-pass sort, keychain-first load/store, image ext fix, wider impl signals, TurnStats.reads (agent) [`dc304379`](https://github.com/jesusalcaladev/zode/commit/dc304379)
 - redact known keys + sk-/Bearer/_KEY shapes (redact) [`519a0ea3`](https://github.com/jesusalcaladev/zode/commit/519a0ea3)
 - allowlist + secret stripping (spawnenv) [`4346d1cd`](https://github.com/jesusalcaladev/zode/commit/4346d1cd)
-- secret-tool lookup/store fallback (keychain) [`af40417f`](https://github.com/jesusalcaladev/zode/commit/af40417f)
+- secret-tool lookup/store fallback (keychain) [`a0c1b793`](https://github.com/jesusalcaladev/zode/commit/a0c1b793)
 
 ### Bug Fixes
 
@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - separator guard sessions vs sessions2 (sessionpath) [`40b7451a`](https://github.com/jesusalcaladev/zode/commit/40b7451a)
 - tryLaunchBg deep copy to gpa (UAF) (compaction) [`04584f91`](https://github.com/jesusalcaladev/zode/commit/04584f91)
 - temp+rename atomic write (modelcache) [`57a4a145`](https://github.com/jesusalcaladev/zode/commit/57a4a145)
+- complete scanner refactor and segment conversions (highlight) [`72fb2558`](https://github.com/jesusalcaladev/zode/commit/72fb2558)
 
 ### Chores
 
