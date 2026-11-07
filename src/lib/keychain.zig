@@ -36,20 +36,29 @@ pub fn lookup(alloc: std.mem.Allocator, io: std.Io, provider: []const u8) ?[]u8 
 }
 
 pub fn store(alloc: std.mem.Allocator, io: std.Io, provider: []const u8, key: []const u8) bool {
-    _ = key;
     if (!available(io)) return false;
     const label = std.fmt.allocPrint(alloc, "zode/{s}", .{provider}) catch return false;
     defer alloc.free(label);
     const argv = [_][]const u8{ "secret-tool", "store", "--label", label, "application", "zode", "user", label };
-    const res = std.process.run(alloc, io, .{
+    var child = std.process.spawn(io, .{
         .argv = &argv,
-        .stdout_limit = .limited(8192),
-        .stderr_limit = .limited(8192),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch return false;
-    defer alloc.free(res.stdout);
-    defer alloc.free(res.stderr);
-    return res.term == .exited and res.term.exited == 0;
+
+    var ok = false;
+    if (child.stdin) |in| {
+        var buf: [4096]u8 = undefined;
+        var w = in.writer(io, &buf);
+        w.interface.writeAll(key) catch {};
+        w.interface.flush() catch {};
+        in.close(io);
+        child.stdin = null;
+    }
+    const term = child.wait(io) catch return false;
+    ok = term == .exited and term.exited == 0;
+    return ok;
 }
 
 test "keychain: lookup returns null without secret-tool" {

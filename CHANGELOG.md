@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - separator guard sessions vs sessions2 (sessionpath) [`40b7451a`](https://github.com/jesusalcaladev/zode/commit/40b7451a)
 - tryLaunchBg deep copy to gpa (UAF) (compaction) [`04584f91`](https://github.com/jesusalcaladev/zode/commit/04584f91)
 - temp+rename atomic write (modelcache) [`57a4a145`](https://github.com/jesusalcaladev/zode/commit/57a4a145)
-- complete scanner refactor and segment conversions (highlight) [`72fb2558`](https://github.com/jesusalcaladev/zode/commit/72fb2558)
+- complete scanner refactor and segment conversions (highlight) [`1b841cb5`](https://github.com/jesusalcaladev/zode/commit/1b841cb5)
+- pipe provider key to secret-tool stdin (keychain) [`83fa2e33`](https://github.com/jesusalcaladev/zode/commit/83fa2e33)
 
 ### Chores
 
