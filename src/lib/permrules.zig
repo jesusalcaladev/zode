@@ -130,21 +130,65 @@ pub const dangerous_patterns: []const []const u8 = &[_][]const u8{
 };
 
 /// Whether a rule's tool+pattern is one of the dangerous bare interpreters.
-/// A bare interpreter with a broad pattern (`bash(*)`, `python(*)`) lets the
-/// model run any command through it, so an `always allow` on it is a hazard.
+/// A bare interpreter with a broad pattern (`bash(*)`, `python(*)`, or
+/// `Bash(python *)`) lets the model run arbitrary commands, so an
+/// `always allow` on it is a hazard.
 pub fn isDangerousPattern(tool: []const u8, pattern: []const u8) bool {
+    // Rule tool is itself a dangerous interpreter with an unrestricted pattern.
     for (dangerous_patterns) |dp| {
         if (std.ascii.eqlIgnoreCase(tool, dp)) {
-            // A pattern of `*` or `*` with anything after it covers everything
-            // the interpreter can run. `*` alone, or `* ` with args, is broad.
             if (std.mem.eql(u8, pattern, "*")) return true;
-            // `bash -c *` also runs anything: the first word is the
-            // interpreter, the rest is the command it will execute.
             if (std.mem.startsWith(u8, pattern, "*")) return true;
-            return false;
+            // `bash(git *)` as "interpreter tool" is not unrestricted, but keep
+            // checking the harness-Bash form below (`Bash(sh *)` case).
+            break;
         }
     }
+    // Harness `Bash(...)` / shell command rules: `Bash(*)` is total.
+    // `Bash(python3 *)`/`Bash(sh *)` (interpreter + only wildcard, no scoped
+    // target) allows arbitrary execution through that interpreter.
+    if (std.ascii.eqlIgnoreCase(tool, "bash")) {
+        if (std.mem.eql(u8, pattern, "*")) return true;
+        if (std.mem.startsWith(u8, pattern, "* ")) return true;
+        if (std.mem.endsWith(u8, pattern, " *")) {
+            const first = patternFirstToken(pattern);
+            for (dangerous_patterns) |dp| {
+                if (std.ascii.eqlIgnoreCase(first, dp)) {
+                    return isUnscopedInterpreterPattern(pattern);
+                }
+            }
+        }
+        return false;
+    }
     return false;
+}
+
+fn isUnscopedInterpreterPattern(pattern: []const u8) bool {
+    // `python3 *` => unscoped. `python3 script.py *` / `python3 -m pytest *` => scoped.
+    var it = std.mem.tokenizeAny(u8, pattern, " \t");
+    _ = it.next() orelse return true; // interpreter
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "*")) return true; // reached wildcard with no target
+        if (std.mem.eql(u8, tok, "-c") or std.mem.eql(u8, tok, "-e") or std.mem.eql(u8, tok, "--eval") or std.mem.eql(u8, tok, "--execute"))
+            return true;
+        if (std.mem.eql(u8, tok, "-m")) {
+            // `-m module *` is scoped by module name.
+            const mod = it.next() orelse return true;
+            if (std.mem.eql(u8, mod, "*")) return true;
+            return false;
+        }
+        if (tok.len > 0 and tok[0] == '-') continue; // flag, keep looking
+        return false; // found a target (script/path/subcommand)
+    }
+    return true;
+}
+
+fn patternFirstToken(pattern: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < pattern.len and (pattern[i] == ' ' or pattern[i] == '\t')) i += 1;
+    const start = i;
+    while (i < pattern.len and pattern[i] != ' ' and pattern[i] != '\t' and pattern[i] != '*') i += 1;
+    return pattern[start..i];
 }
 
 /// Whether `super` covers everything `sub` covers: same tool (or `*` in super),
@@ -176,12 +220,33 @@ pub fn shadowedRule(rules: []const Rule, index: usize) bool {
         // An allow from an equal or stronger source shadows an allow.
         if (other.action != .allow) continue;
         if (!covers(other, sub)) continue;
-        const other_stronger = @intFromEnum(other.source) < @intFromEnum(sub.source);
+        const other_stronger = @backingInt(other.source) < @backingInt(sub.source);
         const same_source = other.source == sub.source;
         const later_in_file = same_source and i > index;
         if (other_stronger or later_in_file) return true;
     }
     return false;
+}
+
+/// Parses `Tool(pattern) action` without allocating. Returns borrowed slices.
+pub fn parseRuleText(text: []const u8) ?struct { tool: []const u8, pattern: []const u8, action: Action } {
+    const line = std.mem.trim(u8, text, " \t\r\n");
+    if (line.len == 0 or line[0] == '#') return null;
+    const open = std.mem.indexOfScalar(u8, line, '(') orelse return null;
+    const tool = std.mem.trim(u8, line[0..open], " \t");
+    if (tool.len == 0) return null;
+    const close = std.mem.lastIndexOfScalar(u8, line, ')') orelse return null;
+    if (close <= open) return null;
+    const pattern = std.mem.trim(u8, line[open + 1 .. close], " \t");
+    var action: Action = .allow;
+    const rest = std.mem.trim(u8, line[close + 1 ..], " \t");
+    if (rest.len > 0) action = Action.parse(rest) orelse return null;
+    return .{ .tool = tool, .pattern = pattern, .action = action };
+}
+
+pub fn isDangerousRuleText(text: []const u8) bool {
+    const r = parseRuleText(text) orelse return false;
+    return isDangerousPattern(r.tool, r.pattern);
 }
 
 /// Parses ONE rule: `Tool(pattern) action`.
@@ -343,7 +408,7 @@ pub const Decision = struct {
 /// already there: the LAST rule of a file wins, and that is handled by the
 /// caller walking the rules in order.
 fn stronger(a: Source, b: Source) bool {
-    return @intFromEnum(a) < @intFromEnum(b);
+    return @backingInt(a) < @backingInt(b);
 }
 
 /// The rules of a JSON value: the `rules` array, in either shape.
@@ -673,10 +738,23 @@ test "permrules: isDangerousPattern flags bare interpreters with broad patterns"
     try t.expect(isDangerousPattern("sh", "*"));
     try t.expect(isDangerousPattern("python", "*"));
     try t.expect(isDangerousPattern("node", "*"));
+    // Bash tool rules that run a dangerous interpreter as prefix.
+    try t.expect(isDangerousPattern("Bash", "*"));
+    try t.expect(isDangerousPattern("Bash", "sh *"));
+    try t.expect(isDangerousPattern("Bash", "python3 *"));
+    try t.expect(isDangerousPattern("Bash", "node *"));
+    try t.expect(isDangerousPattern("Bash", "bash *"));
+    try t.expect(isDangerousPattern("Bash", "python3 -u *")); // flags only, no target
+    // Scoped interpreter invocations are not "run anything" and may be allowed.
+    try t.expect(!isDangerousPattern("Bash", "python3 script.py *"));
+    try t.expect(!isDangerousPattern("Bash", "python3 -m pytest *"));
+    try t.expect(!isDangerousPattern("Bash", "node tools/build.js *"));
     // Narrow patterns are not dangerous: they cover one command, not everything.
     try t.expect(!isDangerousPattern("bash", "git status"));
     try t.expect(!isDangerousPattern("bash", "git *"));
     try t.expect(!isDangerousPattern("python", "script.py"));
+    try t.expect(!isDangerousPattern("Bash", "git *"));
+    try t.expect(!isDangerousPattern("Bash", "zig build test"));
     // Non-interpreter tools are never dangerous.
     try t.expect(!isDangerousPattern("write", "*"));
     try t.expect(!isDangerousPattern("read", "*"));

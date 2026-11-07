@@ -153,6 +153,12 @@ export ZODE_PROVIDER="openrouter"       # opencode | openrouter | anthropic | op
 ./zig-out/bin/zode --models             # list available models
 ```
 
+## What's new / key behavior
+
+- **Staged task pipeline**: `/pipeline <task>` runs a fixed, harness-owned flow — evidence → (investigator when needed) → implement → tester → verify → review — so the model cannot skip verification stages. The harness detects and runs the project's test suite, and it refuses to weaken or delete existing tests (Zig inline tests are re-hashed and enforced). `/code-review [paths]` runs the read-only review stage on the diff or specific files. Control with `ZODE_PIPELINE=auto|off|always`; artifacts are written to `.zode/pipeline/<id>/`. Say “omit tests” or “omit review” in the task to skip those stages.
+- **Memory that stays within budget**: when `ZODE_COMPACT` is unset, zode defaults to `elide` (Tier 1, free) — old tool results are replaced with markers on the wire while the session file keeps full history. This prevents long sessions from overflowing the model's context. Use `ZODE_COMPACT=full` for lossy summarization (opt-in, extra request; never at 256k+ model windows) or `ZODE_COMPACT=off` to keep history verbatim. Check `/context` for the live budget and compaction state.
+- **Mascot (Zo)**: the footer mascot reflects real harness state and, during a pipeline, the active stage (exploring/investigating/implementing/testing/verifying/reviewing) so progress is visible instead of ambiguous.
+
 ---
 
 ## Documentation

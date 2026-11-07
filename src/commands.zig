@@ -833,6 +833,18 @@ pub fn cmdContext(m: *tui.Model) void {
         }, agent.session_elided, agent.tps_last },
     ) catch "details";
     agent.pushInfoOwned(m, l3);
+    // The facts block is context too, and it is the part compaction cannot
+    // elide: it is re-attached verbatim. Showing the count (and the blockers
+    // separately) is how a user knows why the model believes something.
+    const facts_now = m.factsCopy();
+    if (!facts_now.isEmpty()) {
+        const lf = std.fmt.allocPrint(
+            m.allocator,
+            "  facts: {d} verified ({d} blocker{s}) · attached after the cached prefix, dropped when a source changes",
+            .{ facts_now.len, facts_now.countKind(.blocker), if (facts_now.countKind(.blocker) == 1) "" else "s" },
+        ) catch "facts";
+        agent.pushInfoOwned(m, lf);
+    }
     if (provider_count > 0) {
         const l3c = std.fmt.allocPrint(
             m.allocator,
@@ -1257,6 +1269,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
     .{ .key = "/style", .desc = "select an output style: default|explanatory|learning (no args: report | off)" },
+    .{ .key = "/dots", .desc = "on|off: prompt rail dots (click a dot to jump back to that prompt)" },
     .{ .key = "/copy", .desc = "copy an answer to the clipboard: /copy (the last one) | /copy N (N answers back)", .key_hint = "N" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
     .{ .key = "/clear", .desc = "clear the screen and reset the session caches (read list, changed list, skills)" },

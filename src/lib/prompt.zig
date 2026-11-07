@@ -122,7 +122,7 @@ pub const tool_routing_prompt =
     \\Choosing the right tool (do not guess — route): Each rule is "one call instead of N" to save round trips.
     \\ - `check` TYPECHECKS the project in the background, returning errors with file:line. Use it instead of `bash zig build` / `bash npx tsc` / `bash cargo check`: you spend no round trip guessing the command, and the input never freezes. After edits, read its output before writing more — an error found now costs one turn, three turns later costs three. It runs automatically after edits; call with no args and keep working. The harness WILL NOT end your turn while code has a red check behind it — not the harness stalling. What runs is the project's COMPILER, not the tests: no green typecheck means the tests pass. Upper rungs: `bash zig build test`, `check {id}`.
     \\ - INTERNET (find a site, game, product, docs, prices, news) → web tools. NEVER use bash (curl, wget, pip, npm ...) for the web. web_search = you do NOT have the URL and need to find pages. web_fetch = have URL, need content. Search first, fetch 1-2 promising URLs, then answer with links. web_fetch hands back a WINDOW of the page; first line names bytes, total, and `offset` continues them; pass that offset and you get the NEXT window of the same text. A long doc is 2-3 calls at ONE url; answering from first window as whole document is how pages get misread. Keep research narrow: one specific query, default five results, fetch only best primary sources. Snippets suffice for discovery; do not fetch every result. Do not repeat equivalent queries; refine the query instead. For long pages, request next offset needed, stop when evidence sufficient. Final claims must link to the source.
-    \\ - bash = EXECUTING on this machine: builds, tests, git, file inspection grep/glob cannot express. Not a "find out" tool: before bash, ask if read/grep/glob/refs/web_* is better/cheaper. Local code → glob/grep/refs (find) and read (understand).
+    \\ - bash = EXECUTING on this machine: builds, tests, git, file inspection grep/glob cannot express. Not a "find out" tool: before bash, ask if read/grep/glob/refs/web_* is better/cheaper. Local code → glob/grep/refs (find) and read (understand). Interactive TTY commands (e.g. `git rebase -i`, patch-mode prompts) are refused by the harness; use explicit non-interactive commands. Slow verifications may run in the background automatically; use `bash_output` when you need the result, without polling loops.
     \\ - JUPYTER (.ipynb): `read` returns a NUMBERED outline (index, type, size, first line) — that is how you learn a cell's number. Change the cell with `notebook_edit` by that index; NEVER `edit`/`write` the raw JSON of a notebook (cell source there is a JSON string with escaped newlines, the match fails for a reason you cannot see, and a rewrite destroys the outputs the user was looking at). It preserves outputs, metadata and cell ids, and a broken file is refused WITH the line and column of the parse error.
     \\ - `refs` = "where defined / who uses". Definitions and uses separated in one call. Don't grep and deduce the declaration yourself.
     \\ - Multiple files? ONE `read` with `paths` is 1 round trip; N calls = N trips. Round trip = whole request = money + seconds + rate-limit risk. Know 2+ files? Send together. Don't ask to be reminded.
@@ -402,6 +402,15 @@ test "web research stays focused and user-facing output stays compact" {
         try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, needle) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "do not repeat tool output") != null);
+}
+
+test "bash routing aligns with harness safety: TTY-interactive refused, prefer tools, auto-bg" {
+    for ([_][]const u8{ "Interactive TTY commands", "refused by the harness", "non-interactive", "bash_output", "without polling loops" }) |needle| {
+        if (std.mem.indexOf(u8, tool_routing_prompt, needle) == null) {
+            std.debug.print("missing bash safety guidance: {s}\n", .{needle});
+            return error.RuleMissing;
+        }
+    }
 }
 
 test "verification asks for a regression test, but NOT for a test rig" {

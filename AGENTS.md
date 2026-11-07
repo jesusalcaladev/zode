@@ -94,7 +94,7 @@ zig test src/chat.zig            # SSE parser tests
 - `ZODE_MAX_TOOL_OUTPUT` (default 1 MB, hard cap 10 MB; `K`/`M`/`G` suffixes)
 - `ZODE_CONTEXT_LIMIT` (unset: the model's own window, else 128k; budget = `ZODE_COMPACT_PCT`, 80% by default) — full settings reference in `docs/settings.md`
 - `ZODE_FREE_AUTO=1` / `ZODE_TASK_PARALLEL` (default 3) / `ZODE_MAX_ITER` (default 12)
-- `ZODE_COMPACT=off|elide|full`, `ZODE_COMPACT_PCT=10..95`
+- `ZODE_COMPACT=off|elide|full` (default when unset: `elide`, Tier 1 only), `ZODE_COMPACT_PCT=10..95`
 - `ZODE_YES=1` (autoconfirm destructive commands)
 - `ZODE_RESUME=1` / `ZODE_DBG_ERR=1`
 
@@ -107,6 +107,7 @@ src/lib/ pure/testable modules (no TUI, no network): readcache, project,
          prompt, sleep, skills, skillstore, mentions, markdown, highlight,
          web, models, providers, provider, http_client, subagent, ask,
          plan, checkpoint, editor, bench, clean, regex, mascot, theme,
+         facts, filewatch,
          zjsonl, verify, exitgate, cost, review, diffview, repeat,
          outputstyles, outputstyle_store, bundled_outputstyles
 ```
@@ -143,13 +144,14 @@ src/lib/ pure/testable modules (no TUI, no network): readcache, project,
 - **Self-update**: cache in `~/.cache/zode/update.json` (6h TTL, one file, respects `XDG_CACHE_HOME`). Check notifies; `/update` verifies binary (`--version`) before replacing; refuses to go backwards; writes `{exe}.new`, atomic rename over.
 - **Harness-authored prompts go into the SESSION as a `user` message**: `appendHarnessPrompt` is the one door. The wire of every iteration IS the session, so a refusal, checkpoint question or nudge that is not appended is one the model cannot read — action and reason silently uncorrelated. If you ever find yourself passing a nudge as a function argument that reaches no message, stop and append it instead.
 - **The ceiling turn gets no tools**: when the iteration budget is exhausted, `Model.deny_all_tools` removes the tools field from the body (buildBody omits it for an empty schema) and the model is asked for a final summary. A turn ended by a limit must not end in silence. `ZODE_CRASH_TEST=1 zig-out/bin/zode` is the diagnostic for the other hard failure: an intentional panic with the alt screen active, which exercises the crash handler (restore + `/tmp/zode-crash.log`).
-- **Crash path is its own code**: `src/main.zig` defines `pub const panic` (restore terminal via `termseq.restore_all` + `/dev/tty`, crash log with frames to `/tmp/zode-crash.log`) and `pub const std_options = .{ .allow_stack_tracing = true }` (Release builds were printing "stack tracing is disabled"). No `Io`, no allocator, raw syscalls only. ANSI/control bytes never reach a cell: `ansi.strip` removes complete CSI/OSC sequences from every paragraph at build time; `isControlGrapheme` U+FFFD backstop remains for anything else.
+- **Crash path is its own code**: `src/main.zig` defines `pub const panic` (restore terminal via `termseq.restore_all` + `/dev/tty`, crash log with frames to `/tmp/zode-crash.log`), `.enable_segfault_handler = true` in `std_options`, and a `pub const debug = struct { handleSegfault }` override — a real SIGSEGV (a Release build without safety checks) never reaches `panic`, so the override restores the terminal and appends a back-traced `pc:` entry, then defers to `defaultHandleSegfault` (no stack unwinding inside a signal). No `Io`, no allocator, raw syscalls only. ANSI/control bytes never reach a cell: `ansi.strip` removes complete CSI/OSC sequences from every paragraph at build time; `isControlGrapheme` U+FFFD backstop remains for anything else, and the palette refuses key text containing a control byte (a terminal reply is a sequence, not a character).
 - **The task pipeline is a state machine in code, not a prompt**: `/pipeline` (or `ZODE_PIPELINE=auto` on a code/install task) runs Explorer → Investigator? → Implementer → Tester → harness-run suite (with up to 2 repair passes) → Reviewer, and nobody — not the model, not a skill — can skip a stage. The harness runs the tests itself (`lib/testplan.zig`), and **existing tests are untouched or the run stops**: `lib/testguard.zig` re-hashes every `test "..."` block in the repo before and after each writing stage; red → the pipeline says what broke and by name. Review is read-only (`SEVERITY: high|medium|low` lines). `.zode/pipeline/<id>/` holds the artifacts (evidence, notes, review, tester report). "omit tests" / "omit review" in the prompt skips those stages. `/code-review [paths]` runs just the review stage, read-only.
 
 ## Verification workflow
 
 - `zig build test` — the primary gate. Tests read `AGENTS.md` for routing rules (`systemPromptBase` + `tool_routing_prompt` must stay separate) and for banner content (only ASCII wordmark, nothing else below art).
 - `tools/pty_smoke.py` — real pty (`TIOCSWINSZ` at 200x50, own `HOME`, drains pty). Checks: startup, banner, input, palette, scroll, `!cmd`, long prompt preserved, no panic, no `Invalid free`.
+- `tools/segv_probe.py` — SIGSEGV against the real binary in a pty: terminal must be restored, `/tmp/zode-crash.log` must gain a `pc:` entry. The panic path is `ZODE_CRASH_TEST=1`; this one is the memory-fault one.
 - `zig build ui-frame` — design harness: renders scenes with real `drawFn` + `Model` (public API only: `pushToolStart`, `streamStart`, `requestAsk`, etc.). Finds layout bugs (e.g., cache unsorted → banner painted in middle of transcript) that unit tests miss.
 - `zig build debug` — must produce symbolized binary (`.symtab`, `.debug_info`, `nm` lists symbols). A broken `debug` step is worse than none — the description IS the interface.
 - `zig build roster-probe` — verifies free model pool before rotation.

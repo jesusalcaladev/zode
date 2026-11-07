@@ -114,16 +114,25 @@ Four numbers decide compaction:
 | model's window | from catalogue | Adopted when you pick a model in `/model` |
 | fallback window | 128000 | When nothing above says anything |
 | `ZODE_COMPACT_PCT` | `80` | Budget = this % of the window (clamped 10–95) |
-| `ZODE_COMPACT` | `full` | `off`, `elide`, or `full` |
+| `ZODE_COMPACT` | `elide` | `off`, `elide` (default when unset), or `full` |
 | `ZODE_RECENT_WINDOW` | `8` | Messages kept verbatim |
 
 Two tiers, applied until the request is under budget:
 1. **Elide** (`elide`, `full`): old tool results >256 B outside the recent window become a marker. No request, no tokens; the session file keeps the original.
 2. **Summarize** (`full` only): oldest turns replaced by one summary from a single extra model call capped at 16 KB.
 
-`off` does neither — the provider will eventually reject an over-long request.
+`off` does neither — the provider will eventually reject an over-long request. `elide` is the safe default; `full` is opt-in (extra request, lossy summary, never at 256k+ model windows).
 
-Check where you stand with `/context` (window, budget, source of the limit, compaction mode, elided count).
+Check where you stand with `/context` (window, budget, source of the limit, compaction mode, elided count, verified facts).
+
+### Facts and files
+
+Two things keep a long session honest that compaction alone cannot:
+
+- **Verified facts.** A check that failed becomes a `blocker`; a check that passed becomes a `fact` ("compiles, not tested"). They are attached to the request as a `[Facts]` block after the cached prefix, so eliding old tool results does not take them away. The model never invents them: only the harness or a tool can add one.
+- **Files that changed under you.** At the start of each turn zode polls the files it already read. If one really changed (a moved timestamp is confirmed by hashing the bytes, so a `touch` does not count), the cached read and every fact sourced from that file are dropped, and the model is told before it acts on the old content. Writing a file has the same effect immediately.
+
+Neither needs configuration: the block is attached only when it changed, and the poll covers the files in context (at most 512).
 
 ## 7. Verify what zode wrote
 

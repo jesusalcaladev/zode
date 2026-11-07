@@ -19,6 +19,7 @@ const taskstore = @import("lib/taskstore.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
+const facts_mod = @import("lib/facts.zig");
 const goal_mod = @import("lib/goal.zig");
 const checkpoint = @import("lib/checkpoint.zig");
 const bgproc = @import("bgproc.zig");
@@ -27,6 +28,7 @@ const agent_mod = @import("agent.zig");
 const readcache = @import("lib/readcache.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const session_mod = @import("session.zig");
+const permrules = @import("lib/permrules.zig");
 const filesview = @import("lib/filesview.zig");
 const bench_mod = @import("lib/bench.zig");
 const cache_stats = @import("cache_stats.zig");
@@ -1105,6 +1107,10 @@ pub const Model = struct {
     /// It is not an `ArrayList`: the list is a fixed-size array (see `plan.zig`),
     /// so the draw paints it without allocating.
     plan: plan_mod.Plan = .{},
+    /// Verified facts for the session (`lib/facts.zig`). Written by the worker
+    /// (typecheck verdicts, poll invalidation), read by the turn loop, same
+    /// lock as `plan`. Not drawn: the `[Facts]` block is context, not UI.
+    facts: facts_mod.Store = .{},
     /// Worker-only plan-mode state, reset for each user turn.
     plan_touched_this_turn: bool = false,
     plan_write_blocked_this_turn: bool = false,
@@ -1290,10 +1296,9 @@ pub const Model = struct {
     prompt_dot_len: usize = 0,
     prompt_dot_col: u16 = 0,
     prompt_dot_hover: ?usize = null,
-    /// Show the prompt rail dots (the right-margin timeline). Disabled by
-    /// default: not polished enough yet. Re-enable when finished.
-    show_prompt_dots: bool = false,
-
+    /// Show the prompt rail dots (the right-margin timeline): click a dot to
+    /// jump back to that prompt.
+    show_prompt_dots: bool = true,
 
     /// Paragraph cache: 1 arena per closed paragraph, with the lines ALREADY
     /// wrapped at the current width. Invalidated on width change; frees the
@@ -2271,60 +2276,64 @@ pub const Model = struct {
                                 self.allocator.free(label);
                                 if (desc.len > 0) self.allocator.free(desc);
                             };
-                            const pd2 = self.allocator.dupe(u8, e.path) catch ""; _ = self.session_picker_paths.append(self.allocator, pd2) catch self.allocator.free(pd2);
+                            const pd2 = self.allocator.dupe(u8, e.path) catch "";
+                            _ = self.session_picker_paths.append(self.allocator, pd2) catch self.allocator.free(pd2);
                         }
                     }
                 } else {
-                var all_hits: std.ArrayList(session_search.SessionHit) = .empty;
-                defer all_hits.deinit(self.allocator);
+                    var all_hits: std.ArrayList(session_search.SessionHit) = .empty;
+                    defer all_hits.deinit(self.allocator);
 
-                // Tier 1: title substring — always runs, instant.
-                const title_hits: ?[]session_search.SessionHit = session_search.searchTitle(self.allocator, self.session_picker_entries.items, q) catch null;
-                if (title_hits) |h| {
-                    defer self.allocator.free(h);
-                    for (h) |hit| { all_hits.append(self.allocator, hit) catch {}; }
-                }
-
-                // Tier 2: transcript fuzzy — debounced. Only runs after the user
-                // pauses typing for `picker_transcript_debounce_s`. While typing,
-                // only tier-1 results are shown (Phase 29.5).
-                const debounce_ok = self.picker_query_changed_at == 0
-                    or now - self.picker_query_changed_at >= picker_transcript_debounce_s;
-                if (debounce_ok) {
-                    const transcript_hits: ?[]session_search.SessionHit = session_search.searchTranscript(self.allocator, self.io, self.session_picker_entries.items, q) catch null;
-                    if (transcript_hits) |h| {
+                    // Tier 1: title substring — always runs, instant.
+                    const title_hits: ?[]session_search.SessionHit = session_search.searchTitle(self.allocator, self.session_picker_entries.items, q) catch null;
+                    if (title_hits) |h| {
                         defer self.allocator.free(h);
-                        for (h) |hit| { all_hits.append(self.allocator, hit) catch {}; }
-                    }
-                }
-
-                const ranked: ?[]session_search.SessionHit = session_search.rankHits(self.allocator, all_hits.items) catch null;
-                if (ranked) |h| {
-                    defer self.allocator.free(h);
-                    // `ranked` may be empty on error; that's fine, shows nothing.
-                    for (h) |hit| {
-                        const session_id = std.fs.path.basename(hit.entry.path);
-                        const title = hit.entry.title(session_id);
-                        const label = self.allocator.dupe(u8, title) catch "";
-                        var desc: []const u8 = "";
-                        var desc_owned: ?[]u8 = null;
-                        if (hit.tier == .transcript and hit.snippet.len > 0) {
-                            desc_owned = self.allocator.dupe(u8, hit.snippet) catch null;
-                            if (desc_owned) |d| desc = d;
-                        } else {
-                            const age = sessionindex.ageLabel(now, hit.entry.created_at, &now_buf);
-                            desc_owned = self.allocator.dupe(u8, age) catch null;
-                            if (desc_owned) |d| desc = d;
+                        for (h) |hit| {
+                            all_hits.append(self.allocator, hit) catch {};
                         }
-                        self.picker_items.append(self.allocator, .{ .label = label, .desc = desc }) catch {
-                            self.allocator.free(label);
-                            if (desc_owned) |d| self.allocator.free(d);
-                        };
-                        const pdupe = self.allocator.dupe(u8, hit.entry.path) catch "";
-                        _ = self.session_picker_paths.append(self.allocator, pdupe) catch self.allocator.free(pdupe);
+                    }
+
+                    // Tier 2: transcript fuzzy — debounced. Only runs after the user
+                    // pauses typing for `picker_transcript_debounce_s`. While typing,
+                    // only tier-1 results are shown (Phase 29.5).
+                    const debounce_ok = self.picker_query_changed_at == 0 or now - self.picker_query_changed_at >= picker_transcript_debounce_s;
+                    if (debounce_ok) {
+                        const transcript_hits: ?[]session_search.SessionHit = session_search.searchTranscript(self.allocator, self.io, self.session_picker_entries.items, q) catch null;
+                        if (transcript_hits) |h| {
+                            defer self.allocator.free(h);
+                            for (h) |hit| {
+                                all_hits.append(self.allocator, hit) catch {};
+                            }
+                        }
+                    }
+
+                    const ranked: ?[]session_search.SessionHit = session_search.rankHits(self.allocator, all_hits.items) catch null;
+                    if (ranked) |h| {
+                        defer self.allocator.free(h);
+                        // `ranked` may be empty on error; that's fine, shows nothing.
+                        for (h) |hit| {
+                            const session_id = std.fs.path.basename(hit.entry.path);
+                            const title = hit.entry.title(session_id);
+                            const label = self.allocator.dupe(u8, title) catch "";
+                            var desc: []const u8 = "";
+                            var desc_owned: ?[]u8 = null;
+                            if (hit.tier == .transcript and hit.snippet.len > 0) {
+                                desc_owned = self.allocator.dupe(u8, hit.snippet) catch null;
+                                if (desc_owned) |d| desc = d;
+                            } else {
+                                const age = sessionindex.ageLabel(now, hit.entry.created_at, &now_buf);
+                                desc_owned = self.allocator.dupe(u8, age) catch null;
+                                if (desc_owned) |d| desc = d;
+                            }
+                            self.picker_items.append(self.allocator, .{ .label = label, .desc = desc }) catch {
+                                self.allocator.free(label);
+                                if (desc_owned) |d| self.allocator.free(d);
+                            };
+                            const pdupe = self.allocator.dupe(u8, hit.entry.path) catch "";
+                            _ = self.session_picker_paths.append(self.allocator, pdupe) catch self.allocator.free(pdupe);
+                        }
                     }
                 }
-            }
             }
             // The session branch rebuilds items, so the visible list must be
             // rebuilt too. Without this `picker_filtered` stays empty and the
@@ -2334,7 +2343,7 @@ pub const Model = struct {
             for (0..self.picker_items.items.len) |ix| {
                 self.picker_filtered.append(self.allocator, ix) catch break;
             }
-            } else {
+        } else {
             // Original behavior: filter picker_items by label match.
             var buf: [128]u32 = undefined;
             for (self.picker_items.items, 0..) |it, ix| {
@@ -2501,14 +2510,8 @@ pub const Model = struct {
             .description = sarena.dupe(u8, "semantic session search") catch "",
             .prompt = std.fmt.allocPrint(
                 sarena,
-                "Find zode session files semantically relevant to this query: \"{s}\"\n\n"
-                ++ "Session files are JSONL in the sessions directory. Each line is a message "
-                ++ "with role, content, etc. Session titles are derived from message content. "
-                ++ "Use `glob` to list session files, then `read` to examine promising ones. "
-                ++ "Look at titles and user/assistant messages to judge semantic relevance.\n\n"
-                ++ "Return ONLY the file paths of relevant sessions, one per line, no other text. "
-                ++ "Return nothing if none match.",
-                .{ query },
+                "Find zode session files semantically relevant to this query: \"{s}\"\n\n" ++ "Session files are JSONL in the sessions directory. Each line is a message " ++ "with role, content, etc. Session titles are derived from message content. " ++ "Use `glob` to list session files, then `read` to examine promising ones. " ++ "Look at titles and user/assistant messages to judge semantic relevance.\n\n" ++ "Return ONLY the file paths of relevant sessions, one per line, no other text. " ++ "Return nothing if none match.",
+                .{query},
             ) catch "",
         };
         if (task.description.len == 0 or task.prompt.len == 0) {
@@ -2523,8 +2526,13 @@ pub const Model = struct {
         while (rest.len > 0) {
             const nl = std.mem.indexOf(u8, rest, "\n");
             var line: []const u8 = "";
-            if (nl) |i| { line = rest[0..i]; rest = rest[i + 1..]; }
-            else { line = rest; rest = ""; }
+            if (nl) |i| {
+                line = rest[0..i];
+                rest = rest[i + 1 ..];
+            } else {
+                line = rest;
+                rest = "";
+            }
             const trimmed = std.mem.trim(u8, line, " \t\r\n");
             if (trimmed.len == 0) continue;
             if (std.mem.indexOf(u8, trimmed, ".jsonl") == null) continue;
@@ -2550,8 +2558,6 @@ pub const Model = struct {
         self.redraw_requested.store(true, .seq_cst);
         self.unlock();
     }
-
-
 
     ///
     /// Public because `agent.zig` is the one that opens the picker with them, and
@@ -2646,6 +2652,18 @@ pub const Model = struct {
             return;
         };
         self.setStatusWithMood(new_mood, s);
+    }
+
+    /// Sets the active pipeline stage label ("explorer", "investigator",
+    /// "implementer", "tester", "verify", "reviewer") or null. The draw path
+    /// uses it to show what the harness is doing and to keep the mascot/legend
+    /// in sync. Pass static string literals.
+    pub fn setPipelineStage(self: *Model, stage: ?[]const u8) void {
+        self.lock();
+        defer self.unlock();
+        self.pipeline_stage = stage;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
     }
 
     /// `pushError` that composes the text (the `.error_msg` kind, in red).
@@ -5014,6 +5032,46 @@ pub const Model = struct {
         self.redraw_requested.store(true, .seq_cst);
     }
 
+    /// Adds a verified fact. Returns true when the store changed (add
+    /// dedupes, so a repeated verdict is no event).
+    pub fn addFact(self: *Model, kind: facts_mod.Kind, text: []const u8, source: []const u8, source_hash: u64) bool {
+        self.lock();
+        defer self.unlock();
+        return self.facts.add(kind, text, source, source_hash);
+    }
+
+    /// Copy of the store for the turn loop (a value with fixed buffers:
+    /// a memcpy, like `planCopy`).
+    pub fn factsCopy(self: *Model) facts_mod.Store {
+        self.lock();
+        defer self.unlock();
+        return self.facts;
+    }
+
+    /// Forgets every fact. Facts belong to the session: a new or resumed
+    /// session starts empty, exactly like the read cache and the plan.
+    pub fn clearFacts(self: *Model) void {
+        self.lock();
+        defer self.unlock();
+        self.facts.clear();
+    }
+
+    /// Drops the facts whose source file changed (see `facts.Store`).
+    /// Returns how many were removed.
+    pub fn invalidateFactSource(self: *Model, path: []const u8, new_hash: u64) usize {
+        self.lock();
+        defer self.unlock();
+        return self.facts.invalidateSource(path, new_hash);
+    }
+
+    /// Drops the project-wide verdicts (check pass/fail): the project
+    /// changed under them. Returns how many were removed.
+    pub fn invalidateProjectFacts(self: *Model) usize {
+        self.lock();
+        defer self.unlock();
+        return self.facts.invalidateProject();
+    }
+
     /// Moves `pending` to `paras`. Called by draw; `pub` so the tests can check
     /// what got enqueued without setting up an `Io` (draw needs one).
     pub fn drainPending(self: *Model) void {
@@ -5354,11 +5412,18 @@ pub const Model = struct {
     /// move.
     fn refreshPromptDots(self: *Model, width: u16, history_h: u16) void {
         self.prompt_dot_len = 0;
+        if (!self.show_prompt_dots) {
+            self.prompt_dot_hover = null;
+            return;
+        }
         // The rail lives in the right margin, one column left of the
-        // scrollbar. Below 12 columns there is no margin left to use, and
-        // drawing there would paint over the text.
+        // scrollbar (scrollbar is at width-1). Below 12 columns there is no
+        // margin left to use, and drawing there would paint over the text.
         self.prompt_dot_col = if (width >= 12) width - 2 else 0;
-        if (self.prompt_dot_col == 0 or history_h == 0) return;
+        if (self.prompt_dot_col == 0 or history_h == 0) {
+            self.prompt_dot_hover = null;
+            return;
+        }
         if (self.paras.items.len == 0) return;
 
         self.ensureParaHeights();
@@ -5396,6 +5461,7 @@ pub const Model = struct {
 
     /// The dot under the pointer, or null when the pointer is not on one.
     fn promptDotAt(self: *const Model, m: vaxis.Mouse) ?PromptDot {
+        if (!self.show_prompt_dots) return null;
         if (self.prompt_dot_len == 0 or self.prompt_dot_col == 0) return null;
         if (m.row < 0 or m.col < 0) return null;
         if (@as(u16, @intCast(m.col)) != self.prompt_dot_col) return null;
@@ -5959,8 +6025,7 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     // mods, which is the order that works for a key that means two things.
     if (k.codepoint == vaxis.Key.enter) {
         if (k.mods.shift or k.mods.alt) {
-            if (self.ed.insertChar('\n')) |_| {
-            } else |err| {
+            if (self.ed.insertChar('\n')) |_| {} else |err| {
                 if (std.mem.eql(u8, @errorName(err), "InputTooLong")) inputTooLongRejected(self);
             }
             syncAutocomplete(self);
@@ -6054,9 +6119,12 @@ fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
 
     // Any other printable character (key.text decodes UTF-8).
     if (k.text) |txt| {
-        if (txt.len > 0 and !ctrl) {
-            if (self.ed.insert(txt)) |_| {
-            } else |err| {
+        // Same hole as the palette: a terminal reply (kitty `CSI 13;129;3u`,
+        // an SGR mouse report) reaches this path as key text with control
+        // bytes inside, and the composer would insert the sequence into the
+        // prompt — which then goes to the model. Only printable text enters.
+        if (txt.len > 0 and !ctrl and palette.isPrintableText(txt)) {
+            if (self.ed.insert(txt)) |_| {} else |err| {
                 if (std.mem.eql(u8, @errorName(err), "InputTooLong")) inputTooLongRejected(self);
             }
             syncAutocomplete(self);
@@ -6442,9 +6510,7 @@ fn acceptAutocomplete(self: *Model) bool {
 /// rejected edit, so the message is accurate at paint time.
 fn inputTooLongRejected(self: *Model) void {
     const text_len = self.ed.text().len;
-    const msg = std.fmt.bufPrint(&self.input_err_buf,
-        "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.",
-        .{ ed.max_bytes, text_len }) catch {
+    const msg = std.fmt.bufPrint(&self.input_err_buf, "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.", .{ ed.max_bytes, text_len }) catch {
         self.input_err = "Input too long: shorten the text.";
         self.input_too_long = true;
         return;
@@ -6485,7 +6551,11 @@ fn capturePasteKey(self: *Model, k: vaxis.Key) void {
         return;
     }
     if (k.text) |txt| {
-        if (txt.len > 0 and !k.mods.ctrl) {
+        // Same rule as the composer and the palette: a terminal reply that
+        // arrives as key text carries control bytes, and a paste is not the
+        // place to let them in either. Tabs never reach here — a raw 0x09 is
+        // Ctrl+I with no text.
+        if (txt.len > 0 and !k.mods.ctrl and palette.isPrintableText(txt)) {
             self.paste_buf.appendSlice(self.allocator, txt) catch {};
         }
         return;
@@ -6914,6 +6984,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // does the startup warmup. The palette never waits on the network
             // for a list the user expected to be current.
             agent.maybeRefreshCatalog(self);
+            agent.maybeRefreshModelPalette(self);
             try self.armTick(ctx);
         },
         .init => {
@@ -6951,15 +7022,24 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
         },
         .paste_end => {
             self.pasting = false;
-            // Our own editor has no paste callback: we insert by hand. A paste
-            // with line breaks creates a real multiline prompt.
-            insertIntoInput(self, self.paste_buf.items);
+            // Route bracketed paste to the active key prompt (provider connect),
+            // otherwise insert into the composer. Newlines/control chars are
+            // filtered by the key buffer so a pasted API key stays valid.
+            if (self.pal.active and self.pal.mode == .key_prompt) {
+                self.pal.appendKeyText(self.paste_buf.items);
+            } else {
+                insertIntoInput(self, self.paste_buf.items);
+            }
             self.paste_buf.clearRetainingCapacity();
             ctx.redraw = true;
         },
         .paste => |data| {
             // OSC-52 clipboard paste (the terminal already aggregated it).
-            insertIntoInput(self, data);
+            if (self.pal.active and self.pal.mode == .key_prompt) {
+                self.pal.appendKeyText(data);
+            } else {
+                insertIntoInput(self, data);
+            }
             ctx.redraw = true;
         },
         .mouse => |m| {
@@ -6976,12 +7056,22 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // The prompt rail's hover. It is read on motion only (not on drag:
             // a drag belongs to the gesture in progress) and it fills the dot
             // under the pointer, which is the only thing saying it is clickable.
-            if (m.type == .motion and !self.scrollbar_dragging and !self.selecting_text) {
+            // Skip while overlays own the surface so hover never gets stranded.
+            if (m.type == .motion and !self.scrollbar_dragging and !self.selecting_text and
+                !self.pal.active and !self.askActive() and !self.permActive())
+            {
                 const hot: ?usize = if (self.promptDotAt(m)) |d| d.para else null;
                 if (hot != self.prompt_dot_hover) {
                     self.prompt_dot_hover = hot;
                     ctx.redraw = true;
                 }
+                return;
+            }
+            if (m.type == .motion and self.prompt_dot_hover != null and
+                (self.pal.active or self.askActive() or self.permActive()))
+            {
+                self.prompt_dot_hover = null;
+                ctx.redraw = true;
                 return;
             }
             if (self.scrollbar_dragging) {
@@ -7324,11 +7414,12 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
 
     var live_lines: []const PLine = &.{};
     if (live_src.len > 0) {
-        // Streaming text changes every frame: force a redraw so new tokens appear.
+        // Streaming text is rebuilt from the current snapshot each frame so
+        // incomplete markdown (unclosed fences, partial structures) keeps
+        // rendering as it arrives. We force redraw while live content is shown.
         self.diff_needs_full_redraw = true;
         // `live_src` is already frame-arena owned (see the invariant above), so
         // there is nothing to copy here any more.
-        // For the live paragraph, we don't have a Para struct, so use a temporary one
         var live_para = Model.Para{
             .kind = live_kind,
             .text = live_src,
@@ -7622,7 +7713,7 @@ fn inputDisplayText(arena: std.mem.Allocator, text: []const u8, max_display_byte
         for (image_exts) |ext| {
             if (token.len > ext.len + 1) {
                 // Case-insensitive endsWith: compare the last ext.len bytes ignoring case.
-                const tail = token[token.len - ext.len..];
+                const tail = token[token.len - ext.len ..];
                 var matched = true;
                 for (tail, ext) |tc, ec| {
                     if (std.ascii.toLower(tc) != std.ascii.toLower(ec)) {
@@ -7664,9 +7755,9 @@ fn inputDisplayText(arena: std.mem.Allocator, text: []const u8, max_display_byte
     const tail_len: usize = max_display_bytes / 2 - 10;
     const skipped: usize = processed.len - head_len - tail_len;
     const head = processed[0..head_len];
-    const tail = processed[processed.len - tail_len..];
+    const tail = processed[processed.len - tail_len ..];
 
-    const head_and_marker = try std.fmt.allocPrint(arena, "{s}… +{d} more", .{head, skipped});
+    const head_and_marker = try std.fmt.allocPrint(arena, "{s}… +{d} more", .{ head, skipped });
     const result_len = head_and_marker.len + tail.len;
     const result_buf = try arena.alloc(u8, result_len);
     @memcpy(result_buf[0..head_and_marker.len], head_and_marker);
@@ -8481,7 +8572,10 @@ fn drawPermissionModal(
     suggestion: []const u8,
 ) void {
     const w: u16 = @min(width -| 6, 104);
-    const h: u16 = 9;
+    const dangerous_suggestion = allow_always and suggestion.len > 0 and permrules.isDangerousRuleText(suggestion);
+    var h: u16 = 9;
+    if (rule.len > 0) h += 1;
+    if (dangerous_suggestion) h += 1;
     // A TERMINAL TOO SMALL FOR THE BOX IS NOT A REASON TO PAINT NOTHING.
     //
     // It used to `return` here, and this function is what BLOCKS the turn: the
@@ -8528,6 +8622,14 @@ fn drawPermissionModal(
         dy += 1;
     }
 
+    // Warn when "always allow" would create a dangerously broad rule.
+    if (dangerous_suggestion and dy < y + h - 2) {
+        const warn = "warning: broad allow can run arbitrary commands";
+        const max_w = @as(usize, w - 6);
+        _ = p.putText(x + 3, dy, if (warn.len > max_w) warn[0..max_w] else warn, theme.err);
+        dy += 1;
+    }
+
     // Options, each with its key in large type. The first one (y) is the one
     // you press without looking, so it is highlighted.
     //
@@ -8535,27 +8637,30 @@ fn drawPermissionModal(
     // permission: a path inside `.git/` is asked ONCE. "Always allow" there
     // would put the whole `.git/` on the list of places the agent writes
     // without asking, which is the opposite of what the question is for.
-    const opts_all = [_]struct { key: []const u8, label: []const u8 }{
-        .{ .key = "Y", .label = "allow once" },
-        .{ .key = "A", .label = "always allow" },
-        .{ .key = "N", .label = "deny" },
-        .{ .key = "ESC", .label = "cancel" },
+    const opts_all = [_]struct { key: []const u8, label: []const u8, is_always: bool }{
+        .{ .key = "Y", .label = "allow once", .is_always = false },
+        .{ .key = "A", .label = "always allow", .is_always = true },
+        .{ .key = "N", .label = "deny", .is_always = false },
+        .{ .key = "ESC", .label = "cancel", .is_always = false },
     };
     var opts: []const @TypeOf(opts_all[0]) = &opts_all;
     if (!allow_always) opts = &.{ opts_all[0], opts_all[2], opts_all[3] };
-    // The "always allow" option NAMES the rule it would remember: the user is
-    // answering "from now on?", and the answer has to say what "from now on"
-    // means.
+    // The "always allow" option NAMES the rule it would remember.
     var suggestion_buf: [128]u8 = undefined;
-    const suggestion_label_text = suggestion_label(suggestion, &suggestion_buf);
+    const suggestion_label_text = if (allow_always) suggestion_label(suggestion, &suggestion_buf) else "";
     var ox: u16 = x + 3;
     for (opts, 0..) |o, i| {
         _ = p.putText(ox, dy, o.key, theme.brand_bold);
         const adv: u16 = @as(u16, @intCast(o.key.len)) + 1;
         ox += adv;
-        // The "A" row carries the rule it would remember.
-        const label: []const u8 = if (i == 1 and suggestion_label_text.len > 0) suggestion_label_text else o.label;
-        ox = p.putText(ox, dy, label, if (i == 0) theme.brand else theme.brand_soft);
+        const label: []const u8 = if (o.is_always and suggestion_label_text.len > 0) suggestion_label_text else o.label;
+        const label_style = if (i == 0)
+            theme.brand
+        else if (o.is_always and dangerous_suggestion)
+            theme.err
+        else
+            theme.brand_soft;
+        ox = p.putText(ox, dy, label, label_style);
         if (i + 1 < opts.len and ox + 4 < x + w) {
             ox = p.putText(ox, dy, "   ", theme.brand_faint);
         }
@@ -9129,14 +9234,9 @@ fn drawStateFooter(
     // The face reports the HARNESS — thinking, writing, running a tool, done,
     // waiting on a human — and nothing else.
     //
-    // It used to fall back to `self.mood()`, the mood of the last
-    // `setStatusWithZo`, and a mode change (shift+tab), a model switch and
-    // `/yolo` all wrote one. The mascot therefore changed expression when the
-    // user pressed shift+tab: a face that moves when nothing is running is a
-    // face that means nothing, and the state it was advertising (which mode is
-    // set) is text, not a mood. Those switches no longer write a status at all
-    // — the transcript line and the footer's right group say them — and even
-    // if one did, the face here would ignore it.
+    // An active pipeline stage is harness work even when activity flags are
+    // between internal waits (e.g. the test suite runs outside the model loop),
+    // so the stage/status keeps the mascot and legend in sync.
     const mood: StatusKind = if (act.ask or act.perm)
         .warn
     else if (running_tool or act.subagent_completed < act.subagent_total)
@@ -9147,7 +9247,16 @@ fn drawStateFooter(
         // The turn was stopped by ESC: it did not finish, and the face says so
         // until the next turn starts.
         .warn
-    else if (self.busy_started_ns != 0)
+    else if (self.pipeline_stage) |stage| blk: {
+        if (self.status_kind_set and (self.status_kind == .warn or self.status_kind == .err))
+            break :blk self.status_kind;
+        break :blk if (std.mem.eql(u8, stage, "verify"))
+            .tooling
+        else if (std.mem.eql(u8, stage, "done"))
+            .done
+        else
+            .thinking;
+    } else if (self.busy_started_ns != 0)
         // A turn has run and nothing is running now: `done` until the next one
         // starts, whatever else the status says in between.
         .done
@@ -9181,14 +9290,7 @@ fn drawStateFooter(
     // generic activity. The user never has to guess whether zode is
     // investigating, writing code, running tests or reviewing.
     if (self.pipeline_stage) |stage| {
-        const stage_en = if (std.mem.eql(u8, stage, "explorer")) "exploring"
-        else if (std.mem.eql(u8, stage, "investigator")) "investigating"
-        else if (std.mem.eql(u8, stage, "implementer")) "implementing"
-        else if (std.mem.eql(u8, stage, "tester")) "testing"
-        else if (std.mem.eql(u8, stage, "verify")) "verifying"
-        else if (std.mem.eql(u8, stage, "reviewer")) "reviewing"
-        else if (std.mem.eql(u8, stage, "done")) "done"
-        else stage;
+        const stage_en = if (std.mem.eql(u8, stage, "explorer")) "exploring" else if (std.mem.eql(u8, stage, "investigator")) "investigating" else if (std.mem.eql(u8, stage, "implementer")) "implementing" else if (std.mem.eql(u8, stage, "tester")) "testing" else if (std.mem.eql(u8, stage, "verify")) "verifying" else if (std.mem.eql(u8, stage, "reviewer")) "reviewing" else if (std.mem.eql(u8, stage, "done")) "done" else stage;
         legend = stage_en;
         // No detail for pipeline stages: the stage name IS the message.
     } else if (act.ask) {
@@ -9582,7 +9684,7 @@ fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     out.append(arena, .{ .text = label, .style = theme.status }) catch return null;
     out.append(arena, .{ .text = " ", .style = theme.status }) catch return null;
     var nb: [8]u8 = undefined;
-    const pct_txt = std.fmt.bufPrint(&nb, "{d}{s}%", .{agent.ctx_pct, pct_suffix}) catch return null;
+    const pct_txt = std.fmt.bufPrint(&nb, "{d}{s}%", .{ agent.ctx_pct, pct_suffix }) catch return null;
     // The percentage is printed with `putStable`, which does NOT copy the
     // bytes: `pct_txt` points at THIS frame's stack, and the renderer reads
     // the cells after the frame is over. It has to live in the frame's arena.
@@ -10128,9 +10230,7 @@ test "input: over the byte cap, the edit is rejected and the limit is named" {
     // The rejection note: painted inside the composer zone (the affected
     // zone), naming the limit. The key handler sets this exact state.
     m.input_too_long = true;
-    const msg = std.fmt.bufPrint(&m.input_err_buf,
-        "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.",
-        .{ ed.max_bytes, m.ed.text().len }) catch {
+    const msg = std.fmt.bufPrint(&m.input_err_buf, "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.", .{ ed.max_bytes, m.ed.text().len }) catch {
         m.input_err = "Input too long: shorten the text.";
         return;
     };
@@ -12377,7 +12477,7 @@ test "the waiting states show the mascot's warning face in the footer" {
     m.pushHeader(.idle);
 
     m.setStatusWithMood(.warn, "waiting");
-    try openAskForTest(&m, "which one?", "decide", &.{"a", "b"});
+    try openAskForTest(&m, "which one?", "decide", &.{ "a", "b" });
 
     const s = try drawTest(&m, arena_state.allocator(), 92, 26);
     _ = allText(s);
@@ -15330,7 +15430,6 @@ test "scrolling past the segment cache cap leaves no cell pointing at a freed ar
     }
 }
 
-
 // ── the wire path for the keys the terminals report differently ──
 //
 // `editorKey` has always had "shift+enter / alt+enter inserts a newline", and
@@ -15343,6 +15442,47 @@ test "scrolling past the segment cache cap leaves no cell pointing at a freed ar
 // with `.shift = true` proves the handler works and proves nothing about
 // whether the bytes on the wire ever become that `Key`, which is the half that
 // was broken.
+test "wire: a terminal reply delivered as key text never reaches the composer" {
+    // The exact bytes from the crash report (`CSI 13;129;3u`, a kitty key
+    // event with a modifier group). Whatever the parser makes of it, the
+    // composer must end up empty: a reply is a sequence, not a character.
+    // The same is true of a mouse report: vaxis makes it an event, but a key
+    // event whose text carries control bytes must not be inserted either —
+    // that is asserted directly below.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = Model.init(arena);
+    defer m.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = testCtx();
+    ctx.io = threaded.io();
+    ctx.alloc = arena;
+    ctx.cmds = .empty;
+
+    var parser: vaxis.Parser = .{};
+    const res = try parser.parse("\x1b[13;129;3u", arena);
+    if (res.event) |ev| {
+        switch (ev) {
+            .key_press => |k| try typeErasedEventHandler(&m, &ctx, .{ .key_press = k }),
+            else => {},
+        }
+    }
+    try std.testing.expect(m.ed.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), m.ed.text().len);
+
+    // A hand-built key whose text carries the reply: this is the path our
+    // own handler owns, not vaxis's. It must not be inserted either.
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 0, .text = "\x1b[13;129;3u" } });
+    try std.testing.expect(m.ed.isEmpty());
+
+    // And a normal character on the very next keystroke works.
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'a', .text = "a" } });
+    try std.testing.expectEqualStrings("a", m.ed.text());
+}
+
 test "wire: CSI 13;2u arrives as enter+shift and inserts a newline" {
     // ONE arena owns everything that outlives a single step, in the order the
     // repo's own tests use. `m` gets its OWN allocator on purpose and it is

@@ -1,6 +1,7 @@
 const std = @import("std");
 const chat = @import("chat.zig");
 const repeat = @import("lib/repeat.zig");
+const toolstore = @import("lib/toolstore.zig");
 const compaction = @This();
 
 /// Context management: keep the wire view under budget so the stable prefix
@@ -400,20 +401,26 @@ pub fn targetPct(env: ?*const std.process.Environ.Map) i64 {
 /// a long read-only session wants `elide`, a coding session wants `full`, and
 /// someone who would rather see the provider complain wants `off`.
 ///
-/// `ZODE_COMPACT` = `off` | `elide` | `full` (`off` is the default: history is
-/// kept verbatim, nothing is elided or summarized).
+/// `ZODE_COMPACT` = `off` | `elide` | `full`.
+///
+/// Default: `elide` (Tier 1 only, free, no extra request) when unset/empty or
+/// unrecognized — this keeps long sessions from overflowing the model's context
+/// without spending tokens on summaries. Set `ZODE_COMPACT=off` to keep history
+/// verbatim, or `ZODE_COMPACT=full` to also summarize old turns (one extra
+/// request; lossy; never used at 256k+ model windows).
 pub const Mode = enum { off, elide, full };
 
 pub fn mode(env: ?*const std.process.Environ.Map) Mode {
-    const m = env orelse return .off;
-    const s = m.get("ZODE_COMPACT") orelse return .off;
+    const m = env orelse return .elide;
+    const s = m.get("ZODE_COMPACT") orelse return .elide;
+    if (s.len == 0) return .elide;
     if (std.ascii.eqlIgnoreCase(s, "off") or std.ascii.eqlIgnoreCase(s, "never") or
         std.ascii.eqlIgnoreCase(s, "false") or std.ascii.eqlIgnoreCase(s, "0")) return .off;
     if (std.ascii.eqlIgnoreCase(s, "elide") or std.ascii.eqlIgnoreCase(s, "tier1") or
         std.ascii.eqlIgnoreCase(s, "free")) return .elide;
     if (std.ascii.eqlIgnoreCase(s, "full") or std.ascii.eqlIgnoreCase(s, "on") or
         std.ascii.eqlIgnoreCase(s, "yes")) return .full;
-    return .off;
+    return .elide;
 }
 
 /// The mode that is actually in force: what `/compact` set, else `ZODE_COMPACT`.
@@ -504,11 +511,18 @@ pub fn elideTier(
         // needs them verbatim even when compacting.
         if (isCriticalMessage(m.*)) continue;
         const before = messageTokens(m.*);
-        const marker = try std.fmt.allocPrint(
-            arena,
-            "[tool result elided: {d} bytes — re-run the tool if you need it]",
-            .{m.content.len},
-        );
+        const marker = if (toolstore.extractStoredPath(m.content)) |stored_path|
+            try std.fmt.allocPrint(
+                arena,
+                "[tool result elided: {d} bytes — recoverable via read path={s}]",
+                .{ m.content.len, stored_path },
+            )
+        else
+            try std.fmt.allocPrint(
+                arena,
+                "[tool result elided: {d} bytes — re-run the tool if you need it]",
+                .{m.content.len},
+            );
         m.content = marker;
         estimated -= before - messageTokens(m.*);
         elided += 1;
@@ -764,6 +778,44 @@ test "elideTier says WHICH messages it took, not only how many" {
         try std.testing.expect(idx < msgs.items.len);
         try std.testing.expectEqualStrings("tool", msgs.items[idx].role);
     }
+}
+
+test "elideTier preserves recoverable stored-result path markers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_RECENT_WINDOW", "2");
+
+    const stored = try std.fmt.allocPrint(
+        arena,
+        "preview\n\u{2026} (result stored at /tmp/zode-test/tool-results/7.txt; read the part you need)\n{s}",
+        .{&repeat.rep("x", 4000)},
+    );
+    var msgs = [_]chat.ChatMessage{
+        .{ .role = "system", .content = "system" },
+        .{ .role = "user", .content = "u" },
+        .{ .role = "assistant", .content = "a" },
+        .{ .role = "tool", .content = stored },
+        .{ .role = "assistant", .content = "a2" },
+        .{ .role = "tool", .content = &repeat.rep("y", 4000) },
+        .{ .role = "user", .content = "u2" },
+        .{ .role = "assistant", .content = "final" },
+    };
+    const res = try elideTier(arena, &msgs, 100, &env, 0, .full);
+    try std.testing.expect(res.elided > 0);
+    // The stored result marker must keep a recoverable path, not force a blind re-run.
+    var saw_recoverable = false;
+    for (res.msgs) |m| {
+        if (!std.mem.eql(u8, m.role, "tool")) continue;
+        if (std.mem.indexOf(u8, m.content, "recoverable via read path=") != null) {
+            saw_recoverable = true;
+            try std.testing.expect(std.mem.indexOf(u8, m.content, "/tmp/zode-test/tool-results/7.txt") != null);
+        }
+    }
+    try std.testing.expect(saw_recoverable);
 }
 
 test "elideTier reports nothing when it elides nothing" {
@@ -1032,12 +1084,14 @@ test "ZODE_COMPACT_PCT sets the threshold, and the clamps hold" {
     try std.testing.expectEqual(target_pct, targetPct(&e));
 }
 
-test "ZODE_COMPACT picks the mode, and the default is off" {
+test "ZODE_COMPACT picks the mode, and the default is elide" {
     const E = std.process.Environ.Map;
     var e = E.init(std.testing.allocator);
     defer e.deinit();
 
-    try std.testing.expectEqual(Mode.off, mode(null));
+    // Unset → elide (Tier 1, free): keeps long sessions from overflowing the
+    // context window without spending tokens on summaries.
+    try std.testing.expectEqual(Mode.elide, mode(null));
     for ([_][]const u8{ "off", "OFF", "never", "false", "0" }) |v| {
         try e.put("ZODE_COMPACT", v);
         try std.testing.expectEqual(Mode.off, mode(&e));
@@ -1050,11 +1104,11 @@ test "ZODE_COMPACT picks the mode, and the default is off" {
         try e.put("ZODE_COMPACT", v);
         try std.testing.expectEqual(Mode.full, mode(&e));
     }
-    // Anything unrecognized is `off`, on purpose: a typo must not silently
-    // compact or summarize history the user did not ask for.
+    // Empty/unrecognized fall back to elide (safe default for memory). Explicit
+    // `off` is the only way to disable compaction.
     for ([_][]const u8{ "banana", "" }) |v| {
         try e.put("ZODE_COMPACT", v);
-        try std.testing.expectEqual(Mode.off, mode(&e));
+        try std.testing.expectEqual(Mode.elide, mode(&e));
     }
 }
 

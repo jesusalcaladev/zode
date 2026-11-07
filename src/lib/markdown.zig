@@ -373,8 +373,12 @@ pub fn parseLang(
 
         try inline_lines.append(arena, try inlineSegmentsLang(arena, line, kind, base_override, mood_style, "", null));
     }
-    // pending code without a closing fence
-    if (in_code and code_lines.items.len > 0) {
+    // pending code without a closing fence: keep rendering during streaming
+    // (an opening fence with no body yet should still show as a code block).
+    if (in_code) {
+        if (code_lines.items.len == 0) {
+            try code_lines.append(arena, try arena.alloc(Segment, 0));
+        }
         try blocks.append(arena, .{
             .kind = .code,
             .lines = try code_lines.toOwnedSlice(arena),
@@ -1970,8 +1974,8 @@ test "the transcript has five marks and not six" {
     // the vocabulary is the interface, and it is the thing most likely to grow
     // by accident.
     const seen = [_]Kind{
-        .user, .assistant, .info, .tool, .tool_run,
-        .tool_res, .diff, .error_msg, .banner,
+        .user,     .assistant, .info,      .tool,   .tool_run,
+        .tool_res, .diff,      .error_msg, .banner,
     };
     for (seen) |k| {
         const p = prefix(k);
@@ -2381,9 +2385,9 @@ test "every cell of a table survives the rendering" {
     );
     const text = try blockText(arena, blocks[0]);
     const cells = [_][]const u8{
-        "Name", "Context", "Price",
-        "gpt",  "200k",    "3.00",
-        "claude", "1m",   "15.00",
+        "Name",   "Context", "Price",
+        "gpt",    "200k",    "3.00",
+        "claude", "1m",      "15.00",
     };
     for (cells) |c| {
         if (std.mem.indexOf(u8, text, c) == null) {
@@ -2435,4 +2439,29 @@ test "a table inside a code block is code, not a table" {
     try std.testing.expectEqual(Kind.code, blocks[0].kind);
     const text = try blockText(arena, blocks[0]);
     try std.testing.expect(std.mem.indexOf(u8, text, "┌") == null);
+}
+
+test "an unclosed code fence still renders as code while streaming" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    // No closing fence: the stream may be mid-block.
+    const blocks = try parse(arena, .assistant, "```zig\nconst x = 1;\n");
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(Kind.code, blocks[0].kind);
+    try std.testing.expectEqualStrings("zig", blocks[0].lang);
+    const text = try blockText(arena, blocks[0]);
+    try std.testing.expect(std.mem.indexOf(u8, text, "const x = 1;") != null);
+}
+
+test "an opening code fence with no body still renders as code while streaming" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parse(arena, .assistant, "```zig\n");
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(Kind.code, blocks[0].kind);
+    try std.testing.expectEqualStrings("zig", blocks[0].lang);
 }

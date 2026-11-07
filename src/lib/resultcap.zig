@@ -91,13 +91,17 @@ pub const CutRecord = struct {
 /// A session that compacts differently on resume silently loses its cached
 /// prefix otherwise.
 pub const Caps = struct {
-    items: std.ArrayList(CutRecord),
+    items: std.ArrayList(CutRecord) = .empty,
 
-    pub fn deinit(self: *Caps, arena: std.mem.Allocator) void {
+    pub fn init() Caps {
+        return .{ .items = .empty };
+    }
+
+    pub fn deinit(self: *Caps, gpa: std.mem.Allocator) void {
         for (self.items.items) |*r| {
-            arena.free(r.result_id);
+            gpa.free(r.result_id);
         }
-        self.items.deinit();
+        self.items.deinit(gpa);
     }
 
     /// Look up a previous cut decision for `result_id`.
@@ -109,7 +113,8 @@ pub const Caps = struct {
     }
 
     /// Record a new cut decision (or replace an existing one for the same id).
-    pub fn record(self: *Caps, arena: std.mem.Allocator, result_id: []const u8, bytes_kept: usize, cut: bool) void {
+    /// `gpa` owns the stored IDs (session lifetime).
+    pub fn record(self: *Caps, gpa: std.mem.Allocator, result_id: []const u8, bytes_kept: usize, cut: bool) !void {
         for (self.items.items) |*r| {
             if (std.mem.eql(u8, r.result_id, result_id)) {
                 r.bytes_kept = bytes_kept;
@@ -117,9 +122,9 @@ pub const Caps = struct {
                 return;
             }
         }
-        const id_copy = try arena.dupe(u8, result_id);
-        const item = .{ .result_id = id_copy, .bytes_kept = bytes_kept, .cut = cut };
-        _ = self.items.append(arena, item);
+        const id_copy = try gpa.dupe(u8, result_id);
+        errdefer gpa.free(id_copy);
+        try self.items.append(gpa, .{ .result_id = id_copy, .bytes_kept = bytes_kept, .cut = cut });
     }
 };
 pub fn capAggregate(
@@ -173,6 +178,7 @@ pub fn capAggregate(
 /// in `caps`.
 pub fn frozenCapResult(
     caps: *Caps,
+    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     result_id: []const u8,
     text: []const u8,
@@ -192,16 +198,15 @@ pub fn frozenCapResult(
         const buf = try arena.alloc(u8, cut + cut_notice.len);
         @memcpy(buf[0..cut], text[0..cut]);
         @memcpy(buf[cut..], cut_notice);
-        return .{ .text = buf[0..cut + cut_notice.len], .cut = true };
+        return .{ .text = buf[0 .. cut + cut_notice.len], .cut = true };
     }
 
-    // No previous decision: compute it fresh and record it.
+    // No previous decision: compute it fresh and record it with persistent storage.
     const result = try capResult(arena, text, max_chars);
-    const id_copy = try arena.dupe(u8, result_id);
     if (result.cut) {
-        caps.record(arena, id_copy, result.text.len, true);
+        caps.record(gpa, result_id, result.text.len, true) catch {};
     } else {
-        caps.record(arena, id_copy, text.len, false);
+        caps.record(gpa, result_id, text.len, false) catch {};
     }
     return result;
 }
@@ -214,6 +219,7 @@ pub fn frozenCapResult(
 /// that were NOT previously cut (a frozen cut must stay frozen).
 pub fn frozenCapAggregate(
     caps: *Caps,
+    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     results: []const []const u8,
     result_ids: []const []const u8,
@@ -225,7 +231,7 @@ pub fn frozenCapAggregate(
     var capped: std.ArrayList(Capped) = .empty;
     var j: usize = 0;
     for (results) |r| {
-        try capped.append(arena, try frozenCapResult(caps, arena, result_ids[j], r, per_tool_max));
+        try capped.append(arena, try frozenCapResult(caps, gpa, arena, result_ids[j], r, per_tool_max));
         j += 1;
     }
     var total: usize = 0;
@@ -240,7 +246,7 @@ pub fn frozenCapAggregate(
         var best_len: usize = 0;
         var k: usize = 0;
         for (capped.items) |c| {
-            const was_cut = if (caps.find(result_ids[k])) |r| r.cut else false;
+            const was_cut = if (caps.find(result_ids[k])) |rec| rec.cut else false;
             if (!was_cut and c.text.len > best_len and c.text.len > cut_notice.len) {
                 best_len = c.text.len;
                 best = k;
@@ -256,8 +262,7 @@ pub fn frozenCapAggregate(
         total = others + trimmed.text.len;
         capped.items[i] = trimmed;
         // Remember the new cut as frozen too.
-        const id_copy = try arena.dupe(u8, result_ids[i]);
-        caps.record(arena, id_copy, trimmed.text.len, true);
+        caps.record(gpa, result_ids[i], trimmed.text.len, true) catch {};
     }
     return capped.toOwnedSlice(arena);
 }
@@ -266,53 +271,59 @@ pub fn frozenCapAggregate(
 /// Written next to the session JSONL so it survives resume.
 pub fn serializeCaps(caps: *const Caps, out: []u8) []const u8 {
     var w: std.Io.Writer = .fixed(out);
-    w.writeAll("[") catch {};
+    w.writeAll("[") catch return w.buffered();
     var first = true;
-    const quote = '\"';
-    const backslash = '\\';
-    const comma = ',';
-    const open_brace = '{';
-    const close_brace = '}';
     for (caps.items.items) |r| {
-        if (!first) w.writeByte(comma) catch {};
+        if (!first) w.writeByte(',') catch break;
         first = false;
-        w.writeByte(open_brace) catch {};
-        w.writeAll("\"result_id\":") catch {};
-        w.writeByte(quote) catch {};
+        w.writeAll("{\"result_id\":\"") catch break;
         for (r.result_id) |ch| {
-            if (ch == quote or ch == backslash) w.writeByte(backslash) catch {};
-            w.writeByte(ch) catch {};
+            switch (ch) {
+                '"' => w.writeAll("\\\"") catch break,
+                '\\' => w.writeAll("\\\\") catch break,
+                '\n' => w.writeAll("\\n") catch break,
+                '\r' => w.writeAll("\\r") catch break,
+                '\t' => w.writeAll("\\t") catch break,
+                else => w.writeByte(ch) catch break,
+            }
         }
-        w.writeByte(quote) catch {};
-        w.writeAll("\",\"bytes_kept\":") catch {};
-        w.print("{d}", r.bytes_kept) catch {};
-        w.writeAll(",\"cut\":") catch {};
-        w.print("{b}", r.cut) catch {};
-        w.writeByte(close_brace) catch {};
+        w.writeAll("\",\"bytes_kept\":") catch break;
+        w.print("{d}", .{r.bytes_kept}) catch break;
+        w.writeAll(",\"cut\":") catch break;
+        w.writeAll(if (r.cut) "true" else "false") catch break;
+        w.writeByte('}') catch break;
     }
     w.writeAll("]") catch {};
     return w.buffered();
 }
 
 /// Deserialize `Caps` from JSON produced by `serializeCaps`.
-pub fn deserializeCaps(arena: std.mem.Allocator, input: []const u8) !Caps {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, input, .{}) catch return Caps{ .items = .empty };
-    if (parsed != .array) return Caps{ .items = .empty };
-    var caps: Caps = .{ .items = .empty };
+/// Stored IDs are owned by `gpa`.
+pub fn deserializeCaps(gpa: std.mem.Allocator, input: []const u8) !Caps {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, input, .{}) catch return Caps.init();
+    if (parsed != .array) return Caps.init();
+    var caps = Caps.init();
+    errdefer caps.deinit(gpa);
     for (parsed.array.items) |v| {
         if (v != .object) continue;
         const rid = v.object.get("result_id") orelse continue;
+        if (rid != .string) continue;
         const bk = v.object.get("bytes_kept") orelse continue;
         const ct = v.object.get("cut") orelse continue;
-        if (rid != .string or bk != .string or ct != .string) continue;
-        const id_copy = try arena.dupe(u8, rid.string);
-        const bytes_kept = std.fmt.parseInt(u64, bk.string, 10) catch continue;
-        const cut = std.mem.eql(u8, ct.string, "true");
-        caps.items.append(arena, .{
-            .result_id = id_copy,
-            .bytes_kept = @intCast(bytes_kept),
-            .cut = cut,
-        }) catch {};
+        const bytes_kept: usize = switch (bk) {
+            .integer => |i| if (i >= 0) @intCast(i) else continue,
+            .string => std.fmt.parseInt(usize, bk.string, 10) catch continue,
+            else => continue,
+        };
+        const cut: bool = switch (ct) {
+            .bool => |b| b,
+            .string => std.mem.eql(u8, ct.string, "true"),
+            else => continue,
+        };
+        caps.record(gpa, rid.string, bytes_kept, cut) catch {};
     }
     return caps;
 }
@@ -471,7 +482,7 @@ test "capAggregate: a result exactly at the per-tool boundary is not cut" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const results = &[_][]const u8{ "1234567890" };
+    const results = &[_][]const u8{"1234567890"};
     const out = try capAggregate(arena, results[0..], 10, 100);
     try std.testing.expectEqual(out.len, 1);
     try std.testing.expectEqualStrings("1234567890", out[0].text);

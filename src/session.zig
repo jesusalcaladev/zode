@@ -12,8 +12,8 @@
 ///
 /// `auth.json` was already written 0600 (`config.zig`), so the principle was already in
 /// the repo and this one file was simply outside it.
-const session_mode: std.Io.File.Permissions = @enumFromInt(0o600);
-const sessions_dir_mode: std.Io.File.Permissions = @enumFromInt(0o700);
+const session_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
+const sessions_dir_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
 
 /// Base directory for session files (default "sessions", override with setSessionsDir).
 ///
@@ -37,6 +37,7 @@ const chat = @import("chat.zig");
 const cache_stats = @import("cache_stats.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 const repeat = @import("lib/repeat.zig");
+const resultcap = @import("lib/resultcap.zig");
 
 /// A conversation message. Efficient design:
 /// - `content` is the plain text (what goes in and out of the LLM).
@@ -90,10 +91,26 @@ pub const ScrollState = struct {
         const event = obj.get("event") orelse return null;
         if (event != .string or !std.mem.eql(u8, event.string, "scroll")) return null;
         var result = ScrollState{};
-        if (obj.get("anchor_line")) |v| { if (v == .integer) { result.anchor_line = @intCast(v.integer); } }
-        if (obj.get("follow_bottom")) |v| { if (v == .bool) { result.follow_bottom = v.bool; } }
-        if (obj.get("unseen_base_para")) |v| { if (v == .integer) { result.unseen_base_para = @intCast(v.integer); } }
-        if (obj.get("was_away")) |v| { if (v == .bool) { result.was_away = v.bool; } }
+        if (obj.get("anchor_line")) |v| {
+            if (v == .integer) {
+                result.anchor_line = @intCast(v.integer);
+            }
+        }
+        if (obj.get("follow_bottom")) |v| {
+            if (v == .bool) {
+                result.follow_bottom = v.bool;
+            }
+        }
+        if (obj.get("unseen_base_para")) |v| {
+            if (v == .integer) {
+                result.unseen_base_para = @intCast(v.integer);
+            }
+        }
+        if (obj.get("was_away")) |v| {
+            if (v == .bool) {
+                result.was_away = v.bool;
+            }
+        }
         return result;
     }
 };
@@ -134,12 +151,16 @@ pub const Session = struct {
     /// Per session: each session id gets its own tool-results directory, so a
     /// counter starting at zero never collides within a session.
     tool_result_next: usize = 0,
+    /// Frozen result-cap decisions (34.2): re-applied on every turn/resume for
+    /// cache-prefix stability. Persisted as a sidecar next to the session file.
+    result_caps: resultcap.Caps = .{},
 
     pub fn init(allocator: std.mem.Allocator) Session {
         return .{
             .allocator = allocator,
             .id = undefined,
             .messages = .empty,
+            .result_caps = .{},
         };
     }
 
@@ -206,6 +227,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        self.saveCapsSidecar();
         if (self.fw != null) self.fw.?.interface.flush() catch {};
         if (self.file) |f| f.close(self.io);
         for (self.messages.items) |m| {
@@ -215,9 +237,34 @@ pub const Session = struct {
             if (m.tool_name) |t| self.allocator.free(t);
         }
         self.messages.deinit(self.allocator);
+        self.result_caps.deinit(self.allocator);
         if (self.path) |p| self.allocator.free(p);
         if (self.custom_title.len > 0) self.allocator.free(self.custom_title);
         if (self.ai_title.len > 0) self.allocator.free(self.ai_title);
+    }
+
+    fn capsSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
+        const p = self.path orelse return null;
+        return std.fmt.bufPrint(buf, "{s}.caps.json", .{p}) catch null;
+    }
+
+    pub fn saveCapsSidecar(self: *Session) void {
+        const io = self.io;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.capsSidecarPath(&pbuf) orelse return;
+        var out: [64 * 1024]u8 = undefined;
+        const json = resultcap.serializeCaps(&self.result_caps, &out);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json }) catch {};
+    }
+
+    pub fn loadCapsSidecar(self: *Session) void {
+        const io = self.io;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.capsSidecarPath(&pbuf) orelse return;
+        const data = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(1024 * 1024)) catch return;
+        defer self.allocator.free(data);
+        self.result_caps.deinit(self.allocator);
+        self.result_caps = resultcap.deserializeCaps(self.allocator, data) catch .{};
     }
 
     /// Adds a message to memory and persists it (1 linear write).
@@ -609,7 +656,7 @@ fn firstLineCut(arena: std.mem.Allocator, text: []const u8, max_bytes: usize) []
     // Cut at byte boundary, then walk back to UTF-8 boundary.
     var cut = trimmed[0..max_bytes];
     while (cut.len > 0 and (cut[cut.len - 1] & 0xC0) == 0x80) {
-        cut = cut[0..cut.len - 1];
+        cut = cut[0 .. cut.len - 1];
     }
     return arena.dupe(u8, cut) catch "";
 }
@@ -687,6 +734,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
         const m = parseLine(allocator, line) catch continue;
         try s.messages.append(allocator, m);
     }
+    s.loadCapsSidecar();
     return s;
 }
 
@@ -907,7 +955,10 @@ test "ScrollState: writeFields produces valid JSON" {
     // the length, so scan for the closing brace.
     var i: usize = 0;
     while (i < buf.len) : (i += 1) {
-        if (buf[i] == '}') { written_len = i + 1; break; }
+        if (buf[i] == '}') {
+            written_len = i + 1;
+            break;
+        }
     }
     try std.testing.expect(written_len > 0);
     const written = buf[0..written_len];
@@ -947,7 +998,10 @@ test "Session: scroll state persists across resume" {
     var used_path: []const u8 = "";
     {
         const s = try Session.create(alloc, io);
-        defer { s.deinit(); alloc.destroy(s); }
+        defer {
+            s.deinit();
+            alloc.destroy(s);
+        }
         used_path = try alloc.dupe(u8, s.path.?);
         // Set a non-default scroll state and persist it to disk so resume can read it.
         s.setScrollState(.{
@@ -959,7 +1013,10 @@ test "Session: scroll state persists across resume" {
         try s.persistScrollState();
         // resumePath truncates and rewrites, re-persisting the scroll state.
         const s2 = try Session.resumePath(alloc, io, used_path);
-        defer { s2.deinit(); alloc.destroy(s2); }
+        defer {
+            s2.deinit();
+            alloc.destroy(s2);
+        }
         try std.testing.expectEqual(@as(usize, 99), s2.getScrollState().anchor_line);
         try std.testing.expectEqual(false, s2.getScrollState().follow_bottom);
         try std.testing.expectEqual(@as(usize, 5), s2.getScrollState().unseen_base_para);

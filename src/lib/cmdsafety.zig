@@ -36,6 +36,9 @@ pub const Verdict = enum {
     deletes,
     /// It runs another program: a shell, an interpreter, a downloader.
     executes,
+    /// It will hang or require an interactive TTY the harness does not have.
+    /// Refused before execution, even in permissive modes.
+    forbidden,
     /// We do not know this command.
     unknown,
 
@@ -70,8 +73,14 @@ const Entry = struct {
     /// `git config` writes and `git config --get x` reads: one program, two
     /// verbs, and the table has to say which is which.
     read_flags: []const []const u8 = &.{},
+    /// Flags that make the command interactive in a way that hangs a non-TTY
+    /// harness forever (e.g. `git rebase -i`). These are refused before
+    /// execution.
+    forbidden_flags: []const []const u8 = &.{},
     /// What the dangerous flags do, in words.
     why: []const u8 = "",
+    /// What the forbidden flags do, in words.
+    forbidden_why: []const u8 = "",
     /// The subcommand only reads when it has NO positional argument:
     /// `git branch` LISTS and `git branch x` CREATES.
     no_args: bool = false,
@@ -81,16 +90,16 @@ const Entry = struct {
 ///
 /// The list is a list of NAMES and not of paths: `/usr/bin/ls` is `ls`.
 const read_only_programs = [_][]const u8{
-    "ls",       "cat",     "head",   "tail",  "wc",     "grep",   "egrep",
-    "fgrep",    "rg",      "ag",     "find",  "fd",     "tree",   "pwd",
-    "echo",     "printf",  "which",  "whereis", "type",  "stat",   "du",
-    "df",       "date",    "uname",  "whoami", "hostname", "id",   "groups",
-    "printenv", "realpath", "basename", "dirname", "file", "sort", "uniq",
-    "cut",      "tr",      "nl",     "comm",  "join",   "paste", "column",
-    "tac",      "seq",     "expr",   "test",  "jq",     "yq",     "diff",
-    "cmp",      "md5sum",  "sha1sum", "sha256sum", "ps",  "uptime", "free",
-    "lscpu",    "lsblk",   "nproc",  "who",   "w",      "last",   "column",
-    "getconf",  "locale",  "tty",    "stdbuf",
+    "ls",       "cat",      "head",     "tail",      "wc",       "grep",   "egrep",
+    "fgrep",    "rg",       "ag",       "find",      "fd",       "tree",   "pwd",
+    "echo",     "printf",   "which",    "whereis",   "type",     "stat",   "du",
+    "df",       "date",     "uname",    "whoami",    "hostname", "id",     "groups",
+    "printenv", "realpath", "basename", "dirname",   "file",     "sort",   "uniq",
+    "cut",      "tr",       "nl",       "comm",      "join",     "paste",  "column",
+    "tac",      "seq",      "expr",     "test",      "jq",       "yq",     "diff",
+    "cmp",      "md5sum",   "sha1sum",  "sha256sum", "ps",       "uptime", "free",
+    "lscpu",    "lsblk",    "nproc",    "who",       "w",        "last",   "column",
+    "getconf",  "locale",   "tty",      "stdbuf",
 };
 
 /// The programs that change something.
@@ -185,9 +194,9 @@ const execute_programs = [_]struct { name: []const u8, why: []const u8 }{
 const families = [_]Entry{
     // ── git ──
     .{ .program = "git", .sub = "status", .verdict = .read_only },
-    .{ .program = "git", .sub = "diff", .verdict = .read_only, .danger_flags = &.{"--output", "-o"}, .why = "this writes the diff to a file" },
-    .{ .program = "git", .sub = "log", .verdict = .read_only, .danger_flags = &.{"--output", "-o"}, .why = "this writes the log to a file" },
-    .{ .program = "git", .sub = "show", .verdict = .read_only, .danger_flags = &.{"--output", "-o"}, .why = "this writes the output to a file" },
+    .{ .program = "git", .sub = "diff", .verdict = .read_only, .danger_flags = &.{ "--output", "-o" }, .why = "this writes the diff to a file" },
+    .{ .program = "git", .sub = "log", .verdict = .read_only, .danger_flags = &.{ "--output", "-o" }, .why = "this writes the log to a file" },
+    .{ .program = "git", .sub = "show", .verdict = .read_only, .danger_flags = &.{ "--output", "-o" }, .why = "this writes the output to a file" },
     .{ .program = "git", .sub = "blame", .verdict = .read_only },
     .{ .program = "git", .sub = "ls-files", .verdict = .read_only },
     .{ .program = "git", .sub = "ls-tree", .verdict = .read_only },
@@ -229,15 +238,50 @@ const families = [_]Entry{
         .why = "this changes the configuration",
         .no_args = true,
     },
-    .{ .program = "git", .sub = "add", .verdict = .writes, .why = "this stages changes" },
+    .{
+        .program = "git",
+        .sub = "add",
+        .verdict = .writes,
+        .why = "this stages changes",
+        .forbidden_flags = &.{ "-p", "--patch", "-i", "--interactive" },
+        .forbidden_why = "interactive staging needs a TTY and will hang this harness; stage files or hunks with explicit paths/commands instead",
+    },
     .{ .program = "git", .sub = "commit", .verdict = .writes, .why = "this creates a commit" },
-    .{ .program = "git", .sub = "checkout", .verdict = .writes, .why = "this changes the working tree" },
+    .{
+        .program = "git",
+        .sub = "checkout",
+        .verdict = .writes,
+        .why = "this changes the working tree",
+        .forbidden_flags = &.{ "-p", "--patch" },
+        .forbidden_why = "interactive patch mode needs a TTY and will hang this harness; restore specific files/paths instead",
+    },
     .{ .program = "git", .sub = "switch", .verdict = .writes, .why = "this changes the working tree" },
-    .{ .program = "git", .sub = "restore", .verdict = .writes, .why = "this changes the working tree" },
-    .{ .program = "git", .sub = "reset", .verdict = .writes, .why = "this changes the working tree" },
+    .{
+        .program = "git",
+        .sub = "restore",
+        .verdict = .writes,
+        .why = "this changes the working tree",
+        .forbidden_flags = &.{ "-p", "--patch" },
+        .forbidden_why = "interactive patch mode needs a TTY and will hang this harness; restore specific files/paths instead",
+    },
+    .{
+        .program = "git",
+        .sub = "reset",
+        .verdict = .writes,
+        .why = "this changes the working tree",
+        .forbidden_flags = &.{ "-p", "--patch" },
+        .forbidden_why = "interactive patch mode needs a TTY and will hang this harness; reset specific files/paths instead",
+    },
     .{ .program = "git", .sub = "revert", .verdict = .writes, .why = "this creates a commit" },
     .{ .program = "git", .sub = "merge", .verdict = .writes, .why = "this merges" },
-    .{ .program = "git", .sub = "rebase", .verdict = .writes, .why = "this rewrites the history" },
+    .{
+        .program = "git",
+        .sub = "rebase",
+        .verdict = .writes,
+        .why = "this rewrites the history",
+        .forbidden_flags = &.{ "-i", "--interactive" },
+        .forbidden_why = "interactive rebase needs a TTY and will hang this harness; use non-interactive rebase flags or edit commits with explicit commands",
+    },
     .{ .program = "git", .sub = "cherry-pick", .verdict = .writes, .why = "this creates a commit" },
     .{ .program = "git", .sub = "pull", .verdict = .writes, .why = "this changes the working tree" },
     .{ .program = "git", .sub = "push", .verdict = .writes, .why = "this publishes" },
@@ -245,12 +289,26 @@ const families = [_]Entry{
     .{ .program = "git", .sub = "rm", .verdict = .deletes, .why = "this removes files" },
     .{ .program = "git", .sub = "mv", .verdict = .writes, .why = "this moves files" },
     .{ .program = "git", .sub = "tag", .verdict = .writes, .why = "this creates a tag" },
-    .{ .program = "git", .sub = "stash", .verdict = .writes, .why = "this stashes the working tree" },
+    .{
+        .program = "git",
+        .sub = "stash",
+        .verdict = .writes,
+        .why = "this stashes the working tree",
+        .forbidden_flags = &.{ "-p", "--patch" },
+        .forbidden_why = "interactive patch mode needs a TTY and will hang this harness; stash specific paths instead",
+    },
     .{ .program = "git", .sub = "apply", .verdict = .writes, .why = "this applies a patch" },
     .{ .program = "git", .sub = "am", .verdict = .writes, .why = "this applies a patch" },
     .{ .program = "git", .sub = "gc", .verdict = .writes, .why = "this rewrites the repository" },
     .{ .program = "git", .sub = "prune", .verdict = .deletes, .why = "this removes unreachable objects" },
-    .{ .program = "git", .sub = "clean", .verdict = .deletes, .why = "this deletes unreferenced files" },
+    .{
+        .program = "git",
+        .sub = "clean",
+        .verdict = .deletes,
+        .why = "this deletes unreferenced files",
+        .forbidden_flags = &.{ "-i", "--interactive" },
+        .forbidden_why = "interactive clean needs a TTY and will hang this harness; use explicit paths/flags instead",
+    },
     .{ .program = "git", .sub = "repack", .verdict = .writes, .why = "this rewrites the repository" },
     .{ .program = "git", .sub = "worktree", .verdict = .writes, .why = "this changes the worktrees" },
     .{ .program = "git", .sub = "submodule", .verdict = .writes, .why = "this changes the submodules" },
@@ -364,6 +422,19 @@ pub fn classifyPart(part: []const u8, arena: std.mem.Allocator) Finding {
         if (e.sub.len == 0) continue;
         if (!std.mem.eql(u8, e.sub, sub)) continue;
 
+        // Interactive/forbidden flags win over everything: they hang a non-TTY
+        // harness or require human input the harness cannot provide.
+        for (words[2..]) |w| {
+            for (e.forbidden_flags) |f| {
+                if (!flagMatches(w, f)) continue;
+                return .{
+                    .verdict = .forbidden,
+                    .fragment = part,
+                    .why = if (e.forbidden_why.len > 0) e.forbidden_why else "this command requires an interactive TTY the harness does not have",
+                };
+            }
+        }
+
         // A flag that READS settles it: `git config --global --get x` READS
         // the global config, and the flag that reads wins over the flag that
         // writes. Without a read flag, the subcommand WRITES.
@@ -431,6 +502,7 @@ pub fn isReadOnly(command: []const u8, arena: std.mem.Allocator) bool {
 }
 
 /// How bad a verdict is, for taking the worst of several parts.
+/// `forbidden` is highest: the command must not run in this harness.
 fn severity(v: Verdict) u8 {
     return switch (v) {
         .read_only => 0,
@@ -438,6 +510,7 @@ fn severity(v: Verdict) u8 {
         .writes => 2,
         .deletes => 3,
         .executes => 4,
+        .forbidden => 5,
     };
 }
 
@@ -655,7 +728,7 @@ test "cmdsafety: the reason is in words, not in the raw line" {
 test "cmdsafety: read-only is decided by the scanner, not the program name" {
     // Phase 25.4: the read-only table trusts `lib/cmdsafety.zig`. A command
     // the scanner found nothing to flag only reads; anything that writes,
-    // deletes, runs another program, or is unknown does not.
+    // deletes, runs another program, is forbidden, or is unknown does not.
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -675,4 +748,43 @@ test "cmdsafety: read-only is decided by the scanner, not the program name" {
     // A command we do not know is NOT read-only: the cost of asking is one
     // dialog and the cost of guessing wrong is a file.
     try t.expect(!isReadOnly("nobody-tool", a));
+}
+
+test "cmdsafety: interactive commands that hang a non-TTY harness are forbidden" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The case TASKS 31.3/391 calls out explicitly.
+    const rebase_i = classify("git rebase -i HEAD~3", a);
+    try t.expectEqual(Verdict.forbidden, rebase_i.verdict);
+    try t.expect(rebase_i.why.len > 0);
+    try t.expect(!isReadOnly("git rebase -i HEAD~3", a));
+
+    const rebase_interactive = classify("git rebase --interactive main", a);
+    try t.expectEqual(Verdict.forbidden, rebase_interactive.verdict);
+
+    // Non-interactive rebase is still a write, not forbidden.
+    const rebase_ok = classify("git rebase main", a);
+    try t.expectEqual(Verdict.writes, rebase_ok.verdict);
+
+    // Interactive staging hangs waiting for input.
+    try t.expectEqual(Verdict.forbidden, classify("git add -p", a).verdict);
+    try t.expectEqual(Verdict.forbidden, classify("git add --patch src/", a).verdict);
+    try t.expectEqual(Verdict.forbidden, classify("git add -i", a).verdict);
+    // Non-interactive add is still a normal write.
+    try t.expectEqual(Verdict.writes, classify("git add src/main.zig", a).verdict);
+
+    // Patch/interactive modes in other git commands.
+    try t.expectEqual(Verdict.forbidden, classify("git checkout -p", a).verdict);
+    try t.expectEqual(Verdict.forbidden, classify("git restore --patch src/main.zig", a).verdict);
+    try t.expectEqual(Verdict.forbidden, classify("git reset -p HEAD", a).verdict);
+    try t.expectEqual(Verdict.forbidden, classify("git stash -p", a).verdict);
+    try t.expectEqual(Verdict.forbidden, classify("git clean -i", a).verdict);
+    // Non-interactive forms remain classified normally.
+    try t.expectEqual(Verdict.writes, classify("git checkout main", a).verdict);
+    try t.expectEqual(Verdict.deletes, classify("git clean -fdx", a).verdict);
+
+    // Forbidden wins in a pipeline: the whole command must not run.
+    try t.expectEqual(Verdict.forbidden, classify("git status && git rebase -i main", a).verdict);
 }

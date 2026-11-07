@@ -120,7 +120,7 @@ under 160k".
 | model's own window | from the catalogue | Used when `ZODE_CONTEXT_LIMIT` is not set. The palette shows it (`free · 200k`), and choosing a model adopts it. |
 | fallback window | `128000` | Used when neither of the above says anything. |
 | `ZODE_COMPACT_PCT` | `80` | The **budget**: this percentage of the window. Clamped to `10..95`. |
-| `ZODE_COMPACT` | `full` | What compaction may do: `off`, `elide`, `full` (§ below). |
+| `ZODE_COMPACT` | `elide` | What compaction may do when unset: `off`, `elide` (default), `full` (§ below). |
 | `ZODE_RECENT_WINDOW` | `8` | Messages kept verbatim. Clamped to `2..200`. Counts **messages**, so one tool round can be several of them. |
 
 The two tiers, applied until the request is under budget:
@@ -132,8 +132,8 @@ The two tiers, applied until the request is under budget:
    produced by a single extra model call capped at 16 KB.
 
 `off` does neither, and the provider will eventually reject the request for
-being too long. That is a valid choice while watching a request, not a good
-default.
+being too long. Use it only when you explicitly want verbatim history and accept
+the risk; the default `elide` keeps long sessions working without extra requests.
 
 `/context` prints the numbers and **where each one came from**:
 
@@ -141,7 +141,7 @@ default.
 context [████████░░░░░░░░░░░░] ~41100 / 200000 tokens (20.6% of limit)
   system ~9800 · history ~31300 · 14 turns · budget 160000 (26% used)
   limit from: the model's own context window · elided this session: 3 tool results
-  compaction: full at 80% of the limit (ZODE_COMPACT)
+  compaction: elide at 80% of the limit (ZODE_COMPACT)
 ```
 
 `/compact [off|elide|full]` overrides `ZODE_COMPACT` for the session;
@@ -314,6 +314,13 @@ never touches them: what the wire drops, the file keeps.
 | `ZODE_DALTONIZED` | `0` | Colour-blind-safe theme |
 | `ZODE_LSP_TIMEOUT_MS` | built-in | LSP request timeout |
 | `ZODE_DBG_ERR` | `0` | Verbose error output |
+| `ZODE_CORE_DUMP` | `0` | Opt in to a kernel core dump on crash (see below) |
+| `ZODE_LOOP_V2` | `1` | Task-scoped loop (budget ladder + completion contract); `0` restores old wall |
+| `ZODE_LOOP_MAX` | `max(3*soft,60)` | Hard wall for ordinary turns (soft..400) |
+| `ZODE_LOOP_GRANT` | `soft` | Iterations granted per extension |
+| `ZODE_LOOP_EXTENSIONS` | `3` | Max extensions per turn |
+
+`ZODE_CORE_DUMP` — opt in to a real kernel core dump (`$ coredumpctl list`, `coredumpctl debug <pid>`). Off by default because a core carries the whole heap: `auth.json`, tokens, the palette buffer and whatever the environment holds would land under `/var/lib/systemd/coredump`. When it is `1`, zode leaves the process dumpable (`PR_SET_DUMPABLE` stays at its default) and raises `RLIMIT_CORE` to the hard limit (an `ulimit -c 0` from the launching shell would otherwise swallow it silently). Use it while hunting a specific crash and unset it afterwards; `/tmp/zode-crash.log` (pid/pc + frames, or the panic's frames) is the secret-free alternative and is always written.
 
 To check that what you set is what is being used:
 
