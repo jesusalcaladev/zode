@@ -154,6 +154,11 @@ pub const Session = struct {
     /// Frozen result-cap decisions (34.2): re-applied on every turn/resume for
     /// cache-prefix stability. Persisted as a sidecar next to the session file.
     result_caps: resultcap.Caps = .{},
+    /// Phase 7: compaction boundary state. When set, snapshot/wire views keep
+    /// leading system messages + the summary + the most recent tail messages,
+    /// avoiding re-sending summarized history after resume.
+    compact_summary: ?[]const u8 = null,
+    compact_tail_keep: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Session {
         return .{
@@ -161,6 +166,8 @@ pub const Session = struct {
             .id = undefined,
             .messages = .empty,
             .result_caps = .{},
+            .compact_summary = null,
+            .compact_tail_keep = 0,
         };
     }
 
@@ -228,6 +235,7 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         self.saveCapsSidecar();
+        self.saveCompactSidecar();
         if (self.fw != null) self.fw.?.interface.flush() catch {};
         if (self.file) |f| f.close(self.io);
         for (self.messages.items) |m| {
@@ -238,9 +246,75 @@ pub const Session = struct {
         }
         self.messages.deinit(self.allocator);
         self.result_caps.deinit(self.allocator);
+        if (self.compact_summary) |s| self.allocator.free(s);
         if (self.path) |p| self.allocator.free(p);
         if (self.custom_title.len > 0) self.allocator.free(self.custom_title);
         if (self.ai_title.len > 0) self.allocator.free(self.ai_title);
+    }
+
+    fn compactSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
+        const p = self.path orelse return null;
+        return std.fmt.bufPrint(buf, "{s}.compact.json", .{p}) catch null;
+    }
+
+    pub fn setCompactionBoundary(self: *Session, summary: []const u8, tail_keep: usize) void {
+        if (self.compact_summary) |s| self.allocator.free(s);
+        self.compact_summary = self.allocator.dupe(u8, summary) catch null;
+        self.compact_tail_keep = tail_keep;
+        self.saveCompactSidecar();
+    }
+
+    pub fn saveCompactSidecar(self: *Session) void {
+        const io = self.io;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.compactSidecarPath(&pbuf) orelse return;
+        if (self.compact_summary == null) {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+            return;
+        }
+        var out: [256 * 1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        w.writeAll("{\"summary\":\"") catch return;
+        for (self.compact_summary.?) |ch| {
+            switch (ch) {
+                '"' => w.writeAll("\\\"") catch return,
+                '\\' => w.writeAll("\\\\") catch return,
+                '\n' => w.writeAll("\\n") catch return,
+                '\r' => w.writeAll("\\r") catch return,
+                '\t' => w.writeAll("\\t") catch return,
+                else => if (ch < 0x20) w.print("\\u00{x:0>2}", .{ch}) catch return else w.writeByte(ch) catch return,
+            }
+        }
+        w.writeAll("\",\"tail_keep\":") catch return;
+        w.print("{d}", .{self.compact_tail_keep}) catch return;
+        w.writeAll("}") catch return;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.buffered() }) catch {};
+    }
+
+    pub fn loadCompactSidecar(self: *Session) void {
+        const io = self.io;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.compactSidecarPath(&pbuf) orelse return;
+        const data = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(1024 * 1024)) catch return;
+        defer self.allocator.free(data);
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, data, .{}) catch return;
+        if (parsed != .object) return;
+        const sv = parsed.object.get("summary") orelse return;
+        if (sv != .string) return;
+        var tail: usize = 0;
+        if (parsed.object.get("tail_keep")) |tv| {
+            tail = switch (tv) {
+                .integer => |i| if (i >= 0) @intCast(i) else 0,
+                .string => std.fmt.parseInt(usize, tv.string, 10) catch 0,
+                else => 0,
+            };
+        }
+        if (self.compact_summary) |s| self.allocator.free(s);
+        self.compact_summary = self.allocator.dupe(u8, sv.string) catch null;
+        self.compact_tail_keep = tail;
     }
 
     fn capsSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
@@ -735,6 +809,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
         try s.messages.append(allocator, m);
     }
     s.loadCapsSidecar();
+    s.loadCompactSidecar();
     return s;
 }
 

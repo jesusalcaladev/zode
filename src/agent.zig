@@ -3884,25 +3884,53 @@ fn allocPrint(m: *tui.Model, comptime fmt: []const u8, args: anytype) ![]const u
     return std.fmt.allocPrint(m.allocator, fmt, args);
 }
 
+fn sessionMsgToChat(arena: std.mem.Allocator, sm: session_mod.Message) chat.ChatMessage {
+    const content = arena.dupe(u8, sm.content) catch sm.content;
+    const tj = if (sm.tool_calls_json) |j| arena.dupe(u8, j) catch sm.tool_calls_json else null;
+    const id = if (sm.tool_call_id) |v| arena.dupe(u8, v) catch sm.tool_call_id else null;
+    const nm = if (sm.tool_name) |v| arena.dupe(u8, v) catch sm.tool_name else null;
+    return .{
+        .role = @tagName(sm.role),
+        .content = content,
+        .tool_calls_json = tj,
+        .tool_call_id = id,
+        .tool_name = nm,
+    };
+}
+
 /// Copies the session messages into a slice of `ChatMessage`.
 ///
 /// Deep copy: strings are arena-duped here, so a later `setGoalNote` (which
 /// frees the old goal note) cannot dangle the wire view for this iteration.
+/// Phase 7: applies compaction boundaries/state so resumed sessions do not
+/// re-send summarized history.
 pub fn snapshotMsgs(arena: std.mem.Allocator) []chat.ChatMessage {
     const s = session orelse return &.{};
-    const msgs = arena.alloc(chat.ChatMessage, s.messages.items.len) catch return &.{};
+    var msgs_mut = arena.alloc(chat.ChatMessage, s.messages.items.len) catch return &.{};
     for (s.messages.items, 0..) |sm, i| {
-        const content = arena.dupe(u8, sm.content) catch sm.content;
-        const tj = if (sm.tool_calls_json) |j| arena.dupe(u8, j) catch sm.tool_calls_json else null;
-        const id = if (sm.tool_call_id) |v| arena.dupe(u8, v) catch sm.tool_call_id else null;
-        const nm = if (sm.tool_name) |v| arena.dupe(u8, v) catch sm.tool_name else null;
-        msgs[i] = .{
-            .role = @tagName(sm.role),
-            .content = content,
-            .tool_calls_json = tj,
-            .tool_call_id = id,
-            .tool_name = nm,
-        };
+        msgs_mut[i] = sessionMsgToChat(arena, sm);
+    }
+    // Message-embedded boundaries (future/alternative form).
+    const msgs = compaction.trimToBoundary(arena, msgs_mut) catch msgs_mut;
+    // Session-persisted compaction state (Phase 7): keep leading systems,
+    // inject summary, keep recent tail.
+    if (s.compact_summary) |summary| {
+        var out: std.ArrayList(chat.ChatMessage) = .empty;
+        var i: usize = 0;
+        while (i < msgs.len and std.mem.eql(u8, msgs[i].role, "system")) : (i += 1) {
+            out.append(arena, msgs[i]) catch return msgs;
+        }
+        const note = std.fmt.allocPrint(arena, "{s}\n{s}", .{ compaction.summary_note_prefix, summary }) catch summary;
+        out.append(arena, .{ .role = "user", .content = note }) catch return msgs;
+        const tail_keep = @min(s.compact_tail_keep, msgs.len);
+        const tail_from = msgs.len - tail_keep;
+        var j: usize = tail_from;
+        while (j < msgs.len) : (j += 1) {
+            // Avoid duplicating system messages if tail reaches into them.
+            if (j < i) continue;
+            out.append(arena, msgs[j]) catch return msgs;
+        }
+        return out.toOwnedSlice(arena) catch msgs;
     }
     return msgs;
 }
@@ -7211,6 +7239,31 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
     // para el read cache (no son del mismo allocador). Solo marcamos cuando
     // la compactación fue síncrona (arena del turno).
     if (!used_bg) {
+        // Phase 7 microcompaction: persist large elided tool results that were
+        // not already stored, so "nothing is lost, only moved".
+        if (session) |ss| {
+            for (comp.elided_at) |idx| {
+                if (idx >= comp.msgs.len or idx >= msgs0.len) continue;
+                if (!std.mem.eql(u8, comp.msgs[idx].role, "tool")) continue;
+                if (toolstore.extractStoredPath(comp.msgs[idx].content) != null) continue;
+                const original = msgs0[idx].content;
+                if (original.len < 1024) continue;
+                if (ss.path) |spath| {
+                    const stored = toolstore.storeResult(arena, io_global, spath, ss.tool_result_next, original);
+                    ss.tool_result_next += 1;
+                    if (stored.stored) {
+                        if (stored.path) |p| {
+                            comp.msgs[idx].content = std.fmt.allocPrint(
+                                arena,
+                                "[tool result elided: {d} bytes — recoverable via read path={s}]",
+                                .{ original.len, p },
+                            ) catch comp.msgs[idx].content;
+                        }
+                    }
+                }
+            }
+            ss.saveCapsSidecar();
+        }
         if (comp.elided > session_elided) {
             if (std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided})) |msg| {
                 session_elided = comp.elided;
@@ -7331,7 +7384,13 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
                 // carries on with the list it had, which is bigger but correct.
                 // `return null` would end the turn with nothing on screen.
                 var nm: std.ArrayList(chat.ChatMessage) = .empty;
-                const note_msg = std.fmt.allocPrint(arena, "[the earlier part of this conversation was summarized to fit the context budget]\n{s}", .{summary}) catch summary;
+                const note_msg = std.fmt.allocPrint(arena, "{s}\n{s}", .{ compaction.summary_note_prefix, summary }) catch summary;
+                // Phase 7: persist compaction boundary state so resume/wire
+                // trimming does not re-send summarized history.
+                if (session) |ss| {
+                    const tail_keep = if (upto <= comp.msgs.len) comp.msgs.len - upto else 0;
+                    ss.setCompactionBoundary(summary, tail_keep);
+                }
                 if (nm.appendSlice(arena, comp.msgs[0..sum_from])) |_| {
                     if (nm.append(arena, .{ .role = "user", .content = note_msg })) |_| {
                         if (nm.appendSlice(arena, comp.msgs[upto..])) |_| {

@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact known keys + sk-/Bearer/_KEY shapes (redact) [`519a0ea3`](https://github.com/jesusalcaladev/zode/commit/519a0ea3)
 - allowlist + secret stripping (spawnenv) [`4346d1cd`](https://github.com/jesusalcaladev/zode/commit/4346d1cd)
 - secret-tool lookup/store fallback (keychain) [`a0c1b793`](https://github.com/jesusalcaladev/zode/commit/a0c1b793)
+- compaction v2 with recoverable microcompaction and boundaries (phase7) [`80082224`](https://github.com/jesusalcaladev/zode/commit/80082224)
 
 ### Bug Fixes
 
@@ -39,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - temp+rename atomic write (modelcache) [`57a4a145`](https://github.com/jesusalcaladev/zode/commit/57a4a145)
 - complete scanner refactor and segment conversions (highlight) [`1b841cb5`](https://github.com/jesusalcaladev/zode/commit/1b841cb5)
 - pipe provider key to secret-tool stdin (keychain) [`2b64fd87`](https://github.com/jesusalcaladev/zode/commit/2b64fd87)
-- refuse interactive TTY bash and harden Bash permission UX (safety) [`e3813b90`](https://github.com/jesusalcaladev/zode/commit/e3813b90)
+- refuse interactive TTY bash and harden Bash permission UX (safety) [`6605a6dd`](https://github.com/jesusalcaladev/zode/commit/6605a6dd)
 
 ### Chores
 

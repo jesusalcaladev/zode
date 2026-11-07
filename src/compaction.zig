@@ -361,15 +361,64 @@ pub fn tryCollectBg(state: *CompactBgState) ?CompactBgResult {
     return null;
 }
 
+pub const boundary_marker = "[zode-compaction-boundary]";
+pub const summary_note_prefix = "[the earlier part of this conversation was summarized to fit the context budget]";
+
+pub fn isBoundaryMessage(m: chat.ChatMessage) bool {
+    return std.mem.indexOf(u8, m.content, boundary_marker) != null;
+}
+
 /// True when a message is "critical": it must not be elided or summarized
-/// because it carries the goal, the plan, or file references the model needs
-/// to keep at hand.
+/// because it carries goal/plan state, invoked skills, read-file context, or
+/// compaction summaries/boundaries the model needs to keep.
 pub fn isCriticalMessage(m: chat.ChatMessage) bool {
     const c = m.content;
     if (std.mem.indexOf(u8, c, "\u{1}ZODE-GOAL\u{1}") != null) return true;
     if (std.mem.indexOf(u8, c, "[Plan]") != null) return true;
     if (std.mem.indexOf(u8, c, "[earlier conversation summarized") != null) return true;
+    if (std.mem.indexOf(u8, c, summary_note_prefix) != null) return true;
+    if (std.mem.indexOf(u8, c, boundary_marker) != null) return true;
+    // Phase 7: preserve invoked skills across compaction.
+    if (m.tool_name) |tn| {
+        if (std.mem.eql(u8, tn, "skill")) return true;
+        // Phase 7: preserve read files across compaction (file context the
+        // model explicitly loaded). Skip already-elided placeholders.
+        if (std.mem.eql(u8, tn, "read") and std.mem.indexOf(u8, c, "[tool result elided:") == null) return true;
+    }
+    if (std.mem.indexOf(u8, c, "<skill_content") != null) return true;
     return false;
+}
+
+/// Finds the index of the last compaction boundary in `msgs`, or null.
+/// The boundary itself is a marker; callers usually keep messages after it
+/// (plus system/critical context as needed).
+pub fn lastBoundaryIndex(msgs: []const chat.ChatMessage) ?usize {
+    var i: usize = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (isBoundaryMessage(msgs[i])) return i;
+    }
+    return null;
+}
+
+/// Returns a wire view trimmed to the last compaction boundary.
+/// Keeps the leading system message(s) before the boundary's summary context
+/// and everything from the boundary onward. If no boundary exists, returns
+/// `msgs` unchanged.
+pub fn trimToBoundary(arena: std.mem.Allocator, msgs: []const chat.ChatMessage) ![]chat.ChatMessage {
+    const bidx = lastBoundaryIndex(msgs) orelse return @constCast(msgs);
+    var out: std.ArrayList(chat.ChatMessage) = .empty;
+    // Preserve initial system message(s) (stable prefix).
+    var i: usize = 0;
+    while (i < msgs.len and i < bidx and std.mem.eql(u8, msgs[i].role, "system")) : (i += 1) {
+        try out.append(arena, msgs[i]);
+    }
+    // Keep boundary marker and everything after it (boundary+summary note+recent).
+    var j: usize = bidx;
+    while (j < msgs.len) : (j += 1) {
+        try out.append(arena, msgs[j]);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// The most aggressive setting that still makes sense, and why it is a clamp.
@@ -553,8 +602,8 @@ pub fn elideTier(
 /// call sites (the turn and the subagent) and "off" has to mean the same thing in
 /// both: no eliding, no summary, and `needs_summary` false so nothing downstream
 /// asks for one.
-pub fn nothingElided(msgs: []chat.ChatMessage) Compacted {
-    return .{ .msgs = msgs };
+pub fn nothingElided(msgs: []const chat.ChatMessage) Compacted {
+    return .{ .msgs = @constCast(msgs) };
 }
 
 const summary_input_limit: usize = 16 * 1024;
@@ -1236,4 +1285,99 @@ test "elideTier: critical messages are never elided even under a tiny budget" {
     try std.testing.expect(std.mem.eql(u8, res.msgs[7].content, big_tool));
     // And the input is untouched: eliding must never mutate the live history.
     try std.testing.expect(std.mem.eql(u8, msgs[1].content, big_tool));
+}
+
+test "Phase 7: invoked skill tool results are preserved across compaction" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_RECENT_WINDOW", "2");
+
+    const skill_body = &repeat.rep("skill-instructions-", 400);
+    var msgs = [_]chat.ChatMessage{
+        .{ .role = "system", .content = "sys" },
+        .{ .role = "user", .content = "use the skill" },
+        .{ .role = "assistant", .content = "calling skill", .tool_calls_json = "[{\"id\":\"1\"}]" },
+        .{ .role = "tool", .tool_call_id = "1", .tool_name = "skill", .content = skill_body },
+        .{ .role = "assistant", .content = "ok" },
+        .{ .role = "tool", .tool_name = "bash", .content = &repeat.rep("x", 4000) },
+        .{ .role = "user", .content = "continue" },
+        .{ .role = "assistant", .content = "done" },
+    };
+    const res = try elideTier(arena, &msgs, 100, &env, 0, .full);
+    // Bash result may be elided, but skill result must remain intact.
+    var saw_skill = false;
+    for (res.msgs) |m| {
+        if (m.tool_name) |tn| {
+            if (std.mem.eql(u8, tn, "skill")) {
+                saw_skill = true;
+                try std.testing.expect(std.mem.eql(u8, m.content, skill_body));
+            }
+        }
+    }
+    try std.testing.expect(saw_skill);
+}
+
+test "Phase 7: read file tool results are preserved across compaction" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_RECENT_WINDOW", "2");
+
+    const file_body = &repeat.rep("1|const x = 1;\n", 400);
+    var msgs = [_]chat.ChatMessage{
+        .{ .role = "system", .content = "sys" },
+        .{ .role = "assistant", .content = "reading", .tool_calls_json = "[{\"id\":\"r\"}]" },
+        .{ .role = "tool", .tool_call_id = "r", .tool_name = "read", .content = file_body },
+        .{ .role = "assistant", .content = "ok" },
+        .{ .role = "tool", .tool_name = "bash", .content = &repeat.rep("y", 4000) },
+        .{ .role = "user", .content = "go" },
+        .{ .role = "assistant", .content = "done" },
+    };
+    const res = try elideTier(arena, &msgs, 100, &env, 0, .full);
+    var saw_read = false;
+    for (res.msgs) |m| {
+        if (m.tool_name) |tn| {
+            if (std.mem.eql(u8, tn, "read")) {
+                saw_read = true;
+                try std.testing.expect(std.mem.eql(u8, m.content, file_body));
+            }
+        }
+    }
+    try std.testing.expect(saw_read);
+}
+
+test "Phase 7: trimToBoundary keeps system prefix and messages after boundary" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const msgs = [_]chat.ChatMessage{
+        .{ .role = "system", .content = "system prompt" },
+        .{ .role = "user", .content = "old question" },
+        .{ .role = "assistant", .content = "old answer" },
+        .{ .role = "user", .content = compaction.boundary_marker },
+        .{ .role = "user", .content = "[the earlier part of this conversation was summarized to fit the context budget]\nsummary" },
+        .{ .role = "user", .content = "new question" },
+    };
+    const trimmed = try compaction.trimToBoundary(arena, &msgs);
+    try std.testing.expectEqual(@as(usize, 4), trimmed.len);
+    try std.testing.expectEqualStrings("system", trimmed[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, trimmed[1].content, compaction.boundary_marker) != null);
+    try std.testing.expectEqualStrings("new question", trimmed[3].content);
+}
+
+test "Phase 7: trimToBoundary is a no-op without boundary" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const msgs = [_]chat.ChatMessage{
+        .{ .role = "system", .content = "s" },
+        .{ .role = "user", .content = "u" },
+    };
+    const trimmed = try compaction.trimToBoundary(arena, &msgs);
+    try std.testing.expectEqual(msgs.len, trimmed.len);
 }
