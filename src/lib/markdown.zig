@@ -164,6 +164,18 @@ pub const DiffCtx = struct {
     old_state: hl.State = .{},
 };
 
+/// First token of a fenced code block's info string (`rust,no_run` → `rust`).
+fn fenceLangToken(raw: []const u8) []const u8 {
+    const s = std.mem.trim(u8, raw, " \t\r\n");
+    if (s.len == 0) return "";
+    var end: usize = 0;
+    while (end < s.len) : (end += 1) {
+        const c = s[end];
+        if (c == ' ' or c == '\t' or c == ',' or c == '{') break;
+    }
+    return s[0..end];
+}
+
 /// Like `parseBase` but knowing which LANGUAGE the content is in.
 ///
 /// Right now only the diff uses it: without the file extension the body of a
@@ -263,7 +275,7 @@ pub fn parseLang(
                 }
                 in_code = true;
                 const trimmed = std.mem.trimStart(u8, line, " ");
-                code_lang = if (trimmed.len > 3) trimmed[3..] else "";
+                code_lang = fenceLangToken(if (trimmed.len > 3) trimmed[3..] else "");
                 // Every fence starts with no state: whatever stayed open in
                 // the previous block is not carried over.
                 code_state = .{};
@@ -2459,4 +2471,15 @@ test "an opening code fence with no body still renders as code while streaming" 
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqual(Kind.code, blocks[0].kind);
     try std.testing.expectEqualStrings("zig", blocks[0].lang);
+}
+
+test "a fenced block stores only the language token from its info string" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+
+    const blocks = try parse(arena, .assistant, "```rust,no_run\nfn main() {}\n```");
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqual(Kind.code, blocks[0].kind);
+    try std.testing.expectEqualStrings("rust", blocks[0].lang);
 }
