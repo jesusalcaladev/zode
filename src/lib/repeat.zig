@@ -1,5 +1,9 @@
 //! Compile-time repetition, for test data.
 //!
+//! Not to be confused with `repeat_guard.zig`, which implements the runtime tool-call
+//! repetition guard (loop detection). This module is purely comptime test-data
+//! construction.
+//!
 //! Zig 0.17 removed the array multiplication operator (`"x" ** 5000`), and the
 //! tests that build long synthetic content need something in its place. `rep`
 //! is that something: it runs entirely at comptime, so the result is a plain

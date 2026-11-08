@@ -1,5 +1,8 @@
 //! The repetition guard: the same tool, the same arguments, three times running.
 //!
+//! Not to be confused with `repeat.zig`, which provides comptime string repetition
+//! for test data. This module is the runtime loop-detection guard used by the agent.
+//!
 //! ## Why it is separate from the limit
 //!
 //! A loop with a limit is stopped by the limit, which costs the whole budget first: the

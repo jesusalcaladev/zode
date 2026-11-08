@@ -76,7 +76,7 @@ const agentdefs = @import("lib/agentdefs.zig");
 const cachebreak = @import("lib/cachebreak.zig");
 const commands_mod = @import("commands.zig");
 const exitgate = @import("lib/exitgate.zig");
-const repeats_mod = @import("lib/repeats.zig");
+const repeats_mod = @import("lib/repeat_guard.zig");
 const taskloop = @import("lib/taskloop.zig");
 const build_options = @import("build_options");
 const autochk = @import("autochk.zig");
@@ -6097,7 +6097,7 @@ fn progressText(e: taskloop.Evidence) []const u8 {
 /// `u64` FNV-1a over the tool name and the arguments. `0` is never a legal hash here
 /// because `runToolCall` is only reached with a non-empty name.
 /// Re-exported so the call sites and the tests keep one name for the rule. The
-/// IMPLEMENTATION lives in `lib/repeats.zig`; see its doc comment for why it does not
+/// IMPLEMENTATION lives in `lib/repeat_guard.zig`; see its doc comment for why it does not
 /// belong in a file this size.
 pub const repeat_limit = repeats_mod.repeat_limit;
 pub const isRepeatExempt = repeats_mod.isRepeatExempt;

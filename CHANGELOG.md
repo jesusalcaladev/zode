@@ -20,7 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - mark compaction v2 complete (phase7) [`5423ba65`](https://github.com/jesusalcaladev/zode/commit/5423ba65)
-- update architecture, settings, and status for phases 3/5/6/7/10 [`1e00050a`](https://github.com/jesusalcaladev/zode/commit/1e00050a)
+- update architecture, settings, and status for phases 3/5/6/7/10 [`93b76606`](https://github.com/jesusalcaladev/zode/commit/93b76606)
+
+### Refactors
+
+- rename repeats guard to repeat_guard [`9aa2767e`](https://github.com/jesusalcaladev/zode/commit/9aa2767e)
+
+### Other
+
+- modernize TUI and keep terminal background transparent [`186d63dc`](https://github.com/jesusalcaladev/zode/commit/186d63dc)
+- refine borders and composer placeholder [`c9253016`](https://github.com/jesusalcaladev/zode/commit/c9253016)
+- soften code borders and tool result rail [`c932aa54`](https://github.com/jesusalcaladev/zode/commit/c932aa54)
+- compact tool expand hint [`6c7b685c`](https://github.com/jesusalcaladev/zode/commit/6c7b685c)
 
 ## [0.2.0] - 2026-11-07
 
