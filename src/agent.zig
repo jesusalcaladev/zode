@@ -29,6 +29,7 @@ const usercmds_mod = @import("lib/usercmds.zig");
 const pathsafe = @import("lib/pathsafe.zig");
 const permrules = @import("lib/permrules.zig");
 const cmdsafety = @import("lib/cmdsafety.zig");
+const sandbox_mod = @import("lib/sandbox.zig");
 const mentions = @import("lib/mentions.zig");
 const session_mod = @import("session.zig");
 const models_mod = @import("lib/models.zig");
@@ -2938,7 +2939,7 @@ fn curKey(m: *tui.Model) ?[]const u8 {
 // ── user config ───────────────────────────────────────────────
 
 var cfg_arena_state: ?std.heap.ArenaAllocator = null;
-var user_config: config_mod.Config = .{};
+pub var user_config: config_mod.Config = .{};
 
 /// Loads the user's `config.json`. Call once at startup.
 pub fn loadUserConfig() void {
@@ -10069,6 +10070,66 @@ fn capStoreAppendToolResult(
     s.appendToolResult(call_id, tool_name, final_text) catch {};
 }
 
+/// The `command` string from a bash tool's JSON args, or "".
+fn bashCommandOf(args_json: []const u8, arena: std.mem.Allocator) []const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return "";
+    if (parsed != .object) return "";
+    const v = parsed.object.get("command") orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+/// Args JSON with `"sandbox":true` injected, so a flagged bash command
+/// can run sandboxed when the user chooses it (Phase 25). Forces sandbox
+/// even if the model set it to false — the user's dialog choice wins.
+fn withSandboxArg(arena: std.mem.Allocator, args_json: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, args_json, "\"sandbox\"")) |_| {
+        // Force true when explicitly false. Simple textual replacement covers
+        // the JSON forms the model produces.
+        const needles = [_]struct { from: []const u8, to: []const u8 }{
+            .{ .from = "\"sandbox\":false", .to = "\"sandbox\":true" },
+            .{ .from = "\"sandbox\": false", .to = "\"sandbox\": true" },
+            .{ .from = "\"sandbox\" : false", .to = "\"sandbox\" : true" },
+            .{ .from = "\"sandbox\" :false", .to = "\"sandbox\" :true" },
+        };
+        var out: []const u8 = args_json;
+        for (needles) |n| {
+            if (std.mem.indexOf(u8, out, n.from)) |_| {
+                out = replaceAll(arena, out, n.from, n.to) catch out;
+            }
+        }
+        return out;
+    }
+    const trimmed = std.mem.trim(u8, args_json, " \t\r\n");
+    if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
+        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        if (inner.len == 0) return "{\"sandbox\":true}";
+        return std.fmt.allocPrint(arena, "{s},\"sandbox\":true}}", .{trimmed[0 .. trimmed.len - 1]}) catch args_json;
+    }
+    return args_json;
+}
+
+fn replaceAll(arena: std.mem.Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]const u8 {
+    if (needle.len == 0) return input;
+    const count = std.mem.count(u8, input, needle);
+    if (count == 0) return input;
+    const out_len = input.len - (count * needle.len) + (count * replacement.len);
+    var buf = try arena.alloc(u8, out_len);
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < input.len) {
+        if (i + needle.len <= input.len and std.mem.eql(u8, input[i..][0..needle.len], needle)) {
+            @memcpy(buf[o..][0..replacement.len], replacement);
+            o += replacement.len;
+            i += needle.len;
+        } else {
+            buf[o] = input[i];
+            o += 1;
+            i += 1;
+        }
+    }
+    return buf[0..o];
+}
+
 fn execOneCall(
     m: *tui.Model,
     s: *session_mod.Session,
@@ -10217,12 +10278,14 @@ fn execOneCall(
                 } },
             ) catch p;
             switch (m.requestPermissionOnce(call.name, detail)) {
-                .allow => {
+                .allow, .allow_sandbox => {
                     pathsafe.approve(p);
                     // The user has just approved THIS write, with the reason
                     // in front of them. The general dialog would ask the same
                     // question about the same file with the reason hidden, and
                     // two dialogs for one write is a dialog too many.
+                    // `allow_sandbox` is not offered for sensitive-path
+                    // questions, but handled for exhaustiveness.
                     risky_allowed = true;
                 },
                 .allow_always => {
@@ -10267,6 +10330,8 @@ fn execOneCall(
     // but `bash`, so nothing else changes — the scanner in `lib/cmdsafety.zig`
     // decides, not the static flag on the registry row.
     const no_dialog = reads_only;
+    var force_sandbox_bash = false;
+    var exec_args: []const u8 = call.args_json;
     if (!yolo and !auto_allowed and !risky_allowed and !rule_allowed and !no_dialog and permNeedsDialog(perm_tools)) {
         var dbuf: [384]u8 = undefined;
         // A batch's dialog says WHICH FILES it would touch: the user is being
@@ -10298,8 +10363,25 @@ fn execOneCall(
         if (rule_match_text.len > 0) {
             m.setPermRule(rule_match_text);
         }
+        // Phase 25: for a flagged `bash` command, offer a sandboxed run when
+        // bwrap/firejail is available — a dialog is not the only answer.
+        if (std.mem.eql(u8, call.name, "bash")) {
+            const cmdv = bashCommandOf(call.args_json, arena);
+            if (cmdv.len > 0 and cmdsafety.isFlagged(cmdv, arena)) {
+                const path = if (environ_global) |e| e.get("PATH") else null;
+                if (sandbox_mod.detect(io_global, std.Io.Dir.cwd(), path) != .none) {
+                    m.setPermSandboxAvailable(true);
+                }
+            }
+        }
         switch (m.requestPermission(call.name, detail)) {
             .allow => {},
+            .allow_sandbox => {
+                if (std.mem.eql(u8, call.name, "bash")) {
+                    force_sandbox_bash = true;
+                    exec_args = withSandboxArg(arena, call.args_json);
+                }
+            },
             .allow_always => {
                 rememberAlwaysAllow(m, call.name, arg, call.args_json, perm_tools, arena);
             },
@@ -10390,7 +10472,7 @@ fn execOneCall(
         applyGoalCall(m, call.args_json, arena);
     }
 
-    const res = tools_mod.executeWith(io_global, call.name, call.args_json, arena, &m.bg, &m.reads, &m.tasks, perm_rules) catch |err| {
+    const res = tools_mod.executeWith(io_global, call.name, exec_args, arena, &m.bg, &m.reads, &m.tasks, perm_rules) catch |err| {
         const ms = elapsedMs(call_t0);
         // What the MODEL is told is not the error name. See `describeError`.
         const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);

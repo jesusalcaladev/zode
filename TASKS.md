@@ -236,8 +236,8 @@ state, the open bug and the quality bar).
 
 > Phase 6 decides _whether_ to ask; this decides _what is dangerous_. A dialog is useless if one line hides an `rm -rf` behind a pipe.
 
-- [ ] Optional sandbox: if `bwrap` exists, offer a sandboxed `bash` for flagged commands — a dialog is not the only answer
-- [ ] Pure tests: the parser splits quoted separators correctly (a `;` inside a string is not a separator) · a pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution
+- [x] Optional sandbox: if `bwrap` or `firejail` exists, offer a sandboxed `bash` for flagged commands in the permission dialog (`S` / "run sandboxed") — a dialog is not the only answer
+- [x] Pure tests: the parser splits quoted separators correctly (a `;` inside a string is not a separator) · a pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution
 
 ---
 

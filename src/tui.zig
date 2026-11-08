@@ -1382,6 +1382,12 @@ pub const Model = struct {
     /// permission (a write into `.git/`), and the "A" key does not answer
     /// them: the option is not on the table, so the key is not a key.
     perm_allow_always: bool = true,
+    /// Whether the open dialog offers "run in sandbox" (Phase 25).
+    ///
+    /// True for a flagged `bash` command when a sandbox (bwrap/firejail) is
+    /// installed: the sandbox is a real alternative to running with full
+    /// permissions, so the dialog is not the only answer.
+    perm_sandbox_available: bool = false,
     perm_answer: PermAnswer = .none,
     /// The dialog's OWN lock, separate from the history's `spin` (1.7).
     ///
@@ -1685,7 +1691,7 @@ pub const Model = struct {
     /// a call repeated.
     repeats: agent.Repeats = .{},
 
-    pub const PermAnswer = enum { none, allow, allow_always, deny };
+    pub const PermAnswer = enum { none, allow, allow_always, allow_sandbox, deny };
 
     const CachedPara = struct {
         arena: ?*std.heap.ArenaAllocator, // owns the lines + cells
@@ -2986,6 +2992,8 @@ pub const Model = struct {
         @memcpy(self.perm_detail[0..n_det], detail[0..n_det]);
         self.perm_detail_len = n_det;
         self.perm_answer = .none;
+        // `perm_sandbox_available` is set by the caller before this blocks:
+        // clearing it here would discard a "run sandboxed" offer (Phase 25).
         self.perm_active = true;
         // The tick must keep running while the user decides: without this the
         // dialog appears but is not repainted (the clock, the face...).
@@ -3000,6 +3008,7 @@ pub const Model = struct {
         const a = self.perm_answer;
         self.perm_active = false;
         self.perm_rule_len = 0;
+        self.perm_sandbox_available = false;
         self.permUnlock();
         return a;
     }
@@ -3062,6 +3071,20 @@ pub const Model = struct {
         self.permLock();
         defer self.permUnlock();
         return self.perm_allow_always;
+    }
+
+    /// Whether the open dialog offers "run in sandbox" (a flagged bash command
+    /// with bwrap/firejail available). Set by the worker before asking.
+    pub fn setPermSandboxAvailable(self: *Model, available: bool) void {
+        self.permLock();
+        defer self.permUnlock();
+        self.perm_sandbox_available = available;
+    }
+
+    pub fn permSandboxAvailable(self: *Model) bool {
+        self.permLock();
+        defer self.permUnlock();
+        return self.perm_sandbox_available;
     }
 
     /// UI: answers the open dialog.
@@ -7145,11 +7168,16 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 try self.armTick(ctx);
                 return;
             }
-            // Permission dialog active: y/a/n decide, rest ignored.
+            // Permission dialog active: y/s/a/n decide, rest ignored.
             if (self.permActive()) {
                 const cp = key.codepoint;
                 if (cp == 'y' or cp == 'Y') {
                     self.answerPermission(.allow);
+                } else if (cp == 's' or cp == 'S') {
+                    // Phase 25: run a flagged bash command in a sandbox, when
+                    // one is available. Not the only answer — an alternative
+                    // to granting full permissions.
+                    if (self.permSandboxAvailable()) self.answerPermission(.allow_sandbox);
                 } else if (cp == 'a' or cp == 'A') {
                     // Only when the option is on the table. A question that
                     // must not become a standing permission does not show it,
@@ -7880,6 +7908,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             perm_detail,
             self.permRule(),
             self.permAllowAlways(),
+            self.permSandboxAvailable(),
             self.permSuggestion(),
         );
     }
@@ -8844,12 +8873,15 @@ fn drawPermissionModal(
     detail: []const u8,
     rule: []const u8,
     allow_always: bool,
+    allow_sandbox: bool,
     suggestion: []const u8,
 ) void {
     const w: u16 = @min(width -| 6, 104);
     const dangerous_suggestion = allow_always and suggestion.len > 0 and permrules.isDangerousRuleText(suggestion);
+    const sandbox_note = allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash");
     var h: u16 = 9;
     if (rule.len > 0) h += 1;
+    if (sandbox_note) h += 1;
     if (dangerous_suggestion) h += 1;
     // A TERMINAL TOO SMALL FOR THE BOX IS NOT A REASON TO PAINT NOTHING.
     //
@@ -8863,7 +8895,7 @@ fn drawPermissionModal(
     // columns. The direction that matters: it is better to show a cramped
     // question than an invisible one.
     if (w < 30 or height < h + 2) {
-        drawPermissionModalCompact(p, width, height, tool);
+        drawPermissionModalCompact(p, width, height, tool, allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash"));
         return;
     }
     const x: u16 = (width -| w) / 2;
@@ -8897,6 +8929,14 @@ fn drawPermissionModal(
         dy += 1;
     }
 
+    // Phase 25: a sandbox is available, so the dialog is not the only answer.
+    if (sandbox_note and dy < y + h - 2) {
+        const note = "sandbox available: S runs it isolated (project writable, rest read-only)";
+        const max_n = @as(usize, w - 6);
+        _ = p.putText(x + 3, dy, if (note.len > max_n) note[0..max_n] else note, theme.ok);
+        dy += 1;
+    }
+
     // Warn when "always allow" would create a dangerously broad rule.
     if (dangerous_suggestion and dy < y + h - 2) {
         const warn = "warning: broad allow can run arbitrary commands";
@@ -8912,14 +8952,23 @@ fn drawPermissionModal(
     // permission: a path inside `.git/` is asked ONCE. "Always allow" there
     // would put the whole `.git/` on the list of places the agent writes
     // without asking, which is the opposite of what the question is for.
-    const opts_all = [_]struct { key: []const u8, label: []const u8, is_always: bool }{
-        .{ .key = "Y", .label = "allow once", .is_always = false },
-        .{ .key = "A", .label = "always allow", .is_always = true },
-        .{ .key = "N", .label = "deny", .is_always = false },
-        .{ .key = "ESC", .label = "cancel", .is_always = false },
+    const Opt = struct { key: []const u8, label: []const u8, is_always: bool, is_sandbox: bool };
+    const opts_all = [_]Opt{
+        .{ .key = "Y", .label = "allow once", .is_always = false, .is_sandbox = false },
+        .{ .key = "S", .label = "run sandboxed", .is_always = false, .is_sandbox = true },
+        .{ .key = "A", .label = "always allow", .is_always = true, .is_sandbox = false },
+        .{ .key = "N", .label = "deny", .is_always = false, .is_sandbox = false },
+        .{ .key = "ESC", .label = "cancel", .is_always = false, .is_sandbox = false },
     };
-    var opts: []const @TypeOf(opts_all[0]) = &opts_all;
-    if (!allow_always) opts = &.{ opts_all[0], opts_all[2], opts_all[3] };
+    var opts_buf: [5]Opt = undefined;
+    var opts_n: usize = 0;
+    for (opts_all) |o| {
+        if (o.is_always and !allow_always) continue;
+        if (o.is_sandbox and !sandbox_note) continue;
+        opts_buf[opts_n] = o;
+        opts_n += 1;
+    }
+    const opts = opts_buf[0..opts_n];
     // The "always allow" option NAMES the rule it would remember.
     var suggestion_buf: [128]u8 = undefined;
     const suggestion_label_text = if (allow_always) suggestion_label(suggestion, &suggestion_buf) else "";
@@ -8931,6 +8980,8 @@ fn drawPermissionModal(
         const label: []const u8 = if (o.is_always and suggestion_label_text.len > 0) suggestion_label_text else o.label;
         const label_style = if (i == 0)
             theme.brand
+        else if (o.is_sandbox)
+            theme.ok
         else if (o.is_always and dangerous_suggestion)
             theme.err
         else
@@ -8971,6 +9022,7 @@ fn drawPermissionModalCompact(
     width: u16,
     height: u16,
     tool: []const u8,
+    allow_sandbox: bool,
 ) void {
     if (height == 0 or width == 0) return;
     const rows: u16 = if (height >= 2) 2 else 1;
@@ -8989,7 +9041,10 @@ fn drawPermissionModalCompact(
     _ = p.putClipped(1, y, head, width -| 2, theme.warn_bold);
 
     if (rows >= 2) {
-        const opts = "Y allow · A always · N deny · ESC cancel";
+        const opts = if (allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash"))
+            "Y allow · S sandbox · A always · N deny · ESC cancel"
+        else
+            "Y allow · A always · N deny · ESC cancel";
         _ = p.putClipped(1, y + 1, opts, width -| 2, theme.brand_soft);
     }
 }

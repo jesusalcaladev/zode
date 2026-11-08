@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 - complete /resume picker, tiers 1-3 search wiring, and UI/cache fixes (phase29) [`4f9a954d`](https://github.com/jesusalcaladev/zode/commit/4f9a954d)
-- add OpenAI-compatible providers and Phase 11 persistent memory [`2a36ddb4`](https://github.com/jesusalcaladev/zode/commit/2a36ddb4)
+- add OpenAI-compatible providers and Phase 11 persistent memory [`edb19d7c`](https://github.com/jesusalcaladev/zode/commit/edb19d7c)
+- bash safety sandbox offer and classification tests (phase25) [`2be0d4a6`](https://github.com/jesusalcaladev/zode/commit/2be0d4a6)
 
 ## [0.2.0] - 2026-11-07
 
