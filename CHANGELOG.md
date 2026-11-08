@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add OpenAI-compatible providers and Phase 11 persistent memory [`edb19d7c`](https://github.com/jesusalcaladev/zode/commit/edb19d7c)
 - bash safety sandbox offer and classification tests (phase25) [`14b796b3`](https://github.com/jesusalcaladev/zode/commit/14b796b3)
 - web fetch/search quality improvements (phase24) [`974bc401`](https://github.com/jesusalcaladev/zode/commit/974bc401)
-- complete recoverable tool results and per-tool render (phase3) [`faa20a02`](https://github.com/jesusalcaladev/zode/commit/faa20a02)
+- complete recoverable tool results and per-tool render (phase3) [`c7500504`](https://github.com/jesusalcaladev/zode/commit/c7500504)
+- complete Sprint D permissions, hooks, and bash safety (phase6,5,25) [`50fb2e59`](https://github.com/jesusalcaladev/zode/commit/50fb2e59)
 
 ## [0.2.0] - 2026-11-07
 

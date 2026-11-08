@@ -33,7 +33,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
   **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
   **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
-- [ ] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety)
+- [x] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety) — Phase 6 rule engine (permrules/load/enforce) + Phase 5 hooks (`.zode/hooks.json`, Pre/Post/UserPromptSubmit/Stop, `if` via permission-rule syntax) + Phase 25 bash classification/sandbox offer complete.
 - [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
   **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
@@ -77,17 +77,30 @@ state, the open bug and the quality bar).
 
 ---
 
+## Phase 6 — Permission rules (rule engine)
+
+`🔒 security · 🟡 · blocks 5, 25, 34.3, 34.4`
+
+> `Tool(pattern)` rules decide whether a call is allowed, denied, or asks. Phase 34.x extended the engine; this phase is the foundation Sprint D depends on.
+
+- [x] **6.1** Rule grammar and actions: `Tool(pattern) action` (`allow`/`deny`/`ask`, optional, default `allow`) in `src/lib/permrules.zig` (pure), including `dontAsk` (34.12), glob matching, and JSON/string parsing.
+- [x] **6.2** Precedence and decision: sources `local > project > user > policy`; `deny` beats any `allow`; within one source the last match wins; `decide()` names the matching rule.
+- [x] **6.3** Rule loading and enforcement: project `.zode/permissions.json` and user `~/.config/zode/permissions.json` loaded in `src/agent.zig`; rules consulted before tool execution; `ask` carries the matched rule into the dialog; `/permissions` prints rules and their source.
+- [x] **6.4** Safety helpers on the rule engine: dangerous broad-allow detection/warnings and shadowed-rule detection (`permrules`, agent wiring), plus path-scoped enforcement integration (34.1/pathsafe).
+
+---
+
 ## Phase 5 — Hooks
 
 `✨ feature · 🟡 · depends on 6 (for the `if` syntax)`
 
 > Cheapest way to make zode extensible. v1 = command hooks only.
 
-- [ ] Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`
-- [ ] Config `.zode/hooks.json`: `{ matcher, if, command, timeout_ms, once }`
-  - [ ] `matcher` = tool name or regex · `if` = permission-rule syntax (Phase 6) · `timeout_ms` bounds the run · `once` fires at most once
-- [ ] Hook output fed back as a tool result / system note; a non-zero exit on `PreToolUse` blocks the tool with the reason
-- [ ] Pure tests: config parsing · event/matcher/`if` matching · `once` · timeout + one integration test with a real script
+- [x] Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop` (`src/lib/hooks.zig`, wired in `src/agent.zig`).
+- [x] Config `.zode/hooks.json`: `{ event, matcher, if, command, timeout_ms, once }` (project-level), parsed with unknown/malformed hooks skipped.
+  - [x] `matcher` = tool name or regex · `if` = permission-rule syntax (Phase 6, `Tool(pattern)`) · `timeout_ms` bounds the run · `once` fires at most once.
+- [x] Hook output fed back: `PreToolUse` non-zero exit/timed out blocks the tool and returns the reason as the tool result; `PostToolUse` output is appended as a `[hook note]` to the tool result seen by the model; `UserPromptSubmit`/`Stop` hooks fire (side effects).
+- [x] Pure tests (config parsing, event/matcher/`if` matching, `once`, timeout parsing) + integration test with a real script (`zig test src/lib/hooks.zig`).
 
 ---
 
@@ -243,8 +256,10 @@ state, the open bug and the quality bar).
 
 > Phase 6 decides _whether_ to ask; this decides _what is dangerous_. A dialog is useless if one line hides an `rm -rf` behind a pipe.
 
-- [x] Optional sandbox: if `bwrap` or `firejail` exists, offer a sandboxed `bash` for flagged commands in the permission dialog (`S` / "run sandboxed") — a dialog is not the only answer
-- [x] Pure tests: the parser splits quoted separators correctly (a `;` inside a string is not a separator) · a pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution
+- [x] **25.1** Command classification (`src/lib/cmdsafety.zig`, pure): split quoted separators correctly, classify families/flags (including `forbidden` interactive TTY cases), detect redirects/substitutions, and expose `isReadOnly`/`isFlagged`/`classify` with reasons and fragments.
+- [x] **25.2** Classify before asking: flagged `bash` commands are identified by the classifier; read-only bash can avoid unnecessary prompts; sandbox is offered when available (`agent.zig` + permission dialog/TUI `allow_sandbox`).
+- [x] Optional sandbox: if `bwrap` or `firejail` exists, offer a sandboxed `bash` for flagged commands in the permission dialog (`S` / "run sandboxed") — a dialog is not the only answer.
+- [x] Pure tests: quoted `;` is not a separator · pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution (plus family/flag/forbidden coverage in `cmdsafety` tests).
 
 ---
 

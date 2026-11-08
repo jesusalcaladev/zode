@@ -28,6 +28,7 @@ const clean_mod = @import("lib/clean.zig");
 const usercmds_mod = @import("lib/usercmds.zig");
 const pathsafe = @import("lib/pathsafe.zig");
 const permrules = @import("lib/permrules.zig");
+const hooks_mod = @import("lib/hooks.zig");
 const cmdsafety = @import("lib/cmdsafety.zig");
 const sandbox_mod = @import("lib/sandbox.zig");
 const mentions = @import("lib/mentions.zig");
@@ -2551,6 +2552,25 @@ pub var warned_dangerous_allow: std.atomic.Value(bool) = .init(false);
 /// The project-level rules file, relative to the working directory.
 pub const project_rules_file = ".zode/permissions.json";
 
+/// Project-level hooks (Phase 5).
+pub var hooks_set: hooks_mod.Set = .{};
+var hooks_arena: ?std.heap.ArenaAllocator = null;
+pub const project_hooks_file = ".zode/hooks.json";
+
+pub fn loadHooks() void {
+    var hbuf: [640]u8 = undefined;
+    const project_path = if (project_info.root()) |root|
+        std.fmt.bufPrint(&hbuf, "{s}/{s}", .{ root, project_hooks_file }) catch project_hooks_file
+    else
+        project_hooks_file;
+    if (hooks_arena == null) hooks_arena = std.heap.ArenaAllocator.init(gpa_global);
+    const a = hooks_arena.?.allocator();
+    hooks_set = .{};
+    if (readFileToWith(io_global, a, project_path)) |data| {
+        hooks_set = hooks_mod.parseConfig(a, data);
+    }
+}
+
 /// Loads the rules: the project file and the user file.
 ///
 /// The ORDER is the precedence — the strongest source first — and
@@ -2578,6 +2598,7 @@ pub fn loadPermRules() void {
         project_path,
         permissionsFilePath(&pbuf),
     );
+    loadHooks();
 }
 
 /// The rules, loaded from the two files.
@@ -2591,6 +2612,19 @@ pub fn loadPermRulesFrom(io: std.Io, project_path: ?[]const u8, user_path: ?[]co
         perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
     }
     loadPermRulesInto(perm_rules_arena.?.allocator(), io, project_path, user_path);
+    // Test-friendly: load hooks from alongside the project rules file.
+    if (project_path) |pp| {
+        var hbuf: [640]u8 = undefined;
+        // Derive hooks path from project permissions path's directory.
+        const dir = std.fs.path.dirname(pp) orelse ".";
+        const hp = std.fmt.bufPrint(&hbuf, "{s}/{s}", .{ dir, "hooks.json" }) catch null;
+        if (hp) |path| {
+            if (hooks_arena == null) hooks_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            const a = hooks_arena.?.allocator();
+            hooks_set = .{};
+            if (readFileToWith(io, a, path)) |data| hooks_set = hooks_mod.parseConfig(a, data);
+        }
+    }
 }
 
 /// The rules, loaded into a GIVEN arena.
@@ -5227,6 +5261,17 @@ fn user_wants_implementation(text: []const u8) bool {
 /// stages without printing the "Done" line after each one.
 fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
     var iterations: usize = 0;
+    // Phase 5: UserPromptSubmit hooks.
+    {
+        const up_res = hooks_mod.fire(m.allocator, &hooks_set, .{
+            .event = .UserPromptSubmit,
+            .prompt = user_text,
+        }, io_global) catch &[_]hooks_mod.RunResult{};
+        // Non-blocking output is produced by hooks; PreToolUse/PostToolUse feed
+        // back into tool flow. UserPromptSubmit hooks run for side effects.
+        for (up_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
+        if (up_res.len > 0) m.allocator.free(up_res);
+    }
 
     // ── the loop, and the three things that decide when it stops ──
     //
@@ -5573,6 +5618,12 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
 /// `turn_iterations` is the count of executed iterations (the loop's own
 /// counter for a normal turn, the accumulated total for a pipeline run).
 fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
+    // Phase 5: Stop hooks fire when the turn ends.
+    {
+        const stop_res = hooks_mod.fire(m.allocator, &hooks_set, .{ .event = .Stop }, io_global) catch &[_]hooks_mod.RunResult{};
+        for (stop_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
+        if (stop_res.len > 0) m.allocator.free(stop_res);
+    }
     // The bench sample is taken HERE, once per turn, and not per iteration: a
     // turn is the unit the user thinks in ("that took 40 s"), and a per-iteration
     // sample would make the average turn time a fiction.
@@ -10472,7 +10523,28 @@ fn execOneCall(
         applyGoalCall(m, call.args_json, arena);
     }
 
-    const res = tools_mod.executeWith(io_global, call.name, exec_args, arena, &m.bg, &m.reads, &m.tasks, perm_rules) catch |err| {
+    // Phase 5: PreToolUse hooks can block the tool.
+    {
+        const hook_subj = if (subjects.len > 0) subjects[0] else "";
+        const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
+            .event = .PreToolUse,
+            .tool = call.name,
+            .subject = hook_subj,
+        }, io_global) catch &[_]hooks_mod.RunResult{};
+        defer {
+            for (hook_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
+            if (hook_res.len > 0) m.allocator.free(hook_res);
+        }
+        if (hooks_mod.blockedReason(m.allocator, hook_res, .PreToolUse) catch null) |reason| {
+            defer m.allocator.free(reason);
+            const ms = elapsedMs(call_t0);
+            m.pushToolDone(call.name, "blocked by hook", ms, reason);
+            capStoreAppendToolResult(m, s, call.id, call.name, reason, arena, budget);
+            return 0;
+        }
+    }
+
+    var res = tools_mod.executeWith(io_global, call.name, exec_args, arena, &m.bg, &m.reads, &m.tasks, perm_rules) catch |err| {
         const ms = elapsedMs(call_t0);
         // What the MODEL is told is not the error name. See `describeError`.
         const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
@@ -10480,6 +10552,23 @@ fn execOneCall(
         s.appendToolResult(call.id, call.name, emsg) catch {};
         return 0;
     };
+    // Phase 5: PostToolUse hooks; output fed back as a tool result/system note.
+    {
+        const hook_subj = if (subjects.len > 0) subjects[0] else "";
+        const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
+            .event = .PostToolUse,
+            .tool = call.name,
+            .subject = hook_subj,
+        }, io_global) catch &[_]hooks_mod.RunResult{};
+        defer {
+            for (hook_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
+            if (hook_res.len > 0) m.allocator.free(hook_res);
+        }
+        if (hooks_mod.notesText(m.allocator, hook_res) catch null) |note| {
+            defer m.allocator.free(note);
+            res = std.fmt.allocPrint(arena, "{s}\n\n[hook note]\n{s}", .{ res, note }) catch res;
+        }
+    }
     // The automatic typecheck, and the exit gate's write counter, fed from HERE.
     //
     // The success path and not the list of calls, and that is the whole reason this is
