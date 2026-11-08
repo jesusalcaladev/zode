@@ -16,3 +16,6 @@ __pycache__/
 
 # Pipeline artifacts: per-run evidence/reports; not part of the source tree.
 .zode/pipeline/
+# Session plans: the file is the source of truth while the session lives, and
+# a per-session checklist is not source either.
+.zode/plans/

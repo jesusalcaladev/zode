@@ -1796,7 +1796,7 @@ fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
     // At 40 ms/tick when busy, 25 ticks = 1000 ms.
     var tb: [64]u8 = undefined;
     m.copy_toast_text = std.fmt.bufPrint(&tb, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
-    m.copy_toast_frames = 25;
+    m.copy_toast_frames = 12;
 
     var name_buf: [64]u8 = undefined;
     const filename = copyFileName(index, ctx, &name_buf);
@@ -3398,37 +3398,16 @@ pub fn newSession(m: *tui.Model) void {
     m.applyScrollState(.{});
 }
 
-/// Callback for the `/session` picker: resumes the session at `index`.
+/// Callback for the `/session`/`/resume` picker: resumes the session at
+/// `index` (29.6 project-belonging check applied).
 pub fn onSessionPick(m: *tui.Model, _: u32, index: usize) void {
     if (index >= m.session_picker_paths.items.len) return;
     const path = m.session_picker_paths.items[index];
-
-    if (session) |old| {
-        // Persist the old session's scroll state before it is destroyed, so the
-        // reader's position survives the switch. A write failure here is not
-        // fatal: the worst case is the reader starts at the bottom next time.
-        old.persistScrollState() catch {};
-        m.allocator.destroy(old);
-        session = null;
-    }
-    cache_stats.session.reset();
-
-    if (session_mod.Session.resumePath(m.allocator, io_global, path)) |s| {
-        session = s;
-        m.session = s;
-        cache_stats.session = s.usage_stats;
-        const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
-            "session resumed";
-        pushInfoOwned(m, msg);
-        resetSessionFiles(m);
-        // The plan block belongs to the session it was written in: a resumed
-        // session must not inherit the checklist of the one it replaced.
-        m.clearPlan();
-        // Restore the reader's scroll position from the saved session state.
-        m.applyScrollState(s.getScrollState());
-    } else |err| {
-        pushInfoFmt(m, "could not resume {s}: {t}", .{ path, err });
-    }
+    // Keep the path alive across the picker close/resume work by copying it;
+    // the picker owns its path strings.
+    const owned = m.allocator.dupe(u8, path) catch return;
+    defer m.allocator.free(owned);
+    resumeSessionAtPath(m, owned);
 }
 
 /// Callback for F2 rename in the session picker.
@@ -4245,7 +4224,12 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "new-session")) {
         newSession(m);
     } else if (std.mem.eql(u8, cmd, "resume")) {
-        resumeLatest(m);
+        const resume_arg = std.mem.trim(u8, arg orelse "", " \t");
+        if (resume_arg.len == 0) {
+            commands_mod.cmdSession(m);
+        } else {
+            resumeTerm(m, resume_arg);
+        }
     } else if (std.mem.eql(u8, cmd, "rename")) {
         commands_mod.cmdRename(m, arg);
     } else {
@@ -4743,7 +4727,144 @@ fn cmdClean(m: *tui.Model, aplicar: bool) void {
     }
 }
 
-/// `/resume`: reopens the most recent session by mtime.
+/// Shell-quotes a path for a command the user can paste: single quotes, with
+/// embedded single quotes escaped. A path with a space or `'` is data, not shell
+/// syntax (29.6).
+fn shellQuoteSingle(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    out.append(gpa, '\'') catch return null;
+    for (path) |c| {
+        if (c == '\'') out.appendSlice(gpa, "'\\''") catch return null else out.append(gpa, c) catch return null;
+    }
+    out.append(gpa, '\'') catch return null;
+    return out.toOwnedSlice(gpa) catch null;
+}
+
+/// The session id as the user sees it: the file stem without `zode-`/`.jsonl`
+/// noise when present, else the basename.
+fn sessionDisplayId(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    if (std.mem.startsWith(u8, base, "zode-") and std.mem.endsWith(u8, base, ".jsonl")) {
+        return base["zode-".len .. base.len - ".jsonl".len];
+    }
+    return base;
+}
+
+/// 29.6: a session may only be resumed from the project it belongs to (or a
+/// worktree of the same repo, best-effort). A foreign project gets the exact,
+/// shell-quoted command copied to the clipboard and delivered as a user message
+/// — never a silent cross-project resume, and never an error-shaped refusal that
+/// hides how to fix it.
+fn resumeBelongsHere(arena: std.mem.Allocator, path: []const u8) bool {
+    const project_root = project_info.root() orelse project_info.cwd();
+    if (sessionpath.sessionBelongsToProject(arena, io_global, environ_global, project_root, path)) return true;
+    // Best-effort same-repo worktree: if the session lives under a legacy
+    // `<root>/sessions/` of a git worktree that shares this repo, allow it when
+    // our project root and the session's apparent root resolve to the same git
+    // root? Without stored project metadata we cannot prove it cheaply; the safe
+    // default is to refuse and give the user the command.
+    return false;
+}
+
+fn refuseForeignResume(m: *tui.Model, path: []const u8) void {
+    const id = sessionDisplayId(path);
+    // We do not know the foreign project's directory from the session path in
+    // the state-dir layout (it is hashed). Give the actionable id and tell the
+    // user to run it from that project; copy the resume command.
+    const cmd = std.fmt.allocPrint(m.allocator, "zode --resume {s}", .{id}) catch return;
+    defer m.allocator.free(cmd);
+    m.setCopyPending(cmd);
+    pushInfoFmt(m, "that session belongs to a different project. Resume it from that project: {s} (copied to clipboard)", .{cmd});
+    appendHarnessPrompt(m, "The user asked to resume a session that belongs to a different project. Do not resume it here. Tell them to run the copied command from that session's project directory.");
+}
+
+fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const a = astate.allocator();
+    if (!resumeBelongsHere(a, path)) {
+        refuseForeignResume(m, path);
+        return;
+    }
+    if (session) |old| {
+        old.persistScrollState() catch {};
+        m.allocator.destroy(old);
+        session = null;
+    }
+    cache_stats.session.reset();
+    const s = session_mod.Session.resumePath(m.allocator, io_global, path) catch |err| {
+        // 29.6: "when the index says not found, read the file directly before
+        // telling the user it does not exist" — resumePath already reads the file;
+        // a missing/corrupt file is reported honestly.
+        pushInfoFmt(m, "could not resume {s}: {t}", .{ path, err });
+        return;
+    };
+    session = s;
+    m.session = s;
+    cache_stats.session = s.usage_stats;
+    session_elided = 0;
+    resetSummaries();
+    forgetGitRepoProbe();
+    resetSessionFiles(m);
+    m.clearPlan();
+    replaySessionMessages(m, s);
+    m.applyScrollState(s.getScrollState());
+    pushInfoFmt(m, "session resumed: {s} · {d} messages", .{ std.fs.path.basename(path), s.messages.items.len });
+    refreshContextUsage(m);
+}
+
+/// `/resume <term>` (29.6): resolve UUID → file → exact title. Never opens a
+/// picker. Ambiguity is an error with the count.
+fn resumeTerm(m: *tui.Model, term: []const u8) void {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const a = astate.allocator();
+
+    // Direct file path.
+    if (std.mem.endsWith(u8, term, ".jsonl")) {
+        if (std.Io.Dir.cwd().statFile(io_global, term, .{})) |_| {
+            resumeSessionAtPath(m, term);
+            return;
+        } else |_| {}
+    }
+
+    // Scan sessions for id/filename and exact title matches.
+    var matches: std.ArrayList([]const u8) = .empty;
+    defer matches.deinit(a);
+    const all = sessionindex.scan(a, io_global, session_mod.sessions_dir);
+    for (all) |e| {
+        const base = std.fs.path.basename(e.path);
+        const id = sessionDisplayId(e.path);
+        const title = e.title(base);
+        const by_id = std.mem.eql(u8, term, id) or std.mem.eql(u8, term, base) or
+            std.mem.eql(u8, term, e.path) or std.mem.indexOf(u8, base, term) != null;
+        const by_title = std.mem.eql(u8, term, title);
+        if (by_id or by_title) matches.append(a, e.path) catch {};
+    }
+    if (matches.items.len == 1) {
+        resumeSessionAtPath(m, matches.items[0]);
+        return;
+    }
+    if (matches.items.len > 1) {
+        pushInfoFmt(m, "Found {d} sessions matching {s}. Use /resume to pick.", .{ matches.items.len, term });
+        return;
+    }
+    // 29.6: index said not found — try reading a direct `zode-<term>.jsonl` path
+    // before giving up.
+    const direct = std.fmt.allocPrint(a, "{s}/zode-{s}.jsonl", .{ session_mod.sessions_dir, term }) catch null;
+    if (direct) |p| {
+        if (std.Io.Dir.cwd().statFile(io_global, p, .{})) |_| {
+            resumeSessionAtPath(m, p);
+            return;
+        } else |_| {}
+    }
+    pushInfoFmt(m, "no session matching {s}. Use /resume to pick.", .{term});
+}
+
+/// `/resume` (no args): opens the session picker (29.1/29.4). Kept as a
+/// function for callers that want the old "latest by mtime" behavior — but the
+/// command now opens the picker so the choice is never a guess (Phase 29).
 fn resumeLatest(m: *tui.Model) void {
     var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();
@@ -4751,32 +4872,10 @@ fn resumeLatest(m: *tui.Model) void {
 
     const latest = session_mod.Session.latestSessionPath(a, io_global) catch null;
     const path = latest orelse {
-        pushError(m, "no saved sessions");
+        pushInfo(m, "no saved sessions");
         return;
     };
-    if (session) |old| {
-        m.allocator.destroy(old);
-        session = null;
-    }
-    const s = session_mod.Session.resumePath(m.allocator, io_global, path) catch {
-        pushError(m, "could not read the session");
-        return;
-    };
-    session = s;
-    cache_stats.session = s.usage_stats;
-    session_elided = 0;
-    resetSummaries();
-    forgetGitRepoProbe();
-    // The resumed session's context is the one in the FILE, and the read cache
-    // does not know what is in it: an entry that says "the model has this
-    // file" is a guess. Clearing it costs a re-read and buys a truth.
-    resetSessionFiles(m);
-    // The plan block belongs to the session that wrote it, not to this one.
-    m.clearPlan();
-    // Replay session messages into TUI history so they are visible
-    replaySessionMessages(m, s);
-    m.pushInfoFmt("session resumed: {s} · {d} messages", .{ path, s.messages.items.len });
-    refreshContextUsage(m);
+    resumeSessionAtPath(m, path);
 }
 
 // ── the chat: worker and agent loop ───────────────────────────
@@ -5314,21 +5413,13 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
             m.loop_repeated = null;
             switch (repeat_recovery.onRepeat()) {
                 .nudge => {
-                    pushErrorFmt(
-                        m,
-                        "repeated `{s}` with the same arguments {d} times. I have not run it again. Change the approach or arguments, inspect the result, or explain why another action is needed.",
-                        .{ which, repeats_mod.repeat_limit },
-                    );
                     m.repeats.reset();
                     appendHarnessPrompt(m, "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.");
                     continue;
                 },
                 .stop => {
-                    pushErrorFmt(
-                        m,
-                        "stopped: `{s}` repeated with the same arguments after the harness already asked for a different approach. No automatic retry was performed.",
-                        .{which},
-                    );
+                    appendHarnessPrompt(m, "The harness stopped this turn because the same tool call repeated with unchanged arguments after you were asked to change approach. Summarize what you learned and what remains.");
+                    pushInfoFmt(m, "stopped a repeated tool loop ({s})", .{which});
                     break;
                 },
             }
@@ -12157,7 +12248,13 @@ var catalog_refresh_last_ms: std.atomic.Value(i64) = .init(0);
 
 const catalog_refresh_interval_ms: i64 = 15 * 60 * 1000;
 var models_palette_refresh_last_ms: std.atomic.Value(i64) = .init(0);
-const models_palette_refresh_interval_ms: i64 = 10 * std.time.ms_per_s;
+const models_palette_refresh_interval_ms: i64 = 5 * 60 * std.time.ms_per_s;
+
+/// Resets the model palette refresh throttle so the next open/refresh fetches
+/// fresh catalogs (cache invalidation on auth/provider changes).
+pub fn resetModelPaletteRefreshThrottle() void {
+    models_palette_refresh_last_ms.store(0, .release);
+}
 
 fn wallClockMs() i64 {
     const ts = std.Io.Timestamp.now(io_global, .real);
@@ -12175,11 +12272,11 @@ pub fn maybeRefreshCatalog(m: *tui.Model) void {
     };
 }
 
-/// Refreshes the model picker catalog every 10 seconds while it is open, so
-/// provider catalogs (including NVIDIA, fetched when keyed) stay up to date.
-/// Reloads auth keys first so a manually edited `~/.config/zode/auth.json`
-/// takes effect without restarting. Runs on the UI thread and spawns the
-/// network fetch in a worker; stale publishes are ignored by request id.
+/// Refreshes the model picker catalog periodically while it is open (throttled),
+/// so provider catalogs stay up to date. Reloads auth keys first so a manually
+/// edited `~/.config/zode/auth.json` takes effect without restarting. Runs on
+/// the UI thread and spawns the network fetch in a worker; stale publishes are
+/// ignored by request id.
 pub fn maybeRefreshModelPalette(m: *tui.Model) void {
     if (!m.pal.active or m.pal.mode != .models) return;
     const now = wallClockMs();
@@ -13224,6 +13321,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     if (keychain_mod.store(m.allocator, io_global, provider, trimmed)) {
         reloadUserConfig();
         loadAuthKeys(m.allocator);
+        resetModelPaletteRefreshThrottle();
         free_auto.rebuildPool(m);
         openConnectPalette(m);
         m.pal.setKeyMessagef("saved: {s} (keychain)", .{provider}, false);
@@ -13291,6 +13389,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     };
     reloadUserConfig();
     loadAuthKeys(gpa);
+    resetModelPaletteRefreshThrottle();
     // The free-auto pool is built ONCE, from the providers that had a key at
     // that moment. Connecting a provider afterwards left the rotation offering
     // the models of the old set, which is exactly what "rotate the free models

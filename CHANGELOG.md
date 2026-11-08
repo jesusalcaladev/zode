@@ -7,75 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Features
+
+- complete /resume picker, tiers 1-3 search wiring, and UI/cache fixes (phase29) [`44e28506`](https://github.com/jesusalcaladev/zode/commit/44e28506)
+
 ## [0.2.0] - 2026-11-07
 
-### Features
+### Seguridad
 
-- Recoverable session-isolated tool results with frozen per-tool/aggregate caps and explicit recovery paths (harness) [`6605a6d`](https://github.com/jesusalcaladev/zode/commit/6605a6d)
-- Compaction v2: recoverable microcompaction markers, compaction boundaries/summary state persisted for resume, preserved invoked skills and read files, and tier-2 summary circuit-breaker behavior (harness) [`e9c1f30`](https://github.com/jesusalcaladev/zode/commit/e9c1f30)
+- Rechazo de comandos `bash` interactivos/prohibidos que requieren TTY (p. ej. modos interactivos de git/patch) antes de ejecutar o mostrar diálogos; endurecimiento del UX de permisos y de reglas `Bash(...)`/`always allow` (evita persistir reglas amplias/peligrosas). [`6605a6d`](https://github.com/jesusalcaladev/zode/commit/6605a6d)
+- Redacción de secretos conocidos en contenido sensible: `sk-`, `Bearer`, formas `*_KEY` y claves conocidas. [`519a0ea`](https://github.com/jesusalcaladev/zode/commit/519a0ea)
+- Entorno de procesos hijos con allowlist y limpieza de secretos (`spawnenv`). [`4346d1c`](https://github.com/jesusalcaladev/zode/commit/4346d1c)
+- Keychain: fallback lookup/store vía `secret-tool`; fix para pasar la clave del provider por stdin a `secret-tool`. [`a0c1b79`](https://github.com/jesusalcaladev/zode/commit/a0c1b79) [`2b64fd8`](https://github.com/jesusalcaladev/zode/commit/2b64fd8)
+- Config/sesiones endurecidas: directorio 0700, permisos fail-closed, guard de symlinks, `fsync`. [`032ef4f`](https://github.com/jesusalcaladev/zode/commit/032ef4f)
+- Lectura/rutas seguras: `checkReadResolved` para symlinks y uso en `read`; rechazo de rutas sensibles en `grep`. [`e117ffc`](https://github.com/jesusalcaladev/zode/commit/e117ffc) [`f95a754`](https://github.com/jesusalcaladev/zode/commit/f95a754) [`0f651d5`](https://github.com/jesusalcaladev/zode/commit/0f651d5)
+- Redacción al persistir mensajes de sesión (`append`/`appendToolResult`); `auth_buf` limpiado. [`0f0165c`](https://github.com/jesusalcaladev/zode/commit/0f0165c) [`6dd6101`](https://github.com/jesusalcaladev/zode/commit/6dd6101)
+- MCP: construcción de entorno bloqueado vía allowlist. [`33334d4`](https://github.com/jesusalcaladev/zode/commit/33334d4)
+- `prctl SET_DUMPABLE 0` y entorno hijo depurado (con guard por plataforma para builds macOS en CI). [`f70f68b`](https://github.com/jesusalcaladev/zode/commit/f70f68b) [`2ebb372`](https://github.com/jesusalcaladev/zode/commit/2ebb372)
+- Permisos por ruta (Phase 34.1) para herramientas que escriben; reglas `deny` aplicadas eliminando schemas de tools (34.3); aviso de allow peligroso + detección de reglas sombreadas (34.4); modo `dontAsk` (34.12). [`ca77972f`](https://github.com/jesusalcaladev/zode/commit/ca77972f) [`2afe511`](https://github.com/jesusalcaladev/zode/commit/2afe511) [`3a60062`](https://github.com/jesusalcaladev/zode/commit/3a60062) [`17aca8f`](https://github.com/jesusalcaladev/zode/commit/17aca8f)
 
-### Fixes
+### Harness, contexto y resultados
 
-- Refuse TTY-interactive/forbidden bash commands before execution/dialogs and harden Bash permission/always-allow UX (safety) [`6605a6d`](https://github.com/jesusalcaladev/zode/commit/6605a6d)
-- Fix black holes in transcript area (tui)
+- Resultados de herramientas recuperables y aislados por sesión, con caps congeladas por herramienta/agregado y rutas explícitas de recuperación (`read path=...`). [`6605a6d`](https://github.com/jesusalcaladev/zode/commit/6605a6d)
+- Compaction v2: microcompactación recuperable, boundaries/estado de resumen persistido para resume, preservación de *skills* invocadas y archivos leídos, y circuit breaker de resumen tier 2. [`e9c1f30`](https://github.com/jesusalcaladev/zode/commit/e9c1f30)
+- Compaction configurable (`ZODE_COMPACT`, `ZODE_COMPACT_PCT`, `/compact`), compaction en background con doble umbral, presupuesto/umbrales adaptativos por tamaño de ventana, protección de goal/plan/summary en tier 2. [`42b5225`](https://github.com/jesusalcaladev/zode/commit/42b5225) [`83e6e75`](https://github.com/jesusalcaladev/zode/commit/83e6e75) [`4ecf16d`](https://github.com/jesusalcaladev/zode/commit/4ecf16d) [`feb1995`](https://github.com/jesusalcaladev/zode/commit/feb1995)
+- Prompt cache: `cache_control` en mensajes estables y breakpoint al final del prefijo estable. [`abf8ae2`](https://github.com/jesusalcaladev/zode/commit/abf8ae2) [`13cbbf8`](https://github.com/jesusalcaladev/zode/commit/13cbbf8)
+- Caché de lectura escala con la ventana de contexto; decisiones de corte congeladas (Phase 34.2). [`db3c172`](https://github.com/jesusalcaladev/zode/commit/db3c172) [`3eaa598`](https://github.com/jesusalcaladev/zode/commit/3eaa598)
+- Modelo/agente: `snapshotMsgs` deep copy, ordenado single-pass, keychain-first load/store, fix de extensión de imagen, señales de implementación más amplias, `TurnStats.reads`; `jsonString` asigna tamaño exacto. [`dc30437`](https://github.com/jesusalcaladev/zode/commit/dc30437) [`02b4c30`](https://github.com/jesusalcaladev/zode/commit/02b4c30)
+- Salida sobre el límite se corta con aviso (no como tool call fallida). [`394fc85`](https://github.com/jesusalcaladev/zode/commit/394fc85)
 
+### Loop, pipeline y skills
 
-### Features
+- Módulo `taskloop` con presupuesto/contrato de finalización, integrado al loop y headless; `/iter` (Ctrl+P), nudges de implementación/respuesta vacía y guardia de repetición/espiral read-only. [`c5e0082`](https://github.com/jesusalcaladev/zode/commit/c5e0082) [`5c26d62`](https://github.com/jesusalcaladev/zode/commit/5c26d62) [`635d954`](https://github.com/jesusalcaladev/zode/commit/635d954) [`834ef30`](https://github.com/jesusalcaladev/zode/commit/834ef30) [`0dae570`](https://github.com/jesusalcaladev/zode/commit/0dae570) [`5cec987`](https://github.com/jesusalcaladev/zode/commit/5cec987) [`9542482`](https://github.com/jesusalcaladev/zode/commit/9542482)
+- Sin techo duro de iteraciones; pipeline por etapas + hardening de crashes. [`4636a30`](https://github.com/jesusalcaladev/zode/commit/4636a30) [`c9ba1ff`](https://github.com/jesusalcaladev/zode/commit/c9ba1ff)
+- Subagentes en background (`run_in_background`). [`302d9fd`](https://github.com/jesusalcaladev/zode/commit/302d9fd)
+- Skills: enforcement de `allowed_tools`/`model`/`effort`, skills condicionales por ruta, `context:fork` vía subagent y expansión `!cmd` con permisos; listado de skills en el system message para sobrevivir compaction. [`07c799b`](https://github.com/jesusalcaladev/zode/commit/07c799b) [`0b1b4b8`](https://github.com/jesusalcaladev/zode/commit/0b1b4b8) [`3a12792`](https://github.com/jesusalcaladev/zode/commit/3a12792) [`d0acb3d`](https://github.com/jesusalcaladev/zode/commit/d0acb3d)
+- Prompt: regla anti-listing siempre inyectada. [`79fba29`](https://github.com/jesusalcaladev/zode/commit/79fba29)
 
-- Phase 34.1 path-scoped permissions for file-writing tools (permissions) [`ca77972f`](https://github.com/jesusalcaladev/zode/commit/ca77972f)
-- Phase 33.21 permission dialog shows the matched rule (tui) [`d94a22af`](https://github.com/jesusalcaladev/zode/commit/d94a22af)
-- the staged task pipeline + crash hardening (pipeline) [`c9ba1ff4`](https://github.com/jesusalcaladev/zode/commit/c9ba1ff4)
-- remove hard iteration ceiling, compaction off by default, stop lecturing about missing typecheck (loop) [`4636a301`](https://github.com/jesusalcaladev/zode/commit/4636a301)
-- wrap diffs in rounded code block box (tui) [`87d459e4`](https://github.com/jesusalcaladev/zode/commit/87d459e4)
-- nudge model to complete tasks; Zo shows pipeline stage (loop) [`834ef308`](https://github.com/jesusalcaladev/zode/commit/834ef308)
-- empty reply nudge + implementation nudge; Zo shows pipeline stage (loop) [`0dae5701`](https://github.com/jesusalcaladev/zode/commit/0dae5701)
-- add pure taskloop module with budget ladder and completion contract (loop) [`c5e0082e`](https://github.com/jesusalcaladev/zode/commit/c5e0082e)
-- wire taskloop into runAgentLoop, auto-iteration, and /iter (loop) [`5c26d629`](https://github.com/jesusalcaladev/zode/commit/5c26d629)
-- repetition guard detects read-only spiral (loop) [`5cec9878`](https://github.com/jesusalcaladev/zode/commit/5cec9878)
-- headless runner consumes taskloop policy (loop) [`95424820`](https://github.com/jesusalcaladev/zode/commit/95424820)
-- Ctrl+P opens /iter budget; test_all imports taskloop (loop) [`635d9542`](https://github.com/jesusalcaladev/zode/commit/635d9542)
-- usage pretty panel with bar, footer cache-hit, session root hash (commands) [`c41f0015`](https://github.com/jesusalcaladev/zode/commit/c41f0015)
-- always-injected anti-listing rule in tool_routing_prompt (prompt) [`79fba293`](https://github.com/jesusalcaladev/zode/commit/79fba293)
-- snapshotMsgs deep copy, buildModelItems single-pass sort, keychain-first load/store, image ext fix, wider impl signals, TurnStats.reads (agent) [`dc304379`](https://github.com/jesusalcaladev/zode/commit/dc304379)
-- redact known keys + sk-/Bearer/_KEY shapes (redact) [`519a0ea3`](https://github.com/jesusalcaladev/zode/commit/519a0ea3)
-- allowlist + secret stripping (spawnenv) [`4346d1cd`](https://github.com/jesusalcaladev/zode/commit/4346d1cd)
-- secret-tool lookup/store fallback (keychain) [`a0c1b793`](https://github.com/jesusalcaladev/zode/commit/a0c1b793)
-- compaction v2 with recoverable microcompaction and boundaries (phase7) [`80082224`](https://github.com/jesusalcaladev/zode/commit/80082224)
+### TUI / UX
 
-### Bug Fixes
+- Corrección de “agujeros negros” en transcripción; diffs envueltos en bloque con bordes; caret tenue al perder foco; paneles de estado con barra de contexto; unificación `/config`+`/status`+`/usage`; `/doctor`, `/status`, `/compact now`; `/clear`, `/exit`, `/version`. [`87d459e`](https://github.com/jesusalcaladev/zode/commit/87d459e) [`0a54e97`](https://github.com/jesusalcaladev/zode/commit/0a54e97) [`bf2b68c`](https://github.com/jesusalcaladev/zode/commit/bf2b68c) [`c6fe48b`](https://github.com/jesusalcaladev/zode/commit/c6fe48b) [`2207d5b`](https://github.com/jesusalcaladev/zode/commit/2207d5b) [`4408e30`](https://github.com/jesusalcaladev/zode/commit/4408e30) [`93be101`](https://github.com/jesusalcaladev/zode/commit/93be101)
+- Diálogo de permisos muestra la regla que hizo match y nombra la regla que `always allow` recordará; bash read-only puede omitir diálogo. [`d94a22a`](https://github.com/jesusalcaladev/zode/commit/d94a22a) [`7548845`](https://github.com/jesusalcaladev/zode/commit/7548845) [`ddb3ed7`](https://github.com/jesusalcaladev/zode/commit/ddb3ed7)
+- Input: tope de bytes rechaza ediciones sobre el límite (no trunca). Imágenes con límites, evicción nombrada y vida corta por turno. [`6bf19da`](https://github.com/jesusalcaladev/zode/commit/6bf19da) [`ba0c997`](https://github.com/jesusalcaladev/zode/commit/ba0c997) [`9f35a28`](https://github.com/jesusalcaladev/zode/commit/9f35a28)
+- Estado de scroll serializable para resume de sesión. [`21d4ab7`](https://github.com/jesusalcaladev/zode/commit/21d4ab7)
+- Arreglos de palette/picker/fuzzy/mentions/sessionpath, agujeros de layout y eco inmediato de prompts. [`87a1156`](https://github.com/jesusalcaladev/zode/commit/87a1156) [`1ebf2f4`](https://github.com/jesusalcaladev/zode/commit/1ebf2f4) [`5837375`](https://github.com/jesusalcaladev/zode/commit/5837375) [`8fad9f3`](https://github.com/jesusalcaladev/zode/commit/8fad9f3) [`40b7451`](https://github.com/jesusalcaladev/zode/commit/40b7451) [`37e0215`](https://github.com/jesusalcaladev/zode/commit/37e0215) [`c41f001`](https://github.com/jesusalcaladev/zode/commit/c41f001)
 
-- expand owned allocator, cap marker inside cap, path_max <= (mentions) [`8fad9f3b`](https://github.com/jesusalcaladev/zode/commit/8fad9f3b)
-- highlightPositions guard q.len > buf.len (fuzzy) [`58373754`](https://github.com/jesusalcaladev/zode/commit/58373754)
-- freeItems provider + empty guard, saturating key/query, zeroing (palette) [`87a11564`](https://github.com/jesusalcaladev/zode/commit/87a11564)
-- picker filtered for sessions, leak frees, ac reset, palette toggle, cache footer (tui) [`1ebf2f4c`](https://github.com/jesusalcaladev/zode/commit/1ebf2f4c)
-- separator guard sessions vs sessions2 (sessionpath) [`40b7451a`](https://github.com/jesusalcaladev/zode/commit/40b7451a)
-- tryLaunchBg deep copy to gpa (UAF) (compaction) [`04584f91`](https://github.com/jesusalcaladev/zode/commit/04584f91)
-- temp+rename atomic write (modelcache) [`57a4a145`](https://github.com/jesusalcaladev/zode/commit/57a4a145)
-- complete scanner refactor and segment conversions (highlight) [`1b841cb5`](https://github.com/jesusalcaladev/zode/commit/1b841cb5)
-- pipe provider key to secret-tool stdin (keychain) [`2b64fd87`](https://github.com/jesusalcaladev/zode/commit/2b64fd87)
-- refuse interactive TTY bash and harden Bash permission UX (safety) [`6605a6dd`](https://github.com/jesusalcaladev/zode/commit/6605a6dd)
+### Correcciones técnicas
 
-### Chores
+- Compaction: deep copy en `tryLaunchBg` (UAF); heap-alloc de read table. [`04584f9`](https://github.com/jesusalcaladev/zode/commit/04584f9) [`cb3f2c1`](https://github.com/jesusalcaladev/zode/commit/cb3f2c1)
+- Model cache: escritura atómica temp+rename. [`57a4a14`](https://github.com/jesusalcaladev/zode/commit/57a4a14)
+- Highlight: refactor completo del scanner y conversiones de segmentos. [`1b841cb`](https://github.com/jesusalcaladev/zode/commit/1b841cb)
+- `http_client`, `tools/bash`, `main`, `palette` y módulos asociados actualizados para estabilidad/build multiplataforma (incluye fix de `prctl` en macOS y `isPrintableText`/filtro de input en palette). [`2ebb372`](https://github.com/jesusalcaladev/zode/commit/2ebb372)
 
-- changelog points to the actual pipeline commit (release) [`12c35dd7`](https://github.com/jesusalcaladev/zode/commit/12c35dd7)
-- update gitignore and remove vendored code-base-fx reference [`6d3cd1db`](https://github.com/jesusalcaladev/zode/commit/6d3cd1db)
-- auth.json* ignored (gitignore) [`06a65a79`](https://github.com/jesusalcaladev/zode/commit/06a65a79)
+### Build, release y calidad
 
-### Tests
-
-- register redact/spawnenv/keychain [`3e683c17`](https://github.com/jesusalcaladev/zode/commit/3e683c17)
-
-### Other
-
-- zero auth_buf [`6dd6101d`](https://github.com/jesusalcaladev/zode/commit/6dd6101d)
-- scrubbed child env allowlist [`c5c96b3f`](https://github.com/jesusalcaladev/zode/commit/c5c96b3f)
-- prctl SET_DUMPABLE 0, scrubbed child env static [`f70f68b6`](https://github.com/jesusalcaladev/zode/commit/f70f68b6)
-- dir 0700, fail-closed chmod, symlink guard, fsync [`032ef4f9`](https://github.com/jesusalcaladev/zode/commit/032ef4f9)
-- checkReadResolved for symlinks [`e117ffcc`](https://github.com/jesusalcaladev/zode/commit/e117ffcc)
-- redact on append/appendToolResult [`0f0165cc`](https://github.com/jesusalcaladev/zode/commit/0f0165cc)
-- use checkReadResolved [`f95a7545`](https://github.com/jesusalcaladev/zode/commit/f95a7545)
-- refuse credential paths [`0f651d5f`](https://github.com/jesusalcaladev/zode/commit/0f651d5f)
-- buildEnvLocked via allowlist [`33334d47`](https://github.com/jesusalcaladev/zode/commit/33334d47)
+- Release estable **v0.2.0** (sin beta) publicado con GitHub Actions: linux/macos x64+arm64, `ReleaseSmall`, `-Dcpu=baseline`. [`2ebb372`](https://github.com/jesusalcaladev/zode/commit/2ebb372)
+- Churn/changesets internos (`.churn`), CHANGELOG y tooling de versionado. [`fc15b12`](https://github.com/jesusalcaladev/zode/commit/fc15b12) [`9e6692b`](https://github.com/jesusalcaladev/zode/commit/9e6692b)
+- Tests registrados para redact/spawnenv/keychain; `test_all` integra taskloop. [`3e683c1`](https://github.com/jesusalcaladev/zode/commit/3e683c1) [`635d954`](https://github.com/jesusalcaladev/zode/commit/635d954)
 
 ## [0.2.1-beta.2] - 2026-10-31
 

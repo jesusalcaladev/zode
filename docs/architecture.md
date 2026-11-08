@@ -35,6 +35,8 @@ src/lib/               # Pure modules (testable without TUI/network)
 ├── subagent.zig       # Subagent report format (task tool)
 ├── ask.zig            # Ask tool (pure dialog logic)
 ├── plan.zig           # Visible task list
+├── facts.zig          # Verified facts + invalidation by source hash
+├── filewatch.zig      # Per-turn poll: what changed on disk since read
 ├── router.zig         # Cheap-turn model router
 ├── verify.zig         # Slow verification → background
 ├── skills.zig / skillstore.zig  # Skills on disk
@@ -64,6 +66,15 @@ Budget = `budgetPctFor`% of `ZODE_CONTEXT_LIMIT` (clamped 10–95), derived from
 2. **Summarize** (`full` only, and only under 256k): one LLM call with `summaryPrompt()` capped at 16 KB replaces old turns with `[earlier conversation summarized...]`. A 256k+ window keeps history verbatim — a lossy summary is not worth it there.
 
 `off` does neither; the provider eventually rejects an over-long request.
+
+## Facts and file changes
+
+Long sessions drift two ways: the tool results that proved something get elided, and files change on disk under a context that does not know. Both are handled by small, pure modules:
+
+- `lib/facts.zig` — verified statements (`fact`/`decision`/`blocker`), never narrative, never model-written. Each carries its source file and the content hash at confirmation time. Only harness/tool-confirmed verdicts enter (typecheck failures as blockers, proofs as facts); a model-written "fact" would outlive the conversation that should have corrected it. The block is attached as a `[Facts]` user message after the cached prefix — the `[Plan]` trick — only when it changed, so compaction cannot take it away and it costs one short message per change.
+- `lib/filewatch.zig` + `pollTouchedFiles` (`agent.zig`) — a per-turn poll (not an OS watcher: no thread, no kernel events) over the files the read cache holds in context. A moved stat is confirmed by hashing the bytes, the same rule `readcache` applies, so a `touch` is not a change. A confirmed change invalidates the cached read and every fact sourced from it (mismatched hash dies; sourceless check verdicts die on any project change), and the model is told through `appendHarnessPrompt` before it can act on the old content.
+
+What is deliberately NOT here: embeddings and a Merkle index over the whole tree. They need a model/API, storage and update policy, and `grep`/`refs`/the read cache already cover localization in a single-binary pure-Zig harness. Hash-per-file with on-demand reads is the part that pays.
 
 ## Session file format is zjsonl
 

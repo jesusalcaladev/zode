@@ -82,8 +82,12 @@ pub const Http = struct {
         userdata: ?*anyopaque,
     ) !StreamResult {
         const req = try self.openRequest(.POST, url, bearer, body, extra_headers, true);
-        defer req.deinit();
+        // deinit BEFORE destroy: LIFO means the last deferred runs first, so
+        // destroy used to free the Request first and deinit then read freed
+        // memory — the "General protection exception in http.Request.deinit"
+        // that killed the warmup worker inside every catalog fetch.
         defer self.gpa.destroy(req);
+        defer req.deinit();
 
         var redirect_buf: [8192]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);
@@ -253,8 +257,11 @@ pub const Http = struct {
         redirect_out: ?[]u8,
     ) !JsonResult {
         const req = try self.openRequest(method, url, bearer, body, extra_headers, false);
-        defer req.deinit();
+        // deinit BEFORE destroy: LIFO runs the last deferred first, so destroy
+        // used to free the Request and deinit then dereferenced the freed
+        // memory (`r.client` → garbage → general protection exception).
         defer self.gpa.destroy(req);
+        defer req.deinit();
 
         var redirect_buf: [8192]u8 = undefined;
         var response = try req.receiveHead(&redirect_buf);

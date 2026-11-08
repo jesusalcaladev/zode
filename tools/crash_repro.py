@@ -126,11 +126,23 @@ def main():
     for p in panics[:6]:
         print("PANIC:", p.strip()[:400])
 
-    # Is the panic on screen, or only in the log?
-    log = "/tmp/opencode/zode-crash.log"
+    # The pty transcript of this run, for eyeballing what the UI painted.
+    log = "/tmp/opencode/zode-pty.bin"
     with open(log, "wb") as f:
         f.write(bytes(out))
-    print(f"log: {log} ({len(out)} bytes)")
+    print(f"capture: {log} ({len(out)} bytes)")
+
+    # And zode's own crash log, which the panic AND segfault handlers append to
+    # (the terminal is restored before the default handler prints anything, so
+    # this file is the only place the failure is guaranteed to survive).
+    crash = "/tmp/zode-crash.log"
+    try:
+        with open(crash, "r", errors="replace") as f:
+            tail = f.read()[-2000:]
+        print(f"crash log: {crash}")
+        print(tail)
+    except FileNotFoundError:
+        print(f"crash log: {crash} (absent)")
     if sig:
         print(f"\ncore? coredumpctl info {pid}")
         return 2

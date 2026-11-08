@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const sessionpath = @import("sessionpath.zig");
+const zjsonl = @import("zjsonl.zig");
 
 /// The sidecar next to a session file.
 ///
@@ -60,14 +61,132 @@ pub const Entry = struct {
     /// Unix seconds: the sidecar's `created_at`, or the file's mtime.
     created_at: i64,
 
-    /// Resolution: custom_title > ai_title > name > session id.
+        /// Derived from the session JSONL (head/tail windows, Phase 29.1). Empty when
+    /// unknown or not enriched. Owned by the arena/list that produced the entry.
+    first_prompt: []const u8 = "",
+    last_prompt: []const u8 = "",
+    agent_name: []const u8 = "",
+    /// File size in bytes (from stat). 0 when unknown.
+    size_bytes: u64 = 0,
+
+    /// Total title function (29.3): agentName || customTitle || aiTitle ||
+    /// firstPrompt || sessionId[0..8]. A prompt starting with `<tICK>` or that
+    /// is empty after trimming is skipped (autonomous/display-hostless). Never
+    /// returns an empty slice — "(session)" is the last resort (29.2).
     pub fn title(self: *const Entry, session_id: []const u8) []const u8 {
+        if (usablePrompt(self.agent_name)) |pt| return pt;
         if (self.custom_title.len > 0) return self.custom_title;
         if (self.ai_title.len > 0) return self.ai_title;
         if (self.name.len > 0) return self.name;
-        return session_id;
+        if (usablePrompt(self.first_prompt)) |pt| return pt;
+        const id = if (session_id.len > 8) session_id[0..8] else session_id;
+        if (id.len > 0) return id;
+        return "(session)";
     }
 };
+
+pub fn usablePrompt(s: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.startsWith(u8, trimmed, "<tICK>")) return null;
+    return trimmed;
+}
+
+/// Extracts the JSON string value of `"content"` from one complete JSONL line
+/// by string scanning. Returns a view into a decoded buffer the caller provides,
+/// or into `line` when no escapes are present. This is NOT a general JSON
+/// parser: it handles the session message shape and refuses cut fragments.
+fn extractContent(line: []const u8, buf: []u8) ?[]const u8 {
+    // Only user/assistant messages carry titles worth showing.
+    if (std.mem.indexOf(u8, line, "\"role\":\"user\"") == null and
+        std.mem.indexOf(u8, line, "\"role\": \"user\"") == null) return null;
+    const needle = "\"content\":\"";
+    const at = std.mem.indexOf(u8, line, needle) orelse {
+        // Maybe content is not a plain string (array/structured); skip.
+        return null;
+    };
+    var i = at + needle.len;
+    var out: usize = 0;
+    while (i < line.len and out < buf.len) : (i += 1) {
+        const c = line[i];
+        if (c == '"') return std.mem.trim(u8, buf[0..out], " \t\r\n");
+        if (c == '\\' and i + 1 < line.len) {
+            i += 1;
+            buf[out] = switch (line[i]) {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"', '\\', '/' => line[i],
+                else => line[i],
+            };
+            out += 1;
+            continue;
+        }
+        buf[out] = c;
+        out += 1;
+    }
+    return null; // cut fragment / no closing quote
+}
+
+/// First user prompt from a session file head, and last from tail (29.1). Reads
+/// at most 128KB from each end. A file that cannot be read yields empty strings
+/// — the session is still listed (29.2).
+pub const TitleHints = struct { first: []const u8 = "", last: []const u8 = "" };
+
+pub fn titleHints(arena: std.mem.Allocator, io: std.Io, path: []const u8) TitleHints {
+    var res = TitleHints{};
+    var decode: [4096]u8 = undefined;
+
+    // Head (29.1): first complete user prompt.
+    const head_data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(128 * 1024)) catch null;
+    if (head_data) |chunk| {
+        var start: usize = 0;
+        for (chunk, 0..) |c, i| {
+            if (c != '\n') continue;
+            const line = chunk[start..i];
+            start = i + 1;
+            if (extractContent(decompressedLine(arena, line) orelse line, &decode)) |p| {
+                if (usablePrompt(p)) |_| {
+                    res.first = arena.dupe(u8, std.mem.trim(u8, p, " \t\r\n")) catch res.first;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Tail (29.1): last user prompt. Read the final window; if it starts
+    // mid-line, skip to the first newline.
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return res;
+    const size: u64 = st.size;
+    if (size > 0) {
+        const tail_cap: usize = @intCast(@min(@as(u64, 128 * 1024), size));
+        const tail_buf = arena.alloc(u8, tail_cap) catch return res;
+        var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return res;
+        defer file.close(io);
+        const off: u64 = size - @as(u64, tail_cap);
+        const tlen = file.readPositionalAll(io, tail_buf, off) catch 0;
+        const chunk = tail_buf[0..tlen];
+        var from: usize = 0;
+        if (off > 0) {
+            if (std.mem.indexOfScalar(u8, chunk, '\n')) |nl| from = nl + 1 else return res;
+        }
+        var it = std.mem.splitScalar(u8, chunk[from..], '\n');
+        while (it.next()) |ln| {
+            if (ln.len == 0) continue;
+            if (extractContent(decompressedLine(arena, ln) orelse ln, &decode)) |p| {
+                if (usablePrompt(p)) |_| {
+                    res.last = arena.dupe(u8, std.mem.trim(u8, p, " \t\r\n")) catch res.last;
+                }
+            }
+        }
+    }
+    return res;
+}
+
+fn decompressedLine(arena: std.mem.Allocator, line: []const u8) ?[]const u8 {
+    if (!zjsonl.isCompressed(line)) return null;
+    return zjsonl.decompressInto(arena, line, 256 * 1024) catch null;
+}
 
 /// `<session>.jsonl` → `<session>.meta.json`. The suffix is REPLACED, not
 /// appended: `zode-1.jsonl.meta.json` would be a second extension on a file
@@ -213,10 +332,11 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
 
 /// Every session in `dir_path`, NEWEST FIRST.
 ///
-/// One directory read and one sidecar read per session: the list is opened by a
-/// keystroke, so it cannot walk the project or parse a history. A missing
-/// directory is an empty list — a project that never saved a session has no
-/// sessions, which is not an error to show.
+/// Phase 1 (29.1): stat + meta sidecar per session (no JSONL inflation). Phase 2:
+/// head+tail title hints for the first 50 sessions that still lack a resolved
+/// title, so the picker shows meaningful names. A missing directory is an empty
+/// list. 29.2: an unreadable file never drops the entry — it keeps its path/id
+/// and `Entry.title()` falls back to "(session)".
 pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return &.{};
     defer dir.close(io);
@@ -228,10 +348,12 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
         if (!sessionpath.isSessionFile(e.name)) continue;
 
         const path = std.fs.path.join(arena, &.{ dir_path, e.name }) catch continue;
-        const mtime = blk: {
-            const st = dir.statFile(io, e.name, .{}) catch break :blk @as(i64, 0);
-            break :blk st.mtime.toSeconds();
-        };
+        var mtime: i64 = 0;
+        var size_bytes: u64 = 0;
+        if (dir.statFile(io, e.name, .{})) |st| {
+            mtime = st.mtime.toSeconds();
+            size_bytes = st.size;
+        } else |_| {}
 
         var name: []const u8 = "";
         var model: []const u8 = "";
@@ -239,8 +361,6 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
         var ai_title: []const u8 = "";
         var created: i64 = 0;
         const meta = readMeta(arena, io, path);
-        // Only take what is non-empty: `parseMeta` allocates in the same arena,
-        // so the slices stay valid for as long as the list does.
         if (meta.name.len > 0) name = meta.name;
         if (meta.model.len > 0) model = meta.model;
         if (meta.custom_title.len > 0) custom_title = meta.custom_title;
@@ -255,10 +375,19 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
             .custom_title = custom_title,
             .ai_title = ai_title,
             .created_at = created,
+            .size_bytes = size_bytes,
         }) catch continue;
     }
 
     std.mem.sort(Entry, list.items, {}, newerFirst);
+    // Phase 2: enrich first 50 with head/tail prompt hints when no explicit title.
+    const enrich_n = @min(list.items.len, 50);
+    for (list.items[0..enrich_n]) |*ent| {
+        if (ent.custom_title.len > 0 or ent.ai_title.len > 0 or ent.name.len > 0) continue;
+        const hints = titleHints(arena, io, ent.path);
+        ent.first_prompt = hints.first;
+        ent.last_prompt = hints.last;
+    }
     return list.items;
 }
 
@@ -459,32 +588,57 @@ test "scan: newest first, sidecars and non-session files ignored" {
     try t.expectEqual(@as(usize, 0), scan(a, io, try std.fmt.allocPrint(a, "{s}/nope", .{root})).len);
 }
 
-test "Entry.title: custom_title beats ai_title beats name beats id" {
+test "Entry.title: total function follows 29.3 and never drops (29.2)" {
     const id = "zode-abc12345";
-    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena_state.deinit();
-
-    // Only custom_title
+    // custom > ai > name > firstPrompt > sessionId[0..8]
     var e = Entry{ .path = "", .name = "", .model = "", .custom_title = "my title", .ai_title = "", .created_at = 0 };
     try t.expectEqualStrings("my title", e.title(id));
-
-    // Only ai_title
     e = Entry{ .path = "", .name = "", .model = "", .custom_title = "", .ai_title = "ai title", .created_at = 0 };
     try t.expectEqualStrings("ai title", e.title(id));
-
-    // Only name
     e = Entry{ .path = "", .name = "sidecar name", .model = "", .custom_title = "", .ai_title = "", .created_at = 0 };
     try t.expectEqualStrings("sidecar name", e.title(id));
-
-    // Falls back to id
+    e = Entry{ .path = "", .name = "", .model = "", .custom_title = "", .ai_title = "", .created_at = 0, .first_prompt = "fix the bug" };
+    try t.expectEqualStrings("fix the bug", e.title(id));
     e = Entry{ .path = "", .name = "", .model = "", .custom_title = "", .ai_title = "", .created_at = 0 };
-    try t.expectEqualStrings(id, e.title(id));
-
-    // Precedence chain: custom > ai > name > id
-    e = Entry{ .path = "", .name = "n", .model = "", .custom_title = "c", .ai_title = "a", .created_at = 0 };
+    try t.expectEqualStrings(id[0..8], e.title(id));
+    e = Entry{ .path = "", .name = "n", .model = "", .custom_title = "c", .ai_title = "a", .created_at = 0, .first_prompt = "p" };
     try t.expectEqualStrings("c", e.title(id));
     e.custom_title = "";
     try t.expectEqualStrings("a", e.title(id));
     e.ai_title = "";
     try t.expectEqualStrings("n", e.title(id));
+    e.name = "";
+    try t.expectEqualStrings("p", e.title(id));
+    // 29.2: never empty
+    e = Entry{ .path = "", .name = "", .model = "", .custom_title = "", .ai_title = "", .created_at = 0 };
+    try t.expectEqualStrings("(session)", e.title(""));
+}
+
+test "usablePrompt skips autonomous and empty prompts (29.3)" {
+    try t.expect(usablePrompt("") == null);
+    try t.expect(usablePrompt("   \n") == null);
+    try t.expect(usablePrompt("<tICK>do something") == null);
+    try t.expectEqualStrings("hello", usablePrompt("  hello  ").?);
+}
+
+test "titleHints extracts first and last user prompts from head/tail (29.1)" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    const path = "zode-titlehints-test.jsonl";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data =
+        \\{"role":"system","content":"sys"}
+        \\{"role":"user","content":"first task"}
+        \\{"role":"assistant","content":"ok"}
+        \\{"role":"user","content":"second task"}
+        \\
+        ,
+    });
+    const h = titleHints(a, io, path);
+    try t.expectEqualStrings("first task", h.first);
+    try t.expectEqualStrings("second task", h.last);
 }

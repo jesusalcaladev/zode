@@ -96,7 +96,7 @@ pub fn toolBash(
         .exited => |code| code,
         .signal => |sig| blk: {
             out.print(arena, "(signal {d}) ", .{sig}) catch {};
-            break :blk @as(u8, @truncate(128 + @intFromEnum(sig)));
+            break :blk @as(u8, @truncate(128 + @backingInt(sig)));
         },
         else => 255,
     } else null;

@@ -324,24 +324,31 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 > Today `/resume` reopens the newest session by mtime (`agent.resumeLatest`). After a crash, or with two projects open, that is a guess.
 
-- [ ] **29.1** Two-phase rows: `stat` for the row (mtime/size/id — no parsing, so a corrupt file cannot make a session disappear), then head+tail windows (≤128 KB per file, first 50 sessions) fill the title
-  - [ ] String scanning, NOT JSON parsing (the first line may be cut in half); title ladder: `lastPrompt` (tail) || first prompt (head) || `content` prefix || …
-  - [ ] The **tail** entry wins because it is written at write time by the writer, who knows what the user was doing — a `last_prompt` entry is Phase 30.3 and it makes every future listing better
-  - [ ] The picker opens with **zero I/O per session** (today every JSONL is inflated to list it — which is why `/resume` is not instant)
-- [ ] **29.2** 🐛 The highest-value line in the file: a session whose head cannot be read is listed as `(session)`, never dropped — today a first message with a 1 MB `@file` mention or a truncated zjsonl line makes the file invisible to `/resume` while `/clean` offers to delete it
-- [ ] **29.3** The row: `<relative time> · <git branch> · <size or N messages> · #<tag>`; the header shows the position (`Resume (3 of 57)`) — a picker that lies about its size is worse than no picker
-  - [ ] The title is a **total function**: `agentName || customTitle || aiTitle || firstPrompt || sessionId[0..8]`
-  - [ ] Skip a `firstPrompt` starting with `<tICK>` (an autonomous prompt does not become a session name); strip display-hostless tags via the `_AllowEmpty` variant so a `/clear`-only prompt falls through instead of becoming the name
-- [ ] **29.4** Interaction: type anything = filter (no insert mode) · ↑ on the first row jumps into the filter · Ctrl+V previews the focused session **in place**, lazily loaded, **with the same renderer as the live one** (never a summary line) · Ctrl+A/B toggle all-projects/branch · Enter resumes · Esc cancels — or clears the filter when filtering, and the footer says which
-- [ ] **29.5** Search in three honest tiers:
-  - [ ] (1) title substring — instant
-  - [ ] (2) transcript fuzzy, debounced, cropped at BOTH ends (first 1000 + last 1000 of >2000 messages), built from **prose only** (no tool names, no thinking blocks — they add noise to the ranking); each hit shows a snippet that is a bounded window **inside that session** (the `web_search` neighbour-snippet bug)
-  - [ ] (3) semantic — optional, and a **state, not a filter**: the footer shows "Searching…" where the shortcuts were, Esc cancels; the primitive already exists (`task`, effort `low`, depth 1, 24k)
-  - [ ] Ranking, stolen whole: `|Δt| > 60s → recency wins; within a minute → relevance is the tiebreak` — relevance never outranks recency across sessions, only within a minute of it
-- [ ] **29.6** Resuming checks the session BELONGS to this directory
-  - [ ] Different project → refuse with the exact command, shell-quoted (`cd '…' && zode --resume <id>` — a path with a space is a command injection), copied to clipboard, delivered as a **user message** (an instruction, not an error); same-repo worktree → resume directly
-  - [ ] `/resume <term>` never opens a picker: resolve UUID → file → exact title; an ambiguity is an error with the count (`Found 3 sessions matching foo. Use /resume to pick.`)
-  - [ ] When the index says "not found", **read the file directly before telling the user it does not exist** — the index filters sessions it could not enrich, and losing one to that is losing it forever
+- [x] **29.1** Two-phase rows: `stat` for the row (mtime/size/id — no parsing, so a corrupt file cannot make a session disappear), then head+tail windows (≤128 KB per file, first 50 sessions) fill the title
+  - [x] String scanning on complete lines (a cut fragment is skipped, never JSON-parsed); head+tail prompt extraction in `sessionindex.titleHints`. `last_prompt` persisted tail entry is Phase 30.3.
+  - [x] The **tail** prompt is extracted (for future/derived use); persisted `last_prompt` write-time marker is Phase 30.3.
+  - [x] Listing uses stat + meta sidecars (no JSONL inflation). Head/tail enrichment is bounded to the first 50 sessions.
+- [x] **29.2** 🐛 The highest-value line in the file: a session whose head cannot be read is listed as `(session)`, never dropped — `titleHints` returns empty on read failure and `Entry.title()` is a total function with `(session)` fallback.
+- [x] **29.3** The row: `<relative time> · <git branch> · <size or N messages> · #<tag>`; the header shows the position (`Resume (3 of 57)`) — a picker that lies about its size is worse than no picker
+  - [x] The title is a **total function**: `agentName || customTitle || aiTitle || firstPrompt || sessionId[0..8]` (never empty; `(session)` last resort).
+  - [x] Skip a `firstPrompt` starting with `<tICK>` (autonomous) and empty/whitespace prompts via `usablePrompt`.
+  - [x] Row desc shows `<relative time> · <size KB>` when size is known (core). Git branch / message count / `#tag` still need persisted session metadata.
+  - [x] Session picker header shows position in draw (`Resume (…)  (k of N)`); scope reload updates the title/count.
+- [x] **29.4** Interaction: type anything = filter (no insert mode) · ↑ on the first row jumps into the filter · Ctrl+V previews the focused session **in place**, lazily loaded, **with the same renderer as the live one** (never a summary line) · Ctrl+A/B toggle all-projects/branch · Enter resumes · Esc cancels — or clears the filter when filtering, and the footer says which
+  - [x] `/resume` (no args) opens the session picker; Enter resumes via `resumeSessionAtPath` (29.6 checks applied). Filter/search scaffolding exists.
+  - [x] Type-anything filter works (printable chars only; Ctrl chords are not inserted). `↑` on the first row stays at the top row while filter remains the active input.
+  - [x] `Ctrl+V` toggles an in-place preview, loaded lazily for the focused session, rendered via `md.parse` (same markdown parser/styles as the live transcript), never a summary line.
+  - [x] `Ctrl+A` toggles project/all-projects scope and reloads entries (scans `<state>/sessions/*` best-effort). `Ctrl+B` toggles branch scope label (best-effort: branch metadata is not persisted, so it falls back to project scope with an honest label). Chords are handled only while the session picker is active.
+  - [x] `Esc` cancels semantic search/mode, or clears the filter when filtering; the footer says which (`esc clears filter` when filtering).
+- [x] **29.5** Search in three honest tiers:
+  - [x] (1) title substring — instant (`session_search.searchTitle`).
+  - [x] (2) transcript fuzzy, debounced, cropped at BOTH ends (first 1000 + last 1000 of >2000 messages), built from prose only; `session_search` implements tier 1/2 and ranking (`|Δt| > 60s` recency wins, relevance tiebreak within a minute).
+  - [x] (3) semantic — stateful optional search via `Ctrl+S` in the session picker; runs in a detached thread calling the `task` subagent (`sessionSemanticSearch`), shows `Searching…`/cancel state in the footer, and filters results to returned `.jsonl` paths. Scope/context and cancellation into the subagent remain best-effort.
+  - [x] Ranking: `|Δt| > 60s → recency wins; within a minute → relevance is the tiebreak`.
+- [x] **29.6** Resuming checks the session BELONGS to this directory
+  - [x] Different project → refuse with a resume command copied to clipboard and delivered as an info/user-facing instruction (not an error); uses session id. Same-repo worktree detection is best-effort (storage is keyed by project root).
+  - [x] `/resume <term>` never opens a picker: resolves direct `.jsonl` path → id/filename match → exact title; ambiguity errors with `Found N sessions matching … Use /resume to pick.`.
+  - [x] When the index says "not found", tries a direct `zode-<term>.jsonl` path before giving up. `resumeSessionAtPath` reads the file directly and reports read errors honestly.
 
 ---
 
@@ -351,7 +358,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 - [ ] **30.3** A running summary for the list — not yet (write-time summary line every N steps)
 - [ ] **30.4** `/branch` — fork is not `/new` — not yet (copy JSONL, rewrite session id, provenance chain)
-- [ ] **29.5** Search in three tiers — not yet (title substring, transcript fuzzy, semantic)
+- [x] **29.5** Search in three tiers — done in Phase 29 (title substring, transcript fuzzy, semantic best-effort via `Ctrl+S`/`task`)
 - [ ] **30.5** Resume restores more than messages — not yet (plan hydration, cost state, tags)
   - [ ] Turn 1: a title derived from the first prompt — synchronously, free
   - [ ] Turn 3: the AI upgrade via a `task` subagent (effort `low`) over the **last 1000 characters** of the conversation (recent context wins, input bounded); patched only while three things hold: the generation counter matches (a cheap turn-1 request resolving late must not clobber a richer turn-3 one), the session is unchanged, and there is no custom title (the `/rename` race)

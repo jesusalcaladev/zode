@@ -242,9 +242,11 @@ const PickerSnapshot = struct {
     total: usize,
     tag: u32,
     items: []PickerItem,
-    /// Whether a semantic search (tier 3) is in flight. Shown as "Searching…"
-    /// in the picker footer.
     semantic_searching: bool = false,
+    semantic_mode: bool = false,
+    preview: bool = false,
+    /// Preview lines: first byte is kind prefix (U/A/T/E/D/I), rest is text.
+    preview_lines: []const []const u8 = &.{},
 };
 
 // ── painter: cell writes with stable graphemes ─────────────────
@@ -1298,7 +1300,7 @@ pub const Model = struct {
     prompt_dot_hover: ?usize = null,
     /// Show the prompt rail dots (the right-margin timeline): click a dot to
     /// jump back to that prompt.
-    show_prompt_dots: bool = true,
+    show_prompt_dots: bool = false,
 
     /// Paragraph cache: 1 arena per closed paragraph, with the lines ALREADY
     /// wrapped at the current width. Invalidated on width change; frees the
@@ -1567,6 +1569,14 @@ pub const Model = struct {
     /// Whether a semantic search is currently in flight. Shown as "Searching…"
     /// in the picker footer (where the shortcuts hint normally is).
     session_picker_semantic_searching: bool = false,
+    /// Scope for the session/resume picker (29.4): .project = this project (default),
+    /// .all = all projects under the sessions dir, .branch = this git branch when known.
+    session_picker_scope: enum { project, all, branch } = .project,
+    /// In-place session preview (29.4): shows focused session content with the
+    /// live markdown renderer styles, never a summary. Lazily loaded.
+    session_picker_preview: bool = false,
+    session_picker_preview_path: ?[]u8 = null,
+    session_picker_preview_lines: std.ArrayList([]u8) = .empty,
     /// Called when F2 is pressed on a picker item (for renaming).
     picker_rename_cb: ?PickerCb = null,
     /// The session path being renamed (for the sessions picker).
@@ -2007,6 +2017,9 @@ pub const Model = struct {
         self.closePicker();
         self.picker_items.deinit(self.allocator);
         self.picker_filtered.deinit(self.allocator);
+        for (self.session_picker_preview_lines.items) |l| self.allocator.free(l);
+        self.session_picker_preview_lines.deinit(self.allocator);
+        if (self.session_picker_preview_path) |p| self.allocator.free(p);
         // `@` completion matches: gpa-owned paths (see `freeFileMatches`).
         freeFileMatches(self);
         self.ac.file_matches.deinit(self.allocator);
@@ -2040,6 +2053,9 @@ pub const Model = struct {
             if (e.model.len > 0) self.allocator.free(e.model);
             if (e.custom_title.len > 0) self.allocator.free(e.custom_title);
             if (e.ai_title.len > 0) self.allocator.free(e.ai_title);
+            if (e.first_prompt.len > 0) self.allocator.free(e.first_prompt);
+            if (e.last_prompt.len > 0) self.allocator.free(e.last_prompt);
+            if (e.agent_name.len > 0) self.allocator.free(e.agent_name);
         }
         self.session_picker_entries.deinit(self.allocator);
         // Free semantic search results (tier 3, Phase 29.5).
@@ -2135,6 +2151,10 @@ pub const Model = struct {
             self.allocator.free(p);
         }
         self.session_picker_semantic_results.clearRetainingCapacity();
+        self.clearSessionPickerPreview();
+        if (tag == sessions_picker_tag) {
+            self.session_picker_scope = .project;
+        }
         self.picker_sel = 0;
         self.picker_scroll = 0;
         self.pickerRefilter();
@@ -2162,6 +2182,8 @@ pub const Model = struct {
         self.session_picker_semantic_results.clearRetainingCapacity();
         self.session_picker_semantic = false;
         self.session_picker_semantic_searching = false;
+        self.clearSessionPickerPreview();
+        self.session_picker_scope = .project;
         for (self.picker_items.items) |it| {
             self.allocator.free(it.label);
             if (it.desc.len > 0) self.allocator.free(it.desc);
@@ -2239,7 +2261,11 @@ pub const Model = struct {
                     const title = e.title(session_id);
                     const age = sessionindex.ageLabel(now, e.created_at, &now_buf);
                     const label = self.allocator.dupe(u8, title) catch "";
-                    const desc = self.allocator.dupe(u8, age) catch "";
+                    var sbuf: [24]u8 = undefined;
+                    const desc = if (e.size_bytes > 0) blk: {
+                        const sz = std.fmt.bufPrint(&sbuf, "{d} KB", .{e.size_bytes / 1024}) catch "";
+                        break :blk std.fmt.allocPrint(self.allocator, "{s} · {s}", .{ age, sz }) catch self.allocator.dupe(u8, age) catch "";
+                    } else self.allocator.dupe(u8, age) catch "";
                     self.picker_items.append(self.allocator, .{ .label = label, .desc = desc }) catch {
                         self.allocator.free(label);
                         if (desc.len > 0) self.allocator.free(desc);
@@ -2365,13 +2391,62 @@ pub const Model = struct {
             self.unlock();
             return false;
         }
+        const is_sessions = self.picker_tag == sessions_picker_tag;
         const visible: usize = 10;
+
+        // Session picker chords (29.4/29.5): must not become filter text.
+        if (is_sessions) {
+            if (key.matches('s', .{ .ctrl = true })) {
+                if (self.session_picker_semantic_searching) {
+                    self.session_picker_semantic_searching = false;
+                    self.session_picker_semantic = false;
+                    for (self.session_picker_semantic_results.items) |p| self.allocator.free(p);
+                    self.session_picker_semantic_results.clearRetainingCapacity();
+                    self.pickerRefilter();
+                    self.unlock();
+                    return true;
+                }
+                self.session_picker_semantic = true;
+                self.session_picker_semantic_searching = true;
+                self.unlock();
+                const th = std.Thread.spawn(.{}, sessionSemanticSearchThread, .{self}) catch {
+                    self.lock();
+                    self.session_picker_semantic_searching = false;
+                    self.pickerRefilter();
+                    self.unlock();
+                    return true;
+                };
+                th.detach();
+                return true;
+            }
+            if (key.matches('a', .{ .ctrl = true })) {
+                self.session_picker_scope = .all;
+                self.unlock();
+                self.reloadSessionPickerScope();
+                return true;
+            }
+            if (key.matches('b', .{ .ctrl = true })) {
+                self.session_picker_scope = .branch;
+                self.unlock();
+                self.reloadSessionPickerScope();
+                return true;
+            }
+            if (key.matches('v', .{ .ctrl = true })) {
+                self.session_picker_preview = !self.session_picker_preview;
+                if (self.session_picker_preview) self.loadSessionPickerPreview();
+                self.unlock();
+                return true;
+            }
+        }
+
         switch (key.codepoint) {
-            57352 => { // up
+            57352 => { // up (29.4): on first row, stay (filter remains the input)
                 if (self.picker_sel > 0) self.picker_sel -= 1;
+                if (is_sessions and self.session_picker_preview) self.loadSessionPickerPreview();
             },
             57353 => { // down
                 if (self.picker_sel + 1 < self.picker_filtered.items.len) self.picker_sel += 1;
+                if (is_sessions and self.session_picker_preview) self.loadSessionPickerPreview();
             },
             0x0D => { // enter: select
                 const ix = if (self.picker_sel < self.picker_filtered.items.len)
@@ -2400,8 +2475,7 @@ pub const Model = struct {
                 if (label) |l| self.allocator.free(l);
                 return true;
             },
-            27 => { // esc
-                // Cancel semantic search if in flight, or leave semantic mode.
+            27 => { // esc (29.4): clear filter when filtering, else cancel semantic/close
                 if (self.session_picker_semantic_searching) {
                     self.session_picker_semantic_searching = false;
                     self.unlock();
@@ -2410,8 +2484,17 @@ pub const Model = struct {
                 }
                 if (self.session_picker_semantic) {
                     self.session_picker_semantic = false;
+                    self.session_picker_semantic_results.clearRetainingCapacity();
                     self.unlock();
                     self.pickerRefilter();
+                    return true;
+                }
+                if (self.picker_query_len > 0) {
+                    self.picker_query_len = 0;
+                    self.picker_sel = 0;
+                    self.picker_scroll = 0;
+                    self.pickerRefilter();
+                    self.unlock();
                     return true;
                 }
                 const cancel = self.picker_cancel_cb;
@@ -2419,27 +2502,6 @@ pub const Model = struct {
                 self.unlock();
                 self.closePicker();
                 if (cancel) |f| f(self, tag);
-                return true;
-            },
-            's', 'S' => { // toggle semantic search (tier 3)
-                if (self.session_picker_semantic_searching) {
-                    // Cancel in-flight search.
-                    self.session_picker_semantic_searching = false;
-                } else if (self.session_picker_semantic) {
-                    // Leave semantic mode, back to tiers 1+2.
-                    self.session_picker_semantic = false;
-                } else {
-                    // Enter semantic mode: start searching.
-                    self.session_picker_semantic = true;
-                    self.session_picker_semantic_searching = true;
-                    // Kick off the semantic search via the `task` subagent.
-                    // Results are stored in session_picker_semantic_results;
-                    // searching flag is cleared when results arrive (requires
-                    // network/LLM to actually run — see sessionSemanticSearch).
-                    self.sessionSemanticSearch();
-                }
-                self.unlock();
-                self.pickerRefilter();
                 return true;
             },
             57365 => { // F2: rename
@@ -2478,15 +2540,17 @@ pub const Model = struct {
                 self.picker_scroll = 0;
                 self.picker_query_changed_at = if (self.io_ready) std.Io.Timestamp.now(self.io, .real).toSeconds() else 0;
                 self.pickerRefilter();
+                if (is_sessions and self.session_picker_preview) self.loadSessionPickerPreview();
             },
             else => |cp| {
-                if (cp >= 0x20 and cp < 0x7F and self.picker_query_len < self.picker_query.len) {
+                if (!key.mods.ctrl and !key.mods.alt and cp >= 0x20 and cp < 0x7F and self.picker_query_len < self.picker_query.len) {
                     self.picker_query[self.picker_query_len] = @intCast(cp);
                     self.picker_query_len += 1;
                     self.picker_sel = 0;
                     self.picker_scroll = 0;
                     self.picker_query_changed_at = if (self.io_ready) std.Io.Timestamp.now(self.io, .real).toSeconds() else 0;
                     self.pickerRefilter();
+                    if (is_sessions and self.session_picker_preview) self.loadSessionPickerPreview();
                 }
             },
         }
@@ -2497,12 +2561,227 @@ pub const Model = struct {
         return true;
     }
 
+    fn clearSessionPickerPreview(self: *Model) void {
+        self.session_picker_preview = false;
+        if (self.session_picker_preview_path) |p| {
+            self.allocator.free(p);
+            self.session_picker_preview_path = null;
+        }
+        for (self.session_picker_preview_lines.items) |l| self.allocator.free(l);
+        self.session_picker_preview_lines.clearRetainingCapacity();
+    }
+
+    fn loadSessionPickerPreview(self: *Model) void {
+        // Lazily render the focused session with the same markdown parser/styles
+        // as the live transcript (never a summary). 29.4.
+        self.clearSessionPickerPreview();
+        self.session_picker_preview = true;
+        if (self.picker_tag != sessions_picker_tag) return;
+        const ix = if (self.picker_sel < self.picker_filtered.items.len)
+            self.picker_filtered.items[self.picker_sel]
+        else
+            return;
+        if (ix >= self.session_picker_paths.items.len) return;
+        const path = self.session_picker_paths.items[ix];
+        self.session_picker_preview_path = self.allocator.dupe(u8, path) catch null;
+        if (!self.io_ready) return;
+
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, a, .limited(1024 * 1024)) catch return;
+        var line_it = std.mem.splitScalar(u8, data, '\n');
+        while (line_it.next()) |raw| {
+            if (raw.len == 0) continue;
+            const line = if (raw[0] == 'z' and zjsonl.isCompressed(raw))
+                (zjsonl.decompressInto(a, raw, 1024 * 1024) catch continue)
+            else
+                raw;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, line, .{}) catch continue;
+            if (parsed != .object) continue;
+            const obj = parsed.object;
+            const role_v = obj.get("role") orelse continue;
+            if (role_v != .string) continue;
+            const role = role_v.string;
+            const content_v = obj.get("content") orelse continue;
+            if (content_v != .string) continue;
+            const content = content_v.string;
+            if (std.mem.eql(u8, role, "user")) {
+                if (agent.isHarnessInternalUserMessage(content)) continue;
+                self.appendPreviewBlock(.user, content);
+            } else if (std.mem.eql(u8, role, "assistant")) {
+                self.appendPreviewBlock(.assistant, content);
+            } else if (std.mem.eql(u8, role, "tool")) {
+                self.appendPreviewBlock(.tool_res, content);
+            }
+        }
+        if (self.session_picker_preview_lines.items.len == 0) {
+            self.appendPreviewBlock(.info, "(no previewable messages)");
+        }
+    }
+
+    fn appendPreviewBlock(self: *Model, kind: md.Kind, text: []const u8) void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const blocks = md.parse(a, kind, text) catch {
+            self.appendPreviewLine(kind, text);
+            return;
+        };
+        for (blocks) |blk| {
+            for (blk.lines) |segs| {
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(self.allocator);
+                for (segs) |seg| buf.appendSlice(self.allocator, seg.text) catch {};
+                self.appendPreviewLine(blk.kind, buf.items);
+            }
+        }
+    }
+
+    fn appendPreviewLine(self: *Model, kind: md.Kind, text: []const u8) void {
+        const prefix: u8 = switch (kind) {
+            .user => 'U',
+            .assistant => 'A',
+            .tool, .tool_run, .tool_res => 'T',
+            .error_msg => 'E',
+            .diff => 'D',
+            else => 'I',
+        };
+        const max_take: usize = 400;
+        const take = @min(text.len, max_take);
+        const owned = self.allocator.alloc(u8, take + 1) catch return;
+        owned[0] = prefix;
+        if (take > 0) @memcpy(owned[1..][0..take], text[0..take]);
+        self.session_picker_preview_lines.append(self.allocator, owned) catch self.allocator.free(owned);
+    }
+
+    fn reloadSessionPickerScope(self: *Model) void {
+        if (self.picker_tag != sessions_picker_tag) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+
+        const gpa = self.allocator;
+        self.lock();
+        for (self.session_picker_entries.items) |e| {
+            gpa.free(e.path);
+            if (e.name.len > 0) gpa.free(e.name);
+            if (e.model.len > 0) gpa.free(e.model);
+            if (e.custom_title.len > 0) gpa.free(e.custom_title);
+            if (e.ai_title.len > 0) gpa.free(e.ai_title);
+            if (e.first_prompt.len > 0) gpa.free(e.first_prompt);
+            if (e.last_prompt.len > 0) gpa.free(e.last_prompt);
+            if (e.agent_name.len > 0) gpa.free(e.agent_name);
+        }
+        self.session_picker_entries.clearRetainingCapacity();
+        for (self.session_picker_paths.items) |p| gpa.free(p);
+        self.session_picker_paths.clearRetainingCapacity();
+        for (self.picker_items.items) |it| {
+            gpa.free(it.label);
+            if (it.desc.len > 0) gpa.free(it.desc);
+        }
+        self.picker_items.clearRetainingCapacity();
+        self.picker_filtered.clearRetainingCapacity();
+        self.clearSessionPickerPreview();
+        const scope = self.session_picker_scope;
+        const state_dir = session_mod.sessions_dir;
+        const io_ready = self.io_ready;
+        self.unlock();
+
+        var entries: []sessionindex.Entry = &.{};
+        if (io_ready and scope == .all) {
+            const parent = std.fs.path.dirname(state_dir) orelse state_dir;
+            if (std.Io.Dir.cwd().openDir(self.io, parent, .{ .iterate = true })) |dir_val| {
+                var dir = dir_val;
+                defer dir.close(self.io);
+                var acc: std.ArrayList(sessionindex.Entry) = .empty;
+                var it = dir.iterate();
+                while (it.next(self.io) catch null) |ent| {
+                    if (ent.kind != .directory) continue;
+                    const sub = std.fs.path.join(a, &.{ parent, ent.name }) catch continue;
+                    const found = sessionindex.scan(a, self.io, sub);
+                    acc.appendSlice(a, found) catch {};
+                }
+                const here = sessionindex.scan(a, self.io, state_dir);
+                acc.appendSlice(a, here) catch {};
+                entries = acc.toOwnedSlice(a) catch &.{};
+            } else |_| {
+                entries = sessionindex.scan(a, self.io, state_dir);
+            }
+        } else if (io_ready) {
+            // .project and .branch (branch metadata not persisted: project scope)
+            entries = sessionindex.scan(a, self.io, state_dir);
+        }
+
+        self.lock();
+        const now = if (self.io_ready) std.Io.Timestamp.now(self.io, .real).toSeconds() else 0;
+        for (entries) |e| {
+            const pth = gpa.dupe(u8, e.path) catch continue;
+            const ne = sessionindex.Entry{
+                .path = pth,
+                .name = gpa.dupe(u8, e.name) catch "",
+                .model = gpa.dupe(u8, e.model) catch "",
+                .custom_title = gpa.dupe(u8, e.custom_title) catch "",
+                .ai_title = gpa.dupe(u8, e.ai_title) catch "",
+                .created_at = e.created_at,
+                .first_prompt = gpa.dupe(u8, e.first_prompt) catch "",
+                .last_prompt = gpa.dupe(u8, e.last_prompt) catch "",
+                .agent_name = gpa.dupe(u8, e.agent_name) catch "",
+                .size_bytes = e.size_bytes,
+            };
+            self.session_picker_entries.append(gpa, ne) catch {
+                gpa.free(pth);
+                continue;
+            };
+            const session_id = std.fs.path.basename(ne.path);
+            const title = ne.title(session_id);
+            const label = gpa.dupe(u8, title) catch continue;
+            var age_buf: [24]u8 = undefined;
+            const age = sessionindex.ageLabel(now, ne.created_at, &age_buf);
+            var desc_buf: [64]u8 = undefined;
+            const desc_text = if (ne.size_bytes > 0)
+                (std.fmt.bufPrint(&desc_buf, "{s} · {d} KB", .{ age, ne.size_bytes / 1024 }) catch age)
+            else
+                age;
+            const desc = gpa.dupe(u8, desc_text) catch "";
+            self.picker_items.append(gpa, .{ .label = label, .desc = desc }) catch {};
+            self.session_picker_paths.append(gpa, gpa.dupe(u8, ne.path) catch "") catch {};
+        }
+        var tbuf: [64]u8 = undefined;
+        const scope_label: []const u8 = switch (scope) {
+            .project => "",
+            .all => " · all projects",
+            .branch => " · branch (project)",
+        };
+        const ttext = std.fmt.bufPrint(&tbuf, "Resume ({d} sessions){s}", .{ entries.len, scope_label }) catch "Resume";
+        const nt = @min(ttext.len, self.picker_title.len);
+        @memcpy(self.picker_title[0..nt], ttext[0..nt]);
+        self.picker_title_len = nt;
+        self.pickerRefilter();
+        self.unlock();
+    }
+
+    fn sessionSemanticSearchThread(self: *Model) void {
+        self.sessionSemanticSearch();
+    }
+
     fn sessionSemanticSearch(self: *Model) void {
-        const query = self.picker_query[0..self.picker_query_len];
-        if (query.len == 0) {
+        self.lock();
+        const q_owned = self.allocator.dupe(u8, self.picker_query[0..self.picker_query_len]) catch {
             self.session_picker_semantic_searching = false;
+            self.unlock();
+            return;
+        };
+        self.unlock();
+        defer self.allocator.free(q_owned);
+
+        if (q_owned.len == 0) {
+            self.lock();
+            self.session_picker_semantic_searching = false;
+            self.unlock();
             return;
         }
+
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const sarena = arena_state.allocator();
@@ -2510,50 +2789,36 @@ pub const Model = struct {
             .description = sarena.dupe(u8, "semantic session search") catch "",
             .prompt = std.fmt.allocPrint(
                 sarena,
-                "Find zode session files semantically relevant to this query: \"{s}\"\n\n" ++ "Session files are JSONL in the sessions directory. Each line is a message " ++ "with role, content, etc. Session titles are derived from message content. " ++ "Use `glob` to list session files, then `read` to examine promising ones. " ++ "Look at titles and user/assistant messages to judge semantic relevance.\n\n" ++ "Return ONLY the file paths of relevant sessions, one per line, no other text. " ++ "Return nothing if none match.",
-                .{query},
+                "Find zode session files semantically relevant to this query: \"{s}\"\n\nSession files are JSONL in the sessions directory. Each line is a message with role, content, etc. Use glob to list session files, then read to examine promising ones. Look at titles and user/assistant messages to judge semantic relevance.\n\nReturn ONLY the file paths of relevant sessions, one per line, no other text. Return nothing if none match.",
+                .{q_owned},
             ) catch "",
         };
         if (task.description.len == 0 or task.prompt.len == 0) {
+            self.lock();
             self.session_picker_semantic_searching = false;
+            self.unlock();
             return;
         }
         var rep = subagent_mod.Report{};
         const text = agent.runSubagent(self, task, &rep);
-        var matches: std.ArrayList([]const u8) = .empty;
-        defer matches.deinit(self.allocator);
-        var rest = text;
-        while (rest.len > 0) {
-            const nl = std.mem.indexOf(u8, rest, "\n");
-            var line: []const u8 = "";
-            if (nl) |i| {
-                line = rest[0..i];
-                rest = rest[i + 1 ..];
-            } else {
-                line = rest;
-                rest = "";
-            }
-            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+
+
+        self.lock();
+        for (self.session_picker_semantic_results.items) |p| self.allocator.free(p);
+        self.session_picker_semantic_results.clearRetainingCapacity();
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0) continue;
             if (std.mem.indexOf(u8, trimmed, ".jsonl") == null) continue;
             if (std.mem.indexOf(u8, trimmed, "zode-") == null) continue;
-            for (self.session_picker_entries.items) |e| {
-                if (std.mem.eql(u8, e.path, trimmed)) {
-                    const path_copy = self.allocator.dupe(u8, trimmed) catch continue;
-                    matches.append(self.allocator, path_copy) catch {};
-                    break;
-                }
-            }
-        }
-        self.lock();
-        for (self.session_picker_semantic_results.items) |p| {
-            self.allocator.free(p);
-        }
-        self.session_picker_semantic_results.clearRetainingCapacity();
-        for (matches.items) |p| {
-            self.session_picker_semantic_results.append(self.allocator, p) catch {};
+            const pdupe = self.allocator.dupe(u8, trimmed) catch continue;
+            self.session_picker_semantic_results.append(self.allocator, pdupe) catch {
+                self.allocator.free(pdupe);
+            };
         }
         self.session_picker_semantic_searching = false;
+        self.pickerRefilter();
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
         self.unlock();
@@ -2596,6 +2861,17 @@ pub const Model = struct {
         }
         // Trim if we skipped stale indices (keeps the snapshot from exposing
         // uninitialized holes).
+        var preview_lines: []const []const u8 = &.{};
+        if (self.session_picker_preview and self.picker_tag == sessions_picker_tag) {
+            if (arena.alloc([]const u8, self.session_picker_preview_lines.items.len)) |pl| {
+                var pi: usize = 0;
+                for (self.session_picker_preview_lines.items) |l| {
+                    pl[pi] = arena.dupe(u8, l) catch "";
+                    pi += 1;
+                }
+                preview_lines = pl[0..pi];
+            } else |_| {}
+        }
         return .{
             .title = arena.dupe(u8, self.picker_title[0..self.picker_title_len]) catch "",
             .query = arena.dupe(u8, self.picker_query[0..self.picker_query_len]) catch "",
@@ -2605,6 +2881,9 @@ pub const Model = struct {
             .tag = self.picker_tag,
             .items = items[0..out_ix],
             .semantic_searching = self.session_picker_semantic_searching,
+            .semantic_mode = self.session_picker_semantic,
+            .preview = self.session_picker_preview and self.picker_tag == sessions_picker_tag,
+            .preview_lines = preview_lines,
         };
     }
 
@@ -4065,6 +4344,7 @@ pub const Model = struct {
         }
         self.dirty = true;
         self.unlock();
+        agent.resetModelPaletteRefreshThrottle();
         self.requestRedraw();
     }
 
@@ -5630,7 +5910,7 @@ pub const Model = struct {
         try ctx.copyToClipboard(text);
         // Show a toast in the top-right corner for ~2 seconds.
         self.copy_toast_text = "Copied to clipboard";
-        self.copy_toast_frames = 120; // ~2 s at 60 fps
+        self.copy_toast_frames = 60; // ~1 s at 60 fps
     }
 
     fn selectionPointLess(a: SelectionPoint, b: SelectionPoint) bool {
@@ -6622,6 +6902,16 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // way out was a key advertised as a scroll.
             //
             // Ctrl+C is the exit, which is what both places say.
+            // Modal picker active: captures ALL input (before global shortcuts so
+            // session-picker chords like Ctrl+A/B/V/S work; Ctrl+C quit is above).
+            if (self.pickerActive()) {
+                if (self.pickerHandleKey(key)) {
+                    self.flushCopyPending(ctx);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
             // Ctrl+P: command palette (commands and models in two columns).
             // Toggle: pressing it while the commands palette is open closes it,
             // so a stuck-open palette is escapable with the same key.
@@ -6668,16 +6958,12 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 if (self.toggleLastTool()) {
                     ctx.redraw = true;
                 } else {
-                    // With no previous tool, it refreshes the history.
                     self.cache_from = 0;
                     ctx.redraw = true;
                 }
                 return;
             }
-            // Ctrl+V: stage the clipboard's IMAGE for the next message. The
-            // terminal's own paste is text-only (bracketed paste carries no
-            // bytes), so the read goes through the clipboard helpers on the
-            // agent side.
+            // Ctrl+V: stage the clipboard's IMAGE for the next message.
             if (key.matches('v', .{ .ctrl = true })) {
                 agent.attachClipboardImage(self);
                 ctx.redraw = true;
@@ -6686,17 +6972,6 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // Ctrl+P palette open: captures ALL input, scroll included.
             if (self.pal.active) {
                 if (try self.paletteKey(ctx, key)) {
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-
-            // Modal picker active: captures ALL input.
-            if (self.pickerActive()) {
-                if (self.pickerHandleKey(key)) {
-                    // The picker's callback may have queued a clipboard write.
-                    self.flushCopyPending(ctx);
-                    ctx.redraw = true;
                     try self.armTick(ctx);
                     return;
                 }
@@ -9731,19 +10006,13 @@ fn segsWidth(segs: []const InfoSeg) u16 {
 
 /// Centered modal in opencode style: title, filter, items with selection and footer.
 fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
-    // 104 columns: the picker's rows are "label  ·  description" and at 90
-    // the description was the part that got cut.
+    const is_sessions = ps.tag == sessions_picker_tag;
     const box_w: u16 = @min(width -| 4, 104);
-    const box_h: u16 = @min(height -| 4, 15);
+    const box_h: u16 = @min(height -| 4, @as(u16, if (ps.preview) 22 else 15));
     if (box_w < 20 or box_h < 6) return;
     const x0 = (width - box_w) / 2;
-    const y0 = (height - box_h) / 4; // a bit above the center
+    const y0 = (height - box_h) / 4;
 
-    // A wide cell behind the box is a hole in the modal: the renderer writes
-    // the wide cell and jumps `width - 1` columns, so every picker cell under
-    // it is skipped and the rule wins the row (the /copy bug: the "always"
-    // row counted in (1/4) and was never on screen). Split them before
-    // painting, like every other overlay does.
     var wr: u16 = 0;
     while (wr < box_h) : (wr += 1) {
         expandWideCells(p.surface, y0 + wr, width);
@@ -9751,10 +10020,15 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
 
     drawRoundedBox(p, x0, y0, box_w, box_h, .{}, theme.accent);
 
-    // title and filter
-    var tbuf: [96]u8 = undefined;
-    const t1 = std.fmt.bufPrint(&tbuf, " {s}", .{ps.title}) catch " picker";
+    // title with dynamic position for session picker (29.3/29.4)
+    var tbuf: [128]u8 = undefined;
+    const pos = if (ps.total > 0) ps.sel + 1 else 0;
+    const t1 = if (is_sessions)
+        (std.fmt.bufPrint(&tbuf, " {s}  ({d} of {d})", .{ ps.title, pos, ps.total }) catch " Resume")
+    else
+        (std.fmt.bufPrint(&tbuf, " {s}", .{ps.title}) catch " picker");
     _ = p.putText(x0 + 2, y0, t1, theme.accent_bold);
+
     var qbuf: [96]u8 = undefined;
     const q1 = if (ps.query.len > 0)
         std.fmt.bufPrint(&qbuf, "filter: {s}_", .{ps.query}) catch "filter: _"
@@ -9762,45 +10036,81 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
         "filter: (type to search)";
     _ = p.putText(x0 + 2, y0 + 1, q1, theme.dim);
 
-    // items
-    const item_rows: usize = box_h - 5; // title + query + footer + 2 borders
-    for (ps.items, 0..) |it, i| {
-        if (i >= item_rows) break;
-        const row = y0 + 2 + @as(u16, @intCast(i));
-        const is_sel = ps.first_visible + i == ps.sel;
-        if (is_sel) p.fillRange(x0 + 1, x0 + box_w - 1, row, " ", theme.selected);
-        // The label is painted with the characters the FILTER matched in bold,
-        // and the description after it in the dim color: one `putText` for the
-        // whole row made the two look like one sentence, and the query the row
-        // matched was invisible (the filter found it, the eye could not).
-        var hbuf: [64]u32 = undefined;
-        const hn = fuzzy.highlightPositions(it.label, ps.query, &hbuf) orelse 0;
-        var after = putStyled(
-            p,
-            x0 + 2,
-            row,
-            it.label,
-            hbuf[0..hn],
-            if (is_sel) theme.selected else theme.text,
-            null,
-            0,
-        );
-        if (it.desc.len > 0) {
-            after = p.putText(after, row, "  ", if (is_sel) theme.selected else theme.dim);
-            _ = p.putText(after, row, it.desc, if (is_sel) theme.selected else theme.dim);
+    const item_rows: usize = box_h - 5;
+    if (ps.preview and ps.preview_lines.len > 0) {
+        // In-place preview (29.4): same markdown parser/styles, never a summary.
+        var pi: usize = 0;
+        while (pi < ps.preview_lines.len and pi < item_rows) : (pi += 1) {
+            const row = y0 + 2 + @as(u16, @intCast(pi));
+            const raw = ps.preview_lines[pi];
+            if (raw.len == 0) continue;
+            const kindc = raw[0];
+            const text = raw[1..];
+            const st: vaxis.Style = switch (kindc) {
+                'U' => theme.user,
+                'A' => theme.text,
+                'T' => theme.tool_res,
+                'E' => theme.err,
+                'D' => theme.diff_add,
+                else => theme.dim,
+            };
+            p.fillRange(x0 + 1, x0 + box_w - 1, row, " ", .{});
+            _ = p.putText(x0 + 2, row, text, st);
+        }
+    } else {
+        for (ps.items, 0..) |it, i| {
+            if (i >= item_rows) break;
+            const row = y0 + 2 + @as(u16, @intCast(i));
+            const is_sel = ps.first_visible + i == ps.sel;
+            if (is_sel) p.fillRange(x0 + 1, x0 + box_w - 1, row, " ", theme.selected);
+            var hbuf: [64]u32 = undefined;
+            const hn = fuzzy.highlightPositions(it.label, ps.query, &hbuf) orelse 0;
+            var after = putStyled(
+                p,
+                x0 + 2,
+                row,
+                it.label,
+                hbuf[0..hn],
+                if (is_sel) theme.selected else theme.text,
+                null,
+                0,
+            );
+            if (it.desc.len > 0) {
+                after = p.putText(after, row, "  ", if (is_sel) theme.selected else theme.dim);
+                _ = p.putText(after, row, it.desc, if (is_sel) theme.selected else theme.dim);
+            }
         }
     }
 
-    // footer
-    var fbuf: [96]u8 = undefined;
+    // footer (29.4): must say when esc clears filter
+    var fbuf: [160]u8 = undefined;
     var f1_text: []const u8 = "";
     if (ps.semantic_searching) {
-        f1_text = "Searching…  (esc cancel)";
+        f1_text = "Searching…  ·  esc cancel";
+    } else if (is_sessions and ps.query.len > 0) {
+        f1_text = std.fmt.bufPrint(
+            &fbuf,
+            "\u{2191}\u{2193} nav · enter resume · ctrl+v preview · ctrl+s semantic · esc clears filter ({d}/{d})",
+            .{ pos, ps.total },
+        ) catch "esc clears filter · esc closes";
+    } else if (is_sessions) {
+        const sem = if (ps.semantic_mode) " · semantic" else "";
+        f1_text = std.fmt.bufPrint(
+            &fbuf,
+            "\u{2191}\u{2193} nav · enter resume · ctrl+v preview · ctrl+a/b scope · ctrl+s semantic{s} · esc close ({d}/{d})",
+            .{ sem, pos, ps.total },
+        ) catch "enter resume · esc close";
+    } else if (ps.query.len > 0) {
+        f1_text = std.fmt.bufPrint(
+            &fbuf,
+            "\u{2191}\u{2193} navigate · enter select · esc clears filter · esc closes  ({d}/{d})",
+            .{ pos, ps.total },
+        ) catch "esc clears filter · esc closes";
     } else {
         f1_text = std.fmt.bufPrint(
             &fbuf,
-            "\u{2191}\u{2193} navigate \u{b7} enter select \u{b7} esc close  ({d}/{d})",
-            .{ if (ps.total > 0) ps.sel + 1 else 0, ps.total },
+            "\u{2191}\u{2193} navigate · enter select · esc close  ({d}/{d})",
+            .{ pos, ps.total },
         ) catch "";
     }
     _ = p.putText(x0 + 2, y0 + box_h - 2, f1_text, theme.dim);
@@ -12946,6 +13256,7 @@ test "clicking a prompt dot scrolls to that prompt instead of selecting text" {
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
+    m.show_prompt_dots = true;
 
     for (0..8) |i| {
         var text: [32]u8 = undefined;

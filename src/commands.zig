@@ -974,6 +974,9 @@ pub fn cmdSession(m: *tui.Model) void {
         if (e.model.len > 0) gpa.free(e.model);
         if (e.custom_title.len > 0) gpa.free(e.custom_title);
         if (e.ai_title.len > 0) gpa.free(e.ai_title);
+        if (e.first_prompt.len > 0) gpa.free(e.first_prompt);
+        if (e.last_prompt.len > 0) gpa.free(e.last_prompt);
+        if (e.agent_name.len > 0) gpa.free(e.agent_name);
     }
     m.session_picker_entries.deinit(gpa);
     m.session_picker_entries = .empty;
@@ -1002,26 +1005,25 @@ pub fn cmdSession(m: *tui.Model) void {
                 .custom_title = gpa.dupe(u8, s.custom_title) catch "",
                 .ai_title = gpa.dupe(u8, s.ai_title) catch "",
                 .created_at = s.created_at,
+                .first_prompt = gpa.dupe(u8, s.first_prompt) catch "",
+                .last_prompt = gpa.dupe(u8, s.last_prompt) catch "",
+                .agent_name = gpa.dupe(u8, s.agent_name) catch "",
+                .size_bytes = s.size_bytes,
             };
-            if (e.path.len == 0) {
-                // Skip entries we couldn't copy.
-                continue;
-            }
+            if (e.path.len == 0) continue;
             _ = m.session_picker_entries.append(gpa, e) catch {};
             if (idx >= owned_count) {
-                // Stale count (dir flipped between passes): skip extra
-                // rather than overflowing `owned`.
                 gpa.free(e.path);
+                if (e.name.len > 0) gpa.free(e.name);
+                if (e.model.len > 0) gpa.free(e.model);
+                if (e.custom_title.len > 0) gpa.free(e.custom_title);
+                if (e.ai_title.len > 0) gpa.free(e.ai_title);
+                if (e.first_prompt.len > 0) gpa.free(e.first_prompt);
+                if (e.last_prompt.len > 0) gpa.free(e.last_prompt);
+                if (e.agent_name.len > 0) gpa.free(e.agent_name);
                 continue;
             }
-            owned[idx] = .{
-                .path = e.path,
-                .name = e.name,
-                .model = e.model,
-                .custom_title = e.custom_title,
-                .ai_title = e.ai_title,
-                .created_at = e.created_at,
-            };
+            owned[idx] = e;
             idx += 1;
         }
     }
@@ -1037,7 +1039,6 @@ pub fn cmdSession(m: *tui.Model) void {
     var buf: [64]u8 = undefined;
     for (owned[0..owned_len], 0..) |s, i| {
         const session_id = std.fs.path.basename(s.path);
-        // Resolved title: custom_title > ai_title > name > session id (Phase 30.1)
         const title = s.title(session_id);
         const age = sessionindex.ageLabel(now, s.created_at, &buf);
         const is_cur = if (agent.session) |sess| sess.path != null and std.mem.eql(u8, s.path, sess.path.?) else false;
@@ -1045,18 +1046,22 @@ pub fn cmdSession(m: *tui.Model) void {
             (std.fmt.allocPrint(gpa, "{s}  (current)", .{title}) catch gpa.dupe(u8, title) catch "")
         else
             (gpa.dupe(u8, title) catch "");
-        items[i] = .{
-            .label = label_full,
-            .desc = gpa.dupe(u8, age) catch "",
-        };
-        // session_picker_paths is rebuilt by pickerRefilter from the entries;
-        // prefilling it here leaks the strings (the rebuild clears without
-        // freeing) and risks a double free if counts diverge.
+        // 29.3: <relative time> · <size> (branch/tag when available).
+        var dbuf: [32]u8 = undefined;
+        const size = if (s.size_bytes > 0) std.fmt.bufPrint(&dbuf, "{d} KB", .{s.size_bytes / 1024}) catch "" else "";
+        const desc = if (size.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} · {s}", .{ age, size }) catch gpa.dupe(u8, age) catch "")
+        else
+            (gpa.dupe(u8, age) catch "");
+        items[i] = .{ .label = label_full, .desc = desc };
     }
 
+    var tbuf: [64]u8 = undefined;
+    const ptitle = std.fmt.bufPrint(&tbuf, "Resume ({d} sessions)", .{owned_len}) catch "Resume";
+    // openPickerIdxRename copies the title into the model's fixed buffer.
     m.openPickerIdxRename(
         tui.sessions_picker_tag,
-        "sessions",
+        ptitle,
         items,
         agent.onSessionPick,
         null,
