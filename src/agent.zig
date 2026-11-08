@@ -2438,7 +2438,7 @@ fn setAlwaysAllowedNoSave(name: []const u8) bool {
 
 /// Reads `permissions.json` and fills the allowlist. Best-effort: if it does
 /// not exist or is corrupt, the session starts with an empty allowlist.
-fn loadAllowlist() void {
+pub fn loadAllowlist() void {
     var pbuf: [512]u8 = undefined;
     const path = permissionsFilePath(&pbuf) orelse return;
 
@@ -2473,7 +2473,7 @@ fn loadAllowlist() void {
 }
 
 // ── persisted allowlist: ~/.config/zode/permissions.json ─────
-fn permissionsFilePath(buf: []u8) ?[]const u8 {
+pub fn permissionsFilePath(buf: []u8) ?[]const u8 {
     // `environ_global.?` panicked when the global was null, which is its
     // normal state in every test that did not set it: a missing environment
     // is "there is nowhere to persist", not a crash.
@@ -2552,10 +2552,26 @@ pub var warned_dangerous_allow: std.atomic.Value(bool) = .init(false);
 /// The project-level rules file, relative to the working directory.
 pub const project_rules_file = ".zode/permissions.json";
 
+/// Resolved effective project rules path (matches loadPermRules resolution).
+pub fn resolvedProjectRulesPath(buf: []u8) []const u8 {
+    if (project_info.root()) |root| {
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file;
+    }
+    return project_rules_file;
+}
+
 /// Project-level hooks (Phase 5).
 pub var hooks_set: hooks_mod.Set = .{};
 var hooks_arena: ?std.heap.ArenaAllocator = null;
 pub const project_hooks_file = ".zode/hooks.json";
+
+/// Resolved effective project hooks path (matches loadHooks resolution).
+pub fn resolvedProjectHooksPath(buf: []u8) []const u8 {
+    if (project_info.root()) |root| {
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, project_hooks_file }) catch project_hooks_file;
+    }
+    return project_hooks_file;
+}
 
 pub fn loadHooks() void {
     var hbuf: [640]u8 = undefined;
@@ -2691,7 +2707,7 @@ pub fn permDecision(tool: []const u8, subjects: []const []const u8) ?permrules.D
                 .source = .policy,
                 .text = switch (v) {
                     .dangerous => |d| d.what,
-                    else => "a protected file",
+                    else => "a protected path",
                 },
             },
         };
@@ -4149,7 +4165,11 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
         commands_mod.cmdAllowlist(m);
     } else if (std.mem.eql(u8, cmd, "permissions")) {
-        commands_mod.cmdPermissions(m);
+        commands_mod.cmdPermissions(m, arg);
+    } else if (std.mem.eql(u8, cmd, "hooks")) {
+        commands_mod.cmdHooks(m, arg);
+    } else if (std.mem.eql(u8, cmd, "agents")) {
+        commands_mod.cmdAgents(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "usage")) {
@@ -5298,16 +5318,17 @@ fn user_wants_implementation(text: []const u8) bool {
 /// stages without printing the "Done" line after each one.
 fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
     var iterations: usize = 0;
-    // Phase 5: UserPromptSubmit hooks.
+    // Phase 5/34.6: UserPromptSubmit hooks (side effects; additionalContext noted best-effort).
     {
         const up_res = hooks_mod.fire(m.allocator, &hooks_set, .{
             .event = .UserPromptSubmit,
             .prompt = user_text,
         }, io_global) catch &[_]hooks_mod.RunResult{};
-        // Non-blocking output is produced by hooks; PreToolUse/PostToolUse feed
-        // back into tool flow. UserPromptSubmit hooks run for side effects.
-        for (up_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
-        if (up_res.len > 0) m.allocator.free(up_res);
+        defer if (up_res.len > 0) hooks_mod.freeResults(m.allocator, up_res);
+        if (hooks_mod.notesText(m.allocator, up_res) catch null) |note| {
+            defer m.allocator.free(note);
+            appendHarnessPrompt(m, note);
+        }
     }
 
     // ── the loop, and the three things that decide when it stops ──
@@ -5657,11 +5678,11 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
 /// `turn_iterations` is the count of executed iterations (the loop's own
 /// counter for a normal turn, the accumulated total for a pipeline run).
 fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
-    // Phase 5: Stop hooks fire when the turn ends.
+    // Phase 5/34.6: Stop hooks fire when the turn ends.
     {
         const stop_res = hooks_mod.fire(m.allocator, &hooks_set, .{ .event = .Stop }, io_global) catch &[_]hooks_mod.RunResult{};
-        for (stop_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
-        if (stop_res.len > 0) m.allocator.free(stop_res);
+        defer if (stop_res.len > 0) hooks_mod.freeResults(m.allocator, stop_res);
+        _ = hooks_mod.notesText(m.allocator, stop_res) catch null; // side effects; notes best-effort
     }
     // The bench sample is taken HERE, once per turn, and not per iteration: a
     // turn is the unit the user thinks in ("that took 40 s"), and a per-iteration
@@ -10331,7 +10352,10 @@ fn execOneCall(
             .ask => {
                 // The rule that matched: show it in the dialog so the user
                 // sees WHY they are being asked, not a blind "may I?".
-                rule_match_text = d.rule.text;
+                rule_match_text = if (d.rule.source == .policy)
+                    (std.fmt.allocPrint(arena, "policy: protected path ({s})", .{d.rule.pattern}) catch d.rule.text)
+                else
+                    d.rule.text;
             },
         }
     }
@@ -10444,14 +10468,20 @@ fn execOneCall(
         // Name the rule the "always allow" answer would remember, so the user
         // answers with their eyes open ("always allow `Bash(git *)`", not a
         // blind "always allow"). learnRuleForCall re-derives this from the
-        // call itself; here we only tell the dialog what to show.
+        // call itself; here we only tell the dialog what to show. Always reset
+        // first so a previous dialog's suggestion never leaks into this one.
         if (permSuggestion(call.name, call.args_json, arena)) |sugg| {
             m.setPermSuggestion(sugg);
+        } else {
+            m.setPermSuggestion("");
         }
-        // Tell the dialog WHICH rule matched, so it can show "your rule
-        // `Write(.git/**) deny` blocks this" instead of a blind "may I?".
+        // Tell the dialog WHICH rule matched (e.g. an `ask` rule), so it can
+        // show why the user is being asked instead of a blind prompt. Cleared
+        // when no rule matched.
         if (rule_match_text.len > 0) {
             m.setPermRule(rule_match_text);
+        } else {
+            m.setPermRule("");
         }
         // Phase 25: for a flagged `bash` command, offer a sandboxed run when
         // bwrap/firejail is available — a dialog is not the only answer.
@@ -10464,7 +10494,29 @@ fn execOneCall(
                 }
             }
         }
-        switch (m.requestPermission(call.name, detail)) {
+        // 34.14: PermissionRequest hook can answer without a dialog (useful for
+        // headless/automated runs). The hook's decision is honored here; pathsafe
+        // and rule-engine checks above still apply.
+        var hook_perm_answer: ?tui.Model.PermAnswer = null;
+        {
+            const hook_subj = if (subjects.len > 0) subjects[0] else detail;
+            const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
+                .event = .PermissionRequest,
+                .tool = call.name,
+                .subject = hook_subj,
+                .prompt = detail,
+            }, io_global) catch &[_]hooks_mod.RunResult{};
+            defer if (hook_res.len > 0) hooks_mod.freeResults(m.allocator, hook_res);
+            if (hooks_mod.permissionDecision(hook_res)) |pd| {
+                hook_perm_answer = switch (pd) {
+                    .allow => .allow,
+                    .deny => .deny,
+                    .ask => null,
+                };
+            }
+        }
+        const perm_answer = hook_perm_answer orelse m.requestPermission(call.name, detail);
+        switch (perm_answer) {
             .allow => {},
             .allow_sandbox => {
                 if (std.mem.eql(u8, call.name, "bash")) {
@@ -10562,7 +10614,7 @@ fn execOneCall(
         applyGoalCall(m, call.args_json, arena);
     }
 
-    // Phase 5: PreToolUse hooks can block the tool.
+    // Phase 5/34.6: PreToolUse hooks can block the tool or update its input.
     {
         const hook_subj = if (subjects.len > 0) subjects[0] else "";
         const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
@@ -10570,16 +10622,16 @@ fn execOneCall(
             .tool = call.name,
             .subject = hook_subj,
         }, io_global) catch &[_]hooks_mod.RunResult{};
-        defer {
-            for (hook_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
-            if (hook_res.len > 0) m.allocator.free(hook_res);
-        }
+        defer if (hook_res.len > 0) hooks_mod.freeResults(m.allocator, hook_res);
         if (hooks_mod.blockedReason(m.allocator, hook_res, .PreToolUse) catch null) |reason| {
             defer m.allocator.free(reason);
             const ms = elapsedMs(call_t0);
             m.pushToolDone(call.name, "blocked by hook", ms, reason);
             capStoreAppendToolResult(m, s, call.id, call.name, reason, arena, budget);
             return 0;
+        }
+        if (hooks_mod.updatedInput(hook_res)) |ui| {
+            exec_args = arena.dupe(u8, ui) catch exec_args;
         }
     }
 
@@ -10591,7 +10643,7 @@ fn execOneCall(
         s.appendToolResult(call.id, call.name, emsg) catch {};
         return 0;
     };
-    // Phase 5: PostToolUse hooks; output fed back as a tool result/system note.
+    // Phase 5/34.6: PostToolUse hooks; output/additionalContext fed back.
     {
         const hook_subj = if (subjects.len > 0) subjects[0] else "";
         const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
@@ -10599,10 +10651,7 @@ fn execOneCall(
             .tool = call.name,
             .subject = hook_subj,
         }, io_global) catch &[_]hooks_mod.RunResult{};
-        defer {
-            for (hook_res) |hr| if (hr.output.len > 0) m.allocator.free(hr.output);
-            if (hook_res.len > 0) m.allocator.free(hook_res);
-        }
+        defer if (hook_res.len > 0) hooks_mod.freeResults(m.allocator, hook_res);
         if (hooks_mod.notesText(m.allocator, hook_res) catch null) |note| {
             defer m.allocator.free(note);
             res = std.fmt.allocPrint(arena, "{s}\n\n[hook note]\n{s}", .{ res, note }) catch res;
@@ -11662,11 +11711,26 @@ pub fn permSuggestion(call_name: []const u8, args_json: []const u8, arena: std.m
         if (q.len != 1 or q[0].len == 0) return null;
         return std.fmt.allocPrint(arena, "Mcp({s}) allow", .{q[0]}) catch null;
     }
+    // A batch is a composite of steps; a broad `batch(*)` rule is ambiguous and
+    // can auto-allow future batches with different contents. Do not suggest a
+    // broad rule — let the legacy path handle constituent approvals (or the
+    // user allow once). A batch that touches exactly one path can still be
+    // scoped safely.
+    if (std.mem.eql(u8, call_name, "batch")) {
+        const paths = tools_mod.callTouchedPaths(call_name, args_json, arena);
+        if (paths.len == 1 and paths[0].len > 0) {
+            return std.fmt.allocPrint(arena, "batch({s}) allow", .{paths[0]}) catch null;
+        }
+        return null;
+    }
     const paths = tools_mod.callTouchedPaths(call_name, args_json, arena);
     if (paths.len == 1 and paths[0].len > 0) {
         return std.fmt.allocPrint(arena, "{s}({s}) allow", .{ call_name, paths[0] }) catch null;
     }
-    return std.fmt.allocPrint(arena, "{s}(*) allow", .{call_name}) catch null;
+    // No single clear subject: do not persist an overly broad `tool(*)` allow
+    // rule. The dialog can still offer allow-once; "always allow" falls back to
+    // legacy behavior when no safe scoped rule can be suggested.
+    return null;
 }
 
 fn bashPermSuggestion(command: []const u8, arena: std.mem.Allocator) ?[]const u8 {
@@ -11801,17 +11865,17 @@ fn rememberAlwaysAllow(
     arena: std.mem.Allocator,
 ) void {
     const learned = learnRuleForCall(m, name, args_json, arena);
-    // For bash: if a scoped/safe rule was learned, skip the legacy exact-command
-    // "bash allowed: ..." pattern to avoid redundant/confusing messages. If no
-    // safe rule suggestion exists (e.g. inline-code interpreter) or it was refused
-    // as dangerously broad, keep the legacy path only for exact-command scoping
-    // cases? `allowAlwaysFor` saves the exact command string (token-boundary
-    // prefix match), which is scoped - useful fallback.
-    if (std.mem.eql(u8, name, "bash")) {
-        if (learned == .saved) return;
-        // Refused dangerous rule: do not also persist legacy broad behavior.
-        if (learned == .refused_dangerous) return;
-    }
+    // A scoped pattern rule was learned and saved (the 34.1 answer: "always
+    // allow Bash(git *)", not a flat tool name). The rule lives in `perm_rules`
+    // as `local` (strongest) and in the user file, so it auto-allows the same
+    // call next time through `permDecision` — without adding the whole tool to
+    // the coarse flat allowlist.
+    if (learned == .saved) return;
+    // Refused as dangerously broad: do not persist legacy broad behavior either.
+    if (learned == .refused_dangerous) return;
+    // No safe rule suggestion (e.g. inline-code interpreter): fall back to the
+    // legacy scoped mechanism (bash exact-command prefix, or the flat allowlist
+    // for tools with no narrower shape).
     allowAlwaysForCall(m, name, arg, perm_tools);
 }
 
@@ -11821,7 +11885,7 @@ fn rememberAlwaysAllow(
 /// are kept: it is hand-edited, it carries the allowlist too, and dropping
 /// what the user wrote by hand is the one thing a permission file must never
 /// do.
-fn savePermRule(rule: permrules.Rule) bool {
+pub fn savePermRule(rule: permrules.Rule) bool {
     var pbuf: [512]u8 = undefined;
     const path = permissionsFilePath(&pbuf) orelse return false;
 
@@ -18962,9 +19026,10 @@ test "the 'always allow' suggestion names the rule it would remember" {
     const write = permSuggestion("write", "{\"path\":\"src/main.zig\"}", a).?;
     try std.testing.expectEqualStrings("write(src/main.zig) allow", write);
 
-    // And a tool with nothing to narrow becomes itself.
-    const other = permSuggestion("task", "{\"prompt\":\"look around\"}", a).?;
-    try std.testing.expectEqualStrings("task(*) allow", other);
+    // A tool with nothing to narrow safely gets no broad `tool(*)` rule
+    // suggestion (avoids persisting an overly broad grant). The dialog can
+    // still allow once, and "always allow" uses legacy fallback behavior.
+    try std.testing.expect(permSuggestion("task", "{\"prompt\":\"look around\"}", a) == null);
 
     // An MCP call names the QUALIFIED tool: `Mcp(github.create_issue)`.
     //
@@ -19017,6 +19082,78 @@ test "an always-allow suggestion scopes to the tool and pattern, not a flat name
     try std.testing.expect(!permrules.matches(rule, "write", "src/other.zig"));
     // A different tool is NOT covered either.
     try std.testing.expect(!permrules.matches(rule, "edit", "src/main.zig"));
+}
+
+test "34.1: always-allow learns a scoped local rule, not a flat tool allow" {
+    const saved = .{
+        .env = environ_global,
+        .io = io_global,
+        .gpa = gpa_global,
+        .al = always_lens,
+        .rules = perm_rules,
+        .arena = perm_rules_arena,
+    };
+    defer {
+        environ_global = saved.env;
+        io_global = saved.io;
+        gpa_global = saved.gpa;
+        always_lens = saved.al;
+        perm_rules = saved.rules;
+        perm_rules_arena = saved.arena;
+    }
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_global = threaded.io();
+    gpa_global = std.testing.allocator;
+
+    // Isolated HOME so savePermRule never touches the real permissions file.
+    const home = "/tmp/zode-perm-341-test";
+    std.Io.Dir.cwd().deleteTree(io_global, home) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_global, home) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_global, "/tmp/zode-perm-341-test/.config/zode");
+    var emap = std.process.Environ.Map.init(std.testing.allocator);
+    defer emap.deinit();
+    try emap.put("HOME", home);
+    environ_global = &emap;
+
+    for (&always_lens) |*l| l.* = 0;
+    perm_rules = .{};
+    perm_rules_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer {
+        perm_rules_arena.?.deinit();
+        perm_rules_arena = null;
+    }
+
+    // The suggestion is scoped to the path.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const text = permSuggestion("write", "{\"path\":\"src/main.zig\"}", a).?;
+    const rule = permrules.parseRule(text, .local, a).?;
+
+    // Learn it the same way the permission dialog does: a local rule in
+    // perm_rules (strongest source), persisted to the user file.
+    const pa = perm_rules_arena.?.allocator();
+    var all: std.ArrayList(permrules.Rule) = .empty;
+    all.append(pa, rule) catch return error.TestUnexpectedResult;
+    perm_rules = .{ .rules = all.items };
+    _ = savePermRule(rule);
+
+    // The scoped rule auto-allows that exact path via the rule engine.
+    const d = permDecision("write", &.{"src/main.zig"}).?;
+    try std.testing.expectEqual(permrules.Action.allow, d.action);
+    try std.testing.expectEqual(permrules.Source.local, d.rule.source);
+    // A different path is NOT covered — the rule is not a flat "allow write".
+    try std.testing.expect(permDecision("write", &.{"src/other.zig"}) == null);
+    // And the coarse flat tool allowlist was not populated.
+    try std.testing.expect(!isAlwaysAllowed("write"));
+
+    // The rule was persisted (user file carries it).
+    var pbuf: [512]u8 = undefined;
+    const path = permissionsFilePath(&pbuf) orelse return error.NoPath;
+    const data = readFileTo(pa, path) orelse return error.NoFile;
+    try std.testing.expect(std.mem.indexOf(u8, data, "write(src/main.zig) allow") != null);
 }
 
 test "a command that only reads is not a write, and the plan mode lets it run" {

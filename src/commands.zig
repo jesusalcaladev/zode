@@ -15,6 +15,8 @@ const session_mod = @import("session.zig");
 const sessionindex = @import("lib/sessionindex.zig");
 const sessionpath = @import("lib/sessionpath.zig");
 const build_options = @import("build_options");
+const permrules = @import("lib/permrules.zig");
+const hooks_mod = @import("lib/hooks.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -122,43 +124,185 @@ pub fn cmdAllowlist(m: *tui.Model) void {
     agent.pushInfoOwned(m, msg);
 }
 
-/// `/permissions`: the RULES (Phase 6) and where they live.
+/// `/permissions`: permission mode, rules, and allowlist (35.11 panel).
 ///
-/// The rules are the answer to "why did it ask / why did it refuse", and
-/// there is no other way to find out: a rule that lives in a file the user
-/// wrote and never sees again is a rule that surprises them.
-pub fn cmdPermissions(m: *tui.Model) void {
+/// Shows why a call asked/was refused, which rules exist, and where to edit
+/// them. The rule engine is Phase 6; the dialog explanation is 33.21.
+/// Subcommands: `reload` re-reads rules from disk.
+pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
     const gpa = m.allocator;
+    if (arg) |a| {
+        const sub = std.mem.trim(u8, a, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(sub, "reload")) {
+            agent.loadPermRules();
+            agent.loadAllowlist();
+            agent.pushInfoOwned(m, gpa.dupe(u8, "permissions: reloaded rules and allowlist from disk") catch return);
+            // fall through to show current state
+        } else if (sub.len > 7 and std.ascii.eqlIgnoreCase(sub[0..4], "add ")) {
+            const rule_text = std.mem.trim(u8, sub[4..], " \t\r\n");
+            var arena_state = std.heap.ArenaAllocator.init(gpa);
+            defer arena_state.deinit();
+            const aa = arena_state.allocator();
+            const rule = permrules.parseRule(rule_text, .user, aa) orelse {
+                agent.pushInfoFmt(m, "permissions add: invalid rule `{s}` (expected: Tool(pattern) allow|deny|ask|dontAsk)", .{rule_text});
+                return;
+            };
+            if ((rule.action == .allow or rule.action == .dontAsk) and permrules.isDangerousPattern(rule.tool, rule.pattern)) {
+                agent.pushInfoFmt(m, "permissions add: refused dangerous broad allow `{s}` — use a narrower pattern (e.g. Bash(git *)) or deny/ask", .{rule.text});
+                return;
+            }
+            // Add to in-memory rules (local-strength view isn't needed; save as user
+            // and reload so precedence/ordering is consistent) and persist.
+            if (agent.savePermRule(rule)) {
+                agent.loadPermRules();
+                agent.pushInfoFmt(m, "permissions add: saved user rule `{s}`", .{rule.text});
+            } else {
+                agent.pushInfoFmt(m, "permissions add: could not save rule `{s}` (check user permissions file path)", .{rule.text});
+            }
+            // fall through to show current state
+        } else if (sub.len > 0) {
+            agent.pushInfoFmt(m, "permissions: unknown subcommand `{s}` (use: /permissions | /permissions reload | /permissions add <Tool(pattern) action>)", .{sub});
+            return;
+        }
+    }
     const set = agent.permRuleSet();
 
-    agent.pushInfoOwned(m, gpa.dupe(u8, "rules  ·  Tool(pattern) action  ·  allow | deny | ask") catch return);
+    agent.pushInfoFmt(m, "permissions  ·  mode: {s}", .{agent.permModeName()});
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  engine: Phase 6 Tool(pattern) rules + pathsafe dangerous-path protection (34.1)") catch return);
 
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "rules  ·  Tool(pattern) action  ·  allow | deny | ask | dontAsk") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  sources: local > project > user > policy  ·  deny beats any allow  ·  last rule in a file wins") catch return);
     if (set.rules.len == 0) {
-        agent.pushInfoOwned(m, gpa.dupe(u8, "  (none)") catch return);
+        agent.pushInfoOwned(m, gpa.dupe(u8, "  (no loaded rules; built-in pathsafe/policy checks and legacy allowlist still apply)") catch return);
     } else {
-        for (set.rules) |r| {
+        for (set.rules, 0..) |r, i| {
+            var tag_buf: [64]u8 = undefined;
+            var tag_w: std.Io.Writer = .fixed(&tag_buf);
+            if (permrules.isDangerousRuleText(r.text)) tag_w.writeAll("  [dangerous]") catch {};
+            if (permrules.shadowedRule(set.rules, i)) tag_w.writeAll("  [shadowed]") catch {};
             const line = std.fmt.allocPrint(
                 gpa,
-                "  {s: <8} {s}",
-                .{ r.source.name(), r.text },
+                "  {s: <8} {s}{s}",
+                .{ r.source.name(), r.text, tag_w.buffered() },
             ) catch continue;
             agent.pushInfoOwned(m, line);
         }
     }
 
-    // The two files, and the order they win in. The order IS the rule: a
-    // project rule beats a user rule, and a DENY beats any allow.
     agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "legacy allowlist  ·  persisted standing approvals (user permissions file)") catch return);
+    var abuf: [512]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&abuf);
+    aw.writeAll("  tools: ") catch {};
+    var an: usize = 0;
+    for (agent.always_lens, 0..) |l, i| {
+        if (l == 0) continue;
+        if (an > 0) aw.writeAll(", ") catch {};
+        aw.writeAll(agent.always_names[i][0..l]) catch {};
+        an += 1;
+    }
+    if (an == 0) aw.writeAll("(none)") catch {};
+    aw.writeAll("  ·  bash prefixes: ") catch {};
+    var bn: usize = 0;
+    for (agent.bash_pattern_lens, 0..) |l, i| {
+        if (l == 0) continue;
+        if (bn > 0) aw.writeAll(", ") catch {};
+        aw.writeAll(agent.bash_pattern_bufs[i][0..l]) catch {};
+        bn += 1;
+    }
+    if (bn == 0) aw.writeAll("(none)") catch {};
+    agent.pushInfoOwned(m, gpa.dupe(u8, aw.buffered()) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    var prbuf: [640]u8 = undefined;
+    const project_path = agent.resolvedProjectRulesPath(&prbuf);
+    const project_exists = if (m.io_ready) blk: {
+        _ = std.Io.Dir.cwd().statFile(agent.io_global, project_path, .{}) catch break :blk false;
+        break :blk true;
+    } else false;
+    var upbuf: [512]u8 = undefined;
+    const user_path = agent.permissionsFilePath(&upbuf);
+    const user_exists = if (m.io_ready) if (user_path) |p| blk: {
+        _ = std.Io.Dir.cwd().statFile(agent.io_global, p, .{}) catch break :blk false;
+        break :blk true;
+    } else false else false;
+    agent.pushInfoOwned(m, gpa.dupe(u8, "loaded from (effective paths, resolved like the loader):") catch return);
     const files = std.fmt.allocPrint(
         gpa,
-        "files  ·  {s} (project)  ·  ~/.config/zode/permissions.json (user)",
-        .{agent.project_rules_file},
+        "  project: {s} ({s})  ·  user: {s} ({s})",
+        .{
+            project_path,
+            if (!m.io_ready) "unknown" else if (project_exists) "exists" else "missing",
+            user_path orelse "~/.config/zode/permissions.json",
+            if (user_path == null) "unknown path" else if (!m.io_ready) "unknown" else if (user_exists) "exists" else "missing",
+        },
     ) catch return;
     agent.pushInfoOwned(m, files);
-    agent.pushInfoOwned(
-        m,
-        gpa.dupe(u8, "order  ·  project > user  ·  a deny beats any allow  ·  the last rule of a file wins") catch return,
-    );
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  edit: add Tool(pattern) allow|deny|ask lines/objects under \"rules\"; legacy \"tools\"/\"bash\" arrays still work") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  commands: /permissions reload  ·  /permissions add <Tool(pattern) allow|deny|ask>  ·  edit JSON files directly for full control") catch return);
+}
+
+/// `/hooks`: loaded hooks and the hooks file (35.11 panel).
+///
+/// Hooks are Phase 5 (command hooks). Shows what is loaded; editing is done in
+/// `.zode/hooks.json`. Subcommand: `reload` re-reads hooks from disk.
+pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
+    const gpa = m.allocator;
+    if (arg) |a| {
+        const sub = std.mem.trim(u8, a, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(sub, "reload")) {
+            agent.loadHooks();
+            agent.pushInfoOwned(m, gpa.dupe(u8, "hooks: reloaded from disk") catch return);
+            // fall through to show current state
+        } else if (sub.len > 0) {
+            agent.pushInfoFmt(m, "hooks: unknown subcommand `{s}` (use: /hooks | /hooks reload)", .{sub});
+            return;
+        }
+    }
+    const set = agent.hooks_set;
+    agent.pushInfoOwned(m, gpa.dupe(u8, "hooks  ·  Phase 5 command hooks (PreToolUse, PostToolUse, UserPromptSubmit, Stop, PermissionRequest)") catch return);
+    var hpbuf: [640]u8 = undefined;
+    const hooks_path = agent.resolvedProjectHooksPath(&hpbuf);
+    const file_exists = if (m.io_ready) blk: {
+        _ = std.Io.Dir.cwd().statFile(agent.io_global, hooks_path, .{}) catch break :blk false;
+        break :blk true;
+    } else false;
+    const file_line = std.fmt.allocPrint(gpa, "  loaded from (effective project path): {s} ({s}; loaded on startup/reload)", .{ hooks_path, if (!m.io_ready) "unknown" else if (file_exists) "exists" else "missing" }) catch return;
+    agent.pushInfoOwned(m, file_line);
+    if (set.hooks.len == 0) {
+        agent.pushInfoOwned(m, gpa.dupe(u8, "  (no hooks loaded)") catch return);
+    } else {
+        const count = std.fmt.allocPrint(gpa, "  loaded: {d}", .{set.hooks.len}) catch return;
+        agent.pushInfoOwned(m, count);
+        for (set.hooks) |h| {
+            const matcher = if (h.matcher.len > 0) h.matcher else "*";
+            const cond = if (h.@"if".len > 0) h.@"if" else "-";
+            const once = if (h.once) " once" else "";
+            const line = std.fmt.allocPrint(
+                gpa,
+                "  {s}  matcher={s}  if={s}  timeout={d}ms{s}  cmd={s}",
+                .{ h.event.name(), matcher, cond, h.timeout_ms, once, h.command },
+            ) catch continue;
+            agent.pushInfoOwned(m, line);
+        }
+    }
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  contract: PreToolUse can block/update input; PostToolUse/UserPromptSubmit add context; PermissionRequest can allow/deny/ask (JSON stdout contract supported)") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  commands: /hooks reload  ·  edit .zode/hooks.json directly for full control") catch return);
+}
+
+/// `/agents`: subagent definitions/status (35.11 panel).
+///
+/// Agent definitions on disk (Phase 9) and built-in roles (Phase 26) are not
+/// implemented; this panel is honest and shows current subagent behavior.
+pub fn cmdAgents(m: *tui.Model) void {
+    const gpa = m.allocator;
+    agent.pushInfoOwned(m, gpa.dupe(u8, "agents  ·  subagent/task configuration") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  current: task subagent (general-purpose), depth 1, effort low, 24k budget, restricted/read-oriented tool set, no conversation history") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  parallel cap: ZODE_TASK_PARALLEL (default 3; see env/config)") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  definitions on disk (Phase 9): not implemented") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  built-in roles explore/plan/verify (Phase 26): not implemented") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  team mode (Phase 20): not implemented") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  note: interactive agent editing is not implemented") catch return);
 }
 
 /// `/cache`: prompt cache hit-rate of the session.
@@ -945,6 +1089,10 @@ pub fn cmdContext(m: *tui.Model) void {
 /// Only sessions that belong to THIS project are shown (29.6): sessions
 /// from other projects never leak into this project's list.
 pub fn cmdSession(m: *tui.Model) void {
+    if (!m.io_ready) {
+        agent.pushInfo(m, "session: I/O not ready");
+        return;
+    }
     const gpa = m.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1101,6 +1249,11 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
 
     // Persist to the Meta sidecar. Read the current Meta and rewrite with the
     // new custom_title, keeping name/model/created_at/ai_title intact.
+    if (!m.io_ready) {
+        agent.pushInfoFmt(m, "renamed to \"{s}\" (I/O not ready to save)", .{trimmed});
+        return;
+    }
+
     var arena_state = std.heap.ArenaAllocator.init(s.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1252,7 +1405,9 @@ pub const commands = [_]Cmd{
     .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
     .{ .key = "/mode", .desc = "set work mode: build | accept-edits | plan | bypass" },
     .{ .key = "/allowlist", .desc = "always-allowed tools + bash (persisted)" },
-    .{ .key = "/permissions", .desc = "the rules: Tool(pattern) allow | deny | ask" },
+    .{ .key = "/permissions", .desc = "permission rules, mode, allowlist, and file status (panel; /permissions reload)" },
+    .{ .key = "/hooks", .desc = "loaded command hooks and file status (panel; /hooks reload)" },
+    .{ .key = "/agents", .desc = "subagent/task status and definitions (panel)" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
     .{ .key = "/new-session", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
@@ -1413,4 +1568,48 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         try std.testing.expect(std.mem.indexOf(u8, text, "— doctor") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "yolo:") != null);
     }
+}
+
+test "/permissions /hooks /agents panels are registered" {
+    inline for ([_][]const u8{ "/permissions", "/hooks", "/agents" }) |cmd| {
+        var found = false;
+        for (commands) |c| {
+            if (std.mem.eql(u8, c.key, cmd)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "/permissions panel is dispatched" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try agent.submit(&m, "/permissions");
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "permissions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Tool(pattern)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "deny beats any allow") != null);
+}
+
+test "/hooks panel is dispatched" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try agent.submit(&m, "/hooks");
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "hooks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "PreToolUse") != null);
+}
+
+test "/agents panel is dispatched" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try agent.submit(&m, "/agents");
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "agents") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Phase 9") != null);
 }
