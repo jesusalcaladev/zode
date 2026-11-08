@@ -68,6 +68,13 @@ state, the open bug and the quality bar).
 
 > Blind elision loses detail. Storage loses it _on purpose_ — and the model can get it back.
 
+- [x] **3.1** Recoverable storage: oversized tool results are spilled to a session-isolated file (`<sessions>/tool-results/<session>/<n>.txt`, capped at `max_result_bytes` = 400 KB written) and the model receives a preview plus a recoverable `read path=…` notice (`src/lib/toolstore.zig`, wired in `src/agent.zig` `capStoreAppendToolResult`).
+- [x] **3.2** Per-tool result caps: each tool's `max_result_chars` comes from the registry (`src/tools/registry.zig` → `resultcap.default_max_result_chars` = 50 000; `read` is unbounded by design, bounded by the aggregate budget). The cap layer is `src/lib/resultcap.zig`.
+- [x] **3.3** Aggregate per-message budget: all tool results of one assistant message share `max_results_per_message_chars` = 200 000 (`ResultBudget` in `src/agent.zig`), trimming the largest first; cuts always keep the notice inside the budget and never split UTF-8 (`resultcap`).
+- [x] **3.4** Per-tool render: `toolResultSummary` in `src/agent.zig` makes stored/recoverable and capped results obvious, and gives compact per-tool summaries (matches/lines/paths/KB) so special results are not rendered as blind blobs.
+- [x] **3.5** Compaction compatibility: stored-result notices keep a recoverable `read path=` marker that compaction preserves (`compaction.elideTier` test "preserves recoverable stored-result path markers").
+- [x] **3.6** Frozen cut decisions (Phase 34.2 integration): cuts are recorded in the session caps sidecar and re-applied verbatim for cache stability across turns/resume (`resultcap.frozenCapResult` / `Caps`, `session.saveCapsSidecar`).
+
 ---
 
 ## Phase 5 — Hooks

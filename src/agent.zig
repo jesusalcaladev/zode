@@ -12072,7 +12072,7 @@ fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator
     {
         return std.fmt.allocPrint(arena, "{s} · capped ({d} KB)", .{ name, res.len / 1024 }) catch first;
     }
-    if (std.mem.eql(u8, name, "task") or std.mem.eql(u8, name, "review") or std.mem.eql(u8, name, "skill")) {
+    if (std.mem.eql(u8, name, "task") or std.mem.eql(u8, name, "review") or std.mem.eql(u8, name, "skill") or std.mem.eql(u8, name, "goal")) {
         var lines_n: usize = 0;
         var it2 = std.mem.splitScalar(u8, res, '\n');
         while (it2.next()) |_| lines_n += 1;
@@ -12080,15 +12080,37 @@ fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator
             return std.fmt.allocPrint(arena, "{s} · {d} lines, {d} KB", .{ name, lines_n, @max(@as(usize, 1), res.len / 1024) }) catch first;
         }
     }
-    if (std.mem.eql(u8, name, "glob")) {
+    if (std.mem.eql(u8, name, "glob") or std.mem.eql(u8, name, "list_files")) {
         var n: usize = 0;
         var it2 = std.mem.splitScalar(u8, res, '\n');
         while (it2.next()) |l| {
             if (l.len > 0) n += 1;
         }
-        return std.fmt.allocPrint(arena, "{d} path{s}", .{ n, if (n == 1) "" else "s" }) catch first;
+        const label: []const u8 = if (std.mem.eql(u8, name, "glob")) "path" else "entry";
+        return std.fmt.allocPrint(arena, "{d} {s}{s}", .{ n, label, if (n == 1) "" else "s" }) catch first;
     }
-    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "notebook_edit")) {
+    if (std.mem.eql(u8, name, "read")) {
+        var lines_n: usize = 0;
+        var it2 = std.mem.splitScalar(u8, res, '\n');
+        while (it2.next()) |_| lines_n += 1;
+        if (lines_n > 4 or res.len > 512) {
+            return std.fmt.allocPrint(arena, "read · {d} lines, {d} KB", .{ lines_n, @max(@as(usize, 1), res.len / 1024) }) catch first;
+        }
+    }
+    if (std.mem.eql(u8, name, "bash") or std.mem.eql(u8, name, "check") or
+        std.mem.eql(u8, name, "git_status") or std.mem.eql(u8, name, "git_diff") or
+        std.mem.eql(u8, name, "git_log") or std.mem.eql(u8, name, "mcp") or std.mem.eql(u8, name, "lsp"))
+    {
+        var lines_n: usize = 0;
+        var it2 = std.mem.splitScalar(u8, res, '\n');
+        while (it2.next()) |_| lines_n += 1;
+        if (lines_n > 6 or res.len > 240) {
+            return std.fmt.allocPrint(arena, "{s} · {d} lines", .{ name, lines_n }) catch first;
+        }
+    }
+    if (std.mem.eql(u8, name, "edit") or std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "notebook_edit") or
+        std.mem.eql(u8, name, "git_add") or std.mem.eql(u8, name, "git_commit") or std.mem.eql(u8, name, "git_stash"))
+    {
         if (first.len > 0 and first.len <= 120) return first;
     }
     return first;
