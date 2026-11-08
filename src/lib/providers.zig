@@ -236,6 +236,46 @@ pub const defs = [_]ProviderDef{
             "z-ai/glm-5.3-flash",
         },
     },
+    .{
+        .id = "cerebras",
+        .name = "Cerebras",
+        .base_url = "https://api.cerebras.ai/v1",
+        .models_url = "https://api.cerebras.ai/v1/models",
+        .key_env = &.{"ZODE_CEREBRAS_KEY"},
+        .note = "very fast inference",
+    },
+    .{
+        .id = "together",
+        .name = "Together",
+        .base_url = "https://api.together.xyz/v1",
+        .models_url = "https://api.together.xyz/v1/models",
+        .key_env = &.{"ZODE_TOGETHER_KEY"},
+        .note = "open models with OpenAI-compatible API",
+    },
+    .{
+        .id = "fireworks",
+        .name = "Fireworks",
+        .base_url = "https://api.fireworks.ai/inference/v1",
+        .models_url = "https://api.fireworks.ai/inference/v1/models",
+        .key_env = &.{"ZODE_FIREWORKS_KEY"},
+        .note = "fast hosted open models",
+    },
+    .{
+        .id = "deepinfra",
+        .name = "DeepInfra",
+        .base_url = "https://api.deepinfra.com/v1/openai",
+        .models_url = "https://api.deepinfra.com/v1/openai/models",
+        .key_env = &.{"ZODE_DEEPINFRA_KEY"},
+        .note = "OpenAI-compatible hosted models",
+    },
+    .{
+        .id = "sambanova",
+        .name = "SambaNova",
+        .base_url = "https://api.sambanova.ai/v1",
+        .models_url = "https://api.sambanova.ai/v1/models",
+        .key_env = &.{"ZODE_SAMBANOVA_KEY"},
+        .note = "fast inference for open models",
+    },
 };
 
 pub fn byId(id: []const u8) ?*const ProviderDef {
@@ -421,4 +461,33 @@ test "nvidia provider has correct config" {
     // The first one is the answer for a user who picked nothing: it has to be a
     // model that was actually verified against the hosted API.
     try std.testing.expect(std.mem.eql(u8, nvidia.preferred_models[0], "z-ai/glm-5.3"));
+}
+
+test "openai-compatible providers added like mistral resolve and use bearer auth" {
+    const cerebras = byId("cerebras").?;
+    try std.testing.expectEqualStrings("https://api.cerebras.ai/v1", cerebras.base_url);
+    try std.testing.expectEqualStrings("https://api.cerebras.ai/v1/models", cerebras.models_url);
+    try std.testing.expectEqual(@as(usize, 1), cerebras.key_env.len);
+    try std.testing.expectEqualStrings("ZODE_CEREBRAS_KEY", cerebras.key_env[0]);
+    try std.testing.expectEqualStrings("", cerebras.default_model);
+    try std.testing.expect(cerebras.key_style == .bearer);
+    try std.testing.expect(cerebras.models_url.len != 0);
+
+    const together = byId("together").?;
+    try std.testing.expectEqualStrings("ZODE_TOGETHER_KEY", together.key_env[0]);
+    const fireworks = byId("fireworks").?;
+    try std.testing.expectEqualStrings("ZODE_FIREWORKS_KEY", fireworks.key_env[0]);
+    const deepinfra = byId("deepinfra").?;
+    try std.testing.expectEqualStrings("https://api.deepinfra.com/v1/openai", deepinfra.base_url);
+    try std.testing.expectEqualStrings("ZODE_DEEPINFRA_KEY", deepinfra.key_env[0]);
+    const sambanova = byId("sambanova").?;
+    try std.testing.expectEqualStrings("ZODE_SAMBANOVA_KEY", sambanova.key_env[0]);
+
+    // Catalog auth for these stays bearer, like Mistral.
+    for ([_][]const u8{ "cerebras", "together", "fireworks", "deepinfra", "sambanova", "mistral" }) |id| {
+        const def = byId(id).?;
+        const auth = authWithKey(def.key_style, "k");
+        try std.testing.expect(auth.x_api_key == null);
+        try std.testing.expectEqualStrings("k", auth.bearer.?);
+    }
 }

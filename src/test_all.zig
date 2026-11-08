@@ -66,6 +66,9 @@ pub const taskloop = @import("lib/taskloop.zig");
 pub const redact = @import("lib/redact.zig");
 pub const spawnenv = @import("lib/spawnenv.zig");
 pub const keychain = @import("lib/keychain.zig");
+pub const agentsdoc = @import("lib/agentsdoc.zig");
+pub const memory = @import("lib/memory.zig");
+pub const memory_store = @import("lib/memory_store.zig");
 
 // The language server. It was in its own aggregator (`src/lsp_test.zig`) that
 // no build step referenced: 33 test blocks written, and 32 of them not even

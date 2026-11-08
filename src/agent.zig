@@ -81,6 +81,9 @@ const autochk = @import("autochk.zig");
 const lsp_manager = @import("lsp/manager.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const review_mod = @import("lib/review.zig");
+const agentsdoc = @import("lib/agentsdoc.zig");
+const memory_mod = @import("lib/memory.zig");
+const memory_store = @import("lib/memory_store.zig");
 
 // The `/help` tables live with the commands they document. Re-exported because
 // the palette builds its items from `commands`, and that is not a commands
@@ -1081,22 +1084,11 @@ fn readAgentsIn(gpa: std.mem.Allocator, dir: ?[]const u8) ?[]u8 {
 }
 
 fn readAgentsAt(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ?[]u8 {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return null;
-    // The limit is 1 MB, and it was 256 KB, and THAT WAS A BUG that only
-    // showed up because this repository's own `AGENTS.md` crossed the line:
-    //
-    // `readFileAlloc` with `.limited(n)` returns `error.FileTooBig` for a file
-    // over `n`, and the caller does `catch null`, and `null` means "this
-    // project has no instruction file". So a project whose `AGENTS.md` was a
-    // little too big got the BUILT-IN prompt instead of its own, with no
-    // error anywhere: the harness silently stopped reading the project's
-    // rules, and the symptom was "the model ignored my instructions".
-    //
-    // The size does not matter much: the base is trimmed to the prompt buffer
-    // (16 KB) before it is sent, so a megabyte of instructions is read, cached
-    // and cut down to what fits.
-    return std.Io.Dir.cwd().readFileAlloc(io_global, path, gpa, .limited(1024 * 1024)) catch null;
+    // Reads and expands `@import` directives (Phase 11). A missing or oversized
+    // file still returns null, which means "no instruction file here" and lets
+    // precedence fall through — the same behavior as before, just with imports
+    // resolved when the file is present.
+    return agentsdoc.readExpandedAt(gpa, io_global, dir, name);
 }
 
 pub var current_effort: chat.Effort = .medium;
@@ -5595,7 +5587,135 @@ fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
     // started was still running — and the next turn's reset killed it. So the
     // feature produced nothing on exactly the turns it exists for.
     finishAutoCheck(m);
+    maybeProposeMemories(m);
     pushTurnSummary(m);
+}
+
+fn memoryExtractEnabled() bool {
+    // Phase 11: end-of-turn extractor proposes memories; user approves.
+    // Enabled by default, best-effort. Disable with ZODE_MEMORY_EXTRACT=0.
+    const env = environ_global orelse return true;
+    const v = env.get("ZODE_MEMORY_EXTRACT") orelse return true;
+    if (v.len == 0) return true;
+    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "no"));
+}
+
+fn sanitizeMemoryId(id: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    for (id) |c| {
+        if (n >= buf.len) break;
+        buf[n] = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') c else '-';
+        n += 1;
+    }
+    if (n == 0) return "proposal";
+    return buf[0..n];
+}
+
+fn maybeProposeMemories(m: *tui.Model) void {
+    // Phase 11: end-of-turn extractor proposes memories; the USER approves them.
+    // Best-effort, never auto-persists, and never fails the turn.
+    if (!memoryExtractEnabled()) return;
+    if (chat.cancelled()) return;
+    // Only propose after substantive work.
+    if (turn_stats.files.items.len == 0 and !m.auto_check.gate.wroteCode()) return;
+    // Conservative guard: avoid surprising nested extraction during tool-denied
+    // ceiling turns or other constrained states.
+    if (m.deny_all_tools) return;
+
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+
+    var files_list: std.ArrayListUnmanaged(u8) = .empty;
+    for (turn_stats.files.items, 0..) |f, i| {
+        if (i > 0) files_list.appendSlice(arena, ", ") catch {};
+        files_list.appendSlice(arena, f) catch {};
+        if (i >= 24) {
+            files_list.appendSlice(arena, ", …") catch {};
+            break;
+        }
+    }
+
+    const prompt = std.fmt.allocPrint(arena,
+        \\You are extracting durable, project-specific memories for a coding harness.
+        \\Files changed this turn: {s}
+        \\
+        \\Propose 0 to 2 memories ONLY if they are durable facts, decisions, conventions,
+        \\or pitfalls worth keeping for future work in this project. Do NOT propose
+        \\temporary task state, guesses, or anything already obvious from code.
+        \\Only propose memories you can justify from the changed files/context.
+        \\
+        \\Output format (one proposal per block, no extra text):
+        \\<memory>
+        \\id: short-kebab-id
+        \\title: short title
+        \\tags: comma,separated
+        \\body: 1-4 lines of evidence-backed text
+        \\</memory>
+        \\If there are no durable memories, output exactly: <none/>
+    , .{if (files_list.items.len > 0) files_list.items else "(none listed)"}) catch return;
+
+    var rep = subagent_mod.Report{};
+    const task = subagent_mod.Task{
+        .description = "extract memories",
+        .prompt = prompt,
+    };
+    const report = runSubagent(m, task, &rep);
+    if (report.len == 0) return;
+    if (std.mem.indexOf(u8, report, "<none/>") != null) return;
+
+    var saved: usize = 0;
+    var it = std.mem.splitSequence(u8, report, "<memory>");
+    _ = it.next(); // before first
+    while (it.next()) |chunk| {
+        const end = std.mem.indexOf(u8, chunk, "</memory>") orelse continue;
+        const block = chunk[0..end];
+        var id: []const u8 = "";
+        var title: []const u8 = "";
+        var tags: []const u8 = "";
+        var body_lines: std.ArrayListUnmanaged(u8) = .empty;
+        var in_body = false;
+        var lines = std.mem.splitScalar(u8, block, '\n');
+        while (lines.next()) |line| {
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (std.mem.startsWith(u8, t, "id:")) {
+                in_body = false;
+                id = std.mem.trim(u8, t["id:".len..], " \t");
+            } else if (std.mem.startsWith(u8, t, "title:")) {
+                in_body = false;
+                title = std.mem.trim(u8, t["title:".len..], " \t");
+            } else if (std.mem.startsWith(u8, t, "tags:")) {
+                in_body = false;
+                tags = std.mem.trim(u8, t["tags:".len..], " \t");
+            } else if (std.mem.startsWith(u8, t, "body:")) {
+                in_body = true;
+                const b = std.mem.trim(u8, t["body:".len..], " \t");
+                if (b.len > 0) body_lines.appendSlice(arena, b) catch {};
+            } else if (in_body and t.len > 0) {
+                if (body_lines.items.len > 0) body_lines.append(arena, '\n') catch {};
+                body_lines.appendSlice(arena, t) catch {};
+            }
+        }
+        if (body_lines.items.len == 0) continue;
+        if (title.len == 0) title = "Proposed memory";
+        var id_buf: [80]u8 = undefined;
+        const use_id = if (id.len > 0) sanitizeMemoryId(id, &id_buf) else blk: {
+            const ts = std.Io.Timestamp.now(io_global, .real).toSeconds();
+            break :blk std.fmt.bufPrint(&id_buf, "proposal-{d}-{d}", .{ ts, saved }) catch "proposal";
+        };
+
+        const cwd = project_info.cwd();
+        const repo_root = project_info.root();
+        var store = memory_store.Store.resolveForProject(m.allocator, io_global, cwd, repo_root, true) catch continue;
+        defer store.deinit();
+        store.savePending(use_id, title, tags, "end-of-turn extractor; user approval required", body_lines.items) catch continue;
+        saved += 1;
+        if (saved >= 2) break;
+    }
+
+    if (saved > 0) {
+        pushInfoFmt(m, "memory: {d} proposal(s) saved for your approval (use memory pending/approve)", .{saved});
+    }
 }
 
 /// Reports whatever the automatic typecheck found, at the end of a turn.
@@ -8361,6 +8481,193 @@ fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
 }
 
 /// into a broken turn.
+
+fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    _ = _arena;
+
+    const gpa = m.allocator;
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
+        const bad = "The `memory` call needs {\"operation\": \"search|list|get|pending|approve|propose\", ...}.";
+        m.pushToolDone("memory", "malformed arguments", 0, bad);
+        capStoreAppendToolResult(m, s, call.id, "memory", bad, arena, budget);
+        return 1;
+    };
+    var op: []const u8 = "search";
+    var query: []const u8 = "";
+    var id: []const u8 = "";
+    var title: []const u8 = "";
+    var body: []const u8 = "";
+    var tags: []const u8 = "";
+    var budget_bytes: usize = 4000;
+    if (v == .object) {
+        if (v.object.get("operation")) |x| {
+            if (x == .string) op = x.string;
+        }
+        if (v.object.get("query")) |x| {
+            if (x == .string) query = x.string;
+        }
+        if (v.object.get("id")) |x| {
+            if (x == .string) id = x.string;
+        }
+        if (v.object.get("title")) |x| {
+            if (x == .string) title = x.string;
+        }
+        if (v.object.get("body")) |x| {
+            if (x == .string) body = x.string;
+        }
+        if (v.object.get("tags")) |x| {
+            if (x == .string) tags = x.string;
+        }
+        if (v.object.get("budget")) |x| {
+            if (x == .integer and x.integer > 0) budget_bytes = @intCast(@min(x.integer, 64 * 1024));
+        }
+    }
+
+    const cwd = project_info.cwd();
+    const repo_root = project_info.root();
+    var store = memory_store.Store.discover(gpa, io_global, cwd, repo_root) catch
+        memory_store.Store{ .gpa = gpa, .io = io_global };
+    defer store.deinit();
+
+    var out: []u8 = &.{};
+    var owned = false;
+    defer if (owned and out.len > 0) gpa.free(out);
+
+    if (std.ascii.eqlIgnoreCase(op, "list")) {
+        var buf: [memory_mod.max_scan_entries]memory_mod.Entry = undefined;
+        const entries = store.loadAll(&buf) catch &.{};
+        defer store.freeEntries(@constCast(entries));
+        out = memory_mod.renderList(gpa, entries) catch @constCast("(could not list memories)");
+        owned = out.ptr != "(could not list memories)".ptr;
+    } else if (std.ascii.eqlIgnoreCase(op, "get")) {
+        if (id.len == 0) {
+            out = @constCast("memory get requires `id`.");
+        } else {
+            var buf: [memory_mod.max_scan_entries]memory_mod.Entry = undefined;
+            const entries = store.loadAll(&buf) catch &.{};
+            defer store.freeEntries(@constCast(entries));
+            var found: ?memory_mod.Entry = null;
+            for (entries) |e| if (std.mem.eql(u8, e.id, id)) {
+                found = e;
+                break;
+            };
+            if (found) |e| {
+                const one = [_]memory_mod.Entry{e};
+                const r = memory_mod.consult(gpa, &one, "", @max(budget_bytes, 1024)) catch null;
+                if (r) |res| {
+                    out = res.text;
+                    owned = true;
+                } else out = @constCast("(could not read memory)");
+            } else {
+                out = std.fmt.allocPrint(gpa, "No approved memory with id \"{s}\". Use `pending`/`list`.", .{id}) catch @constCast("memory not found");
+                owned = out.ptr != "memory not found".ptr;
+            }
+        }
+    } else if (std.ascii.eqlIgnoreCase(op, "pending")) {
+        // Show pending proposals (files in pending/).
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (store.root.len == 0) {
+            // Try resolving so we can tell the user where proposals would live.
+            var s2 = memory_store.Store.resolveForProject(gpa, io_global, cwd, repo_root, false) catch store;
+            defer if (s2.root.ptr != store.root.ptr) s2.deinit();
+            if (s2.root.len == 0) out = @constCast("[Pending memory proposals]\n(no project memory store yet)\n")
+            else store = s2;
+        }
+        if (out.len == 0) {
+            const dir_path = store.pendingPath(&path_buf) orelse "";
+            if (dir_path.len == 0) {
+                out = @constCast("[Pending memory proposals]\n(no pending directory)\n");
+            } else {
+                var dir = std.Io.Dir.cwd().openDir(io_global, dir_path, .{ .iterate = true }) catch null;
+                if (dir) |*d| {
+                    defer d.close(io_global);
+                    var list: std.ArrayListUnmanaged(u8) = .empty;
+                    defer list.deinit(gpa);
+                    list.appendSlice(gpa, "[Pending memory proposals]\n") catch {};
+                    var n: usize = 0;
+                    var it = d.iterate();
+                    while (it.next(io_global) catch null) |ent| {
+                        if (ent.kind != .file or !std.mem.endsWith(u8, ent.name, ".md")) continue;
+                        list.appendSlice(gpa, "- ") catch {};
+                        list.appendSlice(gpa, ent.name[0 .. ent.name.len - 3]) catch {};
+                        list.appendSlice(gpa, " (approve with memory operation=approve id=...)\n") catch {};
+                        n += 1;
+                    }
+                    if (n == 0) list.appendSlice(gpa, "(no pending proposals)\n") catch {};
+                    out = list.toOwnedSlice(gpa) catch @constCast("(could not list pending proposals)");
+                    owned = true;
+                } else {
+                    out = @constCast("[Pending memory proposals]\n(no pending proposals)\n");
+                }
+            }
+        }
+    } else if (std.ascii.eqlIgnoreCase(op, "approve")) {
+        if (id.len == 0) {
+            out = @constCast("memory approve requires `id` of a pending proposal.");
+        } else {
+            var s2 = memory_store.Store.resolveForProject(gpa, io_global, cwd, repo_root, false) catch store;
+            defer if (s2.root.ptr != store.root.ptr) s2.deinit();
+            const ok = s2.approvePending(id) catch false;
+            if (ok) {
+                out = std.fmt.allocPrint(gpa, "Approved memory proposal \"{s}\". It is now in the project memory store.", .{id}) catch @constCast("Approved.");
+                owned = out.ptr != "Approved.".ptr;
+            } else {
+                out = std.fmt.allocPrint(gpa, "No pending proposal \"{s}\" to approve.", .{id}) catch @constCast("No pending proposal found.");
+                owned = out.ptr != "No pending proposal found.".ptr;
+            }
+        }
+    } else if (std.ascii.eqlIgnoreCase(op, "propose")) {
+        if (body.len == 0) {
+            out = @constCast("memory propose requires `body` (and ideally `title`/`evidence`). Proposal was not saved.");
+        } else {
+            var s2 = memory_store.Store.resolveForProject(gpa, io_global, cwd, repo_root, true) catch {
+                out = @constCast("Could not resolve the project memory store for this repository.");
+                m.pushToolDone("memory", "store unavailable", 0, out);
+                capStoreAppendToolResult(m, s, call.id, "memory", out, arena, budget);
+                return 1;
+            };
+            defer s2.deinit();
+            const use_title = if (title.len > 0) title else "Proposed memory";
+            var id_buf: [64]u8 = undefined;
+            const use_id = if (id.len > 0) id else blk: {
+                const ts = std.Io.Timestamp.now(io_global, .real).toSeconds();
+                break :blk std.fmt.bufPrint(&id_buf, "proposal-{d}", .{ts}) catch "proposal";
+            };
+            s2.savePending(use_id, use_title, tags, "proposed by agent; user approval required", body) catch {
+                out = @constCast("Could not save the memory proposal.");
+                m.pushToolDone("memory", "save failed", 0, out);
+                capStoreAppendToolResult(m, s, call.id, "memory", out, arena, budget);
+                return 1;
+            };
+            out = std.fmt.allocPrint(gpa,
+                "Saved pending memory proposal \"{s}\" ({s}). It is NOT durable until the user approves it. " ++
+                    "Ask the user to approve with: memory operation=approve id={s}",
+                .{ use_title, use_id, use_id }) catch @constCast("Saved pending proposal; user approval required.");
+            owned = out.ptr != "Saved pending proposal; user approval required.".ptr;
+        }
+    } else { // search
+        var buf: [memory_mod.max_scan_entries]memory_mod.Entry = undefined;
+        const entries = store.loadAll(&buf) catch &.{};
+        defer store.freeEntries(@constCast(entries));
+        if (store.root.len == 0) {
+            out = @constCast("[Project memory]\n(no per-project memory store found; approved memories live in .zode/memory/)\n");
+        } else {
+            const r = memory_mod.consult(gpa, entries, query, budget_bytes) catch null;
+            if (r) |res| {
+                out = res.text;
+                owned = true;
+            } else out = @constCast("(could not consult memory)");
+        }
+    }
+
+    const summary = std.fmt.allocPrint(arena, "memory({s})", .{op}) catch "memory";
+    m.pushToolDone("memory", summary, 0, out);
+    capStoreAppendToolResult(m, s, call.id, "memory", out, arena, budget);
+    return 1;
+}
 fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
     var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();
@@ -10445,6 +10752,11 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
             // tree would hand back 400 files of someone else's change.
             i += 1;
             ran += reviewCall(m, s, call, arena, &budget);
+            continue;
+        }
+        if (std.mem.eql(u8, call.name, "memory")) {
+            i += 1;
+            ran += memoryCall(m, s, call, arena, &budget);
             continue;
         }
         if (std.mem.eql(u8, call.name, "task")) {

@@ -1,7 +1,7 @@
 # TASKS — zode
 
 > Visual checklist converted from [`ROADMAP.md`](ROADMAP.md) (2026-10-16).
-> The roadmap keeps the *why*, the research and the upstream findings; this file is
+> The roadmap keeps the _why_, the research and the upstream findings; this file is
 > the board. One checkbox per deliverable.
 >
 > **Ticking a box** means: `zig build test` green · the phase's acceptance check
@@ -9,13 +9,13 @@
 
 ## Legend
 
-| Badge | Kind | | Priority | Meaning |
-|---|---|---|---|---|
-| ✨ | feature | | 🔴 | next |
-| 🏗️ | refactor (not user-visible) | | 🟡 | later |
-| 🐛 | fix (wrong today) | | 🟢 | on demand |
-| ⚡ | token/time saving | | | |
-| 🔒 | security | | | |
+| Badge | Kind                        |     | Priority | Meaning   |
+| ----- | --------------------------- | --- | -------- | --------- |
+| ✨    | feature                     |     | 🔴       | next      |
+| 🏗️    | refactor (not user-visible) |     | 🟡       | later     |
+| 🐛    | fix (wrong today)           |     | 🟢       | on demand |
+| ⚡    | token/time saving           |     |          |           |
+| 🔒    | security                    |     |          |           |
 
 Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-reference.
 
@@ -24,18 +24,18 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 ## 🚀 Next up — the roadmap's own verdict
 
 - [ ] 🔴 **Sprint A2 — Phase 33** (the TUI at a mature harness's level): the port list,
-      42 features read out of the reference implementation. 33.1 and 33.2 are done;
-      the rest is the board. The porting notes are in `docs/analysis/tui-chrome.md`.
+  42 features read out of the reference implementation. 33.1 and 33.2 are done;
+  the rest is the board. The porting notes are in `docs/analysis/tui-chrome.md`.
 - [ ] 🔴 **Sprint A3 — Phase 34** (the machinery the reference implementation has and we do not): sixteen
-      mechanisms that no phase owned, of which **34.1 (path-scoped permissions)** is
-      the one that should not wait — today `write` writes any path it is handed.
-      **2.1 done** (budget listing); **2.2 done** (skills once per session at end of prompt);
-      **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
-      **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
+  mechanisms that no phase owned, of which **34.1 (path-scoped permissions)** is
+  the one that should not wait — today `write` writes any path it is handed.
+  **2.1 done** (budget listing); **2.2 done** (skills once per session at end of prompt);
+  **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
+  **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
 - [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
 - [ ] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety)
 - [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
-      **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
+  **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
 - [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): most needed, least fun — quietly wrong today
 - [ ] 🟢 Everything else per the dependency table at the bottom.
@@ -60,15 +60,13 @@ state, the open bug and the quality bar).
 
 `✨ feature · 🔴 · depends on 1`
 
-
 ---
 
 ## Phase 3 — Output: recoverable results + per-tool render
 
 `⚡ token · 🔴 · depends on 0 · blocks 7, 10`
 
-> Blind elision loses detail. Storage loses it *on purpose* — and the model can get it back.
-
+> Blind elision loses detail. Storage loses it _on purpose_ — and the model can get it back.
 
 ---
 
@@ -102,11 +100,9 @@ state, the open bug and the quality bar).
 
 `⚡ tokens · 🟡 · independent · pairs with /cache`
 
-
 ## Phase 9 — Agent definitions on disk
 
 `✨ feature · 🟡 · independent · basis for 26`
-
 
 ---
 
@@ -124,10 +120,10 @@ state, the open bug and the quality bar).
 
 `✨ feature · 🟡 · independent`
 
-- [ ] Per-project store (markdown, indexed, out of the prompt until consulted)
-- [ ] End-of-turn extractor (a subagent) proposes memories → **the user approves**
-- [ ] `AGENTS.md` loading with `@import` and precedence (zode already injects the instruction file; this adds the store the agent maintains)
-- [ ] Pure tests with temp-root fixtures: discovery · precedence · `@import` resolution · a memory outside the budget is not inlined
+- [x] Per-project store (markdown, indexed, out of the prompt until consulted)
+- [x] End-of-turn extractor (a subagent) proposes memories → **the user approves** (best-effort; `ZODE_MEMORY_EXTRACT=0` disables)
+- [x] `AGENTS.md` loading with `@import` and precedence (zode already injects the instruction file; this adds the store the agent maintains)
+- [x] Pure tests with temp-root fixtures: discovery · precedence · `@import` resolution · a memory outside the budget is not inlined
 
 ---
 
@@ -142,7 +138,6 @@ state, the open bug and the quality bar).
 ## Phase 17 — Notebook editing
 
 `✨ feature · 🟢 · independent`
-
 
 ---
 
@@ -177,7 +172,7 @@ state, the open bug and the quality bar).
 
 `✨ feature · 🟢 · depends on 15`
 
-> `task` = one bounded search, throwaway window. "Watch the test suite and fix flakes" is a *role*, not a question.
+> `task` = one bounded search, throwaway window. "Watch the test suite and fix flakes" is a _role_, not a question.
 
 - [ ] `team_create {name}` starts a team and its task list (Team ≡ TaskList); `team_delete` shuts it down
 - [ ] Teammates = the existing subagent machinery + `name` + `team`; same safety defaults (read-only unless the lead grants more, effort `low`, depth 1)
@@ -239,7 +234,7 @@ state, the open bug and the quality bar).
 
 `🔒 security · 🟡 · depends on 6`
 
-> Phase 6 decides *whether* to ask; this decides *what is dangerous*. A dialog is useless if one line hides an `rm -rf` behind a pipe.
+> Phase 6 decides _whether_ to ask; this decides _what is dangerous_. A dialog is useless if one line hides an `rm -rf` behind a pipe.
 
 - [ ] Optional sandbox: if `bwrap` exists, offer a sandboxed `bash` for flagged commands — a dialog is not the only answer
 - [ ] Pure tests: the parser splits quoted separators correctly (a `;` inside a string is not a separator) · a pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution
@@ -251,11 +246,11 @@ state, the open bug and the quality bar).
 `✨ feature · 🟡 · depends on 9`
 
 - [ ] Three built-in roles with their own prompts, chosen by name:
-  | role | job |
-  |---|---|
-  | `explore` | broad, parallel search; report paths and lines, never edits |
-  | `plan` | read-only architect: explore, then produce an ordered plan |
-  | `verify` | try to break the change: run it, exercise it, find the 20% the first 80% hides |
+  | role      | job                                                                            |
+  | --------- | ------------------------------------------------------------------------------ |
+  | `explore` | broad, parallel search; report paths and lines, never edits                    |
+  | `plan`    | read-only architect: explore, then produce an ordered plan                     |
+  | `verify`  | try to break the change: run it, exercise it, find the 20% the first 80% hides |
 - [ ] Agent memory: a per-project, per-role directory the agent reads at start and appends lessons to; out of the prompt until consulted (costs nothing when empty)
 - [ ] Resume / fork a subagent: resumed with its window intact (a search that found half the answer continues) or forked (same context, different question) — both bounded by the same 24k window and depth 1
 - [ ] Pure tests: role selection by name · an unknown role falls back to the default · a role's tool list is a subset of what the caller is allowed (a role cannot escalate) · memory is not inlined into the prompt · resume keeps the window and fork does not share it
@@ -379,21 +374,23 @@ Ctrl+R turns them on. That is the same rule with a different name.
 `✨ feature · 🟡 · depends on 0 (per-command allowlist = a registry property) · a complete command to port (copy the prompt text verbatim)`
 
 - [ ] **31.1** Layer 1 — verified context inlined into the prompt:
+
   ```
   - Current git status: !`git status`
   - Current git diff: !`git diff HEAD`
   - Current branch: !`git branch --show-current`
   - Recent commits: !`git log --oneline -10`
   ```
-  - [ ] Both syntaxes (fenced ``` !… ``` blocks + inline `` !`cmd` ``); we already have `!cmd` from the input — this moves it *into* a prompt (~30 lines) and gives every command a verified context block (`/review` becomes a merge-base diff for free)
+
+  - [ ] Both syntaxes (fenced `!…` blocks + inline `` !`cmd` ``); we already have `!cmd` from the input — this moves it _into_ a prompt (~30 lines) and gives every command a verified context block (`/review` becomes a merge-base diff for free)
   - [ ] Each command is permission-checked even though the user chose the command that ran it
   - [ ] Substitution uses a function replacer, never a string replace — `$$`, `$&`, `` $` ``, `$'` are shell output, i.e. arbitrary user data
   - [ ] Failure is loud and named (`Shell command failed for pattern "git status": …`) — never a silent empty substitution; an empty `git status` that looks like a clean tree is the worst possible lie
 - [ ] **31.2** Layer 2 — the allowlist is a property of the command: `/commit` gets `Bash(git add:*)`, `git status:*`, `git commit:*` only; `/commit-push-pr` adds `checkout -b`, `push`, `gh pr create/edit/view/merge` — **the asymmetry is the feature**. Injected into `alwaysAllowRules.command` so the turn does not prompt
 - [ ] **31.3** Layer 3 — the git safety protocol, verbatim: never update the git config · never skip hooks (`--no-verify`, `--no-gpg-sign`) unless explicitly requested · **ALWAYS create NEW commits, NEVER `--amend`** unless explicitly requested (the only CRITICAL-classified rule — it destroys work) · do not commit files that likely contain secrets (warn if asked) · no empty commits · never `-i` (`rebase -i` hangs a non-TTY harness forever; `verify.zig` should classify it as **forbidden**, not merely slow)
-- [ ] **31.4** The message never touches argv: the heredoc (upstream) is the same insight as our `git_commit` `-F <file>`; plus the closing clause that makes it ONE round trip: *"Stage and create the commit using a single message. Do not use any other tools or send any other text."*
+- [ ] **31.4** The message never touches argv: the heredoc (upstream) is the same insight as our `git_commit` `-F <file>`; plus the closing clause that makes it ONE round trip: _"Stage and create the commit using a single message. Do not use any other tools or send any other text."_
   - [ ] Style rules: look at the recent commits for this repo's style · name the nature of the change (add/update/fix/refactor/test/docs) · 1–2 sentences on the **why**
-- [ ] **31.5** `/pr` adds: branch name with a user prefix when on the default branch (`username/feature`) · diff against the **merge base**, said explicitly to be *all* the commits in the PR · PR body template (`## Summary` 1–3 bullets + `## Test plan` checklist + a managed `## Changelog` between markers) · title under 70 characters · **idempotent** (`gh pr view --json number 2>/dev/null || true` is itself an inlined command — including the `|| true` — then `gh pr edit` instead of a second PR) · "Return the PR URL when you're done"
+- [ ] **31.5** `/pr` adds: branch name with a user prefix when on the default branch (`username/feature`) · diff against the **merge base**, said explicitly to be _all_ the commits in the PR · PR body template (`## Summary` 1–3 bullets + `## Test plan` checklist + a managed `## Changelog` between markers) · title under 70 characters · **idempotent** (`gh pr view --json number 2>/dev/null || true` is itself an inlined command — including the `|| true` — then `gh pr edit` instead of a second PR) · "Return the PR URL when you're done"
   - [ ] `contentLength` as a getter for dynamic prompts — a wrong static length is how `/context` loses the credibility `ctxTokens` just bought
 - [ ] Tests: context substitution (permission-denied, loud failure, replacer safety) · the allowlist asymmetry pinned · the `/pr` idempotence path · `rebase -i` classified forbidden
 
@@ -431,15 +428,15 @@ Ctrl+R turns them on. That is the same rule with a different name.
 > question the user actually has. A decorative port is a port that costs
 > frames and buys nothing.
 
-  - [x] The **effective** effort level (`chat.effortSupport` decides whether there is a knob at all) — the preference is not the same thing, and showing it would be a lie: the footer would say `xhigh` while the wire carries `high`
-  - [x] The permission-mode **glyph** (`○ ◐ ● ◉`, the four shapes the reference implementation uses) — a word costs 12 columns in a footer that has to survive an 80-column terminal
-  - [x] …and with it, `accept edits` becomes visible again: the test that pins "the normal permission modes cost NOTHING on the row" is a decision about COLUMNS, and a glyph is one column. **The test was rewritten on purpose** (the default still costs nothing; a deviation costs ONE column) and the legend of the glyphs lives in the shortcut list (`?`)
-  - [x] Counts assistant **turns**, not entries (the reference implementation counts them the same way): a tool line is not an answer the reader is missing
-  - [x] The baseline moves with the reader: leaving the bottom starts a count, reaching it ends the one that was running
-  - [x] The **pill** over the transcript: a centred "3 new messages" that floats over the scrollback. It covers the last row on purpose — a control on its own row would move the transcript every time it appeared
-  - [x] It names the turn you are reading: the last `.user` paragraph at or above the anchor
-  - [x] It goes OVER the transcript's first row and **only when the reader is away from the bottom**. A reserved row was tried FIRST and it moved the text under the reader's eyes (10 tests and a crash in the click/selection math): a header that appears and disappears takes a row away exactly when the reader is looking
-  - [x] The editor's own convention: a sticky line covers the content under it
+- [x] The **effective** effort level (`chat.effortSupport` decides whether there is a knob at all) — the preference is not the same thing, and showing it would be a lie: the footer would say `xhigh` while the wire carries `high`
+- [x] The permission-mode **glyph** (`○ ◐ ● ◉`, the four shapes the reference implementation uses) — a word costs 12 columns in a footer that has to survive an 80-column terminal
+- [x] …and with it, `accept edits` becomes visible again: the test that pins "the normal permission modes cost NOTHING on the row" is a decision about COLUMNS, and a glyph is one column. **The test was rewritten on purpose** (the default still costs nothing; a deviation costs ONE column) and the legend of the glyphs lives in the shortcut list (`?`)
+- [x] Counts assistant **turns**, not entries (the reference implementation counts them the same way): a tool line is not an answer the reader is missing
+- [x] The baseline moves with the reader: leaving the bottom starts a count, reaching it ends the one that was running
+- [x] The **pill** over the transcript: a centred "3 new messages" that floats over the scrollback. It covers the last row on purpose — a control on its own row would move the transcript every time it appeared
+- [x] It names the turn you are reading: the last `.user` paragraph at or above the anchor
+- [x] It goes OVER the transcript's first row and **only when the reader is away from the bottom**. A reserved row was tried FIRST and it moved the text under the reader's eyes (10 tests and a crash in the click/selection math): a header that appears and disappears takes a row away exactly when the reader is looking
+- [x] The editor's own convention: a sticky line covers the content under it
 - [ ] **33.4** The transcript screen (`ctrl+o`) — a VIEW of our own history, not new content; `ctrl+e` shows all
 - [ ] **33.5** The bottom-anchored modal pane with a `▔` divider — a pane that keeps 2 transcript rows visible beats a centred box that hides the context
   - [x] The query as a **subsequence** of the label, with a WINDOW (three times the query plus eight) so the fallback does not match half the catalogue
@@ -607,10 +604,10 @@ unit-perfect and still do nothing when it is typed).
 > the parent commit showed base and current behaving identically. It was a
 > use-after-free, and it was ours since the warmup was written.
 
-  - [x] `src/agent.zig` `warmupWorker`: the two `defer`s were in the wrong order, and `defer` is LIFO — the job was **freed** and then `job.model.endWorker()` dereferenced the freed block to do its atomic RMW. A SIGSEGV in a detached worker, which is exactly the "the app stops answering" symptom
-  - [x] The pointer is copied into a local before anything can die
-  - [x] The double free next to it: the `errdefer` in `catalogWarmupAsync` freed the job a second time on the spawn-failure path
-  - [x] A test that the warmup's job lifetime is correct
+- [x] `src/agent.zig` `warmupWorker`: the two `defer`s were in the wrong order, and `defer` is LIFO — the job was **freed** and then `job.model.endWorker()` dereferenced the freed block to do its atomic RMW. A SIGSEGV in a detached worker, which is exactly the "the app stops answering" symptom
+- [x] The pointer is copied into a local before anything can die
+- [x] The double free next to it: the `errdefer` in `catalogWarmupAsync` freed the job a second time on the spawn-failure path
+- [x] A test that the warmup's job lifetime is correct
 - [ ] **36.5** The `endWorker`/`destroy` lifetime is a CLASS, not an incident: every detached worker in the tree needs the same audit (the model worker, the self-update thread, the background reader, the subagents)
 - [ ] **36.6** The self-update thread is neither counted as a worker nor isolated from the shared `Io` (`src/main.zig:737-747`) — the same shape as the crash of 36.1
 
@@ -618,65 +615,64 @@ unit-perfect and still do nothing when it is typed).
 
 ## 🔧 Tool upgrades (independent, one registry row each, no permission changes)
 
-
 ---
 
 ## 📐 Constants and thresholds (data table)
 
-| Constant | Value | Phase |
-|---|---|---|
-| Skill listing budget | 1% of `ZODE_CONTEXT_LIMIT` (in chars) | 2.1 ✓ |
-| Skill per-entry cap | 250 chars | 2.1 ✓ |
-| `default_max_result_chars` | 50 000 | 0/3 |
-| `max_result_bytes` | 400 000 | 3 |
-| `max_results_per_message_chars` | 200 000 | 3 |
-| `summary_max_len` | 50 | 3 |
-| Per-tool `max_result_chars` | 100 000 (read = unbounded) | 0/3 |
-| Compaction budget | 80% of `ZODE_CONTEXT_LIMIT` | existing |
-| Batch step kinds | fixed set (`map`/`filter`/`select`/`count`/`write`) | 16 |
-| Ticks while parked | off by default | 19 |
-| Recurring schedule max age | 30 days | 19 |
-| Web fetch cache TTL | per session | 24 |
-| Word-diff change threshold | 0.40 (above it, no word ranges) | 27 |
-| Diff gutter width | digits of the hunk's max line, per hunk | 27 |
-| `/copy` lookback | 20 turns | 28 |
-| `/copy` block label width | 60 columns (display width, not bytes) | 28 |
-| Resume list enrich window | first 50 sessions, 128 KB head+tail each | 29 |
-| Resume search crop | first 1000 + last 1000 messages, prose only | 29 |
-| Resume relevance window | 60 s (relevance is a tiebreak inside it) | 29 |
-| AI title trigger | turn 3 (turn 1 is the derived placeholder) | 30 |
-| Running summary cadence | every 5 steps or 2 min, whichever first | 30 |
-| Fork name collisions | `X`, `X (Branch)`, `X (Branch 2)` | 30 |
-| Idle before "done" | 5 consecutive quiet intervals, no growth | 32 |
-| Review precondition | `merge-base` + `--shortstat`, fail-open | 32 |
+| Constant                        | Value                                               | Phase    |
+| ------------------------------- | --------------------------------------------------- | -------- |
+| Skill listing budget            | 1% of `ZODE_CONTEXT_LIMIT` (in chars)               | 2.1 ✓    |
+| Skill per-entry cap             | 250 chars                                           | 2.1 ✓    |
+| `default_max_result_chars`      | 50 000                                              | 0/3      |
+| `max_result_bytes`              | 400 000                                             | 3        |
+| `max_results_per_message_chars` | 200 000                                             | 3        |
+| `summary_max_len`               | 50                                                  | 3        |
+| Per-tool `max_result_chars`     | 100 000 (read = unbounded)                          | 0/3      |
+| Compaction budget               | 80% of `ZODE_CONTEXT_LIMIT`                         | existing |
+| Batch step kinds                | fixed set (`map`/`filter`/`select`/`count`/`write`) | 16       |
+| Ticks while parked              | off by default                                      | 19       |
+| Recurring schedule max age      | 30 days                                             | 19       |
+| Web fetch cache TTL             | per session                                         | 24       |
+| Word-diff change threshold      | 0.40 (above it, no word ranges)                     | 27       |
+| Diff gutter width               | digits of the hunk's max line, per hunk             | 27       |
+| `/copy` lookback                | 20 turns                                            | 28       |
+| `/copy` block label width       | 60 columns (display width, not bytes)               | 28       |
+| Resume list enrich window       | first 50 sessions, 128 KB head+tail each            | 29       |
+| Resume search crop              | first 1000 + last 1000 messages, prose only         | 29       |
+| Resume relevance window         | 60 s (relevance is a tiebreak inside it)            | 29       |
+| AI title trigger                | turn 3 (turn 1 is the derived placeholder)          | 30       |
+| Running summary cadence         | every 5 steps or 2 min, whichever first             | 30       |
+| Fork name collisions            | `X`, `X (Branch)`, `X (Branch 2)`                   | 30       |
+| Idle before "done"              | 5 consecutive quiet intervals, no growth            | 32       |
+| Review precondition             | `merge-base` + `--shortstat`, fail-open             | 32       |
 
 ---
 
 ## 🔗 Dependencies (quick matrix)
 
-| Phase | Needs | Why here |
-|---|---|---|
-| 0 | — | every later phase reads the registry |
-| 1 | 0 (optional) | the requested start; reuses the skill system |
-| 2 | 1 | listing and fork build on the new frontmatter |
-| 3 | 0 | the cap layer is where storage plugs in |
-| 4, 6, 8, 9, 11, 13, 15, 17–19, 21–24, 27, 28, 30 | — | independent |
-| 5 | 6 | hooks reuse the rule syntax |
-| 7 | 3 | microcompaction needs the stored-result marker |
-| 10 | 3 | task output reuses storage |
-| 12 | 0 | tool search needs the registry |
-| 14 | 12 | the LSP client reuses the stdio JSON-RPC transport |
-| 16 | 0 | a batch is a registry of step kinds |
-| 20 | 15 | teammates coordinate through the task graph |
-| 25 | 6 | reuses the rule syntax and the read-only table |
-| 26 | 9 | roles are a built-in set of the on-disk definitions |
-| 29 | 30 | a row's title is Phase 30's key; the tail entry is written at write time |
-| 31 | 0 | the per-command allowlist is a registry property |
-| 32 | 26 | the advisor is a `task` subagent; the counts ride on the roles |
-| 33 | — | the TUI port list; independent, one item at a time |
-| 34 | 6 (for 34.3, 34.4) | the permission gaps reuse Phase 6's rule syntax; the rest is independent |
-| 35 | 6, 12, 13 (for the panels) | a UI over a rule engine that does not exist yet promises what the engine does not do |
-| 36 | — | the crash and the two build steps; independent of everything |
+| Phase                                            | Needs                      | Why here                                                                             |
+| ------------------------------------------------ | -------------------------- | ------------------------------------------------------------------------------------ |
+| 0                                                | —                          | every later phase reads the registry                                                 |
+| 1                                                | 0 (optional)               | the requested start; reuses the skill system                                         |
+| 2                                                | 1                          | listing and fork build on the new frontmatter                                        |
+| 3                                                | 0                          | the cap layer is where storage plugs in                                              |
+| 4, 6, 8, 9, 11, 13, 15, 17–19, 21–24, 27, 28, 30 | —                          | independent                                                                          |
+| 5                                                | 6                          | hooks reuse the rule syntax                                                          |
+| 7                                                | 3                          | microcompaction needs the stored-result marker                                       |
+| 10                                               | 3                          | task output reuses storage                                                           |
+| 12                                               | 0                          | tool search needs the registry                                                       |
+| 14                                               | 12                         | the LSP client reuses the stdio JSON-RPC transport                                   |
+| 16                                               | 0                          | a batch is a registry of step kinds                                                  |
+| 20                                               | 15                         | teammates coordinate through the task graph                                          |
+| 25                                               | 6                          | reuses the rule syntax and the read-only table                                       |
+| 26                                               | 9                          | roles are a built-in set of the on-disk definitions                                  |
+| 29                                               | 30                         | a row's title is Phase 30's key; the tail entry is written at write time             |
+| 31                                               | 0                          | the per-command allowlist is a registry property                                     |
+| 32                                               | 26                         | the advisor is a `task` subagent; the counts ride on the roles                       |
+| 33                                               | —                          | the TUI port list; independent, one item at a time                                   |
+| 34                                               | 6 (for 34.3, 34.4)         | the permission gaps reuse Phase 6's rule syntax; the rest is independent             |
+| 35                                               | 6, 12, 13 (for the panels) | a UI over a rule engine that does not exist yet promises what the engine does not do |
+| 36                                               | —                          | the crash and the two build steps; independent of everything                         |
 
 **Tool-track ranking** by value per unit of risk: 15 → 16 → 14 → 25 → 26 → (17, 21, 22, 23, 24) → (18, 19, 20).
 

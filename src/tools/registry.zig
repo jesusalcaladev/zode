@@ -63,6 +63,7 @@ const bash_kill_prompt = @import("prompts/bash_kill.zig");
 const sleep_prompt = @import("prompts/sleep.zig");
 const batch_prompt = @import("prompts/batch.zig");
 const mcp_prompt = @import("prompts/mcp.zig");
+const memory_prompt = @import("prompts/memory.zig");
 const validate = @import("prompts/validate.zig");
 
 // The `mcp` TOOL, for the one thing the registry has to know about it: the
@@ -395,6 +396,18 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .max_result_chars = resultcap.default_max_result_chars,
     },
     .{
+        // Consultation is read-only and out of the prompt until asked for.
+        // `propose`/`approve` write to the project's `.zode/memory` store and
+        // are treated as writes by `callWrites` so plan mode blocks them.
+        .name = "memory",
+        .desc = "Consult or manage the per-project persistent memory store",
+        .schema = memory_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = false,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
         .name = "task",
         .desc = "Send a read-only search to a subagent with its own context, get back a short report",
         .schema = task_prompt.json,
@@ -595,6 +608,11 @@ pub fn toolSummarize(
     if (std.mem.eql(u8, name, "mcp")) return "mcp";
     if (std.mem.eql(u8, name, "batch")) return "batch";
     if (std.mem.eql(u8, name, "skill")) return "skill";
+    if (std.mem.eql(u8, name, "memory")) {
+        const op = extractStringArg(arena, args_json, "operation");
+        if (op) |o| return std.fmt.allocPrint(arena, "memory({s})", .{o}) catch "memory";
+        return "memory";
+    }
     if (std.mem.eql(u8, name, "check")) return "check";
     if (std.mem.eql(u8, name, "notebook_edit")) {
         if (path) |p| return std.fmt.allocPrint(arena, "notebook_edit({s})", .{p}) catch "notebook_edit";
@@ -680,6 +698,7 @@ pub fn toolActivity(
     if (std.mem.eql(u8, name, "mcp")) return "Calling MCP";
     if (std.mem.eql(u8, name, "batch")) return "Running batch";
     if (std.mem.eql(u8, name, "skill")) return "Loading skill";
+    if (std.mem.eql(u8, name, "memory")) return "Consulting memory";
     if (std.mem.eql(u8, name, "check")) return "Typechecking";
     if (std.mem.eql(u8, name, "notebook_edit")) {
         if (path) |p| return std.fmt.allocPrint(arena, "Editing notebook {s}", .{p}) catch "Editing notebook";
@@ -803,6 +822,12 @@ pub fn callWrites(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
         const op = obj.get("operation") orelse return true;
         if (op != .string) return true;
         return std.ascii.eqlIgnoreCase(op.string, "call");
+    }
+    if (std.mem.eql(u8, name, "memory")) {
+        const obj = parseObject(arena, args_json) orelse return false;
+        const op = obj.get("operation") orelse return false;
+        if (op != .string) return false;
+        return std.ascii.eqlIgnoreCase(op.string, "propose") or std.ascii.eqlIgnoreCase(op.string, "approve");
     }
     if (!std.mem.eql(u8, name, "batch")) return false;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return true;
