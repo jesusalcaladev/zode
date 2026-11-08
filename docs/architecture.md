@@ -58,12 +58,17 @@ src/lib/               # Pure modules (testable without TUI/network)
 
 `tryEmitTool` validates JSON before emitting; `flushPendingTools()` forces emission at `finish`. Empty args become `{}`.
 
-## Compaction is two-tier
+## Compaction is two-tier (v2)
 
 Budget = `budgetPctFor`% of `ZODE_CONTEXT_LIMIT` (clamped 10–95), derived from `ZODE_CONTEXT_LIMIT` > the model's own window > 128000 fallback. The percentage scales with the window: 80% under 256k, 90% from 256k, 98% from 1M.
 
-1. **Elide** (`elide`, `full`): old tool results >256 B outside `recent_window=8` become a marker. No request, no tokens; the session file keeps the original. Tier 1 tracks running estimates so long history is scanned once.
-2. **Summarize** (`full` only, and only under 256k): one LLM call with `summaryPrompt()` capped at 16 KB replaces old turns with `[earlier conversation summarized...]`. A 256k+ window keeps history verbatim — a lossy summary is not worth it there.
+1. **Elide / microcompaction** (`elide`, `full`): old tool results >256 B outside `recent_window` become markers. No request, no tokens; the session file keeps the original. Tier 1 tracks running estimates so long history is scanned once. When a stored/recoverable tool result exists, the marker preserves a recoverable `read path=` reference; sync compaction can persist large non-stored elided results to the session tool-result store so nothing is lost, only moved.
+2. **Summarize** (`full` only, and only under 256k): one LLM call with `summaryPrompt()` capped at 16 KB replaces old turns with a summary note. A 256k+ window keeps history verbatim — a lossy summary is not worth it there.
+
+v2 guarantees:
+- **Critical context preserved**: invoked `skill` results/`<skill_content` and non-elided `read` results (plus goal/plan/summary/boundary markers) are protected from compaction.
+- **Boundaries**: compaction summary/boundary state is persisted in the session; `trimToBoundary` keeps the system prefix and messages from the boundary onward so resume/wire views do not re-send summarized history.
+- **Summarizer circuit breaker**: repeated tier-2 summarization failures trip a breaker and stop further summary attempts for the session (reset on success/reset), avoiding request-per-turn waste.
 
 `off` does neither; the provider eventually rejects an over-long request.
 
@@ -93,6 +98,16 @@ Compressed session architecture: session create/resume returns heap `*Session`; 
 Denied answers feed back as `tool_result "denied: permission required"`. `lsp` asks NO permission (spawns from a fixed table, never model). `batch` asks the union of step permissions.
 
 Path-scoped rules (`Tool(pattern)`): loaded once from `local` > `project` (`.zode/permissions.json`) > `user` > `policy`; `deny` beats any `allow`; within one source, last match wins. Resolver is pure Zig (`readLink`), not `realpath(3)`; checks the resolved path, not the written path (symlink hole fixed).
+
+`bash` commands are classified before asking (`cmdsafety`): read-only commands can avoid unnecessary prompts, dangerous/interactive patterns are handled explicitly, and flagged commands may offer a sandbox (`bwrap`/`firejail`) when available.
+
+## Hooks
+
+Project-level command hooks live in `.zode/hooks.json` (v1). Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`. Each hook can specify `matcher` (tool name/regex), `if` (permission-rule syntax, e.g. `Tool(pattern)`), `command`, `timeout_ms`, and `once`. `PreToolUse` non-zero exit/timeout blocks the tool and returns the reason as the tool result; `PostToolUse` output is appended as a `[hook note]` for the model. Malformed/unknown hooks are skipped.
+
+## Background tasks
+
+Long-running commands can execute as background tasks (`bash` with `run_in_background` / auto-background for known slow verifications). The unified task registry writes output to **session-isolated files** and exposes **incremental polling** via `bash_output`/`check` (file cursor returns only new output; terminal state/exit is reported). When a task reaches a terminal state, the harness drains completions and injects a one-time `[background task finished]` system/harness prompt into the session so the model learns without polling.
 
 ## Subagent (`task`)
 

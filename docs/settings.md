@@ -21,6 +21,7 @@ set -a && source .env && set +a
 | Provider, model, subagents, custom endpoints, LSP, MCP | `~/.config/zode/config.json` | Versionable: it holds no secrets |
 | API keys | `~/.config/zode/auth.json` | `0600`, written atomically by `/connect`; never in `config.json` |
 | Permission allowlist and rules | `~/.config/zode/permissions.json`, `.zode/permissions.json` | User rules + project rules |
+| Hooks | `.zode/hooks.json` | Project-level command hooks (`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`Stop`, with `matcher`/`if`/`timeout_ms`/`once`) |
 | Sessions | `./sessions/zode-<id>.jsonl` | Compressed JSONL, `drwx------` / `-rw-------` |
 | Skills | `.zode/skills/<name>/SKILL.md`, `.agents/skills/…`, `~/.config/zode/skills/…` | Project first, no merge |
 | Slash commands | `.zode/commands`, `~/.config/zode/commands` | Markdown files |

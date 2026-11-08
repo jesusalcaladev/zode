@@ -1,11 +1,10 @@
 # TASKS — zode
 
-> Visual checklist converted from [`ROADMAP.md`](ROADMAP.md) (2026-10-16).
-> The roadmap keeps the _why_, the research and the upstream findings; this file is
-> the board. One checkbox per deliverable.
+> Visual checklist and board for zode phases and deliverables.
+> One checkbox per deliverable.
 >
 > **Ticking a box** means: `zig build test` green · the phase's acceptance check
-> passes · ROADMAP.md §0 ("Where zode is today") is updated.
+> passes · status in this file is updated.
 
 ## Legend
 
