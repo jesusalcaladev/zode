@@ -4919,7 +4919,7 @@ pub const Model = struct {
         return @intCast(@divTrunc(now - tr.started_ns, std.time.ns_per_ms));
     }
 
-    /// A tool result: "⎿  Read 1006 lines · 3ms · Ctrl+R expand". Stores the
+    /// A tool result: "│  Read 1006 lines · 3ms · ^R". Stores the
     /// full result so Ctrl+R can expand it to the full transcript. When the
     /// full result equals the summary there is nothing to expand and no hint
     /// is painted.
@@ -4938,7 +4938,7 @@ pub const Model = struct {
         // is condensed and can be expanded to the full transcript.
         const can_expand = result.len > 0 and !std.mem.eql(u8, result, summary);
         const line = if (can_expand)
-            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms · Ctrl+R expand", .{ head, ms }) catch head
+            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms · ^R", .{ head, ms }) catch head
         else
             std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms", .{ head, ms }) catch head;
 
@@ -7599,7 +7599,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     self.drainShellOut();
 
     // Invalidates the cache if the width changed (the lines already come
-    // wrapped) or if a paragraph was edited in-place (Ctrl+R expands a tool
+    // wrapped) or if a paragraph was edited in-place (^R expands a tool
     // result).
     if (self.cache_width != width) {
         self.clearSegCache();
@@ -10439,12 +10439,12 @@ test "render: tool blocks use ●/│ and the result expands" {
         // eye can follow down, which is what an expanded result needs to be
         // tied to the call it came from.
         const r2 = findRow(s, "Read 1006 lines").?;
-        // Collapsed: summary plus the Ctrl+R hint that the full transcript is
+        // Collapsed: summary plus the ^R hint that the full transcript is
         // available.
-        try std.testing.expectEqualStrings("\u{2502} Read 1006 lines \u{b7} 3ms · Ctrl+R expand", std.mem.trim(u8, rowText(s, r2, &buf), " "));
+        try std.testing.expectEqualStrings("\u{2502} Read 1006 lines \u{b7} 3ms · ^R", std.mem.trim(u8, rowText(s, r2, &buf), " "));
     }
 
-    // Ctrl+R expands the full result (several lines).
+    // ^R expands the full result (several lines).
     try std.testing.expect(m.toggleLastTool());
     var arena2_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena2_state.deinit();
