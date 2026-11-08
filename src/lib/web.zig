@@ -1214,7 +1214,7 @@ pub fn filterByDomain(
     return out.items;
 }
 
-fn passes(url: []const u8, allowed: []const []const u8, blocked: []const []const u8) bool {
+pub fn passes(url: []const u8, allowed: []const []const u8, blocked: []const []const u8) bool {
     for (blocked) |d| {
         if (hostInDomain(url, d)) return false;
     }
@@ -1223,6 +1223,13 @@ fn passes(url: []const u8, allowed: []const []const u8, blocked: []const []const
         if (hostInDomain(url, d)) return true;
     }
     return false;
+}
+
+/// Config/argument domain policy for a URL: block wins over allow. An empty
+/// allow list means "allow anything not blocked" (the filter is opt-in).
+/// The metadata-service floor is enforced separately by the fetch tool.
+pub fn domainPolicyAllows(url: []const u8, allowed: []const []const u8, blocked: []const []const u8) bool {
+    return passes(url, allowed, blocked);
 }
 
 /// One entry of the rendered search list.
@@ -1898,4 +1905,94 @@ test "an empty filter returns the list untouched, not a copy" {
         three_results,
         filterByDomain(arena_state.allocator(), three_results, &.{}, &.{}),
     );
+}
+
+pub const QuoteValidation = struct {
+    pub const Error = error{ NoQuotes, QuoteNotInWindow };
+};
+
+/// Validates that extraction quotes are grounded in `window`. At least one
+/// quote is required, and every quote must appear verbatim in the window —
+/// an answer with no quote is not evidence (Phase 24).
+pub fn validateExtractionQuotes(window: []const u8, quotes: []const []const u8) QuoteValidation.Error!void {
+    if (quotes.len == 0) return error.NoQuotes;
+    for (quotes) |q| {
+        const qt = std.mem.trim(u8, q, " \t\r\n");
+        if (qt.len == 0) return error.NoQuotes;
+        if (std.mem.indexOf(u8, window, qt) == null) return error.QuoteNotInWindow;
+    }
+}
+
+/// Parses `QUOTE:` lines (and markdown `> ` blockquotes) from an extraction
+/// response. Quotes are slices into `response`; the returned list uses `arena`.
+pub fn parseExtractionQuotes(response: []const u8, arena: std.mem.Allocator) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, response, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, "QUOTE:")) {
+            const q = std.mem.trim(u8, t["QUOTE:".len..], " \t");
+            if (q.len > 0) out.append(arena, q) catch {};
+        } else if (std.mem.startsWith(u8, t, "> ") and t.len > 2) {
+            out.append(arena, std.mem.trim(u8, t[2..], " \t")) catch {};
+        }
+    }
+    return out.items;
+}
+
+/// Builds the prompt for secondary-model extraction (Phase 24). The model
+/// must answer the question using only the window and include `QUOTE:` lines
+/// with exact text from the window — quotes are mandatory evidence.
+pub fn extractionPrompt(arena: std.mem.Allocator, question: []const u8, window: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena,
+        \\Answer the question using ONLY the page text below.
+        \\You MUST include one or more QUOTE: lines with exact text copied from the page that supports your answer.
+        \\An answer with no quote is not evidence and will be rejected.
+        \\
+        \\QUESTION:
+        \\{s}
+        \\
+        \\PAGE TEXT:
+        \\{s}
+        \\
+        \\Respond in this format:
+        \\ANSWER: <your answer>
+        \\QUOTE: <exact text from the page>
+        \\QUOTE: <another exact quote if needed>
+    , .{ question, window });
+}
+
+test "extraction: quotes must appear in the window or the call errors (Phase 24)" {
+    const window = "Zig is a general-purpose programming language. It was created by Andrew Kelley.";
+
+    // Valid: every quote appears verbatim.
+    try validateExtractionQuotes(window, &.{ "general-purpose programming language", "Andrew Kelley" });
+
+    // No quotes is not evidence.
+    try std.testing.expectError(error.NoQuotes, validateExtractionQuotes(window, &.{}));
+
+    // A quote not in the window is rejected.
+    try std.testing.expectError(error.QuoteNotInWindow, validateExtractionQuotes(window, &.{"this text does not exist"}));
+
+    // One good, one bad.
+    try std.testing.expectError(error.QuoteNotInWindow, validateExtractionQuotes(window, &.{ "Andrew Kelley", "invented yesterday" }));
+
+    // Parsing: QUOTE: lines are extracted.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const resp = "ANSWER: Zig was made by Andrew Kelley.\nQUOTE: created by Andrew Kelley\nQUOTE: general-purpose programming language\n";
+    const quotes = parseExtractionQuotes(resp, a);
+    try std.testing.expectEqual(@as(usize, 2), quotes.len);
+    try std.testing.expectEqualStrings("created by Andrew Kelley", quotes[0]);
+    try validateExtractionQuotes(window, quotes);
+}
+
+test "domain policy: block wins over allow (Phase 24, config/fetch)" {
+    // `passes` is the policy used for domain allow/block lists: a blocked
+    // domain wins even if it (or its parent) is allowed.
+    try std.testing.expect(!passes("https://evil.example.com/x", &.{"example.com"}, &.{"evil.example.com"}));
+    try std.testing.expect(!domainPolicyAllows("https://evil.example.com/x", &.{"example.com"}, &.{"evil.example.com"}));
+    try std.testing.expect(passes("https://good.example.com/x", &.{"example.com"}, &.{"evil.example.com"}));
+    try std.testing.expect(!passes("https://other.com/x", &.{"example.com"}, &.{}));
 }

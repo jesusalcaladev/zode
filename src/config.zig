@@ -58,6 +58,11 @@ pub const Config = struct {
     /// The command is FIXED here and never chosen by the model: that is what
     /// lets the `mcp` tool read a server's catalogue without a dialog.
     mcp_servers: []const mcp_servers.Server = &.{},
+    /// Domain policy for `web_search` and `web_fetch` (`web_domains`).
+    /// A blocked domain wins over an allowed one; the metadata-service range
+    /// stays a fixed floor regardless of these lists.
+    web_domains_allow: []const []const u8 = &.{},
+    web_domains_block: []const []const u8 = &.{},
     /// Config path that was loaded (for diagnostics), or null.
     path: ?[]const u8 = null,
     pub const empty: Config = .{};
@@ -99,6 +104,20 @@ pub fn load(
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch
         return Config.empty;
     return parse(arena, data, path) catch Config.empty;
+}
+
+fn parseStringList(arena: std.mem.Allocator, val: ?std.json.Value) []const []const u8 {
+    const v = val orelse return &.{};
+    if (v != .array) return &.{};
+    var list: std.ArrayList([]const u8) = .empty;
+    for (v.array.items) |item| {
+        if (item != .string) continue;
+        const d = std.mem.trim(u8, item.string, " \t\r\n");
+        if (d.len == 0) continue;
+        const owned = arena.dupe(u8, d) catch continue;
+        list.append(arena, owned) catch {};
+    }
+    return list.items;
 }
 
 pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Config {
@@ -148,6 +167,13 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
                 try list.append(arena, s);
             }
             cfg.mcp_servers = list.items;
+        }
+    }
+    // Domain policy for web tools (`web_domains.allow` / `.block`).
+    if (root.get("web_domains") orelse root.get("webDomains")) |wdv| {
+        if (wdv == .object) {
+            cfg.web_domains_allow = parseStringList(arena, wdv.object.get("allow"));
+            cfg.web_domains_block = parseStringList(arena, wdv.object.get("block"));
         }
     }
 

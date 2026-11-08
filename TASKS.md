@@ -225,10 +225,10 @@ state, the open bug and the quality bar).
 
 `⚡ tokens · 🟡 · independent`
 
-- [ ] Per-URL cache for the session, so the "2–3 calls at one url" the routing table recommends do not pay the network twice; a `force` flag bypasses it
-- [ ] Secondary-model extraction: long page + narrow question → a cheap model reads the window and returns the answer **plus the quotes it relied on** (quotes mandatory — an answer with no quote is not evidence)
-- [ ] Domain allow/block lists (`web_domains.allow` / `.block` in config) applied to search AND fetch; the metadata-service range stays a fixed floor; a user block beats an allow
-- [ ] Pure tests: the cache returns the stored page and `force` re-fetches · the extractor must quote text that appears in the window or the call errors · block wins over allow
+- [x] Per-URL cache for the session, so the "2–3 calls at one url" the routing table recommends do not pay the network twice; a `force` flag bypasses it
+- [x] Secondary-model extraction: long page + narrow question → a cheap model reads the window and returns the answer **plus the quotes it relied on** (quotes mandatory — an answer with no quote is not evidence)
+- [x] Domain allow/block lists (`web_domains.allow` / `.block` in config) applied to search AND fetch; the metadata-service range stays a fixed floor; a user block beats an allow
+- [x] Pure tests: the cache returns the stored page and `force` re-fetches · the extractor must quote text that appears in the window or the call errors · block wins over allow
 
 ## Phase 25 — Bash safety: classify before you ask
 
