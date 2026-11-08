@@ -2,6 +2,11 @@ const std = @import("std");
 
 /// JSON HTTP client on top of std.http.Client (Zig 0.17).
 ///
+/// Architectural note: this module performs network I/O, so it is an exception to
+/// the strict "src/lib = pure/testable, no TUI, no network" guideline. It lives in
+/// `lib/` for shared reuse across the app; keep its public API small and test pure
+/// helpers separately where practical.
+///
 /// NOTE: `Request` is heap-allocated because `receiveHead` and `bodyReader`
 /// keep internal pointers to the request.
 pub const Http = struct {

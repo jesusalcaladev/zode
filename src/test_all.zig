@@ -70,6 +70,36 @@ pub const agentsdoc = @import("lib/agentsdoc.zig");
 pub const memory = @import("lib/memory.zig");
 pub const memory_store = @import("lib/memory_store.zig");
 
+// Additional lib modules (pure/testable utilities, storage, UI helpers).
+pub const env = @import("lib/env.zig");
+pub const regex = @import("lib/regex.zig");
+pub const repeat = @import("lib/repeat.zig");
+pub const repeat_guard = @import("lib/repeat_guard.zig");
+pub const zjsonl = @import("lib/zjsonl.zig");
+pub const termseq = @import("lib/termseq.zig");
+pub const http_client = @import("lib/http_client.zig");
+pub const webcache = @import("lib/webcache.zig");
+pub const modelcache = @import("lib/modelcache.zig");
+pub const provider = @import("lib/provider.zig");
+pub const typecheck = @import("lib/typecheck.zig");
+pub const edit_hint = @import("lib/edit_hint.zig");
+pub const diff_tokenizer = @import("lib/diff_tokenizer.zig");
+pub const diffview = @import("lib/diffview.zig");
+pub const review = @import("lib/review.zig");
+pub const goal = @import("lib/goal.zig");
+pub const exitgate = @import("lib/exitgate.zig");
+pub const fuzzy = @import("lib/fuzzy.zig");
+pub const filesearch = @import("lib/filesearch.zig");
+pub const sessionindex = @import("lib/sessionindex.zig");
+pub const sessionpath = @import("lib/sessionpath.zig");
+pub const skillstore = @import("lib/skillstore.zig");
+pub const bundled_skills = @import("lib/bundled_skills.zig");
+pub const mascot = @import("lib/mascot.zig");
+pub const images = @import("lib/images.zig");
+pub const batch = @import("lib/batch.zig");
+pub const lang_icons = @import("lib/lang_icons.zig");
+pub const hooks = @import("lib/hooks.zig");
+
 // The language server. It was in its own aggregator (`src/lsp_test.zig`) that
 // no build step referenced: 33 test blocks written, and 32 of them not even
 // compiled. They are here now, where `zig build test` reaches them.

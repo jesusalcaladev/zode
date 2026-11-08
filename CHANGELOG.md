@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Refactors
 
 - rename repeats guard to repeat_guard [`02e05bd9`](https://github.com/jesusalcaladev/zode/commit/02e05bd9)
-- organize lib modules into clusters with stable facades [`f5c227c0`](https://github.com/jesusalcaladev/zode/commit/f5c227c0)
+- organize lib modules into clusters with stable facades [`8e60f45c`](https://github.com/jesusalcaladev/zode/commit/8e60f45c)
+- remove dead test file, expand test coverage, clarify lib IO notes [`7fe6c795`](https://github.com/jesusalcaladev/zode/commit/7fe6c795)
 
 ### Other
 

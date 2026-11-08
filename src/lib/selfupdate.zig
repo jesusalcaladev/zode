@@ -1,5 +1,10 @@
 //! Self-update: check GitHub releases and replace the running binary.
 //!
+//! Architectural note: this module performs network/process/filesystem I/O, so it
+//! is an exception to the strict "src/lib = pure/testable, no TUI, no network"
+//! guideline. It lives in `lib/` for shared reuse; networked paths are isolated
+//! behind `Context` to keep logic testable.
+//!
 //! Two things matter here and both are about what the user sees:
 //!
 //! 1. **The check is free on almost every start.** The answer is cached ON DISK
