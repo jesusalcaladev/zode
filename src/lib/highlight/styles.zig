@@ -1,6 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const theme = @import("theme.zig");
+const theme = @import("../theme.zig");
 
 const Style = vaxis.Style;
 

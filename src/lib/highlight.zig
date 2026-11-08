@@ -1,21 +1,21 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const theme = @import("theme.zig");
-const styles = @import("highlight_styles.zig");
-const config = @import("highlight_config.zig");
-const scanner = @import("highlight_scanner.zig");
+const styles = @import("highlight/styles.zig");
+const config = @import("highlight/config.zig");
+const scanner = @import("highlight/scanner.zig");
 const md = @import("markdown.zig");
 
 // ── public API ─────────────────────────────────────────────────
 //
-// `highlight.zig` is the entry point. The real work lives in three focused files:
+// `highlight.zig` is the entry point. The implementation lives in `highlight/`:
 //
-//   - `highlight_styles.zig`   → token styles (`T`), `Kinds`, `styleFor`
-//   - `highlight_config.zig`   → `Cfg`, per-language tables (`langs`), `normalizeLang`, `cfgFor`
-//   - `highlight_scanner.zig`  → `State`, `StrStart`, scanner helpers, `highlightLine`, `highlightLineState`
+//   - `highlight/styles.zig`   → token styles (`T`), `Kinds`, `styleFor`
+//   - `highlight/config.zig`   → `Cfg`, per-language tables (`langs`), `normalizeLang`, `cfgFor`
+//   - `highlight/scanner.zig`  → `State`, `StrStart`, scanner helpers, `highlightLine`, `highlightLineState`
 //
-// Everything below re-exports so existing callers (`markdown.zig`, `test_all.zig`,
-// `test_all_tmp.zig`) keep working without changing a single import.
+// Everything below re-exports so existing callers (`markdown.zig`, `test_all.zig`)
+// keep working without changing a single import.
 
 pub const T = styles.T;
 pub const Kinds = styles.Kinds;

@@ -1,7 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const styles = @import("highlight_styles.zig");
-const config = @import("highlight_config.zig");
+const styles = @import("styles.zig");
+const config = @import("config.zig");
 
 // ── scanner state BETWEEN lines ────────────────────────────────
 //
