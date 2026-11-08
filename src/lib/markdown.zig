@@ -1006,7 +1006,7 @@ pub fn prefix(kind: Kind) struct { text: []const u8, style: Style } {
         .info => .{ .text = "· ", .style = styles.info },
         .tool => .{ .text = "● ", .style = styles.tool_bold },
         .tool_run => .{ .text = "● ", .style = styles.tool_bold },
-        .tool_res => .{ .text = "│ ", .style = styles.tool_res },
+        .tool_res => .{ .text = "│ ", .style = theme.gutter },
         .diff => .{ .text = "", .style = styles.diff_ctx },
         .error_msg => .{ .text = "✗ ", .style = styles.err },
         .banner => .{ .text = "", .style = styles.banner },
