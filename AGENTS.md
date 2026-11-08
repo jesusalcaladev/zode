@@ -96,6 +96,7 @@ zig test src/chat.zig            # SSE parser tests
 - `ZODE_FREE_AUTO=1` / `ZODE_TASK_PARALLEL` (default 3) / `ZODE_MAX_ITER` (default 12)
 - `ZODE_COMPACT=off|elide|full` (default when unset: `elide`, Tier 1 only), `ZODE_COMPACT_PCT=10..95`
 - `ZODE_YES=1` (autoconfirm destructive commands)
+- `ZODE_NERD_ICONS=auto|1|0` (default `auto`, icons on): Nerd Font language icon before code block labels; label always shown. Set `0` if your font lacks Nerd Font glyphs.
 - `ZODE_RESUME=1` / `ZODE_DBG_ERR=1`
 
 ## Architecture map
@@ -105,7 +106,7 @@ src/     main, tui, agent, tools (dispatcher), chat, bgproc, palette,
          session, config, compaction, cache_stats, roster, free_auto
 src/lib/ pure/testable modules (no TUI, no network): readcache, project,
          prompt, sleep, skills, skillstore, mentions, markdown, highlight,
-         web, models, providers, provider, http_client, subagent, ask,
+         lang_icons, web, models, providers, provider, http_client, subagent, ask,
          plan, checkpoint, editor, bench, clean, regex, mascot, theme,
          facts, filewatch,
          zjsonl, verify, exitgate, cost, review, diffview, repeat,

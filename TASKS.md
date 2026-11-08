@@ -477,7 +477,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 - [ ] **33.16** The external editor (`ctrl+g`) and the image paste (`ctrl+v`) — the image path already exists (`src/lib/images.zig`)
 - [ ] **33.18** The modal diff viewer — only worth it once a turn can produce multi-file diffs
 - [ ] **33.19** The compact-summary line — after a tier-2 compaction the transcript loses history **silently**; one honest line says what was summarised
-- [ ] **33.21** The permission dialog with the **rule** explanation — which rule matched, and the rule the user could accept instead of a bare "always allow"
+- [x] **33.21** The permission dialog with the **rule** explanation — which rule matched, and the rule the user could accept instead of a bare "always allow" (shows the matched `ask` rule as "asked by rule: …", shows the scoped rule the "always allow" answer would remember, e.g. `Bash(git *)`; stale rule/suggestion state cleared between dialogs)
 
 **What we deliberately do NOT copy** (and why) — the reasoning is in
 `docs/analysis/tui-chrome.md` §5: the alternate screen (it destroys the
@@ -496,8 +496,8 @@ permanent CPU cost for a decoration).
 > board owned. Every one was read in its **implementation**, not in its prose.
 > Ranked by value per unit of risk.
 
-- [ ] **34.1** Path-scoped permissions and the dangerous-path protection — **MOSTLY COVERED (2026-10-21)**
-  - The reference implementation: a path is allowed through SEVEN checks in this order — resolve the path → the deny rules → the internally editable paths → the **safety check** → the working-directory check → the sandbox allowlist → the allow rules. Its safety check blocks `.git/`, `.claude/`, `.vscode/`, `.idea/`, the shell configs and the UNC paths
+- [x] **34.1** Path-scoped permissions and the dangerous-path protection — **DONE (2026-10-21, always-allow scoping completed 2026-11-08)**
+  - The reference implementation: a path is allowed through SEVEN checks in this order — resolve the path → the deny rules → the internally editable paths → the **safety check** → the working-directory check → the sandbox allowlist → the allow rules. Its safety check blocks `.git/`, `.claude/`, `.vscode/`, `.idea/`, the shell configs and the UNC paths. Zode implements the core (resolved path, deny rules, dangerous-path/secret safety check with ask+approval, `Tool(pattern)` allow/deny/ask/dontAsk, project+user rules, and path-scoped enforcement); working-directory and sandbox allowlists remain separate mechanisms.
   - [x] `src/lib/pathsafe.zig` (new, pure): the table, matched **by SEGMENT and case-insensitively** (`a/b/.git/hooks/x` and `.Git/hooks/x` are both caught; `myproject.git`, `zig-out-mine` and `.gitignore` are NOT), and a separate table for the files whose CONTENT is a secret
   - [x] Wired into `write`, `edit`, `notebook_edit` (per file: one bad path does not lose the good ones) and into `read` — `read` never asks for permission, so it was the only place a secret could be refused before going to the provider
   - [x] The refusal NAMES what writing there would do ("a hook there runs on every commit") and points at `bash`, which asks the user
@@ -506,11 +506,11 @@ permanent CPU cost for a decoration).
   - [x] The multi-file form of `edit` (`files: [{path,…}]`) is in the permission detail AND in the risky-path question: the dialog used to name NO file for a call that touches eight
   - [x] **The path it RESOLVES to is checked too** (2026-10-21): a symlink with an innocent name (`ln -s .git/hooks hooks`) is a path whose NAME says nothing and whose TARGET is exactly what the rule protects. The resolver is component by component and in PURE ZIG (`readLink`), not `realpath(3)`: this project has no libc dependency
   - [x] The `Tool(pattern)` grammar — **DONE 2026-10-21**: `src/lib/permrules.zig` (pure) parses `Tool(pattern) action` (`allow` / `deny` / `ask`, the action optional and defaulting to `allow`), matches the pattern as a glob over the thing the call acts on (the PATH for a file tool, the COMMAND for `bash`), and decides by precedence. The rules live in `.zode/permissions.json` (the project) and `~/.config/zode/permissions.json` (the user), and `/permissions` prints them
-  - [x] The "always allow" answer still remembers the TOOL and not a pattern: "always allow `Bash(git *)`" is the rule the user would want, and the flat list is a coarser answer
-- [ ] **34.2** The **frozen decision** of the result cap — **NOT COVERED**
+  - [x] The "always allow" answer remembers the **scoped pattern rule** it suggests (e.g. `Bash(git *)`, `Write(src/main.zig)`), not a flat whole-tool allow: `rememberAlwaysAllow` learns the rule into `perm_rules` as `local` (strongest) and persists it, and does not fall back to the coarse flat allowlist when a safe scoped rule was learned.
+- [x] **34.2** The **frozen decision** of the result cap — **DONE 2026-11-08 (session wiring completed)**
   - The reference implementation: the cap layer keeps a **frozen decision** — a cut is re-applied verbatim on every later turn instead of being recomputed — and it rebuilds that state from the transcript on resume
   - Ours: `src/lib/resultcap.zig:78` `capAggregate` recomputes per call
-  - [x] A `Caps` state (result id → the cut that was made), persisted next to the session and reloaded on resume — **DONE 2026-10-27**: Added `CutRecord` and `Caps` structs in `src/lib/resultcap.zig` with `find`/`record`, `frozenCapResult`/`frozenCapAggregate` that re-apply previous cuts verbatim, and `serializeCaps`/`deserializeCaps` for JSON persistence next to the session. 6 pure tests (frozen cut reuse, no-cut reuse, aggregate stability, serialize/deserialize round trip, empty serialization). The `Caps` state is held in memory by the caller (session layer integration left as a thin wiring step).
+  - [x] A `Caps` state (result id → the cut that was made), persisted next to the session and reloaded on resume — **DONE 2026-10-27/2026-11-08**: `resultcap.Caps`/`CutRecord`, `frozenCapResult`/`frozenCapAggregate`, `serializeCaps`/`deserializeCaps` (pure tests). Session lifecycle wired: `Session.result_caps` field, `saveCapsSidecar`/`loadCapsSidecar` (`.zode-caps.json` sidecar), loaded on `Session.load`/resume, freed on deinit, saved by agent after frozen cap decisions/tool-result capping (`s.saveCapsSidecar()`).
   - [x] Why it matters covered: a session that compacts differently on resume silently loses its cached prefix — the frozen cut prevents this by re-applying the same cut.
   - `permrules.Action` gained `dontAsk` (34.12) and now `dangerous_patterns` + `isDangerousPattern()` flag bare interpreters with broad patterns (`bash(*)`, `python(*)`, …). `shadowedRule()` detects when an `allow` rule can never fire because another rule covers it (deny beats allow always; stronger source or later same-source rule wins; `ask`/`dontAsk` never shadow).
   - `agent.zig`: `setAlwaysAllowed` and `allowAlwaysFor` now warn once per session about dangerous broad allows (bash `*` or empty, or any interpreter tool with `*` pattern), via `warnDangerousAllowOnce()`. Warning is informational, not a refusal.
@@ -522,14 +522,18 @@ permanent CPU cost for a decoration).
   - [x] Per MODEL and not one bucket: `free-auto` rotates, the cheap router falls back and `/submodel` sends subagents elsewhere, so the row is the model that **answered** (`pick.model`), not the one that was selected
   - [x] A resumed session says which tokens are not in the breakdown: the per-model rows live in memory and the token totals are restored from the session file
   - Where: `commands.cmdCost` + the dispatch in `agent.zig` · `recordSessionUsage` now takes the model · the price decision (`free` / `unpriced` / `priced`) is `cost.priceOf`, so it is tested with no catalogue on disk
-- [ ] **34.6** The hook output contract (`updatedInput`, `additionalContext`) — Phase 5 has the events, not the contract
-  - [ ] The reference implementation: 27 events and 5 hook types
+- [x] **34.6** Hook output contract subset (`updatedInput`, `additionalContext`, permission decisions) — **DONE 2026-11-08 (core contract wired)**
+  - [x] `hooks.RunResult` carries `additional_context`, `updated_input`, `permission_decision`, `system_message` and parses JSON stdout contract (`additionalContext`, `hookSpecificOutput`, `systemMessage`, `updatedInput`, `permissionDecision` allow/deny/ask). Structured deny blocks.
+  - [x] `PreToolUse` can block and apply `updatedInput`; `PostToolUse`/`UserPromptSubmit` notes/additional context fed back; `freeResults` owns cleanup.
+  - [~] Broader upstream parity still open: 27 events and 5 hook types (Phase 5 has command hooks only).
 - [ ] **34.7** The memory recall by relevance and the staleness notes — Phase 11 has the store, not the recall
 - [ ] **34.8** The background **subagents** (not the background shell jobs) — **NOT COVERED**
   - The reference implementation: the agent tool can run a whole agent in the background; Phase 10 is about `bgproc`
   - [ ] `run_in_background: bool` on the `task` tool, and a **notification to the model** when it lands
 - [ ] **34.9** The atomic task claiming — **NOT COVERED** (the reference implementation has a `claim` operation): three parallel agents must not take the same task
-- [ ] **34.14** The `PermissionRequest` hook path for the headless runs
+- [~] **34.14** The `PermissionRequest` hook path for the headless runs — **PARTIAL 2026-11-08**
+  - [x] `PermissionRequest` event added (`hooks.Event`) and fired in `agent.execOneCall` permission flow before the dialog; hook can return allow/deny/ask (JSON contract) and is honored (pathsafe/rule checks still apply).
+  - [ ] Headless `--chat` still executes tools via `main.execHeadless` (effectively yolo/direct tool exec), bypassing `agent.execOneCall` permission dialog/hooks; a full headless PermissionRequest path needs wiring there or a shared permission/tool-exec path.
 
 **Where we are BETTER than the reference implementation** (so nobody ports it
 backwards) — `docs/analysis/harness.md` §4 lists ten: the exit gate, the
@@ -556,7 +560,7 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 - [x] **35.8** `/compact` on demand — **S-M**: implemented `/compact now` — runs tier-1 elision immediately on the live session, reports elided count and new estimate, and tells when tier-2 summary will trigger next turn.
 - [ ] **35.9** `/release-notes` + `/version` — **S**: two one-liners over `src/lib/selfupdate.zig`, which already runs at startup with nobody told
 - [ ] **35.10** `/diff` — **M**: a diff dialog shows the uncommitted changes and the per-turn diffs; the renderer exists (`src/lib/diffview.zig`), the command is the missing half
-- [ ] **35.11** `/permissions` (the rule editor) · `/hooks` (the hook editor) · `/agents` (the subagent definitions) — **M** each, and each one is a panel over a mechanism another phase builds. **They wait for it**: a UI over a rule engine that does not exist yet is how a command ends up promising something the engine does not do
+- [x] **35.11** `/permissions` (rule panel) · `/hooks` (hooks panel) · `/agents` (subagent/definitions status panel) — **DONE (panels, 2026-11-08)**. `/permissions` shows mode, Phase 6 rules with source/precedence and dangerous/shadowed hints, legacy allowlist, and file paths; `/hooks` shows loaded Phase 5 hooks from `.zode/hooks.json`; `/agents` honestly reports current `task` subagent constraints and that definitions/roles/teams (Phases 9/26/20) are not implemented. Read-only panels (engines exist for permissions/hooks; agents definitions do not yet) — edit config files directly; interactive in-TUI editing remains future work.
 - [ ] **35.12** `/rewind` (an arbitrary point, not the last turn) · `/compact` · `/resume` as a picker — covered by Phases 29 and 30
 - [ ] **35.13** `/add-dir` · `/sandbox` · `/mcp` · `/vim` — wait for Phases 6, 12 and 13
 - [ ] **35.14** `/btw` (a side question that does not interrupt) — **S**: one subagent call whose answer is appended, not a turn

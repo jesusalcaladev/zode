@@ -313,6 +313,7 @@ never touches them: what the wire drops, the file keeps.
 | `ZODE_NO_SELF_UPDATE` | `0` | Disable the update check |
 | `ZODE_AUTO_UPDATE` | `0` | Install updates without asking |
 | `ZODE_DALTONIZED` | `0` | Colour-blind-safe theme |
+| `ZODE_NERD_ICONS` | `auto` (on) | Nerd Font language icon in code block chips. The label is always shown; set `0`/`off` if your font lacks Nerd Font glyphs. |
 | `ZODE_LSP_TIMEOUT_MS` | built-in | LSP request timeout |
 | `ZODE_DBG_ERR` | `0` | Verbose error output |
 | `ZODE_CORE_DUMP` | `0` | Opt in to a kernel core dump on crash (see below) |
