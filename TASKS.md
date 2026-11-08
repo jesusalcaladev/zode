@@ -32,7 +32,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
   **2.1 done** (budget listing); **2.2 done** (skills once per session at end of prompt);
   **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
   **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
-- [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks)
+- [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks) — **3 done, 7 done**; Phase 10 pending.
 - [x] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety) — Phase 6 rule engine (permrules/load/enforce) + Phase 5 hooks (`.zode/hooks.json`, Pre/Post/UserPromptSubmit/Stop, `if` via permission-rule syntax) + Phase 25 bash classification/sandbox offer complete.
 - [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
   **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
@@ -108,11 +108,11 @@ state, the open bug and the quality bar).
 
 `⚡ tokens · 🟡 · depends on 3`
 
-- [ ] Microcompaction with a **recoverable marker**: old tool results replaced by a marker naming the stored file (Phase 3) — nothing is lost, only moved
-- [ ] Compaction **boundaries**: trim requests to the last boundary so a later resume does not re-send summarized history
-- [ ] Preserve invoked skills and read files across a compaction
-- [ ] **Circuit breaker**: after N failed summarizer attempts, stop trying (no request-per-turn forever)
-- [ ] Tests: boundary trimming · a skill invoked before compaction is still known after · the breaker trips and stops
+- [x] Microcompaction with a **recoverable marker**: old/large tool results are elided with recoverable `read path=` markers when a stored file exists; sync compaction persists large non-stored elided results to the session tool-result store (`compaction.elideTier` + `toolstore`, `agent` microcompaction path) — nothing is lost, only moved.
+- [x] Compaction **boundaries**: boundary marker/summary note persisted in session state and `trimToBoundary` keeps the system prefix + boundary onward so resume/wire views do not re-send summarized history (`compaction.boundary_marker`, `trimToBoundary`, session `compact_summary`/`compact_tail_keep`, agent restore path).
+- [x] Preserve invoked skills and read files across a compaction: `isCriticalMessage` protects `skill` tool results, `<skill_content`, and non-elided `read` results (plus goal/plan/summary/boundary markers).
+- [x] **Circuit breaker**: summarizer failures are counted; after repeated failures the breaker trips and tier-2 summarization stops trying for the session (resets on success/reset), preventing request-per-turn waste (`SummaryBreaker`/`summarizeTurns` in `agent.zig`).
+- [x] Tests: boundary trimming (`compaction`), skill and read-file preservation across compaction (`compaction` Phase 7 tests), breaker trips/stops and resets (`agent` `SummaryBreaker` tests).
 
 ---
 

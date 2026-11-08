@@ -14,7 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bash safety sandbox offer and classification tests (phase25) [`14b796b3`](https://github.com/jesusalcaladev/zode/commit/14b796b3)
 - web fetch/search quality improvements (phase24) [`974bc401`](https://github.com/jesusalcaladev/zode/commit/974bc401)
 - complete recoverable tool results and per-tool render (phase3) [`c7500504`](https://github.com/jesusalcaladev/zode/commit/c7500504)
-- complete Sprint D permissions, hooks, and bash safety (phase6,5,25) [`50fb2e59`](https://github.com/jesusalcaladev/zode/commit/50fb2e59)
+- complete Sprint D permissions, hooks, and bash safety (phase6,5,25) [`e8086248`](https://github.com/jesusalcaladev/zode/commit/e8086248)
+
+### Documentation
+
+- mark compaction v2 complete (phase7) [`3f81ecdc`](https://github.com/jesusalcaladev/zode/commit/3f81ecdc)
 
 ## [0.2.0] - 2026-11-07
 
