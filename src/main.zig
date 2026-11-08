@@ -30,6 +30,7 @@ const ask = @import("lib/ask.zig");
 const lsp_manager = @import("lsp/manager.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const theme = @import("lib/theme.zig");
+const lang_icons = @import("lib/lang_icons.zig");
 
 var child_env_static: std.process.Environ.Map = undefined;
 var child_env_live: bool = false;
@@ -1023,6 +1024,7 @@ fn runTui(init: std.process.Init) !u8 {
     var model = tui.Model.init(gpa);
     defer model.deinit();
     model.environ = init.environ_map;
+    model.nerd_icons = lang_icons.nerdIconsEnabled(init.environ_map);
     agent.status_model_target = &model;
     // Scrubbed child env: bash/bg tools inherit only safe vars, never keys.
     if (spawnenv_mod.buildChildEnv(gpa, init.environ_map.*)) |ce| {

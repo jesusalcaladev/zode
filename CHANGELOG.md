@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete Sprint D permissions, hooks, and bash safety (phase6,5,25) [`e8086248`](https://github.com/jesusalcaladev/zode/commit/e8086248)
 - unify background tasks with file output and finish notifications (phase10) [`fc10a2d8`](https://github.com/jesusalcaladev/zode/commit/fc10a2d8)
 - enhance hooks and markdown rendering with language icons [`eed09afa`](https://github.com/jesusalcaladev/zode/commit/eed09afa)
-- add permissions, hooks, and agents panels with safer IO handling [`a18d3b7c`](https://github.com/jesusalcaladev/zode/commit/a18d3b7c)
+- add permissions, hooks, and agents panels with safer IO handling [`2b135b19`](https://github.com/jesusalcaladev/zode/commit/2b135b19)
+- update TUI and main integration [`cd1b963e`](https://github.com/jesusalcaladev/zode/commit/cd1b963e)
 
 ### Documentation
 

@@ -12,6 +12,7 @@ const chat = @import("chat.zig");
 const md = @import("lib/markdown.zig");
 const ansi = @import("lib/ansi.zig");
 const theme = @import("lib/theme.zig");
+const lang_icons = @import("lib/lang_icons.zig");
 const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
@@ -619,8 +620,65 @@ fn buildLines(
     ctx: vxfw.DrawContext,
     para: *Model.Para,
     width: u16,
+    nerd_icons: bool,
 ) ![]const PLine {
-    return buildLinesBase(pa, ctx, para, width);
+    return buildLinesBase(pa, ctx, para, width, nerd_icons);
+}
+
+fn appendTextRun(
+    pa: std.mem.Allocator,
+    ctx: vxfw.DrawContext,
+    cells: *std.ArrayList(CellRun),
+    text: []const u8,
+    style: vaxis.Style,
+    remaining: *u16,
+) !void {
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| {
+        const b = g.bytes(text);
+        const gw = theme.graphemeWidth(ctx, b);
+        if (remaining.* < gw) return;
+        remaining.* -= gw;
+        try cells.append(pa, .{ .text = b, .w = gw, .style = style });
+    }
+}
+
+/// Optional language chip row: `│ ` + [icon + space] + label + padding + ` │`.
+/// The icon comes from Nerd Fonts when enabled; the label is always shown.
+fn appendLangChipLine(
+    pa: std.mem.Allocator,
+    ctx: vxfw.DrawContext,
+    lines: *std.ArrayList(PLine),
+    raw_lang: []const u8,
+    box_w: u16,
+    nerd_icons: bool,
+) !void {
+    const chip = lang_icons.lookup(raw_lang, nerd_icons);
+    if (chip.label.len == 0) return;
+
+    var cells: std.ArrayList(CellRun) = .empty;
+    try cells.append(pa, .{ .text = "\u{2502} ", .w = 2, .style = theme.code_border }); // │ 
+
+    // Budget inside the box: left `│ ` (2) + content + right ` │` (2).
+    var remaining: u16 = box_w -| 4;
+    if (chip.icon) |icon| {
+        try appendTextRun(pa, ctx, &cells, icon, theme.code_lang, &remaining);
+        if (remaining > 0) {
+            try cells.append(pa, .{ .text = " ", .w = 1, .style = theme.code_lang });
+            remaining -= 1;
+        }
+    } else {
+        try cells.append(pa, .{ .text = "\u{259A} ", .w = 2, .style = theme.code_lang }); // ▚  (fallback marker)
+        remaining -|= 2;
+    }
+    try appendTextRun(pa, ctx, &cells, chip.label, theme.code_lang, &remaining);
+
+    // Pad to align the closing border with code rows: `│ ` + content + pad + ` │` = box_w.
+    while (remaining > 0) : (remaining -= 1) {
+        try cells.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
+    }
+    try cells.append(pa, .{ .text = " \u{2502}", .w = 2, .style = theme.code_border }); //  │
+    try lines.append(pa, .{ .cells = cells.items, .w = box_w });
 }
 
 /// Builds the lines of a code block with a full rounded border.
@@ -637,6 +695,7 @@ fn buildCodeBlockLines(
     ctx: vxfw.DrawContext,
     blk: anytype,
     width: u16,
+    nerd_icons: bool,
 ) ![]const PLine {
     // ── first pass: build every line's cells and find the max width ─────────
     var raw_lines: std.ArrayList([]const CellRun) = .empty;
@@ -685,39 +744,7 @@ fn buildCodeBlockLines(
     }
 
     // ── language chip with background ───────────────────────────────────────
-    if (blk.lang.len > 0) {
-        var cells: std.ArrayList(CellRun) = .empty;
-        try cells.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
-        try cells.append(pa, .{ .text = "▚ ", .w = 2, .style = theme.code_lang });
-        var lang_w: u16 = 0;
-        var it = vaxis.unicode.graphemeIterator(blk.lang);
-        while (it.next()) |g| {
-            const b = g.bytes(blk.lang);
-            const gw = theme.graphemeWidth(ctx, b);
-            // A lang longer than the box is CLIPPED, not allowed to push the
-            // closing ` │` past the border: the box width is what the code
-            // lines say it is.
-            if (4 + lang_w + gw + 2 > box_w) break;
-            lang_w += gw;
-            try cells.append(pa, .{
-                .text = b,
-                .w = gw,
-                .style = theme.code_lang,
-            });
-        }
-        // `│ ` + `▚ ` + lang + pad + ` │` = box_w, the same width the code
-        // rows get. It used to be computed from the BYTE length of the lang
-        // and then the closing ` │` was added on top: the chip row hung two
-        // columns past the borders while every code row fell two short.
-        const used: u16 = 4 + lang_w;
-        const pad: u16 = box_w -| used -| 2;
-        var i: u16 = 0;
-        while (i < pad) : (i += 1) {
-            try cells.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
-        }
-        try cells.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
-        try lines.append(pa, .{ .cells = cells.items, .w = box_w });
-    }
+    try appendLangChipLine(pa, ctx, &lines, blk.lang, box_w, nerd_icons);
 
     // ── code lines, wrapped to `text_w` columns inside the box ──────────────
     for (raw_lines.items) |src| {
@@ -772,6 +799,7 @@ fn buildDiffBlockLines(
     ctx: vxfw.DrawContext,
     blk: anytype,
     width: u16,
+    nerd_icons: bool,
 ) ![]const PLine {
     // ── first pass: build every line's cells and find the max width ─────────
     var raw_lines: std.ArrayList([]const CellRun) = .empty;
@@ -815,32 +843,7 @@ fn buildDiffBlockLines(
     }
 
     // ── language chip with background ───────────────────────────────────────
-    if (blk.lang.len > 0) {
-        var cells: std.ArrayList(CellRun) = .empty;
-        try cells.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
-        try cells.append(pa, .{ .text = "▚ ", .w = 2, .style = theme.code_lang });
-        var lang_w: u16 = 0;
-        var it = vaxis.unicode.graphemeIterator(blk.lang);
-        while (it.next()) |g| {
-            const b = g.bytes(blk.lang);
-            const gw = theme.graphemeWidth(ctx, b);
-            if (4 + lang_w + gw + 2 > box_w) break;
-            lang_w += gw;
-            try cells.append(pa, .{
-                .text = b,
-                .w = gw,
-                .style = theme.code_lang,
-            });
-        }
-        const used: u16 = 4 + lang_w;
-        const pad: u16 = box_w -| used -| 2;
-        var i: u16 = 0;
-        while (i < pad) : (i += 1) {
-            try cells.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
-        }
-        try cells.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
-        try lines.append(pa, .{ .cells = cells.items, .w = box_w });
-    }
+    try appendLangChipLine(pa, ctx, &lines, blk.lang, box_w, nerd_icons);
 
     // ── diff lines, wrapped to `text_w` columns inside the box ──────────────
     for (raw_lines.items) |src| {
@@ -890,6 +893,7 @@ fn buildLinesBase(
     ctx: vxfw.DrawContext,
     para: *Model.Para,
     width: u16,
+    nerd_icons: bool,
 ) ![]const PLine {
     // The width goes to the parser so a TABLE knows how much room it has: a
     // table that does not fit is degraded into `name: value` rows, and that
@@ -921,7 +925,7 @@ fn buildLinesBase(
             // language chip, lines wrapped in │ … │, bottom border. The box is
             // self-contained (its own borders), so it needs no blank separator
             // rows around it — the border IS the separation.
-            const code_lines = try buildCodeBlockLines(pa, ctx, blk, width);
+            const code_lines = try buildCodeBlockLines(pa, ctx, blk, width, nerd_icons);
             for (code_lines) |ln| try lines.append(pa, ln);
             continue;
         }
@@ -931,7 +935,7 @@ fn buildLinesBase(
             // bottom borders, optional language chip, `│ … │` padding. The
             // diff's own per-line colours (green add / red del / grey context)
             // are preserved inside the box.
-            const diff_lines = try buildDiffBlockLines(pa, ctx, blk, width);
+            const diff_lines = try buildDiffBlockLines(pa, ctx, blk, width, nerd_icons);
             for (diff_lines) |ln| try lines.append(pa, ln);
             continue;
         }
@@ -1054,6 +1058,11 @@ pub const PromptDot = struct {
 
 pub const Model = struct {
     allocator: std.mem.Allocator,
+
+    /// Nerd Font language icons in code block chips (`ZODE_NERD_ICONS`). Default
+    /// enabled (`auto`): the language label is always shown, so a missing font
+    /// degrades to a replacement glyph plus a readable label.
+    nerd_icons: bool = true,
 
     /// Whether the terminal window currently has focus. `true` at startup;
     /// `focus_in`/`focus_out` from vaxis flip it, and the composer's caret is
@@ -3008,6 +3017,7 @@ pub const Model = struct {
         const a = self.perm_answer;
         self.perm_active = false;
         self.perm_rule_len = 0;
+        self.perm_suggestion_len = 0;
         self.perm_sandbox_available = false;
         self.permUnlock();
         return a;
@@ -3410,7 +3420,7 @@ pub const Model = struct {
         // Rehydrate if the paragraph was pruned to its compressed form.
         _ = p_.textLive(self.allocator);
 
-        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_, width);
+        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_, width, self.nerd_icons);
         // A blank row BETWEEN paragraphs: without it the history is a wall of
         // text and you can't see where one response ends and another begins.
         //
@@ -7728,7 +7738,7 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             .text = live_src,
             .lang = if (live_kind == .diff) "zig" else "",
         };
-        live_lines = buildLines(ctx.arena, ctx, &live_para, wrap_width) catch &.{};
+        live_lines = buildLines(ctx.arena, ctx, &live_para, wrap_width, self.nerd_icons) catch &.{};
         live_active = live_lines.len > 0;
     }
 
@@ -8945,9 +8955,12 @@ fn drawPermissionModal(
         }
     }
 
-    // Rule that matched
+    // Rule that matched / asked: explain WHY this dialog appeared, not just
+    // show an opaque rule string.
     if (rule.len > 0 and dy < bottom_limit) {
-        _ = p.putClipped(x + inner_x_pad, dy, rule, inner_w, theme.warn);
+        var rbuf: [160]u8 = undefined;
+        const rtext = std.fmt.bufPrint(&rbuf, "asked by rule: {s}", .{rule}) catch rule;
+        _ = p.putClipped(x + inner_x_pad, dy, rtext, inner_w, theme.warn);
         dy += 1;
     }
 
@@ -14100,6 +14113,7 @@ test "a code block's rows all end on the same column" {
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
+    m.nerd_icons = false; // stable marker width for column counting
 
     m.streamStart();
     m.streamDelta("```javascript\nclass MiniReact {\n  constructor() {}\n}\n```");
@@ -14130,6 +14144,41 @@ test "a code block's rows all end on the same column" {
     // Top border, chip, three code rows, bottom border.
     try std.testing.expectEqual(@as(usize, 6), box_rows);
 }
+
+test "code block chip: nerd icons can be disabled and the label is always shown" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    // Disabled: fallback marker and label, same readable behavior as before.
+    {
+        var m = Model.init(std.testing.allocator);
+        defer m.deinit();
+        m.nerd_icons = false;
+        m.streamStart();
+        m.streamDelta("```zig\nconst n = 1;\n```");
+        m.streamEnd();
+        const s = try drawTest(&m, arena_state.allocator(), 60, 20);
+        const text = allText(s);
+        try std.testing.expect(std.mem.indexOf(u8, text, "zig") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\u{259A}") != null); // ▚ fallback marker
+    }
+
+    // Enabled (auto default): mapped language shows its label; the old fallback
+    // marker is replaced by the Nerd Font icon.
+    {
+        var m = Model.init(std.testing.allocator);
+        defer m.deinit();
+        try std.testing.expect(m.nerd_icons);
+        m.streamStart();
+        m.streamDelta("```zig\nconst n = 1;\n```");
+        m.streamEnd();
+        const s = try drawTest(&m, arena_state.allocator(), 60, 20);
+        const text = allText(s);
+        try std.testing.expect(std.mem.indexOf(u8, text, "zig") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "\u{259A}") == null);
+    }
+}
+
 
 test "a code line wider than the box wraps inside it instead of pushing the border" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
