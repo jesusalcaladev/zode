@@ -25,12 +25,17 @@ fn backgroundId(obj: std.json.ObjectMap) !u32 {
 }
 
 /// `bash_output`: the new output plus the status.
-pub fn toolBashOutput(obj: std.json.ObjectMap, arena: std.mem.Allocator, reg: ?*bgproc.Registry) ![]const u8 {
+pub fn toolBashOutput(
+    io: std.Io,
+    obj: std.json.ObjectMap,
+    arena: std.mem.Allocator,
+    reg: ?*bgproc.Registry,
+) ![]const u8 {
     const r = reg orelse return error.NoBackgroundRegistry;
     const id = backgroundId(obj) catch return error.BadArgs;
 
     var out = bgproc.Output{};
-    const text = bgproc.read(r, &out, id) catch |err| switch (err) {
+    const text = bgproc.read(r, io, &out, id) catch |err| switch (err) {
         // `NoNewOutput` is NOT reported as an error string: the model would read
         // it as "the command failed". It is the normal answer to "anything new?".
         error.NoNewOutput => return std.fmt.allocPrint(arena, "[job {d}] still running, nothing new yet", .{id}),

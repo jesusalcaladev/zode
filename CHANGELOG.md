@@ -15,10 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - web fetch/search quality improvements (phase24) [`974bc401`](https://github.com/jesusalcaladev/zode/commit/974bc401)
 - complete recoverable tool results and per-tool render (phase3) [`c7500504`](https://github.com/jesusalcaladev/zode/commit/c7500504)
 - complete Sprint D permissions, hooks, and bash safety (phase6,5,25) [`e8086248`](https://github.com/jesusalcaladev/zode/commit/e8086248)
+- unify background tasks with file output and finish notifications (phase10) [`11f028d9`](https://github.com/jesusalcaladev/zode/commit/11f028d9)
 
 ### Documentation
 
-- mark compaction v2 complete (phase7) [`3f81ecdc`](https://github.com/jesusalcaladev/zode/commit/3f81ecdc)
+- mark compaction v2 complete (phase7) [`5423ba65`](https://github.com/jesusalcaladev/zode/commit/5423ba65)
 
 ## [0.2.0] - 2026-11-07
 

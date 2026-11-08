@@ -829,7 +829,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // goes in as a `user` message after the `tool` results, which is a shape
         // every provider accepts — the alternative, a `tool_result` with no call id,
         // is not a thing.
-        if (auto_check.autoCheckWait(&bg)) |note| {
+        if (auto_check.autoCheckWait(&bg, io)) |note| {
             try msgs.append(arena, .{ .role = "user", .content = note });
             models.dbg("[auto-check] {s}\n", .{note});
         }
@@ -841,7 +841,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // started was still running — so the feature produced nothing on exactly the
     // turns it exists for. This is the one moment blocking is free: the run is over
     // and the answer is about to be printed.
-    if (auto_check.autoCheckWait(&bg)) |note| {
+    if (auto_check.autoCheckWait(&bg, io)) |note| {
         models.dbg("\n[auto-check] {s}\n", .{note});
     }
     printProofLine(&auto_check, gpa);

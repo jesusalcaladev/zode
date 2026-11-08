@@ -315,7 +315,7 @@ pub fn executeWith(
     } else if (std.mem.eql(u8, name, "goal")) {
         return goal_tool.toolGoal(obj, arena);
     } else if (std.mem.eql(u8, name, "bash_output")) {
-        return bg_tool.toolBashOutput(obj, arena, bg);
+        return bg_tool.toolBashOutput(io, obj, arena, bg);
     } else if (std.mem.eql(u8, name, "bash_kill")) {
         return bg_tool.toolBashKill(obj, arena, bg, io);
     } else if (std.mem.eql(u8, name, "sleep")) {
@@ -1853,7 +1853,7 @@ test "check: a FAILED build is never reported as 'no type errors'" {
         "/usr/lib/zig/std/Build/Step/InstallArtifact.zig:64:32: thread 508062 panic: object files have no standard installation procedure\n",
     );
 
-    const out = try check_tool.report(arena, &reg, 7);
+    const out = try check_tool.report(std.testing.io, arena, &reg, 7);
     try std.testing.expect(std.mem.indexOf(u8, out, "no type errors") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FAILED") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "exit 2") != null);
@@ -1872,7 +1872,7 @@ test "check: a PASSING build with no diagnostics says so, and says nothing scary
     reg.slots[0] = .{ .state = .finished, .id = 8, .exit = 0 };
     try reg.slots[0].buf.appendSlice(std.testing.allocator, "Build finished\\n");
 
-    const out = try check_tool.report(arena, &reg, 8);
+    const out = try check_tool.report(std.testing.io, arena, &reg, 8);
     try std.testing.expect(std.mem.indexOf(u8, out, "no type errors") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FAILED") == null);
 }

@@ -457,18 +457,7 @@ pub const AutoCheck = struct {
 
     /// Waits (briefly) for the check and then collects it, for a caller that is
     /// about to finish.
-    ///
-    /// Measured: with the result only read at the START of the next iteration, a
-    /// turn that ended right after the edit collected nothing — the `zig build` it
-    /// had started was still running — and the next turn's reset killed it. So the
-    /// feature produced nothing on exactly the turns it exists for, which is worse
-    /// than not having it: the model would say "done" about code nobody compiled.
-    ///
-    /// The cap is not a guess about how long a build takes: a build longer than this
-    /// is a build the user is watching, the job keeps running, and the next turn
-    /// reads it. What must not happen is answering about code whose only compile
-    /// check is still in flight.
-    pub fn autoCheckWait(self: *AutoCheck, reg: *bgproc.Registry) ?[]const u8 {
+    pub fn autoCheckWait(self: *AutoCheck, reg: *bgproc.Registry, io: std.Io) ?[]const u8 {
         if (self.job == 0) return null;
         var waited_ms: u32 = 0;
         while (waited_ms < auto_check_wait_ms) {
@@ -476,7 +465,7 @@ pub const AutoCheck = struct {
             sleep_mod.nap(50);
             waited_ms += 50;
         }
-        return self.collect(reg);
+        return self.collect(reg, io);
     }
 
     /// The result, if it is ready, as text for the model. Null while it runs.
@@ -491,7 +480,7 @@ pub const AutoCheck = struct {
     /// Every exit updates `gate` with the verdict AND with how many writes the check
     /// was looking at. Without the second number a green is a green forever, and a
     /// model that fixed the build and then edited a second file gets believed.
-    pub fn collect(self: *AutoCheck, reg: *bgproc.Registry) ?[]const u8 {
+    pub fn collect(self: *AutoCheck, reg: *bgproc.Registry, io: std.Io) ?[]const u8 {
         const id = self.job;
         if (id == 0) return null;
         if (std.mem.eql(u8, bgproc.stateWord(reg, id), "running")) return null;
@@ -499,7 +488,7 @@ pub const AutoCheck = struct {
         var out = bgproc.Output{};
         // No header: it is zode's own `[zig build] finished exit=1` line, and a scan
         // for `file:line: error:` finds the whole command inside it.
-        const text = bgproc.readNoHeader(reg, &out, id) catch return null;
+        const text = bgproc.readNoHeader(reg, io, &out, id) catch return null;
         // Consumed either way: a job that has been read is done, and leaving the id
         // set would make the NEXT edit report the previous turn's errors.
         self.job = 0;
@@ -709,7 +698,6 @@ pub const AutoCheck = struct {
 
     /// Wait for what is in flight, collect it, and ask the pure rule.
     fn decideNow(self: *AutoCheck, reg: *bgproc.Registry, io: std.Io) exitgate.Decision {
-        _ = io;
         if (self.job != 0) {
             var waited_ms: u32 = 0;
             while (waited_ms < auto_check_wait_ms) {
@@ -717,7 +705,7 @@ pub const AutoCheck = struct {
                 sleep_mod.nap(50);
                 waited_ms += 50;
             }
-            _ = self.collect(reg);
+            _ = self.collect(reg, io);
         }
         const d = self.gate.decide();
         // A check still in flight at the cap is neither red nor green: it is unknown.

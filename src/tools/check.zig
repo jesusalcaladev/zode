@@ -156,7 +156,7 @@ pub fn toolCheck(
         // aborts the whole process. See `backgroundId` in bg.zig.
         if (id_i <= 0) return error.MissingId;
         if (id_i > std.math.maxInt(u32)) return error.IdOutOfRange;
-        return report(arena, reg orelse return error.NoBackgroundRegistry, @intCast(id_i));
+        return report(io, arena, reg orelse return error.NoBackgroundRegistry, @intCast(id_i));
     }
 
     const subdir = common.getStr(obj, "subdir") orelse ".";
@@ -190,14 +190,14 @@ pub fn toolCheck(
 }
 
 /// The second half of `check`: what the job printed, as errors with locations.
-pub fn report(arena: std.mem.Allocator, reg: *bgproc.Registry, id: u32) ![]const u8 {
+pub fn report(io: std.Io, arena: std.mem.Allocator, reg: *bgproc.Registry, id: u32) ![]const u8 {
     var out = bgproc.Output{};
     // `readNoHeader` and NOT `read`: the header is zode's own line
     // `[zig build] finished exit=1`, and a scanner looking for `file:line: error:`
     // finds the whole command inside it. That is not a cosmetic problem — the
     // probe reported one more "error" than the build had, and the model is told to
     // fix every line it is given.
-    const text = bgproc.readNoHeader(reg, &out, id) catch |err| switch (err) {
+    const text = bgproc.readNoHeader(reg, io, &out, id) catch |err| switch (err) {
         error.NoNewOutput => return std.fmt.allocPrint(arena, "the check is still running, nothing new yet. Keep working and ask again later.", .{}),
         error.UnknownJob => return std.fmt.allocPrint(arena, "no check job {d}.", .{id}),
     };

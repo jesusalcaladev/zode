@@ -32,7 +32,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
   **2.1 done** (budget listing); **2.2 done** (skills once per session at end of prompt);
   **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
   **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
-- [ ] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks) — **3 done, 7 done**; Phase 10 pending.
+- [x] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks) — complete.
 - [x] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety) — Phase 6 rule engine (permrules/load/enforce) + Phase 5 hooks (`.zode/hooks.json`, Pre/Post/UserPromptSubmit/Stop, `if` via permission-rule syntax) + Phase 25 bash classification/sandbox offer complete.
 - [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
   **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
@@ -130,9 +130,9 @@ state, the open bug and the quality bar).
 
 `⚡ · 🟡 · depends on 3 · bgproc is ~70% there`
 
-- [ ] Unify `bgproc` + `bash_output` into one task registry: output written to a file, incremental polling
-- [ ] **Notification to the model when a task finishes** (a system event, not polling)
-- [ ] Tests: a finished task notifies once · incremental output returns only what is new · a killed task reports its terminal state
+- [x] Unify `bgproc` + `bash_output` into one task registry: output written to a file, incremental polling (`bgproc` session-isolated `bg-tasks/<stem>/bg-<id>.out` files, file cursor/incremental reads via `bash_output`/`check`/autochk; legacy in-memory path preserved for tests/compat).
+- [x] **Notification to the model when a task finishes** (a system event, not polling): `bgproc.drainCompletions` reports terminal jobs once; agent drains and injects `[background task finished]` harness prompts at loop iterations (not model polling).
+- [x] Tests: a finished task notifies once · incremental output returns only what is new · a killed task reports its terminal state (`src/bgproc.zig` Phase 10 tests; full suite green).
 
 ---
 

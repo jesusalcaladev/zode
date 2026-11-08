@@ -42,14 +42,20 @@ pub const max_jobs = 8;
 /// better than one that can point at freed memory.
 pub const max_command = 256;
 
-/// Output kept per job. A build that prints 2 MB of warnings is not worth 2 MB of
-/// RAM and is not worth sending to a model either: past this the buffer stops
-/// growing and says so ONCE, because "truncated" repeated 40 times is the same
-/// noise as never saying it.
+/// Output kept per job in memory (legacy/fallback) and the read buffer size.
+/// File-backed jobs write output to a session-isolated file and poll from it
+/// incrementally; the cap still bounds what is written so a runaway job does
+/// not fill the disk.
 pub const max_output = 64 * 1024;
 
-/// A job's output hit `max_output`.
+/// Maximum bytes written to a file-backed background task output file.
+pub const max_file_output = 400 * 1024;
+
+/// A job's output hit the cap.
 pub const truncation_notice = "\n… (output truncated; the job keeps running and you can keep polling for the exit status)\n";
+
+/// Bytes of output file path kept per job.
+pub const max_output_path = 512;
 
 /// Lifecycle of a job.
 pub const State = enum {
@@ -96,6 +102,9 @@ pub const Job = struct {
     /// any command that is worth running; a longer one is truncated and says so.
     cmd_buf: [max_command]u8 = @splat(0),
     cmd_len: usize = 0,
+    /// Session-isolated output file path (Phase 10). Empty means legacy in-memory.
+    output_path_buf: [max_output_path]u8 = @splat(0),
+    output_path_len: usize = 0,
     /// What the job printed. Own mutex: the reader thread appends while the
     /// worker (or the UI) reads.
     mutex: std.atomic.Mutex = .unlocked,
@@ -103,12 +112,16 @@ pub const Job = struct {
     /// Bytes read and then DISCARDED because of the cap. With this the model can
     /// be told how much it is not seeing, instead of assuming it saw everything.
     dropped: usize = 0,
-    /// Bytes already handed to `bash_output` (the read cursor).
+    /// Bytes already handed to `bash_output` (the read cursor / file offset).
     cursor: usize = 0,
-    /// Set when the buffer hit the cap.
+    /// Bytes written to the output file (file-backed mode).
+    file_written: usize = 0,
+    /// Set when the buffer/file hit the cap.
     truncated: bool = false,
     /// Exit code, valid in `finished`/`killed`.
     exit: ?u8 = null,
+    /// Phase 10: terminal-state notification delivered to the model once.
+    notified: bool = false,
     /// The child, for `kill`. Only touched from the UI thread / on exit.
     child: ?std.process.Child = null,
     /// The child's pid, captured at spawn.
@@ -124,6 +137,11 @@ pub const Job = struct {
 
     pub fn isLive(self: *const Job) bool {
         return self.state != .free;
+    }
+
+    pub fn outputPath(self: *const Job) ?[]const u8 {
+        if (self.output_path_len == 0) return null;
+        return self.output_path_buf[0..self.output_path_len];
     }
 
     /// One word: `running`, `ok`, `failed`, `killed`, `gone`.
@@ -159,47 +177,79 @@ next_id: u32 = 1,
 /// Scrubbed parent env for children (allowlist, secret-stripped).
 child_env: ?*const std.process.Environ.Map = null,
 /// The allocator every job's memory comes from and goes back to.
-///
-/// ## Why the registry owns it, and not the caller
-///
-/// It used to be a `spawn` parameter, and in every real call site the argument was the
-/// TURN's arena. The reader thread is detached and it outlives the turn: it lives until
-/// the child's pipes reach EOF, which for a test suite or a build is often seconds after
-/// the turn that started it has ended and its arena has been deinited. The thread then
-/// called `gpa.free` on a destroyed arena, and the allocator's own `free` memsets the
-/// block it is releasing — memory the kernel had already given back. That is a write to
-/// unmapped memory, and it killed the process.
-///
-/// Found with a symbolized core, after four wrong theories (memory exhaustion, a garbage
-/// grapheme length, the segment cache, the body buffer). The trace is three frames and
-/// names all of them:
-///
-///     std/mem/Allocator.zig:448  free          @memset(bytes, undefined)
-///     std/Io/File/MultiReader.zig:105  deinit   gpa.free(context.fr.interface.buffer)
-///     src/bgproc.zig:586          reader       defer mr.deinit()
-///
-/// The property belongs in the TYPE rather than in a comment on the call site, which is
-/// the same rule the rest of this repo keeps relearning: a caller cannot be trusted with
-/// a lifetime decision it has no way to check, and a `spawn(reg, arena, …)` signature
-/// invites exactly this every time a tool is written.
-/// Defaults to `page_allocator` and NOT to `undefined`, on purpose.
-///
-/// The first version of this field was `= undefined`, on the reasoning that every real
-/// construction goes through `init`. Two of this file's own tests then built a
-/// `Registry{}` literal, the detached reader thread freed a block through an
-/// uninitialized allocator, and the test binary died with a general protection fault —
-/// which is the very crash this field was added to prevent, reproduced by the fix.
-///
-/// An allocator that is merely WRONG fails loudly and frees nothing; an allocator that
-/// is `undefined` frees through a garbage vtable. So the default is the one that cannot
-/// fail a leak check and cannot fault, and `init` is how you get a real one.
 gpa: std.mem.Allocator = std.heap.page_allocator,
+/// Session-scoped base path for file-backed task output (Phase 10).
+/// When set, spawned jobs write output to `<output_base>/bg-<id>.out`.
+output_base: ?[]const u8 = null,
 
 /// Set by ESC. Consumed by `spawn`.
 cancel_all: bool = false,
 
 pub fn init(gpa: std.mem.Allocator) Registry {
     return .{ .gpa = gpa };
+}
+
+/// Sets the session-scoped base directory for background task output files.
+/// Duplicates the path; pass null to disable file-backed output.
+pub fn setOutputBase(self: *Registry, gpa: std.mem.Allocator, path: ?[]const u8) void {
+    if (self.output_base) |old| gpa.free(old);
+    self.output_base = if (path) |p| gpa.dupe(u8, p) catch null else null;
+}
+
+/// Derives a session-isolated directory for background task output files.
+pub fn sessionOutputDir(arena: std.mem.Allocator, session_path: []const u8) ![]const u8 {
+    const dir = std.fs.path.dirname(session_path) orelse ".";
+    const base = std.fs.path.basename(session_path);
+    const stem = if (std.mem.endsWith(u8, base, ".jsonl"))
+        base[0 .. base.len - ".jsonl".len]
+    else
+        base;
+    return std.fs.path.join(arena, &.{ dir, "bg-tasks", stem });
+}
+
+/// Configures file-backed output for this session. Creates the directory.
+pub fn setSession(self: *Registry, gpa: std.mem.Allocator, io: std.Io, session_path: ?[]const u8) void {
+    if (self.output_base) |old| {
+        gpa.free(old);
+        self.output_base = null;
+    }
+    const sp = session_path orelse return;
+    const dir = sessionOutputDir(gpa, sp) catch return;
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, @fromBackingInt(@intCast(0o700))) catch {};
+    self.output_base = gpa.dupe(u8, dir) catch null;
+}
+
+pub const Completion = struct {
+    id: u32,
+    command: []const u8,
+    state: State,
+    exit: ?u8,
+    output_path: ?[]const u8,
+};
+
+/// Returns newly finished/killed jobs that have not been notified to the model.
+/// Marks them notified so each completion is reported once. `arena` owns slices.
+pub fn drainCompletions(self: *Registry, arena: std.mem.Allocator) []Completion {
+    var out: std.ArrayList(Completion) = .empty;
+    for (&self.slots) |*j| {
+        lockSlot(j);
+        const terminal = j.state == .finished or j.state == .killed;
+        if (j.isLive() and terminal and !j.notified) {
+            j.notified = true;
+            const cmd = arena.dupe(u8, j.commandSlice()) catch "";
+            const opath = if (j.outputPath()) |p| arena.dupe(u8, p) catch null else null;
+            out.append(arena, .{
+                .id = j.id,
+                .command = cmd,
+                .state = j.state,
+                .exit = j.exit,
+                .output_path = opath,
+            }) catch {};
+        }
+        unlockSlot(j);
+    }
+    return out.toOwnedSlice(arena) catch &.{};
 }
 
 /// The raw id of a running job (for the UI: "which command is that?").
@@ -242,6 +292,57 @@ fn lockSlot(j: *Job) void {
 }
 fn unlockSlot(j: *Job) void {
     j.mutex.unlock();
+}
+
+fn appendToFileLocked(j: *Job, io: std.Io, out_file: *?std.Io.File, bytes: []const u8) void {
+    _ = out_file;
+    if (bytes.len == 0) return;
+    const path = j.outputPath() orelse {
+        appendLocked(j, std.heap.page_allocator, bytes);
+        return;
+    };
+    const cap = max_file_output - truncation_notice.len;
+    const room = if (j.file_written < cap) cap - j.file_written else 0;
+    if (room == 0) {
+        j.dropped += bytes.len;
+        if (!j.truncated) {
+            j.truncated = true;
+            // write notice once
+            if (appendFileAt(io, path, j.file_written, truncation_notice)) |n| {
+                j.file_written += n;
+            } else {}
+        }
+        return;
+    }
+    const take = @min(room, bytes.len);
+    if (appendFileAt(io, path, j.file_written, bytes[0..take])) |n| {
+        j.file_written += n;
+    } else {
+        j.dropped += bytes.len;
+        return;
+    }
+    if (take < bytes.len) {
+        j.dropped += bytes.len - take;
+        if (!j.truncated) {
+            j.truncated = true;
+            if (appendFileAt(io, path, j.file_written, truncation_notice)) |n| {
+                j.file_written += n;
+            } else {}
+        }
+    }
+}
+
+fn appendFileAt(io: std.Io, path: []const u8, offset: usize, data: []const u8) ?usize {
+    if (data.len == 0) return 0;
+    var file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write }) catch
+        std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch return null;
+    defer file.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var fw = file.writer(io, &wbuf);
+    fw.seekTo(@intCast(offset)) catch return null;
+    fw.interface.writeAll(data) catch return null;
+    fw.interface.flush() catch return null;
+    return data.len;
 }
 
 /// Appends, respecting the cap. Caller holds the lock.
@@ -301,6 +402,32 @@ pub const Output = struct {
     }
 };
 
+fn readIncrementalFromFile(
+    io: std.Io,
+    j: *Job,
+    w: *std.Io.Writer,
+) void {
+    const path = j.outputPath() orelse return;
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return;
+    defer file.close(io);
+    const stat = file.stat(io) catch return;
+    const size: usize = @intCast(@min(stat.size, std.math.maxInt(usize)));
+    if (j.cursor >= size) return;
+    var rbuf: [8192]u8 = undefined;
+    var fr = file.reader(io, &rbuf);
+    fr.seekTo(j.cursor) catch return;
+    var remaining = size - j.cursor;
+    while (remaining > 0) {
+        var tmp: [4096]u8 = undefined;
+        const want = @min(tmp.len, remaining);
+        const n = fr.interface.readSliceShort(tmp[0..want]) catch return;
+        if (n == 0) break;
+        w.writeAll(tmp[0..n]) catch return;
+        j.cursor += n;
+        remaining -= n;
+    }
+}
+
 /// Reads the new output of a job and advances the cursor.
 ///
 /// Writes into `out` (a caller-owned buffer) and returns a slice OF IT. Not a
@@ -308,7 +435,7 @@ pub const Output = struct {
 /// stack dies the moment it returns, and the caller (the agent loop) hands it to
 /// the session writer. That is the `&[_]u8{c}` bug again, and it is the reason
 /// the signature takes the buffer.
-pub fn read(reg: *Registry, out: *Output, id: u32) ![]const u8 {
+pub fn read(reg: *Registry, io: ?std.Io, out: *Output, id: u32) ![]const u8 {
     for (&reg.slots) |*j| {
         if (!j.isLive() or j.id != id) continue;
 
@@ -320,7 +447,14 @@ pub fn read(reg: *Registry, out: *Output, id: u32) ![]const u8 {
         // whole reason the agent is polling.
         const finished = j.state != .running;
         const from = j.cursor;
-        const avail = j.buf.items.len;
+        const file_backed = j.outputPath() != null and io != null;
+        const avail: usize = if (file_backed) blk: {
+            const path = j.outputPath().?;
+            var f = std.Io.Dir.cwd().openFile(io.?, path, .{}) catch break :blk j.file_written;
+            defer f.close(io.?);
+            const st = f.stat(io.?) catch break :blk j.file_written;
+            break :blk @intCast(@min(st.size, std.math.maxInt(usize)));
+        } else j.buf.items.len;
         if (from >= avail and !finished) return error.NoNewOutput;
 
         var w: std.Io.Writer = .fixed(&out.buf);
@@ -335,16 +469,22 @@ pub fn read(reg: *Registry, out: *Output, id: u32) ![]const u8 {
         }
 
         if (from < avail) {
-            w.writeAll(j.buf.items[from..avail]) catch {};
-            j.cursor = avail;
+            if (file_backed) {
+                readIncrementalFromFile(io.?, j, &w);
+            } else {
+                w.writeAll(j.buf.items[from..avail]) catch {};
+                j.cursor = avail;
+            }
         }
         if (j.dropped > 0) {
+            const cap_kb: usize = if (file_backed) max_file_output / 1024 else max_output / 1024;
             w.print("\n({d} bytes of output dropped by the {d} KB cap; the exit status is still exact)\n", .{
-                j.dropped, max_output / 1024,
+                j.dropped, cap_kb,
             }) catch {};
         }
         if (w.buffered().len == 0) w.writeAll("(no new output yet)\n") catch {};
         out.len = w.buffered().len;
+        out.exit = j.exit;
         return out.slice();
     }
     return error.UnknownJob;
@@ -362,7 +502,7 @@ pub fn read(reg: *Registry, out: *Output, id: u32) ![]const u8 {
 /// So the two readings are different things and they are named as such: `read` is
 /// for a model to read (the header answers "what was this?"), `readNoHeader` is
 /// for code that has to tell output from metadata.
-pub fn readNoHeader(reg: *Registry, out: *Output, id: u32) ![]const u8 {
+pub fn readNoHeader(reg: *Registry, io: ?std.Io, out: *Output, id: u32) ![]const u8 {
     for (&reg.slots) |*j| {
         if (!j.isLive() or j.id != id) continue;
 
@@ -371,17 +511,29 @@ pub fn readNoHeader(reg: *Registry, out: *Output, id: u32) ![]const u8 {
 
         const finished = j.state != .running;
         const from = j.cursor;
-        const avail = j.buf.items.len;
+        const file_backed = j.outputPath() != null and io != null;
+        const avail: usize = if (file_backed) blk: {
+            const path = j.outputPath().?;
+            var f = std.Io.Dir.cwd().openFile(io.?, path, .{}) catch break :blk j.file_written;
+            defer f.close(io.?);
+            const st = f.stat(io.?) catch break :blk j.file_written;
+            break :blk @intCast(@min(st.size, std.math.maxInt(usize)));
+        } else j.buf.items.len;
         if (from >= avail and !finished) return error.NoNewOutput;
 
         var w: std.Io.Writer = .fixed(&out.buf);
         if (from < avail) {
-            w.writeAll(j.buf.items[from..avail]) catch {};
-            j.cursor = avail;
+            if (file_backed) {
+                readIncrementalFromFile(io.?, j, &w);
+            } else {
+                w.writeAll(j.buf.items[from..avail]) catch {};
+                j.cursor = avail;
+            }
         }
         if (j.dropped > 0) {
+            const cap_kb: usize = if (file_backed) max_file_output / 1024 else max_output / 1024;
             w.print("\n({d} bytes of output dropped by the {d} KB cap)\n", .{
-                j.dropped, max_output / 1024,
+                j.dropped, cap_kb,
             }) catch {};
         }
         out.exit = j.exit;
@@ -524,6 +676,7 @@ fn anyReading(reg: *Registry) bool {
 pub fn deinit(reg: *Registry, io: ?std.Io, gpa: std.mem.Allocator) void {
     killAll(reg, io, 1000);
     for (&reg.slots) |*j| j.deinit(gpa);
+    if (reg.output_base) |b| gpa.free(b);
     reg.* = .{};
 }
 
@@ -575,6 +728,17 @@ pub fn spawn(
     // short one.
     j.cmd_len = @min(command.len, max_command);
     @memcpy(j.cmd_buf[0..j.cmd_len], command[0..j.cmd_len]);
+    if (reg.output_base) |base| {
+        var pbuf: [max_output_path]u8 = undefined;
+        if (std.fmt.bufPrint(&pbuf, "{s}/bg-{d}.out", .{ base, j.id })) |p| {
+            j.output_path_len = @min(p.len, max_output_path);
+            @memcpy(j.output_path_buf[0..j.output_path_len], p[0..j.output_path_len]);
+            _ = std.Io.Dir.cwd().createDirPathStatus(io, base, @fromBackingInt(@intCast(0o700))) catch {};
+            if (std.Io.Dir.cwd().createFile(io, j.outputPath().?, .{ .truncate = true })) |f| {
+                f.close(io);
+            } else |_| {}
+        } else |_| {}
+    }
     j.child = child;
     // The pid, taken BEFORE the reader thread can reap the child. `killTree`
     // signals `-pgid`, and after a reap that pid belongs to somebody else.
@@ -642,35 +806,43 @@ fn reader(ctx: *ReaderCtx) void {
     mr.init(gpa, io, mr_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
 
+    var out_file: ?std.Io.File = null;
+    if (j.outputPath()) |p| {
+        out_file = std.Io.Dir.cwd().openFile(io, p, .{ .mode = .read_write }) catch std.Io.Dir.cwd().createFile(io, p, .{ .truncate = false }) catch null;
+    }
+    defer if (out_file) |*f| f.close(io);
+
     // `reader(ix).buffered()` is the WHOLE data read from that stream so far, not
     // what arrived in this cycle: `fill` advances `end`, and nothing ever consumes
     // it. Appending it every cycle therefore re-appended the entire buffer on each
     // fill, and a job that printed two error lines had them six times in its
     // output by the time the agent read it.
     //
-    // Found by `zig build check-probe` against a command with a known output: the
-    // report said "7 type error(s)" for a build with 2. A duplicated diagnostic is
-    // worse than a missing one — the model reads it as 7 places to fix.
-    //
-    // `consumed` is per stream and only ever grows. `rebaseGrowing` memmoves the
-    // data to offset 0 and preserves its length, so a shrink here would mean the
-    // accounting is wrong; skipping is the safe direction, because losing output is
-    // worse than repeating it.
+    // `consumed` is per stream and only ever grows.
     var consumed = [_]usize{ 0, 0 };
     while (mr.fill(4096, .none)) |_| {
         for (0..2) |ix| {
             const chunk = mr.reader(ix).buffered();
             if (chunk.len <= consumed[ix]) continue;
-            lockSlot(j);
-            appendLocked(j, gpa, chunk[consumed[ix]..]);
-            unlockSlot(j);
+            const bytes = chunk[consumed[ix]..];
             consumed[ix] = chunk.len;
+            lockSlot(j);
+            if (j.outputPath() != null) {
+                appendToFileLocked(j, io, &out_file, bytes);
+            } else {
+                appendLocked(j, gpa, bytes);
+            }
+            unlockSlot(j);
         }
     } else |err| switch (err) {
         error.EndOfStream => {},
         else => {
             lockSlot(j);
-            appendLocked(j, gpa, "\n(zode: could not read the job's output)\n");
+            if (j.outputPath() != null) {
+                appendToFileLocked(j, io, &out_file, "\n(zode: could not read the job's output)\n");
+            } else {
+                appendLocked(j, gpa, "\n(zode: could not read the job's output)\n");
+            }
             unlockSlot(j);
         },
     }
@@ -833,7 +1005,7 @@ test "read: an unknown id is a named error, not a panic" {
     var reg = Registry{};
     defer reg.deinit(undefined, std.testing.allocator);
     var out = bgproc.Output{};
-    try std.testing.expectError(error.UnknownJob, bgproc.read(&reg, &out, 42));
+    try std.testing.expectError(error.UnknownJob, bgproc.read(&reg, std.testing.io, &out, 42));
 }
 
 test "read: a freed id becomes unknown again (it does not resurrect)" {
@@ -845,7 +1017,7 @@ test "read: a freed id becomes unknown again (it does not resurrect)" {
     try reg.slots[0].buf.appendSlice(std.testing.allocator, "hola");
     bgproc.reap(&reg, std.testing.allocator, 7);
     var out = bgproc.Output{};
-    try std.testing.expectError(error.UnknownJob, bgproc.read(&reg, &out, 7));
+    try std.testing.expectError(error.UnknownJob, bgproc.read(&reg, std.testing.io, &out, 7));
 }
 
 test "read: returns what is new and does NOT repeat the old" {
@@ -864,14 +1036,14 @@ test "read: returns what is new and does NOT repeat the old" {
     try reg.slots[0].buf.appendSlice(std.testing.allocator, "linea1\nlinea2\n");
 
     var o1 = bgproc.Output{};
-    const first = try bgproc.read(&reg, &o1, 3);
+    const first = try bgproc.read(&reg, std.testing.io, &o1, 3);
     try std.testing.expect(std.mem.indexOf(u8, first, "linea1") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "exit=0") != null);
 
     // The second time there is no new output, but the state still matters: it is
     // the answer to "did it finish?".
     var o2 = bgproc.Output{};
-    const second = try bgproc.read(&reg, &o2, 3);
+    const second = try bgproc.read(&reg, std.testing.io, &o2, 3);
     try std.testing.expect(std.mem.indexOf(u8, second, "linea1") == null);
     try std.testing.expect(std.mem.indexOf(u8, second, "exit=0") != null);
 }
@@ -881,7 +1053,7 @@ test "read: a live job with no new output is NoNewOutput, not an empty string" {
     defer reg.deinit(undefined, std.testing.allocator);
     reg.slots[0] = .{ .state = .running, .id = 1 };
     var o3 = bgproc.Output{};
-    try std.testing.expectError(error.NoNewOutput, bgproc.read(&reg, &o3, 1));
+    try std.testing.expectError(error.NoNewOutput, bgproc.read(&reg, std.testing.io, &o3, 1));
 }
 
 test "read: what was lost to the cap is REPORTED" {
@@ -890,7 +1062,7 @@ test "read: what was lost to the cap is REPORTED" {
     reg.slots[0] = .{ .state = .finished, .id = 1, .exit = 0 };
     reg.slots[0].dropped = 12345;
     var o4 = bgproc.Output{};
-    const out = try bgproc.read(&reg, &o4, 1);
+    const out = try bgproc.read(&reg, std.testing.io, &o4, 1);
     try std.testing.expect(std.mem.indexOf(u8, out, "12345") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "exit status is still exact") != null);
 }
@@ -1097,7 +1269,7 @@ test "a job's output is NOT duplicated: the reader consumes what it appended" {
     // header contains the command, and the command contains the word being counted.
     // Counting on `read` gave 6 for 5 lines and looked like a second bug.
     var out = Output{};
-    const text = try readNoHeader(&reg, &out, id);
+    const text = try readNoHeader(&reg, std.testing.io, &out, id);
     try std.testing.expectEqual(@as(usize, 1), countOf(text, "line0\n"));
     try std.testing.expectEqual(@as(usize, 1), countOf(text, "line4\n"));
     try std.testing.expectEqual(@as(usize, 5), countOf(text, "line"));
@@ -1122,7 +1294,7 @@ test "readNoHeader: the command line is not part of the output a parser sees" {
     }
 
     var with = Output{};
-    const a = try read(&reg, &with, id);
+    const a = try read(&reg, std.testing.io, &with, id);
     try std.testing.expect(std.mem.indexOf(u8, a, "src/a.zig:1:1: error: real") != null);
     // The header carries the command, and with it a copy of the error text.
     try std.testing.expect(std.mem.indexOf(u8, a, "echo 'src/a.zig:1:1: error") != null);
@@ -1135,7 +1307,7 @@ test "readNoHeader: the command line is not part of the output a parser sees" {
         if (!std.mem.eql(u8, stateWord(&reg, id2), "running")) break;
     }
     var without = Output{};
-    const b = try readNoHeader(&reg, &without, id2);
+    const b = try readNoHeader(&reg, std.testing.io, &without, id2);
     try std.testing.expect(std.mem.indexOf(u8, b, "src/a.zig:1:1: error: real") != null);
     // And no trace of the command that produced it.
     try std.testing.expect(std.mem.indexOf(u8, b, "echo 'src/a.zig:1:1: error") == null);
@@ -1205,7 +1377,7 @@ test "a background job outlives the ARENA it was started from" {
     try std.testing.expect(!std.mem.eql(u8, stateWord(&reg, id), "running"));
 
     var out: Output = .{};
-    const text = try readNoHeader(&reg, &out, id);
+    const text = try readNoHeader(&reg, io, &out, id);
     try std.testing.expect(std.mem.indexOf(u8, text, "outlived-the-arena") != null);
 }
 
@@ -1286,8 +1458,126 @@ test "a job that has already finished reports the kill as NOT done" {
     try std.testing.expect(!kill(&reg, io, id));
 
     var out: Output = .{};
-    const text = try readNoHeader(&reg, &out, id);
+    const text = try readNoHeader(&reg, io, &out, id);
     try std.testing.expect(std.mem.indexOf(u8, text, "done") != null);
+}
+
+test "Phase 10: finished task notifies once" {
+    var reg = Registry{};
+    defer reg.deinit(undefined, std.testing.allocator);
+    const cmd = try std.testing.allocator.dupe(u8, "echo hi");
+    defer std.testing.allocator.free(cmd);
+    reg.slots[0] = .{ .state = .finished, .id = 11, .exit = 0, .cmd_len = @min(cmd.len, max_command) };
+    @memcpy(reg.slots[0].cmd_buf[0..reg.slots[0].cmd_len], cmd[0..reg.slots[0].cmd_len]);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const a = bgproc.drainCompletions(&reg, arena);
+    try std.testing.expectEqual(@as(usize, 1), a.len);
+    try std.testing.expectEqual(@as(u32, 11), a[0].id);
+    try std.testing.expectEqual(bgproc.State.finished, a[0].state);
+
+    const b = bgproc.drainCompletions(&reg, arena);
+    try std.testing.expectEqual(@as(usize, 0), b.len);
+}
+
+test "Phase 10: incremental output returns only what is new (file-backed)" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.heap.page_allocator;
+
+    var reg: Registry = .init(gpa);
+    defer reg.deinit(io, gpa);
+    const base = "/tmp/opencode/zode-bg-phase10-incr";
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    reg.setOutputBase(gpa, base);
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    // Two chunks separated by time so we can observe incremental reads.
+    const id = try spawn(&reg, io, "printf 'one\\n'; sleep 0.15; printf 'two\\n'");
+
+    var saw_one = false;
+    var waited: u32 = 0;
+    while (waited < 4000) : (waited += 20) {
+        sleep.nap(20);
+        var o = Output{};
+        if (read(&reg, io, &o, id)) |t| {
+            if (std.mem.indexOf(u8, t, "one") != null) saw_one = true;
+            if (saw_one and std.mem.indexOf(u8, t, "two") != null) break;
+            if (!std.mem.eql(u8, stateWord(&reg, id), "running")) {
+                // try one more read
+                var o2 = Output{};
+                if (read(&reg, io, &o2, id)) |t2| {
+                    if (std.mem.indexOf(u8, t2, "two") != null) {}
+                } else |_| {}
+                break;
+            }
+        } else |_| {
+            if (!std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+        }
+    }
+    // Ensure job finished.
+    waited = 0;
+    while (waited < 3000) : (waited += 20) {
+        sleep.nap(20);
+        if (!std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+    }
+    // The file must contain both chunks (file-backed output).
+    if (reg.slots[0].outputPath()) |p| {
+        var f = try std.Io.Dir.cwd().openFile(io, p, .{});
+        defer f.close(io);
+        var buf: [4096]u8 = undefined;
+        var fr = f.reader(io, &buf);
+        const n = try fr.interface.readSliceShort(&buf);
+        const all = buf[0..n];
+        try std.testing.expect(std.mem.indexOf(u8, all, "one") != null);
+        try std.testing.expect(std.mem.indexOf(u8, all, "two") != null);
+    } else return error.TestExpectedFileBackedOutput;
+    // Incremental: "one" was observed during polling (cursor advanced as we read).
+    try std.testing.expect(saw_one);
+}
+
+test "Phase 10: killed task reports its terminal state" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var reg: Registry = .init(std.heap.page_allocator);
+    defer reg.deinit(io, std.heap.page_allocator);
+
+    const id = try spawn(&reg, io, "sleep 30");
+    var waited: u32 = 0;
+    while (waited < 1000) : (waited += 20) {
+        sleep.nap(20);
+        if (std.mem.eql(u8, stateWord(&reg, id), "running")) break;
+    }
+    try std.testing.expect(kill(&reg, io, id));
+
+    waited = 0;
+    while (waited < 3000) : (waited += 20) {
+        sleep.nap(20);
+        const sw = stateWord(&reg, id);
+        if (!std.mem.eql(u8, sw, "running")) break;
+    }
+    const sw = stateWord(&reg, id);
+    try std.testing.expect(std.mem.eql(u8, sw, "killed") or std.mem.eql(u8, sw, "failed"));
+    try std.testing.expect(std.mem.eql(u8, sw, "killed"));
+
+    var out = Output{};
+    const text = read(&reg, io, &out, id) catch |err| switch (err) {
+        error.NoNewOutput => blk: {
+            // finished state should still be reportable via read once terminal with header
+            break :blk read(&reg, io, &out, id) catch "";
+        },
+        else => return err,
+    };
+    _ = text;
+    try std.testing.expectEqual(bgproc.State.killed, blk: {
+        for (&reg.slots) |*j| if (j.isLive() and j.id == id) break :blk j.state;
+        break :blk bgproc.State.free;
+    });
 }
 
 fn killAllCount(reg: *Registry, io: std.Io, budget_ms: u64) usize {

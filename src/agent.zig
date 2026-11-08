@@ -3343,6 +3343,7 @@ test "shutdownUserConfig: after it, no key is readable through the pointer" {
 pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Session {
     if (session) |s| {
         m.session = s;
+        m.bg.setSession(m.allocator, io_global, s.path);
         return s;
     }
     _ = arena;
@@ -3353,12 +3354,14 @@ pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Sessi
         s.* = session_mod.Session.init(m.allocator);
         session = s;
         m.session = s;
+        m.bg.setSession(m.allocator, io_global, null);
         cache_stats.session = .{};
         compact_bg = .{};
         return s;
     };
     session = fresh;
     m.session = fresh;
+    m.bg.setSession(m.allocator, io_global, fresh.path);
     cache_stats.session = .{};
     compact_bg = .{};
     return fresh;
@@ -3859,6 +3862,8 @@ pub fn bootstrapSession(m: *tui.Model) void {
         if (latest) |path| {
             if (session_mod.Session.resumePath(m.allocator, io_global, path)) |s| {
                 session = s;
+                m.session = s;
+                m.bg.setSession(m.allocator, io_global, s.path);
                 cache_stats.session = s.usage_stats;
                 const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
                     "session resumed";
@@ -4829,6 +4834,7 @@ fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
     };
     session = s;
     m.session = s;
+    m.bg.setSession(m.allocator, io_global, s.path);
     cache_stats.session = s.usage_stats;
     session_elided = 0;
     resetSummaries();
@@ -5154,6 +5160,37 @@ fn pipelineApplies(m: *tui.Model, user_text: []const u8) bool {
     };
 }
 
+fn drainBackgroundTaskNotifications(m: *tui.Model) void {
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const done = m.bg.drainCompletions(arena);
+    for (done) |c| {
+        const status = switch (c.state) {
+            .killed => "killed",
+            .finished => if (c.exit != null and c.exit.? == 0) "finished (exit 0)" else "finished (failed)",
+            else => "finished",
+        };
+        const exit_part = if (c.exit) |e|
+            std.fmt.allocPrint(arena, " exit={d}", .{e}) catch ""
+        else
+            "";
+        const path_part = if (c.output_path) |p|
+            std.fmt.allocPrint(arena, " Output file: {s}. Use `bash_output` with id {d} to read any unread output (incremental).", .{ p, c.id }) catch
+                std.fmt.allocPrint(arena, " Use `bash_output` with id {d} to read output.", .{c.id}) catch ""
+        else
+            std.fmt.allocPrint(arena, " Use `bash_output` with id {d} to read output.", .{c.id}) catch "";
+        const msg = std.fmt.allocPrint(
+            m.allocator,
+            "[background task finished] job {d} ({s}) {s}{s}.{s}",
+            .{ c.id, c.command, status, exit_part, path_part },
+        ) catch continue;
+        defer m.allocator.free(msg);
+        appendHarnessPrompt(m, msg);
+        pushInfoFmt(m, "bg task {d} {s}", .{ c.id, if (c.state == .killed) "killed" else "finished" });
+    }
+}
+
 /// The worker: one turn of conversation with the API, with tools.
 fn chatWorker(job: *ChatJob) void {
     const m = job.model;
@@ -5322,7 +5359,9 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
         policy = taskloop.Policy{ .budget = loopBudget(m) };
         last_mark = loopMark(m);
     }
+    drainBackgroundTaskNotifications(m);
     while (iterations < limit) : (iterations += 1) {
+        drainBackgroundTaskNotifications(m);
         // ESC is a STOP, not a "skip this answer".
         //
         // The key handler sets `chat.cancel_current`, which aborts the request
@@ -5795,7 +5834,7 @@ pub fn finishAutoCheck(m: *tui.Model) void {
             sleep_mod.nap(50);
             waited_ms += 50;
         }
-        if (m.auto_check.collect(&m.bg)) |note| {
+        if (m.auto_check.collect(&m.bg, io_global)) |note| {
             const owned = gpa.dupe(u8, note) catch return;
             // Into the history, owned: the session keeps it and this is not the turn's
             // arena. And to the screen, because a compile error nobody was shown is the
@@ -7369,7 +7408,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
     // It goes in as a `user` message, after the `tool` results, which is a shape
     // every provider accepts — the alternative, a `tool_result` with no call id,
     // is not a thing.
-    if (m.auto_check.collect(&m.bg)) |note| {
+    if (m.auto_check.collect(&m.bg, io_global)) |note| {
         const owned = gpa.dupe(u8, note) catch null;
         if (owned) |text| {
             s.append(.user, text) catch m.allocator.free(text);
@@ -16129,7 +16168,7 @@ test "autoCheckResult: a job with locations produces the note, and it is consume
     m.auto_check.label_len = 9;
     m.auto_check.job = 6;
 
-    const note = m.auto_check.collect(&m.bg) orelse return error.NoNote;
+    const note = m.auto_check.collect(&m.bg, std.testing.io) orelse return error.NoNote;
     try std.testing.expect(std.mem.indexOf(u8, note, "src/a.zig:3:5: error") != null);
     // The label, so the model knows this is the compiler and not a guess.
     try std.testing.expect(std.mem.indexOf(u8, note, "zig build") != null);
@@ -16150,7 +16189,7 @@ test "autoCheckResult: a PASSING check says nothing at all" {
     // "it compiles" is worth nothing to a model that was not going to write code
     // anyway, and it is the one message that could be repeated five times in one
     // turn. Silence is the design.
-    try std.testing.expect(m.auto_check.collect(&m.bg) == null);
+    try std.testing.expect(m.auto_check.collect(&m.bg, std.testing.io) == null);
     // Consumed even when silent, or the next edit reports it again.
     try std.testing.expectEqual(@as(u32, 0), m.auto_check.job);
 }
@@ -16158,14 +16197,14 @@ test "autoCheckResult: a PASSING check says nothing at all" {
 test "autoCheckResult: no job, and a job still running, both say nothing" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
-    try std.testing.expect(m.auto_check.collect(&m.bg) == null);
+    try std.testing.expect(m.auto_check.collect(&m.bg, std.testing.io) == null);
 
     m.bg.slots[0] = .{ .state = .running, .id = 3 };
     try m.bg.slots[0].buf.appendSlice(std.testing.allocator, "src/a.zig:1:1: error: early\n");
     m.auto_check.job = 3;
     // Mid-thought, a note that says "still running" is the noise this feature
     // exists to avoid. The job keeps its slot and the next iteration reads it.
-    try std.testing.expect(m.auto_check.collect(&m.bg) == null);
+    try std.testing.expect(m.auto_check.collect(&m.bg, std.testing.io) == null);
     try std.testing.expectEqual(@as(u32, 3), m.auto_check.job);
 }
 
@@ -17475,7 +17514,7 @@ test "a green build followed by another edit makes the gate check AGAIN, for rea
     // would have ended on evidence about files that no longer exist in that form.
     try std.testing.expect(ac.maybeStart(reg, h.threaded.io(), true));
     try waitJob(reg, ac.job);
-    _ = ac.collect(reg);
+    _ = ac.collect(reg, std.testing.io);
     // TWO, not one: the first gate call above already spent one of its own checks
     // (there was a write with nothing behind it), so this is the second. The count is
     // asserted rather than glossed because "one re-check per turn" and "one re-check per
