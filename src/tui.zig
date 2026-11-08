@@ -7965,7 +7965,7 @@ fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
     const toast_x: u16 = width - toast_w - pad;
     const toast_y: u16 = pad;
 
-    drawRoundedBox(p, toast_x, toast_y, toast_w, toast_h, theme.code_bg, theme.code_border);
+    drawRoundedBox(p, toast_x, toast_y, toast_w, toast_h, theme.code_bg, theme.line_bright);
 
     // Text, centered.
     const text_x: u16 = toast_x + (toast_w - text_w) / 2;
@@ -8261,15 +8261,12 @@ fn drawInput(
     }
 
     if (self.ed.isEmpty() and tag_count == 0) {
-        // With a question open this box IS the answer field (the free-text path),
-        // so the placeholder has to say so: it used to invite a prompt, which is
-        // not what pressing Enter there does.
+        // With a question open this box IS the answer field (the free-text path).
         const ph: []const u8 = if (self.askActive())
-            "your answer\u{2026} \u{b7} enter sends it \u{b7} esc: you decide"
+            "Type your answer\u{2026}  Enter to send \u{00b7} Esc to choose"
         else
-            "Ask anything\u{2026} \u{b7} / for commands";
-        // The placeholder carries the dim foreground and NOTHING else: the rows
-        // under it are the terminal's own background (see the clear above).
+            "Ask anything\u{2026}  / commands \u{00b7} @ files \u{00b7} ! shell";
+        // Placeholder on terminal background (no fill).
         const ph_style: vaxis.Style = .{ .fg = theme.placeholder.fg };
         _ = p.putClipped(3, top, ph, ed_w, ph_style);
     }
@@ -10099,7 +10096,7 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
         expandWideCells(p.surface, y0 + wr, width);
     }
 
-    drawRoundedBox(p, x0, y0, box_w, box_h, .{}, theme.accent);
+    drawRoundedBox(p, x0, y0, box_w, box_h, .{}, theme.line_bright);
 
     // title with dynamic position for session picker (29.3/29.4)
     var tbuf: [128]u8 = undefined;
