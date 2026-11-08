@@ -936,11 +936,7 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, n
                 // the list does not exist.
                 const is_sel = r.item == pal.sel[c];
                 const focused = c == pal.column();
-                if (is_sel and focused) p.fillRange(x0, x0 + w, row, " ", theme.selected);
-                // In the unfocused column, the chosen row is marked with a ▸ in
-                // dim blue: you can see which one it is without it looking
-                // focused.
-                if (is_sel and !focused) _ = p.putText(x0, row, "\u{25b8}", theme.brand_soft);
+                if (is_sel) _ = p.putText(x0, row, "\u{25b8}", if (focused) theme.brand_bold else theme.brand_soft);
                 putLabelHighlighted(
                     p,
                     x0 + 1,

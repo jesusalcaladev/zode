@@ -2046,9 +2046,9 @@ test "the gutter is as wide as the hunk, and the next hunk gets its own" {
     try std.testing.expectEqualStrings("98", rows[3][0].text);
 }
 
-test "the word diff paints the background on the changed words ONLY" {
-    // The whole point of the word diff: the reader sees WHAT changed, and
-    // not only THAT something changed on the row.
+test "the word diff emphasizes changed words (terminal background preserved)" {
+    // With terminal background always showing through, changed words are
+    // emphasized (bold/foreground) rather than painted with a background band.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2065,16 +2065,11 @@ test "the word diff paints the background on the changed words ONLY" {
     const changed = findDiffSeg(added, "42") orelse return error.TestUnexpectedResult;
     const same = findDiffSeg(added, "const") orelse return error.TestUnexpectedResult;
 
-    // The changed words carry the diff's background...
-    try std.testing.expectEqual(theme.diffAddBg().bg, changed.style.bg);
-    // ...and the words that did not change carry the tint of the row, which
-    // is a DIFFERENT background. Without the difference the word diff is
-    // invisible: everything is green.
-    try std.testing.expect(!vaxis.Style.eql(
-        .{ .bg = theme.diffAddBg().bg },
-        .{ .bg = theme.diffAddLineBg().bg },
-    ));
-    try std.testing.expectEqual(theme.diffAddLineBg().bg, same.style.bg);
+    // No forced backgrounds (terminal background always).
+    try std.testing.expect(changed.style.bg == .default);
+    try std.testing.expect(same.style.bg == .default);
+    // Changed words are emphasized so the edit is visible without a bg band.
+    try std.testing.expect(changed.style.bold or !vaxis.Style.eql(changed.style, same.style));
 }
 
 test "the segments of a diffed row concatenate to the row" {

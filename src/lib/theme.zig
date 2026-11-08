@@ -79,7 +79,7 @@ pub const brand_soft: vaxis.Style = rgb(0x00, 0xa8, 0x98);
 /// Cool hairline. Sits between `line` and `brand_soft` in weight.
 pub const brand_faint: vaxis.Style = rgb(0x0a, 0x2a, 0x28);
 /// The background of a focused surface's track (a depleting progress bar).
-pub const brand_deep: vaxis.Style = rgb(0x04, 0x14, 0x12);
+pub const brand_deep: vaxis.Style = .{};
 
 // ── semantics ─────────────────────────────────────────────────
 //
@@ -92,19 +92,17 @@ pub const ok: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
 pub const warn: vaxis.Style = rgb(0xf5, 0xa5, 0x24);
 pub const err: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
 
-/// Selection: a BACKGROUND, always.
+/// Selection: foreground emphasis only (terminal background always shows through).
 ///
-/// With only a foreground change a selected row is distinguishable only by
-/// bold, which most people do not see across a 60-column row. This cost a
-/// scrollbar that highlighted the wrong line once.
-pub const sel_bg: vaxis.Style = bg(0x11, 0x24, 0x28);
-pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xa4, 0xd5, 0xda } }, .bg = sel_bg.bg };
+/// Uses bold + accent tint so the row is distinguishable without painting a
+/// solid background over the user's terminal theme.
+pub const sel_bg: vaxis.Style = .{};
+pub const selected: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0x6f, 0xe7, 0xdf } } };
 
-/// A modal's interior. Darker than any plausible terminal background, so a box
-/// reads as a hole in the page and the history cannot show through it.
-pub const panel_bg: vaxis.Style = bg(0x0b, 0x0a, 0x09);
-/// The well a tool's output sits in: the sunken surface of the two.
-pub const well_bg: vaxis.Style = bg(0x12, 0x11, 0x10);
+/// Surfaces: no painted backgrounds (terminal background always shows through).
+pub const panel_bg: vaxis.Style = .{};
+/// The well a tool's output sits in: inherits terminal background.
+pub const well_bg: vaxis.Style = .{};
 
 // ── code token palette ────────────────────────────────────────
 //
@@ -131,25 +129,16 @@ pub const code_deco: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0xff, 0
 
 // ── diff ──────────────────────────────────────────────────────
 //
-// A foreground alone is not a diff: `+ line` and `- line` have to read as two
-// BANDS, and a band is a background. The tints are very dark on purpose
-// (#0e1f14 over black is barely there) — enough to group the lines, not enough
-// to shout over the prose.
+// Terminal background always shows through, so diffs rely on foreground color,
+// bold markers, and gutters rather than painted row backgrounds.
 
 pub const diff_add: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
-pub const diff_add_bg: vaxis.Style = bg(0x0e, 0x1f, 0x14);
+pub const diff_add_bg: vaxis.Style = .{};
 pub const diff_del: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
-pub const diff_del_bg: vaxis.Style = bg(0x22, 0x10, 0x0f);
-/// The tint of a WHOLE added row, one step fainter than the words that
-/// changed inside it.
-///
-/// Two tints per side, and the order matters: the line is the band (the
-/// reader sees "this row is new") and the words are the point (the reader
-/// sees "this is what is new inside the row"). With ONE tint the changed
-/// words disappear into their own line, and a diff of a rewritten function
-/// is a green wall.
-pub const diff_add_line_bg: vaxis.Style = bg(0x08, 0x12, 0x0b);
-pub const diff_del_line_bg: vaxis.Style = bg(0x15, 0x0a, 0x09);
+pub const diff_del_bg: vaxis.Style = .{};
+/// Line/word background tints disabled to preserve terminal background.
+pub const diff_add_line_bg: vaxis.Style = .{};
+pub const diff_del_line_bg: vaxis.Style = .{};
 /// The line number in a diff's gutter.
 ///
 /// It is CONTENT (the line to go and look at) and not chrome, so it is
@@ -573,19 +562,19 @@ pub fn diffStyles(c: Caps) DiffStyles {
         return .{
             .add = resolveStyle(rgb(0x4a, 0x9e, 0xff), c), // blue
             .del = resolveStyle(rgb(0xff, 0xa5, 0x00), c), // orange
-            .add_bg = resolveStyle(bg(0x0e, 0x1f, 0x2e), c),
-            .del_bg = resolveStyle(bg(0x2a, 0x1c, 0x05), c),
-            .add_line_bg = resolveStyle(bg(0x07, 0x11, 0x1a), c),
-            .del_line_bg = resolveStyle(bg(0x1a, 0x11, 0x03), c),
+            .add_bg = .{},
+            .del_bg = .{},
+            .add_line_bg = .{},
+            .del_line_bg = .{},
         };
     }
     return .{
         .add = resolveStyle(diff_add, c),
         .del = resolveStyle(diff_del, c),
-        .add_bg = resolveStyle(diff_add_bg, c),
-        .del_bg = resolveStyle(diff_del_bg, c),
-        .add_line_bg = resolveStyle(diff_add_line_bg, c),
-        .del_line_bg = resolveStyle(diff_del_line_bg, c),
+        .add_bg = .{},
+        .del_bg = .{},
+        .add_line_bg = .{},
+        .del_line_bg = .{},
     };
 }
 

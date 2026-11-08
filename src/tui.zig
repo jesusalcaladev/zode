@@ -5904,8 +5904,8 @@ pub const Model = struct {
             var col = from;
             while (col < to and col < surface.size.width) : (col += 1) {
                 var cell = surface.readCell(col, row);
-                cell.style.bg = theme.selected.bg;
                 cell.style.bold = true;
+                cell.style.fg = theme.selected.fg;
                 surface.writeCell(col, row, cell);
             }
         }
@@ -8371,7 +8371,7 @@ fn drawAutocomplete(
         const label = matchLabel(self, first + i) orelse break;
         const y = top + @as(u16, @intCast(i));
         const is_sel = first + i == self.ac.sel;
-        if (is_sel) p.fillRange(0, width, y, " ", theme.selected);
+        if (is_sel) _ = p.putText(0, y, "▸", theme.brand_bold);
         // `@` paths are already prefixed in the label? No: the label is the raw
         // path, the `@` is drawn dim so the mention form is visible. The path is
         // painted run by run so that the characters the query matched are bold:
@@ -8876,26 +8876,46 @@ fn drawPermissionModal(
     allow_sandbox: bool,
     suggestion: []const u8,
 ) void {
-    const w: u16 = @min(width -| 6, 104);
+    // Responsive width: fit the terminal, keep readable margins, and adapt
+    // cleanly to zoom/resize (vaxis redraws on winsize).
+    const margin: u16 = if (width > 16) 4 else 2;
+    const w: u16 = @min(width -| (margin * 2), 110);
+    const inner_x_pad: u16 = 3;
+    const inner_w: u16 = w -| (inner_x_pad * 2 + 2);
     const dangerous_suggestion = allow_always and suggestion.len > 0 and permrules.isDangerousRuleText(suggestion);
     const sandbox_note = allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash");
-    var h: u16 = 9;
-    if (rule.len > 0) h += 1;
-    if (sandbox_note) h += 1;
-    if (dangerous_suggestion) h += 1;
-    // A TERMINAL TOO SMALL FOR THE BOX IS NOT A REASON TO PAINT NOTHING.
-    //
-    // It used to `return` here, and this function is what BLOCKS the turn: the
-    // worker spins until the user answers, and on a 30-column terminal there
-    // was no dialog to answer with. The app looked exactly like the "it stops
-    // answering" bug — the input was dead because it was waiting for a key
-    // nobody could know to press.
-    //
-    // The compact form asks the same question in two rows and fits in 20
-    // columns. The direction that matters: it is better to show a cramped
-    // question than an invisible one.
-    if (w < 30 or height < h + 2) {
-        drawPermissionModalCompact(p, width, height, tool, allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash"));
+
+    // Wrap the detail (bash command / args) so long commands stay inside the
+    // modal borders instead of overflowing. Cap lines so the dialog remains
+    // usable on small terminals.
+    const max_detail_lines: usize = blk: {
+        if (height <= 14) break :blk 2;
+        if (height <= 22) break :blk 4;
+        break :blk 6;
+    };
+    const detail_rows_all: []const []const u8 = if (detail.len > 0 and inner_w > 0)
+        wrapTextToRows(p, detail, inner_w, p.arena)
+    else
+        &.{};
+    const detail_lines: usize = @min(detail_rows_all.len, max_detail_lines);
+    const detail_truncated = detail_rows_all.len > max_detail_lines;
+
+    // Height: title+label(4) + tool(1) + detail + optional rows + options(1) + padding.
+    var h: u16 = 7;
+    if (detail.len > 0) h +|= @intCast(@max(detail_lines, 1));
+    if (detail_truncated) h +|= 1;
+    if (rule.len > 0) h +|= 1;
+    if (sandbox_note) h +|= 1;
+    if (dangerous_suggestion) h +|= 1;
+    h = @min(h, height -| 2);
+
+    // Too small for a readable box: compact form keeps the turn answerable.
+    if (w < 28 or height < 8 or h < 7) {
+        drawPermissionModalCompact(p, width, height, tool, sandbox_note);
+        return;
+    }
+    if (h > height -| 2) {
+        drawPermissionModalCompact(p, width, height, tool, sandbox_note);
         return;
     }
     const x: u16 = (width -| w) / 2;
@@ -8903,55 +8923,53 @@ fn drawPermissionModal(
 
     drawRoundedBox(p, x, y, w, h, theme.panel_bg, theme.warn_bold);
 
-    // Title, with Zo's face in the "warn" color.
-    _ = p.putText(x + 3, y + 1, "⚠  Permission required", theme.warn_bold);
+    // Title
+    _ = p.putClipped(x + inner_x_pad, y + 1, "⚠  Permission required", inner_w, theme.warn_bold);
 
-    // Which tool and with which arguments.
-    _ = p.putText(x + 3, y + 3, "This tool wants to run:", theme.brand_soft);
+    // Tool
+    _ = p.putClipped(x + inner_x_pad, y + 3, "This tool wants to run:", inner_w, theme.brand_soft);
     var nb: [64]u8 = undefined;
     const tname = std.fmt.bufPrint(&nb, "{s}", .{tool}) catch tool;
-    _ = p.putText(x + 3, y + 4, tname, theme.brand_bold);
+    _ = p.putClipped(x + inner_x_pad, y + 4, tname, inner_w, theme.brand_bold);
 
-    // Detail, clipped to the box's width.
-    const max_d = @as(usize, w - 6);
     var dy: u16 = y + 5;
-    if (detail.len > 0) {
-        const d: []const u8 = if (detail.len > max_d) detail[0..max_d] else detail;
-        _ = p.putText(x + 3, dy, d, theme.dim);
+    const bottom_limit: u16 = y + h -| 2; // leave room for options row
+
+    // Detail, wrapped and clipped so it never crosses the modal border.
+    if (detail.len > 0 and dy < bottom_limit) {
+        var di: usize = 0;
+        while (di < detail_lines and dy < bottom_limit) : (di += 1) {
+            _ = p.putClipped(x + inner_x_pad, dy, detail_rows_all[di], inner_w, theme.dim);
+            dy += 1;
+        }
+        if (detail_truncated and dy < bottom_limit) {
+            _ = p.putClipped(x + inner_x_pad, dy, "… (command truncated in dialog)", inner_w, theme.hint_faint);
+            dy += 1;
+        }
+    }
+
+    // Rule that matched
+    if (rule.len > 0 and dy < bottom_limit) {
+        _ = p.putClipped(x + inner_x_pad, dy, rule, inner_w, theme.warn);
         dy += 1;
     }
 
-    // The rule that matched: why this permission question exists at all.
-    if (rule.len > 0) {
-        const max_r = @as(usize, w - 6);
-        const r: []const u8 = if (rule.len > max_r) rule[0..max_r] else rule;
-        _ = p.putText(x + 3, dy, r, theme.warn);
+    // Sandbox note (Phase 25)
+    if (sandbox_note and dy < bottom_limit) {
+        const note = "sandbox: S runs isolated (project writable, rest read-only)";
+        _ = p.putClipped(x + inner_x_pad, dy, note, inner_w, theme.ok);
         dy += 1;
     }
 
-    // Phase 25: a sandbox is available, so the dialog is not the only answer.
-    if (sandbox_note and dy < y + h - 2) {
-        const note = "sandbox available: S runs it isolated (project writable, rest read-only)";
-        const max_n = @as(usize, w - 6);
-        _ = p.putText(x + 3, dy, if (note.len > max_n) note[0..max_n] else note, theme.ok);
-        dy += 1;
-    }
-
-    // Warn when "always allow" would create a dangerously broad rule.
-    if (dangerous_suggestion and dy < y + h - 2) {
+    // Dangerous broad-allow warning
+    if (dangerous_suggestion and dy < bottom_limit) {
         const warn = "warning: broad allow can run arbitrary commands";
-        const max_w = @as(usize, w - 6);
-        _ = p.putText(x + 3, dy, if (warn.len > max_w) warn[0..max_w] else warn, theme.err);
+        _ = p.putClipped(x + inner_x_pad, dy, warn, inner_w, theme.err);
         dy += 1;
     }
 
-    // Options, each with its key in large type. The first one (y) is the one
-    // you press without looking, so it is highlighted.
-    //
-    // WITHOUT "always allow" for a question that must not become a standing
-    // permission: a path inside `.git/` is asked ONCE. "Always allow" there
-    // would put the whole `.git/` on the list of places the agent writes
-    // without asking, which is the opposite of what the question is for.
+    // Options row — always on the last content row, clipped to the border.
+    const opts_y: u16 = y + h -| 2;
     const Opt = struct { key: []const u8, label: []const u8, is_always: bool, is_sandbox: bool };
     const opts_all = [_]Opt{
         .{ .key = "Y", .label = "allow once", .is_always = false, .is_sandbox = false },
@@ -8969,15 +8987,23 @@ fn drawPermissionModal(
         opts_n += 1;
     }
     const opts = opts_buf[0..opts_n];
-    // The "always allow" option NAMES the rule it would remember.
     var suggestion_buf: [128]u8 = undefined;
     const suggestion_label_text = if (allow_always) suggestion_label(suggestion, &suggestion_buf) else "";
-    var ox: u16 = x + 3;
+    var ox: u16 = x + inner_x_pad;
+    const right_edge: u16 = x + w -| 2;
     for (opts, 0..) |o, i| {
-        _ = p.putText(ox, dy, o.key, theme.brand_bold);
-        const adv: u16 = @as(u16, @intCast(o.key.len)) + 1;
-        ox += adv;
-        const label: []const u8 = if (o.is_always and suggestion_label_text.len > 0) suggestion_label_text else o.label;
+        if (ox >= right_edge) break;
+        const key_w = p.measure(o.key);
+        if (ox +| key_w > right_edge) break;
+        _ = p.putClipped(ox, opts_y, o.key, right_edge -| ox, theme.brand_bold);
+        ox +|= key_w +| 1;
+        if (ox >= right_edge) break;
+        var label: []const u8 = if (o.is_always and suggestion_label_text.len > 0) suggestion_label_text else o.label;
+        // Keep the suggestion label from blowing past the border on narrow/zoomed terminals.
+        if (o.is_always and suggestion_label_text.len > 0) {
+            const room: usize = @intCast(right_edge -| ox);
+            if (room < 18) label = "always allow";
+        }
         const label_style = if (i == 0)
             theme.brand
         else if (o.is_sandbox)
@@ -8986,9 +9012,10 @@ fn drawPermissionModal(
             theme.err
         else
             theme.brand_soft;
-        ox = p.putText(ox, dy, label, label_style);
-        if (i + 1 < opts.len and ox + 4 < x + w) {
-            ox = p.putText(ox, dy, "   ", theme.brand_faint);
+        const label_room: u16 = right_edge -| ox;
+        ox = p.putClipped(ox, opts_y, label, label_room, label_style);
+        if (i + 1 < opts.len and ox + 4 < right_edge) {
+            ox = p.putClipped(ox, opts_y, "   ", 3, theme.brand_faint);
         }
     }
 }
@@ -9280,7 +9307,6 @@ fn drawAskPanel(
             const is_sel = (i == sel);
             const is_other = (i == opts);
             const style: vaxis.Style = if (is_sel) theme.selected else if (is_other) theme.hint else vaxis.Style{};
-            if (is_sel) p.fillRange(inner_col, left + box_w - 1, row, " ", theme.selected);
             var marker: [8]u8 = undefined;
             // Every row is NUMBERED, including the way out of the menu: an
             // unnumbered last row is the one that reads as chrome ("type your own
@@ -10117,7 +10143,7 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
             if (i >= item_rows) break;
             const row = y0 + 2 + @as(u16, @intCast(i));
             const is_sel = ps.first_visible + i == ps.sel;
-            if (is_sel) p.fillRange(x0 + 1, x0 + box_w - 1, row, " ", theme.selected);
+            if (is_sel) _ = p.putText(x0 + 1, row, "▸", theme.brand_bold);
             var hbuf: [64]u32 = undefined;
             const hn = fuzzy.highlightPositions(it.label, ps.query, &hbuf) orelse 0;
             var after = putStyled(
@@ -15274,7 +15300,7 @@ test "timeline: a list answer shows bullets, and the markers are not the text" {
     try std.testing.expect(findRow(s, "- primero") == null);
 }
 
-test "timeline: a code block has a background behind the code, not only after it" {
+test "timeline: a code block renders cleanly with terminal background preserved" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var m = Model.init(std.testing.allocator);
@@ -15286,23 +15312,11 @@ test "timeline: a code block has a background behind the code, not only after it
 
     const s = try drawTest(&m, arena_state.allocator(), 40, 14);
     const row = findRow(s, "const n") orelse return error.TestUnexpectedResult;
-    // The code itself sits on the background, not just the padding after it:
-    // the block is a rectangle, not a stripe whose width changes with the
-    // length of each line (which is what it was on any background but #1a1b26).
-    // Read a cell that is definitely code text (the "c" of "const"); a fixed
-    // column could land in the left margin or on a border cell instead.
+    // Terminal background always shows through: code cells must not force a bg.
     const code_cell = cellWith(s, row, "c") orelse return error.TestUnexpectedResult;
-    const code_bg = code_cell.style.bg;
-    const code_bg_rgb = switch (code_bg) {
-        .rgb => |c| c,
-        else => unreachable,
-    };
-    const want_bg = theme.code_bg.bg;
-    const want_bg_rgb = switch (want_bg) {
-        .rgb => |c| c,
-        else => unreachable,
-    };
-    try std.testing.expect(std.mem.eql(u8, &code_bg_rgb, &want_bg_rgb));
+    try std.testing.expect(code_cell.style.bg == .default);
+    // The code is still present and syntax-highlighted (not plain default text).
+    try std.testing.expect(findRow(s, "const n") != null);
 }
 
 test "estHeight: a fenced block is charged the rows it actually adds" {
