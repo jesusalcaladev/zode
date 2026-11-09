@@ -4017,6 +4017,74 @@ fn cmdVersion(m: *tui.Model) void {
     m.pushInfoFmt("zode {s}", .{selfupdate.current_version});
 }
 
+/// `/release-notes`: show release notes for the running version.
+/// Phase 35.9: reads the matching section from CHANGELOG.md (local, no network).
+fn cmdReleaseNotes(m: *tui.Model) void {
+    const gpa = m.allocator;
+    if (!m.io_ready) {
+        m.pushInfo("release notes: I/O not ready");
+        return;
+    }
+    const io = io_global;
+    const version = selfupdate.current_version;
+
+    const body = std.Io.Dir.cwd().readFileAlloc(io, "CHANGELOG.md", gpa, .limited(1024 * 1024)) catch {
+        m.pushInfo("release notes: CHANGELOG.md not found (run from the repo root, or see the project releases)");
+        return;
+    };
+    defer gpa.free(body);
+
+    const section = extractReleaseSection(gpa, body, version) catch {
+        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
+        return;
+    } orelse {
+        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
+        return;
+    };
+    defer gpa.free(section);
+
+    m.pushInfoFmt("release notes — zode {s}", .{version});
+    // Push the section line by line so it renders as normal info lines.
+    var it = std.mem.splitScalar(u8, section, '\n');
+    while (it.next()) |line| {
+        // Trim trailing CR for Windows-ish safety; keep content.
+        const l = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+        m.pushInfoOwned(gpa.dupe(u8, l) catch continue);
+    }
+}
+
+/// Extract the CHANGELOG section for `version`. For "dev"/non-semver builds,
+/// returns the `[Unreleased]` section. Returns an owned slice, or null if not found.
+fn extractReleaseSection(gpa: std.mem.Allocator, changelog: []const u8, version: []const u8) !?[]u8 {
+    var needle_buf: [128]u8 = undefined;
+    const is_dev = std.mem.eql(u8, version, "dev") or selfupdate.Version.parse(version) == null;
+    const needle = if (is_dev)
+        "## [Unreleased]"
+    else blk: {
+        const v = if (version.len > 0 and (version[0] == 'v' or version[0] == 'V')) version[1..] else version;
+        break :blk std.fmt.bufPrint(&needle_buf, "## [{s}]", .{v}) catch return null;
+    };
+
+    const start = std.mem.indexOf(u8, changelog, needle) orelse return null;
+    // Start after the heading line.
+    var body_start = start;
+    if (std.mem.indexOfScalarPos(u8, changelog, start, '\n')) |nl| {
+        body_start = nl + 1;
+    } else {
+        return try gpa.dupe(u8, "");
+    }
+
+    // Find the next version/section heading (`\n## [`).
+    var end = changelog.len;
+    if (std.mem.indexOfPos(u8, changelog, body_start, "\n## [")) |next| {
+        end = next;
+    }
+
+    const raw = std.mem.trim(u8, changelog[body_start..end], " \t\r\n");
+    if (raw.len == 0) return try gpa.dupe(u8, "(no entries)");
+    return try gpa.dupe(u8, raw);
+}
+
 /// `/clear`: clear the visible transcript and reset the per-session caches
 /// (the read list, the changed list, and the "skills already attached" flag
 /// so the listing is re-attached on the next turn). Like `/new` this buys a
@@ -4188,6 +4256,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "version")) {
         cmdVersion(m);
+    } else if (std.mem.eql(u8, cmd, "release-notes") or std.mem.eql(u8, cmd, "releasenotes")) {
+        cmdReleaseNotes(m);
     } else if (std.mem.eql(u8, cmd, "goal")) {
         commands_mod.cmdGoal(m, rest);
     } else if (std.mem.eql(u8, cmd, "init")) {
@@ -15425,6 +15495,51 @@ test "cmdVersion shows the running zode version" {
     // `current_version` is injected at build time ("dev" for a local build),
     // so the message always starts with "zode ".
     try std.testing.expect(pendingContains(&m, "zode "));
+}
+
+test "extractReleaseSection: finds a versioned section and dev falls back to Unreleased" {
+    const gpa = std.testing.allocator;
+    const changelog =
+        \\# Changelog
+        \\
+        \\## [Unreleased]
+        \\
+        \\### Added
+        \\- New thing
+        \\
+        \\## [0.2.0] - 2026-11-07
+        \\
+        \\### Fixed
+        \\- Old fix
+        \\
+        \\## [0.1.0] - 2026-01-01
+        \\
+        \\- Initial
+        \\
+    ;
+
+    {
+        const s = (try extractReleaseSection(gpa, changelog, "0.2.0")).?;
+        defer gpa.free(s);
+        try std.testing.expect(std.mem.indexOf(u8, s, "Old fix") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "New thing") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "Initial") == null);
+    }
+    {
+        const s = (try extractReleaseSection(gpa, changelog, "v0.2.0")).?;
+        defer gpa.free(s);
+        try std.testing.expect(std.mem.indexOf(u8, s, "Old fix") != null);
+    }
+    {
+        const s = (try extractReleaseSection(gpa, changelog, "dev")).?;
+        defer gpa.free(s);
+        try std.testing.expect(std.mem.indexOf(u8, s, "New thing") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "Old fix") == null);
+    }
+    {
+        const missing = try extractReleaseSection(gpa, changelog, "9.9.9");
+        try std.testing.expect(missing == null);
+    }
 }
 
 test "prompt: the routing guide survives the project's AGENTS.md" {
