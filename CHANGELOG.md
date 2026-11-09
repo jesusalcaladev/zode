@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - update TUI and main integration [`cfaa1a24`](https://github.com/jesusalcaladev/zode/commit/cfaa1a24)
 - wire ACP agent command in main [`d0909ffb`](https://github.com/jesusalcaladev/zode/commit/d0909ffb)
 - add ACP stdio server implementation (acp) [`cdb09dca`](https://github.com/jesusalcaladev/zode/commit/cdb09dca)
-- add /release-notes command to command table (commands) [`dec0acc1`](https://github.com/jesusalcaladev/zode/commit/dec0acc1)
+- add /release-notes command to command table (commands) [`5fd5cc1d`](https://github.com/jesusalcaladev/zode/commit/5fd5cc1d)
 
 ### Documentation
 
@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Tests
 
 - register ACP protocol test module [`0f675bb7`](https://github.com/jesusalcaladev/zode/commit/0f675bb7)
+- add ACP smoke test script (acp) [`bb533c96`](https://github.com/jesusalcaladev/zode/commit/bb533c96)
 
 ### Other
 
