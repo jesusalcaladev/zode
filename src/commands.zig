@@ -1435,6 +1435,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/clear", .desc = "clear the screen and reset the session caches (read list, changed list, skills)" },
     .{ .key = "/exit", .desc = "alias of /quit" },
     .{ .key = "/version", .desc = "show the running zode version" },
+    .{ .key = "/release-notes", .desc = "show release notes for the running version (from CHANGELOG.md)" },
 };
 
 pub const Cmd = struct {

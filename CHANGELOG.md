@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add permissions, hooks, and agents panels with safer IO handling [`2b135b19`](https://github.com/jesusalcaladev/zode/commit/2b135b19)
 - update TUI and main integration [`cfaa1a24`](https://github.com/jesusalcaladev/zode/commit/cfaa1a24)
 - wire ACP agent command in main [`d0909ffb`](https://github.com/jesusalcaladev/zode/commit/d0909ffb)
-- add ACP stdio server implementation (acp) [`b780fb0a`](https://github.com/jesusalcaladev/zode/commit/b780fb0a)
+- add ACP stdio server implementation (acp) [`cdb09dca`](https://github.com/jesusalcaladev/zode/commit/cdb09dca)
+- add /release-notes command to command table (commands) [`dec0acc1`](https://github.com/jesusalcaladev/zode/commit/dec0acc1)
 
 ### Documentation
 
@@ -34,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - organize lib modules into clusters with stable facades [`8e60f45c`](https://github.com/jesusalcaladev/zode/commit/8e60f45c)
 - remove dead test file, expand test coverage, clarify lib IO notes [`1c5f20c0`](https://github.com/jesusalcaladev/zode/commit/1c5f20c0)
 - expose tool call helper exports (tools) [`73c22592`](https://github.com/jesusalcaladev/zode/commit/73c22592)
+
+### Tests
+
+- register ACP protocol test module [`0f675bb7`](https://github.com/jesusalcaladev/zode/commit/0f675bb7)
 
 ### Other
 
