@@ -4266,6 +4266,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "files")) {
         commands_mod.cmdFiles(m);
+    } else if (std.mem.eql(u8, cmd, "diff")) {
+        commands_mod.cmdDiff(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {
         commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
@@ -8663,7 +8665,6 @@ fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
 }
 
 /// into a broken turn.
-
 fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
     var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();
@@ -8755,8 +8756,7 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
             // Try resolving so we can tell the user where proposals would live.
             var s2 = memory_store.Store.resolveForProject(gpa, io_global, cwd, repo_root, false) catch store;
             defer if (s2.root.ptr != store.root.ptr) s2.deinit();
-            if (s2.root.len == 0) out = @constCast("[Pending memory proposals]\n(no project memory store yet)\n")
-            else store = s2;
+            if (s2.root.len == 0) out = @constCast("[Pending memory proposals]\n(no project memory store yet)\n") else store = s2;
         }
         if (out.len == 0) {
             const dir_path = store.pendingPath(&path_buf) orelse "";
@@ -8824,10 +8824,8 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
                 capStoreAppendToolResult(m, s, call.id, "memory", out, arena, budget);
                 return 1;
             };
-            out = std.fmt.allocPrint(gpa,
-                "Saved pending memory proposal \"{s}\" ({s}). It is NOT durable until the user approves it. " ++
-                    "Ask the user to approve with: memory operation=approve id={s}",
-                .{ use_title, use_id, use_id }) catch @constCast("Saved pending proposal; user approval required.");
+            out = std.fmt.allocPrint(gpa, "Saved pending memory proposal \"{s}\" ({s}). It is NOT durable until the user approves it. " ++
+                "Ask the user to approve with: memory operation=approve id={s}", .{ use_title, use_id, use_id }) catch @constCast("Saved pending proposal; user approval required.");
             owned = out.ptr != "Saved pending proposal; user approval required.".ptr;
         }
     } else { // search

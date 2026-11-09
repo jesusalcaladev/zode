@@ -17,6 +17,7 @@ const sessionpath = @import("lib/sessionpath.zig");
 const build_options = @import("build_options");
 const permrules = @import("lib/permrules.zig");
 const hooks_mod = @import("lib/hooks.zig");
+const md = @import("lib/markdown.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -1342,6 +1343,77 @@ pub fn cmdFiles(m: *tui.Model) void {
     agent.pushInfoOwned(m, text);
 }
 
+fn runGitCapture(arena: std.mem.Allocator, argv: []const []const u8, limit: usize) ?[]const u8 {
+    const r = std.process.run(arena, agent.io_global, .{
+        .argv = argv,
+        .stdout_limit = .limited(limit),
+        .stderr_limit = .limited(64 * 1024),
+        .reserve_amount = 4096,
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(20), .clock = .awake } },
+    }) catch return null;
+    return switch (r.term) {
+        .exited => |code| if (code == 0) r.stdout else blk: {
+            if (std.mem.indexOf(u8, r.stderr, "not a git repository") != null or
+                std.mem.indexOf(u8, r.stdout, "not a git repository") != null)
+                break :blk null;
+            // git diff can exit 1 in some cases (e.g. --exit-code not used) but
+            // usually 0; if it produced output, show it.
+            break :blk if (r.stdout.len > 0) r.stdout else null;
+        },
+        else => null,
+    };
+}
+
+/// `/diff`: uncommitted changes and the current turn's changed-file diff.
+pub fn cmdDiff(m: *tui.Model) void {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const status = runGitCapture(arena, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "status", "--short", "--branch" }, 64 * 1024) orelse {
+        agent.pushInfo(m, "diff: not a git repository (or git is not available)");
+        return;
+    };
+
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(m.allocator);
+    header.appendSlice(m.allocator, "diff · uncommitted changes") catch return;
+    const st = std.mem.trim(u8, status, " \t\r\n");
+    if (st.len > 0) {
+        header.append(m.allocator, '\n') catch return;
+        header.appendSlice(m.allocator, st) catch return;
+    } else {
+        header.appendSlice(m.allocator, "\nworking tree clean (nothing staged or modified).") catch return;
+    }
+    const header_owned = m.allocator.dupe(u8, header.items) catch return;
+    agent.pushInfoOwned(m, header_owned);
+
+    if (runGitCapture(arena, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "diff", "--no-color", "-U3", "HEAD" }, 512 * 1024)) |diff| {
+        const trimmed = std.mem.trim(u8, diff, " \t\r\n");
+        if (trimmed.len > 0) {
+            agent.pushInfo(m, "uncommitted (vs HEAD):");
+            m.pushKind(md.Kind.diff, trimmed);
+        }
+    }
+
+    const turn_files = agent.turn_stats.files.items;
+    if (turn_files.len > 0) {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(arena);
+        argv.appendSlice(arena, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "diff", "--no-color", "-U3", "HEAD", "--" }) catch {};
+        for (turn_files) |f| argv.append(arena, f) catch {};
+        if (runGitCapture(arena, argv.items, 512 * 1024)) |tdiff| {
+            const ttrim = std.mem.trim(u8, tdiff, " \t\r\n");
+            if (ttrim.len > 0) {
+                agent.pushInfoFmt(m, "this turn ({d} file(s) changed):", .{turn_files.len});
+                m.pushKind(md.Kind.diff, ttrim);
+            } else {
+                agent.pushInfoFmt(m, "this turn: {d} file(s) touched but diff vs HEAD is empty.", .{turn_files.len});
+            }
+        }
+    }
+}
+
 /// `/providers`: lists the providers with their key state.
 pub fn cmdProviders(m: *tui.Model) void {
     var defs_arena_state = std.heap.ArenaAllocator.init(m.allocator);
@@ -1425,6 +1497,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
     .{ .key = "/rename", .desc = "set a custom title for the current session: /rename <name>" },
     .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
+    .{ .key = "/diff", .desc = "uncommitted changes and this turn's changed-file diff" },
     .{ .key = "/cache", .desc = "cache hit-rate for this session", .palette_visible = false },
     .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
@@ -1584,6 +1657,13 @@ test "/permissions /hooks /agents panels are registered" {
     }
 }
 
+test "/diff is registered in the command table" {
+    for (commands) |c| {
+        if (std.mem.eql(u8, c.key, "/diff")) return;
+    }
+    try std.testing.expect(false);
+}
+
 test "/permissions panel is dispatched" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
@@ -1613,4 +1693,24 @@ test "/agents panel is dispatched" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "agents") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Phase 9") != null);
+}
+
+test "/diff command is dispatched" {
+    const saved_io = agent.io_global;
+    const saved_turn = agent.turn_stats;
+    agent.io_global = std.testing.io;
+    agent.turn_stats = .{};
+    defer {
+        agent.turn_stats = saved_turn;
+        agent.io_global = saved_io;
+    }
+
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try agent.submit(&m, "/diff");
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    // In a git repo with a working test IO, shows "diff · uncommitted";
+    // if process spawning is unavailable under test IO, reports git unavailable.
+    try std.testing.expect(std.mem.indexOf(u8, text, "diff") != null);
 }
