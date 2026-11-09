@@ -4,7 +4,7 @@
 **Language:** Zig 0.17+  
 **TUI framework:** Vaxis 0.6 (pure Zig)  
 **Architecture:** Preserve the existing Zode architecture. This is an evolution, not a rewrite.  
-**Status:** Living design guide. Phase 1 is in progress.
+**Status:** Living design guide. Phase 1 substantially complete, Phase 2 complete (incremental/honest), Phase 3 in progress.
 
 This document adapts the terminal-native development environment direction to Zode's actual codebase, theme system, and `AGENTS.md` rules. It is a design/reference guide for incremental work, not a mandate to implement every section at once and not a substitute for tests.
 
@@ -691,7 +691,7 @@ Audited paths/components (read-only review, to guide incremental changes):
 - **Scroll/viewport:** paragraph/offset anchoring, `follow_bottom`, anchor clamping behavior in `src/tui.zig`. Treat as sensitive; improve only with targeted tests/harness validation.
 - **Status/mascot/composer:** footer/phase presentation and mascot state are part of Zode identity; preserve semantics and readability.
 
-Phase 1 foundations are substantially complete (visual identity remains a continuous constraint). Phase 2 is now in progress: semantic file labels (`lang_icons.forPath`), compact/expanded file card formatters, and honest aggregation/summary building are implemented as pure/tested lib modules (`src/lib/lang_icons.zig`, `src/lib/filechange.zig`). Next: wire structured file-change rendering into the TUI event path, keep stats sourced from real diffs/baselines, and add grouped summaries/navigation incrementally with `drawTest`/harness coverage once the working tree compiles cleanly.
+Phase 1 foundations are substantially complete (visual identity remains a continuous constraint). Phase 2 is complete at the incremental/honest-data level (semantic labels, compact cards, real/net diffs from baselines, grouped summaries, `/files` integration). Phase 3 is in progress: starting with pure/tested review foundations (hunk metadata parsing) while preserving existing diff rendering and runtime behavior.
 
 ### Phase 2 — File intelligence (complete, incremental UI integration)
 
@@ -707,15 +707,16 @@ Phase 1 foundations are substantially complete (visual identity remains a contin
 
 Notes: `zig test src/lib/filechange.zig`, `src/lib/lang_icons.zig`, and `src/lib/filesview.zig` pass. TUI `drawTest`s added for file diff card and honest multi-edit net diff in `src/tui.zig`; full `zig build`/suite validation is currently blocked by unrelated pre-existing `agent.zig`/`agent/discovery` compile errors in the working tree (not caused by this work). All file/net stats are sourced from real diffs/baselines.
 
-### Phase 3 — Interactive review
+### Phase 3 — Interactive review (in progress)
 
-- [ ] Unified diff viewer.
-- [ ] Syntax-aware diff rendering.
-- [ ] Hunk navigation.
-- [ ] File navigation.
-- [ ] Expanded code views.
-- [ ] Review actions (runtime-safe).
-- [ ] External editor integration where appropriate.
+- [x] Hunk metadata parsing foundation (pure/tested: `src/lib/diffhunks.zig` parses unified diff headers/elisions into navigable hunk ranges; supports future hunk navigation UI).
+- [ ] Unified diff viewer (structured/inspectable presentation; Zode already renders unified diffs with preview/expand — evolve incrementally).
+- [x] Syntax-aware diff rendering baseline (existing diff rendering preserves language tokenization/path-aware labels; further improvements incremental).
+- [ ] Hunk navigation (UI focus/keybindings over parsed hunks; requires stable focus/hit semantics).
+- [ ] File navigation (jump between changed files/diff targets; integrate with file intelligence summaries).
+- [ ] Expanded code views (larger-context inspection with responsive fallbacks).
+- [ ] Review actions (runtime-safe only; no invented decisions).
+- [ ] External editor integration where appropriate (resolve `$VISUAL`/`$EDITOR` safely; spawn only through explicit/runtime-governed actions).
 
 ### Phase 4 — Zode Motion
 
