@@ -12,8 +12,8 @@
 ///
 /// `auth.json` was already written 0600 (`config.zig`), so the principle was already in
 /// the repo and this one file was simply outside it.
-const session_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
-const sessions_dir_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
+pub const session_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
+pub const sessions_dir_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
 
 /// Base directory for session files (default "sessions", override with setSessionsDir).
 ///
