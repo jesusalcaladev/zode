@@ -18,6 +18,7 @@ const build_options = @import("build_options");
 const permrules = @import("lib/permrules.zig");
 const hooks_mod = @import("lib/hooks.zig");
 const md = @import("lib/markdown.zig");
+const gitcmds = @import("lib/gitcmds.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -914,6 +915,45 @@ pub fn cmdInit(m: *tui.Model) void {
     };
 }
 
+// Vocabulary bridge: `allow_rules` here are turn-scoped bash allow patterns
+// (zode `Bash(cmd *)` / spec-compatible `Bash(cmd:*)`; external specs may call
+// these "always-allow command rules" / `alwaysAllowRules.command`). They map to
+// `agent.turn_bash_allow_rules` for this turn only — not persisted `perm_rules`.
+fn startGitPromptCommand(m: *tui.Model, prompt: []const u8, allow_rules: []const []const u8, extra: ?[]const u8) void {
+    if (m.isBusy()) {
+        m.pushError("wait for the current turn to finish before running /commit or /pr");
+        return;
+    }
+    var full = prompt;
+    var owned: ?[]u8 = null;
+    defer if (owned) |p| m.allocator.free(p);
+    if (extra) |e| {
+        const trimmed = std.mem.trim(u8, e, " \t\r\n");
+        if (trimmed.len > 0) {
+            owned = std.fmt.allocPrint(m.allocator, "{s}\n\n## User request\n{s}\n", .{ prompt, trimmed }) catch null;
+            if (owned) |p| full = p;
+        }
+    }
+    agent.startChatWithCmdRules(m, full, allow_rules) catch |err| {
+        m.pushErrorFmt("could not start command: {t}", .{err});
+    };
+}
+
+/// Phase 31: create a commit with verified git context and a scoped allowlist.
+pub fn cmdCommit(m: *tui.Model, arg: ?[]const u8) void {
+    startGitPromptCommand(m, gitcmds.commit_prompt, &gitcmds.commit_allow_rules, arg);
+}
+
+/// Phase 31: create/update a PR with merge-base diff and idempotent gh flow.
+pub fn cmdPr(m: *tui.Model, arg: ?[]const u8) void {
+    startGitPromptCommand(m, gitcmds.pr_prompt, &gitcmds.pr_allow_rules, arg);
+}
+
+/// Phase 31.2 naming: commit-push-PR workflow (uses PR allowlist asymmetry).
+pub fn cmdCommitPushPr(m: *tui.Model, arg: ?[]const u8) void {
+    startGitPromptCommand(m, gitcmds.pr_prompt, &gitcmds.pr_allow_rules, arg);
+}
+
 /// `/context`: gauge of context used against the limit and the budget.
 pub fn cmdContext(m: *tui.Model) void {
     _ = agent.ensureSession(m, m.allocator);
@@ -1328,7 +1368,7 @@ pub fn cmdFiles(m: *tui.Model) void {
     // The files the agent changed. The paths are borrowed from the Model's
     // table, which outlives the report.
     if (m.changed.count() > 0) {
-        report.addSection("changed") catch {};
+        report.addSection("changed files (this session)") catch {};
         var paths: [filesview.max_changed][]const u8 = undefined;
         const n = m.changed.fill(&paths);
         for (paths[0..n]) |p| {
@@ -1341,6 +1381,8 @@ pub fn cmdFiles(m: *tui.Model) void {
     report.bash_may_write = m.bash_may_write;
     const text = report.finish(stats, m.changed.dropped) catch return;
     agent.pushInfoOwned(m, text);
+    // Turn-scoped honest net diff summary (real baseline->after stats).
+    m.pushTurnFileSummary();
 }
 
 fn runGitCapture(arena: std.mem.Allocator, argv: []const []const u8, limit: usize) ?[]const u8 {
@@ -1471,6 +1513,9 @@ pub const commands = [_]Cmd{
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
     .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
     .{ .key = "/init", .desc = "analyse the codebase and write AGENTS.md" },
+    .{ .key = "/commit", .desc = "create a git commit with verified context (scoped git allowlist)", .key_hint = "[instructions]" },
+    .{ .key = "/pr", .desc = "create or update a PR with merge-base diff (idempotent, scoped allowlist)", .key_hint = "[instructions]" },
+    .{ .key = "/commit-push-pr", .desc = "commit + push + PR workflow (PR allowlist; alias of /pr flow)", .key_hint = "[instructions]" },
     .{ .key = "/iter", .desc = "iteration budget: /iter [n] (min 8, max 200) or /iter to show current" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },

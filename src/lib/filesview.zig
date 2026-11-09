@@ -34,6 +34,7 @@
 
 const std = @import("std");
 const repeat = @import("repeat.zig");
+const lang_icons = @import("lang_icons.zig");
 
 /// The read cache's counters, as `/files` shows them.
 pub const Stats = struct {
@@ -171,10 +172,16 @@ pub const Report = struct {
         self.reads += 1;
     }
 
-    /// One file the agent wrote to.
+    /// One file the agent wrote to (session-level; no invented stats).
     pub fn addChanged(self: *Report, path: []const u8) !void {
         if (self.body.items.len > 0) try self.body.append(self.gpa, '\n');
-        try self.body.print(self.gpa, "  {s}", .{path});
+        const chip = lang_icons.forPath(path, false);
+        const base = std.fs.path.basename(path);
+        if (chip.label.len > 0 and !std.mem.eql(u8, chip.label, base)) {
+            try self.body.print(self.gpa, "  • [{s}] {s}", .{ chip.label, path });
+        } else {
+            try self.body.print(self.gpa, "  • {s}", .{path});
+        }
         self.changes += 1;
     }
 
@@ -329,4 +336,3 @@ test "Changed: clear forgets everything, and a new session starts empty" {
     try testing.expectEqual(@as(usize, 0), c.count());
     try testing.expectEqual(@as(usize, 0), c.dropped);
 }
-

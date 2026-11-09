@@ -13,6 +13,7 @@ const md = @import("lib/markdown.zig");
 const ansi = @import("lib/ansi.zig");
 const theme = @import("lib/theme.zig");
 const lang_icons = @import("lib/lang_icons.zig");
+const filechange = @import("lib/filechange.zig");
 const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
@@ -457,6 +458,21 @@ fn bannerRuleLine(pa: std.mem.Allocator, width: u16) PLine {
 /// bug this exists to avoid.
 pub const diff_preview_lines = 12;
 
+const max_net_baselines: usize = 64;
+const max_net_baseline_file: usize = 256 * 1024;
+const max_net_baseline_total: usize = 1024 * 1024;
+
+const NetBaseline = struct {
+    path: [filesview.path_max]u8 = undefined,
+    path_len: u16 = 0,
+    baseline: ?[]u8 = null,
+    /// Latest honest net diff stats from `baseline` to the most recent `after`.
+    /// Valid once `has_stats` is set; sourced from real diffs only.
+    net_added: usize = 0,
+    net_removed: usize = 0,
+    has_stats: bool = false,
+};
+
 /// The hairline under the hero's tagline. A LITERAL and not a composed run of
 /// `─`, because `CellRun.w` is a **u8 in COLUMNS**: one run wider than 255
 /// silently stops drawing halfway across a wide terminal. This is the same trap
@@ -657,7 +673,7 @@ fn appendLangChipLine(
     if (chip.label.len == 0) return;
 
     var cells: std.ArrayList(CellRun) = .empty;
-    try cells.append(pa, .{ .text = "\u{2502} ", .w = 2, .style = theme.code_border }); // │ 
+    try cells.append(pa, .{ .text = "\u{2502} ", .w = 2, .style = theme.code_border }); // │
 
     // Budget inside the box: left `│ ` (2) + content + right ` │` (2).
     var remaining: u16 = box_w -| 4;
@@ -1035,6 +1051,16 @@ pub const ShellOut = struct {
     ms: u64,
 };
 
+/// Turn context preserved across the prompt queue. `text` is owned by the
+/// queue (freed on take/clear/deinit); the other fields are value types or
+/// static slices with turn/command lifetime.
+pub const QueuedTurn = struct {
+    text: []u8,
+    mode: agent.ChatJob.Mode = .normal,
+    bash_allow_rules: []const []const u8 = &.{},
+    expand_cmdsubst: bool = false,
+};
+
 /// How many prompt dots fit on the rail.
 ///
 /// Six, because they are painted one row apart at the right margin: a seventh
@@ -1109,7 +1135,13 @@ pub const Model = struct {
     /// streaming state: the input froze, the history got cut off and there was
     /// no way to tell whether it was working. Now they are queued and the UI
     /// tick starts them as soon as no turn is in flight.
-    queue: std.ArrayList([]u8) = .empty,
+    ///
+    /// Each queued item carries its full turn context (mode, scoped bash allow
+    /// rules, cmdsubst expansion). Losing that context on queue/dequeue is a
+    /// context leak: a queued `/commit`/`/pr` or pipeline turn would run as a
+    /// plain normal turn without its allowlist or substitutions. The rules are
+    /// static slices (turn lifetime); only `text` is owned and freed.
+    queue: std.ArrayList(QueuedTurn) = .empty,
 
     /// The visible plan (the `todo` tool). The worker writes it from another
     /// thread and the draw reads it every frame, so it lives under the SAME lock
@@ -1508,6 +1540,13 @@ pub const Model = struct {
     /// the model looking at", and it is a fixed table inside the `Model`: no
     /// allocator, nothing to deinit, and it dies with the session.
     changed: filesview.Changed = .{},
+    /// File paths that already emitted a compact card in the current turn.
+    turn_file_cards: filesview.Changed = .{},
+    /// Turn-scoped baseline content for honest net diffs: first edit stores the
+    /// "before" content, subsequent edits diff against that baseline.
+    net_baselines: [max_net_baselines]NetBaseline = @splat(.{}),
+    net_baselines_len: usize = 0,
+    net_baselines_bytes: usize = 0,
     /// A `bash` command that was NOT read-only ran in this session.
     ///
     /// A command is a string and not a list of files, so the files it changed
@@ -2003,6 +2042,7 @@ pub const Model = struct {
         // nobody else frees them: without this, every turn with tools leaves the
         // whole repo in memory until exit.
         self.checkpoints.deinit();
+        self.clearNetBaselinesLocked();
         // `clearQueue` keeps the capacity (good, so we don't reallocate on
         // every prompt), so the list's buffer must be freed separately or it
         // leaks on exit.
@@ -2817,7 +2857,6 @@ pub const Model = struct {
         var rep = subagent_mod.Report{};
         const text = agent.runSubagent(self, task, &rep);
 
-
         self.lock();
         for (self.session_picker_semantic_results.items) |p| self.allocator.free(p);
         self.session_picker_semantic_results.clearRetainingCapacity();
@@ -3534,6 +3573,14 @@ pub const Model = struct {
             self.setAnchorLine(first);
         } else {
             self.follow_bottom = false;
+            // A paragraph can shrink (e.g. collapsing an expanded tool result).
+            // Keep the anchor offset within the paragraph's current height so the
+            // viewport does not jump past it.
+            if (self.anchor_para < self.para_heights.items.len) {
+                const ph = self.para_heights.items[self.anchor_para];
+                if (self.anchor_off > ph) self.anchor_off = ph;
+            }
+            first = self.anchorLine();
         }
         self.anchor = first;
         return .{ .first = first, .last = satAdd(first, @max(history_h, 1)), .total = t.total, .max_offset = t.max_offset };
@@ -4403,19 +4450,31 @@ pub const Model = struct {
         return items;
     }
 
-    /// Enqueues a prompt. The text MUST be a copy already made by the caller
-    /// (deliberately typed `[]u8`: the queue owns what it stores and frees it
-    /// in `deinit`).
+    /// Enqueues a prompt as a normal turn (compatibility shim). Prefer
+    /// `enqueueTurn` when the turn carries scoped rules or a non-normal mode.
+    /// The text MUST be a copy already made by the caller (the queue owns and
+    /// frees it).
     pub fn enqueuePrompt(self: *Model, text: []u8) usize {
+        return self.enqueueTurn(.{ .text = text });
+    }
+
+    /// Enqueues a turn with its full context preserved. Losing mode/rules on
+    /// queue would make a queued git workflow or pipeline turn run with wrong
+    /// semantics (context leak).
+    pub fn enqueueTurn(self: *Model, turn: QueuedTurn) usize {
         self.lock();
         defer self.unlock();
-        self.queue.append(self.allocator, text) catch return self.queue.items.len;
+        self.queue.append(self.allocator, turn) catch {
+            self.allocator.free(turn.text);
+            return self.queue.items.len;
+        };
         self.dirty = true;
         return self.queue.items.len;
     }
 
-    /// Takes the next prompt out of the queue. `null` if there is none.
-    pub fn takeQueued(self: *Model) ?[]u8 {
+    /// Takes the next queued turn out of the queue. `null` if there is none.
+    /// The caller owns `text` and must free it.
+    pub fn takeQueued(self: *Model) ?QueuedTurn {
         self.lock();
         defer self.unlock();
         if (self.queue.items.len == 0) return null;
@@ -4424,14 +4483,14 @@ pub const Model = struct {
         return first;
     }
 
-    /// Takes the next queued prompt ONLY when it is time to run one: the
+    /// Takes the next queued turn ONLY when it is time to run one: the
     /// queue is not empty and no turn is in flight. The caller starts it.
     ///
     /// The gate lives here, and not inline in the tick, because the starting
     /// (`agent.startChat`) spawns threads and writes the session — nothing a
     /// unit test can call — while the GATE is exactly what regresses when a
     /// queued prompt is shown in the footer and never runs.
-    pub fn takeQueuedWhenIdle(self: *Model) ?[]u8 {
+    pub fn takeQueuedWhenIdle(self: *Model) ?QueuedTurn {
         if (self.isBusy()) return null;
         return self.takeQueued();
     }
@@ -4448,7 +4507,7 @@ pub const Model = struct {
         self.lock();
         defer self.unlock();
         if (self.queue.items.len == 0) return null;
-        return self.queue.items[0];
+        return self.queue.items[0].text;
     }
 
     /// Tenths of a second the current turn has been running. An instant is
@@ -4483,7 +4542,7 @@ pub const Model = struct {
         self.lock();
         defer self.unlock();
         if (self.queue.items.len == 0) return "";
-        const t = self.queue.items[0];
+        const t = self.queue.items[0].text;
         if (t.len <= max) return t;
         return t[0..max];
     }
@@ -4586,7 +4645,7 @@ pub const Model = struct {
     pub fn clearQueue(self: *Model) void {
         self.lock();
         defer self.unlock();
-        for (self.queue.items) |t| self.allocator.free(t);
+        for (self.queue.items) |item| self.allocator.free(item.text);
         self.queue.clearRetainingCapacity();
     }
 
@@ -4829,10 +4888,41 @@ pub const Model = struct {
     /// bright color and the argument in the dim one. Without the mark, `write`
     /// and `hola.js` came out the same cyan and were indistinguishable.
     pub fn pushToolStart(self: *Model, tool: []const u8, arg: []const u8) void {
-        const line = if (arg.len == 0)
+        // Timeline presentation: collapse control whitespace and cap very long
+        // arguments so one tool line stays readable. The full argument is still
+        // kept in `tool_run` state for live status/details.
+        var arg_buf: [160]u8 = undefined;
+        const display_arg = if (arg.len == 0)
+            ""
+        else blk: {
+            const max_display: usize = 120;
+            const limit = @min(arg.len, max_display);
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < limit and n < arg_buf.len) : (i += 1) {
+                const c = arg[i];
+                arg_buf[n] = switch (c) {
+                    '\n', '\r', '\t' => ' ',
+                    else => if (c < 0x20) ' ' else c,
+                };
+                n += 1;
+            }
+            if (arg.len > max_display) {
+                // Avoid cutting inside a UTF-8 continuation byte.
+                while (n > 0 and (arg_buf[n - 1] & 0xc0) == 0x80) n -= 1;
+                if (n > 0 and arg_buf[n - 1] >= 0x80 and (arg_buf[n - 1] & 0xc0) != 0xc0) n -= 1;
+                if (n + 3 <= arg_buf.len) {
+                    @memcpy(arg_buf[n..][0..3], "...");
+                    n += 3;
+                }
+            }
+            break :blk arg_buf[0..n];
+        };
+
+        const line = if (display_arg.len == 0)
             std.fmt.allocPrint(self.allocator, "*{s}*", .{tool}) catch return
         else
-            std.fmt.allocPrint(self.allocator, "*{s}*({s})", .{ tool, arg }) catch return;
+            std.fmt.allocPrint(self.allocator, "*{s}*({s})", .{ tool, display_arg }) catch return;
         defer self.allocator.free(line);
         self.pushKind(.tool_run, line);
 
@@ -4941,7 +5031,33 @@ pub const Model = struct {
         result: []const u8,
     ) void {
         var line_buf: [256]u8 = undefined;
-        const head: []const u8 = if (summary.len > 0) summary else tool;
+        var head_buf: [180]u8 = undefined;
+        const raw_head: []const u8 = if (summary.len > 0) summary else tool;
+        // Keep the timeline result on one readable line; full details remain in
+        // the expandable result.
+        const head = blk: {
+            const max_head: usize = 140;
+            const limit = @min(raw_head.len, max_head);
+            var n: usize = 0;
+            var i: usize = 0;
+            while (i < limit and n < head_buf.len) : (i += 1) {
+                const c = raw_head[i];
+                head_buf[n] = switch (c) {
+                    '\n', '\r', '\t' => ' ',
+                    else => if (c < 0x20) ' ' else c,
+                };
+                n += 1;
+            }
+            if (raw_head.len > max_head) {
+                while (n > 0 and (head_buf[n - 1] & 0xc0) == 0x80) n -= 1;
+                if (n > 0 and head_buf[n - 1] >= 0x80 and (head_buf[n - 1] & 0xc0) != 0xc0) n -= 1;
+                if (n + 3 <= head_buf.len) {
+                    @memcpy(head_buf[n..][0..3], "...");
+                    n += 3;
+                }
+            }
+            break :blk head_buf[0..n];
+        };
         // Marked summary and dim time: you read "what happened" and then "how
         // long it took" without them mixing. When the full result differs from
         // the summary, append a Ctrl+R hint so the user knows the tool result
@@ -5007,8 +5123,137 @@ pub const Model = struct {
         return self.pushDiffLang(before, after, "");
     }
 
-    /// Like `pushDiff` but knowing the file's language, to tokenize the body
-    /// of each line (see `agent.langFromPath`).
+    /// Like `pushDiffLang` but also emits a compact file-change card using the
+    /// file path and real diff statistics. The card is shown before the diff so
+    /// the change is scannable.
+    ///
+    /// Net diff is honest: on the first edit of a path in the current turn, the
+    /// operation's `before` is stored as a bounded baseline. Subsequent edits of
+    /// the same path compute and display the real net diff from that baseline to
+    /// the new `after` content. If baseline storage is unavailable (caps or
+    /// allocation failure), this falls back to the real operation diff without
+    /// inventing net stats.
+    pub fn pushFileDiff(self: *Model, before: []const u8, after: []const u8, path: []const u8) DiffCounts {
+        return self.pushFileDiffOp(before, after, path, .modified);
+    }
+
+    pub fn pushFileDiffOp(
+        self: *Model,
+        before: []const u8,
+        after: []const u8,
+        path: []const u8,
+        operation: filechange.Operation,
+    ) DiffCounts {
+        const lang = langFromPath(path);
+
+        // Under lock: resolve/create baseline for honest net diffs.
+        // Copy baseline bytes out before diffing so we never hold the model lock
+        // across diff computation or rendering (pushInfoFmt/pushDiffLang lock).
+        var baseline_copy: ?[]u8 = null;
+        var is_net = false;
+        var first_card = false;
+        var can_record_net = false;
+        self.lock();
+        const existing = self.netBaselineFor(path);
+        if (existing) |base| {
+            baseline_copy = self.allocator.dupe(u8, base) catch null;
+            if (baseline_copy != null) {
+                is_net = true;
+                can_record_net = true;
+            }
+            // If copy failed, fall back to operation diff and keep prior net stats.
+        } else {
+            self.noteNetBaseline(path, before);
+            if (self.netBaselineFor(path) != null) can_record_net = true;
+            // Check if a card was already shown for this path this turn (defensive).
+            var seen = false;
+            var i: usize = 0;
+            while (i < self.turn_file_cards.count()) : (i += 1) {
+                if (std.mem.eql(u8, self.turn_file_cards.at(i), path)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                self.turn_file_cards.note(path);
+                first_card = true;
+            }
+        }
+        self.unlock();
+        defer if (baseline_copy) |b| self.allocator.free(b);
+
+        const diff_from = if (is_net) baseline_copy.? else before;
+        const dc = self.peekDiffCounts(diff_from, after);
+
+        // Record honest net stats for grouped summaries when the diff is
+        // relative to the turn baseline (or operation==net on first edit).
+        if (can_record_net) {
+            self.lock();
+            self.updateNetBaselineStats(path, dc);
+            self.unlock();
+        }
+
+        // Card policy: show first operation card, and show net cards on
+        // subsequent edits (honest cumulative state vs original baseline).
+        // If net becomes empty, still show "(net, no changes from baseline)".
+        const show_card = first_card or is_net;
+        if (show_card) {
+            var buf: [280]u8 = undefined;
+            const card = filechange.formatCompact(&buf, .{
+                .path = path,
+                .operation = .modified,
+                .added = dc.added,
+                .removed = dc.removed,
+            }, false);
+            const chip = lang_icons.forPath(path, false);
+            const has_label = chip.label.len > 0 and !std.mem.eql(u8, chip.label, filechange.pathParts(path).base);
+            if (is_net) {
+                if (dc.added == 0 and dc.removed == 0) {
+                    if (has_label)
+                        self.pushInfoFmt("file changed (net, no changes)  [{s}] {s}", .{ chip.label, filechange.pathParts(path).base })
+                    else
+                        self.pushInfoFmt("file changed (net, no changes)  {s}", .{filechange.pathParts(path).base});
+                } else if (has_label)
+                    self.pushInfoFmt("file changed (net)  [{s}] {s}", .{ chip.label, card })
+                else
+                    self.pushInfoFmt("file changed (net)  {s}", .{card});
+            } else if (dc.added > 0 or dc.removed > 0) {
+                const op_label = switch (operation) {
+                    .created => "file created",
+                    .deleted => "file deleted",
+                    else => "file changed",
+                };
+                if (has_label)
+                    self.pushInfoFmt("{s}  [{s}] {s}", .{ op_label, chip.label, card })
+                else
+                    self.pushInfoFmt("{s}  {s}", .{ op_label, card });
+            }
+        }
+
+        _ = self.pushDiffLang(diff_from, after, lang);
+        return dc;
+    }
+
+    fn peekDiffCounts(self: *Model, before: []const u8, after: []const u8) DiffCounts {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const diff_lines = md.unifiedDiff(arena, before, after) catch return .{};
+        var added: usize = 0;
+        var removed: usize = 0;
+        for (diff_lines) |l| {
+            if (l.len > 0 and l[0] == '+') added += 1;
+            if (l.len > 0 and l[0] == '-') removed += 1;
+        }
+        return .{ .added = added, .removed = removed };
+    }
+
+    fn langFromPath(path: []const u8) []const u8 {
+        const ext = std.fs.path.extension(path);
+        if (ext.len > 1) return ext[1..];
+        return std.fs.path.basename(path);
+    }
+
     pub fn pushDiffLang(
         self: *Model,
         before: []const u8,
@@ -5257,7 +5502,114 @@ pub const Model = struct {
     pub fn beginCheckpoint(self: *Model, label: []const u8) void {
         self.lock();
         defer self.unlock();
+        self.clearNetBaselinesLocked();
+        self.turn_file_cards.clear();
         self.checkpoints.begin(label);
+    }
+
+    fn clearNetBaselinesLocked(self: *Model) void {
+        var i: usize = 0;
+        while (i < self.net_baselines_len) : (i += 1) {
+            if (self.net_baselines[i].baseline) |b| self.allocator.free(b);
+            self.net_baselines[i] = .{};
+        }
+        self.net_baselines_len = 0;
+        self.net_baselines_bytes = 0;
+    }
+
+    fn updateNetBaselineStats(self: *Model, path: []const u8, dc: DiffCounts) void {
+        var i: usize = 0;
+        while (i < self.net_baselines_len) : (i += 1) {
+            const nb = &self.net_baselines[i];
+            if (std.mem.eql(u8, nb.path[0..nb.path_len], path)) {
+                nb.net_added = dc.added;
+                nb.net_removed = dc.removed;
+                nb.has_stats = true;
+                return;
+            }
+        }
+    }
+
+    pub fn clearNetBaselines(self: *Model) void {
+        self.lock();
+        defer self.unlock();
+        self.clearNetBaselinesLocked();
+    }
+
+    fn netBaselineFor(self: *Model, path: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (i < self.net_baselines_len) : (i += 1) {
+            const nb = &self.net_baselines[i];
+            const p = nb.path[0..nb.path_len];
+            if (std.mem.eql(u8, p, path)) return nb.baseline;
+        }
+        return null;
+    }
+
+    fn noteNetBaseline(self: *Model, path: []const u8, before: []const u8) void {
+        if (path.len == 0 or path.len > filesview.path_max) return;
+        if (self.netBaselineFor(path) != null) return;
+        if (self.net_baselines_len >= max_net_baselines) return;
+        if (before.len > max_net_baseline_file) return;
+        if (self.net_baselines_bytes + before.len > max_net_baseline_total) return;
+        const copy = self.allocator.dupe(u8, before) catch return;
+        var nb = &self.net_baselines[self.net_baselines_len];
+        nb.* = .{};
+        @memcpy(nb.path[0..path.len], path);
+        nb.path_len = @intCast(path.len);
+        nb.baseline = copy;
+        self.net_baselines_len += 1;
+        self.net_baselines_bytes += copy.len;
+    }
+
+    /// Appends a compact grouped summary of turn-scoped file changes with honest
+    /// net stats (from real baseline->after diffs). Returns false when there is
+    /// nothing to report or output could not be produced.
+    pub fn appendTurnFileSummary(self: *Model, out: *std.ArrayList(u8), gpa: std.mem.Allocator) bool {
+        self.lock();
+        defer self.unlock();
+        if (self.net_baselines_len == 0) return false;
+        var total_added: usize = 0;
+        var total_removed: usize = 0;
+        var files: usize = 0;
+        var i: usize = 0;
+        while (i < self.net_baselines_len) : (i += 1) {
+            if (!self.net_baselines[i].has_stats) continue;
+            files += 1;
+            total_added += self.net_baselines[i].net_added;
+            total_removed += self.net_baselines[i].net_removed;
+        }
+        if (files == 0) return false;
+        out.appendSlice(gpa, "changed files (net, this turn)\n") catch return false;
+        i = 0;
+        while (i < self.net_baselines_len) : (i += 1) {
+            const nb = &self.net_baselines[i];
+            if (!nb.has_stats) continue;
+            const path = nb.path[0..nb.path_len];
+            const chip = lang_icons.forPath(path, false);
+            var card_buf: [240]u8 = undefined;
+            const card = filechange.formatCompact(&card_buf, .{
+                .path = path,
+                .operation = .modified,
+                .added = nb.net_added,
+                .removed = nb.net_removed,
+            }, false);
+            if (chip.label.len > 0 and !std.mem.eql(u8, chip.label, filechange.pathParts(path).base))
+                out.print(gpa, "  • [{s}] {s}\n", .{ chip.label, card }) catch return false
+            else
+                out.print(gpa, "  • {s}\n", .{card}) catch return false;
+        }
+        out.print(gpa, "  total  {d} file(s)  +{d} -{d} (net)", .{ files, total_added, total_removed }) catch return false;
+        return true;
+    }
+
+    pub fn pushTurnFileSummary(self: *Model) void {
+        var out: std.ArrayList(u8) = .empty;
+        defer self.allocator.free(out.allocatedSlice());
+        if (self.appendTurnFileSummary(&out, self.allocator)) {
+            self.pushInfoOwned(out.toOwnedSlice(self.allocator) catch return);
+            return;
+        }
     }
 
     /// Adds the snapshot of a file to the checkpoint of the turn in progress.
@@ -7285,11 +7637,11 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // to start the next turn with, so until now a queued prompt was
             // shown in the footer and never ran. The tick is the UI thread
             // waking up anyway, and the turn has just ended by then.
-            if (self.takeQueuedWhenIdle()) |prompt| {
-                agent.startChat(self, prompt) catch |err| {
+            if (self.takeQueuedWhenIdle()) |turn| {
+                agent.startTurn(self, turn.text, turn.mode, turn.bash_allow_rules, turn.expand_cmdsubst) catch |err| {
                     self.pushInfoFmt("error: {t}", .{err});
                 };
-                self.allocator.free(prompt);
+                self.allocator.free(turn.text);
                 ctx.redraw = true;
             }
             // The model catalogue on disk refreshes itself, quietly, about
@@ -8854,6 +9206,7 @@ fn drawRoundedBox(
     // Fill interior first so wide cells are split before border paint.
     var r: u16 = 0;
     while (r < h) : (r += 1) {
+        expandWideCells(p.surface, y + r, p.width);
         p.fillRange(x, x + w, y + r, " ", fill_style);
     }
     // Top / bottom borders.
@@ -8907,22 +9260,36 @@ fn drawPermissionModal(
     const detail_lines: usize = @min(detail_rows_all.len, max_detail_lines);
     const detail_truncated = detail_rows_all.len > max_detail_lines;
 
+    // Rule text can be long (paths/patterns). Wrap it so the dialog explains why
+    // without overflowing; cap lines to keep the modal compact.
+    var rbuf: [160]u8 = undefined;
+    const rtext: []const u8 = if (rule.len > 0)
+        (std.fmt.bufPrint(&rbuf, "asked by rule: {s}", .{rule}) catch rule)
+    else
+        "";
+    const rule_rows_all: []const []const u8 = if (rtext.len > 0 and inner_w > 0)
+        wrapTextToRows(p, rtext, inner_w, p.arena)
+    else
+        &.{};
+    const max_rule_lines: usize = 2;
+    const rule_lines: usize = @min(rule_rows_all.len, max_rule_lines);
+
     // Height: title+label(4) + tool(1) + detail + optional rows + options(1) + padding.
     var h: u16 = 7;
     if (detail.len > 0) h +|= @intCast(@max(detail_lines, 1));
     if (detail_truncated) h +|= 1;
-    if (rule.len > 0) h +|= 1;
+    if (rule_lines > 0) h +|= @intCast(rule_lines);
     if (sandbox_note) h +|= 1;
     if (dangerous_suggestion) h +|= 1;
     h = @min(h, height -| 2);
 
     // Too small for a readable box: compact form keeps the turn answerable.
     if (w < 28 or height < 8 or h < 7) {
-        drawPermissionModalCompact(p, width, height, tool, sandbox_note);
+        drawPermissionModalCompact(p, width, height, tool, allow_always, sandbox_note);
         return;
     }
     if (h > height -| 2) {
-        drawPermissionModalCompact(p, width, height, tool, sandbox_note);
+        drawPermissionModalCompact(p, width, height, tool, allow_always, sandbox_note);
         return;
     }
     const x: u16 = (width -| w) / 2;
@@ -8955,13 +9322,14 @@ fn drawPermissionModal(
         }
     }
 
-    // Rule that matched / asked: explain WHY this dialog appeared, not just
-    // show an opaque rule string.
-    if (rule.len > 0 and dy < bottom_limit) {
-        var rbuf: [160]u8 = undefined;
-        const rtext = std.fmt.bufPrint(&rbuf, "asked by rule: {s}", .{rule}) catch rule;
-        _ = p.putClipped(x + inner_x_pad, dy, rtext, inner_w, theme.warn);
-        dy += 1;
+    // Rule that matched / asked: explain WHY this dialog appeared, wrapped to
+    // stay inside the modal on narrow terminals.
+    if (rule_lines > 0 and dy < bottom_limit) {
+        var ri: usize = 0;
+        while (ri < rule_lines and dy < bottom_limit) : (ri += 1) {
+            _ = p.putClipped(x + inner_x_pad, dy, rule_rows_all[ri], inner_w, theme.warn);
+            dy += 1;
+        }
     }
 
     // Sandbox note (Phase 25)
@@ -9059,6 +9427,7 @@ fn drawPermissionModalCompact(
     width: u16,
     height: u16,
     tool: []const u8,
+    allow_always: bool,
     allow_sandbox: bool,
 ) void {
     if (height == 0 or width == 0) return;
@@ -9078,10 +9447,18 @@ fn drawPermissionModalCompact(
     _ = p.putClipped(1, y, head, width -| 2, theme.warn_bold);
 
     if (rows >= 2) {
+        // Show only the actions the runtime actually accepts; the normal modal
+        // already filters "always allow", and the compact fallback must not
+        // advertise a key that will be ignored.
         const opts = if (allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash"))
-            "Y allow · S sandbox · A always · N deny · ESC cancel"
+            (if (allow_always)
+                "Y allow · S sandbox · A always · N deny · ESC cancel"
+            else
+                "Y allow · S sandbox · N deny · ESC cancel")
+        else if (allow_always)
+            "Y allow · A always · N deny · ESC cancel"
         else
-            "Y allow · A always · N deny · ESC cancel";
+            "Y allow · N deny · ESC cancel";
         _ = p.putClipped(1, y + 1, opts, width -| 2, theme.brand_soft);
     }
 }
@@ -10956,6 +11333,103 @@ test "focus: the accent bar is dimmed when the window is not focused" {
     try std.testing.expect(!lit.readCell(0, input_row).style.dim);
 }
 
+test "scroll: toggling a tool result while scrolled up does not jump to the bottom" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) m.pushInfoFmt("history line {d}", .{i});
+    m.pushToolStart("read", "big.txt");
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'x');
+    m.pushToolDone("read", "Read 200 lines", 3, big[0..]);
+
+    _ = try drawTest(&m, arena_state.allocator(), 60, 18);
+    m.scrollBy(12);
+    _ = try drawTest(&m, arena_state.allocator(), 60, 18);
+    try std.testing.expect(!m.follow_bottom);
+    const before = m.anchorLine();
+
+    try std.testing.expect(m.toggleLastTool());
+    _ = try drawTest(&m, arena_state.allocator(), 60, 18);
+    try std.testing.expect(!m.follow_bottom);
+    // Expanding below the reader must not yank the viewport to the bottom.
+    try std.testing.expect(m.anchorLine() <= before + 2);
+}
+
+test "scroll: collapsing an expanded tool result keeps the viewport stable" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var i: usize = 0;
+    while (i < 10) : (i += 1) m.pushInfoFmt("line {d}", .{i});
+    m.pushToolStart("read", "big.txt");
+    var big: [4096]u8 = undefined;
+    @memset(&big, 'a');
+    // Make it multi-line so the expanded form is tall.
+    for (&big, 0..) |*c, j| {
+        if (j % 40 == 39) c.* = '\n';
+    }
+    m.pushToolDone("read", "Read many lines", 3, big[0..]);
+    // Trailing content keeps the expanded tool result away from the bottom so
+    // we can anchor inside it without computeVisible snapping to follow mode.
+    var k: usize = 0;
+    while (k < 30) : (k += 1) m.pushInfoFmt("tail {d}", .{k});
+
+    _ = try drawTest(&m, arena_state.allocator(), 60, 18);
+    try std.testing.expect(m.last_tool != null);
+    const para_idx = m.last_tool.?.para_idx;
+
+    try std.testing.expect(m.toggleLastTool()); // expand
+    _ = try drawTest(&m, arena_state.allocator(), 60, 18);
+
+    // Place the viewport anchor inside the expanded paragraph.
+    m.follow_bottom = false;
+    m.anchor_para = para_idx;
+    m.anchor_off = 10;
+    _ = try drawTest(&m, arena_state.allocator(), 60, 18);
+    try std.testing.expect(!m.follow_bottom);
+
+    try std.testing.expect(m.toggleLastTool()); // collapse
+    _ = try drawTest(&m, arena_state.allocator(), 60, 18);
+
+    // Collapsing shrank content: stay in manual scroll mode and do not let the
+    // anchor point past the collapsed paragraph.
+    try std.testing.expect(!m.follow_bottom);
+    if (m.anchor_para == para_idx and para_idx < m.para_heights.items.len) {
+        try std.testing.expect(m.anchor_off <= m.para_heights.items[para_idx]);
+    }
+}
+
+test "tool events: start/result timeline lines are normalized for presentation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushToolStart("bash", "echo one\necho two\tthree");
+    m.pushToolDone("bash", "ok\nline2", 12, "ok\nline2");
+
+    const s = try drawTest(&m, arena_state.allocator(), 100, 20);
+    const all = allText(s);
+    // Newlines/tabs in the visible timeline text collapse to spaces.
+    try std.testing.expect(std.mem.indexOf(u8, all, "echo one echo two three") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "ok line2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "12ms") != null);
+
+    var m2 = Model.init(std.testing.allocator);
+    defer m2.deinit();
+    var long_buf: [160]u8 = undefined;
+    @memset(&long_buf, 'x');
+    m2.pushToolStart("read", long_buf[0..]);
+    const s2 = try drawTest(&m2, arena_state.allocator(), 120, 12);
+    try std.testing.expect(std.mem.indexOf(u8, allText(s2), "...") != null);
+}
+
 test "input: rows scrolled out above are announced instead of silently hidden" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -11314,6 +11788,62 @@ test "diff: no changes adds no paragraphs" {
     // No paragraphs: row 0 is the separator/banner, not a diff.
     const row0 = rowText(s, 0, &buf);
     try std.testing.expect(std.mem.indexOf(u8, row0, "+") == null);
+}
+
+test "file diff: emits a compact file change card with real stats" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.beginCheckpoint("t1");
+
+    const dc = m.pushFileDiff("one\ntwo\n", "one\nTWO\nthree\n", "src/demo.zig");
+    try std.testing.expectEqual(@as(usize, 2), dc.added);
+    try std.testing.expectEqual(@as(usize, 1), dc.removed);
+
+    const s = try drawTest(&m, arena_state.allocator(), 72, 20);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "file changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "demo.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "+2 -1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "-two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "+TWO") != null);
+}
+
+test "file diff: multiple edits to same file in one turn show honest net diff" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.beginCheckpoint("t1");
+
+    // Baseline: "alpha\nbeta\n"
+    // Edit 1: beta -> BETA, add gamma => op diff +2 -1
+    const dc1 = m.pushFileDiff("alpha\nbeta\n", "alpha\nBETA\ngamma\n", "src/net.zig");
+    try std.testing.expectEqual(@as(usize, 2), dc1.added);
+    try std.testing.expectEqual(@as(usize, 1), dc1.removed);
+
+    // Edit 2: gamma -> GAMMA (net vs baseline alpha,beta is alpha,BETA,GAMMA => +2 -1)
+    const dc2 = m.pushFileDiff("alpha\nBETA\ngamma\n", "alpha\nBETA\nGAMMA\n", "src/net.zig");
+    try std.testing.expectEqual(@as(usize, 2), dc2.added);
+    try std.testing.expectEqual(@as(usize, 1), dc2.removed);
+
+    // Edit 3: restore to baseline => net has no changes.
+    const dc3 = m.pushFileDiff("alpha\nBETA\nGAMMA\n", "alpha\nbeta\n", "src/net.zig");
+    try std.testing.expectEqual(@as(usize, 0), dc3.added);
+    try std.testing.expectEqual(@as(usize, 0), dc3.removed);
+
+    const s = try drawTest(&m, arena_state.allocator(), 80, 28);
+    const all = allText(s);
+    // First card (operation), then net cards.
+    try std.testing.expect(std.mem.indexOf(u8, all, "file changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "net.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "file changed (net)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "file changed (net, no changes)") != null);
+    // Net diff from baseline to edit 2 state should show BETA and GAMMA additions vs beta.
+    try std.testing.expect(std.mem.indexOf(u8, all, "+BETA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "+GAMMA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "-beta") != null);
 }
 
 test "hero: the wordmark is lit and the grid is three tones" {
@@ -12383,11 +12913,13 @@ test "queue: enqueues, takes in order and frees" {
 
     // FIFO.
     const p1 = m.takeQueued().?;
-    try std.testing.expectEqualStrings("primero", p1);
-    m.allocator.free(p1);
+    try std.testing.expectEqualStrings("primero", p1.text);
+    try std.testing.expect(p1.mode == .normal);
+    try std.testing.expect(!p1.expand_cmdsubst);
+    m.allocator.free(p1.text);
     const p2 = m.takeQueued().?;
-    try std.testing.expectEqualStrings("segundo", p2);
-    m.allocator.free(p2);
+    try std.testing.expectEqualStrings("segundo", p2.text);
+    m.allocator.free(p2.text);
 
     try std.testing.expectEqual(@as(usize, 0), m.queuedCount());
     try std.testing.expect(m.takeQueued() == null);
@@ -12402,6 +12934,33 @@ test "queue: clearQueue frees whatever is left" {
     _ = m.enqueuePrompt(a);
     m.clearQueue();
     try std.testing.expectEqual(@as(usize, 0), m.queuedCount());
+}
+
+test "queue: preserves full turn context for special turns" {
+    // A queued /commit, /pr, pipeline or cmdsubst turn must keep its mode and
+    // scoped bash allow rules. Dropping them on enqueue/dequeue makes the turn
+    // run as a plain normal turn — a context leak (wrong permissions and no
+    // command substitution).
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const rules = [_][]const u8{ "Bash(git status:*)", "Bash(git commit:*)" };
+    const text = m.allocator.dupe(u8, "commit prompt") catch unreachable;
+    _ = m.enqueueTurn(.{
+        .text = text,
+        .mode = .pipeline,
+        .bash_allow_rules = &rules,
+        .expand_cmdsubst = true,
+    });
+
+    const got = m.takeQueued().?;
+    defer m.allocator.free(got.text);
+    try std.testing.expectEqualStrings("commit prompt", got.text);
+    try std.testing.expect(got.mode == .pipeline);
+    try std.testing.expect(got.expand_cmdsubst);
+    try std.testing.expectEqual(@as(usize, 2), got.bash_allow_rules.len);
+    try std.testing.expectEqualStrings("Bash(git status:*)", got.bash_allow_rules[0]);
+    try std.testing.expectEqualStrings("Bash(git commit:*)", got.bash_allow_rules[1]);
 }
 
 test "the face the footer paints is the width the footer computes with" {
@@ -12812,6 +13371,131 @@ test "permissions: permRule resets when the dialog closes" {
     m.perm_active = false;
     m.perm_rule_len = 0;
     try std.testing.expectEqualStrings("", m.permRule());
+}
+
+test "permissions: a long matched rule wraps inside the modal without hiding options" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    @memcpy(m.perm_tool[0..4], "bash");
+    m.perm_tool_len = 4;
+    @memcpy(m.perm_detail[0..4], "echo");
+    m.perm_detail_len = 4;
+    m.perm_active = true;
+    m.setPermRule("Bash(project/scripts/very/deep/path/with/a/really/long/rule/name) ask");
+
+    const s = try drawTest(&m, arena_state.allocator(), 60, 20);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Permission required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "asked by rule") != null);
+    // The rule text is present (possibly wrapped across rows).
+    try std.testing.expect(std.mem.indexOf(u8, all, "long/rule/name") != null or
+        std.mem.indexOf(u8, all, "Bash(project") != null);
+    // The answer options must still be reachable.
+    try std.testing.expect(std.mem.indexOf(u8, all, "Y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null);
+    m.perm_active = false;
+}
+
+test "permissions: narrow terminal with a long rule still shows a readable prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    @memcpy(m.perm_tool[0..4], "bash");
+    m.perm_tool_len = 4;
+    m.perm_active = true;
+    m.setPermRule("Bash(project/scripts/very/deep/path/with/a/really/long/rule/name) ask");
+
+    const s = try drawTest(&m, arena_state.allocator(), 24, 10);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Permission") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Y allow") != null);
+    m.perm_active = false;
+}
+
+test "permissions: a very long bash detail wraps and remains answerable" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    @memcpy(m.perm_tool[0..4], "bash");
+    m.perm_tool_len = 4;
+    const detail = "echo this-is-a-very-long-command with many arguments that should wrap inside the permission dialog without crossing the border";
+    const n = @min(detail.len, m.perm_detail.len);
+    @memcpy(m.perm_detail[0..n], detail[0..n]);
+    m.perm_detail_len = n;
+    m.perm_allow_always = true;
+    m.perm_active = true;
+
+    const s = try drawTest(&m, arena_state.allocator(), 56, 18);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Permission required") != null);
+    // Wrapped content should still expose recognizable parts of the command.
+    try std.testing.expect(std.mem.indexOf(u8, all, "very-long-command") != null or
+        std.mem.indexOf(u8, all, "many arguments") != null);
+    // Critical actions remain available.
+    try std.testing.expect(std.mem.indexOf(u8, all, "allow once") != null or
+        std.mem.indexOf(u8, all, "Y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null or
+        std.mem.indexOf(u8, all, "N") != null);
+    m.perm_active = false;
+}
+
+test "permissions: a long always-allow suggestion stays within a narrow modal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    @memcpy(m.perm_tool[0..4], "bash");
+    m.perm_tool_len = 4;
+    @memcpy(m.perm_detail[0..2], "ls");
+    m.perm_detail_len = 2;
+    m.perm_active = true;
+    m.perm_allow_always = true;
+    m.setPermSuggestion("Bash(project/scripts/very/deep/path/with/a/really/long/suggestion)");
+
+    const s = try drawTest(&m, arena_state.allocator(), 44, 16);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Permission required") != null);
+    // On tight widths the label falls back to the compact form.
+    try std.testing.expect(std.mem.indexOf(u8, all, "always allow") != null or
+        std.mem.indexOf(u8, all, "A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null or
+        std.mem.indexOf(u8, all, "N") != null);
+    m.perm_active = false;
+}
+
+test "permissions: compact fallback hides always-allow when the runtime does not offer it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.streamStart();
+    @memcpy(m.perm_tool[0..4], "bash");
+    m.perm_tool_len = 4;
+    @memcpy(m.perm_detail[0..4], "echo");
+    m.perm_detail_len = 4;
+    m.perm_active = true;
+    m.perm_allow_always = false;
+
+    const s = try drawTest(&m, arena_state.allocator(), 24, 10);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Permission") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Y allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "A always") == null);
+    m.perm_active = false;
 }
 
 test "the mascot IS the state indicator: the face sits next to the label" {
@@ -14179,7 +14863,6 @@ test "code block chip: nerd icons can be disabled and the label is always shown"
     }
 }
 
-
 test "a code line wider than the box wraps inside it instead of pushing the border" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -14919,6 +15602,23 @@ test "ask: narrow and short layouts keep the question visible in the compact pan
     const short = try drawTest(&m, small_arena.allocator(), 80, 13);
     try std.testing.expect(std.mem.indexOf(u8, allText(short), "Which approach") != null);
     try std.testing.expect(std.mem.indexOf(u8, allText(short), "▸ 1 recommended") != null);
+}
+
+test "ask: width 24 with a long question keeps the selector usable" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const options = [_][]const u8{ "keep the current implementation", "rewrite the module completely" };
+    try openAskForTest(&m, "Which approach should we take for this very long and detailed question?", "design", &options);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const s = try drawTest(&m, arena_state.allocator(), 24, 18);
+    const all = allText(s);
+    // The question may wrap, but its key words must remain visible.
+    try std.testing.expect(std.mem.indexOf(u8, all, "Which") != null or
+        std.mem.indexOf(u8, all, "approach") != null);
+    // The selected option marker remains visible in the tight layout.
+    try std.testing.expect(std.mem.indexOf(u8, all, "▸ 1") != null);
 }
 
 test "ask: the option list lives in the panel box, so it cannot be painted over it" {
@@ -16073,8 +16773,9 @@ test "queue: a queued prompt is taken when no turn is in flight, and only then" 
 
     m.streamEnd(); // the turn just ended: it is time
     const got = m.takeQueuedWhenIdle().?;
-    defer m.allocator.free(got);
-    try std.testing.expectEqualStrings("the queued prompt", got);
+    defer m.allocator.free(got.text);
+    try std.testing.expectEqualStrings("the queued prompt", got.text);
+    try std.testing.expect(got.mode == .normal);
     try std.testing.expect(m.takeQueuedWhenIdle() == null);
 }
 

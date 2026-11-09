@@ -10750,13 +10750,12 @@ fn execOneCall(
                 s.appendToolResult(call.id, call.name, res) catch {};
                 return 1;
             };
-            // The language comes from the path's extension, so the body of each line
-            // is tokenized instead of coming out in the prefix's color.
-            const dc = m.pushDiffLang(old, after, langFromPath(pth));
+            // The TUI renders a compact file card (before the diff) and the diff
+            // itself from real before/after content.
+            const dc = m.pushFileDiff(old, after, pth);
             turn_stats.noteDiff(pth, dc);
         }
     }
-
     // [readcache] Two things that need the message this result is about to become.
     //
     // 1) A `write`/`edit` invalidates the file in the cache. Without this, the next

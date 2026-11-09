@@ -11,7 +11,6 @@ const std = @import("std");
 ///
 /// `ZODE_NERD_ICONS` controls rendering: `0`/`off`/`false` disables icons;
 /// `1`/`on`/`true` enables them; `auto` or unset enables them (default).
-
 pub const Chip = struct {
     /// UTF-8 Nerd Font glyph, or null when there is no mapping / icons are off.
     icon: ?[]const u8,
@@ -42,51 +41,51 @@ const table = [_]Entry{
     .{ .aliases = &.{ "typescript", "ts", "mts", "cts" }, .label = "ts", .icon = "\u{e628}" }, // nf-seti-typescript
     .{ .aliases = &.{"tsx"}, .label = "tsx", .icon = "\u{e7ba}" }, // nf-dev-react
     .{ .aliases = &.{"jsx"}, .label = "jsx", .icon = "\u{e7ba}" }, // nf-dev-react
-    .{ .aliases = &.{ "java" }, .label = "java", .icon = "\u{e738}" }, // nf-dev-java
+    .{ .aliases = &.{"java"}, .label = "java", .icon = "\u{e738}" }, // nf-dev-java
     .{ .aliases = &.{ "kotlin", "kt", "kts" }, .label = "kotlin", .icon = "\u{e634}" }, // nf-seti-kotlin
-    .{ .aliases = &.{ "swift" }, .label = "swift", .icon = "\u{e755}" }, // nf-dev-swift
+    .{ .aliases = &.{"swift"}, .label = "swift", .icon = "\u{e755}" }, // nf-dev-swift
     .{ .aliases = &.{ "ruby", "rb" }, .label = "ruby", .icon = "\u{e739}" }, // nf-dev-ruby
-    .{ .aliases = &.{ "php" }, .label = "php", .icon = "\u{e73d}" }, // nf-dev-php
-    .{ .aliases = &.{ "lua" }, .label = "lua", .icon = "\u{e620}" }, // nf-seti-lua
-    .{ .aliases = &.{ "dart" }, .label = "dart", .icon = "\u{e798}" }, // nf-dev-dart
+    .{ .aliases = &.{"php"}, .label = "php", .icon = "\u{e73d}" }, // nf-dev-php
+    .{ .aliases = &.{"lua"}, .label = "lua", .icon = "\u{e620}" }, // nf-seti-lua
+    .{ .aliases = &.{"dart"}, .label = "dart", .icon = "\u{e798}" }, // nf-dev-dart
     .{ .aliases = &.{ "elixir", "ex", "exs" }, .label = "elixir", .icon = "\u{e62d}" }, // nf-custom-elixir
     .{ .aliases = &.{ "erlang", "erl" }, .label = "erlang", .icon = "\u{e7b1}" }, // nf-dev-erlang
     .{ .aliases = &.{ "haskell", "hs" }, .label = "haskell", .icon = "\u{e777}" }, // nf-dev-haskell
-    .{ .aliases = &.{ "scala" }, .label = "scala", .icon = "\u{e737}" }, // nf-dev-scala
+    .{ .aliases = &.{"scala"}, .label = "scala", .icon = "\u{e737}" }, // nf-dev-scala
     .{ .aliases = &.{ "clojure", "clj", "cljs" }, .label = "clojure", .icon = "\u{e768}" }, // nf-dev-clojure
     .{ .aliases = &.{ "julia", "jl" }, .label = "julia", .icon = "\u{e624}" }, // nf-seti-julia
-    .{ .aliases = &.{ "r" }, .label = "r", .icon = "\u{f25d}" }, // nf-fa-registered (R)
+    .{ .aliases = &.{"r"}, .label = "r", .icon = "\u{f25d}" }, // nf-fa-registered (R)
     .{ .aliases = &.{ "perl", "pl" }, .label = "perl", .icon = "\u{e769}" }, // nf-dev-perl
-    .{ .aliases = &.{ "nim" }, .label = "nim", .icon = "\u{e677}" }, // nf-seti-nim
+    .{ .aliases = &.{"nim"}, .label = "nim", .icon = "\u{e677}" }, // nf-seti-nim
     .{ .aliases = &.{ "ocaml", "ml" }, .label = "ocaml", .icon = "\u{e67a}" }, // nf-seti-ocaml
     .{ .aliases = &.{ "solidity", "sol" }, .label = "solidity", .icon = "\u{e656}" }, // nf-seti-solidity
     .{ .aliases = &.{ "json", "jsonc", "json5" }, .label = "json", .icon = "\u{e60b}" }, // nf-seti-json
     .{ .aliases = &.{ "yaml", "yml" }, .label = "yaml", .icon = "\u{f481}" }, // nf-oct-file_code
-    .{ .aliases = &.{ "toml" }, .label = "toml", .icon = "\u{e6b2}" }, // nf-seti-config
+    .{ .aliases = &.{"toml"}, .label = "toml", .icon = "\u{e6b2}" }, // nf-seti-config
     .{ .aliases = &.{ "xml", "xsl", "plist" }, .label = "xml", .icon = "\u{f121}" }, // nf-fa-code
     .{ .aliases = &.{ "markdown", "md", "mdx" }, .label = "md", .icon = "\u{e73e}" }, // nf-dev-markdown
     .{ .aliases = &.{ "html", "htm" }, .label = "html", .icon = "\u{e736}" }, // nf-dev-html5
     .{ .aliases = &.{ "css", "scss", "sass", "less" }, .label = "css", .icon = "\u{e749}" }, // nf-dev-css3
-    .{ .aliases = &.{ "vue" }, .label = "vue", .icon = "\u{e6a0}" }, // nf-seti-vue
-    .{ .aliases = &.{ "svelte" }, .label = "svelte", .icon = "\u{e697}" }, // nf-seti-svelte
-    .{ .aliases = &.{ "astro" }, .label = "astro", .icon = "\u{e628}" }, // nf-seti-typescript (closest common)
+    .{ .aliases = &.{"vue"}, .label = "vue", .icon = "\u{e6a0}" }, // nf-seti-vue
+    .{ .aliases = &.{"svelte"}, .label = "svelte", .icon = "\u{e697}" }, // nf-seti-svelte
+    .{ .aliases = &.{"astro"}, .label = "astro", .icon = "\u{e628}" }, // nf-seti-typescript (closest common)
     .{ .aliases = &.{ "graphql", "gql" }, .label = "graphql", .icon = "\u{e662}" }, // nf-seti-graphql
     .{ .aliases = &.{ "proto", "protobuf" }, .label = "proto", .icon = "\u{f121}" }, // nf-fa-code
-    .{ .aliases = &.{ "sql" }, .label = "sql", .icon = "\u{e706}" }, // nf-dev-database
+    .{ .aliases = &.{"sql"}, .label = "sql", .icon = "\u{e706}" }, // nf-dev-database
     .{ .aliases = &.{ "sh", "bash", "zsh", "shell", "console", "fish", "ksh" }, .label = "sh", .icon = "\u{ebca}" }, // nf-cod-terminal
     .{ .aliases = &.{ "powershell", "ps1", "pwsh" }, .label = "ps", .icon = "\u{ebc7}" }, // nf-cod-terminal_powershell
     .{ .aliases = &.{ "diff", "patch" }, .label = "diff", .icon = "\u{f440}" }, // nf-oct-diff
     .{ .aliases = &.{ "git", "gitignore", "gitattributes" }, .label = "git", .icon = "\u{f1d3}" }, // nf-fa-git
     .{ .aliases = &.{ "dockerfile", "docker", "containerfile" }, .label = "docker", .icon = "\u{f308}" }, // nf-linux-docker
     .{ .aliases = &.{ "makefile", "make", "mk" }, .label = "make", .icon = "\u{e673}" }, // nf-seti-makefile
-    .{ .aliases = &.{ "cmake" }, .label = "cmake", .icon = "\u{e673}" }, // nf-seti-makefile
-    .{ .aliases = &.{ "nix" }, .label = "nix", .icon = "\u{f313}" }, // nf-linux-nixos
+    .{ .aliases = &.{"cmake"}, .label = "cmake", .icon = "\u{e673}" }, // nf-seti-makefile
+    .{ .aliases = &.{"nix"}, .label = "nix", .icon = "\u{f313}" }, // nf-linux-nixos
     .{ .aliases = &.{ "terraform", "tf", "hcl" }, .label = "tf", .icon = "\u{e69a}" }, // nf-seti-terraform
     .{ .aliases = &.{ "ini", "conf", "cfg", "config", "properties" }, .label = "conf", .icon = "\u{e615}" }, // nf-seti-config
     .{ .aliases = &.{ "env", "dotenv" }, .label = "env", .icon = "\u{f462}" }, // nf-oct-key
     .{ .aliases = &.{ "vim", "vimrc" }, .label = "vim", .icon = "\u{e62b}" }, // nf-custom-vim
     .{ .aliases = &.{ "csv", "tsv" }, .label = "csv", .icon = "\u{f1c3}" }, // nf-fa-file_excel_o (tabular)
-    .{ .aliases = &.{ "log" }, .label = "log", .icon = "\u{f15c}" }, // nf-fa-file_text
+    .{ .aliases = &.{"log"}, .label = "log", .icon = "\u{f15c}" }, // nf-fa-file_text
     .{ .aliases = &.{ "txt", "text", "plain" }, .label = "text", .icon = "\u{f15c}" }, // nf-fa-file_text
 };
 
@@ -126,6 +125,37 @@ pub fn lookup(raw: []const u8, nerd_icons: bool) Chip {
     // Unknown language: show the raw token as the label (trimmed), no icon.
     // The chip must stay readable even without a mapping.
     return .{ .icon = null, .label = tok };
+}
+
+/// Resolve an icon and display label from a file path.
+///
+/// Tries the basename first (covers `Makefile`, `Dockerfile`, `.gitignore`)
+/// and then the extension. The label is always meaningful when a mapping or
+/// extension exists; icons remain optional.
+pub fn forPath(path: []const u8, nerd_icons: bool) Chip {
+    const base = std.fs.path.basename(path);
+    if (base.len > 0) {
+        const by_base = lookup(base, nerd_icons);
+        if (by_base.icon != null or !std.mem.eql(u8, by_base.label, base) or hasKnownAlias(base)) {
+            // Known basename mapping, or lookup normalized/canonicalized it.
+            if (by_base.label.len > 0 and (by_base.icon != null or hasKnownAlias(base))) return by_base;
+        }
+    }
+    const ext = std.fs.path.extension(path);
+    if (ext.len > 1 and ext[0] == '.') {
+        return lookup(ext[1..], nerd_icons);
+    }
+    if (base.len > 0) return .{ .icon = null, .label = base };
+    return .{ .icon = null, .label = path };
+}
+
+fn hasKnownAlias(tok: []const u8) bool {
+    for (&table) |*e| {
+        for (e.aliases) |a| {
+            if (eqlLowerAscii(tok, a)) return true;
+        }
+    }
+    return false;
 }
 
 /// Whether Nerd Font icons are enabled. Default is enabled (`auto`/unset = on)
@@ -201,6 +231,25 @@ test "lookup: disabled icons keep the label" {
     const z = lookup("zig", false);
     try std.testing.expectEqualStrings("zig", z.label);
     try std.testing.expect(z.icon == null);
+}
+
+test "forPath: resolves by extension, basename, and preserves readable fallbacks" {
+    const zig = forPath("src/main.zig", true);
+    try std.testing.expectEqualStrings("zig", zig.label);
+    try std.testing.expect(zig.icon != null);
+
+    const tsx = forPath("src/components/Login.tsx", false);
+    try std.testing.expectEqualStrings("tsx", tsx.label);
+    try std.testing.expect(tsx.icon == null);
+
+    const mk = forPath("Makefile", true);
+    try std.testing.expectEqualStrings("make", mk.label);
+
+    const docker = forPath("deploy/Dockerfile", true);
+    try std.testing.expectEqualStrings("docker", docker.label);
+
+    const unknown = forPath("notes/README.unknownext", false);
+    try std.testing.expectEqualStrings("unknownext", unknown.label);
 }
 
 test "nerdIconsEnabled: default/auto/on and explicit off" {
