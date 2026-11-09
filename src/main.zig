@@ -31,6 +31,7 @@ const lsp_manager = @import("lsp/manager.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const theme = @import("lib/theme.zig");
 const lang_icons = @import("lib/lang_icons.zig");
+const acp_server = @import("acp/server.zig");
 
 var child_env_static: std.process.Environ.Map = undefined;
 var child_env_live: bool = false;
@@ -1256,6 +1257,9 @@ pub fn main(init: std.process.Init) !u8 {
         if (std.mem.eql(u8, arg0, "--models")) {
             return runModels(init.gpa, init.io, init.environ_map);
         }
+        if (std.mem.eql(u8, arg0, "acp") or std.mem.eql(u8, arg0, "--acp")) {
+            return acp_server.run(init.gpa, init.io, init.environ_map);
+        }
         if (std.mem.eql(u8, arg0, "--chat")) {
             const text = it.next() orelse {
                 models.dbg("uso: zode --chat \"texto\"\n", .{});
@@ -1278,6 +1282,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print(
                 "zode — code agent harness\n\n" ++
                     "  (no args)    full TUI\n" ++
+                    "  acp, --acp   run Agent Client Protocol (ACP) agent over stdio\n" ++
                     "  --models     list the models of the provider\n" ++
                     "  --chat TXT   send a message (streaming)\n" ++
                     "  --resume     resume the last session\n" ++
