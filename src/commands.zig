@@ -1740,6 +1740,20 @@ test "/agents panel is dispatched" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Phase 9") != null);
 }
 
+/// `/hunk next|prev`: navigate hunks in the last diff (Phase 3).
+pub fn cmdHunk(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (std.mem.eql(u8, a, "next") or std.mem.eql(u8, a, "n") or std.mem.eql(u8, a, "]")) {
+        _ = m.navigateLastDiffHunk(1);
+        return;
+    }
+    if (std.mem.eql(u8, a, "prev") or std.mem.eql(u8, a, "p") or std.mem.eql(u8, a, "previous") or std.mem.eql(u8, a, "[")) {
+        _ = m.navigateLastDiffHunk(-1);
+        return;
+    }
+    agent.pushInfo(m, "usage: /hunk next|prev (also alt+] / alt+[ on the last diff)");
+}
+
 test "/diff command is dispatched" {
     const saved_io = agent.io_global;
     const saved_turn = agent.turn_stats;

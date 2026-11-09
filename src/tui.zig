@@ -14,6 +14,7 @@ const ansi = @import("lib/ansi.zig");
 const theme = @import("lib/theme.zig");
 const lang_icons = @import("lib/lang_icons.zig");
 const filechange = @import("lib/filechange.zig");
+const diffhunks = @import("lib/diffhunks.zig");
 const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
@@ -1367,6 +1368,9 @@ pub const Model = struct {
 
     /// Last tool call executed, to expand it with Ctrl+R.
     last_tool: ?ToolMemo = null,
+    /// Active hunk selection for the last diff (UI navigation, Phase 3).
+    hunk_nav_para: ?usize = null,
+    hunk_nav_idx: ?usize = null,
 
     /// The footer's legend, in a fixed buffer.
     status_buf: [160]u8 = undefined,
@@ -5378,6 +5382,8 @@ pub const Model = struct {
 
         self.lock();
         defer self.unlock();
+        self.hunk_nav_para = null;
+        self.hunk_nav_idx = null;
         const idx = self.paras.items.len + self.pending.items.len;
         self.pending.append(self.allocator, .{
             .kind = .diff,
@@ -5412,6 +5418,90 @@ pub const Model = struct {
     fn freeDiffMemoParts(gpa: std.mem.Allocator, full: []u8, short: []u8) void {
         if (full.len > 0) gpa.free(full);
         if (short.len > 0) gpa.free(short);
+    }
+
+    /// Navigate to next/prev hunk in the last diff (Phase 3). Expands the diff
+    /// when collapsed. Scrolls to the diff paragraph and reports hunk position.
+    pub fn navigateLastDiffHunk(self: *Model, delta: i8) bool {
+        // Expand collapsed diff first (toggleLastTool manages locking).
+        {
+            self.lock();
+            const lt = self.last_tool;
+            const needs_expand = if (lt) |t| t.hasDiff() and !t.diff_expanded else false;
+            self.unlock();
+            if (needs_expand) _ = self.toggleLastTool();
+        }
+
+        self.lock();
+        const lt = self.last_tool orelse {
+            self.unlock();
+            self.pushInfo("hunk nav: no active diff");
+            return false;
+        };
+        if (!lt.hasDiff()) {
+            self.unlock();
+            self.pushInfo("hunk nav: no active diff");
+            return false;
+        }
+        const para_idx = lt.diff_para_idx.?;
+        const full = lt.diff_full;
+        if (full.len == 0) {
+            self.unlock();
+            self.pushInfo("hunk nav: diff not available");
+            return false;
+        }
+        // Parse hunks from full diff text.
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var lines_list: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, full, '\n');
+        while (it.next()) |line| lines_list.append(arena, line) catch {
+            self.unlock();
+            self.pushInfo("hunk nav: out of memory");
+            return false;
+        };
+        const parsed = diffhunks.parse(arena, lines_list.items) catch {
+            self.unlock();
+            self.pushInfo("hunk nav: could not parse diff hunks");
+            return false;
+        };
+        if (parsed.count() == 0) {
+            self.unlock();
+            self.pushInfo("hunk nav: no hunks in diff");
+            return false;
+        }
+        const cur = if (self.hunk_nav_para == para_idx) self.hunk_nav_idx else null;
+        const next_idx = if (delta > 0) parsed.next(cur) else parsed.prev(cur);
+        const idx = next_idx orelse {
+            self.unlock();
+            return false;
+        };
+        const h = parsed.at(idx).?;
+        self.hunk_nav_para = para_idx;
+        self.hunk_nav_idx = idx;
+        self.ensureParaHeights();
+        const target_line = if (para_idx < self.para_heights.items.len) self.heightPrefix(para_idx) else 0;
+        self.follow_bottom = false;
+        self.was_away = true;
+        self.unseen_base_para = self.paras.items.len;
+        self.setAnchorLine(target_line);
+        self.anchor = target_line;
+        self.first_visible = target_line;
+        self.diff_needs_full_redraw = true;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+        self.unlock();
+
+        self.pushInfoFmt("hunk {d}/{d}  @@ -{d},{d} +{d},{d} @@  (alt+] next, alt+[ prev)", .{
+            idx + 1,
+            parsed.count(),
+            h.old_start,
+            h.old_count,
+            h.new_start,
+            h.new_count,
+        });
+        return true;
     }
 
     /// Ctrl+R: expands or collapses the last tool's result.
@@ -7353,6 +7443,15 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     self.cache_from = 0;
                     ctx.redraw = true;
                 }
+                return;
+            }
+            // Phase 3: hunk navigation on the last diff (alt+] next, alt+[ prev).
+            if (key.matches(']', .{ .alt = true })) {
+                if (self.navigateLastDiffHunk(1)) ctx.redraw = true;
+                return;
+            }
+            if (key.matches('[', .{ .alt = true })) {
+                if (self.navigateLastDiffHunk(-1)) ctx.redraw = true;
                 return;
             }
             // Ctrl+V: stage the clipboard's IMAGE for the next message.

@@ -4266,6 +4266,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "files")) {
         commands_mod.cmdFiles(m);
+    } else if (std.mem.eql(u8, cmd, "hunk")) {
+        commands_mod.cmdHunk(m, arg);
     } else if (std.mem.eql(u8, cmd, "diff")) {
         commands_mod.cmdDiff(m);
     } else if (std.mem.eql(u8, cmd, "cache")) {

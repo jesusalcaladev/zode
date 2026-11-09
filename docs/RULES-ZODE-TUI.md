@@ -712,7 +712,7 @@ Notes: `zig test src/lib/filechange.zig`, `src/lib/lang_icons.zig`, and `src/lib
 - [x] Hunk metadata parsing foundation (pure/tested: `src/lib/diffhunks.zig` parses unified diff headers/elisions into navigable hunk ranges; supports future hunk navigation UI).
 - [x] Unified diff viewer structure improved incrementally (diff preview headers now include hunk counts for inspectability; existing unified diff rendering keeps gutters/line numbers, hunk headers, add/remove markers, syntax-aware tokenization, word-level highlights, and preview/expand behavior).
 - [x] Syntax-aware diff rendering baseline (existing diff rendering preserves language tokenization/path-aware labels; improvements remain incremental).
-- [ ] Hunk navigation (UI focus/keybindings over parsed hunks; requires stable focus/hit semantics).
+- [x] Hunk navigation UI (incremental): `alt+]`/`alt+[` and `/hunk next|prev` navigate hunks in the last diff using `diffhunks` (real hunk metadata), auto-expand collapsed diffs, scroll to the diff paragraph, and report `Hunk N/M` with the hunk range. Precise in-paragraph hunk focus/scroll remains a follow-up (needs layout-aware offsets).
 - [ ] File navigation (jump between changed files/diff targets; integrate with file intelligence summaries).
 - [ ] Expanded code views (larger-context inspection with responsive fallbacks).
 - [ ] Review actions (runtime-safe only; no invented decisions).
