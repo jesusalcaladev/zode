@@ -5300,8 +5300,15 @@ pub const Model = struct {
         // the scale and the way to expand it are visible immediately.
         var short: ?[]const u8 = null;
         if (diff_lines.len > diff_preview_lines) {
+            var hunks: usize = 0;
+            for (diff_lines) |l| {
+                if (std.mem.startsWith(u8, l, "@@ -")) hunks += 1;
+            }
             var s: std.ArrayList(u8) = .empty;
-            s.print(arena, "diff preview · +{d} −{d}\n", .{ added, removed }) catch {};
+            if (hunks > 0)
+                s.print(arena, "diff preview · +{d} −{d} · {d} hunk{s}\n", .{ added, removed, hunks, if (hunks == 1) "" else "s" }) catch {}
+            else
+                s.print(arena, "diff preview · +{d} −{d}\n", .{ added, removed }) catch {};
             for (diff_lines[0..diff_preview_lines], 0..) |l, i| {
                 if (i > 0 or s.items.len > 0) s.append(arena, '\n') catch break;
                 s.appendSlice(arena, l) catch break;
@@ -14461,7 +14468,7 @@ test "a long diff collapses into a preview, and Ctrl+R swaps it for the whole th
     }
     try std.testing.expectEqual(@as(usize, 1), diffs);
     const short_text = m.paras.items[diff_idx.?].text;
-    try std.testing.expect(std.mem.startsWith(u8, short_text, "diff preview · +60 −60\n"));
+    try std.testing.expect(std.mem.startsWith(u8, short_text, "diff preview · +60 −60"));
     try std.testing.expect(std.mem.indexOf(u8, short_text, "ctrl+r to expand") != null);
     try std.testing.expect(std.mem.indexOf(u8, short_text, "more lines") != null);
     // The preview is the FIRST lines, and the far end of the file is not there.
