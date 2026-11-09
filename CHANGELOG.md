@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - enhance hooks and markdown rendering with language icons [`eed09afa`](https://github.com/jesusalcaladev/zode/commit/eed09afa)
 - add permissions, hooks, and agents panels with safer IO handling [`2b135b19`](https://github.com/jesusalcaladev/zode/commit/2b135b19)
 - update TUI and main integration [`cfaa1a24`](https://github.com/jesusalcaladev/zode/commit/cfaa1a24)
+- wire ACP agent command in main [`d0909ffb`](https://github.com/jesusalcaladev/zode/commit/d0909ffb)
+- add ACP stdio server implementation (acp) [`b780fb0a`](https://github.com/jesusalcaladev/zode/commit/b780fb0a)
 
 ### Documentation
 
@@ -31,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - rename repeats guard to repeat_guard [`02e05bd9`](https://github.com/jesusalcaladev/zode/commit/02e05bd9)
 - organize lib modules into clusters with stable facades [`8e60f45c`](https://github.com/jesusalcaladev/zode/commit/8e60f45c)
 - remove dead test file, expand test coverage, clarify lib IO notes [`1c5f20c0`](https://github.com/jesusalcaladev/zode/commit/1c5f20c0)
-- expose tool call helper exports (tools) [`4bda05d2`](https://github.com/jesusalcaladev/zode/commit/4bda05d2)
+- expose tool call helper exports (tools) [`73c22592`](https://github.com/jesusalcaladev/zode/commit/73c22592)
 
 ### Other
 
