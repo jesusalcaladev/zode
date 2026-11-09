@@ -3,6 +3,7 @@ pub const chat = @import("chat.zig");
 pub const bgproc = @import("bgproc.zig");
 pub const sleep = @import("lib/sleep.zig");
 pub const ansi = @import("lib/ansi.zig");
+pub const acp_protocol = @import("acp/protocol.zig");
 pub const pipeline = @import("lib/pipeline.zig");
 pub const testguard = @import("lib/testguard.zig");
 pub const testplan = @import("lib/testplan.zig");

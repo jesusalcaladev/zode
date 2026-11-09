@@ -193,6 +193,35 @@ Title resolution order: `custom_title` > `ai_title` > `name` > session id.
 
 ---
 
+## ACP (Agent Client Protocol)
+
+zode can run as a general ACP agent over stdio (JSON-RPC 2.0, one message per line):
+
+```bash
+zode acp
+# or
+zode --acp
+```
+
+- stdout is reserved for ACP protocol messages; logs go to stderr.
+- Supports v1 initialization, `session/new`, `session/load` (replays history), `session/resume`, `session/list/close/delete` (best-effort), `session/prompt` with streaming `session/update` chunks, tool call updates, agent→client `session/request_permission`, and cancellation.
+- `allow_always` / `reject_always` permission decisions are persisted as scoped user rules in `~/.config/zode/permissions.json` (dangerously broad allow patterns are refused).
+
+Example editor/client config (generic ACP stdio agent):
+
+```json
+{
+  "agent": {
+    "command": "zode",
+    "args": ["acp"]
+  }
+}
+```
+
+Configure provider/model the same way as normal zode usage (`ZODE_PROVIDER`, `ZODE_API_KEY`/provider key env, `ZODE_MODEL`, or `~/.config/zode/config.json`).
+
+---
+
 ## Verification workflow
 
 - `zig build test` — the primary gate (800+ tests).
