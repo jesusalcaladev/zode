@@ -23,13 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add ACP stdio server implementation (acp) [`cdb09dca`](https://github.com/jesusalcaladev/zode/commit/cdb09dca)
 - add /release-notes command to command table (commands) [`5fd5cc1d`](https://github.com/jesusalcaladev/zode/commit/5fd5cc1d)
 - add /release-notes command and changelog extractor (agent) [`679c5a23`](https://github.com/jesusalcaladev/zode/commit/679c5a23)
+- add /diff for uncommitted and turn diffs (phase 35.10) (commands) [`177d36ff`](https://github.com/jesusalcaladev/zode/commit/177d36ff)
 
 ### Documentation
 
 - mark compaction v2 complete (phase7) [`5423ba65`](https://github.com/jesusalcaladev/zode/commit/5423ba65)
 - update architecture, settings, and status for phases 3/5/6/7/10 [`93b76606`](https://github.com/jesusalcaladev/zode/commit/93b76606)
 - update settings, tasks, and agent notes [`cee1ff56`](https://github.com/jesusalcaladev/zode/commit/cee1ff56)
-- mark phase 35.5 and 35.9 complete (tasks) [`8d6ed891`](https://github.com/jesusalcaladev/zode/commit/8d6ed891)
+- mark phase 35.5 and 35.9 complete (tasks) [`486dda08`](https://github.com/jesusalcaladev/zode/commit/486dda08)
+- update Phase 3 unified diff viewer progress [`6dfd54db`](https://github.com/jesusalcaladev/zode/commit/6dfd54db)
 
 ### Refactors
 
@@ -49,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - refine borders and composer placeholder [`c9253016`](https://github.com/jesusalcaladev/zode/commit/c9253016)
 - soften code borders and tool result rail [`c932aa54`](https://github.com/jesusalcaladev/zode/commit/c932aa54)
 - compact tool expand hint [`6c7b685c`](https://github.com/jesusalcaladev/zode/commit/6c7b685c)
+- complete phase 2 file intelligence with honest net diffs [`414847ff`](https://github.com/jesusalcaladev/zode/commit/414847ff)
+- start phase 3 review foundations [`464990e2`](https://github.com/jesusalcaladev/zode/commit/464990e2)
+- improve unified diff preview structure [`4fc5112b`](https://github.com/jesusalcaladev/zode/commit/4fc5112b)
 
 ## [0.2.0] - 2026-11-07
 

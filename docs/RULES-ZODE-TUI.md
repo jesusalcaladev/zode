@@ -710,8 +710,8 @@ Notes: `zig test src/lib/filechange.zig`, `src/lib/lang_icons.zig`, and `src/lib
 ### Phase 3 — Interactive review (in progress)
 
 - [x] Hunk metadata parsing foundation (pure/tested: `src/lib/diffhunks.zig` parses unified diff headers/elisions into navigable hunk ranges; supports future hunk navigation UI).
-- [ ] Unified diff viewer (structured/inspectable presentation; Zode already renders unified diffs with preview/expand — evolve incrementally).
-- [x] Syntax-aware diff rendering baseline (existing diff rendering preserves language tokenization/path-aware labels; further improvements incremental).
+- [x] Unified diff viewer structure improved incrementally (diff preview headers now include hunk counts for inspectability; existing unified diff rendering keeps gutters/line numbers, hunk headers, add/remove markers, syntax-aware tokenization, word-level highlights, and preview/expand behavior).
+- [x] Syntax-aware diff rendering baseline (existing diff rendering preserves language tokenization/path-aware labels; improvements remain incremental).
 - [ ] Hunk navigation (UI focus/keybindings over parsed hunks; requires stable focus/hit semantics).
 - [ ] File navigation (jump between changed files/diff targets; integrate with file intelligence summaries).
 - [ ] Expanded code views (larger-context inspection with responsive fallbacks).
