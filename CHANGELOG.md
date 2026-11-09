@@ -22,13 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - wire ACP agent command in main [`d0909ffb`](https://github.com/jesusalcaladev/zode/commit/d0909ffb)
 - add ACP stdio server implementation (acp) [`cdb09dca`](https://github.com/jesusalcaladev/zode/commit/cdb09dca)
 - add /release-notes command to command table (commands) [`5fd5cc1d`](https://github.com/jesusalcaladev/zode/commit/5fd5cc1d)
-- add /release-notes command and changelog extractor (agent) [`856d03d0`](https://github.com/jesusalcaladev/zode/commit/856d03d0)
+- add /release-notes command and changelog extractor (agent) [`679c5a23`](https://github.com/jesusalcaladev/zode/commit/679c5a23)
 
 ### Documentation
 
 - mark compaction v2 complete (phase7) [`5423ba65`](https://github.com/jesusalcaladev/zode/commit/5423ba65)
 - update architecture, settings, and status for phases 3/5/6/7/10 [`93b76606`](https://github.com/jesusalcaladev/zode/commit/93b76606)
 - update settings, tasks, and agent notes [`cee1ff56`](https://github.com/jesusalcaladev/zode/commit/cee1ff56)
+- mark phase 35.5 and 35.9 complete (tasks) [`8d6ed891`](https://github.com/jesusalcaladev/zode/commit/8d6ed891)
 
 ### Refactors
 
