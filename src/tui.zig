@@ -1956,8 +1956,14 @@ pub const Model = struct {
         diff_short: []u8 = &.{},
         diff_expanded: bool = false,
 
+        /// Collapsible diff (Ctrl+R toggles between short/full).
         fn hasDiff(self: *const ToolMemo) bool {
             return self.diff_para_idx != null and self.diff_full.len > 0 and self.diff_short.len > 0;
+        }
+
+        /// Any diff text available for hunk navigation (collapsed or expanded).
+        fn hasNavigableDiff(self: *const ToolMemo) bool {
+            return self.diff_para_idx != null and self.diff_full.len > 0;
         }
 
         fn deinit(self: *ToolMemo, gpa: std.mem.Allocator) void {
@@ -5396,18 +5402,24 @@ pub const Model = struct {
             freeDiffMemoParts(gpa, keep_full, keep_short);
             return;
         };
-        if (collapsed) {
-            // Attached to the tool result that produced it: Ctrl+R toggles the
-            // last thing that was collapsed, which for a write/edit IS the diff.
-            if (self.last_tool) |*lt| {
-                if (lt.diff_full.len > 0) gpa.free(lt.diff_full);
-                if (lt.diff_short.len > 0) gpa.free(lt.diff_short);
-                lt.diff_full = keep_full;
-                lt.diff_short = keep_short;
-                lt.diff_para_idx = idx;
-                lt.diff_expanded = false;
-                keep_full = &.{};
+        // Track diff for Ctrl+R (collapsed) and hunk navigation (any diff).
+        if (self.last_tool) |*lt| {
+            // Always keep full text for hunk navigation.
+            const nav_full = if (collapsed)
+                keep_full
+            else
+                gpa.dupe(u8, text) catch &.{};
+            if (lt.diff_full.len > 0) gpa.free(lt.diff_full);
+            if (lt.diff_short.len > 0) gpa.free(lt.diff_short);
+            lt.diff_para_idx = idx;
+            lt.diff_full = if (nav_full.len > 0) nav_full else &.{};
+            lt.diff_short = if (collapsed) keep_short else &.{};
+            lt.diff_expanded = !collapsed;
+            if (collapsed) {
+                keep_full = &.{}; // ownership moved to lt.diff_full
                 keep_short = &.{};
+            } else if (nav_full.len > 0) {
+                // nav_full is a separate copy for non-collapsed case
             }
         }
         freeDiffMemoParts(gpa, keep_full, keep_short);
@@ -5435,21 +5447,16 @@ pub const Model = struct {
         self.lock();
         const lt = self.last_tool orelse {
             self.unlock();
-            self.pushInfo("hunk nav: no active diff");
+            self.pushInfo("hunk nav: no active diff (expand or run a file edit first)");
             return false;
         };
-        if (!lt.hasDiff()) {
+        if (!lt.hasNavigableDiff()) {
             self.unlock();
-            self.pushInfo("hunk nav: no active diff");
+            self.pushInfo("hunk nav: no active diff (expand or run a file edit first)");
             return false;
         }
         const para_idx = lt.diff_para_idx.?;
         const full = lt.diff_full;
-        if (full.len == 0) {
-            self.unlock();
-            self.pushInfo("hunk nav: diff not available");
-            return false;
-        }
         // Parse hunks from full diff text.
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -5477,30 +5484,36 @@ pub const Model = struct {
             self.unlock();
             return false;
         };
+        const boundary = if (cur) |c| c == idx else false;
         const h = parsed.at(idx).?;
         self.hunk_nav_para = para_idx;
         self.hunk_nav_idx = idx;
         self.ensureParaHeights();
         const target_line = if (para_idx < self.para_heights.items.len) self.heightPrefix(para_idx) else 0;
-        self.follow_bottom = false;
-        self.was_away = true;
-        self.unseen_base_para = self.paras.items.len;
-        self.setAnchorLine(target_line);
-        self.anchor = target_line;
-        self.first_visible = target_line;
-        self.diff_needs_full_redraw = true;
+        self.scrollTo(target_line);
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
         self.unlock();
 
-        self.pushInfoFmt("hunk {d}/{d}  @@ -{d},{d} +{d},{d} @@  (alt+] next, alt+[ prev)", .{
-            idx + 1,
-            parsed.count(),
-            h.old_start,
-            h.old_count,
-            h.new_start,
-            h.new_count,
-        });
+        if (boundary) {
+            self.pushInfoFmt("hunk {d}/{d} (boundary)  @@ -{d},{d} +{d},{d} @@  (/hunk next|prev)", .{
+                idx + 1,
+                parsed.count(),
+                h.old_start,
+                h.old_count,
+                h.new_start,
+                h.new_count,
+            });
+        } else {
+            self.pushInfoFmt("hunk {d}/{d}  @@ -{d},{d} +{d},{d} @@  (alt+] next, alt+[ prev)", .{
+                idx + 1,
+                parsed.count(),
+                h.old_start,
+                h.old_count,
+                h.new_start,
+                h.new_count,
+            });
+        }
         return true;
     }
 
