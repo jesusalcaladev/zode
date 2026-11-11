@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add /release-notes command and changelog extractor (agent) [`679c5a23`](https://github.com/jesusalcaladev/zode/commit/679c5a23)
 - add /diff for uncommitted and turn diffs (phase 35.10) (commands) [`177d36ff`](https://github.com/jesusalcaladev/zode/commit/177d36ff)
 - add structured brief and per-step how/verify support (plan) [`242e9640`](https://github.com/jesusalcaladev/zode/commit/242e9640)
-- support objective, approach, guardrails, and step verification (todo) [`d38515d7`](https://github.com/jesusalcaladev/zode/commit/d38515d7)
+- support objective, approach, guardrails, and step verification (todo) [`4ed8c94e`](https://github.com/jesusalcaladev/zode/commit/4ed8c94e)
+- guide todo usage as concrete implementation plans (prompt) [`0ef3e040`](https://github.com/jesusalcaladev/zode/commit/0ef3e040)
 
 ### Documentation
 
