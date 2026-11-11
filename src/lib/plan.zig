@@ -32,6 +32,15 @@ const std = @import("std");
 /// it is a document.
 pub const max_items = 20;
 pub const text_max = 120;
+/// Per-step implementation note and verification (optional). Kept short so the
+/// checklist stays scannable; the full rationale belongs in the plan brief.
+pub const how_max = 160;
+pub const verify_max = 120;
+/// Plan-level brief: objective, approach and guardrails travel with the plan so
+/// implementation has the "why / how / what must not break" without re-deriving it.
+pub const objective_max = 280;
+pub const approach_max = 360;
+pub const guardrails_max = 360;
 
 pub const Status = enum {
     pending,
@@ -57,10 +66,35 @@ pub const Status = enum {
 pub const Item = struct {
     text: [text_max]u8 = undefined,
     len: u8 = 0,
+    how: [how_max]u8 = undefined,
+    how_len: u8 = 0,
+    verify: [verify_max]u8 = undefined,
+    verify_len: u8 = 0,
     status: Status = .pending,
 
     pub fn textOf(self: *const Item) []const u8 {
         return self.text[0..self.len];
+    }
+
+    pub fn howOf(self: *const Item) []const u8 {
+        return self.how[0..self.how_len];
+    }
+
+    pub fn verifyOf(self: *const Item) []const u8 {
+        return self.verify[0..self.verify_len];
+    }
+};
+
+/// Plan-level context: why the work exists, how it will be done, and what must
+/// not break. Carried with the checklist so implementation does not start from a
+/// list of loose tasks with no objective or guardrails.
+pub const Brief = struct {
+    objective: []const u8 = "",
+    approach: []const u8 = "",
+    guardrails: []const u8 = "",
+
+    pub fn isEmpty(self: Brief) bool {
+        return self.objective.len == 0 and self.approach.len == 0 and self.guardrails.len == 0;
     }
 };
 
@@ -68,6 +102,12 @@ pub const Item = struct {
 pub const Plan = struct {
     items: [max_items]Item = undefined,
     len: u8 = 0,
+    objective: [objective_max]u8 = undefined,
+    objective_len: u16 = 0,
+    approach: [approach_max]u8 = undefined,
+    approach_len: u16 = 0,
+    guardrails: [guardrails_max]u8 = undefined,
+    guardrails_len: u16 = 0,
     /// What it had before the last call. To be able to say "2/4 → 3/4"
     /// and to detect that the model changed nothing.
     prev_done: u8 = 0,
@@ -75,6 +115,39 @@ pub const Plan = struct {
 
     pub fn init() Plan {
         return .{};
+    }
+
+    pub fn objectiveOf(self: *const Plan) []const u8 {
+        return self.objective[0..self.objective_len];
+    }
+
+    pub fn approachOf(self: *const Plan) []const u8 {
+        return self.approach[0..self.approach_len];
+    }
+
+    pub fn guardrailsOf(self: *const Plan) []const u8 {
+        return self.guardrails[0..self.guardrails_len];
+    }
+
+    pub fn hasBrief(self: *const Plan) bool {
+        return self.objective_len != 0 or self.approach_len != 0 or self.guardrails_len != 0;
+    }
+
+    pub fn briefOf(self: *const Plan) Brief {
+        return .{ .objective = self.objectiveOf(), .approach = self.approachOf(), .guardrails = self.guardrailsOf() };
+    }
+
+    pub fn setBrief(self: *Plan, brief: Brief) bool {
+        const before_obj = self.objectiveOf();
+        const before_app = self.approachOf();
+        const before_grd = self.guardrailsOf();
+        const changed = !std.mem.eql(u8, before_obj, std.mem.trim(u8, brief.objective, " \t\r\n")) or
+            !std.mem.eql(u8, before_app, std.mem.trim(u8, brief.approach, " \t\r\n")) or
+            !std.mem.eql(u8, before_grd, std.mem.trim(u8, brief.guardrails, " \t\r\n"));
+        writeField(&self.objective, &self.objective_len, objective_max, brief.objective);
+        writeField(&self.approach, &self.approach_len, approach_max, brief.approach);
+        writeField(&self.guardrails, &self.guardrails_len, guardrails_max, brief.guardrails);
+        return changed;
     }
 
     pub fn isEmpty(self: *const Plan) bool {
@@ -118,12 +191,15 @@ pub const Plan = struct {
         return self.doneCount() == self.len;
     }
 
-    /// Empties the list. Used by `/new` and by the session restart: a plan from
-    /// the previous session has nothing to do with this one.
+    /// Empties the list and its brief. Used by `/new` and by the session restart:
+    /// a plan from the previous session has nothing to do with this one.
     pub fn clear(self: *Plan) void {
         self.len = 0;
         self.prev_len = 0;
         self.prev_done = 0;
+        self.objective_len = 0;
+        self.approach_len = 0;
+        self.guardrails_len = 0;
     }
 
     /// Applies a new list. Returns a code for the history message: the caller
@@ -131,22 +207,36 @@ pub const Plan = struct {
     pub const Applied = enum { changed, same, empty };
 
     pub fn apply(self: *Plan, new_items: []const Item, n: u8) Applied {
+        return self.applyWithBrief(new_items, n, .{});
+    }
+
+    pub fn applyWithBrief(self: *Plan, new_items: []const Item, n: u8, brief: Brief) Applied {
         // The list rules: it is compared BEFORE touching anything so that "same as
         // before" can be said with no history and no allocations.
         var same = n == self.len;
         if (same) {
             for (new_items[0..n], self.items[0..self.len]) |a, b| {
-                if (a.status != b.status or !std.mem.eql(u8, a.textOf(), b.textOf())) {
+                if (a.status != b.status or !std.mem.eql(u8, a.textOf(), b.textOf()) or
+                    !std.mem.eql(u8, a.howOf(), b.howOf()) or !std.mem.eql(u8, a.verifyOf(), b.verifyOf()))
+                {
                     same = false;
                     break;
                 }
             }
         }
+        // A replacement that omits the brief preserves the existing one, so a model
+        // that resends only `items` to tick steps does not erase the objective/guardrails.
+        const brief_same = if (brief.isEmpty())
+            true
+        else
+            std.mem.eql(u8, self.objectiveOf(), std.mem.trim(u8, brief.objective, " \t\r\n")) and
+                std.mem.eql(u8, self.approachOf(), std.mem.trim(u8, brief.approach, " \t\r\n")) and
+                std.mem.eql(u8, self.guardrailsOf(), std.mem.trim(u8, brief.guardrails, " \t\r\n"));
         // An empty list over an empty plan is NOT a change (the model would repeat
-        // "plan cleared" on every call), but emptying a plan that HAD items IS
+        // "plan cleared" on every call), but emptying a plan that HAD items or a brief IS
         // one: it is the signal that it is over.
-        if (n == 0 and self.len == 0) return .same;
-        if (same) return .same;
+        if (n == 0 and self.len == 0 and !self.hasBrief() and brief.isEmpty()) return .same;
+        if (same and brief_same) return .same;
 
         self.prev_len = self.len;
         self.prev_done = self.doneCount();
@@ -158,6 +248,12 @@ pub const Plan = struct {
         var i: u8 = 0;
         while (i < n) : (i += 1) self.items[i] = new_items[i];
         self.len = n;
+        if (!brief.isEmpty()) _ = self.setBrief(brief);
+        if (n == 0) {
+            self.objective_len = 0;
+            self.approach_len = 0;
+            self.guardrails_len = 0;
+        }
         return if (n == 0) .empty else .changed;
     }
 
@@ -183,17 +279,34 @@ pub const Plan = struct {
         var text = std.Io.Writer.Allocating.init(arena);
         const w = &text.writer;
         w.print("Implementation plan ({d}/{d} done):", .{ self.doneCount(), self.len }) catch return "plan updated";
+        if (self.objective_len != 0) w.print("\nObjective: {s}", .{self.objectiveOf()}) catch {};
+        if (self.approach_len != 0) w.print("\nApproach: {s}", .{self.approachOf()}) catch {};
+        if (self.guardrails_len != 0) w.print("\nGuardrails: {s}", .{self.guardrailsOf()}) catch {};
         for (self.items[0..self.len], 0..) |step, i| {
             w.print("\n{s} {d}. {s}", .{ step.status.glyph(), i + 1, step.textOf() }) catch return "plan updated";
+            if (step.how_len != 0) w.print("\n   how: {s}", .{step.howOf()}) catch {};
+            if (step.verify_len != 0) w.print("\n   verify: {s}", .{step.verifyOf()}) catch {};
         }
         return text.written();
     }
 };
 
-/// What the parse returns: the list and how many steps there are.
+fn writeField(buf: anytype, len: anytype, comptime max: usize, text: []const u8) void {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) {
+        len.* = 0;
+        return;
+    }
+    const cp = @min(trimmed.len, max);
+    @memcpy(buf[0..cp], trimmed[0..cp]);
+    len.* = @intCast(cp);
+}
+
+/// What the parse returns: the list, how many steps there are, and the plan brief.
 pub const Result = struct {
     items: [max_items]Item,
     len: u8,
+    brief: Brief = .{},
 };
 
 pub const ParseError = error{ BadPlan, TooManyItems };
@@ -214,6 +327,10 @@ pub const StepUpdate = struct {
     index: u8,
     /// null = leave the text as it is.
     text: ?[]const u8 = null,
+    /// null = leave the implementation note as it is.
+    how: ?[]const u8 = null,
+    /// null = leave the verification note as it is.
+    verify: ?[]const u8 = null,
     /// null = leave the status as it is.
     status: ?Status = null,
 };
@@ -306,6 +423,13 @@ pub fn applyPatch(
         var was_text: [text_max]u8 = undefined;
         @memcpy(was_text[0..was_len], self.items[i].text[0..was_len]);
 
+        const was_how_len = self.items[i].how_len;
+        const was_verify_len = self.items[i].verify_len;
+        var was_how: [how_max]u8 = undefined;
+        var was_verify: [verify_max]u8 = undefined;
+        @memcpy(was_how[0..was_how_len], self.items[i].how[0..was_how_len]);
+        @memcpy(was_verify[0..was_verify_len], self.items[i].verify[0..was_verify_len]);
+
         if (u.status) |st| self.items[i].status = st;
         if (u.text) |t| {
             const trimmed = std.mem.trim(u8, t, " \t");
@@ -322,10 +446,16 @@ pub fn applyPatch(
                 self.items[i].len = @intCast(cp);
             }
         }
+        if (u.how) |h| writeItemField(&self.items[i].how, &self.items[i].how_len, how_max, h);
+        if (u.verify) |vf| writeItemField(&self.items[i].verify, &self.items[i].verify_len, verify_max, vf);
 
         const same = self.items[i].status == was_status and
             self.items[i].len == was_len and
-            std.mem.eql(u8, self.items[i].text[0..was_len], was_text[0..was_len]);
+            std.mem.eql(u8, self.items[i].text[0..was_len], was_text[0..was_len]) and
+            self.items[i].how_len == was_how_len and
+            std.mem.eql(u8, self.items[i].how[0..was_how_len], was_how[0..was_how_len]) and
+            self.items[i].verify_len == was_verify_len and
+            std.mem.eql(u8, self.items[i].verify[0..was_verify_len], was_verify[0..was_verify_len]);
         if (same) continue;
         r.updated += 1;
     }
@@ -368,6 +498,7 @@ pub fn parseItems(arena: std.mem.Allocator, args_json: []const u8, out: *[max_it
 /// JSON again just to get 20 strings out.
 pub fn fromValue(value: std.json.Value, out: *[max_items]Item) ParseError!Result {
     if (value != .object) return error.BadPlan;
+    const brief = briefFromObject(value.object);
     const maybe = value.object.get("items") orelse value.object.get("todos") orelse
         return error.BadPlan;
     const arr = switch (maybe) {
@@ -378,31 +509,10 @@ pub fn fromValue(value: std.json.Value, out: *[max_items]Item) ParseError!Result
 
     var n: u8 = 0;
     for (arr.items) |v| {
-        if (v != .object) return error.BadPlan;
-        const cmaybe = v.object.get("content") orelse v.object.get("text") orelse
-            v.object.get("task") orelse return error.BadPlan;
-        const content = switch (cmaybe) {
-            .string => |s| s,
-            else => return error.BadPlan,
-        };
-        // An unknown status falls back to `pending` instead of failing: the step is
-        // not wrong, it is mislabelled, and throwing the error would force a
-        // retry of the call.
-        const st: Status = if (v.object.get("status")) |sv| blk: {
-            if (sv != .string) break :blk .pending;
-            break :blk Status.parse(sv.string) orelse .pending;
-        } else .pending;
-
-        const trimmed = std.mem.trim(u8, content, " \t");
-        if (trimmed.len == 0) return error.BadPlan;
-        var it = Item{ .status = st };
-        const cp = @min(trimmed.len, text_max);
-        @memcpy(it.text[0..cp], trimmed[0..cp]);
-        it.len = @intCast(cp);
-        out[n] = it;
+        out[n] = itemFromValue(v) catch return error.BadPlan;
         n += 1;
     }
-    return .{ .items = out.*, .len = n };
+    return .{ .items = out.*, .len = n, .brief = brief };
 }
 
 // ── tests ─────────────────────────────────────────────────────
@@ -670,6 +780,33 @@ fn manyItems(n: usize, buf: []u8) []const u8 {
     return w.buffered();
 }
 
+
+/// Reads the plan brief from a tool call object. Tolerates aliases so the model
+/// can say `goal`/`objective`, `how`/`approach`, `guardrails`/`constraints`/`rules`.
+pub fn briefFromObject(obj: std.json.ObjectMap) Brief {
+    return .{
+        .objective = stringField(obj, &.{ "objective", "goal", "summary", "purpose" }),
+        .approach = stringField(obj, &.{ "approach", "how", "strategy", "implementation" }),
+        .guardrails = stringField(obj, &.{ "guardrails", "constraints", "rules", "verification", "checks" }),
+    };
+}
+
+pub fn objHasAny(obj: std.json.ObjectMap, keys: []const []const u8) bool {
+    for (keys) |k| {
+        if (obj.contains(k)) return true;
+    }
+    return false;
+}
+
+fn stringField(obj: std.json.ObjectMap, keys: []const []const u8) []const u8 {
+    for (keys) |k| {
+        if (obj.get(k)) |v| {
+            if (v == .string and v.string.len > 0) return v.string;
+        }
+    }
+    return "";
+}
+
 /// `update` / `remove` / `add`: the keys that make a `todo` call a PATCH.
 pub fn parseUpdates(obj: std.json.ObjectMap, out: *[max_items]StepUpdate) !u8 {
     const v = obj.get("update") orelse obj.get("updates") orelse return 0;
@@ -695,6 +832,14 @@ pub fn parseUpdates(obj: std.json.ObjectMap, out: *[max_items]StepUpdate) !u8 {
         if (e.object.get("text") orelse e.object.get("content")) |tv| {
             if (tv != .string) return error.BadPlan;
             u.text = tv.string;
+        }
+        if (e.object.get("how") orelse e.object.get("implementation")) |hv| {
+            if (hv != .string) return error.BadPlan;
+            u.how = hv.string;
+        }
+        if (e.object.get("verify") orelse e.object.get("check") orelse e.object.get("verification")) |vv| {
+            if (vv != .string) return error.BadPlan;
+            u.verify = vv.string;
         }
         out[n] = u;
         n += 1;
@@ -757,7 +902,22 @@ fn itemFromValue(v: std.json.Value) !Item {
         if (sv != .string) break :blk .pending;
         break :blk Status.parse(sv.string) orelse .pending;
     } else .pending;
-    return itemFromContent(c.string, st);
+    var it = try itemFromContent(c.string, st);
+    if (v.object.get("how") orelse v.object.get("implementation") orelse v.object.get("approach")) |hv| {
+        if (hv == .string) writeItemField(&it.how, &it.how_len, how_max, hv.string);
+    }
+    if (v.object.get("verify") orelse v.object.get("check") orelse v.object.get("verification")) |vv| {
+        if (vv == .string) writeItemField(&it.verify, &it.verify_len, verify_max, vv.string);
+    }
+    return it;
+}
+
+fn writeItemField(buf: anytype, len: anytype, comptime max: usize, text: []const u8) void {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return;
+    const cp = @min(trimmed.len, max);
+    @memcpy(buf[0..cp], trimmed[0..cp]);
+    len.* = @intCast(cp);
 }
 
 fn itemFromContent(text: []const u8, st: Status) !Item {
@@ -791,9 +951,9 @@ fn planOf3() Plan {
     var items: [3]Item = undefined;
     const texts = [_][]const u8{ "read the code", "fix it", "check it" };
     for (texts, 0..) |t, i| {
+        items[i] = .{ .status = .pending };
         @memcpy(items[i].text[0..t.len], t);
         items[i].len = @intCast(t.len);
-        items[i].status = .pending;
     }
     _ = p.apply(items[0..], 3);
     return p;
@@ -830,9 +990,9 @@ test "applyPatch: removals go from the highest index down" {
     var items: [4]Item = undefined;
     const texts = [_][]const u8{ "one", "two", "three", "four" };
     for (texts, 0..) |t, i| {
+        items[i] = .{ .status = .pending };
         @memcpy(items[i].text[0..t.len], t);
         items[i].len = @intCast(t.len);
-        items[i].status = .pending;
     }
     _ = p.apply(items[0..], 4);
     try std.testing.expectEqual(@as(u8, 4), p.len);
@@ -1011,4 +1171,68 @@ test "applyPatch: an empty reword is ignored, and a status in the same object st
     try std.testing.expectEqual(@as(u8, 1), r.updated);
     // And the index was NOT counted as unknown: the step exists, the text was empty.
     try std.testing.expectEqual(@as(u8, 0), r.unknown);
+}
+
+test "fromValue: plan brief and per-step how/verify are parsed and preserved" {
+    var astate = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    var out: [max_items]Item = undefined;
+    const args =
+        \\{"objective":"Add login rate limiting","approach":"Middleware + Redis counter","guardrails":"No behavior change for valid users; add tests",
+        \\"items":[
+        \\{"content":"add middleware","how":"wrap auth route","verify":"unit test rejects burst","status":"pending"},
+        \\{"content":"wire config","status":"pending"}
+        \\]}
+    ;
+    const r = try parseItems(arena, args, &out);
+    try std.testing.expectEqualStrings("Add login rate limiting", r.brief.objective);
+    try std.testing.expectEqualStrings("Middleware + Redis counter", r.brief.approach);
+    try std.testing.expect(std.mem.indexOf(u8, r.brief.guardrails, "No behavior change") != null);
+    try std.testing.expectEqual(@as(u8, 2), r.len);
+    try std.testing.expectEqualStrings("wrap auth route", r.items[0].howOf());
+    try std.testing.expectEqualStrings("unit test rejects burst", r.items[0].verifyOf());
+    try std.testing.expectEqual(@as(usize, 0), r.items[1].howOf().len);
+
+    var p = Plan.init();
+    try std.testing.expectEqual(Plan.Applied.changed, p.applyWithBrief(r.items[0..], r.len, r.brief));
+    try std.testing.expect(p.hasBrief());
+    const details = p.details(arena);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Objective: Add login rate limiting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Guardrails:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "how: wrap auth route") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "verify: unit test rejects burst") != null);
+}
+
+test "applyWithBrief: resending items without brief preserves existing brief" {
+    var p = Plan.init();
+    var items: [1]Item = undefined;
+    items[0] = item("step one", .pending);
+    _ = p.applyWithBrief(items[0..1], 1, .{ .objective = "keep this", .guardrails = "no regressions" });
+    try std.testing.expect(p.hasBrief());
+    items[0] = item("step one", .in_progress);
+    _ = p.applyWithBrief(items[0..1], 1, .{});
+    try std.testing.expectEqualStrings("keep this", p.objectiveOf());
+    try std.testing.expectEqualStrings("no regressions", p.guardrailsOf());
+    try std.testing.expectEqual(Status.in_progress, p.items[0].status);
+}
+
+test "parseUpdates: how and verify can be patched per step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var out: [max_items]StepUpdate = undefined;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"update":[{"index":1,"status":"done","how":"edited src/auth.zig","verify":"zig build test"}]}
+    , .{});
+    const n = try parseUpdates(v.object, &out);
+    try std.testing.expectEqual(@as(u8, 1), n);
+    try std.testing.expectEqualStrings("edited src/auth.zig", out[0].how.?);
+    try std.testing.expectEqualStrings("zig build test", out[0].verify.?);
+
+    var p = planOf3();
+    const r = applyPatch(&p, out[0..n], &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(u8, 1), r.updated);
+    try std.testing.expectEqualStrings("edited src/auth.zig", p.items[0].howOf());
+    try std.testing.expectEqualStrings("zig build test", p.items[0].verifyOf());
 }
