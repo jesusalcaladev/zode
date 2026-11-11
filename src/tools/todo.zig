@@ -35,7 +35,9 @@ pub fn toolTodo(obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const n_add = plan_mod.parseAdd(obj, &add) catch |err| return mapErr(err);
 
     const has_items = obj.get("items") != null or obj.get("todos") != null;
-    if (!has_items and n_upd == 0 and n_rm == 0 and n_add == 0) return error.EmptyPlan;
+    const brief = plan_mod.briefFromObject(obj);
+    const has_brief = !brief.isEmpty();
+    if (!has_items and n_upd == 0 and n_rm == 0 and n_add == 0 and !has_brief) return error.EmptyPlan;
 
     var text = std.Io.Writer.Allocating.init(arena);
     const w = &text.writer;
@@ -46,7 +48,11 @@ pub fn toolTodo(obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
         // throwing work away.
         const r = plan_mod.fromValue(.{ .object = obj }, &items) catch |err| return mapErr(err);
         if (r.len == 0) return error.EmptyPlan;
-        try w.print("plan recorded ({d} step{s}).", .{ r.len, if (r.len == 1) "" else "s" });
+        try w.print("plan recorded ({d} step{s}", .{ r.len, if (r.len == 1) "" else "s" });
+        if (!r.brief.isEmpty()) try w.writeAll(", with objective/approach/guardrails");
+        try w.writeAll(").");
+    } else if (has_brief and n_upd == 0 and n_rm == 0 and n_add == 0) {
+        try w.writeAll("plan brief updated (objective/approach/guardrails).");
     }
     if (n_upd + n_rm + n_add > 0) {
         try w.writeAll(" Applied to the plan above");
@@ -55,7 +61,7 @@ pub fn toolTodo(obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
         if (n_add > 0) try w.print(" ({d} added)", .{n_add});
         try w.writeAll(".");
     }
-    try w.writeAll(" Keep it updated as you go: mark a step done as it happens, not at the end.");
+    try w.writeAll(" Keep it updated as you go: mark a step done as it happens, not at the end. Carry objective, approach, and guardrails so implementation has clear context.");
     return text.written();
 }
 
