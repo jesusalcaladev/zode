@@ -157,7 +157,13 @@ Fetch a URL and extract text.
 
 Search the web (DuckDuckGo / Brave / … depending on config).
 
+---
+
 ## Git and GitHub
+
+### `/git`
+
+Read-only local Git overview: current branch, working tree status, and recent commits. No network calls and no destructive actions.
 
 ### `/github`
 

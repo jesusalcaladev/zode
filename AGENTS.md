@@ -124,17 +124,18 @@ src/lib/ pure/testable modules (no TUI, no network): readcache, project,
 - Startup banner: ONLY the `ZODE` wordmark (5 lines of plain ASCII, no mascot, no greeting, no shortcuts line — Houston/Astro Boy tried and rejected for filling the view).
 - The face is in the composer's footer (the last row of the well), not inside the input.
 
-## TUI design guide
+## TUI never-break guide
 
-`docs/RULES-ZODE-TUI.md` is the living design/reference guide for evolving Zode into a terminal-native development environment. It adapts the UI direction to Zode's existing architecture and theme system:
+`docs/RULES-ZODE-TUI.md` is the concise TUI/runtime/UX invariants guide. Read it before changing `src/tui.zig`, palette/overlay rendering, or TUI-facing agent integration.
 
-- Preserve Zig 0.17 + Vaxis 0.6 and current runtime behavior; UI work is incremental, not a rewrite.
-- Use `src/lib/theme.zig` as the only color/theme source of truth (semantic roles, contrast tests, ANSI256/`NO_COLOR`/daltonized support). Do not add a duplicate palette.
-- Reuse and evolve existing components (`src/tui.zig`, `src/palette.zig`, `src/lib/ask.zig`, permission flow, markdown/highlight, mascot, bgproc/session rendering) instead of duplicating them.
-- Never invent file stats, tool states, or permission decisions; runtime owns truth and the UI renders structured state.
-- Every significant TUI change needs appropriate tests (`zig build test`, and TUI harnesses like `drawTest`, `ui-frame`, or `pty_smoke` when relevant).
+Core invariants (details in the guide):
 
-Phase 1 (UI foundations) is substantially complete: responsive layout hardening, question/permission overflow fixes, scroll/viewport stability improvements, and incremental event presentation consistency, all without changing agent/runtime semantics. Phase 2 (File intelligence) is complete at the incremental/honest-data level: semantic file labels (`lang_icons`), compact/expanded card foundations and TUI diff cards, accurate real diffs, true turn-scoped net diff aggregation (`baseline -> after`, capped/fallback-safe), grouped summaries (`Model` turn net summary + `/files` integration), and labeled session changed-file reporting in `filesview`; file stats are never invented. Full timeline card focus/actions/navigation remain a follow-up UX increment.
+- Preserve Zig 0.17 + Vaxis 0.6 architecture and Zode's terminal-native identity; incremental changes only.
+- `src/lib/theme.zig` is the only color/theme source of truth (semantic roles, capabilities, contrast/theme behavior).
+- Runtime owns truth: never invent file stats, tool states, permission decisions, or execution results. UI renders structured state and never parses rendered UI strings for important state.
+- Permission UI is presentation only; rendering failures must never approve dangerous actions.
+- Keep scroll/viewport anchoring stable, responsive layouts compact-safe, and motion/event-loop paths non-blocking. Reduced/no-animation modes render safe final state immediately.
+- Significant TUI changes need appropriate validation (`zig build test` when buildable; `drawTest`, `zig build ui-frame`, and/or `tools/pty_smoke.py` as relevant).
 
 ## Key design decisions (durable — do not undo without a test)
 

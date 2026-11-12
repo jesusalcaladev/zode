@@ -394,7 +394,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 `✨ feature · 🟡 · depends on 0 (per-command allowlist = a registry property) · a complete command to port (copy the prompt text verbatim)`
 
-- [ ] **31.1** Layer 1 — verified context inlined into the prompt:
+- [x] **31.1** Layer 1 — verified context inlined into the prompt:
 
   ```
   - Current git status: !`git status`
@@ -403,17 +403,17 @@ Ctrl+R turns them on. That is the same rule with a different name.
   - Recent commits: !`git log --oneline -10`
   ```
 
-  - [ ] Both syntaxes (fenced `!…` blocks + inline `` !`cmd` ``); we already have `!cmd` from the input — this moves it _into_ a prompt (~30 lines) and gives every command a verified context block (`/review` becomes a merge-base diff for free)
-  - [ ] Each command is permission-checked even though the user chose the command that ran it
-  - [ ] Substitution uses a function replacer, never a string replace — `$$`, `$&`, `` $` ``, `$'` are shell output, i.e. arbitrary user data
-  - [ ] Failure is loud and named (`Shell command failed for pattern "git status": …`) — never a silent empty substitution; an empty `git status` that looks like a clean tree is the worst possible lie
-- [ ] **31.2** Layer 2 — the allowlist is a property of the command: `/commit` gets `Bash(git add:*)`, `git status:*`, `git commit:*` only; `/commit-push-pr` adds `checkout -b`, `push`, `gh pr create/edit/view/merge` — **the asymmetry is the feature**. Injected into `alwaysAllowRules.command` so the turn does not prompt
-- [ ] **31.3** Layer 3 — the git safety protocol, verbatim: never update the git config · never skip hooks (`--no-verify`, `--no-gpg-sign`) unless explicitly requested · **ALWAYS create NEW commits, NEVER `--amend`** unless explicitly requested (the only CRITICAL-classified rule — it destroys work) · do not commit files that likely contain secrets (warn if asked) · no empty commits · never `-i` (`rebase -i` hangs a non-TTY harness forever; `verify.zig` should classify it as **forbidden**, not merely slow)
-- [ ] **31.4** The message never touches argv: the heredoc (upstream) is the same insight as our `git_commit` `-F <file>`; plus the closing clause that makes it ONE round trip: _"Stage and create the commit using a single message. Do not use any other tools or send any other text."_
-  - [ ] Style rules: look at the recent commits for this repo's style · name the nature of the change (add/update/fix/refactor/test/docs) · 1–2 sentences on the **why**
-- [ ] **31.5** `/pr` adds: branch name with a user prefix when on the default branch (`username/feature`) · diff against the **merge base**, said explicitly to be _all_ the commits in the PR · PR body template (`## Summary` 1–3 bullets + `## Test plan` checklist + a managed `## Changelog` between markers) · title under 70 characters · **idempotent** (`gh pr view --json number 2>/dev/null || true` is itself an inlined command — including the `|| true` — then `gh pr edit` instead of a second PR) · "Return the PR URL when you're done"
-  - [ ] `contentLength` as a getter for dynamic prompts — a wrong static length is how `/context` loses the credibility `ctxTokens` just bought
-- [ ] Tests: context substitution (permission-denied, loud failure, replacer safety) · the allowlist asymmetry pinned · the `/pr` idempotence path · `rebase -i` classified forbidden
+  - [x] Both syntaxes (fenced `!…` blocks + inline `` !`cmd` ``); we already have `!cmd` from the input — this moves it _into_ a prompt (~30 lines) and gives every command a verified context block (`/review` becomes a merge-base diff for free) — `src/lib/cmdsubst.zig`
+  - [x] Each command is permission-checked even though the user chose the command that ran it (cmdsafety forbidden checks + allow rules / permission callback; /commit//pr use scoped allowlists)
+  - [x] Substitution uses a function replacer, never a string replace — `$$`, `$&`, `` $` ``, `$'` are shell output, i.e. arbitrary user data (result built by appending slices)
+  - [x] Failure is loud and named (`Shell command failed for pattern "git status": …`) — never a silent empty substitution; an empty `git status` that looks like a clean tree is the worst possible lie
+- [x] **31.2** Layer 2 — the allowlist is a property of the command: `/commit` gets `Bash(git add:*)`, `git status:*`, `git commit:*` (and read-only git context) only; `/commit-push-pr`/`/pr` adds `checkout`/`switch`, `push`, `remote`, `merge-base`/`fetch`, `gh pr`/`gh auth` — **the asymmetry is the feature**. Injected as turn-scoped bash allow rules (`agent.turn_bash_allow_rules` / `ChatJob.bash_allow_rules`) so the turn does not prompt; `permAutoAllowed`/cmdsubst honor them.
+- [x] **31.3** Layer 3 — the git safety protocol, verbatim in prompts: never update the git config · never skip hooks (`--no-verify`, `--no-gpg-sign`) unless explicitly requested · **ALWAYS create NEW commits, NEVER `--amend`** unless explicitly requested (the only CRITICAL-classified rule — it destroys work) · do not commit files that likely contain secrets (warn if asked) · no empty commits · never `-i` (`rebase -i` hangs a non-TTY harness forever; `cmdsafety` classifies interactive git flags including `git rebase -i/--interactive` as **forbidden**, and cmdsubst refuses forbidden commands)
+- [x] **31.4** The message never touches argv: prompts require heredoc/`git commit -F -` (or `-F <file>`); plus the closing clause that makes it ONE round trip: _"Stage and create the commit using a single message. Do not use any other tools or send any other text."_
+  - [x] Style rules: look at the recent commits for this repo's style · name the nature of the change (add/update/fix/refactor/test/docs) · 1–2 sentences on the **why**
+- [x] **31.5** `/pr` adds: branch name with a user prefix when on the default branch (`username/feature`) · diff against the **merge base**, said explicitly to be _all_ the commits in the PR · PR body template (`## Summary` 1–3 bullets + `## Test plan` checklist + a managed `## Changelog` between markers) · title under 70 characters · **idempotent** (`gh pr view --json number 2>/dev/null || true` is itself an inlined command — including the `|| true` — then `gh pr edit` instead of a second PR) · "Return the PR URL when you're done"; `/commit-push-pr` uses the same PR flow/rules.
+  - [x] `contentLength` as a getter for dynamic prompts — `gitcmds.contentLength(text)` (not a static constant) so substituted/expanded prompts report the correct length.
+- [x] Tests: context substitution (permission-denied, loud failure, replacer safety) · allowlist asymmetry pinned · `/pr` idempotence path markers/prompt contract + allow rules · `rebase -i` classified forbidden (`cmdsafety` + `cmdsubst` forbidden refusal). (`src/lib/cmdsubst.zig`, `src/lib/gitcmds.zig`; full `zig build test`: 1806 passed, 4 skipped, 1 pre-existing unrelated bgproc FileNotFound failure)
 
 ---
 
