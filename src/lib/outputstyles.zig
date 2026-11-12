@@ -18,6 +18,7 @@ pub const Source = core.Source;
 pub const Entry = core.Entry;
 pub const formatStyle = core.formatStyle;
 pub const systemPromptSection = core.systemPromptSection;
+pub const joinNames = core.joinNames;
 
 test {
     _ = core;

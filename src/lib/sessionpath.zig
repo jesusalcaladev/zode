@@ -15,6 +15,7 @@ pub const projectSessionsDir = impl.projectSessionsDir;
 pub const resolveSessionsDir = impl.resolveSessionsDir;
 pub const isSessionFile = impl.isSessionFile;
 pub const sessionBelongsToProject = impl.sessionBelongsToProject;
+pub const sessionDisplayId = impl.sessionDisplayId;
 
 test {
     _ = impl;

@@ -360,3 +360,18 @@ test "systemPromptSection: truncates past max_listed" {
         std.testing.allocator.free(name);
     }
 }
+
+
+/// Joins style names with ", " for an error message.
+/// Note: returns a slice of a stack buffer (valid only until caller's frame/context changes).
+pub fn joinNames(entries: []const Entry) []const u8 {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var first: bool = true;
+    for (entries) |e| {
+        if (!first) w.writeAll(", ") catch {};
+        first = false;
+        w.writeAll(e.name) catch {};
+    }
+    return w.buffered();
+}

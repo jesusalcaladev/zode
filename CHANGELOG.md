@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add /diff for uncommitted and turn diffs (phase 35.10) (commands) [`177d36ff`](https://github.com/jesusalcaladev/zode/commit/177d36ff)
 - add structured brief and per-step how/verify support (plan) [`242e9640`](https://github.com/jesusalcaladev/zode/commit/242e9640)
 - support objective, approach, guardrails, and step verification (todo) [`4ed8c94e`](https://github.com/jesusalcaladev/zode/commit/4ed8c94e)
-- guide todo usage as concrete implementation plans (prompt) [`0ef3e040`](https://github.com/jesusalcaladev/zode/commit/0ef3e040)
+- guide todo usage as concrete implementation plans (prompt) [`8a7fe7d4`](https://github.com/jesusalcaladev/zode/commit/8a7fe7d4)
 
 ### Documentation
 
@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - organize lib modules into clusters with stable facades [`8e60f45c`](https://github.com/jesusalcaladev/zode/commit/8e60f45c)
 - remove dead test file, expand test coverage, clarify lib IO notes [`1c5f20c0`](https://github.com/jesusalcaladev/zode/commit/1c5f20c0)
 - expose tool call helper exports (tools) [`73c22592`](https://github.com/jesusalcaladev/zode/commit/73c22592)
+- extract granular modules and loop/turn helpers (agent) [`e5b6712b`](https://github.com/jesusalcaladev/zode/commit/e5b6712b)
 
 ### Tests
 

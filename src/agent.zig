@@ -38,6 +38,8 @@ const cache_stats = @import("cache_stats.zig");
 const cost_mod = @import("lib/cost.zig");
 const selfupdate = @import("lib/selfupdate.zig");
 const compaction = @import("compaction.zig");
+const cmdsubst = @import("lib/cmdsubst.zig");
+const gitcmds = @import("lib/gitcmds.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
 
@@ -87,6 +89,51 @@ const agentsdoc = @import("lib/agentsdoc.zig");
 const memory_mod = @import("lib/memory.zig");
 const memory_store = @import("lib/memory_store.zig");
 
+const plan_gate = @import("agent/plan_gate.zig");
+const summary_breaker_mod = @import("lib/summary_breaker.zig");
+const agent_perms = @import("agent/perms.zig");
+const agent_types = @import("agent/types.zig");
+const loop_helpers = @import("agent/loop_helpers.zig");
+const agent_loop = @import("agent/loop.zig");
+const submodel_mod = @import("agent/submodel.zig");
+const summarize_mod = @import("agent/summarize.zig");
+const chat_dispatch = @import("agent/chat_dispatch.zig");
+const chat_entry = @import("agent/chat_entry.zig");
+const worker_turn = @import("agent/worker_turn.zig");
+const normal_turn = @import("agent/normal_turn.zig");
+const chat_worker_mod = @import("agent/chat_worker.zig");
+const cmdsubst_expand = @import("agent/cmdsubst_expand.zig");
+const loop_runtime = @import("agent/loop_runtime.zig");
+const pipeline_support = @import("agent/pipeline_support.zig");
+const pipeline_tester_perm = @import("agent/pipeline_tester_perm.zig");
+const loop_evidence = @import("agent/loop_evidence.zig");
+const loop_guards = @import("agent/loop_guards.zig");
+const loop_outcome = @import("agent/loop_outcome.zig");
+const loop_end_checks = @import("agent/loop_end_checks.zig");
+const loop_iter = @import("agent/loop_iter.zig");
+const loop_success = @import("agent/loop_success.zig");
+const loop_run = @import("agent/loop_run.zig");
+const turn_finalize = @import("agent/turn_finalize.zig");
+const stream_retry = @import("agent/stream_retry.zig");
+const permissions_store = @import("agent/permissions_store.zig");
+const permissions_persist = @import("agent/permissions_persist.zig");
+const permissions_policy = @import("agent/permissions_policy.zig");
+const project_rules = @import("agent/project_rules.zig");
+const discovery = @import("agent/discovery.zig");
+const prompt_system = @import("agent/prompt_system.zig");
+const turn_metrics = @import("lib/turn_metrics.zig");
+const envutil = @import("lib/envutil.zig");
+const summary_policy = @import("agent/summary_policy.zig");
+const runtime_buffers = @import("agent/runtime_buffers.zig");
+const tool_exec_policy = @import("agent/tool_exec_policy.zig");
+const tool_exec_perm = @import("agent/tool_exec_perm.zig");
+const tool_exec_preflight = @import("agent/tool_exec_preflight.zig");
+const gate_mod = @import("lib/gate.zig");
+const turn_types = @import("agent/turn_types.zig");
+const tool_exec = @import("agent/tool_exec.zig");
+const runtime_state = @import("agent/runtime_state.zig");
+const cheap_router_state = @import("agent/cheap_router_state.zig");
+
 // The `/help` tables live with the commands they document. Re-exported because
 // the palette builds its items from `commands`, and that is not a commands
 // concern: it is a "what can I type" concern.
@@ -108,156 +155,22 @@ pub const coding_rules = prompt_mod.coding_rules;
 pub const tool_routing_prompt = prompt_mod.tool_routing_prompt;
 pub const verification_prompt = prompt_mod.verification_prompt;
 
-// ── system prompt: the project's AGENTS.md (cached) ──────────
-var agents_md_cache: ?[]u8 = null;
-
-/// Cache-break detection: previous block hashes, set on the first call to
-/// `buildSystemPrompt` and compared on every later call. When a block changes,
-/// `cache_break_last_block` names it and `cache_break_last_pos` gives its byte
-/// offset in the composed prefix.
-var cache_break_prev: ?[8]u64 = null;
-var cache_break_last_block: ?[]const u8 = null;
-var cache_break_last_pos: usize = 0;
-
-/// Resets the cache-break tracker (for tests and session rotation).
+// ── system prompt cache state: extracted to `agent/prompt_system.zig`
 pub fn resetCacheBreak() void {
-    cache_break_prev = null;
-    cache_break_last_block = null;
-    cache_break_last_pos = 0;
+    prompt_system.resetCacheBreak();
 }
-
-/// True when the cache write rate suggests the prefix is unstable:
-/// `writes_per_request > 0.5` over a long session means the prefix is being
-/// re-written every turn instead of being read from the provider's cache.
 pub fn cacheBreakUnstable() bool {
-    return cache_stats.session.writesPerRequest() > 0.5;
+    return prompt_system.cacheBreakUnstable();
 }
 
-/// Cached discovered agent definitions (`.zode/agents/` + `~/.config/zode/agents/`).
-var agent_defs_cache: ?[]agentdefs.Entry = null;
-
-/// Discovers and caches agent definitions, or returns the cached list.
+/// Discovers and caches agent definitions. Cache/state extracted to
+/// `agent/discovery.zig` (behavior preserved); wrapper keeps the public API.
 pub fn ensureAgentDefs(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) []const agentdefs.Entry {
-    if (agent_defs_cache) |defs| return defs;
-    var roots: std.ArrayList([]u8) = .empty;
-    defer roots.deinit(gpa);
-    var proj_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const proj_path = std.fmt.bufPrint(&proj_buf, "{s}/{s}", .{ project_info.cwd(), agentdefs.project_dir }) catch "";
-    if (proj_path.len > 0) {
-        const proj_copy = gpa.dupe(u8, proj_path) catch null;
-        if (proj_copy) |pc| {
-            roots.append(gpa, pc) catch {};
-        }
-    }
-    if (env) |e| {
-        if (e.get("HOME")) |home| {
-            if (home.len > 0) {
-                var user_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const user_path = std.fmt.bufPrint(&user_buf, "{s}/{s}/{s}", .{ home, ".config", agentdefs.user_subdir }) catch "";
-                if (user_path.len > 0) {
-                    const user_copy = gpa.dupe(u8, user_path) catch null;
-                    if (user_copy) |uc| {
-                        roots.append(gpa, uc) catch {};
-                    }
-                }
-            }
-        }
-    }
-    var entries: std.ArrayList(agentdefs.Entry) = .empty;
-    defer entries.deinit(gpa);
-    var seen: std.ArrayList([]u8) = .empty;
-    defer seen.deinit(gpa);
-    for (roots.items) |root| {
-        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
-        defer dir.close(io);
-        var it = dir.iterate();
-        while (it.next(io) catch null) |entry| {
-            if (entry.kind != .directory) continue;
-            if (entry.name.len == 0 or entry.name[0] == '.') continue;
-            var already = false;
-            for (seen.items) |s| {
-                if (std.mem.eql(u8, s, entry.name)) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
-            const name_copy = gpa.dupe(u8, entry.name) catch continue;
-            seen.append(gpa, name_copy) catch {
-                gpa.free(name_copy);
-                continue;
-            };
-            var file_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const file_path = std.fmt.bufPrint(&file_buf, "{s}/{s}/AGENT.md", .{ root, entry.name }) catch {
-                gpa.free(name_copy);
-                continue;
-            };
-            const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, gpa, .limited(64 * 1024)) catch {
-                gpa.free(name_copy);
-                continue;
-            };
-            const fm = agentdefs.splitFrontmatter(text) orelse {
-                gpa.free(text);
-                gpa.free(name_copy);
-                continue;
-            };
-            var tools: [][]const u8 = &[_][]const u8{};
-            if (fm.meta.tools.len > 0) {
-                tools = agentdefs.parseTools(fm.meta.tools, gpa) catch {
-                    gpa.free(text);
-                    gpa.free(name_copy);
-                    continue;
-                };
-            }
-            if (!agentdefs.toolsAreReadOnly(tools)) {
-                gpa.free(text);
-                gpa.free(name_copy);
-                continue;
-            }
-            const desc_dup = gpa.dupe(u8, fm.meta.description) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                continue;
-            };
-            const model_dup = if (fm.meta.model.len > 0) gpa.dupe(u8, fm.meta.model) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                gpa.free(desc_dup);
-                continue;
-            } else "";
-            const effort_dup = if (fm.meta.effort.len > 0) gpa.dupe(u8, fm.meta.effort) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                gpa.free(desc_dup);
-                gpa.free(model_dup);
-                continue;
-            } else "";
-            entries.append(gpa, agentdefs.Entry{
-                .name = name_copy,
-                .description = desc_dup,
-                .tools = tools,
-                .model = model_dup,
-                .effort = effort_dup,
-                .path = file_path,
-                .source = if (std.mem.eql(u8, root[0..], project_info.cwd())) "project" else "user",
-            }) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                gpa.free(desc_dup);
-                if (model_dup.len > 0) gpa.free(model_dup);
-                if (effort_dup.len > 0) gpa.free(effort_dup);
-                continue;
-            };
-            gpa.free(text);
-        }
-    }
-    agent_defs_cache = entries.toOwnedSlice(gpa) catch null;
-    return agent_defs_cache.?;
+    return discovery.ensureAgentDefs(gpa, io, env, project_info.cwd());
 }
 
-/// Resets the agent definitions cache (for config reload).
 pub fn resetAgentDefs() void {
-    agent_defs_cache = null;
+    discovery.resetAgentDefs();
 }
 
 /// Releases the AGENTS.md cache.
@@ -270,15 +183,7 @@ pub fn resetAgentDefs() void {
 /// In the app this is never called: the cache is a process-lifetime allocation. It exists
 /// for tests that take over the globals.
 pub fn forgetAgentsCache(a: std.mem.Allocator) void {
-    if (agents_md_cache) |c| {
-        // The CALLER's allocator, because the cache was read with the one `runOneTurn`
-        // was handed. Two separate wrong guesses were made here before this: freeing it
-        // with `page_allocator` while the block belonged to the testing allocator (an
-        // Invalid free), and freeing it at the call site (a double free the moment any
-        // other owner does the same).
-        a.free(c);
-        agents_md_cache = null;
-    }
+    prompt_system.forgetAgentsCache(a);
 }
 
 /// Where zode is running, resolved ONCE at startup.
@@ -383,444 +288,57 @@ pub fn projectInfoPromptLines(out: []u8) []const u8 {
     return project_info.promptLines(out);
 }
 
-/// Skills found on disk, discovered ONCE and then re-validated by mtime.
-///
-/// The list is cached because it goes into the system prompt, which is rebuilt
-/// for every request: walking the roots and reading the frontmatter of every
-/// `SKILL.md` on every request would be silly I/O on the hot path. The BODY is
-/// never cached — that is loaded on demand by the `skill` tool, which is the whole
-/// point (see `skills.zig`).
-///
-/// ## The list is BORROWED, and that is the whole ownership story
-///
-/// `scan` allocates the entries AND their strings, and hands ownership to the
-/// caller. So the module owns them, and the callers of `discoverSkills` must NOT
-/// free them. The old code had a `freeSkillEntries` that the caller called with a
-/// `defer`, which freed the cache out from under itself: the second
-/// `syncSystemPrompt` of the session read a freed slice. It did not show up
-/// because the block is usually reused by the next allocation and the list still
-/// "looked" right, and because the test that exercises `buildSystemPrompt` runs in
-/// the repo root, where `.zode/skills` does not exist, so there were no strings to
-/// free at all. Hence: borrowed slice, freed once, at teardown, by the module.
-///
-/// ## Why the mtime check and not "discover once forever"
-///
-/// `buildSystemPrompt`'s own doc comment claims a skill that appears on disk
-/// should be usable without a restart. With a permanent cache that was false. The
-/// check is N `stat`s (one per root, one per known `SKILL.md`) and no reads, which
-/// is nothing next to a request to a model; the expensive half (reading and
-/// parsing frontmatter) only happens when something actually changed.
-var skills_cache: ?[]skills.Entry = null;
-/// Allocator that owns `skills_cache` memory, so `resetSkillsCacheForTest` can free it correctly.
-var skills_cache_gpa: std.mem.Allocator = std.heap.page_allocator;
-/// `mtime` + size of every path the cached list was built from: the roots and each
-/// `SKILL.md`. A change in any of them invalidates the list.
-var skills_stamps: [skills_stamp_max]skillstore.Stamp = undefined;
-var skills_stamp_len: usize = 0;
-/// Roots + skills. The array is sized from the loader's own caps so the two can
-/// never drift apart.
-const skills_stamp_max = 64 + skillstore.max_roots;
-
-/// Rescans before the cache is trusted forever.
-///
-/// Bounded on purpose: a `stat` per root and per skill is nothing next to a
-/// request, but the RESCAN reads and parses every frontmatter. A directory whose
-/// mtime changes on every turn (a sync client, a build that rewrites skills) would
-/// pay that on every turn forever. After the cap the cache is trusted as-is, and
-/// `/new` is what picks up a late arrival.
-const skills_rescan_max: usize = 4;
-
-var skills_lock: std.atomic.Mutex = .unlocked;
-var skills_rescans: usize = 0;
-
-/// The skills on disk, or an empty list. BORROWED: do not free.
-///
-/// The lock is held for the whole function, rescan included. `tryLock` in a spin
-/// loop and not `lock`, because this sits on the request path and the critical
-/// section is a handful of `stat`s. Holding it across the rescan is what makes the
-/// swap safe: the old list may be being walked by another thread right now (the
-/// prompt is composed on the worker, `/skills` is drawn on the UI thread), and
-/// that is the exact race the palette had.
+/// Skills/styles discovery and caches extracted to `agent/discovery.zig`.
 pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []const skills.Entry {
-    while (skills_lock.tryLock()) {}
-    defer skills_lock.unlock();
-
-    if (skills_cache != null and skillsFresh(gpa, env)) return skills_cache.?;
-    if (skills_rescans >= skills_rescan_max) return skills_cache orelse &.{};
-    skills_rescans += 1;
-
-    // Always use page_allocator for internal allocations so they are never
-    // tracked by a short-lived test ArenaAllocator (which would report leaks
-    // at deinit). page_allocator.free() is a no-op, so there is no risk of
-    // freeing with the wrong allocator. Only cache the result when the allocator
-    // outlives this call (gpa_global).
-    const fresh = loadSkillsNow(std.heap.page_allocator, env);
-    // Only cache when the allocator outlives this call (gpa_global).
-    if (gpa.vtable == gpa_global.vtable and gpa.ptr == gpa_global.ptr) {
-        // Freed HERE, after the new list exists and only here. Freeing first
-        // would be a use-after-free of the list a reader is walking.
-        freeSkillsCacheLocked();
-        skills_cache = fresh;
-        skills_cache_gpa = std.heap.page_allocator;
-    }
-    stampSkills(gpa, env);
-    return fresh;
+    return discovery.discoverSkills(gpa, io_global, env, gpa_global, project_info.cwd(), project_info.root());
 }
 
-/// Output styles found on disk, cached like skills (same reasons: the list goes
-/// into the system prompt, rebuilt for every request).
-///
-/// The styles list is small (a handful of entries), so the rescan cap and freshness
-/// check mirror skills but with smaller numbers.
-var styles_cache: ?[]outputstyles.Entry = null;
-/// Allocator that owns `styles_cache` memory, so `resetStylesCacheForTest` can free it correctly.
-var styles_cache_gpa: std.mem.Allocator = std.heap.page_allocator;
-var styles_stamps: [outputstyle_store.max_roots]outputstyle_store.Stamp = undefined;
-var styles_stamp_len: usize = 0;
-const styles_rescan_max: usize = 4;
-var styles_rescans: usize = 0;
-var styles_lock: std.atomic.Mutex = .unlocked;
-
-/// The styles on disk, or an empty list. BORROWED: do not free.
 pub fn discoverStyles(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []const outputstyles.Entry {
-    while (styles_lock.tryLock()) {}
-    defer styles_lock.unlock();
-
-    if (styles_cache != null and stylesFresh(gpa, env)) return styles_cache.?;
-    if (styles_rescans >= styles_rescan_max) return styles_cache orelse &.{};
-    styles_rescans += 1;
-
-    // Always use page_allocator for internal allocations so they are never
-    // tracked by a short-lived test ArenaAllocator (which would report leaks
-    // at deinit). page_allocator.free() is a no-op, so there is no risk of
-    // freeing with the wrong allocator. Only cache the result when the allocator
-    // outlives this call (gpa_global).
-    const fresh = loadStylesNow(std.heap.page_allocator, env);
-    // Only cache when the allocator outlives this call (gpa_global).
-    if (gpa.vtable == gpa_global.vtable and gpa.ptr == gpa_global.ptr) {
-        freeStylesCacheLocked();
-        styles_cache = fresh;
-        styles_cache_gpa = std.heap.page_allocator;
-    }
-    stampStyles(gpa, env);
-    return fresh;
+    return discovery.discoverStyles(gpa, io_global, env, gpa_global, project_info.cwd(), project_info.root());
 }
 
-/// Walks the roots right now and allocates the entries. The caller owns them.
-fn loadStylesNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []outputstyles.Entry {
-    var loader = stylesLoader(gpa, env);
-    var buf: [64]outputstyles.Entry = undefined;
-    const found = loader.scan(&buf, buf.len);
-    const copy = gpa.dupe(outputstyles.Entry, found) catch {
-        // Out of memory: no styles rather than a half-built list.
-        for (found) |e| {
-            gpa.free(e.name);
-            gpa.free(e.description);
-            gpa.free(e.path);
-        }
-        return &.{};
-    };
-    return copy;
-}
-
-/// The loader, with its roots made ABSOLUTE.
-fn stylesLoader(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) outputstyle_store.Loader {
-    var loader = outputstyle_store.Loader.init(gpa, io_global, env);
-    const proj = &project_info;
-    const cwd = proj.cwd();
-    if (cwd.len == 0) return loader;
-
-    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
-    loader.project_dir = std.fmt.bufPrint(&bufs[0], "{s}/{s}", .{ cwd, outputstyles.project_dir }) catch loader.project_dir;
-
-    if (proj.root()) |root| {
-        if (!std.mem.eql(u8, root, cwd)) loader.repo_root = root;
-    }
-    return loader;
-}
-
-fn stampStyles(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
-    styles_stamp_len = 0;
-    var loader = stylesLoader(gpa, env);
-    var bufs: [outputstyle_store.max_roots][std.fs.max_path_bytes]u8 = undefined;
-    var paths: [outputstyle_store.max_roots][]const u8 = undefined;
-    const root_count = loader.roots(&bufs, &paths);
-    for (paths[0..root_count]) |p| addStyleStamp(p);
-    if (styles_cache) |list| {
-        for (list) |e| addStyleStamp(e.path);
-    }
-}
-
-fn addStyleStamp(path: []const u8) void {
-    if (styles_stamp_len >= styles_stamps.len) return;
-    if (!outputstyle_store.stampPath(io_global, path, &styles_stamps[styles_stamp_len])) return;
-    styles_stamp_len += 1;
-}
-
-fn stylesFresh(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) bool {
-    var loader = stylesLoader(gpa, env);
-    var bufs: [outputstyle_store.max_roots][std.fs.max_path_bytes]u8 = undefined;
-    var paths: [outputstyle_store.max_roots][]const u8 = undefined;
-    const root_count = loader.roots(&bufs, &paths);
-
-    for (paths[0..root_count]) |p| if (!styleStampUnchanged(p)) return false;
-    if (styles_cache) |list| {
-        for (list) |e| if (!styleStampUnchanged(e.path)) return false;
-    }
-    return true;
-}
-
-fn styleStampUnchanged(path: []const u8) bool {
-    for (styles_stamps[0..styles_stamp_len]) |*st| {
-        if (!std.mem.eql(u8, st.pathOf(), path)) continue;
-        var now: outputstyle_store.Stamp = .{};
-        if (!outputstyle_store.stampPath(io_global, path, &now)) return false;
-        return st.sameAs(&now);
-    }
-    return false;
-}
-
-fn freeStylesCacheLocked() void {
-    // styles_cache_gpa is always std.heap.page_allocator whose free() is a
-    // no-op, so there is no risk of freeing with the wrong allocator.
-    const gpa = styles_cache_gpa;
-    if (styles_cache) |list| {
-        for (list) |e| {
-            gpa.free(e.name);
-            gpa.free(e.description);
-            gpa.free(e.path);
-        }
-        if (list.len > 0) gpa.free(list);
-    }
-    styles_cache = null;
-}
-
-/// Walks the roots right now and allocates the entries. The caller owns them.
-fn loadSkillsNow(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []skills.Entry {
-    var loader = skillsLoader(gpa, env);
-    var buf: [64]skills.Entry = undefined;
-    const found = loader.scan(&buf, buf.len);
-    const copy = gpa.dupe(skills.Entry, found) catch {
-        // Out of memory: no skills rather than a half-built list. The system
-        // prompt still works, and the tool can still be called by name.
-        for (found) |e| {
-            gpa.free(e.name);
-            gpa.free(e.description);
-            gpa.free(e.path);
-        }
-        return &.{};
-    };
-    return copy;
-}
-
-/// The loader, with its roots made ABSOLUTE and pointed at the repository root
-/// when zode was launched below it.
-///
-/// The absolute part is not cosmetic: it is what lets the tests point the loader
-/// at a fixture instead of at the repo of whoever runs the suite, and it removes
-/// any dependence on the process cwd staying put under a caller's feet. In
-/// production `cwd()` IS the process cwd, so the paths are the ones `Dir.cwd()`
-/// would have resolved anyway.
-///
-/// The `repo_root` part is the fix for "cd src && zode sees no skills": the
-/// project's skills live in the root, and git already knows where the root is.
-fn skillsLoader(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) skillstore.Loader {
-    var loader = skillstore.Loader.init(gpa, io_global, env);
-    const proj = &project_info;
-    const cwd = proj.cwd();
-    if (cwd.len == 0) return loader;
-
-    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
-    loader.project_dir = std.fmt.bufPrint(&bufs[0], "{s}/{s}", .{ cwd, skills.project_dir }) catch loader.project_dir;
-    loader.agents_dir = std.fmt.bufPrint(&bufs[1], "{s}/{s}", .{ cwd, skills.agents_dir }) catch loader.agents_dir;
-
-    // Only when it IS a different directory: pointing the loader at the same path
-    // twice would read every skill twice and dedupe it away, which works but pays
-    // the reads for nothing.
-    if (proj.root()) |root| {
-        if (!std.mem.eql(u8, root, cwd)) loader.repo_root = root;
-    }
-    return loader;
-}
-
-/// Records the mtime + size of every root and every `SKILL.md` that was read.
-fn stampSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) void {
-    skills_stamp_len = 0;
-    var loader = skillsLoader(gpa, env);
-    var bufs: [skillstore.max_roots][std.fs.max_path_bytes]u8 = undefined;
-    var paths: [skillstore.max_roots][]const u8 = undefined;
-    const root_count = loader.roots(&bufs, &paths);
-    for (paths[0..root_count]) |p| addStamp(p);
-    if (skills_cache) |list| {
-        for (list) |e| addStamp(e.path);
-    }
-}
-
-fn addStamp(path: []const u8) void {
-    if (skills_stamp_len >= skills_stamps.len) return;
-    if (!skillstore.stampPath(io_global, path, &skills_stamps[skills_stamp_len])) return;
-    skills_stamp_len += 1;
-}
-
-/// Are all the paths the cached list was built from exactly as they were?
-///
-/// A DELETED skill counts as a change: it has to disappear from the prompt, and a
-/// missing file is exactly what `stampPath` records as `exists = false`. Treating
-/// "cannot stat" as "nothing changed" would leave the model reading a skill whose
-/// file is gone, and the `skill` tool would then fail on the very name the prompt
-/// just offered.
-fn skillsFresh(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) bool {
-    var loader = skillsLoader(gpa, env);
-    var bufs: [skillstore.max_roots][std.fs.max_path_bytes]u8 = undefined;
-    var paths: [skillstore.max_roots][]const u8 = undefined;
-    const root_count = loader.roots(&bufs, &paths);
-
-    for (paths[0..root_count]) |p| if (!stampUnchanged(p)) return false;
-    if (skills_cache) |list| {
-        for (list) |e| if (!stampUnchanged(e.path)) return false;
-    }
-    return true;
-}
-
-fn stampUnchanged(path: []const u8) bool {
-    for (skills_stamps[0..skills_stamp_len]) |*st| {
-        if (!std.mem.eql(u8, st.pathOf(), path)) continue;
-        var now: skillstore.Stamp = .{};
-        if (!skillstore.stampPath(io_global, path, &now)) return false;
-        return st.sameAs(&now);
-    }
-    // A path with no stamp is a path we never recorded, which can only happen if
-    // the cap was hit. Not "unchanged": that would silently freeze the list.
-    return false;
-}
-
-/// Frees the cached entries AND the slice they live in.
-///
-/// Both halves, on purpose: they are two allocations and freeing one without the
-/// other is the leak/give-the-wrong-length pair.
-///
-/// Called from the teardown and from the rescan, and from NOWHERE else. The slice
-/// is borrowed by `discoverSkills`, so a caller freeing it is a double free of
-/// memory that is still in use. The lock is NOT taken here: `discoverSkills` calls
-/// it while holding it, and `std.atomic.Mutex` is not reentrant (it would hang).
 pub fn freeSkillsCache() void {
-    while (skills_lock.tryLock()) {}
-    defer skills_lock.unlock();
-    freeSkillsCacheLocked();
+    discovery.freeSkillsCache();
 }
 
-fn freeSkillsCacheLocked() void {
-    // skills_cache_gpa is always std.heap.page_allocator whose free() is a
-    // no-op, so there is no risk of freeing with the wrong allocator.
-    const gpa = skills_cache_gpa;
-    if (skills_cache) |list| {
-        for (list) |e| {
-            gpa.free(e.name);
-            gpa.free(e.description);
-            gpa.free(e.path);
-            if (e.when_to_use.len > 0) gpa.free(e.when_to_use);
-            if (e.allowed_tools.len > 0) gpa.free(e.allowed_tools);
-            if (e.model.len > 0) gpa.free(e.model);
-            if (e.effort.len > 0) gpa.free(e.effort);
-        }
-        if (list.len > 0) gpa.free(list);
-        skills_cache = null;
-    }
-    skills_stamp_len = 0;
-}
-
-/// The system prompt, composed for a run that has no `Model`.
-///
-/// The headless runner used to compose ITS OWN, and it left out the routing table
-/// and the verification prompt. That is the single worst bug this repository has
-/// had in a while, and the reason it survived so long is that every test drives
-/// `--chat`:
-///
-///   - `zode --chat` got NO routing rules, so it reached for `bash zig build`
-///     where `check` exists, and for `bash curl` where `web_search` exists;
-///   - it got no batching rules, so reading three files cost three round trips;
-///   - it got no verification rules, so a task took three times as long;
-///   - it got no `todo` or `refs` guidance, so neither was used.
-///
-/// Test-only: reset the skills cache and stamps. Uses the lock internally.
 pub fn resetSkillsCacheForTest() void {
-    while (skills_lock.tryLock()) {}
-    defer skills_lock.unlock();
-    // Deliberately do NOT free the old cache here. The allocator that owns it
-    // may be a short-lived ArenaAllocator from a previous test that has already
-    // been deinit'd, so freeing with the wrong allocator triggers a
-    // DebugAllocator unreachable. The small leak in tests is acceptable.
-    skills_cache = null;
-    skills_cache_gpa = std.heap.page_allocator;
-    skills_stamp_len = 0;
-    skills_rescans = 0;
+    discovery.resetSkillsCacheForTest();
 }
 
-/// Test-only: reset the styles cache and stamps. Uses the lock internally.
 pub fn resetStylesCacheForTest() void {
-    while (styles_lock.tryLock()) {}
-    defer styles_lock.unlock();
-    // Same reasoning as resetSkillsCacheForTest: don't free with a potentially
-    // dead allocator.
-    styles_cache = null;
-    styles_cache_gpa = std.heap.page_allocator;
-    styles_stamp_len = 0;
-    styles_rescans = 0;
-}
-pub fn buildSystemPromptFor(
-    gpa: std.mem.Allocator,
-    env: ?*const std.process.Environ.Map,
-) ![]u8 {
-    var buf: [16 * 1024]u8 = undefined;
-    return gpa.dupe(u8, buildSystemPrompt(gpa, &buf, env, true));
+    discovery.resetStylesCacheForTest();
 }
 
-/// The room the SKILLS LISTING has, in characters.
-///
-/// 1% of the context window: `ZODE_CONTEXT_LIMIT` when it is set, the 128k
-/// default when it is not.
-///
-/// Two decisions worth writing down, because both of them are about the cache:
-///
-/// 1. **The MODEL's window is not part of it.** The board says "1% of
-///    `ZODE_CONTEXT_LIMIT`", and that is also the only stable answer: the
-///    free-auto rotation changes the active model on every turn, and a budget
-///    that moved with the model would rewrite the system prompt — and
-///    invalidate the provider's cache for the whole request — on every turn.
-/// 2. **The environment comes from `environ_global` when the caller has none.**
-///    The prompt is composed TWICE with two different arguments
-///    (`buildSystemPromptFor` gets the real environment, `syncSystemPrompt`
-///    gets `null`), and a budget that differed between the two would make the
-///    two prompts differ — the same cache bust, one step later.
+fn promptBuildCtx(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map, loc_buf: []u8) prompt_system.BuildCtx {
+    const location = project_info.promptLines(loc_buf);
+    return .{
+        .gpa = gpa,
+        .io = io_global,
+        .cache_gpa = gpa_global,
+        .env = env,
+        .env_fallback = environ_global,
+        .project_cwd = project_info.cwd(),
+        .project_root = project_info.root(),
+        .location = location,
+        .read_only = read_only,
+        .accept_edits = accept_edits,
+        .yolo = yolo,
+        .current_style = current_style,
+    };
+}
+
 fn skillListingBudget(env: ?*const std.process.Environ.Map) usize {
-    const e = env orelse environ_global;
-    return skills.budgetCharsFor(compaction.contextLimitFor(e, 0));
+    var loc_buf: [512]u8 = undefined;
+    return prompt_system.skillListingBudget(promptBuildCtx(gpa_global, env, &loc_buf));
 }
 
-/// Builds the skills-listing section text for the prompt.
-/// Returns an empty slice when there are no skills or the budget is zero.
 fn skillsSectionText(
     gpa: std.mem.Allocator,
     env: ?*const std.process.Environ.Map,
     list_buf: []u8,
 ) []const u8 {
-    const entries = discoverSkills(gpa, env);
-    // Phase 34.11: keep only skills whose declared `paths` apply to the
-    // current project (empty `paths` applies everywhere). Entries are borrowed
-    // from the skills cache, so we copy the struct (slices point at the cache,
-    // which stays alive for this call).
-    var filtered: std.ArrayList(skills.Entry) = .empty;
-    blk: for (entries) |e| {
-        if (skills.skillAppliesHere(e, project_info.root())) {
-            // Out of memory mid-filter is catastrophic; stop adding entries
-            // but keep the ones already collected.
-            if (filtered.append(gpa, e)) |_| {} else |err| switch (err) {
-                error.OutOfMemory => break :blk,
-            }
-        }
-    }
-    defer filtered.deinit(gpa);
-    return skills.systemPromptSection(filtered.items, skillListingBudget(env), list_buf);
+    var loc_buf: [512]u8 = undefined;
+    return prompt_system.skillsSectionText(promptBuildCtx(gpa, env, &loc_buf), list_buf);
 }
 
 fn buildSystemPrompt(
@@ -829,183 +347,24 @@ fn buildSystemPrompt(
     env: ?*const std.process.Environ.Map,
     include_skills: bool,
 ) []const u8 {
-    cache_break_last_block = null;
-    cache_break_last_pos = 0;
-    const base = systemPromptBase(gpa);
-
-    var list_buf: [16 * 1024]u8 = undefined;
-    const section = if (include_skills) skillsSectionText(gpa, env, &list_buf) else "";
-
     var loc_buf: [512]u8 = undefined;
-    const location = project_info.promptLines(&loc_buf);
-
-    // --- Output style: injected at the END of the prompt ---
-    // Discover styles and find the currently selected one.
-    const style_entries = discoverStyles(gpa, env);
-    var style_entry: ?outputstyles.Entry = null;
-    if (current_style) |name| {
-        for (style_entries) |e| {
-            if (std.mem.eql(u8, e.name, name)) {
-                style_entry = e;
-                break;
-            }
-        }
-    }
-    // When the selected style says keep_coding_instructions = false, the base
-    // prompt loses the "How to work" coding rules — the style replaces them.
-    const effective_base: []const u8 = if (style_entry) |s| (if (!s.keep_coding_instructions) prompt_mod.default_system_prompt_core else base) else base;
-
-    // The routing table goes in its OWN slot, right after the base, and is
-    // emitted whether the base came from `AGENTS.md` or from the built-in text.
-    // It is not part of `default_system_prompt` for the reason in its own doc
-    // comment: a project's `AGENTS.md` replaces the built-in prompt, and the one
-    // thing that must survive that replacement is which tool to call.
-    const routing = tool_routing_prompt;
-
-    // Read-only mode goes in the SYSTEM prompt, not just in the tool result: the
-    // model has to know before it decides what to call, or it plans a `write`
-    // and then gets an error, which it reads as a bug and works around.
-    const mode_note: []const u8 = if (read_only)
-        "PLAN MODE is on (shift+tab to cycle; it is read-only): you may READ anything, but write/edit/bash/rename and the git mutations (add/commit/stash/branch) come back with an error and must NOT be retried. Investigate first, then write the IMPLEMENTATION PLAN with the `todo` tool — concrete steps, one per line. Zode displays the complete numbered checklist in the scrollable history; end your turn so the user can review and approve it. On approval zode switches itself to Build mode and tells you to implement; if they ask for changes, revise the plan with `todo` and end the turn again to present it. If the user only asked a question and no change is needed, just answer it.\n\n"
-    else if (accept_edits)
-        "ACCEPT-EDITS MODE is on (shift+tab to cycle): file edits (write, edit, rename) run without asking, but bash still asks for permission. Ask the user with `ask` before running anything destructive.\n\n"
-    else if (yolo)
-        "YOLO MODE is on (shift+tab or /mode to cycle): nothing asks for permission, and your `ask` questions are NOT shown to anyone — the harness takes your own recommendation (the FIRST option) or leaves the question OPEN. Either way, MENTION it in your final summary: what you decided, or what question is still open for the user. An unmentioned decision is a decision the user cannot check.\n\n"
-    else
-        "";
-
-    // THE ORDER IS THE CACHE. A provider serves the prompt cache from the
-    // literal prefix of the system message, so anything that CHANGES invalidates
-    // everything after it. `mode_note` used to sit in the middle (4th of 6),
-    // which meant one `shift+tab` rewrote the skills list and the location lines
-    // as well and dropped the whole prefix.
-    //
-    // So the order is by HOW OFTEN IT CHANGES, stable first:
-    //   base (per project) · routing (constant) · ask guidance (constant)
-    //   · skills (per session) · location (per project)
-    //   · read-only note (EVERY keypress of shift+tab, mid-turn)
-    //   · OUTPUT STYLE (last — selected by the user, changes rarely)
-    const blocks_len = routing.len + verification_prompt.len + ask.guidance.len +
-        section.len + location.len + mode_note.len;
-    var style_block_len: usize = 0;
-    var style_buf: [8 * 1024]u8 = undefined;
-    if (style_entry) |s| {
-        const body = if (s.body) |b| b else "";
-        const framed = outputstyles.formatStyle(s.name, s.description, body, &style_buf);
-        style_block_len = framed.len;
-    }
-    const style_block: []const u8 = if (style_entry) |s|
-        outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf)
-    else
-        "";
-    const blocks = cachebreak.Blocks{
-        .base = effective_base,
-        .routing = routing,
-        .verification = verification_prompt,
-        .ask_guidance = ask.guidance,
-        .skills = section,
-        .location = location,
-        .mode_note = mode_note,
-        .style = style_block,
-    };
-    var hashes: [8]u64 = undefined;
-    for (&[_][]const u8{
-        blocks.base,   blocks.routing,  blocks.verification, blocks.ask_guidance,
-        blocks.skills, blocks.location, blocks.mode_note,    blocks.style,
-    }, 0..) |block, i| {
-        hashes[i] = cachebreak.hashBlock(block);
-    }
-    if (cache_break_prev) |prev| {
-        const offs = cachebreak.blockOffsets(&blocks);
-        for (prev, 0..) |ph, i| {
-            if (ph != hashes[i]) {
-                cache_break_last_block = cachebreak.block_names[i];
-                cache_break_last_pos = offs[i];
-                break;
-            }
-        }
-    }
-    cache_break_prev = hashes;
-    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}", .{
-        effective_base,
-        routing,
-        verification_prompt,
-        ask.guidance,
-        section,
-        location,
-        mode_note,
-        if (style_entry) |s| outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf) else "",
-    }) catch blk: {
-        // It did not fit... same fallback logic as before.
-        const note_lead = "[the project instructions above were truncated to fit";
-        const note_tail = "; the rest is in the project's instruction file]";
-        const overhead = note_lead.len + note_tail.len + 48;
-        if (out.len <= blocks_len + overhead) break :blk routing;
-        const room = out.len - blocks_len - overhead;
-        const fit = prompt_mod.fitPrefix(effective_base, room);
-        break :blk std.fmt.bufPrint(
-            out,
-            "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}",
-            .{
-                fit,
-                note_lead,
-                fit.len,
-                base.len,
-                note_tail,
-                routing,
-                verification_prompt,
-                ask.guidance,
-                section,
-                location,
-                mode_note,
-                if (style_entry) |s| outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf) else "",
-            },
-        ) catch routing;
-    };
-    return composed;
+    return prompt_system.buildSystemPrompt(promptBuildCtx(gpa, env, &loc_buf), out, include_skills);
 }
 
-/// Writes the current system prompt into the session, REPLACING the one that is
-/// there.
-///
-/// Only called when the composed text differs from what the session already has:
-/// on a steady-state turn this is a memcmp and nothing else. That matters because
-/// the system prompt is the biggest stable prefix in the request, and rewriting it
-/// to the same bytes would still change nothing for the provider's cache — but a
-/// naive "always replace" would rewrite the whole thing on every one of the eight
-/// iterations of every turn, which is 16 KB of pointless copying.
+pub fn buildSystemPromptFor(
+    gpa: std.mem.Allocator,
+    env: ?*const std.process.Environ.Map,
+) ![]u8 {
+    var loc_buf: [512]u8 = undefined;
+    return prompt_system.buildSystemPromptFor(promptBuildCtx(gpa, env, &loc_buf));
+}
+
 pub fn syncSystemPrompt(s: *session_mod.Session) void {
     const gpa = s.allocator;
-    var buf: [16 * 1024]u8 = undefined;
-    const want = buildSystemPrompt(gpa, &buf, null, true);
-    for (s.messages.items) |m| {
-        if (m.role != .system) continue;
-        if (std.mem.eql(u8, m.content, want)) return;
-        break;
-    }
-    _ = s.replaceSystem(want) catch {};
+    var loc_buf: [512]u8 = undefined;
+    prompt_system.syncSystemPrompt(s, promptBuildCtx(gpa, null, &loc_buf));
 }
 
-/// The note that carries a `/goal` into the request, as a SECOND system message at the
-/// end.
-///
-/// ## Why it is not folded into the system prompt
-///
-/// `buildSystemPrompt` composes the biggest stable prefix in every request, and the
-/// provider's cache is indexed by the literal prefix: changing any byte of it
-/// invalidates the ~16 KB of tool schemas that follow. A goal changes WITHIN a turn,
-/// every iteration, and it is four lines.
-///
-/// So it goes at the END, as its own system message, with a marker that
-/// `Session.setGoalNote` finds to replace it. Same reason as the read-only notice and
-/// the skill list: order the system prompt by how OFTEN each part changes, and put the
-/// volatile parts last.
-///
-/// ## What is actually in it
-///
-/// The objective, verbatim, plus the budget as NUMBERS. "You have 18 iterations left"
-/// is the cheapest lever in the whole feature: a model told it has plenty polishes, and
-/// one told it has two left finishes.
 pub fn goalNote(
     gpa: std.mem.Allocator,
     g: *const goal_mod.Goal,
@@ -1013,44 +372,7 @@ pub fn goalNote(
     checkpoint: bool,
     open_steps: usize,
 ) ![]const u8 {
-    if (!g.isSet()) return error.NoGoal;
-    if (checkpoint) {
-        return std.fmt.allocPrint(
-            gpa,
-            "{s}{s}\n\n{s}",
-            .{ session_mod.goal_note_marker, g.objective(), try goal_mod.checkpointPrompt(gpa, 0, left, open_steps) },
-        );
-    }
-    // The countdown only appears when it is TRUE information, that is near the ceiling.
-    //
-    // It used to be on every iteration, and that is 60 sentences in the model's context
-    // all saying the same thing: "Budget: 58 iterations left of 60". A number that has
-    // not changed in any way the model can act on is not information, it is a deadline
-    // the model learns to hurry for — which is the opposite of finishing careful work.
-    // What the model needs instead, every time, is the one sentence that keeps the shape
-    // of the turn clear: it ends when the objective is decided, not when the model stops
-    // talking.
-    //
-    // `urgent` is the last few iterations. There the number IS actionable, and a model
-    // with four iterations left should be told to land the plane.
-    const urgent = left <= 4;
-    return std.fmt.allocPrint(
-        gpa,
-        "{s}{s}\n{s}",
-        .{
-            session_mod.goal_note_marker,
-            g.objective(),
-            if (urgent)
-                std.fmt.allocPrint(
-                    gpa,
-                    "{d} iterations left. Land it: finish what is open, and call `goal` with what is true.",
-                    .{left},
-                ) catch "iterations are running out: land it."
-            else
-                "This turn ends when the objective is met or you declare it blocked — not when you stop talking. " ++
-                    "A summary is not a verdict. Call `goal` only when it is true.",
-        },
-    );
+    return prompt_system.goalNote(gpa, g, left, checkpoint, open_steps);
 }
 
 /// The user-facing half of the system prompt: their `AGENTS.md` if they have one,
@@ -1064,12 +386,7 @@ pub fn goalNote(
 /// project instructions at all. Which is the same bug class as the skills roots:
 /// the project lives in the root, and the root is what git already knows.
 pub fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
-    if (agents_md_cache == null) {
-        // The user's project AGENTS.md / CLAUDE.md take priority.
-        agents_md_cache = readAgentsIn(gpa, ".") orelse readAgentsIn(gpa, project_info.root()) orelse null;
-    }
-    if (agents_md_cache) |c| return c;
-    return default_system_prompt;
+    return prompt_system.systemPromptBase(gpa, io_global, project_info.root());
 }
 
 /// `AGENTS.md` then `CLAUDE.md` under `dir`, or null.
@@ -1077,22 +394,6 @@ pub fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
 /// `dir` is a path prefix, so it is `.` for the cwd and the absolute root
 /// otherwise; the two names mean the same thing here, which is why `AGENTS.md`
 /// wins: it is the name the harness docs use.
-fn readAgentsIn(gpa: std.mem.Allocator, dir: ?[]const u8) ?[]u8 {
-    if (dir) |d| {
-        if (readAgentsAt(gpa, d, "AGENTS.md")) |t| return t;
-        return readAgentsAt(gpa, d, "CLAUDE.md");
-    }
-    return null;
-}
-
-fn readAgentsAt(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ?[]u8 {
-    // Reads and expands `@import` directives (Phase 11). A missing or oversized
-    // file still returns null, which means "no instruction file here" and lets
-    // precedence fall through — the same behavior as before, just with imports
-    // resolved when the file is present.
-    return agentsdoc.readExpandedAt(gpa, io_global, dir, name);
-}
-
 pub var current_effort: chat.Effort = .medium;
 
 /// The currently selected output style name, or null when none is selected.
@@ -1141,31 +442,16 @@ pub var read_only: bool = false;
 /// `permModesConsistent` pins that in a test.
 pub var accept_edits: bool = false;
 
-/// The four permission modes. `default` asks for anything that writes
-/// or runs a command; `accept_edits` auto-allows file edits;
-/// `read_only` blocks them; `bypass` (`/yolo`) allows everything.
-pub const PermMode = enum { default, accept_edits, read_only, bypass };
+pub const PermMode = agent_perms.Mode;
 
 /// The mode that applies right now, read off the three flags.
 pub fn currentPermMode() PermMode {
-    if (yolo) return .bypass;
-    if (read_only) return .read_only;
-    if (accept_edits) return .accept_edits;
-    return .default;
+    return agent_perms.modeFromFlags(yolo, read_only, accept_edits);
 }
 
 /// The mode as one word, for the status bar and `/mode`.
 pub fn permModeName() []const u8 {
-    return switch (currentPermMode()) {
-        .default => "build",
-        .accept_edits => "accept-edits",
-        // "plan" and not "read-only": it is what the mode IS for (investigate,
-        // write the plan, get it approved) and what the cycle and `/mode` have
-        // always called it in their own docs. The mechanics are unchanged —
-        // every write is still refused.
-        .read_only => "plan",
-        .bypass => "bypass",
-    };
+    return agent_perms.modeName(currentPermMode());
 }
 
 /// Sets the mode. The three flags are mutually exclusive BY
@@ -1200,12 +486,7 @@ pub fn setPermMode(m: *tui.Model, mode: PermMode) void {
 /// asking me anything" switch, and cycling out of it lands on default,
 /// so the mode the status bar shows is always the mode that applies.
 pub fn cyclePermMode(m: *tui.Model) void {
-    const next = switch (currentPermMode()) {
-        .default => PermMode.accept_edits,
-        .accept_edits => PermMode.read_only,
-        .read_only => PermMode.default,
-        .bypass => PermMode.default,
-    };
+    const next = agent_perms.cycleNext(currentPermMode());
     setPermMode(m, next);
     // The transcript says it, and the footer's RIGHT group shows the mode: the
     // mascot's legend belongs to the agent's work and nothing else.
@@ -1213,105 +494,19 @@ pub fn cyclePermMode(m: *tui.Model) void {
 }
 
 /// `/ask [on|off]`: Plan mode, retained as a command alias.
-fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
-    if (arg) |a| {
-        const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
-        const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
-        if (on) {
-            setPermMode(m, .read_only);
-            const msg = "Plan mode ON: investigate first; writes are blocked pending approval.";
-            pushInfo(m, msg);
-            return;
-        }
-        if (off) {
-            setPermMode(m, .default);
-            const msg = "Build mode ON";
-            pushInfo(m, msg);
-            return;
-        }
-        pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (read_only) "on" else "off"});
-        return;
-    }
-    // No argument: toggle, as it always did.
-    const next: PermMode = if (read_only) .default else .read_only;
-    setPermMode(m, next);
-    pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
-}
-
 /// `/dots [on|off]`: toggle the prompt rail dots (jump back to earlier prompts).
-fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
-    if (arg) |a| {
-        const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
-        const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
-        if (on) {
-            m.show_prompt_dots = true;
-            m.requestRedraw();
-            pushInfo(m, "prompt dots: on — click a dot on the right rail to jump to that prompt");
-            return;
-        }
-        if (off) {
-            m.show_prompt_dots = false;
-            m.prompt_dot_hover = null;
-            m.prompt_dot_len = 0;
-            m.requestRedraw();
-            pushInfo(m, "prompt dots: off");
-            return;
-        }
-        pushInfo(m, "/dots: on|off");
-        return;
-    }
-    m.show_prompt_dots = !m.show_prompt_dots;
-    if (!m.show_prompt_dots) {
-        m.prompt_dot_hover = null;
-        m.prompt_dot_len = 0;
-    }
-    m.requestRedraw();
-    pushInfoFmt(m, "prompt dots: {s}", .{if (m.show_prompt_dots) "on" else "off"});
-}
-
 // ── plan approval: the developer says yes or no ────────────
 
-/// The option labels of the approval dialog. They are the API of the flow:
-/// `planGateDecision` matches the FIRST one by prefix, so changing a label
-/// here without changing the matcher silently turns every approval into a
-/// revision.
-pub const approve_option = "Approve — implement it now";
-pub const revise_option = "Revise — change the plan first";
-
-/// What the model is told after the developer approved. Owned by the caller.
-pub const plan_gate_approved_text =
-    "The user APPROVED the plan, and zode has already switched itself out of plan mode " ++
-    "(you are in Build mode: edits and commands are allowed). Implement the plan now: " ++
-    "work through the steps, verify as you go, and report what changed when done. Do not " ++
-    "ask for approval again — it has been given.";
-
-/// The revision nudge's shape. `{s}` is the user's own words: a rejection with
-/// no reason is the one thing the model cannot act on.
-pub const plan_gate_revise_fmt =
-    "The user did NOT approve the plan yet. They said: \"{s}\"\n" ++
-    "Revise the plan with the `todo` tool (say what changed in the steps), then end your " ++
-    "turn to present it again. You are still in PLAN MODE: do not edit anything until " ++
-    "it is approved.";
-
-/// What an approval answer means, decided WITHOUT a TUI so it can be tested.
-///
-/// - no answer at all (ESC or timeout) → `skip`: end the turn with no nudge.
-///   A user who walked away must not come back to a loop that kept asking —
-///   that is how a plan gate turns into a wall.
-/// - the approve option (prefix match) or an obvious typed yes → `approve`.
-/// - EVERYTHING else — the revise option or the user's own typed words →
-///   `revise`, and those words travel with the nudge as the reason.
-pub const PlanGate = enum { approve, revise, skip };
-
+/// Plan approval: pure decision logic extracted to `agent/plan_gate.zig`.
+/// `decide` matches the FIRST option by prefix, so changing a label here
+/// without changing the matcher silently turns every approval into a revision.
+pub const approve_option = plan_gate.approve_option;
+pub const revise_option = plan_gate.revise_option;
+pub const plan_gate_approved_text = plan_gate.approved_text;
+pub const plan_gate_revise_fmt = plan_gate.revise_fmt;
+pub const PlanGate = plan_gate.Decision;
 pub fn planGateDecision(answer: ?[]const u8) PlanGate {
-    const a = answer orelse return .skip;
-    const t = std.mem.trim(u8, a, " \t\r\n");
-    if (t.len == 0) return .skip;
-    if (std.mem.startsWith(u8, t, "Approve")) return .approve;
-    if (std.ascii.eqlIgnoreCase(t, "approve") or
-        std.ascii.eqlIgnoreCase(t, "yes") or
-        std.ascii.eqlIgnoreCase(t, "y")) return .approve;
-    return .revise;
+    return plan_gate.decide(answer);
 }
 
 /// The approval dialog, run on the WORKER at the moment the model tries to end
@@ -1322,11 +517,13 @@ fn planApprovalNudge(m: *tui.Model) ?[]u8 {
     // plan block and the explanation together, and text that can still move
     // under a modal is text they cannot rely on.
     m.streamEnd();
-    var q_buf: [240]u8 = undefined;
+    var q_buf: [320]u8 = undefined;
+    const pl = m.planCopy();
+    const brief_note: []const u8 = if (pl.hasBrief()) " (includes objective/approach/guardrails)" else " (missing objective/approach/guardrails)";
     const q = std.fmt.bufPrint(
         &q_buf,
-        "Plan ready: {d} step(s) shown above. Approve it so zode can start implementing?",
-        .{m.plan.len},
+        "Plan ready: {d} step(s){s}. Approve it so zode can start implementing?",
+        .{ pl.len, brief_note },
     ) catch "Plan ready. Approve it so zode can start implementing?";
     const opts = [_][]const u8{ approve_option, revise_option };
     setStatusWithZo(m, .warn, "the plan needs your approval");
@@ -1370,224 +567,26 @@ fn planApprovalNudge(m: *tui.Model) ?[]u8 {
 }
 
 /// `/bench`: the numbers that decide whether to tune anything.
-fn cmdBench(m: *tui.Model) void {
-    var buf: [1024]u8 = undefined;
-    const text = m.bench.report(&buf, iterationLimit(), cacheHitPct()) catch {
-        pushInfo(m, "/bench: could not compose the report");
-        return;
-    };
-    // `pushInfo` COPIES, so `buf` (a stack buffer) can die right after: this is
-    // the documented difference from `pushInfoOwned`, which would leave the
-    // pending queue pointing at a dead frame.
-    pushInfo(m, text);
-
-    // The cheap router's numbers, when it is on. It is the one feature whose
-    // whole point is a number the user cannot otherwise see, and a saving you
-    // cannot check is a saving you will assume worked.
-    const cs = cheapRouterStats();
-    if (cs.on) {
-        pushInfoFmt(
-            m,
-            "cheap router: {s} · {d} turn(s) sent to it · {d} fell back{s}",
-            .{
-                cs.model,
-                cs.attempts,
-                cs.fallbacks,
-                if (cs.given_up) @as([]const u8, " · out of play for the rest of the session") else @as([]const u8, ""),
-            },
-        );
-    }
-}
-
-/// `/iter [n]`: set the per-session iteration target.
-/// Minimum 8. Values below 32 warn — short tasks don't need that many, and
-/// a long task that is cut mid-work is exactly what this limit prevents.
-/// The model can also declare its own estimate (via plan/goal); this command
-/// overrides it when the developer wants a different number.
+/// `/iter [n]`: set or show per-session iteration budget.
 pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
-    if (arg) |raw| {
-        const n = std.fmt.parseInt(usize, raw, 10) catch {
-            pushInfo(m, "/iter: expected a number (minimum 8)");
-            return;
-        };
-        if (n < 8) {
-            pushInfoFmt(m, "/iter: minimum is 8, you asked for {d}", .{n});
-            return;
-        }
-        if (n > 200) {
-            pushInfoFmt(m, "/iter: maximum is 200, you asked for {d}", .{n});
-            return;
-        }
-        if (n < 32) {
-            pushInfoFmt(m, "/iter: budget set to {d} iterations — low for a long task, fine for a short one", .{n});
-        } else {
-            pushInfoFmt(m, "/iter: budget set to {d} iterations for this session", .{n});
-        }
-        iter_limit_override = n;
-    } else {
-        const cur = iterationLimit();
-        const src = if (iter_limit_override > 0) "your /iter" else if (model_requested_iter > 0) "the model's estimate" else "ZODE_MAX_ITER / default";
-        pushInfoFmt(m, "/iter: current budget is {d} iterations ({s})", .{ cur, src });
-    }
+    commands_mod.cmdIter(m, arg);
 }
 
 /// `/task-parallel [1..8|auto]`: tune simultaneous subagent requests for this
 /// session. `auto` returns to the environment/default value.
-fn cmdTaskParallel(m: *tui.Model, arg: ?[]const u8) void {
-    if (arg) |raw| {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.ascii.eqlIgnoreCase(value, "auto")) {
-            m.setTaskParallelLimit(0);
-        } else {
-            const parsed = std.fmt.parseInt(u8, value, 10) catch {
-                m.pushInfo("usage: /task-parallel [1..8|auto]");
-                return;
-            };
-            if (parsed < 1 or parsed > 8) {
-                m.pushInfo("usage: /task-parallel [1..8|auto]");
-                return;
-            }
-            m.setTaskParallelLimit(parsed);
-        }
-    }
-    const override = m.taskParallelLimit();
-    const effective = if (override > 0) override else taskParallelLimit(m);
-    m.pushInfoFmt(
-        "subagent parallelism: {d} at a time{s}",
-        .{ effective, if (override > 0) " (session override)" else " (auto: ZODE_TASK_PARALLEL or default)" },
-    );
-}
-
 /// `/skills`: what is loadable, and from where.
-fn cmdSkills(m: *tui.Model) void {
-    const entries = discoverSkills(m.allocator, m.environ);
-    if (entries.len == 0) {
-        pushInfo(m, "no skills found. Put them in .zode/skills/<name>/SKILL.md (this project) or ~/.config/zode/skills/<name>/SKILL.md (yours)");
-        return;
-    }
-    pushInfoFmt(m, "{d} skill{s} (only the name and description are in the prompt; the body loads on demand)", .{
-        entries.len,
-        if (entries.len == 1) @as([]const u8, "") else @as([]const u8, "s"),
-    });
-    for (entries) |e| {
-        const source_tag = switch (e.source) {
-            .project => "[project]",
-            .agents => "[agents]",
-            .user => "[user]",
-            .bundled => "[bundled]",
-        };
-        // The `when to use it` goes with the description, because a description
-        // says WHAT the skill is and the `when` says WHEN to reach for it: a
-        // list that only says what is a list of things the model cannot
-        // choose between.
-        const line = std.fmt.allocPrint(m.allocator, "  {s} {s}: {s}{s}", .{
-            source_tag,
-            e.name,
-            if (e.description.len > 0) e.description else "(no description)",
-            if (e.when_to_use.len > 0)
-                std.fmt.allocPrint(m.allocator, " — {s}", .{e.when_to_use}) catch ""
-            else
-                "",
-        }) catch continue;
-        pushInfoOwned(m, line);
-    }
-}
 
-/// `/style <name>`: select an output style. No args reports the current one;
-/// `off`/`clear` clears it. The style block is injected at the end of the system
-/// prompt on the next request.
-fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
-    const trimmed = std.mem.trim(u8, arg orelse "", " \t\r\n");
-    if (trimmed.len == 0) {
-        // Report current style
-        if (current_style) |name| {
-            const entries = discoverStyles(m.allocator, m.environ);
-            var found: ?[]const u8 = null;
-            var found_desc: []const u8 = "";
-            var found_keep: bool = true;
-            for (entries) |e| {
-                if (std.mem.eql(u8, e.name, name)) {
-                    found = e.name;
-                    found_desc = e.description;
-                    found_keep = e.keep_coding_instructions;
-                    break;
-                }
-            }
-            if (found) |n| {
-                const keep_note = if (found_keep) "" else " (coding rules replaced by this style)";
-                m.pushInfoFmt("output style: {s}{s} — {s}", .{ n, keep_note, found_desc });
-            } else {
-                m.pushInfoFmt("output style: {s} (not found — was it removed?)", .{name});
-            }
-        } else {
-            pushInfo(m, "no output style selected. /style <name> picks one; /style off clears it.");
-        }
-        return;
-    }
 
-    if (std.ascii.eqlIgnoreCase(trimmed, "off") or std.ascii.eqlIgnoreCase(trimmed, "clear")) {
-        current_style = null;
-        current_style_len = 0;
-        pushInfo(m, "output style cleared. The base prompt (with coding rules) is used.");
-        return;
-    }
 
-    // Validate the name exists
-    const entries = discoverStyles(m.allocator, m.environ);
-    var found: ?[]const u8 = null;
-    var found_keep: bool = true;
-    for (entries) |e| {
-        if (std.mem.eql(u8, e.name, trimmed)) {
-            found = e.name;
-            found_keep = e.keep_coding_instructions;
-            break;
-        }
-    }
-    if (found == null) {
-        pushInfoFmt(m, "unknown output style '{s}'. Available: {s}", .{
-            trimmed,
-            if (entries.len > 0) styleNames(entries) else "none",
-        });
-        return;
-    }
-
-    // Copy into the static buffer (same rule as cur_model_buf)
-    const n = @min(trimmed.len, current_style_buf.len);
-    std.mem.copyForwards(u8, current_style_buf[0..n], trimmed[0..n]);
-    current_style_len = n;
-    current_style = current_style_buf[0..n];
-
-    const keep_note = if (found_keep) "" else " — this style replaces the coding rules";
-    pushInfoFmt(m, "output style: {s}{s}", .{ trimmed, keep_note });
-}
 
 /// Should the app reopen the last session at startup?
-///
-/// The `--resume` FLAG and the `ZODE_RESUME=1` variable both turn it ON, and
-/// neither of them turns it OFF.
-///
-/// That asymmetry is the whole point: the flag is dispatched BEFORE the
-/// environment is read, so a line that ASSIGNED the environment's answer
-/// over it made `zode --resume` start a new session and answer "nothing to
-/// resume; starting a new session" — which is exactly what the flag asks it
-/// not to do. The environment can only add a resume, never remove one.
 pub fn shouldResume(flag: bool, env: ?*const std.process.Environ.Map) bool {
-    if (flag) return true;
-    return std.mem.eql(u8, envGet(env, "ZODE_RESUME") orelse "", "1");
+    return envutil.shouldResume(flag, env);
 }
 
 /// Joins style names with ", " for an error message.
-fn styleNames(entries: []const outputstyles.Entry) []const u8 {
-    // Reuse a static buffer for the list
-    var buf: [512]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    var first: bool = true;
-    for (entries) |e| {
-        if (!first) w.writeAll(", ") catch {};
-        first = false;
-        w.writeAll(e.name) catch {};
-    }
-    return w.buffered();
+pub fn styleNames(entries: []const outputstyles.Entry) []const u8 {
+    return outputstyles.joinNames(entries);
 }
 
 // ── `/copy`: taking the answer with you ───────────────────────────────────
@@ -1614,321 +613,6 @@ fn styleNames(entries: []const outputstyles.Entry) []const u8 {
 //    written every time: a copy confirmation you cannot check is not a
 //    confirmation.
 
-/// The tag of the `/copy` picker.
-const copy_picker_tag: u32 = 0x0c0;
-
-/// The assistant texts of the session, newest first.
-///
-/// Only the turns that said something: a tool-only turn has no text, and an
-/// API error is a history notice, not an assistant message.
-fn collectAssistantTexts(s: *session_mod.Session, out: *[copytext.max_lookback][]const u8) usize {
-    var n: usize = 0;
-    var i = s.messages.items.len;
-    while (i > 0 and n < copytext.max_lookback) : (i -= 1) {
-        const msg = s.messages.items[i - 1];
-        if (msg.role != .assistant) continue;
-        if (msg.content.len == 0) continue;
-        out[n] = msg.content;
-        n += 1;
-    }
-    return n;
-}
-
-/// `/copy [N]`: the answer, on the clipboard and in a file.
-fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
-    const s = session orelse {
-        pushInfo(m, copytext.no_messages_msg);
-        return;
-    };
-    var texts: [copytext.max_lookback][]const u8 = undefined;
-    const n = collectAssistantTexts(s, &texts);
-    if (n == 0) {
-        pushInfo(m, copytext.no_messages_msg);
-        return;
-    }
-
-    const sel = copytext.select(texts[0..n], arg);
-    const index: usize = switch (sel) {
-        .found => |i| i,
-        .no_messages => {
-            pushInfo(m, copytext.no_messages_msg);
-            return;
-        },
-        .usage, .too_few => {
-            var buf: [256]u8 = undefined;
-            pushInfo(m, copytext.formatRefusal(&buf, sel, arg));
-            return;
-        },
-    };
-
-    var ctx = copytext.buildCtx(m.allocator, texts[index]) catch {
-        pushInfo(m, "the answer could not be prepared for copying");
-        return;
-    };
-
-    // Nothing to choose (no code blocks) or the user asked for the full
-    // response always: there is no picker to open.
-    if (ctx.blocks.len == 0 or m.copy_always_full) {
-        defer ctx.deinit();
-        performCopy(m, &ctx, 0);
-        return;
-    }
-
-    const items = buildCopyItems(m, &ctx);
-    if (items.len == 0) {
-        ctx.deinit();
-        pushInfo(m, copytext.no_messages_msg);
-        return;
-    }
-    m.setCopyCtx(ctx);
-    m.openPickerIdx(copy_picker_tag, "Copy", items, copyPickerChosen, copyPickerCancelled);
-}
-
-/// The rows of the `/copy` picker: the whole answer, one per code block, and
-/// the row that remembers the choice.
-///
-/// The labels are the code's OWN first lines (that is what the user
-/// recognises), cut to 60 columns. Two blocks that start with the same line
-/// get a counter, because a picker with two identical rows is a picker where
-/// the user cannot tell what they are about to copy.
-fn buildCopyItems(m: *tui.Model, ctx: *const copytext.Ctx) []tui.PickerItem {
-    const gpa = m.allocator;
-    var items: std.ArrayList(tui.PickerItem) = .empty;
-
-    var full_buf: [128]u8 = undefined;
-    const full_text = copytext.formatFullLabel(
-        &full_buf,
-        copytext.countChars(ctx.full),
-        copytext.countLines(ctx.full),
-    );
-    const full_label = gpa.dupe(u8, full_text) catch return items.toOwnedSlice(gpa) catch return &.{};
-    items.append(gpa, .{ .label = full_label, .desc = "" }) catch {
-        gpa.free(full_label);
-        return items.toOwnedSlice(gpa) catch return &.{};
-    };
-
-    var label_buf: [copytext.label_buf_len]u8 = undefined;
-    var base_buf: [copytext.label_buf_len]u8 = undefined;
-    var desc_buf: [96]u8 = undefined;
-    for (ctx.blocks, 0..) |b, bi| {
-        // The base label is COPIED out of the scratch buffer: the loop below
-        // uses the same buffer, and a label that changes under the comparison
-        // is a label that matches the wrong row.
-        const base = copytext.truncateToCols(b.code, copytext.label_max_cols, &label_buf);
-        @memcpy(base_buf[0..base.len], base);
-        const base_label = base_buf[0..base.len];
-        // How many EARLIER rows already say the same thing? Only the earlier
-        // ones: counting the later ones too would give three identical blocks
-        // the same "(3)" and the picker three rows that look the same.
-        var same: usize = 0;
-        for (ctx.blocks[0..bi]) |prev| {
-            if (prev.code.len == b.code.len and std.mem.eql(u8, prev.code, b.code)) continue;
-            const prev_label = copytext.truncateToCols(prev.code, copytext.label_max_cols, &label_buf);
-            if (std.mem.eql(u8, prev_label, base_label)) same += 1;
-        }
-        const label = copytext.uniqueLabel(gpa, base_label, same) catch continue;
-        const desc_text = copytext.formatBlockDesc(&desc_buf, b.lang, b.code);
-        // An EMPTY desc is a literal, not an allocation: `closePicker` only
-        // frees a desc that is not empty, so an allocated "" would leak.
-        const desc = if (desc_text.len == 0) "" else (gpa.dupe(u8, desc_text) catch "");
-        items.append(gpa, .{ .label = label, .desc = desc }) catch {
-            gpa.free(label);
-            if (desc.len > 0) gpa.free(desc);
-            continue;
-        };
-    }
-
-    const always = gpa.dupe(u8, copytext.always_label) catch return items.toOwnedSlice(gpa) catch return &.{};
-    const always_desc = gpa.dupe(u8, copytext.always_desc) catch "";
-    items.append(gpa, .{ .label = always, .desc = always_desc }) catch {
-        gpa.free(always);
-        if (always_desc.len > 0) gpa.free(always_desc);
-    };
-    return items.toOwnedSlice(gpa) catch return &.{};
-}
-
-/// The picker chose a row.
-///
-/// Index 0 is the whole answer, 1..n are the code blocks, and the row after
-/// them is "always copy the full response" (which copies the answer AND
-/// remembers not to ask again).
-fn copyPickerChosen(m: *tui.Model, tag: u32, index: usize) void {
-    _ = tag;
-    var ctx = m.takeCopyCtx() orelse return;
-    defer ctx.deinit();
-    const always = index > ctx.blocks.len;
-    if (always) {
-        m.copy_always_full = true;
-        performCopy(m, &ctx, 0);
-        return;
-    }
-    performCopy(m, &ctx, index);
-}
-
-/// The picker was closed with ESC: a cancel is not an error.
-fn copyPickerCancelled(m: *tui.Model, tag: u32) void {
-    _ = tag;
-    if (m.takeCopyCtx()) |ctx| {
-        var c = ctx;
-        c.deinit();
-    }
-    pushInfo(m, copytext.cancelled_msg);
-}
-
-/// The copy itself: the clipboard first, then the file, then the message.
-fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
-    const text = ctx.textAt(index) orelse return;
-    const chars = copytext.countChars(text);
-    const lines = copytext.countLines(text);
-
-    // The clipboard FIRST, and the file after: upstream learned that the
-    // clipboard call is the one that can be slow (waiting for tmux), and the
-    // message that says "copied" should not arrive after the file.
-    const decision = copyToClipboard(m, text);
-
-    // Toast: show the confirmation in the top-right corner for ~1 second.
-    // At 40 ms/tick when busy, 25 ticks = 1000 ms.
-    var tb: [64]u8 = undefined;
-    m.copy_toast_text = std.fmt.bufPrint(&tb, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
-    m.copy_toast_frames = 12;
-
-    var name_buf: [64]u8 = undefined;
-    const filename = copyFileName(index, ctx, &name_buf);
-    const path = writeCopyFile(m, text, filename);
-
-    var msg_buf: [512]u8 = undefined;
-    if (path) |p| {
-        defer m.allocator.free(p);
-        pushInfo(m, copytext.formatCopiedVia(&msg_buf, chars, lines, decision.method.phrase(), p));
-    } else {
-        // The file could not be written: said out loud, not swallowed. The
-        // clipboard half may still have worked.
-        pushInfo(m, copytext.formatCopiedNoFile(&msg_buf, chars, lines, decision.method.phrase()));
-    }
-}
-
-/// The name of the file the copy is written to.
-///
-/// The whole answer is `response.md`; a block is `copy<ext>`, with the
-/// extension taken from the fence's language. A language tag is MODEL OUTPUT
-/// and a path is a FILESYSTEM, so the tag is sanitised (`copytext`).
-fn copyFileName(index: usize, ctx: *const copytext.Ctx, buf: []u8) []const u8 {
-    if (index == 0) return copytext.full_filename;
-    const block = ctx.blocks[index - 1];
-    return copytext.filenameForBlock(block.lang, buf);
-}
-
-/// The clipboard, with the ladder.
-///
-/// The decision (which rung) is made BEFORE anything is spawned, and the
-/// message names the rung that was used. The last rung is OSC 52, which goes
-/// through the RENDER: the TUI owns the escape sequence, because a sequence
-/// written outside the render is one the next frame paints over.
-fn copyToClipboard(m: *tui.Model, text: []const u8) clipboard.Decision {
-    const env = m.environ orelse {
-        m.setCopyPending(text);
-        return .{ .method = .osc52 };
-    };
-    if (!m.io_ready) {
-        m.setCopyPending(text);
-        return .{ .method = .osc52 };
-    }
-    const plan = clipboard.planFor(m.io, env);
-    const decision = clipboard.copy(m.io, plan, text);
-    if (decision.method == .osc52) {
-        m.setCopyPending(text);
-    }
-    return decision;
-}
-
-/// The file the copy is ALSO written to.
-///
-/// It is written ALWAYS: the clipboard is best-effort by nature (a terminal
-/// that ignores OSC 52, a tool that is not there), and a file is not.
-///
-/// The file is 0600 in a 0700 directory: it holds the model's answer, and
-/// `/tmp` is world-readable.
-fn writeCopyFile(m: *tui.Model, text: []const u8, filename: []const u8) ?[]const u8 {
-    if (!m.io_ready) return null;
-    const gpa = m.allocator;
-    const tmp = clipboard.copyDir(m.environ);
-    const dir_path = std.fmt.allocPrint(gpa, "{s}/zode", .{tmp}) catch return null;
-    defer gpa.free(dir_path);
-    const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, filename }) catch return null;
-
-    var dir = std.Io.Dir.cwd().openDir(m.io, ".", .{}) catch return null;
-    defer dir.close(m.io);
-    // The directory is 0700 and the file 0600: it holds the model's answer and
-    // `/tmp` is world-readable. The mode goes on the OPEN file, not after the
-    // write: a `create` + `chmod` leaves a window in which the file exists
-    // world-readable.
-    _ = dir.createDirPathStatus(m.io, dir_path, copy_dir_mode) catch {};
-    var file = dir.createFile(m.io, path, .{ .truncate = true }) catch {
-        gpa.free(path);
-        return null;
-    };
-    defer file.close(m.io);
-    file.setPermissions(m.io, copy_file_mode) catch {};
-    file.writeStreamingAll(m.io, text) catch {
-        gpa.free(path);
-        return null;
-    };
-    return path;
-}
-
-/// 0700 for the directory of copies, 0600 for the file itself.
-const copy_dir_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
-const copy_file_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
-
-/// `/bg`: the background jobs, and the two ways to stop them.
-fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
-    const arg = arg_in orelse "";
-    if (std.ascii.eqlIgnoreCase(arg, "killall")) {
-        // `killNow`, not just `requestKillAll`: "killall" that only MARKS the
-        // jobs and leaves them running until the app exits is a lie with extra
-        // steps. The io_ready guard is the same one ESC uses (a test Model has
-        // no `Io`).
-        const n = if (m.io_ready) m.bg.killNow(io_global) else m.bg.requestKillAll();
-        pushInfoFmt(m, "killed {d} background command{s}", .{
-            n,
-            if (n == 1) @as([]const u8, "") else @as([]const u8, "s"),
-        });
-        return;
-    }
-    if (std.ascii.startsWithIgnoreCase(arg, "kill")) {
-        var it = std.mem.tokenizeAny(u8, arg, " \t");
-        _ = it.next(); // "kill"
-        const id_str = it.next() orelse {
-            pushInfo(m, "/bg kill <id> · /bg killall");
-            return;
-        };
-        const id = std.fmt.parseInt(u32, id_str, 10) catch {
-            pushInfo(m, "/bg kill <id> · /bg killall");
-            return;
-        };
-        if (m.bg.kill(io_global, id)) {
-            pushInfoFmt(m, "killed job {d}", .{id});
-        } else {
-            pushInfoFmt(m, "job {d} was not running ({s})", .{ id, m.bg.stateWord(id) });
-        }
-        return;
-    }
-
-    var line: [512]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&line);
-    var any = false;
-    for (0..bgproc.max_jobs) |i| {
-        const slot = &m.bg.slots[i];
-        if (!slot.isLive()) continue;
-        any = true;
-        w.print("  job {d} [{s}] {s}\n", .{ slot.id, slot.stateWord(), slot.commandSlice() }) catch {};
-    }
-    if (!any) {
-        pushInfo(m, "no background commands");
-        return;
-    }
-    pushInfo(m, std.mem.trimEnd(u8, w.buffered(), "\n"));
-}
 
 /// Tool results elided in the session (for /context).
 pub var session_elided: usize = 0;
@@ -1964,76 +648,11 @@ pub var compact_bg: compaction.CompactBgState = .{};
 ///   the context keeps paying for summaries forever, and each one is a request whose
 ///   result is thrown away by the next one. Three is enough to carry a long session;
 ///   past that the user is better served by `/new` or a bigger window.
-pub const summary_gap: usize = 6;
-pub const summary_max: usize = 3;
-
-/// How many summaries this session has done, and the iteration of the last one.
-var summaries_done: usize = 0;
-var summarized_at_iteration: usize = 0;
-
-/// Circuit breaker keyed on **consecutive** summarization failures.
-///
-/// Tier 2 is best-effort: when the model cannot summarize, the caller carries on
-/// without a summary. Without a breaker, a summarizer that keeps failing is retried
-/// every iteration — "request-per-turn forever". After `max_consecutive` failures in
-/// a row the breaker trips and `summarizeTurns` stops trying; any successful summary
-/// resets the counter.
-pub const SummaryBreaker = struct {
-    consecutive: usize = 0,
-    /// Three failures in a row is enough: the model is not going to summarize this
-    /// session, and spending a request on it every turn is pure waste.
-    max_consecutive: usize = 3,
-
-    /// Record a failed attempt.
-    pub fn noteFailure(self: *SummaryBreaker) void {
-        self.consecutive += 1;
-    }
-
-    /// Record a successful summary: the counter resets.
-    pub fn noteSuccess(self: *SummaryBreaker) void {
-        self.consecutive = 0;
-    }
-
-    /// True once the breaker has tripped and tier 2 must not run again this session.
-    pub fn tripped(self: *SummaryBreaker) bool {
-        return self.consecutive >= self.max_consecutive;
-    }
-
-    /// Reset for a new session (`/new`, `/resume`, bootstrap).
-    pub fn reset(self: *SummaryBreaker) void {
-        self.consecutive = 0;
-    }
-};
-
-/// One breaker for the session, next to the other summarization state.
-var summary_breaker: SummaryBreaker = .{};
-
-/// May tier 2 run right now, at `iteration`?
-///
-/// It returns true on the first trigger of a session and then at most once every
-/// `summary_gap` iterations, up to `summary_max` times. A tripped breaker always
-/// returns false.
+pub const SummaryBreaker = summary_breaker_mod.SummaryBreaker;
+pub const summary_gap = summary_policy.summary_gap;
+pub const summary_max = summary_policy.summary_max;
 pub fn maySummarize(iteration: usize) bool {
-    if (summary_breaker.tripped()) return false;
-    if (summaries_done >= summary_max) return false;
-    if (summaries_done == 0) return true;
-    return iteration >= summarized_at_iteration + summary_gap;
-}
-
-/// Records that a summary was just made. Separate from `maySummarize` so the call is
-/// visible at the one place that spends a request. A success also resets the breaker.
-fn noteSummarized(iteration: usize) void {
-    summaries_done += 1;
-    summarized_at_iteration = iteration;
-    summary_breaker.noteSuccess();
-}
-
-/// A new session gets the whole budget back. `/new`, `/resume` and the bootstrap all
-/// come through here.
-fn resetSummaries() void {
-    summaries_done = 0;
-    summarized_at_iteration = 0;
-    summary_breaker.reset();
+    return summary_policy.maySummarize(iteration);
 }
 
 /// Tok/s of the in-flight stream (status bar) and of the last finished stream.
@@ -2061,16 +680,14 @@ pub var ctx_real: bool = false;
 /// history and all — so showing our estimate next to it is showing a shadow of
 /// a number we already have.
 pub fn ctxTokens(real: i64, estimate: i64) i64 {
-    return if (real > 0) real else estimate;
+    return turn_metrics.ctxTokens(real, estimate);
 }
 
 /// Recomputes `ctx_used`/`ctx_pct`. Cheap to call, but not needed per frame:
 /// tokens only change when a message is added.
 pub fn refreshContextUsage(m: *tui.Model) void {
     if (session == null) {
-        ctx_used = 0;
-        ctx_pct = 0;
-        ctx_real = false;
+        runtime_state.clearContextUsage(&ctx_used, &ctx_pct, &ctx_real);
         return;
     }
     var astate = std.heap.ArenaAllocator.init(m.allocator);
@@ -2078,11 +695,8 @@ pub fn refreshContextUsage(m: *tui.Model) void {
     const msgs = snapshotMsgs(astate.allocator());
     const estimate = compaction.estimateTokens(msgs);
     const real = cache_stats.session.prev_prompt;
-    ctx_used = ctxTokens(real, estimate);
-    ctx_real = real > 0;
     const limit = @max(1, compaction.contextLimitFor(m.environ, curModelContext()));
-    const pct = (@as(f64, @floatFromInt(ctx_used)) / @as(f64, @floatFromInt(limit))) * 100.0;
-    ctx_pct = @intFromFloat(std.math.clamp(pct, 0, 999));
+    runtime_state.applyContextUsage(real, estimate, @intCast(limit), &ctx_used, &ctx_pct, &ctx_real);
 }
 
 /// Tokens per second of a stream that produced `tokens` in `dt_ns`.
@@ -2092,15 +706,12 @@ pub fn refreshContextUsage(m: *tui.Model) void {
 /// 1-millisecond one are both `dt_ns > 0`, and the second would print 900000
 /// tok/s for a single character).
 pub fn tpsOf(tokens: f64, dt_ns: i128) f64 {
-    if (dt_ns <= 0 or tokens <= 0) return 0;
-    const tps = tokens / (@as(f64, @floatFromInt(dt_ns)) / 1e9);
-    if (tps <= 0.5 or tps >= 100_000) return 0;
-    return tps;
+    return turn_metrics.tpsOf(tokens, dt_ns);
 }
 
 /// Our own count when the provider sent none: ~4 chars per token.
 fn estTokens(chars: usize) f64 {
-    return @as(f64, @floatFromInt(chars)) / 4.0;
+    return turn_metrics.estTokens(chars);
 }
 
 /// The tok/s of a FINISHED stream, for `/context` and the next session's memory.
@@ -2109,12 +720,8 @@ fn estTokens(chars: usize) f64 {
 /// time measured with the real tokenizer instead of with chars/4, which is off
 /// by whatever the tokenizer disagrees with us about (code and CJK both sit far
 /// from 4 chars).
-fn finishTps(chars: usize, start_ns: i128, completion: i64) void {
-    if (start_ns == 0) return;
-    const now_ns = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-    const tokens: f64 = if (completion > 0) @floatFromInt(completion) else estTokens(chars);
-    const tps = tpsOf(tokens, now_ns - start_ns);
-    if (tps > 0) tps_last = tps;
+fn finishTps(chars: usize, start_ns: i128, completion: u32) void {
+    runtime_state.applyFinishTps(io_global, start_ns, chars, @as(i64, completion), &tps_last);
 }
 
 // ── active provider / model / session ────────────────────────
@@ -2137,9 +744,7 @@ pub var cur_provider_buf: [128]u8 = undefined;
 /// `cur_provider_id` at it, so the global never points at memory a
 /// caller can free.
 pub fn setProviderId(id: []const u8) void {
-    const n = @min(id.len, cur_provider_buf.len);
-    std.mem.copyForwards(u8, cur_provider_buf[0..n], id[0..n]);
-    cur_provider_id = cur_provider_buf[0..n];
+    cur_provider_id = runtime_buffers.copyToBuf(&cur_provider_buf, id);
 }
 /// Key state of the active provider's API key.
 ///
@@ -2150,17 +755,9 @@ pub var cur_key_state: u8 = 0; // 0=unknown, 1=verified, 2=saved, 3=invalid
 /// Key state buffer for safe copying (avoids dangling slices).
 pub var cur_key_state_buf: [4]u8 = undefined;
 
-/// Maps key state enum values to display strings.
-pub fn keyStateString(s: u8) []const u8 {
-    switch (s) {
-        1 => "● verified",
-        2 => "○ saved",
-        3 => "✗ invalid",
-        else => "",
-    }
-}
+pub const keyStateString = agent_perms.keyStateString;
 
-var cur_model: []const u8 = "";
+pub var cur_model: []const u8 = "";
 
 /// Active session (`null` until the first message). The worker creates it, not
 /// startup: opening a session file just because the program started would
@@ -2203,20 +800,8 @@ pub fn setModel(name: []const u8) void {
 /// falls through to the environment and then to 128k — which is exactly what it
 /// did before any of this.
 pub fn setModelCtx(name: []const u8, ctx_tokens: u32) void {
-    // `copyForwards` and not `@memcpy`: `name` can BE the buffer (a
-    // `setModel(curModel())`, which is what `defer setModel(saved)` in a test
-    // does, and what any "go back to what I had" would do). `@memcpy` on
-    // overlapping slices is undefined behaviour, and here it panicked instead of
-    // being a no-op, because the source IS the destination.
-    const n = @min(name.len, cur_model_buf.len);
-    std.mem.copyForwards(u8, cur_model_buf[0..n], name[0..n]);
-    cur_model = cur_model_buf[0..n];
+    cur_model = runtime_buffers.copyToBuf(&cur_model_buf, name);
     cur_model_ctx = ctx_tokens;
-    // The effort is adjusted ONLY on a model change (bug 3). Without this, an
-    // `xhigh` picked in a codex-max stays put on a gemini-2.5 that does not
-    // have it: every request degrades in silence to `high`, and the status bar
-    // keeps saying `xhigh`. Two different texts for the same thing, and nothing
-    // that says they differ.
     current_effort = chat.clampEffort(cur_model, current_effort);
 }
 
@@ -2234,9 +819,7 @@ pub var cur_answering: [128]u8 = undefined;
 var cur_answering_len: usize = 0;
 
 pub fn setAnswering(model: []const u8) void {
-    const n = @min(model.len, cur_answering.len);
-    std.mem.copyForwards(u8, cur_answering[0..n], model[0..n]);
-    cur_answering_len = n;
+    cur_answering_len = runtime_buffers.setAnsweringBuf(&cur_answering, model);
 }
 
 pub fn curAnswering() []const u8 {
@@ -2263,11 +846,12 @@ pub fn curModelContext() u32 {
 /// the requested level degrades. The preference is stored apart so that changing
 /// models does not lose what the user had picked.
 pub fn effectiveEffort() chat.Effort {
-    return chat.effectiveEffort(cur_model, current_effort);
+    return runtime_state.effectiveEffortFor(cur_model, current_effort);
 }
 
 // ── permissions: "always allow" per tool (session) ───────────
-const max_always = 8;
+pub const perm_store = permissions_store;
+pub const max_always = 8;
 pub var always_names: [max_always][48]u8 = undefined;
 pub var always_lens: [max_always]usize = @splat(0);
 
@@ -2275,34 +859,39 @@ pub var always_lens: [max_always]usize = @splat(0);
 /// from `permissions.json`'s `"bash"` array. Fixed buffers, like
 /// `always_names`: the slices `loadAllowlist` reads them from live in
 /// an arena that dies at the end of the load.
-const max_bash_patterns = 16;
-const bash_pattern_max = 160;
+pub const max_bash_patterns = 16;
+pub const bash_pattern_max = 160;
 pub var bash_pattern_bufs: [max_bash_patterns][bash_pattern_max]u8 = undefined;
 pub var bash_pattern_lens: [max_bash_patterns]usize = @splat(0);
 
-fn isBashPattern(pat: []const u8) bool {
-    for (bash_pattern_lens, 0..) |l, i| {
-        if (l > 0 and std.mem.eql(u8, bash_pattern_bufs[i][0..l], pat)) return true;
-    }
-    return false;
+/// Phase 31.2: command-scoped bash allow rules for the active git workflow
+/// turn (/commit, /pr). Static slices from `lib/gitcmds.zig`; cleared when the
+/// worker ends the turn. Only one turn executes at a time.
+pub var turn_bash_allow_rules: []const []const u8 = &.{};
+
+pub fn bashAllowedByTurnRules(command: []const u8) bool {
+    if (turn_bash_allow_rules.len == 0) return false;
+    return cmdsubst.matchesAllowRules(command, turn_bash_allow_rules);
 }
 
-/// Like `setAlwaysAllowedNoSave` but for a `bash` command prefix.
+/// Installs turn-scoped bash allow rules for the current turn; returns the
+/// previous value to restore (LIFO). Used to keep global turn state scoped.
+pub fn installTurnBashAllowRules(rules: []const []const u8) []const []const u8 {
+    const prev = turn_bash_allow_rules;
+    turn_bash_allow_rules = rules;
+    return prev;
+}
+
+pub fn restoreTurnBashAllowRules(prev: []const []const u8) void {
+    turn_bash_allow_rules = prev;
+}
+
+fn isBashPattern(pat: []const u8) bool {
+    return permissions_store.isBashPattern(&bash_pattern_bufs, &bash_pattern_lens, pat);
+}
+
 fn addBashPatternNoSave(pat: []const u8) bool {
-    if (isBashPattern(pat)) return true;
-    // An over-long command is REFUSED, never cut. A pattern truncated at an
-    // arbitrary byte is a broader permission than the one the user approved:
-    // the first 96 bytes of `python -c "one specific thing"` would allow any
-    // other `python -c` there is. What was approved is what is stored.
-    if (pat.len == 0 or pat.len > bash_pattern_max) return false;
-    for (bash_pattern_lens, 0..) |l, i| {
-        if (l == 0) {
-            @memcpy(bash_pattern_bufs[i][0..pat.len], pat);
-            bash_pattern_lens[i] = pat.len;
-            return true;
-        }
-    }
-    return false;
+    return permissions_store.addBashPatternNoSave(&bash_pattern_bufs, &bash_pattern_lens, pat, bash_pattern_max);
 }
 
 /// Whether a `bash` call's command matches one of the persisted
@@ -2322,42 +911,25 @@ fn addBashPatternNoSave(pat: []const u8) bool {
 /// this is consulted: plan blocks writes outright and bypass
 /// skips the dialog, so neither reaches here.
 fn permAutoAllowed(name: []const u8, arg: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
-    // A batch is covered by accept-edits when it WRITES: the standing "I trust
-    // the file edits" is about the edits, and a batch's write step is one.
-    if (std.mem.eql(u8, name, "batch")) {
-        return accept_edits and tools_mod.callWrites(name, args_json, arena);
-    }
-    return (accept_edits and isEditTool(name)) or bashPatternAllowed(name, arg);
+    return permissions_policy.permAutoAllowed(
+        accept_edits,
+        turn_bash_allow_rules,
+        &bash_pattern_bufs,
+        &bash_pattern_lens,
+        name,
+        arg,
+        args_json,
+        arena,
+    );
 }
 
 fn bashPatternAllowed(name: []const u8, arg: []const u8) bool {
     if (!std.mem.eql(u8, name, "bash")) return false;
-    const cmd = std.mem.trim(u8, arg, " \t\r\n");
-    for (bash_pattern_lens, 0..) |l, i| {
-        if (l == 0 or l > cmd.len) continue;
-        if (!std.mem.eql(u8, cmd[0..l], bash_pattern_bufs[i][0..l])) continue;
-        if (l != cmd.len and cmd[l] != ' ' and cmd[l] != '\t') continue;
-
-        // The remainder must not start ANOTHER command or redirect
-        // anywhere. `git status` allowed must not become
-        // `git status && rm -rf /`: the pattern names ONE command, and
-        // whatever chains after it is a different command however the
-        // prefix is read. `<` and `>` are in here because a redirect
-        // writes files, and `$` because it expands (a command
-        // substitution more so than a variable). A pattern that covers
-        // the whole line has an empty remainder and is unaffected.
-        const rest = cmd[l..];
-        if (rest.len > 0 and std.mem.indexOfAny(u8, rest, ";|&<>`$\n") != null) continue;
-        return true;
-    }
-    return false;
+    return permissions_store.bashPatternAllowed(&bash_pattern_bufs, &bash_pattern_lens, arg);
 }
 
 fn isAlwaysAllowed(name: []const u8) bool {
-    for (always_lens, 0..) |l, i| {
-        if (l > 0 and std.mem.eql(u8, always_names[i][0..l], name)) return true;
-    }
-    return false;
+    return permissions_store.isAlwaysAllowed(&always_names, &always_lens, name);
 }
 
 /// The `a` key on the permission dialog.
@@ -2424,20 +996,15 @@ fn setAlwaysAllowed(m: *tui.Model, name: []const u8) void {
 /// Returns false if the allowlist is full (it does not grow without limit: it
 /// is at most 8 tools, and past that it is noise in the permission dialog).
 fn setAlwaysAllowedNoSave(name: []const u8) bool {
-    if (isAlwaysAllowed(name)) return true;
-    for (always_lens, 0..) |l, i| {
-        if (l == 0) {
-            const n = @min(name.len, 48);
-            @memcpy(always_names[i][0..n], name[0..n]);
-            always_lens[i] = n;
-            return true;
-        }
-    }
-    return false;
+    return permissions_store.setAlwaysAllowedNoSave(&always_names, &always_lens, name, 48);
 }
 
-/// Reads `permissions.json` and fills the allowlist. Best-effort: if it does
-/// not exist or is corrupt, the session starts with an empty allowlist.
+// ── persisted allowlist: ~/.config/zode/permissions.json ─────
+pub fn permissionsFilePath(buf: []u8) ?[]const u8 {
+    return permissions_persist.filePath(buf, environ_global);
+}
+
+/// Reads `permissions.json` and fills the allowlist. Best-effort.
 pub fn loadAllowlist() void {
     var pbuf: [512]u8 = undefined;
     const path = permissionsFilePath(&pbuf) orelse return;
@@ -2447,45 +1014,12 @@ pub fn loadAllowlist() void {
     const a = astate.allocator();
 
     const data = readFileTo(a, path) orelse return;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, data, .{}) catch return;
-    // Two shapes, because the file is hand-edited and it predates the
-    // `bash` patterns: a bare array is the tool allowlist (the old
-    // format), and an object carries the same list under `tools` plus
-    // the command prefixes under `bash`.
-    switch (parsed) {
-        .array => |arr| for (arr.items) |v| {
-            if (v == .string) _ = setAlwaysAllowedNoSave(v.string);
-        },
-        .object => |obj| {
-            if (obj.get("tools")) |tv| {
-                if (tv == .array) for (tv.array.items) |v| {
-                    if (v == .string) _ = setAlwaysAllowedNoSave(v.string);
-                };
-            }
-            if (obj.get("bash")) |bv| {
-                if (bv == .array) for (bv.array.items) |v| {
-                    if (v == .string) _ = addBashPatternNoSave(v.string);
-                };
-            }
-        },
-        else => {},
-    }
+    const parsed = permissions_persist.parse(a, data);
+    for (parsed.tools) |name| _ = setAlwaysAllowedNoSave(name);
+    for (parsed.bash) |pat| _ = addBashPatternNoSave(pat);
 }
 
-// ── persisted allowlist: ~/.config/zode/permissions.json ─────
-pub fn permissionsFilePath(buf: []u8) ?[]const u8 {
-    // `environ_global.?` panicked when the global was null, which is its
-    // normal state in every test that did not set it: a missing environment
-    // is "there is nowhere to persist", not a crash.
-    const env = environ_global orelse return null;
-    const home = env.get("HOME") orelse return null;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode/permissions.json", .{home}) catch null;
-}
-
-/// Persists the "always allow" allowlist as a JSON array of names.
-///
-/// By hand (not with a writer over a map) because it is at most 8 strings and
-/// this way it reads at a glance.
+/// Persists the allowlist (`{"tools":[...],"bash":[...]}`).
 fn saveAllowlist() void {
     var pbuf: [512]u8 = undefined;
     const path = permissionsFilePath(&pbuf) orelse return;
@@ -2507,17 +1041,9 @@ fn saveAllowlist() void {
     }
 
     var buf: [4096]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    // By hand (not with a writer over a map) because it is two short
-    // arrays and this way it reads at a glance:
-    //   {"tools":["edit"],"bash":["git status"]}
-    w.print("{{\"tools\":", .{}) catch return;
-    config_mod.writeStringArray(&w, gpa_global, names[0..n]) catch return;
-    w.print(",\"bash\":", .{}) catch return;
-    config_mod.writeStringArray(&w, gpa_global, pats[0..np]) catch return;
-    w.print("}}", .{}) catch return;
-    config_mod.writeFileSecure(io_global, environ_global, path, w.buffered()) catch {
-        std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = w.buffered() }) catch {};
+    const rendered = permissions_persist.format(&buf, gpa_global, names[0..n], pats[0..np]) orelse return;
+    config_mod.writeFileSecure(io_global, environ_global, path, rendered) catch {
+        std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = path, .data = rendered }) catch {};
     };
 }
 
@@ -2536,42 +1062,26 @@ fn readFileToWith(io: std.Io, arena: std.mem.Allocator, path: []const u8) ?[]con
 // ── the permission rules (Phase 6) ─────────────────────────────────────────
 
 /// The rules of every source, and the arena that owns them.
-///
-/// The rules are read on EVERY call that needs a decision, so they are
-/// cached and the cache is what the hot path reads. The arena lives until
-/// the process exits: a worker can be reading the rules while the config is
-/// reloaded, and a rule set that is freed under a reader is a use-after-free
-/// (the same rule as the saved keys).
 pub var perm_rules: permrules.Set = .{};
 var perm_rules_arena: ?std.heap.ArenaAllocator = null;
 
 /// Whether the dangerous-allow warning has already been shown this session.
-/// It fires once: repeating it every turn would train the user to dismiss it.
 pub var warned_dangerous_allow: std.atomic.Value(bool) = .init(false);
 
-/// The project-level rules file, relative to the working directory.
-pub const project_rules_file = ".zode/permissions.json";
+pub const project_rules_file = project_rules.project_rules_file;
+pub const project_hooks_file = project_rules.project_hooks_file;
 
-/// Resolved effective project rules path (matches loadPermRules resolution).
 pub fn resolvedProjectRulesPath(buf: []u8) []const u8 {
-    if (project_info.root()) |root| {
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file;
-    }
-    return project_rules_file;
+    return project_rules.resolvedProjectRulesPath(buf, project_info.root());
+}
+
+pub fn resolvedProjectHooksPath(buf: []u8) []const u8 {
+    return project_rules.resolvedProjectHooksPath(buf, project_info.root());
 }
 
 /// Project-level hooks (Phase 5).
 pub var hooks_set: hooks_mod.Set = .{};
 var hooks_arena: ?std.heap.ArenaAllocator = null;
-pub const project_hooks_file = ".zode/hooks.json";
-
-/// Resolved effective project hooks path (matches loadHooks resolution).
-pub fn resolvedProjectHooksPath(buf: []u8) []const u8 {
-    if (project_info.root()) |root| {
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, project_hooks_file }) catch project_hooks_file;
-    }
-    return project_hooks_file;
-}
 
 pub fn loadHooks() void {
     var hbuf: [640]u8 = undefined;
@@ -2580,102 +1090,40 @@ pub fn loadHooks() void {
     else
         project_hooks_file;
     if (hooks_arena == null) hooks_arena = std.heap.ArenaAllocator.init(gpa_global);
-    const a = hooks_arena.?.allocator();
-    hooks_set = .{};
-    if (readFileToWith(io_global, a, project_path)) |data| {
-        hooks_set = hooks_mod.parseConfig(a, data);
-    }
+    project_rules.loadHooksAt(&hooks_set, hooks_arena.?.allocator(), io_global, project_path);
 }
 
-/// Loads the rules: the project file and the user file.
-///
-/// The ORDER is the precedence — the strongest source first — and
-/// `permrules.decide` picks the first that matches. A `deny` beats any
-/// `allow` from any source, and that is decided inside `decide`.
-///
-/// The project file is the one that answers the question this whole
-/// mechanism exists for: a project that wants `.vscode/` written without a
-/// question says so in ITS OWN file, and the file travels with the project.
 pub fn loadPermRules() void {
     var pbuf: [512]u8 = undefined;
     var rbuf: [640]u8 = undefined;
-    // The PROJECT ROOT, and not the working directory: the file travels with
-    // the project, and a run from a subdirectory has to find the same rules.
     const project_path = if (project_info.root()) |root|
         std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file
     else
         project_rules_file;
-    if (perm_rules_arena == null) {
-        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
-    }
-    loadPermRulesInto(
-        perm_rules_arena.?.allocator(),
-        io_global,
-        project_path,
-        permissionsFilePath(&pbuf),
-    );
+    if (perm_rules_arena == null) perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
+    loadPermRulesInto(perm_rules_arena.?.allocator(), io_global, project_path, permissionsFilePath(&pbuf));
     loadHooks();
 }
 
-/// The rules, loaded from the two files.
-///
-/// The paths are PARAMETERS and not read from the environment here, for one
-/// reason: a test has to be able to point them at a fixture. "The rules of
-/// this machine" and "the rules of a file" are the same code with a different
-/// argument.
 pub fn loadPermRulesFrom(io: std.Io, project_path: ?[]const u8, user_path: ?[]const u8) void {
-    if (perm_rules_arena == null) {
-        perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
-    }
+    if (perm_rules_arena == null) perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
     loadPermRulesInto(perm_rules_arena.?.allocator(), io, project_path, user_path);
-    // Test-friendly: load hooks from alongside the project rules file.
     if (project_path) |pp| {
         var hbuf: [640]u8 = undefined;
-        // Derive hooks path from project permissions path's directory.
-        const dir = std.fs.path.dirname(pp) orelse ".";
-        const hp = std.fmt.bufPrint(&hbuf, "{s}/{s}", .{ dir, "hooks.json" }) catch null;
-        if (hp) |path| {
+        if (project_rules.hooksPathForProjectPermissions(pp, &hbuf)) |path| {
             if (hooks_arena == null) hooks_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            const a = hooks_arena.?.allocator();
-            hooks_set = .{};
-            if (readFileToWith(io, a, path)) |data| hooks_set = hooks_mod.parseConfig(a, data);
+            project_rules.loadHooksAt(&hooks_set, hooks_arena.?.allocator(), io, path);
         }
     }
 }
 
-/// The rules, loaded into a GIVEN arena.
-///
-/// The allocator is an argument because the global one does not exist in a
-/// test, and a test that cannot load a rule file cannot test a rule.
 pub fn loadPermRulesInto(
     arena: std.mem.Allocator,
     io: std.Io,
     project_path: ?[]const u8,
     user_path: ?[]const u8,
 ) void {
-    const a = arena;
-
-    var all: std.ArrayList(permrules.Rule) = .empty;
-
-    // The PROJECT file: `.zode/permissions.json`, next to the code.
-    if (project_path) |path| {
-        if (readFileToWith(io, a, path)) |data| {
-            if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
-                for (permrules.parseJson(parsed, .project, a)) |r| all.append(a, r) catch {};
-            } else |_| {}
-        }
-    }
-
-    // The USER file: `~/.config/zode/permissions.json`, next to the keys.
-    if (user_path) |path| {
-        if (readFileToWith(io, a, path)) |data| {
-            if (std.json.parseFromSliceLeaky(std.json.Value, a, data, .{})) |parsed| {
-                for (permrules.parseJson(parsed, .user, a)) |r| all.append(a, r) catch {};
-            } else |_| {}
-        }
-    }
-
-    perm_rules = .{ .rules = all.items };
+    project_rules.loadPermRulesInto(&perm_rules, arena, io, project_path, user_path);
 }
 
 /// The rules, as they stand.
@@ -2689,30 +1137,7 @@ pub fn permRuleSet() permrules.Set {
 /// the command for `bash`. A rule with a pattern matches if it matches ANY
 /// of them, and a rule with no pattern matches any subject.
 pub fn permDecision(tool: []const u8, subjects: []const []const u8) ?permrules.Decision {
-    if (permrules.decide(perm_rules.rules, tool, subjects)) |d| return d;
-
-    // The POLICY: the built-in sensitive table. Its action is ASK, and that
-    // is the whole point of it: the built-in table does not REFUSE (a project
-    // with a `.vscode/` the user wants edited is blocked forever by a
-    // refusal), it asks, and a rule in a file can answer "allow" for it.
-    for (subjects) |sub| {
-        const v = pathsafe.checkWrite(sub);
-        if (v == .ok) continue;
-        return .{
-            .action = .ask,
-            .rule = .{
-                .tool = tool,
-                .pattern = sub,
-                .action = .ask,
-                .source = .policy,
-                .text = switch (v) {
-                    .dangerous => |d| d.what,
-                    else => "a protected path",
-                },
-            },
-        };
-    }
-    return null;
+    return tool_exec.permDecisionWithPolicy(perm_rules, tool, subjects);
 }
 
 // ── environment and history notices ───────────────────────────
@@ -2753,7 +1178,7 @@ fn agent_default_iterations() usize {
     return default_max_iterations;
 }
 
-fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
+pub fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = env orelse return null;
     return m.get(key);
 }
@@ -3298,7 +1723,7 @@ pub fn reloadUserConfig() void {
     // The subagent's pick may have changed with the config: a give-up recorded
     // against the OLD `subagent_model` must not outlive it, or fixing
     // config.json would do nothing until restart.
-    sub_fail_len = 0;
+    submodel_mod.sub_fail_len = 0;
     loadUserConfig();
 }
 
@@ -3430,7 +1855,7 @@ pub fn newSession(m: *tui.Model) void {
     m.clearHistory();
     m.pushInfoFmt("new session: {s}", .{s.id[0..]});
     session_elided = 0;
-    resetSummaries();
+    summary_policy.resetSummaries();
     // The git probe's answer is about the DIRECTORY, and a `git init` in the middle of a
     // session changes it. These are the only two moments that can: everything else in a
     // session happens inside the same tree.
@@ -3748,6 +2173,97 @@ var body_buf_heap: ?[]u8 = null;
 /// the same in a test that takes over the globals.
 var body_buf_with: ?std.mem.Allocator = null;
 
+
+
+const StreamErrorAction = stream_retry.Action;
+
+fn waitRetry(attempt: usize) !void {
+    return Retry.wait(attempt);
+}
+
+fn pushCheapFallbackInfo(m: *tui.Model, w: router_mod.Why, current_model: []const u8) void {
+    pushInfoFmt(
+        m,
+        "{s} {s} {s}. It will not be tried again this session — {s}. {s}=0 turns the cheap router off.",
+        .{
+            cheap_router.cheap_model,
+            router_mod.phrase(w),
+            current_model,
+            router_mod.remedy(w),
+            router_mod.cheap_env,
+        },
+    );
+}
+
+fn handleTurnStreamError(
+    gpa: std.mem.Allocator,
+    m: *tui.Model,
+    err: anyerror,
+    attempt: usize,
+    active_pick: Target,
+    pick: *Target,
+    used_cheap: *bool,
+    rotations: *u8,
+) StreamErrorAction {
+    return stream_retry.handleTurnStreamError(gpa, m, err, attempt, active_pick, pick, used_cheap, rotations, .{
+        .cheap_router = &cheap_router,
+        .quotaVerdict = quotaVerdict,
+        .switchTo = free_auto.switchTo,
+        .targetForCandidate = targetForCandidate,
+        .updateModelContextFromPick = updateModelContextFromPick,
+        .pushSwitchNotice = pushSwitchNotice,
+        .isRetryable = isRetryable,
+        .pushRetryNotice = pushRetryNotice,
+        .waitRetry = waitRetry,
+        .noteTurnFailure = noteTurnFailure,
+        .setAnswering = setAnswering,
+        .pushCheapFallbackInfo = pushCheapFallbackInfo,
+    });
+}
+
+const TurnRequest = struct {
+    body: []const u8,
+    url: []const u8,
+    bearer: ?[]const u8,
+    extra_headers: []const http_client.Http.ExtraHeader,
+};
+
+fn prepareTurnRequest(
+    m: *tui.Model,
+    pick: Target,
+    msgs_wire: []chat.ChatMessage,
+    denied: []const []const u8,
+    schema_arena: std.mem.Allocator,
+    body_buf: []u8,
+    url_buf: []u8,
+    extra_hdrs_buf: *[2]http_client.Http.ExtraHeader,
+) !TurnRequest {
+    const schema = if (m.deny_all_tools)
+        ""
+    else if (read_only)
+        tools_registry.toolsJsonReadOnly()
+    else
+        try tools_registry.toolsJsonFiltered(schema_arena, denied);
+
+    chat.markCachePrefix(msgs_wire, 2);
+    const body = try chat.buildBodyMessagesCapped(
+        body_buf,
+        pick.model,
+        msgs_wire,
+        chat.effectiveEffort(pick.model, current_effort),
+        schema,
+        pick.kind,
+        outputCapFor(pick.def, environ_global),
+    );
+
+    return .{
+        .body = body,
+        .url = targetUrl(url_buf, pick),
+        .bearer = pick.key,
+        .extra_headers = openRouterExtraHeaders(extra_hdrs_buf, pick.def.id),
+    };
+}
+
 fn bodyBuf(gpa: std.mem.Allocator) ![]u8 {
     if (body_buf_heap == null) {
         body_buf_heap = try gpa.alloc(u8, 1 << 20);
@@ -3844,7 +2360,7 @@ pub fn resetSession(m: *tui.Model) void {
         s.flush();
     }
     session_elided = 0;
-    resetSummaries();
+    summary_policy.resetSummaries();
     m.pushInfoFmt("session reset", .{});
 }
 
@@ -4000,128 +2516,22 @@ pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
 /// `/yolo`: toggle bypass mode, the "stop asking me anything"
 /// switch. Turning it on clears the other modes so the status bar
 /// shows the mode that applies; turning it off returns to default.
-fn cmdYolo(m: *tui.Model) void {
-    setPermMode(m, if (yolo) .default else .bypass);
-    // The HISTORY gets the explanation and the footer's YOLO chip next to the
-    // face says the mode (see `drawStateFooter`). Nothing goes to the mascot's
-    // legend: the whole sentence used to, it took the row, pushed the model and
-    // the context gauge off the right end, and turning `/yolo` on looked like
-    // the status bar disappearing.
-    const msg = if (yolo) "yolo ON: no confirmations, and no questions (your questions are answered for you and said in the summary)" else "yolo OFF: asks for permission";
-    pushInfo(m, msg);
-}
-
-/// `/version`: show the running zode version.
-/// Phase 35.9: a one-liner over `src/lib/selfupdate.zig` (`current_version`).
-fn cmdVersion(m: *tui.Model) void {
-    m.pushInfoFmt("zode {s}", .{selfupdate.current_version});
-}
-
-/// `/release-notes`: show release notes for the running version.
-/// Phase 35.9: reads the matching section from CHANGELOG.md (local, no network).
-fn cmdReleaseNotes(m: *tui.Model) void {
-    const gpa = m.allocator;
-    if (!m.io_ready) {
-        m.pushInfo("release notes: I/O not ready");
-        return;
-    }
-    const io = io_global;
-    const version = selfupdate.current_version;
-
-    const body = std.Io.Dir.cwd().readFileAlloc(io, "CHANGELOG.md", gpa, .limited(1024 * 1024)) catch {
-        m.pushInfo("release notes: CHANGELOG.md not found (run from the repo root, or see the project releases)");
-        return;
-    };
-    defer gpa.free(body);
-
-    const section = extractReleaseSection(gpa, body, version) catch {
-        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
-        return;
-    } orelse {
-        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
-        return;
-    };
-    defer gpa.free(section);
-
-    m.pushInfoFmt("release notes — zode {s}", .{version});
-    // Push the section line by line so it renders as normal info lines.
-    var it = std.mem.splitScalar(u8, section, '\n');
-    while (it.next()) |line| {
-        // Trim trailing CR for Windows-ish safety; keep content.
-        const l = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-        m.pushInfoOwned(gpa.dupe(u8, l) catch continue);
-    }
-}
-
-/// Extract the CHANGELOG section for `version`. For "dev"/non-semver builds,
-/// returns the `[Unreleased]` section. Returns an owned slice, or null if not found.
-fn extractReleaseSection(gpa: std.mem.Allocator, changelog: []const u8, version: []const u8) !?[]u8 {
-    var needle_buf: [128]u8 = undefined;
-    const is_dev = std.mem.eql(u8, version, "dev") or selfupdate.Version.parse(version) == null;
-    const needle = if (is_dev)
-        "## [Unreleased]"
-    else blk: {
-        const v = if (version.len > 0 and (version[0] == 'v' or version[0] == 'V')) version[1..] else version;
-        break :blk std.fmt.bufPrint(&needle_buf, "## [{s}]", .{v}) catch return null;
-    };
-
-    const start = std.mem.indexOf(u8, changelog, needle) orelse return null;
-    // Start after the heading line.
-    var body_start = start;
-    if (std.mem.indexOfScalarPos(u8, changelog, start, '\n')) |nl| {
-        body_start = nl + 1;
-    } else {
-        return try gpa.dupe(u8, "");
-    }
-
-    // Find the next version/section heading (`\n## [`).
-    var end = changelog.len;
-    if (std.mem.indexOfPos(u8, changelog, body_start, "\n## [")) |next| {
-        end = next;
-    }
-
-    const raw = std.mem.trim(u8, changelog[body_start..end], " \t\r\n");
-    if (raw.len == 0) return try gpa.dupe(u8, "(no entries)");
-    return try gpa.dupe(u8, raw);
-}
-
 /// `/clear`: clear the visible transcript and reset the per-session caches
 /// (the read list, the changed list, and the "skills already attached" flag
 /// so the listing is re-attached on the next turn). Like `/new` this buys a
 /// truth: after clearing, the model no longer pretends it has files it has
 /// not seen in this session. It does NOT create a new session — use `/new`
 /// for that.
-fn cmdClear(m: *tui.Model) void {
-    resetSessionFiles(m);
-    m.clearHistory();
-    if (session) |s| s.resetSkillsSent();
-    m.pushInfo("screen cleared · read cache + changed list reset · skills listing re-attached next turn");
-}
-
 /// `/mode [build|accept-edits|plan|bypass]`, or the current
 /// mode with no argument.
 ///
 /// Selective permissions: the user picks how much the agent asks,
 /// per CLASS of action, without the all-or-nothing `/yolo`.
-fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
-    if (arg) |a| {
-        const mode = parsePermMode(a);
-        if (mode) |mm| {
-            setPermMode(m, mm);
-            // The transcript and the footer's right group say the mode; the
-            // mascot's legend is the agent's work, not the settings.
-            pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
-            return;
-        }
-        pushInfo(m, "/mode: build|accept-edits|plan|bypass");
-        return;
-    }
-    pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{permModeName()});
-}
+
 
 /// The mode a `/mode` argument names, or null when it names none.
 /// Case-insensitive, and tolerant of the spellings people type.
-fn parsePermMode(a: []const u8) ?PermMode {
+pub fn parsePermMode(a: []const u8) ?PermMode {
     if (std.ascii.eqlIgnoreCase(a, "build") or std.ascii.eqlIgnoreCase(a, "default")) return .default;
     if (std.ascii.eqlIgnoreCase(a, "accept-edits") or
         std.ascii.eqlIgnoreCase(a, "accept_edits") or
@@ -4146,34 +2556,7 @@ fn parsePermMode(a: []const u8) ?PermMode {
 /// What it does NOT do is accept a level the model cannot take and say nothing:
 /// `/effort xhigh` on a three-rung model says so, because the alternative is the
 /// user finding out from a 400 halfway through a turn.
-fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
-    if (arg) |a| {
-        const want = chat.Effort.parse(a) orelse {
-            m.pushInfoFmt("unknown effort: {s} (none|minimal|low|medium|high|xhigh)", .{a});
-            return;
-        };
-        current_effort = want;
-        // What actually goes out, which is not always what was typed. It is said out
-        // loud because the alternative is the user finding out about the 400
-        // halfway through a turn.
-        const got = chat.effortFor(cur_model, want);
-        if (got == null) {
-            m.pushInfoFmt("effort → {s} (this model has no effort knob; the level only sets the answer length)", .{
-                want.label(),
-            });
-        } else if (got.? != want) {
-            m.pushInfoFmt("effort → {s} (this model tops out at {s}, so {s} is what goes on the wire)", .{
-                want.label(),
-                chat.maxEffortFor(cur_model).label(),
-                got.?.label(),
-            });
-        } else {
-            m.pushInfoFmt("effort → {s}", .{want.label()});
-        }
-        return;
-    }
-    openEffortPicker(m);
-}
+
 
 pub fn submit(m: *tui.Model, input: []const u8) !void {
     if (input.len == 0) return;
@@ -4195,7 +2578,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "exit")) {
         // alias of /quit — the TUI handles it
     } else if (std.mem.eql(u8, cmd, "clear")) {
-        cmdClear(m);
+        commands_mod.cmdClear(m);
     } else if (std.mem.eql(u8, cmd, "providers")) {
         commands_mod.cmdProviders(m);
     } else if (std.mem.eql(u8, cmd, "provider")) {
@@ -4207,29 +2590,29 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         // nothing.
         openModelPaletteAsync(m);
     } else if (std.mem.eql(u8, cmd, "effort")) {
-        cmdEffort(m, arg);
+        commands_mod.cmdEffort(m, arg);
     } else if (std.mem.eql(u8, cmd, "color")) {
-        cmdColor(m, arg);
+        commands_mod.cmdColor(m, arg);
     } else if (std.mem.eql(u8, cmd, "submodel")) {
-        cmdSubmodel(m, arg);
+        commands_mod.cmdSubmodel(m, arg);
     } else if (std.mem.eql(u8, cmd, "task-parallel")) {
-        cmdTaskParallel(m, arg);
+        commands_mod.cmdTaskParallel(m, arg);
     } else if (std.mem.eql(u8, cmd, "undo")) {
-        cmdUndo(m);
+        commands_mod.cmdUndo(m);
     } else if (std.mem.eql(u8, cmd, "clean")) {
         // `m.allocator`, not the `Allocator` TYPE. The local `a` above shadows
         // the type name inside this function, so the annotation resolved to a
         // variable and the whole module failed to compile. The tests that build
         // a `Model` on a FixedBufferAllocator caught it.
-        cmdClean(m, cleanWanted(m.environ, arg));
+        commands_mod.cmdClean(m, commands_mod.cleanWanted(m.environ, arg));
     } else if (std.mem.eql(u8, cmd, "free-auto") or std.mem.eql(u8, cmd, "free")) {
         free_auto.cmdFreeAuto(m, arg);
     } else if (std.mem.eql(u8, cmd, "bg")) {
-        cmdBg(m, arg);
+        commands_mod.cmdBg(m, arg);
     } else if (std.mem.eql(u8, cmd, "yolo")) {
-        cmdYolo(m);
+        commands_mod.cmdYolo(m);
     } else if (std.mem.eql(u8, cmd, "mode")) {
-        cmdMode(m, arg);
+        commands_mod.cmdMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "allowlist")) {
         commands_mod.cmdAllowlist(m);
     } else if (std.mem.eql(u8, cmd, "permissions")) {
@@ -4240,6 +2623,10 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdAgents(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
+    } else if (std.mem.eql(u8, cmd, "inspect")) {
+        commands_mod.cmdInspect(m, arg);
+    } else if (std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "workbench")) {
+        commands_mod.cmdView(m, arg);
     } else if (std.mem.eql(u8, cmd, "usage")) {
         commands_mod.cmdUsage(m);
     } else if (std.mem.eql(u8, cmd, "doctor")) {
@@ -4251,29 +2638,41 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "status")) {
         commands_mod.cmdStatus(m);
     } else if (std.mem.eql(u8, cmd, "update")) {
-        cmdUpdate(m);
+        commands_mod.cmdUpdate(m);
     } else if (std.mem.eql(u8, cmd, "compact")) {
         commands_mod.cmdCompact(m, rest);
     } else if (std.mem.eql(u8, cmd, "version")) {
-        cmdVersion(m);
+        commands_mod.cmdVersion(m);
     } else if (std.mem.eql(u8, cmd, "release-notes") or std.mem.eql(u8, cmd, "releasenotes")) {
-        cmdReleaseNotes(m);
+        commands_mod.cmdReleaseNotes(m);
     } else if (std.mem.eql(u8, cmd, "goal")) {
         commands_mod.cmdGoal(m, rest);
     } else if (std.mem.eql(u8, cmd, "init")) {
         commands_mod.cmdInit(m);
+    } else if (std.mem.eql(u8, cmd, "commit")) {
+        commands_mod.cmdCommit(m, arg);
+    } else if (std.mem.eql(u8, cmd, "pr")) {
+        commands_mod.cmdPr(m, arg);
+    } else if (std.mem.eql(u8, cmd, "commit-push-pr") or std.mem.eql(u8, cmd, "commit_push_pr")) {
+        commands_mod.cmdCommitPushPr(m, arg);
     } else if (std.mem.eql(u8, cmd, "session")) {
         commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "files")) {
         commands_mod.cmdFiles(m);
+    } else if (std.mem.eql(u8, cmd, "file")) {
+        commands_mod.cmdFile(m, arg);
     } else if (std.mem.eql(u8, cmd, "hunk")) {
         commands_mod.cmdHunk(m, arg);
     } else if (std.mem.eql(u8, cmd, "diff")) {
-        commands_mod.cmdDiff(m);
+        commands_mod.cmdDiff(m, arg);
+    } else if (std.mem.eql(u8, cmd, "git")) {
+        commands_mod.cmdGit(m, arg);
+    } else if (std.mem.eql(u8, cmd, "github")) {
+        commands_mod.cmdGithub(m, arg);
     } else if (std.mem.eql(u8, cmd, "cache")) {
         commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
-        cmdBench(m);
+        commands_mod.cmdBench(m);
     } else if (std.mem.eql(u8, cmd, "iter")) {
         cmdIter(m, rest);
     } else if (std.mem.eql(u8, cmd, "pipeline")) {
@@ -4291,15 +2690,15 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
             m.pushInfoFmt("code-review: {t}", .{err});
         };
     } else if (std.mem.eql(u8, cmd, "ask")) {
-        cmdAskMode(m, arg);
+        commands_mod.cmdAskMode(m, arg);
     } else if (std.mem.eql(u8, cmd, "dots")) {
-        cmdDots(m, arg);
+        commands_mod.cmdDots(m, arg);
     } else if (std.mem.eql(u8, cmd, "skills")) {
-        cmdSkills(m);
+        commands_mod.cmdSkills(m);
     } else if (std.mem.eql(u8, cmd, "style")) {
-        cmdStyle(m, arg);
+        commands_mod.cmdStyle(m, arg);
     } else if (std.mem.eql(u8, cmd, "copy")) {
-        cmdCopy(m, arg);
+        commands_mod.cmdCopy(m, arg);
     } else if (std.mem.eql(u8, cmd, "reload-cmds") or std.mem.eql(u8, cmd, "reloadcmds") or std.mem.eql(u8, cmd, "reloadcmd")) {
         if (m.io_ready) {
             refreshUserCommandsForce(m.allocator, m.io, m.environ, true);
@@ -4739,144 +3138,6 @@ test "which-cmd and reload-cmds reach submit, and each says something checkable"
 
 // ── /clean: purge zode's own leftovers, nothing else ──────────
 
-/// Was a delete asked for? Either `/clean yes` on the command line, or
-/// `ZODE_YES=1` for when the MODEL runs it (a model that can only type
-/// `/clean` and then be told "no, with yes" has no way out).
-fn cleanWanted(env: ?*const std.process.Environ.Map, arg: ?[]const u8) bool {
-    if (arg) |a| {
-        if (std.mem.eql(u8, a, "yes") or std.mem.eql(u8, a, "y") or
-            std.mem.eql(u8, a, "apply")) return true;
-    }
-    const v = envGet(env, "ZODE_YES") orelse return false;
-    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes");
-}
-
-/// The config dir, or null. `/clean` reads it to find the leftover
-/// `<name>.tmp` of an interrupted atomic write (`config.zig` writes to a temp
-/// and renames it).
-fn cleanConfigDir(a: std.mem.Allocator, env: ?*const std.process.Environ.Map) ?[]const u8 {
-    const home = envGet(env, "HOME") orelse return null;
-    return std.fmt.allocPrint(a, "{s}/.config/zode", .{home}) catch null;
-}
-
-/// `/clean`: the leftovers of zode, and ONLY those.
-///
-/// Dry run by default. The output has to carry the NUMBERS, not just "clean":
-/// "24 empty sessions" is checkable and "nothing to do" is not, and a cleanup
-/// command that reports success without saying what it looked at is the one
-/// that lies when it is wrong.
-///
-/// The `auth.json` / `.zig-cache` exclusion is not here on purpose: it lives in
-/// `clean.isProtected`, next to the scan that could reach them, with the tests
-/// that hold it. A "never touch" list written in the UI would only hold for as
-/// long as nobody adds a new scan.
-fn cmdClean(m: *tui.Model, aplicar: bool) void {
-    // The allocator is a local, and its name is not `a`: `a` is also the name
-    // the two `allocPrint` helpers below use for their own temporaries, and one
-    // name cannot be both the type and the value.
-    const gpa = m.allocator;
-    const inst = clean_mod.instanceDir(gpa, io_global) catch null;
-    defer if (inst) |p| gpa.free(p);
-    const cfg = cleanConfigDir(gpa, m.environ);
-    defer if (cfg) |p| gpa.free(p);
-
-    const now_secs = std.Io.Timestamp.now(io_global, .real).toSeconds();
-    var rep = clean_mod.scan(gpa, io_global, .{
-        .roots = .{ .sessions = "sessions", .instances = inst, .config = cfg },
-        .now_secs = now_secs,
-    }) catch {
-        pushInfo(m, "/clean: could not read the directories");
-        return;
-    };
-    defer rep.deinit();
-
-    const header: []const u8 = if (aplicar)
-        "/clean: applied"
-    else
-        "/clean: dry run (nothing deleted)";
-    pushInfo(m, header);
-
-    if (rep.missing_sessions) {
-        pushInfo(m, "  no sessions/ directory here (nothing to clean in it)");
-    }
-
-    const order = [_]clean_mod.Bucket{ .empty_session, .own_temp, .stale_instance, .old_session };
-    for (order) |b| {
-        const n = rep.count(b);
-        if (n == 0) continue;
-        const line = std.fmt.allocPrint(gpa, "  {d:>3} {s} ({s})", .{
-            n,
-            b.label(),
-            if (b == .old_session) "kept, delete with find sessions/ -mtime +30d" else b.rootHint(),
-        }) catch continue;
-        pushInfoOwned(m, line);
-    }
-
-    if (rep.items.len == 0 and !rep.missing_sessions) {
-        pushInfo(m, "  nothing to clean");
-        return;
-    }
-
-    if (!aplicar) {
-        const total = rep.deletable();
-        if (total == 0) {
-            pushInfo(m, "  nothing to delete without a yes");
-            return;
-        }
-        const line = std.fmt.allocPrint(
-            gpa,
-            "  -> {d} files, {d} bytes. run `/clean yes` to delete them",
-            .{ total, rep.bytes() },
-        ) catch return;
-        pushInfoOwned(m, line);
-        return;
-    }
-
-    const deleted = clean_mod.apply(io_global, &rep, .{
-        .sessions = "sessions",
-        .instances = inst,
-        .config = cfg,
-    }) catch 0;
-    // The failure count goes in the output on purpose: `apply` swallows the
-    // per-file error so one unreadable file does not abort the rest, and
-    // without this line "deleted 23" would be a lie when 24 were candidates.
-    // `pushInfoFmt` and not `allocPrint … catch "literal"`: on OOM the literal
-    // fallback is a pointer into `.rodata`, and `pushInfoOwned` takes ownership
-    // of it — `Model.deinit` then frees static memory. That is the "Invalid
-    // free" this repo has paid for repeatedly, and it only shows up when the
-    // allocator is already failing, which is exactly when you cannot diagnose
-    // it. `pushInfoFmt` composes AND owns, so the mistake cannot be written.
-    if (rep.failed == 0) {
-        m.pushInfoFmt("  deleted {d} files", .{deleted});
-    } else {
-        m.pushInfoFmt("  deleted {d}, {d} could NOT be removed", .{ deleted, rep.failed });
-    }
-}
-
-/// Shell-quotes a path for a command the user can paste: single quotes, with
-/// embedded single quotes escaped. A path with a space or `'` is data, not shell
-/// syntax (29.6).
-fn shellQuoteSingle(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    out.append(gpa, '\'') catch return null;
-    for (path) |c| {
-        if (c == '\'') out.appendSlice(gpa, "'\\''") catch return null else out.append(gpa, c) catch return null;
-    }
-    out.append(gpa, '\'') catch return null;
-    return out.toOwnedSlice(gpa) catch null;
-}
-
-/// The session id as the user sees it: the file stem without `zode-`/`.jsonl`
-/// noise when present, else the basename.
-fn sessionDisplayId(path: []const u8) []const u8 {
-    const base = std.fs.path.basename(path);
-    if (std.mem.startsWith(u8, base, "zode-") and std.mem.endsWith(u8, base, ".jsonl")) {
-        return base["zode-".len .. base.len - ".jsonl".len];
-    }
-    return base;
-}
-
 /// 29.6: a session may only be resumed from the project it belongs to (or a
 /// worktree of the same repo, best-effort). A foreign project gets the exact,
 /// shell-quoted command copied to the clipboard and delivered as a user message
@@ -4894,7 +3155,7 @@ fn resumeBelongsHere(arena: std.mem.Allocator, path: []const u8) bool {
 }
 
 fn refuseForeignResume(m: *tui.Model, path: []const u8) void {
-    const id = sessionDisplayId(path);
+    const id = sessionpath.sessionDisplayId(path);
     // We do not know the foreign project's directory from the session path in
     // the state-dir layout (it is hashed). Give the actionable id and tell the
     // user to run it from that project; copy the resume command.
@@ -4931,7 +3192,7 @@ fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
     m.bg.setSession(m.allocator, io_global, s.path);
     cache_stats.session = s.usage_stats;
     session_elided = 0;
-    resetSummaries();
+    summary_policy.resetSummaries();
     forgetGitRepoProbe();
     resetSessionFiles(m);
     m.clearPlan();
@@ -4962,7 +3223,7 @@ fn resumeTerm(m: *tui.Model, term: []const u8) void {
     const all = sessionindex.scan(a, io_global, session_mod.sessions_dir);
     for (all) |e| {
         const base = std.fs.path.basename(e.path);
-        const id = sessionDisplayId(e.path);
+        const id = sessionpath.sessionDisplayId(e.path);
         const title = e.title(base);
         const by_id = std.mem.eql(u8, term, id) or std.mem.eql(u8, term, base) or
             std.mem.eql(u8, term, e.path) or std.mem.indexOf(u8, base, term) != null;
@@ -5011,16 +3272,7 @@ fn resumeLatest(m: *tui.Model) void {
 /// thread; the UI only receives events.
 /// Job of the chat thread. `text` is a COPY that the worker frees, so the
 /// input buffer can be reused as soon as it is queued.
-pub const ChatJob = struct {
-    model: *tui.Model,
-    text: []const u8,
-    /// What the worker runs: the free-running loop (normal), the staged
-    /// task pipeline (/pipeline, or the automatic classifier), or a read-only
-    /// code review (/code-review).
-    mode: Mode = .normal,
-
-    pub const Mode = enum { normal, pipeline, review };
-};
+pub const ChatJob = agent_types.ChatJob;
 
 pub fn startChat(m: *tui.Model, input: []const u8) !void {
     return startChatImpl(m, input, .normal);
@@ -5040,143 +3292,51 @@ pub fn startCodeReview(m: *tui.Model, input: []const u8) !void {
 }
 
 fn startChatImpl(m: *tui.Model, input: []const u8, mode: ChatJob.Mode) !void {
-    // Truncate long inputs for UI display, keep full text for model
-    const full_input = input;
-    const copy = try m.allocator.dupe(u8, full_input);
-    errdefer m.allocator.free(copy);
+    return startChatImplEx(m, input, mode, &.{}, false);
+}
 
-    // If a turn is already in flight, QUEUE it instead of launching a worker in
-    // parallel: two workers writing at the same time to the same session and
-    // the same streaming state is what made the input freeze and the history
-    // cut itself off.
-    if (m.isBusy()) {
-        _ = m.enqueuePrompt(copy);
-        m.pushInfoFmt("⏳ queued ({d} waiting)", .{m.queuedCount()});
-        return;
-    }
+/// Starts a normal turn with turn-scoped bash allow rules and cmd substitution.
+/// Vocabulary bridge: `bash_allow_rules` accepts zode/spec-compatible `Bash(...)`
+/// command-prefix patterns (including external `:*`/always-allow phrasing mapped
+/// by `cmdsubst.matchesAllowRules`); they apply only to this turn.
+pub fn startChatWithCmdRules(m: *tui.Model, input: []const u8, bash_allow_rules: []const []const u8) !void {
+    return startChatImplEx(m, input, .normal, bash_allow_rules, true);
+}
 
-    // The user line goes into the session file in the WORKER, not here: the
-    // append is a DEFLATE and `write(2)` with the whole history behind it, and
-    // doing it on the UI thread is exactly the wait between pressing Enter and
-    // seeing your own prompt on the screen.
+/// Starts a turn with explicit context (used by the TUI queue drain). Queued
+/// turns must preserve mode/rules/cmdsubst or they run with leaked/wrong
+/// semantics.
+pub fn startTurn(
+    m: *tui.Model,
+    input: []const u8,
+    mode: ChatJob.Mode,
+    bash_allow_rules: []const []const u8,
+    expand_cmdsubst: bool,
+) !void {
+    return startChatImplEx(m, input, mode, bash_allow_rules, expand_cmdsubst);
+}
 
-    // [undo] One snapshot per TURN, not per tool: the user thinks in turns
-    // ("undo that"), and the checkpoint is named after the prompt so the
-    // message can say which turn it was. Note it opens AFTER the `enqueuePrompt`
-    // above, because a queued prompt is NOT a new turn (there are no tools yet)
-    // and it would wipe the checkpoint of a turn that had not even started.
-    m.beginCheckpoint(copy);
-
-    // Opens the streaming paragraph and marks busy: the UI can already paint the
-    // spinner while the worker talks to the API.
-    m.streamStart();
-    // No "…": the face already blinks and the clock runs, the ellipsis only
-    // adds noise.
+fn setThinkingStatus(m: *tui.Model) void {
     setStatusWithZo(m, .thinking, "thinking");
+}
 
-    const job = try m.allocator.create(ChatJob);
-    m.beginWorker(); // the worker closes it; if the spawn fails, we close it here
-    job.* = .{ .model = m, .text = copy, .mode = mode };
-    const spawned = std.Thread.spawn(.{}, chatWorker, .{job}) catch null;
-    const th = spawned orelse {
-        m.endWorker();
-        m.allocator.destroy(job);
-        m.allocator.free(copy);
-        m.streamEnd();
-        return error.ThreadSpawnFailed;
-    };
-    th.detach();
+fn startChatImplEx(
+    m: *tui.Model,
+    input: []const u8,
+    mode: ChatJob.Mode,
+    bash_allow_rules: []const []const u8,
+    expand_cmdsubst: bool,
+) !void {
+    return chat_entry.startChatImplEx(m, input, mode, bash_allow_rules, expand_cmdsubst, chatWorker, setThinkingStatus);
 }
 
 /// Replace image references with [image.ext] placeholders for UI display.
-/// Called on the truncated display input to keep the UI compact.
 pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
-    // Common image extensions
-    const image_exts = &[_][]const u8{ "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp" };
-
-    // Find @image.ext patterns and replace them with [image.ext]
-    var result: [512]u8 = undefined;
-    var ri: usize = 0;
-    var li: usize = 0;
-
-    while (li < text.len) {
-        // Look for @ followed by potential image filename
-        if (text[li] == '@' and li + 1 < text.len) {
-            li += 1;
-            // Collect the filename part (up to space, newline, tab, or end)
-            var fe: usize = li;
-            while (fe < text.len and text[fe] != ' ' and text[fe] != '\n' and text[fe] != '\t' and text[fe] != '@') {
-                fe += 1;
-            }
-            const filename = text[li..fe];
-            // Check if it has an image extension (the part after the last dot)
-            const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse continue;
-            // Extension must not be at the start (like .gitignore) and must exist
-            if (dot >= filename.len - 1) {
-                // No valid extension found, copy @ as-is
-                if (ri + 1 > result.len) break;
-                result[ri] = '@';
-                ri += 1;
-                li += 1;
-                continue;
-            }
-            const ext = filename[dot + 1 ..];
-            var is_image = false;
-            var ei: usize = 0;
-            while (ei < image_exts.len) {
-                if (ext.len == image_exts[ei].len) {
-                    var match = true;
-                    var ci: usize = 0;
-                    while (ci < ext.len) {
-                        if (std.ascii.toLower(ext[ci]) != std.ascii.toLower(image_exts[ei][ci])) {
-                            match = false;
-                            break;
-                        }
-                        ci += 1;
-                    }
-                    if (match) {
-                        is_image = true;
-                        break;
-                    }
-                }
-                ei += 1;
-            }
-            if (is_image) {
-                // Replace @image.ext with [image.ext]
-                var repl_buf: [32]u8 = undefined;
-                const repl_slice = std.fmt.bufPrint(repl_buf[0..], "[image.{s}]", .{ext}) catch break;
-                const repl_len = repl_slice.len;
-                if (ri + repl_len > 512) break;
-                @memcpy(result[ri .. ri + repl_len], repl_buf[0..repl_len]);
-                ri += repl_len;
-                li = fe;
-                continue;
-            }
-        }
-        // Copy normal character
-        if (ri + 1 > result.len) break;
-        result[ri] = text[li];
-        ri += 1;
-        li += 1;
-    }
-    return result[0..ri];
+    return loop_helpers.replaceImagePlaceholders(text);
 }
 
-const harness_pipeline_marker = "[zode-harness:pipeline]";
-
-/// Internal pipeline/control prompts that must reach the model via the session
-/// wire but must not be rendered in the TUI transcript (they read as confusing
-/// "internal messages" to the user, especially on resume). We keep them in the
-/// session (correct) and filter them only at replay/display time.
-pub fn isHarnessInternalUserMessage(content: []const u8) bool {
-    if (std.mem.startsWith(u8, content, harness_pipeline_marker)) return true;
-    // Backward compat with sessions written before the marker existed.
-    if (std.mem.startsWith(u8, content, "[Pipeline evidence]")) return true;
-    if (std.mem.startsWith(u8, content, "[Pipeline verification]")) return true;
-    if (std.mem.startsWith(u8, content, "[Pipeline review]")) return true;
-    if (std.mem.startsWith(u8, content, "[Pipeline]")) return true;
-    return false;
-}
+pub const harness_pipeline_marker = agent_loop.harness_pipeline_marker;
+pub const isHarnessInternalUserMessage = agent_loop.isHarnessInternalUserMessage;
 
 /// The harness-authored prompts (gate refusals, checkpoint notes, "continue")
 /// are APPENDED to the session as a `user` message.
@@ -5196,29 +3356,14 @@ pub fn isHarnessInternalUserMessage(content: []const u8) bool {
 /// a prompt is there. This helper is the one door; no copy is kept here.
 fn appendHarnessPrompt(m: *tui.Model, text: []const u8) void {
     const s = ensureSession(m, m.allocator);
-    s.append(.user, text) catch |err| {
-        models_mod.dbg("harness prompt: could not be appended to the session ({t})\n", .{err});
-    };
+    agent_loop.appendHarnessPromptToSession(s, text);
 }
 
 /// Pipeline-internal prompt: reaches the model (session/wire) but is marked so
 /// the TUI can hide it from the visible transcript.
 fn appendPipelineHarnessPrompt(m: *tui.Model, text: []const u8) void {
     const s = ensureSession(m, m.allocator);
-    const marked = std.fmt.allocPrint(
-        m.allocator,
-        "{s}\n{s}",
-        .{ harness_pipeline_marker, text },
-    ) catch {
-        s.append(.user, text) catch |err| {
-            models_mod.dbg("pipeline harness prompt: could not be appended ({t})\n", .{err});
-        };
-        return;
-    };
-    defer m.allocator.free(marked);
-    s.append(.user, marked) catch |err| {
-        models_mod.dbg("pipeline harness prompt: could not be appended ({t})\n", .{err});
-    };
+    agent_loop.appendPipelineHarnessPromptToSession(s, m.allocator, text);
 }
 
 /// The user line of the turn goes into the session file FIRST: the order in
@@ -5226,163 +3371,196 @@ fn appendPipelineHarnessPrompt(m: *tui.Model, text: []const u8) void {
 /// thread is free to paint the prompt instead of waiting on a DEFLATE.
 fn appendUserLine(m: *tui.Model, user_text: []const u8) void {
     const s = ensureSession(m, m.allocator);
-    s.append(.user, user_text) catch {};
-    s.flush();
+    agent_loop.appendUserLineToSession(s, user_text);
 }
 
-/// Per-turn harness budget. Both whoever drives the turn resets this: the
-/// normal turn and the pipeline (whose stages share one budget).
+/// Per-turn harness budget reset (normal + pipeline turns).
 fn resetTurnBudget(m: *tui.Model) void {
-    m.auto_check.resetTurn(&m.bg, io_global);
-    m.asks_this_turn = 0;
-    m.plan_touched_this_turn = false;
-    m.plan_write_blocked_this_turn = false;
-    m.plan_missing_nudges_this_turn = 0;
-    m.bg.cancel_all = false;
+    loop_runtime.resetTurnBudget(m, io_global);
 }
 
-/// Should this prompt run the STAGED pipeline instead of the free-running
-/// loop? `ZODE_PIPELINE=auto` (default) triggers it on a code/install task;
-/// `always` forces it, `off` disables it (`/pipeline <task>` always works).
+/// Should this prompt run the staged pipeline instead of the free-running loop?
 fn pipelineApplies(m: *tui.Model, user_text: []const u8) bool {
     _ = m;
-    const mode = pipeline_mod.modeFrom(envGet(environ_global, "ZODE_PIPELINE"));
-    return switch (mode) {
-        .off => false,
-        .always => true,
-        .auto => pipeline_mod.classify(user_text).wants_pipeline,
-    };
+    return loop_runtime.pipelineApplies(envGet(environ_global, "ZODE_PIPELINE"), user_text);
+}
+
+fn pushBgTaskInfo(m: *tui.Model, id: u32, status_word: []const u8) void {
+    pushInfoFmt(m, "bg task {d} {s}", .{ id, status_word });
 }
 
 fn drainBackgroundTaskNotifications(m: *tui.Model) void {
     var arena_state = std.heap.ArenaAllocator.init(m.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const done = m.bg.drainCompletions(arena);
-    for (done) |c| {
-        const status = switch (c.state) {
-            .killed => "killed",
-            .finished => if (c.exit != null and c.exit.? == 0) "finished (exit 0)" else "finished (failed)",
-            else => "finished",
-        };
-        const exit_part = if (c.exit) |e|
-            std.fmt.allocPrint(arena, " exit={d}", .{e}) catch ""
-        else
-            "";
-        const path_part = if (c.output_path) |p|
-            std.fmt.allocPrint(arena, " Output file: {s}. Use `bash_output` with id {d} to read any unread output (incremental).", .{ p, c.id }) catch
-                std.fmt.allocPrint(arena, " Use `bash_output` with id {d} to read output.", .{c.id}) catch ""
-        else
-            std.fmt.allocPrint(arena, " Use `bash_output` with id {d} to read output.", .{c.id}) catch "";
-        const msg = std.fmt.allocPrint(
-            m.allocator,
-            "[background task finished] job {d} ({s}) {s}{s}.{s}",
-            .{ c.id, c.command, status, exit_part, path_part },
-        ) catch continue;
-        defer m.allocator.free(msg);
-        appendHarnessPrompt(m, msg);
-        pushInfoFmt(m, "bg task {d} {s}", .{ c.id, if (c.state == .killed) "killed" else "finished" });
-    }
+    loop_runtime.drainBackgroundTaskNotifications(
+        tui.Model,
+        m,
+        arena_state.allocator(),
+        appendHarnessPrompt,
+        pushBgTaskInfo,
+    );
+}
+
+
+fn isBashAlwaysAllowedForCmdSubst() bool {
+    return isAlwaysAllowed("bash");
+}
+
+fn bashCommandAllowedForCmdSubst(command: []const u8) bool {
+    return bashPatternAllowed("bash", command);
+}
+
+fn reportCmdSubstFailure(m: *tui.Model, msg: []const u8) void {
+    m.streamEnd();
+    pushError(m, msg);
+    setStatusWithZo(m, .warn, "command substitution failed");
+}
+
+/// Expands prompt command substitutions for a worker turn. On failure it reports
+/// the error, ends streaming/status appropriately, and returns false (caller must
+/// return from worker). On success it may replace `user_text` with an owned copy.
+fn expandWorkerCmdSubst(m: *tui.Model, job: *ChatJob, user_text: *[]const u8) bool {
+    return cmdsubst_expand.expand(m, job.expand_cmdsubst, job.bash_allow_rules, user_text, .{
+        .io = io_global,
+        .perm = .{
+            .isBashAlwaysAllowed = isBashAlwaysAllowedForCmdSubst,
+            .bashCommandAllowed = bashCommandAllowedForCmdSubst,
+        },
+        .reportFailure = reportCmdSubstFailure,
+    });
+}
+
+
+fn runWorkerTurn(m: *tui.Model, user_text: []const u8, mode: ChatJob.Mode) void {
+    worker_turn.run(m, user_text, mode, .{
+        .pipelineApplies = pipelineApplies,
+        .runPipeline = runPipeline,
+        .runCodeReview = runCodeReview,
+        .runNormalTurn = runNormalTurn,
+    });
 }
 
 /// The worker: one turn of conversation with the API, with tools.
 fn chatWorker(job: *ChatJob) void {
-    const m = job.model;
-    const user_text = job.text;
-    defer {
-        m.allocator.free(user_text);
-        m.allocator.destroy(job);
-    }
-    // Worker counter: the thread is decoupled, and on exit you have to wait for it
-    // BEFORE destroying the `Io` (see `Model.waitWorkers`).
-    m.beginWorker();
-    defer m.endWorker();
-
-    // The task pipeline. A prompt that is a code task — or one the user sent
-    // through `/pipeline` — runs the staged flow (evidence → implement →
-    // tester → verify → review) instead of the free-running loop. ESC and
-    // the permission dialogs work the same; the difference is the order and
-    // the verification the harness performs on its own. `/code-review` does
-    // the review stage alone, read-only.
-    if (job.mode == .pipeline) {
-        runPipeline(m, user_text);
-        return;
-    }
-    if (job.mode == .review) {
-        runCodeReview(m, user_text);
-        return;
-    }
-    if (pipelineApplies(m, user_text)) {
-        runPipeline(m, user_text);
-        return;
-    }
-
-    // The user line of the turn lands in the session file HERE: this is the
-    // first thing the turn does, so the order in the file is unchanged (user
-    // line, then whatever the iterations append), and the UI thread is free to
-    // paint your prompt the moment you press Enter instead of waiting on a
-    // DEFLATE and a `write(2)`.
-    appendUserLine(m, user_text);
-
-    // The automatic typecheck's budget is PER TURN, and any job left over from the
-    // previous one is killed rather than orphaned. Both live in `resetTurn` so the
-    // headless runner gets the same behaviour from the same code.
-    resetTurnBudget(m);
-
-    // The turn stats start here (not in `runOneTurn`): the turn is the whole
-    // `chatWorker`, with its 8 iterations.
-    turn_stats.reset(m.allocator, std.Io.Timestamp.now(io_global, .real).nanoseconds);
-    defer turn_stats.deinit();
-    // Nudge counters reset every turn: a fresh user prompt gets a fresh budget
-    // of nudges so the model isn't nagged forever across turns.
-    m.implementation_nudges = 0;
-    m.empty_reply_nudges = 0;
-
-    const outcome = runAgentLoop(m, user_text);
-    m.streamEnd();
-    endTurn(m, outcome.iterations, outcome.capped);
+    chat_worker_mod.run(job, .{
+        .installTurnBashAllowRules = installTurnBashAllowRules,
+        .restoreTurnBashAllowRules = restoreTurnBashAllowRules,
+        .expandWorkerCmdSubst = expandWorkerCmdSubst,
+        .runWorkerTurn = runWorkerTurn,
+    });
 }
+
+fn resetTurnStatsForNormalTurn(m: *tui.Model, io: std.Io) void {
+    turn_stats.reset(m.allocator, std.Io.Timestamp.now(io, .real).nanoseconds);
+}
+
+fn deinitTurnStatsForNormalTurn() void {
+    turn_stats.deinit();
+}
+
+/// Runs the normal (non-pipeline/review) turn flow on the worker thread.
+fn runNormalTurn(m: *tui.Model, user_text: []const u8) void {
+    normal_turn.run(m, user_text, .{
+        .io = io_global,
+        .appendUserLine = appendUserLine,
+        .resetTurnBudget = resetTurnBudget,
+        .resetTurnStats = resetTurnStatsForNormalTurn,
+        .deinitTurnStats = deinitTurnStatsForNormalTurn,
+        .runAgentLoop = runAgentLoop,
+        .endTurn = endTurn,
+    });
+}
+
 
 /// What the loop ended with.
-pub const TurnOutcome = struct {
-    iterations: usize,
-    capped: bool,
-    reason: taskloop.StopReason = .done,
-};
+pub const TurnOutcome = agent_types.TurnOutcome;
 
-/// Case-insensitive substring search (Zig 0.17 removed std.ascii.indexOfIgnoreCase).
-fn idxIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
+
+
+
+const LoopFlowAction = loop_end_checks.LoopFlowAction;
+
+fn currentPermModeIsReadOnly() bool {
+    return currentPermMode() == .read_only;
 }
 
-/// Did the user's prompt ask for something to be implemented (code, files,
-/// changes)? Used to decide whether to nudge the model when it stops after
-/// only exploring.
-fn user_wants_implementation(text: []const u8) bool {
-    const impl_signals = [_][]const u8{
-        "implement", "implementa", "implementar",
-        "create",    "crea",       "crear",
-        "write",     "escribe",    "escribir",
-        "build",     "construir",  "fix",
-        "corrige",   "corregir",   "arregla",
-        "arreglar",  "add",        "agrega",
-        "agregar",   "feature",    "funcionalidad",
-        "component", "componente", "stack",
-        "pilas",     "refactor",   "migrate",
-        "update",    "change",     "delete",
-        "remove",    "rename",     "move",
-        "make",      "resolve",    "optimize",
-        "automate",
+fn pushGoalMetOpenSteps(m: *tui.Model, open: usize, done: usize, total: usize) void {
+    pushErrorFmt(
+        m,
+        "you declared the goal MET but {d} of your own plan steps are still open ({d}/{d} done). Close them and declare again, or call `goal` with status blocked.",
+        .{ open, done, total },
+    );
+}
+
+fn loopEndChecksOps() loop_end_checks.Ops {
+    return .{
+        .appendHarnessPrompt = appendHarnessPrompt,
+        .pushError = pushError,
+        .pushErrorOwned = pushErrorOwned,
+        .pushGoalMetOpenSteps = pushGoalMetOpenSteps,
+        .currentPermModeIsReadOnly = currentPermModeIsReadOnly,
+        .planApprovalNudge = planApprovalNudge,
+        .loopV2 = loopV2,
+        .loopEvidence = loopEvidence,
+        .loopMark = loopMark,
+        .progressText = progressText,
     };
-    for (impl_signals) |s| {
-        if (idxIgnoreCase(text, s) != null) return true;
-    }
-    return false;
+}
+
+fn applyGoalContractAndEnd(m: *tui.Model, reason: *taskloop.StopReason) LoopFlowAction {
+    return loop_end_checks.applyGoalContractAndEnd(m, reason, turn_stats.tools, loopEndChecksOps());
+}
+
+fn applyNaturalTurnEndChecks(
+    m: *tui.Model,
+    plan_gate_asks: *u8,
+    reason: *taskloop.StopReason,
+) LoopFlowAction {
+    return loop_end_checks.applyNaturalTurnEndChecks(m, plan_gate_asks, reason, loopEndChecksOps());
+}
+
+const LoopGuardAction = loop_guards.LoopGuardAction;
+const ExitGateAction = loop_guards.ExitGateAction;
+
+fn loopGuardsOps() loop_guards.UiOps {
+    const S = struct {
+        fn pushGateLimit(m: *tui.Model, limit: u8) void {
+            pushErrorFmt(m, "exit gate refused {d} times on a red build; ending this turn anyway. If this task cannot be completed here, call `goal` with status blocked and what_would_unblock.", .{limit});
+        }
+        fn pushRepeatStop(m: *tui.Model, which: []const u8) void {
+            pushInfoFmt(m, "stopped a repeated tool loop ({s})", .{which});
+        }
+    };
+    return .{
+        .io = io_global,
+        .appendHarnessPrompt = appendHarnessPrompt,
+        .pushError = pushError,
+        .pushErrorOwned = pushErrorOwned,
+        .pushGateLimit = S.pushGateLimit,
+        .pushRepeatStop = S.pushRepeatStop,
+    };
+}
+
+fn applyLoopV2BudgetCheckpoint(
+    m: *tui.Model,
+    iterations: usize,
+    policy: *?taskloop.Policy,
+    last_mark: *?LoopMark,
+    reason: *taskloop.StopReason,
+) bool {
+    return loop_end_checks.applyLoopV2BudgetCheckpoint(m, iterations, policy, last_mark, reason, loopEndChecksOps());
+}
+
+fn applyStopHookGuard(m: *tui.Model) bool {
+    return loop_guards.applyStopHookGuard(m, loopGuardsOps());
+}
+
+fn applyRepeatGuard(m: *tui.Model, repeat_recovery: *repeats_mod.Recovery) LoopGuardAction {
+    return loop_guards.applyRepeatGuard(m, repeat_recovery, loopGuardsOps());
+}
+
+fn applyExitGateCheck(m: *tui.Model, gate_continue_count: *u8, gate_continue_limit: u8) ExitGateAction {
+    return loop_guards.applyExitGateCheck(m, gate_continue_count, gate_continue_limit, loopGuardsOps());
 }
 
 /// The agent loop shared by the normal turn and the pipeline's stages.
@@ -5390,360 +3568,108 @@ fn user_wants_implementation(text: []const u8) bool {
 /// Returns what the ceiling did to the loop. The caller owns the final
 /// steps (`streamEnd` + `endTurn`), which is what lets the pipeline run the
 /// stages without printing the "Done" line after each one.
-fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
-    var iterations: usize = 0;
-    // Phase 5/34.6: UserPromptSubmit hooks (side effects; additionalContext noted best-effort).
-    {
-        const up_res = hooks_mod.fire(m.allocator, &hooks_set, .{
-            .event = .UserPromptSubmit,
-            .prompt = user_text,
-        }, io_global) catch &[_]hooks_mod.RunResult{};
-        defer if (up_res.len > 0) hooks_mod.freeResults(m.allocator, up_res);
-        if (hooks_mod.notesText(m.allocator, up_res) catch null) |note| {
-            defer m.allocator.free(note);
-            appendHarnessPrompt(m, note);
-        }
-    }
 
-    // ── the loop, and the three things that decide when it stops ──
-    //
-    // `soft` is the reported target. `hard` only exists when a goal is set: it is what
-    // a `/goal` earns, and it is generous on purpose, because a task that reaches 60
-    // iterations was never going to be finished by stopping at 12 — it should have said
-    // `blocked` long before.
-    //
-    // The goal is cleared HERE and not at the end of the turn: a second prompt in the
-    // queue must not inherit the previous turn's objective, or "and now make it 5 KB"
-    // silently becomes a different goal than the one that was answered.
-    const had_goal = m.goal.isSet();
-    if (had_goal) {
+fn fireUserPromptSubmitHooks(m: *tui.Model, user_text: []const u8) void {
+    const up_res = hooks_mod.fire(m.allocator, &hooks_set, .{
+        .event = .UserPromptSubmit,
+        .prompt = user_text,
+    }, io_global) catch &[_]hooks_mod.RunResult{};
+    defer if (up_res.len > 0) hooks_mod.freeResults(m.allocator, up_res);
+    if (hooks_mod.notesText(m.allocator, up_res) catch null) |note| {
+        defer m.allocator.free(note);
+        appendHarnessPrompt(m, note);
+    }
+}
+
+fn resetInheritedGoalState(m: *tui.Model) void {
+    if (m.goal.isSet()) {
         m.goal.status = goal_mod.Status.none;
         m.goal.checkpoints = 0;
         m.goal.blocked_refusals = 0;
     }
+}
 
-    // Ceiling: a turn that keeps asking for tools must end, or a task like
-    // "summarise this project" becomes read-file → read-file forever. The
-    // limit is generous by default and overridable with ZODE_MAX_ITER /
-    // ZODE_GOAL_MAX; it only stops the pathological loop, never a real task.
-    // A turn that hits the ceiling gets one final reply with tools disabled
-    // so it can write its summary instead of ending in silence.
-    const limit = statusIterationLimit(m);
-    m.repeats.reset();
-    var repeat_recovery: repeats_mod.Recovery = .{};
-    // How many times this turn has shown the plan-approval dialog. Bounded so
-    // "reject → revise → re-present" can cycle once but a turn that keeps being
-    // rejected ends on the ordinary ceiling instead of asking forever.
-    var plan_gate_asks: u8 = 0;
 
-    // A NEW turn starts un-cancelled: ESC belongs to the turn it interrupted.
-    chat.cancel_current.store(false, .seq_cst);
-    // Defensive: a previous path must never leave the schema/tool gate stuck.
-    m.deny_all_tools = false;
+const LoopIterStart = loop_iter.LoopIterStart;
 
-    var capped: bool = false;
-    var gate_continue_count: u8 = 0;
-    // How many times the exit gate has forced `continue` this turn on a red build.
-    // Bounded so a build that keeps failing does not cage the turn forever.
-    const gate_continue_limit: u8 = 3;
-    // Task-scoped loop state: only active when ZODE_LOOP_V2=1.
-    var policy: ?taskloop.Policy = null;
-    var last_mark: ?LoopMark = null;
-    var reason: taskloop.StopReason = .done;
-    if (loopV2()) {
-        policy = taskloop.Policy{ .budget = loopBudget(m) };
-        last_mark = loopMark(m);
-    }
-    drainBackgroundTaskNotifications(m);
-    while (iterations < limit) : (iterations += 1) {
-        drainBackgroundTaskNotifications(m);
-        // ESC is a STOP, not a "skip this answer".
-        //
-        // The key handler sets `chat.cancel_current`, which aborts the request
-        // in flight, kills the foreground command and the background jobs — and
-        // then the loop went on to the next iteration, `runOneTurn` cleared the
-        // flag and the agent kept working. From the user's side ESC did nothing:
-        // the answer stopped and the work did not. Checked BEFORE the request,
-        // so the flag is still the one they set.
-        if (chat.cancel_current.load(.seq_cst)) {
-            chat.cancel_current.store(false, .seq_cst);
-            pushInfo(m, "stopped (esc)");
-            reason = .cancelled;
-            break;
-        }
+fn setTurnIteration(it: usize) void {
+    turn_stats.iterations = it;
+}
 
-        // ── Task-scoped budget checkpoint (ZODE_LOOP_V2 only) ─────────────────
-        // Only from iteration 1 on: iteration 0 never checkpoints.
-        if (loopV2() and iterations > 0) {
-            const mark = loopMark(m);
-            const changed = !std.meta.eql(mark, last_mark orelse mark);
-            if (policy) |*p| {
-                p.note(iterations, changed);
-                last_mark = mark;
-                switch (p.decide(iterations)) {
-                    .work => {},
-                    .checkpoint => {
-                        const prompt = std.fmt.allocPrint(
-                            m.allocator,
-                            "Checkpoint: {d} iterations used, {d} left before the next one. {s}. Keep going and finish what is open; do not restart work that is already done. If it genuinely cannot be finished here, call `goal` with status blocked and what_would_unblock.\n",
-                            .{ iterations, p.budget.soft - iterations, progressText(loopEvidence(m)) },
-                        ) catch null;
-                        if (prompt) |text| {
-                            appendHarnessPrompt(m, text);
-                            m.allocator.free(text);
-                        }
-                    },
-                    .stop => |why| {
-                        reason = why;
-                        break;
-                    },
-                }
-            }
-            if (reason != .done) break;
-        }
+fn beginLoopIteration(
+    m: *tui.Model,
+    iterations: usize,
+    policy: *?taskloop.Policy,
+    last_mark: *?LoopMark,
+    reason: *taskloop.StopReason,
+) LoopIterStart {
+    return loop_iter.begin(m, iterations, policy, last_mark, reason, .{
+        .drainBackgroundTaskNotifications = drainBackgroundTaskNotifications,
+        .pushStopped = pushStoppedForLoopError,
+        .applyLoopV2BudgetCheckpoint = applyLoopV2BudgetCheckpoint,
+        .setTurnIteration = setTurnIteration,
+    });
+}
 
-        turn_stats.iterations = iterations + 1;
-        const again = runOneTurn(m, user_text, iterations) catch |err| {
-            if (err == error.Cancelled or chat.cancel_current.load(.seq_cst)) {
-                chat.cancel_current.store(false, .seq_cst);
-                pushInfo(m, "stopped (esc)");
-                return .{ .iterations = iterations, .capped = false, .reason = .cancelled };
-            }
-            reportErr(m, err);
-            // With free-auto on, the pool's state IS the user's next question ("so what
-            // now?"), and the answer fits on one line. Without this you see an
-            // error and nothing else.
-            notePoolState(m);
-            return .{ .iterations = iterations, .capped = false, .reason = .done };
-        };
-        // 0. THE EXIT GATE: may this turn end on the code as it is right now?
-        //
-        //    FIRST, before `again orelse break` and before the repetition guard, and that
-        //    order is the whole fix. The first version of this rule sat two checks below,
-        //    which made it DEAD CODE on the common path: the model stops calling tools,
-        //    `again` is null, and the `orelse break` above had already ended the turn.
-        //    A rule about not stopping has to be ABOVE every stop.
-        //
-        //    This is the check that turns "the turn ended" into "the task ended". The
-        //    harness knows the build failed — it read the exit code and built the model's
-        //    own error message out of the diagnostics — and then let the turn end anyway,
-        //    five times out of five, on a task that was about code compiling.
-        //
-        //    Asking the model whether it is finished is what does not work: a turn that
-        //    has ended in prose is a turn where nobody is grading anything, and the one
-        //    moment a self-assessment would be worth something is the one moment there is
-        //    nobody left to give it. The harness has the evidence; the loop just has to
-        //    ask with it.
-        //
-        //    It waits for a check that is in flight, and starts one more of its own if
-        //    the code has been written since the last finished check. That is the whole
-        //    difference from the old rule, which only looked at the verdict of a check
-        //    that happened to have finished.
-        //
-        //    `blocked` is honoured ABOVE all of it, and never inside the gate: a real
-        //    blocker has to be declarable or this is a cage.
-        //
-        //    ## It runs on EVERY iteration, which is what makes it a gate
-        //
-        //    The first version of the gate ran once, at the end of the turn, after the
-        //    loop had already decided to stop — so the diagnostics were collected, put
-        //    in the history and read by nobody. A check that only runs when the turn is
-        //    over is a check that arrives after the decision.
-        //
-        //    Running it at the TOP of every iteration is what makes it a gate rather
-        //    than a report: the model is told the build is red while it still has budget
-        //    to fix it, and the turn does not end until the code it wrote is either
-        //    green or declared `blocked`.
-        if (m.goal.status != goal_mod.Status.blocked) {
-            if (m.auto_check.exitGate(&m.bg, m.allocator, io_global)) |refusal| {
-                // A `met` that the code contradicts goes back to open, so the ordinary
-                // checkpoint and the ordinary ceiling apply from here. Two artefacts from
-                // the SAME model disagreeing — "I am finished" over a build that says
-                // otherwise — is not something to resolve by trusting one of them.
-                if (m.goal.status == goal_mod.Status.met) m.goal.status = goal_mod.Status.none;
-                pushErrorOwned(m, refusal);
-                if (gate_continue_count >= gate_continue_limit) {
-                    pushErrorFmt(m, "exit gate refused {d} times on a red build; ending this turn anyway. If this task cannot be completed here, call `goal` with status blocked and what_would_unblock.", .{gate_continue_limit});
-                    break;
-                }
-                gate_continue_count += 1;
-                appendHarnessPrompt(m, "The harness will not end this turn yet: the code you wrote does not have a passing check behind it. Read the problems above, fix them, and let the check run again. If you genuinely cannot, call `goal` with status blocked and what_would_unblock.");
-                continue;
-            }
-        }
+fn handleLoopTurnSuccess(
+    m: *tui.Model,
+    again: bool,
+    gate_continue_count: *u8,
+    gate_continue_limit: u8,
+    repeat_recovery: *repeats_mod.Recovery,
+    plan_gate_asks: *u8,
+    reason: *taskloop.StopReason,
+) LoopFlowAction {
+    return loop_success.handle(m, again, gate_continue_count, gate_continue_limit, repeat_recovery, plan_gate_asks, reason, .{
+        .applyExitGateCheck = applyExitGateCheck,
+        .applyStopHookGuard = applyStopHookGuard,
+        .applyRepeatGuard = applyRepeatGuard,
+        .applyNaturalTurnEndChecks = applyNaturalTurnEndChecks,
+    });
+}
 
-        // Gate passed: the user's stop hook can now claim the turn.
-        // The gate ran FIRST (above), so the hook and the gate never both
-        // claim the turn — if the gate refused, this is not reached.
-        if (m.auto_check.stopHookCheck("turn_end", m.allocator)) |refusal| {
-            pushError(m, refusal);
-            appendHarnessPrompt(m, "The harness will not end this turn yet: a stop hook is in force. Resolve it and end the turn, or remove the hook.");
-            continue;
-        }
+fn pushStoppedForLoopError(m: *tui.Model) void {
+    pushInfo(m, "stopped (esc)");
+}
 
-        if (m.loop_repeated) |which| {
-            m.loop_repeated = null;
-            switch (repeat_recovery.onRepeat()) {
-                .nudge => {
-                    m.repeats.reset();
-                    appendHarnessPrompt(m, "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.");
-                    continue;
-                },
-                .stop => {
-                    appendHarnessPrompt(m, "The harness stopped this turn because the same tool call repeated with unchanged arguments after you were asked to change approach. Summarize what you learned and what remains.");
-                    pushInfoFmt(m, "stopped a repeated tool loop ({s})", .{which});
-                    break;
-                },
-            }
-        }
+fn handleRunOneTurnLoopError(m: *tui.Model, err: anyerror, iterations: usize) TurnOutcome {
+    return loop_outcome.handleRunOneTurnLoopError(m, err, iterations, .{
+        .pushStopped = pushStoppedForLoopError,
+        .reportErr = reportErr,
+        .notePoolState = notePoolState,
+    });
+}
 
-        if (!again) {
-            // ── PLAN APPROVAL: the turn may not end with a plan nobody answered on ──
-            //
-            // Plan mode's whole point is investigate → plan → the developer says
-            // yes or no. This loop is the only place that knows the model just
-            // tried to end its turn, so the gate lives HERE: the plan block is
-            // already on screen and the final answer is already painted, which
-            // is exactly what the user needs to read before answering. The
-            // worker blocks on the dialog like it does on every `ask`, and the
-            // activity strip keeps showing that zode is waiting.
-            //
-            // A goal verdict cannot bypass this gate. In plan mode, even a
-            // declared `met` or `blocked` is not approval to implement.
-            if (currentPermMode() == .read_only) {
-                if (m.plan_write_blocked_this_turn and !m.plan_touched_this_turn and m.plan_missing_nudges_this_turn < 2) {
-                    m.plan_missing_nudges_this_turn += 1;
-                    appendHarnessPrompt(m, "Plan mode blocked a write because no implementation plan has been recorded yet. Use `todo` to show the complete, concrete plan to the user, then end your turn so they can approve or revise it. Do not retry the blocked write.");
-                    continue;
-                }
-                if (m.plan_write_blocked_this_turn and !m.plan_touched_this_turn) {
-                    pushError(m, "plan mode is still active: no implementation plan was recorded, so no approval was requested and no write was allowed");
-                    break;
-                }
-                if (m.plan_touched_this_turn and !m.plan.isEmpty() and plan_gate_asks < 2) {
-                    plan_gate_asks += 1;
-                    if (planApprovalNudge(m)) |nudge| {
-                        appendHarnessPrompt(m, nudge);
-                        m.allocator.free(nudge);
-                        continue;
-                    }
-                }
-            }
-
-            // ── Completion contract (ZODE_LOOP_V2 only) ───────────────────────
-            // Before the turn may end naturally, the evidence must allow it.
-            if (loopV2()) {
-                const evidence = loopEvidence(m);
-                if (taskloop.endReason(evidence)) |why| {
-                    reason = why;
-                    break;
-                }
-                if (m.plan_touched_this_turn and m.plan.openCount() > 0 and plan_gate_asks < 2) {
-                    plan_gate_asks += 1;
-                    appendHarnessPrompt(m, "Your plan still has open steps. Continue the task and close them, or call `goal` with status blocked and what_would_unblock if they cannot be finished here.");
-                    continue;
-                }
-                if (m.goal.isOpen() and m.goal.checkpoints < 2) {
-                    m.goal.checkpoints += 1;
-                    appendHarnessPrompt(m, "The goal is still open. Keep going until it is met, or call `goal` with status blocked and what_would_unblock.");
-                    continue;
-                }
-                reason = .stalled;
-                break;
-            }
-            break;
-        }
-
-        if (again) continue; // tool results are already in the session; ask the model again
-
-        // 1. The goal was decided. The model said so, and it is the only thing that
-        //    ends a goal turn early.
-        //
-        //    EXCEPT a `met` WITH OPEN PLAN STEPS, which is the model contradicting
-        //    itself in the same breath: it wrote down four steps, ticked two, and then
-        //    said the work is finished. Measured on the first successful run: exactly
-        //    that — `goal(met)` accepted with steps 3 and 4 still unticked on screen.
-        //
-        //    The turn does not end there. The plan is the model's OWN bookkeeping, so
-        //    the harness can read the contradiction without asking it anything, and the
-        //    model's way out stays machine-readable: close the steps, or declare
-        //    `blocked`. Refusing is not the harness distrusting the verdict — it is two
-        //    of the model's own artefacts disagreeing, and which one is wrong is
-        //    exactly what the model is for.
-        if (!verdictIsFinal(m.goal, m.plan.openCount()) and m.goal.status == goal_mod.Status.met and m.goal.checkpoints == 0) {
-            var g = m.goal;
-            g.checkpoints += 1;
-            m.goal = g;
-            // Back to open, so the ordinary checkpoint and the ordinary ceiling apply
-            // from here: one refusal, and if it argues, the budget is what ends it.
-            m.goal.status = goal_mod.Status.none;
-            pushErrorFmt(
-                m,
-                "you declared the goal MET but {d} of your own plan steps are still open ({d}/{d} done). Close them and declare again, or call `goal` with status blocked.",
-                .{ m.plan.openCount(), m.plan.doneCount(), m.plan.items.len },
-            );
-            appendHarnessPrompt(m, "The harness will not accept `met` yet: your plan still has open steps. Finish them, tick them with `todo`, and call `goal` again — or, if they genuinely cannot be finished here, call `goal` with status blocked and what_would_unblock.");
-            continue;
-        }
-
-        // 1b. `blocked` with nothing behind it.
-        //
-        //     `what_would_unblock` is a field the model FILLS IN, and a field is as easy
-        //     to invent as a fact: "the network is down" costs the same to write as "here
-        //     is the key", and the harness accepted both with the same confidence. So the
-        //     second half of the justification is something it can read off its own state
-        //     — did the turn actually TRY? A `blocked` on the first response with no tool
-        //     ever run is a shrug with a JSON body: nothing was read, nothing executed,
-        //     so there is no evidence for a claim about what is impossible.
-        //
-        //     Refused ONCE. A second `blocked` after the model has run tools is accepted,
-        //     and it has to be: a task that genuinely cannot be done here is exactly what
-        //     `blocked` is for, and a rule with no exit is a cage.
-        if (!goal_mod.verdictCredible(&m.goal, turn_stats.tools)) {
-            m.goal.blocked_refusals += 1;
-            m.goal.status = goal_mod.Status.none;
-            // The refusal and the prompt are TWO buffers. `pushErrorOwned` takes
-            // ownership (the drain moves the pointer into `paras` and
-            // `Model.deinit` frees it), so handing the same slice to `owned`
-            // made it a second owner: a use-after-free while the UI painted the
-            // paragraph, and a double free at teardown. It was `owned = why`
-            // right after `pushErrorOwned(m, why)`. `exitGate`'s refusal 150
-            // lines up has the right shape: the error gets its buffer, the
-            // prompt gets its own.
-            pushErrorOwned(m, goal_mod.blockedRetryText(m.allocator) catch break);
-            appendHarnessPrompt(m, goal_mod.blockedRetryPrompt());
-            continue;
-        }
-
-        if (m.goal.status != goal_mod.Status.none) {
-            reason = .done;
-            break;
-        }
-
-        // 2. The model stopped asking for tools, or it answered in prose while the goal
-        //    is still open. That is the natural end of the turn: break out of the loop
-        // and let endTurn print the summary.
-        break;
-    }
-
-    // Ceiling reached: the model still wants tools but the budget is gone.
-    // Give it one final word with no tools — it can summarise what it did
-    // and where it left off, but it cannot write, edit or run anything.
-    if (iterations >= limit) {
-        capped = true;
-        reason = .ceiling;
-        m.deny_all_tools = true;
-        defer m.deny_all_tools = false;
-        const ceiling_prompt = "The iteration budget for this turn is exhausted. Tools are disabled for this reply — no code can be written now. Write a plain summary of at most 10 lines: what was actually done, what remains unfinished or unverified, which files were touched, and the single next step. Do not apologise for stopping.";
-        appendHarnessPrompt(m, ceiling_prompt);
-        _ = runOneTurn(m, user_text, iterations) catch |err| reportErr(m, err);
-    }
-
-    return .{
-        .iterations = iterations,
-        .capped = capped,
-        .reason = reason,
-    };
+fn finishAgentLoopOutcome(
+    m: *tui.Model,
+    user_text: []const u8,
+    iterations: usize,
+    limit: usize,
+    capped: *bool,
+    reason: *taskloop.StopReason,
+) TurnOutcome {
+    return loop_outcome.finishAgentLoopOutcome(m, user_text, iterations, limit, capped, reason, .{
+        .runCeilingSummaryTurn = runCeilingSummaryTurn,
+    });
+}
+fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
+    return loop_run.run(m, user_text, .{
+        .init = .{
+            .fireUserPromptSubmitHooks = fireUserPromptSubmitHooks,
+            .resetInheritedGoalState = resetInheritedGoalState,
+            .statusIterationLimit = statusIterationLimit,
+            .loopV2 = loopV2,
+            .loopBudget = loopBudget,
+            .loopMark = loopMark,
+            .drainBackgroundTaskNotifications = drainBackgroundTaskNotifications,
+        },
+        .beginLoopIteration = beginLoopIteration,
+        .runOneTurn = runOneTurn,
+        .handleRunOneTurnLoopError = handleRunOneTurnLoopError,
+        .handleLoopTurnSuccess = handleLoopTurnSuccess,
+        .applyGoalContractAndEnd = applyGoalContractAndEnd,
+        .finishAgentLoopOutcome = finishAgentLoopOutcome,
+    });
 }
 
 /// The end-of-turn tail, shared by the normal turn and the pipeline stages:
@@ -5751,50 +3677,105 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
 ///
 /// `turn_iterations` is the count of executed iterations (the loop's own
 /// counter for a normal turn, the accumulated total for a pipeline run).
-fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
-    // Phase 5/34.6: Stop hooks fire when the turn ends.
-    {
-        const stop_res = hooks_mod.fire(m.allocator, &hooks_set, .{ .event = .Stop }, io_global) catch &[_]hooks_mod.RunResult{};
-        defer if (stop_res.len > 0) hooks_mod.freeResults(m.allocator, stop_res);
-        _ = hooks_mod.notesText(m.allocator, stop_res) catch null; // side effects; notes best-effort
+
+
+
+
+fn ensureAndSyncSystemPrompt(m: *tui.Model, gpa: std.mem.Allocator, s: *session_mod.Session) void {
+    var has_system = false;
+    for (s.messages.items) |mm| {
+        if (mm.role == .system) has_system = true;
     }
-    // The bench sample is taken HERE, once per turn, and not per iteration: a
-    // turn is the unit the user thinks in ("that took 40 s"), and a per-iteration
-    // sample would make the average turn time a fiction.
-    m.bench.noteTurn(turn_iterations, turn_stats.elapsedMs(nowNs()), m.ttftMillis(), capped);
-    // The read cache's hit count, ONCE per turn: reading `m.reads.stats` from the
-    // draw every frame would take the cache's lock 60 times a second for a number
-    // that changes once per turn.
-    m.bench.read_hits = m.reads.stats.hits;
-    // The automatic typecheck, WAITED FOR.
-    //
-    // Measured: with the result only read at the start of the next turn, a turn
-    // that ends right after the edit collected nothing — the `zig build` it had
-    // started was still running — and the next turn's reset killed it. So the
-    // feature produced nothing on exactly the turns it exists for.
-    finishAutoCheck(m);
-    maybeProposeMemories(m);
-    pushTurnSummary(m);
+    if (!has_system) {
+        s.append(.system, systemPromptBase(gpa)) catch {};
+    }
+    syncSystemPrompt(s);
+
+    if (prompt_system.cacheBreakLastBlock()) |name| {
+        m.pushInfoFmt("prompt cache broke: {s} block changed at byte {d}", .{ name, prompt_system.cacheBreakLastPos() });
+    } else if (cacheBreakUnstable()) {
+        m.pushInfo("prompt cache: writes per request above 0.5 — prefix may be unstable");
+    }
+}
+
+fn appendFinishedAutoCheckNote(m: *tui.Model, gpa: std.mem.Allocator, s: *session_mod.Session) void {
+    if (m.auto_check.collect(&m.bg, io_global)) |note| {
+        const owned = gpa.dupe(u8, note) catch null;
+        if (owned) |text| {
+            s.append(.user, text) catch m.allocator.free(text);
+            // The same verdict as a durable blocker fact: the note above is a
+            // `user` message tier-1 compaction may elide, the fact below is
+            // re-attached verbatim until the project changes.
+            const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+            _ = m.addFact(.blocker, text[0..line_end], "", 0);
+            pushInfoFmt(m, "· {s} checked the code you just wrote", .{
+                m.auto_check.label[0..m.auto_check.label_len],
+            });
+        }
+    }
+}
+
+const WireSnapshot = struct {
+    msgs: []chat.ChatMessage,
+    mentions_in: MentionCount,
+};
+
+fn buildWireSnapshot(m: *tui.Model, arena: std.mem.Allocator) WireSnapshot {
+    var mentions_in: MentionCount = .{};
+    const msgs1 = withMentions(arena, snapshotMsgs(arena), &mentions_in);
+    return .{
+        .msgs = withPendingImages(m, arena, msgs1),
+        .mentions_in = mentions_in,
+    };
+}
+
+fn ensureTurnModelReady(m: *tui.Model, http: *http_client.Http, pick: *Target) bool {
+    if (pick.model.len == 0) {
+        _ = resolveModel(m, http);
+        pick.* = pickTarget(m);
+        updateModelContextFromPick(pick.*);
+    }
+    if (pick.model.len == 0) {
+        m.streamEnd();
+        pushInfo(m, "no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
+        setStatusWithZo(m, .warn, "no model");
+        return false;
+    }
+    routerWarnOnce(m, pick.model);
+    return true;
+}
+
+fn runCeilingSummaryTurn(
+    m: *tui.Model,
+    user_text: []const u8,
+    iterations: usize,
+    capped: *bool,
+    reason: *taskloop.StopReason,
+) void {
+    capped.* = true;
+    reason.* = .ceiling;
+    m.deny_all_tools = true;
+    defer m.deny_all_tools = false;
+    const ceiling_prompt = "The iteration budget for this turn is exhausted. Tools are disabled for this reply — no code can be written now. Write a plain summary of at most 10 lines: what was actually done, what remains unfinished or unverified, which files were touched, and the single next step. Do not apologise for stopping.";
+    appendHarnessPrompt(m, ceiling_prompt);
+    _ = runOneTurn(m, user_text, iterations) catch |err| reportErr(m, err);
+}
+
+fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
+    agent_loop.endTurn(tui.Model, m, m.allocator, io_global, &hooks_set, turn_iterations,
+        turn_stats.elapsedMs(nowNs()), m.ttftMillis(), m.reads.stats.hits, capped, .{
+        .finishAutoCheck = finishAutoCheck,
+        .maybeProposeMemories = maybeProposeMemories,
+        .pushTurnSummary = pushTurnSummary,
+    });
 }
 
 fn memoryExtractEnabled() bool {
-    // Phase 11: end-of-turn extractor proposes memories; user approves.
-    // Enabled by default, best-effort. Disable with ZODE_MEMORY_EXTRACT=0.
-    const env = environ_global orelse return true;
-    const v = env.get("ZODE_MEMORY_EXTRACT") orelse return true;
-    if (v.len == 0) return true;
-    return !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "off") or std.ascii.eqlIgnoreCase(v, "no"));
+    return loop_helpers.memoryExtractEnabled(environ_global);
 }
 
 fn sanitizeMemoryId(id: []const u8, buf: []u8) []const u8 {
-    var n: usize = 0;
-    for (id) |c| {
-        if (n >= buf.len) break;
-        buf[n] = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') c else '-';
-        n += 1;
-    }
-    if (n == 0) return "proposal";
-    return buf[0..n];
+    return loop_helpers.sanitizeMemoryId(id, buf);
 }
 
 fn maybeProposeMemories(m: *tui.Model) void {
@@ -6094,86 +4075,41 @@ pub fn loopBudgetFor(env: ?*const std.process.Environ.Map) taskloop.Budget {
     return b;
 }
 
-/// Fingerprint of what changed since the last mark: files written, plan steps
-/// closed, verified writes. Reading files is work but is NOT progress that earns
-/// more budget.
-pub const LoopMark = struct {
-    files: usize,
-    plan_done: u8,
-    verified_writes: u32,
-};
+/// Loop progress/evidence helpers (extracted for reuse/headless/TUI parity).
+pub const LoopMark = loop_evidence.LoopMark;
 
 fn loopMark(m: *const tui.Model) LoopMark {
-    return .{
-        .files = turn_stats.files.items.len,
-        .plan_done = m.plan.doneCount(),
-        .verified_writes = m.auto_check.gate.verified_writes,
-    };
+    return loop_evidence.loopMarkFrom(turn_stats.files.items.len, m.plan.doneCount(), m.auto_check.gate.verified_writes);
 }
 
 /// Headless equivalent: builds a LoopMark from the gate's counters.
 pub fn loopMarkFromGate(writes: usize, plan_done: u8, verified_writes: u32) LoopMark {
-    return .{
-        .files = writes,
-        .plan_done = plan_done,
-        .verified_writes = verified_writes,
-    };
+    return loop_evidence.loopMarkFromGate(writes, plan_done, verified_writes);
 }
 
-/// Map the exit gate + plan + goal into a taskloop.Evidence. Values only, no
-/// Model: cheap to test.
+/// Map the exit gate + plan + goal into a taskloop.Evidence.
 fn loopEvidence(m: *const tui.Model) taskloop.Evidence {
-    const gate = m.auto_check.gate;
-    const check_green = gate.verdict == .passed and gate.unverified() == 0;
-    return .{
+    return loop_evidence.loopEvidenceFrom(.{
+        .gate = m.auto_check.gate,
+        .plan = m.plan,
+        .goal_status = m.goal.status,
         .files_written = turn_stats.files.items.len,
-        .check_green = check_green,
-        .check_red = gate.verdict == .failed,
-        .checkable = gate.checkable,
-        .plan_open = m.plan.openCount(),
-        .plan_done = m.plan.doneCount(),
         .tools_run = turn_stats.tools,
-        .verdict = switch (m.goal.status) {
-            .none => .none,
-            .met => .met,
-            .blocked => .blocked,
-        },
-        .blocked_credible = true, // the model declared it with tool evidence behind it
-    };
+    });
 }
 
-/// Map an exit gate + plan into a taskloop.Evidence, for the headless runner
-/// which has no `*tui.Model`. `files_written` comes from the gate's write
-/// counter; `tools_run` is 0 (the headless runner does not track it per-turn
-/// yet — the gate still works because `files_written > 0` is what matters).
+/// Map an exit gate + plan into a taskloop.Evidence, for headless/ACP runners.
 pub fn loopEvidenceFromGate(
     gate: exitgate.Gate,
     plan: plan_mod.Plan,
 ) taskloop.Evidence {
-    const check_green = gate.verdict == .passed and gate.unverified() == 0;
-    return .{
-        .files_written = gate.writes,
-        .check_green = check_green,
-        .check_red = gate.verdict == .failed,
-        .checkable = gate.checkable,
-        .plan_open = plan.openCount(),
-        .plan_done = plan.doneCount(),
-        .tools_run = 0,
-        .verdict = .none,
-        .blocked_credible = false,
-    };
+    return loop_evidence.loopEvidenceFromGate(gate, plan);
 }
 
 /// A one-line description of why the turn cannot end yet, for the checkpoint
 /// prompt. English only.
 fn progressText(e: taskloop.Evidence) []const u8 {
-    if (e.check_red) return "the last check is RED";
-    if (e.files_written > 0 and e.checkable and !e.check_green)
-        return "the files you wrote have no green check behind them";
-    if (e.plan_open > 0) return "the plan still has open steps";
-    if (e.verdict == .none and e.tools_run > 0)
-        return "the turn has not reached a verdict";
-    return "no change was recorded in the last iteration";
+    return loop_evidence.progressText(e);
 }
 
 /// The same tool with the same arguments, three times running.
@@ -6292,70 +4228,19 @@ pub fn cacheSessionStatsForTest() *cache_stats.CacheStats {
 /// to `*TextSink`, on the very first token we would already be reading fields
 /// of another type: in ReleaseFast that is silent UB. That is why a struct with
 /// its own name is used here.
-const TurnCtx = struct {
-    m: *tui.Model,
-    /// Assistant text of this turn (dumped into the session at the end).
-    text: std.ArrayList(u8) = .empty,
-    /// Tool calls requested in this turn.
-    calls: std.ArrayList(Call) = .empty,
-    /// A tool in flight: its header is already painted and the line has to be
-    /// closed.
-    tool_open: bool = false,
-    /// Stream chars, for the tok/s.
-    chars: usize = 0,
-    /// Moment of the first token (ns). 0 = nothing has arrived yet.
-    stream_start_ns: i128 = 0,
-    /// Rolling window for the LIVE tok/s: the moment and the char count of the
-    /// last sample. The rate is computed over the window, not over the whole
-    /// stream, so it tracks the model instead of averaging the first slow
-    /// seconds into every reading after them.
-    tps_win_ns: i128 = 0,
-    tps_win_chars: usize = 0,
-    /// Finish reason of the request.
-    finish: [32]u8 = undefined,
-    finish_len: usize = 0,
-
-    const Call = struct {
-        id: []const u8,
-        name: []const u8,
-        args_json: []const u8,
-    };
-
-    fn deinit(self: *TurnCtx) void {
-        const gpa = self.m.allocator;
-        for (self.calls.items) |c| {
-            gpa.free(c.id);
-            gpa.free(c.name);
-            gpa.free(c.args_json);
-        }
-        self.calls.deinit(gpa);
-        self.text.deinit(gpa);
-    }
-};
+const TurnCtx = turn_types.TurnCtx;
 
 fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
     const t: *TurnCtx = @ptrCast(@alignCast(ud.?));
     t.text.appendSlice(t.m.allocator, delta) catch {};
     t.chars += delta.len;
     const now_ns = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-    if (t.stream_start_ns == 0) {
-        t.stream_start_ns = now_ns;
-        t.tps_win_ns = now_ns;
-        t.tps_win_chars = t.chars;
-        // A fresh stream starts at zero instead of showing the PREVIOUS
-        // stream's number: before, `tps_live` was only written at the END of
-        // each iteration, so the status bar painted iteration N-1's rate (or
-        // the last turn's) while iteration N was streaming.
-        tps_live = 0;
-    } else if (now_ns - t.tps_win_ns >= tps_sample_ns) {
-        const win = tpsOf(estTokens(t.chars - t.tps_win_chars), now_ns - t.tps_win_ns);
-        if (win > 0) {
-            tps_live = win;
-            tps_last = win;
-        }
-        t.tps_win_ns = now_ns;
-        t.tps_win_chars = t.chars;
-    }
+    const r = runtime_state.updateTpsWindow(now_ns, t.stream_start_ns, t.chars, t.tps_win_ns, t.tps_win_chars, tps_live, tps_last, tps_sample_ns);
+    if (r.stream_started) t.stream_start_ns = now_ns;
+    t.tps_win_ns = r.win_ns;
+    t.tps_win_chars = r.win_chars;
+    tps_live = r.tps_live;
+    tps_last = r.tps_last;
     t.m.streamDelta(delta);
 }
 
@@ -6427,34 +4312,10 @@ fn toolCallsJsonFromCalls(gpa: std.mem.Allocator, calls: []const TurnCtx.Call) ?
 /// can be added. The system prompt is injected once at the start of the
 /// conversation.
 /// [roster] Who a turn is sent to.
-///
-/// It exists so that `runOneTurn` does not have to decide between "the active
-/// provider/model" and "the free-auto candidate" in three different places
-/// (body, url and key). With rotation the `pick` is REPLACED inside the retry
-/// loop, and if each place queried the global on its own, half a request would
-/// go to the old provider: a 401 with someone else's key, or a body with the
-/// name of a model that is no longer there.
-const Target = struct {
-    def: *const providers.ProviderDef,
-    model: []const u8,
-    kind: chat.ProviderKind,
-    base_url: []const u8,
-    key: ?[]const u8,
-    /// The pool candidate, or null if this turn goes to the active provider/model.
-    from_roster: ?roster_mod.Candidate = null,
-};
+pub const Target = submodel_mod.Target;
 
 /// The endpoint for a target.
-///
-/// It is a function and not three inline copies because the subagent's model
-/// fallback re-derives it after switching models: a `url` computed once outside
-/// the loop would keep pointing at the provider that just said no.
-fn targetUrl(buf: []u8, t: Target) []const u8 {
-    return if (t.kind == .anthropic)
-        std.fmt.bufPrint(buf, "{s}/messages", .{t.base_url}) catch t.base_url
-    else
-        std.fmt.bufPrint(buf, "{s}/chat/completions", .{t.base_url}) catch t.base_url;
-}
+pub const targetUrl = submodel_mod.targetUrl;
 
 /// This turn's target: the pool if free-auto is on and already has its list,
 /// the active provider/model otherwise.
@@ -6501,148 +4362,46 @@ pub fn outputCapFor(def: *const providers.ProviderDef, env: ?*const std.process.
 }
 
 // ── /submodel: which model the SUBAGENTS run on ──────────────
-//
-// Three ways to say it, in this order — the same shape as the active model's
-// own (`/submodel` beats config.json beats the environment):
-//
-//   1. `/submodel` in this session: unset (inherit), set, or `off` (force none)
-//   2. `subagent_provider` / `subagent_model` in config.json
-//   3. `ZODE_SUBAGENT_PROVIDER` / `ZODE_SUBAGENT_MODEL`
-//
-// Nothing set = what always happened: the subagent runs on the same target as
-// the main turn (free-auto rotation included), at effort `low`.
-//
-// A pick that cannot be used does NOT fail the search: the reason rides in
-// front of the report and the search runs on the normal target. A broken
-// override that killed every `task` would push the searches back into the main
-// context, which is the exact cost the subagent exists to avoid.
+// Extracted to `agent/submodel.zig` (cluster + state + resolution/reporting).
+// `agent.zig` remains the facade and provides runtime context (active provider,
+// key, user config, env).
 
-/// What the developer asked for, wherever it came from.
-const SubPick = struct {
-    provider: []const u8,
-    model: []const u8,
-    /// Which of the three said it. It rides in the report's note so a pick that
-    /// is working and one that was never set can be told apart without going
-    /// to look — a mode you cannot see is a mode you cannot diagnose.
-    source: []const u8,
-};
+const SubPick = submodel_mod.SubPick;
+const SubResolve = submodel_mod.SubResolve;
 
-/// The session's own override. Three states and not two: `off` has to SURVIVE
-/// a config.json that sets the field, or `/submodel off` would do nothing for
-/// exactly the user who needs it most.
-///
-/// The buffers are static for the same reason as `cur_model_buf`: the string
-/// `/submodel` is fed comes from the input line and dies with the next redraw.
-/// The UI thread writes them and the worker reads them, which is the same
-/// accepted race as the model name itself: a ≤128-byte copy with a single
-/// writer.
-var sub_session: enum { unset, set, off } = .unset;
-var sub_provider_buf: [64]u8 = undefined;
-var sub_provider_len: usize = 0;
-var sub_model_buf: [128]u8 = undefined;
-var sub_model_len: usize = 0;
-
-/// Why the pick was given up for the rest of the session ("" = it was not).
-/// Session-long like `router.State.given_up`: a model the provider will not
-/// serve is one it will not serve on the next `task` either, and every attempt
-/// costs a failed request plus a fallback before the search can start.
-var sub_fail_buf: [256]u8 = undefined;
-var sub_fail_len: usize = 0;
+fn submodelCtx(m: *tui.Model) submodel_mod.ResolveCtx {
+    return .{
+        .active_def = activeProviderDef(m.environ),
+        .cur_key = curKey(m),
+        .user_config = user_config,
+        .environ = m.environ,
+    };
+}
 
 fn submodelFail(text: []const u8) void {
-    const n = @min(text.len, sub_fail_buf.len);
-    @memcpy(sub_fail_buf[0..n], text[0..n]);
-    sub_fail_len = n;
+    submodel_mod.submodelFail(text);
 }
 
-/// Formats a reason into `buf` and returns what fit.
-///
-/// A fixed writer and not `bufPrint` because `bufPrint` on overflow gives an
-/// ERROR and no text at all — and a reason that vanishes leaves the note
-/// saying "was not used ()". Truncated is still a reason.
+pub fn submodelClearFail() void {
+    submodel_mod.submodelClearFail();
+}
+
+pub fn submodelSetOff() void {
+    submodel_mod.submodelSetOff();
+}
+
 fn reasonFmt(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    w.print(fmt, args) catch {};
-    return w.buffered();
+    return submodel_mod.reasonFmt(buf, fmt, args);
 }
 
-/// The developer's pick, or null when subagents follow the main turn.
 fn submodelPick(m: *tui.Model) ?SubPick {
-    switch (sub_session) {
-        // The session's `off` beats everything: config.json and the environment
-        // come back on the next launch, and saying "off" has to mean off NOW.
-        .off => return null,
-        .set => return .{
-            .provider = sub_provider_buf[0..sub_provider_len],
-            .model = sub_model_buf[0..sub_model_len],
-            .source = "/submodel",
-        },
-        .unset => {},
-    }
-    if (user_config.subagent_provider.len > 0 or user_config.subagent_model.len > 0) {
-        return .{
-            .provider = user_config.subagent_provider,
-            .model = user_config.subagent_model,
-            .source = "config.json",
-        };
-    }
-    const p = envGet(m.environ, "ZODE_SUBAGENT_PROVIDER") orelse "";
-    const mo = envGet(m.environ, "ZODE_SUBAGENT_MODEL") orelse "";
-    if (p.len == 0 and mo.len == 0) return null;
-    return .{
-        .provider = p,
-        .model = mo,
-        .source = if (mo.len > 0) "ZODE_SUBAGENT_MODEL" else "ZODE_SUBAGENT_PROVIDER",
-    };
+    return submodel_mod.submodelPick(m, user_config);
 }
 
-/// Where a pick resolves to, or why it does not.
-const SubResolve = union(enum) {
-    ok: Target,
-    /// A slice INTO the caller's reason buffer, already written for a human.
-    why: []const u8,
-};
-
-/// Resolves the pick into a target: the named provider (or the active one when
-/// the pick names only a model), the named model (or the provider's
-/// `default_model`), and the key OF THAT PROVIDER.
 fn submodelTarget(m: *tui.Model, pick: SubPick, reason: []u8) SubResolve {
-    const def: *const providers.ProviderDef = blk: {
-        if (pick.provider.len == 0) break :blk activeProviderDef(m.environ);
-        if (config_mod.find(user_config, pick.provider)) |d| break :blk d;
-        if (providers.byId(pick.provider)) |d| break :blk d;
-        return .{ .why = reasonFmt(reason, "zode does not know the provider \"{s}\" (see /providers)", .{pick.provider}) };
-    };
-    const model: []const u8 = if (pick.model.len > 0) pick.model else def.default_model;
-    if (model.len == 0) {
-        return .{ .why = reasonFmt(reason, "\"{s}\" has no default model; name one: /submodel {s} <model>", .{ def.id, def.id }) };
-    }
-    // The key for THIS provider, and `curKey` only when it IS the active one:
-    // `curKey` falls back to the generic `ZODE_API_KEY`, and handing that to
-    // another provider is the one-key-to-the-wrong-endpoint bug all over again.
-    //
-    // `key_env.len == 0` is a provider that needs NO key (ollama and friends):
-    // null there is a configuration, not a missing credential.
-    const key = if (std.mem.eql(u8, def.id, activeProviderDef(m.environ).id))
-        curKey(m)
-    else
-        providers.keyFor(def, m.environ);
-    if (key == null and def.key_env.len > 0) {
-        return .{ .why = reasonFmt(reason, "there is no API key for \"{s}\" (connect it with ctrl+a, or set its ZODE_*_KEY)", .{def.id}) };
-    }
-    return .{ .ok = .{
-        .def = def,
-        .model = model,
-        .kind = chat.kindForProvider(def.id),
-        .base_url = def.base_url,
-        .key = key,
-        .from_roster = null,
-    } };
+    return submodel_mod.submodelTarget(pick, reason, submodelCtx(m));
 }
 
-/// The note for a RUNTIME fallback: the measured clause (`router.phraseHead`)
-/// plus the two names plus the subagent's own command. Split out so the
-/// wording is testable without a dead model and a network.
 fn submodelFallbackNote(
     buf: []u8,
     from_provider: []const u8,
@@ -6651,132 +4410,19 @@ fn submodelFallbackNote(
     to_provider: []const u8,
     to_model: []const u8,
 ) []const u8 {
-    return reasonFmt(
-        buf,
-        "[subagent note: {s}/{s} {s}, so this search went to {s}/{s}. Set another with /submodel, or /submodel off.]",
-        .{ from_provider, from_model, router_mod.phraseHead(w), to_provider, to_model },
-    );
+    return submodel_mod.submodelFallbackNote(buf, from_provider, from_model, w, to_provider, to_model);
 }
 
-/// The pick, applied to `base`. False = the subagent runs on `base` as always.
-/// When the pick existed but could not be used, the NOTE explaining why is
-/// already in the Report — silence here would be a setting that looks like it
-/// works.
 fn applySubmodel(m: *tui.Model, base: *Target, rep: *subagent_mod.Report) bool {
-    // Given up for this session: silent, like the cheap router after its first
-    // 403. The developer has already seen the reason — in the first report and
-    // in `/submodel`, which says it too.
-    if (sub_fail_len > 0) return false;
-    const pick = submodelPick(m) orelse return false;
-
-    var reason_buf: [400]u8 = undefined;
-    switch (submodelTarget(m, pick, &reason_buf)) {
-        .why => |why_not| {
-            var nbuf: [640]u8 = undefined;
-            const prov: []const u8 = if (pick.provider.len > 0)
-                pick.provider
-            else
-                activeProviderDef(m.environ).id;
-            rep.setNote(reasonFmt(
-                &nbuf,
-                "[subagent note: the subagent model {s}/{s} was not used ({s}). Fix it with /submodel, or /submodel off.]",
-                .{ prov, pick.model, why_not },
-            ));
-            return false;
-        },
-        .ok => |target| {
-            base.* = target;
-            // The success note too, not only the failure one: the router reports
-            // a cheap turn that simply WORKED for the same reason — a pick you
-            // cannot see is a pick where "my config did nothing" cannot be told
-            // apart from "my config is not needed here".
-            var nbuf: [320]u8 = undefined;
-            rep.setNote(reasonFmt(
-                &nbuf,
-                "[subagent note: this search runs on {s}/{s} ({s}).]",
-                .{ target.def.id, target.model, pick.source },
-            ));
-            return true;
-        },
-    }
+    return submodel_mod.applySubmodel(m, base, rep, user_config, submodelCtx(m));
 }
 
-/// `/submodel [off | <model> | <provider> <model>]`; no args: report.
-///
-/// It lives here and not in `commands.zig` because it writes THIS module's
-/// state — the same reason `/effort` and `/yolo` stayed in agent.zig.
-fn cmdSubmodel(m: *tui.Model, arg: ?[]const u8) void {
-    const a = arg orelse return submodelReport(m);
-    if (std.mem.eql(u8, a, "off") or std.mem.eql(u8, a, "none")) {
-        sub_session = .off;
-        sub_fail_len = 0;
-        m.pushInfoFmt("subagents: the same model as the main turn (`/submodel off`; config.json and the environment are ignored this session). Set: /submodel <model> | <provider> <model>", .{});
-        return;
-    }
-    var it = std.mem.tokenizeScalar(u8, a, ' ');
-    const t1 = it.next() orelse return submodelReport(m);
-    const t2 = it.next();
-    // ONE token is a model on the active provider, unless it happens to be a
-    // known provider id — then it is `/submodel <provider>` with that
-    // provider's default model. Both readings are what people type: `/submodel
-    // kimi-k2.6` and `/submodel groq` are equally plausible, and always
-    // treating it as a model would send a provider id into the model field.
-    if (t2 == null and (config_mod.find(user_config, t1) != null or providers.byId(t1) != null)) {
-        setSubmodel(t1, "");
-    } else if (t2) |mo| {
-        setSubmodel(t1, mo);
-    } else {
-        setSubmodel("", t1);
-    }
-    // A fresh pick deserves a fresh chance: the give-up was about the OLD one.
-    sub_fail_len = 0;
-    submodelReport(m);
+pub fn setSubmodel(provider: []const u8, model: []const u8) void {
+    submodel_mod.setSubmodel(provider, model);
 }
 
-/// Copies the pick into the session's static buffers. It COPIES, and that is
-/// the point: the string comes from the input line and dies with the next
-/// redraw — a global pointing at it is the `cur_model_buf` bug again.
-fn setSubmodel(provider: []const u8, model: []const u8) void {
-    const p = @min(provider.len, sub_provider_buf.len);
-    std.mem.copyForwards(u8, sub_provider_buf[0..p], provider[0..p]);
-    sub_provider_len = p;
-    const mm = @min(model.len, sub_model_buf.len);
-    std.mem.copyForwards(u8, sub_model_buf[0..mm], model[0..mm]);
-    sub_model_len = mm;
-    sub_session = .set;
-}
-
-/// `/submodel` with no arguments, and also the closing line of every set: it
-/// resolves the pick LIVE, because reporting what is STORED when what matters
-/// is whether it would be USED is how a broken setting keeps looking fine.
-fn submodelReport(m: *tui.Model) void {
-    if (sub_session == .off) {
-        m.pushInfoFmt("subagents: the same model as the main turn (/submodel off). Set: /submodel <model> | /submodel <provider> <model>", .{});
-        return;
-    }
-    const pick = submodelPick(m) orelse {
-        m.pushInfoFmt("subagents: the same model as the main turn (no override). Set: /submodel <model> | /submodel <provider> <model>", .{});
-        return;
-    };
-    const prov: []const u8 = if (pick.provider.len > 0)
-        pick.provider
-    else
-        activeProviderDef(m.environ).id;
-    var reason_buf: [400]u8 = undefined;
-    switch (submodelTarget(m, pick, &reason_buf)) {
-        .ok => |t| {
-            if (sub_fail_len > 0) {
-                m.pushInfoFmt("subagents: {s}/{s} ({s}) — NOT in use: {s}. Change it with /submodel, or /submodel off", .{
-                    t.def.id, t.model, pick.source, sub_fail_buf[0..sub_fail_len],
-                });
-            } else {
-                m.pushInfoFmt("subagents: {s}/{s} ({s}). Off with /submodel off.", .{ t.def.id, t.model, pick.source });
-            }
-        },
-        .why => |why_not| m.pushInfoFmt("subagents: {s}/{s} ({s}) — CANNOT be used: {s}", .{
-            prov, pick.model, pick.source, why_not,
-        }),
-    }
+pub fn submodelReport(m: *tui.Model) void {
+    submodel_mod.submodelReport(m, user_config, submodelCtx(m));
 }
 
 /// Says, once, that the chosen model is a router and that this costs money.
@@ -7210,6 +4856,9 @@ fn writePlanFile(m: *tui.Model) void {
     const w = &fw.interface;
     const id = if (session) |s| s.id[0..] else "current";
     w.print("# Plan {s}\n\n", .{id}) catch return;
+    if (plan.objectiveOf().len > 0) w.print("## Objective\n{s}\n\n", .{plan.objectiveOf()}) catch return;
+    if (plan.approachOf().len > 0) w.print("## Approach\n{s}\n\n", .{plan.approachOf()}) catch return;
+    if (plan.guardrailsOf().len > 0) w.print("## Guardrails\n{s}\n\n", .{plan.guardrailsOf()}) catch return;
     w.print("## Steps ({d}/{d} done)\n\n", .{ plan.doneCount(), plan.len }) catch return;
     for (plan.items[0..plan.len]) |it| {
         const mark = switch (it.status) {
@@ -7218,6 +4867,8 @@ fn writePlanFile(m: *tui.Model) void {
             .in_progress => " ",
         };
         w.print("- [{s}] {s} ({s})\n", .{ mark, it.textOf(), @tagName(it.status) }) catch return;
+        if (it.howOf().len > 0) w.print("  - how: {s}\n", .{it.howOf()}) catch return;
+        if (it.verifyOf().len > 0) w.print("  - verify: {s}\n", .{it.verifyOf()}) catch return;
     }
     fw.interface.flush() catch {};
     _ = a;
@@ -7234,38 +4885,97 @@ fn loadPlanFile(m: *tui.Model) void {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const data = std.Io.Dir.cwd().readFileAlloc(io_global, path, a, .limited(64 * 1024)) catch return;
-    // Parse "- [ ] text (status)" lines.
-    var items: [plan_mod.max_items]plan_mod.Item = undefined;
-    var n: u8 = 0;
+
+    var plan = plan_mod.Plan.init();
+    var section: enum { none, objective, approach, guardrails, steps } = .none;
+    var obj_buf: [plan_mod.objective_max]u8 = undefined;
+    var obj_len: usize = 0;
+    var app_buf: [plan_mod.approach_max]u8 = undefined;
+    var app_len: usize = 0;
+    var grd_buf: [plan_mod.guardrails_max]u8 = undefined;
+    var grd_len: usize = 0;
+    var last_item: ?u8 = null;
+
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
-        const t = std.mem.trim(u8, line, " \t\r");
-        if (!std.mem.startsWith(u8, t, "- [")) continue;
-        if (n >= plan_mod.max_items) break;
-        // Extract text between "] " and " ("
-        const close = std.mem.indexOf(u8, t, "] ") orelse continue;
-        const rest = t[close + 2 ..];
-        var text_end = rest.len;
-        var status: plan_mod.Status = .pending;
-        if (std.mem.lastIndexOf(u8, rest, " (")) |p| {
-            const tail = rest[p + 2 ..];
-            if (tail.len > 0 and tail[tail.len - 1] == ')') {
-                const inside = tail[0 .. tail.len - 1];
-                status = plan_mod.Status.parse(inside) orelse .pending;
+        const raw = std.mem.trimEnd(u8, line, "\r");
+        const t = std.mem.trim(u8, raw, " \t");
+        if (std.mem.eql(u8, t, "## Objective")) { section = .objective; continue; }
+        if (std.mem.eql(u8, t, "## Approach")) { section = .approach; continue; }
+        if (std.mem.eql(u8, t, "## Guardrails")) { section = .guardrails; continue; }
+        if (std.mem.startsWith(u8, t, "## Steps")) { section = .steps; continue; }
+        if (std.mem.startsWith(u8, t, "# ")) continue;
+
+        if (std.mem.startsWith(u8, t, "- [")) {
+            if (plan.len >= plan_mod.max_items) { last_item = null; continue; }
+            const close = std.mem.indexOf(u8, t, "] ") orelse continue;
+            const rest = t[close + 2 ..];
+            var text_end = rest.len;
+            var status: plan_mod.Status = .pending;
+            if (std.mem.lastIndexOf(u8, rest, " (")) |p| {
+                const tail = rest[p + 2 ..];
+                if (tail.len > 0 and tail[tail.len - 1] == ')') {
+                    const inside = tail[0 .. tail.len - 1];
+                    status = plan_mod.Status.parse(inside) orelse .pending;
+                }
+                text_end = p;
             }
-            text_end = p;
+            const text = std.mem.trim(u8, rest[0..text_end], " \t");
+            if (text.len == 0) continue;
+            var it = plan_mod.Item{ .status = status };
+            const cp = @min(text.len, plan_mod.text_max);
+            @memcpy(it.text[0..cp], text[0..cp]);
+            it.len = @intCast(cp);
+            plan.items[plan.len] = it;
+            last_item = plan.len;
+            plan.len += 1;
+            section = .steps;
+            continue;
         }
-        const text = std.mem.trim(u8, rest[0..text_end], " \t");
-        if (text.len == 0) continue;
-        var it = plan_mod.Item{ .status = status };
-        const cp = @min(text.len, plan_mod.text_max);
-        @memcpy(it.text[0..cp], text[0..cp]);
-        it.len = @intCast(cp);
-        items[n] = it;
-        n += 1;
+
+        if (section == .steps and last_item != null and std.mem.startsWith(u8, raw, "  - ")) {
+            const sub = raw[4..];
+            if (std.mem.startsWith(u8, sub, "how: ")) {
+                const v = sub["how: ".len..];
+                const cp = @min(v.len, plan_mod.how_max);
+                @memcpy(plan.items[last_item.?].how[0..cp], v[0..cp]);
+                plan.items[last_item.?].how_len = @intCast(cp);
+            } else if (std.mem.startsWith(u8, sub, "verify: ")) {
+                const v = sub["verify: ".len..];
+                const cp = @min(v.len, plan_mod.verify_max);
+                @memcpy(plan.items[last_item.?].verify[0..cp], v[0..cp]);
+                plan.items[last_item.?].verify_len = @intCast(cp);
+            }
+            continue;
+        }
+
+        if (t.len == 0) continue;
+        switch (section) {
+            .objective => appendPlanText(&obj_buf, &obj_len, t),
+            .approach => appendPlanText(&app_buf, &app_len, t),
+            .guardrails => appendPlanText(&grd_buf, &grd_len, t),
+            else => {},
+        }
     }
-    if (n == 0) return;
-    m.replacePlan(.{ .items = items, .len = n });
+    if (plan.len == 0) return;
+    _ = plan.setBrief(.{
+        .objective = obj_buf[0..obj_len],
+        .approach = app_buf[0..app_len],
+        .guardrails = grd_buf[0..grd_len],
+    });
+    m.replacePlan(plan);
+}
+
+fn appendPlanText(buf: []u8, len: *usize, text: []const u8) void {
+    if (len.* >= buf.len) return;
+    if (len.* > 0 and len.* < buf.len) {
+        buf[len.*] = '\n';
+        len.* += 1;
+    }
+    const avail = buf.len - len.*;
+    const cp = @min(text.len, avail);
+    @memcpy(buf[len.*..][0..cp], text[0..cp]);
+    len.* += cp;
 }
 
 fn syncPlanFile(m: *tui.Model) void {
@@ -7420,180 +5130,104 @@ fn pollTouchedFiles(m: *tui.Model) void {
     pushInfoFmt(m, "· files changed on disk: cached reads and facts invalidated", .{});
 }
 
-fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
-    // Refresh ctx_pct so the background-compaction thresholds see a real number.
-    refreshContextUsage(m);
-    const gpa = m.allocator;
-    const s = ensureSession(m, gpa);
-    // Files the model has in context may have changed on disk between turns
-    // (an edit in another terminal, a checkout). Poll once per turn, before
-    // the facts block is attached: a fact invalidated here stays out of the
-    // new verbatim block, not just out of a future one.
-    if (iteration == 0) pollTouchedFiles(m);
-    // Clock of the TURN (not of the stream): it is what is painted in
-    // "done · N.Ns" and what the user measures when they press again.
-    const turn_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
 
-    // Each ITERATION opens its live paragraph and announces what it is doing (1.3).
-    //
-    // Before, `startChat` opened the live paragraph ONCE per prompt and
-    // `runOneTurn` closed it without reopening: from the 2nd iteration on (and
-    // the loop reaches 8) there was no live paragraph, no activity strip, no
-    // spinner, no clock. In other words, everything that says "still working"
-    // turned off exactly in the part of the turn where the slow part happens
-    m.streamStartIteration();
-
-    var tstate = TurnCtx{ .m = m };
-    defer tstate.deinit();
-
-    // The system prompt always goes FIRST (a stable prefix for the provider's
-    // cache) and is added ONCE only.
-    //
-    // Before, the condition was `items[0].role != .system`, and since `startChat`
-    // had already appended the `user` message, `items[0]` was `user`: a NEW
-    // system was added on every iteration of the agent loop. The second turn
-    // went out as [user, system, tool, system] — the system prompt at the end
-    // and duplicated — and the turn died with no reply and no visible error.
-    // Now the system is looked for in the WHOLE list.
-    var has_system = false;
-    for (s.messages.items) |mm| {
-        if (mm.role == .system) has_system = true;
+/// Tier-2 compaction: summarize old turns into a single note when elision is not
+/// enough. Best-effort; on failure keeps wire messages as-is (with failure noted).
+fn applyTier2CompactionSummary(
+    m: *tui.Model,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    iteration: usize,
+    comp: compaction.Compacted,
+    msgs_wire: *[]chat.ChatMessage,
+) void {
+    if (!comp.needs_summary or comp.summary_upto <= 1 or !maySummarize(iteration)) return;
+    const upto = @min(comp.summary_upto, comp.msgs.len);
+    var sum_from: usize = 1; // never the system message
+    while (sum_from < upto and compaction.isCriticalMessage(comp.msgs[sum_from])) {
+        sum_from += 1;
     }
-    if (!has_system) {
-        s.append(.system, systemPromptBase(gpa)) catch {};
-    }
-    // The prompt that goes out on the wire can differ from the one in the session
-    // (read-only mode, the skill list), so it is synced AFTER the append.
-    syncSystemPrompt(s);
+    if (upto <= sum_from + 1) return;
 
-    // Phase 8: warn when the stable prefix broke (which block changed) or when
-    // the write rate suggests the prefix is unstable (writes_per_request > 0.5).
-    if (cache_break_last_block) |name| {
-        m.pushInfoFmt("prompt cache broke: {s} block changed at byte {d}", .{ name, cache_break_last_pos });
-    } else if (cacheBreakUnstable()) {
-        m.pushInfo("prompt cache: writes per request above 0.5 — prefix may be unstable");
-    }
+    cache_stats.session.markCompacted();
+    pushInfo(m, "\u{b7} context full: summarizing the older turns with the model\u{2026}");
+    var sum_http = http_client.Http.init(gpa, io_global);
+    defer sum_http.deinit();
 
-    // The skill listing is now inside the system message (built by
-    // `syncSystemPrompt` above). It lives at index 0, which compaction never
-    // touches, so skills survive long sessions instead of being elided into a
-    // "[earlier conversation summarized]" note and forgotten. `skills_sent` is
-    // kept for `Session.resetSkillsSent` (screen clear) but no longer gates a
-    // separate user message — that would duplicate the skills on the wire.
+    const sp = pickTarget(m);
+    var surl_buf: [1024]u8 = undefined;
+    const surl = targetUrl(&surl_buf, sp);
 
-    // The plan goes into the CONTEXT of the turn, not only onto the screen.
-    //
-    // Plan mode ends with the checklist and a summary; the developer then
-    // switches to Build and types "do the plan". "The plan" has to resolve: the
-    // `todo` tool result that carried the steps is a tool result, and tier-1
-    // compaction replaces old ones with a marker (a resumed session may not
-    // carry it at all), so the CURRENT list is attached as its own message. It
-    // is attached only when it changed, so the cost is one short message per
-    // edit of the plan and not one per turn.
-    attachPlanContext(m, s);
+    var sum_extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
+    const sum_extra_headers = openRouterExtraHeaders(&sum_extra_hdrs_buf, sp.def.id);
 
-    // The automatic typecheck's verdict, IF it has finished.
-    //
-    // Here and not in `execToolCalls` because the timing is the whole point: the
-    // job was started at the end of the previous iteration so the model could
-    // spend this one doing something else, and this is the last moment before the
-    // request goes out. Read any earlier and it would still be running; read any
-    // later and the model has already decided what to write.
-    //
-    // It goes in as a `user` message, after the `tool` results, which is a shape
-    // every provider accepts — the alternative, a `tool_result` with no call id,
-    // is not a thing.
-    if (m.auto_check.collect(&m.bg, io_global)) |note| {
-        const owned = gpa.dupe(u8, note) catch null;
-        if (owned) |text| {
-            s.append(.user, text) catch m.allocator.free(text);
-            // The same verdict as a durable blocker fact: the note above is a
-            // `user` message tier-1 compaction may elide, the fact below is
-            // re-attached verbatim until the project changes. First line only:
-            // it is the sentence ("found N problems"), the detail stays in
-            // the note's history.
-            const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-            _ = m.addFact(.blocker, text[0..line_end], "", 0);
-            pushInfoFmt(m, "· {s} checked the code you just wrote", .{
-                m.auto_check.label[0..m.auto_check.label_len],
-            });
+    if (summarizeTurns(
+        gpa,
+        &sum_http,
+        surl,
+        sp.key,
+        sp.kind,
+        sp.model,
+        chat.effectiveEffort(sp.model, current_effort),
+        comp.msgs[sum_from..upto],
+        arena,
+        sum_extra_headers,
+        outputCapFor(sp.def, environ_global),
+    )) |summary| {
+        summary_policy.noteSummarized(iteration);
+        pushInfoFmt(m, "\u{b7} older turns summarized ({d} chars, was {d} messages)", .{
+            summary.len,
+            upto - sum_from,
+        });
+        var nm: std.ArrayList(chat.ChatMessage) = .empty;
+        const note_msg = std.fmt.allocPrint(arena, "{s}\n{s}", .{ compaction.summary_note_prefix, summary }) catch summary;
+        if (session) |ss| {
+            const tail_keep = if (upto <= comp.msgs.len) comp.msgs.len - upto else 0;
+            ss.setCompactionBoundary(summary, tail_keep);
         }
+        if (nm.appendSlice(arena, comp.msgs[0..sum_from])) |_| {
+            if (nm.append(arena, .{ .role = "user", .content = note_msg })) |_| {
+                if (nm.appendSlice(arena, comp.msgs[upto..])) |_| {
+                    msgs_wire.* = nm.items;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    } else {
+        summary_policy.noteSummarized(iteration);
+        pushInfo(m, "\u{b7} the summary failed; carrying on with the messages as they are");
     }
+}
 
-    // The verified facts go in after the check that produced them, so a new
-    // blocker rides the same turn instead of the next.
-    attachFactsContext(m, s);
 
-    // Tier 1 compaction before building the body: it is a VIEW of the wire, the
-    // session on disk keeps everything.
-    var astate = std.heap.ArenaAllocator.init(gpa);
-    defer astate.deinit();
-    const arena = astate.allocator();
+const Tier1CompactionResult = struct {
+    comp: compaction.Compacted,
+    used_bg: bool,
+};
 
-    // The `@file` mentions are resolved HERE, on the copy of the messages that
-    // goes to the model, and NOT in the session: the user's prompt is stored
-    // exactly as they typed it (with its `@path`), and the only thing enriched
-    // is what goes out on the wire. If the injected content were stored, the
-    // session file would grow 32 KB per mention and `/resume` would bring the
-    // files inside the prompts.
-    var mentions_in: MentionCount = .{};
-    const msgs1 = withMentions(arena, snapshotMsgs(arena), &mentions_in);
-    // The images, on the wire and ONLY on the wire, for the same reason the
-    // `@file` contents are not stored: the session file would grow megabytes per
-    // screenshot and `/resume` would bring the pictures back. They are consumed
-    // here — one message, one request — and the base64 dies with this turn's arena.
-    const msgs0 = withPendingImages(m, arena, msgs1);
-
-    // Pick the target model BEFORE compaction so the budget uses the correct
-    // context window (critical when free-auto rotates to a model with a smaller window).
-    var pick = pickTarget(m);
-    updateModelContextFromPick(pick);
-
-    // `ZODE_COMPACT=off` is a branch HERE, not inside `elideTier`, so it cannot be
-    // half-applied: with it on, nothing is elided and nothing is summarized, and the
-    // wire carries the history whole.
-    // The goal note goes into the wire view HERE, once per iteration, after the
-    // messages are assembled and before the body is built.
-    if (session) |ss| {
-        const left = if (m.goal.isOpen()) @max(goalHardLimit() - iteration, 0) else 0;
-        const note = if (m.goal.isSet())
-            (goalNote(arena, &m.goal, left, m.goal_checkpoint, m.plan.openCount()) catch null)
-        else
-            null;
-        ss.setGoalNote(note) catch {};
-    }
-
-    const cmode = compaction.effectiveMode(m.environ, m.compact_mode);
-    const cur_ctx = curModelContext();
+fn applyTier1Compaction(
+    m: *tui.Model,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    msgs0: []chat.ChatMessage,
+    ctx_pct_now: u8,
+    cmode: compaction.Mode,
+    cur_ctx: u32,
+) Tier1CompactionResult {
     const bg_pct = compaction.bgPct(m.environ, cur_ctx);
     const hot_pct = compaction.hotPct(m.environ, cur_ctx);
-    // Scale the read cache by window size: bigger window = more files
-    // remembered = fewer re-reads on long sessions.
     m.reads.configure(m.allocator, cur_ctx);
 
-    // 1. Lanzar compactación en background cuando cruzamos el umbral "warm".
-    // No bloquea al usuario; el hilo trabaja mientras el turno sigue.
-    if (cmode != .off and ctx_pct >= bg_pct) {
-        _ = compaction.tryLaunchBg(
-            &compact_bg,
-            gpa,
-            msgs0,
-            m.environ,
-            curModelContext(),
-        );
+    if (cmode != .off and ctx_pct_now >= bg_pct) {
+        _ = compaction.tryLaunchBg(&compact_bg, gpa, msgs0, m.environ, curModelContext());
     }
 
-    // 2. Umbral "hot": si ya cruzamos el crítico, necesitamos el resultado
-    // YA. Usamos el del background si está listo; si no, fallback síncrono.
-    // 3. Incluso por debajo de hot, si hay un resultado de background listo,
-    //    lo aplicamos para mantener el contexto bajo antes de llegar al crítico.
     var used_bg = false;
     var comp = compaction.nothingElided(msgs0);
     if (cmode != .off) {
-        if (ctx_pct >= hot_pct) {
+        if (ctx_pct_now >= hot_pct) {
             if (compaction.tryCollectBg(&compact_bg)) |bg| {
                 used_bg = true;
-                comp = compaction.Compacted{
+                comp = .{
                     .msgs = bg.msgs,
                     .elided = bg.elided,
                     .elided_at = bg.elided_at,
@@ -7612,7 +5246,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
             }
         } else if (compaction.tryCollectBg(&compact_bg)) |bg| {
             used_bg = true;
-            comp = compaction.Compacted{
+            comp = .{
                 .msgs = bg.msgs,
                 .elided = bg.elided,
                 .elided_at = bg.elided_at,
@@ -7631,13 +5265,7 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
         }
     }
 
-    // Si usamos el resultado del background, sus buffers viven en el gpa del
-    // hilo y no en el arena del turno: no podemos marcarlos como elided_at
-    // para el read cache (no son del mismo allocador). Solo marcamos cuando
-    // la compactación fue síncrona (arena del turno).
     if (!used_bg) {
-        // Phase 7 microcompaction: persist large elided tool results that were
-        // not already stored, so "nothing is lost, only moved".
         if (session) |ss| {
             for (comp.elided_at) |idx| {
                 if (idx >= comp.msgs.len or idx >= msgs0.len) continue;
@@ -7667,222 +5295,191 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
                 pushInfoOwned(m, msg);
             } else |_| {}
         }
-        // [readcache] What compaction took away is NOT in the context anymore,
-        // so the read cache has to forget it.
         for (comp.elided_at) |idx| m.reads.markDroppedAt(idx);
     }
-    // Which files went in with the prompt. Without this line the user sees the
-    // model "knowing" something nobody showed it, and with a 30 KB file that
-    // also changes the context spend without any prior notice.
-    //
-    // CAREFUL: `pushInfo` (which COPIES) and not `pushInfoOwned`. The text is
-    // composed in a stack buffer on purpose: `pushInfoOwned` TAKES OWNERSHIP of
-    // the text and frees it in `Model.deinit`, so handing it memory from the
-    // turn's arena (which dies at the end of `runOneTurn`) leaves a dangling
-    // pointer in the pending queue. The next frame paints it, vaxis reads the
-    // BYTES of the freed grapheme, and the app dies with a segfault in the
-    // renderer. Fifth time that family of bug shows up in this repo.
-    if (mentions_in.files > 0 and iteration == 0) {
-        var note_buf: [160]u8 = undefined;
-        const note = if (mentions_in.missing > 0)
-            std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt, {d} not found", .{
-                mentions_in.files,
-                mentions_in.missing,
-            }) catch "@file: inlined"
-        else
-            std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt", .{
-                mentions_in.files,
-            }) catch "@file: inlined";
-        pushInfo(m, note);
-    }
+    return .{ .comp = comp, .used_bg = used_bg };
+}
 
-    if (comp.elided > session_elided) {
-        if (std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided})) |msg| {
-            session_elided = comp.elided;
-            pushInfoOwned(m, msg);
-        } else |_| {}
+
+
+fn maybeActivateCheapRouter(m: *tui.Model, pick: *Target) bool {
+    if (!(router_cheap_on and router_mod.decide(&cheap_router, pick.model, router_cheap_on) == .cheap)) return false;
+    pick.model = cheap_router.cheap_model;
+    setAnswering(pick.model);
+    setStatusWithZoFmt(m, .thinking, "thinking · {s} (cheap)", .{pick.model});
+    return true;
+}
+
+fn buildDeniedToolNames(gpa: std.mem.Allocator) ![]const []const u8 {
+    var denied_names: std.ArrayList([]const u8) = .empty;
+    for (perm_rules.rules) |r| {
+        if (r.action == .deny) try denied_names.append(gpa, r.tool);
     }
-    // [readcache] What compaction took away is NOT in the context anymore, so
-    // the read cache has to forget it. Without this, the next `read` of one of
-    // those files would answer "unchanged, you already have it" about content
-    // the model no longer has: the worst failure a cache can have.
-    for (comp.elided_at) |idx| m.reads.markDroppedAt(idx);
-    // Tier 2: byte elision was not enough, so the old stretch is summarized WITH
-    // THE MODEL.
+    return denied_names.toOwnedSlice(gpa);
+}
+
+
+fn setIterationGoalNote(m: *tui.Model, ss: *session_mod.Session, arena: std.mem.Allocator, iteration: usize) void {
+    const left = if (m.goal.isOpen()) @max(goalHardLimit() - iteration, 0) else 0;
+    const note = if (m.goal.isSet())
+        (goalNote(arena, &m.goal, left, m.goal_checkpoint, m.plan.openCount()) catch null)
+    else
+        null;
+    ss.setGoalNote(note) catch {};
+}
+
+fn announceMentionsInlined(m: *tui.Model, mentions_in: MentionCount, iteration: usize) void {
+    if (!(mentions_in.files > 0 and iteration == 0)) return;
+    var note_buf: [160]u8 = undefined;
+    const note = if (mentions_in.missing > 0)
+        std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt, {d} not found", .{
+            mentions_in.files,
+            mentions_in.missing,
+        }) catch "@file: inlined"
+    else
+        std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt", .{
+            mentions_in.files,
+        }) catch "@file: inlined";
+    pushInfo(m, note);
+}
+
+
+
+fn syncAndAttachTurnContext(m: *tui.Model, gpa: std.mem.Allocator, s: *session_mod.Session) void {
+    // System prompt is a stable prefix (once) and synced for current mode/skills.
+    ensureAndSyncSystemPrompt(m, gpa, s);
+
+    // The skill listing is now inside the system message (built by
+    // `syncSystemPrompt` above). It lives at index 0, which compaction never
+    // touches, so skills survive long sessions instead of being elided into a
+    // "[earlier conversation summarized]" note and forgotten. `skills_sent` is
+    // kept for `Session.resetSkillsSent` (screen clear) but no longer gates a
+    // separate user message — that would duplicate the skills on the wire.
+
+    // The plan goes into the CONTEXT of the turn, not only onto the screen.
     //
-    // It used to run only in the headless runner, and the TUI printed a line
-    // saying it was about to ("context budget reached: summarizing older turns…")
-    // and then NEVER DID IT. `summarizeTurns` had exactly one caller, in
-    // `main.zig`. So in the TUI the estimate kept climbing past the budget until
-    // the body outgrew the buffer and the turn died with a writer error, and the
-    // announcement was a lie.
-    //
-    // It is best-effort on purpose: if the summary fails the turn carries on with
-    // the messages as they are and only loses precision. And it runs ONCE per
-    // turn, before the request, so the turn that triggered it is already the one
-    // that fits.
+    // Plan mode ends with the checklist and a summary; the developer then
+    // switches to Build and types "do the plan". "The plan" has to resolve: the
+    // `todo` tool result that carried the steps is a tool result, and tier-1
+    // compaction replaces old ones with a marker (a resumed session may not
+    // carry it at all), so the CURRENT list is attached as its own message. It
+    // is attached only when it changed, so the cost is one short message per
+    // edit of the plan and not one per turn.
+    attachPlanContext(m, s);
+
+    // Append finished auto-check verdict (if any) before this request is built.
+    appendFinishedAutoCheckNote(m, gpa, s);
+
+    // The verified facts go in after the check that produced them, so a new
+    // blocker rides the same turn instead of the next.
+    attachFactsContext(m, s);
+}
+fn prepareTurnWireMessages(
+    m: *tui.Model,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    s: *session_mod.Session,
+    iteration: usize,
+    ctx_pct_now: u8,
+) []chat.ChatMessage {
+    // Build wire-only snapshot: resolve @file mentions and attach pending images.
+    // Stored session content remains unchanged (user prompt text/base64 not persisted here).
+    const wire = buildWireSnapshot(m, arena);
+    const mentions_in = wire.mentions_in;
+    const msgs0 = wire.msgs;
+
+    // `ZODE_COMPACT=off` is a branch HERE, not inside `elideTier`, so it cannot be
+    // half-applied: with it on, nothing is elided and nothing is summarized, and the
+    // wire carries the history whole.
+    // Goal note goes into wire view once per iteration (after messages assembled).
+    setIterationGoalNote(m, s, arena, iteration);
+
+    const cmode = compaction.effectiveMode(m.environ, m.compact_mode);
+    const cur_ctx = curModelContext();
+    const t1 = applyTier1Compaction(m, gpa, arena, msgs0, ctx_pct_now, cmode, cur_ctx);
+    const comp = t1.comp;
+    // Announce @file mentions inlined with this prompt (iteration 0 only).
+    announceMentionsInlined(m, mentions_in, iteration);
+    // Tier 2: byte elision was not enough, so the old stretch is summarized.
     var msgs_wire: []chat.ChatMessage = comp.msgs;
-    if (comp.needs_summary and comp.summary_upto > 1 and maySummarize(iteration)) {
-        const upto = @min(comp.summary_upto, comp.msgs.len);
-        // Never start the summary stretch on a critical message (goal, plan,
-        // prior summary): keep those verbatim in the wire.
-        var sum_from: usize = 1; // never the system message
-        while (sum_from < upto and compaction.isCriticalMessage(comp.msgs[sum_from])) {
-            sum_from += 1;
-        }
-        if (upto > sum_from + 1) {
-            // Tell the cache statistics that the history is about to get shorter,
-            // so the next prompt count going DOWN is not mistaken for a router
-            // (see `CacheStats.markCompacted`).
-            cache_stats.session.markCompacted();
-            pushInfo(m, "\u{b7} context full: summarizing the older turns with the model\u{2026}");
-            var sum_http = http_client.Http.init(gpa, io_global);
-            defer sum_http.deinit();
-            // The summary is asked of the model that is ACTIVE (not of the
-            // rotating free candidate): a summary of the conversation is worth
-            // spending a real request on, and the rotation may be in the middle of
-            // a quota error.
-            const sp = pickTarget(m);
-            var surl_buf: [1024]u8 = undefined;
-            const surl = targetUrl(&surl_buf, sp);
+    applyTier2CompactionSummary(m, gpa, arena, iteration, comp, &msgs_wire);
+    return msgs_wire;
+}
 
-            // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
-            var sum_extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
-            var sum_extra_hdrs_len: usize = 0;
-            if (std.mem.eql(u8, sp.def.id, "openrouter")) {
-                sum_extra_hdrs_buf[sum_extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
-                sum_extra_hdrs_len += 1;
-                sum_extra_hdrs_buf[sum_extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
-                sum_extra_hdrs_len += 1;
-            }
-            const sum_extra_headers = sum_extra_hdrs_buf[0..sum_extra_hdrs_len];
+const TurnStart = struct {
+    s: *session_mod.Session,
+    turn_t0: i128,
+};
 
-            if (summarizeTurns(
-                gpa,
-                &sum_http,
-                surl,
-                // The key for Anthropic too: `streamRaw` turns it into
-                // x-api-key (see `activeTarget`).
-                sp.key,
-                sp.kind,
-                sp.model,
-                chat.effectiveEffort(sp.model, current_effort),
-                comp.msgs[sum_from..upto],
-                arena,
-                sum_extra_headers,
-                outputCapFor(sp.def, environ_global),
-            )) |summary| {
-                noteSummarized(iteration);
-                pushInfoFmt(m, "\u{b7} older turns summarized ({d} chars, was {d} messages)", .{
-                    summary.len,
-                    upto - sum_from,
-                });
-                // Assembled in one go, and a failure here is NOT fatal: the turn
-                // carries on with the list it had, which is bigger but correct.
-                // `return null` would end the turn with nothing on screen.
-                var nm: std.ArrayList(chat.ChatMessage) = .empty;
-                const note_msg = std.fmt.allocPrint(arena, "{s}\n{s}", .{ compaction.summary_note_prefix, summary }) catch summary;
-                // Phase 7: persist compaction boundary state so resume/wire
-                // trimming does not re-send summarized history.
-                if (session) |ss| {
-                    const tail_keep = if (upto <= comp.msgs.len) comp.msgs.len - upto else 0;
-                    ss.setCompactionBoundary(summary, tail_keep);
-                }
-                if (nm.appendSlice(arena, comp.msgs[0..sum_from])) |_| {
-                    if (nm.append(arena, .{ .role = "user", .content = note_msg })) |_| {
-                        if (nm.appendSlice(arena, comp.msgs[upto..])) |_| {
-                            msgs_wire = nm.items;
-                        } else |_| {}
-                    } else |_| {}
-                } else |_| {}
-            } else {
-                // It failed: say so instead of pretending, and do not retry it every
-                // single turn (that would be one wasted request per turn forever).
-                // A failure counts against the budget, which is the other half of the
-                // old rule: retrying it every turn is one wasted request per turn
-                // forever. But it is no longer PERMANENT — `maySummarize` allows a new
-                // attempt after `summary_gap` iterations, and up to `summary_max` times
-                // in the session, so a session that outgrows the first summary still has
-                // a brake instead of dying on a writer error.
-                noteSummarized(iteration);
-                pushInfo(m, "\u{b7} the summary failed; carrying on with the messages as they are");
-            }
-        }
-    }
+fn beginOneTurnIteration(m: *tui.Model, gpa: std.mem.Allocator, iteration: usize) TurnStart {
+    // Refresh ctx_pct so the background-compaction thresholds see a real number.
+    refreshContextUsage(m);
+    const s = ensureSession(m, gpa);
+    // Files the model has in context may have changed on disk between turns
+    // (an edit in another terminal, a checkout). Poll once per turn, before
+    // the facts block is attached: a fact invalidated here stays out of the
+    // new verbatim block, not just out of a future one.
+    if (iteration == 0) pollTouchedFiles(m);
+    // Clock of the TURN (not of the stream): it is what is painted in
+    // "done · N.Ns" and what the user measures when they press again.
+    const turn_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
 
-    // [roster] Who this turn is asked to.
+    // Each ITERATION opens its live paragraph and announces what it is doing (1.3).
     //
-    // Without free-auto it is the usual active provider/model. With free-auto on
-    // it is the live candidate of the pool (which may be another provider), and
-    // while the pool is still being built it is the active one: the listing is N
-    // requests and the first prompt cannot wait for them.
+    // Before, `startChat` opened the live paragraph ONCE per prompt and
+    // `runOneTurn` closed it without reopening: from the 2nd iteration on (and
+    // the loop reaches 8) there was no live paragraph, no activity strip, no
+    // spinner, no clock. In other words, everything that says "still working"
+    // turned off exactly in the part of the turn where the slow part happens
+    m.streamStartIteration();
+    return .{ .s = s, .turn_t0 = turn_t0 };
+}
+fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
+    const gpa = m.allocator;
+    const started = beginOneTurnIteration(m, gpa, iteration);
+    const s = started.s;
+    const turn_t0 = started.turn_t0;
+
+    var tstate = TurnCtx{ .m = m };
+    defer tstate.deinit();
+
+    syncAndAttachTurnContext(m, gpa, s);
+
+    // Tier 1 compaction before building the body: it is a VIEW of the wire, the
+    // session on disk keeps everything.
+    var astate = std.heap.ArenaAllocator.init(gpa);
+    defer astate.deinit();
+    const arena = astate.allocator();
+
+    const msgs_wire = prepareTurnWireMessages(m, gpa, arena, s, iteration, ctx_pct);
+
+    return executeTurnRequest(m, gpa, s, &tstate, user_text, iteration, turn_t0, msgs_wire);
+}
+
+fn executeTurnRequest(
+    m: *tui.Model,
+    gpa: std.mem.Allocator,
+    s: *session_mod.Session,
+    tstate: *TurnCtx,
+    user_text: []const u8,
+    iteration: usize,
+    turn_t0: i128,
+    msgs_wire: []chat.ChatMessage,
+) !bool {
+    var pick = pickTarget(m);
+
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
 
-    // With no model chosen, the provider is asked BEFORE composing anything. And if
-    // that is not possible, the turn is cut here: not answering is better than
-    // answering oneself with a 403 that does not explain its cause.
-    if (pick.model.len == 0) {
-        _ = resolveModel(m, &http);
-        // Re-pick after resolveModel may have set a model.
-        pick = pickTarget(m);
-        updateModelContextFromPick(pick);
-    }
+    if (!ensureTurnModelReady(m, &http, &pick)) return false;
 
-    if (pick.model.len == 0) {
-        m.streamEnd();
-        pushInfo(m, "no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
-        setStatusWithZo(m, .warn, "no model");
-        return false;
-    }
-
-    // The router warning, ONCE per session, on the first turn that uses one.
-    //
-    // Here and not in `resolveModel`: the model can arrive from four places
-    // (`config.json`, `ZODE_MODEL`, the automatic resolve, the picker) and only
-    // the turn knows which one is actually in use. Warning in each of them is
-    // four places to keep correct, and the one that mattered — the env var, which
-    // is the common case — is a path with no UI to warn into.
-    routerWarnOnce(m, pick.model);
-
-    // The cheap router: this turn goes to the small model, and if it will not
-    // answer we fall back to the one the user picked.
-    //
-    // `active_pick` is kept because the fallback needs somewhere to go back TO,
-    // and because after a rotation the two are no longer the same thing.
     const active_pick = pick;
     var used_cheap = false;
-    if (router_cheap_on and
-        router_mod.decide(&cheap_router, pick.model, router_cheap_on) == .cheap)
-    {
-        // The SAME provider and the same key, a different model name: unlike
-        // `/free-auto` there is no provider to switch, no key to juggle and no
-        // second `Target` to build. That is why this is cheap to add and why the
-        // risk is only "that model is not available on your account".
-        pick.model = cheap_router.cheap_model;
-        used_cheap = true;
-        setAnswering(pick.model);
-        setStatusWithZoFmt(m, .thinking, "thinking · {s} (cheap)", .{pick.model});
-    }
+    if (maybeActivateCheapRouter(m, &pick)) used_cheap = true;
     defer setAnswering("");
 
     chat.cancel_current.store(false, .seq_cst);
-    // The status names the ITERATION from the second one on: plain "thinking" for
-    // 8 turns in a row does not say whether it will take long or it has already
-    // stopped. The first one has no counter because it is the normal case and
-    // the number would be noise.
     if (iteration > 0) {
-        // The limit that ACTUALLY applies, not the soft cap.
-        //
-        // With a goal set the ceiling is `goalHardLimit()` — 60 by default — and this
-        // used to print `iterationLimit()` whatever it was. Measured in a real run: the
-        // status read `thinking · iteration 26/12`, which is a turn that is 34 iterations
-        // from its budget being displayed as 14 over it.
-        //
-        // That is not cosmetic. A user who reads "26/12" concludes the turn is running
-        // away and cuts it short, which is the harness talking the user into aborting
-        // work that has fifty iterations left. A status bar that overstates the budget
-        // gets the user to do the harness's job, wrongly.
         const limit = statusIterationLimit(m);
         const it = std.fmt.allocPrint(
             gpa,
@@ -7895,439 +5492,92 @@ fn runOneTurn(m: *tui.Model, user_text: []const u8, iteration: usize) !bool {
     }
 
     var attempt: usize = 0;
-    // Rotations of THIS turn. A local and not a global because it resets with the
-    // turn: 3 per turn is the ceiling that stops it from going in circles when
-    // the problem is configuration and not quota.
     var rotations: u8 = 0;
-    // Tools a `deny` rule strips from the schema sent to the model: the model
-    // cannot call a tool it cannot see. Built once per turn from the live
-    // permission rules (they can change between turns, but not mid-turn).
-    var denied_names: std.ArrayList([]const u8) = .empty;
-    for (perm_rules.rules) |r| {
-        if (r.action == .deny) {
-            try denied_names.append(gpa, r.tool);
-        }
-    }
-    const denied = try denied_names.toOwnedSlice(gpa);
+    const denied = try buildDeniedToolNames(gpa);
     while (true) : (attempt += 1) {
-        // The body is composed INSIDE the loop, and not before.
-        //
-        // It is the most expensive bug of the rotation: the body carries the
-        // model NAME inside, so rotating meant composing it again. With the body
-        // built outside, the request went to the new provider/model with the old
-        // name inside, and the server answered 400 with a message that made no
-        // sense ("JSON parsing failed") three times, with backoff. It smelled
-        // like a zode bug and it was a zode bug.
-        //
-        // `bodyBuf` is main's heap buffer (not a 1 MiB stack frame), and it is
-        // NOT freed between attempts: `buildBodyMessages` overwrites it and the
-        // pointer is only used while the request is in flight.
         const body_buf = try bodyBuf(gpa);
-        // Tools denied by a permission rule are stripped from the schema the
-        // model sees: it cannot call a tool it cannot see. Built in a throwaway
-        // arena per iteration because the schema is recomputed each rotation
-        // (and `read_only` keeps its own static slice).
         var sarena = std.heap.ArenaAllocator.init(gpa);
         defer sarena.deinit();
-        // `deny_all_tools`: the schema is ABSENT, not empty-star, for the
-        // ceiling turn — the model gets no tool names at all, it cannot call
-        // anything and it cannot even try.
-        const schema = if (m.deny_all_tools) "" else if (read_only) tools_registry.toolsJsonReadOnly() else try tools_registry.toolsJsonFiltered(sarena.allocator(), denied);
-        // Mark the end of the stable prefix so the provider serves it from its
-        // prompt cache instead of re-writing it every turn. One breakpoint, not
-        // one per old message: Anthropic caps a request at four `cache_control`
-        // markers and the system prompt plus the tool schemas already use two.
-        // The last 2 messages stay unmarked (the user's latest input and the
-        // answer still being written). Providers that do not understand the
-        // field ignore it.
-        chat.markCachePrefix(msgs_wire, 2);
-        const body = try chat.buildBodyMessagesCapped(
-            body_buf,
-            pick.model,
-            // `msgs_wire`, not `comp.msgs`: it is the same list with the old
-            // stretch replaced by its summary, and building the body from the
-            // un-summarized one would make the whole of tier 2 a no-op.
-            msgs_wire,
-            // The effort is resolved against `pick.model`, NOT against the active model:
-            // with `free-auto` this loop rotates between pool models, and each
-            // one has its own ladder. Using the active model's would send a
-            // level the candidate does not know (a 400) as soon as rotation
-            // moved to a smaller one. It is the same `Target` the rest of the
-            // rotation path talks about.
-            chat.effectiveEffort(pick.model, current_effort),
-            schema,
-            pick.kind,
-            outputCapFor(pick.def, environ_global),
-        );
-
-        // CAREFUL: `streamChat` expects the FULL URL, not just the provider's
-        // base. Passing the bare base gave 404 on EVERY request from the TUI
-        // (the headless runner in main.zig does add the path, which is why it
-        // worked there).
         var url_buf: [1024]u8 = undefined;
-        const url = targetUrl(&url_buf, pick);
-
-        // The key OF THAT PROVIDER (not the active one's: sending one provider's
-        // key to another endpoint is the `ZODE_PROVIDER` bug, once fixed), passed
-        // as the bearer for BOTH kinds: `streamRaw` is what routes it — Bearer
-        // for OpenAI, x-api-key for Anthropic. Passing null for Anthropic (what
-        // this did) left the request with no credentials at all: streamRaw can
-        // only set x-api-key `if (bearer) |k|`, and there was no k.
-        const bearer: ?[]const u8 = pick.key;
-
-        // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
         var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
-        var extra_hdrs_len: usize = 0;
-        if (std.mem.eql(u8, pick.def.id, "openrouter")) {
-            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
-            extra_hdrs_len += 1;
-            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
-            extra_hdrs_len += 1;
-        }
-        const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
+        const req = try prepareTurnRequest(
+            m,
+            pick,
+            msgs_wire,
+            denied,
+            sarena.allocator(),
+            body_buf,
+            &url_buf,
+            &extra_hdrs_buf,
+        );
 
         chat.streamChat(
             gpa,
             &http,
-            url,
-            bearer,
-            @constCast(body),
+            req.url,
+            req.bearer,
+            @constCast(req.body),
             .{
-                .userdata = &tstate,
+                .userdata = tstate,
                 .onDelta = onDelta,
                 .onToolCall = onToolCall,
                 .onFinish = onFinish,
             },
             pick.kind,
-            true, // the turn the user watches: publishes usage/errors/cancel
-            extra_headers,
+            true,
+            req.extra_headers,
         ) catch |err| {
-            // The cheap router falls back BEFORE anything else touches the error,
-            // because this is the one case where the failure is a fact about the
-            // model rather than about the turn: the small model will not answer,
-            // the one the user picked will, and continuing would spend three
-            // retries and a backoff on something already known.
-            if (used_cheap) {
-                if (router_mod.onFailure(&cheap_router, err, chat.lastErrorBody(), active_pick.model)) {
-                    pick = active_pick;
-                    used_cheap = false;
-                    setAnswering(pick.model);
-                    // The REASON is in the sentence, and it is not decoration: a
-                    // model id the provider does not know is fixed by fixing the
-                    // name, and a gated one is fixed by picking another model.
-                    // Saying "not available on this account" about a typo sends
-                    // somebody to /model for a problem /model cannot see.
-                    const w = router_mod.why(err, chat.lastErrorBody());
-                    pushInfoFmt(
-                        m,
-                        "{s} {s} {s}. It will not be tried again this session — {s}. {s}=0 turns the cheap router off.",
-                        .{
-                            cheap_router.cheap_model,
-                            router_mod.phrase(w),
-                            pick.model,
-                            router_mod.remedy(w),
-                            router_mod.cheap_env,
-                        },
-                    );
-                    continue;
-                }
-                // An account error (401, 402, a 429): the fallback would fail the
-                // same way, so this is NOT the small model's fault and it keeps
-                // its place. The normal retry below handles it and reports it.
-                used_cheap = false;
-                setAnswering("");
+            switch (handleTurnStreamError(gpa, m, err, attempt, active_pick, &pick, &used_cheap, &rotations)) {
+                .retry_request => continue,
+                .cancelled => return false,
+                .fail => |e| return e,
             }
-
-            // [roster] Out of quota on THAT pair? Another pair carries on with the
-            // SAME request and the turn does not die. It goes BEFORE the backoff
-            // retry because a 429 with `retry-after: 30` waiting 30 s on the same
-            // provider is exactly what the user does not want.
-            if (quotaVerdict(err, chat.lastErrorBody())) |why| {
-                if (rotations < roster_mod.max_rotations_per_turn) {
-                    if (free_auto.switchTo(gpa, why, chat.lastErrorBody())) |sw| {
-                        if (targetForCandidate(m, sw.cand)) |next| {
-                            rotations += 1;
-                            pick = next;
-                            updateModelContextFromPick(pick);
-                            pushSwitchNotice(m, sw, pick);
-                            continue; // <- the turn carries on by itself
-                        }
-                    }
-                    // No live pair left (or its provider is no longer in the
-                    // config): fall through to the normal retry, and if that
-                    // fails too, the error below explains what was tried.
-                }
-            }
-            if (isRetryable(err) and attempt < 3) {
-                pushRetryNotice(m, err, attempt);
-                Retry.wait(attempt) catch return false; // ESC cuts it short
-                continue;
-            }
-            // [roster] The retries are gone and this pair still will not answer.
-            // The turn does not rotate (a 5xx may be a blip and the backoff has
-            // already been shown), but the pair is dropped so the NEXT turn does
-            // not start with it. Without this, a model that always fails (a free
-            // one the provider does not serve) keeps the user stuck on the same
-            // error forever and free-auto is worth nothing.
-            noteTurnFailure(m, err, pick);
-            return err;
         };
         break;
     }
-    // The provider's own completion count when it sent one: the same window of
-    // time, the real tokenizer (see `finishTps`).
-    finishTps(tstate.chars, tstate.stream_start_ns, chat.last_usage.completion);
-    recordSessionUsage(m, chat.last_usage, pick.kind, pick.model);
 
-    // Closes the streaming paragraph: what arrived stays in the history.
-    m.streamEnd();
-
-    // The assistant's text goes into the session (also if it was interrupted:
-    // what arrived is real and must not be lost).
-    //
-    // CAREFUL: WITH its `tool_calls`, and this is not optional. The tool message
-    // carries `tool_call_id`, and if the assistant's message does not carry the
-    // `tool_calls` that asked for it, that id matches nothing and the API
-    // answers 400 (`invalid_request_error`) on the NEXT turn. Passing `null`
-    // (which is what it used to be), any turn with a tool died on the second
-    // request: the model asked for the tool, the tool ran, and the final reply
-    // never arrived — with no visible error, because the notice stayed in
-    // `pending` and you had to press a key to see it. Headless did pass the
-    // `tool_calls` (`result.ctx.toolCallsJson`), which is why the agent loop
-    // worked there and not in the TUI: same model, two different clients.
-    //
-    // That is why `TurnCtx` keeps a list of `calls` and not a simple flag: the
-    // JSON has to be rebuilt for the session.
-    const calls_json = if (tstate.calls.items.len > 0)
-        toolCallsJsonFromCalls(gpa, tstate.calls.items)
-    else
-        null;
-    if (tstate.text.items.len > 0 or calls_json != null) {
-        s.appendAssistant(tstate.text.items, calls_json) catch {};
-    }
-    s.flush();
-
-    const partial = tstate.finish_len > 0 and
-        std.mem.eql(u8, tstate.finish[0..tstate.finish_len], "length");
-    if (partial) setStatusWithZo(m, .warn, "interrupted");
-
-    // No tool calls: the turn may be over, but first check if the model
-    // stalled (empty reply) or gave up too early (implementation task with
-    // no files written). fx-style nudge: don't end the turn, ask the model
-    // to continue.
-    if (tstate.calls.items.len == 0) {
-        // ── EMPTY REPLY NUDGE (fx-style) ──
-        //
-        // If the model replied with no text and no tool call, it stalled
-        // mid-task. fx does not end the turn here — it asks the model to
-        // continue: "call the next tool you need, or give your final answer."
-        // This is what makes fx finish long tasks instead of stopping after
-        // a single `list_files`.
-        if (tstate.text.items.len == 0) {
-            if (m.empty_reply_nudges < 3) {
-                m.empty_reply_nudges += 1;
-                appendHarnessPrompt(m, "Your last reply had no text and no tool call. Continue the task: call the next tool you need, or give your final answer.");
-                refreshContextUsage(m);
-                return true; // continue the turn
-            }
-            // Nudge budget spent: let the turn end.
-        }
-
-        // ── NUDGE: model gave up too early ──
-        //
-        // If the user asked to implement something but no files were written,
-        // nudge the model to continue instead of ending the turn after just
-        // exploring. This is what makes zode finish tasks instead of stopping
-        // after the first `list_files`.
-        if (turn_stats.files.items.len == 0 and user_wants_implementation(user_text)) {
-            if (m.implementation_nudges < 3) {
-                m.implementation_nudges += 1;
-                appendHarnessPrompt(m, "The task asks you to implement something, but no files have been created or modified yet. You have only explored — please continue and implement the complete solution, do not stop after just looking at the files.");
-                refreshContextUsage(m);
-                return true; // continue the turn
-            }
-            // Nudge budget spent: let the turn end.
-        }
-
-        // ── NUDGE: stopped after one read-only tool with a stub reply ──
-        //
-        // `list_files` then a 2-word reply is the most common premature end:
-        // the model looked at the directory and reported nothing. One extra
-        // iteration costs one request; ending here wastes the whole turn.
-        // Gate: first two iterations only, short stub text, no files written.
-        if (iteration <= 1 and turn_stats.files.items.len == 0 and
-            turn_stats.tools >= 1 and turn_stats.tools <= 2 and
-            tstate.text.items.len > 0 and tstate.text.items.len < 200)
-        {
-            if (m.implementation_nudges < 3) {
-                m.implementation_nudges += 1;
-                appendHarnessPrompt(m, "You stopped after only exploring with a short reply and no file changes. If the task needs more work, keep going: read what you listed and act on it. If you are truly done, give the final answer with what you did and what you did not do.");
-                refreshContextUsage(m);
-                return true; // continue the turn
-            }
-        }
-
-        // The ctx% is refreshed HERE too, not only on the tools path (which is
-        // the one that calls `refreshContextUsage`): a turn without tools is the
-        // NORMAL case and the counter stayed at the previous turn's value until
-        // a tool appeared.
-        refreshContextUsage(m);
-        // Plain "done" does not say what it cost. With the turn's clock, the
-        // status becomes the summary of what just happened (which is the only
-        // thing left visible when the strip turns off).
-        const turn_ms = elapsedMs(turn_t0);
-        const done_status = std.fmt.allocPrint(
-            gpa,
-            "done · {d}.{d}s",
-            .{ turn_ms / 1000, (turn_ms % 1000) / 100 },
-        ) catch "done";
-        setStatusWithZo(m, .done, done_status);
-        return false;
-    }
-
-    _ = try execToolCalls(m, s, &tstate);
-    refreshContextUsage(m);
-    return true;
+    return finalizeTurnAfterStream(m, gpa, s, tstate, pick, user_text, iteration, turn_t0);
 }
 
-/// Announces tier 2 compaction if the turn triggers it.
-///
-/// Tier 2 (summarizing the old stretch with an LLM call) used to run only in
-/// headless (`main.zig`), so in the TUI the history grew without anything being
-/// said and the ctx% climbed with no explanation. `needs_summary` is the notice
-/// that byte elision has not been enough.
-fn maybeAnnounceCompaction(m: *tui.Model, comp_needs_summary: bool) void {
-    if (!comp_needs_summary) return;
-    const msg = std.fmt.allocPrint(
-        m.allocator,
-        "· context budget reached: summarizing older turns…",
-        .{},
-    ) catch return;
-    pushInfoOwned(m, msg);
+
+fn filesWrittenCountForTurn() usize {
+    return turn_stats.files.items.len;
 }
 
-/// `/undo`: puts the files back the way they were before the last turn.
-///
-/// It undoes FILES, not messages. The session is an append-only JSONL and
-/// rewriting it halfway through a turn is the kind of thing nobody can explain
-/// afterwards: what the user wants when they say "undo that" is for the repo to
-/// go back, not for the model to forget it did it.
-///
-/// The snapshot is taken BEFORE each file-touching tool, and a file that did not
-/// exist is recorded as such (undoing it = deleting it). And if the file could
-/// not be READ (permissions, or it is a directory) nothing is recorded: deleting
-/// a file nobody managed to read is worse than not undoing.
-fn cmdUndo(m: *tui.Model) void {
-    var cp = m.takeCheckpointOwned() orelse {
-        pushInfo(m, "nothing to undo: no turn has changed any file yet");
-        return;
-    };
-    // The snapshots are the caller's memory now (see `takeCheckpointOwned`):
-    // `deinit` needs a non-const pointer.
-    defer cp.deinit(m.allocator);
-    var undone: u8 = 0;
-    var failed: u8 = 0;
-    var skipped: u8 = 0;
-    var detail: [512]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&detail);
-    const out = &w;
-
-    for (cp.files[0..cp.len]) |f| {
-        if (f.truncated) {
-            skipped += 1;
-            out.print("  {s}: too big to restore\n", .{f.pathOf()}) catch {};
-            continue;
-        }
-        if (!f.existed) {
-            // It did not exist before: undoing is deleting it, and only if it is
-            // still a regular file.
-            if (deleteIfUnchanged(f.pathOf())) {
-                undone += 1;
-                out.print("  removed {s}\n", .{f.pathOf()}) catch {};
-            } else {
-                failed += 1;
-                out.print("  {s}: not removed (it changed since, or is gone)\n", .{f.pathOf()}) catch {};
-            }
-            continue;
-        }
-        // `writeFile` and not config.zig's `writeFileSecure`: that one is for
-        // `auth.json` (0600, written to a temp and renamed) and this is a file of
-        // the user's project, with the permissions it already had.
-        std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
-            failed += 1;
-            out.print("  {s}: could not write it back\n", .{f.pathOf()}) catch {};
-            continue;
-        };
-        undone += 1;
-        out.print("  restored {s} ({d} bytes)\n", .{ f.pathOf(), f.data.len }) catch {};
-    }
-
-    // CAREFUL: `allocPrint` and NOT `bufPrint` into a stack buffer.
-    // `pushInfoOwned` TAKES OWNERSHIP of the text and frees it in `Model.deinit`:
-    // a `bufPrint(&buf, ...)` leaves a pointer to the stack in the pending queue
-    // and it paints as a row of `�` (seen in the pty: the headline of the undo
-    // was a wall of replacement characters). Same reason a literal there is an
-    // "Invalid free".
-    const head_buf = if (undone == 0)
-        "undo: nothing could be restored"
-    else
-        std.fmt.allocPrint(m.allocator, "undo: {d} file{s} undone", .{
-            undone,
-            if (undone == 1) "" else "s",
-        }) catch "undo: done";
-    // `pushInfoFmt` COPIES, so a literal fallback is safe here — which is the
-    // whole difference from `pushInfoOwned`, where the same literal is an
-    // "Invalid free" at teardown.
-
-    m.pushInfoFmt("{s} · from: {s}", .{ head_buf, cp.labelOf() });
-    if (w.buffered().len > 0) {
-        // `pushInfoOwned` of an EMPTY string would push a blank line; the old
-        // `catch ""` made that reachable on OOM and printed nothing instead.
-        m.pushInfoFmt("{s}", .{w.buffered()});
-    }
-    if (skipped > 0 or failed > 0) {
-        m.pushInfoFmt("{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
-            skipped,
-            failed,
-        });
-    }
-    if (undone > 0) setStatusWithZo(m, .done, "undone");
+fn toolsRunCountForTurn() usize {
+    return turn_stats.tools;
 }
 
-/// Deletes a file ONLY if it exists and is a regular file.
-///
-/// What is NOT checked is that its contents are the ones the tool left: the
-/// "after" is not stored (that would be twice the memory). Exists and is a
-/// regular file is enough to avoid deleting a directory by mistake. It is a
-/// weak guarantee on purpose: `/undo` is something the user asks for
-/// explicitly, and doing nothing is worse than deleting a file the model just
-/// created.
-fn deleteIfUnchanged(path: []const u8) bool {
-    const dir: std.Io.Dir = .cwd();
-    const st = dir.statFile(io_global, path, .{}) catch return false;
-    if (st.kind != .file) return false;
-    dir.deleteFile(io_global, path) catch return false;
-    return true;
+/// Finalize streamed turn: record usage, persist assistant output, handle nudges/continuation.
+fn finalizeTurnAfterStream(
+    m: *tui.Model,
+    gpa: std.mem.Allocator,
+    s: *session_mod.Session,
+    tstate: *TurnCtx,
+    pick: Target,
+    user_text: []const u8,
+    iteration: usize,
+    turn_t0: i128,
+) !bool {
+    return turn_finalize.run(m, gpa, s, tstate, pick, user_text, iteration, turn_t0, .{
+        .finishTps = finishTps,
+        .recordSessionUsage = recordSessionUsage,
+        .toolCallsJsonFromCalls = toolCallsJsonFromCalls,
+        .appendHarnessPrompt = appendHarnessPrompt,
+        .refreshContextUsage = refreshContextUsage,
+        .userWantsImplementation = loop_helpers.userWantsImplementation,
+        .filesWrittenCount = filesWrittenCountForTurn,
+        .toolsRunCount = toolsRunCountForTurn,
+        .elapsedMs = elapsedMs,
+        .setStatusWithZo = setStatusWithZo,
+        .execToolCalls = execToolCalls,
+    });
 }
 
-/// Applies the list of the `todo` tool and says in the history how much changed.
-///
-/// It lives here and not inside `tools.execute` because of memory ownership:
-/// `execute` returns memory of the turn's arena (freed when the turn ends) and
-/// the plan has to LIVE between frames. The one place with shared state is the
-/// `Model`.
-///
-/// The "nothing changed" case matters: the model resends the whole list on every
-/// call, so without this the history would repeat "plan: 1/3" five times in a
-/// turn and the line would stop carrying information.
-/// Does this `todo` call carry a patch key (`update`, `remove`, `add`)?
-///
-/// A substring test and not a parse, deliberately: this decides which of the two
-/// handlers a call goes to, and parsing every `todo` twice for that is work with
-/// no payoff. The three keys are distinctive enough that a false positive is not a
-/// realistic shape, and the consequence of one is a handler that reports "the patch
-/// had nothing in it" — never a mangled plan.
-fn planPatchKeysPresent(args_json: []const u8) bool {
+/// Step-level patch keys. A full replacement is identified by `items`/`todos`;
+/// brief-only updates (objective/approach/guardrails without items) are handled
+/// by the patch path.
+fn planStepPatchKeysPresent(args_json: []const u8) bool {
     for ([_][]const u8{ "\"update\"", "\"updates\"", "\"remove\"", "\"removed\"", "\"add\"" }) |k| {
         if (std.mem.indexOf(u8, args_json, k) != null) return true;
     }
@@ -8338,6 +5588,13 @@ fn planPatchKeysPresent(args_json: []const u8) bool {
 fn planHasItems(args_json: []const u8) bool {
     return std.mem.indexOf(u8, args_json, "\"items\"") != null or
         std.mem.indexOf(u8, args_json, "\"todos\"") != null;
+}
+
+fn planHasBriefKeys(args_json: []const u8) bool {
+    for ([_][]const u8{ "\"objective\"", "\"approach\"", "\"guardrails\"", "\"goal\"", "\"constraints\"", "\"rules\"" }) |k| {
+        if (std.mem.indexOf(u8, args_json, k) != null) return true;
+    }
+    return false;
 }
 
 /// Applies a `todo` call to a plan, with no `Model` in it, and returns a line to
@@ -8360,7 +5617,12 @@ pub fn applyPlanTo(
     args_json: []const u8,
     arena: std.mem.Allocator,
 ) ?[]const u8 {
-    if (planPatchKeysPresent(args_json) or !planHasItems(args_json)) {
+    // A full replacement is any call that carries `items`/`todos` (optionally with
+    // brief fields). Patches are step operations or brief-only updates without items.
+    if (!planHasItems(args_json) and (planStepPatchKeysPresent(args_json) or planHasBriefKeys(args_json))) {
+        return applyPlanPatchTo(plan, args_json, arena);
+    }
+    if (!planHasItems(args_json)) {
         return applyPlanPatchTo(plan, args_json, arena);
     }
     var items: [plan_mod.max_items]plan_mod.Item = undefined;
@@ -8369,12 +5631,12 @@ pub fn applyPlanTo(
             error.TooManyItems => "the plan has more than 20 steps: shorten it",
             // The message names BOTH forms, because a model that sent `update` must
             // not be told to send `items`.
-            error.BadPlan => "the plan did not parse. Send the whole list as {items:[{content,status}]} " ++
-                "or change one step as {update:[{index,status}]} / {remove:[3]} / {add:[{content}]}. " ++
+            error.BadPlan => "the plan did not parse. Send the whole list as {items:[{content,how,verify,status}],objective,approach,guardrails} " ++
+                "or change one step as {update:[{index,status,how,verify}]} / {remove:[3]} / {add:[{content,how,verify}]}. " ++
                 "Indexes are 1-based.",
         };
     };
-    switch (plan.apply(items[0..], parsed.len)) {
+    switch (plan.applyWithBrief(items[0..], parsed.len, parsed.brief)) {
         .same => return null,
         .empty => return "plan cleared",
         .changed => return plan.summary(arena),
@@ -8393,13 +5655,13 @@ pub fn applyPlanPatchTo(
     arena: std.mem.Allocator,
 ) ?[]const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
-        return "the plan patch did not parse: send {update:[{index,status}]}";
+        return "the plan patch did not parse: send {update:[{index,status,how,verify}]} or objective/approach/guardrails";
     };
-    if (parsed != .object) return "the plan patch did not parse: send {update:[{index,status}]}";
+    if (parsed != .object) return "the plan patch did not parse: send {update:[{index,status,how,verify}]}";
 
     var updates: [plan_mod.max_items]plan_mod.StepUpdate = undefined;
     const n_upd = plan_mod.parseUpdates(parsed.object, &updates) catch {
-        return "the plan patch did not parse. Send {update:[{index,status,text}]} with a 1-based index.";
+        return "the plan patch did not parse. Send {update:[{index,status,text,how,verify}]} with a 1-based index.";
     };
     var remove: [plan_mod.max_items]u8 = undefined;
     const n_rm = plan_mod.parseRemove(parsed.object, &remove) catch {
@@ -8407,10 +5669,39 @@ pub fn applyPlanPatchTo(
     };
     var add: [plan_mod.max_items]plan_mod.Item = undefined;
     const n_add = plan_mod.parseAdd(parsed.object, &add) catch {
-        return "the plan patch did not parse: send {add:[{content}]}.";
+        return "the plan patch did not parse: send {add:[{content,how,verify}]}";
     };
-    if (n_upd == 0 and n_rm == 0 and n_add == 0) {
-        return "the plan patch had nothing in it: send update, remove or add.";
+    const raw_brief = plan_mod.briefFromObject(parsed.object);
+    const has_obj = plan_mod.objHasAny(parsed.object, &.{ "objective", "goal", "summary", "purpose" });
+    const has_app = plan_mod.objHasAny(parsed.object, &.{ "approach", "how", "strategy", "implementation" });
+    const has_grd = plan_mod.objHasAny(parsed.object, &.{ "guardrails", "constraints", "rules", "verification", "checks" });
+    var obj_keep: [plan_mod.objective_max]u8 = undefined;
+    var app_keep: [plan_mod.approach_max]u8 = undefined;
+    var grd_keep: [plan_mod.guardrails_max]u8 = undefined;
+    const brief = plan_mod.Brief{
+        .objective = if (has_obj) raw_brief.objective else blk: {
+            const cur = plan.objectiveOf();
+            @memcpy(obj_keep[0..cur.len], cur);
+            break :blk obj_keep[0..cur.len];
+        },
+        .approach = if (has_app) raw_brief.approach else blk: {
+            const cur = plan.approachOf();
+            @memcpy(app_keep[0..cur.len], cur);
+            break :blk app_keep[0..cur.len];
+        },
+        .guardrails = if (has_grd) raw_brief.guardrails else blk: {
+            const cur = plan.guardrailsOf();
+            @memcpy(grd_keep[0..cur.len], cur);
+            break :blk grd_keep[0..cur.len];
+        },
+    };
+    const brief_changed = if (has_obj or has_app or has_grd) plan.setBrief(brief) else false;
+    if (n_upd == 0 and n_rm == 0 and n_add == 0 and !brief_changed) {
+        if (!brief.isEmpty()) return null;
+        return "the plan patch had nothing in it: send update, remove, add, or objective/approach/guardrails.";
+    }
+    if (n_upd == 0 and n_rm == 0 and n_add == 0 and brief_changed) {
+        return "plan brief updated (objective/approach/guardrails)";
     }
 
     const before = plan.len;
@@ -8425,14 +5716,19 @@ pub fn applyPlanPatchTo(
                 .{ res.unknown, before },
             ) catch null;
         }
+        if (brief_changed) return "plan brief updated (objective/approach/guardrails)";
         return null;
     }
     if (res.unknown > 0) {
+        const suffix: []const u8 = if (brief_changed) "; brief updated" else "";
         return std.fmt.allocPrint(
             arena,
-            "plan: {s} · {d} index/indices did not exist and were ignored",
-            .{ plan.summary(arena), res.unknown },
+            "plan: {s} · {d} index/indices did not exist and were ignored{s}",
+            .{ plan.summary(arena), res.unknown, suffix },
         ) catch null;
+    }
+    if (brief_changed) {
+        return std.fmt.allocPrint(arena, "{s}; brief updated", .{plan.summary(arena)}) catch plan.summary(arena);
     }
     return plan.summary(arena);
 }
@@ -9368,7 +6664,7 @@ pub const default_task_parallel: usize = 3;
 /// through three backoffs that the other two are also sitting in.
 pub const subagent_retry_attempts: usize = 2;
 
-fn taskParallelLimit(m: *tui.Model) usize {
+pub fn taskParallelLimit(m: *tui.Model) usize {
     const override = m.taskParallelLimit();
     if (override > 0) return override;
     const env = m.environ;
@@ -9788,16 +7084,8 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             return subagent_mod.refused("no api key for this provider", rep);
         const bearer: ?[]const u8 = pick.key;
 
-        // Build extra headers for OpenRouter (HTTP-Referer and X-OpenRouter-Title)
         var extra_hdrs_buf: [2]http_client.Http.ExtraHeader = undefined;
-        var extra_hdrs_len: usize = 0;
-        if (std.mem.eql(u8, pick.def.id, "openrouter")) {
-            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
-            extra_hdrs_len += 1;
-            extra_hdrs_buf[extra_hdrs_len] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
-            extra_hdrs_len += 1;
-        }
-        const extra_headers = extra_hdrs_buf[0..extra_hdrs_len];
+        const extra_headers = openRouterExtraHeaders(&extra_hdrs_buf, pick.def.id);
 
         // `streamChatDetail` returns `void`: it owns the StreamCtx and destroys
         // it, and hands back the server's error text in `err_detail` on the way
@@ -10115,27 +7403,10 @@ pub const max_asks_per_turn = 3;
 /// Read-only mode's answer to a write tool. Said as a tool result so the model
 /// changes plan instead of retrying (a retry of the same call is an immediate
 /// loop, and the cap is what saves you from it).
-pub const read_only_text =
-    "plan (read-only) mode is on: the user asked zode to look before it touches anything, " ++
-    "so write/edit and the commands that CHANGE something did not run. The commands that only " ++
-    "read (git status, git diff, rg, ls, cat) still run, and they do not ask. Do NOT retry the " ++
-    "blocked one. Read what you need and write the " ++
-    "IMPLEMENTATION PLAN with the `todo` tool, then end your turn — the user will be asked " ++
-    "to approve it and zode will switch itself out of plan mode. For anything you need to " ++
-    "know first, use `ask` — or say so in one line — the user can turn plan mode off with shift+tab.";
+pub const read_only_text = tool_exec_policy.read_only_text;
 
-/// Whether a call is a `bash` that only READS.
-///
-/// It is the table of `lib/cmdsafety.zig`: `git status`, `rg`, `ls`… read and
-/// change nothing, and a command we do not know is NOT read-only (the cost of
-/// asking is one dialog and the cost of guessing wrong is a file).
 fn callReadsOnly(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
-    if (!std.mem.eql(u8, name, "bash")) return false;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return false;
-    if (parsed != .object) return false;
-    const cmd = parsed.object.get("command") orelse return false;
-    if (cmd != .string) return false;
-    return cmdsafety.isReadOnly(cmd.string, arena);
+    return tool_exec_policy.callReadsOnly(name, args_json, arena);
 }
 
 /// ESC: kills the foreground command if there is one. Returns how many were
@@ -10167,26 +7438,7 @@ pub fn killForeground() usize {
 /// the first results are the ones that get the room — which is the same
 /// outcome when the results are similar in size, and the only one available
 /// without rewriting the session.
-const ResultBudget = struct {
-    used: usize = 0,
-
-    /// The cap for the next result: the smaller of the tool's own cap and what
-    /// is left of the message.
-    ///
-    /// A tool with no cap of its own (`read`) is bounded by the message: that
-    /// is the backstop, and it is why `read` being unbounded is a decision
-    /// about the PER-TOOL cap and not about the message.
-    fn capFor(self: *const ResultBudget, per_tool: usize) usize {
-        const total = resultcap.max_results_per_message_chars;
-        const left = if (self.used < total) total - self.used else 0;
-        if (per_tool == 0) return left;
-        return @min(per_tool, left);
-    }
-
-    fn charge(self: *ResultBudget, n: usize) void {
-        self.used += n;
-    }
-};
+const ResultBudget = turn_types.ResultBudget;
 
 /// Phase 3: apply per-tool/aggregate caps, spill oversized results to the
 /// session's recoverable tool-result store, freeze the cut decision (34.2),
@@ -10202,113 +7454,15 @@ fn capStoreAppendToolResult(
     budget: *ResultBudget,
 ) void {
     _ = _m;
-    const tool_cap = tools_registry.resultCap(tool_name);
-    var result_text: []const u8 = result;
-    // `read` is unbounded by registry design (cap 0) and has its own limits;
-    // avoid persisting huge reads unless a cap applies. Other tools: if over
-    // the per-tool cap, store recoverably when we have a session path.
-    if (tool_cap != 0 and result.len > tool_cap) {
-        if (s.path) |spath| {
-            const stored = toolstore.storeResult(arena, io_global, spath, s.tool_result_next, result);
-            s.tool_result_next += 1;
-            if (stored.stored) result_text = stored.text;
-        }
-    } else if (tool_cap == 0 and result.len > resultcap.default_max_result_chars) {
-        // Defensive: even unbounded tools can be recovered if extremely large
-        // and a session exists, so compaction/model context stays usable.
-        if (s.path) |spath| {
-            const stored = toolstore.storeResult(arena, io_global, spath, s.tool_result_next, result);
-            s.tool_result_next += 1;
-            if (stored.stored) result_text = stored.text;
-        }
-    }
-    const budget_cap = budget.capFor(tool_cap);
-    // If the model gets a stored preview, keep the recovery notice intact
-    // even when aggregate budget is tight.
-    var final_text = result_text;
-    if (toolstore.extractStoredPath(result_text)) |_| {
-        // Stored result: preserve the full preview+recovery notice for cache
-        // stability and recoverability. If no previous frozen decision exists,
-        // freeze the current preview as-is.
-        if (s.result_caps.find(call_id)) |rec| {
-            if (!rec.cut) {
-                final_text = result_text;
-            } else {
-                // Reapply frozen cut (legacy); ensure recovery hint remains if possible.
-                const capped = resultcap.frozenCapResult(&s.result_caps, s.allocator, arena, call_id, result_text, @max(budget_cap, rec.bytes_kept)) catch resultcap.Capped{ .text = result_text, .cut = false };
-                final_text = capped.text;
-            }
-        } else {
-            s.result_caps.record(s.allocator, call_id, result_text.len, false) catch {};
-            final_text = result_text;
-        }
-    } else {
-        const capped = resultcap.frozenCapResult(&s.result_caps, s.allocator, arena, call_id, result_text, budget_cap) catch resultcap.Capped{ .text = result_text, .cut = false };
-        final_text = capped.text;
-    }
-    budget.charge(final_text.len);
-    s.saveCapsSidecar();
-    s.appendToolResult(call_id, tool_name, final_text) catch {};
+    tool_exec.capStoreAppendToolResult(s, io_global, call_id, tool_name, result, arena, budget);
 }
 
-/// The `command` string from a bash tool's JSON args, or "".
 fn bashCommandOf(args_json: []const u8, arena: std.mem.Allocator) []const u8 {
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return "";
-    if (parsed != .object) return "";
-    const v = parsed.object.get("command") orelse return "";
-    return if (v == .string) v.string else "";
+    return agent_perms.bashCommandOf(args_json, arena);
 }
 
-/// Args JSON with `"sandbox":true` injected, so a flagged bash command
-/// can run sandboxed when the user chooses it (Phase 25). Forces sandbox
-/// even if the model set it to false — the user's dialog choice wins.
 fn withSandboxArg(arena: std.mem.Allocator, args_json: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, args_json, "\"sandbox\"")) |_| {
-        // Force true when explicitly false. Simple textual replacement covers
-        // the JSON forms the model produces.
-        const needles = [_]struct { from: []const u8, to: []const u8 }{
-            .{ .from = "\"sandbox\":false", .to = "\"sandbox\":true" },
-            .{ .from = "\"sandbox\": false", .to = "\"sandbox\": true" },
-            .{ .from = "\"sandbox\" : false", .to = "\"sandbox\" : true" },
-            .{ .from = "\"sandbox\" :false", .to = "\"sandbox\" :true" },
-        };
-        var out: []const u8 = args_json;
-        for (needles) |n| {
-            if (std.mem.indexOf(u8, out, n.from)) |_| {
-                out = replaceAll(arena, out, n.from, n.to) catch out;
-            }
-        }
-        return out;
-    }
-    const trimmed = std.mem.trim(u8, args_json, " \t\r\n");
-    if (trimmed.len >= 2 and trimmed[0] == '{' and trimmed[trimmed.len - 1] == '}') {
-        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
-        if (inner.len == 0) return "{\"sandbox\":true}";
-        return std.fmt.allocPrint(arena, "{s},\"sandbox\":true}}", .{trimmed[0 .. trimmed.len - 1]}) catch args_json;
-    }
-    return args_json;
-}
-
-fn replaceAll(arena: std.mem.Allocator, input: []const u8, needle: []const u8, replacement: []const u8) ![]const u8 {
-    if (needle.len == 0) return input;
-    const count = std.mem.count(u8, input, needle);
-    if (count == 0) return input;
-    const out_len = input.len - (count * needle.len) + (count * replacement.len);
-    var buf = try arena.alloc(u8, out_len);
-    var i: usize = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        if (i + needle.len <= input.len and std.mem.eql(u8, input[i..][0..needle.len], needle)) {
-            @memcpy(buf[o..][0..replacement.len], replacement);
-            o += replacement.len;
-            i += needle.len;
-        } else {
-            buf[o] = input[i];
-            o += 1;
-            i += 1;
-        }
-    }
-    return buf[0..o];
+    return tool_exec_perm.withSandboxArg(arena, args_json);
 }
 
 fn execOneCall(
@@ -10319,508 +7473,169 @@ fn execOneCall(
     denied: *usize,
     budget: *ResultBudget,
 ) usize {
-    const arg = toolArgSummary(call.name, call.args_json, arena);
-    // The timeline may lead with WHAT IT IS FOR (`bash`'s description); the
-    // permission paths below keep `arg`, the command itself.
-    const label = toolTimelineLabel(call.name, call.args_json, arg, arena);
-    m.pushToolStart(call.name, label);
-    // The status says WHAT is running, not a generic "working": with a slow `bash`
-    // that is the difference between "working" and "hung". The text is
-    // copied to a fixed buffer, so the label from the worker's arena can die
-    // without a problem.
-    setStatusWithZo(m, .tooling, label);
-
-    // ── forbidden commands (non-TTY harness) ──
-    //
-    // Some commands are not "risky, ask first" — they will hang forever waiting
-    // for interactive input the harness cannot provide (e.g. `git rebase -i`).
-    // Refuse them before any dialog, and refuse them even in permissive modes:
-    // yolo means no permission prompts, not "run commands that deadlock the session".
-    if (std.mem.eql(u8, call.name, "bash")) {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch null;
-        if (parsed != null and parsed.? == .object) {
-            if (parsed.?.object.get("command")) |cmdv| {
-                if (cmdv == .string) {
-                    const f = cmdsafety.classify(cmdv.string, arena);
-                    if (f.verdict == .forbidden) {
-                        const msg = if (f.why.len > 0)
-                            std.fmt.allocPrint(
-                                arena,
-                                "refused: {s}\ncommand: {s}",
-                                .{ f.why, f.fragment },
-                            ) catch "refused: this command requires an interactive TTY the harness does not have."
-                        else
-                            "refused: this command requires an interactive TTY the harness does not have.";
-                        m.pushToolDone(call.name, "refused: interactive command", 0, msg);
-                        capStoreAppendToolResult(m, s, call.id, call.name, msg, arena, budget);
-                        return 0;
-                    }
-                }
-            }
-        }
-    }
-
-    // ── read-only mode ──
-    //
-    // BEFORE the permission dialog, and that order is the point: in read-only the
-    // call is not going to happen, so asking "may I run this write?" and then
-    // saying no is a dialog that lies. The user asked for "look, don't touch", and
-    // a permission prompt for a write in that mode is a bug in the UI.
-    //
-    // A BATCH is decided by its steps: a batch of reads is a read, and a batch
-    // with a write step is a write. The static list of write tools cannot say
-    // that, and a batch that wrote in plan mode would be a hole in the mode.
-    //
-    // A `bash` that only READS is not a write: `git status`, `rg`, `ls` change
-    // nothing, and the mode is about not touching things. Blocking them would
-    // mean the agent cannot LOOK, and a plan written without looking is a
-    // plan written in the dark.
-    const reads_only = callReadsOnly(call.name, call.args_json, arena);
-    if (read_only and !reads_only and callIsWrite(call.name, call.args_json, arena)) {
-        m.plan_write_blocked_this_turn = true;
-        m.pushToolDone(call.name, "blocked by plan mode", 0, read_only_text);
-        capStoreAppendToolResult(m, s, call.id, call.name, read_only_text, arena, budget);
-        return 0;
-    }
-
-    // ── the permission RULES (Phase 6) ──
-    //
-    // The rules come BEFORE the questions: a rule that says "allow" means the
-    // call does not ask at all, and a rule that says "deny" means it does
-    // not run at all. The questions are for the calls that no rule has an
-    // opinion about.
-    //
-    // The SUBJECTS are what the call acts on: the paths for a file tool, the
-    // command for `bash`. A rule with a pattern is about ONE of them.
-    const subjects = tools_mod.callSubjects(call.name, call.args_json, arena);
-    const rule_decision = permDecision(call.name, subjects);
-    var rule_allowed = false;
-    var rule_match_text: []const u8 = "";
-    if (rule_decision) |d| {
-        switch (d.action) {
-            .allow => {
-                rule_allowed = true;
-            },
-            .dontAsk => {
-                // dontAsk: no dialog, the model answers for itself. The call
-                // proceeds as if allowed, but the user did not pre-approve it
-                // — the model decided on its own.
-                rule_allowed = true;
-            },
-            .deny => {
-                // The refusal NAMES the rule: "this is not allowed" is not an
-                // answer, "your own rule says so" is.
-                const msg = std.fmt.allocPrint(
-                    arena,
-                    "refused: the rule `{s}` ({s}) does not allow this.",
-                    .{ d.rule.text, d.rule.source.name() },
-                ) catch "refused: a permission rule does not allow this.";
-                m.pushToolDone(call.name, "refused by a rule", 0, msg);
-                capStoreAppendToolResult(m, s, call.id, call.name, msg, arena, budget);
-                return 0;
-            },
-            .ask => {
-                // The rule that matched: show it in the dialog so the user
-                // sees WHY they are being asked, not a blind "may I?".
-                rule_match_text = if (d.rule.source == .policy)
-                    (std.fmt.allocPrint(arena, "policy: protected path ({s})", .{d.rule.pattern}) catch d.rule.text)
-                else
-                    d.rule.text;
-            },
-        }
-    }
-
-    // ── the SENSITIVE-PATH question ──
-    //
-    // It comes BEFORE the general permission dialog, and it is a DIFFERENT
-    // question: not "may I run this tool" but "may I write IN HERE", where
-    // "here" is a place where writing is a bad idea (`.git/`, a hook, a
-    // shell config).
-    //
-    // The tool cannot ask: it has no `Model` and it cannot see a dialog. The
-    // dispatcher can, so the question happens here and the answer is handed
-    // to the tool as an approval of that one path.
-    //
-    // It asks ONCE and never offers "always allow": a rule that remembers
-    // "the agent may write inside .git/" is the opposite of the rule.
-    const risky = tools_mod.riskyPaths(call.name, call.args_json, arena);
-    var risky_allowed = false;
-    if (risky.len > 0 and !yolo and !rule_allowed) {
-        var asked = false;
-        for (risky) |p| {
-            const v = pathsafe.checkWrite(p);
-            if (v == .ok) continue;
-            if (asked) continue;
-            asked = true;
-            var dbuf: [384]u8 = undefined;
-            const detail = std.fmt.bufPrint(
-                &dbuf,
-                "{s} is not a place this tool writes: {s}",
-                .{ p, switch (v) {
-                    .dangerous => |d| d.why,
-                    else => "it is protected",
-                } },
-            ) catch p;
-            switch (m.requestPermissionOnce(call.name, detail)) {
-                .allow, .allow_sandbox => {
-                    pathsafe.approve(p);
-                    // The user has just approved THIS write, with the reason
-                    // in front of them. The general dialog would ask the same
-                    // question about the same file with the reason hidden, and
-                    // two dialogs for one write is a dialog too many.
-                    // `allow_sandbox` is not offered for sensitive-path
-                    // questions, but handled for exhaustiveness.
-                    risky_allowed = true;
-                },
-                .allow_always => {
-                    pathsafe.approve(p);
-                    risky_allowed = true;
-                },
-                .deny, .none => {
-                    denied.* += 1;
-                    turn_stats.noteDenied();
-                    const msg = pathsafe.refusalText(arena, v);
-                    m.pushToolDone(call.name, "refused: sensitive path", 0, msg);
-                    capStoreAppendToolResult(m, s, call.id, call.name, msg, arena, budget);
-                    return 0;
-                },
-            }
-        }
-    }
-
-    // ── permission ──
-    //
-    // Accept-edits auto-allows file edits, and a `bash` command
-    // that matches a persisted prefix is allowed without a dialog.
-    // Both are the user's standing "I trust this" — the selective
-    // part of selective permissions — and everything else that
-    // needs permission still asks, unless `/yolo` said not to.
-    //
-    // The permission set of a CALL is the union of the tools it calls, and for
-    // every tool but `batch` that union is the tool itself. A batch of reads
-    // asks for nothing; a batch with a write step asks for exactly what that
-    // write would have asked.
-    const perm_tools = tools_mod.callPermissionTools(call.name, call.args_json, arena);
-    const auto_allowed = permAutoAllowed(call.name, arg, call.args_json, arena);
-    //
-    // In READ-ONLY mode a command that only reads does not ask: the mode is
-    // the user saying "look, do not touch", and a dialog about `ls` is the
-    // mode asking the question it was meant to settle.
-    //
-    // That same scanner-decided read-only-ness is a seat at the read-only
-    // table in ANY mode (Phase 25.4): a `bash` command the scanner found
-    // nothing to flag (`git status`, `ls`, `rg foo`) only reads, so it never
-    // reaches the permission dialog. `reads_only` is `false` for every tool
-    // but `bash`, so nothing else changes — the scanner in `lib/cmdsafety.zig`
-    // decides, not the static flag on the registry row.
-    const no_dialog = reads_only;
-    var force_sandbox_bash = false;
-    var exec_args: []const u8 = call.args_json;
-    if (!yolo and !auto_allowed and !risky_allowed and !rule_allowed and !no_dialog and permNeedsDialog(perm_tools)) {
-        var dbuf: [384]u8 = undefined;
-        // A batch's dialog says WHICH FILES it would touch: the user is being
-        // asked to approve a set of writes, and the set is the whole question.
-        var detail: []const u8 = if (std.mem.eql(u8, call.name, "batch"))
-            tools_mod.batchPermissionDetail(call.args_json, arena)
-        else
-            std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
-        // The RISK, in words, for a command that has one: "this deletes
-        // unreferenced files" beats `git clean -fdx` on its own.
-        //
-        // The user is being asked to approve a command they did not write,
-        // and the raw line is not a risk: it is a spelling.
-        if (std.mem.eql(u8, call.name, "bash") and cmdsafety.classify(arg, arena).why.len > 0) {
-            const why = cmdsafety.classify(arg, arena).why;
-            var both: [640]u8 = undefined;
-            const with_why = std.fmt.bufPrint(&both, "{s} — {s}", .{ detail, why }) catch detail;
-            detail = with_why;
-        }
-        // Name the rule the "always allow" answer would remember, so the user
-        // answers with their eyes open ("always allow `Bash(git *)`", not a
-        // blind "always allow"). learnRuleForCall re-derives this from the
-        // call itself; here we only tell the dialog what to show. Always reset
-        // first so a previous dialog's suggestion never leaks into this one.
-        if (permSuggestion(call.name, call.args_json, arena)) |sugg| {
-            m.setPermSuggestion(sugg);
-        } else {
-            m.setPermSuggestion("");
-        }
-        // Tell the dialog WHICH rule matched (e.g. an `ask` rule), so it can
-        // show why the user is being asked instead of a blind prompt. Cleared
-        // when no rule matched.
-        if (rule_match_text.len > 0) {
-            m.setPermRule(rule_match_text);
-        } else {
-            m.setPermRule("");
-        }
-        // Phase 25: for a flagged `bash` command, offer a sandboxed run when
-        // bwrap/firejail is available — a dialog is not the only answer.
-        if (std.mem.eql(u8, call.name, "bash")) {
-            const cmdv = bashCommandOf(call.args_json, arena);
-            if (cmdv.len > 0 and cmdsafety.isFlagged(cmdv, arena)) {
-                const path = if (environ_global) |e| e.get("PATH") else null;
-                if (sandbox_mod.detect(io_global, std.Io.Dir.cwd(), path) != .none) {
-                    m.setPermSandboxAvailable(true);
-                }
-            }
-        }
-        // 34.14: PermissionRequest hook can answer without a dialog (useful for
-        // headless/automated runs). The hook's decision is honored here; pathsafe
-        // and rule-engine checks above still apply.
-        var hook_perm_answer: ?tui.Model.PermAnswer = null;
-        {
-            const hook_subj = if (subjects.len > 0) subjects[0] else detail;
-            const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
-                .event = .PermissionRequest,
-                .tool = call.name,
-                .subject = hook_subj,
-                .prompt = detail,
-            }, io_global) catch &[_]hooks_mod.RunResult{};
-            defer if (hook_res.len > 0) hooks_mod.freeResults(m.allocator, hook_res);
-            if (hooks_mod.permissionDecision(hook_res)) |pd| {
-                hook_perm_answer = switch (pd) {
-                    .allow => .allow,
-                    .deny => .deny,
-                    .ask => null,
-                };
-            }
-        }
-        const perm_answer = hook_perm_answer orelse m.requestPermission(call.name, detail);
-        switch (perm_answer) {
-            .allow => {},
-            .allow_sandbox => {
-                if (std.mem.eql(u8, call.name, "bash")) {
-                    force_sandbox_bash = true;
-                    exec_args = withSandboxArg(arena, call.args_json);
-                }
-            },
-            .allow_always => {
-                rememberAlwaysAllow(m, call.name, arg, call.args_json, perm_tools, arena);
-            },
-            .deny, .none => {
-                // The denial is handed back to the model as a result
-                // so it changes strategy instead of retrying.
-                denied.* += 1;
-                turn_stats.noteDenied();
-                m.pushToolDone(call.name, "denied: permission required", 0, "denied");
-                capStoreAppendToolResult(m, s, call.id, call.name, "denied: permission required", arena, budget);
-                return 0;
-            },
-        }
-    }
-
-    const call_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-
-    // [undo] The BEFORE snapshot. `existed` is separate because "it was not there"
-    // and "it was empty" undo differently (delete vs write empty), and a
-    // `catch ""` does not tell them apart. And if the failure is NOT "does not
-    // exist" (permissions, a directory), NO snapshot is taken: `/undo` would
-    // delete a file it never managed to read, which is the worst thing an undo
-    // can do.
-    //
-    // A BATCH can touch SEVERAL files, and `/undo` has to be able to put all
-    // of them back. The snapshot is taken per file, exactly as it is for a
-    // direct call: a batch that wrote three files and snapshotted one would
-    // undo a third of the turn.
-    var before: ?[]const u8 = null;
-    if (std.mem.eql(u8, call.name, "batch")) {
-        for (tools_mod.callTouchedPaths(call.name, call.args_json, arena)) |pth| {
-            snapshotForUndo(m, pth, arena);
-        }
-    } else if (touchesFile(call.name)) {
-        if (filePathOf(call.args_json, arena)) |pth| {
-            if (std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024))) |content| {
-                before = content;
-                m.snapshotFile(pth, content, true);
-            } else |err| {
-                switch (err) {
-                    error.FileNotFound => m.snapshotFile(pth, "", false),
-                    else => {},
-                }
-            }
-        }
-    }
-
-    // The `todo` tool has no result to look at: its effect is the PLAN the user
-    // sees, and it is applied here (not inside `execute`) because the plan lives
-    // in the `Model`, which belongs to the TUI.
-    // `read` on a PICTURE does not return bytes. The bytes are put aside by
-    // `prepareImage` and go on the next user message, because a `tool` message's
-    // content is a plain string in OpenAI's shape and an image cannot ride there.
-    //
-    // It is intercepted HERE and not inside `tools/read.zig` because the tool has
-    // no `Model`, and the pending list, the current model's vision and the message
-    // that carries it are all the `Model`'s.
-    if (std.mem.eql(u8, call.name, "read")) {
-        if (prepareImage(m, call.args_json)) |res| {
-            s.appendToolResult(call.id, call.name, res) catch {};
-            turn_stats.noteTool();
-            return 0;
-        }
-    }
-
-    if (std.mem.eql(u8, call.name, "todo")) {
-        // Which of the two forms it is — a patch has one of those keys and a
-        // replacement does not — is decided inside `applyPlanTo`, so the headless
-        // runner cannot pick the other one. Deciding it by the KEYS and not by "does
-        // it have items" is what lets a call do both: replace the list and then
-        // patch it.
-        applyPlanCall(m, call.args_json, arena);
-    }
-
-    // The `goal` tool is the same shape of thing: it has no effect the harness can see
-    // in the tool's text, only in the Model.
-    //
-    // **It was missing here for one whole release cycle.** `applyGoalCall` was written,
-    // `toolGoal` was written, the schema was there, and the model called it and was told
-    // "recorded: the goal is BLOCKED" — while the harness went on to the hard ceiling
-    // and printed `the goal was never decided`. Two halves of one feature, wired
-    // individually, and nothing that could notice the seam: the tool's test checks the
-    // TEXT, `goal.test` checks the PARSING, and neither of them goes from a tool call
-    // to the Model.
-    //
-    // That is why the test below drives `execOneCall` and not the pure functions.
-    if (std.mem.eql(u8, call.name, "goal")) {
-        applyGoalCall(m, call.args_json, arena);
-    }
-
-    // Phase 5/34.6: PreToolUse hooks can block the tool or update its input.
-    {
-        const hook_subj = if (subjects.len > 0) subjects[0] else "";
-        const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
-            .event = .PreToolUse,
-            .tool = call.name,
-            .subject = hook_subj,
-        }, io_global) catch &[_]hooks_mod.RunResult{};
-        defer if (hook_res.len > 0) hooks_mod.freeResults(m.allocator, hook_res);
-        if (hooks_mod.blockedReason(m.allocator, hook_res, .PreToolUse) catch null) |reason| {
-            defer m.allocator.free(reason);
-            const ms = elapsedMs(call_t0);
-            m.pushToolDone(call.name, "blocked by hook", ms, reason);
-            capStoreAppendToolResult(m, s, call.id, call.name, reason, arena, budget);
-            return 0;
-        }
-        if (hooks_mod.updatedInput(hook_res)) |ui| {
-            exec_args = arena.dupe(u8, ui) catch exec_args;
-        }
-    }
-
-    var res = tools_mod.executeWith(io_global, call.name, exec_args, arena, &m.bg, &m.reads, &m.tasks, perm_rules) catch |err| {
-        const ms = elapsedMs(call_t0);
-        // What the MODEL is told is not the error name. See `describeError`.
-        const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
-        m.pushToolDone(call.name, "failed", ms, emsg);
-        s.appendToolResult(call.id, call.name, emsg) catch {};
-        return 0;
-    };
-    // Phase 5/34.6: PostToolUse hooks; output/additionalContext fed back.
-    {
-        const hook_subj = if (subjects.len > 0) subjects[0] else "";
-        const hook_res = hooks_mod.fire(m.allocator, &hooks_set, .{
-            .event = .PostToolUse,
-            .tool = call.name,
-            .subject = hook_subj,
-        }, io_global) catch &[_]hooks_mod.RunResult{};
-        defer if (hook_res.len > 0) hooks_mod.freeResults(m.allocator, hook_res);
-        if (hooks_mod.notesText(m.allocator, hook_res) catch null) |note| {
-            defer m.allocator.free(note);
-            res = std.fmt.allocPrint(arena, "{s}\n\n[hook note]\n{s}", .{ res, note }) catch res;
-        }
-    }
-    // The automatic typecheck, and the exit gate's write counter, fed from HERE.
-    //
-    // The success path and not the list of calls, and that is the whole reason this is
-    // four lines below the `execute`: a denied `edit`, a `write` to a path that could not
-    // be opened and an `edit` whose old string was not found ALL return above, and none
-    // of them changed a byte. Counting them made the gate wait for a check of files
-    // that still had their old contents — a check that comes back green and is about
-    // the wrong thing, which is worse than no check because it reads as evidence.
-    const wrote = m.auto_check.noteWrite(call.name, call.args_json);
-    m.auto_check.afterTool(&m.bg, io_global, wrote);
-
-    const ms = elapsedMs(call_t0);
-    turn_stats.noteTool();
-    if (TurnStats.isReadOnlyTool(call.name)) turn_stats.noteRead();
-    if (std.mem.eql(u8, call.name, "bash") and startedBackground(res)) m.bench.bg_jobs += 1;
-    const summary = toolResultSummary(call.name, res, arena);
-    m.pushToolDone(call.name, summary, ms, res);
-
-    // Diff against the previous content, if the tool touched a file.
-    if (before) |old| {
-        if (filePathOf(call.args_json, arena)) |pth| {
-            const after = std.Io.Dir.cwd().readFileAlloc(io_global, pth, arena, .limited(4 * 1024 * 1024)) catch {
-                s.appendToolResult(call.id, call.name, res) catch {};
-                return 1;
+    const Ctx = struct {};
+    var ctx = Ctx{};
+    const H = struct {
+        fn permAns(a: tui.Model.PermAnswer) tool_exec.PermAnswer {
+            return switch (a) {
+                .allow => .allow,
+                .allow_always => .allow_always,
+                .allow_sandbox => .allow_sandbox,
+                .deny => .deny,
+                .none => .none,
             };
-            // The TUI renders a compact file card (before the diff) and the diff
-            // itself from real before/after content.
-            const dc = m.pushFileDiff(old, after, pth);
+        }
+        fn toolArgSummaryFn(p: *anyopaque, name: []const u8, args_json: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return toolArgSummary(name, args_json, a);
+        }
+        fn toolTimelineLabelFn(p: *anyopaque, name: []const u8, args_json: []const u8, arg: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return toolTimelineLabel(name, args_json, arg, a);
+        }
+        fn toolResultSummaryFn(p: *anyopaque, name: []const u8, res: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return toolResultSummary(name, res, a);
+        }
+        fn setStatusToolingFn(p: *anyopaque, m_: *tui.Model, text: []const u8) void {
+            _ = p;
+            setStatusWithZo(m_, .tooling, text);
+        }
+        fn pushToolStartFn(p: *anyopaque, m_: *tui.Model, name: []const u8, label: []const u8) void {
+            _ = p;
+            m_.pushToolStart(name, label);
+        }
+        fn pushToolDoneFn(p: *anyopaque, m_: *tui.Model, name: []const u8, summary: []const u8, ms: u64, text: []const u8) void {
+            _ = p;
+            m_.pushToolDone(name, summary, ms, text);
+        }
+        fn permAutoAllowedFn(p: *anyopaque, name: []const u8, arg: []const u8, args_json: []const u8, a: std.mem.Allocator) bool {
+            _ = p;
+            return permAutoAllowed(name, arg, args_json, a);
+        }
+        fn permNeedsDialogFn(p: *anyopaque, perm_tools: []const []const u8) bool {
+            _ = p;
+            return permNeedsDialog(perm_tools);
+        }
+        fn rememberAlwaysAllowFn(p: *anyopaque, m_: *tui.Model, name: []const u8, arg: []const u8, args_json: []const u8, perm_tools: []const []const u8, a: std.mem.Allocator) void {
+            _ = p;
+            rememberAlwaysAllow(m_, name, arg, args_json, perm_tools, a);
+        }
+        fn requestPermissionFn(p: *anyopaque, m_: *tui.Model, name: []const u8, detail: []const u8) tool_exec.PermAnswer {
+            _ = p;
+            return permAns(m_.requestPermission(name, detail));
+        }
+        fn requestPermissionOnceFn(p: *anyopaque, m_: *tui.Model, name: []const u8, detail: []const u8) tool_exec.PermAnswer {
+            _ = p;
+            return permAns(m_.requestPermissionOnce(name, detail));
+        }
+        fn setPermSuggestionFn(p: *anyopaque, m_: *tui.Model, s_: []const u8) void {
+            _ = p;
+            m_.setPermSuggestion(s_);
+        }
+        fn setPermRuleFn(p: *anyopaque, m_: *tui.Model, s_: []const u8) void {
+            _ = p;
+            m_.setPermRule(s_);
+        }
+        fn setPermSandboxAvailableFn(p: *anyopaque, m_: *tui.Model, v: bool) void {
+            _ = p;
+            m_.setPermSandboxAvailable(v);
+        }
+        fn permSuggestionFn(p: *anyopaque, name: []const u8, args_json: []const u8, a: std.mem.Allocator) ?[]const u8 {
+            _ = p;
+            return permSuggestion(name, args_json, a);
+        }
+        fn sandboxAvailableFn(p: *anyopaque, cmdv: []const u8, a: std.mem.Allocator) bool {
+            _ = p;
+            if (cmdv.len == 0 or !cmdsafety.isFlagged(cmdv, a)) return false;
+            const path = if (environ_global) |e| e.get("PATH") else null;
+            return sandbox_mod.detect(io_global, std.Io.Dir.cwd(), path) != .none;
+        }
+        fn bashCommandOfFn(p: *anyopaque, args_json: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return bashCommandOf(args_json, a);
+        }
+        fn filePathOfFn(p: *anyopaque, args_json: []const u8, a: std.mem.Allocator) ?[]const u8 {
+            _ = p;
+            return filePathOf(args_json, a);
+        }
+        fn snapshotForUndoFn(p: *anyopaque, m_: *tui.Model, pth: []const u8, a: std.mem.Allocator) void {
+            _ = p;
+            snapshotForUndo(m_, pth, a);
+        }
+        fn prepareImageFn(p: *anyopaque, m_: *tui.Model, args_json: []const u8) ?[]const u8 {
+            _ = p;
+            return prepareImage(m_, args_json);
+        }
+        fn applyPlanCallFn(p: *anyopaque, m_: *tui.Model, args_json: []const u8, a: std.mem.Allocator) void {
+            _ = p;
+            applyPlanCall(m_, args_json, a);
+        }
+        fn applyGoalCallFn(p: *anyopaque, m_: *tui.Model, args_json: []const u8, a: std.mem.Allocator) void {
+            _ = p;
+            applyGoalCall(m_, args_json, a);
+        }
+        fn noteToolFn(p: *anyopaque) void {
+            _ = p;
+            turn_stats.noteTool();
+        }
+        fn noteDeniedFn(p: *anyopaque) void {
+            _ = p;
+            turn_stats.noteDenied();
+        }
+        fn noteReadFn(p: *anyopaque) void {
+            _ = p;
+            turn_stats.noteRead();
+        }
+        fn pushFileDiffAndNoteFn(p: *anyopaque, m_: *tui.Model, old: []const u8, after: []const u8, pth: []const u8) void {
+            _ = p;
+            const dc = m_.pushFileDiff(old, after, pth);
             turn_stats.noteDiff(pth, dc);
         }
-    }
-    // [readcache] Two things that need the message this result is about to become.
-    //
-    // 1) A `write`/`edit` invalidates the file in the cache. Without this, the next
-    //    `read` of the file the model JUST edited would take the fast path (the
-    //    stat does not have to change for the answer to be wrong: the content
-    //    lives in the model only) and answer "unchanged, it is in your context"
-    //    with the OLD text in the context. `mtime` would catch it a second later;
-    //    this catches it now.
-    // 2) A `read` records WHICH message its content went into, which is how
-    //    compaction can tell the cache that it just deleted that content.
-    if (filePathOf(call.args_json, arena)) |pth| {
-        if (isWriteTool(call.name)) {
-            m.reads.invalidate(pth);
-            // The facts sourced from the file are about the text that was
-            // just replaced: keep them and the model is told something true
-            // about a version that no longer exists.
-            _ = m.invalidateFactSource(pth, 0);
-            _ = m.invalidateProjectFacts();
-        }
-    }
-
-    // [/files] The files this call WROTE to, for the session's list.
-    //
-    // It is the SUCCESS path and not the list of calls: a denied `edit`, a
-    // `write` to a path that could not be opened and an `edit` whose old
-    // string was not found ALL changed nothing, and a list that says "changed"
-    // about them is a list that lies.
-    //
-    // `callTouchedPaths` and not `filePathOf`: it knows the MULTI-FILE form of
-    // `edit` (`files: [{path,…}]`) and the writing steps of a `batch`, and
-    // those are the calls that touch more than one file. A `rename` is NOT
-    // here: it FINDS its own files and its arguments never name them, so
-    // there is nothing to read out of the call.
-    if (callIsWrite(call.name, call.args_json, arena)) {
-        for (tools_mod.callTouchedPaths(call.name, call.args_json, arena)) |pth| {
-            m.changed.note(pth);
-        }
-    }
-    // A `bash` that was NOT read-only may have changed files, and the paths
-    // are not in the arguments: a command is a string, not a list of files.
-    // The report says so instead of implying that the list is complete.
-    if (std.mem.eql(u8, call.name, "bash") and !reads_only) {
-        m.bash_may_write = true;
-    }
-
-    // Phase 3: recoverable storage + per-tool/aggregate/frozen capping.
-    capStoreAppendToolResult(m, s, call.id, call.name, res, arena, budget);
-    if (std.mem.eql(u8, call.name, "read")) {
-        if (s.messages.items.len > 0) {
-            const idx: u32 = @intCast(s.messages.items.len - 1);
-            if (filePathOf(call.args_json, arena)) |pth| m.reads.setMessageIndex(pth, idx);
-        }
-    }
-    return 1;
+    };
+    const ops = tool_exec.ExecOneOps{
+        .ctx = @ptrCast(&ctx),
+        .toolArgSummary = H.toolArgSummaryFn,
+        .toolTimelineLabel = H.toolTimelineLabelFn,
+        .toolResultSummary = H.toolResultSummaryFn,
+        .setStatusTooling = H.setStatusToolingFn,
+        .pushToolStart = H.pushToolStartFn,
+        .pushToolDone = H.pushToolDoneFn,
+        .permAutoAllowed = H.permAutoAllowedFn,
+        .permNeedsDialog = H.permNeedsDialogFn,
+        .rememberAlwaysAllow = H.rememberAlwaysAllowFn,
+        .requestPermission = H.requestPermissionFn,
+        .requestPermissionOnce = H.requestPermissionOnceFn,
+        .setPermSuggestion = H.setPermSuggestionFn,
+        .setPermRule = H.setPermRuleFn,
+        .setPermSandboxAvailable = H.setPermSandboxAvailableFn,
+        .permSuggestion = H.permSuggestionFn,
+        .sandboxAvailable = H.sandboxAvailableFn,
+        .bashCommandOf = H.bashCommandOfFn,
+        .filePathOf = H.filePathOfFn,
+        .snapshotForUndo = H.snapshotForUndoFn,
+        .prepareImage = H.prepareImageFn,
+        .applyPlanCall = H.applyPlanCallFn,
+        .applyGoalCall = H.applyGoalCallFn,
+        .noteTool = H.noteToolFn,
+        .noteDenied = H.noteDeniedFn,
+        .noteRead = H.noteReadFn,
+        .pushFileDiffAndNote = H.pushFileDiffAndNoteFn,
+    };
+    const state = tool_exec.ExecState{
+        .io = io_global,
+        .yolo = yolo,
+        .read_only = read_only,
+        .environ = environ_global,
+        .perm_rules = perm_rules,
+        .hooks_set = &hooks_set,
+        .accept_edits = accept_edits,
+    };
+    return tool_exec.execOneCall(m, s, call, arena, denied, budget, state, ops);
 }
 
-/// Did this `bash` result start a background job?
-///
-/// Parsed from the RESULT text and not from the arguments: by the time the result
-/// exists the registry is the truth, and matching the model's own wording would
-/// count a foreground `bash` whose output happened to contain the words.
 fn startedBackground(res: []const u8) bool {
-    return std.mem.startsWith(u8, res, "started in the background as job ");
+    return tool_exec_policy.startedBackground(res);
 }
 
 /// Runs a run of consecutive read-only tool calls at the same time.
@@ -10847,132 +7662,45 @@ fn runParallelBatch(
     to: usize,
     arena: std.mem.Allocator,
     budget: *ResultBudget,
-) struct { ok: usize, denied: usize } {
-    const n = to - from;
-    const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-
-    // One header per call, in order, all before anything runs.
-    for (t.calls.items[from..to]) |call| {
-        const arg = toolArgSummary(call.name, call.args_json, arena);
-        m.pushToolStart(call.name, arg);
-    }
-    // The strip says "running" with the batch, not one tool: with four greps
-    // there is no single tool that is "the" one, and a name that changes every
-    // frame reads as a flicker.
-    var batch_buf: [128]u8 = undefined;
-    const batch_label = std.fmt.bufPrint(&batch_buf, "{d} searches in parallel", .{n}) catch "searching";
-    setStatusWithZo(m, .tooling, batch_label);
-    // `pushToolStart` set `tool_run` to the last one; clear it so the clock line
-    // does not claim a single tool is running.
-    m.toolRunEnd();
-
-    const Job = struct {
-        name: []const u8,
-        args: []const u8,
-        id: []const u8,
-        text: []const u8,
-        ms: u64,
-        err: bool,
-    };
-    var results = arena.alloc(Job, n) catch {
-        // Out of memory for the results: fall back to serial. A correct-but-slow
-        // turn beats a broken one.
-        var ok: usize = 0;
-        var denied: usize = 0;
-        for (t.calls.items[from..to]) |call| {
-            ok += execOneCall(m, s, call, arena, &denied, budget);
+) tool_exec.ParallelResult {
+    const Ctx = struct { m: *tui.Model, s: *session_mod.Session };
+    var ctx = Ctx{ .m = m, .s = s };
+    const Ops = struct {
+        fn toolArgSummaryFn(p: *anyopaque, name: []const u8, args_json: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return toolArgSummary(name, args_json, a);
         }
-        return .{ .ok = ok, .denied = denied };
-    };
-    @memset(results, .{ .name = "", .args = "", .id = "", .text = "", .ms = 0, .err = false });
-
-    const Ctx = struct {
-        call: TurnCtx.Call,
-        out: *Job,
-        m: *tui.Model,
-        pending: *std.atomic.Value(usize),
-    };
-    var ctxs = arena.alloc(Ctx, n) catch return .{ .ok = 0, .denied = 0 };
-    // The per-batch pending count, decremented by each thread. `m.workerCount()`
-    // is NOT used to wait: it includes the chat worker, and waiting for it here
-    // would be waiting for the turn to finish (see `waitForBatch`).
-    var pending = std.atomic.Value(usize).init(n);
-    for (t.calls.items[from..to], 0..) |call, k| {
-        ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .pending = &pending };
-    }
-    // `beginWorker`/`endWorker` around the thread as well: at exit `waitWorkers`
-    // has to hold until these are done, or `app.deinit()` destroys the `Io` while
-    // one of them is inside `std.process.run` (the AGENTS.md detached-worker trap).
-    const Runner = struct {
-        fn run(ctx: *Ctx) void {
-            ctx.m.beginWorker();
-            defer ctx.m.endWorker();
-            defer _ = ctx.pending.fetchSub(1, .seq_cst);
-            const call_t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-            // A per-call arena: the shared one is off limits from two threads
-            // (its ArrayList length would be a data race, and a silent one).
-            var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
-            defer astate.deinit();
-            const a = astate.allocator();
-            const text = tools_mod.executeWith(io_global, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads, &ctx.m.tasks, perm_rules) catch |err| {
-                ctx.out.err = true;
-                ctx.out.text = @constCast(@errorName(err));
-                ctx.out.ms = elapsedMs(call_t0);
-                return;
-            };
-            // COPIED OUT OF `a`: the arena dies with this thread's `defer`, and
-            // `waitForBatch` returns only when every `defer` has run, so a
-            // `results[k].text` pointing into `a` is a dangling pointer for
-            // EVERY call, not a race. It was `a.dupe` — allocating the copy in
-            // the same arena that is about to be freed — with a comment
-            // asserting the opposite. `ctx.m.allocator` is the model's
-            // allocator, which outlives the batch, exactly as `runTaskBatch`'s
-            // runner does it.
-            ctx.out.text = ctx.m.allocator.dupe(u8, text) catch "";
-            ctx.out.ms = elapsedMs(call_t0);
+        fn toolResultSummaryFn(p: *anyopaque, name: []const u8, res: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return toolResultSummary(name, res, a);
+        }
+        fn setStatusToolingFn(p: *anyopaque, text: []const u8) void {
+            const c: *Ctx = @ptrCast(@alignCast(p));
+            setStatusWithZo(c.m, .tooling, text);
+        }
+        fn execOneCallSerialFn(p: *anyopaque, call: TurnCtx.Call, a: std.mem.Allocator, denied: *usize, b: *ResultBudget) usize {
+            const c: *Ctx = @ptrCast(@alignCast(p));
+            return execOneCall(c.m, c.s, call, a, denied, b);
+        }
+        fn capStoreAppendFn(p: *anyopaque, call_id: []const u8, tool_name: []const u8, result: []const u8, a: std.mem.Allocator, b: *ResultBudget) void {
+            const c: *Ctx = @ptrCast(@alignCast(p));
+            capStoreAppendToolResult(c.m, c.s, call_id, tool_name, result, a, b);
+        }
+        fn noteToolFn(p: *anyopaque) void {
+            _ = p;
+            turn_stats.noteTool();
         }
     };
-    for (ctxs) |*c| {
-        // A SPAWN FAILURE has to run the call inline, or the result slot stays
-        // empty and the model gets a tool result with no tool call behind it.
-        const th = std.Thread.spawn(.{}, Runner.run, .{c}) catch {
-            Runner.run(c);
-            continue;
-        };
-        th.detach();
-    }
-    waitForBatch(&pending, 120_000);
-
-    // Results, in request order.
-    var ok: usize = 0;
-    for (results, 0..) |r, k| {
-        if (r.text.len == 0 and r.err) {
-            m.pushToolDone(t.calls.items[from + k].name, "failed", r.ms, "the parallel search failed");
-            s.appendToolResult(t.calls.items[from + k].id, t.calls.items[from + k].name, "the parallel search failed") catch {};
-            continue;
-        }
-        ok += 1;
-        turn_stats.noteTool();
-        const summary = toolResultSummary(t.calls.items[from + k].name, r.text, arena);
-        m.pushToolDone(t.calls.items[from + k].name, summary, r.ms, r.text);
-        // Phase 3: recoverable storage + per-tool/aggregate/frozen capping.
-        capStoreAppendToolResult(m, s, t.calls.items[from + k].id, t.calls.items[from + k].name, r.text, arena, budget);
-        // `r.text` was copied by TUI/session/capping paths as needed; free
-        // heap-owned results. `err` slots may hold literals.
-        if (!r.err) m.allocator.free(r.text);
-    }
-
-    // The batch's own clock: it is the number the user can compare against a
-    // serial run of the same searches, which is the whole point of doing this.
-    const total_ms = elapsedMs(t0);
-    var sum_buf: [128]u8 = undefined;
-    const sum = std.fmt.bufPrint(&sum_buf, "{d} searches in parallel · {d}.{d}s", .{
-        n,
-        total_ms / 1000,
-        (total_ms % 1000) / 100,
-    }) catch "searches";
-    setStatusWithZo(m, .tooling, sum);
-    return .{ .ok = ok, .denied = 0 };
+    const ops = tool_exec.ParallelOps{
+        .ctx = @ptrCast(&ctx),
+        .toolArgSummary = Ops.toolArgSummaryFn,
+        .toolResultSummary = Ops.toolResultSummaryFn,
+        .setStatusTooling = Ops.setStatusToolingFn,
+        .execOneCallSerial = Ops.execOneCallSerialFn,
+        .capStoreAppendToolResult = Ops.capStoreAppendFn,
+        .noteTool = Ops.noteToolFn,
+    };
+    return tool_exec.runParallelBatch(m, s, t, from, to, arena, budget, io_global, perm_rules, ops);
 }
 
 /// A plain `nanosleep`, NOT `Io.sleep`.
@@ -10982,15 +7710,7 @@ fn runParallelBatch(
 /// activity strip freezes and the screen looks dead. Same trap as `Retry.wait`,
 /// documented in AGENTS.md.
 fn napMs(ms: u64) void {
-    if (builtin.os.tag != .linux) {
-        std.Thread.yield() catch {};
-        return;
-    }
-    const ts = std.os.linux.timespec{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
-    };
-    _ = std.os.linux.nanosleep(&ts, null);
+    tool_exec.napMs(ms);
 }
 
 /// Waits for the batch's threads.
@@ -11009,10 +7729,7 @@ fn napMs(ms: u64) void {
 /// server that never answers would park the turn forever, which is the freeze this
 /// project has already paid for once.
 fn waitForBatch(pending: *std.atomic.Value(usize), deadline_ms: u64) void {
-    var waited: u64 = 0;
-    while (pending.load(.seq_cst) > 0 and waited < deadline_ms) : (waited += 5) {
-        napMs(5);
-    }
+    tool_exec.waitForBatch(pending, deadline_ms);
 }
 
 /// Points the Model's task graph at this session's file.
@@ -11040,168 +7757,85 @@ fn bindTasks(m: *tui.Model, s: *session_mod.Session) void {
 /// the old return value was handed to `runOneTurn`, which dropped it, and the
 /// model never saw a word of what happened after its tools ran.
 fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
-    const gpa = m.allocator;
-    bindTasks(m, s);
-    var astate = std.heap.ArenaAllocator.init(gpa);
-    defer astate.deinit();
-    const arena = astate.allocator();
-    const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-    var ran: usize = 0;
-    var denied: usize = 0;
-    // The budget of THIS message: it is reset for every assistant message, and
-    // it is what stops a fan-out of reads from putting a megabyte in one turn.
-    var budget: ResultBudget = .{};
-    _ = &budget;
-
-    var i: usize = 0;
-    while (i < t.calls.items.len) {
-        const call = t.calls.items[i];
-
-        // The three tools that need the Model are intercepted HERE, before
-        // `tools.execute`, because they cannot work without it: `ask` needs the
-        // dialog, `task` needs to run a nested loop with this turn's HTTP client,
-        // and `skill` needs the discovered entries. Reaching `execute` with one of
-        // them is `error.UnknownTool`, which reads as a typo in the model's
-        // arguments; the interception is the fix, not a nicer error.
-        if (std.mem.eql(u8, call.name, "ask")) {
-            i += 1;
-            ran += askCall(m, s, call, arena, &budget);
-            continue;
+    const SCtx = struct { m: *tui.Model, s: *session_mod.Session };
+    var sctx = SCtx{ .m = m, .s = s };
+    const S = struct {
+        fn askW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return askCall(m_, s_, call, a, b);
         }
-        if (std.mem.eql(u8, call.name, "skill")) {
-            i += 1;
-            ran += skillCall(m, s, call, arena, &budget);
-            continue;
+        fn skillW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return skillCall(m_, s_, call, a, b);
         }
-        if (std.mem.eql(u8, call.name, "review")) {
-            // Intercepted here for the same reason as `ask` and `todo`: what it needs
-            // is the TURN's list of touched files, which lives in `turn_stats` and not
-            // in anything a tool can reach. A `review` tool that got the whole working
-            // tree would hand back 400 files of someone else's change.
-            i += 1;
-            ran += reviewCall(m, s, call, arena, &budget);
-            continue;
+        fn reviewW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return reviewCall(m_, s_, call, a, b);
         }
-        if (std.mem.eql(u8, call.name, "memory")) {
-            i += 1;
-            ran += memoryCall(m, s, call, arena, &budget);
-            continue;
+        fn memoryW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return memoryCall(m_, s_, call, a, b);
         }
-        if (std.mem.eql(u8, call.name, "task")) {
-            // Consecutive `task` calls go together: they are independent
-            // read-only searches, and in series each one is a full round trip of
-            // waiting for something that does not depend on the previous one.
-            const jt = taskBatchEnd(t.calls.items, i);
-            if (jt - i == 1) {
-                i += 1;
-                ran += taskCall(m, s, call, arena, &budget);
-            } else {
-                const r = runTaskBatch(m, s, t, i, jt, arena, &budget);
-                ran += r.ok + r.denied;
-                i = jt;
-            }
-            continue;
+        fn taskW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return taskCall(m_, s_, call, a, b);
         }
-
-        // ── parallel batch of read-only tools ──
-        //
-        // Consecutive calls that only READ are gathered and run at the same time.
-        // Three greps over a big tree is the common case (the model fans out to
-        // find something), and in series that is 3x the wait for a result that
-        // does not depend on any of the other two.
-        //
-        // What makes it safe is NOT "they are fast" but "they cannot observe each
-        // other": no shared output buffer, no ordering requirement, no
-        // permission dialog (they are all in the no-permission group). A tool
-        // that wrote anything, or that the model expects to see the world after,
-        // is not in `isParallelSafe` and stays in the serial path below.
-        //
-        // The results are appended to the session in the ORIGINAL order, because
-        // that is the order the model asked for and the order it reads.
-        var batch: usize = i;
-        while (batch < t.calls.items.len and tools_mod.isParallelSafe(t.calls.items[batch].name)) batch += 1;
-
-        if (batch - i > 1) {
-            const n = runParallelBatch(m, s, t, i, batch, arena, &budget);
-            ran += n.ok;
-            denied += n.denied;
-            i = batch;
-            continue;
+        fn runTaskBatchW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, t_: *TurnCtx, from: usize, to: usize, a: std.mem.Allocator, b: *ResultBudget) tool_exec.ParallelResult {
+            _ = p;
+            const r = runTaskBatch(m_, s_, t_, from, to, a, b);
+            return .{ .ok = r.ok, .denied = r.denied };
         }
-
-        i += 1;
-        ran += execOneCall(m, s, call, arena, &denied, &budget);
-    }
-    // The repetition guard, fed HERE because this is the only place a tool call is
-    // seen with its arguments. The loop checks the flag; it cannot count, because it
-    // never sees a call.
-    //
-    // It stays here even though the automatic check moved: this is about the CALL and
-    // not about its effect, so three denied attempts to run the same command are still
-    // three attempts and still a loop worth stopping.
-    //
-    // A call whose whole purpose is to LOOK AT SOMETHING AGAIN is exempt, and the
-    // criterion is that it has no argument that could distinguish it from itself:
-    // the only variable is time, and time is not in the arguments. See
-    // `isRepeatExempt` and `Repeats.noteGuarded`, which is where the rule lives so
-    // that this call and its tests cannot disagree.
-    for (t.calls.items) |c| {
-        if (m.repeats.noteGuarded(c.name, c.args_json)) |which| {
-            if (m.loop_repeated == null) {
-                m.loop_repeated = which;
-            }
+        fn execOneCallW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, denied: *usize, b: *ResultBudget) usize {
+            _ = p;
+            return execOneCall(m_, s_, call, a, denied, b);
         }
-        // No-progress guard: break out of a read-only spiral
-        // (read → read → read with no write in between). `read` is exempt from the
-        // identical-call guard, so count it separately; any write/edit resets it.
-        if (std.mem.eql(u8, c.name, "read")) {
-            if (m.repeats.noteRead()) |which| {
-                if (m.loop_repeated == null) {
-                    m.loop_repeated = which;
-                }
-            }
-        } else if (std.mem.eql(u8, c.name, "write") or std.mem.eql(u8, c.name, "edit") or std.mem.eql(u8, c.name, "notebook_edit")) {
-            m.repeats.noteWrite();
+        fn toolArgSummaryW(p: *anyopaque, name: []const u8, args_json: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return toolArgSummary(name, args_json, a);
         }
-    }
-    // The automatic typecheck is started from the SUCCESS path of each call
-    // (`execOneCall`), not from this list. This loop cannot tell a call that ran from
-    // one that did not, and both of the mistakes that produced came from asking it to:
-    //
-    // 1. It started a check for a DENIED edit, and for one that failed to apply, so the
-    //    build it waited for was a build of files that still had their old contents:
-    //    green, and about the wrong thing.
-    // 2. It counted them as writes, so the exit gate would refuse to let the turn end
-    //    on the strength of a check covering code that was never written.
-    //
-    // An edit is still followed by a typecheck without the model asking — the model
-    // finds out it broke something one iteration too late otherwise — and it is still
-    // started in the BACKGROUND, so the model goes on to the next file and the result
-    // is waiting when it looks.
-
-    s.flush();
-    // "tools done" says nothing. With the numbers it does: you know whether it was
-    // fast (and therefore whether the model is going to continue or has stopped)
-    // and whether there were denials, which is what you have to look at after.
-    const total_ms = elapsedMs(t0);
-    const tools_status = std.fmt.allocPrint(
-        gpa,
-        "{d} tool{s} · {d}.{d}s{s}",
-        .{
-            ran,
-            if (ran == 1) "" else "s",
-            total_ms / 1000,
-            (total_ms % 1000) / 100,
-            if (denied > 0) " · denied" else "",
-        },
-    ) catch "tools done";
-    setStatusWithZo(m, .tooling, tools_status);
-
-    // NOTE: no synthetic user message is appended here. The next request is
-    // built from tool messages alone (that is how the headless runner always
-    // worked against both OpenAI and Anthropic), and the message used to be
-    // returned and then dropped silently — the wire is the session, not a
-    // return value.
+        fn toolResultSummaryW(p: *anyopaque, name: []const u8, res: []const u8, a: std.mem.Allocator) []const u8 {
+            _ = p;
+            return toolResultSummary(name, res, a);
+        }
+        fn setStatusToolingW(p: *anyopaque, text: []const u8) void {
+            const c: *SCtx = @ptrCast(@alignCast(p));
+            setStatusWithZo(c.m, .tooling, text);
+        }
+        fn execOneCallSerialW(p: *anyopaque, call: TurnCtx.Call, a: std.mem.Allocator, denied: *usize, b: *ResultBudget) usize {
+            const c: *SCtx = @ptrCast(@alignCast(p));
+            return execOneCall(c.m, c.s, call, a, denied, b);
+        }
+        fn capStoreAppendW(p: *anyopaque, call_id: []const u8, tool_name: []const u8, result: []const u8, a: std.mem.Allocator, b: *ResultBudget) void {
+            const c: *SCtx = @ptrCast(@alignCast(p));
+            capStoreAppendToolResult(c.m, c.s, call_id, tool_name, result, a, b);
+        }
+        fn noteToolW(p: *anyopaque) void {
+            _ = p;
+            turn_stats.noteTool();
+        }
+    };
+    const pops = tool_exec.ParallelOps{
+        .ctx = @ptrCast(&sctx),
+        .toolArgSummary = S.toolArgSummaryW,
+        .toolResultSummary = S.toolResultSummaryW,
+        .setStatusTooling = S.setStatusToolingW,
+        .execOneCallSerial = S.execOneCallSerialW,
+        .capStoreAppendToolResult = S.capStoreAppendW,
+        .noteTool = S.noteToolW,
+    };
+    const tcops = tool_exec.ToolCallsOps{
+        .ctx = @ptrCast(&sctx),
+        .askCall = S.askW,
+        .skillCall = S.skillW,
+        .reviewCall = S.reviewW,
+        .memoryCall = S.memoryW,
+        .taskCall = S.taskW,
+        .runTaskBatch = S.runTaskBatchW,
+        .execOneCall = S.execOneCallW,
+        .parallel = pops,
+        .perm_rules = perm_rules,
+    };
+    return tool_exec.execToolCalls(m, s, t, io_global, tcops);
 }
 
 /// The text sent as "user" so the model sees the tool results. It lives in a
@@ -11686,28 +8320,11 @@ fn countDiagLines(s: []const u8) usize {
 
 /// Does this tool modify a file on disk?
 fn touchesFile(name: []const u8) bool {
-    return std.mem.eql(u8, name, "write") or
-        std.mem.eql(u8, name, "edit") or
-        // A notebook edit rewrites a file whole, so `/undo` has to have the bytes it
-        // had before: this is the list that decides whether a snapshot is taken, and a
-        // tool missing from it is an edit nobody can take back.
-        std.mem.eql(u8, name, "notebook_edit");
+    return tool_exec_policy.touchesFile(name);
 }
 
-/// Does this CALL modify a file?
-///
-/// A `batch` is decided by its steps: a batch of reads is a read, and a batch
-/// with a `write` or an `edit` step is a write. The static list of write
-/// tools cannot say that, and a batch that wrote in plan mode would be a
-/// hole in the mode.
 fn callIsWrite(name: []const u8, args_json: []const u8, arena: std.mem.Allocator) bool {
-    if (std.mem.eql(u8, name, "batch")) return tools_mod.callWrites(name, args_json, arena);
-    // An MCP CALL can change the world: the tool behind it is the user's own
-    // and zode cannot know what it does, so plan mode blocks it. The `list`
-    // and `search` operations only read the catalogue and are allowed: a plan
-    // written without looking is a plan written in the dark.
-    if (std.mem.eql(u8, name, "mcp")) return tools_mod.callWrites(name, args_json, arena);
-    return isWriteTool(name);
+    return tool_exec_policy.callIsWrite(name, args_json, arena);
 }
 
 /// The BEFORE snapshot of one file, for `/undo`.
@@ -12066,12 +8683,7 @@ fn allowAlwaysForCall(m: *tui.Model, name: []const u8, arg: []const u8, perm_too
 /// files and commit them while saying it touched nothing. Read-only git tools
 /// (status/diff/log) are deliberately NOT here.
 pub fn isWriteTool(name: []const u8) bool {
-    return isEditTool(name) or // write, edit, rename
-        std.mem.eql(u8, name, "bash") or
-        std.mem.eql(u8, name, "git_add") or
-        std.mem.eql(u8, name, "git_commit") or
-        std.mem.eql(u8, name, "git_stash") or
-        std.mem.eql(u8, name, "git_branch");
+    return tool_exec_policy.isWriteTool(name);
 }
 
 /// The tools that change files but run no command: the ones
@@ -12080,11 +8692,7 @@ pub fn isWriteTool(name: []const u8) bool {
 /// is `task`, because a subagent is exactly the thing that should
 /// stay behind a dialog.
 pub fn isEditTool(name: []const u8) bool {
-    return std.mem.eql(u8, name, "write") or
-        std.mem.eql(u8, name, "edit") or
-        std.mem.eql(u8, name, "rename") or
-        // A file edit: accept-edits may auto-allow it, and plan mode must refuse it.
-        std.mem.eql(u8, name, "notebook_edit");
+    return agent_perms.isEditTool(name);
 }
 
 /// Path of the file a writing tool touches (or null if it does not say).
@@ -12378,9 +8986,7 @@ fn toolResultSummary(name: []const u8, res: []const u8, arena: std.mem.Allocator
 }
 
 fn elapsedMs(t0: i128) u64 {
-    const now = std.Io.Timestamp.now(io_global, .real).nanoseconds;
-    if (now <= t0) return 0;
-    return @intCast(@divTrunc(now - t0, 1_000_000));
+    return tool_exec.elapsedMs(io_global, t0);
 }
 
 // ── errors and retries ────────────────────────────────────────
@@ -12435,27 +9041,10 @@ pub fn quotaVerdict(err: anyerror, detail: []const u8) ?roster_mod.Why {
 /// It is a substring match, case insensitive, because every provider words its
 /// own, and there is no one constant that works for all of them.
 pub fn isGateMessage(detail: []const u8) bool {
-    return containsNoCase(detail, "within opencode") or
-        containsNoCase(detail, "access is disabled") or
-        containsNoCase(detail, "not available for your") or
-        containsNoCase(detail, "only be used from within") or
-        containsNoCase(detail, "agentic harness") or
-        containsNoCase(detail, "not available on this account");
+    return gate_mod.isGateMessage(detail);
 }
-
-/// `containsNoCase` without allocating: it lowercases the two characters at a
-/// time instead of building a lowercase copy of the whole text.
 pub fn containsNoCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var k: usize = 0;
-        while (k < needle.len and
-            std.ascii.toLower(haystack[i + k]) == std.ascii.toLower(needle[k])) k += 1;
-        if (k == needle.len) return true;
-    }
-    return false;
+    return gate_mod.containsNoCase(haystack, needle);
 }
 
 const Retry = struct {
@@ -12712,17 +9301,19 @@ fn providerEnvNames(gpa: std.mem.Allocator) []u8 {
 /// If the elided view still goes over the budget, a summary is asked of the
 /// model and the old turns are replaced with a note. Best-effort: if it fails,
 /// it carries on without a summary.
-/// Accumulates the summary text (userdata of `summarizeTurns`'s callback).
-const SummarySink = struct {
-    gpa: std.mem.Allocator,
-    buf: std.ArrayList(u8) = .empty,
-};
 
-/// Summarizes a stretch of old messages with the model itself.
-///
-/// Returns the summary text, or null if it could not be done (it is
-/// best-effort: if it fails, the caller carries on with the messages as they
-/// are and only loses precision).
+fn openRouterExtraHeaders(
+    buf: *[2]http_client.Http.ExtraHeader,
+    provider_id: []const u8,
+) []const http_client.Http.ExtraHeader {
+    if (!std.mem.eql(u8, provider_id, "openrouter")) return &.{};
+    buf[0] = .{ .name = "HTTP-Referer", .value = "https://github.com/jesusalcala/zode" };
+    buf[1] = .{ .name = "X-OpenRouter-Title", .value = "zode" };
+    return buf[0..2];
+}
+
+/// Tier-2 compaction summarization (extracted). Keeps `agent.summarizeTurns`
+/// as the public entry point/facade.
 pub fn summarizeTurns(
     gpa: std.mem.Allocator,
     http: *http_client.Http,
@@ -12736,55 +9327,21 @@ pub fn summarizeTurns(
     extra_headers: []const http_client.Http.ExtraHeader,
     max_output_tokens: u32,
 ) ?[]const u8 {
-    // Breaker open: stop spending requests on a summarizer that cannot summarize.
-    if (summary_breaker.tripped()) return null;
-
-    var ast = std.heap.ArenaAllocator.init(gpa);
-    defer ast.deinit();
-    const a = ast.allocator();
-
-    // A single user message with the conversation to summarize + the instruction.
-    const prompt = compaction.summaryPrompt(a, msgs) catch {
-        summary_breaker.noteFailure();
-        models_mod.dbg("[compaction] could not build the summary prompt\n", .{});
-        return null;
-    };
-    const body_buf = bodyBuf(gpa) catch {
-        summary_breaker.noteFailure();
-        return null;
-    };
-    const one = [_]chat.ChatMessage{.{ .role = "user", .content = prompt }};
-    const body = chat.buildBodyMessagesCapped(body_buf, model_name, &one, effort, "", kind, max_output_tokens) catch {
-        summary_breaker.noteFailure();
-        models_mod.dbg("[compaction] could not build the summary body\n", .{});
-        return null;
-    };
-
-    // The userdata carries the allocator + the buffer: a callback cannot capture
-    // `gpa` (a nested function does not see the outer environment).
-    var sink = SummarySink{ .gpa = gpa };
-    const cb: chat.Callbacks = .{
-        .userdata = &sink,
-        .onDelta = struct {
-            fn f(ud: ?*anyopaque, d: []const u8) void {
-                const s: *SummarySink = @ptrCast(@alignCast(ud.?));
-                s.buf.appendSlice(s.gpa, d) catch {};
-            }
-        }.f,
-    };
-    // Not the user's turn: its usage is not the turn's, and its errors are not
-    // the turn's either.
-    chat.streamChat(gpa, http, url, bearer, @constCast(body), cb, kind, false, extra_headers) catch |err| {
-        summary_breaker.noteFailure();
-        models_mod.dbg("[compaction] el resumen fallo: {t}\n", .{err});
-        return null;
-    };
-    if (sink.buf.items.len == 0) {
-        summary_breaker.noteFailure();
-        return null;
-    }
-    summary_breaker.noteSuccess();
-    return arena.dupe(u8, sink.buf.items) catch null;
+    const body_buf = bodyBuf(gpa) catch return null;
+    return summarize_mod.summarizeTurns(
+        gpa,
+        body_buf,
+        http,
+        url,
+        bearer,
+        kind,
+        model_name,
+        effort,
+        msgs,
+        arena,
+        extra_headers,
+        max_output_tokens,
+    );
 }
 
 // ── pickers ───────────────────────────────────────────────────
@@ -12796,7 +9353,7 @@ fn onProviderPick(m: *tui.Model, _: u32, label: []const u8) void {
 }
 
 fn onEffortPick(m: *tui.Model, _: u32, label: []const u8) void {
-    cmdEffort(m, label);
+    commands_mod.cmdEffort(m, label);
 }
 
 /// `/color`: the palette the diff is painted with.
@@ -12809,31 +9366,10 @@ fn onEffortPick(m: *tui.Model, _: u32, label: []const u8) void {
 ///
 /// The choice is for the session, and it says what it did: a palette that
 /// changed without saying so is a palette the user cannot trust.
-fn cmdColor(m: *tui.Model, arg: ?[]const u8) void {
-    if (arg) |a| {
-        if (std.mem.eql(u8, a, "default") or std.mem.eql(u8, a, "normal")) {
-            theme.caps.daltonized = false;
-            m.pushInfoFmt("diff palette → default (green / red)", .{});
-        } else if (std.mem.eql(u8, a, "daltonized") or std.mem.eql(u8, a, "daltonise") or
-            std.mem.eql(u8, a, "daltonize"))
-        {
-            theme.caps.daltonized = true;
-            m.pushInfoFmt("diff palette → daltonized (blue / orange)", .{});
-        } else {
-            m.pushInfoFmt("unknown palette: {s} (default | daltonized)", .{a});
-            return;
-        }
-        // The whole history is painted with the old palette, so it has to be
-        // laid out again.
-        m.clearSegCache();
-        m.dirty = true;
-        return;
-    }
-    openColorPicker(m);
-}
+
 
 /// The palette picker: the two pairs, with the active one marked.
-fn openColorPicker(m: *tui.Model) void {
+pub fn openColorPicker(m: *tui.Model) void {
     const gpa = m.allocator;
     const names = [_][]const u8{ "default", "daltonized" };
     const items = gpa.alloc(tui.PickerItem, names.len) catch return;
@@ -12854,7 +9390,7 @@ fn openColorPicker(m: *tui.Model) void {
 }
 
 fn onColorPick(m: *tui.Model, _: u32, label: []const u8) void {
-    cmdColor(m, label);
+    commands_mod.cmdColor(m, label);
 }
 
 /// Job of the model picker's catalog refresh.
@@ -13037,7 +9573,7 @@ fn warmupWorker(job: *WarmupJob) void {
     // on the shared `Io` is exactly the shape AGENTS.md already has a
     // use-after-free for, and isolating it is the right thing regardless of what
     // it fixes today.
-    //
+
     // Measured: it takes the no-key case from "answers nothing" to "answers every
     // time". It is NOT the fix for the saved-key case — gating the warmup off
     // entirely changes nothing there, which is why that bug is written up as OPEN
@@ -13059,118 +9595,11 @@ fn warmupWorker(job: *WarmupJob) void {
     tui.allowStatusModelRetry(m);
 }
 
-// ── self-update ─────────────────────────────────────────────────
-
-/// Looks for a newer release at startup, in a worker, and says so if there is
-/// one. It says NOTHING when the build is current: a line on every start saying
-/// "you are up to date" is noise, and it is the same line that makes the real
-/// notice invisible.
-///
-/// The check costs a file read on almost every start: `selfupdate` caches the
-/// answer on disk for six hours, so the network is touched twice a day at most.
+/// Self-update check at startup (delegated). Kept as `agent.startUpdateCheck` for main.zig.
 pub fn startUpdateCheck(m: *tui.Model) void {
-    if (envGet(m.environ, "ZODE_NO_SELF_UPDATE") != null) return;
-    spawnUpdateJob(m, .check) catch {};
+    commands_mod.startUpdateCheck(m);
 }
 
-/// `/update`: installs the newest release. It runs in a WORKER because it
-/// downloads ~2 MB, and a download on the UI thread is the app frozen for as
-/// long as GitHub takes.
-fn cmdUpdate(m: *tui.Model) void {
-    spawnUpdateJob(m, .install) catch pushError(m, "could not start the update");
-}
-
-const UpdateMode = enum { check, install };
-const UpdateJob = struct { model: *tui.Model, mode: UpdateMode };
-
-fn spawnUpdateJob(m: *tui.Model, mode: UpdateMode) !void {
-    const gpa = m.allocator;
-    const job = try gpa.create(UpdateJob);
-    job.* = .{ .model = m, .mode = mode };
-    m.beginWorker();
-    const thread = std.Thread.spawn(.{}, updateWorker, .{job}) catch {
-        m.endWorker();
-        gpa.destroy(job);
-        return error.ThreadSpawnFailed;
-    };
-    thread.detach();
-}
-
-fn updateWorker(job: *UpdateJob) void {
-    const m = job.model;
-    const mode = job.mode;
-    // LIFO, and the order matters: the job is freed LAST, after `endWorker` has
-    // read the model's counter through the (still valid) job.
-    defer m.allocator.destroy(job);
-    defer m.endWorker();
-
-    // Its own `Io`: a detached worker doing blocking TLS on the UI's event loop
-    // is the shape that made the app look hung.
-    var threaded: std.Io.Threaded = .init(m.allocator, .{});
-    defer threaded.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
-    defer arena_state.deinit();
-
-    const ctx: selfupdate.Context = .{
-        .io = threaded.io(),
-        .alloc = arena_state.allocator(),
-        .env = m.environ,
-    };
-
-    switch (mode) {
-        .check => {
-            const up = selfupdate.check(ctx, false) orelse return;
-            announceUpdate(m, up);
-            // Opt-in automatic install. The default is to TELL the user: a
-            // binary replaced behind their back is a change they cannot see and
-            // a restart they never asked for.
-            if (envGet(m.environ, "ZODE_AUTO_UPDATE") != null) installUpdateNow(m, ctx);
-        },
-        .install => installUpdateNow(m, ctx),
-    }
-}
-
-fn announceUpdate(m: *tui.Model, up: selfupdate.Update) void {
-    var buf: [160]u8 = undefined;
-    const phrase = selfupdate.phrase(&buf, up);
-    m.pushInfoFmt("zode {s} · /update installs it", .{phrase});
-}
-
-fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
-    m.pushInfoFmt("updating zode from {s}…", .{selfupdate.current_version});
-    const tag = selfupdate.installLatest(ctx) catch |err| switch (err) {
-        // Not a failure: there is simply nothing newer to install.
-        error.AlreadyNewest => {
-            m.pushInfoFmt("zode {s} is already the newest release", .{selfupdate.current_version});
-            return;
-        },
-        else => {
-            m.pushErrorFmt("update failed: {s}", .{updateErrorPhrase(err)});
-            return;
-        },
-    };
-    m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
-}
-
-/// What went wrong, in words the user can act on. "UpdateFailed" is not one:
-/// the three cases have three different fixes (wait, reinstall, sudo).
-fn updateErrorPhrase(err: selfupdate.InstallError) []const u8 {
-    return switch (err) {
-        error.AlreadyNewest => "already the newest release",
-        error.NoAssetForPlatform => "this platform has no release binary",
-        error.DownloadFailed => "could not download it (network, GitHub, or no release yet)",
-        error.BinaryDoesNotRun => "the downloaded binary does not run here; nothing was replaced",
-        error.NotWritable => "could not replace the running binary (permissions?)",
-        error.UnsupportedPlatform => "no releases for this OS/arch",
-    };
-}
-
-/// `/model` and Ctrl+T: the two-column model palette.
-///
-/// The active provider's models are requested; while they arrive, the palette
-/// opens anyway with the providers column (which is local and needs no
-/// network), and the worker fills it in when it finishes. So there is no blank
-/// wait.
 pub fn pickerModelsAsync(m: *tui.Model) !void {
     const job = createModelsJob(m) catch |err| {
         const def = activeProviderDef(m.environ);
@@ -13682,7 +10111,7 @@ pub const model_groups = [_]palette.Group{
 };
 
 /// `/provider`: picker with all the providers and their key state.
-fn openProviderPicker(m: *tui.Model) void {
+pub fn openProviderPicker(m: *tui.Model) void {
     const gpa = m.allocator;
     var defs_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer defs_arena_state.deinit();
@@ -13711,7 +10140,7 @@ fn openProviderPicker(m: *tui.Model) void {
 /// harmless extra row: picking it means the request 400s, and the picker had no
 /// way to say so. The list is `chat.effortLevels(cur_model)`, so it is exactly
 /// the vocabulary that `effortFor` will send.
-fn openEffortPicker(m: *tui.Model) void {
+pub fn openEffortPicker(m: *tui.Model) void {
     const gpa = m.allocator;
     const levels = chat.effortLevels(cur_model);
     const items = gpa.alloc(tui.PickerItem, levels.len) catch return;
@@ -13779,26 +10208,7 @@ pub const cmd_groups = [_]palette.Group{
 
 /// Wrapper of `cmdGroup` for the tests (see the `key[1..]` note).
 pub fn cmdGroupPublic(key: []const u8) u8 {
-    return cmdGroup(key);
-}
-
-/// Group (+1 index over `cmd_groups`) of each command. It lives apart from the
-/// list so the commands can be reordered without touching the mapping.
-fn cmdGroup(key: []const u8) u8 {
-    // "connect" (no slash) is the palette header item, not a slash command.
-    if (std.mem.eql(u8, key, "connect")) return 1;
-    // `key[1..]` blew up with "integer overflow" if the key came in empty: in
-    // Zig 0.16 a `0..1` slice over a len-0 []const u8 is a panic, not an empty
-    // slice. The slash is removed only if it is really there.
-    const k = if (key.len > 0 and key[0] == '/') key[1..] else key;
-    if (std.mem.eql(u8, k, "help") or std.mem.eql(u8, k, "new") or
-        std.mem.eql(u8, k, "resume") or std.mem.eql(u8, k, "yolo")) return 2;
-    if (std.mem.eql(u8, k, "free-auto") or std.mem.eql(u8, k, "free")) return 3;
-    if (std.mem.eql(u8, k, "model") or
-        std.mem.eql(u8, k, "provider") or std.mem.eql(u8, k, "providers") or
-        std.mem.eql(u8, k, "effort") or
-        std.mem.eql(u8, k, "submodel") or std.mem.eql(u8, k, "task-parallel")) return 4;
-    return 5;
+    return commands_mod.cmdGroupPublic(key);
 }
 
 /// Ctrl+P → Connect: the modal to connect providers. A single list with all the
@@ -13864,7 +10274,7 @@ pub fn openCommandPalette(m: *tui.Model) void {
         else if (c.key_hint) |h| h else "";
         items[item_idx] = .{
             .kind = .command,
-            .group = cmdGroup(c.key),
+            .group = commands_mod.cmdGroup(c.key),
             .label = gpa.dupe(u8, c.key) catch return,
             .hint = gpa.dupe(u8, hint) catch "",
         };
@@ -14361,7 +10771,7 @@ test "targetForCandidate: an unknown provider returns null (not a half-built tar
 /// The globals `/submodel` writes. Zig runs the tests in ONE process, so a
 /// test that sets a pick and does not put it back poisons the next one.
 const SubGlobals = struct {
-    session: @TypeOf(sub_session),
+    session: @TypeOf(submodel_mod.sub_session),
     provider_len: usize,
     model_len: usize,
     fail_len: usize,
@@ -14369,19 +10779,19 @@ const SubGlobals = struct {
 
     fn take() SubGlobals {
         return .{
-            .session = sub_session,
-            .provider_len = sub_provider_len,
-            .model_len = sub_model_len,
-            .fail_len = sub_fail_len,
+            .session = submodel_mod.sub_session,
+            .provider_len = submodel_mod.sub_provider_len,
+            .model_len = submodel_mod.sub_model_len,
+            .fail_len = submodel_mod.sub_fail_len,
             .config = user_config,
         };
     }
 
     fn putBack(s: SubGlobals) void {
-        sub_session = s.session;
-        sub_provider_len = s.provider_len;
-        sub_model_len = s.model_len;
-        sub_fail_len = s.fail_len;
+        submodel_mod.sub_session = s.session;
+        submodel_mod.sub_provider_len = s.provider_len;
+        submodel_mod.sub_model_len = s.model_len;
+        submodel_mod.sub_fail_len = s.fail_len;
         user_config = s.config;
     }
 };
@@ -14398,8 +10808,8 @@ test "submodel: the session beats config.json, config beats the environment, off
     try env.put("ZODE_SUBAGENT_MODEL", "env-model");
     m.environ = &env;
 
-    sub_session = .unset;
-    sub_fail_len = 0;
+    submodel_mod.sub_session = .unset;
+    submodel_mod.sub_fail_len = 0;
     user_config = .{ .subagent_provider = "cfg-prov", .subagent_model = "cfg-model" };
 
     {
@@ -14419,11 +10829,11 @@ test "submodel: the session beats config.json, config beats the environment, off
 
     // `off` over the session AND over config.json — or it would do nothing for
     // exactly the user who has the field set and wants it out of the way.
-    sub_session = .off;
+    submodel_mod.sub_session = .off;
     try std.testing.expect(submodelPick(&m) == null);
 
     // No config → the environment.
-    sub_session = .unset;
+    submodel_mod.sub_session = .unset;
     user_config = .{};
     {
         const p = submodelPick(&m).?;
@@ -14447,32 +10857,32 @@ test "/submodel parses the three spellings, and off means none of them" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     user_config = .{};
-    sub_session = .unset;
-    sub_fail_len = 0;
+    submodel_mod.sub_session = .unset;
+    submodel_mod.sub_fail_len = 0;
 
     // A known provider id → provider-only (its default model).
-    cmdSubmodel(&m, "groq");
+    commands_mod.cmdSubmodel(&m, "groq");
     {
         const p = submodelPick(&m).?;
         try std.testing.expectEqualStrings("groq", p.provider);
         try std.testing.expectEqualStrings("", p.model);
     }
     // Anything else → a model on the active provider.
-    cmdSubmodel(&m, "kimi-k2.6");
+    commands_mod.cmdSubmodel(&m, "kimi-k2.6");
     {
         const p = submodelPick(&m).?;
         try std.testing.expectEqualStrings("", p.provider);
         try std.testing.expectEqualStrings("kimi-k2.6", p.model);
     }
     // provider + model.
-    cmdSubmodel(&m, "groq llama-x");
+    commands_mod.cmdSubmodel(&m, "groq llama-x");
     {
         const p = submodelPick(&m).?;
         try std.testing.expectEqualStrings("groq", p.provider);
         try std.testing.expectEqualStrings("llama-x", p.model);
     }
     // off.
-    cmdSubmodel(&m, "off");
+    commands_mod.cmdSubmodel(&m, "off");
     try std.testing.expect(submodelPick(&m) == null);
 }
 
@@ -14483,8 +10893,8 @@ test "submodel: an unknown provider does not kill the search: a note, and the no
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     user_config = .{};
-    sub_session = .unset;
-    sub_fail_len = 0;
+    submodel_mod.sub_session = .unset;
+    submodel_mod.sub_fail_len = 0;
     setSubmodel("provider-que-no-existe", "some-model");
 
     var base = activeTarget(&m);
@@ -14509,8 +10919,8 @@ test "submodel: a provider with no key does not kill the search either" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     user_config = .{};
-    sub_session = .unset;
-    sub_fail_len = 0;
+    submodel_mod.sub_session = .unset;
+    submodel_mod.sub_fail_len = 0;
     // With `m.environ` null and no saved keys, `keyFor(groq)` is null whatever
     // the real process environment holds — the test does not depend on whether
     // the person running it happens to have GROQ_API_KEY exported.
@@ -14539,8 +10949,8 @@ test "submodel: the pick replaces the target, and the note says which model is r
     try env.put("ZODE_GROQ_KEY", "gsk-test");
     m.environ = &env;
     user_config = .{};
-    sub_session = .unset;
-    sub_fail_len = 0;
+    submodel_mod.sub_session = .unset;
+    submodel_mod.sub_fail_len = 0;
     setSubmodel("groq", "llama-3.3-70b-versatile");
 
     var base = activeTarget(&m);
@@ -14564,7 +10974,7 @@ test "submodel: a pick given up for the session does not try again, and says not
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     user_config = .{};
-    sub_session = .unset;
+    submodel_mod.sub_session = .unset;
     setSubmodel("groq", "llama-3.3-70b-versatile");
     submodelFail("groq/llama-3.3-70b-versatile is not available on this account (Forbidden)");
 
@@ -15071,12 +11481,12 @@ test "/clean without arguments NEVER deletes" {
     // The dry run is the whole safety story, so it is tested at the level the
     // user reaches it: the command, not the module. A test of `scan` alone
     // would pass even if `cmdClean` had the argument backwards.
-    try std.testing.expect(!cleanWanted(null, null));
-    try std.testing.expect(!cleanWanted(null, ""));
-    try std.testing.expect(!cleanWanted(null, "no"));
-    try std.testing.expect(cleanWanted(null, "yes"));
-    try std.testing.expect(cleanWanted(null, "y"));
-    try std.testing.expect(cleanWanted(null, "apply"));
+    try std.testing.expect(!commands_mod.cleanWanted(null, null));
+    try std.testing.expect(!commands_mod.cleanWanted(null, ""));
+    try std.testing.expect(!commands_mod.cleanWanted(null, "no"));
+    try std.testing.expect(commands_mod.cleanWanted(null, "yes"));
+    try std.testing.expect(commands_mod.cleanWanted(null, "y"));
+    try std.testing.expect(commands_mod.cleanWanted(null, "apply"));
 }
 
 test "/clean shows up in /help with its 'yes'" {
@@ -15273,7 +11683,6 @@ test "plan file: write/load round-trip via .zode/plans/<id>.md" {
 
     // EVIDENCE: leave the file in place so the reviewer can `cat` it. The name
     // says the test wrote it; a following run overwrites it whole.
-    std.debug.print("\n[plan-file-test] wrote and reloaded: {s}\n", .{path});
 }
 
 test "read-only: the text that goes back to the model says NOT to retry" {
@@ -15353,14 +11762,14 @@ const PromptTestEnv = struct {
         var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
         errdefer threaded.deinit();
 
-        const saved_agents = agents_md_cache;
-        agents_md_cache = null;
-        styles_cache = null;
-        styles_stamp_len = 0;
-        styles_rescans = 0;
-        skills_cache = null;
-        skills_stamp_len = 0;
-        skills_rescans = 0;
+        const saved_agents = prompt_system.agents_md_cache;
+        prompt_system.agents_md_cache = null;
+        discovery.styles_cache = null;
+        discovery.styles_stamp_len = 0;
+        discovery.styles_rescans = 0;
+        discovery.skills_cache = null;
+        discovery.skills_stamp_len = 0;
+        discovery.skills_rescans = 0;
 
         io_global = threaded.io();
         gpa_global = std.testing.allocator;
@@ -15377,13 +11786,13 @@ const PromptTestEnv = struct {
     }
 
     fn deinit(self: *PromptTestEnv) void {
-        styles_cache = null;
-        styles_stamp_len = 0;
-        styles_rescans = 0;
-        skills_cache = null;
-        skills_stamp_len = 0;
-        skills_rescans = 0;
-        agents_md_cache = self.saved_agents;
+        discovery.styles_cache = null;
+        discovery.styles_stamp_len = 0;
+        discovery.styles_rescans = 0;
+        discovery.skills_cache = null;
+        discovery.skills_stamp_len = 0;
+        discovery.skills_rescans = 0;
+        prompt_system.agents_md_cache = self.saved_agents;
         gpa_global = self.saved_gpa;
         io_global = self.saved_io;
         environ_global = self.saved_env;
@@ -15411,7 +11820,7 @@ test "the skills listing in the PROMPT goes under a tight budget" {
     // The bundled skills are there, but only their NAMES: 1% of a 6000-token
     // window is 240 characters, and that is not a description.
     try std.testing.expect(std.mem.indexOf(u8, tight, "- simplify") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tight, "Review a diff for reuse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tight, "Review recent or targeted code") == null);
 }
 
 test "the skills listing in the PROMPT keeps the descriptions when there is room" {
@@ -15422,7 +11831,7 @@ test "the skills listing in the PROMPT keeps the descriptions when there is room
     var buf: [16 * 1024]u8 = undefined;
     const roomy = buildSystemPrompt(env.allocator(), &buf, null, true);
     try std.testing.expect(std.mem.indexOf(u8, roomy, "- simplify") != null);
-    try std.testing.expect(std.mem.indexOf(u8, roomy, "Review a diff for reuse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roomy, "Review recent or targeted code") != null);
 }
 
 // Phase 2.2: the system prompt built without skills does not contain the
@@ -15434,7 +11843,7 @@ test "buildSystemPrompt without skills leaves the cacheable prefix clean" {
     var buf: [16 * 1024]u8 = undefined;
     const prompt = buildSystemPrompt(env.allocator(), &buf, null, false);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- simplify") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Review a diff for reuse") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Review recent or targeted code") == null);
     // Everything else is still there.
     try std.testing.expect(std.mem.indexOf(u8, prompt, "NEVER use bash") != null);
 }
@@ -15475,7 +11884,7 @@ test "cmdClear clears the screen and resets the session caches" {
     m.io_ready = true;
     m.environ = null;
 
-    cmdClear(&m);
+    commands_mod.cmdClear(&m);
 
     try std.testing.expect(pendingContains(&m, "screen cleared"));
     try std.testing.expect(pendingContains(&m, "read cache + changed list reset"));
@@ -15489,7 +11898,7 @@ test "cmdVersion shows the running zode version" {
     m.io_ready = true;
     m.environ = null;
 
-    cmdVersion(&m);
+    commands_mod.cmdVersion(&m);
 
     // `current_version` is injected at build time ("dev" for a local build),
     // so the message always starts with "zode ".
@@ -15518,25 +11927,25 @@ test "extractReleaseSection: finds a versioned section and dev falls back to Unr
     ;
 
     {
-        const s = (try extractReleaseSection(gpa, changelog, "0.2.0")).?;
+        const s = (try commands_mod.extractReleaseSection(gpa, changelog, "0.2.0")).?;
         defer gpa.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, "Old fix") != null);
         try std.testing.expect(std.mem.indexOf(u8, s, "New thing") == null);
         try std.testing.expect(std.mem.indexOf(u8, s, "Initial") == null);
     }
     {
-        const s = (try extractReleaseSection(gpa, changelog, "v0.2.0")).?;
+        const s = (try commands_mod.extractReleaseSection(gpa, changelog, "v0.2.0")).?;
         defer gpa.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, "Old fix") != null);
     }
     {
-        const s = (try extractReleaseSection(gpa, changelog, "dev")).?;
+        const s = (try commands_mod.extractReleaseSection(gpa, changelog, "dev")).?;
         defer gpa.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, "New thing") != null);
         try std.testing.expect(std.mem.indexOf(u8, s, "Old fix") == null);
     }
     {
-        const missing = try extractReleaseSection(gpa, changelog, "9.9.9");
+        const missing = try commands_mod.extractReleaseSection(gpa, changelog, "9.9.9");
         try std.testing.expect(missing == null);
     }
 }
@@ -15554,14 +11963,14 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     // `buildSystemPrompt` reads the CWD's `AGENTS.md` through the cache, so a
     // hand-placed cache entry is used: the point is that the composition puts it
     // in the same way in both cases.
-    const saved_cache = agents_md_cache;
+    const saved_cache = prompt_system.agents_md_cache;
     const saved_io = io_global;
     const saved_gpa = gpa_global;
     defer {
         resetStylesCacheForTest();
         resetSkillsCacheForTest();
         gpa_global = saved_gpa;
-        agents_md_cache = saved_cache;
+        prompt_system.agents_md_cache = saved_cache;
         io_global = saved_io;
     }
 
@@ -15585,7 +11994,7 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     resetStylesCacheForTest();
     const fake_agents = try std.testing.allocator.dupe(u8, "# proyecto\nNo hagas esto.");
     defer std.testing.allocator.free(fake_agents);
-    agents_md_cache = fake_agents;
+    prompt_system.agents_md_cache = fake_agents;
 
     // 16 KB and not 8, because `bufPrint` TRUNCATES silently and the last block is the
     // one that goes missing: a routing table that stops mid-sentence looks like a
@@ -15613,7 +12022,7 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     // subdirectory.
     const saved_io = io_global;
     const saved_info = project_info;
-    const saved_agents = agents_md_cache;
+    const saved_agents = prompt_system.agents_md_cache;
     const saved_gpa = gpa_global;
     defer {
         resetStylesCacheForTest();
@@ -15621,7 +12030,7 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
         gpa_global = saved_gpa;
         io_global = saved_io;
         project_info = saved_info;
-        agents_md_cache = saved_agents;
+        prompt_system.agents_md_cache = saved_agents;
     }
 
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -15649,8 +12058,8 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     // composition buffer, `bufPrint` would fail, and `buildSystemPrompt` would
     // return the base alone — which is the right behaviour, and would make this
     // test fail for a reason that has nothing to do with the cwd line.
-    agents_md_cache = try std.testing.allocator.dupe(u8, "# proyecto de prueba\n");
-    defer if (agents_md_cache != null and saved_agents == null) std.testing.allocator.free(agents_md_cache.?);
+    prompt_system.agents_md_cache = try std.testing.allocator.dupe(u8, "# proyecto de prueba\n");
+    defer if (prompt_system.agents_md_cache != null and saved_agents == null) std.testing.allocator.free(prompt_system.agents_md_cache.?);
 
     var out: [16 * 1024]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
@@ -15691,14 +12100,14 @@ test "prompt: the REPO's AGENTS.md is used when the cwd has none of its own" {
     const agents = try std.fmt.bufPrint(&agents_buf, "{s}/AGENTS.md", .{root});
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = agents, .data = "REGLA DEL REPO" });
 
-    const got = readAgentsIn(std.testing.allocator, root) orelse return error.TestUnexpectedResult;
+    const got = prompt_system.readAgentsIn(std.testing.allocator, io_global, root) orelse return error.TestUnexpectedResult;
     defer std.testing.allocator.free(got);
     try std.testing.expect(std.mem.indexOf(u8, got, "REGLA DEL REPO") != null);
 
     // And a directory with neither name is NOT an error (it returns null, which is
     // how the `orelse` chains the next place).
-    try std.testing.expect(readAgentsIn(std.testing.allocator, "/tmp") == null);
-    try std.testing.expect(readAgentsIn(std.testing.allocator, null) == null);
+    try std.testing.expect(prompt_system.readAgentsIn(std.testing.allocator, io_global, "/tmp") == null);
+    try std.testing.expect(prompt_system.readAgentsIn(std.testing.allocator, io_global, null) == null);
 }
 
 test "skills: the list is invalidated when a SKILL.md changes on disk" {
@@ -15709,16 +12118,16 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     const saved_io = io_global;
     const saved_info = project_info;
     const saved_gpa = gpa_global;
-    const saved_cache = skills_cache;
-    const saved_stamp_len = skills_stamp_len;
-    const saved_rescans = skills_rescans;
+    const saved_cache = discovery.skills_cache;
+    const saved_stamp_len = discovery.skills_stamp_len;
+    const saved_rescans = discovery.skills_rescans;
     defer {
         io_global = saved_io;
         project_info = saved_info;
         gpa_global = saved_gpa;
-        skills_cache = saved_cache;
-        skills_stamp_len = saved_stamp_len;
-        skills_rescans = saved_rescans;
+        discovery.skills_cache = saved_cache;
+        discovery.skills_stamp_len = saved_stamp_len;
+        discovery.skills_rescans = saved_rescans;
     }
 
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -15735,9 +12144,9 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
 
     // CWD = root, so that the repo root does not add extra roots.
     setProjectInfoForTest(io_global, root);
-    skills_cache = null;
-    skills_stamp_len = 0;
-    skills_rescans = 0;
+    discovery.skills_cache = null;
+    discovery.skills_stamp_len = 0;
+    discovery.skills_rescans = 0;
 
     // 1) Bundled skills are always available (5 built-in skills).
     var env_map: std.process.Environ.Map = undefined;
@@ -15782,11 +12191,11 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     //    Asserted against the COMPOSED prompt and not only against
     //    `discoverSkills`, because a discovery that is right and a composition
     //    that drops (or inlines) the section are two different bugs.
-    const saved_agents = agents_md_cache;
-    defer agents_md_cache = saved_agents;
+    const saved_agents = prompt_system.agents_md_cache;
+    defer prompt_system.agents_md_cache = saved_agents;
     const fake_agents = try std.testing.allocator.dupe(u8, "# proyecto\ninstrucciones.");
     defer std.testing.allocator.free(fake_agents);
-    agents_md_cache = fake_agents;
+    prompt_system.agents_md_cache = fake_agents;
 
     try std.Io.Dir.cwd().writeFile(io_global, .{
         .sub_path = skill_path,
@@ -15804,8 +12213,8 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
 
     // The global state is left as it was for the next test. Skills were loaded
     // with page_allocator (no-op free), so nothing to release here.
-    freeSkillsCacheLocked();
-    skills_rescans = saved_rescans;
+    discovery.freeSkillsCacheLocked();
+    discovery.skills_rescans = saved_rescans;
 }
 
 test "tools: `ask`, `skill`, `bash_output` and `bash_kill` do NOT ask for permission" {
@@ -15990,24 +12399,24 @@ test "system prompt: the volatile parts go LAST, so a mode change does not drop 
     // The skills list is a module global that OWNS memory from whatever allocator
     // asked for it. Left pointing into `std.testing.allocator`, it is a leak that
     // this test gets blamed for, so it is saved and dropped here.
-    const saved_cache = skills_cache;
-    const saved_rescans = skills_rescans;
-    skills_cache = null;
-    skills_rescans = 0;
+    const saved_cache = discovery.skills_cache;
+    const saved_rescans = discovery.skills_rescans;
+    discovery.skills_cache = null;
+    discovery.skills_rescans = 0;
     defer {
-        freeSkillsCacheLocked();
-        skills_cache = saved_cache;
-        skills_rescans = saved_rescans;
+        discovery.freeSkillsCacheLocked();
+        discovery.skills_cache = saved_cache;
+        discovery.skills_rescans = saved_rescans;
     }
 
     // Same for the project's AGENTS.md: `systemPromptBase` reads it ONCE into a
     // global that owns the memory. In a test that allocator is the testing one,
     // so leaving it there is a leak attributed to whichever test read it.
-    const saved_agents = agents_md_cache;
+    const saved_agents = prompt_system.agents_md_cache;
     const fake_base = try std.testing.allocator.dupe(u8, "base de prueba");
     defer std.testing.allocator.free(fake_base);
-    agents_md_cache = fake_base;
-    defer agents_md_cache = saved_agents;
+    prompt_system.agents_md_cache = fake_base;
+    defer prompt_system.agents_md_cache = saved_agents;
 
     var out: [16 * 1024]u8 = undefined;
     const p = buildSystemPrompt(std.testing.allocator, &out, null, true);
@@ -16065,20 +12474,20 @@ test "system prompt: the verification rules are injected even with a project's A
     // Initialize project_info to avoid GPF when skills system accesses it.
     setProjectInfoForTest(io_global, "/tmp");
 
-    const saved_cache = skills_cache;
-    const saved_rescans = skills_rescans;
-    skills_cache = null;
-    skills_rescans = 0;
+    const saved_cache = discovery.skills_cache;
+    const saved_rescans = discovery.skills_rescans;
+    discovery.skills_cache = null;
+    discovery.skills_rescans = 0;
     defer {
-        freeSkillsCacheLocked();
-        skills_cache = saved_cache;
-        skills_rescans = saved_rescans;
+        discovery.freeSkillsCacheLocked();
+        discovery.skills_cache = saved_cache;
+        discovery.skills_rescans = saved_rescans;
     }
-    const saved_agents = agents_md_cache;
+    const saved_agents = prompt_system.agents_md_cache;
     const fake = try std.testing.allocator.dupe(u8, "# proyecto\nReglas del proyecto.");
     defer std.testing.allocator.free(fake);
-    agents_md_cache = fake;
-    defer agents_md_cache = saved_agents;
+    prompt_system.agents_md_cache = fake;
+    defer prompt_system.agents_md_cache = saved_agents;
 
     var out: [16 * 1024]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
@@ -16416,9 +12825,9 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
         // global `styles_cache`. Freeing them with `std.testing.allocator`
         // (via `resetStylesCacheForTest`) would be an Invalid free; the arena
         // is deinited separately, so just drop the reference.
-        styles_cache = null;
-        styles_stamp_len = 0;
-        styles_rescans = 0;
+        discovery.styles_cache = null;
+        discovery.styles_stamp_len = 0;
+        discovery.styles_rescans = 0;
         gpa_global = saved_gpa;
         io_global = saved_io;
     }
@@ -16432,20 +12841,20 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
     // the next test would read a pointer into memory that has been freed. That is a
     // use-after-free that shows up as a segfault in whichever test runs second,
     // which is how it would have been misread.
-    const saved_agents = agents_md_cache;
-    agents_md_cache = null;
-    defer agents_md_cache = saved_agents;
+    const saved_agents = prompt_system.agents_md_cache;
+    prompt_system.agents_md_cache = null;
+    defer prompt_system.agents_md_cache = saved_agents;
 
     var buf: [16 * 1024]u8 = undefined;
     const from_tui = buildSystemPrompt(a, &buf, null, true);
     // The first call above caches arena-allocated entries in the globals.
     // Drop them before the second call so `freeStylesCacheLocked`/`freeSkillsCacheLocked`
     // don't try to free arena memory with `std.testing.allocator`.
-    styles_cache = null;
-    skills_cache = null;
+    discovery.styles_cache = null;
+    discovery.skills_cache = null;
     const headless = try buildSystemPromptFor(a, null);
-    styles_cache = null;
-    skills_cache = null;
+    discovery.styles_cache = null;
+    discovery.skills_cache = null;
 
     try std.testing.expectEqualStrings(from_tui, headless);
 
@@ -16489,15 +12898,15 @@ test "the project's own AGENTS.md is READ, even when it is big" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     const saved_io = io_global;
-    const saved_agents = agents_md_cache;
+    const saved_agents = prompt_system.agents_md_cache;
     io_global = threaded.io();
-    agents_md_cache = null;
+    prompt_system.agents_md_cache = null;
     defer {
         // The cache was filled with the TESTING allocator, so it is freed with
         // it: leaving it behind is a leak the test runner would report for a
         // file the test did not create.
-        if (agents_md_cache) |c| std.testing.allocator.free(c);
-        agents_md_cache = saved_agents;
+        if (prompt_system.agents_md_cache) |c| std.testing.allocator.free(c);
+        prompt_system.agents_md_cache = saved_agents;
         io_global = saved_io;
     }
 
@@ -16531,8 +12940,8 @@ test "a project whose AGENTS.md does not fit still gets the ROUTING, not just it
         // `buildSystemPrompt` above cached arena-allocated entries in the globals.
         // Dropping the references (not freeing): the arena is deinited separately,
         // and freeing with `std.testing.allocator` would be an Invalid free.
-        styles_cache = null;
-        skills_cache = null;
+        discovery.styles_cache = null;
+        discovery.skills_cache = null;
         gpa_global = saved_gpa;
         io_global = saved_io;
     }
@@ -16540,9 +12949,9 @@ test "a project whose AGENTS.md does not fit still gets the ROUTING, not just it
     resetStylesCacheForTest();
     resetSkillsCacheForTest();
 
-    const saved_agents = agents_md_cache;
-    agents_md_cache = null;
-    defer agents_md_cache = saved_agents;
+    const saved_agents = prompt_system.agents_md_cache;
+    prompt_system.agents_md_cache = null;
+    defer prompt_system.agents_md_cache = saved_agents;
 
     var buf: [16 * 1024]u8 = undefined;
     const composed = buildSystemPrompt(a, &buf, null, true);
@@ -16701,6 +13110,53 @@ test "the plan block disappears the moment the last step is ticked" {
     try std.testing.expect(m.plan.isEmpty());
 }
 
+test "applyPlanTo: brief and per-step how/verify are recorded and preserved" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var plan = plan_mod.Plan.init();
+    const created = applyPlanTo(&plan,
+        \\{"objective":"Ship feature X","approach":"Edit src/a.zig and add tests","guardrails":"No API changes; run zig build test",
+        \\"items":[{"content":"update logic","how":"change parse() in src/a.zig","verify":"zig build test","status":"in_progress"},
+        \\{"content":"add tests","how":"extend test suite","verify":"zig build test -Dtest-filter=a","status":"pending"}]}
+    , a) orelse return error.NoLine;
+    try std.testing.expect(std.mem.indexOf(u8, created, "next:") != null);
+    try std.testing.expectEqualStrings("Ship feature X", plan.objectiveOf());
+    try std.testing.expect(std.mem.indexOf(u8, plan.approachOf(), "src/a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.guardrailsOf(), "zig build test") != null);
+    try std.testing.expectEqualStrings("change parse() in src/a.zig", plan.items[0].howOf());
+    try std.testing.expectEqualStrings("zig build test", plan.items[0].verifyOf());
+
+    // Ticking a step without resending brief must preserve it.
+    const tick = applyPlanTo(&plan, "{\"update\":[{\"index\":1,\"status\":\"done\"}]}", a) orelse return error.NoTick;
+    _ = tick;
+    try std.testing.expectEqualStrings("Ship feature X", plan.objectiveOf());
+    try std.testing.expectEqual(plan_mod.Status.done, plan.items[0].status);
+    try std.testing.expectEqualStrings("change parse() in src/a.zig", plan.items[0].howOf());
+
+    // Brief can be updated via patch without touching steps.
+    const brief_upd = applyPlanTo(&plan, "{\"guardrails\":\"No API changes; run zig build && zig build test\"}", a) orelse return error.NoBriefUpd;
+    try std.testing.expect(std.mem.indexOf(u8, brief_upd, "brief updated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.guardrailsOf(), "zig build &&") != null);
+    try std.testing.expectEqual(@as(u8, 2), plan.len);
+    try std.testing.expectEqualStrings("Ship feature X", plan.objectiveOf());
+
+    // Replacing items without brief preserves the existing brief.
+    const replaced = applyPlanTo(&plan,
+        \\{"items":[{"content":"update logic","status":"done","how":"change parse() in src/a.zig","verify":"zig build test"},
+        \\{"content":"add tests","status":"in_progress","how":"extend test suite","verify":"zig build test -Dtest-filter=a"}]}
+    , a) orelse return error.NoReplace;
+    _ = replaced;
+    try std.testing.expectEqualStrings("Ship feature X", plan.objectiveOf());
+    try std.testing.expect(std.mem.indexOf(u8, plan.guardrailsOf(), "zig build &&") != null);
+
+    const details = plan.details(a);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Objective: Ship feature X") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "Guardrails:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, details, "how:") != null);
+}
+
 test "mode, yolo and ask switches never speak through the mascot" {
     // The mascot is the agent's work: what it writes and runs. A mode switch,
     // a `/yolo` or a `/ask` is TEXT for the transcript and a chip in the
@@ -16712,13 +13168,13 @@ test "mode, yolo and ask switches never speak through the mascot" {
     // A word from the harness, so the legend is not trivially empty.
     m.setStatusText("done");
 
-    cmdMode(&m, "plan");
-    cmdMode(&m, "build");
+    commands_mod.cmdMode(&m, "plan");
+    commands_mod.cmdMode(&m, "build");
     cyclePermMode(&m);
-    cmdAskMode(&m, "on");
-    cmdAskMode(&m, "off");
-    cmdYolo(&m);
-    cmdYolo(&m);
+    commands_mod.cmdAskMode(&m, "on");
+    commands_mod.cmdAskMode(&m, "off");
+    commands_mod.cmdYolo(&m);
+    commands_mod.cmdYolo(&m);
 
     try std.testing.expectEqualStrings("done", m.status());
 }
@@ -17074,7 +13530,7 @@ test "/yolo says what it does with the questions, because the user reads that li
     }
     yolo = false;
 
-    cmdYolo(&m);
+    commands_mod.cmdYolo(&m);
     try std.testing.expect(yolo);
     m.drainPending();
     var joined: std.ArrayList(u8) = .empty;
@@ -17104,8 +13560,8 @@ test "the YOLO mode note is in the prompt, because the model has to know BEFORE 
     const saved_gpa = gpa_global;
     io_global = threaded.io();
     defer {
-        styles_cache = null;
-        skills_cache = null;
+        discovery.styles_cache = null;
+        discovery.skills_cache = null;
         gpa_global = saved_gpa;
         io_global = saved_io;
     }
@@ -17113,9 +13569,9 @@ test "the YOLO mode note is in the prompt, because the model has to know BEFORE 
     resetStylesCacheForTest();
     resetSkillsCacheForTest();
 
-    const saved_agents = agents_md_cache;
-    agents_md_cache = null;
-    defer agents_md_cache = saved_agents;
+    const saved_agents = prompt_system.agents_md_cache;
+    prompt_system.agents_md_cache = null;
+    defer prompt_system.agents_md_cache = saved_agents;
 
     const saved = yolo;
     defer yolo = saved;
@@ -17711,12 +14167,12 @@ test "tier 2 compaction is a BUDGET with a gap, not a switch that turns off fore
     // So the flag is gone and there are two numbers instead, and they answer different
     // questions: how OFTEN (the gap, so a long turn does not pay per iteration) and how
     // MANY (the cap, so a session that keeps filling the context does not pay forever).
-    const saved = .{ summaries_done, summarized_at_iteration };
+    const saved = .{ summary_policy.summaries_done, summary_policy.summarized_at_iteration };
     defer {
-        summaries_done = saved[0];
-        summarized_at_iteration = saved[1];
+        summary_policy.summaries_done = saved[0];
+        summary_policy.summarized_at_iteration = saved[1];
     }
-    resetSummaries();
+    summary_policy.resetSummaries();
 
     // The first trigger of a session is immediate: the turn that filled the context is
     // the one that does not fit any more, so it is the one that must be summarized.
@@ -17724,7 +14180,7 @@ test "tier 2 compaction is a BUDGET with a gap, not a switch that turns off fore
 
     // And the next five iterations it does NOT: that is the waste the bool was invented
     // to stop, and it is the half that matters on a 60-iteration goal turn.
-    noteSummarized(0);
+    summary_policy.noteSummarized(0);
     var i: usize = 1;
     while (i < summary_gap) : (i += 1) {
         try std.testing.expect(!maySummarize(i));
@@ -17736,9 +14192,9 @@ test "tier 2 compaction is a BUDGET with a gap, not a switch that turns off fore
     // `/new` or a bigger window than by zode quietly spending a request per summary
     // forever, each one thrown away by the next.
     var it: usize = summary_gap;
-    while (summaries_done < summary_max) {
+    while (summary_policy.summaries_done < summary_max) {
         try std.testing.expect(maySummarize(it));
-        noteSummarized(it);
+        summary_policy.noteSummarized(it);
         it += summary_gap;
     }
     try std.testing.expect(!maySummarize(it));
@@ -17746,7 +14202,7 @@ test "tier 2 compaction is a BUDGET with a gap, not a switch that turns off fore
 
     // A new session gets the whole budget back, which is the only thing that made the
     // old flag's reset make sense.
-    resetSummaries();
+    summary_policy.resetSummaries();
     try std.testing.expect(maySummarize(0));
 }
 
@@ -17900,9 +14356,7 @@ test "`met` with open plan steps is refused once, and the model has to answer" {
 /// Whether a verdict ends the turn. Extracted so the rule can be asserted without
 /// standing up a whole turn.
 pub fn verdictIsFinal(g: goal_mod.Goal, open_steps: usize) bool {
-    if (g.status == goal_mod.Status.none) return false;
-    if (g.status == goal_mod.Status.met and open_steps > 0) return false;
-    return true;
+    return goal_mod.verdictIsFinal(g, open_steps);
 }
 
 // ── selective permissions: modes, edit tools, bash patterns ──
@@ -18296,38 +14750,6 @@ test "permissions.json: the old shape and the new one both load, and saving roun
 // It needs `ZODE_PROVIDER` and that provider's key, and it picks a free model
 // so it costs nothing on a free tier.
 //
-/// Reads `KEY=VALUE` pairs from `.env` into `map`.
-///
-/// `.env` is gitignored and chmod 600, so it is the one place a provider key
-/// can enter a test without entering the tree. `put` dupes both sides, so the
-/// buffer this reads into is free on return.
-fn loadDotEnv(io: std.Io, map: *std.process.Environ.Map) void {
-    const data = std.Io.Dir.cwd().readFileAlloc(io, ".env", std.heap.page_allocator, .limited(64 * 1024)) catch return;
-    defer std.heap.page_allocator.free(data);
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        const bare = if (std.mem.startsWith(u8, trimmed, "export ")) trimmed["export ".len..] else trimmed;
-        const eq = std.mem.indexOfScalar(u8, bare, '=') orelse continue;
-        const key = std.mem.trim(u8, bare[0..eq], " \t");
-        const val = std.mem.trim(u8, bare[eq + 1 ..], " \t\"'");
-        if (key.len == 0) continue;
-        map.put(key, val) catch return;
-    }
-}
-
-/// Whether the map holds any credential at all: the generic `ZODE_API_KEY` or
-/// any provider's `ZODE_<PROVIDER>_KEY`. The E2E test cannot run without one,
-/// and it must not run against a provider that would answer 401.
-fn envHasAnyKey(map: *const std.process.Environ.Map) bool {
-    if (map.get("ZODE_API_KEY") != null) return true;
-    var it = map.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.endsWith(u8, entry.key_ptr.*, "_KEY")) return true;
-    }
-    return false;
-}
 
 test "the parallel batch's tool results outlive the per-call arenas" {
     // THE crash of "I ask for a plan, it starts doing things, and then it stops
@@ -18506,7 +14928,7 @@ test "/copy with no answer says so, instead of doing nothing" {
     defer session = saved;
     session = null;
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     const text = try historyText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, copytext.no_messages_msg) != null);
@@ -18521,7 +14943,7 @@ test "/copy N refuses with the count it HAS, and with the plural right" {
     const cs = try CopySession.setup(std.testing.allocator, "the only answer");
     defer cs.done();
 
-    cmdCopy(&m, "3");
+    commands_mod.cmdCopy(&m, "3");
     const text = try historyText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "Only 1 assistant message available to copy") != null);
@@ -18536,7 +14958,7 @@ test "/copy with a word instead of a number says HOW to use it" {
     const cs = try CopySession.setup(std.testing.allocator, "the only answer");
     defer cs.done();
 
-    cmdCopy(&m, "abc");
+    commands_mod.cmdCopy(&m, "abc");
     const text = try historyText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "Usage: /copy [N]") != null);
@@ -18564,7 +14986,7 @@ test "/copy opens the picker with the whole answer, the blocks and the always ro
     );
     defer cs.done();
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     try std.testing.expect(m.pickerActive());
     // Three rows: the whole answer, the two blocks... and the "always" row.
     try std.testing.expectEqual(@as(usize, 4), m.picker_items.items.len);
@@ -18600,7 +15022,7 @@ test "the /copy picker paints every row, including the last one, on a 160x44 scr
     );
     defer cs.done();
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     try std.testing.expect(m.pickerActive());
 
     // The banner, because THAT is what the bug needs: on a 160x44 terminal the
@@ -18612,7 +15034,7 @@ test "the /copy picker paints every row, including the last one, on a 160x44 scr
     m2.pushInfo("· session resumed: sessions/zode-smoke1.jsonl");
     m2.pushHeader(.idle);
     m2.pushKind(.user, "/copy");
-    cmdCopy(&m2, null);
+    commands_mod.cmdCopy(&m2, null);
     try std.testing.expect(m2.pickerActive());
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -18648,7 +15070,7 @@ test "/copy with no code block copies the answer straight away, with no picker" 
     const cs = try CopySession.setup(std.testing.allocator, "just prose, no fences");
     defer cs.done();
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     try std.testing.expect(!m.pickerActive());
 }
 
@@ -18672,7 +15094,7 @@ test "the /copy picker copies the row that was highlighted, even with two identi
     );
     defer cs.done();
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     try std.testing.expect(m.pickerActive());
     // The rows are: the whole answer, the first block, the second block, the
     // "always" row. Two downs land on the SECOND block.
@@ -18721,7 +15143,7 @@ test "the /copy picker copies the file it says it copied" {
     );
     defer cs.done();
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     try std.testing.expect(m.pickerActive());
     // The first row is the whole answer: take it.
     _ = m.pickerHandleKey(.{ .codepoint = 13 }); // enter
@@ -18761,7 +15183,7 @@ test "ESC in the /copy picker is a cancel, not an error" {
     );
     defer cs.done();
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     try std.testing.expect(m.pickerActive());
     _ = m.pickerHandleKey(.{ .codepoint = 27 }); // esc
     try std.testing.expect(!m.pickerActive());
@@ -18802,7 +15224,7 @@ test "two blocks with the same first line get DIFFERENT labels" {
     );
     defer cs.done();
 
-    cmdCopy(&m, null);
+    commands_mod.cmdCopy(&m, null);
     try std.testing.expect(m.pickerActive());
     try std.testing.expectEqual(@as(usize, 5), m.picker_items.items.len);
     try std.testing.expectEqualStrings("const same = 1;", m.picker_items.items[1].label);
@@ -18860,11 +15282,11 @@ test "E2E: a real turn against a real provider completes and answers" {
     // the gitignored `.env` is the only fix that makes a repeat impossible.
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
-    loadDotEnv(io, &env_map);
+    envutil.loadDotEnv(io, &env_map);
     // No credential, no test: running without one is a 401, which is not an
     // end-to-end of anything. Skip — a red "no key" is exactly as ignorable as
     // the quota failure this test was redesigned to survive.
-    if (!envHasAnyKey(&env_map)) return;
+    if (!envutil.envHasAnyKey(&env_map)) return;
 
     // The three globals the worker reads. `loadUserConfig` is what resolves the
     // provider from `ZODE_PROVIDER`, and it reads `environ_global` — so without this
@@ -19601,117 +16023,12 @@ test "prepareImageFor: a full waiting list is refused naming the file" {
 /// second pipeline from inside a stage.
 var pipeline_active = false;
 
-const Snapshot = struct {
-    /// Path as reported by the walker (`/`-separated).
-    path: []const u8,
-    /// Test entries from BEFORE the stages run.
-    tests: []const testguard_mod.Entry,
-};
+/// Pipeline support helpers (run dir/artifacts, git/test helpers, prompts).
+const SuiteResult = pipeline_support.SuiteResult;
 
-/// Scan every tracked `.zig` file under `.` for inline tests. The snapshot
-/// is by value in the arena: the text each file had before anything ran.
-fn snapshotZigTests(arena: std.mem.Allocator, io: std.Io) ![]Snapshot {
-    var paths = std.ArrayList([]const u8).empty;
-    var root = std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true }) catch return error.NoRoot;
-    defer root.close(io);
-    var walker = root.walk(arena) catch return error.NoRoot;
-    defer walker.deinit();
-    while (try walker.next(io)) |e| {
-        switch (e.kind) {
-            .directory => {
-                if (filesearch.skipDir(e.basename)) walker.leave(io);
-            },
-            .file => {
-                if (!std.mem.endsWith(u8, e.path, ".zig")) continue;
-                try paths.append(arena, try arena.dupe(u8, e.path));
-            },
-            else => {},
-        }
-    }
 
-    var out = std.ArrayList(Snapshot).empty;
-    for (paths.items) |p| {
-        const text = std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(4 * 1024 * 1024)) catch continue;
-        const tests = testguard_mod.scan(arena, text) catch continue;
-        try out.append(arena, .{ .path = p, .tests = tests });
-    }
-    return out.toOwnedSlice(arena);
-}
-
-const Violation = struct {
-    path: []const u8,
-    missing: []const []const u8,
-    changed: []const []const u8,
-};
-
-/// Re-scan every snapshotted file and report which baseline tests are gone
-/// or different. Files created during the pipeline are not in the baseline
-/// and are not verified — a new file cannot weaken an old test.
-fn verifyZigTests(
-    arena: std.mem.Allocator,
-    io: std.Io,
-    snaps: []const Snapshot,
-) ![]Violation {
-    var out = std.ArrayList(Violation).empty;
-    for (snaps) |s| {
-        const text = std.Io.Dir.cwd().readFileAlloc(io, s.path, arena, .limited(4 * 1024 * 1024)) catch {
-            // The file is GONE: every baseline test in it is missing.
-            const names = arena.alloc([]const u8, s.tests.len) catch continue;
-            for (s.tests, 0..) |t, i| names[i] = t.name;
-            try out.append(arena, .{ .path = s.path, .missing = names, .changed = &.{} });
-            continue;
-        };
-        const rep = testguard_mod.verify(arena, s.tests, text) catch {
-            // Malformed Zig after the stage: report every baseline entry as missing.
-            const names = arena.alloc([]const u8, s.tests.len) catch continue;
-            for (s.tests, 0..) |t, i| names[i] = t.name;
-            try out.append(arena, .{ .path = s.path, .missing = names, .changed = &.{} });
-            continue;
-        };
-        if (!rep.ok()) {
-            try out.append(arena, .{ .path = s.path, .missing = rep.missing, .changed = rep.changed });
-        }
-    }
-    return out.toOwnedSlice(arena);
-}
-
-/// A short, actionable list of what was violated — the model needs file and
-/// NAME, not a boolean.
-fn formatViolations(arena: std.mem.Allocator, violations: []const Violation) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (violations) |v| {
-        try out.print(arena, "{s}:\n", .{v.path});
-        for (v.missing) |name| {
-            try out.print(arena, "  missing test: {s}\n", .{name});
-        }
-        for (v.changed) |name| {
-            try out.print(arena, "  changed test: {s}\n", .{name});
-        }
-    }
-    return out.toOwnedSlice(arena);
-}
-
-/// The artifacts directory for this run. `.zode/pipeline/<unix>-<pid>`.
-fn pipelineRunDir(buf: []u8, io: std.Io) ?[]const u8 {
-    const ts = std.Io.Timestamp.now(io, .real).toSeconds();
-    const pid: usize = @intCast(std.os.linux.getpid());
-    var id_buf: [64]u8 = undefined;
-    const id = pipeline_mod.runIdBuf(&id_buf, ts, pid);
-    return std.fmt.bufPrint(buf, ".zode/pipeline/{s}", .{id}) catch null;
-}
-
-/// Best-effort write of one artifact. Never fails the run.
-fn writeArtifact(io: std.Io, run_dir: []const u8, name: []const u8, data: []const u8) void {
-    std.Io.Dir.cwd().createDirPath(io, run_dir) catch return;
-    var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ run_dir, name }) catch return;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch {};
-}
 
 /// Run one pipeline subagent and write its report as an artifact.
-///
-/// `rep` belongs to the caller (it is ~9 KB on the stack); the report slice
-/// it returns points into it, so the caller copies what it needs.
 fn runPipelineSubagent(
     m: *tui.Model,
     rep: *subagent_mod.Report,
@@ -19720,171 +16037,21 @@ fn runPipelineSubagent(
     run_dir: []const u8,
     artifact: []const u8,
 ) []const u8 {
-    const task = subagent_mod.Task{
-        .description = label,
-        .prompt = prompt,
-        // The tester gets write/edit through its own flag; everyone else
-        // is read-only.
-        .allow_writes = std.mem.eql(u8, label, "tester"),
-        .effort = "low",
-    };
-    const out = runSubagent(m, task, rep);
-    writeArtifact(io_global, run_dir, artifact, out);
-    return out;
+    return pipeline_support.runPipelineSubagent(m, io_global, rep, label, prompt, run_dir, artifact, runSubagent);
 }
 
-/// The combined output of the test suite, plus the verdict.
-const SuiteResult = struct {
-    passed: bool,
-    /// The last few KB of combined stdout+stderr, for the repair prompt.
-    tail: []const u8,
-};
 
-/// The harness runs the test suite ITSELF. The model never grades its own work.
-fn runTestSuite(
-    arena: std.mem.Allocator,
-    io: std.Io,
-    plan: testplan_mod.Plan,
-) SuiteResult {
-    const result = std.process.run(arena, io, .{
-        .argv = plan.argv,
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(15 * 60), .clock = .awake } },
-    }) catch |err| {
-        const msg = std.fmt.allocPrint(arena, "the test command could not start: {t}", .{err}) catch "";
-        return .{ .passed = false, .tail = msg };
-    };
-    const full = arena.alloc(u8, result.stdout.len + result.stderr.len + 1) catch
-        return .{ .passed = false, .tail = "(out of memory)" };
-    @memcpy(full[0..result.stdout.len], result.stdout);
-    full[result.stdout.len] = '\n';
-    @memcpy(full[result.stdout.len + 1 ..][0..result.stderr.len], result.stderr);
-    const tail_len = @min(full.len, 3000);
-    return .{ .passed = result.term.success(), .tail = full[full.len - tail_len ..] };
-}
 
-/// `git diff HEAD`, capped for the reviewer's prompt. Empty outside a repo.
-fn gitDiffHEAD(arena: std.mem.Allocator, io: std.Io) []const u8 {
-    const result = std.process.run(arena, io, .{
-        .argv = &.{ "git", "diff", "HEAD" },
-        .stdout_limit = .limited(pipeline_mod.review_diff_cap * 2),
-        .stderr_limit = .limited(4096),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } },
-    }) catch return "";
-    const diff = result.stdout;
-    if (diff.len <= pipeline_mod.review_diff_cap) return diff;
-    const n = pipeline_mod.review_diff_cap;
-    const buf = arena.alloc(u8, n + 64) catch return diff[0..n];
-    @memcpy(buf[0..n], diff[0..n]);
-    const tail = std.fmt.bufPrint(buf[n..], "\n[diff truncated at {d} KB — ask for specific files]\n", .{n / 1024}) catch "";
-    return buf[0 .. n + tail.len];
-}
 
-/// `git status --short`, capped. Tells the reviewer which files are NEW.
-fn gitStatusShort(arena: std.mem.Allocator, io: std.Io) []const u8 {
-    const result = std.process.run(arena, io, .{
-        .argv = &.{ "git", "status", "--short" },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
-    }) catch return "";
-    return result.stdout;
-}
-
-// ── prompts ─────────────────────────────────────────────────────
-const explorer_prompt =
-    "You are the EXPLORER stage of a strict pipeline. You map the territory; you do not change anything.\n" ++
-    "Task: {s}\n\n" ++
-    "Find: the files and symbols that matter for this task, the existing tests that cover them, the project's conventions for code like this, the likely touch-points and the risks. Use read, grep, glob, list_files — and nothing else.\n" ++
-    "Reply with a compact report of at most 800 words with these sections, in this order:\n" ++
-    "SCOPE: files/symbols this task touches, one line each with WHY.\n" ++
-    "TESTS: which existing tests exercise those paths, or NONE.\n" ++
-    "CONVENTIONS: the local style the change must match (naming, error handling, tests).\n" ++
-    "RISKS: what can break and where.\n" ++
-    "UNKNOWNS: what you could not determine. If you used a guess, say GUESS explicitly.\n";
-
-const investigator_prompt =
-    "You are the INVESTIGATOR stage of a strict pipeline. You verify claims about the outside world; you never invent.\n" ++
-    "Task: {s}\n\n" ++
-    "Explorer's findings:\n{s}\n\n" ++
-    "Use web_fetch / web_search (and anything local: installed packages, --help, the dependency's own source if present) to verify what the task or the findings leave uncertain: API names, versions, flags, package names, breaking changes.\n" ++
-    "Rules: every claim carries a source (URL or local path). If you cannot verify it, mark it UNVERIFIED — never fill the gap.\n" ++
-    "Reply with at most 800 words:\n" ++
-    "VERIFIED: <claim> — <source> (one line each)\n" ++
-    "UNVERIFIED: <claim> (one line each)\n" ++
-    "RECOMMENDATION: the one approach the evidence supports.\n";
-
-const tester_prompt =
-    "You are the TESTER stage of a strict pipeline. You write the tests the change needs — you do not fix production code.\n" ++
-    "Task: {s}\n\n" ++
-    "Evidence:\n{s}\n\n" ++
-    "Rules:\n" ++
-    "- Add tests for the NEW or CHANGED behavior only. Do not reorganize existing tests.\n" ++
-    "- NEVER modify or delete an existing test. The harness re-hashes the baseline and the pipeline stops if you touch one.\n" ++
-    "- Prefer the project's existing test style (in Zig: top-level test \"...\" blocks in the same file).\n" ++
-    "- If the implementation is broken, do NOT fix it: finish your part and report FAILING tests and why. The Implementer fixes the code.\n" ++
-    "- If the tests already cover it, add nothing and say so.\n" ++
-    "Reply with at most 400 words: what you added, and the result you expect.\n";
-
-const implementer_seed =
-    "[Pipeline evidence] This task comes with a pre-researched map from zode's pipeline. Use it; do not re-derive what it already found.\n\n" ++
-    "{s}\n\n" ++
-    "{s}\n\n" ++
-    "Do the work. The map is a starting point, not a boundary: if it missed something, go find it. Never weaken or delete an existing test — add, fix code, or say what is blocked.\n";
-
-const verify_repair_prompt =
-    "[Pipeline verification] The test suite does not pass. Fix the CODE — never the tests, never the expectations.\n" ++
-    "Command: {s}\n\n" ++
-    "Output (the last part of it):\n{s}\n\n" ++
-    "If a test asserts the OLD behavior and the task changed the behavior on purpose, the test must be UPDATED — but say that out loud in your answer and name the test. If you cannot make it pass without touching tests, call `goal` with status blocked and what_would_unblock.\n";
-
-const review_repair_prompt =
-    "[Pipeline review] The reviewer found high-severity problems in your diff. Fix the CODE; do not touch the tests.\n\n" ++
-    "{s}\n";
-
-const reviewer_prompt =
-    "You are the CODE-REVIEW stage of a strict pipeline. You are the skeptical senior engineer; you do not write code.\n" ++
-    "Review the diff below. Read any file you need through the tools.\n\n" ++
-    "Diff:\n{s}\n\n" ++
-    "New/changed files (untracked or staged):\n{s}\n\n" ++
-    "Report findings as lines, one per finding:\n" ++
-    "SEVERITY: high|medium|low — <file>:<line> — <what is wrong> — <why it matters>\n" ++
-    "End with `SEVERITY: none` if there is nothing to report.\n" ++
-    "Judge: correctness, error handling, edge cases, races, security, tests that assert nothing, dead code, and clarity. Do not comment on style the project already has — formatting and naming that match the file are not findings.\n";
-
-/// Whether this task touches anything from outside the repository, which is
-/// where hallucinated APIs and fake package names come from — the one part
-/// Explorer cannot check by reading local code.
-fn needsInvestigation(task_text: []const u8, evidence: []const u8) bool {
-    const external_signals = [_][]const u8{
-        "install",    "instal",    "dependenc", "dependencia", "dependency",
-        "api",        "package",   "library",   "npm",         "pip",
-        "cargo add",  "go get",    "import",    "crate",       "endpoint",
-        "web_search", "web_fetch", "http",      "url",
-    };
-    for (external_signals) |s| {
-        if (indexOfIgnoreCase(task_text, s) != null) return true;
-    }
-    const unknown_signals = [_][]const u8{
-        "UNKNOWNS:", "unverified", "could not verify", "not sure",
-        "GUESS",
-    };
-    for (unknown_signals) |s| {
-        if (indexOfIgnoreCase(evidence, s) != null) return true;
-    }
-    return false;
-}
-
-/// Case-insensitive substring (ASCII).
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return i;
-    }
-    return null;
-}
+// ── prompts (pipeline) ──────────────────────────────────────
+const explorer_prompt = pipeline_support.explorer_prompt;
+const investigator_prompt = pipeline_support.investigator_prompt;
+const tester_prompt = pipeline_support.tester_prompt;
+const implementer_seed = pipeline_support.implementer_seed;
+const verify_repair_prompt = pipeline_support.verify_repair_prompt;
+const review_repair_prompt = pipeline_support.review_repair_prompt;
+const reviewer_prompt = pipeline_support.reviewer_prompt;
+const review_files_prompt = pipeline_support.review_files_prompt;
 
 fn pipelineCancelled() bool {
     return chat.cancel_current.load(.seq_cst);
@@ -19906,143 +16073,186 @@ fn pipelineStop(m: *tui.Model, cancelled: bool) void {
 /// Tester? → harness-run suite (with repair passes) → Reviewer → (one
 /// repair if high-severity) → summary. The model works INSIDE a stage; the
 /// harness owns the order.
-fn runPipeline(m: *tui.Model, task_text: []const u8) void {
-    const gpa = m.allocator;
-    const io = io_global;
-    const verdict = pipeline_mod.classify(task_text);
 
-    pipeline_active = true;
-    defer {
-        pipeline_active = false;
-        m.setPipelineStage(null);
-    }
+fn writePipelinePlanArtifact(
+    arena: std.mem.Allocator,
+    run_dir: []const u8,
+    task_text: []const u8,
+    evidence: []const u8,
+    investigator_notes: []const u8,
+) void {
+    pipeline_support.writePipelinePlanArtifact(io_global, arena, run_dir, task_text, evidence, investigator_notes);
+}
 
-    // Announce, then do the same session bookkeeping every turn does.
-    pushInfo(m, "· pipeline started: evidence → implement → tester → verify → review");
-    appendUserLine(m, task_text);
-    resetTurnBudget(m);
-    turn_stats.reset(gpa, std.Io.Timestamp.now(io, .real).nanoseconds);
-    defer turn_stats.deinit();
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var dir_buf: [512]u8 = undefined;
-    const run_dir = pipelineRunDir(&dir_buf, io) orelse {
-        pushError(m, "pipeline: could not create the artifacts directory");
-        m.streamEnd();
-        endTurn(m, turn_stats.iterations, false);
-        return;
-    };
-
-    if (pipelineCancelled()) return pipelineStop(m, true);
-
-    // ── baseline: the tests that exist BEFORE anything runs ──
-    const snaps = snapshotZigTests(arena, io) catch &.{};
-
-    // ── 1. Explorer ──
+fn runPipelineExplorerStage(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    task_text: []const u8,
+    run_dir: []const u8,
+) ?[]const u8 {
     m.setPipelineStage("explorer");
     setStatusWithZo(m, .thinking, "pipeline · explorer");
-    const evidence = blk: {
-        var rep: subagent_mod.Report = undefined;
-        const prompt = std.fmt.allocPrint(arena, explorer_prompt, .{task_text}) catch {
-            pushError(m, "pipeline: could not compose the explorer prompt");
-            m.streamEnd();
-            endTurn(m, turn_stats.iterations, false);
-            return;
-        };
-        const out = runPipelineSubagent(m, &rep, "explorer", prompt, run_dir, "evidence.md");
-        break :blk arena.dupe(u8, out) catch out;
+    var rep: subagent_mod.Report = undefined;
+    const prompt = std.fmt.allocPrint(arena, explorer_prompt, .{task_text}) catch {
+        pushError(m, "pipeline: could not compose the explorer prompt");
+        m.streamEnd();
+        endTurn(m, turn_stats.iterations, false);
+        return null;
     };
+    const out = runPipelineSubagent(m, &rep, "explorer", prompt, run_dir, "evidence.md");
+    const evidence = arena.dupe(u8, out) catch out;
     pushInfo(m, "· pipeline: explorer — evidence in .zode/pipeline/");
-    if (pipelineCancelled()) return pipelineStop(m, true);
+    // Consolidated implementation brief artifact for traceability/handoff.
+    writePipelinePlanArtifact(arena, run_dir, task_text, evidence, "No investigation was needed for this task.");
+    return evidence;
+}
 
-    // ── 2. Investigator (only when the task touches the outside world) ──
-    const notes: ?[]const u8 = if (needsInvestigation(task_text, evidence)) blk: {
-        m.setPipelineStage("investigator");
-        setStatusWithZo(m, .thinking, "pipeline · investigator");
-        var rep: subagent_mod.Report = undefined;
-        const prompt = std.fmt.allocPrint(arena, investigator_prompt, .{ task_text, evidence }) catch break :blk null;
-        const out = runPipelineSubagent(m, &rep, "investigator", prompt, run_dir, "notes.md");
-        break :blk arena.dupe(u8, out) catch out;
-    } else null;
-    if (notes) |_| {
-        pushInfo(m, "· pipeline: investigator — notes in .zode/pipeline/");
-    } else {
+
+fn runPipelineInvestigatorStage(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    task_text: []const u8,
+    run_dir: []const u8,
+    evidence: []const u8,
+) ?[]const u8 {
+    if (!pipeline_support.needsInvestigation(task_text, evidence)) {
         pushInfo(m, "· pipeline: investigator — skipped (nothing outside the repo to verify)");
+        return null;
     }
-    if (pipelineCancelled()) return pipelineStop(m, true);
+    m.setPipelineStage("investigator");
+    setStatusWithZo(m, .thinking, "pipeline · investigator");
+    var rep: subagent_mod.Report = undefined;
+    const prompt = std.fmt.allocPrint(arena, investigator_prompt, .{ task_text, evidence }) catch return null;
+    const out = runPipelineSubagent(m, &rep, "investigator", prompt, run_dir, "notes.md");
+    const notes = arena.dupe(u8, out) catch out;
+    pushInfo(m, "· pipeline: investigator — notes in .zode/pipeline/");
+    writePipelinePlanArtifact(arena, run_dir, task_text, evidence, notes);
+    return notes;
+}
 
-    // ── 3. Implementer (the normal loop, seeded with evidence) ──
+fn runPipelineImplementerStage(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    task_text: []const u8,
+    evidence: []const u8,
+    notes: ?[]const u8,
+) bool {
     m.setPipelineStage("implementer");
     setStatusWithZo(m, .thinking, "pipeline · implementer");
     const seed = std.fmt.allocPrint(arena, implementer_seed, .{
+        task_text,
         evidence,
         if (notes) |n| n else "No investigation was needed for this task.",
     }) catch {
         pushError(m, "pipeline: could not compose the implementer seed");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
-        return;
+        return false;
     };
     appendPipelineHarnessPrompt(m, seed);
-    if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) return pipelineStop(m, true);
-
-    // ── 4. The implementer may not touch existing tests ──
-    const violations = verifyZigTests(arena, io, snaps) catch &.{};
-    if (violations.len > 0) {
-        const detail = formatViolations(arena, violations) catch "existing tests were modified";
-        pushErrorFmt(m, "pipeline: existing tests were modified — this is not allowed:\n{s}\nRestoring them is required.", .{detail});
-        const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The existing tests changed during your work:\n{s}\nRestore them exactly as they were. Do not re-add your version of them by hand in any other file — the point is the ORIGINAL tests, byte for byte.", .{detail}) catch {
-            m.streamEnd();
-            endTurn(m, turn_stats.iterations, false);
-            return;
-        };
-        appendPipelineHarnessPrompt(m, reprimand);
-        if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) return pipelineStop(m, true);
-        const left = verifyZigTests(arena, io, snaps) catch &.{};
-        if (left.len > 0) {
-            pushError(m, "pipeline: existing tests are still modified — stopping. The tree is left as it is; review the diff before deciding.");
-            m.streamEnd();
-            endTurn(m, turn_stats.iterations, false);
-            return;
-        }
-        pushInfo(m, "· pipeline: existing tests restored");
+    if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) {
+        pipelineStop(m, true);
+        return false;
     }
+    return true;
+}
 
-    // ── 5. Tester (creates tests; may not weaken existing ones) ──
-    if (!verdict.omit_tests) {
-        m.setPipelineStage("tester");
-        setStatusWithZo(m, .thinking, "pipeline · tester");
-        var rep: subagent_mod.Report = undefined;
-        const prompt = std.fmt.allocPrint(arena, tester_prompt, .{ task_text, evidence }) catch {
-            m.streamEnd();
-            endTurn(m, turn_stats.iterations, false);
-            return;
-        };
-        _ = runPipelineSubagent(m, &rep, "tester", prompt, run_dir, "tester-report.md");
-        pushInfo(m, "· pipeline: tester — report in .zode/pipeline/");
-        if (pipelineCancelled()) return pipelineStop(m, true);
-        const violations2 = verifyZigTests(arena, io, snaps) catch &.{};
-        if (violations2.len > 0) {
-            const detail = formatViolations(arena, violations2) catch "existing tests were modified";
-            pushErrorFmt(m, "pipeline: the tester modified existing tests — refusing to trust its report:\n{s}", .{detail});
-        }
-    } else {
+fn enforceImplementerTestGuard(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    task_text: []const u8,
+    snaps: []const pipeline_support.Snapshot,
+) bool {
+    const violations = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
+    if (violations.len == 0) return true;
+
+    const detail = pipeline_support.formatViolations(arena, violations) catch "existing tests were modified";
+    pushErrorFmt(m, "pipeline: existing tests were modified — this is not allowed:\n{s}\nRestoring them is required.", .{detail});
+    const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The existing tests changed during your work:\n{s}\nRestore them exactly as they were. Do not re-add your version of them by hand in any other file — the point is the ORIGINAL tests, byte for byte.", .{detail}) catch {
+        m.streamEnd();
+        endTurn(m, turn_stats.iterations, false);
+        return false;
+    };
+    appendPipelineHarnessPrompt(m, reprimand);
+    if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) {
+        pipelineStop(m, true);
+        return false;
+    }
+    const left = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
+    if (left.len > 0) {
+        pushError(m, "pipeline: existing tests are still modified — stopping. The tree is left as it is; review the diff before deciding.");
+        m.streamEnd();
+        endTurn(m, turn_stats.iterations, false);
+        return false;
+    }
+    pushInfo(m, "· pipeline: existing tests restored");
+    return true;
+}
+
+fn runPipelineTesterStage(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    task_text: []const u8,
+    evidence: []const u8,
+    run_dir: []const u8,
+    snaps: []const pipeline_support.Snapshot,
+    omit_tests: bool,
+) bool {
+    if (omit_tests) {
         pushInfo(m, "· pipeline: tests omitted at the task's request");
+        return true;
     }
 
-    // ── 6. The harness runs the suite ──
-    var tests_passed = verdict.omit_tests;
-    if (!verdict.omit_tests) {
+    m.setPipelineStage("tester");
+    setStatusWithZo(m, .thinking, "pipeline · tester");
+    var rep: subagent_mod.Report = undefined;
+    const prompt = std.fmt.allocPrint(arena, tester_prompt, .{ task_text, evidence }) catch {
+        m.streamEnd();
+        endTurn(m, turn_stats.iterations, false);
+        return false;
+    };
+    _ = runPipelineSubagent(m, &rep, "tester", prompt, run_dir, "tester-report.md");
+    pushInfo(m, "· pipeline: tester — report in .zode/pipeline/");
+    if (pipelineCancelled()) {
+        pipelineStop(m, true);
+        return false;
+    }
+    const violations2 = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
+    if (violations2.len > 0) {
+        const detail = pipeline_support.formatViolations(arena, violations2) catch "existing tests were modified";
+        pushErrorFmt(m, "pipeline: the tester modified existing tests — refusing to trust its report:\n{s}", .{detail});
+    }
+    return true;
+}
+
+const PipelineVerifyResult = struct {
+    stopped: bool,
+    tests_passed: bool,
+};
+
+fn runPipelineVerifyStage(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    task_text: []const u8,
+    snaps: []const pipeline_support.Snapshot,
+    omit_tests: bool,
+) PipelineVerifyResult {
+    var tests_passed = omit_tests;
+    if (!omit_tests) {
         m.setPipelineStage("verify");
         setStatusWithZo(m, .tooling, "pipeline · running the test suite");
         if (testplan_mod.planAt(io, ".")) |plan| {
             var cycle: usize = 0;
             while (cycle <= pipeline_mod.max_repair_cycles) {
-                if (pipelineCancelled()) return pipelineStop(m, true);
-                const suite = runTestSuite(arena, io, plan);
+                if (pipelineCancelled()) {
+                    pipelineStop(m, true);
+                    return .{ .stopped = true, .tests_passed = tests_passed };
+                }
+                const suite = pipeline_support.runTestSuite(arena, io, plan);
                 if (suite.passed) {
                     tests_passed = true;
                     pushInfoFmt(m, "· pipeline: {s} — all tests pass", .{plan.label});
@@ -20058,24 +16268,30 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
                 appendPipelineHarnessPrompt(m, repair);
                 m.setPipelineStage("implementer");
                 setStatusWithZo(m, .thinking, "pipeline · implementer (repair)");
-                if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) return pipelineStop(m, true);
+                if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) {
+                    pipelineStop(m, true);
+                    return .{ .stopped = true, .tests_passed = tests_passed };
+                }
                 m.setPipelineStage("verify");
                 setStatusWithZo(m, .tooling, "pipeline · running the test suite");
-                const touch = verifyZigTests(arena, io, snaps) catch &.{};
+                const touch = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
                 if (touch.len > 0) {
-                    const detail = formatViolations(arena, touch) catch "existing tests were modified";
+                    const detail = pipeline_support.formatViolations(arena, touch) catch "existing tests were modified";
                     pushErrorFmt(m, "pipeline: a repair modified existing tests:\n{s}\nRestoring them is required.", .{detail});
                     const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The repair pass changed existing tests:\n{s}\nRestore them exactly as they were.", .{detail}) catch break;
                     appendPipelineHarnessPrompt(m, reprimand);
                     m.setPipelineStage("implementer");
-                    if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) return pipelineStop(m, true);
+                    if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) {
+                        pipelineStop(m, true);
+                        return .{ .stopped = true, .tests_passed = tests_passed };
+                    }
                     m.setPipelineStage("verify");
-                    const left = verifyZigTests(arena, io, snaps) catch &.{};
+                    const left = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
                     if (left.len > 0) {
                         pushError(m, "pipeline: existing tests are still modified after repair — stopping. Review the diff before deciding.");
                         m.streamEnd();
                         endTurn(m, turn_stats.iterations, false);
-                        return;
+                        return .{ .stopped = true, .tests_passed = tests_passed };
                     }
                 }
             }
@@ -20085,42 +16301,147 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
         }
         if (!tests_passed) setStatusWithZo(m, .warn, "pipeline · tests failing");
     }
+    return .{ .stopped = false, .tests_passed = tests_passed };
+}
+
+fn runPipelineReviewStage(
+    m: *tui.Model,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    task_text: []const u8,
+    evidence: []const u8,
+    run_dir: []const u8,
+    omit_review: bool,
+    omit_tests: bool,
+    tests_passed_in: bool,
+) PipelineVerifyResult {
+    var tests_passed = tests_passed_in;
+    if (omit_review) {
+        pushInfo(m, "· pipeline: review omitted at the task's request");
+        return .{ .stopped = false, .tests_passed = tests_passed };
+    }
+
+    m.setPipelineStage("reviewer");
+    setStatusWithZo(m, .thinking, "pipeline · reviewer");
+    var rep: subagent_mod.Report = undefined;
+    const diff = pipeline_support.gitDiffHEAD(arena, io);
+    const status = pipeline_support.gitStatusShort(arena, io);
+    const prompt = std.fmt.allocPrint(arena, reviewer_prompt, .{ task_text, evidence, diff, status }) catch "";
+    const report = runPipelineSubagent(m, &rep, "reviewer", prompt, run_dir, "review.md");
+    const counts = pipeline_mod.parseReviewReport(report);
+    if (pipelineCancelled()) {
+        pipelineStop(m, true);
+        return .{ .stopped = true, .tests_passed = tests_passed };
+    }
+    if (counts.high > 0) {
+        pushInfoFmt(m, "· pipeline: review found {d} high-severity problem(s) — running one repair pass", .{counts.high});
+        const repair = std.fmt.allocPrint(arena, review_repair_prompt, .{report}) catch "";
+        if (repair.len > 0) appendPipelineHarnessPrompt(m, repair);
+        m.setPipelineStage("implementer");
+        setStatusWithZo(m, .thinking, "pipeline · implementer (review fix)");
+        if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) {
+            pipelineStop(m, true);
+            return .{ .stopped = true, .tests_passed = tests_passed };
+        }
+        if (!omit_tests) {
+            if (testplan_mod.planAt(io, ".")) |plan| {
+                m.setPipelineStage("verify");
+                setStatusWithZo(m, .tooling, "pipeline · running the test suite");
+                const suite = pipeline_support.runTestSuite(arena, io, plan);
+                pushInfo(m, if (suite.passed) "· pipeline: tests still pass after the repair" else "· pipeline: tests are RED after the repair");
+                if (!suite.passed) tests_passed = false;
+            }
+        }
+    }
+    pushInfoFmt(m, "· pipeline: review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
+    return .{ .stopped = false, .tests_passed = tests_passed };
+}
+fn runPipeline(m: *tui.Model, task_text: []const u8) void {
+    const gpa = m.allocator;
+    const io = io_global;
+    const verdict = pipeline_mod.classify(task_text);
+
+    pipeline_active = true;
+    defer {
+        pipeline_active = false;
+        m.setPipelineStage(null);
+    }
+
+    // Announce, then do the same session bookkeeping every turn does.
+    pushInfo(m, "· pipeline started: evidence/plan → implement → tester → verify → review (artifacts in .zode/pipeline/)");
+    appendUserLine(m, task_text);
+    resetTurnBudget(m);
+    turn_stats.reset(gpa, std.Io.Timestamp.now(io, .real).nanoseconds);
+    defer turn_stats.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var dir_buf: [512]u8 = undefined;
+    const run_dir = pipeline_support.pipelineRunDir(&dir_buf, io) orelse {
+        pushError(m, "pipeline: could not create the artifacts directory");
+        m.streamEnd();
+        endTurn(m, turn_stats.iterations, false);
+        return;
+    };
+
+    if (pipelineCancelled()) return pipelineStop(m, true);
+
+    // ── baseline: the tests that exist BEFORE anything runs ──
+    const snaps = pipeline_support.snapshotZigTests(arena, io) catch &.{};
+
+    // ── 1. Explorer ──
+    const evidence = runPipelineExplorerStage(m, arena, task_text, run_dir) orelse return;
+    if (pipelineCancelled()) return pipelineStop(m, true);
+
+    // ── 2. Investigator (only when the task touches the outside world) ──
+    const notes = runPipelineInvestigatorStage(m, arena, task_text, run_dir, evidence);
+    if (pipelineCancelled()) return pipelineStop(m, true);
+
+    // ── 3. Implementer (the normal loop, seeded with evidence) ──
+    if (!runPipelineImplementerStage(m, arena, task_text, evidence, notes)) return;
+
+    // ── 4. The implementer may not touch existing tests ──
+    if (!enforceImplementerTestGuard(m, arena, io, task_text, snaps)) return;
+
+    // ── 5. Tester (creates tests; may not weaken existing ones) ──
+    if (!runPipelineTesterStage(m, arena, io, task_text, evidence, run_dir, snaps, verdict.omit_tests)) return;
+
+    // ── 6. The harness runs the suite ──
+    const verify_result = runPipelineVerifyStage(m, arena, io, task_text, snaps, verdict.omit_tests);
+    if (verify_result.stopped) return;
+    var tests_passed = verify_result.tests_passed;
     if (pipelineCancelled()) return pipelineStop(m, true);
 
     // ── 7. Code-Review (read-only) ──
-    if (!verdict.omit_review) {
-        m.setPipelineStage("reviewer");
-        setStatusWithZo(m, .thinking, "pipeline · reviewer");
-        var rep: subagent_mod.Report = undefined;
-        const diff = gitDiffHEAD(arena, io);
-        const status = gitStatusShort(arena, io);
-        const prompt = std.fmt.allocPrint(arena, reviewer_prompt, .{ diff, status }) catch "";
-        const report = runPipelineSubagent(m, &rep, "reviewer", prompt, run_dir, "review.md");
-        const counts = pipeline_mod.parseReviewReport(report);
-        if (pipelineCancelled()) return pipelineStop(m, true);
-        if (counts.high > 0) {
-            pushInfoFmt(m, "· pipeline: review found {d} high-severity problem(s) — running one repair pass", .{counts.high});
-            const repair = std.fmt.allocPrint(arena, review_repair_prompt, .{report}) catch "";
-            if (repair.len > 0) appendPipelineHarnessPrompt(m, repair);
-            m.setPipelineStage("implementer");
-            setStatusWithZo(m, .thinking, "pipeline · implementer (review fix)");
-            if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) return pipelineStop(m, true);
-            if (!verdict.omit_tests) {
-                if (testplan_mod.planAt(io, ".")) |plan| {
-                    m.setPipelineStage("verify");
-                    setStatusWithZo(m, .tooling, "pipeline · running the test suite");
-                    const suite = runTestSuite(arena, io, plan);
-                    pushInfo(m, if (suite.passed) "· pipeline: tests still pass after the repair" else "· pipeline: tests are RED after the repair");
-                    if (!suite.passed) tests_passed = false;
-                }
-            }
-        }
-        pushInfoFmt(m, "· pipeline: review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
-    } else {
-        pushInfo(m, "· pipeline: review omitted at the task's request");
-    }
+    const review_result = runPipelineReviewStage(
+        m,
+        arena,
+        io,
+        task_text,
+        evidence,
+        run_dir,
+        verdict.omit_review,
+        verdict.omit_tests,
+        tests_passed,
+    );
+    if (review_result.stopped) return;
+    tests_passed = review_result.tests_passed;
 
     // ── 8. Summary ──
+    finishPipelineRun(m, verdict, tests_passed, io, run_dir);
+}
+
+
+
+fn finishPipelineRun(
+    m: *tui.Model,
+    verdict: pipeline_mod.Verdict,
+    tests_passed: bool,
+    io: std.Io,
+    run_dir: []const u8,
+) void {
     m.setPipelineStage("done");
     const verify_label = if (verdict.omit_tests)
         pipeline_mod.verifyWord(.skipped)
@@ -20136,14 +16457,6 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
     endTurn(m, turn_stats.iterations, false);
 }
 
-const review_files_prompt =
-    "You are the CODE-REVIEW role of zode's pipeline. You are the skeptical senior engineer; you do not write code.\n" ++
-    "Review these files. Read whatever you need through the tools.\n\n" ++
-    "{s}\n\n" ++
-    "Report findings as lines, one per finding:\n" ++
-    "SEVERITY: high|medium|low — <file>:<line> — <what is wrong> — <why it matters>\n" ++
-    "End with `SEVERITY: none` if there is nothing to report.\n" ++
-    "Judge: correctness, error handling, edge cases, races, security, tests that assert nothing, dead code, and clarity. Do not comment on style the project already has.\n";
 
 /// `/code-review [paths...]` — the review stage alone, on demand.
 ///
@@ -20151,6 +16464,40 @@ const review_files_prompt =
 /// session changed). With paths it reviews exactly those files. Read-only:
 /// it changes nothing, writes nothing, and its findings are printed for the
 /// developer to act on.
+
+const ReviewPromptBuild = pipeline_support.ReviewPromptBuild;
+
+
+fn resolveCodeReviewPrompt(m: *tui.Model, arena: std.mem.Allocator, io: std.Io, trimmed: []const u8) ?[]const u8 {
+    if (trimmed.len == 0) {
+        switch (pipeline_support.buildDiffReviewPrompt(arena, io)) {
+            .prompt => |p| return p,
+            .nothing_to_review => {
+                pushInfo(m, "· code-review: nothing to review — the working tree is clean");
+                m.streamEnd();
+                setStatusWithZo(m, .done, "code-review done");
+                endTurn(m, turn_stats.iterations, false);
+                return null;
+            },
+            .compose_failed => {
+                pushError(m, "code-review: could not compose the review prompt");
+                m.streamEnd();
+                endTurn(m, turn_stats.iterations, false);
+                return null;
+            },
+        }
+    }
+    switch (pipeline_support.buildFilesReviewPrompt(arena, io, trimmed)) {
+        .prompt => |p| return p,
+        .nothing_to_review => unreachable,
+        .compose_failed => {
+            pushError(m, "code-review: could not compose the review prompt");
+            m.streamEnd();
+            endTurn(m, turn_stats.iterations, false);
+            return null;
+        },
+    }
+}
 fn runCodeReview(m: *tui.Model, arg: []const u8) void {
     const gpa = m.allocator;
     const io = io_global;
@@ -20171,48 +16518,17 @@ fn runCodeReview(m: *tui.Model, arg: []const u8) void {
     const arena = arena_state.allocator();
 
     var dir_buf: [512]u8 = undefined;
-    const run_dir = pipelineRunDir(&dir_buf, io) orelse ".zode/pipeline";
+    const run_dir = pipeline_support.pipelineRunDir(&dir_buf, io) orelse ".zode/pipeline";
 
     // ── build the review prompt ──
     const trimmed = std.mem.trim(u8, arg, " \t\r\n");
-    const prompt = blk: {
-        if (trimmed.len == 0) {
-            const diff = gitDiffHEAD(arena, io);
-            const status = gitStatusShort(arena, io);
-            if (diff.len == 0 and status.len == 0) {
-                pushInfo(m, "· code-review: nothing to review — the working tree is clean");
-                m.streamEnd();
-                setStatusWithZo(m, .done, "code-review done");
-                endTurn(m, turn_stats.iterations, false);
-                return;
-            }
-            break :blk std.fmt.allocPrint(arena, reviewer_prompt, .{ diff, status }) catch {
-                pushError(m, "code-review: could not compose the review prompt");
-                m.streamEnd();
-                endTurn(m, turn_stats.iterations, false);
-                return;
-            };
-        }
-        // Explicit files: read each, cap each, embed. The reviewer can page
-        // anything else through the tools.
-        var files: std.ArrayList(u8) = .empty;
-        var it = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
-        while (it.next()) |path| {
-            const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024)) catch {
-                files.print(arena, "— {s}: could not read\n", .{path}) catch {};
-                continue;
-            };
-            files.print(arena, "— {s}:\n\n```\n{s}\n```\n\n", .{ path, text }) catch {};
-        }
-        const embedded = files.toOwnedSlice(arena) catch "";
-        break :blk std.fmt.allocPrint(arena, review_files_prompt, .{embedded}) catch {
-            pushError(m, "code-review: could not compose the review prompt");
-            m.streamEnd();
-            endTurn(m, turn_stats.iterations, false);
-            return;
-        };
-    };
+    const prompt = resolveCodeReviewPrompt(m, arena, io, trimmed) orelse return;
 
+    finishCodeReviewRun(m, prompt, run_dir);
+}
+
+
+fn finishCodeReviewRun(m: *tui.Model, prompt: []const u8, run_dir: []const u8) void {
     var rep: subagent_mod.Report = undefined;
     const report = runPipelineSubagent(m, &rep, "reviewer", prompt, run_dir, "review.md");
     const counts = pipeline_mod.parseReviewReport(report);
@@ -20226,80 +16542,28 @@ fn runCodeReview(m: *tui.Model, arg: []const u8) void {
     endTurn(m, turn_stats.iterations, false);
 }
 
-/// The permission gate for the pipeline's TESTER subagent.
-///
-/// The main tool path (`execOneCall`) owns the full gate, tied to the turn's
-/// budget and dialog machinery. The tester needs the subset that must hold
-/// wherever code is written, in every mode:
-///   1. a `deny` rule means the call never runs;
-///   2. sensitive paths ask ONCE, and never remember;
-///   3. an `ask` rule names the rule in the dialog;
-///   4. otherwise the ordinary dialog applies (unless `/yolo`, a rule, the
-///      allowlist or accept-edits bought the call a pass).
-///
-/// Returns null when the call may run, or the refusal text to feed back as
-/// the tool result.
+fn pipelineTesterPermOps() pipeline_tester_perm.Ops {
+    const S = struct {
+        fn yoloFn() bool { return yolo; }
+    };
+    return .{
+        .yolo = S.yoloFn,
+        .toolArgSummary = toolArgSummary,
+        .permDecision = permDecision,
+        .permAutoAllowed = permAutoAllowed,
+    };
+}
+
+const PipelineRuleCheck = pipeline_tester_perm.PipelineRuleCheck;
+
+/// The permission gate for the pipeline's TESTER subagent (delegated).
 fn pipelineWriteGate(
     m: *tui.Model,
     arena: std.mem.Allocator,
     call_name: []const u8,
     args_json: []const u8,
 ) ?[]const u8 {
-    if (yolo) return null;
-
-    const arg = toolArgSummary(call_name, args_json, arena);
-
-    // The rules. A deny is absolute; an allow/dontAsk waves the call through;
-    // an ask leaves the user the final word.
-    const subjects = tools_mod.callSubjects(call_name, args_json, arena);
-    var rule_allowed = false;
-    var rule_text: []const u8 = "";
-    if (permDecision(call_name, subjects)) |d| {
-        switch (d.action) {
-            .deny => {
-                return std.fmt.allocPrint(
-                    arena,
-                    "refused: the rule `{s}` does not allow this.",
-                    .{d.rule.text},
-                ) catch "refused: a permission rule does not allow this.";
-            },
-            .allow, .dontAsk => rule_allowed = true,
-            .ask => rule_text = d.rule.text,
-        }
-    }
-
-    // Sensitive paths ask ONCE, never remember.
-    if (!rule_allowed) {
-        const risky = tools_mod.riskyPaths(call_name, args_json, arena);
-        for (risky) |p| {
-            const v = pathsafe.checkWrite(p);
-            if (v == .ok) continue;
-            const detail = std.fmt.allocPrint(
-                arena,
-                "{s} is not a place this tool writes (tester — pipeline)",
-                .{p},
-            ) catch p;
-            switch (m.requestPermissionOnce(call_name, detail)) {
-                .allow, .allow_always => pathsafe.approve(p),
-                else => return "denied: the user refused this write.",
-            }
-        }
-    }
-
-    // The ordinary dialog.
-    const auto_allowed = permAutoAllowed(call_name, arg, args_json, arena);
-    if (rule_allowed or auto_allowed) return null;
-    var dbuf: [384]u8 = undefined;
-    const detail = std.fmt.bufPrint(&dbuf, "tester: {s} {s}", .{ call_name, arg }) catch call_name;
-    var with_rule: [512]u8 = undefined;
-    const full = if (rule_text.len > 0)
-        std.fmt.bufPrint(&with_rule, "{s} — your rule `{s}` matches", .{ detail, rule_text }) catch detail
-    else
-        detail;
-    return switch (m.requestPermission(call_name, full)) {
-        .allow, .allow_always => null,
-        else => "denied: the user refused this write.",
-    };
+    return pipeline_tester_perm.pipelineWriteGate(m, arena, call_name, args_json, pipelineTesterPermOps());
 }
 
 test "buildModelItems: a free model in the cache does not corrupt the heap [crash]" {

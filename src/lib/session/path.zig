@@ -100,6 +100,16 @@ pub fn projectSessionsDir(arena: std.mem.Allocator, project_root: []const u8) ![
     return std.fs.path.join(arena, &.{ project_root, legacy_sessions_dir });
 }
 
+/// The session id as the user sees it: the file stem without `zode-`/`.jsonl`
+/// noise when present, else the basename.
+pub fn sessionDisplayId(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    if (std.mem.startsWith(u8, base, "zode-") and std.mem.endsWith(u8, base, ".jsonl")) {
+        return base["zode-".len .. base.len - ".jsonl".len];
+    }
+    return base;
+}
+
 /// Does this path exist and is it a directory?
 fn isDir(io: std.Io, path: []const u8) bool {
     const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;

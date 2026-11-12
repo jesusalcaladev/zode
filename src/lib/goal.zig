@@ -589,3 +589,10 @@ test "the Goal holds its own text: no slice into an arena that dies" {
     try std_test.expect(g.isSet());
     try std_test.expect(g.isOpen());
 }
+
+/// Whether a verdict ends the turn given how many plan steps remain open.
+pub fn verdictIsFinal(g: Goal, open_steps: usize) bool {
+    if (g.status == .none) return false;
+    if (g.status == .met and open_steps > 0) return false;
+    return true;
+}
