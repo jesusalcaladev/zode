@@ -29,14 +29,27 @@ pub fn applyStopHookGuard(m: *tui.Model, ops: UiOps) bool {
 pub fn applyRepeatGuard(m: *tui.Model, repeat_recovery: *repeats_mod.Recovery, ops: UiOps) LoopGuardAction {
     if (m.loop_repeated) |which| {
         m.loop_repeated = null;
+        // A read spiral is not "the same call with unchanged arguments": it is
+        // one file read again and again. Telling the model the arguments are
+        // unchanged would be false, and a false reason is a reason it cannot
+        // act on.
+        const same_file = std.mem.eql(u8, which, "read");
         switch (repeat_recovery.onRepeat()) {
             .nudge => {
                 m.repeats.reset();
-                ops.appendHarnessPrompt(m, "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.");
+                if (same_file) {
+                    ops.appendHarnessPrompt(m, "The harness detected the same file being read over and over without a change in between. Its content is already above you; do not read it again unchanged. Use what you have, or read a different file.");
+                } else {
+                    ops.appendHarnessPrompt(m, "The harness detected the same tool call repeated with unchanged arguments. Do not call it again unchanged. Inspect the prior result and choose a materially different next step; if the operation is genuinely necessary, explain why before trying it once with a deliberate change.");
+                }
                 return .continue_loop;
             },
             .stop => {
-                ops.appendHarnessPrompt(m, "The harness stopped this turn because the same tool call repeated with unchanged arguments after you were asked to change approach. Summarize what you learned and what remains.");
+                if (same_file) {
+                    ops.appendHarnessPrompt(m, "The harness stopped this turn because the same file was read again after you were asked to change approach. Summarize what you learned and what remains.");
+                } else {
+                    ops.appendHarnessPrompt(m, "The harness stopped this turn because the same tool call repeated with unchanged arguments after you were asked to change approach. Summarize what you learned and what remains.");
+                }
                 ops.pushRepeatStop(m, which);
                 return .break_loop;
             },

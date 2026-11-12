@@ -262,7 +262,7 @@ pub fn execToolCalls(
             if (m.loop_repeated == null) m.loop_repeated = which;
         }
         if (std.mem.eql(u8, c.name, "read")) {
-            if (m.repeats.noteRead()) |which| {
+            if (m.repeats.noteRead(c.args_json)) |which| {
                 if (m.loop_repeated == null) m.loop_repeated = which;
             }
         } else if (std.mem.eql(u8, c.name, "write") or std.mem.eql(u8, c.name, "edit") or std.mem.eql(u8, c.name, "notebook_edit")) {

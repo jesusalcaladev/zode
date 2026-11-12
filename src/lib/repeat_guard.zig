@@ -29,9 +29,16 @@ const std = @import("std");
 
 pub const repeat_limit: u8 = 3;
 
-/// Lecturas consecutivas sin una escritura nueva antes de que el harness
-/// fuerce un cambio de rumbo. Detecta el bucle "read-file → read-file → read-file"
-/// que nunca termina en un resumen.
+/// Consecutive reads of the SAME file, without a write in between, before the
+/// harness forces a change of course. It catches the spiral of re-reading one
+/// file and never producing a summary.
+///
+/// It is NOT a budget on reading: researching a task reads five, ten or twenty
+/// DIFFERENT files, and that is the model working, not looping. Counting every
+/// consecutive read stopped real turns while they were reading
+/// `markdown.zig`, `agent.zig` and `theme.zig` — one file each, nothing
+/// repeated — and the stop ("repeated tool loop (read)") was both wrong and the
+/// end of the turn.
 pub const repeat_read_limit: u8 = 5;
 
 /// The bounded response to a repeated tool call.
@@ -66,14 +73,49 @@ pub fn isRepeatExempt(name: []const u8) bool {
     return std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "bash_output");
 }
 
+fn hashOf(text: []const u8) u64 {
+    var h: u64 = 14695981039346656037;
+    for (text) |c| {
+        h ^= c;
+        h *%= 1099511628211;
+    }
+    return h;
+}
+
+/// The `path` argument of a tool call, as written in the JSON. A read that
+/// carries `paths` (the batch form) has no single target and falls back to
+/// hashing the whole argument list, which still distinguishes the files.
+fn pathArg(args_json: []const u8) []const u8 {
+    const key = "\"path\"";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, args_json, i, key)) |at| {
+        var j = at + key.len;
+        while (j < args_json.len and (args_json[j] == ' ' or args_json[j] == ':')) j += 1;
+        if (j >= args_json.len or args_json[j] != '"') {
+            i = at + key.len;
+            continue;
+        }
+        j += 1;
+        const start = j;
+        while (j < args_json.len and args_json[j] != '"') {
+            if (args_json[j] == '\\') j += 1;
+            j += 1;
+        }
+        if (j >= args_json.len) return args_json;
+        return args_json[start..j];
+    }
+    return args_json;
+}
+
 pub const Repeats = struct {
     last: u64 = 0,
     run: u8 = 0,
     tool: [64]u8 = undefined,
     tool_len: usize = 0,
-    /// Lecturas consecutivas sin una escritura nueva (write/edit/notebook_edit).
-    /// Detecta el bucle "read-file → read-file → read-file" que nunca termina.
+    /// Consecutive reads of the SAME path since the last write. `read_path` is
+    /// the hash of that path; a different path starts a new run.
     reads_since_write: u8 = 0,
+    read_path: u64 = 0,
 
     /// Feeds one call. Returns the tool name when this is the third identical one.
     pub fn note(self: *Repeats, name: []const u8, args_json: []const u8) ?[]const u8 {
@@ -113,10 +155,16 @@ pub const Repeats = struct {
         return self.note(name, args_json);
     }
 
-    /// Called when the model issues a `read`. Counts consecutive reads without
-    /// a write in between. Returns "read" when the read limit is reached,
-    /// signalling the loop to break out of a read-only spiral.
-    pub fn noteRead(self: *Repeats) ?[]const u8 {
+    /// Called when the model issues a `read`. Counts consecutive reads of the
+    /// SAME path without a write in between. Returns "read" when the limit is
+    /// reached, signalling the loop to break out of a one-file spiral.
+    ///
+    /// Different files never count against each other: a turn that reads
+    /// `agent.zig`, then `tui.zig`, then `theme.zig` is not repeating anything.
+    pub fn noteRead(self: *Repeats, args_json: []const u8) ?[]const u8 {
+        const h = hashOf(pathArg(args_json));
+        if (self.reads_since_write > 0 and h != self.read_path) self.reads_since_write = 0;
+        self.read_path = h;
         self.reads_since_write += 1;
         if (self.reads_since_write >= repeat_read_limit) return "read";
         return null;
@@ -167,37 +215,83 @@ test "repeats: exemptions never trigger" {
     }
 }
 
-test "repeats: noteRead triggers after repeat_read_limit consecutive reads" {
+test "repeats: noteRead triggers after repeat_read_limit reads of the SAME file" {
     var r: Repeats = .{};
+    const args = "{\"path\":\"src/a.zig\"}";
     for (0..repeat_read_limit - 1) |_| {
-        try std.testing.expect(r.noteRead() == null);
+        try std.testing.expect(r.noteRead(args) == null);
     }
-    try std.testing.expectEqualStrings("read", r.noteRead().?);
+    try std.testing.expectEqualStrings("read", r.noteRead(args).?);
+}
+
+test "repeats: reading DIFFERENT files never counts as a spiral" {
+    // The bug: five consecutive reads of five different files stopped the turn
+    // with "stopped a repeated tool loop (read)" while the model was doing
+    // exactly what it was asked to do — reading the code.
+    var r: Repeats = .{};
+    const files = [_][]const u8{
+        "{\"path\":\"src/lib/markdown.zig\"}",
+        "{\"path\":\"src/agent.zig\"}",
+        "{\"path\":\"src/lib/theme.zig\"}",
+        "{\"path\":\"src/tui.zig\"}",
+        "{\"path\":\"src/lib/repeat_guard.zig\"}",
+        "{\"path\":\"src/tui.zig\"}",
+        "{\"path\":\"src/agent.zig\"}",
+        "{\"path\":\"src/lib/markdown.zig\"}",
+    };
+    for (files) |args| try std.testing.expect(r.noteRead(args) == null);
+}
+
+test "repeats: a different file resets the same-file run" {
+    var r: Repeats = .{};
+    const a = "{\"path\":\"a.zig\"}";
+    for (0..repeat_read_limit - 1) |_| _ = r.noteRead(a);
+    try std.testing.expect(r.noteRead("{\"path\":\"b.zig\"}") == null);
+    // The run starts over on `a.zig`: four more is not a spiral yet.
+    for (0..repeat_read_limit - 1) |_| {
+        try std.testing.expect(r.noteRead(a) == null);
+    }
+    try std.testing.expectEqualStrings("read", r.noteRead(a).?);
 }
 
 test "repeats: noteWrite resets the read counter" {
     var r: Repeats = .{};
+    const args = "{\"path\":\"src/a.zig\",\"offset\":0}";
     // Just under the limit
     for (0..repeat_read_limit - 1) |_| {
-        try std.testing.expect(r.noteRead() == null);
+        try std.testing.expect(r.noteRead(args) == null);
     }
     r.noteWrite();
     // After a write, reads start from zero again
     for (0..repeat_read_limit - 1) |_| {
-        try std.testing.expect(r.noteRead() == null);
+        try std.testing.expect(r.noteRead(args) == null);
     }
-    try std.testing.expectEqualStrings("read", r.noteRead().?);
+    try std.testing.expectEqualStrings("read", r.noteRead(args).?);
 }
 
 test "repeats: mixed reads and writes do not trigger early" {
     var r: Repeats = .{};
+    const args = "{\"path\":\"src/a.zig\"}";
     // read, write, read, write, read - no spiral
-    try std.testing.expect(r.noteRead() == null);
+    try std.testing.expect(r.noteRead(args) == null);
     r.noteWrite();
-    try std.testing.expect(r.noteRead() == null);
+    try std.testing.expect(r.noteRead(args) == null);
     r.noteWrite();
-    try std.testing.expect(r.noteRead() == null);
+    try std.testing.expect(r.noteRead(args) == null);
     r.noteWrite();
-    try std.testing.expect(r.noteRead() == null);
+    try std.testing.expect(r.noteRead(args) == null);
+}
+
+test "repeats: the read path survives offsets and limits" {
+    // The same file read in ranges is still the same file.
+    var r: Repeats = .{};
+    const ranges = [_][]const u8{
+        "{\"path\":\"src/tui.zig\",\"offset\":0,\"limit\":80}",
+        "{\"path\":\"src/tui.zig\",\"offset\":80,\"limit\":80}",
+        "{\"path\":\"src/tui.zig\",\"offset\":160,\"limit\":80}",
+        "{\"path\":\"src/tui.zig\",\"offset\":240,\"limit\":80}",
+    };
+    for (ranges) |args| try std.testing.expect(r.noteRead(args) == null);
+    try std.testing.expectEqualStrings("read", r.noteRead(ranges[0]).?);
 }
 
