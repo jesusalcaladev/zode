@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - add the modules the committed tree already imports (build) [`23b5cefc`](https://github.com/jesusalcaladev/zode/commit/23b5cefc)
-- make the committed tree compile again (build) [`1c1b7d05`](https://github.com/jesusalcaladev/zode/commit/1c1b7d05)
+- make the committed tree compile again (build) [`98a3f7b9`](https://github.com/jesusalcaladev/zode/commit/98a3f7b9)
 
 ### Documentation
 
@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark phase 35.5 and 35.9 complete (tasks) [`486dda08`](https://github.com/jesusalcaladev/zode/commit/486dda08)
 - update Phase 3 unified diff viewer progress [`39f5a026`](https://github.com/jesusalcaladev/zode/commit/39f5a026)
 - document the native GitHub integration (github) [`2df603d0`](https://github.com/jesusalcaladev/zode/commit/2df603d0)
+- clean up README with clearer structure and docs references [`14a5e99f`](https://github.com/jesusalcaladev/zode/commit/14a5e99f)
 
 ### Refactors
 

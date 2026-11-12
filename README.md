@@ -1,11 +1,11 @@
 # zode
 
-A code agent in the terminal, written in **pure Zig** (no libc, no C dependencies; the only external one is libvaxis).
-**~1.3 MB** stripped binary, ~6 MB RAM, all code in one directory.
+A terminal code agent written in **pure Zig** (no libc, no C dependencies; the only external one is `libvaxis`, also pure Zig).
 
-It is not a wrapper around another agent: it speaks HTTP with the provider, runs the tools on your machine, and decides on its own which tool to call.
+- ~1.3 MB stripped binary, ~6 MB RAM, all code in one directory.
+- Not a wrapper around another agent: it speaks HTTP with the provider, runs tools on your machine, and decides which tool to call next.
 
-```bash
+```
 $ zode
 ######  ####  ####   ######
 ##  ## ##  ## ##   # ##
@@ -25,7 +25,7 @@ The fastest way is the installer script, which downloads the latest release bina
 curl -fsSL https://github.com/jesusalcaladev/zode/releases/latest/download/install.sh | bash
 ```
 
-Or with options:
+With options:
 
 ```bash
 curl -fsSL https://github.com/jesusalcaladev/zode/releases/latest/download/install.sh | bash -s -- --version v0.1.0 --install-dir ~/.local/bin
@@ -45,13 +45,15 @@ export PATH="$HOME/.local/bin:$PATH"
 zode v0.2.0 is available (minor) · /update installs it
 ```
 
-`/update` downloads the release asset, **runs it once to prove it works on this machine**, and only then replaces the binary atomically — a build for another CPU never replaces a working one. Restart `zode` afterwards.
+`/update` downloads the release asset, **runs it once to prove it works on this machine**, verifies `--version`, refuses to go backwards, writes `{exe}.new`, then atomically renames over. Restart `zode` afterwards.
 
 The check is cached in `~/.cache/zode/update.json` for six hours. `ZODE_NO_SELF_UPDATE=1` disables it; `ZODE_AUTO_UPDATE=1` installs without asking.
 
-### Build from source
+---
 
-Requires **Zig 0.17.0** (the only dependency besides libvaxis, which is fetched by `build.zig.zon`).
+## Build from source
+
+Requires **Zig 0.17.0** (the only dependency besides `libvaxis`, fetched by `build.zig.zon`).
 
 ```bash
 git clone https://github.com/jesusalcaladev/zode.git
@@ -62,103 +64,68 @@ zig build -Doptimize=ReleaseSmall   # ~1.3 MB stripped binary
 ./zig-out/bin/zode --models         # list available models
 ```
 
-## Build Flags
+### Build flags
 
-### Optimization Levels
+| Flag | Default | Meaning |
+|---|---|---|
+| `-Doptimize=ReleaseSmall` | yes | Optimized for size (~1.3 MB). Recommended for distribution. |
+| `-Doptimize=ReleaseSafe` | | Optimized for safety (~2.2 MB). |
+| `-Doptimize=Debug` | | No optimizations, symbols included (~6–8 MB). |
+| `-Dstrip=true` | yes | Removes debug sections. Production builds. |
+| `-Dstrip=false` | | Keeps symbols. Use only with `-Doptimize=Debug`. |
+| `-Dcpu=baseline` | | **Required** for any binary you distribute. Without it the binary targets this machine's CPU and older hardware gets `Illegal instruction`. |
+| `-Dversion=v0.1.0` | | Embeds a version string (`--version`). |
 
-| Flag | Description | Size | Use Case |
-|------|-------------|------|----------|
-| `-Doptimize=ReleaseSmall` (default) | Optimized for size | ~1.3 MB | Distribution, production |
-| `-Doptimize=ReleaseSafe` | Optimized for safety, larger | ~2.2 MB | Production where bugs matter |
-| `-Doptimize=Debug` | No optimizations, symbols included | ~6-8 MB | Debugging, development |
-
-### Binary Stripping
-
-| Flag | Description | When to Use |
-|------|-------------|-------------|
-| `-Dstrip=true` (default) | Removes debug sections (`.symtab`, `.debug_info`) | Production builds |
-| `-Dstrip=false` | Keeps symbols for debugging | Debug builds (with `-Doptimize=Debug`) |
-
-**⚠️ Important**: `-Dstrip=false` alone does **NOT** produce symbols on ReleaseSmall/ReleaseSafe. Use it **only** with `-Doptimize=Debug`.
-
-### Version Embedding
+Common combinations:
 
 ```bash
--Dversion=v0.1.0
-```
-- Embeds version string in binary (`--version` command)
-- Useful for tracking deployed versions
-
-### CPU Target (Critical for Distribution)
-
-```bash
--Dcpu=baseline
-```
-- **REQUIRED** for any binary you distribute
-- Without it, the binary targets **THIS machine's CPU**
-- Older hardware gets `Illegal instruction` crashes
-- Baseline targets x86_64, ARMv7, and other common architectures
-
-### Common Build Combinations
-
-#### Production (Recommended)
-```bash
+# Production (recommended)
 zig build -Doptimize=ReleaseSmall -Dcpu=baseline
-# Result: ~1.3 MB, universally compatible
-```
 
-#### Production with Debug Symbols
-```bash
+# Production with debug symbols
 zig build -Doptimize=ReleaseSafe -Dstrip=false -Dcpu=baseline
-# Result: ~2.2 MB, debuggable, universal
-```
 
-#### Development
-```bash
+# Development
 zig build -Doptimize=Debug -Dstrip=false
-# Result: ~6-8 MB, full symbols, current CPU only
 ```
-
-### Quick Reference Table
-
-| Build Type | Command | Size | Compatible | Debuggable |
-|------------|---------|------|------------|------------|
-| **ReleaseSmall** | `zig build -Doptimize=ReleaseSmall` | 1.3 MB | ✅ Universal | ❌ |
-| **ReleaseSafe** | `zig build -Doptimize=ReleaseSafe` | 2.2 MB | ✅ Universal | ❌ |
-| **Debug** | `zig build -Doptimize=Debug` | 6-8 MB | ❌ Current CPU only | ✅ |
-
-### Best Practices
-
-1. **Always use `-Dcpu=baseline`** for any build you plan to share
-2. **Use ReleaseSmall** for production releases (smallest size)
-3. **Keep Debug builds locally** - they're large and CPU-specific
-4. **Symbol requirement**: Debug builds get symbols automatically; release builds do **not** get them even with `-Dstrip=false`
-5. **Default flags**: `-Doptimize=ReleaseSmall` and `-Dstrip=true` are already the defaults
 
 ---
 
-## Quick Start
+## Quick start
+
+Configure (optional — uses the OpenCode free tier by default):
 
 ```bash
-# Configure (optional — uses OpenCode free tier by default)
-export ZODE_API_KEY="your-key"          # generic fallback key
-export ZODE_PROVIDER="openrouter"       # opencode | openrouter | anthropic | openai | groq | deepseek | …
-
-# Run the TUI
-./zig-out/bin/zode
-
-# Or run headless (no TTY needed)
-./zig-out/bin/zode --chat "refactor the read cache to use a sliding window"
-./zig-out/bin/zode --resume             # reopen the most recent session
-./zig-out/bin/zode --models             # list available models
+export ZODE_API_KEY="your-key"
+export ZODE_PROVIDER="openrouter"   # opencode | openrouter | anthropic | openai | groq | deepseek | …
 ```
+
+Run:
+
+```bash
+./zig-out/bin/zode                  # TUI
+./zig-out/bin/zode --chat "refactor the read cache to use a sliding window"   # headless
+./zig-out/bin/zode --resume         # reopen the most recent session
+./zig-out/bin/zode --models         # list available models
+./zig-out/bin/zode --chat "/context" # headless with a slash command
+```
+
+Supported providers include opencode, openrouter, anthropic, openai, groq, deepseek, mistral, command-code, github-copilot, xai, zai, zai-coding, nvidia, and local (Ollama / LM Studio, no key). Keys are resolved in this order:
+
+1. `~/.config/zode/auth.json` — what you typed in `/connect` (`0600`, wins over env).
+2. The provider's own variable (`ZODE_OPENROUTER_KEY`, `ZODE_ANTHROPIC_KEY`, …).
+3. `ZODE_API_KEY` — the generic fallback.
+
+See [`docs/settings.md`](docs/settings.md) for the full provider table and `config.json` schema.
+
+---
 
 ## What's new / key behavior
 
-- **Staged task pipeline**: `/pipeline <task>` runs a fixed, harness-owned flow — evidence → (investigator when needed) → implement → tester → verify → review — so the model cannot skip verification stages. The harness detects and runs the project's test suite, and it refuses to weaken or delete existing tests (Zig inline tests are re-hashed and enforced). `/code-review [paths]` runs the read-only review stage on the diff or specific files. Control with `ZODE_PIPELINE=auto|off|always`; artifacts are written to `.zode/pipeline/<id>/`. Say “omit tests” or “omit review” in the task to skip those stages.
-- **Long sessions stay usable (recoverable results + compaction v2)**: oversized tool results can be spilled to session-isolated files with recoverable `read path=` notices and per-tool/aggregate caps, so detail is moved instead of lost. Compaction defaults to `elide` (Tier 1) and supports v2 guarantees: recoverable microcompaction markers, resume boundaries (`trimToBoundary`), preserved skills/read context and critical markers, and a summarizer circuit breaker; `full` summarization remains opt-in (never at 256k+ windows). Check `/context` for the live budget/state.
+- **Staged task pipeline** (`/pipeline <task>`): a fixed, harness-owned flow — evidence → (investigator when needed) → implement → tester → verify → review — so the model cannot skip verification stages. The harness detects and runs the project's test suite, and refuses to weaken or delete existing tests (Zig inline tests are re-hashed and enforced). `/code-review [paths]` runs the read-only review stage on the diff or specific files. Control with `ZODE_PIPELINE=auto|off|always`; artifacts land in `.zode/pipeline/<id>/`. Say "omit tests" or "omit review" in the task to skip those stages.
+- **Long sessions stay usable** (recoverable results + compaction v2): oversized tool results spill to session-isolated files with recoverable `read path=` notices and per-tool/aggregate caps. Compaction defaults to `elide` (Tier 1) and supports v2 guarantees: recoverable microcompaction markers, resume boundaries (`trimToBoundary`), preserved skills/read context and critical markers, and a summarizer circuit breaker. `full` summarization is opt-in (never at 256k+ windows). Check `/context` for the live budget/state.
 - **Permissions, hooks, and bash safety**: `Tool(pattern)` rules (project `.zode/permissions.json` / user rules) decide allow/deny/ask with clear precedence; project command hooks in `.zode/hooks.json` (`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`Stop`, matcher/`if`/timeout/once) can block or annotate tool flow; `bash` is classified before asking, with sandbox offers for flagged commands when available.
-- **Background tasks that notify on completion**: long commands can run in the unified background task registry with session-isolated file-backed output and incremental `bash_output` polling. When a task finishes or is killed, the harness injects a one-time system event so the model learns without polling.
+- **Background tasks that notify on completion**: long commands run in the unified background task registry with session-isolated file-backed output and incremental `bash_output` polling. When a task finishes or is killed, the harness injects a one-time system event so the model learns without polling.
 - **Mascot (Zo)**: the footer mascot reflects real harness state and, during a pipeline, the active stage (exploring/investigating/implementing/testing/verifying/reviewing) so progress is visible instead of ambiguous.
 
 ---
@@ -167,10 +134,11 @@ export ZODE_PROVIDER="openrouter"       # opencode | openrouter | anthropic | op
 
 | File | For |
 |---|---|
-| `docs/settings.md` | All environment variables, `config.json`, key precedence, token budget |
-| `docs/commands.md` | Every slash command and what it does |
-| `docs/usage.md` | How to use zode, end to end (run → model → task → verify) |
-| `docs/architecture.md` | How streaming, compaction, permissions, subagents, MCP, self-update work |
+| `README.md` | Install, quick start, key behavior, verification, contributing |
+| [`docs/settings.md`](docs/settings.md) | All environment variables, `config.json`, key precedence, token budget |
+| [`docs/commands.md`](docs/commands.md) | Every slash command and what it does |
+| [`docs/usage.md`](docs/usage.md) | How to use zode, end to end (run → model → task → verify) |
+| [`docs/architecture.md`](docs/architecture.md) | How streaming, compaction, permissions, subagents, MCP, self-update work |
 | `AGENTS.md` | Code conventions for contributors and AI coding agents |
 
 Load a `.env` without exporting every line by hand:
@@ -186,8 +154,9 @@ set -a && source .env && set +a
 Sessions are append-only JSONL in `./sessions/zode-<id>.jsonl`. Lines of 512 bytes or more are compressed with raw DEFLATE level 9 and base64-encoded (`z` prefix marker). Compaction never touches session files: what the context window drops, the file keeps.
 
 A `<session>.meta.json` sidecar holds structural title keys:
-- `custom_title` — set by `/rename`; never overwritten by the AI
-- `ai_title` — generated by the AI at turn 3; ephemeral, safe to regenerate
+
+- `custom_title` — set by `/rename`; never overwritten by the AI.
+- `ai_title` — generated by the AI at turn 3; ephemeral, safe to regenerate.
 
 Title resolution order: `custom_title` > `ai_title` > `name` > session id.
 
@@ -232,15 +201,15 @@ Configure provider/model the same way as normal zode usage (`ZODE_PROVIDER`, `ZO
 
 ---
 
-## Contributing / Public repo files
+## Contributing / public repo files
 
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (Zig 0.17, pure std, tests)
-- [`SECURITY.md`](SECURITY.md) — vulnerability reporting, scope
-- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community conduct
-- [`.github/ISSUE_TEMPLATE/bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md) — bug template
-- [`.github/ISSUE_TEMPLATE/feature_request.md`](.github/ISSUE_TEMPLATE/feature_request.md) — feature template
-- [`.github/pull_request_template.md`](.github/pull_request_template.md) — PR template
-- [`.github/workflows/zig.yml`](.github/workflows/zig.yml) — basic CI (`zig build` + `zig build test`)
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) — releases for 4 platforms + install.sh
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to contribute (Zig 0.17, pure std, tests).
+- [`SECURITY.md`](SECURITY.md) — vulnerability reporting, scope.
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community conduct.
+- [`.github/ISSUE_TEMPLATE/bug_report.md`](.github/ISSUE_TEMPLATE/bug_report.md) — bug template.
+- [`.github/ISSUE_TEMPLATE/feature_request.md`](.github/ISSUE_TEMPLATE/feature_request.md) — feature template.
+- [`.github/pull_request_template.md`](.github/pull_request_template.md) — PR template.
+- [`.github/workflows/zig.yml`](.github/workflows/zig.yml) — basic CI (`zig build` + `zig build test`).
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) — releases for 4 platforms + `install.sh`.
 
 This repo is under MIT (`LICENSE`). If you open a PR, confirm `zig build test` passes and that the change respects the `pure Zig std` rule.
