@@ -29,10 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - guide todo usage as concrete implementation plans (prompt) [`8a7fe7d4`](https://github.com/jesusalcaladev/zode/commit/8a7fe7d4)
 - add native GitHub context, types and REST client (github) [`a242f9cb`](https://github.com/jesusalcaladev/zode/commit/a242f9cb)
 - add the native `github` gateway tool (github) [`f35a03ed`](https://github.com/jesusalcaladev/zode/commit/f35a03ed)
+- add the git workflow module with native GitHub first (git) [`51df440c`](https://github.com/jesusalcaladev/zode/commit/51df440c)
 
 ### Bug Fixes
 
-- add the modules the committed tree already imports (build) [`b62cbbb6`](https://github.com/jesusalcaladev/zode/commit/b62cbbb6)
+- add the modules the committed tree already imports (build) [`23b5cefc`](https://github.com/jesusalcaladev/zode/commit/23b5cefc)
 
 ### Documentation
 
