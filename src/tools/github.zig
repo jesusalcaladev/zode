@@ -403,3 +403,35 @@ test "github: urlEncode escapes what a query string cannot carry" {
     try std.testing.expectEqualStrings("%2F", urlEncode(a, "/"));
     try std.testing.expectEqualStrings("owner%3Abranch", urlEncode(a, "owner:branch"));
 }
+
+test "github: whoami without a token says so in words, without a network call" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"operation\":\"whoami\"}", .{});
+    const out = try toolGithub(std.testing.io, v.object, a);
+    // The harness has no GitHub token in the test environment, so this is the
+    // branch a person hits first: the answer is WORDS, not a stack trace.
+    try std.testing.expect(std.mem.indexOf(u8, out, "no token configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "GITHUB_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ghp_") == null);
+}
+
+test "github: a missing argument is named instead of guessed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"operation\":\"pr_view\"}", .{});
+    const out = try toolGithub(std.testing.io, v.object, a);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pr_view") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "number") != null);
+}
+
+test "github: a bad `repo` is refused with the shape it wants" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"operation\":\"repo\",\"repo\":\"not-a-slug\"}", .{});
+    const out = try toolGithub(std.testing.io, v.object, a);
+    try std.testing.expect(std.mem.indexOf(u8, out, "owner/name") != null);
+}

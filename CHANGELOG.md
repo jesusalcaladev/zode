@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - mark phase 35.5 and 35.9 complete (tasks) [`486dda08`](https://github.com/jesusalcaladev/zode/commit/486dda08)
 - update Phase 3 unified diff viewer progress [`39f5a026`](https://github.com/jesusalcaladev/zode/commit/39f5a026)
 - document the native GitHub integration (github) [`2df603d0`](https://github.com/jesusalcaladev/zode/commit/2df603d0)
-- clean up README with clearer structure and docs references [`14a5e99f`](https://github.com/jesusalcaladev/zode/commit/14a5e99f)
+- clean up README with clearer structure and docs references [`a1d52413`](https://github.com/jesusalcaladev/zode/commit/a1d52413)
 
 ### Refactors
 
@@ -60,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - register ACP protocol test module [`0f675bb7`](https://github.com/jesusalcaladev/zode/commit/0f675bb7)
 - add ACP smoke test script (acp) [`9e60750f`](https://github.com/jesusalcaladev/zode/commit/9e60750f)
 - add a pty smoke for the /github command (github) [`ac702c5c`](https://github.com/jesusalcaladev/zode/commit/ac702c5c)
+- pin the paths a person hits without credentials (github) [`c4521cd6`](https://github.com/jesusalcaladev/zode/commit/c4521cd6)
 
 ### Other
 
