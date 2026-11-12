@@ -133,12 +133,20 @@ pub const code_deco: vaxis.Style = .{ .italic = true, .fg = .{ .rgb = .{ 0xff, 0
 // bold markers, and gutters rather than painted row backgrounds.
 
 pub const diff_add: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
-pub const diff_add_bg: vaxis.Style = .{};
+/// The band behind the WORDS that changed inside an added row. Stronger than
+/// the row's own tint (`diff_add_line_bg`), because "this row was added" and
+/// "this is what changed in it" are two different statements.
+pub const diff_add_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x1e, 0x3b, 0x24 } } };
 pub const diff_del: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
-pub const diff_del_bg: vaxis.Style = .{};
+/// The band behind the WORDS that changed inside a deleted row.
+pub const diff_del_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x3d, 0x1f, 0x1f } } };
 /// Line/word background tints disabled to preserve terminal background.
-pub const diff_add_line_bg: vaxis.Style = .{};
-pub const diff_del_line_bg: vaxis.Style = .{};
+/// Background tint of a whole added row: soft green so the `+` reads as a band,
+/// and the text on top stays legible.
+pub const diff_add_line_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x16, 0x25, 0x16 } } };
+/// Background tint of a whole deleted row: soft red so the `-` reads as a band,
+/// and the text on top stays legible.
+pub const diff_del_line_bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x25, 0x16, 0x16 } } };
 /// The line number in a diff's gutter.
 ///
 /// It is CONTENT (the line to go and look at) and not chrome, so it is
@@ -321,11 +329,7 @@ pub const text_pairs = [_][2]vaxis.Style{
     .{ brand_soft, well_bg },
     .{ ok, diff_add_bg },
     .{ err, diff_del_bg },
-    .{ diff_add, diff_add_line_bg },
-    .{ diff_del, diff_del_line_bg },
     .{ diff_gutter, well_bg },
-    .{ diff_gutter, diff_add_line_bg },
-    .{ diff_gutter, diff_del_line_bg },
     .{ diff_ctx, well_bg },
     .{ code_text, well_bg },
     .{ code_kw, well_bg },
@@ -562,19 +566,19 @@ pub fn diffStyles(c: Caps) DiffStyles {
         return .{
             .add = resolveStyle(rgb(0x4a, 0x9e, 0xff), c), // blue
             .del = resolveStyle(rgb(0xff, 0xa5, 0x00), c), // orange
-            .add_bg = .{},
-            .del_bg = .{},
-            .add_line_bg = .{},
-            .del_line_bg = .{},
+            .add_bg = resolveStyle(.{ .bg = .{ .rgb = .{ 0x1c, 0x2c, 0x44 } } }, c),
+            .del_bg = resolveStyle(.{ .bg = .{ .rgb = .{ 0x3a, 0x2a, 0x14 } } }, c),
+            .add_line_bg = resolveStyle(diff_add_line_bg, c),
+            .del_line_bg = resolveStyle(diff_del_line_bg, c),
         };
     }
     return .{
         .add = resolveStyle(diff_add, c),
         .del = resolveStyle(diff_del, c),
-        .add_bg = .{},
-        .del_bg = .{},
-        .add_line_bg = .{},
-        .del_line_bg = .{},
+        .add_bg = resolveStyle(diff_add_bg, c),
+        .del_bg = resolveStyle(diff_del_bg, c),
+        .add_line_bg = resolveStyle(diff_add_line_bg, c),
+        .del_line_bg = resolveStyle(diff_del_line_bg, c),
     };
 }
 
@@ -615,6 +619,20 @@ pub fn diffAddLineBg() vaxis.Style {
 pub fn diffDelLineBg() vaxis.Style {
     if (caps.no_color) return .{};
     return diffStyles(caps).del_line_bg;
+}
+
+/// The `+64` of a diff stat (`1 file changed (+64 −95)`, a file-change card).
+/// Same green/red pair as the diff itself, so the numbers and the rows they
+/// summarize read in one language.
+pub fn diffStatAdd() vaxis.Style {
+    if (caps.no_color) return .{ .bold = true };
+    return resolveStyle(diff_stat_add, caps);
+}
+
+/// The `−95` of a diff stat. See `diffStatAdd`.
+pub fn diffStatDel() vaxis.Style {
+    if (caps.no_color) return .{ .bold = true };
+    return resolveStyle(diff_stat_del, caps);
 }
 
 test "contrast: the ratio is order-independent and correct on the anchors" {

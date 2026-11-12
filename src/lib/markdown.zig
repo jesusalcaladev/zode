@@ -477,6 +477,30 @@ fn baseStyle(kind: Kind) Style {
     };
 }
 
+/// A `+12` / `−3` diff stat starting at `i`, if there is one.
+///
+/// The token has to read as a COUNT: one or more digits right after the sign,
+/// no letter or digit touching either end (`a+1`, `10-14`, `+64px` are not
+/// stats). The sign may be `-` or the typographic minus (`−`, U+2212) that the
+/// summary line uses. The leading separator rule is what keeps `104-95` (a
+/// number range) and identifiers out of it.
+fn diffStatAt(line: []const u8, i: usize) ?struct { end: usize, add: bool } {
+    if (i >= line.len) return null;
+    const minus = "\u{2212}";
+    const is_minus = std.mem.startsWith(u8, line[i..], minus);
+    const add = line[i] == '+';
+    if (!add and !is_minus and line[i] != '-') return null;
+    if (i > 0) {
+        const prev = line[i - 1];
+        if (std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '+' or prev == '-') return null;
+    }
+    var j = i + (if (is_minus) minus.len else 1);
+    if (j >= line.len or !std.ascii.isDigit(line[j])) return null;
+    while (j < line.len and std.ascii.isDigit(line[j])) j += 1;
+    if (j < line.len and (std.ascii.isAlphanumeric(line[j]) or line[j] == '_')) return null;
+    return .{ .end = j, .add = add };
+}
+
 /// One unified diff row: the gutter, the marker, the body.
 ///
 /// Before it was a SINGLE segment for the whole line with `diff_add`, which is a
@@ -591,8 +615,26 @@ fn diffSegments(
             const seg_start = body_off;
             body_off += t.text.len;
             // A context row is dim grey: it is the row that did NOT change,
-            // and it must not compete with the ones that did.
+            // and it must not compete with the ones that did. Added/deleted
+            // rows keep their token colours (keyword, type, number) so the
+            // prefix and body read as different colors — the green wall is
+            // gone. The whole-row tint (soft green / red band) carries the
+            // "added / removed" signal, and changed words get the word band.
             var st: Style = if (is_ctx) theme.diff_ctx else t.style;
+            // The body of an added/deleted row reads in its LINE colour: green
+            // for additions, red for deletions. The highlighter's weight and
+            // italic are kept (a keyword is still bold), but the colour is the
+            // row's, because that is what makes a diff scannable at a glance.
+            // Context rows keep the dim grey above.
+            if (is_add) {
+                const a = theme.diffAdd();
+                st.fg = a.fg;
+                st.bold = st.bold or a.bold;
+            } else if (is_del) {
+                const d = theme.diffDel();
+                st.fg = d.fg;
+                st.bold = st.bold or d.bold;
+            }
             st = withBg(st, line_bg);
             if (row.ranges.len > 0) {
                 try splitByRanges(arena, &out, t.text, st, seg_start, row.ranges, word_bg);
@@ -646,6 +688,9 @@ fn changedStyle(base: Style, bg: ?vaxis.Color) Style {
     if (bg) |c| {
         s.bg = c;
     } else {
+        // A changed word has NO word band: drop the row tint and use bold
+        // instead, so the edit shows as emphasis and not as another band.
+        s.bg = .default;
         s.bold = true;
     }
     return s;
@@ -923,6 +968,22 @@ pub fn inlineSegmentsLang(
                     start = i;
                     continue;
                 }
+            }
+        }
+        // Diff stats: `(+64 −95)` in a notice line — the Done summary and the
+        // file-change card. They are the only numbers on those lines that get
+        // a colour of their own, and it is the same green/red pair the diff
+        // rows use, so the stat and the rows say the same thing.
+        if (kind == .info) {
+            if (diffStatAt(line, i)) |stat| {
+                if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                try segs.append(arena, .{
+                    .text = line[i..stat.end],
+                    .style = if (stat.add) theme.diffStatAdd() else theme.diffStatDel(),
+                });
+                i = stat.end;
+                start = i;
+                continue;
             }
         }
         i += 1;
@@ -1633,11 +1694,13 @@ test "diffSegments: the prefix gets its color and the body BY TOKENS" {
     try std.testing.expectEqualStrings("+nuevo", joined.items);
 }
 
-test "a + line of the diff carries tokens, not a green segment" {
-    // The green wall: `+const n: u32 = 42` was ONE segment with `diff_add`. Now
-    // the prefix goes with its own color and the body is tokenized, so `const`
-    // is a keyword, `u32` a type and `42` a number. That is what makes a diff
-    // readable without opening the file.
+test "a + line of the diff is tokenized and reads in the row's green" {
+    // The green wall has two halves, and both matter:
+    //   - the row is still TOKENIZED (`const` is a keyword, `u32` a type, `42`
+    //     a number), so the structure of the line survives;
+    //   - every body token is painted in the ROW's colour — green for an added
+    //     line, red for a deleted one — so the diff is scannable at a glance
+    //     instead of asking the reader to decode three token colours per row.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1646,13 +1709,13 @@ test "a + line of the diff carries tokens, not a green segment" {
     try std.testing.expect(segs.len >= 4);
 
     const kw = findDiffSeg(segs, "const") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(theme.code_kw.fg, kw.style.fg);
     const typ = findDiffSeg(segs, "u32") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(theme.code_type.fg, typ.style.fg);
     const num = findDiffSeg(segs, "42") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(theme.code_num.fg, num.style.fg);
+    try std.testing.expectEqual(theme.diffAdd().fg, kw.style.fg);
+    try std.testing.expectEqual(theme.diffAdd().fg, typ.style.fg);
+    try std.testing.expectEqual(theme.diffAdd().fg, num.style.fg);
 
-    // And the prefix keeps its diff green, which is DISTINCT from the green of
+    // The prefix keeps its diff green too, and it is DISTINCT from the green of
     // the code strings (before, both were `index 2`).
     try std.testing.expect(!std.meta.eql(theme.diff_add.fg, theme.code_str.fg));
 
@@ -1661,6 +1724,16 @@ test "a + line of the diff carries tokens, not a green segment" {
     defer joined.deinit(std.testing.allocator);
     for (segs) |sg| try joined.appendSlice(std.testing.allocator, sg.text);
     try std.testing.expectEqualStrings("+const n: u32 = 42", joined.items);
+}
+
+test "a - line of the diff reads in the row's red" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const segs = try inlineSegmentsLang(arena, "-const n: u32 = 42", .diff, null, null, "zig", null);
+    const token = findDiffSeg(segs, "const") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(theme.diffDel().fg, token.style.fg);
 }
 
 fn findDiffSeg(segs: []const Segment, needle: []const u8) ?Segment {
@@ -1755,6 +1828,56 @@ test "tool_res_bold is bold FOR REAL (the 'two tones' was not a no-op)" {
     const plain = try inlineSegments(arena, "salida", .tool_res);
     try std.testing.expect(!plain[0].style.bold);
     try std.testing.expectEqual(styles.tool_res.fg, plain[0].style.fg);
+}
+
+test "info: the (+64 −95) stat reads green/red and the text around it does not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The Done summary: `⏺ Done · 5 tools · 1 file changed (+64 −95) · 102.4s`.
+    const segs = try inlineSegments(arena, "\u{23ba} Done \u{b7} 1 file changed (+64 \u{2212}95) \u{b7} 102.4s", .info);
+    var saw_add = false;
+    var saw_del = false;
+    for (segs) |s| {
+        if (std.mem.eql(u8, s.text, "+64")) {
+            saw_add = true;
+            try std.testing.expectEqual(theme.diffStatAdd().fg, s.style.fg);
+        }
+        if (std.mem.eql(u8, s.text, "\u{2212}95")) {
+            saw_del = true;
+            try std.testing.expectEqual(theme.diffStatDel().fg, s.style.fg);
+        }
+        // The duration is NOT a stat: `102.4s` has no sign.
+        if (std.mem.eql(u8, s.text, "102.4s")) {
+            try std.testing.expectEqual(styles.info.fg, s.style.fg);
+        }
+    }
+    try std.testing.expect(saw_add);
+    try std.testing.expect(saw_del);
+
+    // The file-change card's compact form uses an ASCII `-` and no parens.
+    const card = try inlineSegments(arena, "  File Changed  [zig] markdown.zig  +64 -95  \u{b7}  src/lib", .info);
+    var card_add = false;
+    var card_del = false;
+    for (card) |s| {
+        if (std.mem.eql(u8, s.text, "+64")) card_add = true;
+        if (std.mem.eql(u8, s.text, "-95")) card_del = true;
+    }
+    try std.testing.expect(card_add and card_del);
+}
+
+test "info: a number range is not a diff stat" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `104-95`, `a+1`, `+64px` and `x-1` are text, not counts.
+    for ([_][]const u8{ "range 104-95", "expr a+1", "width +64px", "id x-1" }) |line| {
+        for (try inlineSegments(arena, line, .info)) |s| {
+            try std.testing.expectEqual(styles.info.fg, s.style.fg);
+        }
+    }
 }
 
 test "unifiedDiff: a small change in a large file does NOT dump the whole file" {
@@ -2058,9 +2181,10 @@ test "the gutter is as wide as the hunk, and the next hunk gets its own" {
     try std.testing.expectEqualStrings("98", rows[3][0].text);
 }
 
-test "the word diff emphasizes changed words (terminal background preserved)" {
-    // With terminal background always showing through, changed words are
-    // emphasized (bold/foreground) rather than painted with a background band.
+test "the word diff gives changed words a stronger band than the row" {
+    // Two bands: the row's tint says "this line was added", and the words that
+    // actually changed get a stronger one. Without the second band a `+` row is
+    // one flat green line and the reader cannot see WHAT changed in it.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2077,11 +2201,13 @@ test "the word diff emphasizes changed words (terminal background preserved)" {
     const changed = findDiffSeg(added, "42") orelse return error.TestUnexpectedResult;
     const same = findDiffSeg(added, "const") orelse return error.TestUnexpectedResult;
 
-    // No forced backgrounds (terminal background always).
-    try std.testing.expect(changed.style.bg == .default);
-    try std.testing.expect(same.style.bg == .default);
-    // Changed words are emphasized so the edit is visible without a bg band.
-    try std.testing.expect(changed.style.bold or !vaxis.Style.eql(changed.style, same.style));
+    // Unchanged words carry the row tint.
+    try std.testing.expectEqual(theme.diffAddLineBg().bg, same.style.bg);
+    // Changed words carry the stronger word band, and it is NOT the row's.
+    try std.testing.expectEqual(theme.diffAddBg().bg, changed.style.bg);
+    try std.testing.expect(!std.meta.eql(changed.style.bg, same.style.bg));
+    // …and the row's green text survives on top of the band.
+    try std.testing.expectEqual(theme.diffAdd().fg, changed.style.fg);
 }
 
 test "the segments of a diffed row concatenate to the row" {

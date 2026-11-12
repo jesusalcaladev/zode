@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add the modules the committed tree already imports (build) [`23b5cefc`](https://github.com/jesusalcaladev/zode/commit/23b5cefc)
 - make the committed tree compile again (build) [`98a3f7b9`](https://github.com/jesusalcaladev/zode/commit/98a3f7b9)
 - keep typed composer input visible and scrollable (tui) [`57e24d60`](https://github.com/jesusalcaladev/zode/commit/57e24d60)
-- detect repeated reads per file instead of per turn (agent) [`fa40e0fb`](https://github.com/jesusalcaladev/zode/commit/fa40e0fb)
+- detect repeated reads per file instead of per turn (agent) [`d8a4e91e`](https://github.com/jesusalcaladev/zode/commit/d8a4e91e)
+- highlight diff stats and improve diff emphasis (tui) [`303bce7f`](https://github.com/jesusalcaladev/zode/commit/303bce7f)
 
 ### Documentation
 
