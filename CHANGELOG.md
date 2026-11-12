@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add the native `github` gateway tool (github) [`f35a03ed`](https://github.com/jesusalcaladev/zode/commit/f35a03ed)
 - add the git workflow module with native GitHub first (git) [`1998ccc5`](https://github.com/jesusalcaladev/zode/commit/1998ccc5)
 - add the /github status command and route the model to it (github) [`f25b91ca`](https://github.com/jesusalcaladev/zode/commit/f25b91ca)
+- refine file intelligence navigation and compact change output (tui) [`45b3cd87`](https://github.com/jesusalcaladev/zode/commit/45b3cd87)
 
 ### Bug Fixes
 
@@ -39,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep typed composer input visible and scrollable (tui) [`57e24d60`](https://github.com/jesusalcaladev/zode/commit/57e24d60)
 - detect repeated reads per file instead of per turn (agent) [`d8a4e91e`](https://github.com/jesusalcaladev/zode/commit/d8a4e91e)
 - highlight diff stats and improve diff emphasis (tui) [`f0d49e17`](https://github.com/jesusalcaladev/zode/commit/f0d49e17)
+
+### Chores
+
+- track local plans and pending memory notes (zode) [`e1624043`](https://github.com/jesusalcaladev/zode/commit/e1624043)
 
 ### Documentation
 
@@ -49,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - update Phase 3 unified diff viewer progress [`39f5a026`](https://github.com/jesusalcaladev/zode/commit/39f5a026)
 - document the native GitHub integration (github) [`2df603d0`](https://github.com/jesusalcaladev/zode/commit/2df603d0)
 - clean up README with clearer structure and docs references [`a1d52413`](https://github.com/jesusalcaladev/zode/commit/a1d52413)
-- refresh TUI invariants and task/command documentation [`0edcaeea`](https://github.com/jesusalcaladev/zode/commit/0edcaeea)
+- refresh TUI invariants and task/command documentation [`47c27a05`](https://github.com/jesusalcaladev/zode/commit/47c27a05)
 
 ### Refactors
 

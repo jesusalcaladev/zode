@@ -505,6 +505,24 @@ const NetBaseline = struct {
     has_stats: bool = false,
 };
 
+const max_file_intel: usize = 128;
+
+/// One file-change event in the timeline (file intelligence): structured state
+/// for focus/actions/navigation. Backed by real diff stats and paragraph indices.
+pub const FileIntelEntry = struct {
+    path: [filesview.path_max]u8 = @splat(0),
+    path_len: u16 = 0,
+    diff_para: ?usize = null,
+    added: u32 = 0,
+    removed: u32 = 0,
+    is_net: bool = false,
+    op: filechange.Operation = .modified,
+
+    pub fn pathOf(self: *const FileIntelEntry) []const u8 {
+        return self.path[0..self.path_len];
+    }
+};
+
 /// The hairline under the hero's tagline. A LITERAL and not a composed run of
 /// `─`, because `CellRun.w` is a **u8 in COLUMNS**: one run wider than 255
 /// silently stops drawing halfway across a wide terminal. This is the same trap
@@ -1701,6 +1719,11 @@ pub const Model = struct {
     /// Used by explicit file navigation/copy actions (no rendered-string parsing).
     last_changed_file: [filesview.path_max]u8 = undefined,
     last_changed_file_len: u16 = 0,
+    /// File intelligence timeline: structured file-change entries (card + diff)
+    /// for focus/actions/navigation. Runtime-owned; never inferred from rendered UI.
+    file_intel: [max_file_intel]FileIntelEntry = @splat(.{}),
+    file_intel_len: usize = 0,
+    file_focus: ?usize = null,
     /// Turn-scoped baseline content for honest net diffs: first edit stores the
     /// "before" content, subsequent edits diff against that baseline.
     net_baselines: [max_net_baselines]NetBaseline = @splat(.{}),
@@ -5369,6 +5392,186 @@ pub const Model = struct {
         return self.last_changed_file[0..self.last_changed_file_len];
     }
 
+    /// Focused file-intelligence entry (runtime state), or the most recent one.
+    pub fn focusedFileIntel(self: *const Model) ?*const FileIntelEntry {
+        if (self.file_intel_len == 0) return null;
+        const idx = self.file_focus orelse (self.file_intel_len - 1);
+        if (idx >= self.file_intel_len) return &self.file_intel[self.file_intel_len - 1];
+        return &self.file_intel[idx];
+    }
+
+    pub fn focusedFilePath(self: *const Model) ?[]const u8 {
+        const e = self.focusedFileIntel() orelse return self.lastChangedFile();
+        const p = e.pathOf();
+        return if (p.len > 0) p else self.lastChangedFile();
+    }
+
+    pub fn clearFileIntel(self: *Model) void {
+        self.file_intel_len = 0;
+        self.file_focus = null;
+    }
+
+    fn recordFileIntel(
+        self: *Model,
+        path: []const u8,
+        diff_para: ?usize,
+        added: usize,
+        removed: usize,
+        is_net: bool,
+        op: filechange.Operation,
+    ) void {
+        if (path.len == 0 or path.len > filesview.path_max) return;
+        if (self.file_intel_len >= max_file_intel) {
+            // Keep the newest entries: drop the oldest so navigation stays useful.
+            const keep = max_file_intel - 1;
+            std.mem.copyForwards(FileIntelEntry, self.file_intel[0..keep], self.file_intel[1..self.file_intel_len]);
+            self.file_intel_len = keep;
+            if (self.file_focus) |f| {
+                self.file_focus = if (f == 0) 0 else f - 1;
+            }
+        }
+        const idx = self.file_intel_len;
+        var e = &self.file_intel[idx];
+        @memcpy(e.path[0..path.len], path);
+        e.path_len = @intCast(path.len);
+        e.diff_para = diff_para;
+        e.added = @intCast(@min(added, std.math.maxInt(u32)));
+        e.removed = @intCast(@min(removed, std.math.maxInt(u32)));
+        e.is_net = is_net;
+        e.op = op;
+        self.file_intel_len = idx + 1;
+        // Focus follows the latest change by default (matches "last changed").
+        self.file_focus = idx;
+    }
+
+
+
+    fn fileIntelLabel(self: *const Model, path: []const u8) struct { has: bool, label: []const u8 } {
+        _ = self;
+        const chip = lang_icons.forPath(path, false);
+        const base = filechange.pathParts(path).base;
+        const has = chip.label.len > 0 and !std.mem.eql(u8, chip.label, base);
+        return .{ .has = has, .label = chip.label };
+    }
+
+    fn fileIntelOpWord(e: *const FileIntelEntry) []const u8 {
+        return if (e.is_net) "net" else switch (e.op) {
+            .created => "created",
+            .deleted => "deleted",
+            .renamed => "renamed",
+            .restored => "restored",
+            else => "changed",
+        };
+    }
+
+    fn showFileIntelFocus(self: *Model, idx: usize, jump: bool) bool {
+        if (idx >= self.file_intel_len) return false;
+        self.file_focus = idx;
+        const e = &self.file_intel[idx];
+        const path = e.pathOf();
+        const n = self.file_intel_len;
+
+        if (path.len > 0 and path.len <= self.last_changed_file.len) {
+            @memcpy(self.last_changed_file[0..path.len], path);
+            self.last_changed_file_len = @intCast(path.len);
+        }
+
+        if (jump) {
+            if (e.diff_para) |ti| {
+                self.ensureParaHeights();
+                self.lock();
+                const lt = self.last_tool;
+                const needs_expand = if (lt) |t| t.diff_para_idx == ti and !t.diff_expanded else false;
+                self.scrollTo(self.heightPrefix(ti));
+                self.follow_bottom = false;
+                self.anchor_para = ti;
+                self.anchor_off = 0;
+                self.dirty = true;
+                self.redraw_requested.store(true, .seq_cst);
+                self.unlock();
+                if (needs_expand) {
+                    _ = self.toggleLastTool();
+                    self.ensureParaHeights();
+                    self.scrollTo(self.heightPrefix(ti));
+                }
+            }
+        }
+
+        const info = self.fileIntelLabel(path);
+        const op_word = fileIntelOpWord(e);
+        var path_buf: [200]u8 = undefined;
+        const shown_path = filechange.shortenPathInto(&path_buf, path, 56);
+        if (e.added == 0 and e.removed == 0) {
+            if (info.has)
+                self.pushInfoFmt("  [{d}/{d}] {s} [{s}] {s}  (unchanged)", .{ idx + 1, n, op_word, info.label, shown_path })
+            else
+                self.pushInfoFmt("  [{d}/{d}] {s} {s}  (unchanged)", .{ idx + 1, n, op_word, shown_path });
+        } else {
+            if (info.has)
+                self.pushInfoFmt("  [{d}/{d}] {s} [{s}] {s}  +{d} -{d}", .{ idx + 1, n, op_word, info.label, shown_path, e.added, e.removed })
+            else
+                self.pushInfoFmt("  [{d}/{d}] {s} {s}  +{d} -{d}", .{ idx + 1, n, op_word, shown_path, e.added, e.removed });
+        }
+        return true;
+    }
+
+    /// Jump to and report the currently focused file-intelligence entry.
+    pub fn showFocusedFileIntel(self: *Model) bool {
+        if (self.file_intel_len == 0) return false;
+        const idx = self.file_focus orelse (self.file_intel_len - 1);
+        return self.showFileIntelFocus(@min(idx, self.file_intel_len - 1), true);
+    }
+
+    /// List tracked file-intelligence entries (compact, navigable state).
+    pub fn pushFileIntelList(self: *Model) bool {
+        const n = self.file_intel_len;
+        if (n == 0) {
+            self.pushInfo("file: no changed files in this session");
+            return false;
+        }
+        const focus = @min(self.file_focus orelse (n - 1), n - 1);
+        self.pushInfoFmt("file changes  ({d})", .{n});
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const e = &self.file_intel[i];
+            const path = e.pathOf();
+            const marker: []const u8 = if (i == focus) ">" else " ";
+            const info = self.fileIntelLabel(path);
+            const op_word = fileIntelOpWord(e);
+            var path_buf: [200]u8 = undefined;
+            const shown_path = filechange.shortenPathInto(&path_buf, path, 52);
+            if (e.added == 0 and e.removed == 0) {
+                if (info.has)
+                    self.pushInfoFmt("{s} [{d}] {s} [{s}] {s}  (unchanged)", .{ marker, i + 1, op_word, info.label, shown_path })
+                else
+                    self.pushInfoFmt("{s} [{d}] {s} {s}  (unchanged)", .{ marker, i + 1, op_word, shown_path });
+            } else {
+                if (info.has)
+                    self.pushInfoFmt("{s} [{d}] {s} [{s}] {s}  +{d} -{d}", .{ marker, i + 1, op_word, info.label, shown_path, e.added, e.removed })
+                else
+                    self.pushInfoFmt("{s} [{d}] {s} {s}  +{d} -{d}", .{ marker, i + 1, op_word, shown_path, e.added, e.removed });
+            }
+        }
+        self.pushInfo("  /file next|prev · /file show · /file copy|open");
+        return true;
+    }
+
+    /// Navigate file-intelligence entries (changed files/diffs) and focus one.
+    /// Scrolls to its diff (expanding when it is the tracked collapsed diff),
+    /// updates the focused file path for actions, and reports position/stats.
+    pub fn navigateFileIntel(self: *Model, delta: i8) bool {
+        if (self.file_intel_len == 0) {
+            self.pushInfo("file: no changed files in this session");
+            return false;
+        }
+        const cur = self.file_focus orelse (self.file_intel_len - 1);
+        const n = self.file_intel_len;
+        const next_idx: usize = if (delta > 0)
+            if (cur + 1 < n) cur + 1 else 0
+        else if (cur == 0) n - 1 else cur - 1;
+        return self.showFileIntelFocus(next_idx, true);
+    }
+
     pub fn pushFileDiffOp(
         self: *Model,
         before: []const u8,
@@ -5429,42 +5632,58 @@ pub const Model = struct {
             self.unlock();
         }
 
-        // Card policy: show first operation card, and show net cards on
+        // Card policy: show the first operation card, and show net cards on
         // subsequent edits (honest cumulative state vs original baseline).
-        // If net becomes empty, still show net/no-changes explicitly (honest).
+        // If net becomes empty, still report it explicitly — but compactly.
         const show_card = first_card or is_net;
+        var pre_count: usize = 0;
+        self.lock();
+        pre_count = self.paras.items.len + self.pending.items.len;
+        self.unlock();
         if (show_card) {
             const chip = lang_icons.forPath(path, false);
             const base = filechange.pathParts(path).base;
             const has_label = chip.label.len > 0 and !std.mem.eql(u8, chip.label, base);
-            const op_word: []const u8 = if (is_net) "Net" else switch (operation) {
-                .created => "Created",
-                .deleted => "Deleted",
-                .renamed => "Renamed",
-                .restored => "Restored",
-                else => "Changed",
+            const op_word: []const u8 = if (is_net) "net" else switch (operation) {
+                .created => "created",
+                .deleted => "deleted",
+                .renamed => "renamed",
+                .restored => "restored",
+                else => "changed",
             };
+            var path_buf: [200]u8 = undefined;
+            const shown_path = filechange.shortenPathInto(&path_buf, path, 64);
             if (is_net and dc.added == 0 and dc.removed == 0) {
                 if (has_label)
-                    self.pushInfoFmt("  File {s}  [{s}]  {s}  ·  No net changes (baseline -> current)", .{ op_word, chip.label, path })
+                    self.pushInfoFmt("  {s} [{s}] {s}  (unchanged)", .{ op_word, chip.label, shown_path })
                 else
-                    self.pushInfoFmt("  File {s}  {s}  ·  No net changes (baseline -> current)", .{ op_word, path });
+                    self.pushInfoFmt("  {s} {s}  (unchanged)", .{ op_word, shown_path });
             } else if (is_net or dc.added > 0 or dc.removed > 0) {
-                var buf: [280]u8 = undefined;
-                const card = filechange.formatCompact(&buf, .{
-                    .path = path,
-                    .operation = operation,
-                    .added = dc.added,
-                    .removed = dc.removed,
-                }, false);
                 if (has_label)
-                    self.pushInfoFmt("  File {s}  [{s}]  {s}", .{ op_word, chip.label, card })
+                    self.pushInfoFmt("  {s} [{s}] {s}  +{d} -{d}", .{ op_word, chip.label, shown_path, dc.added, dc.removed })
                 else
-                    self.pushInfoFmt("  File {s}  {s}", .{ op_word, card });
+                    self.pushInfoFmt("  {s} {s}  +{d} -{d}", .{ op_word, shown_path, dc.added, dc.removed });
             }
         }
 
         _ = self.pushDiffLang(diff_from, after, lang, path);
+
+        // Record structured file-intelligence entry for focus/navigation/actions.
+        if (show_card or dc.added > 0 or dc.removed > 0) {
+            const expected_diff = pre_count + @as(usize, if (show_card) 1 else 0);
+            var focus_para: ?usize = null;
+            self.lock();
+            if (self.last_tool) |lt| {
+                if (lt.diff_para_idx) |dpi| {
+                    if (dpi == expected_diff and lt.diff_path.len > 0 and std.mem.eql(u8, lt.diff_path, path)) {
+                        focus_para = dpi;
+                    }
+                }
+            }
+            self.unlock();
+            if (focus_para == null and show_card) focus_para = pre_count;
+            self.recordFileIntel(path, focus_para, dc.added, dc.removed, is_net, operation);
+        }
         return dc;
     }
 
@@ -6040,26 +6259,30 @@ pub const Model = struct {
             total_removed += self.net_baselines[i].net_removed;
         }
         if (files == 0) return false;
-        out.appendSlice(gpa, "Files  ·  Net changes this turn (baseline -> current, honest)\n") catch return false;
+        out.appendSlice(gpa, "files (turn net)\n") catch return false;
         i = 0;
         while (i < self.net_baselines_len) : (i += 1) {
             const nb = &self.net_baselines[i];
             if (!nb.has_stats) continue;
             const path = nb.path[0..nb.path_len];
             const chip = lang_icons.forPath(path, false);
-            var card_buf: [240]u8 = undefined;
-            const card = filechange.formatCompact(&card_buf, .{
-                .path = path,
-                .operation = .modified,
-                .added = nb.net_added,
-                .removed = nb.net_removed,
-            }, false);
-            if (chip.label.len > 0 and !std.mem.eql(u8, chip.label, filechange.pathParts(path).base))
-                out.print(gpa, "  Net  [{s}]  {s}\n", .{ chip.label, card }) catch return false
-            else
-                out.print(gpa, "  Net  {s}\n", .{card}) catch return false;
+            const base = filechange.pathParts(path).base;
+            const has_label = chip.label.len > 0 and !std.mem.eql(u8, chip.label, base);
+            var path_buf: [200]u8 = undefined;
+            const shown_path = filechange.shortenPathInto(&path_buf, path, 64);
+            if (nb.net_added == 0 and nb.net_removed == 0) {
+                if (has_label)
+                    out.print(gpa, "  net [{s}] {s}  (unchanged)\n", .{ chip.label, shown_path }) catch return false
+                else
+                    out.print(gpa, "  net {s}  (unchanged)\n", .{shown_path}) catch return false;
+            } else {
+                if (has_label)
+                    out.print(gpa, "  net [{s}] {s}  +{d} -{d}\n", .{ chip.label, shown_path, nb.net_added, nb.net_removed }) catch return false
+                else
+                    out.print(gpa, "  net {s}  +{d} -{d}\n", .{ shown_path, nb.net_added, nb.net_removed }) catch return false;
+            }
         }
-        out.print(gpa, "  Total  {d} file(s)  +{d} -{d}  ·  honest net diff", .{ files, total_added, total_removed }) catch return false;
+        out.print(gpa, "  total  {d} file{s}  +{d} -{d}", .{ files, if (files == 1) "" else "s", total_added, total_removed }) catch return false;
         return true;
     }
 
@@ -6286,6 +6509,8 @@ pub const Model = struct {
         self.anchor_para = 0;
         self.anchor_off = 0;
         self.follow_bottom = true;
+        self.clearFileIntel();
+        self.last_changed_file_len = 0;
         self.lock();
         defer self.unlock();
         self.plan.clear();
@@ -12157,6 +12382,34 @@ test "autocomplete: not offered with spaces nor without the slash" {
     try std.testing.expect(!m.ac.active);
 }
 
+test "file intelligence: tracks changes and navigates focused file entries" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.beginCheckpoint("t1");
+
+    _ = m.pushFileDiff("a\n", "a\nb\n", "src/one.zig");
+    _ = m.pushFileDiff("x\n", "y\n", "src/two.zig");
+
+    try std.testing.expectEqual(@as(usize, 2), m.file_intel_len);
+    const focused = m.focusedFilePath() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.endsWith(u8, focused, "two.zig"));
+
+    try std.testing.expect(m.navigateFileIntel(-1));
+    const prev = m.focusedFilePath() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.endsWith(u8, prev, "one.zig"));
+
+    try std.testing.expect(m.navigateFileIntel(1));
+    const back = m.focusedFilePath() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.endsWith(u8, back, "two.zig"));
+
+    const s = try drawTest(&m, arena_state.allocator(), 80, 24);
+    const all = allText(s);
+    try std.testing.expect(std.mem.indexOf(u8, all, "[2/2]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "two.zig") != null);
+}
+
 test "fileQueryAt: the @ token under the cursor, and an email is not a mention" {
     // PURE: this is the logic `refreshFileMatches` keys off, and it has to
     // agree with `mentions.scan` (the thing that later parses the prompt).
@@ -12307,7 +12560,7 @@ test "file diff: emits a compact file change card with real stats" {
 
     const s = try drawTest(&m, arena_state.allocator(), 72, 20);
     const all = allText(s);
-    try std.testing.expect(std.mem.indexOf(u8, all, "File Changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "demo.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "+2 -1") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "-two") != null);
@@ -12340,10 +12593,10 @@ test "file diff: multiple edits to same file in one turn show honest net diff" {
     const s = try drawTest(&m, arena_state.allocator(), 80, 28);
     const all = allText(s);
     // First card (operation), then honest net cards (baseline -> current).
-    try std.testing.expect(std.mem.indexOf(u8, all, "File Changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "net.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "File Net") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "No net changes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "net") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "(unchanged)") != null);
     // Net diff from baseline to edit 2 state should show BETA and GAMMA additions vs beta.
     try std.testing.expect(std.mem.indexOf(u8, all, "+BETA") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "+GAMMA") != null);

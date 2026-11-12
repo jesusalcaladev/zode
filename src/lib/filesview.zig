@@ -179,9 +179,9 @@ pub const Report = struct {
         const chip = lang_icons.forPath(path, false);
         const base = std.fs.path.basename(path);
         if (chip.label.len > 0 and !std.mem.eql(u8, chip.label, base)) {
-            try self.body.print(self.gpa, "  Changed  [{s}]  {s}", .{ chip.label, path });
+            try self.body.print(self.gpa, "  changed [{s}] {s}", .{ chip.label, path });
         } else {
-            try self.body.print(self.gpa, "  Changed  {s}", .{path});
+            try self.body.print(self.gpa, "  changed {s}", .{path});
         }
         self.changes += 1;
     }
@@ -274,7 +274,7 @@ test "the changed files are their own section" {
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "2 changed") != null);
     try testing.expect(std.mem.indexOf(u8, text, "changed\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "Changed") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "changed [") != null or std.mem.indexOf(u8, text, "  changed ") != null);
     try testing.expect(std.mem.indexOf(u8, text, "src/agent.zig") != null);
 }
 

@@ -1798,7 +1798,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
     .{ .key = "/rename", .desc = "set a custom title for the current session: /rename <name>" },
     .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
-    .{ .key = "/file", .desc = "last changed file: /file | copy|path|open | next|prev (file/diff navigation)", .key_hint = "copy|open|next|prev" },
+    .{ .key = "/file", .desc = "changed file intelligence: /file | list|show | next|prev | copy|open", .key_hint = "list|next|prev|copy|open" },
     .{ .key = "/diff", .desc = "uncommitted changes and this turn's changed-file diff" },
     .{ .key = "/git", .desc = "read-only Git overview (branch, status, recent commits)", .palette_visible = true },
     .{ .key = "/github", .desc = "GitHub integration status: repo/auth context and native `github` tool ops", .palette_visible = true },
@@ -2022,40 +2022,56 @@ pub fn cmdHunk(m: *tui.Model, arg: ?[]const u8) void {
 }
 
 /// `/file [copy|path|next|prev|open]`: last changed file (Phase 2/3, honest structured state).
-/// Navigation uses diff targets (file changes emit diffs). Copy/path copies the
-/// last changed file path to clipboard via OSC52 when supported.
-/// `open` provides safe external-editor guidance (TUI suspend/spawn integration is deferred).
+/// File intelligence focus/actions: navigate changed-file entries, jump to the
+/// focused diff, and act on the focused path (copy/open). Runtime-owned state.
 pub fn cmdFile(m: *tui.Model, arg: ?[]const u8) void {
     const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
     if (std.mem.eql(u8, a, "next") or std.mem.eql(u8, a, "n")) {
+        if (m.navigateFileIntel(1)) return;
         _ = m.navigateDiff(1);
         return;
     }
     if (std.mem.eql(u8, a, "prev") or std.mem.eql(u8, a, "p") or std.mem.eql(u8, a, "previous")) {
+        if (m.navigateFileIntel(-1)) return;
         _ = m.navigateDiff(-1);
         return;
     }
-    const path = m.lastChangedFile() orelse {
-        agent.pushInfo(m, "File: no changed file recorded in this session yet");
+    if (std.mem.eql(u8, a, "show") or std.mem.eql(u8, a, "go") or std.mem.eql(u8, a, "current")) {
+        if (m.showFocusedFileIntel()) return;
+        const path = m.focusedFilePath() orelse m.lastChangedFile() orelse {
+            agent.pushInfo(m, "file: no changed files in this session");
+            return;
+        };
+        agent.pushInfoFmt(m, "file: {s}", .{path});
+        return;
+    }
+    if (std.mem.eql(u8, a, "list") or std.mem.eql(u8, a, "ls")) {
+        _ = m.pushFileIntelList();
+        return;
+    }
+    const path = m.focusedFilePath() orelse m.lastChangedFile() orelse {
+        agent.pushInfo(m, "file: no changed files in this session");
         return;
     };
     if (std.mem.eql(u8, a, "copy") or std.mem.eql(u8, a, "path")) {
         m.setCopyPending(path);
-        agent.pushInfoFmt(m, "File path copied: {s}", .{path});
+        agent.pushInfoFmt(m, "file: copied path  {s}", .{path});
         return;
     }
     if (std.mem.eql(u8, a, "open") or std.mem.eql(u8, a, "edit")) {
         m.setCopyPending(path);
-        agent.pushInfoFmt(m, "File: {s}", .{path});
-        agent.pushInfo(m, "Open: path copied to clipboard. Run your editor outside the TUI (e.g. $VISUAL/$EDITOR). In-TUI editor spawn is deferred for safe terminal suspend/resume.");
+        agent.pushInfoFmt(m, "file: {s}", .{path});
+        agent.pushInfo(m, "open: path copied to clipboard. Run $VISUAL/$EDITOR outside the TUI (in-TUI spawn is deferred).");
         return;
     }
     if (a.len > 0) {
-        agent.pushInfo(m, "usage: /file | /file copy|path|open|next|prev");
+        agent.pushInfo(m, "usage: /file [list|show|next|prev|copy|path|open]");
         return;
     }
-    agent.pushInfoFmt(m, "File: last changed  {s}", .{path});
-    agent.pushInfo(m, "Review actions (safe): /diff, /hunk next|prev, /file next|prev, /file copy, /code-review, /undo (turn-level)");
+    // Show/jump to focused file intelligence entry when available.
+    if (m.showFocusedFileIntel()) return;
+    agent.pushInfoFmt(m, "file: {s}", .{path});
+    agent.pushInfo(m, "actions: /file list|next|prev · /file copy|open · /diff · /hunk next|prev");
 }
 
 test "/diff command is dispatched" {

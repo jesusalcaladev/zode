@@ -1834,6 +1834,7 @@ fn langFromPath(path: []const u8) []const u8 {
 pub fn resetSessionFiles(m: *tui.Model) void {
     m.reads.clear();
     m.changed.clear();
+    m.clearFileIntel();
     m.bash_may_write = false;
     // Facts belong to the session: a new or resumed session starts empty,
     // with the same reason the read cache is cleared above.
@@ -2125,16 +2126,35 @@ pub const TurnStats = struct {
     /// Second line: `src/agent.zig · src/tui.zig` (the files touched).
     ///
     /// The files go alone: the summary already says how many tools ran, and
-    /// what is useful here is the WHAT, not the tool. It could be stored with
-    /// the tool's name, but with a turn of 5 tools the line runs off the screen
-    /// and the path is what people are looking for.
+    /// what is useful here is the WHAT, not the tool. When there are many,
+    /// the list is capped so one turn does not dump a wall of paths.
     pub fn detailLine(self: *const TurnStats, buf: []u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
+        const max_show: usize = 3;
+        const shown = @min(self.files.items.len, max_show);
         var first = true;
-        for (self.files.items) |f| {
+        for (self.files.items[0..shown]) |f| {
             if (!first) try w.writeAll(" \u{b7} ");
             first = false;
-            try w.writeAll(f);
+            var pbuf: [160]u8 = undefined;
+            const shown_path = if (f.len > 48) blk: {
+                const prefix = "\u{2026}/";
+                if (48 <= prefix.len + 1) break :blk f;
+                const keep = 48 - prefix.len;
+                var cut = if (f.len > keep) f.len - keep else 0;
+                if (std.mem.indexOfScalarPos(u8, f, cut, '/')) |s| {
+                    if (f.len - (s + 1) <= keep) cut = s + 1;
+                }
+                const tail = f[cut..];
+                @memcpy(pbuf[0..prefix.len], prefix);
+                @memcpy(pbuf[prefix.len..][0..tail.len], tail);
+                break :blk pbuf[0 .. prefix.len + tail.len];
+            } else f;
+            try w.writeAll(shown_path);
+        }
+        if (self.files.items.len > shown) {
+            if (!first) try w.writeAll(" \u{b7} ");
+            try w.print("+{d} more", .{self.files.items.len - shown});
         }
         return w.buffered();
     }
@@ -2343,6 +2363,25 @@ test "TurnStats: a 0-line diff invents no files" {
     s.reset(g, 0);
     s.noteDiff("nada.zig", .{});
     try std.testing.expectEqual(@as(usize, 0), s.files.items.len);
+    s.deinit();
+}
+
+test "TurnStats: detailLine caps a long file list" {
+    var s = TurnStats{};
+    var backing: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&backing);
+    const g = fba.allocator();
+    s.reset(g, 0);
+    s.noteDiff("a.zig", .{ .added = 1, .removed = 0 });
+    s.noteDiff("b.zig", .{ .added = 1, .removed = 0 });
+    s.noteDiff("c.zig", .{ .added = 1, .removed = 0 });
+    s.noteDiff("d.zig", .{ .added = 1, .removed = 0 });
+    var detail_buf: [256]u8 = undefined;
+    const detail = try s.detailLine(&detail_buf);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "a.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "c.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "+1 more") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "d.zig") == null);
     s.deinit();
 }
 

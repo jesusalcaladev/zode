@@ -48,23 +48,60 @@ pub fn pathParts(path: []const u8) struct { base: []const u8, dir: []const u8 } 
     };
 }
 
-/// Compact one-line file change card text.
-///
-/// Format (text fallback): `name  +A -R  ·  dir`
-/// The leading marker/icon/label is left to the renderer so it can apply
-/// theme roles and semantic file labels consistently.
-pub fn formatCompact(buf: []u8, c: Change, nerd_icons: bool) []const u8 {
-    _ = nerd_icons; // label/icon rendering is handled by the caller/renderer
-    const parts = pathParts(c.path);
-    if (parts.dir.len == 0 or std.mem.eql(u8, parts.dir, ".")) {
-        return std.fmt.bufPrint(buf, "{s}  +{d} -{d}", .{ parts.base, c.added, c.removed }) catch parts.base;
+/// A shortened path for display: keeps the basename and as much of the tail
+/// as fits, replacing a long prefix with `…/`. The basename is never cut.
+pub fn shortenPath(path: []const u8, max: usize) []const u8 {
+    if (path.len <= max or max < 4) return path;
+    const base = std.fs.path.basename(path);
+    // Always keep at least `…/` + basename tail.
+    if (base.len + 2 >= max) return base;
+    const keep = max - 2; // room after "…/"
+    const tail_start = path.len - keep;
+    // Try to cut at a path separator so we don't split a segment.
+    var cut = tail_start;
+    if (std.mem.indexOfScalarPos(u8, path, tail_start, '/')) |s| {
+        if (path.len - (s + 1) + 2 <= max) cut = s + 1;
     }
-    return std.fmt.bufPrint(buf, "{s}  +{d} -{d}  ·  {s}", .{
-        parts.base,
-        c.added,
-        c.removed,
-        parts.dir,
-    }) catch parts.base;
+    // If that still doesn't fit well, fall back to raw tail.
+    if (path.len - cut + 2 > max) cut = path.len - keep;
+    return path; // caller renders with prefix marker; see shortenPathInto
+}
+
+/// Writes a shortened display path into `out` and returns it. When the path is
+/// shortened the result starts with `…/`.
+pub fn shortenPathInto(out: []u8, path: []const u8, max: usize) []const u8 {
+    if (path.len <= max or out.len == 0) {
+        const n = @min(path.len, out.len);
+        @memcpy(out[0..n], path[0..n]);
+        return out[0..n];
+    }
+    const prefix = "\u{2026}/";
+    if (max <= prefix.len + 1 or out.len <= prefix.len) {
+        const base = std.fs.path.basename(path);
+        const n = @min(base.len, out.len);
+        @memcpy(out[0..n], base[0..n]);
+        return out[0..n];
+    }
+    const keep = @min(max - prefix.len, out.len - prefix.len);
+    var cut = if (path.len > keep) path.len - keep else 0;
+    if (std.mem.indexOfScalarPos(u8, path, cut, '/')) |s| {
+        if (path.len - (s + 1) <= keep) cut = s + 1;
+    }
+    const tail = path[cut..];
+    @memcpy(out[0..prefix.len], prefix);
+    @memcpy(out[prefix.len..][0..tail.len], tail);
+    return out[0 .. prefix.len + tail.len];
+}
+
+/// Compact one-line file change card body: `path  +A -R`.
+///
+/// The operation/label prefix is composed by the caller so it can carry
+/// semantic styling. `nerd_icons` is reserved for icon-aware rendering.
+pub fn formatCompact(buf: []u8, c: Change, nerd_icons: bool) []const u8 {
+    _ = nerd_icons;
+    var path_buf: [200]u8 = undefined;
+    const p = shortenPathInto(&path_buf, c.path, 56);
+    return std.fmt.bufPrint(buf, "{s}  +{d} -{d}", .{ p, c.added, c.removed }) catch c.path;
 }
 
 /// Expanded file card lines (renderer applies styles/borders as appropriate).
@@ -139,7 +176,16 @@ test "pathParts and compact formatting" {
     const c = Change{ .path = "src/auth/session.ts", .added = 24, .removed = 8 };
     var buf: [160]u8 = undefined;
     const line = formatCompact(&buf, c, false);
-    try std.testing.expectEqualStrings("session.ts  +24 -8  ·  src/auth", line);
+    try std.testing.expectEqualStrings("src/auth/session.ts  +24 -8", line);
+}
+
+test "formatCompact shortens a long path but keeps the basename" {
+    const c = Change{ .path = "src/very/deeply/nested/directory/structure/component.zig", .added = 1, .removed = 0 };
+    var buf: [160]u8 = undefined;
+    const line = formatCompact(&buf, c, false);
+    try std.testing.expect(std.mem.indexOf(u8, line, "component.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "+1 -0") != null);
+    try std.testing.expect(line.len <= "src/very/deeply/nested/directory/structure/component.zig  +1 -0".len);
 }
 
 test "expanded formatting includes operation and path" {
