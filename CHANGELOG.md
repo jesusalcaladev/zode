@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add structured brief and per-step how/verify support (plan) [`242e9640`](https://github.com/jesusalcaladev/zode/commit/242e9640)
 - support objective, approach, guardrails, and step verification (todo) [`4ed8c94e`](https://github.com/jesusalcaladev/zode/commit/4ed8c94e)
 - guide todo usage as concrete implementation plans (prompt) [`8a7fe7d4`](https://github.com/jesusalcaladev/zode/commit/8a7fe7d4)
+- add native GitHub context, types and REST client (github) [`754d0600`](https://github.com/jesusalcaladev/zode/commit/754d0600)
 
 ### Documentation
 
@@ -42,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - organize lib modules into clusters with stable facades [`8e60f45c`](https://github.com/jesusalcaladev/zode/commit/8e60f45c)
 - remove dead test file, expand test coverage, clarify lib IO notes [`1c5f20c0`](https://github.com/jesusalcaladev/zode/commit/1c5f20c0)
 - expose tool call helper exports (tools) [`73c22592`](https://github.com/jesusalcaladev/zode/commit/73c22592)
-- extract granular modules and loop/turn helpers (agent) [`e5b6712b`](https://github.com/jesusalcaladev/zode/commit/e5b6712b)
+- extract granular modules and loop/turn helpers (agent) [`33da78b4`](https://github.com/jesusalcaladev/zode/commit/33da78b4)
 
 ### Tests
 
