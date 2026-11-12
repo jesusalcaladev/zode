@@ -36,6 +36,7 @@ const lsp_tool = @import("lsp.zig");
 const mcp_tool = @import("mcp.zig");
 const mcp_manager = @import("../mcp/manager.zig");
 const mcp_servers = @import("../mcp/servers.zig");
+const github_tool = @import("github.zig");
 
 // The per-tool prompt modules: the TEXT the model reads about a tool lives with that
 // tool, as `prompts/<name>.zig`. This file decides the ORDER and nothing else, so a
@@ -326,6 +327,8 @@ pub fn executeWith(
         return lsp_tool.toolLsp(io, obj, arena);
     } else if (std.mem.eql(u8, name, "mcp")) {
         return mcp_tool.toolMcp(io, obj, arena);
+    } else if (std.mem.eql(u8, name, "github")) {
+        return github_tool.toolGithub(io, obj, arena);
     }
     return error.UnknownTool;
 }

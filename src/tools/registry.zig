@@ -64,6 +64,7 @@ const sleep_prompt = @import("prompts/sleep.zig");
 const batch_prompt = @import("prompts/batch.zig");
 const mcp_prompt = @import("prompts/mcp.zig");
 const memory_prompt = @import("prompts/memory.zig");
+const github_prompt = @import("prompts/github.zig");
 const validate = @import("prompts/validate.zig");
 
 // The `mcp` TOOL, for the one thing the registry has to know about it: the
@@ -71,6 +72,9 @@ const validate = @import("prompts/validate.zig");
 // rules match on and the name the "always allow" list remembers, and it is
 // decided by the arguments of the call, not by the table.
 const mcp_tool = @import("mcp.zig");
+
+// GitHub gateway: permission/writes depend on the operation.
+const github_tool = @import("github.zig");
 
 /// The result cap of a tool, in characters. `0` means UNBOUNDED.
 ///
@@ -258,6 +262,19 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .desc = "push | pop | list: put changes aside and bring them back",
         .schema = git_stash_prompt.json,
         .read_only = false,
+        .parallel_safe = false,
+        .destructive = true,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        // Read operations (repo/PR/issue/checks inspection) are permission-free;
+        // mutating operations (create/update/comment) require permission per call
+        // via `callPermissionTools`/`callWrites`. Marked read_only so inspection
+        // remains available in read-only/plan tool schemas, like git_status.
+        .name = "github",
+        .desc = "Structured GitHub operations: repo/PR/issue/checks via API",
+        .schema = github_prompt.json,
+        .read_only = true,
         .parallel_safe = false,
         .destructive = true,
         .max_result_chars = resultcap.default_max_result_chars,
@@ -606,6 +623,11 @@ pub fn toolSummarize(
     if (std.mem.eql(u8, name, "task_update")) return "task_update";
     if (std.mem.eql(u8, name, "task_stop")) return "task_stop";
     if (std.mem.eql(u8, name, "mcp")) return "mcp";
+    if (std.mem.eql(u8, name, "github")) {
+        const op = extractStringArg(arena, args_json, "operation");
+        if (op) |o| return std.fmt.allocPrint(arena, "github({s})", .{o}) catch "github";
+        return "github";
+    }
     if (std.mem.eql(u8, name, "batch")) return "batch";
     if (std.mem.eql(u8, name, "skill")) return "skill";
     if (std.mem.eql(u8, name, "memory")) {
@@ -696,6 +718,11 @@ pub fn toolActivity(
     if (std.mem.eql(u8, name, "task_update")) return "Updating task";
     if (std.mem.eql(u8, name, "task_stop")) return "Stopping task";
     if (std.mem.eql(u8, name, "mcp")) return "Calling MCP";
+    if (std.mem.eql(u8, name, "github")) {
+        const op = extractStringArg(arena, args_json, "operation");
+        if (op) |o| return std.fmt.allocPrint(arena, "GitHub: {s}", .{o}) catch "GitHub";
+        return "GitHub";
+    }
     if (std.mem.eql(u8, name, "batch")) return "Running batch";
     if (std.mem.eql(u8, name, "skill")) return "Loading skill";
     if (std.mem.eql(u8, name, "memory")) return "Consulting memory";
@@ -763,6 +790,20 @@ pub fn callPermissionTools(name: []const u8, args_json: []const u8, arena: std.m
             one[0] = q;
             return one;
         }
+        // GitHub: read operations are free; mutating operations ask per op
+        // (github.pr_create, github.issue_comment, ...).
+        if (std.mem.eql(u8, name, "github")) {
+            const obj = parseObject(arena, args_json) orelse return oneTool(arena, "github");
+            const op = common.getStr(obj, "operation") orelse return oneTool(arena, "github");
+            // A READ operation asks for nothing: it only reads.
+            if (github_tool.isReadOp(op)) return &.{};
+            // A WRITE operation asks about ITSELF, so a rule can say
+            // `github.pr_create` and mean exactly that.
+            const subj = github_tool.subjectOf(obj, arena) orelse return oneTool(arena, "github");
+            const one = arena.alloc([]const u8, 1) catch return &.{};
+            one[0] = subj;
+            return one;
+        }
         return oneTool(arena, name);
     }
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
@@ -828,6 +869,15 @@ pub fn callWrites(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
         const op = obj.get("operation") orelse return false;
         if (op != .string) return false;
         return std.ascii.eqlIgnoreCase(op.string, "propose") or std.ascii.eqlIgnoreCase(op.string, "approve");
+    }
+    if (std.mem.eql(u8, name, "github")) {
+        const obj = parseObject(arena, args_json) orelse return true;
+        const op = common.getStr(obj, "operation") orelse return true;
+        // An operation nobody recognizes is a WRITE for permission purposes:
+        // the harness cannot reason about what it would do, and the direction
+        // that is safe to be wrong in is the one that asks.
+        if (!github_tool.isKnownOp(op)) return true;
+        return github_tool.isWriteOp(op);
     }
     if (!std.mem.eql(u8, name, "batch")) return false;
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch return true;
@@ -903,6 +953,13 @@ pub fn callSubjects(name: []const u8, args_json: []const u8, arena: std.mem.Allo
         const q = mcp_tool.qualifiedOf(obj, arena) orelse return &.{};
         const one = arena.alloc([]const u8, 1) catch return &.{};
         one[0] = q;
+        return one;
+    }
+    if (std.mem.eql(u8, name, "github")) {
+        const obj = parseObject(arena, args_json) orelse return &.{};
+        const subj = github_tool.subjectOf(obj, arena) orelse return &.{};
+        const one = arena.alloc([]const u8, 1) catch return &.{};
+        one[0] = subj;
         return one;
     }
     return callTouchedPaths(name, args_json, arena);
@@ -1458,4 +1515,60 @@ test "toolsJsonFiltered: a deny-all star removes every tool" {
 
     try std.testing.expectEqualStrings("[]", filtered);
     try std.testing.expect(std.mem.indexOf(u8, filtered, "\"read\"") == null);
+}
+
+
+test "github: read ops are permission-free and writes ask per operation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const read_ops = [_][]const u8{
+        "{\"operation\":\"auth_status\"}",
+        "{\"operation\":\"whoami\"}",
+        "{\"operation\":\"repo\"}",
+        "{\"operation\":\"pr_view\",\"number\":1}",
+        "{\"operation\":\"issue_list\"}",
+    };
+    for (read_ops) |args| {
+        const p = callPermissionTools("github", args, arena);
+        try std.testing.expectEqual(@as(usize, 0), p.len);
+        try std.testing.expect(!callWrites("github", args, arena));
+        const subj = callSubjects("github", args, arena);
+        try std.testing.expectEqual(@as(usize, 0), subj.len);
+    }
+
+    const w = callPermissionTools("github", "{\"operation\":\"pr_create\",\"title\":\"x\"}", arena);
+    try std.testing.expectEqual(@as(usize, 1), w.len);
+    try std.testing.expectEqualStrings("github.pr_create", w[0]);
+    try std.testing.expect(callWrites("github", "{\"operation\":\"pr_create\",\"title\":\"x\"}", arena));
+    const ws = callSubjects("github", "{\"operation\":\"pr_create\",\"title\":\"x\"}", arena);
+    try std.testing.expectEqual(@as(usize, 1), ws.len);
+    try std.testing.expectEqualStrings("github.pr_create", ws[0]);
+
+    const ic = callPermissionTools("github", "{\"operation\":\"issue_comment\",\"number\":3,\"body\":\"hi\"}", arena);
+    try std.testing.expectEqual(@as(usize, 1), ic.len);
+    try std.testing.expectEqualStrings("github.issue_comment", ic[0]);
+    try std.testing.expect(callWrites("github", "{\"operation\":\"issue_comment\",\"number\":3,\"body\":\"hi\"}", arena));
+
+    // Unknown/broken args are treated as writes (safe direction).
+    try std.testing.expect(callWrites("github", "not json", arena));
+
+    // An operation NOBODY RECOGNIZES asks, because the harness cannot reason
+    // about what it would do. A read op does not ask.
+    try std.testing.expect(callWrites("github", "{\"operation\":\"explode\"}", arena));
+    const unknown = callPermissionTools("github", "{\"operation\":\"explode\"}", arena);
+    try std.testing.expectEqual(@as(usize, 1), unknown.len);
+    try std.testing.expectEqualStrings("github", unknown[0]);
+    try std.testing.expect(callWrites("github", "{\"operation\":\"\"}", arena));
+    try std.testing.expect(callWrites("github", "{}", arena));
+}
+
+test "toolSummarize/toolActivity: github includes operation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("github(pr_view)", toolSummarize(arena, "github", "{\"operation\":\"pr_view\"}"));
+    try std.testing.expectEqualStrings("GitHub: pr_view", toolActivity(arena, "github", "{\"operation\":\"pr_view\"}"));
 }
