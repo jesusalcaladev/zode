@@ -125,6 +125,15 @@ Rotates between free models of providers with a key; quotas cause rotation. `quo
 
 A server is a **program**; schemas live in the manager catalogue, not in the request `tools` array (cache-prefix protection). The `mcp` tool has `search`, `list`, `call`. Server config is user-level (`~/.config/zode/config.json` `mcp_servers`), not from `.mcp.json` (remote-code-execution risk). Read-only schema composed from `registry.blob` at comptime; `lsp` permission fixed to `read_only = true`.
 
+## Native GitHub integration
+
+GitHub is a first-class remote integration (separate from local git tools):
+
+- **Gateway tool:** `github` provides a stable schema with operation dispatch (`auth_status`, `whoami`, `repo`, `pr_list`, `pr_view`, `pr_checks`, `pr_create`, `pr_update`, `pr_comment`, `issue_list`, `issue_view`, `issue_create`, `issue_comment`, `actions_runs`) to keep tool catalogs/cache prefix stable.
+- **Context and API:** `src/lib/github/context.zig` resolves host/owner/repo from git remotes (HTTPS/SSH/enterprise) with explicit `repo` override support; `src/lib/github/api.zig` performs REST requests via Zig std HTTP/JSON, resolves auth without exposing secrets (`GITHUB_TOKEN`/`GH_TOKEN` then `~/.config/zode/auth.json`), and surfaces actionable status/rate-limit errors.
+- **Permissions and runtime:** read ops are permission-free; mutating ops require permission per operation (`github.<op>`). Registry/dispatch/tool execution policy classify dynamic write behavior for the gateway.
+- **UX and workflows:** `/github` reports local integration/auth/repo context (no network, no token values). `/pr` and `/commit-push-pr` prefer native `github` operations when available and keep `gh`/CLI fallback for compatibility.
+
 ## Self-update
 
 Cache in `~/.cache/zode/update.json` (6 h TTL, one file, respects `XDG_CACHE_HOME`). The check notifies; `/update` verifies the binary (`--version`) before replacing, refuses to go backwards, writes `{exe}.new`, then atomic rename over.

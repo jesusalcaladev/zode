@@ -157,6 +157,26 @@ Fetch a URL and extract text.
 
 Search the web (DuckDuckGo / Brave / … depending on config).
 
+## Git and GitHub
+
+### `/github`
+
+Native GitHub integration status for the current workspace (local, read-only, no network API calls by default).
+
+- Shows resolved repository/host from git remotes (or reports unresolved), current branch when available, token configuration state, and token source (`GITHUB_TOKEN`, `GH_TOKEN`, or `~/.config/zode/auth.json`) without ever showing token values.
+- Explains how to use the native `github` tool (structured, permission-checked) for remote GitHub operations and which ops are read vs write.
+- `/pr` and `/commit-push-pr` workflows prefer native `github` operations when supported, with `gh`/CLI fallback when needed.
+
+Usage: `/github [status]`
+
+### `/pr`
+
+Guided pull request workflow. Prefers native `github` tool operations (`repo`, `pr_list`/`pr_view`, `pr_checks`, `pr_create`/`pr_update`, `pr_comment`) with `gh`/CLI fallback, while keeping git safety and idempotence (inspect existing PRs before creating duplicates, full diff from merge base, no secrets in output).
+
+### `/commit-push-pr`
+
+Commit, push, and open/update a pull request in one guided flow. Prefers native `github` tool operations for PR inspection/creation/update when supported, with `gh`/CLI fallback.
+
 ---
 
 ## Permissions

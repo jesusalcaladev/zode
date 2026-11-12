@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add native GitHub context, types and REST client (github) [`a242f9cb`](https://github.com/jesusalcaladev/zode/commit/a242f9cb)
 - add the native `github` gateway tool (github) [`f35a03ed`](https://github.com/jesusalcaladev/zode/commit/f35a03ed)
 - add the git workflow module with native GitHub first (git) [`1998ccc5`](https://github.com/jesusalcaladev/zode/commit/1998ccc5)
-- add the /github status command and route the model to it (github) [`afdc567c`](https://github.com/jesusalcaladev/zode/commit/afdc567c)
+- add the /github status command and route the model to it (github) [`f25b91ca`](https://github.com/jesusalcaladev/zode/commit/f25b91ca)
 
 ### Bug Fixes
 
@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - update settings, tasks, and agent notes [`cee1ff56`](https://github.com/jesusalcaladev/zode/commit/cee1ff56)
 - mark phase 35.5 and 35.9 complete (tasks) [`486dda08`](https://github.com/jesusalcaladev/zode/commit/486dda08)
 - update Phase 3 unified diff viewer progress [`39f5a026`](https://github.com/jesusalcaladev/zode/commit/39f5a026)
+- document the native GitHub integration (github) [`4c2ac9c5`](https://github.com/jesusalcaladev/zode/commit/4c2ac9c5)
 
 ### Refactors
 

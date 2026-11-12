@@ -81,7 +81,17 @@ Zode asks before destructive actions. The flow:
 
 See `docs/architecture.md` §permissions for the rule precedence (local > project > user > policy; deny beats any allow).
 
-## 5. Manage sessions
+## 5. Work with GitHub
+
+Local git and remote GitHub are separate concerns in zode:
+
+- **Local git:** use `git_*` tools and `/git` for repository status/history/diff operations on this machine.
+- **Remote GitHub:** use the native `github` tool for supported GitHub API operations (repo/PR/issue/actions context and mutations) with structured, actionable results.
+- **Auth:** token precedence is `GITHUB_TOKEN`, then `GH_TOKEN`, then `~/.config/zode/auth.json` keys `github:<host>`, `github`, `github.com`. Token values are never shown in output.
+- **Context:** repository/host are resolved from git remotes when possible; pass `repo` as `owner/name` to target another repository explicitly.
+- **Commands:** `/github` shows local integration status (repo/auth source, no network). `/pr` and `/commit-push-pr` prefer native `github` operations when available and fall back to `gh`/CLI when needed.
+
+## 6. Manage sessions
 
 Sessions are append-only JSONL in `./sessions/zode-<id>.jsonl`; long lines are compressed and the file is never touched by compaction.
 

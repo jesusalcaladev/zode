@@ -20,6 +20,7 @@ set -a && source .env && set +a
 | Per-session switches | environment | Beats `config.json` for the fields they name (see each section) |
 | Provider, model, subagents, custom endpoints, LSP, MCP | `~/.config/zode/config.json` | Versionable: it holds no secrets |
 | API keys | `~/.config/zode/auth.json` | `0600`, written atomically by `/connect`; never in `config.json` |
+| GitHub tokens (for native `github` tool) | `GITHUB_TOKEN` / `GH_TOKEN`, then `~/.config/zode/auth.json` | Precedence: env `GITHUB_TOKEN`, env `GH_TOKEN`, `auth.json` keys `github:<host>`, `github`, `github.com` (values never exposed) |
 | Permission allowlist and rules | `~/.config/zode/permissions.json`, `.zode/permissions.json` | User rules + project rules |
 | Hooks | `.zode/hooks.json` | Project-level command hooks (`PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`Stop`, with `matcher`/`if`/`timeout_ms`/`once`) |
 | Sessions | `./sessions/zode-<id>.jsonl` | Compressed JSONL, `drwx------` / `-rw-------` |
