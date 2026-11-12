@@ -19,6 +19,7 @@ const permrules = @import("lib/permrules.zig");
 const hooks_mod = @import("lib/hooks.zig");
 const md = @import("lib/markdown.zig");
 const gitcmds = @import("lib/gitcmds.zig");
+const github_lib = @import("lib/github.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -954,6 +955,58 @@ pub fn cmdCommitPushPr(m: *tui.Model, arg: ?[]const u8) void {
     startGitPromptCommand(m, gitcmds.pr_prompt, &gitcmds.pr_allow_rules, arg);
 }
 
+/// `/github`: GitHub integration status and context (local, read-only).
+/// Shows resolved repo/host, auth token source (never the token), and how to
+/// use the native `github` tool for remote operations.
+pub fn cmdGithub(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (a.len > 0 and !std.ascii.eqlIgnoreCase(a, "status") and !std.ascii.eqlIgnoreCase(a, "help")) {
+        agent.pushInfo(m, "usage: /github [status|help]");
+        return;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const remote = if (m.io_ready) github_lib.context.resolve(arena, agent.io_global) else null;
+    const host: []const u8 = if (remote) |r| r.host else "github.com";
+    const auth = github_lib.api.resolveToken(arena, agent.io_global, agent.environ_global, host);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(m.allocator);
+    out.appendSlice(m.allocator, "GitHub integration (native, local status)\n") catch return;
+    if (remote) |r| {
+        out.print(m.allocator, "  repo     {s}/{s}\n", .{ r.owner, r.repo }) catch return;
+        out.print(m.allocator, "  host     {s}\n", .{r.host}) catch return;
+        if (r.url.len > 0) out.print(m.allocator, "  remote   {s}\n", .{r.url}) catch return;
+    } else {
+        out.appendSlice(m.allocator, "  repo     unresolved from git remotes\n") catch return;
+        out.print(m.allocator, "  host     {s} (default)\n", .{host}) catch return;
+    }
+    if (m.io_ready) {
+        if (github_lib.context.currentBranch(arena, agent.io_global)) |b| {
+            out.print(m.allocator, "  branch   {s}\n", .{b}) catch return;
+        }
+    }
+    out.print(m.allocator, "  auth     {s} (source: {s})\n", .{ if (auth.token != null) "configured" else "not configured", auth.source }) catch return;
+    if (auth.token == null) {
+        out.appendSlice(m.allocator, "  hint     set GITHUB_TOKEN or GH_TOKEN, or store token in ~/.config/zode/auth.json as \"github\" / \"github:<host>\"\n") catch return;
+    } else {
+        out.appendSlice(m.allocator, "  note     token value is never shown; verify with `github` op `whoami`\n") catch return;
+    }
+    out.appendSlice(m.allocator, "  tool     `github` (structured gateway, native-first for supported remote ops)\n") catch return;
+    out.appendSlice(m.allocator, "  reads    auth_status, whoami, repo, pr_list, pr_view, pr_checks, issue_list, issue_view, actions_runs\n") catch return;
+    out.appendSlice(m.allocator, "  writes   pr_create, pr_update, pr_comment, issue_create, issue_comment (permission per op)\n") catch return;
+    out.appendSlice(m.allocator, "  flows    /pr and /commit-push-pr prefer native `github` ops; `gh`/CLI fallback when needed\n") catch return;
+    if (std.ascii.eqlIgnoreCase(a, "help")) {
+        out.appendSlice(m.allocator, "  examples github auth_status | github repo | github pr_list state=open | github pr_view number=123\n") catch return;
+    }
+
+    const owned = m.allocator.dupe(u8, std.mem.trimEnd(u8, out.items, "\n")) catch return;
+    agent.pushInfoOwned(m, owned);
+}
+
 /// `/context`: gauge of context used against the limit and the budget.
 pub fn cmdContext(m: *tui.Model) void {
     _ = agent.ensureSession(m, m.allocator);
@@ -1516,6 +1569,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/commit", .desc = "create a git commit with verified context (scoped git allowlist)", .key_hint = "[instructions]" },
     .{ .key = "/pr", .desc = "create or update a PR with merge-base diff (idempotent, scoped allowlist)", .key_hint = "[instructions]" },
     .{ .key = "/commit-push-pr", .desc = "commit + push + PR workflow (PR allowlist; alias of /pr flow)", .key_hint = "[instructions]" },
+    .{ .key = "/github", .desc = "GitHub integration status: repo/auth context and native `github` tool ops", .palette_visible = true },
     .{ .key = "/iter", .desc = "iteration budget: /iter [n] (min 8, max 200) or /iter to show current" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
