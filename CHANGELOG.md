@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add the modules the committed tree already imports (build) [`23b5cefc`](https://github.com/jesusalcaladev/zode/commit/23b5cefc)
 - make the committed tree compile again (build) [`98a3f7b9`](https://github.com/jesusalcaladev/zode/commit/98a3f7b9)
+- keep typed composer input visible and scrollable (tui) [`c9c8b8ba`](https://github.com/jesusalcaladev/zode/commit/c9c8b8ba)
 
 ### Documentation
 
@@ -60,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - register ACP protocol test module [`0f675bb7`](https://github.com/jesusalcaladev/zode/commit/0f675bb7)
 - add ACP smoke test script (acp) [`9e60750f`](https://github.com/jesusalcaladev/zode/commit/9e60750f)
 - add a pty smoke for the /github command (github) [`ac702c5c`](https://github.com/jesusalcaladev/zode/commit/ac702c5c)
-- pin the paths a person hits without credentials (github) [`c4521cd6`](https://github.com/jesusalcaladev/zode/commit/c4521cd6)
+- pin the paths a person hits without credentials (github) [`cd0f93c8`](https://github.com/jesusalcaladev/zode/commit/cd0f93c8)
 
 ### Other
 

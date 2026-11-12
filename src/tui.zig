@@ -1,10 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// How many bytes of input text are shown before truncation.
-/// Past this the input is cut to head + "... +N more" + tail.
-pub const max_input_display_bytes: usize = 400;
-
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const agent = @import("agent.zig");
@@ -8827,97 +8823,6 @@ fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
 /// the only green in the bottom third of the screen and it is always where the
 /// caret is, which is the entire job.
 ///
-/// Input display text: if the buffer is longer than `max_display_bytes`, show
-/// the head, then `... +N more`, then the tail. Image file paths are shown as
-/// `[image.{ext}]`. The FULL text stays in the editor buffer for sending.
-/// Returns an arena-owned slice; caller must not free (arena lives for frame).
-fn inputDisplayText(arena: std.mem.Allocator, text: []const u8, max_display_bytes: usize) ![]const u8 {
-    if (text.len == 0) return "";
-
-    // Detect image file paths and replace with [image.{ext}].
-    // A path is an image if it ends with a known image extension.
-    const image_exts = [_][]const u8{ "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "tiff" };
-    var has_image: bool = false;
-    var processed: []const u8 = text;
-    var processed_buf: []u8 = undefined;
-    var processed_allocated: bool = false;
-
-    // Simple image detection: look for known extensions at word boundaries.
-    // If found, replace the whole path token with [image.ext].
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < text.len) {
-        const c = text[i];
-        // A token starts at a non-space char.
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
-            try out.append(arena, c);
-            i += 1;
-            continue;
-        }
-        // Find end of token.
-        var j = i;
-        while (j < text.len and text[j] != ' ' and text[j] != '\t' and text[j] != '\n' and text[j] != '\r') j += 1;
-        const token = text[i..j];
-        // Check if token ends with an image extension.
-        var matched_ext: ?[]const u8 = null;
-        for (image_exts) |ext| {
-            if (token.len > ext.len + 1) {
-                // Case-insensitive endsWith: compare the last ext.len bytes ignoring case.
-                const tail = token[token.len - ext.len ..];
-                var matched = true;
-                for (tail, ext) |tc, ec| {
-                    if (std.ascii.toLower(tc) != std.ascii.toLower(ec)) {
-                        matched = false;
-                        break;
-                    }
-                }
-                if (matched) {
-                    matched_ext = ext;
-                    break;
-                }
-            }
-        }
-        if (matched_ext) |ext| {
-            has_image = true;
-            const tag = try std.fmt.allocPrint(arena, "[image.{s}]", .{ext});
-            try out.appendSlice(arena, tag);
-            arena.free(tag);
-        } else {
-            try out.appendSlice(arena, token);
-        }
-        i = j;
-    }
-
-    if (out.items.len > 0) {
-        processed_allocated = true;
-        processed_buf = try out.toOwnedSlice(arena);
-        processed = processed_buf;
-    }
-
-    // Truncate if longer than max_display_bytes.
-    if (processed.len <= max_display_bytes) {
-        if (processed_allocated) arena.free(processed_buf);
-        return processed;
-    }
-
-    // Show head + "... +N more" + tail.
-    const head_len: usize = max_display_bytes / 2 - 10;
-    const tail_len: usize = max_display_bytes / 2 - 10;
-    const skipped: usize = processed.len - head_len - tail_len;
-    const head = processed[0..head_len];
-    const tail = processed[processed.len - tail_len ..];
-
-    const head_and_marker = try std.fmt.allocPrint(arena, "{s}… +{d} more", .{ head, skipped });
-    const result_len = head_and_marker.len + tail.len;
-    const result_buf = try arena.alloc(u8, result_len);
-    @memcpy(result_buf[0..head_and_marker.len], head_and_marker);
-    @memcpy(result_buf[head_and_marker.len..], tail);
-
-    if (processed_allocated) arena.free(processed_buf);
-
-    return result_buf;
-}
-
 /// The terminal cursor is anchored at the real editor position.
 fn drawInput(
     p: *Painter,
@@ -9006,14 +8911,15 @@ fn drawInput(
     // eight-row box with all the text in one row running off the right, and
     // everything past the border was dropped without a word.
     //
-    // Long input (e.g. a huge paste) is truncated for display: head + "... +N more" + tail.
-    // The FULL text stays in the editor buffer for sending.
-    const full_text = self.ed.text();
-    const disp_text = if (full_text.len > max_input_display_bytes)
-        inputDisplayText(p.arena, full_text, max_input_display_bytes) catch full_text
-    else
-        full_text;
-    const truncated = full_text.len > max_input_display_bytes;
+    // The text is painted WHOLE. It used to be elided with `… +N more` once it
+    // passed 400 bytes — a guard meant for huge pastes that also caught anyone
+    // typing a normal paragraph. The box grew from the full text while the row
+    // was wrapped from the ELIDED copy, so the composer ended up taller than
+    // its text and the caret was hidden outright: from the user's side the
+    // input "broke" mid-sentence and cut itself like a paste. The wrap already
+    // knows how to scroll (bottom-anchored, `↑ N more` on the rule), so there
+    // is nothing to elide.
+    const disp_text = self.ed.text();
 
     // The staged images announce themselves HERE, as `[name]` tags on a row of
     // their own above the text: an image that lives only in the outgoing
@@ -9045,23 +8951,29 @@ fn drawInput(
         var tri = ed.RowIter.init(tag_text, ed_w, meas);
         while (tri.next() != null) tag_rows += 1;
     }
-    // Wrap the (possibly truncated) text into rows. RowIter is public in editor.zig.
-    var rows_buf: std.ArrayList(ed.Row) = .empty;
-    var rit = ed.RowIter.init(disp_all, ed_w, meas);
-    while (rit.next()) |r| {
-        rows_buf.append(p.arena, r) catch continue;
+    // Wrap the text into rows, counting them FIRST so the window can be
+    // bottom-anchored: the cursor is at the end of what you are typing, and
+    // that is the row that has to stay on screen. Only the visible rows are
+    // kept — a 256 KB paste is thousands of rows and the box shows at most
+    // `input_h` of them.
+    var total_rows: usize = 0;
+    {
+        var rit = ed.RowIter.init(disp_all, ed_w, meas);
+        while (rit.next() != null) total_rows += 1;
     }
-    const total_rows = rows_buf.items.len;
-    // Bottom-anchored (like the history): the cursor is at the end of what you
-    // are typing, so that is what has to stay visible.
     const first = if (total_rows > input_h) total_rows - input_h else 0;
-    const shown = rows_buf.items[first..];
-    for (shown, 0..) |piece, i| {
-        const row = top + @as(u16, @intCast(i));
-        if (i >= input_h) break;
-        if (piece.bytes.len == 0) continue;
-        const text_style: vaxis.Style = .{ .fg = theme.input_text.fg };
-        _ = p.putClipped(3, row, piece.bytes, ed_w, text_style);
+    {
+        var rit = ed.RowIter.init(disp_all, ed_w, meas);
+        var idx: usize = 0;
+        while (rit.next()) |piece| : (idx += 1) {
+            if (idx < first) continue;
+            const i = idx - first;
+            if (i >= input_h) break;
+            if (piece.bytes.len == 0) continue;
+            const row = top + @as(u16, @intCast(i));
+            const text_style: vaxis.Style = .{ .fg = theme.input_text.fg };
+            _ = p.putClipped(3, row, piece.bytes, ed_w, text_style);
+        }
     }
 
     // The edit was rejected because it would exceed the byte cap: paint the
@@ -9080,14 +8992,17 @@ fn drawInput(
         }
     }
 
-    // The terminal cursor, at its VISUAL row and column. Only when not
-    // truncated: for truncated input the cursor would point at the wrong place.
-    if (!truncated) {
+    // The terminal cursor, at its VISUAL row and column. It is always shown:
+    // the text is no longer elided, so there is no "truncated" case where the
+    // caret would point at the wrong place. When the caret is outside the
+    // visible window (the user moved it above the scrolled rows) there is no
+    // cell to anchor it to, and the accent bar already marks the composer.
+    {
         const cc = self.ed.cursorRowCol(ed_w, meas);
         // The typed text sits `tag_rows` below the top of the box: the visual
         // row of the cursor is the editor's row PLUS the tag block.
         const vrow = cc.row + tag_rows;
-        if (vrow >= first and vrow < first + shown.len) {
+        if (vrow >= first and vrow < first + input_h and vrow < total_rows) {
             const col = 3 + @min(cc.col, ed_w - 1);
             surface.cursor = .{
                 .row = top + @as(u16, @intCast(vrow - first)),
@@ -11547,6 +11462,76 @@ test "input: over the byte cap, the edit is rejected and the limit is named" {
     var line: [128]u8 = undefined;
     const painted = std.mem.trim(u8, rowText(s, row, &line), " ");
     try std.testing.expect(std.mem.indexOf(u8, painted, "262144-byte cap") != null);
+}
+
+test "input: a long TYPED prompt is shown whole, never elided like a paste" {
+    // The bug: any buffer over 400 bytes was cut to `head … +N more tail` for
+    // display — a guard for huge pastes that also caught a person typing a
+    // paragraph. The box grew from the FULL text while the rows were wrapped
+    // from the ELIDED copy, so the composer came out taller than its text and
+    // the caret was hidden: the input "broke" mid-sentence, exactly as if the
+    // text had been pasted in.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var typed: std.ArrayList(u8) = .empty;
+    defer typed.deinit(std.testing.allocator);
+    typed.appendSlice(std.testing.allocator, "inicio ") catch {};
+    while (typed.items.len < 600) typed.appendSlice(std.testing.allocator, "palabra ") catch {};
+    typed.appendSlice(std.testing.allocator, "final") catch {};
+    m.ed.insert(typed.items) catch {};
+
+    const w: u16 = 80;
+    const h: u16 = 40;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(std.testing.allocator);
+    var row: u16 = 0;
+    while (row < h) : (row += 1) {
+        var b: [512]u8 = undefined;
+        all.appendSlice(std.testing.allocator, rowText(s, row, &b)) catch {};
+        all.append(std.testing.allocator, '\n') catch {};
+    }
+    // No paste/elision marker anywhere: the text is painted as it was typed.
+    try std.testing.expect(std.mem.indexOf(u8, all.items, " more") == null or std.mem.indexOf(u8, all.items, "\u{2191}") != null);
+    // The tail (where you are typing) stays on screen.
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "final") != null);
+}
+
+test "input: a prompt taller than the box keeps the tail and counts the rows above" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    var typed: std.ArrayList(u8) = .empty;
+    defer typed.deinit(std.testing.allocator);
+    typed.appendSlice(std.testing.allocator, "inicio ") catch {};
+    while (typed.items.len < 600) typed.appendSlice(std.testing.allocator, "palabra ") catch {};
+    typed.appendSlice(std.testing.allocator, "final") catch {};
+    m.ed.insert(typed.items) catch {};
+
+    const w: u16 = 40;
+    const h: u16 = 30;
+    const s = try drawTest(&m, arena_state.allocator(), w, h);
+
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(std.testing.allocator);
+    var row: u16 = 0;
+    while (row < h) : (row += 1) {
+        var b: [512]u8 = undefined;
+        all.appendSlice(std.testing.allocator, rowText(s, row, &b)) catch {};
+        all.append(std.testing.allocator, '\n') catch {};
+    }
+    // The end of what you are typing stays visible…
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "final") != null);
+    // …the head scrolled out, and the rule says how many rows did.
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "inicio") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "more") != null);
+    try std.testing.expect(s.cursor != null);
 }
 
 test "history: the transcript sits on the terminal's own background" {
@@ -15266,11 +15251,11 @@ test "the TUI diff uses the path's language: a + line carries tokens" {
     try std.testing.expect(std.mem.indexOf(u8, row, "u32") != null);
 }
 
-test "the + prefix and the body have DIFFERENT colors (green wall removed)" {
-    // The ROADMAP's anti-all-green invariant. With `+const n: u32 = 4` in
-    // zig: the prefix is `diff_add` and `const` is a code keyword. Before, the
-    // two greens were ALSO the very same color (`str` and `diff_add` were
-    // `index 2`).
+test "the + prefix and the body share the row's green (scannable diff)" {
+    // A diff reads as rows: an added line is green, a deleted one red. The body
+    // is still TOKENIZED (the structure survives), but its colour is the row's
+    // so the reader scans bands instead of decoding token colours. The diff
+    // green is distinct from the green of code strings.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -15278,7 +15263,8 @@ test "the + prefix and the body have DIFFERENT colors (green wall removed)" {
     const segs = try md.inlineSegmentsLang(arena, "+const n", .diff, null, null, "zig", null);
     try std.testing.expect(segs.len >= 2);
     try std.testing.expectEqualStrings("+", segs[0].text);
-    try std.testing.expect(!std.meta.eql(segs[0].style.fg, segs[1].style.fg));
+    try std.testing.expectEqual(theme.diffAdd().fg, segs[0].style.fg);
+    try std.testing.expectEqual(theme.diffAdd().fg, segs[1].style.fg);
     try std.testing.expect(!std.meta.eql(theme.diff_add.fg, theme.code_str.fg));
 }
 
