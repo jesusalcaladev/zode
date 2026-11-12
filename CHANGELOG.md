@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - update settings, tasks, and agent notes [`cee1ff56`](https://github.com/jesusalcaladev/zode/commit/cee1ff56)
 - mark phase 35.5 and 35.9 complete (tasks) [`486dda08`](https://github.com/jesusalcaladev/zode/commit/486dda08)
 - update Phase 3 unified diff viewer progress [`39f5a026`](https://github.com/jesusalcaladev/zode/commit/39f5a026)
-- document the native GitHub integration (github) [`4c2ac9c5`](https://github.com/jesusalcaladev/zode/commit/4c2ac9c5)
+- document the native GitHub integration (github) [`2df603d0`](https://github.com/jesusalcaladev/zode/commit/2df603d0)
 
 ### Refactors
 
@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - register ACP protocol test module [`0f675bb7`](https://github.com/jesusalcaladev/zode/commit/0f675bb7)
 - add ACP smoke test script (acp) [`9e60750f`](https://github.com/jesusalcaladev/zode/commit/9e60750f)
+- add a pty smoke for the /github command (github) [`8d257aa6`](https://github.com/jesusalcaladev/zode/commit/8d257aa6)
 
 ### Other
 
