@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - add the modules the committed tree already imports (build) [`23b5cefc`](https://github.com/jesusalcaladev/zode/commit/23b5cefc)
+- make the committed tree compile again (build) [`1c1b7d05`](https://github.com/jesusalcaladev/zode/commit/1c1b7d05)
 
 ### Documentation
 
@@ -57,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - register ACP protocol test module [`0f675bb7`](https://github.com/jesusalcaladev/zode/commit/0f675bb7)
 - add ACP smoke test script (acp) [`9e60750f`](https://github.com/jesusalcaladev/zode/commit/9e60750f)
-- add a pty smoke for the /github command (github) [`8d257aa6`](https://github.com/jesusalcaladev/zode/commit/8d257aa6)
+- add a pty smoke for the /github command (github) [`ac702c5c`](https://github.com/jesusalcaladev/zode/commit/ac702c5c)
 
 ### Other
 

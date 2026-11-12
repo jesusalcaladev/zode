@@ -5,6 +5,7 @@ const cache_stats = @import("cache_stats.zig");
 const compaction = @import("compaction.zig");
 const goal_mod = @import("lib/goal.zig");
 const providers = @import("lib/providers.zig");
+const config_mod = @import("config.zig");
 const chat = @import("chat.zig");
 const filesview = @import("lib/filesview.zig");
 const readcache = @import("lib/readcache.zig");
@@ -19,6 +20,12 @@ const permrules = @import("lib/permrules.zig");
 const hooks_mod = @import("lib/hooks.zig");
 const md = @import("lib/markdown.zig");
 const gitcmds = @import("lib/gitcmds.zig");
+const selfupdate = @import("lib/selfupdate.zig");
+const theme = @import("lib/theme.zig");
+const clean_mod = @import("lib/clean.zig");
+const copytext = @import("lib/copytext.zig");
+const clipboard = @import("clipboard.zig");
+const bgproc = @import("bgproc.zig");
 const github_lib = @import("lib/github.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
@@ -700,15 +707,6 @@ pub fn cmdStatus(m: *tui.Model) void {
     const budget = compaction.budgetFor(m.environ, ctx);
     const pct = compaction.targetPct(m.environ);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "┌─ zode {s} — status", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ model:   {s}  (ctx {d} tokens)", .{ cur_model, ctx }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ effort:  {s}  ·  style: {s}", .{ effort_label, style }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ perms:   {s}  ·  api key: {s}", .{ perm, key_state }) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "├─ compaction") catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   mode:   {s}", .{@tagName(eff)}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   limit:  {d} tokens", .{limit}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   budget: {d} tokens ({d}% of limit)", .{ budget, pct }) catch return);
-
     var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();
     const msgs = agent.snapshotMsgs(astate.allocator());
@@ -716,8 +714,13 @@ pub fn cmdStatus(m: *tui.Model) void {
     const pct_used: f64 = @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(@max(1, limit))) * 100.0;
     var gauge_buf: [64]u8 = undefined;
     const bar = renderProgressBar(@intFromFloat(@min(@as(f64, 100.0), @max(@as(f64, 0.0), pct_used))), &gauge_buf);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   [{s}] ~{d} / {d} tokens ({d:.1}% of limit)", .{ bar, used, limit, pct_used }) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
+
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "status  ·  zode {s}", .{build_options.version}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  model:    {s}  (ctx {d})", .{ cur_model, ctx }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  effort:   {s}  ·  style: {s}  ·  view: {s}", .{ effort_label, style, m.view_mode.name() }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  perms:    {s}  ·  api key: {s}", .{ perm, key_state }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  compact:  {s}  ·  limit {d}  ·  budget {d} ({d}%)", .{ @tagName(eff), limit, budget, pct }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  context:  [{s}] ~{d}/{d} ({d:.1}% of limit)", .{ bar, used, limit, pct_used }) catch return);
     agent.pushInfoOwned(m, "");
 }
 
@@ -735,24 +738,23 @@ pub fn cmdConfig(m: *tui.Model) void {
     const hot_pct = compaction.hotPct(m.environ, ctx);
     const src = compaction.limitSource(m.environ, ctx);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "┌─ zode {s} — config", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ limit source: {s}", .{
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "config  ·  zode {s}", .{build_options.version}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  limit source:  {s}", .{
         switch (src) {
             .model => "the model's own context window",
             .env => "ZODE_CONTEXT_LIMIT",
             .default_ => "the 128k default",
         },
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ limit:        {d} tokens", .{limit}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ budget:       {d} tokens ({d}% of limit)", .{ budget, pct }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ compact mode: {s}  ({s})", .{
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  limit:         {d} tokens", .{limit}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  budget:        {d} tokens ({d}% of limit)", .{ budget, pct }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  compact:       {s}  ({s})", .{
         @tagName(eff),
         if (m.compact_mode == null) "from ZODE_COMPACT" else "overridden with /compact",
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ warm threshold (bg):  {d}%  (ZODE_COMPACT_BG_PCT)", .{bg_pct}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ hot threshold (sync): {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ recent window:        {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  warm (bg):     {d}%  (ZODE_COMPACT_BG_PCT)", .{bg_pct}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  hot (sync):    {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  recent window: {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)}) catch return);
     agent.pushInfoOwned(m, "");
 }
 
@@ -772,24 +774,26 @@ pub fn cmdUsage(m: *tui.Model) void {
     var output_buf: [32]u8 = undefined;
     var cached_buf: [32]u8 = undefined;
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "╭─ zode {s} · usage", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ requests  {d}", .{requests}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ total     {s} tokens", .{formatTokenCount(&total_buf, total)}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   input   {s}", .{formatTokenCount(&input_buf, input)}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   output  {s}", .{formatTokenCount(&output_buf, output)}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ cache     {s}  {s}  {d:.1}%", .{
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "usage  ·  zode {s}", .{build_options.version}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  requests:  {d}", .{requests}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  tokens:    {s} total  (input {s}, output {s})", .{
+        formatTokenCount(&total_buf, total),
+        formatTokenCount(&input_buf, input),
+        formatTokenCount(&output_buf, output),
+    }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  cache:     {s}  {s}  {d:.1}%", .{
         formatTokenCount(&cached_buf, cached),
         bar,
         hit,
     }) catch return);
     if (m.reads.stats.hits > 0 or m.reads.stats.misses > 0) {
-        agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ read      {d} re-reads avoided · ~{d} KB", .{
+        agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  read:      {d} re-reads avoided  ·  ~{d} KB", .{
             m.reads.stats.hits,
             m.reads.stats.saved / 1024,
         }) catch return);
     }
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ elided    {d} tool results", .{agent.session_elided}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "╰─ /cost per-model · /cache verdict") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  elided:    {d} tool results", .{agent.session_elided}) catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  next:      /cost per-model  ·  /cache verdict") catch return);
     agent.pushInfoOwned(m, "");
 }
 
@@ -817,23 +821,29 @@ pub fn cmdDoctor(m: *tui.Model) void {
     const budget = compaction.budgetFor(m.environ, agent.curModelContext());
     const pct = compaction.targetPct(m.environ);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "┌─ zode {s} — doctor", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ mode:         {s}", .{agent.permModeName()}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ compact:      {s} at {d}% (budget {d} tokens)", .{
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "doctor  ·  zode {s}", .{build_options.version}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  mode:      {s}", .{agent.permModeName()}) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  compact:   {s} at {d}% (budget {d} tokens)", .{
         @tagName(eff), pct, budget,
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ yolo:         {s}  ·  read-only: {s}  ·  accept-edits: {s}", .{
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  flags:     yolo={s}  ·  read-only={s}  ·  accept-edits={s}", .{
         if (agent.yolo) "on" else "off",
         if (agent.read_only) "on" else "off",
         if (agent.accept_edits) "on" else "off",
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│ api key:      {s} (value never printed)", .{
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  api key:   {s} (value never printed)", .{
         if (agent.api_key_global) |_| "set" else "not set",
     }) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "├─ sessions") catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   dir:   {s}/", .{session_mod.sessions_dir}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "│   elided results this session: {d}", .{agent.session_elided}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "└─") catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  motion:    {s}  ·  view: {s}  ·  ticks={d}  ·  mascot repaints={d}", .{
+        if (m.no_animation) "none" else if (m.reduced_motion) "reduced" else "full",
+        m.view_mode.name(),
+        m.motion_tick_count,
+        m.mascot_motion_repaints,
+    }) catch return);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  sessions:  dir={s}/  ·  elided this session={d}", .{
+        session_mod.sessions_dir,
+        agent.session_elided,
+    }) catch return);
     agent.pushInfoOwned(m, "");
 }
 
@@ -953,58 +963,6 @@ pub fn cmdPr(m: *tui.Model, arg: ?[]const u8) void {
 /// Phase 31.2 naming: commit-push-PR workflow (uses PR allowlist asymmetry).
 pub fn cmdCommitPushPr(m: *tui.Model, arg: ?[]const u8) void {
     startGitPromptCommand(m, gitcmds.pr_prompt, &gitcmds.pr_allow_rules, arg);
-}
-
-/// `/github`: GitHub integration status and context (local, read-only).
-/// Shows resolved repo/host, auth token source (never the token), and how to
-/// use the native `github` tool for remote operations.
-pub fn cmdGithub(m: *tui.Model, arg: ?[]const u8) void {
-    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
-    if (a.len > 0 and !std.ascii.eqlIgnoreCase(a, "status") and !std.ascii.eqlIgnoreCase(a, "help")) {
-        agent.pushInfo(m, "usage: /github [status|help]");
-        return;
-    }
-
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const remote = if (m.io_ready) github_lib.context.resolve(arena, agent.io_global) else null;
-    const host: []const u8 = if (remote) |r| r.host else "github.com";
-    const auth = github_lib.api.resolveToken(arena, agent.io_global, agent.environ_global, host);
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(m.allocator);
-    out.appendSlice(m.allocator, "GitHub integration (native, local status)\n") catch return;
-    if (remote) |r| {
-        out.print(m.allocator, "  repo     {s}/{s}\n", .{ r.owner, r.repo }) catch return;
-        out.print(m.allocator, "  host     {s}\n", .{r.host}) catch return;
-        if (r.url.len > 0) out.print(m.allocator, "  remote   {s}\n", .{r.url}) catch return;
-    } else {
-        out.appendSlice(m.allocator, "  repo     unresolved from git remotes\n") catch return;
-        out.print(m.allocator, "  host     {s} (default)\n", .{host}) catch return;
-    }
-    if (m.io_ready) {
-        if (github_lib.context.currentBranch(arena, agent.io_global)) |b| {
-            out.print(m.allocator, "  branch   {s}\n", .{b}) catch return;
-        }
-    }
-    out.print(m.allocator, "  auth     {s} (source: {s})\n", .{ if (auth.token != null) "configured" else "not configured", auth.source }) catch return;
-    if (auth.token == null) {
-        out.appendSlice(m.allocator, "  hint     set GITHUB_TOKEN or GH_TOKEN, or store token in ~/.config/zode/auth.json as \"github\" / \"github:<host>\"\n") catch return;
-    } else {
-        out.appendSlice(m.allocator, "  note     token value is never shown; verify with `github` op `whoami`\n") catch return;
-    }
-    out.appendSlice(m.allocator, "  tool     `github` (structured gateway, native-first for supported remote ops)\n") catch return;
-    out.appendSlice(m.allocator, "  reads    auth_status, whoami, repo, pr_list, pr_view, pr_checks, issue_list, issue_view, actions_runs\n") catch return;
-    out.appendSlice(m.allocator, "  writes   pr_create, pr_update, pr_comment, issue_create, issue_comment (permission per op)\n") catch return;
-    out.appendSlice(m.allocator, "  flows    /pr and /commit-push-pr prefer native `github` ops; `gh`/CLI fallback when needed\n") catch return;
-    if (std.ascii.eqlIgnoreCase(a, "help")) {
-        out.appendSlice(m.allocator, "  examples github auth_status | github repo | github pr_list state=open | github pr_view number=123\n") catch return;
-    }
-
-    const owned = m.allocator.dupe(u8, std.mem.trimEnd(u8, out.items, "\n")) catch return;
-    agent.pushInfoOwned(m, owned);
 }
 
 /// `/context`: gauge of context used against the limit and the budget.
@@ -1421,7 +1379,7 @@ pub fn cmdFiles(m: *tui.Model) void {
     // The files the agent changed. The paths are borrowed from the Model's
     // table, which outlives the report.
     if (m.changed.count() > 0) {
-        report.addSection("changed files (this session)") catch {};
+        report.addSection("Changed files (this session)") catch {};
         var paths: [filesview.max_changed][]const u8 = undefined;
         const n = m.changed.fill(&paths);
         for (paths[0..n]) |p| {
@@ -1459,8 +1417,251 @@ fn runGitCapture(arena: std.mem.Allocator, argv: []const []const u8, limit: usiz
     };
 }
 
-/// `/diff`: uncommitted changes and the current turn's changed-file diff.
-pub fn cmdDiff(m: *tui.Model) void {
+/// `/diff [next|prev]`: uncommitted changes and the current turn's changed-file
+/// diff, or navigate between diff blocks in the timeline.
+/// `/inspect [context|git|session]`: read-only workbench inspector (Phase 5).
+/// Presentation layer over shared runtime state; never invents state/stats.
+pub fn cmdInspect(m: *tui.Model, arg: ?[]const u8) void {
+    const gpa = m.allocator;
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(a, "git")) {
+        cmdGit(m, null);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(a, "context")) {
+        cmdContext(m);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(a, "session")) {
+        if (agent.session) |s| {
+            const id = if (s.path) |p| std.fs.path.basename(p) else "(no path)";
+            agent.pushInfoFmt(m, "Inspect  ·  Session  {s}", .{id});
+            if (s.custom_title.len > 0) agent.pushInfoFmt(m, "  Title  {s}", .{s.custom_title});
+            agent.pushInfoFmt(m, "  Messages  {d}", .{s.messages.items.len});
+            agent.pushInfo(m, "  Details  /session, /resume, /rename");
+        } else {
+            agent.pushInfo(m, "Inspect  ·  Session  none active (/session, /resume)");
+        }
+        return;
+    }
+    if (a.len > 0) {
+        agent.pushInfo(m, "usage: /inspect | /inspect context|git|session");
+        return;
+    }
+
+    // Unified workbench overview (runtime-truth only).
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "Inspect  ·  Workbench overview  (zode {s})", .{build_options.version}) catch return);
+    const motion: []const u8 = if (m.no_animation) "none" else if (m.reduced_motion) "reduced" else "full";
+    agent.pushInfoFmt(m, "  Model  {s}  ·  Perms  {s}  ·  Motion  {s}  ·  View  {s}", .{ agent.curModel(), agent.permModeName(), motion, m.view_mode.name() });
+
+    // Context (honest estimate, same basis as /context).
+    _ = agent.ensureSession(m, gpa);
+    var astate = std.heap.ArenaAllocator.init(gpa);
+    defer astate.deinit();
+    const msgs = agent.snapshotMsgs(astate.allocator());
+    const used = compaction.estimateTokens(msgs);
+    const limit = compaction.contextLimitFor(m.environ, agent.curModelContext());
+    const budget = compaction.budgetFor(m.environ, agent.curModelContext());
+    const pct = if (limit > 0) @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(limit)) * 100.0 else 0.0;
+    agent.pushInfoFmt(m, "  Context  ~{d}/{d} tokens ({d:.1}%)  ·  budget {d}  ·  {d} turn(s)", .{
+        used, limit, pct, budget, if (msgs.len > 0) msgs.len - 1 else 0,
+    });
+
+    // Git (best-effort, read-only).
+    if (m.io_ready) {
+        var garena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer garena.deinit();
+        const ga = garena.allocator();
+        const branch = runGitCapture(ga, &.{ "git", "--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD" }, 4096);
+        const st = runGitCapture(ga, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "status", "--short" }, 64 * 1024);
+        if (branch) |b| {
+            const bt = std.mem.trim(u8, b, " \t\r\n");
+            var changes: usize = 0;
+            if (st) |s| {
+                const stt = std.mem.trim(u8, s, " \t\r\n");
+                if (stt.len > 0) {
+                    var it = std.mem.splitScalar(u8, stt, '\n');
+                    while (it.next()) |_| changes += 1;
+                }
+            }
+            if (changes == 0)
+                agent.pushInfoFmt(m, "  Git  {s}  ·  clean", .{bt})
+            else
+                agent.pushInfoFmt(m, "  Git  {s}  ·  {d} changed path(s)", .{ bt, changes });
+        } else {
+            agent.pushInfo(m, "  Git  not a repository (or git unavailable)");
+        }
+    } else {
+        agent.pushInfo(m, "  Git  (I/O not ready)");
+    }
+
+    // Session/file focus (honest).
+    if (agent.session) |s| {
+        const id = if (s.path) |p| std.fs.path.basename(p) else "(active)";
+        agent.pushInfoFmt(m, "  Session  {s}", .{id});
+    }
+    if (m.lastChangedFile()) |p| agent.pushInfoFmt(m, "  File  last changed  {s}", .{p});
+
+    switch (m.view_mode) {
+        .review => agent.pushInfo(m, "  Details  /diff /hunk /files /file /code-review /git  ·  /context /status /session"),
+        .flow => agent.pushInfo(m, "  Details  /context /status /session  ·  /git /diff /files"),
+        .focus => agent.pushInfo(m, "  Details  /status /context /session (focus view; runtime state unchanged)"),
+        .normal => agent.pushInfo(m, "  Details  /context /status /config /usage /cache /doctor /git /diff /files /session"),
+    }
+}
+
+/// `/view [normal|focus|flow|review]`: workbench presentation mode (Phase 5).
+/// Presentation layer only; does not change runtime/permission/tool behavior.
+pub fn cmdView(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (a.len == 0) {
+        agent.pushInfoFmt(m, "View mode: {s}  ·  {s}", .{ m.view_mode.name(), m.view_mode.desc() });
+        agent.pushInfo(m, "  usage: /view normal|focus|flow|review");
+        return;
+    }
+    const mode: tui.ViewMode = if (std.ascii.eqlIgnoreCase(a, "normal") or std.ascii.eqlIgnoreCase(a, "off"))
+        .normal
+    else if (std.ascii.eqlIgnoreCase(a, "focus"))
+        .focus
+    else if (std.ascii.eqlIgnoreCase(a, "flow"))
+        .flow
+    else if (std.ascii.eqlIgnoreCase(a, "review"))
+        .review
+    else {
+        agent.pushInfo(m, "usage: /view normal|focus|flow|review");
+        return;
+    };
+    m.view_mode = mode;
+    m.redraw_requested.store(true, .seq_cst);
+    agent.pushInfoFmt(m, "View mode: {s}  ·  {s}", .{ mode.name(), mode.desc() });
+}
+
+/// `/github`: GitHub integration status and context (local, read-only).
+/// Shows resolved repo/host, auth token source (never the token), and how to
+/// use the native `github` tool for remote operations.
+pub fn cmdGithub(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (a.len > 0 and !std.ascii.eqlIgnoreCase(a, "status") and !std.ascii.eqlIgnoreCase(a, "help")) {
+        agent.pushInfo(m, "usage: /github [status|help]");
+        return;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const remote = if (m.io_ready) github_lib.context.resolve(arena, agent.io_global) else null;
+    const host: []const u8 = if (remote) |r| r.host else "github.com";
+    const auth = github_lib.api.resolveToken(arena, agent.io_global, agent.environ_global, host);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(m.allocator);
+    out.appendSlice(m.allocator, "GitHub integration (native, local status)\n") catch return;
+    if (remote) |r| {
+        out.print(m.allocator, "  repo     {s}/{s}\n", .{ r.owner, r.repo }) catch return;
+        out.print(m.allocator, "  host     {s}\n", .{r.host}) catch return;
+        if (r.url.len > 0) out.print(m.allocator, "  remote   {s}\n", .{r.url}) catch return;
+    } else {
+        out.appendSlice(m.allocator, "  repo     unresolved from git remotes\n") catch return;
+        out.print(m.allocator, "  host     {s} (default)\n", .{host}) catch return;
+    }
+    if (m.io_ready) {
+        if (github_lib.context.currentBranch(arena, agent.io_global)) |b| {
+            out.print(m.allocator, "  branch   {s}\n", .{b}) catch return;
+        }
+    }
+    out.print(m.allocator, "  auth     {s} (source: {s})\n", .{ if (auth.token != null) "configured" else "not configured", auth.source }) catch return;
+    if (auth.token == null) {
+        out.appendSlice(m.allocator, "  hint     set GITHUB_TOKEN or GH_TOKEN, or store token in ~/.config/zode/auth.json as \"github\" / \"github:<host>\"\n") catch return;
+    } else {
+        out.appendSlice(m.allocator, "  note     token value is never shown; verify with `github` op `whoami`\n") catch return;
+    }
+    out.appendSlice(m.allocator, "  tool     `github` (structured gateway, native-first for supported remote ops)\n") catch return;
+    out.appendSlice(m.allocator, "  reads    auth_status, whoami, repo, pr_list, pr_view, pr_checks, issue_list, issue_view, actions_runs\n") catch return;
+    out.appendSlice(m.allocator, "  writes   pr_create, pr_update, pr_comment, issue_create, issue_comment (permission per op)\n") catch return;
+    out.appendSlice(m.allocator, "  flows    /pr and /commit-push-pr prefer native `github` ops; `gh`/CLI fallback when needed\n") catch return;
+    if (std.ascii.eqlIgnoreCase(a, "help")) {
+        out.appendSlice(m.allocator, "  examples github auth_status | github repo | github pr_list state=open | github pr_view number=123\n") catch return;
+    }
+
+    const owned = m.allocator.dupe(u8, std.mem.trimEnd(u8, out.items, "\n")) catch return;
+    agent.pushInfoOwned(m, owned);
+}
+
+/// `/git`: read-only Git overview (Phase 5 foundation). No destructive actions.
+pub fn cmdGit(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (a.len > 0) {
+        agent.pushInfo(m, "usage: /git (read-only overview: branch, status, recent commits)");
+        return;
+    }
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const branch = runGitCapture(arena, &.{ "git", "--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD" }, 4096);
+    const status = runGitCapture(arena, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "status", "--short" }, 64 * 1024);
+    const log = runGitCapture(arena, &.{ "git", "--no-optional-locks", "log", "--oneline", "-n", "5", "--decorate" }, 16 * 1024);
+
+    if (branch == null and status == null and log == null) {
+        agent.pushInfo(m, "Git: not a repository (or git is not available)");
+        return;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(m.allocator);
+    out.appendSlice(m.allocator, "Git  ·  read-only overview\n") catch return;
+    if (branch) |b| {
+        const bt = std.mem.trim(u8, b, " \t\r\n");
+        out.print(m.allocator, "  Branch  {s}\n", .{bt}) catch return;
+    }
+    if (status) |s| {
+        const st = std.mem.trim(u8, s, " \t\r\n");
+        if (st.len == 0) {
+            out.appendSlice(m.allocator, "  Status  working tree clean\n") catch return;
+        } else {
+            out.appendSlice(m.allocator, "  Status\n") catch return;
+            var lines: usize = 0;
+            var it = std.mem.splitScalar(u8, st, '\n');
+            while (it.next()) |line| {
+                if (lines >= 40) {
+                    out.appendSlice(m.allocator, "    … (more changes; use /diff)\n") catch break;
+                    break;
+                }
+                out.print(m.allocator, "    {s}\n", .{line}) catch break;
+                lines += 1;
+            }
+        }
+    }
+    if (log) |l| {
+        const lt = std.mem.trim(u8, l, " \t\r\n");
+        if (lt.len > 0) {
+            out.appendSlice(m.allocator, "  Recent\n") catch return;
+            var it = std.mem.splitScalar(u8, lt, '\n');
+            while (it.next()) |line| {
+                out.print(m.allocator, "    {s}\n", .{line}) catch break;
+            }
+        }
+    }
+    out.appendSlice(m.allocator, "  Actions  /diff (changes), /code-review (read-only analysis). No destructive git actions.") catch {};
+    const owned = m.allocator.dupe(u8, std.mem.trimEnd(u8, out.items, "\n")) catch return;
+    agent.pushInfoOwned(m, owned);
+}
+
+pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (std.mem.eql(u8, a, "next") or std.mem.eql(u8, a, "n")) {
+        _ = m.navigateDiff(1);
+        return;
+    }
+    if (std.mem.eql(u8, a, "prev") or std.mem.eql(u8, a, "p") or std.mem.eql(u8, a, "previous")) {
+        _ = m.navigateDiff(-1);
+        return;
+    }
+    if (a.len > 0) {
+        agent.pushInfo(m, "usage: /diff | /diff next|prev");
+        return;
+    }
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1500,10 +1701,10 @@ pub fn cmdDiff(m: *tui.Model) void {
         if (runGitCapture(arena, argv.items, 512 * 1024)) |tdiff| {
             const ttrim = std.mem.trim(u8, tdiff, " \t\r\n");
             if (ttrim.len > 0) {
-                agent.pushInfoFmt(m, "this turn ({d} file(s) changed):", .{turn_files.len});
+                agent.pushInfoFmt(m, "files  ·  this turn vs HEAD  ·  {d} file(s)", .{turn_files.len});
                 m.pushKind(md.Kind.diff, ttrim);
             } else {
-                agent.pushInfoFmt(m, "this turn: {d} file(s) touched but diff vs HEAD is empty.", .{turn_files.len});
+                agent.pushInfoFmt(m, "files  ·  this turn  ·  {d} file(s) touched, diff vs HEAD is empty", .{turn_files.len});
             }
         }
     }
@@ -1569,7 +1770,6 @@ pub const commands = [_]Cmd{
     .{ .key = "/commit", .desc = "create a git commit with verified context (scoped git allowlist)", .key_hint = "[instructions]" },
     .{ .key = "/pr", .desc = "create or update a PR with merge-base diff (idempotent, scoped allowlist)", .key_hint = "[instructions]" },
     .{ .key = "/commit-push-pr", .desc = "commit + push + PR workflow (PR allowlist; alias of /pr flow)", .key_hint = "[instructions]" },
-    .{ .key = "/github", .desc = "GitHub integration status: repo/auth context and native `github` tool ops", .palette_visible = true },
     .{ .key = "/iter", .desc = "iteration budget: /iter [n] (min 8, max 200) or /iter to show current" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
@@ -1583,6 +1783,8 @@ pub const commands = [_]Cmd{
     .{ .key = "/new-session", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
+    .{ .key = "/inspect", .desc = "workbench inspector (runtime-truth): overview | context|git|session", .key_hint = "context|git|session", .palette_visible = true },
+    .{ .key = "/view", .desc = "workbench view mode (presentation only): normal|focus|flow|review", .key_hint = "normal|focus|flow|review", .palette_visible = true },
     .{ .key = "/doctor", .desc = "diagnosis: model, effort, style, permissions, key, compaction, sessions" },
     .{ .key = "/config", .desc = "effective configuration: limits, budgets, compact thresholds, recent window" },
     .{ .key = "/status", .desc = "session status: model, effort, perms, compaction, context gauge", .key_hint = "context gauge" },
@@ -1596,7 +1798,11 @@ pub const commands = [_]Cmd{
     .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
     .{ .key = "/rename", .desc = "set a custom title for the current session: /rename <name>" },
     .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
+    .{ .key = "/file", .desc = "last changed file: /file | copy|path|open | next|prev (file/diff navigation)", .key_hint = "copy|open|next|prev" },
     .{ .key = "/diff", .desc = "uncommitted changes and this turn's changed-file diff" },
+    .{ .key = "/git", .desc = "read-only Git overview (branch, status, recent commits)", .palette_visible = true },
+    .{ .key = "/github", .desc = "GitHub integration status: repo/auth context and native `github` tool ops", .palette_visible = true },
+    .{ .key = "/hunk", .desc = "navigate hunks in the last diff: /hunk next|prev (also alt+] / alt+[)", .key_hint = "next|prev" },
     .{ .key = "/cache", .desc = "cache hit-rate for this session", .palette_visible = false },
     .{ .key = "/ask", .desc = "on|off: enable Plan mode (Shift+Tab also cycles modes)" },
     .{ .key = "/skills", .desc = "list the loadable skills" },
@@ -1659,7 +1865,7 @@ test "the files command says when there is nothing, instead of showing an empty 
 
     const text = try pendingText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "nothing read or written") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Nothing read or written") != null);
 }
 
 test "the files command says a file is NOT in the context when it is not" {
@@ -1713,7 +1919,7 @@ test "cmdDoctor runs without crashing and names itself" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "doctor") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "mode:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "yolo:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "yolo") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "compact:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "sessions") != null);
 }
@@ -1729,7 +1935,7 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         try agent.submit(&m, "/usage");
         const text = try pendingText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "· usage") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "usage") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "requests") != null);
     }
     {
@@ -1738,8 +1944,8 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         try agent.submit(&m, "/doctor");
         const text = try pendingText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "— doctor") != null);
-        try std.testing.expect(std.mem.indexOf(u8, text, "yolo:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "doctor") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "yolo") != null);
     }
 }
 
@@ -1756,11 +1962,18 @@ test "/permissions /hooks /agents panels are registered" {
     }
 }
 
-test "/diff is registered in the command table" {
+test "/diff, /hunk and /file are registered in the command table" {
+    var found_diff = false;
+    var found_hunk = false;
+    var found_file = false;
     for (commands) |c| {
-        if (std.mem.eql(u8, c.key, "/diff")) return;
+        if (std.mem.eql(u8, c.key, "/diff")) found_diff = true;
+        if (std.mem.eql(u8, c.key, "/hunk")) found_hunk = true;
+        if (std.mem.eql(u8, c.key, "/file")) found_file = true;
     }
-    try std.testing.expect(false);
+    try std.testing.expect(found_diff);
+    try std.testing.expect(found_hunk);
+    try std.testing.expect(found_file);
 }
 
 test "/permissions panel is dispatched" {
@@ -1808,6 +2021,43 @@ pub fn cmdHunk(m: *tui.Model, arg: ?[]const u8) void {
     agent.pushInfo(m, "usage: /hunk next|prev (also alt+] / alt+[ on the last diff)");
 }
 
+/// `/file [copy|path|next|prev|open]`: last changed file (Phase 2/3, honest structured state).
+/// Navigation uses diff targets (file changes emit diffs). Copy/path copies the
+/// last changed file path to clipboard via OSC52 when supported.
+/// `open` provides safe external-editor guidance (TUI suspend/spawn integration is deferred).
+pub fn cmdFile(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (std.mem.eql(u8, a, "next") or std.mem.eql(u8, a, "n")) {
+        _ = m.navigateDiff(1);
+        return;
+    }
+    if (std.mem.eql(u8, a, "prev") or std.mem.eql(u8, a, "p") or std.mem.eql(u8, a, "previous")) {
+        _ = m.navigateDiff(-1);
+        return;
+    }
+    const path = m.lastChangedFile() orelse {
+        agent.pushInfo(m, "File: no changed file recorded in this session yet");
+        return;
+    };
+    if (std.mem.eql(u8, a, "copy") or std.mem.eql(u8, a, "path")) {
+        m.setCopyPending(path);
+        agent.pushInfoFmt(m, "File path copied: {s}", .{path});
+        return;
+    }
+    if (std.mem.eql(u8, a, "open") or std.mem.eql(u8, a, "edit")) {
+        m.setCopyPending(path);
+        agent.pushInfoFmt(m, "File: {s}", .{path});
+        agent.pushInfo(m, "Open: path copied to clipboard. Run your editor outside the TUI (e.g. $VISUAL/$EDITOR). In-TUI editor spawn is deferred for safe terminal suspend/resume.");
+        return;
+    }
+    if (a.len > 0) {
+        agent.pushInfo(m, "usage: /file | /file copy|path|open|next|prev");
+        return;
+    }
+    agent.pushInfoFmt(m, "File: last changed  {s}", .{path});
+    agent.pushInfo(m, "Review actions (safe): /diff, /hunk next|prev, /file next|prev, /file copy, /code-review, /undo (turn-level)");
+}
+
 test "/diff command is dispatched" {
     const saved_io = agent.io_global;
     const saved_turn = agent.turn_stats;
@@ -1826,4 +2076,1017 @@ test "/diff command is dispatched" {
     // In a git repo with a working test IO, shows "diff · uncommitted";
     // if process spawning is unavailable under test IO, reports git unavailable.
     try std.testing.expect(std.mem.indexOf(u8, text, "diff") != null);
+}
+
+pub fn cmdVersion(m: *tui.Model) void {
+    m.pushInfoFmt("zode {s}", .{selfupdate.current_version});
+}
+
+/// `/release-notes`: show release notes for the running version.
+pub fn cmdReleaseNotes(m: *tui.Model) void {
+    const gpa = m.allocator;
+    if (!m.io_ready) {
+        m.pushInfo("release notes: I/O not ready");
+        return;
+    }
+    const io = agent.io_global;
+    const version = selfupdate.current_version;
+
+    const body = std.Io.Dir.cwd().readFileAlloc(io, "CHANGELOG.md", gpa, .limited(1024 * 1024)) catch {
+        m.pushInfo("release notes: CHANGELOG.md not found (run from the repo root, or see the project releases)");
+        return;
+    };
+    defer gpa.free(body);
+
+    const section = extractReleaseSection(gpa, body, version) catch {
+        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
+        return;
+    } orelse {
+        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
+        return;
+    };
+    defer gpa.free(section);
+
+    m.pushInfoFmt("release notes — zode {s}", .{version});
+    var it = std.mem.splitScalar(u8, section, '\n');
+    while (it.next()) |line| {
+        const l = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+        m.pushInfoOwned(gpa.dupe(u8, l) catch continue);
+    }
+}
+
+pub fn extractReleaseSection(gpa: std.mem.Allocator, changelog: []const u8, version: []const u8) !?[]u8 {
+    var needle_buf: [128]u8 = undefined;
+    const is_dev = std.mem.eql(u8, version, "dev") or selfupdate.Version.parse(version) == null;
+    const needle = if (is_dev)
+        "## [Unreleased]"
+    else blk: {
+        const v = if (version.len > 0 and (version[0] == 'v' or version[0] == 'V')) version[1..] else version;
+        break :blk std.fmt.bufPrint(&needle_buf, "## [{s}]", .{v}) catch return null;
+    };
+
+    const start = std.mem.indexOf(u8, changelog, needle) orelse return null;
+    var body_start = start;
+    if (std.mem.indexOfScalarPos(u8, changelog, start, '\n')) |nl| {
+        body_start = nl + 1;
+    } else {
+        return try gpa.dupe(u8, "");
+    }
+
+    var end = changelog.len;
+    if (std.mem.indexOfPos(u8, changelog, body_start, "\n## [")) |next| {
+        end = next;
+    }
+
+    const raw = std.mem.trim(u8, changelog[body_start..end], " \t\r\n");
+    if (raw.len == 0) return try gpa.dupe(u8, "(no entries)");
+    return try gpa.dupe(u8, raw);
+}
+
+pub fn cmdTaskParallel(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |raw| {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(value, "auto")) {
+            m.setTaskParallelLimit(0);
+        } else {
+            const parsed = std.fmt.parseInt(u8, value, 10) catch {
+                m.pushInfo("usage: /task-parallel [1..8|auto]");
+                return;
+            };
+            if (parsed < 1 or parsed > 8) {
+                m.pushInfo("usage: /task-parallel [1..8|auto]");
+                return;
+            }
+            m.setTaskParallelLimit(parsed);
+        }
+    }
+    const override = m.taskParallelLimit();
+    const effective = if (override > 0) override else agent.taskParallelLimit(m);
+    m.pushInfoFmt(
+        "subagent parallelism: {d} at a time{s}",
+        .{ effective, if (override > 0) " (session override)" else " (auto: ZODE_TASK_PARALLEL or default)" },
+    );
+}
+
+pub fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
+        const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
+        if (on) {
+            agent.setPermMode(m, .read_only);
+            agent.pushInfo(m, "Plan mode ON: investigate first; writes are blocked pending approval.");
+            return;
+        }
+        if (off) {
+            agent.setPermMode(m, .default);
+            agent.pushInfo(m, "Build mode ON");
+            return;
+        }
+        agent.pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (agent.read_only) "on" else "off"});
+        return;
+    }
+    const next: agent.PermMode = if (agent.read_only) .default else .read_only;
+    agent.setPermMode(m, next);
+    agent.pushInfoFmt(m, "permission mode: {s}", .{agent.permModeName()});
+}
+
+pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        const on = std.ascii.eqlIgnoreCase(a, "on") or std.ascii.eqlIgnoreCase(a, "1");
+        const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
+        if (on) {
+            m.show_prompt_dots = true;
+            m.requestRedraw();
+            agent.pushInfo(m, "prompt dots: on — click a dot on the right rail to jump to that prompt");
+            return;
+        }
+        if (off) {
+            m.show_prompt_dots = false;
+            m.prompt_dot_hover = null;
+            m.prompt_dot_len = 0;
+            m.requestRedraw();
+            agent.pushInfo(m, "prompt dots: off");
+            return;
+        }
+        agent.pushInfo(m, "/dots: on|off");
+        return;
+    }
+    m.show_prompt_dots = !m.show_prompt_dots;
+    if (!m.show_prompt_dots) {
+        m.prompt_dot_hover = null;
+        m.prompt_dot_len = 0;
+    }
+    m.requestRedraw();
+    agent.pushInfoFmt(m, "prompt dots: {s}", .{if (m.show_prompt_dots) "on" else "off"});
+}
+
+pub fn cmdYolo(m: *tui.Model) void {
+    agent.setPermMode(m, if (agent.yolo) .default else .bypass);
+    const msg = if (agent.yolo)
+        "yolo ON: no confirmations, and no questions (your questions are answered for you and said in the summary)"
+    else
+        "yolo OFF: asks for permission";
+    agent.pushInfo(m, msg);
+}
+
+pub fn cmdBench(m: *tui.Model) void {
+    var buf: [1024]u8 = undefined;
+    const text = m.bench.report(&buf, agent.iterationLimit(), agent.cacheHitPct()) catch {
+        agent.pushInfo(m, "/bench: could not compose the report");
+        return;
+    };
+    agent.pushInfo(m, text);
+
+    const cs = agent.cheapRouterStats();
+    if (cs.on) {
+        agent.pushInfoFmt(
+            m,
+            "cheap router: {s} · {d} turn(s) sent to it · {d} fell back{s}",
+            .{
+                cs.model,
+                cs.attempts,
+                cs.fallbacks,
+                if (cs.given_up) @as([]const u8, " · out of play for the rest of the session") else @as([]const u8, ""),
+            },
+        );
+    }
+}
+
+pub fn cmdClear(m: *tui.Model) void {
+    agent.resetSessionFiles(m);
+    m.clearHistory();
+    if (agent.session) |s| s.resetSkillsSent();
+    m.pushInfo("screen cleared · read cache + changed list reset · skills listing re-attached next turn");
+}
+
+/// `/mode [build|accept-edits|plan|bypass]`, or the current mode with no argument.
+pub fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        const mode = agent.parsePermMode(a);
+        if (mode) |mm| {
+            agent.setPermMode(m, mm);
+            agent.pushInfoFmt(m, "permission mode: {s}", .{agent.permModeName()});
+            return;
+        }
+        agent.pushInfo(m, "/mode: build|accept-edits|plan|bypass");
+        return;
+    }
+    agent.pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{agent.permModeName()});
+}
+
+/// `/skills`: what is loadable, and from where.
+pub fn cmdSkills(m: *tui.Model) void {
+    const entries = agent.discoverSkills(m.allocator, m.environ);
+    if (entries.len == 0) {
+        agent.pushInfo(m, "no skills found. Put them in .zode/skills/<name>/SKILL.md (this project) or ~/.config/zode/skills/<name>/SKILL.md (yours)");
+        return;
+    }
+    agent.pushInfoFmt(m, "{d} skill{s} (only the name and description are in the prompt; the body loads on demand)", .{
+        entries.len,
+        if (entries.len == 1) @as([]const u8, "") else @as([]const u8, "s"),
+    });
+    for (entries) |e| {
+        const source_tag = switch (e.source) {
+            .project => "[project]",
+            .agents => "[agents]",
+            .user => "[user]",
+            .bundled => "[bundled]",
+        };
+        const line = std.fmt.allocPrint(m.allocator, "  {s} {s}: {s}{s}", .{
+            source_tag,
+            e.name,
+            if (e.description.len > 0) e.description else "(no description)",
+            if (e.when_to_use.len > 0)
+                std.fmt.allocPrint(m.allocator, " — {s}", .{e.when_to_use}) catch ""
+            else
+                "",
+        }) catch continue;
+        agent.pushInfoOwned(m, line);
+    }
+}
+
+/// `/style <name>`: select an output style. No args reports the current one;
+/// `off`/`clear` clears it. The style block is injected at the end of the system prompt.
+pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
+    const trimmed = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (trimmed.len == 0) {
+        if (agent.current_style) |name| {
+            const entries = agent.discoverStyles(m.allocator, m.environ);
+            var found: ?[]const u8 = null;
+            var found_desc: []const u8 = "";
+            var found_keep: bool = true;
+            for (entries) |e| {
+                if (std.mem.eql(u8, e.name, name)) {
+                    found = e.name;
+                    found_desc = e.description;
+                    found_keep = e.keep_coding_instructions;
+                    break;
+                }
+            }
+            if (found) |n| {
+                const keep_note = if (found_keep) "" else " (coding rules replaced by this style)";
+                m.pushInfoFmt("output style: {s}{s} — {s}", .{ n, keep_note, found_desc });
+            } else {
+                m.pushInfoFmt("output style: {s} (not found — was it removed?)", .{name});
+            }
+        } else {
+            agent.pushInfo(m, "no output style selected. /style <name> picks one; /style off clears it.");
+        }
+        return;
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "off") or std.ascii.eqlIgnoreCase(trimmed, "clear")) {
+        agent.current_style = null;
+        agent.current_style_len = 0;
+        agent.pushInfo(m, "output style cleared. The base prompt (with coding rules) is used.");
+        return;
+    }
+
+    const entries = agent.discoverStyles(m.allocator, m.environ);
+    var found: ?[]const u8 = null;
+    var found_keep: bool = true;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.name, trimmed)) {
+            found = e.name;
+            found_keep = e.keep_coding_instructions;
+            break;
+        }
+    }
+    if (found == null) {
+        agent.pushInfoFmt(m, "unknown output style '{s}'. Available: {s}", .{
+            trimmed,
+            if (entries.len > 0) agent.styleNames(entries) else "none",
+        });
+        return;
+    }
+
+    const n = @min(trimmed.len, agent.current_style_buf.len);
+    std.mem.copyForwards(u8, agent.current_style_buf[0..n], trimmed[0..n]);
+    agent.current_style_len = n;
+    agent.current_style = agent.current_style_buf[0..n];
+
+    const keep_note = if (found_keep) "" else " — this style replaces the coding rules";
+    agent.pushInfoFmt(m, "output style: {s}{s}", .{ trimmed, keep_note });
+}
+
+pub fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        const want = chat.Effort.parse(a) orelse {
+            m.pushInfoFmt("unknown effort: {s} (none|minimal|low|medium|high|xhigh)", .{a});
+            return;
+        };
+        agent.current_effort = want;
+        const got = chat.effortFor(agent.cur_model, want);
+        if (got == null) {
+            m.pushInfoFmt("effort → {s} (this model has no effort knob; the level only sets the answer length)", .{
+                want.label(),
+            });
+        } else if (got.? != want) {
+            m.pushInfoFmt("effort → {s} (this model tops out at {s}, so {s} is what goes on the wire)", .{
+                want.label(),
+                chat.maxEffortFor(agent.cur_model).label(),
+                got.?.label(),
+            });
+        } else {
+            m.pushInfoFmt("effort → {s}", .{want.label()});
+        }
+        return;
+    }
+    agent.openEffortPicker(m);
+}
+
+pub fn cmdColor(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |a| {
+        if (std.mem.eql(u8, a, "default") or std.mem.eql(u8, a, "normal")) {
+            theme.caps.daltonized = false;
+            m.pushInfoFmt("diff palette → default (green / red)", .{});
+        } else if (std.mem.eql(u8, a, "daltonized") or std.mem.eql(u8, a, "daltonise") or
+            std.mem.eql(u8, a, "daltonize"))
+        {
+            theme.caps.daltonized = true;
+            m.pushInfoFmt("diff palette → daltonized (blue / orange)", .{});
+        } else {
+            m.pushInfoFmt("unknown palette: {s} (default | daltonized)", .{a});
+            return;
+        }
+        m.clearSegCache();
+        m.dirty = true;
+        return;
+    }
+    agent.openColorPicker(m);
+}
+
+pub fn cleanWanted(env: ?*const std.process.Environ.Map, arg: ?[]const u8) bool {
+    if (arg) |a| {
+        if (std.mem.eql(u8, a, "yes") or std.mem.eql(u8, a, "y") or
+            std.mem.eql(u8, a, "apply")) return true;
+    }
+    const v = agent.envGet(env, "ZODE_YES") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "yes");
+}
+
+/// The config dir, or null. `/clean` reads it to find the leftover
+/// `<name>.tmp` of an interrupted atomic write (`config.zig` writes to a temp
+/// and renames it).
+pub fn cleanConfigDir(a: std.mem.Allocator, env: ?*const std.process.Environ.Map) ?[]const u8 {
+    const home = agent.envGet(env, "HOME") orelse return null;
+    return std.fmt.allocPrint(a, "{s}/.config/zode", .{home}) catch null;
+}
+
+/// `/clean`: the leftovers of zode, and ONLY those.
+///
+/// Dry run by default. The output has to carry the NUMBERS, not just "clean":
+/// "24 empty sessions" is checkable and "nothing to do" is not, and a cleanup
+/// command that reports success without saying what it looked at is the one
+/// that lies when it is wrong.
+///
+/// The `auth.json` / `.zig-cache` exclusion is not here on purpose: it lives in
+/// `clean.isProtected`, next to the scan that could reach them, with the tests
+/// that hold it. A "never touch" list written in the UI would only hold for as
+/// long as nobody adds a new scan.
+pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
+    // The allocator is a local, and its name is not `a`: `a` is also the name
+    // the two `allocPrint` helpers below use for their own temporaries, and one
+    // name cannot be both the type and the value.
+    const gpa = m.allocator;
+    const inst = clean_mod.instanceDir(gpa, agent.io_global) catch null;
+    defer if (inst) |p| gpa.free(p);
+    const cfg = cleanConfigDir(gpa, m.environ);
+    defer if (cfg) |p| gpa.free(p);
+
+    const now_secs = std.Io.Timestamp.now(agent.io_global, .real).toSeconds();
+    var rep = clean_mod.scan(gpa, agent.io_global, .{
+        .roots = .{ .sessions = "sessions", .instances = inst, .config = cfg },
+        .now_secs = now_secs,
+    }) catch {
+        agent.pushInfo(m, "/clean: could not read the directories");
+        return;
+    };
+    defer rep.deinit();
+
+    const header: []const u8 = if (aplicar)
+        "/clean: applied"
+    else
+        "/clean: dry run (nothing deleted)";
+    agent.pushInfo(m, header);
+
+    if (rep.missing_sessions) {
+        agent.pushInfo(m, "  no sessions/ directory here (nothing to clean in it)");
+    }
+
+    const order = [_]clean_mod.Bucket{ .empty_session, .own_temp, .stale_instance, .old_session };
+    for (order) |b| {
+        const n = rep.count(b);
+        if (n == 0) continue;
+        const line = std.fmt.allocPrint(gpa, "  {d:>3} {s} ({s})", .{
+            n,
+            b.label(),
+            if (b == .old_session) "kept, delete with find sessions/ -mtime +30d" else b.rootHint(),
+        }) catch continue;
+        agent.pushInfoOwned(m, line);
+    }
+
+    if (rep.items.len == 0 and !rep.missing_sessions) {
+        agent.pushInfo(m, "  nothing to clean");
+        return;
+    }
+
+    if (!aplicar) {
+        const total = rep.deletable();
+        if (total == 0) {
+            agent.pushInfo(m, "  nothing to delete without a yes");
+            return;
+        }
+        const line = std.fmt.allocPrint(
+            gpa,
+            "  -> {d} files, {d} bytes. run `/clean yes` to delete them",
+            .{ total, rep.bytes() },
+        ) catch return;
+        agent.pushInfoOwned(m, line);
+        return;
+    }
+
+    const deleted = clean_mod.apply(agent.io_global, &rep, .{
+        .sessions = "sessions",
+        .instances = inst,
+        .config = cfg,
+    }) catch 0;
+    // The failure count goes in the output on purpose: `apply` swallows the
+    // per-file error so one unreadable file does not abort the rest, and
+    // without this line "deleted 23" would be a lie when 24 were candidates.
+    // `pushInfoFmt` and not `allocPrint … catch "literal"`: on OOM the literal
+    // fallback is a pointer into `.rodata`, and `pushInfoOwned` takes ownership
+    // of it — `Model.deinit` then frees static memory. That is the "Invalid
+    // free" this repo has paid for repeatedly, and it only shows up when the
+    // allocator is already failing, which is exactly when you cannot diagnose
+    // it. `pushInfoFmt` composes AND owns, so the mistake cannot be written.
+    if (rep.failed == 0) {
+        m.pushInfoFmt("  deleted {d} files", .{deleted});
+    } else {
+        m.pushInfoFmt("  deleted {d}, {d} could NOT be removed", .{ deleted, rep.failed });
+    }
+}
+
+pub fn cmdUndo(m: *tui.Model) void {
+    var cp = m.takeCheckpointOwned() orelse {
+        agent.pushInfo(m, "nothing to undo: no turn has changed any file yet");
+        return;
+    };
+    // The snapshots are the caller's memory now (see `takeCheckpointOwned`):
+    // `deinit` needs a non-const pointer.
+    defer cp.deinit(m.allocator);
+    var undone: u8 = 0;
+    var failed: u8 = 0;
+    var skipped: u8 = 0;
+    var detail: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&detail);
+    const out = &w;
+
+    for (cp.files[0..cp.len]) |f| {
+        if (f.truncated) {
+            skipped += 1;
+            out.print("  {s}: too big to restore\n", .{f.pathOf()}) catch {};
+            continue;
+        }
+        if (!f.existed) {
+            // It did not exist before: undoing is deleting it, and only if it is
+            // still a regular file.
+            if (deleteIfUnchanged(f.pathOf())) {
+                undone += 1;
+                out.print("  removed {s}\n", .{f.pathOf()}) catch {};
+            } else {
+                failed += 1;
+                out.print("  {s}: not removed (it changed since, or is gone)\n", .{f.pathOf()}) catch {};
+            }
+            continue;
+        }
+        // `writeFile` and not config.zig's `writeFileSecure`: that one is for
+        // `auth.json` (0600, written to a temp and renamed) and this is a file of
+        // the user's project, with the permissions it already had.
+        std.Io.Dir.cwd().writeFile(agent.io_global, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
+            failed += 1;
+            out.print("  {s}: could not write it back\n", .{f.pathOf()}) catch {};
+            continue;
+        };
+        undone += 1;
+        out.print("  restored {s} ({d} bytes)\n", .{ f.pathOf(), f.data.len }) catch {};
+    }
+
+    // CAREFUL: `allocPrint` and NOT `bufPrint` into a stack buffer.
+    // `pushInfoOwned` TAKES OWNERSHIP of the text and frees it in `Model.deinit`:
+    // a `bufPrint(&buf, ...)` leaves a pointer to the stack in the pending queue
+    // and it paints as a row of `�` (seen in the pty: the headline of the undo
+    // was a wall of replacement characters). Same reason a literal there is an
+    // "Invalid free".
+    const head_buf = if (undone == 0)
+        "undo: nothing could be restored"
+    else
+        std.fmt.allocPrint(m.allocator, "undo: {d} file{s} undone", .{
+            undone,
+            if (undone == 1) "" else "s",
+        }) catch "undo: done";
+    // `pushInfoFmt` COPIES, so a literal fallback is safe here — which is the
+    // whole difference from `pushInfoOwned`, where the same literal is an
+    // "Invalid free" at teardown.
+
+    m.pushInfoFmt("{s} · from: {s}", .{ head_buf, cp.labelOf() });
+    if (w.buffered().len > 0) {
+        // `pushInfoOwned` of an EMPTY string would push a blank line; the old
+        // `catch ""` made that reachable on OOM and printed nothing instead.
+        m.pushInfoFmt("{s}", .{w.buffered()});
+    }
+    if (skipped > 0 or failed > 0) {
+        m.pushInfoFmt("{d} file(s) skipped, {d} failed · the diff of the turn is still in the history", .{
+            skipped,
+            failed,
+        });
+    }
+    if (undone > 0) agent.setStatusWithZo(m, .done, "undone");
+}
+
+/// Deletes a file ONLY if it exists and is a regular file.
+///
+/// What is NOT checked is that its contents are the ones the tool left: the
+/// "after" is not stored (that would be twice the memory). Exists and is a
+/// regular file is enough to avoid deleting a directory by mistake. It is a
+/// weak guarantee on purpose: `/undo` is something the user asks for
+/// explicitly, and doing nothing is worse than deleting a file the model just
+/// created.
+fn deleteIfUnchanged(path: []const u8) bool {
+    const dir: std.Io.Dir = .cwd();
+    const st = dir.statFile(agent.io_global, path, .{}) catch return false;
+    if (st.kind != .file) return false;
+    dir.deleteFile(agent.io_global, path) catch return false;
+    return true;
+}
+
+/// ── /copy ────────────────────────────────────────────────────
+const copy_picker_tag: u32 = 0x0c0;
+
+/// API error is a history notice, not an assistant message.
+fn collectAssistantTexts(s: *session_mod.Session, out: *[copytext.max_lookback][]const u8) usize {
+    var n: usize = 0;
+    var i = s.messages.items.len;
+    while (i > 0 and n < copytext.max_lookback) : (i -= 1) {
+        const msg = s.messages.items[i - 1];
+        if (msg.role != .assistant) continue;
+        if (msg.content.len == 0) continue;
+        out[n] = msg.content;
+        n += 1;
+    }
+    return n;
+}
+
+/// `/copy [N]`: the answer, on the clipboard and in a file.
+pub fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
+    const s = agent.session orelse {
+        agent.pushInfo(m, copytext.no_messages_msg);
+        return;
+    };
+    var texts: [copytext.max_lookback][]const u8 = undefined;
+    const n = collectAssistantTexts(s, &texts);
+    if (n == 0) {
+        agent.pushInfo(m, copytext.no_messages_msg);
+        return;
+    }
+
+    const sel = copytext.select(texts[0..n], arg);
+    const index: usize = switch (sel) {
+        .found => |i| i,
+        .no_messages => {
+            agent.pushInfo(m, copytext.no_messages_msg);
+            return;
+        },
+        .usage, .too_few => {
+            var buf: [256]u8 = undefined;
+            agent.pushInfo(m, copytext.formatRefusal(&buf, sel, arg));
+            return;
+        },
+    };
+
+    var ctx = copytext.buildCtx(m.allocator, texts[index]) catch {
+        agent.pushInfo(m, "the answer could not be prepared for copying");
+        return;
+    };
+
+    // Nothing to choose (no code blocks) or the user asked for the full
+    // response always: there is no picker to open.
+    if (ctx.blocks.len == 0 or m.copy_always_full) {
+        defer ctx.deinit();
+        performCopy(m, &ctx, 0);
+        return;
+    }
+
+    const items = buildCopyItems(m, &ctx);
+    if (items.len == 0) {
+        ctx.deinit();
+        agent.pushInfo(m, copytext.no_messages_msg);
+        return;
+    }
+    m.setCopyCtx(ctx);
+    m.openPickerIdx(copy_picker_tag, "Copy", items, copyPickerChosen, copyPickerCancelled);
+}
+
+/// The rows of the `/copy` picker: the whole answer, one per code block, and
+/// the row that remembers the choice.
+///
+/// The labels are the code's OWN first lines (that is what the user
+/// recognises), cut to 60 columns. Two blocks that start with the same line
+/// get a counter, because a picker with two identical rows is a picker where
+/// the user cannot tell what they are about to copy.
+fn buildCopyItems(m: *tui.Model, ctx: *const copytext.Ctx) []tui.PickerItem {
+    const gpa = m.allocator;
+    var items: std.ArrayList(tui.PickerItem) = .empty;
+
+    var full_buf: [128]u8 = undefined;
+    const full_text = copytext.formatFullLabel(
+        &full_buf,
+        copytext.countChars(ctx.full),
+        copytext.countLines(ctx.full),
+    );
+    const full_label = gpa.dupe(u8, full_text) catch return items.toOwnedSlice(gpa) catch return &.{};
+    items.append(gpa, .{ .label = full_label, .desc = "" }) catch {
+        gpa.free(full_label);
+        return items.toOwnedSlice(gpa) catch return &.{};
+    };
+
+    var label_buf: [copytext.label_buf_len]u8 = undefined;
+    var base_buf: [copytext.label_buf_len]u8 = undefined;
+    var desc_buf: [96]u8 = undefined;
+    for (ctx.blocks, 0..) |b, bi| {
+        // The base label is COPIED out of the scratch buffer: the loop below
+        // uses the same buffer, and a label that changes under the comparison
+        // is a label that matches the wrong row.
+        const base = copytext.truncateToCols(b.code, copytext.label_max_cols, &label_buf);
+        @memcpy(base_buf[0..base.len], base);
+        const base_label = base_buf[0..base.len];
+        // How many EARLIER rows already say the same thing? Only the earlier
+        // ones: counting the later ones too would give three identical blocks
+        // the same "(3)" and the picker three rows that look the same.
+        var same: usize = 0;
+        for (ctx.blocks[0..bi]) |prev| {
+            if (prev.code.len == b.code.len and std.mem.eql(u8, prev.code, b.code)) continue;
+            const prev_label = copytext.truncateToCols(prev.code, copytext.label_max_cols, &label_buf);
+            if (std.mem.eql(u8, prev_label, base_label)) same += 1;
+        }
+        const label = copytext.uniqueLabel(gpa, base_label, same) catch continue;
+        const desc_text = copytext.formatBlockDesc(&desc_buf, b.lang, b.code);
+        // An EMPTY desc is a literal, not an allocation: `closePicker` only
+        // frees a desc that is not empty, so an allocated "" would leak.
+        const desc = if (desc_text.len == 0) "" else (gpa.dupe(u8, desc_text) catch "");
+        items.append(gpa, .{ .label = label, .desc = desc }) catch {
+            gpa.free(label);
+            if (desc.len > 0) gpa.free(desc);
+            continue;
+        };
+    }
+
+    const always = gpa.dupe(u8, copytext.always_label) catch return items.toOwnedSlice(gpa) catch return &.{};
+    const always_desc = gpa.dupe(u8, copytext.always_desc) catch "";
+    items.append(gpa, .{ .label = always, .desc = always_desc }) catch {
+        gpa.free(always);
+        if (always_desc.len > 0) gpa.free(always_desc);
+    };
+    return items.toOwnedSlice(gpa) catch return &.{};
+}
+
+/// The picker chose a row.
+///
+/// Index 0 is the whole answer, 1..n are the code blocks, and the row after
+/// them is "always copy the full response" (which copies the answer AND
+/// remembers not to ask again).
+fn copyPickerChosen(m: *tui.Model, tag: u32, index: usize) void {
+    _ = tag;
+    var ctx = m.takeCopyCtx() orelse return;
+    defer ctx.deinit();
+    const always = index > ctx.blocks.len;
+    if (always) {
+        m.copy_always_full = true;
+        performCopy(m, &ctx, 0);
+        return;
+    }
+    performCopy(m, &ctx, index);
+}
+
+/// The picker was closed with ESC: a cancel is not an error.
+fn copyPickerCancelled(m: *tui.Model, tag: u32) void {
+    _ = tag;
+    if (m.takeCopyCtx()) |ctx| {
+        var c = ctx;
+        c.deinit();
+    }
+    agent.pushInfo(m, copytext.cancelled_msg);
+}
+
+/// The copy itself: the clipboard first, then the file, then the message.
+fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
+    const text = ctx.textAt(index) orelse return;
+    const chars = copytext.countChars(text);
+    const lines = copytext.countLines(text);
+
+    // The clipboard FIRST, and the file after: upstream learned that the
+    // clipboard call is the one that can be slow (waiting for tmux), and the
+    // message that says "copied" should not arrive after the file.
+    const decision = copyToClipboard(m, text);
+
+    // Toast: show the confirmation in the top-right corner for ~1 second.
+    // At 40 ms/tick when busy, 25 ticks = 1000 ms.
+    var tb: [64]u8 = undefined;
+    m.copy_toast_text = std.fmt.bufPrint(&tb, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
+    m.copy_toast_frames = 12;
+
+    var name_buf: [64]u8 = undefined;
+    const filename = copyFileName(index, ctx, &name_buf);
+    const path = writeCopyFile(m, text, filename);
+
+    var msg_buf: [512]u8 = undefined;
+    if (path) |p| {
+        defer m.allocator.free(p);
+        agent.pushInfo(m, copytext.formatCopiedVia(&msg_buf, chars, lines, decision.method.phrase(), p));
+    } else {
+        // The file could not be written: said out loud, not swallowed. The
+        // clipboard half may still have worked.
+        agent.pushInfo(m, copytext.formatCopiedNoFile(&msg_buf, chars, lines, decision.method.phrase()));
+    }
+}
+
+/// The name of the file the copy is written to.
+///
+/// The whole answer is `response.md`; a block is `copy<ext>`, with the
+/// extension taken from the fence's language. A language tag is MODEL OUTPUT
+/// and a path is a FILESYSTEM, so the tag is sanitised (`copytext`).
+fn copyFileName(index: usize, ctx: *const copytext.Ctx, buf: []u8) []const u8 {
+    if (index == 0) return copytext.full_filename;
+    const block = ctx.blocks[index - 1];
+    return copytext.filenameForBlock(block.lang, buf);
+}
+
+/// The clipboard, with the ladder.
+///
+/// The decision (which rung) is made BEFORE anything is spawned, and the
+/// message names the rung that was used. The last rung is OSC 52, which goes
+/// through the RENDER: the TUI owns the escape sequence, because a sequence
+/// written outside the render is one the next frame paints over.
+fn copyToClipboard(m: *tui.Model, text: []const u8) clipboard.Decision {
+    const env = m.environ orelse {
+        m.setCopyPending(text);
+        return .{ .method = .osc52 };
+    };
+    if (!m.io_ready) {
+        m.setCopyPending(text);
+        return .{ .method = .osc52 };
+    }
+    const plan = clipboard.planFor(m.io, env);
+    const decision = clipboard.copy(m.io, plan, text);
+    if (decision.method == .osc52) {
+        m.setCopyPending(text);
+    }
+    return decision;
+}
+
+/// The file the copy is ALSO written to.
+///
+/// It is written ALWAYS: the clipboard is best-effort by nature (a terminal
+/// that ignores OSC 52, a tool that is not there), and a file is not.
+///
+/// The file is 0600 in a 0700 directory: it holds the model's answer, and
+/// `/tmp` is world-readable.
+fn writeCopyFile(m: *tui.Model, text: []const u8, filename: []const u8) ?[]const u8 {
+    if (!m.io_ready) return null;
+    const gpa = m.allocator;
+    const tmp = clipboard.copyDir(m.environ);
+    const dir_path = std.fmt.allocPrint(gpa, "{s}/zode", .{tmp}) catch return null;
+    defer gpa.free(dir_path);
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, filename }) catch return null;
+
+    var dir = std.Io.Dir.cwd().openDir(m.io, ".", .{}) catch return null;
+    defer dir.close(m.io);
+    // The directory is 0700 and the file 0600: it holds the model's answer and
+    // `/tmp` is world-readable. The mode goes on the OPEN file, not after the
+    // write: a `create` + `chmod` leaves a window in which the file exists
+    // world-readable.
+    _ = dir.createDirPathStatus(m.io, dir_path, copy_dir_mode) catch {};
+    var file = dir.createFile(m.io, path, .{ .truncate = true }) catch {
+        gpa.free(path);
+        return null;
+    };
+    defer file.close(m.io);
+    file.setPermissions(m.io, copy_file_mode) catch {};
+    file.writeStreamingAll(m.io, text) catch {
+        gpa.free(path);
+        return null;
+    };
+    return path;
+}
+
+/// 0700 for the directory of copies, 0600 for the file itself.
+const copy_dir_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
+const copy_file_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
+
+
+/// `/bg`: the background jobs, and the two ways to stop them.
+pub fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
+    const arg = arg_in orelse "";
+    if (std.ascii.eqlIgnoreCase(arg, "killall")) {
+        const n = if (m.io_ready) m.bg.killNow(agent.io_global) else m.bg.requestKillAll();
+        agent.pushInfoFmt(m, "killed {d} background command{s}", .{
+            n,
+            if (n == 1) @as([]const u8, "") else @as([]const u8, "s"),
+        });
+        return;
+    }
+    if (std.ascii.startsWithIgnoreCase(arg, "kill")) {
+        var it = std.mem.tokenizeAny(u8, arg, " \t");
+        _ = it.next(); // "kill"
+        const id_str = it.next() orelse {
+            agent.pushInfo(m, "/bg kill <id> · /bg killall");
+            return;
+        };
+        const id = std.fmt.parseInt(u32, id_str, 10) catch {
+            agent.pushInfo(m, "/bg kill <id> · /bg killall");
+            return;
+        };
+        if (m.bg.kill(agent.io_global, id)) {
+            agent.pushInfoFmt(m, "killed job {d}", .{id});
+        } else {
+            agent.pushInfoFmt(m, "job {d} was not running ({s})", .{ id, m.bg.stateWord(id) });
+        }
+        return;
+    }
+
+    var line: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&line);
+    var any = false;
+    for (0..bgproc.max_jobs) |i| {
+        const slot = &m.bg.slots[i];
+        if (!slot.isLive()) continue;
+        any = true;
+        w.print("  job {d} [{s}] {s}\n", .{ slot.id, slot.stateWord(), slot.commandSlice() }) catch {};
+    }
+    if (!any) {
+        agent.pushInfo(m, "no background commands");
+        return;
+    }
+    agent.pushInfo(m, std.mem.trimEnd(u8, w.buffered(), "\n"));
+}
+
+// ── self-update ─────────────────────────────────────────────
+
+/// Looks for a newer release at startup, in a worker, and says so if there is
+/// one. It says NOTHING when the build is current.
+pub fn startUpdateCheck(m: *tui.Model) void {
+    if (agent.envGet(m.environ, "ZODE_NO_SELF_UPDATE") != null) return;
+    spawnUpdateJob(m, .check) catch {};
+}
+
+/// `/update`: installs the newest release.
+pub fn cmdUpdate(m: *tui.Model) void {
+    spawnUpdateJob(m, .install) catch agent.pushError(m, "could not start the update");
+}
+
+const UpdateMode = enum { check, install };
+const UpdateJob = struct { model: *tui.Model, mode: UpdateMode };
+
+fn spawnUpdateJob(m: *tui.Model, mode: UpdateMode) !void {
+    const gpa = m.allocator;
+    const job = try gpa.create(UpdateJob);
+    job.* = .{ .model = m, .mode = mode };
+    m.beginWorker();
+    const thread = std.Thread.spawn(.{}, updateWorker, .{job}) catch {
+        m.endWorker();
+        gpa.destroy(job);
+        return error.ThreadSpawnFailed;
+    };
+    thread.detach();
+}
+
+fn updateWorker(job: *UpdateJob) void {
+    const m = job.model;
+    const mode = job.mode;
+    defer m.allocator.destroy(job);
+    defer m.endWorker();
+
+    var threaded: std.Io.Threaded = .init(m.allocator, .{});
+    defer threaded.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+
+    const ctx: selfupdate.Context = .{
+        .io = threaded.io(),
+        .alloc = arena_state.allocator(),
+        .env = m.environ,
+    };
+
+    switch (mode) {
+        .check => {
+            const up = selfupdate.check(ctx, false) orelse return;
+            announceUpdate(m, up);
+            if (agent.envGet(m.environ, "ZODE_AUTO_UPDATE") != null) installUpdateNow(m, ctx);
+        },
+        .install => installUpdateNow(m, ctx),
+    }
+}
+
+fn announceUpdate(m: *tui.Model, up: selfupdate.Update) void {
+    var buf: [160]u8 = undefined;
+    const phrase = selfupdate.phrase(&buf, up);
+    m.pushInfoFmt("zode {s} · /update installs it", .{phrase});
+}
+
+fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
+    m.pushInfoFmt("updating zode from {s}…", .{selfupdate.current_version});
+    const tag = selfupdate.installLatest(ctx) catch |err| switch (err) {
+        error.AlreadyNewest => {
+            m.pushInfoFmt("zode {s} is already the newest release", .{selfupdate.current_version});
+            return;
+        },
+        else => {
+            m.pushErrorFmt("update failed: {s}", .{updateErrorPhrase(err)});
+            return;
+        },
+    };
+    m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
+}
+
+fn updateErrorPhrase(err: selfupdate.InstallError) []const u8 {
+    return switch (err) {
+        error.AlreadyNewest => "already the newest release",
+        error.NoAssetForPlatform => "this platform has no release binary",
+        error.DownloadFailed => "could not download it (network, GitHub, or no release yet)",
+        error.BinaryDoesNotRun => "the downloaded binary does not run here; nothing was replaced",
+        error.NotWritable => "could not replace the running binary (permissions?)",
+        error.UnsupportedPlatform => "no releases for this OS/arch",
+    };
+}
+
+/// Group (+1 index over command groups) of each command key.
+pub fn cmdGroup(key: []const u8) u8 {
+    if (std.mem.eql(u8, key, "connect")) return 1;
+    const k = if (key.len > 0 and key[0] == '/') key[1..] else key;
+    if (std.mem.eql(u8, k, "help") or std.mem.eql(u8, k, "new") or
+        std.mem.eql(u8, k, "resume") or std.mem.eql(u8, k, "yolo")) return 2;
+    if (std.mem.eql(u8, k, "free-auto") or std.mem.eql(u8, k, "free")) return 3;
+    if (std.mem.eql(u8, k, "model") or
+        std.mem.eql(u8, k, "provider") or std.mem.eql(u8, k, "providers") or
+        std.mem.eql(u8, k, "effort") or
+        std.mem.eql(u8, k, "submodel") or std.mem.eql(u8, k, "task-parallel")) return 4;
+    return 5;
+}
+
+/// Public wrapper for tests/external callers.
+pub fn cmdGroupPublic(key: []const u8) u8 {
+    return cmdGroup(key);
+}
+
+/// `/submodel [off | <model> | <provider> <model>]`; no args: report.
+pub fn cmdSubmodel(m: *tui.Model, arg: ?[]const u8) void {
+    const a = arg orelse return agent.submodelReport(m);
+    if (std.mem.eql(u8, a, "off") or std.mem.eql(u8, a, "none")) {
+        agent.submodelSetOff();
+        m.pushInfoFmt("subagents: the same model as the main turn (`/submodel off`; config.json and the environment are ignored this session). Set: /submodel <model> | <provider> <model>", .{});
+        return;
+    }
+    var it = std.mem.tokenizeScalar(u8, a, ' ');
+    const t1 = it.next() orelse return agent.submodelReport(m);
+    const t2 = it.next();
+    if (t2 == null and (config_mod.find(agent.user_config, t1) != null or providers.byId(t1) != null)) {
+        agent.setSubmodel(t1, "");
+    } else if (t2) |mo| {
+        agent.setSubmodel(t1, mo);
+    } else {
+        agent.setSubmodel("", t1);
+    }
+    agent.submodelClearFail();
+    agent.submodelReport(m);
+}
+
+
+const runtime_state = @import("agent/runtime_state.zig");
+
+/// `/iter [n]`: set or show per-session iteration budget.
+pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
+    if (arg) |raw| {
+        const n = std.fmt.parseInt(usize, raw, 10) catch {
+            agent.pushInfo(m, "/iter: expected a number (minimum 8)");
+            return;
+        };
+        if (n < 8) {
+            agent.pushInfoFmt(m, "/iter: minimum is 8, you asked for {d}", .{n});
+            return;
+        }
+        if (n > 200) {
+            agent.pushInfoFmt(m, "/iter: maximum is 200, you asked for {d}", .{n});
+            return;
+        }
+        if (n < 32) {
+            agent.pushInfoFmt(m, "/iter: budget set to {d} iterations — low for a long task, fine for a short one", .{n});
+        } else {
+            agent.pushInfoFmt(m, "/iter: budget set to {d} iterations for this session", .{n});
+        }
+        agent.iter_limit_override = n;
+    } else {
+        const cur = agent.iterationLimit();
+        const src = runtime_state.iterationSource(agent.iter_limit_override > 0, agent.model_requested_iter > 0);
+        agent.pushInfoFmt(m, "/iter: current budget is {d} iterations ({s})", .{ cur, src });
+    }
 }

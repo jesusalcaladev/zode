@@ -50,12 +50,12 @@ pub fn pathParts(path: []const u8) struct { base: []const u8, dir: []const u8 } 
 
 /// Compact one-line file change card text.
 ///
-/// Format (text fallback, Nerd Font icon optional): `name  +A -R  ·  dir`
-/// The leading marker/icon is left to the renderer so it can apply theme roles.
+/// Format (text fallback): `name  +A -R  ·  dir`
+/// The leading marker/icon/label is left to the renderer so it can apply
+/// theme roles and semantic file labels consistently.
 pub fn formatCompact(buf: []u8, c: Change, nerd_icons: bool) []const u8 {
+    _ = nerd_icons; // label/icon rendering is handled by the caller/renderer
     const parts = pathParts(c.path);
-    const chip = lang_icons.forPath(c.path, nerd_icons);
-    _ = chip;
     if (parts.dir.len == 0 or std.mem.eql(u8, parts.dir, ".")) {
         return std.fmt.bufPrint(buf, "{s}  +{d} -{d}", .{ parts.base, c.added, c.removed }) catch parts.base;
     }

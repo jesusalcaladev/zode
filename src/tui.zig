@@ -69,6 +69,33 @@ pub const StatusKind = enum {
     }
 };
 
+/// Phase 5 workbench view mode (presentation layer only).
+/// Must not change agent/session/permission/tool runtime behavior.
+pub const ViewMode = enum {
+    normal,
+    focus,
+    flow,
+    review,
+
+    pub fn name(self: ViewMode) []const u8 {
+        return switch (self) {
+            .normal => "normal",
+            .focus => "focus",
+            .flow => "flow",
+            .review => "review",
+        };
+    }
+
+    pub fn desc(self: ViewMode) []const u8 {
+        return switch (self) {
+            .normal => "default presentation",
+            .focus => "reduced chrome/metadata (presentation only)",
+            .flow => "conversation/streaming emphasis (presentation only)",
+            .review => "diff/file/review emphasis (presentation only)",
+        };
+    }
+};
+
 /// The face is always SEVEN columns wide, and that is what the footer's layout
 /// is built on.
 ///
@@ -459,6 +486,14 @@ fn bannerRuleLine(pa: std.mem.Allocator, width: u16) PLine {
 /// bug this exists to avoid.
 pub const diff_preview_lines = 12;
 
+/// Large code blocks are previewed in the rendered transcript for readability.
+/// The full content remains in the message/session (honest fallback). When a
+/// generic per-block expand state is added, this becomes the default collapsed
+/// size; until then, the preview is stable and non-destructive.
+pub const code_preview_lines = 80;
+pub const code_preview_head = 50;
+pub const code_preview_tail = 20;
+
 const max_net_baselines: usize = 64;
 const max_net_baseline_file: usize = 256 * 1024;
 const max_net_baseline_total: usize = 1024 * 1024;
@@ -704,6 +739,7 @@ fn appendLangChipLine(
 ///   - a top border `╭─────╮`
 ///   - an optional language chip with a background
 ///   - each line wrapped in `│ … │`
+///   - optional line numbers (when useful, for multi-line blocks)
 ///   - a bottom border `╰─────╯`
 ///
 /// All memory comes out of `pa`.
@@ -739,12 +775,23 @@ fn buildCodeBlockLines(
         if (ln_w > max_w) max_w = ln_w;
     }
 
-    // Inner width: code text + left gutter `│ ` + right gutter ` │`. A line
-    // wider than that WRAPS inside the box (third pass), so `max_w` sizes the
-    // box but never pushes it past the terminal.
+    // Line numbers: useful for multi-line code blocks. Continuation rows from
+    // wrapping keep gutter space without repeating the number.
+    const show_line_numbers = blk.lines.len > 1;
+    const line_no_width: u16 = if (!show_line_numbers) 0 else blk: {
+        var n = blk.lines.len;
+        var digits: u16 = 1;
+        while (n >= 10) : (n /= 10) digits += 1;
+        break :blk digits + 1; // right-aligned number field + trailing space
+    };
+
+    // Inner width: code text + left gutter `│ ` + optional line-number gutter
+    // + right gutter ` │`. A line wider than that WRAPS inside the box, so
+    // `max_w` sizes the box but never pushes it past the terminal.
     const inner_w: u16 = @intCast(@min(max_w, std.math.maxInt(u16)));
-    const box_w: u16 = @min(inner_w + 4, width);
-    const text_w: u16 = box_w -| 4;
+    const desired = inner_w + 4 + line_no_width;
+    const box_w: u16 = @min(desired, width);
+    const text_w: u16 = box_w -| (4 + line_no_width);
 
     var lines: std.ArrayList(PLine) = .empty;
 
@@ -764,30 +811,123 @@ fn buildCodeBlockLines(
     try appendLangChipLine(pa, ctx, &lines, blk.lang, box_w, nerd_icons);
 
     // ── code lines, wrapped to `text_w` columns inside the box ──────────────
-    for (raw_lines.items) |src| {
-        var i: usize = 0;
-        while (true) {
-            var out: std.ArrayList(CellRun) = .empty;
-            try out.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
-            var used: u16 = 0;
-            while (i < src.len) : (i += 1) {
-                const c = src[i];
-                if (used + c.w > text_w) break;
-                var st = c.style;
-                st.bg = theme.code_bg.bg;
-                try out.append(pa, .{ .text = c.text, .w = c.w, .style = st });
-                used += c.w;
+    // Large blocks show head+tail preview with an honest omission notice; full
+    // content remains in the session/message (no data loss).
+    const total_lines = raw_lines.items.len;
+    const truncated = total_lines > code_preview_lines;
+    const head_n: usize = if (truncated) @min(code_preview_head, total_lines) else total_lines;
+    const tail_n: usize = if (truncated) @min(code_preview_tail, total_lines - head_n) else 0;
+    const hidden_lines: usize = if (truncated) total_lines - head_n - tail_n else 0;
+
+    const RenderCodeLine = struct {
+        fn run(
+            pa_: std.mem.Allocator,
+            out_lines: *std.ArrayList(PLine),
+            src: []const CellRun,
+            line_no: usize,
+            show_nums: bool,
+            line_no_w: u16,
+            text_w_: u16,
+            box_w_: u16,
+        ) !void {
+            var i: usize = 0;
+            var first_chunk = true;
+            while (true) {
+                var out: std.ArrayList(CellRun) = .empty;
+                try out.append(pa_, .{ .text = "│ ", .w = 2, .style = theme.code_border });
+                if (show_nums) {
+                    if (first_chunk) {
+                        var num_buf: [16]u8 = undefined;
+                        const num_field_w: u16 = line_no_w -| 1;
+                        const num_text = std.fmt.bufPrint(&num_buf, "{d}", .{line_no}) catch "?";
+                        const num_cols: u16 = @intCast(@min(num_text.len, num_field_w));
+                        var pad_n: u16 = num_field_w -| num_cols;
+                        while (pad_n > 0) : (pad_n -= 1) {
+                            try out.append(pa_, .{ .text = " ", .w = 1, .style = theme.diff_gutter });
+                        }
+                        const num_owned = try pa_.dupe(u8, num_text);
+                        var ni: usize = 0;
+                        while (ni < num_owned.len and ni < num_cols) : (ni += 1) {
+                            try out.append(pa_, .{ .text = num_owned[ni .. ni + 1], .w = 1, .style = theme.diff_gutter });
+                        }
+                        try out.append(pa_, .{ .text = " ", .w = 1, .style = theme.diff_gutter });
+                    } else {
+                        var pad_n: u16 = line_no_w;
+                        while (pad_n > 0) : (pad_n -= 1) {
+                            try out.append(pa_, .{ .text = " ", .w = 1, .style = theme.diff_gutter });
+                        }
+                    }
+                }
+                var used: u16 = 0;
+                while (i < src.len) : (i += 1) {
+                    const c = src[i];
+                    if (used + c.w > text_w_) break;
+                    var st = c.style;
+                    st.bg = theme.code_bg.bg;
+                    try out.append(pa_, .{ .text = c.text, .w = c.w, .style = st });
+                    used += c.w;
+                }
+                if (text_w_ == 0) i = src.len;
+                var pad: u16 = text_w_ -| used;
+                while (pad > 0) : (pad -= 1) {
+                    try out.append(pa_, .{ .text = " ", .w = 1, .style = theme.code_bg });
+                }
+                try out.append(pa_, .{ .text = " │", .w = 2, .style = theme.code_border });
+                try out_lines.append(pa_, .{ .cells = out.items, .w = box_w_ });
+                first_chunk = false;
+                if (i >= src.len) break;
             }
-            // A box this narrow fits no cell at all: drop the rest of the
-            // line, or the chunk loop below never advances.
-            if (text_w == 0) i = src.len;
-            var pad: u16 = text_w -| used;
-            while (pad > 0) : (pad -= 1) {
-                try out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
+        }
+    };
+
+    for (raw_lines.items[0..head_n], 0..) |src, line_idx| {
+        try RenderCodeLine.run(pa, &lines, src, line_idx + 1, show_line_numbers, line_no_width, text_w, box_w);
+    }
+
+    if (truncated) {
+        var notice_buf: [176]u8 = undefined;
+        const notice = if (tail_n > 0)
+            (std.fmt.bufPrint(
+                &notice_buf,
+                "… {d} lines omitted (preview; full content preserved in session)",
+                .{hidden_lines},
+            ) catch "… preview omitted (full content preserved in session)")
+        else
+            (std.fmt.bufPrint(
+                &notice_buf,
+                "… +{d} more lines (preview; full content preserved in session)",
+                .{hidden_lines},
+            ) catch "… preview truncated (full content preserved in session)");
+        var out: std.ArrayList(CellRun) = .empty;
+        try out.append(pa, .{ .text = "│ ", .w = 2, .style = theme.code_border });
+        if (show_line_numbers) {
+            var pad_n: u16 = line_no_width;
+            while (pad_n > 0) : (pad_n -= 1) {
+                try out.append(pa, .{ .text = " ", .w = 1, .style = theme.diff_gutter });
             }
-            try out.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
-            try lines.append(pa, .{ .cells = out.items, .w = box_w });
-            if (i >= src.len) break;
+        }
+        var used: u16 = 0;
+        var itn = vaxis.unicode.graphemeIterator(notice);
+        while (itn.next()) |g| {
+            const b = g.bytes(notice);
+            const gw = theme.graphemeWidth(ctx, b);
+            if (used + gw > text_w) break;
+            const owned_b = try pa.dupe(u8, b);
+            try out.append(pa, .{ .text = owned_b, .w = gw, .style = theme.ink3 });
+            used += gw;
+        }
+        var pad: u16 = text_w -| used;
+        while (pad > 0) : (pad -= 1) {
+            try out.append(pa, .{ .text = " ", .w = 1, .style = theme.code_bg });
+        }
+        try out.append(pa, .{ .text = " │", .w = 2, .style = theme.code_border });
+        try lines.append(pa, .{ .cells = out.items, .w = box_w });
+
+        if (tail_n > 0) {
+            const tail_start = total_lines - tail_n;
+            for (raw_lines.items[tail_start..], 0..) |src, j| {
+                try RenderCodeLine.run(pa, &lines, src, tail_start + j + 1, show_line_numbers, line_no_width, text_w, box_w);
+            }
         }
     }
 
@@ -1401,6 +1541,21 @@ pub const Model = struct {
     face_painted_text: [7]u8 = undefined,
     face_painted_dx: u8 = 0,
 
+    /// Phase 4 (Zode Motion): motion accessibility/performance controls.
+    /// `no_animation` disables decorative/continuous motion and renders final
+    /// states immediately. `reduced_motion` keeps essential status changes but
+    /// avoids continuous motion (e.g. mascot lean/jitter loops). Correctness
+    /// and responsiveness take priority over motion.
+    reduced_motion: bool = false,
+    no_animation: bool = false,
+    motion_tick_count: u64 = 0,
+    mascot_motion_repaints: u64 = 0,
+
+    /// Phase 5 (Workbench): presentation-only workspace view mode.
+    /// This is a UI layer over shared runtime state; it must not change agent,
+    /// session, permission, or tool execution behavior.
+    view_mode: ViewMode = .normal,
+
     /// Permission dialog (fixed buffers, no churn between threads).
     perm_tool: [64]u8 = undefined,
     perm_tool_len: usize = 0,
@@ -1546,6 +1701,10 @@ pub const Model = struct {
     changed: filesview.Changed = .{},
     /// File paths that already emitted a compact card in the current turn.
     turn_file_cards: filesview.Changed = .{},
+    /// Last file path that produced a file-diff card/change event (session-scoped).
+    /// Used by explicit file navigation/copy actions (no rendered-string parsing).
+    last_changed_file: [filesview.path_max]u8 = undefined,
+    last_changed_file_len: u16 = 0,
     /// Turn-scoped baseline content for honest net diffs: first edit stores the
     /// "before" content, subsequent edits diff against that baseline.
     net_baselines: [max_net_baselines]NetBaseline = @splat(.{}),
@@ -1786,6 +1945,10 @@ pub const Model = struct {
         /// Language of the content (only the diff uses it, to tokenize the body
         /// of each line). `""` = unknown.
         lang: []const u8 = "",
+        /// Milliseconds since app clock when the paragraph became visible
+        /// (drained to history). Used by Phase 4 motion for layout-neutral,
+        /// deterministic reveal/entrance accents. 0 means "not recent / unknown".
+        born_ms: u64 = 0,
         /// The paragraph is outside the window and `text` is compressed.
         is_cold: bool = false,
         /// Best known height in LINES: the exact one if the paragraph has been
@@ -1955,6 +2118,9 @@ pub const Model = struct {
         diff_full: []u8 = &.{},
         diff_short: []u8 = &.{},
         diff_expanded: bool = false,
+        /// File path associated with the diff (when known). Honest metadata for
+        /// navigation/review context; never inferred from rendered text.
+        diff_path: []u8 = &.{},
 
         /// Collapsible diff (Ctrl+R toggles between short/full).
         fn hasDiff(self: *const ToolMemo) bool {
@@ -1971,8 +2137,10 @@ pub const Model = struct {
             if (self.summary.len > 0) gpa.free(self.summary);
             if (self.diff_full.len > 0) gpa.free(self.diff_full);
             if (self.diff_short.len > 0) gpa.free(self.diff_short);
+            if (self.diff_path.len > 0) gpa.free(self.diff_path);
             self.diff_full = &.{};
             self.diff_short = &.{};
+            self.diff_path = &.{};
             self.diff_para_idx = null;
         }
     };
@@ -4527,6 +4695,34 @@ pub const Model = struct {
     pub fn attachIo(self: *Model, io: std.Io) void {
         self.io = io;
         self.io_ready = true;
+        self.refreshMotionEnv();
+    }
+
+    /// Reads motion preferences from the environment. Safe to call repeatedly.
+    /// `ZODE_NO_ANIMATION=1|true|yes|on` disables decorative motion.
+    /// `ZODE_REDUCED_MOTION=1|true|yes|on` avoids continuous motion.
+    pub fn refreshMotionEnv(self: *Model) void {
+        self.no_animation = agent.envTruthyIn(self.environ, "ZODE_NO_ANIMATION", false) or
+            agent.envTruthyIn(self.environ, "NO_ANIMATION", false);
+        self.reduced_motion = agent.envTruthyIn(self.environ, "ZODE_REDUCED_MOTION", false) or
+            agent.envTruthyIn(self.environ, "REDUCED_MOTION", false) or
+            self.no_animation;
+    }
+
+    pub fn motionAllowed(self: *const Model) bool {
+        return !self.no_animation and !self.reduced_motion;
+    }
+
+    /// Mascot pose for rendering. Reduced/no animation returns a stable
+    /// representative pose (frame 0, no lean, no jump hint) so status remains
+    /// readable without continuous motion. Final state/correctness first.
+    fn mascotPose(self: *Model, kind: mascot.StatusKind, now_ms: u64) mascot.Pose {
+        // Note: setKind mutates animator clock; only meaningful in animated mode.
+        if (self.no_animation or self.reduced_motion) {
+            return .{ .text = mascot.face(kind), .hint = .none, .dx = 0 };
+        }
+        self.mascot_animator.setKind(kind, now_ms);
+        return self.mascot_animator.pose(now_ms);
     }
 
     /// Milliseconds since `start`. 0 if there is no clock or no turn.
@@ -5068,15 +5264,39 @@ pub const Model = struct {
             }
             break :blk head_buf[0..n];
         };
+        // Clear failure marker for tool outputs (presentation only). Never hide
+        // errors: collapsed summaries still show this text and ^R expands details.
+        var fail_head_buf: [184]u8 = undefined;
+        const display_head: []const u8 = blk: {
+            const s = std.mem.trimStart(u8, head, " \t");
+            if (s.len == 0) break :blk head;
+            // UTF-8 ✗ is 3 bytes; also accept ASCII markers.
+            if (std.mem.startsWith(u8, s, "\xe2\x9c\x97") or std.mem.startsWith(u8, s, "!")) break :blk head;
+            const prefixes = [_][]const u8{ "error", "denied", "refused", "failed", "panic", "aborted", "killed" };
+            for (prefixes) |pfx| {
+                if (s.len >= pfx.len and std.ascii.eqlIgnoreCase(s[0..pfx.len], pfx)) {
+                    const boundary = if (s.len == pfx.len)
+                        true
+                    else blk_b: {
+                        const c = s[pfx.len];
+                        break :blk_b (c == ':' or c == ' ' or c == ',' or c == '!' or c == '.');
+                    };
+                    if (boundary) {
+                        break :blk std.fmt.bufPrint(&fail_head_buf, "\xe2\x9c\x97 {s}", .{head}) catch head;
+                    }
+                }
+            }
+            break :blk head;
+        };
         // Marked summary and dim time: you read "what happened" and then "how
         // long it took" without them mixing. When the full result differs from
         // the summary, append a Ctrl+R hint so the user knows the tool result
         // is condensed and can be expanded to the full transcript.
         const can_expand = result.len > 0 and !std.mem.eql(u8, result, summary);
         const line = if (can_expand)
-            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms · ^R", .{ head, ms }) catch head
+            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms · ^R", .{ display_head, ms }) catch display_head
         else
-            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms", .{ head, ms }) catch head;
+            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms", .{ display_head, ms }) catch display_head;
 
         // Three copies: the paragraph's (pending), the summary and the full
         // result (for Ctrl+R). All gpa-owned.
@@ -5130,7 +5350,7 @@ pub const Model = struct {
     /// already counted and thrown away); the caller can show it in the
     /// summary.
     pub fn pushDiff(self: *Model, before: []const u8, after: []const u8) DiffCounts {
-        return self.pushDiffLang(before, after, "");
+        return self.pushDiffLang(before, after, "", "");
     }
 
     /// Like `pushDiffLang` but also emits a compact file-change card using the
@@ -5147,6 +5367,12 @@ pub const Model = struct {
         return self.pushFileDiffOp(before, after, path, .modified);
     }
 
+    /// Returns the last changed file path, if any (structured state, not parsed UI).
+    pub fn lastChangedFile(self: *const Model) ?[]const u8 {
+        if (self.last_changed_file_len == 0) return null;
+        return self.last_changed_file[0..self.last_changed_file_len];
+    }
+
     pub fn pushFileDiffOp(
         self: *Model,
         before: []const u8,
@@ -5155,6 +5381,10 @@ pub const Model = struct {
         operation: filechange.Operation,
     ) DiffCounts {
         const lang = langFromPath(path);
+        if (path.len > 0 and path.len <= self.last_changed_file.len) {
+            @memcpy(self.last_changed_file[0..path.len], path);
+            self.last_changed_file_len = @intCast(path.len);
+        }
 
         // Under lock: resolve/create baseline for honest net diffs.
         // Copy baseline bytes out before diffing so we never hold the model lock
@@ -5205,42 +5435,40 @@ pub const Model = struct {
 
         // Card policy: show first operation card, and show net cards on
         // subsequent edits (honest cumulative state vs original baseline).
-        // If net becomes empty, still show "(net, no changes from baseline)".
+        // If net becomes empty, still show net/no-changes explicitly (honest).
         const show_card = first_card or is_net;
         if (show_card) {
-            var buf: [280]u8 = undefined;
-            const card = filechange.formatCompact(&buf, .{
-                .path = path,
-                .operation = .modified,
-                .added = dc.added,
-                .removed = dc.removed,
-            }, false);
             const chip = lang_icons.forPath(path, false);
-            const has_label = chip.label.len > 0 and !std.mem.eql(u8, chip.label, filechange.pathParts(path).base);
-            if (is_net) {
-                if (dc.added == 0 and dc.removed == 0) {
-                    if (has_label)
-                        self.pushInfoFmt("file changed (net, no changes)  [{s}] {s}", .{ chip.label, filechange.pathParts(path).base })
-                    else
-                        self.pushInfoFmt("file changed (net, no changes)  {s}", .{filechange.pathParts(path).base});
-                } else if (has_label)
-                    self.pushInfoFmt("file changed (net)  [{s}] {s}", .{ chip.label, card })
-                else
-                    self.pushInfoFmt("file changed (net)  {s}", .{card});
-            } else if (dc.added > 0 or dc.removed > 0) {
-                const op_label = switch (operation) {
-                    .created => "file created",
-                    .deleted => "file deleted",
-                    else => "file changed",
-                };
+            const base = filechange.pathParts(path).base;
+            const has_label = chip.label.len > 0 and !std.mem.eql(u8, chip.label, base);
+            const op_word: []const u8 = if (is_net) "Net" else switch (operation) {
+                .created => "Created",
+                .deleted => "Deleted",
+                .renamed => "Renamed",
+                .restored => "Restored",
+                else => "Changed",
+            };
+            if (is_net and dc.added == 0 and dc.removed == 0) {
                 if (has_label)
-                    self.pushInfoFmt("{s}  [{s}] {s}", .{ op_label, chip.label, card })
+                    self.pushInfoFmt("  File {s}  [{s}]  {s}  ·  No net changes (baseline -> current)", .{ op_word, chip.label, path })
                 else
-                    self.pushInfoFmt("{s}  {s}", .{ op_label, card });
+                    self.pushInfoFmt("  File {s}  {s}  ·  No net changes (baseline -> current)", .{ op_word, path });
+            } else if (is_net or dc.added > 0 or dc.removed > 0) {
+                var buf: [280]u8 = undefined;
+                const card = filechange.formatCompact(&buf, .{
+                    .path = path,
+                    .operation = operation,
+                    .added = dc.added,
+                    .removed = dc.removed,
+                }, false);
+                if (has_label)
+                    self.pushInfoFmt("  File {s}  [{s}]  {s}", .{ op_word, chip.label, card })
+                else
+                    self.pushInfoFmt("  File {s}  {s}", .{ op_word, card });
             }
         }
 
-        _ = self.pushDiffLang(diff_from, after, lang);
+        _ = self.pushDiffLang(diff_from, after, lang, path);
         return dc;
     }
 
@@ -5269,6 +5497,7 @@ pub const Model = struct {
         before: []const u8,
         after: []const u8,
         lang: []const u8,
+        path: []const u8,
     ) DiffCounts {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -5325,7 +5554,7 @@ pub const Model = struct {
             }
             s.print(
                 arena,
-                "\n… {d} more lines · ctrl+r to expand",
+                "\n… {d} more lines  ·  Ctrl+R to expand",
                 .{diff_lines.len - diff_preview_lines},
             ) catch {};
             if (s.items.len > 0) short = s.items;
@@ -5335,7 +5564,7 @@ pub const Model = struct {
         // diff. A preview is a summary, and a word-level highlight inside a
         // summary is confetti: the reader cannot see the whole change, so
         // which words changed inside those twelve rows is noise.
-        self.pushDiffKind(joined.items, short, lang, short == null);
+        self.pushDiffKind(joined.items, short, lang, path, short == null);
         return .{ .added = added, .removed = removed };
     }
 
@@ -5352,7 +5581,7 @@ pub const Model = struct {
     /// `pushToolStart` already copied from the path: otherwise the paragraph
     /// would point at the worker's arena, which is freed at the end of the
     /// turn.
-    fn pushDiffKind(self: *Model, text: []const u8, short: ?[]const u8, lang: []const u8, word_diff: bool) void {
+    fn pushDiffKind(self: *Model, text: []const u8, short: ?[]const u8, lang: []const u8, path: []const u8, word_diff: bool) void {
         const gpa = self.allocator;
 
         // What the paragraph shows, and what is kept for Ctrl+R. When either
@@ -5385,6 +5614,10 @@ pub const Model = struct {
             self.pushKind(.diff, para_src);
             return;
         };
+        const path_copy: []u8 = if (path.len > 0)
+            (gpa.dupe(u8, path) catch gpa.dupe(u8, "") catch @constCast(@as([]const u8, "")))
+        else
+            (gpa.dupe(u8, "") catch @constCast(@as([]const u8, "")));
 
         self.lock();
         defer self.unlock();
@@ -5399,6 +5632,7 @@ pub const Model = struct {
         }) catch {
             gpa.free(text_copy);
             gpa.free(lang_copy);
+            if (path_copy.len > 0) gpa.free(path_copy);
             freeDiffMemoParts(gpa, keep_full, keep_short);
             return;
         };
@@ -5411,9 +5645,11 @@ pub const Model = struct {
                 gpa.dupe(u8, text) catch &.{};
             if (lt.diff_full.len > 0) gpa.free(lt.diff_full);
             if (lt.diff_short.len > 0) gpa.free(lt.diff_short);
+            if (lt.diff_path.len > 0) gpa.free(lt.diff_path);
             lt.diff_para_idx = idx;
-            lt.diff_full = if (nav_full.len > 0) nav_full else &.{};
-            lt.diff_short = if (collapsed) keep_short else &.{};
+            lt.diff_full = if (nav_full.len > 0) @constCast(nav_full) else @constCast(@as([]const u8, &.{}));
+            lt.diff_short = if (collapsed) keep_short else @constCast(@as([]const u8, &.{}));
+            lt.diff_path = @constCast(path_copy);
             lt.diff_expanded = !collapsed;
             if (collapsed) {
                 keep_full = &.{}; // ownership moved to lt.diff_full
@@ -5421,6 +5657,9 @@ pub const Model = struct {
             } else if (nav_full.len > 0) {
                 // nav_full is a separate copy for non-collapsed case
             }
+            // path_copy ownership moved to lt.diff_path (even if empty, it's &.{}).
+        } else if (path_copy.len > 0) {
+            gpa.free(path_copy);
         }
         freeDiffMemoParts(gpa, keep_full, keep_short);
         self.dirty = true;
@@ -5430,6 +5669,101 @@ pub const Model = struct {
     fn freeDiffMemoParts(gpa: std.mem.Allocator, full: []u8, short: []u8) void {
         if (full.len > 0) gpa.free(full);
         if (short.len > 0) gpa.free(short);
+    }
+
+    /// Navigate between diff paragraphs in the timeline (Phase 3 file/diff
+    /// navigation foundation). Scrolls to the target diff and reports position.
+    /// Presentation-only navigation: history and runtime state are unchanged.
+    pub fn navigateDiff(self: *Model, delta: i8) bool {
+        self.ensureParaHeights();
+        self.lock();
+        var count: usize = 0;
+        for (self.paras.items) |p| {
+            if (p.kind == .diff) count += 1;
+        }
+        if (count == 0) {
+            self.unlock();
+            self.pushInfo("Diff nav: no diff blocks in the timeline");
+            return false;
+        }
+        const cur_para = if (self.follow_bottom and self.paras.items.len > 0)
+            self.paras.items.len - 1
+        else
+            @min(self.anchor_para, if (self.paras.items.len == 0) 0 else self.paras.items.len - 1);
+
+        var target: ?usize = null;
+        var target_ord: usize = 0;
+        if (delta > 0) {
+            // Next diff after the current position; wrap to first.
+            var ord: usize = 0;
+            for (self.paras.items, 0..) |p, i| {
+                if (p.kind != .diff) continue;
+                ord += 1;
+                if (i > cur_para) {
+                    target = i;
+                    target_ord = ord;
+                    break;
+                }
+            }
+            if (target == null) {
+                ord = 0;
+                for (self.paras.items, 0..) |p, i| {
+                    if (p.kind != .diff) continue;
+                    ord += 1;
+                    target = i;
+                    target_ord = ord;
+                    break;
+                }
+            }
+        } else {
+            // Previous diff before the current position; wrap to last.
+            var ord: usize = 0;
+            var last: ?struct { i: usize, ord: usize } = null;
+            for (self.paras.items, 0..) |p, i| {
+                if (p.kind != .diff) continue;
+                ord += 1;
+                if (i < cur_para) last = .{ .i = i, .ord = ord };
+            }
+            if (last) |l| {
+                target = l.i;
+                target_ord = l.ord;
+            } else {
+                ord = 0;
+                for (self.paras.items, 0..) |p, i| {
+                    if (p.kind != .diff) continue;
+                    ord += 1;
+                    target = i;
+                    target_ord = ord;
+                }
+            }
+        }
+
+        const ti = target orelse {
+            self.unlock();
+            return false;
+        };
+        // Expand collapsed diff if this target is the tracked last diff.
+        const lt = self.last_tool;
+        const needs_expand = if (lt) |t| t.diff_para_idx == ti and !t.diff_expanded else false;
+        self.ensureParaHeights();
+        const target_line = self.heightPrefix(ti);
+        self.scrollTo(target_line);
+        self.follow_bottom = false;
+        self.anchor_para = ti;
+        self.anchor_off = 0;
+        self.anchor = target_line;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+        self.unlock();
+
+        if (needs_expand) {
+            _ = self.toggleLastTool();
+            // Expanding changes paragraph height; re-scroll to the diff.
+            self.ensureParaHeights();
+            self.scrollTo(self.heightPrefix(ti));
+        }
+        self.pushInfoFmt("Diff {d}/{d}  (use /diff next|prev)", .{ target_ord, count });
+        return true;
     }
 
     /// Navigate to next/prev hunk in the last diff (Phase 3). Expands the diff
@@ -5447,12 +5781,12 @@ pub const Model = struct {
         self.lock();
         const lt = self.last_tool orelse {
             self.unlock();
-            self.pushInfo("hunk nav: no active diff (expand or run a file edit first)");
+            self.pushInfo("Hunk nav: no active diff (expand or run a file edit first)");
             return false;
         };
         if (!lt.hasNavigableDiff()) {
             self.unlock();
-            self.pushInfo("hunk nav: no active diff (expand or run a file edit first)");
+            self.pushInfo("Hunk nav: no active diff (expand or run a file edit first)");
             return false;
         }
         const para_idx = lt.diff_para_idx.?;
@@ -5465,17 +5799,17 @@ pub const Model = struct {
         var it = std.mem.splitScalar(u8, full, '\n');
         while (it.next()) |line| lines_list.append(arena, line) catch {
             self.unlock();
-            self.pushInfo("hunk nav: out of memory");
+            self.pushError("Hunk nav: out of memory");
             return false;
         };
         const parsed = diffhunks.parse(arena, lines_list.items) catch {
             self.unlock();
-            self.pushInfo("hunk nav: could not parse diff hunks");
+            self.pushError("Hunk nav: could not parse diff hunks");
             return false;
         };
         if (parsed.count() == 0) {
             self.unlock();
-            self.pushInfo("hunk nav: no hunks in diff");
+            self.pushInfo("Hunk nav: no hunks in diff");
             return false;
         }
         const cur = if (self.hunk_nav_para == para_idx) self.hunk_nav_idx else null;
@@ -5486,33 +5820,53 @@ pub const Model = struct {
         };
         const boundary = if (cur) |c| c == idx else false;
         const h = parsed.at(idx).?;
+        var path_buf: [filesview.path_max]u8 = undefined;
+        var path_len: usize = 0;
+        if (self.last_tool) |lt2| {
+            if (lt2.diff_path.len > 0) {
+                path_len = @min(lt2.diff_path.len, path_buf.len);
+                @memcpy(path_buf[0..path_len], lt2.diff_path[0..path_len]);
+            }
+        }
         self.hunk_nav_para = para_idx;
         self.hunk_nav_idx = idx;
+        // Best-effort scroll to the selected hunk header. `header_line` is the
+        // 0-based unified-diff line index; rendered rows can differ with
+        // wrapping/word-diff layout, so this is approximate and clamped by
+        // scroll bounds. Precise layout-aware focus is a follow-up.
         self.ensureParaHeights();
-        const target_line = if (para_idx < self.para_heights.items.len) self.heightPrefix(para_idx) else 0;
+        const para_start = if (para_idx < self.para_heights.items.len) self.heightPrefix(para_idx) else 0;
+        const para_h = if (para_idx < self.para_heights.items.len) self.para_heights.items[para_idx] else 0;
+        const approx_off: usize = @min(h.header_line, if (para_h > 0) para_h - 1 else h.header_line);
+        const target_line = para_start + approx_off;
         self.scrollTo(target_line);
+        self.follow_bottom = false;
+        self.anchor_para = para_idx;
+        self.anchor_off = 0;
+        self.anchor = target_line;
         self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
         self.unlock();
 
+        const path = path_buf[0..path_len];
         if (boundary) {
-            self.pushInfoFmt("hunk {d}/{d} (boundary)  @@ -{d},{d} +{d},{d} @@  (/hunk next|prev)", .{
-                idx + 1,
-                parsed.count(),
-                h.old_start,
-                h.old_count,
-                h.new_start,
-                h.new_count,
-            });
+            if (path.len > 0)
+                self.pushInfoFmt("Hunk {d}/{d} (boundary)  {s}  @@ -{d},{d} +{d},{d} @@  (/hunk next|prev)", .{
+                    idx + 1, parsed.count(), path, h.old_start, h.old_count, h.new_start, h.new_count,
+                })
+            else
+                self.pushInfoFmt("Hunk {d}/{d} (boundary)  @@ -{d},{d} +{d},{d} @@  (/hunk next|prev)", .{
+                    idx + 1, parsed.count(), h.old_start, h.old_count, h.new_start, h.new_count,
+                });
         } else {
-            self.pushInfoFmt("hunk {d}/{d}  @@ -{d},{d} +{d},{d} @@  (alt+] next, alt+[ prev)", .{
-                idx + 1,
-                parsed.count(),
-                h.old_start,
-                h.old_count,
-                h.new_start,
-                h.new_count,
-            });
+            if (path.len > 0)
+                self.pushInfoFmt("Hunk {d}/{d}  {s}  @@ -{d},{d} +{d},{d} @@  (Alt+] next, Alt+[ prev)", .{
+                    idx + 1, parsed.count(), path, h.old_start, h.old_count, h.new_start, h.new_count,
+                })
+            else
+                self.pushInfoFmt("Hunk {d}/{d}  @@ -{d},{d} +{d},{d} @@  (Alt+] next, Alt+[ prev)", .{
+                    idx + 1, parsed.count(), h.old_start, h.old_count, h.new_start, h.new_count,
+                });
         }
         return true;
     }
@@ -5690,7 +6044,7 @@ pub const Model = struct {
             total_removed += self.net_baselines[i].net_removed;
         }
         if (files == 0) return false;
-        out.appendSlice(gpa, "changed files (net, this turn)\n") catch return false;
+        out.appendSlice(gpa, "Files  ·  Net changes this turn (baseline -> current, honest)\n") catch return false;
         i = 0;
         while (i < self.net_baselines_len) : (i += 1) {
             const nb = &self.net_baselines[i];
@@ -5705,11 +6059,11 @@ pub const Model = struct {
                 .removed = nb.net_removed,
             }, false);
             if (chip.label.len > 0 and !std.mem.eql(u8, chip.label, filechange.pathParts(path).base))
-                out.print(gpa, "  • [{s}] {s}\n", .{ chip.label, card }) catch return false
+                out.print(gpa, "  Net  [{s}]  {s}\n", .{ chip.label, card }) catch return false
             else
-                out.print(gpa, "  • {s}\n", .{card}) catch return false;
+                out.print(gpa, "  Net  {s}\n", .{card}) catch return false;
         }
-        out.print(gpa, "  total  {d} file(s)  +{d} -{d} (net)", .{ files, total_added, total_removed }) catch return false;
+        out.print(gpa, "  Total  {d} file(s)  +{d} -{d}  ·  honest net diff", .{ files, total_added, total_removed }) catch return false;
         return true;
     }
 
@@ -5893,6 +6247,7 @@ pub const Model = struct {
         // called, any scroll was wiped on the next frame: PageUp moved NOTHING
         // and it looked like scrolling didn't work.
         const hubo_nuevo = self.pending.items.len > 0;
+        const born_ms = if (hubo_nuevo) self.nowMs() else 0;
         for (self.pending.items) |p| {
             self.paras.append(self.allocator, .{
                 .kind = p.kind,
@@ -5900,6 +6255,7 @@ pub const Model = struct {
                 .base = p.base,
                 .mood = p.mood,
                 .lang = p.lang,
+                .born_ms = born_ms,
                 .word_diff = p.word_diff,
             }) catch {
                 self.allocator.free(p.text);
@@ -5919,7 +6275,7 @@ pub const Model = struct {
         // anchor is ABSOLUTE, so appending paragraphs cannot move the view, and
         // `follow_bottom` is what makes new text follow you when you ARE at the
         // bottom. Both fall out of `computeVisible`.
-        _ = hubo_nuevo;
+
     }
 
     /// Empties the visible history (Ctrl+L). The cached paragraphs are freed
@@ -6032,9 +6388,13 @@ pub const Model = struct {
     ///  * the EXCEPTION is a face whose motion layer moves: ~30 fps, the
     ///    fastest a terminal needs, because the lean is whole cells and there
     ///    is nothing between two of them to draw.
+    ///
+    /// Phase 4 (reduced/no animation): continuous mascot motion ticks are
+    /// disabled; the loop keeps worker-wakeup cadence only.
     fn tickInterval(self: *Model) u32 {
         const a = self.activity();
         var cap: u32 = if (a.busy or a.dirty) 40 else 120;
+        if (self.no_animation or self.reduced_motion) return cap;
         if (mascot.moves(self.mascot_animator.kind)) cap = 33;
         const left = mascot.frames.remainingMs(
             self.mascot_animator.kind,
@@ -6049,6 +6409,7 @@ pub const Model = struct {
     /// paint, and one that lands mid-beat does not.
     fn mascotMoved(self: *Model) bool {
         if (!self.face_painted) return true;
+        if (self.no_animation or self.reduced_motion) return false;
         const p = self.mascot_animator.pose(self.nowMs());
         return p.dx != self.face_painted_dx or !std.mem.eql(u8, p.text, &self.face_painted_text);
     }
@@ -7740,6 +8101,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // which only repaints if something changed; the alternative is an
             // app that goes dead with no explanation.
             self.tick_armed = false;
+            self.motion_tick_count +%= 1;
             const a = self.activity();
             const asked = self.redraw_requested.swap(false, .seq_cst);
             // `mascotMoved` and not "there is an animation": at rest the face
@@ -7748,7 +8110,10 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // when the app is otherwise idle, so without this the idle track
             // (blinks, exhale, yawn) was only ever painted when a key happened
             // to arrive — which is why it read as a frozen glyph.
-            if (asked or a.busy or a.dirty or a.perm or a.picker or self.pal.active or self.mascotMoved()) {
+            // Phase 4: mascot motion repaints are disabled by reduced/no animation.
+            const mascot_moved = self.mascotMoved();
+            if (mascot_moved) self.mascot_motion_repaints +%= 1;
+            if (asked or a.busy or a.dirty or a.perm or a.picker or self.pal.active or mascot_moved) {
                 ctx.redraw = true;
             }
             // The queue is drained here and not by the worker: `startChat`
@@ -9404,11 +9769,11 @@ fn drawPermissionModal(
 
     // Too small for a readable box: compact form keeps the turn answerable.
     if (w < 28 or height < 8 or h < 7) {
-        drawPermissionModalCompact(p, width, height, tool, allow_always, sandbox_note);
+        drawPermissionModalCompact(p, width, height, tool, detail, rule, allow_always, sandbox_note);
         return;
     }
     if (h > height -| 2) {
-        drawPermissionModalCompact(p, width, height, tool, allow_always, sandbox_note);
+        drawPermissionModalCompact(p, width, height, tool, detail, rule, allow_always, sandbox_note);
         return;
     }
     const x: u16 = (width -| w) / 2;
@@ -9546,11 +9911,15 @@ fn drawPermissionModalCompact(
     width: u16,
     height: u16,
     tool: []const u8,
+    detail: []const u8,
+    rule: ?[]const u8,
     allow_always: bool,
     allow_sandbox: bool,
 ) void {
     if (height == 0 or width == 0) return;
-    const rows: u16 = if (height >= 2) 2 else 1;
+    // Show critical context when space allows, but never hide the options row.
+    const has_ctx = allow_sandbox or rule != null or detail.len > 0;
+    const rows: u16 = if (height >= 3 and has_ctx) 3 else if (height >= 2) 2 else 1;
     const y: u16 = height - rows;
 
     // The whole row is cleared first: the history would show through the
@@ -9561,9 +9930,26 @@ fn drawPermissionModalCompact(
         p.fillRange(0, width, y + r, " ", .{});
     }
 
-    var nb: [64]u8 = undefined;
+    var nb: [96]u8 = undefined;
     const head = std.fmt.bufPrint(&nb, "⚠ Permission: {s}", .{tool}) catch "⚠ Permission";
     _ = p.putClipped(1, y, head, width -| 2, theme.warn_bold);
+
+    const opts_y: u16 = y + rows - 1;
+    if (rows >= 3) {
+        // Critical context (clipped). Full modal explains why/effects; compact
+        // preserves the most important cue when there is room.
+        if (allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash")) {
+            _ = p.putClipped(1, y + 1, "sandbox available (S): OS restrictions if kernel allows", width -| 2, theme.hint);
+        } else if (rule) |rname| {
+            var rb: [160]u8 = undefined;
+            const why = std.fmt.bufPrint(&rb, "asked by rule: {s}", .{rname}) catch "asked by permission rule";
+            _ = p.putClipped(1, y + 1, why, width -| 2, theme.hint);
+        } else {
+            // Detail summary (first line/chunk), clipped.
+            const d = std.mem.trim(u8, detail, " \t\r\n");
+            if (d.len > 0) _ = p.putClipped(1, y + 1, d, width -| 2, theme.ink3);
+        }
+    }
 
     if (rows >= 2) {
         // Show only the actions the runtime actually accepts; the normal modal
@@ -9578,7 +9964,7 @@ fn drawPermissionModalCompact(
             "Y allow · A always · N deny · ESC cancel"
         else
             "Y allow · N deny · ESC cancel";
-        _ = p.putClipped(1, y + 1, opts, width -| 2, theme.brand_soft);
+        _ = p.putClipped(1, opts_y, opts, width -| 2, theme.brand_soft);
     }
 }
 
@@ -9727,11 +10113,11 @@ fn drawAskPanel(
         }
         if (compact_row < compact_rows) {
             const hint: []const u8 = if (choice_rows > 0)
-                "↑↓ choose · enter · esc"
+                "↑↓ choose · Enter · Esc"
             else if (snap.typing)
-                "enter sends · esc: decide"
+                "Enter sends · Esc: decide"
             else
-                "answer below · esc: decide";
+                "Type answer below · Esc: decide";
             _ = p.putClipped(1, compact_row, askLineForWidth(p, hint, compact_w, p.arena), compact_w, theme.hint);
         }
         return;
@@ -9824,7 +10210,7 @@ fn drawAskPanel(
                 std.fmt.bufPrint(&marker, "  {d} ", .{i + 1}) catch "  ";
             const used = p.putClipped(inner_col, row, mk, inner_w, style);
             const marker_cols = used - inner_col;
-            const tag_text = if (i == 0 and !is_other) " · recommended" else "";
+            const tag_text = if (i == 0 and !is_other) " · Recommended" else "";
             const tag_cols: u16 = @intCast(columnsOf(p, tag_text));
             const keep_tag = tag_text.len > 0 and inner_w > marker_cols + tag_cols + 8;
             const label_cols = inner_w - marker_cols - (if (keep_tag) tag_cols else 0);
@@ -9850,11 +10236,11 @@ fn drawAskPanel(
     // drawn in the one tone of the palette that cannot be read.
     var hb: [96]u8 = undefined;
     const hint_txt: []const u8 = if (snap.typing)
-        "enter sends it · esc: you decide"
+        "Enter sends · Esc: you decide"
     else if (choice_rows > 0)
-        "↑↓ choose · enter answers · esc: you decide"
+        "↑↓ choose · Enter answers · Esc: you decide"
     else
-        "type your answer below · enter sends it · esc: you decide";
+        "Type your answer below · Enter sends · Esc: you decide";
     const ht = std.fmt.bufPrint(&hb, "{s}", .{hint_txt}) catch hint_txt;
     if (ht.len > 0 and row < last_row) {
         _ = p.putClipped(inner_col, row, ht, inner_w, theme.hint);
@@ -10134,12 +10520,12 @@ fn drawStateFooter(
         .warn => .warn,
         .err => .err,
     };
-    // Advance the mascot's clock. `setKind` is what restarts a track, and it
-    // only fires on a CHANGE: two tools in a row keep the loop they are in the
-    // middle of instead of snapping back to its first beat.
+    // Phase 4 (Zode Motion): reduced/no animation renders a stable pose
+    // (representative face, no lean/jump hint) immediately. Continuous motion
+    // is only sampled when motion is allowed.
     const now_ms = self.nowMs();
-    self.mascot_animator.setKind(m_kind, now_ms);
-    const pose = self.mascot_animator.pose(now_ms);
+    if (self.motionAllowed()) self.mascot_animator.setKind(m_kind, now_ms);
+    const pose = self.mascotPose(m_kind, now_ms);
     const face_text = pose.text;
 
     var legend: []const u8 = "";
@@ -10186,6 +10572,11 @@ fn drawStateFooter(
         // Idle: the agent's own last word, if it said one ("done", "ready").
         legend = self.status();
         if (legend.len == 0) legend = "ready";
+        // Phase 5 Review mode (presentation-only): subtle review affordance when
+        // idle and there is file/diff context. Never shown during critical states.
+        if (self.view_mode == .review and detail.len == 0 and self.lastChangedFile() != null) {
+            detail = "review: /diff /hunk /file";
+        }
     }
     if (queued > 0) {
         var qbuf: [32]u8 = undefined;
@@ -10507,7 +10898,8 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
     // It is only shown when the model HAS a knob: a model with no effort
     // control has no level to show, and a footer full of words nobody can act
     // on is a footer nobody reads.
-    if (chat.effortSupport(shown_model) != .none) {
+    // Phase 5 Focus mode: reduce secondary chrome (runtime state unchanged).
+    if (m.view_mode != .focus and chat.effortSupport(shown_model) != .none) {
         const eff = agent.effectiveEffort();
         if (out.items.len > 0) {
             out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
@@ -10529,6 +10921,14 @@ fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
             }
             out.append(arena, .{ .text = "free-auto: building pool…", .style = theme.warn }) catch return null;
         }
+    }
+
+    // Phase 5 workbench view mode (presentation-only, secondary metadata).
+    if (m.view_mode != .normal) {
+        if (out.items.len > 0) {
+            out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
+        }
+        out.append(arena, .{ .text = m.view_mode.name(), .style = theme.brand }) catch return null;
     }
 
     if (out.items.len == 0) return null;
@@ -11922,7 +12322,7 @@ test "file diff: emits a compact file change card with real stats" {
 
     const s = try drawTest(&m, arena_state.allocator(), 72, 20);
     const all = allText(s);
-    try std.testing.expect(std.mem.indexOf(u8, all, "file changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "File Changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "demo.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "+2 -1") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "-two") != null);
@@ -11954,11 +12354,11 @@ test "file diff: multiple edits to same file in one turn show honest net diff" {
 
     const s = try drawTest(&m, arena_state.allocator(), 80, 28);
     const all = allText(s);
-    // First card (operation), then net cards.
-    try std.testing.expect(std.mem.indexOf(u8, all, "file changed") != null);
+    // First card (operation), then honest net cards (baseline -> current).
+    try std.testing.expect(std.mem.indexOf(u8, all, "File Changed") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "net.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "file changed (net)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "file changed (net, no changes)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "File Net") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "No net changes") != null);
     // Net diff from baseline to edit 2 state should show BETA and GAMMA additions vs beta.
     try std.testing.expect(std.mem.indexOf(u8, all, "+BETA") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "+GAMMA") != null);
@@ -14581,7 +14981,7 @@ test "a long diff collapses into a preview, and Ctrl+R swaps it for the whole th
     try std.testing.expectEqual(@as(usize, 1), diffs);
     const short_text = m.paras.items[diff_idx.?].text;
     try std.testing.expect(std.mem.startsWith(u8, short_text, "diff preview · +60 −60"));
-    try std.testing.expect(std.mem.indexOf(u8, short_text, "ctrl+r to expand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "Ctrl+R to expand") != null);
     try std.testing.expect(std.mem.indexOf(u8, short_text, "more lines") != null);
     // The preview is the FIRST lines, and the far end of the file is not there.
     try std.testing.expect(std.mem.indexOf(u8, short_text, "linea 0") != null);
@@ -14591,12 +14991,12 @@ test "a long diff collapses into a preview, and Ctrl+R swaps it for the whole th
     try std.testing.expect(m.toggleLastTool());
     const full_text = m.paras.items[diff_idx.?].text;
     try std.testing.expect(std.mem.indexOf(u8, full_text, "linea 59") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_text, "ctrl+r to expand") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text, "Ctrl+R to expand") == null);
 
     // …and Ctrl+R closes it again (the same key, the same paragraph).
     try std.testing.expect(m.toggleLastTool());
     const again = m.paras.items[diff_idx.?].text;
-    try std.testing.expect(std.mem.indexOf(u8, again, "ctrl+r to expand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, again, "Ctrl+R to expand") != null);
     try std.testing.expect(std.mem.indexOf(u8, again, "linea 59") == null);
 
     // And the whole thing survives a draw at a realistic size.
@@ -14672,7 +15072,7 @@ test "Ctrl+R on a paragraph that went COLD rehydrates it instead of corrupting i
 
     const idx = m.last_tool.?.diff_para_idx.?;
     const text_len = m.paras.items[idx].text.len;
-    try std.testing.expect(std.mem.indexOf(u8, m.paras.items[idx].text, "ctrl+r to expand") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.paras.items[idx].text, "Ctrl+R to expand") != null);
 
     // Cold, the way `pruneCold` leaves it when you scroll away.
     const buf = try std.testing.allocator.alloc(u8, text_len + 1);
@@ -14690,7 +15090,7 @@ test "Ctrl+R on a paragraph that went COLD rehydrates it instead of corrupting i
     const p = &m.paras.items[idx];
     try std.testing.expect(!p.is_cold);
     try std.testing.expect(std.mem.indexOf(u8, p.text, "line 79!") != null); // the whole diff
-    try std.testing.expect(std.mem.indexOf(u8, p.text, "ctrl+r to expand") == null);
+    try std.testing.expect(std.mem.indexOf(u8, p.text, "Ctrl+R to expand") == null);
     // And it is really the text: a decompression of raw bytes would be garbage
     // or an assert, never a clean diff.
     try std.testing.expect(std.mem.indexOf(u8, p.text, "with enough text for a realistic preview") != null);
@@ -14845,7 +15245,7 @@ test "the TUI diff uses the path's language: a + line carries tokens" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
 
-    _ = m.pushDiffLang("x\n", "const n: u32 = 4\n", "zig");
+    _ = m.pushDiffLang("x\n", "const n: u32 = 4\n", "zig", "");
     _ = try drawTest(&m, arena_state.allocator(), 60, 20);
 
     // The paragraph carries the language with it (not a pointer to the worker's
@@ -15675,7 +16075,7 @@ test "ask: the options are painted INSIDE the panel, numbered, and the selection
     try std.testing.expect(findRow(s, "4 " ++ ask_other_label) != null);
     // ...the first row is marked as the recommendation, in words and not implied
     // by position...
-    try std.testing.expect(findRow(s, "recommended") != null);
+    try std.testing.expect(findRow(s, "Recommended") != null);
     // ...and the highlighted row says so with a marker, not only with a colour.
     try std.testing.expect(findRow(s, "▸ 1 postgres") != null);
 }
@@ -15719,8 +16119,10 @@ test "ask: narrow and short layouts keep the question visible in the compact pan
     var small_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer small_arena.deinit();
     const short = try drawTest(&m, small_arena.allocator(), 80, 13);
-    try std.testing.expect(std.mem.indexOf(u8, allText(short), "Which approach") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allText(short), "▸ 1 recommended") != null);
+    const short_text = allText(short);
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "Which approach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "▸ 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_text, "Recommended") != null);
 }
 
 test "ask: width 24 with a long question keeps the selector usable" {
@@ -16417,12 +16819,12 @@ test "ask panel wraps by words, stays in history, and leaves the answer input vi
         "Decision",
         &.{ "Use adapter", "Add adapter" },
     );
-    const s = try drawTest(&m, arena, 40, 24);
+    const s = try drawTest(&m, arena, 60, 24);
 
     // The complete word remains on one row instead of being split at the box
     // edge, and the question's choices remain inside the bordered panel.
     try std.testing.expect(findRow(s, "exceptionallylongword") != null);
-    try std.testing.expect(findRow(s, "recommended") != null);
+    try std.testing.expect(findRow(s, "Recommended") != null);
     try std.testing.expect(findRow(s, "Use adapter") != null);
 
     // The panel is confined to the history viewport; the borderless prompt and
@@ -16431,7 +16833,7 @@ test "ask panel wraps by words, stays in history, and leaves the answer input vi
     // In ask mode the prompt is `?` (warn color) to distinguish from normal prompt.
     const input_top = s.size.height - 2;
     try std.testing.expectEqualStrings("?", s.readCell(1, input_top).char.grapheme);
-    try std.testing.expect(findRow(s, "enter answers") != null);
+    try std.testing.expect(findRow(s, "Enter answers") != null);
 }
 
 test "ramReport: an empty session is zero, and the split adds up by construction" {

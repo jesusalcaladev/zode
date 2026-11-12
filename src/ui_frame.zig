@@ -228,8 +228,8 @@ fn dumpLayout(wtr: *std.Io.Writer, m: *tui.Model) !void {
     try wtr.print(
         "\x1b[2m  layout: hist_rows={d} first={d} last={d} max_offset={d} cache_lo={d} live_h={d} paras={d} cache={d}\n",
         .{
-            m.hist_rows, m.first_visible, m.max_offset, m.max_offset,
-            m.cache_lo,  m.live_h,       m.paras.items.len, m.seg_cache.items.len,
+            m.hist_rows, m.first_visible, m.max_offset,      m.max_offset,
+            m.cache_lo,  m.live_h,        m.paras.items.len, m.seg_cache.items.len,
         },
     );
     for (m.seg_cache.items, 0..) |c, i| {
@@ -337,7 +337,7 @@ fn sceneDiff(m: *tui.Model) void {
     ;
     m.pushToolStart("Edit", "src/lib/theme.zig");
     m.toolRunEnd();
-    _ = m.pushDiffLang(before, after, "zig");
+    _ = m.pushDiffLang(before, after, "zig", "");
     m.pushToolDone("Edit", "Edit  src/lib/theme.zig", 7, "x");
     m.pushInfoFmt("{d} tool results elided", .{3});
 }
@@ -384,7 +384,7 @@ fn sceneBigWrite(m: *tui.Model) void {
         before.appendSlice(std.heap.page_allocator, line) catch break;
         after.appendSlice(std.heap.page_allocator, line) catch break;
     }
-    _ = m.pushDiffLang(before.items, after.items, "zig");
+    _ = m.pushDiffLang(before.items, after.items, "zig", "");
     m.pushToolDone("Write", "Write  src/lib/taskstore.zig (600 lines)", 31, "x");
 }
 

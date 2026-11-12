@@ -164,10 +164,11 @@ pub const Report = struct {
     /// file was read.
     pub fn addRead(self: *Report, path: []const u8, lines: u32, in_context: bool) !void {
         if (self.body.items.len > 0) try self.body.append(self.gpa, '\n');
-        try self.body.print(self.gpa, "  {s: <30} {d: >7} lines  \u{b7} {s}", .{
+        const state = if (in_context) "in context" else "not in context";
+        try self.body.print(self.gpa, "  Read     {s: <34} {d: >6} lines  ·  {s}", .{
             path,
             lines,
-            if (in_context) "in context" else "not in context",
+            state,
         });
         self.reads += 1;
     }
@@ -178,9 +179,9 @@ pub const Report = struct {
         const chip = lang_icons.forPath(path, false);
         const base = std.fs.path.basename(path);
         if (chip.label.len > 0 and !std.mem.eql(u8, chip.label, base)) {
-            try self.body.print(self.gpa, "  • [{s}] {s}", .{ chip.label, path });
+            try self.body.print(self.gpa, "  Changed  [{s}]  {s}", .{ chip.label, path });
         } else {
-            try self.body.print(self.gpa, "  • {s}", .{path});
+            try self.body.print(self.gpa, "  Changed  {s}", .{path});
         }
         self.changes += 1;
     }
@@ -201,11 +202,11 @@ pub const Report = struct {
         errdefer out.deinit(self.gpa);
 
         if (self.reads == 0 and self.changes == 0 and !self.bash_may_write) {
-            try out.appendSlice(self.gpa, "files \u{b7} nothing read or written yet this session");
+            try out.appendSlice(self.gpa, "Files  ·  Nothing read or written yet this session");
             return out.toOwnedSlice(self.gpa);
         }
 
-        try out.print(self.gpa, "files \u{b7} {d} read \u{b7} {d} changed this session", .{
+        try out.print(self.gpa, "Files  ·  {d} read  ·  {d} changed this session", .{
             self.reads,
             self.changes,
         });
@@ -214,16 +215,16 @@ pub const Report = struct {
             try out.appendSlice(self.gpa, self.body.items);
         }
         if (dropped > 0) {
-            try out.print(self.gpa, "\n  \u{b7} {d} more file(s) not listed (the list holds {d})", .{
+            try out.print(self.gpa, "\n  Note  {d} more file(s) not listed (list holds {d})", .{
                 dropped,
                 max_changed,
             });
         }
         if (self.bash_may_write) {
-            try out.print(self.gpa, "\n  \u{b7} a `bash` command may have changed files that are not in this list", .{});
+            try out.print(self.gpa, "\n  Note  A `bash` command may have changed files that are not in this list", .{});
         }
         if (stats.hits > 0 or stats.saved > 0) {
-            try out.print(self.gpa, "\nread cache \u{b7} {d} re-read{s} avoided \u{b7} ~{d} KB not re-sent", .{
+            try out.print(self.gpa, "\n  Cache  {d} re-read{s} avoided  ·  ~{d} KB not re-sent", .{
                 stats.hits,
                 if (stats.hits == 1) "" else "s",
                 stats.saved / 1024,
@@ -242,8 +243,9 @@ test "the empty report says so, and does not show an empty section" {
     defer r.deinit();
     const text = try r.finish(.{}, 0);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "nothing read or written") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Nothing read or written") != null);
     try testing.expect(std.mem.indexOf(u8, text, "read cache") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Cache") == null);
 }
 
 test "the header counts the files, and the rows say whether they are in the context" {
@@ -272,6 +274,7 @@ test "the changed files are their own section" {
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "2 changed") != null);
     try testing.expect(std.mem.indexOf(u8, text, "changed\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Changed") != null);
     try testing.expect(std.mem.indexOf(u8, text, "src/agent.zig") != null);
 }
 
