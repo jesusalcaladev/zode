@@ -1296,6 +1296,56 @@ pub fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
     m.pushInfoOwned(text);
 }
 
+/// Rehydrates the in-memory plan on resume by replaying todo tool calls (30.5).
+fn hydratePlanFromSession(m: *tui.Model, s: *session_mod.Session) void {
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var plan = plan_mod.Plan.init();
+
+    for (s.messages.items) |sm| {
+        if (sm.role != .assistant) continue;
+        const tcj = sm.tool_calls_json orelse continue;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, tcj, .{}) catch continue;
+        if (parsed != .array) continue;
+        for (parsed.array.items) |call| {
+            if (call != .object) continue;
+            const obj = call.object;
+            var name: ?[]const u8 = null;
+            if (obj.get("function")) |f| {
+                if (f == .object) {
+                    if (f.object.get("name")) |n| if (n == .string) {
+                        name = n.string;
+                    };
+                }
+            }
+            if (name == null) {
+                if (obj.get("name")) |n| if (n == .string) {
+                    name = n.string;
+                };
+            }
+            if (name == null or !std.mem.eql(u8, name.?, "todo")) continue;
+
+            var args: ?[]const u8 = null;
+            if (obj.get("function")) |f| {
+                if (f == .object) {
+                    if (f.object.get("arguments")) |a| if (a == .string) {
+                        args = a.string;
+                    };
+                }
+            }
+            if (args == null) {
+                if (obj.get("arguments")) |a| if (a == .string) {
+                    args = a.string;
+                };
+            }
+            if (args == null) continue;
+            _ = applyPlanTo(&plan, args.?, arena);
+        }
+    }
+    m.replacePlan(plan);
+}
+
 /// Replays the session messages into the TUI history so they are visible
 /// when a session is resumed. The session messages are stored in the session
 /// file but the TUI's history (`paras`) is separate and needs to be populated
@@ -3295,6 +3345,7 @@ fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
     resetSessionFiles(m);
     m.clearPlan();
     replaySessionMessages(m, s);
+    hydratePlanFromSession(m, s);
     m.applyScrollState(s.getScrollState());
     pushInfoFmt(m, "session resumed: {s} · {d} messages", .{ std.fs.path.basename(path), s.messages.items.len });
     refreshContextUsage(m);
