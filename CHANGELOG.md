@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add the native `github` gateway tool (github) [`f35a03ed`](https://github.com/jesusalcaladev/zode/commit/f35a03ed)
 - add the git workflow module with native GitHub first (git) [`1998ccc5`](https://github.com/jesusalcaladev/zode/commit/1998ccc5)
 - add the /github status command and route the model to it (github) [`f25b91ca`](https://github.com/jesusalcaladev/zode/commit/f25b91ca)
-- refine file intelligence navigation and compact change output (tui) [`45b3cd87`](https://github.com/jesusalcaladev/zode/commit/45b3cd87)
+- refine file intelligence navigation and compact change output (tui) [`d06c2137`](https://github.com/jesusalcaladev/zode/commit/d06c2137)
 
 ### Bug Fixes
 
@@ -70,6 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add ACP smoke test script (acp) [`9e60750f`](https://github.com/jesusalcaladev/zode/commit/9e60750f)
 - add a pty smoke for the /github command (github) [`ac702c5c`](https://github.com/jesusalcaladev/zode/commit/ac702c5c)
 - pin the paths a person hits without credentials (github) [`cd0f93c8`](https://github.com/jesusalcaladev/zode/commit/cd0f93c8)
+- cover session summary/counters and consistency checkpoints (30.3, 30.5) [`0e676f03`](https://github.com/jesusalcaladev/zode/commit/0e676f03)
 
 ### Other
 
@@ -82,6 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - improve unified diff preview structure [`4fc5112b`](https://github.com/jesusalcaladev/zode/commit/4fc5112b)
 - add hunk navigation ui for last diff [`1ddc6995`](https://github.com/jesusalcaladev/zode/commit/1ddc6995)
 - fine-tune hunk navigation [`05d4454f`](https://github.com/jesusalcaladev/zode/commit/05d4454f)
+- tui/commands: complete 35.3,35.4,35.12,35.13,35.15 and update task board [`5c035cd2`](https://github.com/jesusalcaladev/zode/commit/5c035cd2)
+- mark Sprint E/Phase 35 complete and refresh next-up status [`fe9bd452`](https://github.com/jesusalcaladev/zode/commit/fe9bd452)
+- clean up Phase 30 checklist structure [`8a0dc0f8`](https://github.com/jesusalcaladev/zode/commit/8a0dc0f8)
+- hydrate plan from todo calls on resume (30.5) [`d34022c4`](https://github.com/jesusalcaladev/zode/commit/d34022c4)
+- derive turn-1 title from first prompt (30.2 partial) [`f3999e51`](https://github.com/jesusalcaladev/zode/commit/f3999e51)
+- mark 30.2 turn-1 title derivation done [`f8378dfa`](https://github.com/jesusalcaladev/zode/commit/f8378dfa)
+- add /branch to fork sessions (30.4) [`32c0d9e7`](https://github.com/jesusalcaladev/zode/commit/32c0d9e7)
+- add turn-3 AI title upgrade (30.2) [`efb2760f`](https://github.com/jesusalcaladev/zode/commit/efb2760f)
+- add running summaries and resume counters/checkpoints (30.3, 30.5) [`431272d8`](https://github.com/jesusalcaladev/zode/commit/431272d8)
 
 ## [0.2.0] - 2026-11-07
 

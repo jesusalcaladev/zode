@@ -1308,3 +1308,133 @@ test "Session: scroll state persists across resume" {
     defer alloc.free(used_path);
     defer std.Io.Dir.cwd().deleteFile(io, used_path) catch {};
 }
+
+
+test "load: checkpoint event detects consistency mismatch" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const p = try std.fmt.allocPrint(a, ".zode-ckpt-{d}.jsonl", .{std.testing.random_seed});
+    defer std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    defer {
+        const caps = std.fmt.allocPrint(a, "{s}.caps.json", .{p}) catch null;
+        if (caps) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+        const compact = std.fmt.allocPrint(a, "{s}.compact.json", .{p}) catch null;
+        if (compact) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = p,
+        .data =
+        \\{"role":"user","content":"hi"}
+        \\{"role":"assistant","content":"hello"}
+        \\{"event":"checkpoint","messages":3}
+        \\
+        ,
+    });
+
+    var sess = try load(alloc, io, p);
+    defer sess.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sess.messages.items.len);
+    try std.testing.expectEqual(@as(?usize, 3), sess.checkpoint_expected_messages);
+    try std.testing.expect(sess.consistency_mismatch);
+}
+
+test "load: matching checkpoint has no consistency mismatch" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const p = try std.fmt.allocPrint(a, ".zode-ckpt-ok-{d}.jsonl", .{std.testing.random_seed});
+    defer std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    defer {
+        const caps = std.fmt.allocPrint(a, "{s}.caps.json", .{p}) catch null;
+        if (caps) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+        const compact = std.fmt.allocPrint(a, "{s}.compact.json", .{p}) catch null;
+        if (compact) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = p,
+        .data =
+        \\{"role":"user","content":"hi"}
+        \\{"role":"assistant","content":"hello"}
+        \\{"event":"checkpoint","messages":2}
+        \\
+        ,
+    });
+
+    var sess = try load(alloc, io, p);
+    defer sess.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sess.messages.items.len);
+    try std.testing.expect(!sess.consistency_mismatch);
+}
+
+test "resumePath: restores 30.3/30.5 meta fields and counters" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    const s = try Session.create(alloc, io);
+    const path = try alloc.dupe(u8, s.path.?);
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer {
+        var arena2 = std.heap.ArenaAllocator.init(alloc);
+        defer arena2.deinit();
+        const a2 = arena2.allocator();
+        const caps = std.fmt.allocPrint(a2, "{s}.caps.json", .{path}) catch null;
+        if (caps) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+        const compact = std.fmt.allocPrint(a2, "{s}.compact.json", .{path}) catch null;
+        if (compact) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+        const meta = std.fmt.allocPrint(a2, "{s}.meta.json", .{path}) catch null;
+        if (meta) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+    }
+    {
+        defer {
+            s.deinit();
+            alloc.destroy(s);
+        }
+        try s.append(.user, "hello there");
+        try s.append(.assistant, "general kenobi");
+        // Set fields and persist meta/checkpoint as resume would expect.
+        if (s.summary.len > 0) alloc.free(s.summary);
+        s.summary = try alloc.dupe(u8, "general kenobi");
+        s.prompts_asked = 4;
+        s.permissions_asked = 2;
+        s.escs = 1;
+        s.persistConsistencyCheckpoint();
+        var meta_arena = std.heap.ArenaAllocator.init(alloc);
+        defer meta_arena.deinit();
+        const ma = meta_arena.allocator();
+        sessionindex.writeMeta(io, ma, path, .{
+            .name = "",
+            .model = "m",
+            .created_at = 1,
+            .custom_title = "ct",
+            .ai_title = "at",
+            .tag = "t",
+            .forked_from = "fork1234",
+            .ai_title_gen = 3,
+            .summary = s.summary,
+            .prompts_asked = s.prompts_asked,
+            .permissions_asked = s.permissions_asked,
+            .escs = s.escs,
+        }) catch unreachable;
+    }
+
+    const s2 = try Session.resumePath(alloc, io, path);
+    defer {
+        s2.deinit();
+        alloc.destroy(s2);
+    }
+    try std.testing.expectEqualStrings("ct", s2.custom_title);
+    try std.testing.expectEqualStrings("at", s2.ai_title);
+    try std.testing.expectEqualStrings("t", s2.tag);
+    try std.testing.expectEqualStrings("general kenobi", s2.summary);
+    try std.testing.expectEqual(@as(u32, 4), s2.prompts_asked);
+    try std.testing.expectEqual(@as(u32, 2), s2.permissions_asked);
+    try std.testing.expectEqual(@as(u32, 1), s2.escs);
+}

@@ -620,6 +620,45 @@ test "writeMeta and readMeta roundtrip through a real file" {
     try t.expectEqual(@as(i64, 42), back.created_at);
 }
 
+test "writeMeta/readMeta roundtrip preserves 30.2-30.5 fields" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+
+    const root = try std.fmt.allocPrint(a, ".zode-meta-rt305-{d}", .{t.random_seed});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    const session = try std.fs.path.join(a, &.{ root, "zode-2.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = session, .data = "{}\n" });
+
+    try writeMeta(io, a, session, .{
+        .name = "n",
+        .model = "m",
+        .created_at = 7,
+        .custom_title = "Custom",
+        .ai_title = "AI",
+        .tag = "work",
+        .forked_from = "abcd1234",
+        .ai_title_gen = 3,
+        .summary = "Investigating resume counters",
+        .prompts_asked = 5,
+        .permissions_asked = 2,
+        .escs = 1,
+    });
+    const back = readMeta(a, io, session);
+    try t.expectEqualStrings("Custom", back.custom_title);
+    try t.expectEqualStrings("AI", back.ai_title);
+    try t.expectEqualStrings("work", back.tag);
+    try t.expectEqualStrings("abcd1234", back.forked_from);
+    try t.expectEqual(@as(u32, 3), back.ai_title_gen);
+    try t.expectEqualStrings("Investigating resume counters", back.summary);
+    try t.expectEqual(@as(u32, 5), back.prompts_asked);
+    try t.expectEqual(@as(u32, 2), back.permissions_asked);
+    try t.expectEqual(@as(u32, 1), back.escs);
+}
+
 test "scan: newest first, sidecars and non-session files ignored" {
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
