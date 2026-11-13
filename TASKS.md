@@ -240,10 +240,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 `✨ feature + 🐛 fix · 🟡 · independent; writes what 29 reads`
 
-- [ ] **30.3** A running summary for the list — not yet (write-time summary line every N steps)
-- [ ] **30.4** `/branch` — fork is not `/new` — not yet (copy JSONL, rewrite session id, provenance chain)
-- [x] **29.5** Search in three tiers — done in Phase 29 (title substring, transcript fuzzy, semantic best-effort via `Ctrl+S`/`task`)
-- [ ] **30.5** Resume restores more than messages — not yet (plan hydration, cost state, tags)
+- [ ] **30.2** Automatic session titles (free first, AI upgrade later)
   - [ ] Turn 1: a title derived from the first prompt — synchronously, free
   - [ ] Turn 3: the AI upgrade via a `task` subagent (effort `low`) over the **last 1000 characters** of the conversation (recent context wins, input bounded); patched only while three things hold: the generation counter matches (a cheap turn-1 request resolving late must not clobber a richer turn-3 one), the session is unchanged, and there is no custom title (the `/rename` race)
   - [ ] Prompt shape: good `Fix login button on mobile` · bad `Code changes` (vague) · bad `Investigate and fix the issue where…` (long) · bad `Fix Login Button On Mobile` (wrong case); 3–7 words, sentence case, JSON-schema-constrained, `null` on any failure, and it **never blocks**
