@@ -241,7 +241,7 @@ Ctrl+R turns them on. That is the same rule with a different name.
 `✨ feature + 🐛 fix · 🟡 · independent; writes what 29 reads`
 
 - [ ] **30.2** Automatic session titles (free first, AI upgrade later)
-  - [ ] Turn 1: a title derived from the first prompt — synchronously, free
+  - [x] Turn 1: a title derived from the first prompt — synchronously, free
   - [ ] Turn 3: the AI upgrade via a `task` subagent (effort `low`) over the **last 1000 characters** of the conversation (recent context wins, input bounded); patched only while three things hold: the generation counter matches (a cheap turn-1 request resolving late must not clobber a richer turn-3 one), the session is unchanged, and there is no custom title (the `/rename` race)
   - [ ] Prompt shape: good `Fix login button on mobile` · bad `Code changes` (vague) · bad `Investigate and fix the issue where…` (long) · bad `Fix Login Button On Mobile` (wrong case); 3–7 words, sentence case, JSON-schema-constrained, `null` on any failure, and it **never blocks**
 - [ ] **30.3** A running summary for the list: one line written at write time (no model call) every `min(5 steps, 2 min)` — in a three-hour session the first prompt is hours stale and the row is useless
