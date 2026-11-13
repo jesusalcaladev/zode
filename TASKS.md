@@ -25,18 +25,15 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [ ] 🔴 **Sprint A2 — Phase 33** (the TUI at a mature harness's level): the port list,
   42 features read out of the reference implementation. 33.1 and 33.2 are done;
   the rest is the board. The porting notes are in `docs/analysis/tui-chrome.md`.
-- [ ] 🔴 **Sprint A3 — Phase 34** (the machinery the reference implementation has and we do not): sixteen
-  mechanisms that no phase owned, of which **34.1 (path-scoped permissions)** is
-  the one that should not wait — today `write` writes any path it is handed.
+- [ ] 🔴 **Sprint A3 — Phase 34** (the machinery the reference implementation has and we do not): remaining mechanisms beyond core permissions/rules; **34.1 path-scoped permissions is done** (resolved-path checks, deny rules, dangerous-path/secret protection, `Tool(pattern)` rules), with follow-ups noted in Phase 34.
   **2.1 done** (budget listing); **2.2 done** (skills once per session at end of prompt);
   **2.3 done** (named args `$1`, `$name`); **2.4 done** (`context: fork` via subagent);
   **2.5 done** (`!cmd` output substitution behind Phase 6 permissions).
 - [x] 🟡 **Sprint C — Phase 3 → 7 → 10** (recoverable results → compaction v2 → background tasks) — complete.
 - [x] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety) — Phase 6 rule engine (permrules/load/enforce) + Phase 5 hooks (`.zode/hooks.json`, Pre/Post/UserPromptSubmit/Stop, `if` via permission-rule syntax) + Phase 25 bash classification/sandbox offer complete.
-- [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
-  **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
+- [x] 🟡 **Sprint E — Phase 35** (the command surface): complete (35.1–35.15, including `/mcp`, `/sandbox`, `/add-dir`, `/vim`).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
-- [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): Phase 29 complete; Phase 30 pending (names/forks/restore) — quietly wrong today
+- [ ] 🟡 **Phase 30** (names/forks/restore): Phase 29 complete; Phase 30 pending (30.2 auto-titles, 30.3 summaries, 30.4 `/branch`, 30.5 richer resume restore)
 - [ ] 🟢 Everything else per the dependency table at the bottom.
 
 **Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills +
