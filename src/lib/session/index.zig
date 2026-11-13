@@ -51,6 +51,12 @@ pub const Meta = struct {
     forked_from: []const u8 = "",
     /// Generation of ai_title (30.2): higher/explicit generations win (turn-3 upgrade > turn-1 derive).
     ai_title_gen: u32 = 0,
+    /// Running one-line summary for the session list (30.3), no LLM.
+    summary: []const u8 = "",
+    /// 30.5 lifetime counters.
+    prompts_asked: u32 = 0,
+    permissions_asked: u32 = 0,
+    escs: u32 = 0,
 };
 
 /// One session in the list.
@@ -76,6 +82,8 @@ pub const Entry = struct {
     size_bytes: u64 = 0,
     /// Session tag (35.3), without leading '#'.
     tag: []const u8 = "",
+    /// Running one-line summary for the session list (30.3).
+    summary: []const u8 = "",
 
     /// Total title function (29.3): agentName || customTitle || aiTitle ||
     /// firstPrompt || sessionId[0..8]. A prompt starting with `<tICK>` or that
@@ -232,6 +240,10 @@ pub fn readMeta(arena: std.mem.Allocator, io: std.Io, session_path: []const u8) 
     if (parsed.tag.len > 0) result.tag = arena.dupe(u8, parsed.tag) catch "";
     if (parsed.forked_from.len > 0) result.forked_from = arena.dupe(u8, parsed.forked_from) catch "";
     result.ai_title_gen = parsed.ai_title_gen;
+    if (parsed.summary.len > 0) result.summary = arena.dupe(u8, parsed.summary) catch "";
+    result.prompts_asked = parsed.prompts_asked;
+    result.permissions_asked = parsed.permissions_asked;
+    result.escs = parsed.escs;
     return result;
 }
 
@@ -267,6 +279,18 @@ pub fn parseMeta(arena: std.mem.Allocator, data: []const u8) Meta {
     }
     if (o.get("ai_title_gen")) |v| {
         if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) meta.ai_title_gen = @intCast(v.integer);
+    }
+    if (o.get("summary")) |v| {
+        if (v == .string) meta.summary = v.string;
+    }
+    if (o.get("prompts_asked")) |v| {
+        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) meta.prompts_asked = @intCast(v.integer);
+    }
+    if (o.get("permissions_asked")) |v| {
+        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) meta.permissions_asked = @intCast(v.integer);
+    }
+    if (o.get("escs")) |v| {
+        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) meta.escs = @intCast(v.integer);
     }
     return meta;
 }
@@ -336,6 +360,11 @@ pub fn writeMetaTitles(w: *std.Io.Writer, meta: Meta) !void {
     if (meta.ai_title_gen != 0) {
         try w.print(",\"ai_title_gen\":{d}", .{meta.ai_title_gen});
     }
+    try w.writeAll(",\"summary\":");
+    try writeJsonString(w, meta.summary);
+    if (meta.prompts_asked != 0) try w.print(",\"prompts_asked\":{d}", .{meta.prompts_asked});
+    if (meta.permissions_asked != 0) try w.print(",\"permissions_asked\":{d}", .{meta.permissions_asked});
+    if (meta.escs != 0) try w.print(",\"escs\":{d}", .{meta.escs});
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -389,6 +418,7 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
         var custom_title: []const u8 = "";
         var ai_title: []const u8 = "";
         var tag: []const u8 = "";
+        var summary: []const u8 = "";
         var created: i64 = 0;
         const meta = readMeta(arena, io, path);
         if (meta.name.len > 0) name = meta.name;
@@ -396,6 +426,7 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
         if (meta.custom_title.len > 0) custom_title = meta.custom_title;
         if (meta.ai_title.len > 0) ai_title = meta.ai_title;
         if (meta.tag.len > 0) tag = meta.tag;
+        if (meta.summary.len > 0) summary = meta.summary;
         if (meta.created_at > 0) created = meta.created_at;
         if (created == 0) created = mtime;
 
@@ -408,6 +439,7 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
             .created_at = created,
             .size_bytes = size_bytes,
             .tag = tag,
+            .summary = summary,
         }) catch continue;
     }
 

@@ -2320,6 +2320,7 @@ pub const Model = struct {
             if (e.first_prompt.len > 0) self.allocator.free(e.first_prompt);
             if (e.last_prompt.len > 0) self.allocator.free(e.last_prompt);
             if (e.agent_name.len > 0) self.allocator.free(e.agent_name);
+            if (e.summary.len > 0) self.allocator.free(e.summary);
         }
         self.session_picker_entries.deinit(self.allocator);
         // Free semantic search results (tier 3, Phase 29.5).
@@ -2527,7 +2528,16 @@ pub const Model = struct {
                     const label = self.allocator.dupe(u8, title) catch "";
                     var sbuf: [24]u8 = undefined;
                     const sz = if (e.size_bytes > 0) (std.fmt.bufPrint(&sbuf, "{d} KB", .{e.size_bytes / 1024}) catch "") else "";
-                    const desc = if (e.tag.len > 0 and sz.len > 0)
+                    const summary = if (e.summary.len > 0) e.summary else (if (e.last_prompt.len > 0) e.last_prompt else "");
+                    const desc = if (summary.len > 0 and e.tag.len > 0 and sz.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} · {s} · #{s} · {s}", .{ age, sz, e.tag, summary }) catch self.allocator.dupe(u8, age) catch "")
+                    else if (summary.len > 0 and e.tag.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} · #{s} · {s}", .{ age, e.tag, summary }) catch self.allocator.dupe(u8, age) catch "")
+                    else if (summary.len > 0 and sz.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} · {s} · {s}", .{ age, sz, summary }) catch self.allocator.dupe(u8, age) catch "")
+                    else if (summary.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} · {s}", .{ age, summary }) catch self.allocator.dupe(u8, age) catch "")
+                    else if (e.tag.len > 0 and sz.len > 0)
                         (std.fmt.allocPrint(self.allocator, "{s} · {s} · #{s}", .{ age, sz, e.tag }) catch self.allocator.dupe(u8, age) catch "")
                     else if (e.tag.len > 0)
                         (std.fmt.allocPrint(self.allocator, "{s} · #{s}", .{ age, e.tag }) catch self.allocator.dupe(u8, age) catch "")
@@ -2566,7 +2576,12 @@ pub const Model = struct {
                             const title = e.title(session_id);
                             const age = sessionindex.ageLabel(now, e.created_at, &now_buf);
                             const label = self.allocator.dupe(u8, title) catch "";
-                            const desc = if (e.tag.len > 0)
+                            const summary = if (e.summary.len > 0) e.summary else (if (e.last_prompt.len > 0) e.last_prompt else "");
+                            const desc = if (summary.len > 0 and e.tag.len > 0)
+                                (std.fmt.allocPrint(self.allocator, "{s} · #{s} · {s}", .{ age, e.tag, summary }) catch self.allocator.dupe(u8, age) catch "")
+                            else if (summary.len > 0)
+                                (std.fmt.allocPrint(self.allocator, "{s} · {s}", .{ age, summary }) catch self.allocator.dupe(u8, age) catch "")
+                            else if (e.tag.len > 0)
                                 (std.fmt.allocPrint(self.allocator, "{s} · #{s}", .{ age, e.tag }) catch self.allocator.dupe(u8, age) catch "")
                             else
                                 self.allocator.dupe(u8, age) catch "";
@@ -2620,7 +2635,12 @@ pub const Model = struct {
                                 if (desc_owned) |d| desc = d;
                             } else {
                                 const age = sessionindex.ageLabel(now, hit.entry.created_at, &now_buf);
-                                desc_owned = if (hit.entry.tag.len > 0)
+                                const summary = if (hit.entry.summary.len > 0) hit.entry.summary else (if (hit.entry.last_prompt.len > 0) hit.entry.last_prompt else "");
+                                desc_owned = if (summary.len > 0 and hit.entry.tag.len > 0)
+                                    (std.fmt.allocPrint(self.allocator, "{s} · #{s} · {s}", .{ age, hit.entry.tag, summary }) catch null)
+                                else if (summary.len > 0)
+                                    (std.fmt.allocPrint(self.allocator, "{s} · {s}", .{ age, summary }) catch null)
+                                else if (hit.entry.tag.len > 0)
                                     (std.fmt.allocPrint(self.allocator, "{s} · #{s}", .{ age, hit.entry.tag }) catch null)
                                 else
                                     (self.allocator.dupe(u8, age) catch null);
@@ -3005,6 +3025,7 @@ pub const Model = struct {
                 .last_prompt = gpa.dupe(u8, e.last_prompt) catch "",
                 .agent_name = gpa.dupe(u8, e.agent_name) catch "",
                 .size_bytes = e.size_bytes,
+                .summary = gpa.dupe(u8, e.summary) catch "",
             };
             self.session_picker_entries.append(gpa, ne) catch {
                 gpa.free(pth);
@@ -3015,8 +3036,13 @@ pub const Model = struct {
             const label = gpa.dupe(u8, title) catch continue;
             var age_buf: [24]u8 = undefined;
             const age = sessionindex.ageLabel(now, ne.created_at, &age_buf);
-            var desc_buf: [64]u8 = undefined;
-            const desc_text = if (ne.size_bytes > 0)
+            const summary = if (ne.summary.len > 0) ne.summary else (if (ne.last_prompt.len > 0) ne.last_prompt else "");
+            var desc_buf: [96]u8 = undefined;
+            const desc_text = if (summary.len > 0 and ne.size_bytes > 0)
+                (std.fmt.bufPrint(&desc_buf, "{s} · {d} KB · {s}", .{ age, ne.size_bytes / 1024, summary }) catch age)
+            else if (summary.len > 0)
+                (std.fmt.bufPrint(&desc_buf, "{s} · {s}", .{ age, summary }) catch age)
+            else if (ne.size_bytes > 0)
                 (std.fmt.bufPrint(&desc_buf, "{s} · {d} KB", .{ age, ne.size_bytes / 1024 }) catch age)
             else
                 age;
@@ -3269,7 +3295,9 @@ pub const Model = struct {
         // The tick must keep running while the user decides: without this the
         // dialog appears but is not repainted (the clock, the face...).
         self.redraw_requested.store(true, .seq_cst);
+        const sess = self.session;
         self.permUnlock();
+        if (sess) |sp| sp.bumpPermissionsAsked();
 
         // SLEEPING wait: the backoff grows up to 20 ms, so the worker burns no
         // CPU while the user decides (before it was spin-yield).
@@ -8385,6 +8413,7 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                     });
                 }
                 chat.cancel_current.store(true, .seq_cst);
+                if (self.session) |sp| sp.bumpEscs();
                 // The face follows the fact: a cancelled turn is `warn`, not
                 // `done`. Set here (the UI thread) and cleared by the next
                 // `streamStart`, so the mark belongs to THIS turn.

@@ -1280,6 +1280,7 @@ pub fn cmdSession(m: *tui.Model) void {
         if (e.first_prompt.len > 0) gpa.free(e.first_prompt);
         if (e.last_prompt.len > 0) gpa.free(e.last_prompt);
         if (e.agent_name.len > 0) gpa.free(e.agent_name);
+        if (e.summary.len > 0) gpa.free(e.summary);
     }
     m.session_picker_entries.deinit(gpa);
     m.session_picker_entries = .empty;
@@ -1312,6 +1313,7 @@ pub fn cmdSession(m: *tui.Model) void {
                 .last_prompt = gpa.dupe(u8, s.last_prompt) catch "",
                 .agent_name = gpa.dupe(u8, s.agent_name) catch "",
                 .size_bytes = s.size_bytes,
+                .summary = gpa.dupe(u8, s.summary) catch "",
             };
             if (e.path.len == 0) continue;
             _ = m.session_picker_entries.append(gpa, e) catch {};
@@ -1324,6 +1326,7 @@ pub fn cmdSession(m: *tui.Model) void {
                 if (e.first_prompt.len > 0) gpa.free(e.first_prompt);
                 if (e.last_prompt.len > 0) gpa.free(e.last_prompt);
                 if (e.agent_name.len > 0) gpa.free(e.agent_name);
+                if (e.summary.len > 0) gpa.free(e.summary);
                 continue;
             }
             owned[idx] = e;
@@ -1349,10 +1352,19 @@ pub fn cmdSession(m: *tui.Model) void {
             (std.fmt.allocPrint(gpa, "{s}  (current)", .{title}) catch gpa.dupe(u8, title) catch "")
         else
             (gpa.dupe(u8, title) catch "");
-        // 29.3/35.3: <relative time> · <size> · #tag (branch/count when available).
+        // 29.3/30.3/35.3: <relative time> · <size> · #tag · <running summary>.
         var dbuf: [32]u8 = undefined;
         const size = if (s.size_bytes > 0) std.fmt.bufPrint(&dbuf, "{d} KB", .{s.size_bytes / 1024}) catch "" else "";
-        const desc = if (s.tag.len > 0 and size.len > 0)
+        const summary = if (s.summary.len > 0) s.summary else (if (s.last_prompt.len > 0) s.last_prompt else "");
+        const desc = if (summary.len > 0 and s.tag.len > 0 and size.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} · {s} · #{s} · {s}", .{ age, size, s.tag, summary }) catch gpa.dupe(u8, age) catch "")
+        else if (summary.len > 0 and s.tag.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} · #{s} · {s}", .{ age, s.tag, summary }) catch gpa.dupe(u8, age) catch "")
+        else if (summary.len > 0 and size.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} · {s} · {s}", .{ age, size, summary }) catch gpa.dupe(u8, age) catch "")
+        else if (summary.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} · {s}", .{ age, summary }) catch gpa.dupe(u8, age) catch "")
+        else if (s.tag.len > 0 and size.len > 0)
             (std.fmt.allocPrint(gpa, "{s} · {s} · #{s}", .{ age, size, s.tag }) catch gpa.dupe(u8, age) catch "")
         else if (s.tag.len > 0)
             (std.fmt.allocPrint(gpa, "{s} · #{s}", .{ age, s.tag }) catch gpa.dupe(u8, age) catch "")
@@ -1469,6 +1481,12 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
         .custom_title = s.custom_title,
         .ai_title = meta.ai_title,
         .tag = s.tag,
+        .forked_from = meta.forked_from,
+        .ai_title_gen = meta.ai_title_gen,
+        .summary = meta.summary,
+        .prompts_asked = meta.prompts_asked,
+        .permissions_asked = meta.permissions_asked,
+        .escs = meta.escs,
     }) catch |err| {
         agent.pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
         return;

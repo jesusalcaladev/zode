@@ -244,13 +244,13 @@ Ctrl+R turns them on. That is the same rule with a different name.
   - [x] Turn 1: a title derived from the first prompt — synchronously, free
   - [x] Turn 3: AI title upgrade (background, effort `low`, never blocks) over the last 1000 characters of conversation (recent context wins, bounded); applied only when generation matches (turn-3 upgrade over turn-1/empty), session meta is unchanged/eligible, and there is no custom title (`/rename` race)
   - [x] Prompt/result constraints: asks for JSON-only `{"title":"..."}` or `null` (3–7 words, sentence case guidance/examples in prompt), parses JSON/null safely, rejects/ignores invalid results on failure
-- [ ] **30.3** A running summary for the list: one line written at write time (no model call) every `min(5 steps, 2 min)` — in a three-hour session the first prompt is hours stale and the row is useless
+- [x] **30.3** A running summary for the list: one line written at write time (no model call) every `min(5 steps, 2 min)` — in a three-hour session the first prompt is hours stale and the row is useless (session `summary` in Meta, derived from recent conversation on persist and shown in session picker/list rows)
 - [x] **30.4** `/branch` — fork is not `/new`
   - [x] Copy the session JSONL into a new session id, stamp provenance (`forked_from` in session meta), and carry side tables over (`.caps.json`, `.compact.json`, `tool-results/<stem>/`) · branch session file created with `0o600` permissions
   - [x] It names itself and tells you how back: reports `Branched "<title>". To resume the original: zode --resume <id>` and copies the resume command; collision ladder `foo`, `foo (Branch)`, `foo (Branch 2)` (custom branch title accepted via `/branch [title]`)
-- [ ] **30.5** Resume restores more than messages: the id **and the project directory**, the cost state, the custom title, the tag, the agent definition — and the **plan**, by scanning the transcript for the last `todo` call (free: the plan block reappears on `--resume` with no new state file and no new failure mode)
-  - [ ] Counters that only make sense across a session (prompts asked, permissions asked, ESCs) — turns `/bench` from a per-session number into a lifetime one
-  - [ ] A defensive consistency marker in the transcript (a turn checkpoint recording how many messages it expected), compared on resume — our zjsonl has no integrity marker and a truncated resume is currently silent
+- [x] **30.5** Resume restores more than messages: the id **and the project directory**, the cost state, the custom title, the tag, the agent definition — and the **plan**, by scanning the transcript for the last `todo` call (free: the plan block reappears on `--resume` with no new state file and no new failure mode)
+  - [x] Counters that only make sense across a session (prompts asked, permissions asked, ESCs) — turns `/bench` from a per-session number into a lifetime one (persisted in session Meta, restored on resume, incremented on prompt submit / permission dialog / ESC cancel)
+  - [x] A defensive consistency marker in the transcript (a turn checkpoint recording how many messages it expected), compared on resume — our zjsonl has no integrity marker and a truncated resume is currently silent (`{"event":"checkpoint","messages":N}` persisted at turn end and reported on mismatch at resume)
 - [ ] Tests: pure + fixture JSONL for fork provenance, title precedence (custom beats AI, generation counter), plan hydration, the consistency marker
 
 ---

@@ -2017,7 +2017,12 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
         .custom_title = s.custom_title,
         .ai_title = meta.ai_title,
         .tag = s.tag,
+        .forked_from = meta.forked_from,
         .ai_title_gen = meta.ai_title_gen,
+        .summary = meta.summary,
+        .prompts_asked = meta.prompts_asked,
+        .permissions_asked = meta.permissions_asked,
+        .escs = meta.escs,
     }) catch |err| {
         pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
         return;
@@ -3455,6 +3460,10 @@ pub fn branchSession(m: *tui.Model, arg: ?[]const u8) void {
         .tag = src_meta.tag,
         .forked_from = src_id,
         .ai_title_gen = 0,
+        .summary = src_meta.summary,
+        .prompts_asked = src_meta.prompts_asked,
+        .permissions_asked = src_meta.permissions_asked,
+        .escs = src_meta.escs,
     }) catch |err| {
         pushErrorFmt(m, "branched session created but could not write metadata: {t}", .{err});
     };
@@ -3492,6 +3501,9 @@ fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
     m.session = s;
     m.bg.setSession(m.allocator, io_global, s.path);
     cache_stats.session = s.usage_stats;
+    // 30.5: restore session counters/cost-visible usage state on resume.
+    // cache_stats is the source of live cost/usage UI; session usage_stats holds the persisted snapshot.
+    // (cost_mod is per-session module state reset elsewhere; usage snapshot is what we persist/restore.)
     session_elided = 0;
     summary_policy.resetSummaries();
     forgetGitRepoProbe();
@@ -3500,7 +3512,20 @@ fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
     replaySessionMessages(m, s);
     hydratePlanFromSession(m, s);
     m.applyScrollState(s.getScrollState());
-    pushInfoFmt(m, "session resumed: {s} · {d} messages", .{ std.fs.path.basename(path), s.messages.items.len });
+    if (s.consistency_mismatch) {
+        if (s.checkpoint_expected_messages) |expected| {
+            pushInfoFmt(m, "session resumed with consistency mismatch: expected {d} messages, found {d}", .{ expected, s.checkpoint_actual_messages });
+        } else {
+            pushInfo(m, "session resumed with consistency mismatch");
+        }
+    }
+    pushInfoFmt(m, "session resumed: {s} · {d} messages · prompts {d} · permissions {d} · ESCs {d}", .{
+        std.fs.path.basename(path),
+        s.messages.items.len,
+        s.prompts_asked,
+        s.permissions_asked,
+        s.escs,
+    });
     refreshContextUsage(m);
 }
 
@@ -3678,6 +3703,7 @@ fn appendUserLine(m: *tui.Model, user_text: []const u8) void {
     maybeSetTurn1Title(s, user_text);
     maybeScheduleTurn3AiTitle(m, s, user_text);
     agent_loop.appendUserLineToSession(s, user_text);
+    s.bumpPromptsAsked();
 }
 
 fn isRealUserTurnMessage(sm: session_mod.Message) bool {
@@ -3759,6 +3785,10 @@ fn maybeSetTurn1Title(s: *session_mod.Session, user_text: []const u8) void {
         .tag = s.tag,
         .forked_from = existing.forked_from,
         .ai_title_gen = s.ai_title_gen,
+        .summary = existing.summary,
+        .prompts_asked = existing.prompts_asked,
+        .permissions_asked = existing.permissions_asked,
+        .escs = existing.escs,
     }) catch {};
 }
 
@@ -4064,6 +4094,10 @@ fn aiTitleWorker(job: *AiTitleJob) void {
         .tag = meta_now.tag,
         .forked_from = meta_now.forked_from,
         .ai_title_gen = job.expected_gen,
+        .summary = meta_now.summary,
+        .prompts_asked = meta_now.prompts_asked,
+        .permissions_asked = meta_now.permissions_asked,
+        .escs = meta_now.escs,
     }) catch return;
 
     // Best-effort in-memory update if this is still the active session.
@@ -4472,6 +4506,7 @@ fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
         .maybeProposeMemories = maybeProposeMemories,
         .pushTurnSummary = pushTurnSummary,
     });
+    if (session) |s| s.persistConsistencyCheckpoint();
 }
 
 fn memoryExtractEnabled() bool {

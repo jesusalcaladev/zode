@@ -150,6 +150,20 @@ pub const Session = struct {
     ai_title_gen: u32 = 0,
     /// Session tag (35.3), stored without leading '#'. Persisted via Meta sidecar.
     tag: []const u8 = "",
+    /// Running one-line summary for session list (30.3), persisted in Meta sidecar.
+    summary: []const u8 = "",
+    /// 30.3: count of persisted message steps since last summary update.
+    summary_steps: usize = 0,
+    /// 30.3: unix seconds of last summary update (0 = never).
+    summary_last_update_s: i64 = 0,
+    /// 30.5: lifetime session counters (restored on resume).
+    prompts_asked: u32 = 0,
+    permissions_asked: u32 = 0,
+    escs: u32 = 0,
+    /// 30.5: last consistency checkpoint expected message count vs actual on load.
+    checkpoint_expected_messages: ?usize = null,
+    checkpoint_actual_messages: usize = 0,
+    consistency_mismatch: bool = false,
 
     /// Next index for a stored tool result (`sessions/<id>/tool-results/<n>.txt`).
     /// Per session: each session id gets its own tool-results directory, so a
@@ -224,9 +238,7 @@ pub const Session = struct {
         s.io = io;
         // Streaming writer: appends at the end of the fd (no 0xFF hole).
         s.fw = std.Io.File.Writer.initStreaming(file, io, &s.write_buf);
-        // Persist the empty Meta sidecar so titles/tags can be added later.
-        // custom_title, ai_title and tag start empty; they are filled by /rename
-        // and the turn-3 AI title upgrade respectively.
+        // Persist the empty Meta sidecar so titles/tags/summary can be added later.
         sessionindex.writeMeta(io, allocator, s.path.?, .{
             .name = "",
             .model = "",
@@ -234,6 +246,8 @@ pub const Session = struct {
             .custom_title = "",
             .ai_title = "",
             .tag = "",
+            .ai_title_gen = 0,
+            .summary = "",
         }) catch {};
         return s;
     }
@@ -256,6 +270,7 @@ pub const Session = struct {
         if (self.custom_title.len > 0) self.allocator.free(self.custom_title);
         if (self.ai_title.len > 0) self.allocator.free(self.ai_title);
         if (self.tag.len > 0) self.allocator.free(self.tag);
+        if (self.summary.len > 0) self.allocator.free(self.summary);
     }
 
     fn compactSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
@@ -490,6 +505,118 @@ pub const Session = struct {
         }
         w.writeAll("}\n") catch {};
         w.flush() catch {}; // durable per line
+        self.maybeUpdateRunningSummary();
+    }
+
+    /// 30.3: update running summary in Meta every min(5 steps, 2 min), no model call.
+    fn maybeUpdateRunningSummary(self: *Session) void {
+        self.summary_steps += 1;
+        const now_s = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        const due_steps = self.summary_steps >= 5;
+        const due_time = self.summary_last_update_s == 0 or (now_s - self.summary_last_update_s) >= 120;
+        if (!due_steps and !due_time) return;
+
+        var buf: [160]u8 = undefined;
+        const new_summary = deriveRunningSummary(&buf, self.messages.items) orelse return;
+
+        if (self.summary.len > 0 and std.mem.eql(u8, self.summary, new_summary)) {
+            self.summary_steps = 0;
+            self.summary_last_update_s = now_s;
+            return;
+        }
+        if (self.summary.len > 0) self.allocator.free(self.summary);
+        self.summary = self.allocator.dupe(u8, new_summary) catch "";
+        self.summary_steps = 0;
+        self.summary_last_update_s = now_s;
+
+        const path = self.path orelse return;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const meta = sessionindex.readMeta(arena, self.io, path);
+        sessionindex.writeMeta(self.io, arena, path, .{
+            .name = meta.name,
+            .model = meta.model,
+            .created_at = meta.created_at,
+            .custom_title = meta.custom_title,
+            .ai_title = meta.ai_title,
+            .tag = meta.tag,
+            .forked_from = meta.forked_from,
+            .ai_title_gen = meta.ai_title_gen,
+            .summary = self.summary,
+            .prompts_asked = meta.prompts_asked,
+            .permissions_asked = meta.permissions_asked,
+            .escs = meta.escs,
+        }) catch {};
+    }
+
+    fn deriveRunningSummary(buf: []u8, msgs: []const Message) ?[]const u8 {
+        // Recent context wins: prefer latest assistant response, else latest user prompt.
+        var i: usize = msgs.len;
+        while (i > 0) {
+            i -= 1;
+            const m = msgs[i];
+            if (m.role == .assistant) {
+                if (summaryLineFromText(buf, m.content)) |s| return s;
+            }
+        }
+        i = msgs.len;
+        while (i > 0) {
+            i -= 1;
+            const m = msgs[i];
+            if (m.role == .user) {
+                // Skip obvious harness-internal/system-like user messages when possible.
+                if (std.mem.startsWith(u8, m.content, "\x01ZODE-")) continue;
+                if (summaryLineFromText(buf, m.content)) |s| return s;
+            }
+        }
+        return null;
+    }
+
+    fn summaryLineFromText(buf: []u8, text: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        var it = std.mem.splitScalar(u8, trimmed, '\n');
+        var line: []const u8 = "";
+        while (it.next()) |raw| {
+            const t = std.mem.trim(u8, raw, " \t\r");
+            if (t.len == 0) continue;
+            line = t;
+            break;
+        }
+        if (line.len == 0) return null;
+        // Collapse whitespace and cap length for a one-line list summary.
+        var n: usize = 0;
+        var prev_space = true;
+        for (line) |c| {
+            if (n + 1 >= buf.len) break;
+            const ch: u8 = if (c == '\t' or c == '\r') ' ' else c;
+            if (ch == ' ') {
+                if (prev_space) continue;
+                prev_space = true;
+                buf[n] = ' ';
+                n += 1;
+            } else {
+                prev_space = false;
+                buf[n] = ch;
+                n += 1;
+            }
+        }
+        while (n > 0 and buf[n - 1] == ' ') n -= 1;
+        const max_len: usize = 72;
+        if (n > max_len) {
+            var cut = max_len;
+            while (cut > 20 and buf[cut] != ' ') cut -= 1;
+            if (cut < 20) cut = max_len;
+            n = cut;
+            while (n > 0 and buf[n - 1] == ' ') n -= 1;
+            if (n + 3 <= buf.len) {
+                buf[n] = '.'; buf[n + 1] = '.'; buf[n + 2] = '.';
+                n += 3;
+            }
+        }
+        if (n == 0) return null;
+        return buf[0..n];
     }
 
     /// Reopens an existing session: loads the history and keeps persisting.
@@ -500,21 +627,27 @@ pub const Session = struct {
         errdefer allocator.destroy(s);
         s.* = try load(allocator, io, path);
         s.io = io;
-        // Load titles/tag from the Meta sidecar.
-        const meta = sessionindex.readMeta(allocator, io, path);
+        // Load titles/tag/summary from the Meta sidecar.
+        var meta_arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer meta_arena_state.deinit();
+        const meta_arena = meta_arena_state.allocator();
+        const meta = sessionindex.readMeta(meta_arena, io, path);
         if (meta.custom_title.len > 0) {
-            const copy = try allocator.dupe(u8, meta.custom_title);
-            s.custom_title = copy;
+            s.custom_title = try allocator.dupe(u8, meta.custom_title);
         }
         if (meta.ai_title.len > 0) {
-            const copy = try allocator.dupe(u8, meta.ai_title);
-            s.ai_title = copy;
+            s.ai_title = try allocator.dupe(u8, meta.ai_title);
         }
         s.ai_title_gen = meta.ai_title_gen;
         if (meta.tag.len > 0) {
-            const copy = try allocator.dupe(u8, meta.tag);
-            s.tag = copy;
+            s.tag = try allocator.dupe(u8, meta.tag);
         }
+        if (meta.summary.len > 0) {
+            s.summary = try allocator.dupe(u8, meta.summary);
+        }
+        s.prompts_asked = meta.prompts_asked;
+        s.permissions_asked = meta.permissions_asked;
+        s.escs = meta.escs;
         var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         defer dir.close(io);
         const file = try dir.createFile(io, path, .{ .truncate = true });
@@ -602,6 +735,51 @@ pub const Session = struct {
         try self.scroll_state.writeFields(file_writer);
         try file_writer.writeByte('\n');
         try file_writer.flush();
+    }
+
+    /// 30.5: defensive consistency marker (expected message count at turn boundary).
+    pub fn persistConsistencyCheckpoint(self: *Session) void {
+        const file_writer = &(self.fw orelse return);
+        const w = &file_writer.interface;
+        w.print("{{\"event\":\"checkpoint\",\"messages\":{d}}}\n", .{self.messages.items.len}) catch return;
+        w.flush() catch {};
+    }
+
+    fn persistMetaNow(self: *Session) void {
+        const path = self.path orelse return;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const meta = sessionindex.readMeta(arena, self.io, path);
+        sessionindex.writeMeta(self.io, arena, path, .{
+            .name = meta.name,
+            .model = meta.model,
+            .created_at = meta.created_at,
+            .custom_title = self.custom_title,
+            .ai_title = self.ai_title,
+            .tag = self.tag,
+            .forked_from = meta.forked_from,
+            .ai_title_gen = self.ai_title_gen,
+            .summary = self.summary,
+            .prompts_asked = self.prompts_asked,
+            .permissions_asked = self.permissions_asked,
+            .escs = self.escs,
+        }) catch {};
+    }
+
+    pub fn bumpPromptsAsked(self: *Session) void {
+        self.prompts_asked +%= 1;
+        self.persistMetaNow();
+    }
+
+    pub fn bumpPermissionsAsked(self: *Session) void {
+        self.permissions_asked +%= 1;
+        self.persistMetaNow();
+    }
+
+    pub fn bumpEscs(self: *Session) void {
+        self.escs +%= 1;
+        self.persistMetaNow();
     }
 
     /// Returns a copy of the current scroll state.
@@ -816,8 +994,16 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
             s.scroll_state = st;
             continue;
         }
+        if (parseCheckpointEvent(line)) |expected| {
+            s.checkpoint_expected_messages = expected;
+            continue;
+        }
         const m = parseLine(allocator, line) catch continue;
         try s.messages.append(allocator, m);
+    }
+    s.checkpoint_actual_messages = s.messages.items.len;
+    if (s.checkpoint_expected_messages) |expected| {
+        s.consistency_mismatch = expected != s.messages.items.len;
     }
     s.loadCapsSidecar();
     s.loadCompactSidecar();
@@ -856,6 +1042,16 @@ fn getUsize(obj: std.json.ObjectMap, key: []const u8) ?usize {
     const value = getI64(obj, key) orelse return null;
     if (value < 0) return null;
     return std.math.cast(usize, value);
+}
+
+fn parseCheckpointEvent(line: []const u8) ?usize {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, line, .{}) catch return null;
+    if (parsed != .object) return null;
+    const event = parsed.object.get("event") orelse return null;
+    if (event != .string or !std.mem.eql(u8, event.string, "checkpoint")) return null;
+    const msg_v = parsed.object.get("messages") orelse return null;
+    if (msg_v != .integer or msg_v.integer < 0) return null;
+    return std.math.cast(usize, msg_v.integer);
 }
 
 fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Message {
