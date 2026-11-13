@@ -35,6 +35,7 @@ const sessionindex = @import("lib/sessionindex.zig");
 pub const goal_note_marker = "\u{1}ZODE-GOAL\u{1}";
 const chat = @import("chat.zig");
 const cache_stats = @import("cache_stats.zig");
+const cost_mod = @import("lib/cost.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 const repeat = @import("lib/repeat.zig");
 const resultcap = @import("lib/resultcap.zig");
@@ -160,10 +161,14 @@ pub const Session = struct {
     prompts_asked: u32 = 0,
     permissions_asked: u32 = 0,
     escs: u32 = 0,
+    /// Active agent definition name (30.5 restore), if any.
+    agent_name: []const u8 = "",
     /// 30.5: last consistency checkpoint expected message count vs actual on load.
     checkpoint_expected_messages: ?usize = null,
     checkpoint_actual_messages: usize = 0,
     consistency_mismatch: bool = false,
+    /// Suppress running-summary/meta rewrites during bulk resume replay.
+    suppress_summary_update: bool = false,
 
     /// Next index for a stored tool result (`sessions/<id>/tool-results/<n>.txt`).
     /// Per session: each session id gets its own tool-results directory, so a
@@ -248,6 +253,7 @@ pub const Session = struct {
             .tag = "",
             .ai_title_gen = 0,
             .summary = "",
+            .agent_name = "",
         }) catch {};
         return s;
     }
@@ -271,6 +277,7 @@ pub const Session = struct {
         if (self.ai_title.len > 0) self.allocator.free(self.ai_title);
         if (self.tag.len > 0) self.allocator.free(self.tag);
         if (self.summary.len > 0) self.allocator.free(self.summary);
+        if (self.agent_name.len > 0) self.allocator.free(self.agent_name);
     }
 
     fn compactSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
@@ -544,9 +551,10 @@ pub const Session = struct {
             .forked_from = meta.forked_from,
             .ai_title_gen = meta.ai_title_gen,
             .summary = self.summary,
-            .prompts_asked = meta.prompts_asked,
-            .permissions_asked = meta.permissions_asked,
-            .escs = meta.escs,
+            .prompts_asked = self.prompts_asked,
+            .permissions_asked = self.permissions_asked,
+            .escs = self.escs,
+            .agent_name = meta.agent_name,
         }) catch {};
     }
 
@@ -648,6 +656,9 @@ pub const Session = struct {
         s.prompts_asked = meta.prompts_asked;
         s.permissions_asked = meta.permissions_asked;
         s.escs = meta.escs;
+        if (meta.agent_name.len > 0) {
+            s.agent_name = try allocator.dupe(u8, meta.agent_name);
+        }
         var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         defer dir.close(io);
         const file = try dir.createFile(io, path, .{ .truncate = true });
@@ -727,6 +738,27 @@ pub const Session = struct {
         try file_writer.flush();
     }
 
+    /// Persist per-model cost tracker snapshot for 30.5 resume restoration.
+    pub fn appendCostSnapshot(self: *Session) !void {
+        if (cost_mod.session.len == 0 and cost_mod.session.spill_requests == 0) return;
+        const file_writer = &(self.fw orelse return).interface;
+        try file_writer.writeAll("{\"event\":\"cost\",\"entries\":[");
+        var i: usize = 0;
+        while (i < cost_mod.session.len) : (i += 1) {
+            if (i != 0) try file_writer.writeByte(',');
+            const e = &cost_mod.session.entries[i];
+            try file_writer.writeAll("{\"model\":");
+            try writeEscaped(file_writer, e.text());
+            try file_writer.print(",\"prompt\":{d},\"completion\":{d}}}", .{ e.prompt_tokens, e.completion_tokens });
+        }
+        try file_writer.print("],\"spill_prompt\":{d},\"spill_completion\":{d},\"spill_requests\":{d}}}\n", .{
+            cost_mod.session.spill_prompt,
+            cost_mod.session.spill_completion,
+            cost_mod.session.spill_requests,
+        });
+        try file_writer.flush();
+    }
+
     /// Persists the current scroll state as a JSONL record. Called when the
     /// session is rewritten (on resume) and when the session is about to be
     /// replaced, so the reader's position survives.
@@ -764,6 +796,7 @@ pub const Session = struct {
             .prompts_asked = self.prompts_asked,
             .permissions_asked = self.permissions_asked,
             .escs = self.escs,
+            .agent_name = meta.agent_name,
         }) catch {};
     }
 
@@ -990,6 +1023,10 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Session
             s.usage_stats = stats;
             continue;
         }
+        if (parseCostSnapshot(line)) |tr| {
+            cost_mod.session = tr;
+            continue;
+        }
         if (ScrollState.parseFromLine(line)) |st| {
             s.scroll_state = st;
             continue;
@@ -1052,6 +1089,38 @@ fn parseCheckpointEvent(line: []const u8) ?usize {
     const msg_v = parsed.object.get("messages") orelse return null;
     if (msg_v != .integer or msg_v.integer < 0) return null;
     return std.math.cast(usize, msg_v.integer);
+}
+
+fn parseCostSnapshot(line: []const u8) ?cost_mod.Tracker {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, std.heap.page_allocator, line, .{}) catch return null;
+    if (parsed != .object) return null;
+    const event = parsed.object.get("event") orelse return null;
+    if (event != .string or !std.mem.eql(u8, event.string, "cost")) return null;
+    var tr = cost_mod.Tracker{};
+    if (parsed.object.get("entries")) |ev| {
+        if (ev == .array) {
+            for (ev.array.items) |it| {
+                if (tr.len >= cost_mod.max_models) break;
+                if (it != .object) continue;
+                const m = it.object.get("model") orelse continue;
+                if (m != .string) continue;
+                const p = getI64(it.object, "prompt") orelse 0;
+                const c = getI64(it.object, "completion") orelse 0;
+                const e = &tr.entries[tr.len];
+                e.* = .{};
+                const n = @min(m.string.len, e.model_buf.len);
+                @memcpy(e.model_buf[0..n], m.string[0..n]);
+                e.model_len = n;
+                e.prompt_tokens = p;
+                e.completion_tokens = c;
+                tr.len += 1;
+            }
+        }
+    }
+    tr.spill_prompt = getI64(parsed.object, "spill_prompt") orelse 0;
+    tr.spill_completion = getI64(parsed.object, "spill_completion") orelse 0;
+    tr.spill_requests = getUsize(parsed.object, "spill_requests") orelse 0;
+    return tr;
 }
 
 fn parseLine(gpa: std.mem.Allocator, line: []const u8) !Message {
@@ -1437,4 +1506,38 @@ test "resumePath: restores 30.3/30.5 meta fields and counters" {
     try std.testing.expectEqual(@as(u32, 4), s2.prompts_asked);
     try std.testing.expectEqual(@as(u32, 2), s2.permissions_asked);
     try std.testing.expectEqual(@as(u32, 1), s2.escs);
+}
+
+
+test "consistency checkpoint fixture: persisted checkpoint line is detected on load" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const p = try std.fmt.allocPrint(a, ".zode-ckpt-fixture-{d}.jsonl", .{std.testing.random_seed});
+    defer std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    defer {
+        const caps = std.fmt.allocPrint(a, "{s}.caps.json", .{p}) catch null;
+        if (caps) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+        const compact = std.fmt.allocPrint(a, "{s}.compact.json", .{p}) catch null;
+        if (compact) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+    }
+
+    // Fixture JSONL: two messages then a checkpoint expecting 2 (no truncation).
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = p,
+        .data =
+        \\{"role":"user","content":"plan it"}
+        \\{"role":"assistant","content":"ok"}
+        \\{"event":"checkpoint","messages":2}
+        \\
+        ,
+    });
+    var sess = try load(alloc, io, p);
+    defer sess.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sess.checkpoint_actual_messages);
+    try std.testing.expectEqual(@as(?usize, 2), sess.checkpoint_expected_messages);
+    try std.testing.expect(!sess.consistency_mismatch);
 }

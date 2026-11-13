@@ -1296,14 +1296,8 @@ pub fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
     m.pushInfoOwned(text);
 }
 
-/// Rehydrates the in-memory plan on resume by replaying todo tool calls (30.5).
-fn hydratePlanFromSession(m: *tui.Model, s: *session_mod.Session) void {
-    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var plan = plan_mod.Plan.init();
-
-    for (s.messages.items) |sm| {
+pub fn replayPlanFromSessionMessages(plan: *plan_mod.Plan, msgs: []const session_mod.Message, arena: std.mem.Allocator) void {
+    for (msgs) |sm| {
         if (sm.role != .assistant) continue;
         const tcj = sm.tool_calls_json orelse continue;
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, tcj, .{}) catch continue;
@@ -1340,9 +1334,18 @@ fn hydratePlanFromSession(m: *tui.Model, s: *session_mod.Session) void {
                 };
             }
             if (args == null) continue;
-            _ = applyPlanTo(&plan, args.?, arena);
+            _ = applyPlanTo(plan, args.?, arena);
         }
     }
+}
+
+/// Rehydrates the in-memory plan on resume by replaying todo tool calls (30.5).
+fn hydratePlanFromSession(m: *tui.Model, s: *session_mod.Session) void {
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var plan = plan_mod.Plan.init();
+    replayPlanFromSessionMessages(&plan, s.messages.items, arena);
     m.replacePlan(plan);
 }
 
@@ -2515,6 +2518,9 @@ fn recordSessionUsage(m: *tui.Model, usage: chat.Usage, kind: chat.ProviderKind,
     if (session) |s| {
         s.appendUsageSnapshot(cache_stats.session) catch |err| {
             m.pushErrorFmt("could not save session usage: {t}", .{err});
+        };
+        s.appendCostSnapshot() catch |err| {
+            models_mod.dbg("cost snapshot: {t}\n", .{err});
         };
     }
 }
@@ -13768,6 +13774,32 @@ test "iterationLimit is the SAME for both runners, and ZODE_MAX_ITER moves it" {
 
     try std.testing.expectEqual(agent_default_iterations(), iterationLimit());
     try std.testing.expect(iterationLimit() > 6);
+}
+
+
+test "plan hydration: replayPlanFromSessionMessages rebuilds todo plan from transcript (30.5)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var plan = plan_mod.Plan.init();
+    const msgs = [_]session_mod.Message{
+        .{
+            .role = .assistant,
+            .content = "",
+            .tool_calls_json = "[{\"function\":{\"name\":\"todo\",\"arguments\":\"{\\\"items\\\":[{\\\"content\\\":\\\"step one\\\"},{\\\"content\\\":\\\"step two\\\",\\\"status\\\":\\\"done\\\"}]}\"}}]",
+        },
+        .{
+            .role = .assistant,
+            .content = "",
+            .tool_calls_json = "[{\"function\":{\"name\":\"todo\",\"arguments\":\"{\\\"update\\\":[{\\\"index\\\":1,\\\"status\\\":\\\"in_progress\\\"}]}\"}}]",
+        },
+    };
+    replayPlanFromSessionMessages(&plan, &msgs, a);
+    try std.testing.expectEqual(@as(u8, 2), plan.len);
+    try std.testing.expectEqualStrings("step one", plan.items[0].textOf());
+    try std.testing.expect(plan.items[0].status == .in_progress);
+    try std.testing.expect(plan.items[1].status == .done);
 }
 
 test "applyPlanTo works with NO Model, which is what --chat has" {

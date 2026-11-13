@@ -57,6 +57,8 @@ pub const Meta = struct {
     prompts_asked: u32 = 0,
     permissions_asked: u32 = 0,
     escs: u32 = 0,
+    /// Active agent definition name, when a session is scoped to one.
+    agent_name: []const u8 = "",
 };
 
 /// One session in the list.
@@ -244,6 +246,7 @@ pub fn readMeta(arena: std.mem.Allocator, io: std.Io, session_path: []const u8) 
     result.prompts_asked = parsed.prompts_asked;
     result.permissions_asked = parsed.permissions_asked;
     result.escs = parsed.escs;
+    if (parsed.agent_name.len > 0) result.agent_name = arena.dupe(u8, parsed.agent_name) catch "";
     return result;
 }
 
@@ -291,6 +294,11 @@ pub fn parseMeta(arena: std.mem.Allocator, data: []const u8) Meta {
     }
     if (o.get("escs")) |v| {
         if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) meta.escs = @intCast(v.integer);
+    }
+    if (o.get("agent_name")) |v| {
+        if (v == .string) meta.agent_name = v.string;
+    } else if (o.get("agent")) |v| {
+        if (v == .string) meta.agent_name = v.string;
     }
     return meta;
 }
@@ -365,6 +373,10 @@ pub fn writeMetaTitles(w: *std.Io.Writer, meta: Meta) !void {
     if (meta.prompts_asked != 0) try w.print(",\"prompts_asked\":{d}", .{meta.prompts_asked});
     if (meta.permissions_asked != 0) try w.print(",\"permissions_asked\":{d}", .{meta.permissions_asked});
     if (meta.escs != 0) try w.print(",\"escs\":{d}", .{meta.escs});
+    if (meta.agent_name.len > 0) {
+        try w.writeAll(",\"agent_name\":");
+        try writeJsonString(w, meta.agent_name);
+    }
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -419,6 +431,7 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
         var ai_title: []const u8 = "";
         var tag: []const u8 = "";
         var summary: []const u8 = "";
+        var agent_name: []const u8 = "";
         var created: i64 = 0;
         const meta = readMeta(arena, io, path);
         if (meta.name.len > 0) name = meta.name;
@@ -427,6 +440,7 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
         if (meta.ai_title.len > 0) ai_title = meta.ai_title;
         if (meta.tag.len > 0) tag = meta.tag;
         if (meta.summary.len > 0) summary = meta.summary;
+        if (meta.agent_name.len > 0) agent_name = meta.agent_name;
         if (meta.created_at > 0) created = meta.created_at;
         if (created == 0) created = mtime;
 
@@ -440,6 +454,7 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
             .size_bytes = size_bytes,
             .tag = tag,
             .summary = summary,
+            .agent_name = agent_name,
         }) catch continue;
     }
 
@@ -716,6 +731,81 @@ test "Entry.title: total function follows 29.3 and never drops (29.2)" {
     e = Entry{ .path = "", .name = "", .model = "", .custom_title = "", .ai_title = "", .created_at = 0 };
     try t.expectEqualStrings("(session)", e.title(""));
 }
+
+test "title precedence and generation metadata: custom beats AI; ai_title_gen persists" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+
+    const root = try std.fmt.allocPrint(a, ".zode-titleprec-{d}", .{t.random_seed});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    const session = try std.fs.path.join(a, &.{ root, "zode-t.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = session, .data = "{}\n" });
+
+    // Generation counter is preserved in meta; custom title still wins in display precedence.
+    try writeMeta(io, a, session, .{
+        .custom_title = "Manual title",
+        .ai_title = "AI title",
+        .ai_title_gen = 3,
+    });
+    const back = readMeta(a, io, session);
+    try t.expectEqual(@as(u32, 3), back.ai_title_gen);
+    try t.expectEqualStrings("Manual title", back.custom_title);
+    try t.expectEqualStrings("AI title", back.ai_title);
+
+    const e = Entry{
+        .path = session,
+        .name = "",
+        .model = "",
+        .custom_title = back.custom_title,
+        .ai_title = back.ai_title,
+        .created_at = 0,
+    };
+    try t.expectEqualStrings("Manual title", e.title("zode-t"));
+}
+
+test "fork provenance fixture: forked_from is persisted and visible via scan/readMeta" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+
+    const root = try std.fmt.allocPrint(a, ".zode-forkprov-{d}", .{t.random_seed});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    const src = try std.fs.path.join(a, &.{ root, "zode-src0001.jsonl" });
+    const dst = try std.fs.path.join(a, &.{ root, "zode-dst0002.jsonl" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src, .data = "{\"role\":\"user\",\"content\":\"hello\"}\n" });
+    // Simulate branch copy + provenance stamp.
+    const src_data = try std.Io.Dir.cwd().readFileAlloc(io, src, a, .limited(1024));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = src_data });
+    try writeMeta(io, a, dst, .{
+        .custom_title = "hello (Branch)",
+        .forked_from = "zode-src0001",
+        .created_at = 2,
+        .summary = "hello",
+    });
+
+    const meta = readMeta(a, io, dst);
+    try t.expectEqualStrings("zode-src0001", meta.forked_from);
+    try t.expectEqualStrings("hello (Branch)", meta.custom_title);
+
+    const list = scan(a, io, root);
+    var found = false;
+    for (list) |e| {
+        if (std.mem.endsWith(u8, e.path, "zode-dst0002.jsonl")) {
+            found = true;
+            // Provenance is in meta/sidecar; scan preserves title/summary and file content copied.
+            try t.expectEqualStrings("hello (Branch)", e.title("zode-dst0002"));
+            try t.expectEqualStrings("hello", e.summary);
+        }
+    }
+    try t.expect(found);
+}
+
 
 test "usablePrompt skips autonomous and empty prompts (29.3)" {
     try t.expect(usablePrompt("") == null);

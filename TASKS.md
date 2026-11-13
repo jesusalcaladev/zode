@@ -251,7 +251,8 @@ Ctrl+R turns them on. That is the same rule with a different name.
 - [x] **30.5** Resume restores more than messages: the id **and the project directory**, the cost state, the custom title, the tag, the agent definition — and the **plan**, by scanning the transcript for the last `todo` call (free: the plan block reappears on `--resume` with no new state file and no new failure mode)
   - [x] Counters that only make sense across a session (prompts asked, permissions asked, ESCs) — turns `/bench` from a per-session number into a lifetime one (persisted in session Meta, restored on resume, incremented on prompt submit / permission dialog / ESC cancel)
   - [x] A defensive consistency marker in the transcript (a turn checkpoint recording how many messages it expected), compared on resume — our zjsonl has no integrity marker and a truncated resume is currently silent (`{"event":"checkpoint","messages":N}` persisted at turn end and reported on mismatch at resume)
-- [ ] Tests: pure + fixture JSONL for fork provenance, title precedence (custom beats AI, generation counter), plan hydration, the consistency marker
+  - [x] Cost/usage and agent metadata restore improvements: usage snapshot restored to live cache stats, per-model cost tracker snapshots (`{"event":"cost"...}`) persisted/restored, and `agent_name` added to session Meta/restore paths
+- [x] Tests: pure + fixture JSONL for fork provenance, title precedence (custom beats AI, generation counter), plan hydration, the consistency marker (session/index/agent tests added for meta/summary/counter restore, consistency checkpoints, fork provenance fixture, title precedence + `ai_title_gen` metadata, and plan hydration replay from transcript `todo` calls)
 
 ---
 
