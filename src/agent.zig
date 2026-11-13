@@ -2896,6 +2896,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         }
     } else if (std.mem.eql(u8, cmd, "new-session")) {
         newSession(m);
+    } else if (std.mem.eql(u8, cmd, "branch")) {
+        branchSession(m, arg);
     } else if (std.mem.eql(u8, cmd, "resume")) {
         const resume_arg = std.mem.trim(u8, arg orelse "", " \t");
         if (resume_arg.len == 0) {
@@ -3312,6 +3314,155 @@ fn refuseForeignResume(m: *tui.Model, path: []const u8) void {
     m.setCopyPending(cmd);
     pushInfoFmt(m, "that session belongs to a different project. Resume it from that project: {s} (copied to clipboard)", .{cmd});
     appendHarnessPrompt(m, "The user asked to resume a session that belongs to a different project. Do not resume it here. Tell them to run the copied command from that session's project directory.");
+}
+
+fn copySidecarIfExists(arena: std.mem.Allocator, src_session_path: []const u8, suffix: []const u8, dst_session_path: []const u8) !void {
+    const src = try std.fmt.allocPrint(arena, "{s}{s}", .{ src_session_path, suffix });
+    const dst = try std.fmt.allocPrint(arena, "{s}{s}", .{ dst_session_path, suffix });
+    const data = std.Io.Dir.cwd().readFileAlloc(io_global, src, arena, .limited(4 * 1024 * 1024)) catch return;
+    std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = dst, .data = data }) catch {};
+}
+
+fn copyDirRecursiveIfExists(arena: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+    var dir = std.Io.Dir.cwd().openDir(io_global, src, .{ .iterate = true }) catch return;
+    defer dir.close(io_global);
+    std.Io.Dir.cwd().createDirPath(io_global, dst) catch {};
+    var it = dir.iterate();
+    while (it.next(io_global) catch null) |e| {
+        const sp = try std.fs.path.join(arena, &.{ src, e.name });
+        const dp = try std.fs.path.join(arena, &.{ dst, e.name });
+        switch (e.kind) {
+            .file => {
+                const data = std.Io.Dir.cwd().readFileAlloc(io_global, sp, arena, .limited(64 * 1024 * 1024)) catch continue;
+                std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = dp, .data = data }) catch {};
+            },
+            .directory => copyDirRecursiveIfExists(arena, sp, dp) catch {},
+            else => {},
+        }
+    }
+}
+
+fn makeBranchTitle(gpa: std.mem.Allocator, arena: std.mem.Allocator, base: []const u8) []const u8 {
+    const entries = sessionindex.scan(arena, io_global, session_mod.sessions_dir);
+    var n: usize = 0;
+    while (n < 1000) : (n += 1) {
+        const cand = if (n == 0)
+            (std.fmt.allocPrint(gpa, "{s}", .{base}) catch return base)
+        else if (n == 1)
+            (std.fmt.allocPrint(gpa, "{s} (Branch)", .{base}) catch return base)
+        else
+            (std.fmt.allocPrint(gpa, "{s} (Branch {d})", .{ base, n }) catch return base);
+        var taken = false;
+        for (entries) |e| {
+            const t = e.title(sessionpath.sessionDisplayId(e.path));
+            if (std.mem.eql(u8, t, cand)) { taken = true; break; }
+            if (e.custom_title.len > 0 and std.mem.eql(u8, e.custom_title, cand)) { taken = true; break; }
+            if (e.name.len > 0 and std.mem.eql(u8, e.name, cand)) { taken = true; break; }
+        }
+        if (!taken) return cand;
+        gpa.free(cand);
+    }
+    return std.fmt.allocPrint(gpa, "{s} (Branch)", .{base}) catch base;
+}
+
+/// 30.4: fork/branch the current session into a new session file.
+pub fn branchSession(m: *tui.Model, arg: ?[]const u8) void {
+    const s = session orelse {
+        pushInfo(m, "no active session to branch");
+        return;
+    };
+    const src_path = s.path orelse {
+        pushInfo(m, "current session has no file path to branch");
+        return;
+    };
+
+    s.flush();
+    s.persistScrollState() catch {};
+    s.saveCapsSidecar();
+    s.saveCompactSidecar();
+
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const now = std.Io.Timestamp.now(io_global, .real);
+    const ts_us: u64 = @intCast(@divTrunc(now.nanoseconds, 1000));
+    const alphabet = "0123456789abcdefghjkmnpqrstvwxyz";
+    var new_id: [8]u8 = undefined;
+    var v = ts_us;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        new_id[i] = alphabet[@intCast(v & 31)];
+        v >>= 5;
+    }
+    const new_path = std.fmt.allocPrint(a, "{s}{c}zode-{s}.jsonl", .{ session_mod.sessions_dir, std.fs.path.sep, &new_id }) catch {
+        pushError(m, "could not create branch session path");
+        return;
+    };
+
+    const src_data = std.Io.Dir.cwd().readFileAlloc(io_global, src_path, a, .limited(64 * 1024 * 1024)) catch |err| {
+        pushErrorFmt(m, "could not read session to branch: {t}", .{err});
+        return;
+    };
+    std.Io.Dir.cwd().createDirPath(io_global, session_mod.sessions_dir) catch {};
+    {
+        var dst = std.Io.Dir.cwd().createFile(io_global, new_path, .{ .truncate = true, .permissions = session_mod.session_mode }) catch |err| {
+            pushErrorFmt(m, "could not create branch session: {t}", .{err});
+            return;
+        };
+        defer dst.close(io_global);
+        dst.setPermissions(io_global, session_mod.session_mode) catch {};
+        dst.writeStreamingAll(io_global, src_data) catch |err| {
+            pushErrorFmt(m, "could not write branch session: {t}", .{err});
+            return;
+        };
+    }
+
+    const src_stem = std.fs.path.stem(src_path);
+    const new_stem = std.fs.path.stem(new_path);
+    const src_id = sessionpath.sessionDisplayId(src_path);
+
+    copySidecarIfExists(a, src_path, ".caps.json", new_path) catch {};
+    copySidecarIfExists(a, src_path, ".compact.json", new_path) catch {};
+
+    const src_tr = std.fmt.allocPrint(a, "{s}{c}tool-results{c}{s}", .{ session_mod.sessions_dir, std.fs.path.sep, std.fs.path.sep, src_stem }) catch null;
+    const dst_tr = std.fmt.allocPrint(a, "{s}{c}tool-results{c}{s}", .{ session_mod.sessions_dir, std.fs.path.sep, std.fs.path.sep, new_stem }) catch null;
+    if (src_tr != null and dst_tr != null) {
+        copyDirRecursiveIfExists(a, src_tr.?, dst_tr.?) catch {};
+    }
+
+    const src_meta = sessionindex.readMeta(a, io_global, src_path);
+    const base_title = blk: {
+        if (src_meta.custom_title.len > 0) break :blk src_meta.custom_title;
+        if (src_meta.ai_title.len > 0) break :blk src_meta.ai_title;
+        if (src_meta.name.len > 0) break :blk src_meta.name;
+        break :blk src_id;
+    };
+    const requested = if (arg) |x| std.mem.trim(u8, x, " \t\r\n") else "";
+    const branch_title = if (requested.len > 0)
+        (m.allocator.dupe(u8, requested) catch requested)
+    else
+        makeBranchTitle(m.allocator, a, base_title);
+    defer if (requested.len == 0) m.allocator.free(branch_title);
+
+    sessionindex.writeMeta(io_global, a, new_path, .{
+        .name = src_meta.name,
+        .model = src_meta.model,
+        .created_at = @intCast(@divTrunc(now.nanoseconds, 1_000_000_000)),
+        .custom_title = branch_title,
+        .ai_title = "",
+        .tag = src_meta.tag,
+        .forked_from = src_id,
+    }) catch |err| {
+        pushErrorFmt(m, "branched session created but could not write metadata: {t}", .{err});
+    };
+
+    const resume_cmd = std.fmt.allocPrint(m.allocator, "zode --resume {s}", .{src_id}) catch null;
+    if (resume_cmd) |cmd| {
+        m.setCopyPending(cmd);
+        m.allocator.free(cmd);
+    }
+    pushInfoFmt(m, "Branched \"{s}\". To resume the original: zode --resume {s}", .{ branch_title, src_id });
 }
 
 fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {

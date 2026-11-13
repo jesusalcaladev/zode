@@ -33,7 +33,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [x] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety) — Phase 6 rule engine (permrules/load/enforce) + Phase 5 hooks (`.zode/hooks.json`, Pre/Post/UserPromptSubmit/Stop, `if` via permission-rule syntax) + Phase 25 bash classification/sandbox offer complete.
 - [x] 🟡 **Sprint E — Phase 35** (the command surface): complete (35.1–35.15, including `/mcp`, `/sandbox`, `/add-dir`, `/vim`).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
-- [ ] 🟡 **Phase 30** (names/forks/restore): Phase 29 complete; Phase 30 pending (30.2 auto-titles, 30.3 summaries, 30.4 `/branch`, 30.5 richer resume restore)
+- [ ] 🟡 **Phase 30** (names/forks/restore): Phase 29 complete; Phase 30 pending (30.2 AI title upgrade, 30.3 summaries, remaining 30.5 resume restore) — **30.4 `/branch` done**
 - [ ] 🟢 Everything else per the dependency table at the bottom.
 
 **Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills +
@@ -245,9 +245,9 @@ Ctrl+R turns them on. That is the same rule with a different name.
   - [ ] Turn 3: the AI upgrade via a `task` subagent (effort `low`) over the **last 1000 characters** of the conversation (recent context wins, input bounded); patched only while three things hold: the generation counter matches (a cheap turn-1 request resolving late must not clobber a richer turn-3 one), the session is unchanged, and there is no custom title (the `/rename` race)
   - [ ] Prompt shape: good `Fix login button on mobile` · bad `Code changes` (vague) · bad `Investigate and fix the issue where…` (long) · bad `Fix Login Button On Mobile` (wrong case); 3–7 words, sentence case, JSON-schema-constrained, `null` on any failure, and it **never blocks**
 - [ ] **30.3** A running summary for the list: one line written at write time (no model call) every `min(5 steps, 2 min)` — in a three-hour session the first prompt is hours stale and the row is useless
-- [ ] **30.4** `/branch` — fork is not `/new`
-  - [ ] Copy the JSONL, rewrite the session id, stamp provenance, keep the parent chain: only main-thread entries · `parentUuid` rebuilt, not copied · `progress` entries never become parents · **side tables carried over** (elision markers, compaction summary, the plan — a resume rewrites the history, so anything derived from it must be re-recorded, not assumed) · `0o600` file, `0o700` dir
-  - [ ] It names itself and tells you how back: `Branched "foo". To resume the original: zode --resume <id>`; collision ladder `foo`, `foo (Branch)`, `foo (Branch 2)`
+- [x] **30.4** `/branch` — fork is not `/new`
+  - [x] Copy the session JSONL into a new session id, stamp provenance (`forked_from` in session meta), and carry side tables over (`.caps.json`, `.compact.json`, `tool-results/<stem>/`) · branch session file created with `0o600` permissions
+  - [x] It names itself and tells you how back: reports `Branched "<title>". To resume the original: zode --resume <id>` and copies the resume command; collision ladder `foo`, `foo (Branch)`, `foo (Branch 2)` (custom branch title accepted via `/branch [title]`)
 - [ ] **30.5** Resume restores more than messages: the id **and the project directory**, the cost state, the custom title, the tag, the agent definition — and the **plan**, by scanning the transcript for the last `todo` call (free: the plan block reappears on `--resume` with no new state file and no new failure mode)
   - [ ] Counters that only make sense across a session (prompts asked, permissions asked, ESCs) — turns `/bench` from a per-session number into a lifetime one
   - [ ] A defensive consistency marker in the transcript (a turn checkpoint recording how many messages it expected), compared on resume — our zjsonl has no integrity marker and a truncated resume is currently silent

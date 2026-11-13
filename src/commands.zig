@@ -1948,6 +1948,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/vim", .desc = "toggle vim keybindings for the input editor" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
     .{ .key = "/new-session", .desc = "new session" },
+    .{ .key = "/branch", .desc = "fork the current session into a new branch", .key_hint = "[title]" },
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
     .{ .key = "/inspect", .desc = "workbench inspector (runtime-truth): overview | context|git|session", .key_hint = "context|git|session", .palette_visible = true },

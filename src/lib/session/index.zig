@@ -47,6 +47,8 @@ pub const Meta = struct {
     ai_title: []const u8 = "",
     /// Session tag (readability layer, 35.3). Stored without leading '#'.
     tag: []const u8 = "",
+    /// Parent session (30.4 /branch provenance), e.g. session id/stem of the fork source.
+    forked_from: []const u8 = "",
 };
 
 /// One session in the list.
@@ -226,6 +228,7 @@ pub fn readMeta(arena: std.mem.Allocator, io: std.Io, session_path: []const u8) 
     if (parsed.custom_title.len > 0) result.custom_title = arena.dupe(u8, parsed.custom_title) catch "";
     if (parsed.ai_title.len > 0) result.ai_title = arena.dupe(u8, parsed.ai_title) catch "";
     if (parsed.tag.len > 0) result.tag = arena.dupe(u8, parsed.tag) catch "";
+    if (parsed.forked_from.len > 0) result.forked_from = arena.dupe(u8, parsed.forked_from) catch "";
     return result;
 }
 
@@ -253,6 +256,11 @@ pub fn parseMeta(arena: std.mem.Allocator, data: []const u8) Meta {
     }
     if (o.get("tag")) |v| {
         if (v == .string) meta.tag = v.string;
+    }
+    if (o.get("forked_from")) |v| {
+        if (v == .string) meta.forked_from = v.string;
+    } else if (o.get("parent")) |v| {
+        if (v == .string) meta.forked_from = v.string;
     }
     return meta;
 }
@@ -302,14 +310,14 @@ fn writeMetaJson(w: *std.Io.Writer, meta: Meta) !void {
     try writeJsonString(w, meta.name);
     try w.writeAll(",\"model\":");
     try writeJsonString(w, meta.model);
-    try w.print(",\"created_at\":{d}}}\n", .{meta.created_at});
+    try w.print(",\"created_at\":{d}", .{meta.created_at});
+    try writeMetaTitles(w, meta);
+    try w.writeAll("}\n");
 }
 
 
-/// Writes the title/tag fields (custom_title, ai_title, tag) into a JSON object
-/// that is already open. Appends `,"custom_title":...,"ai_title":...,"tag":...`
-/// before the closing brace. The caller must write the opening `{` and other
-/// fields first, and the closing `}` after.
+/// Writes the title/tag/fork fields (custom_title, ai_title, tag, forked_from)
+/// into a JSON object that is already open.
 pub fn writeMetaTitles(w: *std.Io.Writer, meta: Meta) !void {
     try w.writeAll(",\"custom_title\":");
     try writeJsonString(w, meta.custom_title);
@@ -317,6 +325,8 @@ pub fn writeMetaTitles(w: *std.Io.Writer, meta: Meta) !void {
     try writeJsonString(w, meta.ai_title);
     try w.writeAll(",\"tag\":");
     try writeJsonString(w, meta.tag);
+    try w.writeAll(",\"forked_from\":");
+    try writeJsonString(w, meta.forked_from);
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
