@@ -145,6 +145,31 @@ pub const Editor = struct {
         self.cursor = self.buf.items.len;
     }
 
+    /// Moves the cursor up by one logical line, keeping the column when possible.
+    pub fn moveUp(self: *Editor) void {
+        const s = self.buf.items;
+        const ls = lineStart(s, self.cursor);
+        if (ls == 0) return; // already on first line
+        const col = self.cursor - ls;
+        const prev_end = ls - 1; // '\n' before current line
+        const prev_start = lineStart(s, prev_end);
+        const prev_len = prev_end - prev_start;
+        self.cursor = prev_start + @min(col, prev_len);
+    }
+
+    /// Moves the cursor down by one logical line, keeping the column when possible.
+    pub fn moveDown(self: *Editor) void {
+        const s = self.buf.items;
+        const ls = lineStart(s, self.cursor);
+        const le = lineEnd(s, self.cursor);
+        if (le >= s.len) return; // already on last line
+        const col = self.cursor - ls;
+        const next_start = le + 1;
+        const next_end = lineEnd(s, next_start);
+        const next_len = next_end - next_start;
+        self.cursor = next_start + @min(col, next_len);
+    }
+
     pub fn moveWordLeft(self: *Editor) void {
         var i = self.cursor;
         // Skip spaces backwards, then the word.
@@ -694,6 +719,22 @@ test "multiline: cursorLine and visual_lines" {
 
     e.moveToEnd();
     try std.testing.expectEqual(@as(usize, 1), e.cursorLine());
+}
+
+test "moveUp/moveDown keep column across logical lines" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+
+    try e.insert("abcd\nef\nghijk");
+    e.moveToEnd(); // at end of "ghijk", col 5
+    e.moveUp();
+    try std.testing.expectEqual(@as(usize, 7), e.cursor); // end of "ef" (clamped)
+    e.moveUp();
+    try std.testing.expectEqual(@as(usize, 2), e.cursor); // "ab|cd"
+    e.moveDown();
+    try std.testing.expectEqual(@as(usize, 7), e.cursor);
+    e.moveDown();
+    try std.testing.expectEqual(@as(usize, 10), e.cursor); // "gh|ijk"
 }
 
 test "deleteToStart and deleteToEnd" {

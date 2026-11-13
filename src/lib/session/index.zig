@@ -45,6 +45,8 @@ pub const Meta = struct {
     custom_title: []const u8 = "",
     /// AI-generated title (turn 3). Safe to regenerate.
     ai_title: []const u8 = "",
+    /// Session tag (readability layer, 35.3). Stored without leading '#'.
+    tag: []const u8 = "",
 };
 
 /// One session in the list.
@@ -68,6 +70,8 @@ pub const Entry = struct {
     agent_name: []const u8 = "",
     /// File size in bytes (from stat). 0 when unknown.
     size_bytes: u64 = 0,
+    /// Session tag (35.3), without leading '#'.
+    tag: []const u8 = "",
 
     /// Total title function (29.3): agentName || customTitle || aiTitle ||
     /// firstPrompt || sessionId[0..8]. A prompt starting with `<tICK>` or that
@@ -221,6 +225,7 @@ pub fn readMeta(arena: std.mem.Allocator, io: std.Io, session_path: []const u8) 
     result.created_at = parsed.created_at;
     if (parsed.custom_title.len > 0) result.custom_title = arena.dupe(u8, parsed.custom_title) catch "";
     if (parsed.ai_title.len > 0) result.ai_title = arena.dupe(u8, parsed.ai_title) catch "";
+    if (parsed.tag.len > 0) result.tag = arena.dupe(u8, parsed.tag) catch "";
     return result;
 }
 
@@ -245,6 +250,9 @@ pub fn parseMeta(arena: std.mem.Allocator, data: []const u8) Meta {
     }
     if (o.get("ai_title")) |v| {
         if (v == .string) meta.ai_title = v.string;
+    }
+    if (o.get("tag")) |v| {
+        if (v == .string) meta.tag = v.string;
     }
     return meta;
 }
@@ -298,15 +306,17 @@ fn writeMetaJson(w: *std.Io.Writer, meta: Meta) !void {
 }
 
 
-/// Writes the title fields (custom_title, ai_title) into a JSON object that
-/// is already open. Appends `,"custom_title":...,"ai_title":...` before the
-/// closing brace. The caller must write the opening `{` and other fields first,
-/// and the closing `}` after.
+/// Writes the title/tag fields (custom_title, ai_title, tag) into a JSON object
+/// that is already open. Appends `,"custom_title":...,"ai_title":...,"tag":...`
+/// before the closing brace. The caller must write the opening `{` and other
+/// fields first, and the closing `}` after.
 pub fn writeMetaTitles(w: *std.Io.Writer, meta: Meta) !void {
     try w.writeAll(",\"custom_title\":");
     try writeJsonString(w, meta.custom_title);
     try w.writeAll(",\"ai_title\":");
     try writeJsonString(w, meta.ai_title);
+    try w.writeAll(",\"tag\":");
+    try writeJsonString(w, meta.tag);
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -359,12 +369,14 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
         var model: []const u8 = "";
         var custom_title: []const u8 = "";
         var ai_title: []const u8 = "";
+        var tag: []const u8 = "";
         var created: i64 = 0;
         const meta = readMeta(arena, io, path);
         if (meta.name.len > 0) name = meta.name;
         if (meta.model.len > 0) model = meta.model;
         if (meta.custom_title.len > 0) custom_title = meta.custom_title;
         if (meta.ai_title.len > 0) ai_title = meta.ai_title;
+        if (meta.tag.len > 0) tag = meta.tag;
         if (meta.created_at > 0) created = meta.created_at;
         if (created == 0) created = mtime;
 
@@ -376,6 +388,7 @@ pub fn scan(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) []Entry 
             .ai_title = ai_title,
             .created_at = created,
             .size_bytes = size_bytes,
+            .tag = tag,
         }) catch continue;
     }
 

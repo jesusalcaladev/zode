@@ -179,10 +179,8 @@ const RosterJob = struct {
 /// roster arena, not from the def.
 fn rosterWorker(job: *RosterJob) void {
     const m = job.model;
-    defer {
-        m.allocator.destroy(job);
-        m.endWorker();
-    }
+    defer m.allocator.destroy(job);
+    defer m.endWorker(); // registered second -> runs FIRST (job must outlive endWorker)
 
     var astate = std.heap.ArenaAllocator.init(m.allocator);
     defer astate.deinit();

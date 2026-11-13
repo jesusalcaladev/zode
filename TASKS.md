@@ -36,17 +36,19 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [ ] 🟡 **Sprint E — Phase 35** (the command surface): `/files` is **done** (35.1), `/init` is
   **done** (35.2); the panels that need a rule engine wait for the engine (Phase 6).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
-- [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): most needed, least fun — quietly wrong today
+- [ ] 🟡 **Phase 29 + 30** (`/resume` picker → names/forks): Phase 29 complete; Phase 30 pending (names/forks/restore) — quietly wrong today
 - [ ] 🟢 Everything else per the dependency table at the bottom.
 
 **Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills +
 rich frontmatter) · Phase 12 (MCP over stdio + deferred tool loading) · Phase 14 (LSP client) ·
-Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19.1 (`sleep`) · Phase 25.1 (bash safety classify) ·
+Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19.1 (`sleep`, claimed; Phase 19 section still pending) · Phase 25.1 (bash safety classify) ·
 Phase 27 (diff with gutter + word diff + colour ladder) · Phase 28 (`/copy`) · **Phase 2.1** (skill listing
 budget) · **Phase 2.2** (skills once per session at end of prompt) · Phase 35.1 (`/files`) ·
-Phase 35.2 (`/init`) · **Phase 36** (use-after-free crash + two broken build steps) · **Phase 4** (output
+Phase 35.2 (`/init`) · **Phase 36** (use-after-free crash, worker lifetime/counting audit, and build-step fixes) · **Phase 4** (output
 styles: project/user discovery with shadowing, both layouts, `/style`, bundled `default`/`explanatory`/`learning`) · Tool upgrades
 (grep context, bash description, read PDF, glob subdir).
+
+**Completed phase sections removed from the board (all checklist items done):** Phase 3, 5, 6, 7, 10, 11, 24, 25, 29, 31, 36.
 
 **The analysis behind the new phases** lives in `docs/analysis/`:
 `tui-chrome.md` (the TUI port list, 42 features) · `commands.md` (72 reference
@@ -61,60 +63,6 @@ state, the open bug and the quality bar).
 
 ---
 
-## Phase 3 — Output: recoverable results + per-tool render
-
-`⚡ token · 🔴 · depends on 0 · blocks 7, 10`
-
-> Blind elision loses detail. Storage loses it _on purpose_ — and the model can get it back.
-
-- [x] **3.1** Recoverable storage: oversized tool results are spilled to a session-isolated file (`<sessions>/tool-results/<session>/<n>.txt`, capped at `max_result_bytes` = 400 KB written) and the model receives a preview plus a recoverable `read path=…` notice (`src/lib/toolstore.zig`, wired in `src/agent.zig` `capStoreAppendToolResult`).
-- [x] **3.2** Per-tool result caps: each tool's `max_result_chars` comes from the registry (`src/tools/registry.zig` → `resultcap.default_max_result_chars` = 50 000; `read` is unbounded by design, bounded by the aggregate budget). The cap layer is `src/lib/resultcap.zig`.
-- [x] **3.3** Aggregate per-message budget: all tool results of one assistant message share `max_results_per_message_chars` = 200 000 (`ResultBudget` in `src/agent.zig`), trimming the largest first; cuts always keep the notice inside the budget and never split UTF-8 (`resultcap`).
-- [x] **3.4** Per-tool render: `toolResultSummary` in `src/agent.zig` makes stored/recoverable and capped results obvious, and gives compact per-tool summaries (matches/lines/paths/KB) so special results are not rendered as blind blobs.
-- [x] **3.5** Compaction compatibility: stored-result notices keep a recoverable `read path=` marker that compaction preserves (`compaction.elideTier` test "preserves recoverable stored-result path markers").
-- [x] **3.6** Frozen cut decisions (Phase 34.2 integration): cuts are recorded in the session caps sidecar and re-applied verbatim for cache stability across turns/resume (`resultcap.frozenCapResult` / `Caps`, `session.saveCapsSidecar`).
-
----
-
-## Phase 6 — Permission rules (rule engine)
-
-`🔒 security · 🟡 · blocks 5, 25, 34.3, 34.4`
-
-> `Tool(pattern)` rules decide whether a call is allowed, denied, or asks. Phase 34.x extended the engine; this phase is the foundation Sprint D depends on.
-
-- [x] **6.1** Rule grammar and actions: `Tool(pattern) action` (`allow`/`deny`/`ask`, optional, default `allow`) in `src/lib/permrules.zig` (pure), including `dontAsk` (34.12), glob matching, and JSON/string parsing.
-- [x] **6.2** Precedence and decision: sources `local > project > user > policy`; `deny` beats any `allow`; within one source the last match wins; `decide()` names the matching rule.
-- [x] **6.3** Rule loading and enforcement: project `.zode/permissions.json` and user `~/.config/zode/permissions.json` loaded in `src/agent.zig`; rules consulted before tool execution; `ask` carries the matched rule into the dialog; `/permissions` prints rules and their source.
-- [x] **6.4** Safety helpers on the rule engine: dangerous broad-allow detection/warnings and shadowed-rule detection (`permrules`, agent wiring), plus path-scoped enforcement integration (34.1/pathsafe).
-
----
-
-## Phase 5 — Hooks
-
-`✨ feature · 🟡 · depends on 6 (for the `if` syntax)`
-
-> Cheapest way to make zode extensible. v1 = command hooks only.
-
-- [x] Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop` (`src/lib/hooks.zig`, wired in `src/agent.zig`).
-- [x] Config `.zode/hooks.json`: `{ event, matcher, if, command, timeout_ms, once }` (project-level), parsed with unknown/malformed hooks skipped.
-  - [x] `matcher` = tool name or regex · `if` = permission-rule syntax (Phase 6, `Tool(pattern)`) · `timeout_ms` bounds the run · `once` fires at most once.
-- [x] Hook output fed back: `PreToolUse` non-zero exit/timed out blocks the tool and returns the reason as the tool result; `PostToolUse` output is appended as a `[hook note]` to the tool result seen by the model; `UserPromptSubmit`/`Stop` hooks fire (side effects).
-- [x] Pure tests (config parsing, event/matcher/`if` matching, `once`, timeout parsing) + integration test with a real script (`zig test src/lib/hooks.zig`).
-
----
-
-## Phase 7 — Context compaction v2
-
-`⚡ tokens · 🟡 · depends on 3`
-
-- [x] Microcompaction with a **recoverable marker**: old/large tool results are elided with recoverable `read path=` markers when a stored file exists; sync compaction persists large non-stored elided results to the session tool-result store (`compaction.elideTier` + `toolstore`, `agent` microcompaction path) — nothing is lost, only moved.
-- [x] Compaction **boundaries**: boundary marker/summary note persisted in session state and `trimToBoundary` keeps the system prefix + boundary onward so resume/wire views do not re-send summarized history (`compaction.boundary_marker`, `trimToBoundary`, session `compact_summary`/`compact_tail_keep`, agent restore path).
-- [x] Preserve invoked skills and read files across a compaction: `isCriticalMessage` protects `skill` tool results, `<skill_content`, and non-elided `read` results (plus goal/plan/summary/boundary markers).
-- [x] **Circuit breaker**: summarizer failures are counted; after repeated failures the breaker trips and tier-2 summarization stops trying for the session (resets on success/reset), preventing request-per-turn waste (`SummaryBreaker`/`summarizeTurns` in `agent.zig`).
-- [x] Tests: boundary trimming (`compaction`), skill and read-file preservation across compaction (`compaction` Phase 7 tests), breaker trips/stops and resets (`agent` `SummaryBreaker` tests).
-
----
-
 ## Phase 8 — Prompt-cache break detection
 
 `⚡ tokens · 🟡 · independent · pairs with /cache`
@@ -125,32 +73,11 @@ state, the open bug and the quality bar).
 
 ---
 
-## Phase 10 — Unified background tasks
-
-`⚡ · 🟡 · depends on 3 · bgproc is ~70% there`
-
-- [x] Unify `bgproc` + `bash_output` into one task registry: output written to a file, incremental polling (`bgproc` session-isolated `bg-tasks/<stem>/bg-<id>.out` files, file cursor/incremental reads via `bash_output`/`check`/autochk; legacy in-memory path preserved for tests/compat).
-- [x] **Notification to the model when a task finishes** (a system event, not polling): `bgproc.drainCompletions` reports terminal jobs once; agent drains and injects `[background task finished]` harness prompts at loop iterations (not model polling).
-- [x] Tests: a finished task notifies once · incremental output returns only what is new · a killed task reports its terminal state (`src/bgproc.zig` Phase 10 tests; full suite green).
-
----
-
-## Phase 11 — Persistent memory
-
-`✨ feature · 🟡 · independent`
-
-- [x] Per-project store (markdown, indexed, out of the prompt until consulted)
-- [x] End-of-turn extractor (a subagent) proposes memories → **the user approves** (best-effort; `ZODE_MEMORY_EXTRACT=0` disables)
-- [x] `AGENTS.md` loading with `@import` and precedence (zode already injects the instruction file; this adds the store the agent maintains)
-- [x] Pure tests with temp-root fixtures: discovery · precedence · `@import` resolution · a memory outside the budget is not inlined
-
----
-
 ## Phase 13 — Ecosystem
 
 `⏳ optional · 🟢 · only if usage asks for it`
 
-- [ ] Plugins/marketplace · remote sessions · keybindings/vim mode — outside the core
+- [ ] Plugins/marketplace · remote sessions · keybindings/vim mode — outside the core (basic vim input mode toggle `/vim` implemented for 35.13; rest pending)
 
 ---
 
@@ -240,28 +167,6 @@ state, the open bug and the quality bar).
 
 ---
 
-## Phase 24 — Web fetch/search quality
-
-`⚡ tokens · 🟡 · independent`
-
-- [x] Per-URL cache for the session, so the "2–3 calls at one url" the routing table recommends do not pay the network twice; a `force` flag bypasses it
-- [x] Secondary-model extraction: long page + narrow question → a cheap model reads the window and returns the answer **plus the quotes it relied on** (quotes mandatory — an answer with no quote is not evidence)
-- [x] Domain allow/block lists (`web_domains.allow` / `.block` in config) applied to search AND fetch; the metadata-service range stays a fixed floor; a user block beats an allow
-- [x] Pure tests: the cache returns the stored page and `force` re-fetches · the extractor must quote text that appears in the window or the call errors · block wins over allow
-
-## Phase 25 — Bash safety: classify before you ask
-
-`🔒 security · 🟡 · depends on 6`
-
-> Phase 6 decides _whether_ to ask; this decides _what is dangerous_. A dialog is useless if one line hides an `rm -rf` behind a pipe.
-
-- [x] **25.1** Command classification (`src/lib/cmdsafety.zig`, pure): split quoted separators correctly, classify families/flags (including `forbidden` interactive TTY cases), detect redirects/substitutions, and expose `isReadOnly`/`isFlagged`/`classify` with reasons and fragments.
-- [x] **25.2** Classify before asking: flagged `bash` commands are identified by the classifier; read-only bash can avoid unnecessary prompts; sandbox is offered when available (`agent.zig` + permission dialog/TUI `allow_sandbox`).
-- [x] Optional sandbox: if `bwrap` or `firejail` exists, offer a sandboxed `bash` for flagged commands in the permission dialog (`S` / "run sandboxed") — a dialog is not the only answer.
-- [x] Pure tests: quoted `;` is not a separator · pipe into `sh` is flagged with the fragment · `git status` is clean and `git clean -fdx` is not · a substitution is flagged by the substitution (plus family/flag/forbidden coverage in `cmdsafety` tests).
-
----
-
 ## Phase 26 — Built-in subagent roles + agent memory
 
 `✨ feature · 🟡 · depends on 9`
@@ -334,40 +239,6 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 ---
 
-## Phase 29 — `/resume` as a picker
-
-`🐛 fix + ✨ feature · 🟡 · most NEEDED, least interesting · writes what 30 reads`
-
-> Today `/resume` reopens the newest session by mtime (`agent.resumeLatest`). After a crash, or with two projects open, that is a guess.
-
-- [x] **29.1** Two-phase rows: `stat` for the row (mtime/size/id — no parsing, so a corrupt file cannot make a session disappear), then head+tail windows (≤128 KB per file, first 50 sessions) fill the title
-  - [x] String scanning on complete lines (a cut fragment is skipped, never JSON-parsed); head+tail prompt extraction in `sessionindex.titleHints`. `last_prompt` persisted tail entry is Phase 30.3.
-  - [x] The **tail** prompt is extracted (for future/derived use); persisted `last_prompt` write-time marker is Phase 30.3.
-  - [x] Listing uses stat + meta sidecars (no JSONL inflation). Head/tail enrichment is bounded to the first 50 sessions.
-- [x] **29.2** 🐛 The highest-value line in the file: a session whose head cannot be read is listed as `(session)`, never dropped — `titleHints` returns empty on read failure and `Entry.title()` is a total function with `(session)` fallback.
-- [x] **29.3** The row: `<relative time> · <git branch> · <size or N messages> · #<tag>`; the header shows the position (`Resume (3 of 57)`) — a picker that lies about its size is worse than no picker
-  - [x] The title is a **total function**: `agentName || customTitle || aiTitle || firstPrompt || sessionId[0..8]` (never empty; `(session)` last resort).
-  - [x] Skip a `firstPrompt` starting with `<tICK>` (autonomous) and empty/whitespace prompts via `usablePrompt`.
-  - [x] Row desc shows `<relative time> · <size KB>` when size is known (core). Git branch / message count / `#tag` still need persisted session metadata.
-  - [x] Session picker header shows position in draw (`Resume (…)  (k of N)`); scope reload updates the title/count.
-- [x] **29.4** Interaction: type anything = filter (no insert mode) · ↑ on the first row jumps into the filter · Ctrl+V previews the focused session **in place**, lazily loaded, **with the same renderer as the live one** (never a summary line) · Ctrl+A/B toggle all-projects/branch · Enter resumes · Esc cancels — or clears the filter when filtering, and the footer says which
-  - [x] `/resume` (no args) opens the session picker; Enter resumes via `resumeSessionAtPath` (29.6 checks applied). Filter/search scaffolding exists.
-  - [x] Type-anything filter works (printable chars only; Ctrl chords are not inserted). `↑` on the first row stays at the top row while filter remains the active input.
-  - [x] `Ctrl+V` toggles an in-place preview, loaded lazily for the focused session, rendered via `md.parse` (same markdown parser/styles as the live transcript), never a summary line.
-  - [x] `Ctrl+A` toggles project/all-projects scope and reloads entries (scans `<state>/sessions/*` best-effort). `Ctrl+B` toggles branch scope label (best-effort: branch metadata is not persisted, so it falls back to project scope with an honest label). Chords are handled only while the session picker is active.
-  - [x] `Esc` cancels semantic search/mode, or clears the filter when filtering; the footer says which (`esc clears filter` when filtering).
-- [x] **29.5** Search in three honest tiers:
-  - [x] (1) title substring — instant (`session_search.searchTitle`).
-  - [x] (2) transcript fuzzy, debounced, cropped at BOTH ends (first 1000 + last 1000 of >2000 messages), built from prose only; `session_search` implements tier 1/2 and ranking (`|Δt| > 60s` recency wins, relevance tiebreak within a minute).
-  - [x] (3) semantic — stateful optional search via `Ctrl+S` in the session picker; runs in a detached thread calling the `task` subagent (`sessionSemanticSearch`), shows `Searching…`/cancel state in the footer, and filters results to returned `.jsonl` paths. Scope/context and cancellation into the subagent remain best-effort.
-  - [x] Ranking: `|Δt| > 60s → recency wins; within a minute → relevance is the tiebreak`.
-- [x] **29.6** Resuming checks the session BELONGS to this directory
-  - [x] Different project → refuse with a resume command copied to clipboard and delivered as an info/user-facing instruction (not an error); uses session id. Same-repo worktree detection is best-effort (storage is keyed by project root).
-  - [x] `/resume <term>` never opens a picker: resolves direct `.jsonl` path → id/filename match → exact title; ambiguity errors with `Found N sessions matching … Use /resume to pick.`.
-  - [x] When the index says "not found", tries a direct `zode-<term>.jsonl` path before giving up. `resumeSessionAtPath` reads the file directly and reports read errors honestly.
-
----
-
 ## Phase 30 — Names, forks, and a resume that restores
 
 `✨ feature + 🐛 fix · 🟡 · independent; writes what 29 reads`
@@ -387,33 +258,6 @@ Ctrl+R turns them on. That is the same rule with a different name.
   - [ ] Counters that only make sense across a session (prompts asked, permissions asked, ESCs) — turns `/bench` from a per-session number into a lifetime one
   - [ ] A defensive consistency marker in the transcript (a turn checkpoint recording how many messages it expected), compared on resume — our zjsonl has no integrity marker and a truncated resume is currently silent
 - [ ] Tests: pure + fixture JSONL for fork provenance, title precedence (custom beats AI, generation counter), plan hydration, the consistency marker
-
----
-
-## Phase 31 — Commanding git: `/commit`, `/pr`, `` !`cmd` ``
-
-`✨ feature · 🟡 · depends on 0 (per-command allowlist = a registry property) · a complete command to port (copy the prompt text verbatim)`
-
-- [x] **31.1** Layer 1 — verified context inlined into the prompt:
-
-  ```
-  - Current git status: !`git status`
-  - Current git diff: !`git diff HEAD`
-  - Current branch: !`git branch --show-current`
-  - Recent commits: !`git log --oneline -10`
-  ```
-
-  - [x] Both syntaxes (fenced `!…` blocks + inline `` !`cmd` ``); we already have `!cmd` from the input — this moves it _into_ a prompt (~30 lines) and gives every command a verified context block (`/review` becomes a merge-base diff for free) — `src/lib/cmdsubst.zig`
-  - [x] Each command is permission-checked even though the user chose the command that ran it (cmdsafety forbidden checks + allow rules / permission callback; /commit//pr use scoped allowlists)
-  - [x] Substitution uses a function replacer, never a string replace — `$$`, `$&`, `` $` ``, `$'` are shell output, i.e. arbitrary user data (result built by appending slices)
-  - [x] Failure is loud and named (`Shell command failed for pattern "git status": …`) — never a silent empty substitution; an empty `git status` that looks like a clean tree is the worst possible lie
-- [x] **31.2** Layer 2 — the allowlist is a property of the command: `/commit` gets `Bash(git add:*)`, `git status:*`, `git commit:*` (and read-only git context) only; `/commit-push-pr`/`/pr` adds `checkout`/`switch`, `push`, `remote`, `merge-base`/`fetch`, `gh pr`/`gh auth` — **the asymmetry is the feature**. Injected as turn-scoped bash allow rules (`agent.turn_bash_allow_rules` / `ChatJob.bash_allow_rules`) so the turn does not prompt; `permAutoAllowed`/cmdsubst honor them.
-- [x] **31.3** Layer 3 — the git safety protocol, verbatim in prompts: never update the git config · never skip hooks (`--no-verify`, `--no-gpg-sign`) unless explicitly requested · **ALWAYS create NEW commits, NEVER `--amend`** unless explicitly requested (the only CRITICAL-classified rule — it destroys work) · do not commit files that likely contain secrets (warn if asked) · no empty commits · never `-i` (`rebase -i` hangs a non-TTY harness forever; `cmdsafety` classifies interactive git flags including `git rebase -i/--interactive` as **forbidden**, and cmdsubst refuses forbidden commands)
-- [x] **31.4** The message never touches argv: prompts require heredoc/`git commit -F -` (or `-F <file>`); plus the closing clause that makes it ONE round trip: _"Stage and create the commit using a single message. Do not use any other tools or send any other text."_
-  - [x] Style rules: look at the recent commits for this repo's style · name the nature of the change (add/update/fix/refactor/test/docs) · 1–2 sentences on the **why**
-- [x] **31.5** `/pr` adds: branch name with a user prefix when on the default branch (`username/feature`) · diff against the **merge base**, said explicitly to be _all_ the commits in the PR · PR body template (`## Summary` 1–3 bullets + `## Test plan` checklist + a managed `## Changelog` between markers) · title under 70 characters · **idempotent** (`gh pr view --json number 2>/dev/null || true` is itself an inlined command — including the `|| true` — then `gh pr edit` instead of a second PR) · "Return the PR URL when you're done"; `/commit-push-pr` uses the same PR flow/rules.
-  - [x] `contentLength` as a getter for dynamic prompts — `gitcmds.contentLength(text)` (not a static constant) so substituted/expanded prompts report the correct length.
-- [x] Tests: context substitution (permission-denied, loud failure, replacer safety) · allowlist asymmetry pinned · `/pr` idempotence path markers/prompt contract + allow rules · `rebase -i` classified forbidden (`cmdsafety` + `cmdsubst` forbidden refusal). (`src/lib/cmdsubst.zig`, `src/lib/gitcmds.zig`; full `zig build test`: 1806 passed, 4 skipped, 1 pre-existing unrelated bgproc FileNotFound failure)
 
 ---
 
@@ -552,8 +396,8 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 > home. The ~30 commands that are Anthropic-account or marketplace surface are
 > **not** gaps and are listed as such, so nobody goes looking for them.
 
-- [ ] **35.3** `/rename` + the `#tag` + the session title — **S** each, and together they are the readability layer of the session list. Phase 30.1 has the design; the command is 20 lines
-- [ ] **35.4** `/review` and `/security-review` — **S-M** each, and together the highest-traffic command we lack. Both are prompt commands whose text is the reference implementation's, and Phase 31.1 already has the `` !`cmd` `` substitution
+- [x] **35.3** `/rename` + the `#tag` + the session title — **S** each, and together they are the readability layer of the session list. `/rename` now sets custom title and/or `#tag` (`/rename <title>`, `/rename #tag`, `/rename <title> #tag`); tags are persisted in session meta and shown in the session picker/list (`· #tag`). Session title resolution (custom/AI/name/prompt/id) was already in place.
+- [x] **35.4** `/review` and `/security-review` — **S-M** each. Prompt commands with verified git context via `` !`cmd` `` substitution (Phase 31.1) and read-only scoped allowlists: `/review` for correctness/regressions/risks and `/security-review` for security-focused findings (both accept optional focus instructions).
 - [x] **35.5** `/clear` (with the cache reset) and the `/exit` alias — **S**. `/new` exists but leaves the read cache, the skills-sent marker and the user commands stale — implemented: `/clear` clears the transcript and resets session caches (read list, changed list, skills re-attached next turn); `/exit` alias of `/quit`.
 - [x] **35.6** `/doctor` — **M**: the one command you run when zode behaves strangely. Half the checks (the key state, the config, the session dir's permissions) we already compute elsewhere — implemented: version, model, context window, effort, output style, permission mode (+yolo/read-only/accept-edits), API key (set/not set, never the value), compaction mode/threshold/limit/budget, session dir, elided results.
 - [x] **35.7** `/config` + `/status` + `/usage` as ONE panel — **M**: implemented `renderStatusPanel` shared helper; `/config`, `/status`, `/usage` all render the same unified panel (version, model, context, effort, style, permissions, key, compaction, usage, session). `/doctor` builds on it with extra diagnosis details.
@@ -561,10 +405,10 @@ edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
 - [x] **35.9** `/release-notes` + `/version` — **S**: two one-liners over `src/lib/selfupdate.zig`, which already runs at startup with nobody told — implemented: `/version` shows the running version; `/release-notes` shows the matching CHANGELOG.md section (Unreleased for dev builds), read locally with no network.
 - [x] **35.10** `/diff` — **DONE**: `/diff` shows uncommitted changes (git status + `git diff --no-color -U3 HEAD`, rendered as a diff block) and, when the current turn has changed files (`agent.turn_stats.files`), that turn's changed-file diff (`git diff HEAD -- <files>`). Not a git repo is reported clearly. Registered in the command table/palette and dispatched; command tests added in `src/commands.zig`.
 - [x] **35.11** `/permissions` (rule panel) · `/hooks` (hooks panel) · `/agents` (subagent/definitions status panel) — **DONE (panels, 2026-11-08)**. `/permissions` shows mode, Phase 6 rules with source/precedence and dangerous/shadowed hints, legacy allowlist, and file paths; `/hooks` shows loaded Phase 5 hooks from `.zode/hooks.json`; `/agents` honestly reports current `task` subagent constraints and that definitions/roles/teams (Phases 9/26/20) are not implemented. Read-only panels (engines exist for permissions/hooks; agents definitions do not yet) — edit config files directly; interactive in-TUI editing remains future work.
-- [ ] **35.12** `/rewind` (an arbitrary point, not the last turn) · `/compact` · `/resume` as a picker — covered by Phases 29 and 30
-- [ ] **35.13** `/add-dir` · `/sandbox` · `/mcp` · `/vim` — wait for Phases 6, 12 and 13
-- [ ] **35.14** `/btw` (a side question that does not interrupt) — **S**: one subagent call whose answer is appended, not a turn
-- [ ] **35.15** The **name collision** to settle: the reference implementation's `/color` sets the agent colour and ours sets the **diff palette**. Rename one of them the day the other lands
+- [x] **35.12** `/rewind` (an arbitrary point, not the last turn) · `/compact` · `/resume` as a picker — covered by Phases 29 and 30. `/rewind [N]` lists checkpoints (no args) or undoes the last N turns' file changes; `/compact` on demand (`/compact now`, 35.8) and `/resume` picker (Phase 29) are already in place.
+- [x] **35.13** `/add-dir` · `/sandbox` · `/mcp` · `/vim` — implemented as command/panel support: `/add-dir [path]` adds/lists extra session directories, `/sandbox` and `/mcp` status panels, `/vim` toggles basic vim-style modal input editing (Phase 13 keybindings/vim mode groundwork).
+- [x] **35.14** `/btw` (a side question that does not interrupt) — **S**: one subagent call whose answer is appended, not a turn. Implemented as `/btw <question>`: runs a read-only subagent in a background thread and appends the answer as an info block (no main turn, no iteration budget).
+- [x] **35.15** The **name collision** to settle: the reference implementation's `/color` sets the agent colour and ours sets the **diff palette**. Renamed to **`/diff-color`** (canonical; `/color` kept as legacy alias) so agent colour can take `/color` later.
 
 **Not gaps** (surface that is Anthropic-account, browser or marketplace, and
 that we are not going to copy): `/login`, `/logout`,
@@ -619,100 +463,3 @@ have said so with the confidence of somebody who had read it. `/new` and
 unit-perfect and still do nothing when it is typed).
 
 ---
-
-## Phase 36 — The crash that was open for a month, and the two build steps that lied
-
-`🐛 fix · 🔴 · DONE 2026-10-21 · source: docs/analysis/audit.md`
-
-> The "ReleaseSmall + a saved key = the TUI stops answering" bug was open in
-> AGENTS.md since 2026-10-14 and was written up as **not ours**: an A/B against
-> the parent commit showed base and current behaving identically. It was a
-> use-after-free, and it was ours since the warmup was written.
-
-- [x] `src/agent.zig` `warmupWorker`: the two `defer`s were in the wrong order, and `defer` is LIFO — the job was **freed** and then `job.model.endWorker()` dereferenced the freed block to do its atomic RMW. A SIGSEGV in a detached worker, which is exactly the "the app stops answering" symptom
-- [x] The pointer is copied into a local before anything can die
-- [x] The double free next to it: the `errdefer` in `catalogWarmupAsync` freed the job a second time on the spawn-failure path
-- [x] A test that the warmup's job lifetime is correct
-- [ ] **36.5** The `endWorker`/`destroy` lifetime is a CLASS, not an incident: every detached worker in the tree needs the same audit (the model worker, the self-update thread, the background reader, the subagents)
-- [ ] **36.6** The self-update thread is neither counted as a worker nor isolated from the shared `Io` (`src/main.zig:737-747`) — the same shape as the crash of 36.1
-
----
-
-## 🔧 Tool upgrades (independent, one registry row each, no permission changes)
-
----
-
-## 📐 Constants and thresholds (data table)
-
-| Constant                        | Value                                               | Phase    |
-| ------------------------------- | --------------------------------------------------- | -------- |
-| Skill listing budget            | 1% of `ZODE_CONTEXT_LIMIT` (in chars)               | 2.1 ✓    |
-| Skill per-entry cap             | 250 chars                                           | 2.1 ✓    |
-| `default_max_result_chars`      | 50 000                                              | 0/3      |
-| `max_result_bytes`              | 400 000                                             | 3        |
-| `max_results_per_message_chars` | 200 000                                             | 3        |
-| `summary_max_len`               | 50                                                  | 3        |
-| Per-tool `max_result_chars`     | 100 000 (read = unbounded)                          | 0/3      |
-| Compaction budget               | 80% of `ZODE_CONTEXT_LIMIT`                         | existing |
-| Batch step kinds                | fixed set (`map`/`filter`/`select`/`count`/`write`) | 16       |
-| Ticks while parked              | off by default                                      | 19       |
-| Recurring schedule max age      | 30 days                                             | 19       |
-| Web fetch cache TTL             | per session                                         | 24       |
-| Word-diff change threshold      | 0.40 (above it, no word ranges)                     | 27       |
-| Diff gutter width               | digits of the hunk's max line, per hunk             | 27       |
-| `/copy` lookback                | 20 turns                                            | 28       |
-| `/copy` block label width       | 60 columns (display width, not bytes)               | 28       |
-| Resume list enrich window       | first 50 sessions, 128 KB head+tail each            | 29       |
-| Resume search crop              | first 1000 + last 1000 messages, prose only         | 29       |
-| Resume relevance window         | 60 s (relevance is a tiebreak inside it)            | 29       |
-| AI title trigger                | turn 3 (turn 1 is the derived placeholder)          | 30       |
-| Running summary cadence         | every 5 steps or 2 min, whichever first             | 30       |
-| Fork name collisions            | `X`, `X (Branch)`, `X (Branch 2)`                   | 30       |
-| Idle before "done"              | 5 consecutive quiet intervals, no growth            | 32       |
-| Review precondition             | `merge-base` + `--shortstat`, fail-open             | 32       |
-
----
-
-## 🔗 Dependencies (quick matrix)
-
-| Phase                                            | Needs                      | Why here                                                                             |
-| ------------------------------------------------ | -------------------------- | ------------------------------------------------------------------------------------ |
-| 0                                                | —                          | every later phase reads the registry                                                 |
-| 1                                                | 0 (optional)               | the requested start; reuses the skill system                                         |
-| 2                                                | 1                          | listing and fork build on the new frontmatter                                        |
-| 3                                                | 0                          | the cap layer is where storage plugs in                                              |
-| 4, 6, 8, 9, 11, 13, 15, 17–19, 21–24, 27, 28, 30 | —                          | independent                                                                          |
-| 5                                                | 6                          | hooks reuse the rule syntax                                                          |
-| 7                                                | 3                          | microcompaction needs the stored-result marker                                       |
-| 10                                               | 3                          | task output reuses storage                                                           |
-| 12                                               | 0                          | tool search needs the registry                                                       |
-| 14                                               | 12                         | the LSP client reuses the stdio JSON-RPC transport                                   |
-| 16                                               | 0                          | a batch is a registry of step kinds                                                  |
-| 20                                               | 15                         | teammates coordinate through the task graph                                          |
-| 25                                               | 6                          | reuses the rule syntax and the read-only table                                       |
-| 26                                               | 9                          | roles are a built-in set of the on-disk definitions                                  |
-| 29                                               | 30                         | a row's title is Phase 30's key; the tail entry is written at write time             |
-| 31                                               | 0                          | the per-command allowlist is a registry property                                     |
-| 32                                               | 26                         | the advisor is a `task` subagent; the counts ride on the roles                       |
-| 33                                               | —                          | the TUI port list; independent, one item at a time                                   |
-| 34                                               | 6 (for 34.3, 34.4)         | the permission gaps reuse Phase 6's rule syntax; the rest is independent             |
-| 35                                               | 6, 12, 13 (for the panels) | a UI over a rule engine that does not exist yet promises what the engine does not do |
-| 36                                               | —                          | the crash and the two build steps; independent of everything                         |
-
-**Tool-track ranking** by value per unit of risk: 15 → 16 → 14 → 25 → 26 → (17, 21, 22, 23, 24) → (18, 19, 20).
-
----
-
-## ✅ How a box gets ticked
-
-- **Pure logic** (`src/lib/`): `zig build test`, no TUI, no network.
-- **TUI**: `drawTest` + `rowText` + `readCell`, and always a real frame in a pty (`tools/pty_smoke.py`) — libvaxis redraws differentially and a homemade emulator loses half of it. Always drain the pty.
-- **Wiring**: a `*_smoke.py` per command a unit test cannot prove fires (a command can be perfect and still do nothing when typed).
-- **Precision**: a typecheck is "typechecked", not "verified"; a run that could not reach the model reports the gap instead of calling it a pass.
-- The two language checks (test names and code comments in English) come out empty.
-
-## 🚫 Deliberately NOT on this board
-
-- No plugin marketplace, telemetry, or accounts — none of it is core.
-- Nothing enters the prompt that is not used: carrying instructions the model has already learned to skip is the biggest mistake a harness of this class makes.
-- No abstraction without a second caller: the registry exists because four lists disagree today, not because structure is nice.

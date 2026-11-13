@@ -27,6 +27,9 @@ const copytext = @import("lib/copytext.zig");
 const clipboard = @import("clipboard.zig");
 const bgproc = @import("bgproc.zig");
 const github_lib = @import("lib/github.zig");
+const subagent_mod = @import("lib/subagent.zig");
+const mcp_manager = @import("mcp/manager.zig");
+const sandbox_mod = @import("lib/sandbox.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -313,6 +316,96 @@ pub fn cmdAgents(m: *tui.Model) void {
     agent.pushInfoOwned(m, gpa.dupe(u8, "  built-in roles explore/plan/verify (Phase 26): not implemented") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  team mode (Phase 20): not implemented") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  note: interactive agent editing is not implemented") catch return);
+}
+
+/// `/mcp`: MCP server configuration and status (35.13 panel, partial).
+/// Shows configured servers without forcing connections; tools are discovered on demand.
+pub fn cmdMcp(m: *tui.Model) void {
+    const gpa = m.allocator;
+    agent.pushInfoOwned(m, gpa.dupe(u8, "mcp  ·  MCP server configuration and status") catch return);
+    agent.pushInfoFmt(m, "  manager: {s}", .{if (mcp_manager.isReady()) "ready" else "not initialized"});
+    const servers = mcp_manager.configuredServers();
+    if (servers.len == 0) {
+        agent.pushInfo(m, "  servers: none configured (add `mcp_servers` in ~/.config/zode/config.json)");
+    } else {
+        agent.pushInfoFmt(m, "  servers: {d} configured", .{servers.len});
+        for (servers) |s| {
+            const cmd = if (s.command.len > 0) s.command[0] else "(no command)";
+            agent.pushInfoFmt(m, "    - {s}  ({s}, {d} arg{s}, {d} env)", .{
+                s.name,
+                cmd,
+                if (s.command.len > 1) s.command.len - 1 else 0,
+                if (s.command.len == 2) "" else "s",
+                s.env.len,
+            });
+        }
+        agent.pushInfo(m, "  note: tool catalogs are discovered lazily on use (use the `mcp` tool to search/list/call)");
+    }
+}
+
+/// `/sandbox`: sandbox availability for flagged bash commands (35.13 panel, partial).
+pub fn cmdSandbox(m: *tui.Model) void {
+    const path = agent.envGet(m.environ, "PATH");
+    const kind = sandbox_mod.detect(agent.io_global, std.Io.Dir.cwd(), path);
+    agent.pushInfoOwned(m, m.allocator.dupe(u8, "sandbox  ·  availability for flagged bash commands") catch return);
+    switch (kind) {
+        .none => {
+            agent.pushInfo(m, "  detected: none (install bubblewrap `bwrap` or `firejail` to enable sandboxed runs)");
+        },
+        else => {
+            agent.pushInfoFmt(m, "  detected: {s} ({s})", .{ kind.name(), sandbox_mod.binary(kind) });
+            agent.pushInfo(m, "  behavior: optional sandboxed execution offered for flagged bash commands (project writable, rest read-only; no network isolation)");
+        },
+    }
+    agent.pushInfo(m, "  note: sandbox is opt-in per command when offered by the permission dialog (not applied to every command)");
+}
+
+/// `/vim`: toggle vim keybindings for the input editor (35.13 / Phase 13).
+pub fn cmdVim(m: *tui.Model) void {
+    m.vim_mode = !m.vim_mode;
+    m.vim_normal = false;
+    m.vim_pending = 0;
+    if (m.vim_mode) {
+        // Start in insert mode to avoid surprising users mid-typing.
+        agent.pushInfo(m, "vim mode: on (insert). Esc -> normal, i/a/... -> insert. /vim to disable.");
+    } else {
+        agent.pushInfo(m, "vim mode: off");
+    }
+}
+
+/// `/add-dir <path>`: add an additional directory for this session (35.13).
+/// Lists added directories when called without arguments.
+pub fn cmdAddDir(m: *tui.Model, arg: ?[]const u8) void {
+    const gpa = m.allocator;
+    const trimmed = if (arg) |a| std.mem.trim(u8, a, " \t\r\n") else "";
+    if (trimmed.len == 0) {
+        if (m.extra_dirs.items.len == 0) {
+            agent.pushInfo(m, "no additional directories added. usage: /add-dir <path>");
+            return;
+        }
+        agent.pushInfoOwned(m, gpa.dupe(u8, "additional directories:") catch return);
+        for (m.extra_dirs.items) |d| {
+            agent.pushInfoFmt(m, "  - {s}", .{d});
+        }
+        return;
+    }
+    // Avoid duplicates.
+    for (m.extra_dirs.items) |d| {
+        if (std.mem.eql(u8, d, trimmed)) {
+            agent.pushInfoFmt(m, "already added: {s}", .{trimmed});
+            return;
+        }
+    }
+    const copy = gpa.dupe(u8, trimmed) catch {
+        agent.pushError(m, "could not add directory");
+        return;
+    };
+    m.extra_dirs.append(gpa, copy) catch {
+        gpa.free(copy);
+        agent.pushError(m, "could not add directory");
+        return;
+    };
+    agent.pushInfoFmt(m, "added directory: {s}", .{trimmed});
 }
 
 /// `/cache`: prompt cache hit-rate of the session.
@@ -932,7 +1025,7 @@ pub fn cmdInit(m: *tui.Model) void {
 // `agent.turn_bash_allow_rules` for this turn only — not persisted `perm_rules`.
 fn startGitPromptCommand(m: *tui.Model, prompt: []const u8, allow_rules: []const []const u8, extra: ?[]const u8) void {
     if (m.isBusy()) {
-        m.pushError("wait for the current turn to finish before running /commit or /pr");
+        m.pushError("wait for the current turn to finish before running this command");
         return;
     }
     var full = prompt;
@@ -963,6 +1056,16 @@ pub fn cmdPr(m: *tui.Model, arg: ?[]const u8) void {
 /// Phase 31.2 naming: commit-push-PR workflow (uses PR allowlist asymmetry).
 pub fn cmdCommitPushPr(m: *tui.Model, arg: ?[]const u8) void {
     startGitPromptCommand(m, gitcmds.pr_prompt, &gitcmds.pr_allow_rules, arg);
+}
+
+/// Phase 35.4: review current changes with verified git context.
+pub fn cmdReview(m: *tui.Model, arg: ?[]const u8) void {
+    startGitPromptCommand(m, gitcmds.review_prompt, &gitcmds.review_allow_rules, arg);
+}
+
+/// Phase 35.4: security-focused review of current changes.
+pub fn cmdSecurityReview(m: *tui.Model, arg: ?[]const u8) void {
+    startGitPromptCommand(m, gitcmds.security_review_prompt, &gitcmds.security_review_allow_rules, arg);
 }
 
 /// `/context`: gauge of context used against the limit and the budget.
@@ -1246,10 +1349,14 @@ pub fn cmdSession(m: *tui.Model) void {
             (std.fmt.allocPrint(gpa, "{s}  (current)", .{title}) catch gpa.dupe(u8, title) catch "")
         else
             (gpa.dupe(u8, title) catch "");
-        // 29.3: <relative time> · <size> (branch/tag when available).
+        // 29.3/35.3: <relative time> · <size> · #tag (branch/count when available).
         var dbuf: [32]u8 = undefined;
         const size = if (s.size_bytes > 0) std.fmt.bufPrint(&dbuf, "{d} KB", .{s.size_bytes / 1024}) catch "" else "";
-        const desc = if (size.len > 0)
+        const desc = if (s.tag.len > 0 and size.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} · {s} · #{s}", .{ age, size, s.tag }) catch gpa.dupe(u8, age) catch "")
+        else if (s.tag.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} · #{s}", .{ age, s.tag }) catch gpa.dupe(u8, age) catch "")
+        else if (size.len > 0)
             (std.fmt.allocPrint(gpa, "{s} · {s}", .{ age, size }) catch gpa.dupe(u8, age) catch "")
         else
             (gpa.dupe(u8, age) catch "");
@@ -1269,12 +1376,13 @@ pub fn cmdSession(m: *tui.Model) void {
     );
 }
 
-/// `/rename <name>`: set a custom title for the current session.
-/// The custom title wins over AI titles and session IDs in the session list,
-/// and is persisted to the session's Meta sidecar.
+/// `/rename <name>`: set a custom title and/or tag for the current session.
+/// Forms: `/rename <title>`, `/rename #tag`, `/rename <title> #tag`.
+/// Custom title wins over AI titles/session IDs in the session list; tag is
+/// shown as `#tag` in the session picker. Persisted to the Meta sidecar.
 pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
     const name = arg orelse {
-        agent.pushInfo(m, "usage: /rename <name>");
+        agent.pushInfo(m, "usage: /rename <title> | /rename #tag | /rename <title> #tag");
         return;
     };
     const trimmed = std.mem.trim(u8, name, " \t\r\n");
@@ -1282,9 +1390,42 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
         agent.pushInfo(m, "rename: empty name");
         return;
     }
-    if (trimmed.len > 64) {
-        agent.pushInfo(m, "rename: name too long (max 64 chars)");
-        return;
+
+    var new_title: ?[]const u8 = null;
+    var new_tag: ?[]const u8 = null;
+    if (trimmed[0] == '#' and std.mem.indexOfAny(u8, trimmed, " \t\r\n") == null) {
+        // Tag-only: `/rename #tag` (or `#` to clear).
+        const t = std.mem.trim(u8, trimmed[1..], " \t\r\n");
+        new_tag = t;
+    } else if (std.mem.lastIndexOfScalar(u8, trimmed, '#')) |hash| blk: {
+        if (hash > 0 and (trimmed[hash - 1] == ' ' or trimmed[hash - 1] == '\t')) {
+            const t = std.mem.trim(u8, trimmed[hash + 1 ..], " \t\r\n");
+            if (t.len > 0 and std.mem.indexOfAny(u8, t, " \t\r\n") == null) {
+                new_title = std.mem.trim(u8, trimmed[0..hash], " \t\r\n");
+                new_tag = t;
+                break :blk;
+            }
+        }
+        new_title = trimmed;
+    } else {
+        new_title = trimmed;
+    }
+
+    if (new_title) |t| {
+        if (t.len == 0) {
+            agent.pushInfo(m, "rename: empty title");
+            return;
+        }
+        if (t.len > 64) {
+            agent.pushInfo(m, "rename: title too long (max 64 chars)");
+            return;
+        }
+    }
+    if (new_tag) |t| {
+        if (t.len > 32) {
+            agent.pushInfo(m, "rename: tag too long (max 32 chars)");
+            return;
+        }
     }
 
     const s = agent.session orelse {
@@ -1292,17 +1433,23 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
         return;
     };
 
-    // Free old custom_title if any (replaced by the new one).
-    if (s.custom_title.len > 0) s.allocator.free(s.custom_title);
-    s.custom_title = s.allocator.dupe(u8, trimmed) catch {
-        agent.pushInfo(m, "rename: out of memory");
-        return;
-    };
+    if (new_title) |t| {
+        if (s.custom_title.len > 0) s.allocator.free(s.custom_title);
+        s.custom_title = s.allocator.dupe(u8, t) catch {
+            agent.pushInfo(m, "rename: out of memory");
+            return;
+        };
+    }
+    if (new_tag) |t| {
+        if (s.tag.len > 0) s.allocator.free(s.tag);
+        s.tag = if (t.len == 0) "" else (s.allocator.dupe(u8, t) catch {
+            agent.pushInfo(m, "rename: out of memory");
+            return;
+        });
+    }
 
-    // Persist to the Meta sidecar. Read the current Meta and rewrite with the
-    // new custom_title, keeping name/model/created_at/ai_title intact.
     if (!m.io_ready) {
-        agent.pushInfoFmt(m, "renamed to \"{s}\" (I/O not ready to save)", .{trimmed});
+        agent.pushInfo(m, "renamed (I/O not ready to save)");
         return;
     }
 
@@ -1319,14 +1466,26 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
         .name = meta.name,
         .model = meta.model,
         .created_at = meta.created_at,
-        .custom_title = trimmed,
+        .custom_title = s.custom_title,
         .ai_title = meta.ai_title,
+        .tag = s.tag,
     }) catch |err| {
         agent.pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
         return;
     };
 
-    agent.pushInfoFmt(m, "renamed to \"{s}\"", .{trimmed});
+    if (new_title != null and new_tag != null) {
+        if (s.tag.len > 0)
+            agent.pushInfoFmt(m, "renamed to \"{s}\" #{s}", .{ s.custom_title, s.tag })
+        else
+            agent.pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+    } else if (new_title != null) {
+        agent.pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+    } else if (s.tag.len > 0) {
+        agent.pushInfoFmt(m, "session tag set to #{s}", .{s.tag});
+    } else {
+        agent.pushInfo(m, "session tag cleared");
+    }
 }
 
 /// `/files`: what the model is looking at, and what it changed.
@@ -1759,7 +1918,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/provider", .desc = "pick a provider in a modal" },
     .{ .key = "/providers", .desc = "list providers" },
     .{ .key = "/effort", .desc = "none|minimal|low|medium|high|xhigh (no args: picker)" },
-    .{ .key = "/color", .desc = "the diff palette: default | daltonized (no args: picker)" },
+    .{ .key = "/diff-color", .desc = "the diff palette: default | daltonized (alias: /color, no args: picker)" },
     .{ .key = "/submodel", .desc = "which model the SUBAGENTS use (no args: report | <model> | <provider> <model> | off)" },
     .{ .key = "/task-parallel", .desc = "simultaneous subagent limit: 1..8 | auto", .key_hint = "1..8 | auto", .palette_visible = false },
     .{ .key = "/reload-cmds", .desc = "reload user commands from disk", .palette_visible = false },
@@ -1770,8 +1929,12 @@ pub const commands = [_]Cmd{
     .{ .key = "/commit", .desc = "create a git commit with verified context (scoped git allowlist)", .key_hint = "[instructions]" },
     .{ .key = "/pr", .desc = "create or update a PR with merge-base diff (idempotent, scoped allowlist)", .key_hint = "[instructions]" },
     .{ .key = "/commit-push-pr", .desc = "commit + push + PR workflow (PR allowlist; alias of /pr flow)", .key_hint = "[instructions]" },
+    .{ .key = "/review", .desc = "review current changes with verified git context (read-only)", .key_hint = "[focus]" },
+    .{ .key = "/security-review", .desc = "security-focused review of current changes (read-only)", .key_hint = "[focus]" },
     .{ .key = "/iter", .desc = "iteration budget: /iter [n] (min 8, max 200) or /iter to show current" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
+    .{ .key = "/rewind", .desc = "undo the last N turns' file changes: /rewind | /rewind N", .key_hint = "N" },
+    .{ .key = "/rewind", .desc = "undo the last N turns' file changes: /rewind | /rewind N", .key_hint = "N" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
     .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
     .{ .key = "/mode", .desc = "set work mode: build | accept-edits | plan | bypass" },
@@ -1779,6 +1942,10 @@ pub const commands = [_]Cmd{
     .{ .key = "/permissions", .desc = "permission rules, mode, allowlist, and file status (panel; /permissions reload)" },
     .{ .key = "/hooks", .desc = "loaded command hooks and file status (panel; /hooks reload)" },
     .{ .key = "/agents", .desc = "subagent/task status and definitions (panel)" },
+    .{ .key = "/mcp", .desc = "MCP server configuration and status (panel)" },
+    .{ .key = "/sandbox", .desc = "sandbox availability for flagged bash commands (panel)" },
+    .{ .key = "/add-dir", .desc = "add/list additional directories for this session: /add-dir [path]", .key_hint = "[path]" },
+    .{ .key = "/vim", .desc = "toggle vim keybindings for the input editor" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
     .{ .key = "/new-session", .desc = "new session" },
     .{ .key = "/resume", .desc = "resume the last session" },
@@ -1796,7 +1963,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/pipeline", .desc = "the staged pipeline for a task: evidence → implement → tester → verify → review", .key_hint = "<task>" },
     .{ .key = "/code-review", .desc = "read-only review of the changes: /code-review (diff) | /code-review <paths>", .key_hint = "[paths]" },
     .{ .key = "/session", .desc = "the sessions of this project, newest first (enter opens one)" },
-    .{ .key = "/rename", .desc = "set a custom title for the current session: /rename <name>" },
+    .{ .key = "/rename", .desc = "set session title and/or tag: /rename <title> | /rename #tag | /rename <title> #tag" },
     .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
     .{ .key = "/file", .desc = "changed file intelligence: /file | list|show | next|prev | copy|open", .key_hint = "list|next|prev|copy|open" },
     .{ .key = "/diff", .desc = "uncommitted changes and this turn's changed-file diff" },
@@ -1809,6 +1976,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/style", .desc = "select an output style: default|explanatory|learning (no args: report | off)" },
     .{ .key = "/dots", .desc = "on|off: prompt rail dots (click a dot to jump back to that prompt)" },
     .{ .key = "/copy", .desc = "copy an answer to the clipboard: /copy (the last one) | /copy N (N answers back)", .key_hint = "N" },
+    .{ .key = "/btw", .desc = "side question (subagent, answer appended, not a turn)", .key_hint = "<question>" },
     .{ .key = "/quit", .desc = "quit", .key_hint = "ctrl+c" },
     .{ .key = "/clear", .desc = "clear the screen and reset the session caches (read list, changed list, skills)" },
     .{ .key = "/exit", .desc = "alias of /quit" },
@@ -2653,6 +2821,80 @@ fn collectAssistantTexts(s: *session_mod.Session, out: *[copytext.max_lookback][
     return n;
 }
 
+/// `/btw <question>`: side question answered by a subagent and appended.
+///
+/// Spec (TASKS 35.14): one subagent call whose answer is appended, not a turn.
+/// Runs in a background thread so it does not block the UI; the result is
+/// enqueued as an info block when ready.
+pub fn cmdBtw(m: *tui.Model, arg: ?[]const u8) void {
+    const question = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (question.len == 0) {
+        agent.pushInfo(m, "usage: /btw <question>");
+        return;
+    }
+
+    const gpa = m.allocator;
+    const owned = gpa.dupe(u8, question) catch {
+        agent.pushInfo(m, "btw: could not allocate the question");
+        return;
+    };
+
+    const Job = struct {
+        m: *tui.Model,
+        question: []u8,
+
+        fn run(job: *@This()) void {
+            const model = job.m;
+            const a = model.allocator;
+            defer a.destroy(job);
+            defer model.endWorker(); // registered second -> runs FIRST
+            defer a.free(job.question);
+
+            var rep = subagent_mod.Report{};
+            var desc_buf: [160]u8 = undefined;
+            const desc = std.fmt.bufPrint(&desc_buf, "btw: {s}", .{clipQuestion(job.question, 120)}) catch "btw side question";
+            const task = subagent_mod.Task{
+                .description = desc,
+                .prompt = job.question,
+            };
+
+            // runSubagent expects global IO/API state to be initialized (as in
+            // normal TUI use). The returned text points into `rep`.
+            const text = agent.runSubagent(model, task, &rep);
+            const msg = std.fmt.allocPrint(a, "btw · {s}\n{s}", .{ job.question, text }) catch {
+                model.pushInfo("btw: answer ready (could not format)");
+                return;
+            };
+            model.pushInfoOwned(msg);
+        }
+
+        fn clipQuestion(q: []const u8, max: usize) []const u8 {
+            if (q.len <= max) return q;
+            var end = max;
+            while (end > 0 and (q[end - 1] & 0xc0) == 0x80) end -= 1;
+            if (end == 0) end = @min(max, q.len);
+            return q[0..end];
+        }
+    };
+
+    const job = gpa.create(Job) catch {
+        gpa.free(owned);
+        agent.pushInfo(m, "btw: could not start the side question");
+        return;
+    };
+    job.* = .{ .m = m, .question = owned };
+    m.beginWorker();
+    const thread = std.Thread.spawn(.{}, Job.run, .{job}) catch {
+        m.endWorker();
+        gpa.destroy(job);
+        gpa.free(owned);
+        agent.pushInfo(m, "btw: could not start the side question");
+        return;
+    };
+    thread.detach();
+    agent.pushInfo(m, "btw: asking a side question (running in background)...");
+}
+
 /// `/copy [N]`: the answer, on the clipboard and in a file.
 pub fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
     const s = agent.session orelse {
@@ -3079,6 +3321,97 @@ pub fn cmdSubmodel(m: *tui.Model, arg: ?[]const u8) void {
 
 const runtime_state = @import("agent/runtime_state.zig");
 
+/// `/rewind [N]`: undo the last N turns' file changes (35.12).
+/// Without N, lists available checkpoints.
+pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
+    const n_turns: usize = if (arg) |a| blk: {
+        const t = std.mem.trim(u8, a, " \t\r\n");
+        if (t.len == 0) break :blk 0;
+        break :blk std.fmt.parseInt(usize, t, 10) catch 0;
+    } else 0;
+
+    if (n_turns == 0) {
+        const count = m.checkpoints.len;
+        if (count == 0) {
+            agent.pushInfo(m, "nothing to rewind: no turn has changed any file yet");
+            return;
+        }
+        var buf: [2048]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print("checkpoints (most recent first):\n", .{}) catch {};
+        var i: usize = count;
+        var shown: usize = 0;
+        while (i > 0 and shown < 20) {
+            i -= 1;
+            const cp = &m.checkpoints.items[i];
+            shown += 1;
+            w.print("  {d}. {s} ({d} file{s}, {d} undoable)\n", .{
+                shown,
+                cp.labelOf(),
+                cp.fileCount(),
+                if (cp.fileCount() == 1) "" else "s",
+                cp.undoable(),
+            }) catch {};
+        }
+        w.print("use /rewind N to undo the last N turns", .{}) catch {};
+        agent.pushInfo(m, w.buffered());
+        return;
+    }
+
+    const count = m.checkpoints.len;
+    if (count == 0) {
+        agent.pushInfo(m, "nothing to rewind: no turn has changed any file yet");
+        return;
+    }
+    if (n_turns > count) {
+        agent.pushInfoFmt(m, "rewind: only {d} checkpoint{s} available", .{ count, if (count == 1) "" else "s" });
+        return;
+    }
+
+    var total_undone: usize = 0;
+    var total_failed: usize = 0;
+    var total_skipped: usize = 0;
+    var k: usize = 0;
+    while (k < n_turns) : (k += 1) {
+        var cp = m.takeCheckpointOwned() orelse break;
+        defer cp.deinit(m.allocator);
+        for (cp.files[0..cp.len]) |f| {
+            if (f.truncated) {
+                total_skipped += 1;
+                continue;
+            }
+            if (!f.existed) {
+                if (deleteIfUnchanged(f.pathOf())) {
+                    total_undone += 1;
+                } else {
+                    total_failed += 1;
+                }
+            } else {
+                std.Io.Dir.cwd().writeFile(agent.io_global, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
+                    total_failed += 1;
+                    continue;
+                };
+                total_undone += 1;
+            }
+        }
+    }
+
+    if (total_undone == 0) {
+        agent.pushInfo(m, "rewind: nothing could be restored");
+    } else {
+        agent.pushInfoFmt(m, "rewind: restored {d} file change{s} across {d} turn{s}", .{
+            total_undone,
+            if (total_undone == 1) "" else "s",
+            n_turns,
+            if (n_turns == 1) "" else "s",
+        });
+    }
+    if (total_skipped > 0 or total_failed > 0) {
+        agent.pushInfoFmt(m, "{d} skipped, {d} failed", .{ total_skipped, total_failed });
+    }
+    if (total_undone > 0) agent.setStatusWithZo(m, .done, "rewound");
+}
+
 /// `/iter [n]`: set or show per-session iteration budget.
 pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
     if (arg) |raw| {
@@ -3105,4 +3438,13 @@ pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
         const src = runtime_state.iterationSource(agent.iter_limit_override > 0, agent.model_requested_iter > 0);
         agent.pushInfoFmt(m, "/iter: current budget is {d} iterations ({s})", .{ cur, src });
     }
+}
+
+test "/btw without a question shows usage" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    cmdBtw(&m, null);
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "usage: /btw") != null);
 }

@@ -146,6 +146,8 @@ pub const Session = struct {
     /// AI-generated title (turn 3). Safe to regenerate. Persisted via
     /// sessionindex Meta sidecar.
     ai_title: []const u8 = "",
+    /// Session tag (35.3), stored without leading '#'. Persisted via Meta sidecar.
+    tag: []const u8 = "",
 
     /// Next index for a stored tool result (`sessions/<id>/tool-results/<n>.txt`).
     /// Per session: each session id gets its own tool-results directory, so a
@@ -220,15 +222,16 @@ pub const Session = struct {
         s.io = io;
         // Streaming writer: appends at the end of the fd (no 0xFF hole).
         s.fw = std.Io.File.Writer.initStreaming(file, io, &s.write_buf);
-        // Persist the empty Meta sidecar so titles can be added later (Phase 30.1).
-        // custom_title and ai_title start empty; they are filled by /rename and
-        // the turn-3 AI title upgrade respectively.
+        // Persist the empty Meta sidecar so titles/tags can be added later.
+        // custom_title, ai_title and tag start empty; they are filled by /rename
+        // and the turn-3 AI title upgrade respectively.
         sessionindex.writeMeta(io, allocator, s.path.?, .{
             .name = "",
             .model = "",
             .created_at = @intCast(@divTrunc(now.nanoseconds, 1_000_000_000)),
             .custom_title = "",
             .ai_title = "",
+            .tag = "",
         }) catch {};
         return s;
     }
@@ -250,6 +253,7 @@ pub const Session = struct {
         if (self.path) |p| self.allocator.free(p);
         if (self.custom_title.len > 0) self.allocator.free(self.custom_title);
         if (self.ai_title.len > 0) self.allocator.free(self.ai_title);
+        if (self.tag.len > 0) self.allocator.free(self.tag);
     }
 
     fn compactSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
@@ -494,7 +498,7 @@ pub const Session = struct {
         errdefer allocator.destroy(s);
         s.* = try load(allocator, io, path);
         s.io = io;
-        // Load titles from the Meta sidecar (Phase 30.1).
+        // Load titles/tag from the Meta sidecar.
         const meta = sessionindex.readMeta(allocator, io, path);
         if (meta.custom_title.len > 0) {
             const copy = try allocator.dupe(u8, meta.custom_title);
@@ -503,6 +507,10 @@ pub const Session = struct {
         if (meta.ai_title.len > 0) {
             const copy = try allocator.dupe(u8, meta.ai_title);
             s.ai_title = copy;
+        }
+        if (meta.tag.len > 0) {
+            const copy = try allocator.dupe(u8, meta.tag);
+            s.tag = copy;
         }
         var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         defer dir.close(io);

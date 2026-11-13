@@ -1255,6 +1255,16 @@ pub const Model = struct {
     /// prompt is edited with `editor.Editor`.
     ed: ed.Editor,
 
+    /// Vim-like modal editing for the input (Phase 13/35.13): `/vim` toggles.
+    /// When enabled, starts in insert mode; Esc enters normal mode.
+    vim_mode: bool = false,
+    vim_normal: bool = false,
+    /// Pending vim operator/key (e.g. 'd', 'g') in normal mode.
+    vim_pending: u8 = 0,
+
+    /// Additional directories added via `/add-dir` (35.13). Owned strings.
+    extra_dirs: std.ArrayList([]u8) = .empty,
+
     /// Transient "input too long" note: an edit was rejected because it would
     /// exceed `ed.max_bytes`. The message names the limit; it is painted inside
     /// the composer zone (the affected zone) by `drawInput` and cleared on the
@@ -2254,6 +2264,8 @@ pub const Model = struct {
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
+        for (self.extra_dirs.items) |d| self.allocator.free(d);
+        self.extra_dirs.deinit(self.allocator);
         for (self.paras.items) |p| freePara(self.allocator, p);
         self.paras.deinit(self.allocator);
         for (self.pending.items) |p| freePara(self.allocator, .{ .kind = p.kind, .text = p.text, .lang = p.lang });
@@ -2514,10 +2526,15 @@ pub const Model = struct {
                     const age = sessionindex.ageLabel(now, e.created_at, &now_buf);
                     const label = self.allocator.dupe(u8, title) catch "";
                     var sbuf: [24]u8 = undefined;
-                    const desc = if (e.size_bytes > 0) blk: {
-                        const sz = std.fmt.bufPrint(&sbuf, "{d} KB", .{e.size_bytes / 1024}) catch "";
-                        break :blk std.fmt.allocPrint(self.allocator, "{s} · {s}", .{ age, sz }) catch self.allocator.dupe(u8, age) catch "";
-                    } else self.allocator.dupe(u8, age) catch "";
+                    const sz = if (e.size_bytes > 0) (std.fmt.bufPrint(&sbuf, "{d} KB", .{e.size_bytes / 1024}) catch "") else "";
+                    const desc = if (e.tag.len > 0 and sz.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} · {s} · #{s}", .{ age, sz, e.tag }) catch self.allocator.dupe(u8, age) catch "")
+                    else if (e.tag.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} · #{s}", .{ age, e.tag }) catch self.allocator.dupe(u8, age) catch "")
+                    else if (sz.len > 0)
+                        (std.fmt.allocPrint(self.allocator, "{s} · {s}", .{ age, sz }) catch self.allocator.dupe(u8, age) catch "")
+                    else
+                        self.allocator.dupe(u8, age) catch "";
                     self.picker_items.append(self.allocator, .{ .label = label, .desc = desc }) catch {
                         self.allocator.free(label);
                         if (desc.len > 0) self.allocator.free(desc);
@@ -2549,7 +2566,10 @@ pub const Model = struct {
                             const title = e.title(session_id);
                             const age = sessionindex.ageLabel(now, e.created_at, &now_buf);
                             const label = self.allocator.dupe(u8, title) catch "";
-                            const desc = self.allocator.dupe(u8, age) catch "";
+                            const desc = if (e.tag.len > 0)
+                                (std.fmt.allocPrint(self.allocator, "{s} · #{s}", .{ age, e.tag }) catch self.allocator.dupe(u8, age) catch "")
+                            else
+                                self.allocator.dupe(u8, age) catch "";
                             self.picker_items.append(self.allocator, .{ .label = label, .desc = desc }) catch {
                                 self.allocator.free(label);
                                 if (desc.len > 0) self.allocator.free(desc);
@@ -2600,7 +2620,10 @@ pub const Model = struct {
                                 if (desc_owned) |d| desc = d;
                             } else {
                                 const age = sessionindex.ageLabel(now, hit.entry.created_at, &now_buf);
-                                desc_owned = self.allocator.dupe(u8, age) catch null;
+                                desc_owned = if (hit.entry.tag.len > 0)
+                                    (std.fmt.allocPrint(self.allocator, "{s} · #{s}", .{ age, hit.entry.tag }) catch null)
+                                else
+                                    (self.allocator.dupe(u8, age) catch null);
                                 if (desc_owned) |d| desc = d;
                             }
                             self.picker_items.append(self.allocator, .{ .label = label, .desc = desc }) catch {
@@ -2660,8 +2683,10 @@ pub const Model = struct {
                 }
                 self.session_picker_semantic = true;
                 self.session_picker_semantic_searching = true;
+                self.beginWorker();
                 self.unlock();
                 const th = std.Thread.spawn(.{}, sessionSemanticSearchThread, .{self}) catch {
+                    self.endWorker();
                     self.lock();
                     self.session_picker_semantic_searching = false;
                     self.pickerRefilter();
@@ -3014,6 +3039,7 @@ pub const Model = struct {
     }
 
     fn sessionSemanticSearchThread(self: *Model) void {
+        defer self.endWorker();
         self.sessionSemanticSearch();
     }
 
@@ -7258,7 +7284,7 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
         }
         return;
     }
-    if (std.mem.eql(u8, trimmed, "/quit")) {
+    if (std.mem.eql(u8, trimmed, "/quit") or std.mem.eql(u8, trimmed, "/exit")) {
         self.ed.clear();
         ctx.quit = true;
         return;
@@ -7345,6 +7371,23 @@ fn onShortcutPick(_: *Model, _: u32, _: []const u8) void {}
 
 fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     const k = key;
+
+    // Vim mode (35.13 / Phase 13): modal input editing.
+    if (self.vim_mode) {
+        if (!self.vim_normal) {
+            // Insert mode: Esc returns to normal mode.
+            if (k.matches(vaxis.Key.escape, .{})) {
+                self.vim_normal = true;
+                self.vim_pending = 0;
+                ctx.redraw = true;
+                return true;
+            }
+        } else {
+            // Normal mode: interpret keys as commands (minimal subset).
+            const handled = try vimNormalKey(self, ctx, k);
+            if (handled) return true;
+        }
+    }
 
     // `?` on an EMPTY input opens the shortcut list.
     //
@@ -7523,6 +7566,145 @@ fn syncAutocomplete(self: *Model) void {
         return;
     }
     setAcMode(self, .none, 0);
+}
+
+/// Minimal vim normal-mode handling for the input editor (35.13).
+fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
+    // Allow Ctrl combos to fall through to normal handling when not a vim command.
+    if (k.mods.ctrl) {
+        self.vim_pending = 0;
+        return false;
+    }
+    // Special keys
+    if (k.matches(vaxis.Key.escape, .{})) {
+        self.vim_pending = 0;
+        ctx.redraw = true;
+        return true;
+    }
+    if (k.codepoint == vaxis.Key.enter) {
+        if (self.vim_pending == 0) {
+            try submitInput(self, ctx);
+            return true;
+        }
+        self.vim_pending = 0;
+        return false;
+    }
+    if (k.matches(vaxis.Key.backspace, .{}) or k.matches(vaxis.Key.left, .{})) {
+        self.ed.moveLeft();
+        self.vim_pending = 0;
+        ctx.redraw = true;
+        return true;
+    }
+    if (k.matches(vaxis.Key.right, .{})) {
+        self.ed.moveRight();
+        self.vim_pending = 0;
+        ctx.redraw = true;
+        return true;
+    }
+    if (k.matches(vaxis.Key.up, .{})) {
+        self.ed.moveUp();
+        self.vim_pending = 0;
+        ctx.redraw = true;
+        return true;
+    }
+    if (k.matches(vaxis.Key.down, .{})) {
+        self.ed.moveDown();
+        self.vim_pending = 0;
+        ctx.redraw = true;
+        return true;
+    }
+
+    const txt = k.text orelse {
+        self.vim_pending = 0;
+        return false;
+    };
+    if (txt.len != 1) return false;
+    const c = txt[0];
+
+    // Pending 'g' (gg)
+    if (self.vim_pending == 'g') {
+        self.vim_pending = 0;
+        if (c == 'g') {
+            self.ed.moveToStart();
+            ctx.redraw = true;
+            return true;
+        }
+        return false;
+    }
+    // Pending 'd' (dd, dw, db, d$)
+    if (self.vim_pending == 'd') {
+        self.vim_pending = 0;
+        if (c == 'd') {
+            // delete current logical line
+            const s = self.ed.text();
+            var ls = self.ed.cursor;
+            while (ls > 0 and s[ls - 1] != '\n') ls -= 1;
+            var le = self.ed.cursor;
+            while (le < s.len and s[le] != '\n') le += 1;
+            if (le < s.len and s[le] == '\n') le += 1; // include newline
+            if (le > ls) self.ed.deleteRange(ls, le) catch {};
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        } else if (c == 'w') {
+            const start = self.ed.cursor;
+            self.ed.moveWordRight();
+            const end = self.ed.cursor;
+            self.ed.cursor = start;
+            if (end > start) self.ed.deleteRange(start, end) catch {};
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        } else if (c == 'b') {
+            self.ed.deleteWordBefore();
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        } else if (c == '$') {
+            self.ed.deleteToEnd();
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        }
+        return false;
+    }
+
+    switch (c) {
+        'h' => { self.ed.moveLeft(); ctx.redraw = true; return true; },
+        'l' => { self.ed.moveRight(); ctx.redraw = true; return true; },
+        'j' => { self.ed.moveDown(); ctx.redraw = true; return true; },
+        'k' => { self.ed.moveUp(); ctx.redraw = true; return true; },
+        'w' => { self.ed.moveWordRight(); ctx.redraw = true; return true; },
+        'b' => { self.ed.moveWordLeft(); ctx.redraw = true; return true; },
+        '0' => { self.ed.moveHome(); ctx.redraw = true; return true; },
+        '$' => { self.ed.moveEnd(); ctx.redraw = true; return true; },
+        'G' => { self.ed.moveToEnd(); ctx.redraw = true; return true; },
+        'g' => { self.vim_pending = 'g'; ctx.redraw = true; return true; },
+        'd' => { self.vim_pending = 'd'; ctx.redraw = true; return true; },
+        'x' => { self.ed.deleteAfter(); syncAutocomplete(self); ctx.redraw = true; return true; },
+        'D' => { self.ed.deleteToEnd(); syncAutocomplete(self); ctx.redraw = true; return true; },
+        'i' => { self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
+        'I' => { self.ed.moveHome(); self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
+        'a' => { self.ed.moveRight(); self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
+        'A' => { self.ed.moveEnd(); self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
+        'o' => {
+            self.ed.moveEnd();
+            if (self.ed.insertChar('\n')) |_| {} else |_| {}
+            self.vim_normal = false; self.vim_pending = 0; syncAutocomplete(self); ctx.redraw = true; return true;
+        },
+        'O' => {
+            const s = self.ed.text();
+            var ls = self.ed.cursor;
+            while (ls > 0 and s[ls - 1] != '\n') ls -= 1;
+            self.ed.setCursor(ls);
+            if (self.ed.insertChar('\n')) |_| {} else |_| {}
+            self.ed.setCursor(ls);
+            self.vim_normal = false; self.vim_pending = 0; syncAutocomplete(self); ctx.redraw = true; return true;
+        },
+        else => {},
+    }
+    self.vim_pending = 0;
+    return false;
 }
 
 /// Switches the popup's mode, freeing the previous mode's data. Every field
@@ -17669,7 +17851,7 @@ test "render: a diff row that wraps stays under the code" {
     try std.testing.expect(std.mem.indexOf(u8, cont, "= 1234567890") != null);
 }
 
-test "/color switches the diff palette and says what it did" {
+test "/diff-color switches the diff palette and says what it did" {
     // The daltonized pair (blue/orange) is the one that survives the most
     // common colour-vision deficiency, and a palette that changed without
     // saying so is a palette the user cannot trust.
@@ -17680,14 +17862,20 @@ test "/color switches the diff palette and says what it did" {
     defer m.deinit();
 
     theme.caps = .{ .rgb = true };
-    try agent.submit(&m, "/color daltonized");
+    try agent.submit(&m, "/diff-color daltonized");
     try std.testing.expect(theme.caps.daltonized);
 
-    try agent.submit(&m, "/color default");
+    try agent.submit(&m, "/diff-color default");
     try std.testing.expect(!theme.caps.daltonized);
 
     // An unknown palette is refused and it does NOT change anything.
-    try agent.submit(&m, "/color mauve");
+    try agent.submit(&m, "/diff-color mauve");
+    try std.testing.expect(!theme.caps.daltonized);
+
+    // Legacy alias remains accepted.
+    try agent.submit(&m, "/color daltonized");
+    try std.testing.expect(theme.caps.daltonized);
+    try agent.submit(&m, "/color default");
     try std.testing.expect(!theme.caps.daltonized);
 }
 

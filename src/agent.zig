@@ -1884,7 +1884,7 @@ pub fn onSessionPick(m: *tui.Model, _: u32, index: usize) void {
 
 /// Callback for F2 rename in the session picker.
 /// `m.picker_rename_target` holds the session path (set by the TUI's F2 handler).
-/// Renames the session by setting its custom_title and persisting to the Meta sidecar.
+/// Renames the current session's custom title/tag and persists to the Meta sidecar.
 pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
     const path = m.picker_rename_target orelse {
         pushInfo(m, "rename: could not find session path");
@@ -1903,43 +1903,86 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
     };
 
     // Only rename if this picker item is the current session.
-    if (s.path != null and std.mem.eql(u8, path, s.path.?)) {
-        // Rename the current session to the label (stripped of " (current)").
-        const trimmed = std.mem.trim(u8, display, " \t\r\n");
-        if (trimmed.len == 0) {
-            pushInfo(m, "rename: empty name");
-            return;
-        }
-        if (trimmed.len > 64) {
-            pushInfo(m, "rename: name too long (max 64 chars)");
-            return;
-        }
+    if (s.path == null or !std.mem.eql(u8, path, s.path.?)) {
+        pushInfoFmt(m, "rename: {s} is not the current session (use /rename <name>)", .{display});
+        return;
+    }
 
+    const trimmed = std.mem.trim(u8, display, " \t\r\n");
+    if (trimmed.len == 0) {
+        pushInfo(m, "rename: empty name");
+        return;
+    }
+
+    var new_title: ?[]const u8 = null;
+    var new_tag: ?[]const u8 = null;
+    if (trimmed[0] == '#' and std.mem.indexOfAny(u8, trimmed, " \t\r\n") == null) {
+        const t = std.mem.trim(u8, trimmed[1..], " \t\r\n");
+        new_tag = t;
+    } else if (std.mem.lastIndexOfScalar(u8, trimmed, '#')) |hash| blk: {
+        if (hash > 0 and (trimmed[hash - 1] == ' ' or trimmed[hash - 1] == '\t')) {
+            const t = std.mem.trim(u8, trimmed[hash + 1 ..], " \t\r\n");
+            if (t.len > 0 and std.mem.indexOfAny(u8, t, " \t\r\n") == null) {
+                new_title = std.mem.trim(u8, trimmed[0..hash], " \t\r\n");
+                new_tag = t;
+                break :blk;
+            }
+        }
+        new_title = trimmed;
+    } else {
+        new_title = trimmed;
+    }
+    if (new_title) |t| {
+        if (t.len == 0) { pushInfo(m, "rename: empty title"); return; }
+        if (t.len > 64) { pushInfo(m, "rename: title too long (max 64 chars)"); return; }
+    }
+    if (new_tag) |t| {
+        if (t.len > 32) { pushInfo(m, "rename: tag too long (max 32 chars)"); return; }
+    }
+
+    if (new_title) |t| {
         if (s.custom_title.len > 0) s.allocator.free(s.custom_title);
-        s.custom_title = s.allocator.dupe(u8, trimmed) catch {
+        s.custom_title = s.allocator.dupe(u8, t) catch {
             pushInfo(m, "rename: out of memory");
             return;
         };
-
-        var arena_state = std.heap.ArenaAllocator.init(s.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const meta = sessionindex.readMeta(arena, io_global, path);
-        sessionindex.writeMeta(io_global, arena, path, .{
-            .name = meta.name,
-            .model = meta.model,
-            .created_at = meta.created_at,
-            .custom_title = trimmed,
-            .ai_title = meta.ai_title,
-        }) catch |err| {
-            pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
+    }
+    if (new_tag) |t| {
+        if (s.tag.len > 0) s.allocator.free(s.tag);
+        s.tag = if (t.len == 0) "" else (s.allocator.dupe(u8, t) catch {
+            pushInfo(m, "rename: out of memory");
             return;
-        };
+        });
+    }
 
-        pushInfoFmt(m, "renamed to \"{s}\"", .{trimmed});
+    var arena_state = std.heap.ArenaAllocator.init(s.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const meta = sessionindex.readMeta(arena, io_global, path);
+    sessionindex.writeMeta(io_global, arena, path, .{
+        .name = meta.name,
+        .model = meta.model,
+        .created_at = meta.created_at,
+        .custom_title = s.custom_title,
+        .ai_title = meta.ai_title,
+        .tag = s.tag,
+    }) catch |err| {
+        pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
+        return;
+    };
+
+    if (new_title != null and new_tag != null) {
+        if (s.tag.len > 0)
+            pushInfoFmt(m, "renamed to \"{s}\" #{s}", .{ s.custom_title, s.tag })
+        else
+            pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+    } else if (new_title != null) {
+        pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+    } else if (s.tag.len > 0) {
+        pushInfoFmt(m, "session tag set to #{s}", .{s.tag});
     } else {
-        pushInfoFmt(m, "rename: {s} is not the current session (use /rename <name>)", .{display});
+        pushInfo(m, "session tag cleared");
     }
 }
 
@@ -2630,7 +2673,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         openModelPaletteAsync(m);
     } else if (std.mem.eql(u8, cmd, "effort")) {
         commands_mod.cmdEffort(m, arg);
-    } else if (std.mem.eql(u8, cmd, "color")) {
+    } else if (std.mem.eql(u8, cmd, "diff-color") or std.mem.eql(u8, cmd, "color")) {
         commands_mod.cmdColor(m, arg);
     } else if (std.mem.eql(u8, cmd, "submodel")) {
         commands_mod.cmdSubmodel(m, arg);
@@ -2638,6 +2681,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdTaskParallel(m, arg);
     } else if (std.mem.eql(u8, cmd, "undo")) {
         commands_mod.cmdUndo(m);
+    } else if (std.mem.eql(u8, cmd, "rewind")) {
+        commands_mod.cmdRewind(m, arg);
     } else if (std.mem.eql(u8, cmd, "clean")) {
         // `m.allocator`, not the `Allocator` TYPE. The local `a` above shadows
         // the type name inside this function, so the annotation resolved to a
@@ -2660,6 +2705,14 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdHooks(m, arg);
     } else if (std.mem.eql(u8, cmd, "agents")) {
         commands_mod.cmdAgents(m);
+    } else if (std.mem.eql(u8, cmd, "mcp")) {
+        commands_mod.cmdMcp(m);
+    } else if (std.mem.eql(u8, cmd, "sandbox")) {
+        commands_mod.cmdSandbox(m);
+    } else if (std.mem.eql(u8, cmd, "add-dir") or std.mem.eql(u8, cmd, "add_dir")) {
+        commands_mod.cmdAddDir(m, arg);
+    } else if (std.mem.eql(u8, cmd, "vim")) {
+        commands_mod.cmdVim(m);
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "inspect")) {
@@ -2694,6 +2747,10 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdPr(m, arg);
     } else if (std.mem.eql(u8, cmd, "commit-push-pr") or std.mem.eql(u8, cmd, "commit_push_pr")) {
         commands_mod.cmdCommitPushPr(m, arg);
+    } else if (std.mem.eql(u8, cmd, "review")) {
+        commands_mod.cmdReview(m, arg);
+    } else if (std.mem.eql(u8, cmd, "security-review") or std.mem.eql(u8, cmd, "security_review")) {
+        commands_mod.cmdSecurityReview(m, arg);
     } else if (std.mem.eql(u8, cmd, "session")) {
         commands_mod.cmdSession(m);
     } else if (std.mem.eql(u8, cmd, "files")) {
@@ -2738,6 +2795,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdStyle(m, arg);
     } else if (std.mem.eql(u8, cmd, "copy")) {
         commands_mod.cmdCopy(m, arg);
+    } else if (std.mem.eql(u8, cmd, "btw")) {
+        commands_mod.cmdBtw(m, arg);
     } else if (std.mem.eql(u8, cmd, "reload-cmds") or std.mem.eql(u8, cmd, "reloadcmds") or std.mem.eql(u8, cmd, "reloadcmd")) {
         if (m.io_ready) {
             refreshUserCommandsForce(m.allocator, m.io, m.environ, true);
@@ -6535,11 +6594,7 @@ pub fn startShell(m: *tui.Model, command: []const u8) void {
         cmd: []u8,
         args: []u8,
 
-        fn run(self: *@This()) void {
-            // The turn is not over until this is, and `app.deinit()` destroys the
-            // `Io` and the allocator it is using.
-            self.m.beginWorker();
-            defer self.m.endWorker();
+        fn runBody(self: *@This()) void {
             defer self.m.allocator.free(self.args);
 
             const t0 = std.Io.Timestamp.now(io_global, .real).nanoseconds;
@@ -6569,6 +6624,17 @@ pub fn startShell(m: *tui.Model, command: []const u8) void {
             };
             self.m.pushShellOut(self.cmd, owned_text, ms);
         }
+
+        fn runThread(self: *@This()) void {
+            // The turn is not over until this is, and `app.deinit()` destroys the
+            // `Io` and the allocator it is using.
+            defer self.m.endWorker();
+            self.runBody();
+        }
+
+        fn runInline(self: *@This()) void {
+            self.runBody();
+        }
     };
 
     const job = m.allocator.create(Job) catch {
@@ -6576,10 +6642,14 @@ pub fn startShell(m: *tui.Model, command: []const u8) void {
         return;
     };
     job.* = .{ .m = m, .cmd = cmd_copy, .args = args };
-    // A spawn failure runs it here, on the UI thread. It is the same block the
-    // app would have shown, so a failure to spawn cannot lose the command.
-    const th = std.Thread.spawn(.{}, Job.run, .{job}) catch {
-        Job.run(job);
+    // Count the worker before spawn so teardown cannot race a thread that has
+    // started but not yet incremented. On spawn failure we run inline on the UI
+    // thread (no detached worker), so balance the count and do not call the
+    // threaded entry point.
+    m.beginWorker();
+    const th = std.Thread.spawn(.{}, Job.runThread, .{job}) catch {
+        m.endWorker();
+        Job.runInline(job);
         return;
     };
     th.detach();

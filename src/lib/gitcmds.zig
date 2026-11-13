@@ -56,6 +56,33 @@ pub const pr_allow_rules = [_][]const u8{
     "Bash(gh auth *)",
 };
 
+/// 35.4 — `/review`: read-only git context for reviewing changes.
+pub const review_allow_rules = [_][]const u8{
+    "Bash(git status *)",
+    "Bash(git diff *)",
+    "Bash(git log *)",
+    "Bash(git show *)",
+    "Bash(git rev-parse *)",
+    "Bash(git branch *)",
+    "Bash(git merge-base *)",
+    "Bash(git remote *)",
+    "Bash(git blame *)",
+};
+
+/// 35.4 — `/security-review`: same read-only context, security-focused analysis.
+pub const security_review_allow_rules = [_][]const u8{
+    "Bash(git status *)",
+    "Bash(git diff *)",
+    "Bash(git log *)",
+    "Bash(git show *)",
+    "Bash(git rev-parse *)",
+    "Bash(git branch *)",
+    "Bash(git merge-base *)",
+    "Bash(git remote *)",
+    "Bash(git blame *)",
+    "Bash(git grep *)",
+};
+
 pub const commit_prompt =
     \\You are creating a git commit in the current repository. Follow this protocol exactly.
     \\
@@ -149,6 +176,66 @@ pub const pr_prompt =
     \\- Commit messages must never be passed as fragile argv strings; use heredoc / `git commit -F -` when committing.
     \\- Return the PR URL when you're done. Use a single clear final message with the URL.
 ;
+
+pub const review_prompt =
+    \\You are reviewing the current changes in this repository. Use the verified context below; do not guess.
+    \\
+    \\## Verified context (collected now)
+    \\- Current git status:
+    \\!`git status --short --branch 2>/dev/null || git status`
+    \\- Current branch:
+    \\!`git branch --show-current 2>/dev/null || true`
+    \\- Default branch (best effort):
+    \\!`git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main`
+    \\- Merge base against origin default (best effort):
+    \\!`(BASE=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main); git merge-base HEAD "origin/$BASE" 2>/dev/null) || git merge-base HEAD HEAD~10 2>/dev/null || true`
+    \\- Uncommitted diff (staged + unstaged vs HEAD):
+    \\!`git --no-pager diff --no-color HEAD 2>/dev/null || true`
+    \\- Staged diff:
+    \\!`git --no-pager diff --no-color --cached 2>/dev/null || true`
+    \\- Diff since merge base (all branch/PR commits, best effort):
+    \\!`(BASE=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main); MB=$(git merge-base HEAD "origin/$BASE" 2>/dev/null || echo HEAD~10); git --no-pager diff --no-color "$MB"..HEAD 2>/dev/null) || true`
+    \\- Recent commits:
+    \\!`git --no-pager log --oneline -10 2>/dev/null || true`
+    \\
+    \\## Review instructions
+    \\- Prioritize correctness, regressions, missing tests, behavior changes, and maintainability risks.
+    \\- Report findings first, ordered by severity (high → medium → low), with concrete file/line references when possible.
+    \\- For each finding include: what is wrong/risky, why it matters, and a suggested fix.
+    \\- If there are no findings, say so explicitly and mention residual risks or testing gaps.
+    \\- Do not make code changes. This is a review, not an implementation turn.
+    \\- Keep the summary brief after the findings.
+    ;
+
+pub const security_review_prompt =
+    \\You are performing a security review of the current changes in this repository. Use the verified context below; do not guess.
+    \\
+    \\## Verified context (collected now)
+    \\- Current git status:
+    \\!`git status --short --branch 2>/dev/null || git status`
+    \\- Current branch:
+    \\!`git branch --show-current 2>/dev/null || true`
+    \\- Default branch (best effort):
+    \\!`git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main`
+    \\- Merge base against origin default (best effort):
+    \\!`(BASE=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main); git merge-base HEAD "origin/$BASE" 2>/dev/null) || git merge-base HEAD HEAD~10 2>/dev/null || true`
+    \\- Uncommitted diff (staged + unstaged vs HEAD):
+    \\!`git --no-pager diff --no-color HEAD 2>/dev/null || true`
+    \\- Staged diff:
+    \\!`git --no-pager diff --no-color --cached 2>/dev/null || true`
+    \\- Diff since merge base (all branch/PR commits, best effort):
+    \\!`(BASE=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@' || echo main); MB=$(git merge-base HEAD "origin/$BASE" 2>/dev/null || echo HEAD~10); git --no-pager diff --no-color "$MB"..HEAD 2>/dev/null) || true`
+    \\- Recent commits:
+    \\!`git --no-pager log --oneline -10 2>/dev/null || true`
+    \\
+    \\## Security review instructions
+    \\- Focus on vulnerabilities and security-relevant regressions: injection, authn/authz flaws, secrets exposure, unsafe deserialization/parsing, path traversal, SSRF, command execution, memory/unsafe behavior, insecure defaults, crypto misuse, and data leakage.
+    \\- Treat user-controlled input, untrusted files, network data, and tool/command arguments as attack surfaces.
+    \\- Report findings first, ordered by severity (high → medium → low), with concrete file/line references when possible.
+    \\- For each finding include: the issue, exploit/impact scenario, why it is reachable in this codebase, and a concrete remediation.
+    \\- If no security findings are present, say so explicitly and note any assumptions, blind spots, or areas needing deeper verification.
+    \\- Do not make code changes. This is a security review, not an implementation turn.
+    ;
 
 /// Returns the content length for a dynamic prompt. 31.5: a getter, not a
 /// static constant, so substituted/expanded prompts report the correct length.
