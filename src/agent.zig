@@ -3518,9 +3518,90 @@ fn appendPipelineHarnessPrompt(m: *tui.Model, text: []const u8) void {
 /// The user line of the turn goes into the session file FIRST: the order in
 /// the file is user line, then whatever the iterations append, and the UI
 /// thread is free to paint the prompt instead of waiting on a DEFLATE.
+/// Also sets a synchronous turn-1 title from the first user prompt (30.2).
 fn appendUserLine(m: *tui.Model, user_text: []const u8) void {
     const s = ensureSession(m, m.allocator);
+    maybeSetTurn1Title(s, user_text);
     agent_loop.appendUserLineToSession(s, user_text);
+}
+
+fn isRealUserTurnMessage(sm: session_mod.Message) bool {
+    return sm.role == .user and !agent_loop.isHarnessInternalUserMessage(sm.content);
+}
+
+fn deriveTitleFromPrompt(buf: []u8, prompt: []const u8) []const u8 {
+    // First non-empty line, trimmed and collapsed to a short single line.
+    var it = std.mem.splitScalar(u8, prompt, '\n');
+    var line: []const u8 = "";
+    while (it.next()) |raw| {
+        const t = std.mem.trim(u8, raw, " \t\r");
+        if (t.len == 0) continue;
+        line = t;
+        break;
+    }
+    if (line.len == 0) line = std.mem.trim(u8, prompt, " \t\r\n");
+    if (line.len == 0) return "";
+
+    var n: usize = 0;
+    var prev_space = true;
+    for (line) |c| {
+        if (n + 1 >= buf.len) break;
+        const ch = if (c == '\t' or c == '\r') ' ' else c;
+        if (ch == ' ') {
+            if (prev_space) continue;
+            prev_space = true;
+            buf[n] = ' ';
+            n += 1;
+        } else {
+            prev_space = false;
+            buf[n] = ch;
+            n += 1;
+        }
+    }
+    while (n > 0 and buf[n - 1] == ' ') n -= 1;
+
+    // Keep it short; prefer breaking on word boundary.
+    const max_len: usize = 60;
+    if (n > max_len) {
+        var cut = max_len;
+        while (cut > 0 and buf[cut] != ' ') cut -= 1;
+        if (cut < 20) cut = max_len;
+        n = cut;
+        while (n > 0 and buf[n - 1] == ' ') n -= 1;
+    }
+    return buf[0..n];
+}
+
+fn maybeSetTurn1Title(s: *session_mod.Session, user_text: []const u8) void {
+    if (s.custom_title.len > 0 or s.ai_title.len > 0) return;
+    // Count existing real user turns (exclude harness-internal prompts).
+    var user_turns: usize = 0;
+    for (s.messages.items) |sm| {
+        if (isRealUserTurnMessage(sm)) user_turns += 1;
+    }
+    if (user_turns != 0) return;
+
+    var buf: [128]u8 = undefined;
+    const title = deriveTitleFromPrompt(&buf, user_text);
+    if (title.len == 0) return;
+
+    if (s.ai_title.len > 0) s.allocator.free(s.ai_title);
+    s.ai_title = s.allocator.dupe(u8, title) catch "";
+    if (s.ai_title.len == 0) return;
+
+    const path = s.path orelse return;
+    var arena_state = std.heap.ArenaAllocator.init(s.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const existing = sessionindex.readMeta(arena, s.io, path);
+    sessionindex.writeMeta(s.io, arena, path, .{
+        .name = existing.name,
+        .model = existing.model,
+        .created_at = existing.created_at,
+        .custom_title = s.custom_title,
+        .ai_title = s.ai_title,
+        .tag = s.tag,
+    }) catch {};
 }
 
 /// Per-turn harness budget reset (normal + pipeline turns).
