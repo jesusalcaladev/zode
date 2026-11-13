@@ -2017,6 +2017,7 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
         .custom_title = s.custom_title,
         .ai_title = meta.ai_title,
         .tag = s.tag,
+        .ai_title_gen = meta.ai_title_gen,
     }) catch |err| {
         pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
         return;
@@ -3453,6 +3454,7 @@ pub fn branchSession(m: *tui.Model, arg: ?[]const u8) void {
         .ai_title = "",
         .tag = src_meta.tag,
         .forked_from = src_id,
+        .ai_title_gen = 0,
     }) catch |err| {
         pushErrorFmt(m, "branched session created but could not write metadata: {t}", .{err});
     };
@@ -3669,10 +3671,12 @@ fn appendPipelineHarnessPrompt(m: *tui.Model, text: []const u8) void {
 /// The user line of the turn goes into the session file FIRST: the order in
 /// the file is user line, then whatever the iterations append, and the UI
 /// thread is free to paint the prompt instead of waiting on a DEFLATE.
-/// Also sets a synchronous turn-1 title from the first user prompt (30.2).
+/// Also sets a synchronous turn-1 title from the first user prompt (30.2)
+/// and may schedule a turn-3 AI title upgrade (30.2).
 fn appendUserLine(m: *tui.Model, user_text: []const u8) void {
     const s = ensureSession(m, m.allocator);
     maybeSetTurn1Title(s, user_text);
+    maybeScheduleTurn3AiTitle(m, s, user_text);
     agent_loop.appendUserLineToSession(s, user_text);
 }
 
@@ -3739,6 +3743,7 @@ fn maybeSetTurn1Title(s: *session_mod.Session, user_text: []const u8) void {
     if (s.ai_title.len > 0) s.allocator.free(s.ai_title);
     s.ai_title = s.allocator.dupe(u8, title) catch "";
     if (s.ai_title.len == 0) return;
+    s.ai_title_gen = 1;
 
     const path = s.path orelse return;
     var arena_state = std.heap.ArenaAllocator.init(s.allocator);
@@ -3752,7 +3757,325 @@ fn maybeSetTurn1Title(s: *session_mod.Session, user_text: []const u8) void {
         .custom_title = s.custom_title,
         .ai_title = s.ai_title,
         .tag = s.tag,
+        .forked_from = existing.forked_from,
+        .ai_title_gen = s.ai_title_gen,
     }) catch {};
+}
+
+const AiTitleJob = struct {
+    allocator: std.mem.Allocator,
+    session_path: []u8,
+    expected_gen: u32,
+    tail: []u8,
+    provider_id: []u8,
+    base_url: []u8,
+    model: []u8,
+    api_key: ?[]u8,
+    kind: chat.ProviderKind,
+
+    fn deinit(self: *AiTitleJob) void {
+        self.allocator.free(self.session_path);
+        self.allocator.free(self.tail);
+        self.allocator.free(self.provider_id);
+        self.allocator.free(self.base_url);
+        self.allocator.free(self.model);
+        if (self.api_key) |k| self.allocator.free(k);
+        self.allocator.destroy(self);
+    }
+};
+
+fn maybeScheduleTurn3AiTitle(m: *tui.Model, s: *session_mod.Session, user_text: []const u8) void {
+    if (s.custom_title.len > 0) return;
+    // Only upgrade from turn-1 derived title (gen 1) or when no AI title yet but we want
+    // to be safe; spec says "turn 3 AI upgrade..." so trigger on 3rd real user turn.
+    // Count existing real user turns (current not appended yet).
+    var user_turns: usize = 0;
+    for (s.messages.items) |sm| {
+        if (isRealUserTurnMessage(sm)) user_turns += 1;
+    }
+    const this_turn = user_turns + 1;
+    if (this_turn != 3) return;
+    // Do not clobber a newer/richer title generation.
+    if (s.ai_title_gen >= 3) return;
+
+    const path = s.path orelse return;
+    const tail = collectConversationTailForTitle(m.allocator, s, user_text) catch return;
+    errdefer m.allocator.free(tail);
+
+    // Snapshot active target/config (best-effort). Title upgrade must never block.
+    const def = activeProviderDef(m.environ);
+    const key = providers.keyFor(def, m.environ) orelse api_key_global;
+    const job = m.allocator.create(AiTitleJob) catch {
+        m.allocator.free(tail);
+        return;
+    };
+    job.* = .{
+        .allocator = m.allocator,
+        .session_path = m.allocator.dupe(u8, path) catch {
+            m.allocator.destroy(job);
+            m.allocator.free(tail);
+            return;
+        },
+        .expected_gen = 3,
+        .tail = tail,
+        .provider_id = m.allocator.dupe(u8, def.id) catch {
+            m.allocator.free(job.session_path);
+            m.allocator.destroy(job);
+            m.allocator.free(tail);
+            return;
+        },
+        .base_url = m.allocator.dupe(u8, def.base_url) catch {
+            m.allocator.free(job.provider_id);
+            m.allocator.free(job.session_path);
+            m.allocator.destroy(job);
+            m.allocator.free(tail);
+            return;
+        },
+        .model = m.allocator.dupe(u8, cur_model) catch {
+            m.allocator.free(job.base_url);
+            m.allocator.free(job.provider_id);
+            m.allocator.free(job.session_path);
+            m.allocator.destroy(job);
+            m.allocator.free(tail);
+            return;
+        },
+        .api_key = if (key) |k| (m.allocator.dupe(u8, k) catch null) else null,
+        .kind = chat.kindForProvider(def.id),
+    };
+    // Mark intent so a late turn-1 async result (if ever introduced) cannot win over turn-3.
+    s.ai_title_gen = 3;
+
+    const th = std.Thread.spawn(.{}, aiTitleWorker, .{job}) catch {
+        job.deinit();
+        return;
+    };
+    th.detach();
+}
+
+fn collectConversationTailForTitle(gpa: std.mem.Allocator, s: *session_mod.Session, current_user: []const u8) ![]u8 {
+    // Recent context wins, bounded to last 1000 chars total.
+    var rev_chunks: std.ArrayList([]const u8) = .empty;
+    defer rev_chunks.deinit(gpa);
+
+    var total: usize = 0;
+    const max_chars: usize = 1000;
+
+    const pushChunk = struct {
+        fn f(alloc: std.mem.Allocator, list: *std.ArrayList([]const u8), tot: *usize, label: []const u8, text: []const u8, limit: usize) void {
+            if (tot.* >= limit) return;
+            const t = std.mem.trim(u8, text, " \t\r\n");
+            if (t.len == 0) return;
+            const prefix_len = label.len + 2; // "U: "
+            const room = limit - tot.*;
+            if (room <= prefix_len) return;
+            const take = @min(t.len, room - prefix_len);
+            const start = if (t.len > take) t.len - take else 0;
+            const slice = t[start..];
+            const chunk = std.fmt.allocPrint(alloc, "{s}: {s}\n", .{ label, slice }) catch return;
+            list.append(alloc, chunk) catch {
+                alloc.free(chunk);
+                return;
+            };
+            tot.* += chunk.len;
+        }
+    }.f;
+
+    // Include current user prompt first (most recent).
+    pushChunk(gpa, &rev_chunks, &total, "U", current_user, max_chars);
+    // Then walk backwards through session messages.
+    var i: usize = s.messages.items.len;
+    while (i > 0 and total < max_chars) {
+        i -= 1;
+        const msg = s.messages.items[i];
+        switch (msg.role) {
+            .user => {
+                if (agent_loop.isHarnessInternalUserMessage(msg.content)) continue;
+                pushChunk(gpa, &rev_chunks, &total, "U", msg.content, max_chars);
+            },
+            .assistant => pushChunk(gpa, &rev_chunks, &total, "A", msg.content, max_chars),
+            else => {},
+        }
+    }
+
+    // Reverse to chronological order, keep within 1000 chars from the end.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer {
+        for (rev_chunks.items) |c| gpa.free(c);
+        out.deinit(gpa);
+    }
+    var j: usize = rev_chunks.items.len;
+    while (j > 0) {
+        j -= 1;
+        try out.appendSlice(gpa, rev_chunks.items[j]);
+        gpa.free(rev_chunks.items[j]);
+    }
+    // Trim to last 1000 chars if needed (recent context wins).
+    if (out.items.len > max_chars) {
+        const start = out.items.len - max_chars;
+        std.mem.copyForwards(u8, out.items[0 .. out.items.len - start], out.items[start..]);
+        out.shrinkRetainingCapacity(out.items.len - start);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn extractAiTitleJson(arena: std.mem.Allocator, raw: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.eql(u8, trimmed, "null")) return null;
+
+    // Try parse whole response as JSON value first.
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, trimmed, .{}) catch null;
+    if (parsed) |v| {
+        switch (v) {
+            .null => return null,
+            .string => |s| return normalizeAiTitleCandidate(s),
+            .object => |o| {
+                if (o.get("title")) |tv| {
+                    if (tv == .string) return normalizeAiTitleCandidate(tv.string);
+                    if (tv == .null) return null;
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Fallback: find a JSON object/string snippet in noisy output.
+    if (std.mem.indexOf(u8, trimmed, "\"title\"")) |k| {
+        if (std.mem.indexOfScalarPos(u8, trimmed, k, ':')) |colon| {
+            var i = colon + 1;
+            while (i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t' or trimmed[i] == '\n' or trimmed[i] == '\r')) i += 1;
+            if (i + 4 <= trimmed.len and std.mem.eql(u8, trimmed[i .. i + 4], "null")) return null;
+            if (i < trimmed.len and trimmed[i] == '"') {
+                i += 1;
+                const start = i;
+                var esc = false;
+                while (i < trimmed.len) : (i += 1) {
+                    if (esc) { esc = false; continue; }
+                    if (trimmed[i] == '\\') { esc = true; continue; }
+                    if (trimmed[i] == '"') {
+                        return normalizeAiTitleCandidate(trimmed[start..i]);
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn normalizeAiTitleCandidate(s: []const u8) ?[]const u8 {
+    const t = std.mem.trim(u8, s, " \t\r\n\"'");
+    if (t.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(t, "null")) return null;
+    // Basic sanity: 3-7 words preferred; reject obviously bad long/vague forms softly by trimming.
+    var words: usize = 0;
+    var in_word = false;
+    for (t) |c| {
+        const ws = c == ' ' or c == '\t' or c == '\n' or c == '\r';
+        if (ws) {
+            in_word = false;
+        } else if (!in_word) {
+            in_word = true;
+            words += 1;
+        }
+    }
+    if (words == 0) return null;
+    if (words > 12) return null; // clearly not a short title
+    if (t.len > 80) return null;
+    return t;
+}
+
+fn aiTitleWorker(job: *AiTitleJob) void {
+    defer job.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(job.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Build request.
+    var url_buf: [1024]u8 = undefined;
+    const url = if (job.kind == .anthropic)
+        (std.fmt.bufPrint(&url_buf, "{s}/messages", .{job.base_url}) catch return)
+    else
+        (std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{job.base_url}) catch return);
+
+    const sys =
+        "Generate a short session title for this coding conversation. " ++
+        "Return JSON only: {\"title\":\"...\"} or null. " ++
+        "Rules: 3-7 words, sentence case, specific, no trailing period. " ++
+        "Good: Fix login button on mobile. " ++
+        "Bad: Code changes. Bad: Investigate and fix the issue where... Bad: Fix Login Button On Mobile. " ++
+        "If you cannot produce a good title, return null.";
+    const user_prompt = std.fmt.allocPrint(arena,
+        "Conversation tail (most recent context):\n{s}\n\nReturn only JSON.",
+        .{job.tail},
+    ) catch return;
+
+    const msgs = [_]chat.ChatMessage{
+        .{ .role = "system", .content = sys },
+        .{ .role = "user", .content = user_prompt },
+    };
+
+    var body_buf: [32 * 1024]u8 = undefined;
+    // Use low effort for cheap/fast upgrade.
+    const body = chat.buildBodyMessages(&body_buf, job.model, &msgs, .low, "", job.kind) catch return;
+
+    var http = http_client.Http.init(job.allocator, io_global);
+    defer http.deinit();
+
+    const extra_headers: []const http_client.Http.ExtraHeader = &.{};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(job.allocator);
+    const Sink = struct { gpa: std.mem.Allocator, buf: *std.ArrayList(u8) };
+    var sink = Sink{ .gpa = job.allocator, .buf = &out };
+    const cb: chat.Callbacks = .{
+        .userdata = &sink,
+        .onDelta = struct {
+            fn f(ud: ?*anyopaque, d: []const u8) void {
+                const s: *Sink = @ptrCast(@alignCast(ud.?));
+                s.buf.appendSlice(s.gpa, d) catch {};
+            }
+        }.f,
+    };
+
+    chat.streamChat(job.allocator, &http, url, job.api_key, @constCast(body), cb, job.kind, false, extra_headers) catch return;
+    if (out.items.len == 0) return;
+
+    const title = extractAiTitleJson(arena, out.items) orelse return;
+
+    // Apply only if conditions still hold: no custom title, generation matches, session unchanged (same path/meta state).
+    const meta_now = sessionindex.readMeta(arena, io_global, job.session_path);
+    if (meta_now.custom_title.len > 0) return;
+    // A newer/richer generation must not be clobbered.
+    if (meta_now.ai_title_gen > job.expected_gen) return;
+    // Turn-3 upgrade may replace turn-1 derived title (gen 1) or empty/unset (gen 0), or the same gen.
+    if (job.expected_gen == 3) {
+        if (!(meta_now.ai_title_gen == 0 or meta_now.ai_title_gen == 1 or meta_now.ai_title_gen == 3)) return;
+    } else if (meta_now.ai_title_gen != 0 and meta_now.ai_title_gen != job.expected_gen) {
+        return;
+    }
+
+    sessionindex.writeMeta(io_global, arena, job.session_path, .{
+        .name = meta_now.name,
+        .model = meta_now.model,
+        .created_at = meta_now.created_at,
+        .custom_title = meta_now.custom_title,
+        .ai_title = title,
+        .tag = meta_now.tag,
+        .forked_from = meta_now.forked_from,
+        .ai_title_gen = job.expected_gen,
+    }) catch return;
+
+    // Best-effort in-memory update if this is still the active session.
+    if (session) |s| {
+        if (s.path) |p| {
+            if (std.mem.eql(u8, p, job.session_path) and s.custom_title.len == 0 and s.ai_title_gen <= job.expected_gen) {
+                if (s.ai_title.len > 0) s.allocator.free(s.ai_title);
+                s.ai_title = s.allocator.dupe(u8, title) catch s.ai_title;
+                if (s.ai_title.len > 0) s.ai_title_gen = job.expected_gen;
+            }
+        }
+    }
 }
 
 /// Per-turn harness budget reset (normal + pipeline turns).

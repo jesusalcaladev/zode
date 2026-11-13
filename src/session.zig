@@ -146,6 +146,8 @@ pub const Session = struct {
     /// AI-generated title (turn 3). Safe to regenerate. Persisted via
     /// sessionindex Meta sidecar.
     ai_title: []const u8 = "",
+    /// Generation of ai_title (30.2): 1=turn-1 derive, 3=turn-3 AI upgrade.
+    ai_title_gen: u32 = 0,
     /// Session tag (35.3), stored without leading '#'. Persisted via Meta sidecar.
     tag: []const u8 = "",
 
@@ -508,6 +510,7 @@ pub const Session = struct {
             const copy = try allocator.dupe(u8, meta.ai_title);
             s.ai_title = copy;
         }
+        s.ai_title_gen = meta.ai_title_gen;
         if (meta.tag.len > 0) {
             const copy = try allocator.dupe(u8, meta.tag);
             s.tag = copy;

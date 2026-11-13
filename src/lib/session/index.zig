@@ -49,6 +49,8 @@ pub const Meta = struct {
     tag: []const u8 = "",
     /// Parent session (30.4 /branch provenance), e.g. session id/stem of the fork source.
     forked_from: []const u8 = "",
+    /// Generation of ai_title (30.2): higher/explicit generations win (turn-3 upgrade > turn-1 derive).
+    ai_title_gen: u32 = 0,
 };
 
 /// One session in the list.
@@ -229,6 +231,7 @@ pub fn readMeta(arena: std.mem.Allocator, io: std.Io, session_path: []const u8) 
     if (parsed.ai_title.len > 0) result.ai_title = arena.dupe(u8, parsed.ai_title) catch "";
     if (parsed.tag.len > 0) result.tag = arena.dupe(u8, parsed.tag) catch "";
     if (parsed.forked_from.len > 0) result.forked_from = arena.dupe(u8, parsed.forked_from) catch "";
+    result.ai_title_gen = parsed.ai_title_gen;
     return result;
 }
 
@@ -261,6 +264,9 @@ pub fn parseMeta(arena: std.mem.Allocator, data: []const u8) Meta {
         if (v == .string) meta.forked_from = v.string;
     } else if (o.get("parent")) |v| {
         if (v == .string) meta.forked_from = v.string;
+    }
+    if (o.get("ai_title_gen")) |v| {
+        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) meta.ai_title_gen = @intCast(v.integer);
     }
     return meta;
 }
@@ -327,6 +333,9 @@ pub fn writeMetaTitles(w: *std.Io.Writer, meta: Meta) !void {
     try writeJsonString(w, meta.tag);
     try w.writeAll(",\"forked_from\":");
     try writeJsonString(w, meta.forked_from);
+    if (meta.ai_title_gen != 0) {
+        try w.print(",\"ai_title_gen\":{d}", .{meta.ai_title_gen});
+    }
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {

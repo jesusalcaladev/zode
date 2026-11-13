@@ -33,7 +33,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 - [x] 🟡 **Sprint D — Phase 6 → 5 → 25** (permissions → hooks → bash safety) — Phase 6 rule engine (permrules/load/enforce) + Phase 5 hooks (`.zode/hooks.json`, Pre/Post/UserPromptSubmit/Stop, `if` via permission-rule syntax) + Phase 25 bash classification/sandbox offer complete.
 - [x] 🟡 **Sprint E — Phase 35** (the command surface): complete (35.1–35.15, including `/mcp`, `/sandbox`, `/add-dir`, `/vim`).
 - [ ] 🟡 **Tool track — Phase 25 → 26 → 20** (bash safety → roles → teams); 20 waits on 15, 32 on 26
-- [ ] 🟡 **Phase 30** (names/forks/restore): Phase 29 complete; Phase 30 pending (30.2 AI title upgrade, 30.3 summaries, remaining 30.5 resume restore) — **30.4 `/branch` done**
+- [ ] 🟡 **Phase 30** (names/forks/restore): Phase 29 complete; Phase 30 pending (30.3 summaries, remaining 30.5 resume restore) — **30.2 auto-titles and 30.4 `/branch` done**
 - [ ] 🟢 Everything else per the dependency table at the bottom.
 
 **Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills +
@@ -240,10 +240,10 @@ Ctrl+R turns them on. That is the same rule with a different name.
 
 `✨ feature + 🐛 fix · 🟡 · independent; writes what 29 reads`
 
-- [ ] **30.2** Automatic session titles (free first, AI upgrade later)
+- [x] **30.2** Automatic session titles (free first, AI upgrade later)
   - [x] Turn 1: a title derived from the first prompt — synchronously, free
-  - [ ] Turn 3: the AI upgrade via a `task` subagent (effort `low`) over the **last 1000 characters** of the conversation (recent context wins, input bounded); patched only while three things hold: the generation counter matches (a cheap turn-1 request resolving late must not clobber a richer turn-3 one), the session is unchanged, and there is no custom title (the `/rename` race)
-  - [ ] Prompt shape: good `Fix login button on mobile` · bad `Code changes` (vague) · bad `Investigate and fix the issue where…` (long) · bad `Fix Login Button On Mobile` (wrong case); 3–7 words, sentence case, JSON-schema-constrained, `null` on any failure, and it **never blocks**
+  - [x] Turn 3: AI title upgrade (background, effort `low`, never blocks) over the last 1000 characters of conversation (recent context wins, bounded); applied only when generation matches (turn-3 upgrade over turn-1/empty), session meta is unchanged/eligible, and there is no custom title (`/rename` race)
+  - [x] Prompt/result constraints: asks for JSON-only `{"title":"..."}` or `null` (3–7 words, sentence case guidance/examples in prompt), parses JSON/null safely, rejects/ignores invalid results on failure
 - [ ] **30.3** A running summary for the list: one line written at write time (no model call) every `min(5 steps, 2 min)` — in a three-hour session the first prompt is hours stale and the row is useless
 - [x] **30.4** `/branch` — fork is not `/new`
   - [x] Copy the session JSONL into a new session id, stamp provenance (`forked_from` in session meta), and carry side tables over (`.caps.json`, `.compact.json`, `tool-results/<stem>/`) · branch session file created with `0o600` permissions
