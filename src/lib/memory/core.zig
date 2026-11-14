@@ -26,6 +26,8 @@ pub const Entry = struct {
     body: []const u8 = "",
     /// Path the entry was loaded from, for display/precedence diagnostics.
     path: []const u8 = "",
+    /// Runtime-only recall annotation (not persisted). Caller-owned.
+    staleness: []const u8 = "",
 };
 
 pub const Meta = struct {
@@ -88,11 +90,25 @@ pub fn parseMemory(text: []const u8) Entry {
     return e;
 }
 
-/// Simple case-insensitive substring match over title/tags/body.
+/// Simple case-insensitive substring match over title/tags/body/id.
 pub fn matches(e: Entry, query: []const u8) bool {
     if (query.len == 0) return true;
-    return containsIgnoreCase(e.title, query) or containsIgnoreCase(e.tags, query) or
-        containsIgnoreCase(e.body, query) or containsIgnoreCase(e.id, query);
+    return scoreMatch(e, query) > 0;
+}
+
+/// Relevance score for recall ranking. Higher is more relevant.
+pub fn scoreMatch(e: Entry, query: []const u8) usize {
+    if (query.len == 0) return 1;
+    var score: usize = 0;
+    if (containsIgnoreCase(e.id, query)) score += 8;
+    if (containsIgnoreCase(e.title, query)) score += 6;
+    if (containsIgnoreCase(e.tags, query)) score += 4;
+    if (containsIgnoreCase(e.evidence, query)) score += 3;
+    if (containsIgnoreCase(e.body, query)) score += 2;
+    // Prefer entries with evidence/timestamps over bare notes on ties.
+    if (e.evidence.len > 0) score += 1;
+    if (e.updated_at.len > 0 or e.created_at.len > 0) score += 1;
+    return score;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -120,7 +136,8 @@ pub const ConsultResult = struct {
 
 /// Renders matching entries into an owned buffer, never exceeding `budget_bytes`.
 /// Entries that do not fit are omitted entirely (never partially inlined in a way
-/// that hides truncation) and counted in `omitted`.
+/// that hides truncation) and counted in `omitted`. Matches are ranked by
+/// relevance when a query is provided.
 pub fn consult(gpa: std.mem.Allocator, entries: []const Entry, query: []const u8, budget_bytes: usize) !ConsultResult {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -134,8 +151,49 @@ pub fn consult(gpa: std.mem.Allocator, entries: []const Entry, query: []const u8
         try out.appendSlice(gpa, "\n");
     }
 
+    // Select and rank matches (relevance recall).
+    var matched: std.ArrayListUnmanaged(Entry) = .empty;
+    defer matched.deinit(gpa);
     for (entries) |e| {
         if (!matches(e, query)) continue;
+        try matched.append(gpa, e);
+    }
+    if (query.len > 0 and matched.items.len > 1) {
+        const Ctx = struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                // `query` is captured via threadlocal-ish not possible; compare by precomputed
+                // stable fields only is insufficient. Use a second pass via sort with cached scores
+                // by embedding score in a wrapper? keep simple: compare id/title/body presence not enough.
+                // Fallback: compare by (has title/tag/body richness, id) — actual query scoring done below.
+                const aa = if (a.id.len > 0) a.id else a.title;
+                const bb = if (b.id.len > 0) b.id else b.title;
+                return std.mem.lessThan(u8, aa, bb);
+            }
+        };
+        _ = Ctx;
+    }
+    // Rank by score desc for query recall (stable by original id/title on ties).
+    if (query.len > 0 and matched.items.len > 1) {
+        // Insertion sort is fine for small bounded memory lists.
+        var i: usize = 1;
+        while (i < matched.items.len) : (i += 1) {
+            const x = matched.items[i];
+            const sx = scoreMatch(x, query);
+            var j: usize = i;
+            while (j > 0) : (j -= 1) {
+                const y = matched.items[j - 1];
+                const sy = scoreMatch(y, query);
+                const better = sx > sy or (sx == sy and std.mem.lessThan(u8,
+                    if (x.id.len > 0) x.id else x.title,
+                    if (y.id.len > 0) y.id else y.title));
+                if (!better) break;
+                matched.items[j] = y;
+            }
+            matched.items[j] = x;
+        }
+    }
+
+    for (matched.items) |e| {
         var item: std.ArrayListUnmanaged(u8) = .empty;
         defer item.deinit(gpa);
         try item.appendSlice(gpa, "\n---\n");
@@ -150,6 +208,25 @@ pub fn consult(gpa: std.mem.Allocator, entries: []const Entry, query: []const u8
         if (e.tags.len > 0) {
             try item.appendSlice(gpa, "tags: ");
             try item.appendSlice(gpa, e.tags);
+            try item.appendSlice(gpa, "\n");
+        }
+        if (e.updated_at.len > 0) {
+            try item.appendSlice(gpa, "updated_at: ");
+            try item.appendSlice(gpa, e.updated_at);
+            try item.appendSlice(gpa, "\n");
+        } else if (e.created_at.len > 0) {
+            try item.appendSlice(gpa, "created_at: ");
+            try item.appendSlice(gpa, e.created_at);
+            try item.appendSlice(gpa, "\n");
+        }
+        if (e.evidence.len > 0) {
+            try item.appendSlice(gpa, "evidence: ");
+            try item.appendSlice(gpa, e.evidence);
+            try item.appendSlice(gpa, "\n");
+        }
+        if (e.staleness.len > 0) {
+            try item.appendSlice(gpa, "staleness: ");
+            try item.appendSlice(gpa, e.staleness);
             try item.appendSlice(gpa, "\n");
         }
         try item.appendSlice(gpa, "\n");
@@ -219,6 +296,11 @@ fn renderListLine(e: Entry, out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Alloc
         try out.appendSlice(gpa, e.tags);
         try out.appendSlice(gpa, "]");
     }
+    if (e.staleness.len > 0) {
+        try out.appendSlice(gpa, " {stale: ");
+        try out.appendSlice(gpa, e.staleness);
+        try out.appendSlice(gpa, "}");
+    }
     try out.appendSlice(gpa, "\n");
 }
 
@@ -232,6 +314,73 @@ pub fn renderList(gpa: std.mem.Allocator, entries: []const Entry) ![]u8 {
     }
     for (entries) |e| try renderListLine(e, &out, gpa);
     return out.toOwnedSlice(gpa);
+}
+
+/// Best-effort staleness note for recall: flags missing evidence paths.
+/// Evidence may be comma/space/newline-separated; tokens that look like file
+/// paths are checked relative to cwd and repo root. Returns empty when nothing
+/// looks stale, else an owned note.
+pub fn stalenessNote(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8, repo_root: ?[]const u8, e: Entry) []const u8 {
+    if (e.evidence.len == 0) {
+        if (e.updated_at.len == 0 and e.created_at.len == 0) return gpa.dupe(u8, "no evidence or timestamp") catch "";
+        return "";
+    }
+    var missing: std.ArrayListUnmanaged(u8) = .empty;
+    defer missing.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, e.evidence, ", \t\r\n");
+    var n_missing: usize = 0;
+    var n_checked: usize = 0;
+    while (it.next()) |tok_raw| {
+        const tok = std.mem.trim(u8, tok_raw, "\"'`()[]");
+        if (tok.len == 0) continue;
+        // Heuristic: path-like tokens only (avoid flagging plain text evidence).
+        const looks_path = std.mem.indexOfScalar(u8, tok, '/') != null or std.mem.indexOfScalar(u8, tok, '.') != null;
+        if (!looks_path) continue;
+        n_checked += 1;
+        if (pathExists(io, cwd, repo_root, tok)) continue;
+        n_missing += 1;
+        if (missing.items.len == 0) missing.appendSlice(gpa, "missing evidence: ") catch {} else missing.appendSlice(gpa, ", ") catch {};
+        const cap = @min(tok.len, 80);
+        missing.appendSlice(gpa, tok[0..cap]) catch {};
+    }
+    if (n_checked == 0) {
+        // Evidence text but no path-like tokens; can't verify, not a staleness error.
+        if (e.updated_at.len == 0 and e.created_at.len == 0) return gpa.dupe(u8, "evidence not path-verifiable") catch "";
+        return "";
+    }
+    if (n_missing == 0) return "";
+    if (missing.items.len == 0) return gpa.dupe(u8, "evidence paths missing") catch "";
+    return missing.toOwnedSlice(gpa) catch "";
+}
+
+fn pathExists(io: std.Io, cwd: []const u8, repo_root: ?[]const u8, path: []const u8) bool {
+    if (path.len == 0) return false;
+    // Absolute-ish or repo-relative: try as-is from cwd, then from repo root.
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch null;
+    if (f) |*ff| { ff.close(io); return true; }
+    var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch null;
+    if (d) |*dd| { dd.close(io); return true; }
+    if (cwd.len > 0 and path[0] != '/') {
+        var b1: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&b1, "{s}/{s}", .{ cwd, path })) |p| {
+            f = std.Io.Dir.cwd().openFile(io, p, .{}) catch null;
+            if (f) |*ff| { ff.close(io); return true; }
+            d = std.Io.Dir.cwd().openDir(io, p, .{}) catch null;
+            if (d) |*dd| { dd.close(io); return true; }
+        } else |_| {}
+    }
+    if (repo_root) |root| {
+        if (root.len > 0 and path[0] != '/') {
+            var b2: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fmt.bufPrint(&b2, "{s}/{s}", .{ root, path })) |p| {
+                f = std.Io.Dir.cwd().openFile(io, p, .{}) catch null;
+                if (f) |*ff| { ff.close(io); return true; }
+                d = std.Io.Dir.cwd().openDir(io, p, .{}) catch null;
+                if (d) |*dd| { dd.close(io); return true; }
+            } else |_| {}
+        }
+    }
+    return false;
 }
 
 test "parseMemory: reads frontmatter and body" {

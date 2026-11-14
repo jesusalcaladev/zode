@@ -69,6 +69,10 @@ pub const Item = struct {
     /// and NOT a pointer into the catalogue, because the items outlive the
     /// worker's arena: same dangling-pointer family the labels would fall into.
     ctx_tokens: u32 = 0,
+    /// Model pricing/free info for preview pane (33.7).
+    is_free: bool = false,
+    price_prompt: f64 = 0,
+    price_completion: f64 = 0,
 };
 
 pub const Group = struct {
@@ -594,7 +598,7 @@ test "the selected row is always visible, even with a group header in the window
         // that are not items.
         it.* = .{ .kind = .command, .label = "x", .group = if (i < 5) 1 else 2 };
     }
-    pal.setItems(&items, &.{.{ .name = "one" }, .{ .name = "two" }});
+    pal.setItems(&items, &.{ .{ .name = "one" }, .{ .name = "two" } });
     pal.refilter();
 
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
@@ -659,10 +663,12 @@ pub const Box = struct {
     h: u16,
     /// Width of the left column (models mode).
     col_w: u16,
-    /// Rows usable for items, without title, search or footer.
+    /// Rows usable for items, without title, search, preview or footer.
     list_rows: usize,
     /// Row of the first item line.
     list_top: u16,
+    /// Rows reserved for the bottom preview pane (0 when absent).
+    preview_rows: u16,
 };
 
 /// Computes the modal's size. Models mode: two columns; commands: one.
@@ -680,8 +686,10 @@ pub fn boxFor(pal: *const Palette, width: u16, height: u16) Box {
     // The providers column is a third: it holds short names and a key state,
     // and the models column is the one that has to fit a 40-character id.
     const col_w: u16 = if (two_cols) @max(18, w / 3) else w;
-    // h = border(1) + title(1) + search(1) + items + footer(1) + border(1)
-    const list_rows: usize = if (hh > 7) @as(usize, hh) - 5 else 1;
+    // h = border(1) + title(1) + search(1) + items + [preview] + footer(1) + border(1)
+    const preview_rows: u16 = if (pal.mode == .models) 2 else 0;
+    const chrome: usize = 5 + @as(usize, preview_rows);
+    const list_rows: usize = if (hh > @as(u16, @intCast(chrome + 1))) @as(usize, hh) - chrome else 1;
     return .{
         .x = (width -| w) / 2,
         .y = @max(1, (height -| hh) / 4),
@@ -690,6 +698,7 @@ pub fn boxFor(pal: *const Palette, width: u16, height: u16) Box {
         .col_w = col_w,
         .list_rows = list_rows,
         .list_top = 0, // `draw` sets it (depends on key_prompt mode)
+        .preview_rows = preview_rows,
     };
 }
 
@@ -778,8 +787,9 @@ pub fn draw(
     // ── list ──
     if (pal.mode == .models and pal.countIn(0) > 0) {
         // Providers column + separator + models column.
+        const sep_bottom = box.y + box.h - 2 - box.preview_rows;
         var ry: u16 = 3;
-        while (ry < box.h - 2) : (ry += 1) {
+        while (box.y + ry < sep_bottom) : (ry += 1) {
             p.putStable(box.x + box.col_w, box.y + ry, "│", 1, theme.brand_faint);
         }
         // The models column keeps ONE column for the scrollbar: the list is
@@ -794,6 +804,11 @@ pub fn draw(
         // the right of a row is not painted under it.
         const r0 = drawColumn(p, pal, box, 0, box.x + 1, box.w - 3, "");
         drawColumnScrollbar(p, pal, box, box.x + box.w - 2, r0);
+    }
+
+    // ── model preview pane (33.7) ──
+    if (pal.mode == .models and box.preview_rows > 0) {
+        drawModelPreview(p, pal, box);
     }
 
     // ── footer ──
@@ -1054,6 +1069,51 @@ fn drawColumnScrollbar(p: *Painter, pal: *const Palette, box: Box, x: u16, total
             if (in_thumb) theme.brand else theme.rule,
         );
     }
+}
+
+fn drawModelPreview(p: *Painter, pal: *const Palette, box: Box) void {
+    const pr = box.preview_rows;
+    if (pr == 0) return;
+    // Bottom pane inside the modal, above footer.
+    const fy = box.y + box.h - 2;
+    const y0 = fy -| pr;
+    if (y0 + 1 >= fy) return;
+    p.fillRange(box.x + 1, box.x + box.w - 1, y0, "─", theme.brand_faint);
+
+    var it = pal.selectedIn(1);
+    if (it == null) it = pal.selectedIn(0);
+    const item = it orelse {
+        _ = p.putClipped(box.x + 2, y0 + 1, "Select a model to preview details", box.w -| 4, theme.hint);
+        return;
+    };
+    if (item.kind != .model) {
+        _ = p.putClipped(box.x + 2, y0 + 1, "Select a model to preview details", box.w -| 4, theme.hint);
+        return;
+    }
+
+    var line1: [160]u8 = undefined;
+    const ctx_txt = if (item.ctx_tokens > 0)
+        (std.fmt.bufPrint(&line1, "context: {d}k tokens", .{item.ctx_tokens / 1024}) catch "context: unknown")
+    else
+        "context: unknown";
+
+    var line2: [160]u8 = undefined;
+    var price_buf: [96]u8 = undefined;
+    const price_txt = if (item.is_free)
+        "price: free"
+    else if (item.price_prompt > 0 or item.price_completion > 0)
+        (std.fmt.bufPrint(
+            &price_buf,
+            "price: ${d:.2}/1M in · ${d:.2}/1M out",
+            .{ item.price_prompt * 1_000_000.0, item.price_completion * 1_000_000.0 },
+        ) catch "price: unknown")
+    else
+        "price: unknown";
+    const free_txt: []const u8 = if (item.is_free) " · free" else "";
+    const text2 = std.fmt.bufPrint(&line2, "{s}{s}", .{ price_txt, free_txt }) catch price_txt;
+
+    _ = p.putClipped(box.x + 2, y0, ctx_txt, box.w -| 4, theme.item);
+    if (y0 + 1 < fy) _ = p.putClipped(box.x + 2, y0 + 1, text2, box.w -| 4, theme.dim);
 }
 
 fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) void {
@@ -1357,7 +1417,7 @@ fn activateItem(pal: *Palette, item_index: u32) Action {
                 pal.mode = .key_prompt;
                 pal.key_len = 0;
                 pal.key_msg_len = 0;
-                pal.setKeyMessage("paste the key and press enter", false);
+                pal.setKeyMessage("paste key + enter (empty = remove key)", false);
                 break :blk Action{ .none = {} };
             }
             break :blk Action{ .set_provider = it.label };

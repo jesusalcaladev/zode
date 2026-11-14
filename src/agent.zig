@@ -42,6 +42,7 @@ const cmdsubst = @import("lib/cmdsubst.zig");
 const gitcmds = @import("lib/gitcmds.zig");
 const palette = @import("palette.zig");
 const config_mod = @import("config.zig");
+const authstore = @import("lib/authstore.zig");
 
 const ask = @import("lib/ask.zig");
 const bgproc = @import("bgproc.zig");
@@ -575,10 +576,6 @@ pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
 /// `/task-parallel [1..8|auto]`: tune simultaneous subagent requests for this
 /// session. `auto` returns to the environment/default value.
 /// `/skills`: what is loadable, and from where.
-
-
-
-
 /// Should the app reopen the last session at startup?
 pub fn shouldResume(flag: bool, env: ?*const std.process.Environ.Map) bool {
     return envutil.shouldResume(flag, env);
@@ -612,7 +609,6 @@ pub fn styleNames(entries: []const outputstyles.Entry) []const u8 {
 //    reliable, so the message names the one that was used, and the file is
 //    written every time: a copy confirmation you cannot check is not a
 //    confirmation.
-
 
 /// Tool results elided in the session (for /context).
 pub var session_elided: usize = 0;
@@ -1350,25 +1346,73 @@ fn hydratePlanFromSession(m: *tui.Model, s: *session_mod.Session) void {
 }
 
 /// Replays the session messages into the TUI history so they are visible
-/// when a session is resumed. The session messages are stored in the session
-/// file but the TUI's history (`paras`) is separate and needs to be populated
-/// from the session messages on resume.
+/// when a session is resumed. Reconstructs conversation output (including tool
+/// results/summaries and compaction notes) so prior work is visible again.
 ///
 /// Internal harness/pipeline prompts are kept in the session (the model needs
 /// them on the wire) but hidden from the visible transcript.
 pub fn replaySessionMessages(m: *tui.Model, s: *session_mod.Session) void {
+    if (s.compact_summary) |summary| {
+        const note = std.fmt.allocPrint(m.allocator, "compaction summary\n{s}", .{summary}) catch null;
+        if (note) |n| {
+            m.pushKind(.info, n);
+            m.allocator.free(n);
+        }
+    }
+
     for (s.messages.items) |sm| {
         if (sm.role == .user and isHarnessInternalUserMessage(sm.content)) continue;
-        const kind = switch (sm.role) {
-            .user => md.Kind.user,
-            .assistant => md.Kind.assistant,
-            .tool => md.Kind.tool_res,
-            .system => md.Kind.info,
-        };
-        m.pushKind(kind, sm.content);
+        switch (sm.role) {
+            .user => m.pushKind(.user, sm.content),
+            .assistant => {
+                if (sm.tool_calls_json) |tj| {
+                    replayAssistantToolCalls(m, tj);
+                }
+                if (sm.content.len > 0) m.pushKind(.assistant, sm.content);
+            },
+            .tool => {
+                if (sm.tool_name) |name| {
+                    const labeled = std.fmt.allocPrint(m.allocator, "tool {s}\n{s}", .{ name, sm.content }) catch null;
+                    if (labeled) |txt| {
+                        m.pushKind(.tool_res, txt);
+                        m.allocator.free(txt);
+                    } else {
+                        m.pushKind(.tool_res, sm.content);
+                    }
+                } else {
+                    m.pushKind(.tool_res, sm.content);
+                }
+            },
+            .system => m.pushKind(.info, sm.content),
+        }
     }
     // Drain the pending queue so the paragraphs are in `paras` immediately
     m.drainPending();
+}
+
+fn replayAssistantToolCalls(m: *tui.Model, tool_calls_json: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, tool_calls_json, .{}) catch return;
+    if (parsed != .array) return;
+    for (parsed.array.items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        var name: []const u8 = "tool";
+        if (obj.get("function")) |f| {
+            if (f == .object) {
+                if (f.object.get("name")) |n| if (n == .string) {
+                    name = n.string;
+                };
+            }
+        } else if (obj.get("name")) |n| {
+            if (n == .string) name = n.string;
+        }
+        const line = std.fmt.allocPrint(m.allocator, "tool call: {s}", .{name}) catch continue;
+        defer m.allocator.free(line);
+        m.pushKind(.info, line);
+    }
 }
 
 /// Error to the history, in RED (`md.Kind.error_msg`, `✗` prefix).
@@ -1471,6 +1515,10 @@ pub var user_config: config_mod.Config = .{};
 
 /// Loads the user's `config.json`. Call once at startup.
 pub fn loadUserConfig() void {
+    if (cfg_arena_state != null) {
+        updateSessionRedactionContext();
+        return;
+    }
     if (cfg_arena_state == null) {
         cfg_arena_state = std.heap.ArenaAllocator.init(gpa_global);
         user_config = config_mod.load(cfg_arena_state.?.allocator(), io_global, environ_global);
@@ -1691,6 +1739,32 @@ test "persistLastModel/restoreLastModel: what left is what comes back" {
 /// up missing from the one that matters.
 pub var status_model_target: ?*tui.Model = null;
 
+var extra_redaction_keys_buf: [32][]const u8 = undefined;
+var extra_redaction_keys_len: usize = 0;
+
+fn rebuildExtraRedactionKeys() void {
+    extra_redaction_keys_len = 0;
+    const env = environ_global orelse return;
+    // User-configured providers may define custom key_env vars not covered by
+    // built-in provider defs; include them in session redaction.
+    for (user_config.extra) |d| {
+        for (d.key_env) |var_name| {
+            if (env.get(var_name)) |k| {
+                if (k.len < 8) continue;
+                if (extra_redaction_keys_len >= extra_redaction_keys_buf.len) return;
+                extra_redaction_keys_buf[extra_redaction_keys_len] = k;
+                extra_redaction_keys_len += 1;
+            }
+        }
+    }
+}
+
+fn updateSessionRedactionContext() void {
+    rebuildExtraRedactionKeys();
+    session_mod.setRedactionContext(environ_global, api_key_global);
+    session_mod.setRedactionExtraKeys(extra_redaction_keys_buf[0..extra_redaction_keys_len]);
+}
+
 /// Reads `~/.config/zode/auth.json` and hands it to `providers` so `keyFor`
 /// uses it. Without this, connecting a provider from the palette saved the key
 /// and then never used it: `keyFor` only looked at the environment.
@@ -1710,9 +1784,12 @@ var keys_arena_state: ?std.heap.ArenaAllocator = null;
 fn loadAuthKeys(_: std.mem.Allocator) void {
     var buf: [1024]u8 = undefined;
     const path = config_mod.authPath(environ_global, &buf) orelse return;
-    // BEFORE reading: an `auth.json` created by an older zode (or by hand) can
-    // be 0644, and reading it does not fix that. Every start of the app went
-    // through here and left the keys readable by every user on the machine.
+    // BEFORE reading: harden and refuse symlinked sensitive paths (same spirit
+    // as writeFileSecure) so auth material is not read from/trusted via links.
+    if (!config_mod.isSafeSensitivePath(io_global, environ_global, path)) {
+        providers.setSavedKeys(null);
+        return;
+    }
     config_mod.tightenPermissions(io_global, path);
 
     if (keys_arena_state == null) keys_arena_state = std.heap.ArenaAllocator.init(gpa_global);
@@ -1735,14 +1812,51 @@ fn loadAuthKeys(_: std.mem.Allocator) void {
         }
     }
 
-    const data = readFileTo(a, path) orelse {
+    // Re-check immediately before reading the file contents.
+    if (!config_mod.isSafeSensitivePath(io_global, environ_global, path)) {
         providers.setSavedKeys(map);
+        updateSessionRedactionContext();
+        return;
+    }
+    const raw_data = readFileTo(a, path) orelse {
+        providers.setSavedKeys(map);
+        updateSessionRedactionContext();
+        return;
+    };
+    const was_plaintext = !authstore.isEncrypted(raw_data);
+    const data = decryptAuthFileData(a, raw_data, environ_global) orelse {
+        providers.setSavedKeys(map);
+        updateSessionRedactionContext();
         return;
     };
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, data, .{}) catch {
         providers.setSavedKeys(map);
+        updateSessionRedactionContext();
         return;
     };
+    // Opportunistic migration: upgrade legacy plaintext auth.json to encrypted
+    // at-rest storage when a master key is available.
+    if (was_plaintext) {
+        // Best-effort: never block startup/key loading on migration failure.
+        if (authMasterKeyForWrite(a, environ_global)) |_| {
+            writeAuthFileSecureMaybeEncrypted(a, environ_global, path, data) catch {};
+        }
+    }
+    // Opportunistic hardening: if passphrase is configured and local master key
+    // file is still unprotected plaintext base64, rewrap it.
+    if (authPassphrase(environ_global)) |_| {
+        var pbuf2: [1024]u8 = undefined;
+        if (authMasterPath(environ_global, &pbuf2)) |mpath| {
+            if (config_mod.isSafeSensitivePath(io_global, environ_global, mpath)) {
+                if (readFileTo(a, mpath)) |mraw| {
+                    const mt = std.mem.trim(u8, mraw, " \t\r\n");
+                    if (!authstore.isPassphraseProtectedMasterKey(mt) and authstore.decodeKeyB64(mt) != null) {
+                        _ = writeAuthMasterKeyFile(a, environ_global, mt);
+                    }
+                }
+            }
+        }
+    }
     if (parsed != .object) {
         providers.setSavedKeys(map);
         return;
@@ -1759,6 +1873,7 @@ fn loadAuthKeys(_: std.mem.Allocator) void {
         map.put(a, kv.key_ptr.*, a.dupe(u8, v.string) catch continue) catch continue;
     }
     providers.setSavedKeys(map);
+    updateSessionRedactionContext();
 }
 
 /// Re-reads `config.json` from scratch.
@@ -1797,6 +1912,7 @@ pub fn shutdownUserConfig() void {
         s.deinit();
         keys_arena_state = null;
     }
+    clearCachedAuthMasterKey();
     user_config = .{};
     // The skills cache is the third arena-like thing in the process and the only
     // one with heap strings owned by the module. It is BORROWED by everyone, so
@@ -1894,6 +2010,30 @@ pub fn resetSessionFiles(m: *tui.Model) void {
     m.clearFacts();
 }
 
+/// `/clear`: keep the same session identity but reset it to a fresh state
+/// (cleared transcript/output and 0% context), like a new session without
+/// creating a new session file/id.
+pub fn clearCurrentSessionLikeNew(m: *tui.Model) void {
+    resetSessionFiles(m);
+    m.clearPlan();
+    m.clearHistory();
+    session_elided = 0;
+    summary_policy.resetSummaries();
+    cache_stats.session.reset();
+    cost_mod.session = .{};
+    ctx_used = 0;
+    ctx_pct = 0;
+    ctx_real = false;
+
+    if (session) |s| {
+        s.clearContents() catch |err| {
+            pushErrorFmt(m, "could not clear session: {t}", .{err});
+        };
+    }
+    refreshContextUsage(m);
+    m.requestRedraw();
+}
+
 /// Creates a new session and discards the current one.
 pub fn newSession(m: *tui.Model) void {
     if (session) |old| {
@@ -1986,11 +2126,20 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
         new_title = trimmed;
     }
     if (new_title) |t| {
-        if (t.len == 0) { pushInfo(m, "rename: empty title"); return; }
-        if (t.len > 64) { pushInfo(m, "rename: title too long (max 64 chars)"); return; }
+        if (t.len == 0) {
+            pushInfo(m, "rename: empty title");
+            return;
+        }
+        if (t.len > 64) {
+            pushInfo(m, "rename: title too long (max 64 chars)");
+            return;
+        }
     }
     if (new_tag) |t| {
-        if (t.len > 32) { pushInfo(m, "rename: tag too long (max 32 chars)"); return; }
+        if (t.len > 32) {
+            pushInfo(m, "rename: tag too long (max 32 chars)");
+            return;
+        }
     }
 
     if (new_title) |t| {
@@ -2294,8 +2443,6 @@ var body_buf_heap: ?[]u8 = null;
 /// `shutdownBuffers`: the two are the same for the whole life of a process and are NOT
 /// the same in a test that takes over the globals.
 var body_buf_with: ?std.mem.Allocator = null;
-
-
 
 const StreamErrorAction = stream_retry.Action;
 
@@ -2671,8 +2818,6 @@ pub fn runPaletteCommand(m: *tui.Model, cmd: []const u8) PaletteCmd {
 ///
 /// Selective permissions: the user picks how much the agent asks,
 /// per CLASS of action, without the all-or-nothing `/yolo`.
-
-
 /// The mode a `/mode` argument names, or null when it names none.
 /// Case-insensitive, and tolerant of the spellings people type.
 pub fn parsePermMode(a: []const u8) ?PermMode {
@@ -2700,8 +2845,6 @@ pub fn parsePermMode(a: []const u8) ?PermMode {
 /// What it does NOT do is accept a level the model cannot take and say nothing:
 /// `/effort xhigh` on a three-rung model says so, because the alternative is the
 /// user finding out from a 400 halfway through a turn.
-
-
 pub fn submit(m: *tui.Model, input: []const u8) !void {
     if (input.len == 0) return;
     if (input[0] != '/') return startChat(m, input);
@@ -3367,9 +3510,18 @@ fn makeBranchTitle(gpa: std.mem.Allocator, arena: std.mem.Allocator, base: []con
         var taken = false;
         for (entries) |e| {
             const t = e.title(sessionpath.sessionDisplayId(e.path));
-            if (std.mem.eql(u8, t, cand)) { taken = true; break; }
-            if (e.custom_title.len > 0 and std.mem.eql(u8, e.custom_title, cand)) { taken = true; break; }
-            if (e.name.len > 0 and std.mem.eql(u8, e.name, cand)) { taken = true; break; }
+            if (std.mem.eql(u8, t, cand)) {
+                taken = true;
+                break;
+            }
+            if (e.custom_title.len > 0 and std.mem.eql(u8, e.custom_title, cand)) {
+                taken = true;
+                break;
+            }
+            if (e.name.len > 0 and std.mem.eql(u8, e.name, cand)) {
+                taken = true;
+                break;
+            }
         }
         if (!taken) return cand;
         gpa.free(cand);
@@ -3986,8 +4138,14 @@ fn extractAiTitleJson(arena: std.mem.Allocator, raw: []const u8) ?[]const u8 {
                 const start = i;
                 var esc = false;
                 while (i < trimmed.len) : (i += 1) {
-                    if (esc) { esc = false; continue; }
-                    if (trimmed[i] == '\\') { esc = true; continue; }
+                    if (esc) {
+                        esc = false;
+                        continue;
+                    }
+                    if (trimmed[i] == '\\') {
+                        esc = true;
+                        continue;
+                    }
                     if (trimmed[i] == '"') {
                         return normalizeAiTitleCandidate(trimmed[start..i]);
                     }
@@ -4041,7 +4199,8 @@ fn aiTitleWorker(job: *AiTitleJob) void {
         "Good: Fix login button on mobile. " ++
         "Bad: Code changes. Bad: Investigate and fix the issue where... Bad: Fix Login Button On Mobile. " ++
         "If you cannot produce a good title, return null.";
-    const user_prompt = std.fmt.allocPrint(arena,
+    const user_prompt = std.fmt.allocPrint(
+        arena,
         "Conversation tail (most recent context):\n{s}\n\nReturn only JSON.",
         .{job.tail},
     ) catch return;
@@ -4133,6 +4292,45 @@ fn pushBgTaskInfo(m: *tui.Model, id: u32, status_word: []const u8) void {
     pushInfoFmt(m, "bg task {d} {s}", .{ id, status_word });
 }
 
+const BgSubagentCompletion = struct {
+    id: u32,
+    description: []const u8,
+    report: []const u8,
+};
+
+var bg_subagent_mutex: std.atomic.Mutex = .unlocked;
+var bg_subagent_next_id: u32 = 1;
+var bg_subagent_pending: std.ArrayList(BgSubagentCompletion) = .empty;
+
+fn pushBgSubagentCompletion(gpa: std.mem.Allocator, id: u32, description: []const u8, report: []const u8) void {
+    while (!bg_subagent_mutex.tryLock()) std.Thread.yield() catch {};
+    defer bg_subagent_mutex.unlock();
+    const desc_copy = gpa.dupe(u8, description) catch "";
+    const rep_copy = gpa.dupe(u8, report) catch "";
+    bg_subagent_pending.append(gpa, .{ .id = id, .description = desc_copy, .report = rep_copy }) catch {
+        if (desc_copy.len > 0) gpa.free(desc_copy);
+        if (rep_copy.len > 0) gpa.free(rep_copy);
+    };
+}
+
+fn allocBgSubagentId() u32 {
+    while (!bg_subagent_mutex.tryLock()) std.Thread.yield() catch {};
+    defer bg_subagent_mutex.unlock();
+    const id = bg_subagent_next_id;
+    bg_subagent_next_id +%= 1;
+    if (bg_subagent_next_id == 0) bg_subagent_next_id = 1;
+    return id;
+}
+
+fn drainBgSubagentCompletions(gpa: std.mem.Allocator) []const BgSubagentCompletion {
+    while (!bg_subagent_mutex.tryLock()) std.Thread.yield() catch {};
+    defer bg_subagent_mutex.unlock();
+    if (bg_subagent_pending.items.len == 0) return &.{};
+    const out = gpa.dupe(BgSubagentCompletion, bg_subagent_pending.items) catch return &.{};
+    bg_subagent_pending.clearRetainingCapacity();
+    return out;
+}
+
 fn drainBackgroundTaskNotifications(m: *tui.Model) void {
     var arena_state = std.heap.ArenaAllocator.init(m.allocator);
     defer arena_state.deinit();
@@ -4143,8 +4341,24 @@ fn drainBackgroundTaskNotifications(m: *tui.Model) void {
         appendHarnessPrompt,
         pushBgTaskInfo,
     );
+    const bg_done = drainBgSubagentCompletions(m.allocator);
+    if (bg_done.len == 0) return;
+    defer m.allocator.free(@constCast(bg_done));
+    for (bg_done) |c| {
+        defer {
+            if (c.description.len > 0) m.allocator.free(@constCast(c.description));
+            if (c.report.len > 0) m.allocator.free(@constCast(c.report));
+        }
+        const msg = std.fmt.allocPrint(
+            m.allocator,
+            "[background subagent finished] subagent {d} ({s})\n{s}",
+            .{ c.id, c.description, c.report },
+        ) catch continue;
+        defer m.allocator.free(msg);
+        appendHarnessPrompt(m, msg);
+        pushInfoFmt(m, "bg subagent {d} finished", .{c.id});
+    }
 }
-
 
 fn isBashAlwaysAllowedForCmdSubst() bool {
     return isAlwaysAllowed("bash");
@@ -4173,7 +4387,6 @@ fn expandWorkerCmdSubst(m: *tui.Model, job: *ChatJob, user_text: *[]const u8) bo
         .reportFailure = reportCmdSubstFailure,
     });
 }
-
 
 fn runWorkerTurn(m: *tui.Model, user_text: []const u8, mode: ChatJob.Mode) void {
     worker_turn.run(m, user_text, mode, .{
@@ -4215,12 +4428,8 @@ fn runNormalTurn(m: *tui.Model, user_text: []const u8) void {
     });
 }
 
-
 /// What the loop ended with.
 pub const TurnOutcome = agent_types.TurnOutcome;
-
-
-
 
 const LoopFlowAction = loop_end_checks.LoopFlowAction;
 
@@ -4312,7 +4521,6 @@ fn applyExitGateCheck(m: *tui.Model, gate_continue_count: *u8, gate_continue_lim
 /// Returns what the ceiling did to the loop. The caller owns the final
 /// steps (`streamEnd` + `endTurn`), which is what lets the pipeline run the
 /// stages without printing the "Done" line after each one.
-
 fn fireUserPromptSubmitHooks(m: *tui.Model, user_text: []const u8) void {
     const up_res = hooks_mod.fire(m.allocator, &hooks_set, .{
         .event = .UserPromptSubmit,
@@ -4332,7 +4540,6 @@ fn resetInheritedGoalState(m: *tui.Model) void {
         m.goal.blocked_refusals = 0;
     }
 }
-
 
 const LoopIterStart = loop_iter.LoopIterStart;
 
@@ -4421,10 +4628,6 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
 ///
 /// `turn_iterations` is the count of executed iterations (the loop's own
 /// counter for a normal turn, the accumulated total for a pipeline run).
-
-
-
-
 fn ensureAndSyncSystemPrompt(m: *tui.Model, gpa: std.mem.Allocator, s: *session_mod.Session) void {
     var has_system = false;
     for (s.messages.items) |mm| {
@@ -4506,8 +4709,7 @@ fn runCeilingSummaryTurn(
 }
 
 fn endTurn(m: *tui.Model, turn_iterations: usize, capped: bool) void {
-    agent_loop.endTurn(tui.Model, m, m.allocator, io_global, &hooks_set, turn_iterations,
-        turn_stats.elapsedMs(nowNs()), m.ttftMillis(), m.reads.stats.hits, capped, .{
+    agent_loop.endTurn(tui.Model, m, m.allocator, io_global, &hooks_set, turn_iterations, turn_stats.elapsedMs(nowNs()), m.ttftMillis(), m.reads.stats.hits, capped, .{
         .finishAutoCheck = finishAutoCheck,
         .maybeProposeMemories = maybeProposeMemories,
         .pushTurnSummary = pushTurnSummary,
@@ -5645,14 +5847,29 @@ fn loadPlanFile(m: *tui.Model) void {
     while (lines.next()) |line| {
         const raw = std.mem.trimEnd(u8, line, "\r");
         const t = std.mem.trim(u8, raw, " \t");
-        if (std.mem.eql(u8, t, "## Objective")) { section = .objective; continue; }
-        if (std.mem.eql(u8, t, "## Approach")) { section = .approach; continue; }
-        if (std.mem.eql(u8, t, "## Guardrails")) { section = .guardrails; continue; }
-        if (std.mem.startsWith(u8, t, "## Steps")) { section = .steps; continue; }
+        if (std.mem.eql(u8, t, "## Objective")) {
+            section = .objective;
+            continue;
+        }
+        if (std.mem.eql(u8, t, "## Approach")) {
+            section = .approach;
+            continue;
+        }
+        if (std.mem.eql(u8, t, "## Guardrails")) {
+            section = .guardrails;
+            continue;
+        }
+        if (std.mem.startsWith(u8, t, "## Steps")) {
+            section = .steps;
+            continue;
+        }
         if (std.mem.startsWith(u8, t, "# ")) continue;
 
         if (std.mem.startsWith(u8, t, "- [")) {
-            if (plan.len >= plan_mod.max_items) { last_item = null; continue; }
+            if (plan.len >= plan_mod.max_items) {
+                last_item = null;
+                continue;
+            }
             const close = std.mem.indexOf(u8, t, "] ") orelse continue;
             const rest = t[close + 2 ..];
             var text_end = rest.len;
@@ -5875,6 +6092,49 @@ fn pollTouchedFiles(m: *tui.Model) void {
     pushInfoFmt(m, "· files changed on disk: cached reads and facts invalidated", .{});
 }
 
+/// A single-line excerpt of a compaction summary for the transcript.
+/// Picks the first non-empty line, strips common bullet markers, and truncates
+/// on a UTF-8 boundary so the info line stays compact and honest.
+fn compactSummaryExcerpt(summary: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < summary.len) {
+        while (i < summary.len and (summary[i] == '\n' or summary[i] == '\r' or summary[i] == ' ' or summary[i] == '\t')) : (i += 1) {}
+        if (i >= summary.len) break;
+        var end = i;
+        while (end < summary.len and summary[end] != '\n' and summary[end] != '\r') : (end += 1) {}
+        var line = std.mem.trim(u8, summary[i..end], " \t");
+        while (line.len > 0) {
+            const c = line[0];
+            if (c == '-' or c == '*' or c == '+' or c == '#' or c == '>' or c == '`') {
+                line = std.mem.trimStart(u8, line[1..], " \t");
+                continue;
+            }
+            if (std.ascii.isDigit(c)) {
+                var j: usize = 1;
+                while (j < line.len and std.ascii.isDigit(line[j])) j += 1;
+                if (j < line.len and (line[j] == '.' or line[j] == ')')) {
+                    line = std.mem.trimStart(u8, line[j + 1 ..], " \t");
+                    continue;
+                }
+            }
+            break;
+        }
+        if (line.len > 0) {
+            const max_len: usize = 120;
+            if (line.len <= max_len) return line;
+            var cut = max_len;
+            while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
+            while (cut > 0 and line[cut - 1] != ' ' and cut > max_len * 3 / 4) cut -= 1;
+            if (cut == 0 or cut < max_len * 3 / 4) {
+                cut = max_len;
+                while (cut > 0 and (line[cut] & 0xC0) == 0x80) cut -= 1;
+            }
+            return line[0..cut];
+        }
+        i = end;
+    }
+    return "";
+}
 
 /// Tier-2 compaction: summarize old turns into a single note when elision is not
 /// enough. Best-effort; on failure keeps wire messages as-is (with failure noted).
@@ -5920,10 +6180,18 @@ fn applyTier2CompactionSummary(
         outputCapFor(sp.def, environ_global),
     )) |summary| {
         summary_policy.noteSummarized(iteration);
-        pushInfoFmt(m, "\u{b7} older turns summarized ({d} chars, was {d} messages)", .{
-            summary.len,
-            upto - sum_from,
-        });
+        const excerpt = compactSummaryExcerpt(summary);
+        if (excerpt.len > 0) {
+            pushInfoFmt(m, "\u{b7} compacted {d} older messages: {s}", .{
+                upto - sum_from,
+                excerpt,
+            });
+        } else {
+            pushInfoFmt(m, "\u{b7} compacted {d} older messages into a summary ({d} chars)", .{
+                upto - sum_from,
+                summary.len,
+            });
+        }
         var nm: std.ArrayList(chat.ChatMessage) = .empty;
         const note_msg = std.fmt.allocPrint(arena, "{s}\n{s}", .{ compaction.summary_note_prefix, summary }) catch summary;
         if (session) |ss| {
@@ -5942,7 +6210,6 @@ fn applyTier2CompactionSummary(
         pushInfo(m, "\u{b7} the summary failed; carrying on with the messages as they are");
     }
 }
-
 
 const Tier1CompactionResult = struct {
     comp: compaction.Compacted,
@@ -6045,8 +6312,6 @@ fn applyTier1Compaction(
     return .{ .comp = comp, .used_bg = used_bg };
 }
 
-
-
 fn maybeActivateCheapRouter(m: *tui.Model, pick: *Target) bool {
     if (!(router_cheap_on and router_mod.decide(&cheap_router, pick.model, router_cheap_on) == .cheap)) return false;
     pick.model = cheap_router.cheap_model;
@@ -6062,7 +6327,6 @@ fn buildDeniedToolNames(gpa: std.mem.Allocator) ![]const []const u8 {
     }
     return denied_names.toOwnedSlice(gpa);
 }
-
 
 fn setIterationGoalNote(m: *tui.Model, ss: *session_mod.Session, arena: std.mem.Allocator, iteration: usize) void {
     const left = if (m.goal.isOpen()) @max(goalHardLimit() - iteration, 0) else 0;
@@ -6087,8 +6351,6 @@ fn announceMentionsInlined(m: *tui.Model, mentions_in: MentionCount, iteration: 
         }) catch "@file: inlined";
     pushInfo(m, note);
 }
-
-
 
 fn syncAndAttachTurnContext(m: *tui.Model, gpa: std.mem.Allocator, s: *session_mod.Session) void {
     // System prompt is a stable prefix (once) and synced for current mode/skills.
@@ -6283,7 +6545,6 @@ fn executeTurnRequest(
 
     return finalizeTurnAfterStream(m, gpa, s, tstate, pick, user_text, iteration, turn_t0);
 }
-
 
 fn filesWrittenCountForTurn() usize {
     return turn_stats.files.items.len;
@@ -6762,10 +7023,26 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     var owned = false;
     defer if (owned and out.len > 0) gpa.free(out);
 
+    const annotateStaleness = struct {
+        fn run(alloc: std.mem.Allocator, io: std.Io, cwd_path: []const u8, root: ?[]const u8, entries: []memory_mod.Entry) void {
+            for (entries) |*e| {
+                e.staleness = memory_mod.stalenessNote(alloc, io, cwd_path, root, e.*);
+            }
+        }
+        fn freeNotes(alloc: std.mem.Allocator, entries: []memory_mod.Entry) void {
+            for (entries) |*e| {
+                if (e.staleness.len > 0) alloc.free(@constCast(e.staleness));
+                e.staleness = "";
+            }
+        }
+    };
+
     if (std.ascii.eqlIgnoreCase(op, "list")) {
         var buf: [memory_mod.max_scan_entries]memory_mod.Entry = undefined;
         const entries = store.loadAll(&buf) catch &.{};
         defer store.freeEntries(@constCast(entries));
+        annotateStaleness.run(gpa, io_global, cwd, repo_root, @constCast(entries));
+        defer annotateStaleness.freeNotes(gpa, @constCast(entries));
         out = memory_mod.renderList(gpa, entries) catch @constCast("(could not list memories)");
         owned = out.ptr != "(could not list memories)".ptr;
     } else if (std.ascii.eqlIgnoreCase(op, "get")) {
@@ -6775,14 +7052,16 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
             var buf: [memory_mod.max_scan_entries]memory_mod.Entry = undefined;
             const entries = store.loadAll(&buf) catch &.{};
             defer store.freeEntries(@constCast(entries));
-            var found: ?memory_mod.Entry = null;
-            for (entries) |e| if (std.mem.eql(u8, e.id, id)) {
-                found = e;
+            var found_idx: ?usize = null;
+            for (entries, 0..) |e, i| if (std.mem.eql(u8, e.id, id)) {
+                found_idx = i;
                 break;
             };
-            if (found) |e| {
-                const one = [_]memory_mod.Entry{e};
-                const r = memory_mod.consult(gpa, &one, "", @max(budget_bytes, 1024)) catch null;
+            if (found_idx) |fi| {
+                var one_arr = [_]memory_mod.Entry{entries[fi]};
+                annotateStaleness.run(gpa, io_global, cwd, repo_root, &one_arr);
+                defer annotateStaleness.freeNotes(gpa, &one_arr);
+                const r = memory_mod.consult(gpa, &one_arr, "", @max(budget_bytes, 1024)) catch null;
                 if (r) |res| {
                     out = res.text;
                     owned = true;
@@ -6871,13 +7150,15 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
                 "Ask the user to approve with: memory operation=approve id={s}", .{ use_title, use_id, use_id }) catch @constCast("Saved pending proposal; user approval required.");
             owned = out.ptr != "Saved pending proposal; user approval required.".ptr;
         }
-    } else { // search
+    } else { // search (relevance-ranked recall)
         var buf: [memory_mod.max_scan_entries]memory_mod.Entry = undefined;
         const entries = store.loadAll(&buf) catch &.{};
         defer store.freeEntries(@constCast(entries));
         if (store.root.len == 0) {
             out = @constCast("[Project memory]\n(no per-project memory store found; approved memories live in .zode/memory/)\n");
         } else {
+            annotateStaleness.run(gpa, io_global, cwd, repo_root, @constCast(entries));
+            defer annotateStaleness.freeNotes(gpa, @constCast(entries));
             const r = memory_mod.consult(gpa, entries, query, budget_bytes) catch null;
             if (r) |res| {
                 out = res.text;
@@ -7520,6 +7801,18 @@ fn runTaskBatch(
                 return;
             }
             _ = ctx.m.bench.subagents.fetchAdd(1, .seq_cst);
+            // Background subagent (34.8): start detached execution and return
+            // immediately with a "started" message; the report arrives later as
+            // a harness notification.
+            if (ctx.task.run_in_background) {
+                if (startBackgroundSubagentTask(ctx.m, ctx.task, ctx.m.allocator)) |msg| {
+                    // startBackgroundSubagentTask allocates with msg_arena; we
+                    // asked for ctx.m.allocator so the caller can free it.
+                    ctx.out.text = @constCast(msg);
+                    return;
+                }
+                // Fall back to foreground if background start failed.
+            }
             // Each one has its OWN Report (a fixed 8 KB buffer) and its own
             // arena: sharing either between two threads is a silent data race.
             var rep = subagent_mod.Report{};
@@ -7588,6 +7881,91 @@ fn runTaskBatch(
 const subagentBadArgsText =
     "The `task` call needs a \"description\" (one line: what to find out) and may have a \"prompt\" (the full question). Nothing was searched. Do it yourself with grep/glob/read, or call `task` again with a description.";
 
+fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena: std.mem.Allocator) ?[]const u8 {
+    const bg_id = allocBgSubagentId();
+    const gpa = m.allocator;
+    const desc_owned = gpa.dupe(u8, task.description) catch return null;
+    errdefer gpa.free(desc_owned);
+    const prompt_owned = gpa.dupe(u8, task.prompt) catch "";
+    const allowed_owned = gpa.dupe(u8, task.allowed_tools) catch "";
+    const model_owned = gpa.dupe(u8, task.model) catch "";
+    const effort_owned = gpa.dupe(u8, task.effort) catch "";
+    const def_owned = gpa.dupe(u8, task.definition) catch "";
+
+    const BgCtx = struct {
+        m: *tui.Model,
+        task: subagent_mod.Task,
+        id: u32,
+        desc: []const u8,
+        prompt: []const u8,
+        allowed: []const u8,
+        model: []const u8,
+        effort: []const u8,
+        definition: []const u8,
+    };
+    const ctx = gpa.create(BgCtx) catch {
+        if (prompt_owned.len > 0) gpa.free(prompt_owned);
+        if (allowed_owned.len > 0) gpa.free(allowed_owned);
+        if (model_owned.len > 0) gpa.free(model_owned);
+        if (effort_owned.len > 0) gpa.free(effort_owned);
+        if (def_owned.len > 0) gpa.free(def_owned);
+        gpa.free(desc_owned);
+        return null;
+    };
+    var bg_task = task;
+    bg_task.description = desc_owned;
+    bg_task.prompt = prompt_owned;
+    bg_task.allowed_tools = allowed_owned;
+    bg_task.model = model_owned;
+    bg_task.effort = effort_owned;
+    bg_task.definition = def_owned;
+    bg_task.run_in_background = false;
+    ctx.* = .{
+        .m = m,
+        .task = bg_task,
+        .id = bg_id,
+        .desc = desc_owned,
+        .prompt = prompt_owned,
+        .allowed = allowed_owned,
+        .model = model_owned,
+        .effort = effort_owned,
+        .definition = def_owned,
+    };
+    const Runner = struct {
+        fn run(c: *BgCtx) void {
+            c.m.beginWorker();
+            defer c.m.endWorker();
+            const a = c.m.allocator;
+            var rep = subagent_mod.Report{};
+            const text = runSubagent(c.m, c.task, &rep);
+            pushBgSubagentCompletion(a, c.id, c.desc, text);
+            if (c.prompt.len > 0) a.free(c.prompt);
+            if (c.allowed.len > 0) a.free(c.allowed);
+            if (c.model.len > 0) a.free(c.model);
+            if (c.effort.len > 0) a.free(c.effort);
+            if (c.definition.len > 0) a.free(c.definition);
+            if (c.desc.len > 0) a.free(c.desc);
+            a.destroy(c);
+        }
+    };
+    const th = std.Thread.spawn(.{}, Runner.run, .{ctx}) catch {
+        if (prompt_owned.len > 0) gpa.free(prompt_owned);
+        if (allowed_owned.len > 0) gpa.free(allowed_owned);
+        if (model_owned.len > 0) gpa.free(model_owned);
+        if (effort_owned.len > 0) gpa.free(effort_owned);
+        if (def_owned.len > 0) gpa.free(def_owned);
+        gpa.free(desc_owned);
+        gpa.destroy(ctx);
+        return null;
+    };
+    th.detach();
+    return std.fmt.allocPrint(
+        msg_arena,
+        "subagent started in background (id {d}, \"{s}\"). You will be notified with its report when it completes.",
+        .{ bg_id, task.description },
+    ) catch "subagent started in background. You will be notified with its report when it completes.";
+}
+
 fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator, budget: *ResultBudget) usize {
     var task = subagent_mod.parseTask(arena, call.args_json) catch {
         m.pushToolDone("task", "malformed arguments", 0, subagentBadArgsText);
@@ -7630,12 +8008,15 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
     _ = m.bench.subagents.fetchAdd(1, .seq_cst);
 
     // `run_in_background: true` — run the subagent in the background so the
-    // turn is not parked while a long search runs. Background execution
-    // (detached thread + result registry) is implemented in a follow-up; for
-    // now the flag is accepted in the schema and the subagent runs in the
-    // foreground, with an info line so the model knows the flag was honored.
+    // turn is not parked while a long search runs (34.8). Return an id
+    // immediately; the report is delivered as a harness notification when done.
     if (task.run_in_background) {
-        m.pushInfo("subagent running in background (foreground execution this release)");
+        if (startBackgroundSubagentTask(m, task, arena)) |msg| {
+            m.pushToolDone("task", "started in background", 0, msg);
+            capStoreAppendToolResult(m, s, call.id, "task", msg, arena, budget);
+            return 1;
+        }
+        // Fall back to foreground if background start failed.
     }
 
     var rep = subagent_mod.Report{};
@@ -8821,6 +9202,107 @@ fn stageClipboardImage(m: *tui.Model, mime: []const u8, ext: []const u8, bytes: 
     m.pushInfoFmt("· image staged ({s}, {d} KB) — it goes with your next message", .{
         name, (bytes.len + 1023) / 1024,
     });
+}
+
+/// Ctrl+G: open the current prompt in $VISUAL/$EDITOR, then replace it with
+/// the saved file contents.
+///
+/// The TUI runs in raw/alt-screen mode under vxfw, so we temporarily restore
+/// the terminal, run the editor with inherited stdio, and then re-enable the
+/// modes zode expects before requesting a full redraw.
+pub fn openExternalEditor(m: *tui.Model) void {
+    if (!m.io_ready) return;
+    const gpa = m.allocator;
+    const io = m.io;
+
+    const editor_cmd = blk: {
+        if (m.environ) |env| {
+            if (env.get("VISUAL")) |v| if (v.len > 0) break :blk v;
+            if (env.get("EDITOR")) |v| if (v.len > 0) break :blk v;
+        }
+        break :blk "vi";
+    };
+
+    const path = "/tmp/opencode/zode-prompt.md";
+    {
+        std.Io.Dir.cwd().createDirPath(io, "/tmp/opencode") catch {};
+        var f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch {
+            m.pushInfo("· could not open a temp file for the external editor");
+            return;
+        };
+        defer f.close(io);
+        var wbuf: [4096]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        w.interface.writeAll(m.ed.text()) catch {
+            m.pushInfo("· could not write the prompt to the temp file");
+            return;
+        };
+        w.interface.flush() catch {
+            m.pushInfo("· could not save the prompt to the temp file");
+            return;
+        };
+    }
+
+    if (@import("builtin").os.tag == .linux) {
+        _ = std.os.linux.write(std.posix.STDOUT_FILENO, termseq.restore_all.ptr, termseq.restore_all.len);
+    }
+
+    const shell_cmd = if (std.mem.indexOfAny(u8, editor_cmd, " \t") != null)
+        (std.fmt.allocPrint(gpa, "{s} {s}", .{ editor_cmd, path }) catch null)
+    else
+        null;
+    defer if (shell_cmd) |s| gpa.free(s);
+
+    var argv_buf: [3][]const u8 = undefined;
+    const argv: []const []const u8 = if (shell_cmd) |s| blk: {
+        argv_buf[0] = "sh";
+        argv_buf[1] = "-c";
+        argv_buf[2] = s;
+        break :blk argv_buf[0..3];
+    } else blk: {
+        argv_buf[0] = editor_cmd;
+        argv_buf[1] = path;
+        break :blk argv_buf[0..2];
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch {
+        if (@import("builtin").os.tag == .linux) {
+            const resume_seq = "\x1b[?1049h\x1b[?2004h\x1b[?1002;1003;1004;1006h\x1b[?1000h\x1b[>1u\x1b[?25l\x1b[0m";
+            _ = std.os.linux.write(std.posix.STDOUT_FILENO, resume_seq.ptr, resume_seq.len);
+        }
+        m.pushInfoFmt("· could not launch external editor: {s}", .{editor_cmd});
+        m.dirty = true;
+        m.cache_from = 0;
+        return;
+    };
+    _ = child.wait(io) catch {};
+
+    if (@import("builtin").os.tag == .linux) {
+        const resume_seq = "\x1b[?1049h\x1b[?2004h\x1b[?1002;1003;1004;1006h\x1b[?1000h\x1b[>1u\x1b[?25l\x1b[0m";
+        _ = std.os.linux.write(std.posix.STDOUT_FILENO, resume_seq.ptr, resume_seq.len);
+    }
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(@import("lib/editor.zig").max_bytes)) catch {
+        m.dirty = true;
+        m.cache_from = 0;
+        m.pushInfo("· external editor closed; could not read the edited file");
+        return;
+    };
+    defer gpa.free(bytes);
+
+    m.ed.clear();
+    m.ed.insert(bytes) catch {
+        m.pushInfo("· edited prompt is too large for the input buffer");
+    };
+    m.ed.moveToEnd();
+    m.dirty = true;
+    m.cache_from = 0;
+    m.redraw_requested.store(true, .seq_cst);
 }
 
 /// The TUI's half: same function, with the `Model`'s pieces.
@@ -10057,7 +10539,6 @@ fn providerEnvNames(gpa: std.mem.Allocator) []u8 {
 /// If the elided view still goes over the budget, a summary is asked of the
 /// model and the old turns are replaced with a note. Best-effort: if it fails,
 /// it carries on without a summary.
-
 fn openRouterExtraHeaders(
     buf: *[2]http_client.Http.ExtraHeader,
     provider_id: []const u8,
@@ -10122,8 +10603,6 @@ fn onEffortPick(m: *tui.Model, _: u32, label: []const u8) void {
 ///
 /// The choice is for the session, and it says what it did: a palette that
 /// changed without saying so is a palette the user cannot trust.
-
-
 /// The palette picker: the two pairs, with the active one marked.
 pub fn openColorPicker(m: *tui.Model) void {
     const gpa = m.allocator;
@@ -10683,6 +11162,9 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
                     .hint = hint_owned,
                     .provider = prov,
                     .ctx_tokens = mi.context_length,
+                    .is_free = mi.is_free,
+                    .price_prompt = mi.price_prompt,
+                    .price_completion = mi.price_completion,
                 };
                 models.append(gpa, it) catch {
                     gpa.free(label);
@@ -10721,6 +11203,9 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
                         .hint = hint_owned,
                         .provider = prov,
                         .ctx_tokens = mi.context_length,
+                        .is_free = mi.is_free,
+                        .price_prompt = mi.price_prompt,
+                        .price_completion = mi.price_completion,
                     }) catch {};
                 }
             }
@@ -10845,6 +11330,9 @@ fn fallbackModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
                 gpa.dupe(u8, active_provider) catch "",
             .provider = gpa.dupe(u8, active_provider) catch "",
             .ctx_tokens = mi.context_length,
+            .is_free = mi.is_free,
+            .price_prompt = mi.price_prompt,
+            .price_completion = mi.price_completion,
         };
         i += 1;
     }
@@ -11139,8 +11627,349 @@ pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
     m.pal.mode = .key_prompt;
     m.pal.key_len = 0;
     m.pal.key_msg_len = 0;
-    m.pal.setKeyMessage("paste the key and press enter", false);
+    m.pal.setKeyMessage("paste key + enter (empty = remove key)", false);
     _ = gpa;
+}
+
+const auth_master_label = "__auth_master__";
+var cached_auth_master_key: ?[32]u8 = null;
+var cached_auth_master_key_set: bool = false;
+
+fn setCachedAuthMasterKey(k: [32]u8) void {
+    cached_auth_master_key = k;
+    cached_auth_master_key_set = true;
+}
+
+fn clearCachedAuthMasterKey() void {
+    if (cached_auth_master_key_set) {
+        if (cached_auth_master_key) |*k| authstore.secureZero(k);
+    }
+    cached_auth_master_key = null;
+    cached_auth_master_key_set = false;
+}
+
+fn authMasterPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
+    const dir = config_mod.configDir(env, buf) orelse return null;
+    if (dir.len + "/auth.master".len > buf.len) return null;
+    @memcpy(buf[dir.len..][0.."/auth.master".len], "/auth.master");
+    return buf[0 .. dir.len + "/auth.master".len];
+}
+
+fn envAuthMasterKey(env: ?*const std.process.Environ.Map) ?[32]u8 {
+    const e = env orelse return null;
+    const v = e.get("ZODE_AUTH_MASTER_KEY") orelse return null;
+    const trimmed = std.mem.trim(u8, v, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return authstore.decodeKeyB64(trimmed);
+}
+
+fn authPassphrase(env: ?*const std.process.Environ.Map) ?[]const u8 {
+    const e = env orelse return null;
+    if (e.get("ZODE_AUTH_PASSPHRASE")) |p| {
+        const t = std.mem.trim(u8, p, "\r\n");
+        if (t.len > 0) return t;
+    }
+    return null;
+}
+
+fn promptAuthPassphrase(alloc: std.mem.Allocator) ?[]u8 {
+    // Best-effort interactive prompt from /dev/tty with echo disabled when possible.
+    // Returns allocated passphrase.
+    if (comptime !builtin.os.tag.isDarwin() and builtin.os.tag != .linux) return null;
+
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, "/dev/tty", .{ .ACCMODE = .RDWR }, 0) catch return null;
+    defer {
+        if (comptime builtin.os.tag == .linux) {
+            _ = std.os.linux.close(fd);
+        } else {
+            _ = std.c.close(fd);
+        }
+    }
+
+    // Disable echo (best-effort) while reading the passphrase.
+    var old_term: ?std.posix.termios = null;
+    if (std.posix.tcgetattr(fd)) |t| {
+        old_term = t;
+        var raw = t;
+        raw.lflag.ECHO = false;
+        raw.lflag.ECHONL = false;
+        std.posix.tcsetattr(fd, .NOW, raw) catch {};
+    } else |_| {}
+
+    _ = if (comptime builtin.os.tag == .linux)
+        std.os.linux.write(fd, "zode auth passphrase: ".ptr, "zode auth passphrase: ".len)
+    else
+        std.c.write(fd, "zode auth passphrase: ".ptr, "zode auth passphrase: ".len);
+    // (best-effort write; ignore short/error)
+    _ = {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var buf: [256]u8 = undefined;
+    var done = false;
+    while (!done) {
+        const n = std.posix.read(fd, &buf) catch break;
+        if (n == 0) break;
+        for (buf[0..n]) |c| {
+            if (c == '\n' or c == '\r') {
+                done = true;
+                break;
+            }
+            // Basic backspace/delete handling.
+            if (c == 0x7f or c == 0x08) {
+                if (out.items.len > 0) {
+                    const last = out.items.len - 1;
+                    authstore.secureZero(out.items[last .. last + 1]);
+                    out.items.len = last;
+                }
+                continue;
+            }
+            // Ignore other control chars.
+            if (c < 0x20) continue;
+            out.append(alloc, c) catch {
+                if (old_term) |t| std.posix.tcsetattr(fd, .NOW, t) catch {};
+                _ = if (comptime builtin.os.tag == .linux) std.os.linux.write(fd, "\n".ptr, 1) else std.c.write(fd, "\n".ptr, 1);
+                return null;
+            };
+        }
+    }
+
+    if (old_term) |t| std.posix.tcsetattr(fd, .NOW, t) catch {};
+    _ = if (comptime builtin.os.tag == .linux) std.os.linux.write(fd, "\n".ptr, 1) else std.c.write(fd, "\n".ptr, 1);
+
+    if (out.items.len == 0) return null;
+    const dup = alloc.dupe(u8, out.items) catch return null;
+    authstore.secureZero(out.items);
+    return dup;
+}
+
+fn unlockPassphraseProtectedMasterKey(alloc: std.mem.Allocator, env: ?*const std.process.Environ.Map, protected: []const u8) ?[]u8 {
+    // Returns allocated master-key base64 (as stored/usable by decodeKeyB64).
+    if (authPassphrase(env)) |p| {
+        return authstore.decryptMasterKeyWithPassphrase(alloc, protected, p) catch null;
+    }
+    const prompted = promptAuthPassphrase(alloc) orelse return null;
+    defer {
+        authstore.secureZero(prompted);
+        alloc.free(prompted);
+    }
+    return authstore.decryptMasterKeyWithPassphrase(alloc, protected, prompted) catch null;
+}
+
+fn readAuthMasterKeyFile(alloc: std.mem.Allocator, env: ?*const std.process.Environ.Map) ?[32]u8 {
+    if (cached_auth_master_key_set) return cached_auth_master_key;
+    if (envAuthMasterKey(env)) |k| {
+        setCachedAuthMasterKey(k);
+        return cached_auth_master_key;
+    }
+
+    var pbuf: [1024]u8 = undefined;
+    const path = authMasterPath(env, &pbuf) orelse return null;
+    if (!config_mod.isSafeSensitivePath(io_global, env, path)) return null;
+    config_mod.tightenPermissions(io_global, path);
+    const data = readFileTo(alloc, path) orelse return null;
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+
+    if (authstore.isPassphraseProtectedMasterKey(trimmed)) {
+        const mk_b64 = unlockPassphraseProtectedMasterKey(alloc, env, trimmed) orelse return null;
+        defer {
+            authstore.secureZero(@constCast(mk_b64));
+            alloc.free(mk_b64);
+        }
+        const k = authstore.decodeKeyB64(mk_b64) orelse return null;
+        setCachedAuthMasterKey(k);
+        return cached_auth_master_key;
+    }
+
+    const k = authstore.decodeKeyB64(trimmed) orelse return null;
+    // Opportunistic hardening: if passphrase is configured, rewrap plaintext master key.
+    if (authPassphrase(env)) |_| {
+        _ = writeAuthMasterKeyFile(alloc, env, trimmed);
+    }
+    setCachedAuthMasterKey(k);
+    return cached_auth_master_key;
+}
+
+fn writeAuthMasterKeyFile(alloc: std.mem.Allocator, env: ?*const std.process.Environ.Map, key_b64: []const u8) bool {
+    var pbuf: [1024]u8 = undefined;
+    const path = authMasterPath(env, &pbuf) orelse return false;
+
+    // If a passphrase is provided, protect the local master-key file with it.
+    // (Keychain-backed master keys are still preferred by authMasterKeyForWrite.)
+    if (authPassphrase(env)) |pass| {
+        const protected = authstore.encryptMasterKeyWithPassphrase(alloc, key_b64, pass) catch return false;
+        defer {
+            authstore.secureZero(@constCast(protected));
+            alloc.free(protected);
+        }
+        config_mod.writeFileSecure(io_global, env, path, protected) catch return false;
+        return true;
+    }
+
+    config_mod.writeFileSecure(io_global, env, path, key_b64) catch return false;
+    return true;
+}
+
+fn removeAuthMasterKeyFile(env: ?*const std.process.Environ.Map) void {
+    var pbuf: [1024]u8 = undefined;
+    const path = authMasterPath(env, &pbuf) orelse return;
+    if (!config_mod.isSafeSensitivePath(io_global, env, path)) return;
+    std.Io.Dir.cwd().deleteFile(io_global, path) catch {};
+    clearCachedAuthMasterKey();
+}
+
+fn decryptAuthFileData(alloc: std.mem.Allocator, raw: []const u8, env: ?*const std.process.Environ.Map) ?[]const u8 {
+    if (!authstore.isEncrypted(raw)) return raw;
+    if (cached_auth_master_key_set) {
+        if (cached_auth_master_key) |key| {
+            if (authstore.decrypt(alloc, raw, key)) |pt| return pt else |_| {}
+        }
+    }
+    if (envAuthMasterKey(env)) |key| {
+        if (authstore.decrypt(alloc, raw, key)) |pt| return pt else |_| {}
+    }
+    const keychain_mod = @import("lib/keychain.zig");
+    if (keychain_mod.available(io_global)) {
+        if (keychain_mod.lookup(alloc, io_global, auth_master_label)) |key_b64| {
+            defer alloc.free(key_b64);
+            if (authstore.decodeKeyB64(key_b64)) |key| {
+                if (authstore.decrypt(alloc, raw, key)) |pt| return pt else |_| {}
+            }
+        }
+    }
+    if (readAuthMasterKeyFile(alloc, env)) |key| {
+        return authstore.decrypt(alloc, raw, key) catch null;
+    }
+    return null;
+}
+
+fn authMasterKeyForWrite(alloc: std.mem.Allocator, env: ?*const std.process.Environ.Map) ?[32]u8 {
+    if (cached_auth_master_key_set) return cached_auth_master_key;
+    if (envAuthMasterKey(env)) |k| {
+        setCachedAuthMasterKey(k);
+        return cached_auth_master_key;
+    }
+
+    const keychain_mod = @import("lib/keychain.zig");
+    if (keychain_mod.available(io_global)) {
+        if (keychain_mod.lookup(alloc, io_global, auth_master_label)) |key_b64| {
+            defer alloc.free(key_b64);
+            if (authstore.decodeKeyB64(key_b64)) |k| {
+                setCachedAuthMasterKey(k);
+                return cached_auth_master_key;
+            }
+            // Corrupt/stale master key entry: replace it below.
+        }
+        var b64_buf: [128]u8 = undefined;
+        const b64 = authstore.generateKeyB64(&b64_buf) catch return null;
+        if (keychain_mod.store(alloc, io_global, auth_master_label, b64)) {
+            if (authstore.decodeKeyB64(b64)) |k| {
+                setCachedAuthMasterKey(k);
+                return cached_auth_master_key;
+            }
+        }
+        // Fall through to local key-file fallback.
+    }
+
+    // Reuse/unlock existing local master key (supports passphrase-protected envelopes).
+    if (readAuthMasterKeyFile(alloc, env)) |k| return k;
+
+    var b64_buf2: [128]u8 = undefined;
+    const b64 = authstore.generateKeyB64(&b64_buf2) catch return null;
+    if (!writeAuthMasterKeyFile(alloc, env, b64)) return null;
+    if (authstore.decodeKeyB64(b64)) |k| {
+        setCachedAuthMasterKey(k);
+        return cached_auth_master_key;
+    }
+    return null;
+}
+
+fn writeAuthFileSecureMaybeEncrypted(
+    alloc: std.mem.Allocator,
+    env: ?*const std.process.Environ.Map,
+    auth_path: []const u8,
+    plaintext_json: []const u8,
+) !void {
+    if (authMasterKeyForWrite(alloc, env)) |key| {
+        const enc = authstore.encrypt(alloc, plaintext_json, key) catch {
+            try config_mod.writeFileSecure(io_global, env, auth_path, plaintext_json);
+            return;
+        };
+        defer alloc.free(enc);
+        try config_mod.writeFileSecure(io_global, env, auth_path, enc);
+        return;
+    }
+    // Last resort: plaintext fallback with strict file permissions.
+    try config_mod.writeFileSecure(io_global, env, auth_path, plaintext_json);
+}
+
+fn readAuthObjectForUpdate(alloc: std.mem.Allocator, auth_path: []const u8, env: ?*const std.process.Environ.Map) std.json.ObjectMap {
+    var obj: std.json.ObjectMap = .{};
+    if (readFileTo(alloc, auth_path)) |raw| {
+        const data = decryptAuthFileData(alloc, raw, env) orelse raw;
+        if (std.json.parseFromSliceLeaky(std.json.Value, alloc, data, .{})) |v| {
+            if (v == .object) obj = v.object;
+        } else |_| {}
+    }
+    return obj;
+}
+
+/// Removes a stored provider key from keychain and `auth.json` (best-effort).
+pub fn removeProviderKey(m: *tui.Model, provider: []const u8) void {
+    const gpa = m.allocator;
+    const keychain_mod = @import("lib/keychain.zig");
+    _ = keychain_mod.clear(gpa, io_global, provider);
+
+    var dir_buf: [1024]u8 = undefined;
+    const dir_path = config_mod.configDir(m.environ, &dir_buf) orelse {
+        m.pal.setKeyMessage("could not locate ~/.config/zode", true);
+        return;
+    };
+    var path_buf: [1200]u8 = undefined;
+    const auth_path = std.fmt.bufPrint(&path_buf, "{s}/auth.json", .{dir_path}) catch return;
+
+    var astate = std.heap.ArenaAllocator.init(gpa);
+    defer astate.deinit();
+    const a = astate.allocator();
+
+    var obj = readAuthObjectForUpdate(a, auth_path, m.environ);
+
+    var pairs: [64][2][]const u8 = undefined;
+    var np: usize = 0;
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key_ptr.*, provider)) continue;
+        if (np >= pairs.len) break;
+        const v = kv.value_ptr.*;
+        if (v != .string) continue;
+        pairs[np] = .{ kv.key_ptr.*, v.string };
+        np += 1;
+    }
+
+    if (np == 0) {
+        std.Io.Dir.cwd().deleteFile(io_global, auth_path) catch {};
+        // Also remove auth master keys when no stored provider keys remain.
+        _ = keychain_mod.clear(a, io_global, auth_master_label);
+        removeAuthMasterKeyFile(m.environ);
+    } else {
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        config_mod.writeStringMap(&w, gpa, pairs[0..np]) catch {
+            m.pal.setKeyMessage("could not update auth.json", true);
+            return;
+        };
+        writeAuthFileSecureMaybeEncrypted(a, m.environ, auth_path, w.buffered()) catch {
+            m.pal.setKeyMessage("could not write auth.json", true);
+            return;
+        };
+    }
+
+    reloadUserConfig();
+    loadAuthKeys(gpa);
+    resetModelPaletteRefreshThrottle();
+    free_auto.rebuildPool(m);
+    openConnectPalette(m);
+    m.pal.setKeyMessagef("removed key: {s}", .{provider}, false);
 }
 
 /// Saves a provider's key in `~/.config/zode/auth.json`.
@@ -11185,20 +12014,9 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
     defer astate.deinit();
     const a = astate.allocator();
 
-    // Read whatever is there, add/update this entry and rewrite:
-    // saving a key must not lose the other providers' keys.
-    var obj: std.json.ObjectMap = .{}; // unmanaged: the empty map is `.{}`
-    if (readFileTo(a, auth_path)) |prev| {
-        if (std.json.parseFromSliceLeaky(std.json.Value, a, prev, .{})) |v| {
-            if (v == .object) {
-                obj = v.object;
-            } else {
-                obj = .{}; // not an object: start from scratch
-            }
-        } else |_| {
-            obj = .{}; // broken JSON: from scratch too, better than staying quiet
-        }
-    }
+    // Read whatever is there (plaintext legacy or encrypted), add/update this
+    // entry and rewrite. Saving a key must not lose the other providers' keys.
+    var obj = readAuthObjectForUpdate(a, auth_path, m.environ);
     obj.put(a, provider, .{ .string = trimmed }) catch return;
 
     // `auth.json` is a handful of keys: it fits easily in a stack buffer, so
@@ -11226,7 +12044,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
         return;
     };
 
-    config_mod.writeFileSecure(io_global, m.environ, auth_path, w.buffered()) catch {
+    writeAuthFileSecureMaybeEncrypted(a, m.environ, auth_path, w.buffered()) catch {
         m.pal.setKeyMessage("could not write auth.json", true);
         return;
     };
@@ -12629,11 +13447,25 @@ test "Session.resetSkillsSent clears the flag" {
     try std.testing.expect(!s.skills_sent);
 }
 
-// Phase 35.5: `/clear` clears the transcript and resets the per-session caches
-// (read list, changed list, and the skills-sent flag) without creating a new
-// session. `session` is null in a test, so the skills branch is skipped — the
-// point is that the command is wired and does not panic.
-test "cmdClear clears the screen and resets the session caches" {
+// `/clear` resets transcript/output and context state like a fresh session
+// without creating a new session identity. `session` is null in a test, so the
+// command must still be wired and not panic.
+test "cmdClear clears output and resets context without creating a session" {
+    const saved_session = session;
+    const saved_ctx_used = ctx_used;
+    const saved_ctx_pct = ctx_pct;
+    const saved_ctx_real = ctx_real;
+    defer {
+        session = saved_session;
+        ctx_used = saved_ctx_used;
+        ctx_pct = saved_ctx_pct;
+        ctx_real = saved_ctx_real;
+    }
+    session = null;
+    ctx_used = 123;
+    ctx_pct = 45;
+    ctx_real = true;
+
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     m.io = std.testing.io;
@@ -12642,9 +13474,12 @@ test "cmdClear clears the screen and resets the session caches" {
 
     commands_mod.cmdClear(&m);
 
-    try std.testing.expect(pendingContains(&m, "screen cleared"));
-    try std.testing.expect(pendingContains(&m, "read cache + changed list reset"));
-    try std.testing.expect(pendingContains(&m, "skills listing re-attached next turn"));
+    try std.testing.expectEqual(@as(i64, 0), ctx_used);
+    try std.testing.expectEqual(@as(u8, 0), ctx_pct);
+    try std.testing.expect(!ctx_real);
+    try std.testing.expect(pendingContains(&m, "session cleared"));
+    try std.testing.expect(pendingContains(&m, "context reset to 0%"));
+    try std.testing.expect(session == null);
 }
 
 test "cmdVersion shows the running zode version" {
@@ -13775,7 +14610,6 @@ test "iterationLimit is the SAME for both runners, and ZODE_MAX_ITER moves it" {
     try std.testing.expectEqual(agent_default_iterations(), iterationLimit());
     try std.testing.expect(iterationLimit() > 6);
 }
-
 
 test "plan hydration: replayPlanFromSessionMessages rebuilds todo plan from transcript (30.5)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -16808,8 +17642,6 @@ var pipeline_active = false;
 /// Pipeline support helpers (run dir/artifacts, git/test helpers, prompts).
 const SuiteResult = pipeline_support.SuiteResult;
 
-
-
 /// Run one pipeline subagent and write its report as an artifact.
 fn runPipelineSubagent(
     m: *tui.Model,
@@ -16821,9 +17653,6 @@ fn runPipelineSubagent(
 ) []const u8 {
     return pipeline_support.runPipelineSubagent(m, io_global, rep, label, prompt, run_dir, artifact, runSubagent);
 }
-
-
-
 
 // ── prompts (pipeline) ──────────────────────────────────────
 const explorer_prompt = pipeline_support.explorer_prompt;
@@ -16855,7 +17684,6 @@ fn pipelineStop(m: *tui.Model, cancelled: bool) void {
 /// Tester? → harness-run suite (with repair passes) → Reviewer → (one
 /// repair if high-severity) → summary. The model works INSIDE a stage; the
 /// harness owns the order.
-
 fn writePipelinePlanArtifact(
     arena: std.mem.Allocator,
     run_dir: []const u8,
@@ -16865,7 +17693,6 @@ fn writePipelinePlanArtifact(
 ) void {
     pipeline_support.writePipelinePlanArtifact(io_global, arena, run_dir, task_text, evidence, investigator_notes);
 }
-
 
 fn runPipelineExplorerStage(
     m: *tui.Model,
@@ -16889,7 +17716,6 @@ fn runPipelineExplorerStage(
     writePipelinePlanArtifact(arena, run_dir, task_text, evidence, "No investigation was needed for this task.");
     return evidence;
 }
-
 
 fn runPipelineInvestigatorStage(
     m: *tui.Model,
@@ -17215,8 +18041,6 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
     finishPipelineRun(m, verdict, tests_passed, io, run_dir);
 }
 
-
-
 fn finishPipelineRun(
     m: *tui.Model,
     verdict: pipeline_mod.Verdict,
@@ -17239,16 +18063,13 @@ fn finishPipelineRun(
     endTurn(m, turn_stats.iterations, false);
 }
 
-
 /// `/code-review [paths...]` — the review stage alone, on demand.
 ///
 /// With no arguments it reviews the working tree's uncommitted diff (what the
 /// session changed). With paths it reviews exactly those files. Read-only:
 /// it changes nothing, writes nothing, and its findings are printed for the
 /// developer to act on.
-
 const ReviewPromptBuild = pipeline_support.ReviewPromptBuild;
-
 
 fn resolveCodeReviewPrompt(m: *tui.Model, arena: std.mem.Allocator, io: std.Io, trimmed: []const u8) ?[]const u8 {
     if (trimmed.len == 0) {
@@ -17309,7 +18130,6 @@ fn runCodeReview(m: *tui.Model, arg: []const u8) void {
     finishCodeReviewRun(m, prompt, run_dir);
 }
 
-
 fn finishCodeReviewRun(m: *tui.Model, prompt: []const u8, run_dir: []const u8) void {
     var rep: subagent_mod.Report = undefined;
     const report = runPipelineSubagent(m, &rep, "reviewer", prompt, run_dir, "review.md");
@@ -17326,7 +18146,9 @@ fn finishCodeReviewRun(m: *tui.Model, prompt: []const u8, run_dir: []const u8) v
 
 fn pipelineTesterPermOps() pipeline_tester_perm.Ops {
     const S = struct {
-        fn yoloFn() bool { return yolo; }
+        fn yoloFn() bool {
+            return yolo;
+        }
     };
     return .{
         .yolo = S.yoloFn,
@@ -17346,6 +18168,29 @@ fn pipelineWriteGate(
     args_json: []const u8,
 ) ?[]const u8 {
     return pipeline_tester_perm.pipelineWriteGate(m, arena, call_name, args_json, pipelineTesterPermOps());
+}
+
+test "compactSummaryExcerpt returns a single-line summary excerpt" {
+    const bullets =
+        \\- Goal: fix the crash in parser
+        \\- Decision: keep UTF-8 boundaries
+        \\- Unfinished: add a regression test
+    ;
+    try std.testing.expectEqualStrings(
+        "Goal: fix the crash in parser",
+        compactSummaryExcerpt(bullets),
+    );
+
+    const numbered = "1. First step\n2. Second step";
+    try std.testing.expectEqualStrings("First step", compactSummaryExcerpt(numbered));
+
+    const long = "This is a very long summary line that should be truncated to keep the transcript compact and readable without taking over the whole screen while still saying something honest about what was summarized.";
+    const excerpt = compactSummaryExcerpt(long);
+    try std.testing.expect(excerpt.len <= 120);
+    try std.testing.expect(excerpt.len > 0);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(excerpt));
+
+    try std.testing.expectEqualStrings("", compactSummaryExcerpt(" \n\t\n"));
 }
 
 test "buildModelItems: a free model in the cache does not corrupt the heap [crash]" {

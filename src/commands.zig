@@ -1835,8 +1835,12 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
         _ = m.navigateDiff(-1);
         return;
     }
+    if (std.mem.eql(u8, a, "view") or std.mem.eql(u8, a, "viewer") or std.mem.eql(u8, a, "modal")) {
+        if (!m.openDiffViewer()) agent.pushInfo(m, "diff: no changed-file diffs to view in this session");
+        return;
+    }
     if (a.len > 0) {
-        agent.pushInfo(m, "usage: /diff | /diff next|prev");
+        agent.pushInfo(m, "usage: /diff | /diff next|prev|view");
         return;
     }
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1985,7 +1989,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/rename", .desc = "set session title and/or tag: /rename <title> | /rename #tag | /rename <title> #tag" },
     .{ .key = "/files", .desc = "the files the model has read, and the ones it changed" },
     .{ .key = "/file", .desc = "changed file intelligence: /file | list|show | next|prev | copy|open", .key_hint = "list|next|prev|copy|open" },
-    .{ .key = "/diff", .desc = "uncommitted changes and this turn's changed-file diff" },
+    .{ .key = "/diff", .desc = "uncommitted changes, timeline diff nav, or modal viewer for changed files (/diff view)" },
     .{ .key = "/git", .desc = "read-only Git overview (branch, status, recent commits)", .palette_visible = true },
     .{ .key = "/github", .desc = "GitHub integration status: repo/auth context and native `github` tool ops", .palette_visible = true },
     .{ .key = "/hunk", .desc = "navigate hunks in the last diff: /hunk next|prev (also alt+] / alt+[)", .key_hint = "next|prev" },
@@ -2456,10 +2460,8 @@ pub fn cmdBench(m: *tui.Model) void {
 }
 
 pub fn cmdClear(m: *tui.Model) void {
-    agent.resetSessionFiles(m);
-    m.clearHistory();
-    if (agent.session) |s| s.resetSkillsSent();
-    m.pushInfo("screen cleared · read cache + changed list reset · skills listing re-attached next turn");
+    agent.clearCurrentSessionLikeNew(m);
+    m.pushInfo("session cleared · output/context reset to 0% (same session)");
 }
 
 /// `/mode [build|accept-edits|plan|bypass]`, or the current mode with no argument.
@@ -3160,6 +3162,20 @@ fn writeCopyFile(m: *tui.Model, text: []const u8, filename: []const u8) ?[]const
 const copy_dir_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o700));
 const copy_file_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
 
+/// Copy arbitrary message text (used by per-message targeting / 33.12).
+pub fn copyTargetedText(m: *tui.Model, text: []const u8) void {
+    if (text.len == 0) {
+        agent.pushInfo(m, "nothing to copy");
+        return;
+    }
+    // Build a minimal context as full-response copy.
+    var ctx = copytext.buildCtx(m.allocator, text) catch {
+        agent.pushInfo(m, "the message could not be prepared for copying");
+        return;
+    };
+    defer ctx.deinit();
+    performCopy(m, &ctx, 0);
+}
 
 /// `/bg`: the background jobs, and the two ways to stop them.
 pub fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
@@ -3336,7 +3352,6 @@ pub fn cmdSubmodel(m: *tui.Model, arg: ?[]const u8) void {
     agent.submodelClearFail();
     agent.submodelReport(m);
 }
-
 
 const runtime_state = @import("agent/runtime_state.zig");
 

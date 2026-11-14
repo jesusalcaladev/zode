@@ -1,6 +1,8 @@
 const std = @import("std");
 const http_client = @import("http_client.zig");
 const providers = @import("providers.zig");
+const redact_mod = @import("redact.zig");
+const session_mod = @import("../session.zig");
 
 /// Diagnostics for the model catalog, OFF unless asked for.
 ///
@@ -40,8 +42,21 @@ pub fn dbg(comptime fmt: []const u8, args: anytype) void {
     const io = dbg_io orelse return;
     var buf: [1024]u8 = undefined;
     var line: [512]u8 = undefined;
+    var scrubbed_buf: [512]u8 = undefined;
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(std.heap.page_allocator);
+    providers.appendSavedRedactionKeys(&keys, std.heap.page_allocator);
+    providers.appendEnvRedactionKeys(&keys, std.heap.page_allocator, session_mod.redactionEnv());
+    if (session_mod.redactionExtraKey().len >= 8) keys.append(std.heap.page_allocator, session_mod.redactionExtraKey()) catch {};
+    for (session_mod.redactionExtraKeys()) |k| if (k.len >= 8) keys.append(std.heap.page_allocator, k) catch {};
     const raw = std.fmt.bufPrint(&line, fmt, args) catch return;
-    const safe = sanitizeForTerminal(raw, &buf);
+    const scrubbed = redact_mod.redact(std.heap.page_allocator, raw, keys.items) catch raw;
+    defer if (scrubbed.ptr != raw.ptr) std.heap.page_allocator.free(scrubbed);
+    const src = if (scrubbed.len <= scrubbed_buf.len) blk: {
+        @memcpy(scrubbed_buf[0..scrubbed.len], scrubbed);
+        break :blk scrubbed_buf[0..scrubbed.len];
+    } else scrubbed[0..@min(scrubbed.len, scrubbed_buf.len)];
+    const safe = sanitizeForTerminal(src, &buf);
     var w = std.Io.File.stderr().writer(io, &buf);
     w.interface.writeAll(safe) catch {};
     w.interface.flush() catch {};

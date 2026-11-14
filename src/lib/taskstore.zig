@@ -227,6 +227,21 @@ pub const Store = struct {
         self.items.items[i].owner = copy;
     }
 
+    /// Atomically claims a task for `owner`: succeeds only if the task is
+    /// unowned or already owned by the same owner. Never steals ownership from
+    /// another agent (34.9).
+    pub fn claim(self: *Store, id: u32, owner: []const u8) !void {
+        const i = self.indexOf(id) orelse return error.UnknownTask;
+        const clean = std.mem.trim(u8, owner, " \t\r\n");
+        if (clean.len == 0) return error.OwnerRequired;
+        if (self.items.items[i].owner) |current| {
+            if (!std.mem.eql(u8, current, clean)) return error.AlreadyClaimed;
+            return; // idempotent claim by same owner
+        }
+        const copy = try self.gpa.dupe(u8, clean);
+        self.items.items[i].owner = copy;
+    }
+
     pub fn setSubject(self: *Store, id: u32, subject: []const u8) !void {
         const i = self.indexOf(id) orelse return error.UnknownTask;
         const clean = std.mem.trim(u8, subject, " \t\r\n");
@@ -690,6 +705,21 @@ test "taskstore: the list has a ceiling and it is a named error" {
         _ = try st.create("task", "");
     }
     try testing.expectError(error.TooManyTasks, st.create("one more", ""));
+}
+
+test "taskstore: claim is atomic - cannot steal ownership" {
+    var st = newStore();
+    defer st.deinit();
+    const id = try st.create("Claim me", "");
+    try st.claim(id, "alice");
+    try testing.expectEqualStrings("alice", st.get(id).?.owner.?);
+    // Same owner is idempotent.
+    try st.claim(id, "alice");
+    try testing.expectEqualStrings("alice", st.get(id).?.owner.?);
+    // Different owner cannot claim it.
+    try testing.expectError(error.AlreadyClaimed, st.claim(id, "bob"));
+    try testing.expectEqualStrings("alice", st.get(id).?.owner.?);
+    try testing.expectError(error.UnknownTask, st.claim(99, "alice"));
 }
 
 test "taskstore: in_progress without an owner is refused, with one it sticks" {

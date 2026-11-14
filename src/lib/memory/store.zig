@@ -101,9 +101,9 @@ pub const Store = struct {
                 .tags = self.gpa.dupe(u8, parsed.tags) catch "",
                 .body = self.gpa.dupe(u8, parsed.body) catch "",
                 .path = self.gpa.dupe(u8, full) catch "",
-                .created_at = "",
-                .updated_at = "",
-                .evidence = "",
+                .created_at = self.gpa.dupe(u8, parsed.created_at) catch "",
+                .updated_at = self.gpa.dupe(u8, parsed.updated_at) catch "",
+                .evidence = self.gpa.dupe(u8, parsed.evidence) catch "",
             };
             // If dupes failed partially, keep what we have; never point into freed `data`.
             if (e.title.len == 0 and parsed.title.len > 0) e.title = "";

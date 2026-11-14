@@ -1,3 +1,6 @@
+const redact_mod = @import("lib/redact.zig");
+const providers = @import("lib/providers.zig");
+const session_mod = @import("session.zig");
 const std = @import("std");
 const http_client = @import("lib/http_client.zig");
 const sleep = @import("lib/sleep.zig");
@@ -387,7 +390,7 @@ pub fn effectiveEffort(model: []const u8, want: Effort) Effort {
 /// have no way to tell that those are different things).
 pub fn clampEffort(model: []const u8, want: Effort) Effort {
     const top = maxEffortFor(model);
-    if (@intFromEnum(want) > @intFromEnum(top)) return top;
+    if (@backingInt(want) > @backingInt(top)) return top;
     return want;
 }
 
@@ -502,6 +505,7 @@ fn storeErrText(out: *ErrBuf, msg: []const u8) void {
     const n = @min(msg.len, out.buf.len);
     @memcpy(out.buf[0..n], msg[0..n]);
     out.len = n;
+    scrubErrBuf(out);
 }
 
 fn setServerMessage(body: []const u8) void {
@@ -510,6 +514,21 @@ fn setServerMessage(body: []const u8) void {
 
 /// The main turn's error buffer: what `lastErrorBody()` reads.
 pub var main_err: ErrBuf = .{};
+
+fn scrubErrBuf(out: *ErrBuf) void {
+    if (out.len == 0) return;
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(std.heap.page_allocator);
+    providers.appendSavedRedactionKeys(&keys, std.heap.page_allocator);
+    providers.appendEnvRedactionKeys(&keys, std.heap.page_allocator, session_mod.redactionEnv());
+    if (session_mod.redactionExtraKey().len >= 8) keys.append(std.heap.page_allocator, session_mod.redactionExtraKey()) catch {};
+    for (session_mod.redactionExtraKeys()) |k| if (k.len >= 8) keys.append(std.heap.page_allocator, k) catch {};
+    const msg = out.buf[0..out.len];
+    const scrubbed = redact_mod.redact(std.heap.page_allocator, msg, keys.items) catch return;
+    defer if (scrubbed.ptr != msg.ptr) std.heap.page_allocator.free(scrubbed);
+    out.len = @min(scrubbed.len, out.buf.len);
+    @memcpy(out.buf[0..out.len], scrubbed[0..out.len]);
+}
 
 fn setServerMessageRaw(out: *ErrBuf, body: []const u8) void {
     out.len = 0;
@@ -530,6 +549,7 @@ fn setServerMessageRaw(out: *ErrBuf, body: []const u8) void {
             }
             if (n > 0) {
                 out.len = n;
+                scrubErrBuf(out);
                 return;
             }
         }
@@ -551,6 +571,7 @@ fn setServerMessageRaw(out: *ErrBuf, body: []const u8) void {
             }
             if (n > 0) {
                 out.len = n;
+                scrubErrBuf(out);
                 return;
             }
         }
@@ -586,6 +607,20 @@ pub fn dbgInitEnv(env: ?*const std.process.Environ.Map) void {
 
 fn dbg_err() bool {
     return dbg_err_flag;
+}
+
+fn dbgPrint(comptime fmt: []const u8, args: anytype) void {
+    var raw: [1024]u8 = undefined;
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(std.heap.page_allocator);
+    providers.appendSavedRedactionKeys(&keys, std.heap.page_allocator);
+    providers.appendEnvRedactionKeys(&keys, std.heap.page_allocator, session_mod.redactionEnv());
+    if (session_mod.redactionExtraKey().len >= 8) keys.append(std.heap.page_allocator, session_mod.redactionExtraKey()) catch {};
+    for (session_mod.redactionExtraKeys()) |k| if (k.len >= 8) keys.append(std.heap.page_allocator, k) catch {};
+    const msg = std.fmt.bufPrint(&raw, fmt, args) catch return;
+    const scrubbed = redact_mod.redact(std.heap.page_allocator, msg, keys.items) catch msg;
+    defer if (scrubbed.ptr != msg.ptr) std.heap.page_allocator.free(scrubbed);
+    std.debug.print("{s}", .{scrubbed});
 }
 
 pub fn lastErrorBody() []const u8 {
@@ -1250,7 +1285,7 @@ fn streamRaw(
 
     if (res.status != 200) {
         if (dbg_err()) {
-            std.debug.print("[DBG] status={d} raw={s}\n", .{ res.status, ctx.raw[0..@min(ctx.raw_len, 240)] });
+            dbgPrint("[DBG] status={d} raw={s}\n", .{ res.status, ctx.raw[0..@min(ctx.raw_len, 240)] });
         }
         if (res.retry_after) |ra| {
             ctx.retry_after = ra;
@@ -1299,7 +1334,7 @@ fn streamRaw(
         }
         return err;
     }
-    if (dbg_err()) std.debug.print("[DBG] 200 raw={s}\n", .{ctx.raw[0..@min(ctx.raw_len, 240)]});
+    if (dbg_err()) dbgPrint("[DBG] 200 raw={s}\n", .{ctx.raw[0..@min(ctx.raw_len, 240)]});
     ctx.retry_after = res.retry_after;
     if (ctx.mirror_globals) retry_after_secs = ctx.retry_after;
     ctx.finish() catch |err| switch (err) {
@@ -2607,7 +2642,7 @@ test "clampEffort: changing model lowers the step that no longer exists" {
             const once = clampEffort(m, lv);
             const twice = clampEffort(m, once);
             try std.testing.expectEqual(once, twice);
-            try std.testing.expect(@intFromEnum(once) <= @intFromEnum(lv));
+            try std.testing.expect(@backingInt(once) <= @backingInt(lv));
         }
     }
 }
@@ -2926,7 +2961,6 @@ test "a user message with no images is byte-for-byte what it was" {
     try std.testing.expect(std.mem.indexOf(u8, body, "[{\"type\"") == null);
 }
 
-
 test "buildBodyOpenAI: cache_control emitted when flagged" {
     const msgs = [_]ChatMessage{
         .{ .role = "user", .content = "old stable message", .cache_control = true },
@@ -3053,4 +3087,3 @@ test "Anthropic body: a long conversation stays under the four-breakpoint ceilin
     const body = try buildBodyMessages(&buf, "claude-test", &msgs, .low, tools, .anthropic);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
 }
-

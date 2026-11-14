@@ -40,6 +40,7 @@ const filesearch = @import("lib/filesearch.zig");
 const mascot = @import("lib/mascot.zig");
 const sessionindex = @import("lib/sessionindex.zig");
 const session_search = @import("lib/session_search.zig");
+const commands = @import("commands.zig");
 const repeat = @import("lib/repeat.zig");
 
 /// The kind of the status: what color the face is and what phase the app is in.
@@ -331,13 +332,18 @@ pub const Painter = struct {
     /// Writes an ALREADY stable grapheme (literal or arena that outlives the
     /// frame). Allocates no memory.
     pub fn putStable(self: *Painter, col: u16, row: u16, g: []const u8, w: u8, style: vaxis.Style) void {
+        self.putStableLinked(col, row, g, w, style, .{});
+    }
+
+    /// Like `putStable`, but with an OSC 8 hyperlink.
+    pub fn putStableLinked(self: *Painter, col: u16, row: u16, g: []const u8, w: u8, style: vaxis.Style, link: vaxis.Cell.Hyperlink) void {
         // A control byte must NEVER reach a cell: vaxis emits grapheme bytes
         // raw, so a `\r`, `\n`, ESC or DEL from tool output or streamed text
         // breaks the frame (interleaved text, weird glyphs, broken layout).
         // The width measured it as 1, so it slipped past the clipping below.
         // Render it as a visible replacement instead of dropping it silently.
         if (isControlGrapheme(g)) {
-            self.putStable(col, row, "\u{fffd}", 1, style);
+            self.putStableLinked(col, row, "\u{fffd}", 1, style, link);
             return;
         }
         if (col >= self.width or row >= self.height or col + w > self.width) return;
@@ -349,6 +355,7 @@ pub const Painter = struct {
             // said), so a 256-color terminal got a byte sequence it does not
             // understand, and what it did with it was undefined.
             .style = theme.resolve(style),
+            .link = link,
         });
     }
 
@@ -437,6 +444,7 @@ const CellRun = struct {
     text: []const u8, // grapheme, stable (paragraph arena)
     w: u8, // 1 o 2 columnas
     style: vaxis.Style,
+    link: vaxis.Cell.Hyperlink = .{},
 };
 
 const PLine = struct {
@@ -747,6 +755,92 @@ fn appendLangChipLine(
     try lines.append(pa, .{ .cells = cells.items, .w = box_w });
 }
 
+const LinkSpan = struct {
+    start: usize,
+    end: usize,
+    uri: []const u8,
+};
+
+fn isLinkChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or switch (c) {
+        '-', '_', '.', '~', '/', ':', '?', '#', '[', ']', '@', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '%', '=', '\\' => true,
+        else => false,
+    };
+}
+
+fn trimLinkEnd(text: []const u8, start: usize, end: usize) usize {
+    var e = end;
+    while (e > start) {
+        const c = text[e - 1];
+        if (c == '.' or c == ',' or c == ';' or c == ':' or c == '!' or c == '?' or c == ')' or c == ']' or c == '\'' or c == '"' or c == '>') {
+            e -= 1;
+            continue;
+        }
+        break;
+    }
+    return e;
+}
+
+fn isPathTokenChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or switch (c) {
+        '/', '.', '_', '-', '~', ':', '@', '+', '%' => true,
+        else => false,
+    };
+}
+
+fn detectLinks(pa: std.mem.Allocator, text: []const u8) []const LinkSpan {
+    var out: std.ArrayList(LinkSpan) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const at_token_start = i == 0 or std.ascii.isWhitespace(text[i - 1]) or switch (text[i - 1]) {
+            '(', '[', '{', '"', '\'', '`', '<', '=', ',', ';' => true,
+            else => false,
+        };
+        const rest = text[i..];
+        if (at_token_start and (std.mem.startsWith(u8, rest, "https://") or std.mem.startsWith(u8, rest, "http://"))) {
+            var e = i;
+            while (e < text.len and isLinkChar(text[e]) and text[e] != '<' and text[e] != '>' and text[e] != '"') : (e += 1) {}
+            e = trimLinkEnd(text, i, e);
+            if (e > i + 8) {
+                const uri = pa.dupe(u8, text[i..e]) catch text[i..e];
+                out.append(pa, .{ .start = i, .end = e, .uri = uri }) catch {};
+                i = e;
+                continue;
+            }
+        }
+        if (at_token_start and isPathTokenChar(text[i])) {
+            var e = i;
+            var has_slash = false;
+            var dots_only = true;
+            while (e < text.len and isPathTokenChar(text[e])) : (e += 1) {
+                if (text[e] == '/') has_slash = true;
+                if (text[e] != '.' and text[e] != '/') dots_only = false;
+            }
+            e = trimLinkEnd(text, i, e);
+            const token = text[i..e];
+            const path_like = has_slash and !dots_only and token.len > 1;
+            if (path_like) {
+                const uri = if (std.mem.startsWith(u8, token, "/"))
+                    (std.fmt.allocPrint(pa, "file://{s}", .{token}) catch token)
+                else
+                    (std.fmt.allocPrint(pa, "file:{s}", .{token}) catch token);
+                out.append(pa, .{ .start = i, .end = e, .uri = uri }) catch {};
+                i = e;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    return out.items;
+}
+
+fn linkForOffset(spans: []const LinkSpan, off: usize) ?[]const u8 {
+    for (spans) |s| {
+        if (off >= s.start and off < s.end) return s.uri;
+    }
+    return null;
+}
+
 /// Builds the lines of a code block with a full rounded border.
 ///
 /// The block gets:
@@ -773,14 +867,18 @@ fn buildCodeBlockLines(
         // shift the whole right border a column left of where it is painted.
         var ln_w: usize = 0;
         for (src) |seg| {
+            const spans = detectLinks(pa, seg.text);
             var it = vaxis.unicode.graphemeIterator(seg.text);
             while (it.next()) |g| {
                 const b = g.bytes(seg.text);
+                const off: usize = @intFromPtr(b.ptr) - @intFromPtr(seg.text.ptr);
+                const uri = linkForOffset(spans, off);
                 const gw = theme.graphemeWidth(ctx, b);
                 try cells.append(pa, .{
                     .text = b,
                     .w = gw,
                     .style = seg.style,
+                    .link = if (uri) |u| .{ .uri = u } else .{},
                 });
                 ln_w += gw;
             }
@@ -979,14 +1077,18 @@ fn buildDiffBlockLines(
         var cells: std.ArrayList(CellRun) = .empty;
         var ln_w: usize = 0;
         for (src) |seg| {
+            const spans = detectLinks(pa, seg.text);
             var it = vaxis.unicode.graphemeIterator(seg.text);
             while (it.next()) |g| {
                 const b = g.bytes(seg.text);
+                const off: usize = @intFromPtr(b.ptr) - @intFromPtr(seg.text.ptr);
+                const uri = linkForOffset(spans, off);
                 const gw = theme.graphemeWidth(ctx, b);
                 try cells.append(pa, .{
                     .text = b,
                     .w = gw,
                     .style = seg.style,
+                    .link = if (uri) |u| .{ .uri = u } else .{},
                 });
                 ln_w += gw;
             }
@@ -1128,13 +1230,17 @@ fn buildLinesBase(
                 first_line = false;
             }
             for (src) |seg| {
+                const spans = detectLinks(pa, seg.text);
                 var it = vaxis.unicode.graphemeIterator(seg.text);
                 while (it.next()) |g| {
                     const b = g.bytes(seg.text);
+                    const off: usize = @intFromPtr(b.ptr) - @intFromPtr(seg.text.ptr);
+                    const uri = linkForOffset(spans, off);
                     try cells.append(pa, .{
                         .text = b,
                         .w = theme.graphemeWidth(ctx, b),
                         .style = seg.style,
+                        .link = if (uri) |u| .{ .uri = u } else .{},
                     });
                 }
             }
@@ -1828,6 +1934,27 @@ pub const Model = struct {
     /// The session path being renamed (for the sessions picker).
     picker_rename_target: ?[]u8 = null,
 
+    // ── modal diff viewer (33.18) ──
+    diff_viewer_active: bool = false,
+    diff_viewer_sel: usize = 0,
+    diff_viewer_scroll: usize = 0,
+
+    // ── transcript search (33.13) ──
+    search_bar_active: bool = false,
+    search_query_buf: [128]u8 = undefined,
+    search_query_len: usize = 0,
+    search_matches: std.ArrayList(usize) = .empty, // paragraph indices
+    search_current: usize = 0,
+    search_has_query: bool = false,
+
+    // ── per-message targeting (33.12) ──
+    message_target_para: ?usize = null,
+
+    // ── transcript screen (33.4) ──
+    transcript_view_active: bool = false,
+    transcript_view_scroll: usize = 0,
+    transcript_view_show_all: bool = false,
+
     // ── `/copy` ──────────────────────────────────────────────────────────
     //
     /// The text waiting to go to the clipboard as OSC 52.
@@ -2261,6 +2388,7 @@ pub const Model = struct {
             self.allocator.free(so.text);
         }
         self.shell_out.deinit(self.allocator);
+        self.search_matches.deinit(self.allocator);
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
@@ -2424,6 +2552,353 @@ pub const Model = struct {
         self.picker_scroll = 0;
         self.pickerRefilter();
         self.picker_active = true;
+    }
+
+    // ── per-message targeting (33.12) ─────────────────
+    pub fn clearMessageTarget(self: *Model) void {
+        if (self.message_target_para != null) {
+            self.message_target_para = null;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+        }
+    }
+
+    fn isTargetableMessagePara(self: *const Model, idx: usize) bool {
+        if (idx >= self.paras.items.len) return false;
+        return switch (self.paras.items[idx].kind) {
+            .user, .assistant => true,
+            else => false,
+        };
+    }
+
+    fn targetBasePara(self: *const Model) usize {
+        if (self.paras.items.len == 0) return 0;
+        const last = self.paras.items.len - 1;
+        if (self.follow_bottom) return last;
+        return @min(self.anchor_para, last);
+    }
+
+    pub fn targetPrevMessage(self: *Model) bool {
+        const n = self.paras.items.len;
+        if (n == 0) return false;
+        var i: usize = if (self.message_target_para) |tp|
+            (if (tp == 0) return true else tp - 1)
+        else
+            self.targetBasePara();
+        while (true) {
+            if (self.isTargetableMessagePara(i)) {
+                self.message_target_para = i;
+                self.scrollToParaIndex(i);
+                self.dirty = true;
+                self.redraw_requested.store(true, .seq_cst);
+                return true;
+            }
+            if (i == 0) break;
+            i -= 1;
+        }
+        return false;
+    }
+
+    pub fn targetNextMessage(self: *Model) bool {
+        const n = self.paras.items.len;
+        if (n == 0) return false;
+        var i: usize = if (self.message_target_para) |tp| tp + 1 else self.targetBasePara();
+        while (i < n) : (i += 1) {
+            if (self.isTargetableMessagePara(i)) {
+                self.message_target_para = i;
+                self.scrollToParaIndex(i);
+                self.dirty = true;
+                self.redraw_requested.store(true, .seq_cst);
+                return true;
+            }
+        }
+        return self.message_target_para != null;
+    }
+
+    pub fn targetedMessageText(self: *Model) ?[]const u8 {
+        const idx = self.message_target_para orelse return null;
+        if (idx >= self.paras.items.len) return null;
+        if (!self.isTargetableMessagePara(idx)) return null;
+        const p = &self.paras.items[idx];
+        return p.textLive(self.allocator);
+    }
+
+    // ── transcript screen (33.4) ──────────────────────
+    pub fn transcriptViewActive(self: *const Model) bool {
+        return self.transcript_view_active;
+    }
+
+    pub fn openTranscriptView(self: *Model) void {
+        self.transcript_view_active = true;
+        self.transcript_view_scroll = 0;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    pub fn closeTranscriptView(self: *Model) void {
+        self.transcript_view_active = false;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    pub fn toggleTranscriptView(self: *Model) void {
+        if (self.transcript_view_active) self.closeTranscriptView() else self.openTranscriptView();
+    }
+
+    pub fn toggleTranscriptShowAll(self: *Model) void {
+        self.transcript_view_show_all = !self.transcript_view_show_all;
+        self.transcript_view_scroll = 0;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    pub fn transcriptViewHandleKey(self: *Model, key: vaxis.Key) bool {
+        if (!self.transcript_view_active) return false;
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{}) or key.matches('o', .{ .ctrl = true })) {
+            self.closeTranscriptView();
+            return true;
+        }
+        if (key.matches('e', .{ .ctrl = true })) {
+            self.toggleTranscriptShowAll();
+            return true;
+        }
+        if (key.codepoint == 57352 or key.matches('k', .{})) { // up
+            self.transcript_view_scroll -|= 1;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+            return true;
+        }
+        if (key.codepoint == 57353 or key.matches('j', .{})) { // down
+            self.transcript_view_scroll +|= 1;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_up, .{}) or key.codepoint == 2 or key.matches('u', .{ .ctrl = true })) {
+            self.transcript_view_scroll -|= 10;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_down, .{}) or key.codepoint == 6 or key.matches('d', .{ .ctrl = true })) {
+            self.transcript_view_scroll +|= 10;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+            return true;
+        }
+        if (key.matches('g', .{})) {
+            self.transcript_view_scroll = 0;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+            return true;
+        }
+        if (key.matches('G', .{})) {
+            self.transcript_view_scroll = std.math.maxInt(usize) / 4;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+            return true;
+        }
+        return true; // consume keys while transcript view is open
+    }
+
+    // ── transcript search (33.13) ─────────────────────
+    pub fn transcriptSearchActive(self: *const Model) bool {
+        return self.search_bar_active;
+    }
+
+    pub fn openTranscriptSearch(self: *Model) void {
+        self.search_bar_active = true;
+        self.search_query_len = 0;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    pub fn closeTranscriptSearch(self: *Model) void {
+        self.search_bar_active = false;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    pub fn clearTranscriptSearch(self: *Model) void {
+        self.search_bar_active = false;
+        self.search_query_len = 0;
+        self.search_matches.clearRetainingCapacity();
+        self.search_current = 0;
+        self.search_has_query = false;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    fn scrollToParaIndex(self: *Model, para_idx: usize) void {
+        if (para_idx >= self.paras.items.len) return;
+        self.ensureParaHeights();
+        const line = self.heightPrefix(para_idx);
+        self.scrollTo(line);
+        self.follow_bottom = false;
+        self.anchor_para = para_idx;
+        self.anchor_off = 0;
+        self.anchor = line;
+    }
+
+    pub fn runTranscriptSearch(self: *Model) void {
+        self.search_matches.clearRetainingCapacity();
+        self.search_current = 0;
+        self.search_has_query = self.search_query_len > 0;
+        if (self.search_query_len == 0) return;
+        const q = self.search_query_buf[0..self.search_query_len];
+        for (self.paras.items, 0..) |*p, i| {
+            const text = p.textLive(self.allocator);
+            if (containsIgnoreCase(text, q)) {
+                self.search_matches.append(self.allocator, i) catch {};
+            }
+        }
+        if (self.search_matches.items.len > 0) {
+            self.search_current = 0;
+            self.scrollToParaIndex(self.search_matches.items[0]);
+        }
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    pub fn transcriptSearchNext(self: *Model, forward: bool) bool {
+        const n = self.search_matches.items.len;
+        if (n == 0) {
+            if (self.search_has_query) self.pushInfo("search: no matches");
+            return false;
+        }
+        if (forward) {
+            self.search_current = if (self.search_current + 1 < n) self.search_current + 1 else 0;
+        } else {
+            self.search_current = if (self.search_current == 0) n - 1 else self.search_current - 1;
+        }
+        self.scrollToParaIndex(self.search_matches.items[self.search_current]);
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+        return true;
+    }
+
+    /// Handles keys while the transcript search bar is active.
+    pub fn searchBarHandleKey(self: *Model, key: vaxis.Key) bool {
+        if (!self.search_bar_active) return false;
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.closeTranscriptSearch();
+            return true;
+        }
+        if (key.codepoint == 0x0D) { // enter
+            self.runTranscriptSearch();
+            self.closeTranscriptSearch();
+            if (self.search_matches.items.len == 0 and self.search_query_len > 0) {
+                self.pushInfo("search: no matches");
+            } else if (self.search_matches.items.len > 0) {
+                self.pushInfoFmt("search: {d}/{d}", .{ self.search_current + 1, self.search_matches.items.len });
+            }
+            return true;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.search_query_len > 0) self.search_query_len -= 1;
+            self.dirty = true;
+            self.redraw_requested.store(true, .seq_cst);
+            return true;
+        }
+        if (key.text) |txt| {
+            if (txt.len > 0 and !key.mods.ctrl and palette.isPrintableText(txt)) {
+                const space = self.search_query_buf.len - self.search_query_len;
+                const ncopy = @min(space, txt.len);
+                if (ncopy > 0) {
+                    @memcpy(self.search_query_buf[self.search_query_len..][0..ncopy], txt[0..ncopy]);
+                    self.search_query_len += ncopy;
+                }
+                self.dirty = true;
+                self.redraw_requested.store(true, .seq_cst);
+                return true;
+            }
+        }
+        if (!key.mods.ctrl and !key.mods.alt and key.codepoint >= 32 and key.codepoint < 127) {
+            if (self.search_query_len < self.search_query_buf.len) {
+                self.search_query_buf[self.search_query_len] = @intCast(key.codepoint);
+                self.search_query_len += 1;
+                self.dirty = true;
+                self.redraw_requested.store(true, .seq_cst);
+            }
+            return true;
+        }
+        return true;
+    }
+
+    // ── modal diff viewer (33.18) ─────────────────────
+    pub fn diffViewerActive(self: *const Model) bool {
+        return self.diff_viewer_active;
+    }
+
+    pub fn openDiffViewer(self: *Model) bool {
+        if (self.file_intel_len == 0) return false;
+        const focus = @min(self.file_focus orelse (self.file_intel_len - 1), self.file_intel_len - 1);
+        self.diff_viewer_active = true;
+        self.diff_viewer_sel = focus;
+        self.diff_viewer_scroll = 0;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+        return true;
+    }
+
+    pub fn closeDiffViewer(self: *Model) void {
+        self.diff_viewer_active = false;
+        self.diff_viewer_scroll = 0;
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    fn diffViewerSelectedPara(self: *const Model) ?usize {
+        if (self.file_intel_len == 0) return null;
+        const idx = @min(self.diff_viewer_sel, self.file_intel_len - 1);
+        return self.file_intel[idx].diff_para;
+    }
+
+    /// Handles keys while the diff viewer modal is active. Returns true if consumed.
+    pub fn diffViewerHandleKey(self: *Model, key: vaxis.Key) bool {
+        if (!self.diff_viewer_active) return false;
+        if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+            self.closeDiffViewer();
+            return true;
+        }
+        const n = self.file_intel_len;
+        if (n == 0) {
+            self.closeDiffViewer();
+            return true;
+        }
+        if (key.codepoint == 57352 or key.matches('k', .{})) { // up
+            self.diff_viewer_sel = if (self.diff_viewer_sel == 0) n - 1 else self.diff_viewer_sel - 1;
+            self.diff_viewer_scroll = 0;
+            return true;
+        }
+        if (key.codepoint == 57353 or key.matches('j', .{})) { // down
+            self.diff_viewer_sel = if (self.diff_viewer_sel + 1 < n) self.diff_viewer_sel + 1 else 0;
+            self.diff_viewer_scroll = 0;
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_down, .{}) or key.codepoint == 6) { // ctrl+f
+            self.diff_viewer_scroll +|= 10;
+            return true;
+        }
+        if (key.matches(vaxis.Key.page_up, .{}) or key.codepoint == 2) { // ctrl+b
+            self.diff_viewer_scroll -|= 10;
+            return true;
+        }
+        if (key.matches('d', .{ .ctrl = true })) {
+            self.diff_viewer_scroll +|= 10;
+            return true;
+        }
+        if (key.matches('u', .{ .ctrl = true })) {
+            self.diff_viewer_scroll -|= 10;
+            return true;
+        }
+        if (key.codepoint == 0x0D) { // enter: jump to diff in transcript
+            const idx = @min(self.diff_viewer_sel, n - 1);
+            self.closeDiffViewer();
+            _ = self.showFileIntelFocus(idx, true);
+            return true;
+        }
+        return true; // consume other keys while modal is open
     }
 
     /// Closes and frees. UI thread.
@@ -5498,8 +5973,6 @@ pub const Model = struct {
         self.file_focus = idx;
     }
 
-
-
     fn fileIntelLabel(self: *const Model, path: []const u8) struct { has: bool, label: []const u8 } {
         _ = self;
         const chip = lang_icons.forPath(path, false);
@@ -7157,9 +7630,14 @@ pub const Model = struct {
                 agent.openModelPaletteAsync(self);
             },
             .connect => |conn| {
-                // Saving the key is I/O: the agent does it. The palette stays
-                // open so you can see the result.
-                agent.storeKey(self, conn.provider, conn.key);
+                // Saving/removing the key is I/O: the agent does it. The palette
+                // stays open so you can see the result. Empty submit removes key.
+                const trimmed = std.mem.trim(u8, conn.key, " \t\r\n");
+                if (trimmed.len == 0) {
+                    agent.removeProviderKey(self, conn.provider);
+                } else {
+                    agent.storeKey(self, conn.provider, conn.key);
+                }
                 self.pal.key_len = 0;
             },
         }
@@ -7698,27 +8176,139 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
     }
 
     switch (c) {
-        'h' => { self.ed.moveLeft(); ctx.redraw = true; return true; },
-        'l' => { self.ed.moveRight(); ctx.redraw = true; return true; },
-        'j' => { self.ed.moveDown(); ctx.redraw = true; return true; },
-        'k' => { self.ed.moveUp(); ctx.redraw = true; return true; },
-        'w' => { self.ed.moveWordRight(); ctx.redraw = true; return true; },
-        'b' => { self.ed.moveWordLeft(); ctx.redraw = true; return true; },
-        '0' => { self.ed.moveHome(); ctx.redraw = true; return true; },
-        '$' => { self.ed.moveEnd(); ctx.redraw = true; return true; },
-        'G' => { self.ed.moveToEnd(); ctx.redraw = true; return true; },
-        'g' => { self.vim_pending = 'g'; ctx.redraw = true; return true; },
-        'd' => { self.vim_pending = 'd'; ctx.redraw = true; return true; },
-        'x' => { self.ed.deleteAfter(); syncAutocomplete(self); ctx.redraw = true; return true; },
-        'D' => { self.ed.deleteToEnd(); syncAutocomplete(self); ctx.redraw = true; return true; },
-        'i' => { self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
-        'I' => { self.ed.moveHome(); self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
-        'a' => { self.ed.moveRight(); self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
-        'A' => { self.ed.moveEnd(); self.vim_normal = false; self.vim_pending = 0; ctx.redraw = true; return true; },
+        'h' => {
+            self.ed.moveLeft();
+            ctx.redraw = true;
+            return true;
+        },
+        'l' => {
+            self.ed.moveRight();
+            ctx.redraw = true;
+            return true;
+        },
+        'j' => {
+            self.ed.moveDown();
+            ctx.redraw = true;
+            return true;
+        },
+        'k' => {
+            self.ed.moveUp();
+            ctx.redraw = true;
+            return true;
+        },
+        'w' => {
+            self.ed.moveWordRight();
+            ctx.redraw = true;
+            return true;
+        },
+        'b' => {
+            self.ed.moveWordLeft();
+            ctx.redraw = true;
+            return true;
+        },
+        '0' => {
+            self.ed.moveHome();
+            ctx.redraw = true;
+            return true;
+        },
+        '$' => {
+            self.ed.moveEnd();
+            ctx.redraw = true;
+            return true;
+        },
+        'G' => {
+            self.ed.moveToEnd();
+            ctx.redraw = true;
+            return true;
+        },
+        'g' => {
+            self.vim_pending = 'g';
+            ctx.redraw = true;
+            return true;
+        },
+        'd' => {
+            self.vim_pending = 'd';
+            ctx.redraw = true;
+            return true;
+        },
+        'x' => {
+            self.ed.deleteAfter();
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        },
+        'D' => {
+            self.ed.deleteToEnd();
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        },
+        '/' => {
+            self.openTranscriptSearch();
+            ctx.redraw = true;
+            return true;
+        },
+        'n' => {
+            if (self.search_has_query or self.search_matches.items.len > 0) {
+                _ = self.transcriptSearchNext(true);
+                ctx.redraw = true;
+                return true;
+            }
+        },
+        'N' => {
+            if (self.search_has_query or self.search_matches.items.len > 0) {
+                _ = self.transcriptSearchNext(false);
+                ctx.redraw = true;
+                return true;
+            }
+        },
+        'y', 'c' => {
+            if (self.message_target_para) |_| {
+                if (self.targetedMessageText()) |text| {
+                    commands.copyTargetedText(self, text);
+                } else {
+                    self.pushInfo("nothing to copy");
+                }
+                self.clearMessageTarget();
+                ctx.redraw = true;
+                return true;
+            }
+        },
+        'i' => {
+            self.vim_normal = false;
+            self.vim_pending = 0;
+            ctx.redraw = true;
+            return true;
+        },
+        'I' => {
+            self.ed.moveHome();
+            self.vim_normal = false;
+            self.vim_pending = 0;
+            ctx.redraw = true;
+            return true;
+        },
+        'a' => {
+            self.ed.moveRight();
+            self.vim_normal = false;
+            self.vim_pending = 0;
+            ctx.redraw = true;
+            return true;
+        },
+        'A' => {
+            self.ed.moveEnd();
+            self.vim_normal = false;
+            self.vim_pending = 0;
+            ctx.redraw = true;
+            return true;
+        },
         'o' => {
             self.ed.moveEnd();
             if (self.ed.insertChar('\n')) |_| {} else |_| {}
-            self.vim_normal = false; self.vim_pending = 0; syncAutocomplete(self); ctx.redraw = true; return true;
+            self.vim_normal = false;
+            self.vim_pending = 0;
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
         },
         'O' => {
             const s = self.ed.text();
@@ -7727,7 +8317,11 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
             self.ed.setCursor(ls);
             if (self.ed.insertChar('\n')) |_| {} else |_| {}
             self.ed.setCursor(ls);
-            self.vim_normal = false; self.vim_pending = 0; syncAutocomplete(self); ctx.redraw = true; return true;
+            self.vim_normal = false;
+            self.vim_pending = 0;
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
         },
         else => {},
     }
@@ -8189,6 +8783,33 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // way out was a key advertised as a scroll.
             //
             // Ctrl+C is the exit, which is what both places say.
+            // Transcript screen (33.4): captures input while open.
+            if (self.transcriptViewActive()) {
+                if (self.transcriptViewHandleKey(key)) {
+                    self.flushCopyPending(ctx);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
+            // Modal diff viewer (33.18): captures input while open.
+            if (self.diffViewerActive()) {
+                if (self.diffViewerHandleKey(key)) {
+                    self.flushCopyPending(ctx);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
+            // Transcript search bar (33.13): captures input while typing query.
+            if (self.transcriptSearchActive()) {
+                if (self.searchBarHandleKey(key)) {
+                    self.flushCopyPending(ctx);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
             // Modal picker active: captures ALL input (before global shortcuts so
             // session-picker chords like Ctrl+A/B/V/S work; Ctrl+C quit is above).
             if (self.pickerActive()) {
@@ -8263,6 +8884,27 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             if (key.matches('v', .{ .ctrl = true })) {
                 agent.attachClipboardImage(self);
                 ctx.redraw = true;
+                return;
+            }
+            // Ctrl+G: edit the current prompt in $VISUAL/$EDITOR.
+            if (key.matches('g', .{ .ctrl = true })) {
+                agent.openExternalEditor(self);
+                syncAutocomplete(self);
+                ctx.redraw = true;
+                return;
+            }
+            // Ctrl+F: transcript search (33.13).
+            if (key.matches('f', .{ .ctrl = true })) {
+                if (self.transcriptSearchActive()) self.closeTranscriptSearch() else self.openTranscriptSearch();
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
+            // Ctrl+O: transcript screen (33.4).
+            if (key.matches('o', .{ .ctrl = true })) {
+                self.toggleTranscriptView();
+                ctx.redraw = true;
+                try self.armTick(ctx);
                 return;
             }
             // Ctrl+P palette open: captures ALL input, scroll included.
@@ -8357,6 +8999,42 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
                 }
             }
 
+            // Per-message targeting (33.12): Shift+↑/↓ targets previous/next message.
+            if (key.codepoint == vaxis.Key.up and key.mods.shift and !key.mods.ctrl and !key.mods.alt) {
+                if (self.targetPrevMessage()) {
+                    self.pushInfo("targeted message · Shift+↑/↓ move, y copy, Esc clear");
+                } else {
+                    self.pushInfo("no previous message to target");
+                }
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
+            if (key.codepoint == vaxis.Key.down and key.mods.shift and !key.mods.ctrl and !key.mods.alt) {
+                if (self.targetNextMessage()) {
+                    self.pushInfo("targeted message · Shift+↑/↓ move, y copy, Esc clear");
+                } else {
+                    self.pushInfo("no next message to target");
+                }
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
+            // Copy targeted message action (33.12).
+            if (self.message_target_para != null and !self.hasInput() and !key.mods.ctrl and !key.mods.alt) {
+                if (key.codepoint == 'y' or key.codepoint == 'c') {
+                    if (self.targetedMessageText()) |text| {
+                        commands.copyTargetedText(self, text);
+                    } else {
+                        self.pushInfo("nothing to copy");
+                    }
+                    self.clearMessageTarget();
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
+
             // With an empty editor, the arrows belong to the history rather
             // than to an invisible cursor. Ask choices and open pickers have
             // already consumed their own arrows above.
@@ -8400,6 +9078,13 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             if (key.matches(vaxis.Key.escape, .{})) {
                 if (self.askActive()) {
                     self.declineAsk();
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                if (self.message_target_para != null) {
+                    self.clearMessageTarget();
+                    self.pushInfo("message target cleared");
                     ctx.redraw = true;
                     try self.armTick(ctx);
                     return;
@@ -9130,6 +9815,18 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // ── modal picker (opencode style, centered) ──
     if (self.pickerSnapshot(ctx.arena)) |ps| {
         drawPicker(&p, width, height, ps);
+    }
+    // ── modal diff viewer (33.18) ──
+    if (self.diffViewerActive()) {
+        drawDiffViewer(&p, self, width, height);
+    }
+    // ── transcript screen (33.4) ──
+    if (self.transcriptViewActive()) {
+        drawTranscriptView(&p, self, width, height);
+    }
+    // ── transcript search bar (33.13) ──
+    if (self.transcriptSearchActive()) {
+        drawTranscriptSearchBar(&p, self, width, height);
     }
 
     // ── permission dialog (modal over the history, at the bottom) ──
@@ -9891,7 +10588,7 @@ fn drawLines(
         if (row >= hh) break;
         var col: u16 = margin;
         for (ln.cells) |cell| {
-            p.putStable(col, row, cell.text, cell.w, cell.style);
+            p.putStableLinked(col, row, cell.text, cell.w, cell.style, cell.link);
             const new_col: usize = @as(usize, col) + @as(usize, cell.w);
             col = if (new_col > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(new_col);
             if (col >= p.width) break;
@@ -11185,6 +11882,213 @@ fn drawStateFooter(
     }
 }
 
+fn drawTranscriptSearchBar(p: *Painter, m: *const Model, width: u16, height: u16) void {
+    if (!m.search_bar_active) return;
+    const box_w: u16 = @min(width -| 4, 80);
+    if (box_w < 20 or height < 3) return;
+    const x0 = (width - box_w) / 2;
+    const y0 = if (height > 6) height - 4 else 0;
+    p.fillRange(x0, x0 + box_w, y0, " ", theme.selected);
+    var buf: [192]u8 = undefined;
+    const q = m.search_query_buf[0..m.search_query_len];
+    const label = std.fmt.bufPrint(&buf, " / {s}_  (Enter search, Esc close)", .{q}) catch " / ";
+    _ = p.putClipped(x0 + 1, y0, label, box_w -| 2, theme.selected);
+}
+
+fn drawTranscriptView(p: *Painter, m: *Model, width: u16, height: u16) void {
+    if (!m.transcript_view_active) return;
+    const box_w: u16 = if (width > 8) width - 4 else width;
+    const box_h: u16 = if (height > 4) height - 2 else height;
+    if (box_w < 20 or box_h < 6) return;
+    const x0 = (width - box_w) / 2;
+    const y0 = (height - box_h) / 2;
+
+    var wr: u16 = 0;
+    while (wr < box_h) : (wr += 1) {
+        expandWideCells(p.surface, y0 + wr, width);
+        p.fillRange(x0, x0 + box_w, y0 + wr, " ", .{});
+    }
+    drawRoundedBox(p, x0, y0, box_w, box_h, .{}, theme.line_bright);
+
+    var title_buf: [96]u8 = undefined;
+    const mode: []const u8 = if (m.transcript_view_show_all) "show all" else "compact";
+    const title = std.fmt.bufPrint(&title_buf, " Transcript ({s}) ", .{mode}) catch " Transcript ";
+    _ = p.putText(x0 + 2, y0, title, theme.accent_bold);
+    const hint = " ↑↓/j k scroll · PgUp/PgDn · g/G · Ctrl+E show all · Ctrl+O/Esc close ";
+    _ = p.putClipped(x0 + 2, y0 + box_h - 1, hint, box_w -| 4, theme.hint);
+
+    const content_y = y0 + 1;
+    const content_h: usize = @intCast(box_h -| 2);
+    if (content_h == 0) return;
+
+    // Collect visible lines from paragraph texts (view of existing history, no new content).
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(p.ctx.arena);
+    for (m.paras.items, 0..) |*para, pi| {
+        const kind_label: []const u8 = switch (para.kind) {
+            .user => "user",
+            .assistant => "assistant",
+            .tool => "tool",
+            .diff => "diff",
+            .info => "info",
+            .error_msg => "error",
+            .banner => "banner",
+            else => "text",
+        };
+        var hdr: [96]u8 = undefined;
+        const header = std.fmt.bufPrint(&hdr, "[{d}] {s}", .{ pi + 1, kind_label }) catch kind_label;
+        lines.append(p.ctx.arena, p.ctx.arena.dupe(u8, header) catch header) catch {};
+
+        const text = para.textLive(m.allocator);
+        if (text.len == 0) {
+            lines.append(p.ctx.arena, "") catch {};
+            lines.append(p.ctx.arena, "") catch {};
+            continue;
+        }
+        if (!m.transcript_view_show_all and text.len > 1200) {
+            // Compact mode: show a bounded preview of very long content.
+            var it = std.mem.splitScalar(u8, text[0..@min(text.len, 1200)], '\n');
+            var shown: usize = 0;
+            while (it.next()) |ln| {
+                if (shown >= 12) break;
+                lines.append(p.ctx.arena, ln) catch {};
+                shown += 1;
+            }
+            if (shown >= 12) lines.append(p.ctx.arena, "… (Ctrl+E to show all)") catch {};
+        } else {
+            var it = std.mem.splitScalar(u8, text, '\n');
+            var shown: usize = 0;
+            const max_lines: usize = if (m.transcript_view_show_all) 400 else 80;
+            while (it.next()) |ln| {
+                if (shown >= max_lines) {
+                    lines.append(p.ctx.arena, "… (content truncated in transcript view)") catch {};
+                    break;
+                }
+                lines.append(p.ctx.arena, ln) catch {};
+                shown += 1;
+            }
+        }
+        lines.append(p.ctx.arena, "") catch {};
+    }
+
+    if (lines.items.len == 0) {
+        _ = p.putClipped(x0 + 2, content_y, "(no transcript history)", box_w -| 4, theme.hint);
+        return;
+    }
+
+    const max_scroll = if (lines.items.len > content_h) lines.items.len - content_h else 0;
+    const scroll = @min(m.transcript_view_scroll, max_scroll);
+    m.transcript_view_scroll = scroll;
+
+    var i: usize = 0;
+    while (i < content_h and scroll + i < lines.items.len) : (i += 1) {
+        const row = content_y + @as(u16, @intCast(i));
+        const line = lines.items[scroll + i];
+        const style = if (line.len > 0 and line[0] == '[') theme.accent else theme.ink;
+        _ = p.putClipped(x0 + 2, row, line, box_w -| 4, style);
+    }
+}
+
+fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) void {
+    const n = m.file_intel_len;
+    if (n == 0) return;
+
+    const box_w: u16 = @min(width -| 4, 120);
+    const box_h: u16 = @min(height -| 4, 32);
+    if (box_w < 40 or box_h < 10) return;
+    const x0 = (width - box_w) / 2;
+    const y0 = (height - box_h) / 6;
+
+    var wr: u16 = 0;
+    while (wr < box_h) : (wr += 1) {
+        expandWideCells(p.surface, y0 + wr, width);
+        p.fillRange(x0, x0 + box_w, y0 + wr, " ", .{});
+    }
+    drawRoundedBox(p, x0, y0, box_w, box_h, .{}, theme.line_bright);
+
+    const sel = @min(m.diff_viewer_sel, n - 1);
+    var title_buf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, " Diff viewer  ({d}/{d} files) ", .{ sel + 1, n }) catch " Diff viewer ";
+    _ = p.putText(x0 + 2, y0, title, theme.accent_bold);
+    const hint = " ↑↓ file · PgUp/PgDn scroll · Enter jump · Esc close ";
+    _ = p.putClipped(x0 + 2, y0 + box_h - 1, hint, box_w -| 4, theme.hint);
+
+    // File list area
+    const list_rows: u16 = @min(@as(u16, @intCast(@min(n, 6))), box_h -| 8);
+    var i: usize = 0;
+    while (i < n and i < list_rows) : (i += 1) {
+        const e = &m.file_intel[i];
+        const path = e.pathOf();
+        const row = y0 + 1 + @as(u16, @intCast(i));
+        const selected = i == sel;
+        if (selected) p.fillRange(x0 + 1, x0 + box_w - 1, row, " ", theme.selected);
+        var line_buf: [256]u8 = undefined;
+        const marker: []const u8 = if (selected) "▸ " else "  ";
+        const info = m.fileIntelLabel(path);
+        const op_word = Model.fileIntelOpWord(e);
+        const text = if (e.added == 0 and e.removed == 0)
+            if (info.has)
+                (std.fmt.bufPrint(&line_buf, "{s}{s} [{s}] {s}  (unchanged)", .{ marker, op_word, info.label, path }) catch path)
+            else
+                (std.fmt.bufPrint(&line_buf, "{s}{s} {s}  (unchanged)", .{ marker, op_word, path }) catch path)
+        else if (info.has)
+            (std.fmt.bufPrint(&line_buf, "{s}{s} [{s}] {s}  +{d} -{d}", .{ marker, op_word, info.label, path, e.added, e.removed }) catch path)
+        else
+            (std.fmt.bufPrint(&line_buf, "{s}{s} {s}  +{d} -{d}", .{ marker, op_word, path, e.added, e.removed }) catch path);
+        const style = if (selected) theme.selected else theme.ink;
+        _ = p.putClipped(x0 + 2, row, text, box_w -| 4, style);
+    }
+
+    const sep_y = y0 + 1 + list_rows;
+    if (sep_y + 2 < y0 + box_h - 1) {
+        p.fillRange(x0 + 1, x0 + box_w - 1, sep_y, "─", theme.rule);
+    }
+
+    // Diff content area
+    const diff_top = sep_y + 1;
+    const diff_bottom = y0 + box_h - 2;
+    if (diff_bottom <= diff_top) return;
+    const diff_rows: usize = diff_bottom - diff_top + 1;
+
+    const para_idx_opt = m.diffViewerSelectedPara();
+    if (para_idx_opt == null or para_idx_opt.? >= m.paras.items.len) {
+        _ = p.putClipped(x0 + 2, diff_top, "(no diff content available for this file)", box_w -| 4, theme.hint);
+        return;
+    }
+    const para = m.paras.items[para_idx_opt.?];
+    if (para.kind != .diff) {
+        _ = p.putClipped(x0 + 2, diff_top, "(selected entry is not a diff)", box_w -| 4, theme.hint);
+        return;
+    }
+
+    // Count lines and render visible window
+    var total_lines: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, para.text, '\n');
+        while (it.next()) |_| total_lines += 1;
+    }
+    const max_scroll = if (total_lines > diff_rows) total_lines - diff_rows else 0;
+    const scroll = @min(m.diff_viewer_scroll, max_scroll);
+
+    var line_idx: usize = 0;
+    var drawn: usize = 0;
+    var it = std.mem.splitScalar(u8, para.text, '\n');
+    while (it.next()) |line| : (line_idx += 1) {
+        if (line_idx < scroll) continue;
+        if (drawn >= diff_rows) break;
+        const row = diff_top + @as(u16, @intCast(drawn));
+        const style: vaxis.Style = if (line.len > 0) switch (line[0]) {
+            '+' => theme.diff_add,
+            '-' => theme.diff_del,
+            '@' => theme.diff_hunk,
+            '\\' => theme.hint,
+            else => theme.diff_ctx,
+        } else theme.diff_ctx;
+        _ = p.putClipped(x0 + 2, row, line, box_w -| 4, style);
+        drawn += 1;
+    }
+}
+
 /// A piece of the footer's right-hand group, with its style.
 const InfoSeg = struct { text: []const u8, style: vaxis.Style };
 
@@ -11345,18 +12249,34 @@ fn segsWidth(segs: []const InfoSeg) u16 {
 /// Centered modal in opencode style: title, filter, items with selection and footer.
 fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
     const is_sessions = ps.tag == sessions_picker_tag;
-    const box_w: u16 = @min(width -| 4, 104);
-    const box_h: u16 = @min(height -| 4, @as(u16, if (ps.preview) 22 else 15));
-    if (box_w < 20 or box_h < 6) return;
-    const x0 = (width - box_w) / 2;
-    const y0 = (height - box_h) / 4;
+    // Bottom-anchored modal pane (33.5): keeps 2 transcript rows visible above a ▔ divider.
+    const box_w: u16 = if (width > 2) width else 20;
+    const desired_h: u16 = @as(u16, if (ps.preview) 20 else 13);
+    const max_h: u16 = if (height > 3) height - 2 else height; // leave >=2 transcript rows above divider
+    var box_h: u16 = @min(desired_h, max_h);
+    if (box_h < 7) box_h = @min(@as(u16, 7), height);
+    if (box_w < 20 or box_h < 6 or height < 8) return;
+
+    var y0: u16 = if (height > box_h) height - box_h else 0;
+    if (y0 < 2) {
+        y0 = 2;
+        box_h = if (height > y0) height - y0 else box_h;
+    }
+    const x0: u16 = 0;
 
     var wr: u16 = 0;
     while (wr < box_h) : (wr += 1) {
-        expandWideCells(p.surface, y0 + wr, width);
+        const row = y0 + wr;
+        if (row >= height) break;
+        expandWideCells(p.surface, row, width);
+        p.fillRange(0, box_w, row, " ", .{});
     }
 
-    drawRoundedBox(p, x0, y0, box_w, box_h, .{}, theme.line_bright);
+    // Top divider (▔) keeps 2 transcript rows visible above the pane.
+    var dx: u16 = 0;
+    while (dx < box_w) : (dx += 1) {
+        _ = p.putStable(x0 + dx, y0, "▔", 1, theme.line_bright);
+    }
 
     // title with dynamic position for session picker (29.3/29.4)
     var tbuf: [128]u8 = undefined;
@@ -11365,21 +12285,26 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
         (std.fmt.bufPrint(&tbuf, " {s}  ({d} of {d})", .{ ps.title, pos, ps.total }) catch " Resume")
     else
         (std.fmt.bufPrint(&tbuf, " {s}", .{ps.title}) catch " picker");
-    _ = p.putText(x0 + 2, y0, t1, theme.accent_bold);
+    _ = p.putText(x0 + 2, y0 + 1, t1, theme.accent_bold);
 
     var qbuf: [96]u8 = undefined;
     const q1 = if (ps.query.len > 0)
         std.fmt.bufPrint(&qbuf, "filter: {s}_", .{ps.query}) catch "filter: _"
     else
         "filter: (type to search)";
-    _ = p.putText(x0 + 2, y0 + 1, q1, theme.dim);
+    _ = p.putText(x0 + 2, y0 + 2, q1, theme.dim);
 
-    const item_rows: usize = box_h - 5;
+    // Layout: divider/title/filter/content/footer
+    const content_top = y0 + 3;
+    const footer_row = y0 + box_h - 1;
+    const item_rows: usize = if (footer_row > content_top) footer_row - content_top else 0;
+
     if (ps.preview and ps.preview_lines.len > 0) {
         // In-place preview (29.4): same markdown parser/styles, never a summary.
         var pi: usize = 0;
         while (pi < ps.preview_lines.len and pi < item_rows) : (pi += 1) {
-            const row = y0 + 2 + @as(u16, @intCast(pi));
+            const row = content_top + @as(u16, @intCast(pi));
+            if (row >= footer_row) break;
             const raw = ps.preview_lines[pi];
             if (raw.len == 0) continue;
             const kindc = raw[0];
@@ -11392,15 +12317,21 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
                 'D' => theme.diff_add,
                 else => theme.dim,
             };
-            p.fillRange(x0 + 1, x0 + box_w - 1, row, " ", .{});
-            _ = p.putText(x0 + 2, row, text, st);
+            p.fillRange(x0, x0 + box_w, row, " ", .{});
+            _ = p.putClipped(x0 + 2, row, text, box_w -| 4, st);
         }
     } else {
         for (ps.items, 0..) |it, i| {
             if (i >= item_rows) break;
-            const row = y0 + 2 + @as(u16, @intCast(i));
+            const row = content_top + @as(u16, @intCast(i));
+            if (row >= footer_row) break;
             const is_sel = ps.first_visible + i == ps.sel;
-            if (is_sel) _ = p.putText(x0 + 1, row, "▸", theme.brand_bold);
+            if (is_sel) {
+                p.fillRange(x0, x0 + box_w, row, " ", theme.selected);
+                _ = p.putText(x0 + 1, row, "▸", theme.brand_bold);
+            } else {
+                p.fillRange(x0, x0 + box_w, row, " ", .{});
+            }
             var hbuf: [64]u32 = undefined;
             const hn = fuzzy.highlightPositions(it.label, ps.query, &hbuf) orelse 0;
             var after = putStyled(
@@ -11415,7 +12346,7 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
             );
             if (it.desc.len > 0) {
                 after = p.putText(after, row, "  ", if (is_sel) theme.selected else theme.dim);
-                _ = p.putText(after, row, it.desc, if (is_sel) theme.selected else theme.dim);
+                _ = p.putClipped(after, row, it.desc, if (after < box_w - 2) box_w - 2 - after else 0, if (is_sel) theme.selected else theme.dim);
             }
         }
     }
@@ -11451,7 +12382,7 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
             .{ pos, ps.total },
         ) catch "";
     }
-    _ = p.putText(x0 + 2, y0 + box_h - 2, f1_text, theme.dim);
+    _ = p.putClipped(x0 + 2, footer_row, f1_text, box_w -| 4, theme.dim);
 }
 
 // ── render tests ──────────────────────────────────────────
@@ -18251,56 +19182,18 @@ test "the wordmark is drawn as FIVE rows of art, and it is not read as headings"
     try std.testing.expect(std.mem.startsWith(u8, last, "######"));
 }
 
-test "the sensitive-path question has no 'always allow'" {
-    // A rule that remembers "the agent may write inside .git/" is the
-    // opposite of the rule, so the question is asked ONCE and the option is
-    // not on the table.
+test "detectLinks finds URLs and file paths" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    const a = arena_state.allocator();
 
-    var m = Model.init(std.testing.allocator);
-    defer m.deinit();
-    m.perm_tool_len = @min("write".len, m.perm_tool.len);
-    @memcpy(m.perm_tool[0..m.perm_tool_len], "write");
-    m.perm_detail_len = @min(".git/hooks/pre-commit is not a place this tool writes".len, m.perm_detail.len);
-    @memcpy(m.perm_detail[0..m.perm_detail_len], ".git/hooks/pre-commit is not a place this tool writes");
-    m.perm_active = true;
+    const urls = detectLinks(a, "see https://example.com/path and http://a.test/x.");
+    try std.testing.expectEqual(@as(usize, 2), urls.len);
+    try std.testing.expectEqualStrings("https://example.com/path", urls[0].uri);
+    try std.testing.expectEqualStrings("http://a.test/x", urls[1].uri);
 
-    // The ordinary question: four options, and "always allow" is one of them.
-    const normal = try drawTest(&m, arena, 80, 24);
-    try std.testing.expect(findRow(normal, "always allow") != null);
-
-    // The sensitive one: three.
-    m.perm_allow_always = false;
-    const once = try drawTest(&m, arena, 80, 24);
-    try std.testing.expect(findRow(once, "always allow") == null);
-    try std.testing.expect(findRow(once, "allow once") != null);
-    try std.testing.expect(findRow(once, "deny") != null);
-    // And the REASON is in the dialog: the user is being asked about a path
-    // they cannot see otherwise.
-    try std.testing.expect(findRow(once, "not a place this tool writes") != null);
-}
-
-test "streaming: a very large response grows without an artificial cap" {
-    // Output renders indefinitely: stream_buf grows with every chunk until the
-    // allocator itself refuses (real OOM). No fixed byte cap truncates the
-    // live stream.
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-
-    var m = Model.init(std.testing.allocator);
-    defer m.deinit();
-
-    m.streamStart();
-    // Stream enough chunks to far exceed any reasonable fixed cap.
-    const chunk = "lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
-    var sent: usize = 0;
-    const target = 400 * 1024;
-    while (sent < target) : (sent += chunk.len) {
-        m.streamDelta(chunk);
-    }
-
-    // The buffer holds everything that was streamed: no artificial cap was hit.
-    try std.testing.expect(m.stream_buf.items.len >= target);
+    const paths = detectLinks(a, "edit src/tui.zig and /tmp/out.txt now");
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expectEqualStrings("file:src/tui.zig", paths[0].uri);
+    try std.testing.expectEqualStrings("file:///tmp/out.txt", paths[1].uri);
 }

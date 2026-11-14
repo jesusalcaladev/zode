@@ -311,6 +311,45 @@ pub fn savedKeyFor(id: []const u8) ?[]const u8 {
     return m.get(id);
 }
 
+/// Appends known saved provider keys for secret redaction. Best-effort and
+/// allocation-tolerant; callers should treat failures as non-fatal.
+pub fn appendSavedRedactionKeys(list: *std.ArrayList([]const u8), gpa: std.mem.Allocator) void {
+    const m = saved_keys.load(.acquire) orelse return;
+    var it = m.iterator();
+    while (it.next()) |kv| {
+        const v = kv.value_ptr.*;
+        if (v.len < 8) continue;
+        list.append(gpa, v) catch {};
+    }
+}
+
+/// Appends provider keys from the environment for secret redaction.
+/// Includes built-in provider key env vars and common global API key vars.
+pub fn appendEnvRedactionKeys(
+    list: *std.ArrayList([]const u8),
+    gpa: std.mem.Allocator,
+    env: ?*const std.process.Environ.Map,
+) void {
+    const e = env orelse return;
+    for (&defs) |*d| {
+        for (d.key_env) |var_name| {
+            if (e.get(var_name)) |k| {
+                if (k.len >= 8) list.append(gpa, k) catch {};
+            }
+        }
+    }
+    if (e.get("ZODE_API_KEY")) |k| {
+        if (k.len >= 8) list.append(gpa, k) catch {};
+    }
+}
+
+/// Returns known saved provider keys for redaction. Caller owns the slice.
+pub fn savedRedactionKeys(gpa: std.mem.Allocator) []const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    appendSavedRedactionKeys(&list, gpa);
+    return list.toOwnedSlice(gpa) catch &.{};
+}
+
 pub fn keyFor(def: *const ProviderDef, env: ?*const std.process.Environ.Map) ?[]const u8 {
     // 1) The one stored via the palette: what the user just typed.
     if (savedKeyFor(def.id)) |k| {

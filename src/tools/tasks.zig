@@ -184,6 +184,7 @@ pub fn toolTaskUpdate(
     const blocks = try getIdList(arena, obj, "add_blocks");
     const blocked_by = try getIdList(arena, obj, "add_blocked_by");
     const status_text = common.getStr(obj, "status");
+    const claim_req = common.getBool(obj, "claim");
 
     // An alias, not a second way of doing things: `status: deleted` arrives from
     // models trained on another harness, and it means exactly what `task_stop` does.
@@ -217,11 +218,36 @@ pub fn toolTaskUpdate(
     if (description) |d| {
         if (d.len > taskstore.max_description) return error.DescriptionTooLong;
     }
+    if (claim_req) {
+        const who = owner orelse taskstore.default_owner;
+        if (std.mem.trim(u8, who, " \t\r\n").len == 0) return error.OwnerRequired;
+    }
 
     var out = std.Io.Writer.Allocating.init(arena);
     const w = &out.writer;
     try w.print("#{d}", .{id});
     var wrote_any = false;
+
+    // Atomic claim (34.9): refuse if another agent already owns the task.
+    if (claim_req) {
+        const who = owner orelse taskstore.default_owner;
+        st.claim(id, who) catch |err| {
+            if (err == error.AlreadyClaimed) {
+                const cur = if (st.get(id)) |t| (t.owner orelse "someone else") else "someone else";
+                try w.print(" — cannot claim it: already owned by {s}. Pick a different task.", .{cur});
+                writeSaveNote(w, io, st);
+                return out.written();
+            }
+            if (err == error.OwnerRequired) {
+                try w.print(" — cannot claim it with no owner: send owner (\"{s}\" for your own work).", .{taskstore.default_owner});
+                writeSaveNote(w, io, st);
+                return out.written();
+            }
+            return err;
+        };
+        try w.print(" claimed by {s}", .{who});
+        wrote_any = true;
+    }
 
     if (subject) |s| {
         try st.setSubject(id, s);
@@ -234,11 +260,15 @@ pub fn toolTaskUpdate(
         wrote_any = true;
     }
     if (owner) |o| {
-        try st.setOwner(id, o);
-        if (st.get(id).?.owner) |now| {
-            try w.print(" owner {s}", .{now});
-        } else try w.writeAll(" owner cleared");
-        wrote_any = true;
+        if (!claim_req) {
+            try st.setOwner(id, o);
+            if (st.get(id).?.owner) |now| {
+                try w.print(" owner {s}", .{now});
+            } else try w.writeAll(" owner cleared");
+            wrote_any = true;
+        } else if (std.mem.trim(u8, o, " \t\r\n").len == 0) {
+            // claim already handled; explicit empty owner request is contradictory, ignore.
+        }
     }
     for (blocks) |b| {
         try st.link(id, b);
@@ -467,6 +497,24 @@ test "task_update: a bad argument changes NOTHING" {
     try testing.expectError(error.UnknownTask, toolTaskUpdate(testing.io, &st, try args(arena, "{{\"id\":77,\"status\":\"completed\"}}", .{}), arena));
     // And no task was touched.
     try testing.expectEqual(taskstore.Status.pending, st.get(1).?.status);
+}
+
+test "task_update: claim is atomic and refuses stealing ownership" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var st = taskstore.Store{ .gpa = testing.allocator };
+    defer st.deinit();
+    _ = try st.create("One", "");
+    const first = try toolTaskUpdate(testing.io, &st, try args(arena, "{{\"id\":1,\"claim\":true,\"owner\":\"alice\",\"status\":\"in_progress\"}}", .{}), arena);
+    try testing.expect(std.mem.indexOf(u8, first, "claimed by alice") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "status in_progress") != null);
+    try testing.expectEqualStrings("alice", st.get(1).?.owner.?);
+
+    const second = try toolTaskUpdate(testing.io, &st, try args(arena, "{{\"id\":1,\"claim\":true,\"owner\":\"bob\"}}", .{}), arena);
+    try testing.expect(std.mem.indexOf(u8, second, "cannot claim it") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "alice") != null);
+    try testing.expectEqualStrings("alice", st.get(1).?.owner.?);
 }
 
 test "task_update: status deleted is the removal, not a lesson about vocabulary" {

@@ -39,6 +39,33 @@ const cost_mod = @import("lib/cost.zig");
 const zjsonl = @import("lib/zjsonl.zig");
 const repeat = @import("lib/repeat.zig");
 const resultcap = @import("lib/resultcap.zig");
+const redact_mod = @import("lib/redact.zig");
+const providers = @import("lib/providers.zig");
+
+var redact_env: ?*const std.process.Environ.Map = null;
+var redact_extra_key: []const u8 = "";
+var redact_extra_keys: []const []const u8 = &.{};
+
+pub fn setRedactionContext(env: ?*const std.process.Environ.Map, extra_key: ?[]const u8) void {
+    redact_env = env;
+    redact_extra_key = extra_key orelse "";
+}
+
+pub fn setRedactionExtraKeys(keys: []const []const u8) void {
+    redact_extra_keys = keys;
+}
+
+pub fn redactionEnv() ?*const std.process.Environ.Map {
+    return redact_env;
+}
+
+pub fn redactionExtraKey() []const u8 {
+    return redact_extra_key;
+}
+
+pub fn redactionExtraKeys() []const []const u8 {
+    return redact_extra_keys;
+}
 
 /// A conversation message. Efficient design:
 /// - `content` is the plain text (what goes in and out of the LLM).
@@ -369,12 +396,23 @@ pub const Session = struct {
         self.result_caps = resultcap.deserializeCaps(self.allocator, data) catch .{};
     }
 
+    fn scrubForPersist(self: *Session, content: []const u8) ![]u8 {
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(self.allocator);
+        providers.appendSavedRedactionKeys(&keys, self.allocator);
+        providers.appendEnvRedactionKeys(&keys, self.allocator, redact_env);
+        if (redact_extra_key.len >= 8) keys.append(self.allocator, redact_extra_key) catch {};
+        for (redact_extra_keys) |k| {
+            if (k.len >= 8) keys.append(self.allocator, k) catch {};
+        }
+        return redact_mod.redact(self.allocator, content, keys.items);
+    }
+
     /// Adds a message to memory and persists it (1 linear write).
-    /// Content is scrubbed for key shapes before persist (defense in depth:
-    /// a key leaked into a tool result must not reach disk verbatim).
+    /// Content is scrubbed for key shapes and known saved provider keys before
+    /// persist (defense in depth).
     pub fn append(self: *Session, role: Message.Role, content: []const u8) !void {
-        const redact = @import("lib/redact.zig").redact;
-        const scrubbed = redact(self.allocator, content, &.{}) catch content;
+        const scrubbed = self.scrubForPersist(content) catch content;
         defer if (scrubbed.ptr != content.ptr) self.allocator.free(scrubbed);
         const copy = try self.allocator.dupe(u8, scrubbed);
         errdefer self.allocator.free(copy);
@@ -467,8 +505,7 @@ pub const Session = struct {
         tool_name: []const u8,
         content: []const u8,
     ) !void {
-        const redact = @import("lib/redact.zig").redact;
-        const scrubbed = redact(self.allocator, content, &.{}) catch content;
+        const scrubbed = self.scrubForPersist(content) catch content;
         defer if (scrubbed.ptr != content.ptr) self.allocator.free(scrubbed);
         const copy = try self.allocator.dupe(u8, scrubbed);
         errdefer self.allocator.free(copy);
@@ -487,16 +524,19 @@ pub const Session = struct {
 
     /// Serializes and writes one JSONL line. No pretty-print: 1 line = 1 message.
     /// The content is DEFLATE-compressed if it saves >=25% (marker "z").
+    /// Content is redacted again at persist boundary (defense in depth).
     fn persist(self: *Session, m: *const Message) !void {
         if (self.fw == null) return;
         const w = &self.fw.?.interface;
+        const scrubbed = self.scrubForPersist(m.content) catch m.content;
+        defer if (scrubbed.ptr != m.content.ptr) self.allocator.free(scrubbed);
         w.writeAll("{\"role\":\"") catch {};
         w.writeAll(@tagName(m.role)) catch {};
         w.writeAll("\",\"content\":\"") catch {};
-        if (zjsonl.compressLine(&self.compress_buf, m.content)) |cline| {
+        if (zjsonl.compressLine(&self.compress_buf, scrubbed)) |cline| {
             writeEscaped(w, cline) catch {};
         } else {
-            writeEscaped(w, m.content) catch {};
+            writeEscaped(w, scrubbed) catch {};
         }
         w.writeAll("\"") catch {};
         if (m.tool_calls_json) |tj| {
@@ -619,7 +659,9 @@ pub const Session = struct {
             n = cut;
             while (n > 0 and buf[n - 1] == ' ') n -= 1;
             if (n + 3 <= buf.len) {
-                buf[n] = '.'; buf[n + 1] = '.'; buf[n + 2] = '.';
+                buf[n] = '.';
+                buf[n + 1] = '.';
+                buf[n + 2] = '.';
                 n += 3;
             }
         }
@@ -767,6 +809,64 @@ pub const Session = struct {
         try self.scroll_state.writeFields(file_writer);
         try file_writer.writeByte('\n');
         try file_writer.flush();
+    }
+
+    /// Clears conversation/content state in-place while keeping the same session
+    /// identity (id/path/titles/meta). Rewrites the session file so resume/reopen
+    /// sees an empty conversation and 0% context.
+    pub fn clearContents(self: *Session) !void {
+        // Free messages.
+        for (self.messages.items) |m| {
+            self.allocator.free(m.content);
+            if (m.tool_calls_json) |tj| self.allocator.free(tj);
+            if (m.tool_call_id) |id| self.allocator.free(id);
+            if (m.tool_name) |n| self.allocator.free(n);
+        }
+        self.messages.clearRetainingCapacity();
+
+        // Reset compaction/summary state.
+        if (self.compact_summary) |cs| {
+            self.allocator.free(cs);
+            self.compact_summary = null;
+        }
+        self.compact_tail_keep = 0;
+        if (self.summary.len > 0) {
+            self.allocator.free(self.summary);
+            self.summary = "";
+        }
+        self.summary_steps = 0;
+        self.summary_last_update_s = 0;
+
+        // Reset session-local runtime state that should behave like a fresh session.
+        self.usage_stats = .{};
+        self.scroll_state = .{};
+        self.skills_sent = false;
+        self.checkpoint_expected_messages = null;
+        self.checkpoint_actual_messages = 0;
+        self.result_caps.deinit(self.allocator);
+        self.result_caps = .{};
+
+        // Rewrite file (truncate) with empty conversation.
+        const path = self.path orelse return;
+        if (self.fw) |*fw| {
+            fw.interface.flush() catch {};
+        }
+        if (self.file) |f| {
+            f.close(self.io);
+            self.file = null;
+            self.fw = null;
+        }
+        var dir = try std.Io.Dir.cwd().openDir(self.io, ".", .{});
+        defer dir.close(self.io);
+        const file = try dir.createFile(self.io, path, .{ .truncate = true });
+        file.setPermissions(self.io, session_mode) catch {};
+        self.file = file;
+        self.fw = std.Io.File.Writer.initStreaming(file, self.io, &self.write_buf);
+        try self.persistScrollState();
+        try self.fw.?.interface.flush();
+        // Keep sidecar/meta in sync (summary/titles preserved by callers/meta).
+        self.persistMetaNow();
+        self.saveCapsSidecar();
     }
 
     /// 30.5: defensive consistency marker (expected message count at turn boundary).
@@ -1378,7 +1478,6 @@ test "Session: scroll state persists across resume" {
     defer std.Io.Dir.cwd().deleteFile(io, used_path) catch {};
 }
 
-
 test "load: checkpoint event detects consistency mismatch" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -1507,7 +1606,6 @@ test "resumePath: restores 30.3/30.5 meta fields and counters" {
     try std.testing.expectEqual(@as(u32, 2), s2.permissions_asked);
     try std.testing.expectEqual(@as(u32, 1), s2.escs);
 }
-
 
 test "consistency checkpoint fixture: persisted checkpoint line is detected on load" {
     const alloc = std.testing.allocator;

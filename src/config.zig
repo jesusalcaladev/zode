@@ -686,9 +686,19 @@ fn isSymlink(io: std.Io, dir: std.Io.Dir, path: []const u8) bool {
     return true;
 }
 
-fn isPathSymlink(io: std.Io, path: []const u8) bool {
+pub fn isPathSymlink(io: std.Io, path: []const u8) bool {
     var buf: [4096]u8 = undefined;
     _ = std.Io.Dir.cwd().readLink(io, path, &buf) catch return false;
+    return true;
+}
+
+/// True when `path` (and its config dir context, if provided by caller) is safe
+/// to read as a sensitive config/auth file: not a symlink.
+pub fn isSafeSensitivePath(io: std.Io, env: ?*const std.process.Environ.Map, path: []const u8) bool {
+    var dir_buf: [1024]u8 = undefined;
+    const dir_path = configDir(env, &dir_buf) orelse return false;
+    if (isPathSymlink(io, dir_path)) return false;
+    if (isPathSymlink(io, path)) return false;
     return true;
 }
 
@@ -706,7 +716,7 @@ pub fn writeFileSecure(
     // `Dir.createDirPath` is mkdir -p: the user may not have ~/.config/zode yet.
     // Mode 0700: auth.json is 0600 but a 0755 dir still leaks its size/mtime
     // and enables /tmp-HOME symlink races.
-    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir_path, @enumFromInt(0o700)) catch
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir_path, @fromBackingInt(@intCast(0o700))) catch
         try std.Io.Dir.cwd().createDirPath(io, dir_path);
 
     var tmp_buf: [1200]u8 = undefined;
@@ -715,7 +725,7 @@ pub fn writeFileSecure(
 
     var file = try std.Io.Dir.cwd().createFile(io, tmp, .{
         .truncate = true,
-        .permissions = @enumFromInt(0o600),
+        .permissions = @fromBackingInt(@intCast(0o600)),
     });
     defer file.close(io);
     // `permissions` above only applies when the file is CREATED. A
@@ -724,9 +734,9 @@ pub fn writeFileSecure(
     // rename publishes it as `auth.json` at 0644 with the keys readable by every
     // user on the machine. So the mode is set on the OPEN file, every time,
     // and verified: a silent 0644 publish is worse than failing.
-    file.setPermissions(io, @enumFromInt(0o600)) catch return error.PermissionsNotAvailable;
+    file.setPermissions(io, @fromBackingInt(@intCast(0o600))) catch return error.PermissionsNotAvailable;
     const st0 = file.stat(io) catch return error.PermissionsNotAvailable;
-    if (@intFromEnum(st0.permissions) & 0o077 != 0) return error.PermissionsNotAvailable;
+    if (@backingInt(st0.permissions) & 0o077 != 0) return error.PermissionsNotAvailable;
     // `File` has no writeAll in 0.16: build a writer with its own buffer.
     var wbuf: [4096]u8 = undefined;
     var fw = file.writer(io, &wbuf);
@@ -761,11 +771,11 @@ pub fn tightenPermissions(io: std.Io, path: []const u8) void {
     defer file.close(io);
     const st = file.stat(io) catch return;
     // 0o077 is group+other: anything in there is someone else's read (or write).
-    if (@intFromEnum(st.permissions) & 0o077 == 0) return;
-    file.setPermissions(io, @enumFromInt(0o600)) catch {};
+    if (@backingInt(st.permissions) & 0o077 == 0) return;
+    file.setPermissions(io, @fromBackingInt(@intCast(0o600))) catch {};
     // Verify: silently leaving 0644 is worse than tightening.
     const st2 = file.stat(io) catch return;
-    if (@intFromEnum(st2.permissions) & 0o077 != 0) {
+    if (@backingInt(st2.permissions) & 0o077 != 0) {
         // Keep going (startup must not refuse), but keys remain unreadable?
         // Caller reads via loadAuthKeys which will now see loose file.
     }
@@ -859,7 +869,7 @@ fn modeOf(io: std.Io, path: []const u8) !u32 {
     const st = try f.stat(io);
     // `Permissions` carries the file-type bits too (0100644 for a regular
     // file), so only the mode itself is interesting here.
-    return @intFromEnum(st.permissions) & 0o7777;
+    return @backingInt(st.permissions) & 0o7777;
 }
 
 test "writeFileSecure: a leftover 0644 temp file does not publish auth.json at 0644" {
@@ -884,7 +894,7 @@ test "writeFileSecure: a leftover 0644 temp file does not publish auth.json at 0
     // the umask of whoever runs it.
     const tmp = path ++ ".tmp";
     const stale = try std.Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true });
-    stale.setPermissions(io, @enumFromInt(0o644)) catch {};
+    stale.setPermissions(io, @fromBackingInt(@intCast(0o644))) catch {};
     stale.close(io);
     try std.testing.expectEqual(@as(u32, 0o644), try modeOf(io, tmp));
 
@@ -908,7 +918,7 @@ test "tightenPermissions: a 0644 auth.json becomes 0600, a private one is left a
     tightenPermissions(io, "");
 
     const f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-    f.setPermissions(io, @enumFromInt(0o644)) catch {};
+    f.setPermissions(io, @fromBackingInt(@intCast(0o644))) catch {};
     f.close(io);
     try std.testing.expectEqual(@as(u32, 0o644), try modeOf(io, path));
 

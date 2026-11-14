@@ -22,6 +22,10 @@ const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");
 const taskstore = @import("lib/taskstore.zig");
+const hooks_mod = @import("lib/hooks.zig");
+const permrules = @import("lib/permrules.zig");
+const pathsafe = @import("lib/pathsafe.zig");
+const cmdsafety = @import("lib/cmdsafety.zig");
 const kittyKeyboardPush = @import("lib/termseq.zig").kittyKeyboardPush;
 const kittyKeyboardPop = @import("lib/termseq.zig").kittyKeyboardPop;
 const termseq = @import("lib/termseq.zig");
@@ -480,6 +484,11 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // list during a turn. Nothing is written, so nothing can be half-written either.
     var tasks = taskstore.Store{ .gpa = gpa };
     defer bg.deinit(io, gpa);
+    // Permission rules and hooks (Phase 5/6/34): headless is yolo/non-interactive
+    // (no permission dialog), but hooks must still be able to allow/deny/audit tool
+    // use. Load project `.zode/permissions.json` and `.zode/hooks.json` via the
+    // shared agent globals used by the permission/hook helpers.
+    agent.loadPermRules();
 
     // The headless model gets ASKED for too. Without this, `--chat` against a
     // provider with no `default_model` would send `"model": ""` and the server
@@ -935,11 +944,9 @@ fn headlessSystemPrompt(a: std.mem.Allocator, env: ?*const std.process.Environ.M
     // decide X" to the main agent, which is the same decision through another door.
     return try agent.buildSystemPromptFor(a, env);
 }
-/// `tools_mod.execute` plus the background registry.
-///
-/// A thin wrapper and not a change to the signature of `execute`: the registry
-/// lives in the `Model` in the TUI, and a headless run has none, so it is passed
-/// as a parameter that only the caller knows about.
+/// Headless tool execution (Phase 34.14): yolo/non-interactive (no dialog),
+/// but permission rules and hooks (PreToolUse/PostToolUse/PermissionRequest)
+/// are enforced so automated hooks can allow/deny/audit in `--chat`.
 fn execHeadless(
     io: std.Io,
     bg: *bgproc.Registry,
@@ -949,20 +956,145 @@ fn execHeadless(
     args: []const u8,
     arena: std.mem.Allocator,
 ) ![]const u8 {
-    // `read` on a picture goes the same way as in the TUI, through the SAME
-    // function. The first version of the image feature only existed in the TUI's
-    // loop, and `zode --chat` — the runner every pty test drives — happily
-    // returned raw PNG bytes with no error anywhere.
+    // `read` on a picture goes the same way as in the TUI.
     if (std.mem.eql(u8, name, "read")) {
         if (agent.prepareImageFor(arena, io, images, agent.curAnswering(), args)) |res| {
             return res;
         }
     }
-    // NO read cache in the headless runner: it is one turn, one context, and the
-    // cache would only be able to help within it. The headless agent is also where
-    // a "you already have this" answer is most confusing to debug, because there
-    // is no session on screen to compare against.
-    return tools_mod.executeWith(io, name, args, arena, bg, null, tasks, null);
+
+    const gpa = agent.gpa_global;
+    const subjects = tools_mod.callSubjects(name, args, arena);
+
+    // Bash: refuse commands that require an interactive TTY the harness cannot provide.
+    if (std.mem.eql(u8, name, "bash")) {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args, .{}) catch null;
+        if (parsed) |pv| {
+            if (pv == .object) {
+                if (pv.object.get("command")) |cmdv| {
+                    if (cmdv == .string) {
+                        const f = cmdsafety.classify(cmdv.string, arena);
+                        if (f.verdict == .forbidden) {
+                            return if (f.why.len > 0)
+                                std.fmt.allocPrint(arena, "refused: {s}\ncommand: {s}", .{ f.why, f.fragment })
+                            else
+                                arena.dupe(u8, "refused: this command requires an interactive TTY the harness does not have.");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Permission rules (deny/allow/dontAsk/ask). Headless is yolo: we do not
+    // prompt, but explicit deny rules must still refuse.
+    const rule_decision = agent.permDecision(name, subjects);
+    if (rule_decision) |d| {
+        switch (d.action) {
+            .allow, .dontAsk => {},
+            .deny => return std.fmt.allocPrint(
+                arena,
+                "refused: the rule `{s}` ({s}) does not allow this.",
+                .{ d.rule.text, d.rule.source.name() },
+            ),
+            .ask => {
+                // No interactive dialog in headless; let PermissionRequest hooks decide below.
+            },
+        }
+    }
+
+    // Dangerous/sensitive paths: in yolo headless we do not prompt, but honor
+    // explicit denials from PermissionRequest hooks when fired.
+    const risky = tools_mod.riskyPaths(name, args, arena);
+
+    // PermissionRequest hooks (34.14): fire for headless runs so hooks can
+    // allow/deny/audit. If a hook denies, refuse. If it allows (or returns ask
+    // in yolo/headless), continue; headless cannot show a dialog.
+    {
+        var detail_buf: [384]u8 = undefined;
+        const arg: []const u8 = if (subjects.len > 0) subjects[0] else "";
+        var detail: []const u8 = if (std.mem.eql(u8, name, "batch"))
+            tools_mod.batchPermissionDetail(args, arena)
+        else
+            std.fmt.bufPrint(&detail_buf, "{s} {s}", .{ name, arg }) catch name;
+        if (std.mem.eql(u8, name, "bash") and arg.len > 0) {
+            const why = cmdsafety.classify(arg, arena).why;
+            if (why.len > 0) detail = std.fmt.allocPrint(arena, "{s} — {s}", .{ detail, why }) catch detail;
+        }
+        if (risky.len > 0) {
+            // Name the first risky path in the hook subject/detail.
+            const v = pathsafe.checkWrite(risky[0]);
+            if (v != .ok) {
+                const w = switch (v) { .dangerous => |d| d.why, else => "" };
+                detail = if (w.len > 0)
+                    std.fmt.allocPrint(arena, "{s} — risky path {s}: {s}", .{ detail, risky[0], w }) catch detail
+                else
+                    std.fmt.allocPrint(arena, "{s} — risky path {s}", .{ detail, risky[0] }) catch detail;
+            }
+        }
+        const hook_subj = if (subjects.len > 0) subjects[0] else detail;
+        const hook_res = hooks_mod.fire(gpa, &agent.hooks_set, .{
+            .event = .PermissionRequest,
+            .tool = name,
+            .subject = hook_subj,
+            .prompt = detail,
+        }, io) catch &[_]hooks_mod.RunResult{};
+        defer if (hook_res.len > 0) hooks_mod.freeResults(gpa, hook_res);
+        if (hooks_mod.permissionDecision(hook_res)) |pd| {
+            if (pd == .deny) {
+                for (hook_res) |r| {
+                    if (!r.ran or r.permission_decision != .deny) continue;
+                    const reason = if (r.system_message.len > 0) r.system_message else if (r.additional_context.len > 0) r.additional_context else r.output;
+                    if (reason.len > 0) {
+                        return std.fmt.allocPrint(arena, "denied by PermissionRequest hook: {s}", .{reason});
+                    }
+                }
+                return arena.dupe(u8, "denied by PermissionRequest hook");
+            }
+            // allow/ask: continue (headless is yolo/non-interactive).
+        }
+    }
+
+    // PreToolUse hooks: may block or update tool input.
+    var exec_args: []const u8 = args;
+    {
+        const hook_subj = if (subjects.len > 0) subjects[0] else args;
+        const pre_res = hooks_mod.fire(gpa, &agent.hooks_set, .{
+            .event = .PreToolUse,
+            .tool = name,
+            .subject = hook_subj,
+            .prompt = args,
+        }, io) catch &[_]hooks_mod.RunResult{};
+        defer if (pre_res.len > 0) hooks_mod.freeResults(gpa, pre_res);
+        if (hooks_mod.blockedReason(gpa, pre_res, .PreToolUse) catch null) |reason| {
+            defer gpa.free(reason);
+            return std.fmt.allocPrint(arena, "blocked by PreToolUse hook: {s}", .{reason});
+        }
+        if (hooks_mod.updatedInput(pre_res)) |ui| {
+            exec_args = arena.dupe(u8, ui) catch args;
+        }
+    }
+
+    // Execute the tool.
+    var res = try tools_mod.executeWith(io, name, exec_args, arena, bg, null, tasks, null);
+
+    // PostToolUse hooks: append non-blocking notes/context to the tool result.
+    {
+        const hook_subj = if (subjects.len > 0) subjects[0] else exec_args;
+        const post_res = hooks_mod.fire(gpa, &agent.hooks_set, .{
+            .event = .PostToolUse,
+            .tool = name,
+            .subject = hook_subj,
+            .prompt = res,
+        }, io) catch &[_]hooks_mod.RunResult{};
+        defer if (post_res.len > 0) hooks_mod.freeResults(gpa, post_res);
+        if (hooks_mod.notesText(gpa, post_res) catch null) |note| {
+            defer gpa.free(note);
+            res = std.fmt.allocPrint(arena, "{s}\n[hook note] {s}", .{ res, note }) catch res;
+        }
+    }
+
+    return res;
 }
 
 /// TUI mode: zode (no args)

@@ -13,6 +13,8 @@ pub const parseMemory = core.parseMemory;
 pub const matches = core.matches;
 pub const ConsultResult = core.ConsultResult;
 pub const consult = core.consult;
+pub const scoreMatch = core.scoreMatch;
+pub const stalenessNote = core.stalenessNote;
 pub const renderEntry = core.renderEntry;
 pub const renderList = core.renderList;
 
