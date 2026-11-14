@@ -299,20 +299,50 @@ pub const Palette = struct {
         const focus = self.column();
         for (0..2) |c| {
             self.filtered[c].clearRetainingCapacity();
-            for (self.items, 0..) |it, i| {
-                const in_col: bool = if (single)
-                    c == 0
-                else if (c == 0)
-                    (it.kind == .provider or it.kind == .connect)
-                else
-                    (it.kind == .model);
-                if (!in_col) continue;
-                if (!single and c != focus and q.len > 0) {
-                    self.filtered[c].append(self.gpa, @intCast(i)) catch return;
-                    continue;
+            const filter_col = single or c == focus or q.len == 0;
+            if (filter_col and q.len > 0) {
+                const Scored = struct { idx: u32, score: i32 };
+                var scored: std.ArrayList(Scored) = .empty;
+                defer scored.deinit(self.gpa);
+                for (self.items, 0..) |it, i| {
+                    const in_col: bool = if (single)
+                        c == 0
+                    else if (c == 0)
+                        (it.kind == .provider or it.kind == .connect)
+                    else
+                        (it.kind == .model);
+                    if (!in_col) continue;
+                    if (!matches(it, self.groups, q)) continue;
+                    scored.append(self.gpa, .{ .idx = @intCast(i), .score = matchScore(it, self.groups, q) }) catch return;
                 }
-                if (!matches(it, self.groups, q)) continue;
-                self.filtered[c].append(self.gpa, @intCast(i)) catch return;
+                // Best first; ties keep the original order (stable insertion sort)
+                // so equal-scoring rows do not jump between keystrokes.
+                var si: usize = 1;
+                while (si < scored.items.len) : (si += 1) {
+                    const key = scored.items[si];
+                    var j = si;
+                    while (j > 0 and scored.items[j - 1].score < key.score) : (j -= 1) {
+                        scored.items[j] = scored.items[j - 1];
+                    }
+                    scored.items[j] = key;
+                }
+                for (scored.items) |s| self.filtered[c].append(self.gpa, s.idx) catch return;
+            } else {
+                for (self.items, 0..) |it, i| {
+                    const in_col: bool = if (single)
+                        c == 0
+                    else if (c == 0)
+                        (it.kind == .provider or it.kind == .connect)
+                    else
+                        (it.kind == .model);
+                    if (!in_col) continue;
+                    if (!single and c != focus and q.len > 0) {
+                        self.filtered[c].append(self.gpa, @intCast(i)) catch return;
+                        continue;
+                    }
+                    if (!matches(it, self.groups, q)) continue;
+                    self.filtered[c].append(self.gpa, @intCast(i)) catch return;
+                }
             }
         }
         for (0..2) |c| {
@@ -428,6 +458,26 @@ pub fn matches(item: Item, groups: []const Group, q: []const u8) bool {
     var buf: [64]u32 = undefined;
     if (fuzzyMatch(item.label, q, &buf) != null) return true;
     return false;
+}
+
+/// Score for ordering filtered results. Higher is better. Label matches
+/// (prefix/substring/fuzzy) use the shared fuzzy scorer so exact matches win;
+/// hint/group-only matches get a modest score so they appear after label hits.
+fn matchScore(item: Item, groups: []const Group, q: []const u8) i32 {
+    if (q.len == 0) return 0;
+    var buf: [64]u32 = undefined;
+    if (highlightPositions(item.label, q, &buf)) |n| {
+        return fuzzy.score(item.label, q, n, buf[0..n]);
+    }
+    if (fuzzyMatch(item.label, q, &buf)) |n| {
+        return fuzzy.score(item.label, q, n, buf[0..n]);
+    }
+    var s: i32 = 0;
+    if (item.hint.len > 0 and containsIgnoreCase(item.hint, q)) s = @max(s, 120);
+    for (groups, 0..) |g, i| {
+        if (i + 1 == item.group and containsIgnoreCase(g.name, q)) s = @max(s, 80);
+    }
+    return s;
 }
 
 // ── fuzzy matching ────────────────────────────────────────────

@@ -2922,6 +2922,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "inspect")) {
         commands_mod.cmdInspect(m, arg);
+    } else if (std.mem.eql(u8, cmd, "tasks")) {
+        commands_mod.cmdTasks(m);
     } else if (std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "workbench")) {
         commands_mod.cmdView(m, arg);
     } else if (std.mem.eql(u8, cmd, "usage")) {

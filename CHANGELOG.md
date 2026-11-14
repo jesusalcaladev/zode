@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add the git workflow module with native GitHub first (git) [`1998ccc5`](https://github.com/jesusalcaladev/zode/commit/1998ccc5)
 - add the /github status command and route the model to it (github) [`f25b91ca`](https://github.com/jesusalcaladev/zode/commit/f25b91ca)
 - refine file intelligence navigation and compact change output (tui) [`d06c2137`](https://github.com/jesusalcaladev/zode/commit/d06c2137)
+- complete phase 33 (picker scoring, notifications, context chart, tasks panel) (tui) [`4f12a4a1`](https://github.com/jesusalcaladev/zode/commit/4f12a4a1)
 
 ### Bug Fixes
 
@@ -70,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add ACP smoke test script (acp) [`9e60750f`](https://github.com/jesusalcaladev/zode/commit/9e60750f)
 - add a pty smoke for the /github command (github) [`ac702c5c`](https://github.com/jesusalcaladev/zode/commit/ac702c5c)
 - pin the paths a person hits without credentials (github) [`cd0f93c8`](https://github.com/jesusalcaladev/zode/commit/cd0f93c8)
-- cover session summary/counters and consistency checkpoints (30.3, 30.5) [`0e676f03`](https://github.com/jesusalcaladev/zode/commit/0e676f03)
+- cover session summary/counters and consistency checkpoints (30.3, 30.5) [`0f32bd73`](https://github.com/jesusalcaladev/zode/commit/0f32bd73)
 
 ### Other
 
@@ -92,6 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add /branch to fork sessions (30.4) [`32c0d9e7`](https://github.com/jesusalcaladev/zode/commit/32c0d9e7)
 - add turn-3 AI title upgrade (30.2) [`efb2760f`](https://github.com/jesusalcaladev/zode/commit/efb2760f)
 - add running summaries and resume counters/checkpoints (30.3, 30.5) [`431272d8`](https://github.com/jesusalcaladev/zode/commit/431272d8)
+- finish phase 30 restore/tests (summaries, counters, checkpoints) [`2b069e13`](https://github.com/jesusalcaladev/zode/commit/2b069e13)
+- harden auth key storage and add passphrase-protected master key [`7027bc08`](https://github.com/jesusalcaladev/zode/commit/7027bc08)
 
 ## [0.2.0] - 2026-11-07
 

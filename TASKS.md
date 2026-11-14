@@ -206,13 +206,13 @@ state, the open bug and the quality bar).
   - [x] Leftmost and **runs win**: "bc" in "a-xbc" highlights the run and not a scattered "b"
   - [x] The matched characters are painted in the accent colour, and the positions are BYTE offsets joined to the painting at the grapheme's first byte
   - [x] The fuzzy is a FALLBACK: an exact match always wins, so the item the user meant is never pushed down
-  - [ ] The list is still in the provider's order, and the reference implementation sorts by score. Ours is deliberate (the free models first), so sorting is a decision and not a port
+  - [x] **33.6** Filtered results sort by match score (exact/prefix/substring/fuzzy, best first; ties keep original order). With no query the list stays in its deliberate order (providers/free-first as provided) so the default ordering is unchanged.
 - [x] **33.7** The picker with a **preview pane** (at the bottom or at the right) — the model preview (context window, price, free) is the most useful picker addition we do not have
   - [x] It has to be a **bottom pane**, not a third column: at 110 columns there is no room for a third one
   - [x] The parser receives the WIDTH (`DiffOpts.width`), because "does it fit" is a question only the width can answer
-- [ ] **33.9** The notifications channel — a transient queue for "the updater restarted", "the IDE connected", "the token budget is nearly gone"; absolutely positioned, so nothing shifts
-- [ ] **33.10** The context visualisation — we compute the numbers; the reference implementation draws a proportional chart per category (system, tools, messages, skills, compaction reserve)
-- [ ] **33.11** The task panel with blockers and priorities — **the data model already exists** (`src/lib/taskstore.zig`: `blocks`/`blocked_by`/`hasOpenBlocker`) and is not surfaced
+- [x] **33.9** The notifications channel — a transient queue for "the updater restarted", "the IDE connected", "the token budget is nearly gone"; absolutely positioned, so nothing shifts (stacked top-right toasts in `src/tui.zig`, `Model.pushNotification`; updater flow emits notifications)
+- [x] **33.10** The context visualisation — we compute the numbers; the reference implementation draws a proportional chart per category (system, tools, messages, skills, compaction reserve) (`/context` shows a proportional breakdown bar and per-category estimates)
+- [x] **33.11** The task panel with blockers and priorities — **the data model already exists** (`src/lib/taskstore.zig`: `blocks`/`blocked_by`/`hasOpenBlocker`) and is now surfaced via `/tasks` (panel view with blocked/ready/in-progress/completed counts, dependency/blocker details, and priority-ordered listing)
 - [x] **33.12** The per-message actions — `shift+↑` targets the message under the cursor; ours has `/copy N` and no per-message targeting
 - [x] **33.13** The transcript search (`/` and `n`/`N`) — our paragraphs are already segmented, so the scan is over the segments, not the cells
 - [x] **33.14** OSC 8 hyperlinks — the paths and the URLs as real links; the detection is ~30 lines and vaxis exposes the cell attributes

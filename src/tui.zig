@@ -66,6 +66,19 @@ pub const StatusKind = enum {
     }
 };
 
+/// 33.9: transient notifications channel (absolutely positioned, no layout shift).
+pub const Notification = struct {
+    text: [160]u8 = undefined,
+    len: usize = 0,
+    frames: u64 = 0,
+
+    pub fn slice(self: *const Notification) []const u8 {
+        return self.text[0..self.len];
+    }
+};
+
+pub const max_notifications: usize = 4;
+
 /// Phase 5 workbench view mode (presentation layer only).
 /// Must not change agent/session/permission/tool runtime behavior.
 pub const ViewMode = enum {
@@ -2002,6 +2015,10 @@ pub const Model = struct {
     /// Toast notification: text shown when user copies to clipboard, and frames remaining.
     copy_toast_text: []const u8 = "",
     copy_toast_frames: u64 = 0,
+
+    /// 33.9: transient notifications channel (absolutely positioned, no layout shift).
+    notifications: [max_notifications]Notification = .{ .{}, .{}, .{}, .{} },
+    notification_len: usize = 0,
 
     environ: ?*const std.process.Environ.Map = null,
     /// The model the footer shows, resolved ONCE and cached here.
@@ -7492,6 +7509,27 @@ pub const Model = struct {
         }
     }
 
+    /// Push a transient notification (33.9). Absolutely positioned; no layout shift.
+    /// Keeps a bounded queue (drops the oldest when full). Safe to call from UI thread.
+    pub fn pushNotification(self: *Model, text: []const u8) void {
+        if (text.len == 0) return;
+        if (self.notification_len == max_notifications) {
+            // Drop oldest: shift left.
+            var i: usize = 1;
+            while (i < self.notification_len) : (i += 1) {
+                self.notifications[i - 1] = self.notifications[i];
+            }
+            self.notification_len -= 1;
+        }
+        var n = &self.notifications[self.notification_len];
+        const nlen = @min(text.len, n.text.len);
+        @memcpy(n.text[0..nlen], text[0..nlen]);
+        n.len = nlen;
+        n.frames = 240; // ~4s at 60fps
+        self.notification_len += 1;
+        self.requestRedraw();
+    }
+
     fn copySelectedText(self: *Model, ctx: *vxfw.EventContext) !void {
         // A PRESS followed by a RELEASE at the same point is a CLICK, not a
         // selection, and it used to fire OSC 52 anyway: `selectedText` on one
@@ -9921,9 +9959,31 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     }
 
     // ── copy toast: top-right, rounded border, ~2 seconds ──
+    var notif_y: u16 = 2;
     if (self.copy_toast_frames > 0) {
         self.copy_toast_frames -= 1;
         drawCopyToast(&p, width, height, self.copy_toast_text);
+        notif_y += 4;
+    }
+
+    // ── transient notifications (33.9): top-right stack, absolutely positioned ──
+    {
+        var i: usize = 0;
+        while (i < self.notification_len) {
+            if (self.notifications[i].frames == 0) {
+                // Remove expired: shift left.
+                var j = i + 1;
+                while (j < self.notification_len) : (j += 1) {
+                    self.notifications[j - 1] = self.notifications[j];
+                }
+                self.notification_len -= 1;
+                continue;
+            }
+            self.notifications[i].frames -= 1;
+            drawNotificationToast(&p, width, height, self.notifications[i].slice(), notif_y);
+            notif_y +|= 4;
+            i += 1;
+        }
     }
 
     return surface;
@@ -9945,6 +10005,28 @@ fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
     // Text, centered.
     const text_x: u16 = toast_x + (toast_w - text_w) / 2;
     _ = p.putText(text_x, toast_y + 1, text, theme.ink);
+}
+
+/// 33.9: transient notification toast, absolutely positioned at (top-right, y).
+fn drawNotificationToast(p: *Painter, width: u16, height: u16, text: []const u8, y: u16) void {
+    if (width < 10 or height < 4) return;
+    const pad: u16 = 2;
+    const toast_h: u16 = 3;
+    if (y + toast_h >= height) return;
+    const max_text_w: u16 = if (width > 2 * pad + 8) width - 2 * pad - 4 else 8;
+    const text_w: u16 = @min(@as(u16, @intCast(@min(text.len, 60))), max_text_w);
+    const toast_w: u16 = @min(@max(text_w + 4, 20), width -| 2 * pad);
+    const toast_x: u16 = width -| toast_w -| pad;
+
+    drawRoundedBox(p, toast_x, y, toast_w, toast_h, theme.code_bg, theme.line_bright);
+
+    // Text, centered and clipped to the box.
+    const inner_w: u16 = if (toast_w > 4) toast_w - 4 else 0;
+    const draw_w: u16 = @min(text_w, inner_w);
+    if (draw_w == 0) return;
+    const text_x: u16 = toast_x + 2 + (inner_w -| draw_w) / 2;
+    const shown = text[0..@min(text.len, draw_w)];
+    _ = p.putText(text_x, y + 1, shown, theme.ink);
 }
 
 /// The prompt. No box, no borders, no top rule of its own: the hairline above

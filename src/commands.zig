@@ -30,6 +30,7 @@ const github_lib = @import("lib/github.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const sandbox_mod = @import("lib/sandbox.zig");
+const taskstore = @import("lib/taskstore.zig");
 
 /// The `/…` commands and the two tables `/help` prints.
 ///
@@ -1109,6 +1110,73 @@ pub fn cmdContext(m: *tui.Model) void {
         .{ sys, hist, turns, budget, pct_budget },
     ) catch "details";
     agent.pushInfoOwned(m, l2);
+
+    // 33.10: proportional context breakdown by category.
+    var cat_system: i64 = 0;
+    var cat_tools: i64 = 0;
+    var cat_messages: i64 = 0;
+    var cat_skills: i64 = 0;
+    for (msgs, 0..) |msg, mi| {
+        const base: i64 = @intCast(msg.content.len / 4 + 4);
+        const tc: i64 = if (msg.tool_calls_json) |tj| @intCast(tj.len / 4 + 8) else 0;
+        if (std.mem.eql(u8, msg.role, "system")) {
+            cat_system += base + tc;
+        } else if (std.mem.eql(u8, msg.role, "tool")) {
+            if (std.mem.indexOf(u8, msg.content, "<skill_content") != null) {
+                cat_skills += base + tc;
+            } else {
+                cat_tools += base + tc;
+            }
+        } else {
+            // user/assistant: count skill blocks as skills, tool call payloads as tools.
+            cat_messages += base;
+            if (msg.tool_calls_json) |_| {
+                // Assistant tool calls are tool-use overhead.
+                cat_tools += tc;
+            }
+            if (std.mem.indexOf(u8, msg.content, "<skill_content") != null) {
+                // Best-effort: skill content embedded in a message.
+                const bump = @min(base, @max(@divTrunc(base, 2), 1));
+                cat_skills += bump;
+                cat_messages -= bump;
+            }
+            _ = mi;
+        }
+    }
+    const cat_reserve: i64 = @max(0, limit - budget);
+    const chart_total: i64 = @max(1, cat_system + cat_tools + cat_messages + cat_skills + cat_reserve);
+    const chart_w: usize = 30;
+    const cats = [_]struct { label: []const u8, val: i64, ch: []const u8 }{
+        .{ .label = "system", .val = cat_system, .ch = "█" },
+        .{ .label = "tools", .val = cat_tools, .ch = "▓" },
+        .{ .label = "messages", .val = cat_messages, .ch = "▒" },
+        .{ .label = "skills", .val = cat_skills, .ch = "░" },
+        .{ .label = "reserve", .val = cat_reserve, .ch = "·" },
+    };
+    var chart_buf: [256]u8 = undefined;
+    var ci: usize = 0;
+    var used_cells: usize = 0;
+    for (cats, 0..) |c, idx| {
+        var cells: usize = @intCast(@divTrunc(c.val * @as(i64, @intCast(chart_w)), chart_total));
+        if (idx == cats.len - 1) {
+            cells = if (chart_w > used_cells) chart_w - used_cells else 0;
+        } else {
+            if (cells == 0 and c.val > 0) cells = 1;
+            if (used_cells + cells > chart_w) cells = chart_w - used_cells;
+        }
+        used_cells += cells;
+        for (0..cells) |_| {
+            if (ci + 3 > chart_buf.len) break;
+            @memcpy(chart_buf[ci .. ci + c.ch.len], c.ch);
+            ci += c.ch.len;
+        }
+    }
+    const l3chart = std.fmt.allocPrint(
+        m.allocator,
+        "  breakdown [{s}] sys ~{d} · tools ~{d} · msgs ~{d} · skills ~{d} · reserve ~{d}",
+        .{ chart_buf[0..ci], cat_system, cat_tools, cat_messages, cat_skills, cat_reserve },
+    ) catch "breakdown";
+    agent.pushInfoOwned(m, l3chart);
     // WHERE the limit came from, because the number is now an automatic: with a
     // fixed 128k you could not tell "the model has 128k" from "zode is budgeting
     // 128k for a 1M model" from "the catalogue was never downloaded", and all
@@ -1596,6 +1664,128 @@ fn runGitCapture(arena: std.mem.Allocator, argv: []const []const u8, limit: usiz
 
 /// `/diff [next|prev]`: uncommitted changes and the current turn's changed-file
 /// diff, or navigate between diff blocks in the timeline.
+/// `/tasks`: task panel with blockers and priorities (33.11).
+pub fn cmdTasks(m: *tui.Model) void {
+    const st = &m.tasks;
+    if (st.count() == 0) {
+        if (st.fresh_after_corrupt) {
+            agent.pushInfo(m, "tasks · no tasks (saved task list could not be read and was started fresh)");
+        } else {
+            agent.pushInfo(m, "tasks · no tasks yet. Use task_create to add the first one.");
+        }
+        return;
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out = std.Io.Writer.Allocating.init(arena);
+    const w = &out.writer;
+
+    if (st.fresh_after_corrupt) {
+        w.writeAll("[saved task list could not be read and was started fresh]\n") catch {};
+    }
+
+    var pending: usize = 0;
+    var in_progress: usize = 0;
+    var completed: usize = 0;
+    var blocked: usize = 0;
+    var ready: usize = 0;
+    for (st.items.items) |t| {
+        switch (t.status) {
+            .pending => pending += 1,
+            .in_progress => in_progress += 1,
+            .completed => completed += 1,
+        }
+        if (t.isOpen()) {
+            if (st.hasOpenBlocker(t.id)) blocked += 1 else ready += 1;
+        }
+    }
+    w.print("tasks · {d} total · {d} in progress · {d} ready · {d} blocked · {d} pending · {d} completed\n", .{
+        st.items.items.len, in_progress, ready, blocked, pending, completed,
+    }) catch {};
+
+    // Priority order for panel: in_progress, then ready pending, then blocked pending, then completed.
+    const Order = struct { idx: usize, rank: u8 };
+    var order: [taskstore.max_tasks]Order = undefined;
+    var n: usize = 0;
+    for (st.items.items, 0..) |t, i| {
+        if (n >= order.len) break;
+        const rank: u8 = switch (t.status) {
+            .in_progress => 0,
+            .pending => if (st.hasOpenBlocker(t.id)) @as(u8, 2) else 1,
+            .completed => 3,
+        };
+        order[n] = .{ .idx = i, .rank = rank };
+        n += 1;
+    }
+    // Stable insertion sort by rank, then by id.
+    var oi: usize = 1;
+    while (oi < n) : (oi += 1) {
+        const key = order[oi];
+        var j = oi;
+        while (j > 0) : (j -= 1) {
+            const prev = order[j - 1];
+            const swap = prev.rank > key.rank or
+                (prev.rank == key.rank and st.items.items[prev.idx].id > st.items.items[key.idx].id);
+            if (!swap) break;
+            order[j] = prev;
+        }
+        order[j] = key;
+    }
+
+    for (order[0..n]) |e| {
+        const t = st.items.items[e.idx];
+        const blocked_now = t.isOpen() and st.hasOpenBlocker(t.id);
+        w.print("#{d} [{s}]", .{ t.id, t.status.name() }) catch {};
+        if (blocked_now) w.writeAll(" [blocked]") catch {};
+        if (t.owner) |o| w.print(" {s}", .{o}) catch {} else w.writeAll(" (unassigned)") catch {};
+        w.print(" — {s}\n", .{t.subject}) catch {};
+
+        // Dependencies/blockers.
+        if (t.blocked_by.items.len > 0) {
+            w.writeAll("   waits on: ") catch {};
+            var first = true;
+            for (t.blocked_by.items) |bid| {
+                if (!first) w.writeAll(", ") catch {};
+                first = false;
+                if (st.get(bid)) |b| {
+                    w.print("#{d} ({s})", .{ bid, b.status.name() }) catch {};
+                } else {
+                    w.print("#{d} (missing)", .{bid}) catch {};
+                }
+            }
+            w.writeAll("\n") catch {};
+        }
+        if (t.blocks.items.len > 0) {
+            w.writeAll("   blocks: ") catch {};
+            var first = true;
+            for (t.blocks.items) |bid| {
+                if (!first) w.writeAll(", ") catch {};
+                first = false;
+                if (st.get(bid)) |b| {
+                    w.print("#{d} ({s})", .{ bid, b.status.name() }) catch {};
+                } else {
+                    w.print("#{d} (missing)", .{bid}) catch {};
+                }
+            }
+            w.writeAll("\n") catch {};
+        }
+        if (t.description.len > 0) {
+            const desc = std.mem.trim(u8, t.description, " \t\r\n");
+            if (desc.len > 0) {
+                const max_desc: usize = 160;
+                const cut = if (desc.len > max_desc) desc[0..max_desc] else desc;
+                w.print("   note: {s}{s}\n", .{ cut, if (desc.len > max_desc) "…" else "" }) catch {};
+            }
+        }
+    }
+
+    const text = out.written();
+    const owned = m.allocator.dupe(u8, text) catch return;
+    agent.pushInfoOwned(m, owned);
+}
+
 /// `/inspect [context|git|session]`: read-only workbench inspector (Phase 5).
 /// Presentation layer over shared runtime state; never invents state/stats.
 pub fn cmdInspect(m: *tui.Model, arg: ?[]const u8) void {
@@ -1974,6 +2164,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/resume", .desc = "resume the last session" },
     .{ .key = "/context", .desc = "tokens used vs budget, and what compaction will do" },
     .{ .key = "/inspect", .desc = "workbench inspector (runtime-truth): overview | context|git|session", .key_hint = "context|git|session", .palette_visible = true },
+    .{ .key = "/tasks", .desc = "task panel with blockers and priorities (task graph)", .palette_visible = true },
     .{ .key = "/view", .desc = "workbench view mode (presentation only): normal|focus|flow|review", .key_hint = "normal|focus|flow|review", .palette_visible = true },
     .{ .key = "/doctor", .desc = "diagnosis: model, effort, style, permissions, key, compaction, sessions" },
     .{ .key = "/config", .desc = "effective configuration: limits, budgets, compact thresholds, recent window" },
@@ -3284,21 +3475,28 @@ fn announceUpdate(m: *tui.Model, up: selfupdate.Update) void {
     var buf: [160]u8 = undefined;
     const phrase = selfupdate.phrase(&buf, up);
     m.pushInfoFmt("zode {s} · /update installs it", .{phrase});
+    m.pushNotification(phrase);
 }
 
 fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
     m.pushInfoFmt("updating zode from {s}…", .{selfupdate.current_version});
+    m.pushNotification("Updating zode…");
     const tag = selfupdate.installLatest(ctx) catch |err| switch (err) {
         error.AlreadyNewest => {
             m.pushInfoFmt("zode {s} is already the newest release", .{selfupdate.current_version});
+            m.pushNotification("zode is already up to date");
             return;
         },
         else => {
             m.pushErrorFmt("update failed: {s}", .{updateErrorPhrase(err)});
+            m.pushNotification("Update failed");
             return;
         },
     };
+    var nbuf: [160]u8 = undefined;
+    const note = std.fmt.bufPrint(&nbuf, "Updated to {s} · restart zode", .{tag}) catch "Updated · restart zode";
     m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
+    m.pushNotification(note);
 }
 
 fn updateErrorPhrase(err: selfupdate.InstallError) []const u8 {
