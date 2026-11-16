@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete phase 9 with both layouts and Settings integration (agents) [`fc5cc42d`](https://github.com/jesusalcaladev/zode/commit/fc5cc42d)
 - complete phase 32 (three-way count, advisor, spend gate, idle stability) (verify) [`9f330046`](https://github.com/jesusalcaladev/zode/commit/9f330046)
 - complete phase 23 (whitelisted config tool) (config) [`1e917004`](https://github.com/jesusalcaladev/zode/commit/1e917004)
-- complete phase 8 (prompt-cache break detection) (cache) [`3c0d1b05`](https://github.com/jesusalcaladev/zode/commit/3c0d1b05)
+- complete phase 8 (prompt-cache break detection) (cache) [`c4b9cf00`](https://github.com/jesusalcaladev/zode/commit/c4b9cf00)
 
 ### Bug Fixes
 
@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - document the native GitHub integration (github) [`2df603d0`](https://github.com/jesusalcaladev/zode/commit/2df603d0)
 - clean up README with clearer structure and docs references [`a1d52413`](https://github.com/jesusalcaladev/zode/commit/a1d52413)
 - refresh TUI invariants and task/command documentation [`47c27a05`](https://github.com/jesusalcaladev/zode/commit/47c27a05)
+- mark phase 17 (notebook editing) complete (tasks) [`b05268a2`](https://github.com/jesusalcaladev/zode/commit/b05268a2)
 
 ### Refactors
 
