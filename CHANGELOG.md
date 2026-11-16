@@ -33,7 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add the /github status command and route the model to it (github) [`f25b91ca`](https://github.com/jesusalcaladev/zode/commit/f25b91ca)
 - refine file intelligence navigation and compact change output (tui) [`d06c2137`](https://github.com/jesusalcaladev/zode/commit/d06c2137)
 - complete phase 33 (picker scoring, notifications, context chart, tasks panel) (tui) [`d666861e`](https://github.com/jesusalcaladev/zode/commit/d666861e)
-- interactive Settings screen, team mode, roles, model cache TTL and image input [`5e78c3c1`](https://github.com/jesusalcaladev/zode/commit/5e78c3c1)
+- interactive Settings screen, team mode, roles, model cache TTL and image input [`ff57591e`](https://github.com/jesusalcaladev/zode/commit/ff57591e)
+- complete phase 9 with both layouts and Settings integration (agents) [`a7021211`](https://github.com/jesusalcaladev/zode/commit/a7021211)
 
 ### Bug Fixes
 

@@ -22,14 +22,13 @@ pub fn ensureAgentDefs(
     project_cwd: []const u8,
 ) []const agentdefs.Entry {
     if (agent_defs_cache) |defs| return defs;
+
     var roots: std.ArrayList([]u8) = .empty;
     defer roots.deinit(gpa);
     var proj_buf: [std.fs.max_path_bytes]u8 = undefined;
     const proj_path = std.fmt.bufPrint(&proj_buf, "{s}/{s}", .{ project_cwd, agentdefs.project_dir }) catch "";
     if (proj_path.len > 0) {
-        if (gpa.dupe(u8, proj_path)) |pc| {
-            roots.append(gpa, pc) catch gpa.free(pc);
-        } else |_| {}
+        if (gpa.dupe(u8, proj_path)) |pc| roots.append(gpa, pc) catch gpa.free(pc) else |_| {}
     }
     if (env) |e| {
         if (e.get("HOME")) |home| {
@@ -37,103 +36,125 @@ pub fn ensureAgentDefs(
                 var user_buf: [std.fs.max_path_bytes]u8 = undefined;
                 const user_path = std.fmt.bufPrint(&user_buf, "{s}/{s}/{s}", .{ home, ".config", agentdefs.user_subdir }) catch "";
                 if (user_path.len > 0) {
-                    if (gpa.dupe(u8, user_path)) |uc| {
-                        roots.append(gpa, uc) catch gpa.free(uc);
-                    } else |_| {}
+                    if (gpa.dupe(u8, user_path)) |uc| roots.append(gpa, uc) catch gpa.free(uc) else |_| {}
                 }
             }
         }
     }
+
     var entries: std.ArrayList(agentdefs.Entry) = .empty;
     defer entries.deinit(gpa);
+    // `seen` is keyed by NAME. Project roots are first, so a project definition
+    // shadows a user one with the same name; within one root a directory shadows
+    // a flat file only if it comes first in the iteration (it does — dirs are
+    // visited before flat files in `scanRoot`).
     var seen: std.ArrayList([]u8) = .empty;
     defer seen.deinit(gpa);
-    for (roots.items) |root| {
-        var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
-        defer dir.close(io);
-        var it = dir.iterate();
-        while (it.next(io) catch null) |entry| {
-            if (entry.kind != .directory) continue;
-            if (entry.name.len == 0 or entry.name[0] == '.') continue;
-            var already = false;
-            for (seen.items) |s| {
-                if (std.mem.eql(u8, s, entry.name)) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
-            const name_copy = gpa.dupe(u8, entry.name) catch continue;
-            seen.append(gpa, name_copy) catch {
-                gpa.free(name_copy);
-                continue;
-            };
-            var file_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const file_path = std.fmt.bufPrint(&file_buf, "{s}/{s}/AGENT.md", .{ root, entry.name }) catch {
-                gpa.free(name_copy);
-                continue;
-            };
-            const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, gpa, .limited(64 * 1024)) catch {
-                gpa.free(name_copy);
-                continue;
-            };
-            const fm = agentdefs.splitFrontmatter(text) orelse {
-                gpa.free(text);
-                gpa.free(name_copy);
-                continue;
-            };
-            var tools: [][]const u8 = &[_][]const u8{};
-            if (fm.meta.tools.len > 0) {
-                tools = agentdefs.parseTools(fm.meta.tools, gpa) catch {
-                    gpa.free(text);
-                    gpa.free(name_copy);
-                    continue;
-                };
-            }
-            if (!agentdefs.toolsAreReadOnly(tools)) {
-                gpa.free(text);
-                gpa.free(name_copy);
-                continue;
-            }
-            const desc_dup = gpa.dupe(u8, fm.meta.description) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                continue;
-            };
-            const model_dup = if (fm.meta.model.len > 0) gpa.dupe(u8, fm.meta.model) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                gpa.free(desc_dup);
-                continue;
-            } else "";
-            const effort_dup = if (fm.meta.effort.len > 0) gpa.dupe(u8, fm.meta.effort) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                gpa.free(desc_dup);
-                gpa.free(model_dup);
-                continue;
-            } else "";
-            entries.append(gpa, agentdefs.Entry{
-                .name = name_copy,
-                .description = desc_dup,
-                .tools = tools,
-                .model = model_dup,
-                .effort = effort_dup,
-                .path = file_path,
-                .source = if (std.mem.startsWith(u8, root, project_cwd) and project_cwd.len > 0) "project" else "user",
-            }) catch {
-                gpa.free(text);
-                gpa.free(name_copy);
-                gpa.free(desc_dup);
-                if (model_dup.len > 0) gpa.free(model_dup);
-                if (effort_dup.len > 0) gpa.free(effort_dup);
-                continue;
-            };
-            gpa.free(text);
-        }
-    }
+
+    for (roots.items) |root| scanRoot(gpa, io, root, project_cwd, &entries, &seen);
+
     agent_defs_cache = entries.toOwnedSlice(gpa) catch null;
     return agent_defs_cache.?;
+}
+
+/// Scans one root for both layouts. The directory layout is visited first so
+/// `<name>/AGENT.md` wins over a flat `<name>.md` in the same root.
+fn scanRoot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    project_cwd: []const u8,
+    entries: *std.ArrayList(agentdefs.Entry),
+    seen: *std.ArrayList([]u8),
+) void {
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    // Pass 1: directories containing AGENT.md.
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        addDefinition(gpa, io, root, project_cwd, entry.name, true, entries, seen);
+    }
+    // Pass 2: flat `<name>.md` files.
+    var it2 = dir.iterate();
+    while (it2.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const stem = agentdefs.flatStem(entry.name) orelse continue;
+        addDefinition(gpa, io, root, project_cwd, stem, false, entries, seen);
+    }
+}
+
+/// Adds one definition if its name has not been claimed yet. Owns every string
+/// it puts into `entries`; frees everything on any refusal.
+fn addDefinition(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    project_cwd: []const u8,
+    name: []const u8,
+    is_dir: bool,
+    entries: *std.ArrayList(agentdefs.Entry),
+    seen: *std.ArrayList([]u8),
+) void {
+    if (!agentdefs.validName(name)) return;
+    for (seen.items) |s| {
+        if (std.mem.eql(u8, s, name)) return;
+    }
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = if (is_dir)
+        std.fmt.bufPrint(&path_buf, "{s}/{s}/AGENT.md", .{ root, name }) catch return
+    else
+        std.fmt.bufPrint(&path_buf, "{s}/{s}.md", .{ root, name }) catch return;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, gpa, .limited(64 * 1024)) catch return;
+    defer gpa.free(text);
+
+    const fm = agentdefs.splitFrontmatter(text) orelse return;
+    // The frontmatter `name`, when present, is authoritative for routing; the
+    // directory/file stem is the fallback. A mismatch is tolerated (the body
+    // still loads) but the frontmatter name wins.
+    const def_name = if (agentdefs.validName(fm.meta.name)) fm.meta.name else name;
+    for (seen.items) |s| {
+        if (std.mem.eql(u8, s, def_name)) return;
+    }
+
+    var tools: [][]const u8 = &[_][]const u8{};
+    if (fm.meta.tools.len > 0) {
+        tools = agentdefs.parseTools(fm.meta.tools, gpa) catch return;
+    }
+    if (!agentdefs.toolsAreReadOnly(tools)) {
+        gpa.free(tools);
+        return;
+    }
+
+    const name_copy = gpa.dupe(u8, def_name) catch return;
+    errdefer gpa.free(name_copy);
+    const path_copy = gpa.dupe(u8, file_path) catch return;
+    errdefer gpa.free(path_copy);
+    const desc = gpa.dupe(u8, fm.meta.description) catch return;
+    errdefer gpa.free(desc);
+    const model = if (fm.meta.model.len > 0) gpa.dupe(u8, fm.meta.model) catch "" else "";
+    const effort = if (fm.meta.effort.len > 0) gpa.dupe(u8, fm.meta.effort) catch "" else "";
+
+    seen.append(gpa, name_copy) catch return;
+    entries.append(gpa, .{
+        .name = name_copy,
+        .description = desc,
+        .tools = tools,
+        .model = model,
+        .effort = effort,
+        .path = path_copy,
+        .source = if (project_cwd.len > 0 and std.mem.startsWith(u8, root, project_cwd)) "project" else "user",
+    }) catch {
+        _ = seen.pop();
+        gpa.free(name_copy);
+        gpa.free(path_copy);
+        gpa.free(desc);
+        if (model.len > 0) gpa.free(model);
+        if (effort.len > 0) gpa.free(effort);
+        gpa.free(tools);
+    };
 }
 
 // ── skills ────────────────────────────────────────────────────────────────

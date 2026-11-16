@@ -409,6 +409,27 @@ pub var current_style: ?[]const u8 = null;
 pub var current_style_buf: [128]u8 = undefined;
 pub var current_style_len: usize = 0;
 
+/// Default agent definition (Phase 9) used when `task` names no `definition`.
+/// Loaded from `settings.active_agent` in config.json at startup; empty means
+/// no default. Kept in a fixed buffer so it never dangles.
+pub var active_agent_buf: [64]u8 = undefined;
+pub var active_agent_len: usize = 0;
+
+pub fn active_agent_name() ?[]const u8 {
+    return if (active_agent_len > 0) active_agent_buf[0..active_agent_len] else null;
+}
+
+pub fn setActiveAgent(m: *tui.Model, name: []const u8) void {
+    if (name.len == 0 or name.len > active_agent_buf.len) {
+        active_agent_len = 0;
+        m.pushInfo("· default agent cleared (task uses its built-in behavior)");
+        return;
+    }
+    @memcpy(active_agent_buf[0..name.len], name);
+    active_agent_len = name.len;
+    m.pushInfoFmt("· default agent → {s}", .{name});
+}
+
 /// Permission mode: false = asks before write/edit/bash, true = auto.
 pub var yolo: bool = false;
 
@@ -1525,6 +1546,14 @@ pub fn loadUserConfig() void {
     if (cfg_arena_state == null) {
         cfg_arena_state = std.heap.ArenaAllocator.init(gpa_global);
         user_config = config_mod.load(cfg_arena_state.?.allocator(), io_global, environ_global);
+
+        // Phase 9: the default agent definition from settings.active_agent.
+        if (user_config.settings.active_agent) |name| {
+            if (agentdefs.validName(name) and name.len <= active_agent_buf.len) {
+                @memcpy(active_agent_buf[0..name.len], name);
+                active_agent_len = name.len;
+            }
+        }
 
         // Precedence order: config.json > ZODE_PROVIDER > opencode.
         // (ZODE_PROVIDER used to be ignored in the TUI: it stayed on "opencode"
@@ -8115,6 +8144,17 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
         capStoreAppendToolResult(m, s, call.id, "task", subagentBadArgsText, arena, budget);
         return 1;
     };
+
+    // Phase 9: a default agent definition (settings.active_agent) applies when
+    // the model did not name one explicitly. An explicit name always wins.
+    if (task.definition.len == 0) {
+        if (active_agent_name()) |def_name| {
+            const defs = ensureAgentDefs(m.allocator, io_global, m.environ);
+            if (agentdefs.find(defs, def_name) != null) {
+                task.definition = def_name;
+            }
+        }
+    }
 
     // Phase 9: if the task names an agent definition, look it up and apply its
     // tools/model/effort. The definition's tools must be read-only — a
@@ -18771,4 +18811,54 @@ test "withPendingImages: a no-vision model gets NO image bytes on the wire" {
     try std.testing.expectEqual(@as(u8, 0), out[0].images.len);
     // The images were DROPPED, not left pending for a later request.
     try std.testing.expectEqual(@as(u8, 0), m.pending_images.len);
+}
+
+/// Settings → Agent definitions → "New agent…": create a flat definition from
+/// the template under `.zode/agents/<name>.md`, then open it in $EDITOR so the
+/// user can fill it in immediately. Name is generated (agent-1, agent-2, …) to
+/// avoid an interactive prompt inside the screen; the frontmatter is editable.
+pub fn createAgentFromSettings(m: *tui.Model) void {
+    if (!m.io_ready) return;
+    const gpa = m.allocator;
+    const io = m.io;
+
+    const defs = ensureAgentDefs(gpa, io, m.environ);
+    var n: usize = 1;
+    var name_buf: [32]u8 = undefined;
+    var name: []const u8 = "";
+    while (n <= 999) : (n += 1) {
+        const candidate = std.fmt.bufPrint(&name_buf, "agent-{d}", .{n}) catch break;
+        if (agentdefs.find(defs, candidate) == null) {
+            name = candidate;
+            break;
+        }
+    }
+    if (name.len == 0) {
+        m.pushInfo("· could not pick a free agent name (too many definitions)");
+        return;
+    }
+
+    const dir = std.fmt.allocPrint(gpa, "{s}/{s}", .{ project_info.cwd(), agentdefs.project_dir }) catch return;
+    defer gpa.free(dir);
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {
+        m.pushInfo("· could not create .zode/agents (check directory permissions)");
+        return;
+    };
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}.md", .{ dir, name }) catch return;
+    defer gpa.free(path);
+    const body = agentdefs.template(name) catch return;
+    defer gpa.free(body);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body }) catch {
+        m.pushInfo("· could not write the new agent definition");
+        return;
+    };
+    resetAgentDefs();
+    m.pushInfoFmt("· agent \"{s}\" created at .zode/agents/{s}.md — edit it with ! vi", .{ name, name });
+
+    // We do NOT spawn $EDITOR here: doing it correctly means restoring the
+    // alt-screen, raw mode and mouse capture, then re-arming them, and a failure
+    // in the middle leaves a broken terminal. The file is ready on disk — the
+    // user can edit it with `! vi .zode/agents/<name>.md` or from their shell.
+    resetAgentDefs();
+    m.requestRedraw();
 }

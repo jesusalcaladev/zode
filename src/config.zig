@@ -43,6 +43,8 @@ pub const Settings = struct {
     color_palette: ?[]const u8 = null,
     vim_mode: ?bool = null,
     nerd_icons: ?[]const u8 = null,
+    /// Default agent definition used by `task` when no `definition` is given.
+    active_agent: ?[]const u8 = null,
 };
 
 pub const Config = struct {
@@ -246,6 +248,9 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
             }
             if (so.get("nerd_icons")) |v| {
                 if (v == .string) cfg.settings.nerd_icons = try arena.dupe(u8, v.string);
+            }
+            if (so.get("active_agent")) |v| {
+                if (v == .string) cfg.settings.active_agent = try arena.dupe(u8, v.string);
             }
         }
     }
@@ -752,13 +757,14 @@ fn settingValue(v: Settings, key: []const u8, arena: std.mem.Allocator) ?std.jso
     if (std.mem.eql(u8, key, "color_palette")) if (v.color_palette) |s| return .{ .string = arena.dupe(u8, s) catch return null };
     if (std.mem.eql(u8, key, "vim_mode")) if (v.vim_mode) |b| return .{ .bool = b };
     if (std.mem.eql(u8, key, "nerd_icons")) if (v.nerd_icons) |s| return .{ .string = arena.dupe(u8, s) catch return null };
+    if (std.mem.eql(u8, key, "active_agent")) if (v.active_agent) |s| return .{ .string = arena.dupe(u8, s) catch return null };
     return null;
 }
 
 const setting_keys = [_][]const u8{
     "output_style", "effort", "permission_mode", "compaction", "task_parallel",
     "max_iter", "context_limit", "auto_check", "web_allow_local", "prompt_cache",
-    "read_cache_bytes", "color_palette", "vim_mode", "nerd_icons",
+    "read_cache_bytes", "color_palette", "vim_mode", "nerd_icons", "active_agent",
 };
 
 /// Patches ONLY the `"settings"` object of `~/.config/zode/config.json`.

@@ -29,6 +29,7 @@ const bgproc = @import("bgproc.zig");
 const github_lib = @import("lib/github.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const configmenu = @import("lib/configmenu.zig");
+const agentdefs = @import("lib/agentdefs.zig");
 const common = @import("tools/common.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const sandbox_mod = @import("lib/sandbox.zig");
@@ -312,7 +313,19 @@ pub fn cmdAgents(m: *tui.Model) void {
     agent.pushInfoOwned(m, gpa.dupe(u8, "agents  ·  subagent/task configuration") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  current: task subagent (general-purpose), depth 1, effort low, 24k budget, restricted/read-oriented tool set, no conversation history") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  parallel cap: ZODE_TASK_PARALLEL (default 3; see env/config)") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  definitions on disk (Phase 9): .zode/agents/<name>/AGENT.md and ~/.config/zode/agents/<name>/AGENT.md") catch return);
+    var defs: []const agentdefs.Entry = &.{};
+    if (m.io_ready) defs = agent.ensureAgentDefs(gpa, m.io, m.environ);
+    if (defs.len == 0) {
+        agent.pushInfoOwned(m, gpa.dupe(u8, "  definitions on disk (Phase 9): none (open /config → Agent definitions to create one)") catch return);
+    } else {
+        for (defs) |d| {
+            agent.pushInfoOwned(m, std.fmt.allocPrint(gpa,
+                "  · {s} [{s}] — {s}",
+                .{ d.name, d.source, if (d.description.len > 0) d.description else "no description" },
+            ) catch return);
+        }
+    }
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  layouts: .zode/agents/<name>.md or <name>/AGENT.md (project overrides user)") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  built-in roles (Phase 26): explore / plan / verify via task(role=…)") catch return);
     const team_summary = m.team.summary(gpa) catch "";
     defer gpa.free(team_summary);
@@ -894,7 +907,17 @@ pub fn settingsValue(m: *tui.Model, s: configmenu.Setting) []const u8 {
         .color_palette => gpa.dupe(u8, if (theme.caps.daltonized) "daltonized" else "default") catch "",
         .vim_mode => gpa.dupe(u8, if (m.vim_mode) "on" else "off") catch "",
         .nerd_icons => gpa.dupe(u8, if (m.nerd_icons) "on" else "off") catch "",
+        .active_agent => activeAgentValue(m),
+        .new_agent => gpa.dupe(u8, "enter to create") catch "",
     };
+}
+
+/// The default agent definition name, from config.json or the "none" label.
+fn activeAgentValue(m: *tui.Model) []const u8 {
+    if (agent.active_agent_name()) |name| {
+        return m.allocator.dupe(u8, name) catch "none";
+    }
+    return m.allocator.dupe(u8, "none") catch "none";
 }
 
 fn formatBytes(n: usize) []const u8 {
@@ -945,6 +968,7 @@ fn persistSettings(m: *tui.Model) void {
     s.color_palette = if (theme.caps.daltonized) "daltonized" else "default";
     s.vim_mode = m.vim_mode;
     s.nerd_icons = if (m.nerd_icons) "on" else "off";
+    s.active_agent = if (agent.active_agent_name()) |name| m.allocator.dupe(u8, name) catch null else null;
     config_mod.patchSettings(m.io, m.environ, s) catch {};
 }
 
@@ -979,6 +1003,8 @@ pub fn applySettingValue(m: *tui.Model, s: configmenu.Setting, value: []const u8
         .color_palette => cmdColor(m, value),
         .vim_mode => cmdVim(m),
         .nerd_icons => m.nerd_icons = std.mem.eql(u8, value, "on"),
+        .active_agent => agent.setActiveAgent(m, value),
+        .new_agent => return, // handled by the row handler (opens an editor)
     }
     if (s.persisted()) persistSettings(m);
 }
@@ -987,6 +1013,13 @@ pub fn applySettingValue(m: *tui.Model, s: configmenu.Setting, value: []const u8
 pub fn applySettingsRow(m: *tui.Model, s: configmenu.Setting, action: SettingsAction) void {
     switch (s.kind()) {
         .info => return,
+        .action => {
+            if (s == .new_agent and action == .enter) {
+                m.settingsClose();
+                agent.createAgentFromSettings(m);
+            }
+            return;
+        },
         .palette => {
             if (action != .enter) return;
             m.settingsClose();
@@ -995,6 +1028,35 @@ pub fn applySettingsRow(m: *tui.Model, s: configmenu.Setting, action: SettingsAc
         },
         .picker, .toggle => {},
     }
+
+    // `active_agent` is a DYNAMIC picker: its options are the definitions that
+    // exist on disk, including "none". Built from the same discovery the `task`
+    // tool uses, so the list cannot drift from what is actually available.
+    if (s == .active_agent) {
+        const defs = agent.ensureAgentDefs(m.allocator, m.io, m.environ);
+        const current = settingsValue(m, s);
+        defer m.allocator.free(current);
+        var idx: usize = 0; // 0 = "none"
+        for (defs, 0..) |d, i| {
+            if (std.mem.eql(u8, d.name, current)) {
+                idx = i + 1;
+                break;
+            }
+        }
+        const total = defs.len + 1;
+        const next = switch (action) {
+            .enter, .next => (idx + 1) % total,
+            .prev => if (idx == 0) total - 1 else idx - 1,
+        };
+        if (next == 0) {
+            agent.setActiveAgent(m, "");
+        } else {
+            agent.setActiveAgent(m, defs[next - 1].name);
+        }
+        persistSettings(m);
+        return;
+    }
+
     const current = settingsValue(m, s);
     defer m.allocator.free(current);
     const opts = configmenu.optionsFor(s);

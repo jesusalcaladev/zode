@@ -42,7 +42,7 @@ state, the open bug and the quality bar).
 
 ---
 
-**Phase 9 (Agent definitions on disk)** is complete: definitions load from `.zode/agents/<name>/AGENT.md` (project) and `~/.config/zode/agents/<name>/AGENT.md` (user) with frontmatter (`name`, `description`, `tools`, `model`, `effort`), read-only tool validation, project-over-user shadowing, cached discovery, and pure tests (`src/lib/agentdefs.zig`, wired via `src/agent/discovery.zig`).
+**Phase 9 (Agent definitions on disk)** is complete: definitions load from BOTH `.zode/agents/<name>.md` (flat, the common case) and `.zode/agents/<name>/AGENT.md` (directory), and the same under `~/.config/zode/agents/`; frontmatter (`name`, `description`, `tools`, `model`, `effort`) is parsed and validated (read-only tools only, no escalation); project shadows user by name and a directory shadows a flat file in the same root; discovery is cached and resettable. The Settings screen has an **Agent definitions** section: `Default agent` (persisted as `settings.active_agent` in config.json, applied by `task` when no definition is named) and `New agent…` (creates `.zode/agents/<name>.md` from a pure template). `/agents` lists the real discovered definitions. Pure tests cover name validation, flat stems, frontmatter, tool validation, template and discovery (`src/lib/agentdefs.zig`, `src/agent/discovery.zig`).
 
 ---
 

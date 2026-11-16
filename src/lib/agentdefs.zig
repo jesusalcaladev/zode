@@ -1,13 +1,43 @@
-//! Agent definitions on disk: `.zode/agents/*.md` (project) and
-//! `~/.config/zode/agents/*.md` (user), with frontmatter `name`, `description`,
-//! `tools`, `model`, `effort`.
+//! Agent definitions on disk (Phase 9, complete).
 //!
-//! Pure on purpose: discovery, parsing and validation are testable without
-//! touching the real filesystem beyond reading the fixture files the tests
-//! provide.
+//! TWO layouts are supported, both discovered by `discovery.zig`:
+//!
+//!   .zode/agents/<name>/AGENT.md      (directory, allows extra files beside it)
+//!   .zode/agents/<name>.md            (flat file, the common case)
+//!
+//! and the same under `~/.config/zode/agents/`. Project shadows user by name;
+//! a flat file and a directory with the same name are ONE definition (the
+//! directory wins). Frontmatter keys: `name`, `description`, `tools`, `model`,
+//! `effort`. Only read-only tools are allowed — a definition cannot escalate.
+//!
+//! Pure on purpose: every function here is testable without the TUI, without
+//! IO and without a network. Discovery (the part that touches the filesystem)
+//! lives in `src/agent/discovery.zig`.
 
 const std = @import("std");
 const subagent = @import("subagent.zig");
+
+/// A definition name is a stable routing key (used by `task(definition=…)` and
+/// by permission rules), so it is deliberately narrow.
+pub fn validName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Template written by "New agent" in the Settings screen. Kept here (pure)
+/// so the shape of a definition has one source of truth.
+pub fn template(name: []const u8) ![]u8 {
+    if (!validName(name)) return error.InvalidName;
+    return std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "---\nname: {s}\ndescription: What this agent does, in one line\ntools: read,grep,glob,list_files\nmodel: \neffort: low\n---\n\n# {s}\n\nDescribe the job this agent does. It is read-only by default; add tools only\nif they are in the read-only subagent set.\n",
+        .{ name, name },
+    );
+}
 
 /// One agent definition's frontmatter.
 pub const Meta = struct {
@@ -117,6 +147,16 @@ pub fn toolsAreReadOnly(tools: [][]const u8) bool {
     return true;
 }
 
+/// `<name>.md` → `name`, or null for a file that is not a definition (a
+/// README, a dotfile, a stray note). Mirrors the output-styles discovery rule.
+pub fn flatStem(file_name: []const u8) ?[]const u8 {
+    const ext = ".md";
+    if (!std.mem.endsWith(u8, file_name, ext)) return null;
+    const stem = file_name[0 .. file_name.len - ext.len];
+    if (!validName(stem)) return null;
+    return stem;
+}
+
 /// Looks up a definition by name. Returns null when unknown.
 pub fn find(entries: []const Entry, name: []const u8) ?Entry {
     for (entries) |e| {
@@ -206,4 +246,29 @@ test "agentdefs: find returns the matching entry" {
 test "agentdefs: effortFor returns default when definition has none" {
     try std.testing.expect(std.mem.eql(u8, effortFor("", "low"), "low"));
     try std.testing.expect(std.mem.eql(u8, effortFor("medium", "low"), "medium"));
+}
+test "agentdefs: validName rejects routing-unsafe names" {
+    try std.testing.expect(validName("explore"));
+    try std.testing.expect(validName("my-agent_2"));
+    try std.testing.expect(!validName(""));
+    try std.testing.expect(!validName("Has Space"));
+    try std.testing.expect(!validName("../evil"));
+    try std.testing.expect(!validName("dot.name"));
+}
+
+test "agentdefs: template is valid and names the agent" {
+    const t = try template("reviewer");
+    defer std.heap.page_allocator.free(t);
+    const r = splitFrontmatter(t) orelse return error.NoFrontmatter;
+    try std.testing.expectEqualStrings("reviewer", r.meta.name);
+    try std.testing.expectEqualStrings("low", r.meta.effort);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "read-only") != null);
+    try std.testing.expectError(error.InvalidName, template("bad name"));
+}
+
+test "agentdefs: flatStem recognises definition files only" {
+    try std.testing.expectEqualStrings("explore", flatStem("explore.md").?);
+    try std.testing.expect(flatStem("README.md") == null); // upper case is not a valid name
+    try std.testing.expect(flatStem("notes.txt") == null);
+    try std.testing.expect(flatStem("with space.md") == null);
 }

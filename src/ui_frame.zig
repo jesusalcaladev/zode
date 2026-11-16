@@ -30,6 +30,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("tui.zig");
 const commands = @import("commands.zig");
+const configmenu = @import("lib/configmenu.zig");
 const sleepz = @import("lib/sleep.zig");
 const plan_mod = @import("lib/plan.zig");
 const palette = @import("palette.zig");
@@ -93,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "models", .fill = sceneModels },
         .{ .name = "config", .fill = sceneConfig },
         .{ .name = "config-style", .fill = sceneConfigStyle },
+        .{ .name = "config-agents", .fill = sceneConfigAgents },
         .{ .name = "plan", .fill = scenePlan },
         .{ .name = "long", .fill = sceneLong },
         .{ .name = "scroll", .fill = sceneScroll, .after = sceneScrollAfter },
@@ -640,4 +642,17 @@ fn sceneScrollAfter(m: *tui.Model) void {
     // header names the turn, and in the hero there is no prompt yet.
     m.scrollBy(10);
     m.pushKind(.assistant, "una respuesta que llego mientras el lector estaba en otro turno");
+}
+
+/// Agent definitions section (Phase 9): default agent + New agent action.
+fn sceneConfigAgents(m: *tui.Model) void {
+    sceneConfig(m);
+    for (configmenu.all_sections, 0..) |s, i| {
+        if (s == .agents) {
+            m.settings_section = i;
+            break;
+        }
+    }
+    m.settings_row = 0;
+    m.settings_col = 1;
 }

@@ -16,6 +16,7 @@ pub const Section = enum {
     agent,
     permissions,
     appearance,
+    agents,
 
     pub fn label(self: Section) []const u8 {
         return switch (self) {
@@ -25,6 +26,7 @@ pub const Section = enum {
             .agent => "Agent behavior",
             .permissions => "Permissions",
             .appearance => "Appearance & input",
+            .agents => "Agent definitions",
         };
     }
 
@@ -36,6 +38,7 @@ pub const Section = enum {
             .agent => "Iterations, parallelism and verification",
             .permissions => "What the agent may do without asking",
             .appearance => "Presentation and keybindings",
+            .agents => "Reusable agents on disk and the default for task",
         };
     }
 };
@@ -47,6 +50,7 @@ pub const all_sections = [_]Section{
     .agent,
     .permissions,
     .appearance,
+    .agents,
 };
 
 /// Every setting row. `cache_stats` and `permission_rules` are read-only
@@ -70,6 +74,8 @@ pub const Setting = enum {
     color_palette,
     vim_mode,
     nerd_icons,
+    active_agent,
+    new_agent,
 
     pub fn label(self: Setting) []const u8 {
         return switch (self) {
@@ -91,6 +97,8 @@ pub const Setting = enum {
             .color_palette => "Diff colors",
             .vim_mode => "Vim input mode",
             .nerd_icons => "Nerd Font icons",
+            .active_agent => "Default agent",
+            .new_agent => "New agent…",
         };
     }
 
@@ -114,6 +122,8 @@ pub const Setting = enum {
             .color_palette => "default (green/red) or daltonized (blue/orange).",
             .vim_mode => "Vim-like keybindings in the composer.",
             .nerd_icons => "Language glyph before code-block labels (auto = detect).",
+            .active_agent => "Used by task when no definition is named (Enter to cycle).",
+            .new_agent => "Create .zode/agents/<name>.md from a template, then edit it with !.",
         };
     }
 
@@ -125,6 +135,8 @@ pub const Setting = enum {
             .task_parallel, .max_iter, .auto_check => .agent,
             .permission_mode, .permission_rules, .web_allow_local => .permissions,
             .color_palette, .vim_mode, .nerd_icons => .appearance,
+            .active_agent => .agents,
+            .new_agent => .agents,
         };
     }
 
@@ -138,6 +150,8 @@ pub const Setting = enum {
             .nerd_icons => .picker,
             .prompt_cache, .auto_check, .web_allow_local, .vim_mode => .toggle,
             .permission_mode => .picker,
+            .active_agent => .picker,
+            .new_agent => .action,
         };
     }
 
@@ -145,7 +159,10 @@ pub const Setting = enum {
     /// and the two palette rows are not persisted here (model/provider already
     /// have their own persistence path).
     pub fn persisted(self: Setting) bool {
-        return self.kind() != .info and self != .model and self != .provider;
+        return switch (self.kind()) {
+            .info, .action, .palette => false,
+            .picker, .toggle => self != .model and self != .provider,
+        };
     }
 };
 
@@ -158,6 +175,8 @@ pub const Kind = enum {
     toggle,
     /// Read-only information row; Enter does nothing.
     info,
+    /// Runs an action (e.g. create a new agent file) on Enter.
+    action,
 };
 
 pub fn settingsFor(section: Section) []const Setting {
@@ -168,6 +187,7 @@ pub fn settingsFor(section: Section) []const Setting {
         .agent => &.{ .task_parallel, .max_iter, .auto_check },
         .permissions => &.{ .permission_mode, .permission_rules, .web_allow_local },
         .appearance => &.{ .color_palette, .vim_mode, .nerd_icons },
+        .agents => &.{ .active_agent, .new_agent },
     };
 }
 
@@ -185,7 +205,9 @@ pub fn optionsFor(s: Setting) []const []const u8 {
         .context_limit => &.{ "auto", "32k", "64k", "128k", "200k", "1M" },
         .color_palette => &.{ "default", "daltonized" },
         .nerd_icons => &.{ "auto", "on", "off" },
-        .model, .provider, .cache_stats, .permission_rules => &.{},
+        // `active_agent` gets its options from the discovered definitions at
+        // runtime; the catalog cannot know them at comptime.
+        .model, .provider, .cache_stats, .permission_rules, .new_agent, .active_agent => &.{},
     };
 }
 
@@ -226,8 +248,12 @@ test "configmenu: picker/toggle rows have options, palette/info rows do not" {
     for (all_sections) |sec| {
         for (settingsFor(sec)) |s| {
             switch (s.kind()) {
-                .palette, .info => try std.testing.expectEqual(@as(usize, 0), optionsFor(s).len),
-                .picker, .toggle => try std.testing.expect(optionsFor(s).len > 0),
+                .palette, .info, .action => try std.testing.expectEqual(@as(usize, 0), optionsFor(s).len),
+                .picker, .toggle => {
+                    // active_agent is a dynamic picker: options come from disk.
+                    if (s == .active_agent) continue;
+                    try std.testing.expect(optionsFor(s).len > 0);
+                },
             }
         }
     }
@@ -242,6 +268,8 @@ test "configmenu: only real settings are marked persisted" {
     try std.testing.expect(Setting.compaction.persisted());
     try std.testing.expect(Setting.prompt_cache.persisted());
     try std.testing.expect(!Setting.cache_stats.persisted());
+    try std.testing.expect(!Setting.new_agent.persisted());
+    try std.testing.expect(Setting.active_agent.persisted());
     try std.testing.expect(!Setting.model.persisted());
 }
 
