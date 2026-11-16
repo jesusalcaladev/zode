@@ -58,6 +58,7 @@ pub const spendgate = @import("lib/spendgate.zig");
 pub const idlestability = @import("lib/idlestability.zig");
 pub const configkeys = @import("lib/configkeys.zig");
 pub const usermessage = @import("lib/usermessage.zig");
+pub const worktree = @import("lib/worktree.zig");
 pub const textadmit = @import("lib/textadmit.zig");
 pub const textcap = @import("lib/textcap.zig");
 pub const resultcap = @import("lib/resultcap.zig");

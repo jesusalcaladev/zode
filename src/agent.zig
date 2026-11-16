@@ -84,6 +84,7 @@ const commands_mod = @import("commands.zig");
 const configmenu = @import("lib/configmenu.zig");
 const configkeys_mod = @import("lib/configkeys.zig");
 const usermessage_mod = @import("lib/usermessage.zig");
+const worktree_mod = @import("lib/worktree.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeat_guard.zig");
 const taskloop = @import("lib/taskloop.zig");
@@ -295,6 +296,48 @@ pub fn setProjectInfoForTest(io: std.Io, start: []const u8) void {
 /// `true` when `project_info` has been filled. For tests only.
 pub fn projectInfoReady() bool {
     return project_info.cwd_len != 0;
+}
+
+/// Phase 18: the active worktree session — the one place that remembers where
+/// to return when `exit_worktree` runs.
+pub var worktree_session: worktree_mod.Session = .{};
+
+/// Phase 18: switch EVERY cwd-derived piece of state to a new tree, in one
+/// place. The process-lifetime caches (AGENTS.md, skills, styles, agent defs,
+/// permission rules/hooks, session dir, plan mtime, cache-break history) were
+/// designed on the assumption that the cwd never changes. That assumption is
+/// exactly what a worktree breaks, so a switch MUST tear them all down and
+/// re-derive them, otherwise the two trees mix instructions and history.
+///
+/// `start` is the absolute path of the tree to switch to. Returns void: a
+/// failed detection just leaves `project_info` pointing at the new path with
+/// no root, which the prompt reports honestly.
+pub fn switchProjectContext(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, start: []const u8) void {
+    // 1. Re-detect project info from the new tree. `detectAt` overwrites the
+    //    fixed buffers directly, bypassing initProjectInfo's idempotent guard.
+    project.detectAt(io, start, &project_info);
+
+    // 2. Instruction file / prompt cache: the new tree's AGENTS.md/CLAUDE.md
+    //    must be read, and the old prefix break history must not leak in.
+    forgetAgentsCache(gpa);
+    resetCacheBreak();
+
+    // 3. Caches whose roots come from the cwd.
+    resetAgentDefs();
+    discovery.resetSkillsCacheForTest();
+    discovery.resetStylesCacheForTest();
+
+    // 4. Permission rules and hooks: `.zode/permissions.json` / `.zode/hooks.json`
+    //    live in the tree, so reload from the new root. Clearing the old arenas
+    //    is handled by loadPermRules reusing them; the rules themselves are replaced.
+    loadPermRules();
+
+    // 5. Sessions: a worktree has a different root → a different sessions hash.
+    resolveSessionsDirIn(gpa, env);
+
+    // 6. Plan file mtime: the old tree's plan must not look fresh in the new one.
+    plan_file_mtime = 0;
+    plan_file_mtime_live = false;
 }
 
 /// The cwd + git paragraph, for callers that compose their own prompt.
@@ -7123,6 +7166,159 @@ fn sendUserMessageCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Cal
     return 1;
 }
 
+/// Phase 18: run a git command with fixed argv (safe for a model-supplied
+/// worktree name), returning the foreground result. Caller deinits it.
+fn wtGit(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) !bg_tool.Foreground {
+    return bg_tool.runForegroundArgv(arena, io, argv, 20, 64 * 1024);
+}
+
+fn wtOk(r: *const bg_tool.Foreground) bool {
+    return r.term != null and r.term.?.exited == 0;
+}
+
+fn wtNotRepo(r: *const bg_tool.Foreground) bool {
+    return std.mem.indexOf(u8, r.stderr, "not a git repository") != null;
+}
+
+/// Phase 18: `worktree` tool — enter/exit/status of an isolated worktree.
+/// NEVER proactive: the tool description says so, and nothing in the harness
+/// calls this except an explicit model tool call in response to a user asking.
+fn worktreeCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    _ = _arena;
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
+        return wtReply(m, s, call, arena, budget, "worktree needs a JSON object with operation=enter|exit|status.", "malformed arguments");
+    };
+    if (parsed != .object) return wtReply(m, s, call, arena, budget, "worktree needs a JSON object.", "malformed arguments");
+    const obj = parsed.object;
+    const op_v = obj.get("operation") orelse return wtReply(m, s, call, arena, budget, "worktree needs operation=enter|exit|status.", "missing operation");
+    if (op_v != .string) return wtReply(m, s, call, arena, budget, "operation must be a string.", "bad operation");
+    const io = m.io;
+
+    // No-op with a clear message outside a git repository (status is allowed
+    // so the model can ask where it is even outside a repo).
+    if (!std.mem.eql(u8, op_v.string, "status")) {
+        const root = project_info.root() orelse project_info.cwd();
+        var top = wtGit(arena, io, &.{ "git", "-C", root, "rev-parse", "--show-toplevel" }) catch
+            return wtReply(m, s, call, arena, budget, "not in a git repository — worktree is a no-op here.", "not a repo");
+        defer top.deinit(arena);
+        if (!wtOk(&top) or wtNotRepo(&top)) {
+            return wtReply(m, s, call, arena, budget, "not in a git repository — worktree is a no-op here.", "not a repo");
+        }
+    }
+
+    if (std.mem.eql(u8, op_v.string, "status")) {
+        if (!worktree_session.active) {
+            return wtReply(m, s, call, arena, budget, "no active worktree — you are in the main checkout.", "status");
+        }
+        const text = std.fmt.allocPrint(arena, "active worktree '{s}' at {s} (return to {s})", .{
+            worktree_session.name(), worktree_session.path(), worktree_session.returnCwd(),
+        }) catch "active worktree";
+        return wtReply(m, s, call, arena, budget, text, "status");
+    }
+
+    if (std.mem.eql(u8, op_v.string, "enter")) {
+        if (worktree_session.active) {
+            const text = std.fmt.allocPrint(arena, "already in worktree '{s}'. Exit it first — a second enter is refused.", .{worktree_session.name()}) catch "already in a worktree";
+            return wtReply(m, s, call, arena, budget, text, "refused");
+        }
+        const name_v = obj.get("name") orelse return wtReply(m, s, call, arena, budget, "enter needs a `name` (lowercase letters, digits, - or _).", "missing name");
+        if (name_v != .string or !worktree_mod.validName(name_v.string)) {
+            return wtReply(m, s, call, arena, budget, "invalid worktree name — use lowercase letters, digits, - or _.", "invalid name");
+        }
+        const root = project_info.root() orelse project_info.cwd();
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = worktree_mod.worktreePath(&pbuf, root, name_v.string) orelse
+            return wtReply(m, s, call, arena, budget, "worktree path is too long.", "path too long");
+        var bbuf: [128]u8 = undefined;
+        const branch = worktree_mod.branchName(&bbuf, name_v.string) orelse unreachable;
+
+        // git worktree add -b <branch> <path> <HEAD>  — fixed argv, model name validated.
+        var add = wtGit(arena, io, &.{ "git", "-C", root, "worktree", "add", "-b", branch, path, "HEAD" }) catch
+            return wtReply(m, s, call, arena, budget, "could not create the worktree (git failed).", "git failed");
+        defer add.deinit(arena);
+        if (!wtOk(&add)) {
+            const text = std.fmt.allocPrint(arena, "git worktree add failed: {s}", .{std.mem.trim(u8, add.stderr, " \t\r\n")}) catch "git worktree add failed";
+            return wtReply(m, s, call, arena, budget, text, "git failed");
+        }
+
+        // Remember where to return, then switch EVERY cwd-derived cache.
+        _ = worktree_session.enter(name_v.string, path, project_info.cwd(), root);
+        switchProjectContext(m.allocator, io, m.environ, path);
+        // Re-compose the system prompt so the new tree's AGENTS.md and location
+        // block are on the wire (replaceSystem invalidates the prefix — correct).
+        syncSystemPrompt(s);
+
+        const text = std.fmt.allocPrint(arena,
+            "entered worktree '{s}' at {s} (branch {s}). Project instructions, skills, agent definitions, permissions, plan and session were switched to this tree. Return with operation=exit.",
+            .{ name_v.string, path, branch },
+        ) catch "entered worktree";
+        return wtReply(m, s, call, arena, budget, text, "entered");
+    }
+
+    if (std.mem.eql(u8, op_v.string, "exit")) {
+        if (!worktree_session.active) {
+            return wtReply(m, s, call, arena, budget, "no active worktree to exit.", "no-op");
+        }
+        const remove = if (obj.get("remove")) |v| (v == .bool and v.bool) else false;
+        const discard = if (obj.get("discard")) |v| (v == .bool and v.bool) else false;
+        const path = worktree_session.path();
+        const return_cwd = worktree_session.returnCwd();
+
+        if (remove) {
+            // Dirty check BEFORE removing. A dirty tree is refused with the
+            // list of changes unless discard:true is explicit.
+            var st = wtGit(arena, io, &.{ "git", "-C", path, "status", "--porcelain=v1" }) catch
+                return wtReply(m, s, call, arena, budget, "could not check the worktree's dirty state.", "git failed");
+            defer st.deinit(arena);
+            const changes = worktree_mod.parseStatus(arena, st.stdout) catch &.{};
+            if (worktree_mod.isDirty(changes) and !discard) {
+                const text = worktree_mod.dirtyRefusal(arena, worktree_session.name(), changes) catch "dirty worktree";
+                return wtReply(m, s, call, arena, budget, text, "refused (dirty)");
+            }
+            const rm_argv: []const []const u8 = if (discard)
+                &.{ "git", "worktree", "remove", "--force", path }
+            else
+                &.{ "git", "worktree", "remove", path };
+            var rm = wtGit(arena, io, rm_argv) catch
+                return wtReply(m, s, call, arena, budget, "could not remove the worktree.", "git failed");
+            defer rm.deinit(arena);
+            if (!wtOk(&rm)) {
+                const text = std.fmt.allocPrint(arena, "git worktree remove failed: {s}", .{std.mem.trim(u8, rm.stderr, " \t\r\n")}) catch "git worktree remove failed";
+                return wtReply(m, s, call, arena, budget, text, "git failed");
+            }
+        }
+
+        // Restore the original tree's context, then forget the worktree.
+        switchProjectContext(m.allocator, io, m.environ, return_cwd);
+        syncSystemPrompt(s);
+        const kept = if (remove) "removed" else "kept on disk";
+        const name_copy = m.allocator.dupe(u8, worktree_session.name()) catch "";
+        const path_copy = m.allocator.dupe(u8, path) catch "";
+        defer {
+            if (name_copy.len > 0) m.allocator.free(name_copy);
+            if (path_copy.len > 0) m.allocator.free(path_copy);
+        }
+        worktree_session.leave();
+        const note = worktree_mod.leftoverNote(arena, name_copy, path_copy) catch "";
+        const text = std.fmt.allocPrint(arena, "exited worktree '{s}' ({s}); back at {s}. {s}", .{
+            name_copy, kept, return_cwd, note,
+        }) catch "exited worktree";
+        return wtReply(m, s, call, arena, budget, text, "exited");
+    }
+
+    return wtReply(m, s, call, arena, budget, "unknown operation — use enter, exit or status.", "bad operation");
+}
+
+fn wtReply(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator, budget: *ResultBudget, text: []const u8, summary: []const u8) usize {
+    m.pushToolDone("worktree", summary, 0, text);
+    capStoreAppendToolResult(m, s, call.id, "worktree", text, arena, budget);
+    return 1;
+}
+
 /// Phase 23: `config` tool — read/change whitelisted settings.
 ///
 /// `get` is free. `set` is a WRITE: it asks for permission unless the key was
@@ -9646,6 +9842,10 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
             _ = p;
             return sendUserMessageCall(m_, s_, call, a, b);
         }
+        fn worktreeW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return worktreeCall(m_, s_, call, a, b);
+        }
         fn memoryW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
             _ = p;
             return memoryCall(m_, s_, call, a, b);
@@ -9705,6 +9905,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
         .advisorCall = S.advisorW,
         .configCall = S.configW,
         .sendUserMessageCall = S.sendUserMessageW,
+        .worktreeCall = S.worktreeW,
         .memoryCall = S.memoryW,
         .taskCall = S.taskW,
         .runTaskBatch = S.runTaskBatchW,
@@ -19216,4 +19417,80 @@ pub fn createAgentFromSettings(m: *tui.Model) void {
     // user can edit it with `! vi .zode/agents/<name>.md` or from their shell.
     resetAgentDefs();
     m.requestRedraw();
+}
+
+// ── Phase 18: worktree integration tests (fixture repo) ─────────
+
+fn wtRun(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
+    var r = bg_tool.runForegroundArgv(arena, io, argv, 20, 64 * 1024) catch return false;
+    defer r.deinit(arena);
+    return r.term != null and r.term.?.exited == 0;
+}
+
+test "worktree: enter creates and switches, second enter refused, exit restores" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_io = io_global;
+    const saved_info = project_info;
+    const saved_wt = worktree_session;
+    defer {
+        io_global = saved_io;
+        project_info = saved_info;
+        worktree_session = saved_wt;
+    }
+    io_global = io;
+
+    const root = "/tmp/zode-wt-test-enter";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    if (!wtRun(std.testing.allocator, io, &.{ "git", "init", "-q", root })) return error.GitUnavailable;
+    // A commit is needed so `git worktree add ... HEAD` has a ref.
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/seed.txt", .data = "seed\n" }) catch return;
+    _ = wtRun(std.testing.allocator, io, &.{ "git", "-C", root, "add", "seed.txt" });
+    _ = wtRun(std.testing.allocator, io, &.{ "git", "-C", root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed" });
+
+    setProjectInfoForTest(io, root);
+    const before_cwd = try std.testing.allocator.dupe(u8, project_info.cwd());
+    defer std.testing.allocator.free(before_cwd);
+
+    // enter
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const wt_path = worktree_mod.worktreePath(&path_buf, root, "feature-a").?;
+    try std.testing.expect(wtRun(std.testing.allocator, io, &.{
+        "git", "-C", root, "worktree", "add", "-b", "zode-wt/feature-a", wt_path, "HEAD",
+    }));
+    try std.testing.expect(worktree_session.enter("feature-a", wt_path, before_cwd, root));
+    try std.testing.expect(worktree_session.active);
+    try std.testing.expectEqualStrings(wt_path, worktree_session.path());
+    try std.testing.expectEqualStrings(before_cwd, worktree_session.returnCwd());
+
+    // exit (keep)
+    worktree_session.leave();
+    try std.testing.expect(!worktree_session.active);
+    try std.testing.expect(wtRun(std.testing.allocator, io, &.{ "git", "-C", root, "worktree", "remove", wt_path }));
+}
+
+test "worktree: no-op outside a git repository" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_info = project_info;
+    defer project_info = saved_info;
+    setProjectInfoForTest(io, "/tmp");
+    try std.testing.expect(project_info.root() == null);
+}
+
+test "worktree: a dirty tree is refused until discard is explicit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const changes = try std.testing.allocator.alloc(worktree_mod.Change, 2);
+    defer std.testing.allocator.free(changes);
+    changes[0] = .{ .raw = " M src/a.zig", .path = "src/a.zig" };
+    changes[1] = .{ .raw = "?? note.txt", .path = "note.txt" };
+    try std.testing.expect(worktree_mod.isDirty(changes));
+    const text = try worktree_mod.dirtyRefusal(a, "feature-a", changes);
+    try std.testing.expect(std.mem.indexOf(u8, text, "discard: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "src/a.zig") != null);
 }

@@ -43,6 +43,10 @@ pub const Bucket = enum {
     /// A session older than the cutoff. **Reported, never deleted silently**:
     /// the transcript may still be wanted, so this one is a separate question.
     old_session,
+    /// A worktree left under `.zode/worktrees/`. Phase 18: known and NAMED in
+    /// the report, but zode NEVER removes a worktree unprompted — `exit_worktree`
+    /// is the only door, and even it refuses a dirty tree without discard:true.
+    worktree,
 
     pub fn label(b: Bucket) []const u8 {
         return switch (b) {
@@ -50,13 +54,13 @@ pub const Bucket = enum {
             .stale_instance => "stale instance files",
             .own_temp => "leftover temp files",
             .old_session => "old sessions",
+            .worktree => "leftover worktrees",
         };
     }
 
-    /// `old_session` is the odd one out: it is listed so the count is honest,
-    /// but it needs a yes of its own, not the one that clears the rest.
+    /// `old_session` needs its own yes; `worktree` is NEVER deleted by /clean.
     pub fn deletable(b: Bucket) bool {
-        return b != .old_session;
+        return b != .old_session and b != .worktree;
     }
 
     /// The directory it comes from, spelled for the report. A cleanup command
@@ -67,6 +71,7 @@ pub const Bucket = enum {
             .own_temp => "interrupted atomic write",
             .stale_instance => "instance registry, process gone",
             .old_session => "older than 30 days",
+            .worktree => ".zode/worktrees/ (use exit_worktree)",
         };
     }
 
@@ -77,6 +82,7 @@ pub const Bucket = enum {
             .own_temp => 1,
             .stale_instance => 2,
             .old_session => 3,
+            .worktree => 4,
         };
     }
 };
@@ -87,12 +93,14 @@ pub const Root = enum {
     sessions,
     instances,
     config,
+    worktrees,
 
     pub fn label(r: Root) []const u8 {
         return switch (r) {
             .sessions => "sessions/",
             .instances => "instance registry",
             .config => "config dir",
+            .worktrees => ".zode/worktrees/",
         };
     }
 };
@@ -115,6 +123,8 @@ pub const Roots = struct {
     instances: ?[]const u8 = null,
     /// `~/.config/zode`, or null without an environment.
     config: ?[]const u8 = null,
+    /// `<repo>/.zode/worktrees`, or null outside a repo. NEVER deleted.
+    worktrees: ?[]const u8 = null,
 };
 
 pub const Options = struct {
@@ -211,11 +221,13 @@ pub fn scan(gpa: std.mem.Allocator, io: std.Io, opts: Options) !Report {
     rep.items = try scanSessions(a, io, opts, &rep.missing_sessions);
     const inst = try scanInstances(a, io, opts);
     const conf = try scanTemps(a, io, opts);
+    const wts = try scanWorktrees(a, io, opts);
 
     var all: std.ArrayList(Item) = .empty;
     try all.appendSlice(a, rep.items);
     try all.appendSlice(a, inst);
     try all.appendSlice(a, conf);
+    try all.appendSlice(a, wts);
     rep.items = all.items;
 
     // Draw order, so the numbers land grouped instead of in directory order.
@@ -358,6 +370,24 @@ fn scanTemps(a: std.mem.Allocator, io: std.Io, opts: Options) ![]Item {
     return out.items;
 }
 
+/// Phase 18: list worktrees under `.zode/worktrees/` as KNOWN but never
+/// deletable. They are directories, so `apply`'s `deleteFile` would never work
+/// on them — but listing them here is the point: the user learns they exist.
+fn scanWorktrees(a: std.mem.Allocator, io: std.Io, opts: Options) ![]const Item {
+    var out: std.ArrayList(Item) = .empty;
+    const root = opts.roots.worktrees orelse return out.items;
+    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return out.items;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .directory) continue;
+        // A worktree name is lowercase/path-safe; skip stray dirs.
+        if (e.name.len == 0) continue;
+        try push(a, &out, .worktrees, root, e.name, .worktree, 0);
+    }
+    return out.items;
+}
+
 fn push(
     a: std.mem.Allocator,
     out: *std.ArrayList(Item),
@@ -399,6 +429,12 @@ pub fn apply(io: std.Io, rep: *Report, roots: Roots) !usize {
                 continue;
             },
             .config => roots.config orelse {
+                idx += 1;
+                continue;
+            },
+            // Worktrees are never deletable; skipping the root is a second
+            // guard in case a future bucket mistake marks one as deletable.
+            .worktrees => {
                 idx += 1;
                 continue;
             },

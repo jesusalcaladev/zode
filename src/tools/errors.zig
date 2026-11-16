@@ -125,6 +125,12 @@ pub fn describeError(arena: std.mem.Allocator, err: anyerror, name: []const u8, 
         error.BadAttachment => "each attachment needs a non-empty `path` (and an optional kind: infer|image|diff|log).",
         error.UnknownStatus => "status must be normal or proactive.",
         error.MessageTooLong => "the message is over 64 KB. Shorten it — the user reads one clear answer, not a dump.",
+        // Phase 18: worktree errors. Each says the way forward.
+        error.InvalidWorktreeName => "invalid worktree name — use lowercase letters, digits, - or _ (1-64 chars).",
+        error.AlreadyInWorktree => "already in a worktree. Call worktree operation=exit before entering another one.",
+        error.NoActiveWorktree => "there is no active worktree to exit.",
+        error.DirtyWorktree => "the worktree is dirty. Pass discard: true explicitly to remove it anyway (the changes are listed in the tool result).",
+        error.NotAGitRepo => "not in a git repository — worktree is a no-op here.",
         error.OutOfMemory => "there was not enough memory to answer that. Ask for less at once.",
         else => "the call failed with an internal error. Do not retry it unchanged: simplify what you asked for.",
     };

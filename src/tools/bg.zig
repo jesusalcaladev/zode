@@ -104,7 +104,7 @@ pub const Foreground = struct {
     /// Honest: this is what the model sees, not a guess about how much more there was.
     bytes_read: usize = 0,
 
-    fn deinit(self: Foreground, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: Foreground, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
         gpa.free(self.stderr);
     }

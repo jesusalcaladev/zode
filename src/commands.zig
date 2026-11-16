@@ -30,6 +30,7 @@ const github_lib = @import("lib/github.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const configmenu = @import("lib/configmenu.zig");
 const agentdefs = @import("lib/agentdefs.zig");
+const worktree_mod = @import("lib/worktree.zig");
 const common = @import("tools/common.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const sandbox_mod = @import("lib/sandbox.zig");
@@ -3118,11 +3119,14 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
     const inst = clean_mod.instanceDir(gpa, agent.io_global) catch null;
     defer if (inst) |p| gpa.free(p);
     const cfg = cleanConfigDir(gpa, m.environ);
+    var wt_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const project_root = agent.project_info.root() orelse agent.project_info.cwd();
+    const wt_root = std.fmt.bufPrint(&wt_buf, "{s}/{s}", .{ project_root, worktree_mod.worktrees_subdir }) catch null;
     defer if (cfg) |p| gpa.free(p);
 
     const now_secs = std.Io.Timestamp.now(agent.io_global, .real).toSeconds();
     var rep = clean_mod.scan(gpa, agent.io_global, .{
-        .roots = .{ .sessions = "sessions", .instances = inst, .config = cfg },
+        .roots = .{ .sessions = "sessions", .instances = inst, .config = cfg, .worktrees = wt_root },
         .now_secs = now_secs,
     }) catch {
         agent.pushInfo(m, "/clean: could not read the directories");
@@ -3140,7 +3144,7 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
         agent.pushInfo(m, "  no sessions/ directory here (nothing to clean in it)");
     }
 
-    const order = [_]clean_mod.Bucket{ .empty_session, .own_temp, .stale_instance, .old_session };
+    const order = [_]clean_mod.Bucket{ .empty_session, .own_temp, .stale_instance, .old_session, .worktree };
     for (order) |b| {
         const n = rep.count(b);
         if (n == 0) continue;
