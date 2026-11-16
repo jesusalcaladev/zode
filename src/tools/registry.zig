@@ -61,6 +61,7 @@ const team_delete_prompt = @import("prompts/team_delete.zig");
 const send_message_prompt = @import("prompts/send_message.zig");
 const team_status_prompt = @import("prompts/team_status.zig");
 const review_prompt = @import("prompts/review.zig");
+const advisor_prompt = @import("prompts/advisor.zig");
 const goal_prompt = @import("prompts/goal.zig");
 const bash_output_prompt = @import("prompts/bash_output.zig");
 const bash_kill_prompt = @import("prompts/bash_kill.zig");
@@ -477,6 +478,15 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .name = "review",
         .desc = "Read your own diff back with a checklist (the harness requires it before the turn ends)",
         .schema = review_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = false,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        .name = "advisor",
+        .desc = "Independent second opinion at a checkpoint (no args, whole session forwarded)",
+        .schema = advisor_prompt.json,
         .read_only = true,
         .parallel_safe = false,
         .destructive = false,

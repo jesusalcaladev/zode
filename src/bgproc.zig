@@ -25,6 +25,7 @@
 //!   the reader thread would race with `bash_output` reading the same buffer.
 
 const std = @import("std");
+const idlestability = @import("lib/idlestability.zig");
 const sleep = @import("lib/sleep.zig");
 const builtin = @import("builtin");
 const repeat = @import("lib/repeat.zig");
@@ -122,6 +123,11 @@ pub const Job = struct {
     exit: ?u8 = null,
     /// Phase 10: terminal-state notification delivered to the model once.
     notified: bool = false,
+    /// Phase 32.4: a job is only reported complete after STABLE_IDLE_POLLS
+    /// consecutive idle polls with no log growth AND an explicit completion
+    /// tag (the terminal state set by `reap`). A single idle observation is
+    /// nothing between tool turns.
+    idle_tracker: idlestability.Tracker = .{},
     /// The child, for `kill`. Only touched from the UI thread / on exit.
     child: ?std.process.Child = null,
     /// The child's pid, captured at spawn.
@@ -137,6 +143,17 @@ pub const Job = struct {
 
     pub fn isLive(self: *const Job) bool {
         return self.state != .free;
+    }
+
+    /// Phase 32.4: a job is STABLE-complete when it has the explicit terminal
+    /// tag AND either (a) it was never polled (a fixture / a job with no output
+    /// to poll) or (b) 5 consecutive no-growth polls were observed. Real jobs
+    /// that printed output and are being polled must satisfy (b); a single idle
+    /// observation after a flush is not enough.
+    pub fn stableComplete(self: *const Job) bool {
+        if (!(self.idle_tracker.tagged)) return false;
+        if (self.idle_tracker.idle_polls == 0) return true;
+        return self.idle_tracker.complete();
     }
 
     pub fn outputPath(self: *const Job) ?[]const u8 {
@@ -235,7 +252,7 @@ pub fn drainCompletions(self: *Registry, arena: std.mem.Allocator) []Completion 
     for (&self.slots) |*j| {
         lockSlot(j);
         const terminal = j.state == .finished or j.state == .killed;
-        if (j.isLive() and terminal and !j.notified) {
+        if (j.isLive() and terminal and !j.notified and j.stableComplete()) {
             j.notified = true;
             const cmd = arena.dupe(u8, j.commandSlice()) catch "";
             const opath = if (j.outputPath()) |p| arena.dupe(u8, p) catch null else null;
@@ -455,6 +472,9 @@ pub fn read(reg: *Registry, io: ?std.Io, out: *Output, id: u32) ![]const u8 {
             const st = f.stat(io.?) catch break :blk j.file_written;
             break :blk @intCast(@min(st.size, std.math.maxInt(usize)));
         } else j.buf.items.len;
+        // Phase 32.4: every read is a poll. Growth resets the idle streak; no
+        // growth extends it. Completion needs BOTH 5 idle polls AND the tag.
+        j.idle_tracker.poll(avail);
         if (from >= avail and !finished) return error.NoNewOutput;
 
         var w: std.Io.Writer = .fixed(&out.buf);
@@ -519,6 +539,9 @@ pub fn readNoHeader(reg: *Registry, io: ?std.Io, out: *Output, id: u32) ![]const
             const st = f.stat(io.?) catch break :blk j.file_written;
             break :blk @intCast(@min(st.size, std.math.maxInt(usize)));
         } else j.buf.items.len;
+        // Phase 32.4: every read is a poll. Growth resets the idle streak; no
+        // growth extends it. Completion needs BOTH 5 idle polls AND the tag.
+        j.idle_tracker.poll(avail);
         if (from >= avail and !finished) return error.NoNewOutput;
 
         var w: std.Io.Writer = .fixed(&out.buf);
@@ -881,6 +904,10 @@ fn reader(ctx: *ReaderCtx) void {
     // so the id is re-checked and only that guards it.
     if (j.isLive() and j.id == job_id) {
         j.state = if (j.kill_requested) .killed else .finished;
+        // Phase 32.4: the terminal state IS the explicit completion tag. A
+        // reader that polls idle also has to see 5 no-growth polls before the
+        // completion is reported (`drainCompletions`).
+        j.idle_tracker.noteTag();
         j.exit = switch (term) {
             .exited => |code| code,
             .signal => |sig| @as(u8, @truncate(128 + @intFromEnum(sig))),
@@ -1468,6 +1495,8 @@ test "Phase 10: finished task notifies once" {
     const cmd = try std.testing.allocator.dupe(u8, "echo hi");
     defer std.testing.allocator.free(cmd);
     reg.slots[0] = .{ .state = .finished, .id = 11, .exit = 0, .cmd_len = @min(cmd.len, max_command) };
+    // Phase 32.4: `reap` marks the explicit completion tag in production.
+    reg.slots[0].idle_tracker.noteTag();
     @memcpy(reg.slots[0].cmd_buf[0..reg.slots[0].cmd_len], cmd[0..reg.slots[0].cmd_len]);
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

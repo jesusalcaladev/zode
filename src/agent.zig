@@ -11,6 +11,7 @@ const chat = @import("chat.zig");
 const http_client = @import("lib/http_client.zig");
 const tools_mod = @import("tools/dispatch.zig");
 const web_mod = @import("tools/web.zig");
+const spendgate_mod = @import("lib/spendgate.zig");
 const team_mod = @import("lib/team.zig");
 // The `mcp` tool's own module, for the ONE thing the timeline needs from it:
 // the qualified name of the tool a call is about. The dispatcher does not
@@ -7035,6 +7036,61 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
 ///
 /// A boolean would be satisfied by one review at the start of the turn and would call
 /// the last three files "reviewed" for the rest of it. `reviewed_writes` is the value of
+/// Phase 32.2: `advisor` — one independent LLM call at a checkpoint.
+///
+/// No arguments: the whole conversation is forwarded automatically. The
+/// advisor is a `task`-shaped subagent: effort low, read-only tools, no
+/// conversation it did not receive, no new transport. It sees the serialized
+/// session and the anti-sycophancy calibration; it cannot change anything.
+///
+/// The caller is responsible for making the deliverable DURABLE before calling
+/// (write the file, stage the change): this call takes time, and an unwritten
+/// result does not persist through it. The tool itself only advises.
+fn advisorCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    _ = _arena;
+
+    m.pushToolStart("advisor", "independent review of the conversation");
+
+    // Forward the WHOLE conversation: role + content of every message, in
+    // order. Tool calls and results are included as their text, so the advisor
+    // sees the evidence, not just the model's summary of it.
+    var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
+    for (s.messages.items) |sm| {
+        if (isHarnessInternalUserMessage(sm.content)) continue;
+        const role_name: []const u8 = switch (sm.role) {
+            .system => "system",
+            .user => "user",
+            .assistant => "assistant",
+            .tool => "tool",
+        };
+        wm.append(arena, .{ .role = role_name, .content = sm.content }) catch break;
+    }
+    const transcript = agentroles.serializeWindow(arena, wm.items) catch "";
+
+    const prompt = std.fmt.allocPrint(arena,
+        "You are an independent advisor. Read the conversation below and give one short, specific piece of advice about the work in progress.\n" ++
+            "CALIBRATION: a passing self-test is NOT evidence the advice is wrong — it is evidence your test does not check what the advice is checking. " ++
+            "If your advice conflicts with data the agent already retrieved, say so plainly; do not assume the agent is wrong. " ++
+            "Be concrete: name the file, the step or the assumption. 'Looks good' is not advice.\n\n" ++
+            "--- conversation ---\n{s}\n--- end ---\n",
+        .{transcript},
+    ) catch "Advise on the conversation above.";
+
+    const task = subagent_mod.Task{
+        .description = "independent checkpoint advice",
+        .prompt = prompt,
+        .role = "explore", // read-only tool set, effort low (the default)
+    };
+    var rep = subagent_mod.Report{};
+    const text = runSubagent(m, task, &rep);
+    m.pushToolDone("advisor", "advice", 0, text);
+    capStoreAppendToolResult(m, s, call.id, "advisor", text, arena, budget);
+    return 1;
+}
+
 /// `writes` at the moment of the review, so an edit afterwards makes the diff unreviewed
 /// again — the same staleness arithmetic the verification uses, for the same reason.
 fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
@@ -8231,6 +8287,9 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
 
     var rep = subagent_mod.Report{};
     const text = runSubagent(m, task, &rep);
+    // Phase 32.1: a verify-role report feeds the three-way count pill. The
+    // protocol lines are parsed by the TUI; no icons, refuted hidden at zero.
+    if (std.mem.eql(u8, task.role, "verify")) m.setVerifyReport(text);
     m.pushToolDone("task", "report", 0, text);
     capStoreAppendToolResult(m, s, call.id, "task", text, arena, budget);
     return 1;
@@ -9339,6 +9398,10 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
             _ = p;
             return reviewCall(m_, s_, call, a, b);
         }
+        fn advisorW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return advisorCall(m_, s_, call, a, b);
+        }
         fn memoryW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
             _ = p;
             return memoryCall(m_, s_, call, a, b);
@@ -9395,6 +9458,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
         .askCall = S.askW,
         .skillCall = S.skillW,
         .reviewCall = S.reviewW,
+        .advisorCall = S.advisorW,
         .memoryCall = S.memoryW,
         .taskCall = S.taskW,
         .runTaskBatch = S.runTaskBatchW,
@@ -18455,6 +18519,42 @@ fn runPipelineReviewStage(
     pushInfoFmt(m, "· pipeline: review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
     return .{ .stopped = false, .tests_passed = tests_passed };
 }
+/// Phase 32.3: four CHEAP local checks before any expensive pipeline stage
+/// (an explorer subagent, a container, ...). Fail-OPEN: an unreadable signal
+/// proceeds with a note, never a wall. Messages go to the user via `pushInfo`.
+fn pipelineSpendGate(m: *tui.Model, arena: std.mem.Allocator, io: std.Io) bool {
+    var inputs = spendgate_mod.Inputs{};
+
+    // 1. merge-base with main exists.
+    const mb = bg_tool.runForeground(arena, io,
+        "git merge-base HEAD main 2>/dev/null || git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD master 2>/dev/null",
+        5, 512) catch null;
+    if (mb) |r| {
+        inputs.has_merge_base = r.term != null and r.term.?.exited == 0 and std.mem.trim(u8, r.stdout, " \t\r\n").len > 0;
+    } else {
+        // Not a git repo / git missing: fail open, proceed with a note.
+        inputs.quota_readable = false;
+    }
+
+    // 2. non-empty diff (--shortstat) against that base.
+    const diff = bg_tool.runForeground(arena, io, "git diff --shortstat HEAD 2>/dev/null", 5, 1024) catch null;
+    if (diff) |r| {
+        inputs.has_changes = r.term != null and r.term.?.exited == 0 and std.mem.trim(u8, r.stdout, " \t\r\n").len > 0;
+    }
+
+    // 3. repo not too large (count tracked files). Unreadable -> 0 -> fail open.
+    const files = bg_tool.runForeground(arena, io, "git ls-files 2>/dev/null | wc -l", 8, 64) catch null;
+    if (files) |r| {
+        if (r.term != null and r.term.?.exited == 0) {
+            inputs.repo_files = std.fmt.parseInt(usize, std.mem.trim(u8, r.stdout, " \t\r\n"), 10) catch 0;
+        }
+    }
+
+    const v = spendgate_mod.decide(arena, inputs) catch return true;
+    for (v.notes) |note| pushInfo(m, note);
+    return v.kind == .proceed;
+}
+
 fn runPipeline(m: *tui.Model, task_text: []const u8) void {
     const gpa = m.allocator;
     const io = io_global;
@@ -18476,6 +18576,15 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // Phase 32.3: gate BEFORE anything expensive starts. An empty diff stops
+    // here instead of launching a container that would echo "no changes".
+    if (!pipelineSpendGate(m, arena, io)) {
+        pushInfo(m, "· pipeline stopped by the spend gate: nothing expensive was started");
+        m.streamEnd();
+        endTurn(m, turn_stats.iterations, false);
+        return;
+    }
 
     var dir_buf: [512]u8 = undefined;
     const run_dir = pipeline_support.pipelineRunDir(&dir_buf, io) orelse {

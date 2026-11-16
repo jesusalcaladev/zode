@@ -16,6 +16,7 @@ const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
 const taskstore = @import("lib/taskstore.zig");
 const team_mod = @import("lib/team.zig");
+const verifycounts = @import("lib/verifycounts.zig");
 const configmenu = @import("lib/configmenu.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
@@ -1545,6 +1546,12 @@ pub const Model = struct {
     /// "implementer", "tester", "reviewer", or null when not in a pipeline.
     /// Zo paints this so the user always knows what the harness is doing.
     pipeline_stage: ?[]const u8 = null,
+    /// Phase 32: three-way verify counts from a verify-role subagent report.
+    /// Painted in the activity strip as "N found · N verified" (refuted hidden
+    /// at zero). Empty counts read as "setting up", never "0 findings".
+    verify_counts: verifycounts.Counts = .{},
+    verify_phase: verifycounts.Phase = .setting_up,
+    verify_counter: verifycounts.Counter = .{},
     /// How many times the harness has nudged the model to implement instead of
     // just exploring. Reset each turn; bounded to avoid endless nudges.
     implementation_nudges: u8 = 0,
@@ -3827,6 +3834,18 @@ pub const Model = struct {
             return;
         };
         self.setStatusWithMood(new_mood, s);
+    }
+
+    /// Phase 32.1: fold a verify-role subagent report into the activity strip.
+    /// The protocol lines ("found:", "verified:", "refuted:") are counted; the
+    /// pill animates +1 toward the target on each tick via `verify_counter`.
+    pub fn setVerifyReport(self: *Model, report: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        self.verify_counts = verifycounts.parseReport(report);
+        self.verify_phase = if (self.verify_counts.hasData()) .verifying else .setting_up;
+        self.verify_counter.setTarget(self.verify_counts.found + self.verify_counts.verified + self.verify_counts.refuted);
+        self.dirty = true;
     }
 
     /// Sets the active pipeline stage label ("explorer", "investigator",
@@ -9394,7 +9413,11 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // Phase 4: mascot motion repaints are disabled by reduced/no animation.
             const mascot_moved = self.mascotMoved();
             if (mascot_moved) self.mascot_motion_repaints +%= 1;
-            if (asked or a.busy or a.dirty or a.perm or a.picker or self.pal.active or mascot_moved) {
+            // Phase 32.1: advance the three-way count pill by +1 per tick so it
+            // animates toward the target like the tps rolling window.
+            const verify_moved = self.verify_counter.tick();
+            if (verify_moved) self.dirty = true;
+            if (asked or a.busy or a.dirty or a.perm or a.picker or self.pal.active or mascot_moved or verify_moved) {
                 ctx.redraw = true;
             }
             // The queue is drained here and not by the worker: `startChat`
@@ -11798,7 +11821,13 @@ fn drawStateFooter(
     // When a pipeline stage is active, the face says THAT stage, not the
     // generic activity. The user never has to guess whether zode is
     // investigating, writing code, running tests or reviewing.
-    if (self.pipeline_stage) |stage| {
+    if (self.verify_counts.hasData()) {
+        // Phase 32.1: the pill reads the three-way count. No data never lands
+        // here (it reads "setting up" via the pipeline stage / idle branch), so
+        // this is always real evidence, never "0 findings" pretending to be one.
+        legend = self.verify_phase.label();
+        detail = verifycountsCountdown(self, &detail_buf);
+    } else if (self.pipeline_stage) |stage| {
         const stage_en = if (std.mem.eql(u8, stage, "explorer")) "exploring" else if (std.mem.eql(u8, stage, "investigator")) "investigating" else if (std.mem.eql(u8, stage, "implementer")) "implementing" else if (std.mem.eql(u8, stage, "tester")) "testing" else if (std.mem.eql(u8, stage, "verify")) "verifying" else if (std.mem.eql(u8, stage, "reviewer")) "reviewing" else if (std.mem.eql(u8, stage, "done")) "done" else stage;
         legend = stage_en;
         // No detail for pipeline stages: the stage name IS the message.
@@ -12465,6 +12494,25 @@ fn segsWidth(segs: []const InfoSeg) u16 {
 /// DIFFERENT shape from drawPicker so it never reads as "the model picker
 /// again". Left column = sections, right column = rows with current values,
 /// bottom detail = description and output-style preview.
+/// The activity-strip detail for a verify report. Uses the +1 counter so the
+/// numbers climb toward the target instead of jumping to the final count.
+fn verifycountsCountdown(m: *Model, buf: []u8) []const u8 {
+    var c = m.verify_counts;
+    // Only show as many findings as the animation has reached.
+    const shown = m.verify_counter.shown;
+    const total: usize = c.found + c.verified + c.refuted;
+    if (shown < total) {
+        var left = shown;
+        c.refuted = 0;
+        c.verified = @min(c.verified, left);
+        left -= c.verified;
+        c.found = @min(c.found, left);
+    }
+    const text = c.format(m.allocator) catch return "";
+    defer m.allocator.free(text);
+    return std.fmt.bufPrint(buf, "· {s}", .{text}) catch "";
+}
+
 fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void {
     if (width < 40 or height < 12) return;
     const secs = configmenu.all_sections;

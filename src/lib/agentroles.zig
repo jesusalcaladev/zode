@@ -49,8 +49,17 @@ pub const verify_prompt =
     \\Role: verify.
     \\- Your job is to try to break the change: run it, exercise it, and find the 20% the first 80% hides.
     \\- Be adversarial and evidence-based: look for regressions, edge cases, missing checks, and claims not backed by results.
+    \\- Work from the harness's OWN checklist (the review items you were given), never from a checklist you invent.
     \\- Report what you checked, what failed or looks risky (with paths/lines), what you could not verify, and why.
     \\- "I could not break it" is only useful with what you actually tried.
+    \\
+    \\REPORT PROTOCOL — each finding goes through three states, as words only (never icons):
+    \\  found    — you spotted something worth checking (a candidate).
+    \\  verified — you confirmed it by running/exercising it; give the evidence.
+    \\  refuted  — you tried and it did NOT hold up; say what disproved it.
+    \\Emit one line per finding in the exact form: "found: ...", "verified: ...", "refuted: ...".
+    \\The harness counts these lines; a finding you merely suspect is `found`, not `verified`.
+    \\An empty finding list is fine — say what you tried. Do not invent counts.
 ;
 
 /// Returns the role-specific prompt, or empty for the default (no role).

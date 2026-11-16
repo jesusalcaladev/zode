@@ -34,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - refine file intelligence navigation and compact change output (tui) [`d06c2137`](https://github.com/jesusalcaladev/zode/commit/d06c2137)
 - complete phase 33 (picker scoring, notifications, context chart, tasks panel) (tui) [`d666861e`](https://github.com/jesusalcaladev/zode/commit/d666861e)
 - interactive Settings screen, team mode, roles, model cache TTL and image input [`ff57591e`](https://github.com/jesusalcaladev/zode/commit/ff57591e)
-- complete phase 9 with both layouts and Settings integration (agents) [`a7021211`](https://github.com/jesusalcaladev/zode/commit/a7021211)
+- complete phase 9 with both layouts and Settings integration (agents) [`fc5cc42d`](https://github.com/jesusalcaladev/zode/commit/fc5cc42d)
+- complete phase 32 (three-way count, advisor, spend gate, idle stability) (verify) [`cfe78532`](https://github.com/jesusalcaladev/zode/commit/cfe78532)
 
 ### Bug Fixes
 

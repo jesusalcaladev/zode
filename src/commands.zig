@@ -3944,3 +3944,23 @@ test "render: the Settings screen shows sections and rows" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Context & cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Permissions") != null);
 }
+
+test "settings: verify pill reads setting up with no data" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expect(!m.verify_counts.hasData());
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const text = try m.verify_counts.format(arena_state.allocator());
+    try std.testing.expectEqualStrings("setting up", text);
+}
+
+test "settings: a verify report feeds the three-way pill" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.setVerifyReport("found: a\nverified: b\nrefuted: c\n");
+    try std.testing.expectEqual(@as(usize, 1), m.verify_counts.found);
+    try std.testing.expectEqual(@as(usize, 1), m.verify_counts.verified);
+    try std.testing.expectEqual(@as(usize, 1), m.verify_counts.refuted);
+    try std.testing.expectEqual(@as(usize, 3), m.verify_counter.target);
+}
