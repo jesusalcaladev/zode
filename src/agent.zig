@@ -83,6 +83,7 @@ const cachebreak = @import("lib/cachebreak.zig");
 const commands_mod = @import("commands.zig");
 const configmenu = @import("lib/configmenu.zig");
 const configkeys_mod = @import("lib/configkeys.zig");
+const usermessage_mod = @import("lib/usermessage.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeat_guard.zig");
 const taskloop = @import("lib/taskloop.zig");
@@ -7048,6 +7049,80 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
 ///
 /// A boolean would be satisfied by one review at the start of the turn and would call
 /// the last three files "reviewed" for the rest of it. `reviewed_writes` is the value of
+/// Phase 21: `send_user_message` — the durable answer to the user.
+///
+/// `normal` goes into the scrollable transcript as an `.assistant` paragraph
+/// (full markdown) AND into the session, so it survives resume. `proactive`
+/// ALSO raises a transient notification — the model initiated contact while
+/// the user may be looking away. Attachments that do not exist are a NAMED
+/// error: no silent drop, and nothing is rendered before the check.
+fn sendUserMessageCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    _ = _arena;
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
+        const msg = "send_user_message needs a JSON object with a `message`.";
+        m.pushToolDone("send_user_message", "malformed arguments", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "send_user_message", msg, arena, budget);
+        return 1;
+    };
+    if (parsed != .object) {
+        const msg = "send_user_message needs a JSON object with a `message`.";
+        m.pushToolDone("send_user_message", "malformed arguments", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "send_user_message", msg, arena, budget);
+        return 1;
+    }
+
+    const msg = usermessage_mod.parse(arena, parsed.object) catch |err| {
+        const text = tools_mod.describeError(arena, err, "send_user_message", call.args_json);
+        m.pushToolDone("send_user_message", "invalid message", 0, text);
+        capStoreAppendToolResult(m, s, call.id, "send_user_message", text, arena, budget);
+        return 1;
+    };
+
+    // Every attachment path must exist BEFORE anything is rendered.
+    if (usermessage_mod.missingAttachment(io_global, msg)) |bad| {
+        const text = usermessage_mod.missingAttachmentText(arena, bad) catch "an attachment path does not exist.";
+        m.pushToolDone("send_user_message", "attachment not found", 0, text);
+        capStoreAppendToolResult(m, s, call.id, "send_user_message", text, arena, budget);
+        return 1;
+    }
+
+    // Attachments: images go to the wire on the next request; diff/log paths
+    // are named in a note appended to the message text (their content stays
+    // readable via `read`). A missing path was already refused above.
+    var note: std.ArrayList(u8) = .empty;
+    for (msg.attachments) |att| {
+        note.appendSlice(arena, "\n\n[attachment: ") catch {};
+        note.appendSlice(arena, att.path) catch {};
+        note.appendSlice(arena, "]") catch {};
+    }
+    const full = if (note.items.len > 0)
+        std.fmt.allocPrint(arena, "{s}{s}", .{ msg.text, note.items }) catch msg.text
+    else
+        msg.text;
+
+    // The durable, user-facing answer: an assistant paragraph, not a log line.
+    m.pushKind(.assistant, full);
+    s.appendAssistant(full, null) catch {};
+
+    if (usermessage_mod.routesToNotification(msg.status)) {
+        // Toasts are short and plain; the full markdown message is in the
+        // transcript above. Keep the toast to the first line.
+        var short = msg.text;
+        if (std.mem.indexOfScalar(u8, short, '\n')) |nl| short = short[0..nl];
+        if (short.len > 140) short = short[0..140];
+        m.pushNotification(short);
+    }
+
+    const ack = std.fmt.allocPrint(arena, "message delivered to the user ({s})", .{msg.status.name()}) catch "message delivered";
+    m.pushToolDone("send_user_message", "delivered", 0, ack);
+    capStoreAppendToolResult(m, s, call.id, "send_user_message", ack, arena, budget);
+    return 1;
+}
+
 /// Phase 23: `config` tool — read/change whitelisted settings.
 ///
 /// `get` is free. `set` is a WRITE: it asks for permission unless the key was
@@ -9567,6 +9642,10 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
             _ = p;
             return configCall(m_, s_, call, a, b);
         }
+        fn sendUserMessageW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return sendUserMessageCall(m_, s_, call, a, b);
+        }
         fn memoryW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
             _ = p;
             return memoryCall(m_, s_, call, a, b);
@@ -9625,6 +9704,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
         .reviewCall = S.reviewW,
         .advisorCall = S.advisorW,
         .configCall = S.configW,
+        .sendUserMessageCall = S.sendUserMessageW,
         .memoryCall = S.memoryW,
         .taskCall = S.taskW,
         .runTaskBatch = S.runTaskBatchW,

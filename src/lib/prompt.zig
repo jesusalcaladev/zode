@@ -136,7 +136,7 @@ pub const tool_routing_prompt =
     \\ - Skill exists for non-obvious task you've been told about: load with `skill` before improvising. Body not in context on purpose.
     \\ - Finish a step with another open? Say so with `todo`. User reads last line to know if working or stuck. A plan is not a loose task list: when creating it, include objective (what success looks like), approach (how/files/strategy), and guardrails (what must not break and how to verify), and make each step concrete with how/verify when useful. Send whole list once with `items` (plus objective/approach/guardrails), then `update` ({index,status,how,verify}) — 1-BASED — or `remove`/`add`. Resending items without brief fields preserves the existing brief. Don't resend list to change one entry: can lose a step. Exactly one in_progress. Not for single obvious step or thinking out loud: static list = noise.
     \\ - Task GRAPH (`task_create`/`task_list`/`task_get`/`task_update`/`task_stop`) is `todo`'s structured sibling, and `todo` is what to use for almost every job — the user watches it on screen. Reach for the graph when the order is NOT linear (tasks blocking tasks), when a list came from the user, or when the work must survive a compaction that eats prose (ids and edges live in a file next to the session). Keep ONE source of truth per job. `task_list` shows what is available and what each task waits on; claim with `task_update` (status in_progress + owner in ONE call); completion is refused while a blocker is open and its result says what it just unblocked — read that line instead of re-listing.
-    \\ - Output: lead with result, only relevant files/checks, state uncertainty, do not repeat tool output or narrate routine progress.
+    \\ - Output: lead with result, only relevant files/checks, state uncertainty, do not repeat tool output or narrate routine progress. When you have the answer, put it in `send_user_message` as plain text ending with "done!" — THAT is what the user reads; a wall of tool results is not an answer. Use status=proactive only when you initiate contact (scheduled task done, background blocker).
     \\ - Listing files is not doing the task. After looking at what is there you must read the result and act on it (read the file, make the change, run the check). Do not end the turn with only exploration unless the user asked a question. If you are done, say what you changed and what you verified.
     \\
 ;
@@ -424,4 +424,9 @@ test "verification asks for a regression test, but NOT for a test rig" {
     if (std.mem.indexOf(u8, verification_prompt, "unless the user asked for one") == null) {
         return error.RuleMissing;
     }
+}
+
+test "prompt: the routing table tells the model to use send_user_message for the answer" {
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "send_user_message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "done!") != null);
 }

@@ -64,6 +64,7 @@ const review_prompt = @import("prompts/review.zig");
 const advisor_prompt = @import("prompts/advisor.zig");
 const goal_prompt = @import("prompts/goal.zig");
 const config_prompt = @import("prompts/config.zig");
+const send_user_message_prompt = @import("prompts/send_user_message.zig");
 const configkeys_mod = @import("../lib/configkeys.zig");
 const bash_output_prompt = @import("prompts/bash_output.zig");
 const bash_kill_prompt = @import("prompts/bash_kill.zig");
@@ -507,6 +508,15 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .name = "config",
         .desc = "Read or change a whitelisted setting (never auth.json)",
         .schema = config_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = false,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        .name = "send_user_message",
+        .desc = "The durable answer to the user (markdown), with status and inline attachments",
+        .schema = send_user_message_prompt.json,
         .read_only = true,
         .parallel_safe = false,
         .destructive = false,

@@ -119,6 +119,12 @@ pub fn describeError(arena: std.mem.Allocator, err: anyerror, name: []const u8, 
             "glob's arguments were out of range, so nothing ran: pattern is a non-empty glob, subdir is a non-empty directory, limit is an integer from 1 to 200 (default 200), sort is one of newest, oldest, name. What arrived was: {s}",
             .{clipForError(arena, args_json)},
         ) catch "glob's limit must be an integer from 1 to 200 and sort must be newest, oldest or name; resend them within those values.",
+        // Phase 21: send_user_message errors. Each names what to fix.
+        error.AttachmentNotFound => "an attachment path does not exist. Check it with glob or list_files, then call send_user_message again.",
+        error.TooManyAttachments => "send_user_message accepts at most 8 attachments. Combine them or send fewer.",
+        error.BadAttachment => "each attachment needs a non-empty `path` (and an optional kind: infer|image|diff|log).",
+        error.UnknownStatus => "status must be normal or proactive.",
+        error.MessageTooLong => "the message is over 64 KB. Shorten it — the user reads one clear answer, not a dump.",
         error.OutOfMemory => "there was not enough memory to answer that. Ask for less at once.",
         else => "the call failed with an internal error. Do not retry it unchanged: simplify what you asked for.",
     };

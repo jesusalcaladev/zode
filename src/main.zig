@@ -23,6 +23,7 @@ const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");
 const taskstore = @import("lib/taskstore.zig");
 const team_mod = @import("lib/team.zig");
+const usermessage_mod = @import("lib/usermessage.zig");
 const hooks_mod = @import("lib/hooks.zig");
 const permrules = @import("lib/permrules.zig");
 const pathsafe = @import("lib/pathsafe.zig");
@@ -972,6 +973,26 @@ fn execHeadless(
         if (agent.prepareImageFor(arena, io, images, agent.curAnswering(), args)) |res| {
             return res;
         }
+    }
+
+    // Phase 21: `send_user_message` is the DURABLE answer in --chat too. There
+    // is no Model here, so print the message to stdout (the script's result)
+    // after validating it. Attachments that do not exist are a named error.
+    if (std.mem.eql(u8, name, "send_user_message")) {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args, .{}) catch
+            return "send_user_message needs a JSON object with a `message`.";
+        if (parsed != .object) return "send_user_message needs a JSON object with a `message`.";
+        const msg = usermessage_mod.parse(arena, parsed.object) catch |err| {
+            return tools_mod.describeError(arena, err, "send_user_message", args);
+        };
+        if (usermessage_mod.missingAttachment(io, msg)) |bad| {
+            return usermessage_mod.missingAttachmentText(arena, bad) catch "an attachment path does not exist.";
+        }
+        var out_buf: [8192]u8 = undefined;
+        var out = std.Io.File.stdout().writer(io, &out_buf);
+        out.interface.print("{s}\n", .{msg.text}) catch {};
+        out.interface.flush() catch {};
+        return std.fmt.allocPrint(arena, "message delivered to the user ({s})", .{msg.status.name()}) catch "message delivered";
     }
 
     const gpa = agent.gpa_global;
