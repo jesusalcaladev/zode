@@ -15,6 +15,8 @@ const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
 const taskstore = @import("lib/taskstore.zig");
+const team_mod = @import("lib/team.zig");
+const configmenu = @import("lib/configmenu.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
@@ -1364,6 +1366,16 @@ pub const Model = struct {
     /// degrades to a replacement glyph plus a readable label.
     nerd_icons: bool = true,
 
+    /// Interactive Settings screen (the Claude-Code-style internal config).
+    /// A full-screen two-column surface, deliberately NOT the generic picker —
+    /// that one is used by Ctrl+P / model selection and looking alike was the
+    /// source of the "is this the model picker again?" confusion.
+    settings_active: bool = false,
+    settings_section: usize = 0,
+    settings_row: usize = 0,
+    /// 0 = section column, 1 = value rows. Tab switches.
+    settings_col: u8 = 0,
+
     /// Whether the terminal window currently has focus. `true` at startup;
     /// `focus_in`/`focus_out` from vaxis flip it, and the composer's caret is
     /// dimmed while it is `false` so the reader sees at a glance that typing
@@ -1873,6 +1885,9 @@ pub const Model = struct {
     /// in `init`: the default is `page_allocator`, which is merely WRONG rather than
     /// a garbage vtable — see `taskstore.Store.gpa`.
     tasks: taskstore.Store = .{},
+    /// The active team (Phase 20). Team equals TaskList: the roster and
+    /// mailboxes live here, while the shared work list is `tasks` above.
+    team: team_mod.Team = .{ .gpa = std.heap.page_allocator },
     /// Bench counters for `/bench`.
     bench: bench_mod.Stats = .{},
 
@@ -2369,6 +2384,7 @@ pub const Model = struct {
             .mascot_animator = mascot.Animator.init(.idle),
         };
         m.tasks.gpa = allocator;
+        m.team.gpa = allocator;
         // Empty initial status; real content appears once there's a model/turn.
         m.setStatusText("");
         // The read cache's table is heap-allocated (it is ~300 KB by VALUE at
@@ -2385,6 +2401,10 @@ pub const Model = struct {
         self.reads.deinit();
         // The task graph holds its own strings and its file path.
         self.tasks.deinit();
+        // The team (roster + mailboxes) owns its own strings. Acknowledge any
+        // teammate still live first — no teammate outlives the app.
+        _ = self.team.sweepOnExit();
+        self.team.deinit();
         // `/copy`: the pending clipboard text and the picker's context are
         // the model's memory, and nobody else frees them.
         if (self.copy_pending) |p| self.allocator.free(p);
@@ -2953,6 +2973,87 @@ pub const Model = struct {
         self.lock();
         defer self.unlock();
         return self.picker_active;
+    }
+
+    pub fn settingsOpen(self: *Model) void {
+        self.settings_active = true;
+        self.settings_section = 0;
+        self.settings_row = 0;
+        self.settings_col = 0;
+    }
+
+    pub fn settingsClose(self: *Model) void {
+        self.settings_active = false;
+    }
+
+    /// The Settings screen owns every key while it is open, like the picker.
+    /// Returns true when the key was consumed.
+    pub fn settingsHandleKey(self: *Model, key: vaxis.Key) bool {
+        if (!self.settings_active) return false;
+        const sec = configmenu.all_sections[@min(self.settings_section, configmenu.all_sections.len - 1)];
+        const rows = configmenu.settingsFor(sec);
+        switch (key.codepoint) {
+            9 => { // Tab: switch column
+                self.settings_col = if (self.settings_col == 0) 1 else 0;
+                return true;
+            },
+            57352 => { // up
+                if (self.settings_col == 0) {
+                    if (self.settings_section > 0) {
+                        self.settings_section -= 1;
+                        self.settings_row = 0;
+                    }
+                } else if (self.settings_row > 0) {
+                    self.settings_row -= 1;
+                }
+                return true;
+            },
+            57353 => { // down
+                if (self.settings_col == 0) {
+                    if (self.settings_section + 1 < configmenu.all_sections.len) {
+                        self.settings_section += 1;
+                        self.settings_row = 0;
+                    }
+                } else if (self.settings_row + 1 < rows.len) {
+                    self.settings_row += 1;
+                }
+                return true;
+            },
+            0x0D => { // Enter
+                if (self.settings_col == 0) {
+                    self.settings_col = 1;
+                    self.settings_row = @min(self.settings_row, rows.len -| 1);
+                    return true;
+                }
+                if (self.settings_row >= rows.len) return true;
+                agent.applySettingsRow(self, rows[self.settings_row], .enter);
+                return true;
+            },
+            0x1b => { // Esc: back to sections, then close
+                if (self.settings_col == 1) {
+                    self.settings_col = 0;
+                } else {
+                    self.settingsClose();
+                }
+                return true;
+            },
+            0x08, 127 => { // backspace: previous value
+                if (self.settings_col == 1 and self.settings_row < rows.len) {
+                    agent.applySettingsRow(self, rows[self.settings_row], .prev);
+                }
+                return true;
+            },
+            else => {
+                // ← / → cycle a value when a row is selected.
+                if (key.codepoint == 57356 or key.codepoint == 57357) {
+                    if (self.settings_col == 1 and self.settings_row < rows.len) {
+                        agent.applySettingsRow(self, rows[self.settings_row], if (key.codepoint == 57357) .next else .prev);
+                    }
+                    return true;
+                }
+                return true; // capture everything else while the screen is up
+            },
+        }
     }
 
     // ── `/copy` ──────────────────────────────────────────────────────────
@@ -7849,6 +7950,10 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
         self.pending_images = self.draft_images;
         self.draft_images = .{};
     }
+    // `@shot.png` typed in the prompt becomes a real attachment, not 32 KB of
+    // binary inlined as text. Vision is checked here AND at the wire (the
+    // answering model can change mid-turn).
+    agent.stageImageMentions(self, owned);
 
     agent.submit(self, owned) catch |err| {
         // `pushInfoFmt` and NOT `allocPrint(ctx.alloc, …) + pushInfoOwned`: the
@@ -8842,6 +8947,27 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // Transcript search bar (33.13): captures input while typing query.
             if (self.transcriptSearchActive()) {
                 if (self.searchBarHandleKey(key)) {
+                    self.flushCopyPending(ctx);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
+            // Ctrl+, — the Settings screen (internal config). Distinct from
+            // Ctrl+P/T so it cannot be mistaken for the model picker again.
+            if (key.matches(',', .{ .ctrl = true })) {
+                if (self.settings_active) {
+                    self.settingsClose();
+                } else {
+                    self.settingsOpen();
+                }
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
+            // The Settings screen captures every key while it is open.
+            if (self.settings_active) {
+                if (self.settingsHandleKey(key)) {
                     self.flushCopyPending(ctx);
                     ctx.redraw = true;
                     try self.armTick(ctx);
@@ -9984,6 +10110,11 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             notif_y +|= 4;
             i += 1;
         }
+    }
+
+    // ── Settings screen: FULL-SURFACE, painted last so nothing overlaps it ──
+    if (self.settings_active) {
+        drawSettingsScreen(&p, self, width, height);
     }
 
     return surface;
@@ -12329,6 +12460,96 @@ fn segsWidth(segs: []const InfoSeg) u16 {
 }
 
 /// Centered modal in opencode style: title, filter, items with selection and footer.
+
+/// The Settings screen: a full-surface two-column layout, deliberately a
+/// DIFFERENT shape from drawPicker so it never reads as "the model picker
+/// again". Left column = sections, right column = rows with current values,
+/// bottom detail = description and output-style preview.
+fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void {
+    if (width < 40 or height < 12) return;
+    const secs = configmenu.all_sections;
+    const sec = secs[@min(m.settings_section, secs.len - 1)];
+    const rows = configmenu.settingsFor(sec);
+
+    // Opaque background: clear every cell so nothing from the transcript
+    // shows through the screen.
+    var row: u16 = 0;
+    while (row < height) : (row += 1) {
+        p.fillRow(row, " ", .{});
+    }
+
+    const left_w: u16 = @intCast(@min(@as(usize, 34), @as(usize, width) / 3));
+    const split: u16 = left_w + 1;
+    const top: u16 = 2;
+    const bottom: u16 = height - 2;
+
+    // Title and keyboard hints.
+    _ = p.putText(2, 0, "Settings · internal configuration", theme.brand_hi);
+    const hint = "Tab column · ↑↓ move · ←→ value · Enter cycle · Esc back";
+    const hint_x: u16 = if (width > hint.len + 2) @intCast(width - hint.len - 2) else 2;
+    _ = p.putClipped(hint_x, 0, hint, width - hint_x - 1, theme.ink3);
+    p.fillRange(0, width, 1, "─", theme.line_bright);
+
+    // Vertical divider between columns.
+    row = top;
+    while (row <= bottom) : (row += 1) {
+        p.putStable(split, row, "│", 1, theme.line);
+    }
+
+    // Left column: sections.
+    for (secs, 0..) |s, i| {
+        const y = top + @as(u16, @intCast(i)) + 1;
+        if (y > bottom) break;
+        const chosen = i == m.settings_section;
+        if (chosen) p.fillRange(1, split, y, " ", theme.sel_bg);
+        const mark: []const u8 = if (chosen) "▸ " else "  ";
+        _ = p.putText(2, y, mark, if (chosen) theme.brand else theme.ink3);
+        _ = p.putClipped(4, y, s.label(), left_w - 4, if (chosen) theme.selected else theme.ink);
+        if (chosen and m.settings_col == 0) {
+            p.putStable(1, y, "│", 1, theme.brand);
+        }
+    }
+
+    // Right column: the selected section's rows and their current values.
+    const rx: u16 = split + 2;
+    const rw: u16 = width - rx - 2;
+    for (rows, 0..) |s, i| {
+        const y = top + @as(u16, @intCast(i)) + 1;
+        if (y > bottom - 5) break;
+        const chosen = i == m.settings_row;
+        if (chosen) p.fillRange(rx - 1, width - 1, y, " ", theme.sel_bg);
+        const value = commands.settingsValue(m, s);
+        defer m.allocator.free(value);
+        _ = p.putClipped(rx, y, s.label(), 24, if (chosen) theme.selected else theme.ink);
+        var shown = value;
+        if (shown.len == 0) shown = "(not set)";
+        if (shown.len > 28) shown = shown[0..28];
+        _ = p.putClipped(rx + 25, y, shown, rw - 25, if (chosen) theme.brand_hi else theme.ink2);
+        if (s.persisted()) {
+            _ = p.putText(width - 10, y, "saved", theme.ok);
+        }
+        if (chosen and m.settings_col == 1) {
+            p.putStable(rx - 1, y, "▸", 1, theme.brand);
+        }
+    }
+
+    // Detail area: description + output-style preview (last 4 rows).
+    const dtop: u16 = bottom - 3;
+    p.fillRange(rx - 1, width - 1, dtop - 1, "─", theme.line);
+    if (m.settings_row < rows.len) {
+        const s = rows[@min(m.settings_row, rows.len - 1)];
+        _ = p.putClipped(rx, dtop, s.description(), rw, theme.ink2);
+        if (s == .output_style) {
+            const body = agent.stylePreview(m.allocator, m.environ) catch "";
+            defer if (body.len > 0) m.allocator.free(body);
+            if (body.len > 0) {
+                _ = p.putClipped(rx, dtop + 1, body, rw, theme.code_comment);
+            }
+        }
+    }
+    _ = p.putText(2, height - 1, "Esc: close · changes apply now and are saved to config.json", theme.ink3);
+}
+
 fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
     const is_sessions = ps.tag == sessions_picker_tag;
     // Bottom-anchored modal pane (33.5): keeps 2 transcript rows visible above a ▔ divider.

@@ -264,6 +264,23 @@ pub const Task = struct {
     /// `~/.config/zode/agents/`. When set, the definition's tools/model/effort
     /// override the defaults (the definition's tools must still be read-only).
     definition: []const u8 = "",
+    /// Built-in role name (`explore`, `plan`, `verify`). Unknown names fall back
+    /// to the default (no role).
+    role: []const u8 = "",
+    /// Resume an existing subagent window by id (keeps its window intact).
+    resume_id: []const u8 = "",
+    /// Fork an existing subagent window by id (copies its context; does not
+    /// share/mutate the original window).
+    fork_id: []const u8 = "",
+    /// Teammate name (Phase 20). When set with an active team, this run IS a
+    /// persistent teammate: it keeps its window between turns, gets the task
+    /// graph and send_message tools, and claims work instead of being pushed.
+    name: []const u8 = "",
+    /// Team name this teammate belongs to (Phase 20).
+    team_name: []const u8 = "",
+    /// Set by the harness when it wakes a teammate (not by the model). Enables
+    /// the teammate tool set and the shared stores in `runSubagent`.
+    is_teammate: bool = false,
     /// When true, the subagent runs in the BACKGROUND: the task call returns an
     /// id immediately instead of waiting for the report, and the model is
     /// notified when the subagent lands. Use for long-running searches that
@@ -310,6 +327,31 @@ pub fn parseTask(arena: std.mem.Allocator, args_json: []const u8) ParseError!Tas
         if (v == .string) definition = std.mem.trim(u8, v.string, " \t\r\n");
     }
 
+    var role: []const u8 = "";
+    if (obj.get("role")) |v| {
+        if (v == .string) role = std.mem.trim(u8, v.string, " \t\r\n");
+    }
+
+    var resume_id: []const u8 = "";
+    if (obj.get("resume")) |v| {
+        if (v == .string) resume_id = std.mem.trim(u8, v.string, " \t\r\n");
+    }
+
+    var fork_id: []const u8 = "";
+    if (obj.get("fork")) |v| {
+        if (v == .string) fork_id = std.mem.trim(u8, v.string, " \t\r\n");
+    }
+
+    var name: []const u8 = "";
+    if (obj.get("name")) |v| {
+        if (v == .string) name = std.mem.trim(u8, v.string, " \t\r\n");
+    }
+
+    var team_name: []const u8 = "";
+    if (obj.get("team")) |v| {
+        if (v == .string) team_name = std.mem.trim(u8, v.string, " \t\r\n");
+    }
+
     var run_in_background: bool = false;
     if (obj.get("run_in_background")) |v| {
         if (v == .bool) run_in_background = v.bool;
@@ -319,6 +361,11 @@ pub fn parseTask(arena: std.mem.Allocator, args_json: []const u8) ParseError!Tas
         .description = description,
         .prompt = prompt,
         .definition = definition,
+        .role = role,
+        .resume_id = resume_id,
+        .fork_id = fork_id,
+        .name = name,
+        .team_name = team_name,
         .run_in_background = run_in_background,
     };
 }
@@ -632,3 +679,18 @@ test "the system prompt explicitly says it cannot ask" {
     try std.testing.expect(std.mem.indexOf(u8, subagent.system_prompt, "complete and useful") != null);
 }
 
+
+test "parseTask: reads role, resume and fork fields" {
+    var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ast.deinit();
+    const a = ast.allocator();
+
+    const t = try subagent.parseTask(a, "{\"description\":\"x\",\"role\":\"explore\",\"resume\":\"sa-1\"}");
+    try std.testing.expectEqualStrings("explore", t.role);
+    try std.testing.expectEqualStrings("sa-1", t.resume_id);
+    try std.testing.expectEqualStrings("", t.fork_id);
+
+    const t2 = try subagent.parseTask(a, "{\"description\":\"x\",\"role\":\"unknown\",\"fork\":\"sa-2\"}");
+    try std.testing.expectEqualStrings("unknown", t2.role);
+    try std.testing.expectEqualStrings("sa-2", t2.fork_id);
+}

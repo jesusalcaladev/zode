@@ -17,6 +17,8 @@ const bg_tool = @import("bg.zig");
 const errors_tool = @import("errors.zig");
 const typecheck = @import("../lib/typecheck.zig");
 const taskstore = @import("../lib/taskstore.zig");
+const team_mod = @import("../lib/team.zig");
+const team_tools = @import("team_tools.zig");
 const common = @import("common.zig");
 const verify_mod = @import("../lib/verify.zig");
 const notebook_tool = @import("notebook.zig");
@@ -255,6 +257,23 @@ pub fn executeWith(
     tasks: ?*taskstore.Store,
     perm_rules: ?permrules.Set,
 ) ![]const u8 {
+    return executeTeam(io, name, args_json, arena, bg, cache, tasks, perm_rules, null);
+}
+
+/// `executeWith` plus the session's team (Phase 20). The team store is set by
+/// the session holders; callers with no team pass null and the four team tools
+/// answer with `error.NoTeam` and a sentence, never a silent no-op.
+pub fn executeTeam(
+    io: std.Io,
+    name: []const u8,
+    args_json: []const u8,
+    arena: std.mem.Allocator,
+    bg: ?*bgproc.Registry,
+    cache: ?*readcache.Cache,
+    tasks: ?*taskstore.Store,
+    perm_rules: ?permrules.Set,
+    team: ?*team_mod.Team,
+) ![]const u8 {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{});
     if (parsed != .object) return error.BadArgs;
     const obj = parsed.object;
@@ -313,6 +332,14 @@ pub fn executeWith(
         return tasks_tool.toolTaskUpdate(io, tasks, obj, arena);
     } else if (std.mem.eql(u8, name, "task_stop")) {
         return tasks_tool.toolTaskStop(io, tasks, obj, arena);
+    } else if (std.mem.eql(u8, name, "team_create")) {
+        return team_tools.toolTeamCreate(team, obj, arena);
+    } else if (std.mem.eql(u8, name, "team_delete")) {
+        return team_tools.toolTeamDelete(io, team, obj, arena);
+    } else if (std.mem.eql(u8, name, "send_message")) {
+        return team_tools.toolSendMessage(team, obj, arena);
+    } else if (std.mem.eql(u8, name, "team_status")) {
+        return team_tools.toolTeamStatus(team, arena);
     } else if (std.mem.eql(u8, name, "goal")) {
         return goal_tool.toolGoal(obj, arena);
     } else if (std.mem.eql(u8, name, "bash_output")) {

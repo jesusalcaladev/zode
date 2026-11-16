@@ -22,15 +22,12 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 ## 🚀 Next up — the roadmap's own verdict
 
-- [ ] 🔴 **Sprint A2 — Phase 33** (the TUI at a mature harness's level): the port list,
-  42 features read out of the reference implementation. 33.1 and 33.2 are done;
-  the rest is the board. The porting notes are in `docs/analysis/tui-chrome.md`.
-- [ ] 🟡 **Tool track — Phase 26 → 20** (roles → teams); Phase 25 (bash safety) is complete. 20 waits on 15, 32 on 26.
+- [ ] 🟡 **Tool track — Phase 32** (verify-or-refute); Phase 25 (bash safety) and Phase 20 (team mode) are complete. Phase 9 and Phase 26 are complete. 32 is the last open item in this track.
 - [ ] 🟢 Everything else per the dependency table at the bottom.
 
-**Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills + rich frontmatter) · **Phase 2 (2.1–2.5)** (skill listing budget, once-per-session listing, named args/`$ARGUMENTS`, `context: fork`, `!cmd` substitution behind permissions) · Phase 4 (output styles) · Phase 12 (MCP over stdio + deferred tool loading) · Phase 14 (LSP client) · Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19.1 (`sleep`, claimed; Phase 19 section still pending) · Phase 25.1 (bash safety classify) · Phase 27 (diff with gutter + word diff + colour ladder) · Phase 28 (`/copy`) · Phase 35.1 (`/files`) · Phase 35.2 (`/init`) · Phase 36 (use-after-free crash, worker lifetime/counting audit, and build-step fixes) · Tool upgrades (grep context, bash description, read PDF, glob subdir).
+**Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills + rich frontmatter) · **Phase 2 (2.1–2.5)** (skill listing budget, once-per-session listing, named args/`$ARGUMENTS`, `context: fork`, `!cmd` substitution behind permissions) · Phase 4 (output styles) · Phase 9 (agent definitions on disk: `.zode/agents/<name>/AGENT.md` + `~/.config/zode/agents/<name>/AGENT.md`, frontmatter parsing/validation, project-over-user shadowing, cached discovery) · Phase 12 (MCP over stdio + deferred tool loading) · Phase 14 (LSP client) · Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19.1 (`sleep`, claimed; Phase 19 section still pending) · Phase 20 (team mode: `team_create`/`team_delete`/`send_message`/`team_status`, Team equals TaskList, message routing by name and broadcast, idle claim from the task graph, orderly shutdown acknowledged once, session overrides) · Phase 25.1 (bash safety classify) · Phase 26 (built-in subagent roles `explore`/`plan`/`verify` with role prompts, per-project per-role agent memory consulted/not inlined, resumable/forkable subagent windows with persisted ids, role-aware tool access and pure tests) · **model catalog invalidation at 5 minutes** (one `modelcache.max_age_seconds` TTL drives `--models` freshness, the palette refresh throttle, and a "catalog older than 5 min · refreshing" notice; a stale list is still shown for resilience but flagged) · **image input improvements** (`@shot.png` typed in the prompt is staged as a real attachment instead of binary text — TUI and headless; last-moment vision gate in `withPendingImages` and headless wire drops all image bytes when the answering model cannot see images, even if it changed after staging) · **interactive Settings screen** (full-surface two-column Claude-Code-style internal config opened with `/config` or `Ctrl+,`: sections for Model & reasoning, Output style with live preview and source badge, Context & cache with stats/verdict + prompt-cache + read-cache size, Agent behavior, Permissions, Appearance; changes persist to `~/.config/zode/config.json` through a patch writer that preserves unknown fields; `/config report` keeps the numbers panel; bundled `concise` output style added) · Phase 27 (diff with gutter + word diff + colour ladder) · Phase 28 (`/copy`) · **Phase 33 (TUI at a mature harness's level)** (effective effort/glyphs, turn counts, scroll pill/context header, transcript screen, bottom-anchored modal/fuzzy picker with scoring and preview, notifications, context visualisation, task panel, per-message actions, transcript search, OSC 8 hyperlinks, external editor/image paste, modal diff viewer, compact-summary line, permission dialog with rule explanation) · Phase 35.1 (`/files`) · Phase 35.2 (`/init`) · Phase 36 (use-after-free crash, worker lifetime/counting audit, and build-step fixes) · Tool upgrades (grep context, bash description, read PDF, glob subdir).
 
-**Completed phase sections removed from the board (all checklist items done):** Phase 2, 3, 5, 6, 7, 10, 11, 24, 25, 29, 30, 31, 34, 35, 36.
+**Completed phase sections removed from the board (all checklist items done):** Phase 2, 3, 5, 6, 7, 9, 10, 11, 20, 24, 25, 26, 29, 30, 31, 33, 34, 35, 36.
 
 **The analysis behind the new phases** lives in `docs/analysis/`:
 `tui-chrome.md` (the TUI port list, 42 features) · `commands.md` (72 reference
@@ -43,9 +40,9 @@ state, the open bug and the quality bar).
 
 `⚡ tokens · 🟡 · independent · pairs with /cache`
 
-## Phase 9 — Agent definitions on disk
+---
 
-`✨ feature · 🟡 · independent · basis for 26`
+**Phase 9 (Agent definitions on disk)** is complete: definitions load from `.zode/agents/<name>/AGENT.md` (project) and `~/.config/zode/agents/<name>/AGENT.md` (user) with frontmatter (`name`, `description`, `tools`, `model`, `effort`), read-only tool validation, project-over-user shadowing, cached discovery, and pure tests (`src/lib/agentdefs.zig`, wired via `src/agent/discovery.zig`).
 
 ---
 
@@ -90,19 +87,9 @@ state, the open bug and the quality bar).
 - [ ] Scheduled prompts obey the same permissions as typed ones (a scheduled prompt that wants to write still asks)
 - [ ] Pure tests (waiting on ticks + schedule): cron parsing (5-field, ranges, steps, names) · a `once` schedule fires once and is removed · a tick is suppressed while a tool is running
 
-## Phase 20 — Team mode: persistent collaborators
+---
 
-`✨ feature · 🟢 · depends on 15`
-
-> `task` = one bounded search, throwaway window. "Watch the test suite and fix flakes" is a _role_, not a question.
-
-- [ ] `team_create {name}` starts a team and its task list (Team ≡ TaskList); `team_delete` shuts it down
-- [ ] Teammates = the existing subagent machinery + `name` + `team`; same safety defaults (read-only unless the lead grants more, effort `low`, depth 1)
-- [ ] `send_message {to, message}`: to a teammate by name, or `"*"` for a broadcast (explicitly expensive, linear in team size). Plain assistant text is NOT visible to another agent — a message is a tool call, that is the only channel
-- [ ] Teammates go idle between turns and **claim** from the task graph (`task_list` → `task_update` with `owner`); a teammate is never pushed work it did not take, and the lead does not narrate the idleness
-- [ ] Orderly shutdown: the lead requests it, teammates acknowledge, a killing sweep runs on exit like `bgproc`'s — no teammate outlives the app
-- [ ] The concurrency cap stays `ZODE_TASK_PARALLEL` (three streams on one key is the whole reason it exists)
-- [ ] Pure tests: create/delete · message routing by name and broadcast · a message to an unknown name is a named error · claiming sets the owner and only one agent can own a task · a shutdown request is answered exactly once
+**Phase 20 (Team mode: persistent collaborators)** is complete: `team_create`/`team_delete`/`send_message`/`team_status` tools over a pure `lib/team.zig` store (Team equals TaskList, sharing the session's task graph); messages route by name or `"*"` broadcast (explicitly expensive, linear in team size) and an unknown name is a named error. A teammate is spawned with `task(name=…, team=…)`: it keeps its own persisted subagent window between turns (Phase 26), gets the task-graph + message tools with read-only defaults, and the harness wakes it ONLY when a message is addressed to it — it claims work itself with `task_list` → `task_update(claim, owner)`, never pushed, no idleness narration. Turns are serialized on the turn thread so two teammates never race the store. Orderly shutdown acknowledges each teammate exactly once, and an exit sweep (`sweepOnExit`) leaves no live team state. Concurrency stays capped by `ZODE_TASK_PARALLEL`. Pure and integration tests cover create/delete, routing/broadcast, unknown-name error, wake/claim/window persistence, atomic claim and shutdown acknowledgement.
 
 ---
 
@@ -143,19 +130,9 @@ state, the open bug and the quality bar).
 
 ---
 
-## Phase 26 — Built-in subagent roles + agent memory
+---
 
-`✨ feature · 🟡 · depends on 9`
-
-- [ ] Three built-in roles with their own prompts, chosen by name:
-  | role      | job                                                                            |
-  | --------- | ------------------------------------------------------------------------------ |
-  | `explore` | broad, parallel search; report paths and lines, never edits                    |
-  | `plan`    | read-only architect: explore, then produce an ordered plan                     |
-  | `verify`  | try to break the change: run it, exercise it, find the 20% the first 80% hides |
-- [ ] Agent memory: a per-project, per-role directory the agent reads at start and appends lessons to; out of the prompt until consulted (costs nothing when empty)
-- [ ] Resume / fork a subagent: resumed with its window intact (a search that found half the answer continues) or forked (same context, different question) — both bounded by the same 24k window and depth 1
-- [ ] Pure tests: role selection by name · an unknown role falls back to the default · a role's tool list is a subset of what the caller is allowed (a role cannot escalate) · memory is not inlined into the prompt · resume keeps the window and fork does not share it
+**Phase 26 (Built-in subagent roles + agent memory)** is complete: built-in roles `explore`, `plan`, and `verify` are selectable by name with role-specific prompts; per-project per-role memory lives under `.zode/agent-memory/<role>/` and is consulted (not inlined, costs nothing when empty) with role access to append lessons; subagents can be resumed (same window) or forked (copied window) via persisted subagent ids; pure tests cover role selection/fallback, role/caller tool subset rules, memory prompt behavior, and resume/fork window semantics.
 
 ---
 
@@ -177,49 +154,7 @@ state, the open bug and the quality bar).
 
 ---
 
-## Phase 33 — The TUI at a mature harness's level
-
-`✨ feature · 🔴 · the port list · source: docs/analysis/tui-chrome.md`
-
-> The reference is a TUI written in TypeScript + Ink, read line by
-> line. 42 candidate features: **18 PORT**, **15 ALREADY** (we are equal or
-> better), **9 SKIP** (with reasons). The full table is in
-> `docs/analysis/tui-chrome.md`; this is the board version, and the porting
-> notes for the top rows are in §4 of that file.
->
-> **The rule of the phase**: nothing enters the TUI that does not answer a
-> question the user actually has. A decorative port is a port that costs
-> frames and buys nothing.
-
-- [x] The **effective** effort level (`chat.effortSupport` decides whether there is a knob at all) — the preference is not the same thing, and showing it would be a lie: the footer would say `xhigh` while the wire carries `high`
-- [x] The permission-mode **glyph** (`○ ◐ ● ◉`, the four shapes the reference implementation uses) — a word costs 12 columns in a footer that has to survive an 80-column terminal
-- [x] …and with it, `accept edits` becomes visible again: the test that pins "the normal permission modes cost NOTHING on the row" is a decision about COLUMNS, and a glyph is one column. **The test was rewritten on purpose** (the default still costs nothing; a deviation costs ONE column) and the legend of the glyphs lives in the shortcut list (`?`)
-- [x] Counts assistant **turns**, not entries (the reference implementation counts them the same way): a tool line is not an answer the reader is missing
-- [x] The baseline moves with the reader: leaving the bottom starts a count, reaching it ends the one that was running
-- [x] The **pill** over the transcript: a centred "3 new messages" that floats over the scrollback. It covers the last row on purpose — a control on its own row would move the transcript every time it appeared
-- [x] It names the turn you are reading: the last `.user` paragraph at or above the anchor
-- [x] It goes OVER the transcript's first row and **only when the reader is away from the bottom**. A reserved row was tried FIRST and it moved the text under the reader's eyes (10 tests and a crash in the click/selection math): a header that appears and disappears takes a row away exactly when the reader is looking
-- [x] The editor's own convention: a sticky line covers the content under it
-- [x] **33.4** The transcript screen (`ctrl+o`) — a VIEW of our own history, not new content; `ctrl+e` shows all
-- [x] **33.5** The bottom-anchored modal pane with a `▔` divider — a pane that keeps 2 transcript rows visible beats a centred box that hides the context
-  - [x] The query as a **subsequence** of the label, with a WINDOW (three times the query plus eight) so the fallback does not match half the catalogue
-  - [x] Leftmost and **runs win**: "bc" in "a-xbc" highlights the run and not a scattered "b"
-  - [x] The matched characters are painted in the accent colour, and the positions are BYTE offsets joined to the painting at the grapheme's first byte
-  - [x] The fuzzy is a FALLBACK: an exact match always wins, so the item the user meant is never pushed down
-  - [x] **33.6** Filtered results sort by match score (exact/prefix/substring/fuzzy, best first; ties keep original order). With no query the list stays in its deliberate order (providers/free-first as provided) so the default ordering is unchanged.
-- [x] **33.7** The picker with a **preview pane** (at the bottom or at the right) — the model preview (context window, price, free) is the most useful picker addition we do not have
-  - [x] It has to be a **bottom pane**, not a third column: at 110 columns there is no room for a third one
-  - [x] The parser receives the WIDTH (`DiffOpts.width`), because "does it fit" is a question only the width can answer
-- [x] **33.9** The notifications channel — a transient queue for "the updater restarted", "the IDE connected", "the token budget is nearly gone"; absolutely positioned, so nothing shifts (stacked top-right toasts in `src/tui.zig`, `Model.pushNotification`; updater flow emits notifications)
-- [x] **33.10** The context visualisation — we compute the numbers; the reference implementation draws a proportional chart per category (system, tools, messages, skills, compaction reserve) (`/context` shows a proportional breakdown bar and per-category estimates)
-- [x] **33.11** The task panel with blockers and priorities — **the data model already exists** (`src/lib/taskstore.zig`: `blocks`/`blocked_by`/`hasOpenBlocker`) and is now surfaced via `/tasks` (panel view with blocked/ready/in-progress/completed counts, dependency/blocker details, and priority-ordered listing)
-- [x] **33.12** The per-message actions — `shift+↑` targets the message under the cursor; ours has `/copy N` and no per-message targeting
-- [x] **33.13** The transcript search (`/` and `n`/`N`) — our paragraphs are already segmented, so the scan is over the segments, not the cells
-- [x] **33.14** OSC 8 hyperlinks — the paths and the URLs as real links; the detection is ~30 lines and vaxis exposes the cell attributes
-- [x] **33.16** The external editor (`ctrl+g`) and the image paste (`ctrl+v`) — the image path already exists (`src/lib/images.zig`)
-- [x] **33.18** The modal diff viewer — only worth it once a turn can produce multi-file diffs
-- [x] **33.19** The compact-summary line — after a tier-2 compaction the transcript loses history **silently**; one honest line says what was summarised
-- [x] **33.21** The permission dialog with the **rule** explanation — which rule matched, and the rule the user could accept instead of a bare "always allow" (shows the matched `ask` rule as "asked by rule: …", shows the scoped rule the "always allow" answer would remember, e.g. `Bash(git *)`; stale rule/suggestion state cleared between dialogs)
+**Phase 33 (TUI at a mature harness's level)** is complete: all 18 ported features (33.1–33.7, 33.9–33.14, 33.16, 33.18, 33.19, 33.21) are implemented and checked; its section was removed from the board per convention.
 
 **What we deliberately do NOT copy** (and why) — the reasoning is in
 `docs/analysis/tui-chrome.md` §5: the alternate screen (it destroys the
@@ -227,8 +162,6 @@ terminal's native scrollback), the random-verb spinner (our phase label says
 more), the boxed prompt (our rule costs 1 row instead of 3), the user-defined
 status line (an execution surface we do not need) and the shimmer animation (a
 permanent CPU cost for a decoration).
-
----
 
 **Where we are BETTER than the reference implementation** (so nobody ports it
 backwards) — `docs/analysis/harness.md` §4 lists ten: the exit gate, the

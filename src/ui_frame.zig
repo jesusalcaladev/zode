@@ -23,12 +23,13 @@
 ///
 /// Usage: `zig build ui-frame -Drun-args="[scene] [width] [height]"`
 /// Scenes: welcome · turn · tools · bash · diff · ask · perm · palette ·
-///         plan · long · all
+///         config · plan · long · all
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const tui = @import("tui.zig");
+const commands = @import("commands.zig");
 const sleepz = @import("lib/sleep.zig");
 const plan_mod = @import("lib/plan.zig");
 const palette = @import("palette.zig");
@@ -90,6 +91,8 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "perm", .fill = scenePerm },
         .{ .name = "palette", .fill = scenePalette },
         .{ .name = "models", .fill = sceneModels },
+        .{ .name = "config", .fill = sceneConfig },
+        .{ .name = "config-style", .fill = sceneConfigStyle },
         .{ .name = "plan", .fill = scenePlan },
         .{ .name = "long", .fill = sceneLong },
         .{ .name = "scroll", .fill = sceneScroll, .after = sceneScrollAfter },
@@ -442,6 +445,23 @@ fn scenePalette(m: *tui.Model) void {
     m.pushHeader(.idle);
     m.pushKind(.user, "/mo");
     m.openPaletteWith(.commands, paletteItems(), paletteGroups());
+}
+
+/// The interactive `/config` modal: a Claude-Code-style settings list with
+/// current values and a value picker on Enter. Rendered through the real
+/// `openPicker` + `drawPicker` path so layout bugs show up here.
+fn sceneConfig(m: *tui.Model) void {
+    m.pushHeader(.idle);
+    m.pushKind(.user, "/config");
+    commands.cmdConfig(m, null);
+}
+
+/// The Output style section, where the description + body preview lives.
+fn sceneConfigStyle(m: *tui.Model) void {
+    sceneConfig(m);
+    m.settings_section = 1;
+    m.settings_row = 0;
+    m.settings_col = 1;
 }
 
 /// The MODELS palette (Ctrl+T): two columns, providers on the left and the

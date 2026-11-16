@@ -366,11 +366,12 @@ test "scan: project shadows repo and user, both layouts and bundled styles are f
 
     // Precedence is fixed even though the order INSIDE a root is not: project
     // first, then repo, then user, then the bundled styles last.
-    try std.testing.expectEqual(@as(usize, 6), found.len);
+    try std.testing.expectEqual(@as(usize, 7), found.len); // 3 project/user + 4 bundled (default/concise/explanatory/learning)
     try std.testing.expectEqualStrings("mine", found[0].name);
     try std.testing.expectEqualStrings("repoonly", found[1].name);
     try std.testing.expectEqualStrings("default", found[4].name);
-    try std.testing.expectEqualStrings("explanatory", found[5].name);
+    try std.testing.expectEqualStrings("concise", found[5].name);
+    try std.testing.expectEqualStrings("explanatory", found[6].name);
     // The user root's two files are both present, in either order.
     try std.testing.expect(findEntry(found, "useronly") != null);
     try std.testing.expect(findEntry(found, "learning") != null);

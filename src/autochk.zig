@@ -22,6 +22,12 @@
 //!   REFUSAL that tells the model to poll the job, not a freeze of the user's session.
 
 const std = @import("std");
+
+fn autoCheckEnabled(self: *const AutoCheck) bool {
+    if (self.enabled_override) |v| return v;
+    return env_mod.truthyIn(self.env, "ZODE_AUTO_CHECK", true);
+}
+
 const bgproc = @import("bgproc.zig");
 const check_tool = @import("tools/check.zig");
 const bg_tool = @import("tools/bg.zig");
@@ -222,6 +228,10 @@ pub const AutoCheck = struct {
     /// reached for a module global twice, so "testable" meant "works right until the
     /// global is uninitialised". Owning the environment is what makes it a value.
     env: ?*const std.process.Environ.Map = null,
+    /// Session override from the Settings screen. A FIELD (not the module
+    /// global) so a test that constructs `AutoCheck{}` is never affected by a
+    /// toggle another test made. Null means the env decides.
+    enabled_override: ?bool = null,
     /// The job id, or 0 when there is none. An id and a re-read of the registry is
     /// the whole contract: the output belongs to a background thread's buffer, so it
     /// cannot be a pointer into a turn's arena.
@@ -351,7 +361,7 @@ pub const AutoCheck = struct {
     ///   that still have their old contents — a check that would be green and mean
     ///   nothing at all.
     pub fn noteWrite(self: *AutoCheck, name: []const u8, args_json: []const u8) bool {
-        if (!env_mod.truthyIn(self.env, "ZODE_AUTO_CHECK", true)) return false;
+        if (!autoCheckEnabled(self)) return false;
         if (!touchesFile(name)) return false;
 
         // Its own arena, and NOT the caller's. The only thing allocated is one parsed
@@ -391,7 +401,7 @@ pub const AutoCheck = struct {
         io: std.Io,
         forced: bool,
     ) bool {
-        if (!env_mod.truthyIn(self.env, "ZODE_AUTO_CHECK", true)) {
+        if (!autoCheckEnabled(self)) {
             self.last_start_failure = .env_off;
             return false;
         }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const images = @import("images.zig");
 const fuzzy = @import("fuzzy.zig");
 
 pub const max_files = 4;
@@ -115,6 +116,10 @@ pub fn expand(alloc: std.mem.Allocator, io: std.Io, text: []const u8) !Expansion
     const max_to_load = @min(@as(usize, scan_result.count), @as(usize, max_files));
     for (0..max_to_load) |i| {
         const path = scan_result.mentions[i].pathOf();
+        // An image mention is NOT inlined as bytes. The harness stages it as an
+        // attachment (see `agent.stageImageMentions`); inlining 32 KB of a PNG here
+        // produced binary garbage in the prompt and a 400 on some providers.
+        if (images.mimeForPath(path) != null) continue;
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
             missing_count += 1;
             continue;
@@ -262,4 +267,10 @@ test "highlightMatch: prefix wins over substring" {
     try std.testing.expectEqual(@as(u32, 0), buf[0]);
     try std.testing.expectEqual(@as(u32, 1), buf[1]);
     try std.testing.expectEqual(@as(u32, 2), buf[2]);
+}
+
+test "looksLikePath: an image filename is a mention path" {
+    try std.testing.expect(looksLikePath("shot.png"));
+    try std.testing.expect(looksLikePath("dir/photo.jpg"));
+    try std.testing.expect(!looksLikePath("hello"));
 }

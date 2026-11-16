@@ -22,6 +22,7 @@ const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
 const plan_mod = @import("lib/plan.zig");
 const taskstore = @import("lib/taskstore.zig");
+const team_mod = @import("lib/team.zig");
 const hooks_mod = @import("lib/hooks.zig");
 const permrules = @import("lib/permrules.zig");
 const pathsafe = @import("lib/pathsafe.zig");
@@ -343,10 +344,10 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
                 }
                 break :blk n;
             };
-            std.debug.print("{d} modelos ({d} free) — lista guardada, {s}\n", .{
+            std.debug.print("{d} models ({d} free) — saved catalog, {s}\n", .{
                 e.models.len,
                 free,
-                if (ageIsStale(io, e.fetched_at)) "obsoleta, se actualiza" else "actual",
+                if (ageIsStale(io, e.fetched_at)) "stale, refresh due" else "fresh",
             });
             printed = true;
         }
@@ -380,11 +381,7 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
 /// attached is a jump through a garbage vtable — a segfault, which is exactly what the
 /// first version did. Measured: 203 ms then a core dump, every time.
 fn ageIsStale(io: std.Io, fetched_at: i64) bool {
-    if (fetched_at <= 0) return true;
-    const now = std.Io.Timestamp.now(io, .real).toSeconds();
-    if (now <= fetched_at) return false;
-    const hours = @divTrunc(now - fetched_at, 3600);
-    return hours >= modelcache.max_age_hours;
+    return modelcache.isStale(io, fetched_at);
 }
 
 /// Headless mode: zode --chat "text"
@@ -483,6 +480,9 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // what `task_list` reads back inside the run — which is the whole point of a task
     // list during a turn. Nothing is written, so nothing can be half-written either.
     var tasks = taskstore.Store{ .gpa = gpa };
+    // The team (Phase 20) is memory-only for a headless run, like `tasks`.
+    var team = team_mod.Team.init(gpa);
+    defer team.deinit();
     defer bg.deinit(io, gpa);
     // Permission rules and hooks (Phase 5/6/34): headless is yolo/non-interactive
     // (no permission dialog), but hooks must still be able to allow/deny/audit tool
@@ -523,6 +523,10 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         };
         std.debug.print("model: {s} (first free in the catalog; ZODE_MODEL to override)\n", .{model_name});
     }
+
+    // `@shot.png` typed in --chat becomes a real attachment. `model_name` is
+    // resolved above; `mentions.expand` no longer inlines image bytes as text.
+    stageImageMentionsHeadless(arena, io, &pending_images, text, model_name);
 
     // Here and not earlier: `model_name` is empty until the block above has run,
     // and a check on an empty model is a check that never fires — which is what
@@ -664,6 +668,12 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         // tokens for information the model already has.
         var wire = msgs.items;
         defer pending_images.clear(gpa);
+        // LAST-MOMENT VISION GATE, same as the TUI: the answering model can
+        // change after the image was staged (cheap router, /free-auto rotation).
+        // A model with no vision gets no bytes — just the typed text.
+        if (!pending_images.isEmpty() and !models_mod.isVision(model_name)) {
+            pending_images.clear(gpa);
+        }
         if (!pending_images.isEmpty()) {
             const note = images_mod.wireNote(arena, &pending_images) catch "";
             if (note.len > 0) {
@@ -795,7 +805,7 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         try msgs.append(arena, .{ .role = "assistant", .content = "", .tool_calls_json = tc_json });
         for (result.ctx.parts.items) |*p| {
             models.dbg("\n[tool {s}] {s}\n", .{ p.name.items, p.args.items });
-            const res = execHeadless(io, &bg, &tasks, &pending_images, p.name.items, p.args.items, arena) catch |err| {
+            const res = execHeadless(io, &bg, &tasks, &team, &pending_images, p.name.items, p.args.items, arena) catch |err| {
                 try msgs.append(arena, .{
                     .role = "tool",
                     .content = try std.fmt.allocPrint(arena, "error: {t}", .{err}),
@@ -951,6 +961,7 @@ fn execHeadless(
     io: std.Io,
     bg: *bgproc.Registry,
     tasks: *taskstore.Store,
+    team: *team_mod.Team,
     images: *images_mod.Pending,
     name: []const u8,
     args: []const u8,
@@ -1076,7 +1087,7 @@ fn execHeadless(
     }
 
     // Execute the tool.
-    var res = try tools_mod.executeWith(io, name, exec_args, arena, bg, null, tasks, null);
+    var res = try tools_mod.executeTeam(io, name, exec_args, arena, bg, null, tasks, null, team);
 
     // PostToolUse hooks: append non-blocking notes/context to the tool result.
     {
@@ -1430,4 +1441,33 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     return runTui(init);
+}
+
+/// Headless counterpart of `agent.stageImageMentions`: turn `@shot.png` in the
+/// typed prompt into a real attachment instead of inlined binary text.
+fn stageImageMentionsHeadless(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    pending: *images_mod.Pending,
+    text: []const u8,
+    model: []const u8,
+) void {
+    const mentions_local = @import("lib/mentions.zig");
+    const scanned = mentions_local.scan(text) catch return;
+    const has_vision = models_mod.isVision(model);
+    for (scanned.mentions[0..scanned.count]) |mention| {
+        const path = mention.pathOf();
+        const mime = images_mod.mimeForPath(path) orelse continue;
+        if (pending.len >= images_mod.max_images) break;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(images_mod.max_bytes)) catch continue;
+        var p = images_mod.prepare(arena, path, bytes, mime, has_vision) catch continue;
+        defer p.deinit(arena);
+        const b64 = p.image_b64 orelse continue;
+        p.image_b64 = null;
+        const slot = &pending.images[pending.len];
+        slot.* = .{ .mime = mime, .data_b64 = b64, .path = arena.dupe(u8, path) catch "" };
+        pending.len += 1;
+        pending.total_bytes += bytes.len;
+        pending.user_attached = true;
+    }
 }

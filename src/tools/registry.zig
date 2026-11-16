@@ -56,6 +56,10 @@ const ask_prompt = @import("prompts/ask.zig");
 const lsp_prompt = @import("prompts/lsp.zig");
 const skill_prompt = @import("prompts/skill.zig");
 const task_prompt = @import("prompts/task.zig");
+const team_create_prompt = @import("prompts/team_create.zig");
+const team_delete_prompt = @import("prompts/team_delete.zig");
+const send_message_prompt = @import("prompts/send_message.zig");
+const team_status_prompt = @import("prompts/team_status.zig");
 const review_prompt = @import("prompts/review.zig");
 const goal_prompt = @import("prompts/goal.zig");
 const bash_output_prompt = @import("prompts/bash_output.zig");
@@ -370,6 +374,42 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .max_result_chars = resultcap.default_max_result_chars,
     },
     .{
+        .name = "team_create",
+        .desc = "Start a persistent team and its shared task list (Team equals TaskList)",
+        .schema = team_create_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = true,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        .name = "team_delete",
+        .desc = "Shut down the current team: acknowledge and clear the roster",
+        .schema = team_delete_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = true,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        .name = "send_message",
+        .desc = "Message a teammate by name, or all with to=* (the only agent-to-agent channel)",
+        .schema = send_message_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = false,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        .name = "team_status",
+        .desc = "Report the team: roster, shutdown acknowledgements and queued messages",
+        .schema = team_status_prompt.json,
+        .read_only = true,
+        .parallel_safe = true,
+        .destructive = false,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
         .name = "ask",
         .desc = "Ask the user one question when the answer changes what you do",
         .schema = ask_prompt.json,
@@ -622,6 +662,10 @@ pub fn toolSummarize(
     if (std.mem.eql(u8, name, "task_list")) return "task_list";
     if (std.mem.eql(u8, name, "task_update")) return "task_update";
     if (std.mem.eql(u8, name, "task_stop")) return "task_stop";
+    if (std.mem.eql(u8, name, "team_create")) return "team_create";
+    if (std.mem.eql(u8, name, "team_delete")) return "team_delete";
+    if (std.mem.eql(u8, name, "send_message")) return "send_message";
+    if (std.mem.eql(u8, name, "team_status")) return "team_status";
     if (std.mem.eql(u8, name, "mcp")) return "mcp";
     if (std.mem.eql(u8, name, "github")) {
         const op = extractStringArg(arena, args_json, "operation");
@@ -717,6 +761,10 @@ pub fn toolActivity(
     if (std.mem.eql(u8, name, "task_list")) return "Listing tasks";
     if (std.mem.eql(u8, name, "task_update")) return "Updating task";
     if (std.mem.eql(u8, name, "task_stop")) return "Stopping task";
+    if (std.mem.eql(u8, name, "team_create")) return "Creating team";
+    if (std.mem.eql(u8, name, "team_delete")) return "Shutting down team";
+    if (std.mem.eql(u8, name, "send_message")) return "Sending message";
+    if (std.mem.eql(u8, name, "team_status")) return "Team status";
     if (std.mem.eql(u8, name, "mcp")) return "Calling MCP";
     if (std.mem.eql(u8, name, "github")) {
         const op = extractStringArg(arena, args_json, "operation");

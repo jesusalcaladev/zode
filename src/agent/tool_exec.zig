@@ -113,7 +113,7 @@ pub fn runParallelBatch(
             var astate = std.heap.ArenaAllocator.init(ctx.m.allocator);
             defer astate.deinit();
             const a = astate.allocator();
-            const text = tools_mod.executeWith(ctx.io, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads, &ctx.m.tasks, ctx.perm_rules) catch |err| {
+            const text = tools_mod.executeTeam(ctx.io, ctx.call.name, ctx.call.args_json, a, &ctx.m.bg, &ctx.m.reads, &ctx.m.tasks, ctx.perm_rules, &ctx.m.team) catch |err| {
                 ctx.out.err = true;
                 ctx.out.text = @constCast(@errorName(err));
                 ctx.out.ms = elapsedMs(ctx.io, call_t0);
@@ -571,7 +571,7 @@ pub fn execOneCall(
         if (hooks_mod.updatedInput(hook_res)) |ui| exec_args = arena.dupe(u8, ui) catch exec_args;
     }
 
-    var res = tools_mod.executeWith(state.io, call.name, exec_args, arena, &m.bg, &m.reads, &m.tasks, state.perm_rules) catch |err| {
+    var res = tools_mod.executeTeam(state.io, call.name, exec_args, arena, &m.bg, &m.reads, &m.tasks, state.perm_rules, &m.team) catch |err| {
         const ms = elapsedMs(state.io, call_t0);
         const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
         ops.pushToolDone(ops.ctx, m, call.name, "failed", ms, emsg);

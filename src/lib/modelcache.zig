@@ -41,10 +41,26 @@ const models = @import("models.zig");
 /// moves, and a comment does not make a cache stale.
 pub const version: u32 = 1;
 
-/// Past this age the cache is used AND refreshed anyway. The TTL decides whether the
-/// refresh is URGENT, not whether the data is usable: a month-old list of model ids is
-/// still a useful thing to show while the network is down.
-pub const max_age_hours: u32 = 24;
+/// Past this age the cache is STALE and a refresh is triggered. Five minutes:
+/// long enough that opening the picker twice in a row does not hit the network,
+/// short enough that a model retired this morning is gone by the next open.
+///
+/// This is the single source of truth for catalog freshness — the palette's
+/// refresh throttle and the `--models` freshness notice both derive from it.
+pub const max_age_seconds: i64 = 5 * 60;
+pub const max_age_ms: i64 = max_age_seconds * std.time.ms_per_s;
+
+/// True when a cached catalog is older than `max_age_seconds` and should be
+/// refreshed. `fetched_at <= 0` (missing/unknown timestamp) counts as stale.
+pub fn isStale(io: std.Io, fetched_at: i64) bool {
+    if (fetched_at <= 0) return true;
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    if (now <= fetched_at) return false;
+    return (now - fetched_at) >= max_age_seconds;
+}
+
+/// Human phrase for the TTL, used in notices ("older than 5 min").
+pub const max_age_label: []const u8 = "5 min";
 
 pub const Entry = struct {
     fetched_at: i64 = 0,
@@ -515,4 +531,16 @@ test "copyOut survives the arena it came from, which a plain struct copy does no
         try std_test.expect(copied[0].is_free);
     }
     inner.deinit();
+}
+
+test "modelcache: a catalog older than 5 minutes is stale, a fresh one is not" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    try std.testing.expect(isStale(io, 0));
+    try std.testing.expect(isStale(io, now - max_age_seconds));
+    try std.testing.expect(!isStale(io, now));
+    try std.testing.expect(!isStale(io, now + 10));
+    try std.testing.expectEqual(@as(i64, 300), max_age_seconds);
 }

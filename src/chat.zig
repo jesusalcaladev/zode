@@ -1488,7 +1488,15 @@ pub fn buildBodyMessagesCapped(
 /// Marks are cleared on every other message, because the array is reused across
 /// the turns of one iteration: history only grows, so the breakpoint moves and
 /// the previous one has to be unset.
+/// Session toggle from the Settings screen. When false, no breakpoint is
+/// emitted, so every request re-sends the prefix in full. Default on.
+pub var prompt_cache_enabled: bool = true;
+
 pub fn markCachePrefix(messages: []ChatMessage, keep_recent: usize) void {
+    if (!prompt_cache_enabled) {
+        for (messages) |*m| m.cache_control = false;
+        return;
+    }
     if (messages.len <= keep_recent) return;
     const breakpoint = messages.len - keep_recent - 1;
     for (messages, 0..) |*m, i| {

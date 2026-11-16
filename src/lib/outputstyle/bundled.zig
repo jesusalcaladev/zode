@@ -24,6 +24,12 @@ pub const bundled_styles: []const BundledStyle = &[_]BundledStyle{
         .body = @embedFile("output_styles/default.md"),
     },
     .{
+        .name = "concise",
+        .description = "Shortest answer that resolves the request: result first, then evidence",
+        .keep_coding_instructions = true,
+        .body = @embedFile("output_styles/concise.md"),
+    },
+    .{
         .name = "explanatory",
         .description = "Explain every step before taking it; show your reasoning",
         .keep_coding_instructions = true,
@@ -57,7 +63,7 @@ pub fn substituteArguments(body: []const u8, args: []const u8, out: []u8) []cons
 }
 
 test "bundled styles are embedded and accessible" {
-    try std.testing.expect(bundled_styles.len == 3);
+    try std.testing.expect(bundled_styles.len == 4);
     for (bundled_styles) |s| {
         try std.testing.expect(s.name.len > 0);
         try std.testing.expect(s.description.len > 0);
@@ -67,6 +73,7 @@ test "bundled styles are embedded and accessible" {
 
 test "getBundled: finds by name" {
     try std.testing.expect(getBundled("default") != null);
+    try std.testing.expect(getBundled("concise") != null);
     try std.testing.expect(getBundled("explanatory") != null);
     try std.testing.expect(getBundled("learning") != null);
     try std.testing.expect(getBundled("nonexistent") == null);

@@ -75,7 +75,14 @@ pub fn limitSource(env: ?*const std.process.Environ.Map, model_ctx: u32) LimitSo
 /// free pool) and the budget ignored it in favour of a constant, so a 1M model
 /// compacted at 102k: tier 1 eliding and tier 2 asking an LLM to summarize
 /// thousands of tokens early, over and over, for nothing.
+/// Session-level override set from the interactive `/config` modal. Zero means
+/// "not overridden" (use env / model window). A global because the budget is
+/// read from several pure call sites in both runners; `mirror_globals` keeps
+/// subagents from stomping it.
+pub var context_limit_override: i64 = 0;
+
 pub fn contextLimitFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
+    if (context_limit_override > 0) return context_limit_override;
     if (env) |m| {
         if (m.get("ZODE_CONTEXT_LIMIT")) |s| {
             return std.fmt.parseInt(i64, s, 10) catch default_context_limit;

@@ -10,6 +10,8 @@ const md = @import("lib/markdown.zig");
 const chat = @import("chat.zig");
 const http_client = @import("lib/http_client.zig");
 const tools_mod = @import("tools/dispatch.zig");
+const web_mod = @import("tools/web.zig");
+const team_mod = @import("lib/team.zig");
 // The `mcp` tool's own module, for the ONE thing the timeline needs from it:
 // the qualified name of the tool a call is about. The dispatcher does not
 // re-export it because nothing else wants it, and a re-export would be a
@@ -89,6 +91,7 @@ const review_mod = @import("lib/review.zig");
 const agentsdoc = @import("lib/agentsdoc.zig");
 const memory_mod = @import("lib/memory.zig");
 const memory_store = @import("lib/memory_store.zig");
+const agentroles = @import("lib/agentroles.zig");
 
 const plan_gate = @import("agent/plan_gate.zig");
 const summary_breaker_mod = @import("lib/summary_breaker.zig");
@@ -2933,7 +2936,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "cost")) {
         commands_mod.cmdCost(m);
     } else if (std.mem.eql(u8, cmd, "config")) {
-        commands_mod.cmdConfig(m);
+        commands_mod.cmdConfig(m, rest);
     } else if (std.mem.eql(u8, cmd, "status")) {
         commands_mod.cmdStatus(m);
     } else if (std.mem.eql(u8, cmd, "update")) {
@@ -4334,6 +4337,9 @@ fn drainBgSubagentCompletions(gpa: std.mem.Allocator) []const BgSubagentCompleti
 }
 
 fn drainBackgroundTaskNotifications(m: *tui.Model) void {
+    // Team wake/shutdown is handled here too: it is the same "at the top of an
+    // iteration" moment, and reuses the single drain hook in loop_iter/loop_run.
+    drainTeamNotifications(m);
     var arena_state = std.heap.ArenaAllocator.init(m.allocator);
     defer arena_state.deinit();
     loop_runtime.drainBackgroundTaskNotifications(
@@ -4359,6 +4365,72 @@ fn drainBackgroundTaskNotifications(m: *tui.Model) void {
         defer m.allocator.free(msg);
         appendHarnessPrompt(m, msg);
         pushInfoFmt(m, "bg subagent {d} finished", .{c.id});
+    }
+}
+
+/// Phase 20: wake teammates that have pending messages, one bounded turn each,
+/// at the top of an iteration. Serialized on the turn thread — a teammate that
+/// is already running is skipped, so two turns never overlap on the shared task
+/// graph (`taskstore.Store` has no mutex) and nobody can claim a task twice.
+///
+/// A teammate is NEVER pushed work: it wakes only because a message was
+/// addressed to it, and it decides what to claim from `task_list` itself. The
+/// lead does not narrate idleness — the teammate's report is the only visible
+/// artifact, injected as a harness `user` message like any other notification.
+fn drainTeamNotifications(m: *tui.Model) void {
+    if (!m.team.active()) return;
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Shutdown: acknowledge every teammate that has not yet answered, once.
+    // The lead's `team_delete` set the flag; here we close the bookkeeping and
+    // reset the roster so no live state survives past this turn.
+    if (m.team.shutting_down) {
+        if (!m.team.shutdownComplete()) {
+            var names: [team_mod.max_teammates][]const u8 = undefined;
+            var n: usize = 0;
+            for (m.team.members.items) |mem| {
+                if (!mem.acknowledged and n < names.len) {
+                    names[n] = a.dupe(u8, mem.name) catch continue;
+                    n += 1;
+                }
+            }
+            for (names[0..n]) |name| {
+                m.team.acknowledgeShutdown(name) catch {};
+            }
+            const note = std.fmt.allocPrint(a, "[team \"{s}\" shut down: {d} teammate(s) acknowledged]", .{ m.team.name, n }) catch "";
+            if (note.len > 0) appendHarnessPrompt(m, note);
+        }
+        m.team.reset();
+        return;
+    }
+
+    const wake = m.team.wakeable(a) catch return;
+    for (wake) |name| {
+        const prompt = m.team.drainPrompt(name, a) catch continue;
+        if (prompt.len == 0) continue;
+        m.team.setRunning(name, true);
+        defer m.team.setRunning(name, false);
+
+        const window = m.team.window(name) orelse "";
+        var rep = subagent_mod.Report{};
+        const task = subagent_mod.Task{
+            .description = std.fmt.allocPrint(a, "teammate {s} wakes on a message", .{name}) catch name,
+            .prompt = prompt,
+            .resume_id = window,
+            .name = name,
+            .team_name = m.team.name,
+            .is_teammate = true,
+        };
+        const report = runSubagent(m, task, &rep);
+        const note = std.fmt.allocPrint(
+            a,
+            "[teammate {s} report]\n{s}",
+            .{ name, report },
+        ) catch continue;
+        appendHarnessPrompt(m, note);
+        pushInfoFmt(m, "teammate {s} reported", .{name});
     }
 }
 
@@ -5093,6 +5165,54 @@ pub const auto_check_per_turn = autochk.auto_check_per_turn;
 pub const codePathsFromArgs = autochk.codePathsFromArgs;
 pub const forgetGitRepoProbe = autochk.forgetGitRepoProbe;
 pub const attachAutoCheckEnv = autochk.attachEnv;
+
+/// Session overrides for the interactive `/config` modal. Null/zero means the
+/// env var (or model window) decides; a value forces it for the session.
+pub fn autochk_enabled(m: *tui.Model) bool {
+    if (m.auto_check.enabled_override) |v| return v;
+    return envTruthy("ZODE_AUTO_CHECK", true);
+}
+
+pub fn autochk_set_enabled(m: *tui.Model, v: bool) void {
+    m.auto_check.enabled_override = v;
+}
+
+pub fn web_allow_local_enabled() bool {
+    return web_mod.allow_local_override orelse false;
+}
+
+pub fn web_allow_local_set(v: bool) void {
+    web_mod.allow_local_override = v;
+}
+
+pub fn prompt_cache_enabled() bool {
+    return chat.prompt_cache_enabled;
+}
+
+pub fn prompt_cache_set(v: bool) void {
+    chat.prompt_cache_enabled = v;
+}
+
+/// Re-export for the Settings screen's key handler.
+pub const applySettingsRow = commands_mod.applySettingsRow;
+
+/// First line of the active output style's body, for the Settings preview.
+/// Empty when no style is active.
+pub fn stylePreview(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) ![]u8 {
+    const name = current_style orelse return gpa.dupe(u8, "default · base prompt with coding rules");
+    const entries = discoverStyles(gpa, env);
+    for (entries) |e| {
+        if (!std.mem.eql(u8, e.name, name)) continue;
+        if (e.body) |b| {
+            const t = std.mem.trim(u8, b, " \t\r\n");
+            var it = std.mem.splitScalar(u8, t, '\n');
+            const line = std.mem.trim(u8, it.next() orelse "", " \t\r");
+            return gpa.dupe(u8, line);
+        }
+        return gpa.dupe(u8, e.description);
+    }
+    return gpa.dupe(u8, name);
+}
 
 /// The moment the turn started, for the bench sample. Taken here because the
 /// worker's start is not the same as the model's first token.
@@ -7893,6 +8013,9 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
     const model_owned = gpa.dupe(u8, task.model) catch "";
     const effort_owned = gpa.dupe(u8, task.effort) catch "";
     const def_owned = gpa.dupe(u8, task.definition) catch "";
+    const role_owned = gpa.dupe(u8, task.role) catch "";
+    const resume_owned = gpa.dupe(u8, task.resume_id) catch "";
+    const fork_owned = gpa.dupe(u8, task.fork_id) catch "";
 
     const BgCtx = struct {
         m: *tui.Model,
@@ -7904,6 +8027,9 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
         model: []const u8,
         effort: []const u8,
         definition: []const u8,
+        role: []const u8,
+        resume_id: []const u8,
+        fork_id: []const u8,
     };
     const ctx = gpa.create(BgCtx) catch {
         if (prompt_owned.len > 0) gpa.free(prompt_owned);
@@ -7911,6 +8037,9 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
         if (model_owned.len > 0) gpa.free(model_owned);
         if (effort_owned.len > 0) gpa.free(effort_owned);
         if (def_owned.len > 0) gpa.free(def_owned);
+        if (role_owned.len > 0) gpa.free(role_owned);
+        if (resume_owned.len > 0) gpa.free(resume_owned);
+        if (fork_owned.len > 0) gpa.free(fork_owned);
         gpa.free(desc_owned);
         return null;
     };
@@ -7921,6 +8050,9 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
     bg_task.model = model_owned;
     bg_task.effort = effort_owned;
     bg_task.definition = def_owned;
+    bg_task.role = role_owned;
+    bg_task.resume_id = resume_owned;
+    bg_task.fork_id = fork_owned;
     bg_task.run_in_background = false;
     ctx.* = .{
         .m = m,
@@ -7932,6 +8064,9 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
         .model = model_owned,
         .effort = effort_owned,
         .definition = def_owned,
+        .role = role_owned,
+        .resume_id = resume_owned,
+        .fork_id = fork_owned,
     };
     const Runner = struct {
         fn run(c: *BgCtx) void {
@@ -7946,6 +8081,9 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
             if (c.model.len > 0) a.free(c.model);
             if (c.effort.len > 0) a.free(c.effort);
             if (c.definition.len > 0) a.free(c.definition);
+            if (c.role.len > 0) a.free(c.role);
+            if (c.resume_id.len > 0) a.free(c.resume_id);
+            if (c.fork_id.len > 0) a.free(c.fork_id);
             if (c.desc.len > 0) a.free(c.desc);
             a.destroy(c);
         }
@@ -7956,6 +8094,9 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
         if (model_owned.len > 0) gpa.free(model_owned);
         if (effort_owned.len > 0) gpa.free(effort_owned);
         if (def_owned.len > 0) gpa.free(def_owned);
+        if (role_owned.len > 0) gpa.free(role_owned);
+        if (resume_owned.len > 0) gpa.free(resume_owned);
+        if (fork_owned.len > 0) gpa.free(fork_owned);
         gpa.free(desc_owned);
         gpa.destroy(ctx);
         return null;
@@ -8004,6 +8145,33 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
         } else {
             m.pushInfoFmt("unknown agent definition '{s}', using defaults", .{task.definition});
         }
+    }
+
+    // Phase 20: a `task` with `name` registers a persistent teammate. It keeps
+    // its own subagent window (Phase 26) between turns, so the harness can wake
+    // it later with a message and it resumes with its context intact.
+    if (task.name.len > 0) {
+        if (!m.team.active()) {
+            const msg = "this task names a teammate but there is no team. Call team_create first.";
+            m.pushToolDone("task", "no team", 0, msg);
+            capStoreAppendToolResult(m, s, call.id, "task", msg, arena, budget);
+            return 1;
+        }
+        if (!m.team.has(task.name)) {
+            m.team.add(task.name, false) catch {
+                const msg = "cannot register teammate (team full or invalid name).";
+                m.pushToolDone("task", "teammate not added", 0, msg);
+                capStoreAppendToolResult(m, s, call.id, "task", msg, arena, budget);
+                return 1;
+            };
+        }
+        if (m.team.window(task.name) == null) {
+            var wid_buf: [32]u8 = undefined;
+            const wid = agentroles.newId(&wid_buf, m.bench.subagents.load(.seq_cst) + 1);
+            m.team.setWindow(task.name, wid) catch {};
+        }
+        task.resume_id = m.team.window(task.name) orelse "";
+        task.is_teammate = true;
     }
 
     m.pushToolStart("task", task.description);
@@ -8071,6 +8239,10 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
         }
     }
 
+    // Phase 26: built-in role selection (unknown role falls back to default).
+    const role = agentroles.Role.fromName(task.role);
+    const role_prompt = agentroles.promptFor(role);
+
     var http = http_client.Http.init(gpa, io_global);
     defer http.deinit();
 
@@ -8094,10 +8266,19 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             return subagent_mod.refused("the skill's tools were not accepted", rep);
         };
         tool_list = allowed.items;
+    } else if (task.is_teammate) {
+        // Phase 20: a teammate gets the task graph reads/writes and the message
+        // channel on top of the read-only set. Still no bash/write unless the
+        // lead explicitly granted them.
+        tool_list = &agentroles.teammate_tool_names;
     } else if (task.allow_writes) {
         // The Tester: the read-only set plus exactly write and edit. Nothing
         // else — no bash, no ask, no task recursion.
         tool_list = &subagent_mod.tester_tool_names;
+    } else if (role) |r| {
+        // Built-in role: use the role's base tool set (subset of read-only tools;
+        // roles cannot escalate).
+        tool_list = agentroles.baseToolsFor(r);
     } else {
         tool_list = &subagent_mod.tool_names;
     }
@@ -8138,17 +8319,89 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     var tstate = SubTurn{ .m = m };
     defer tstate.deinit(gpa);
 
+    const system_prompt: []const u8 = if (role_prompt.len > 0)
+        (std.fmt.allocPrint(sarena, "{s}\n\n{s}", .{ subagent_mod.system_prompt, role_prompt }) catch subagent_mod.system_prompt)
+    else
+        subagent_mod.system_prompt;
+
+    // Phase 26: agent memory is consulted, not inlined into the prompt. For a
+    // role run we point the subagent at the per-project, per-role lessons file
+    // (if any) so it can read/consult it; memory content is not embedded here.
+    var memory_note: []const u8 = "";
+    if (role) |r| {
+        var lbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (agentroles.lessonsPath(&lbuf, project_info.cwd(), r)) |lp| {
+            if (std.Io.Dir.cwd().statFile(io_global, lp, .{})) |_| {
+                memory_note = std.fmt.allocPrint(
+                    sarena,
+                    "[agent memory for this role is available at {s}; consult it with `read` if relevant (not inlined). Append lessons there if you have write access.]\n\n",
+                    .{lp},
+                ) catch "";
+            } else |_| {}
+        }
+    }
+
+    const session_path: ?[]const u8 = if (m.session) |sess| sess.path else null;
+    // Determine subagent window id: resume keeps the same id; fork/new gets a new id.
+    var sa_id_buf: [32]u8 = undefined;
+    var subagent_id: []const u8 = "";
+    if (task.resume_id.len > 0) {
+        subagent_id = sarena.dupe(u8, task.resume_id) catch "";
+    } else {
+        const ctr = m.bench.subagents.load(.seq_cst);
+        subagent_id = sarena.dupe(u8, agentroles.newId(&sa_id_buf, ctr + 1)) catch "sa-0";
+    }
+
     const user_msg = if (task.prompt.len > 0)
         std.fmt.allocPrint(
             sarena,
-            "{s}\n\n{s}",
-            .{ task.description, task.prompt },
+            "{s}{s}\n\n{s}",
+            .{ memory_note, task.description, task.prompt },
         ) catch return subagent_mod.refused("no memory for the prompt", rep)
     else
-        sarena.dupe(u8, task.description) catch return subagent_mod.refused("no memory for the prompt", rep);
+        std.fmt.allocPrint(
+            sarena,
+            "{s}{s}",
+            .{ memory_note, task.description },
+        ) catch return subagent_mod.refused("no memory for the prompt", rep);
 
-    msgs.append(sarena, .{ .role = "system", .content = subagent_mod.system_prompt }) catch
-        return subagent_mod.refused("no memory for the system prompt", rep);
+    var resumed = false;
+    if (task.resume_id.len > 0 or task.fork_id.len > 0) {
+        const src_id = if (task.resume_id.len > 0) task.resume_id else task.fork_id;
+        if (session_path == null) {
+            return subagent_mod.refused("cannot resume/fork subagent: no session file", rep);
+        }
+        if (!agentroles.isValidId(src_id)) {
+            return subagent_mod.refused("invalid subagent id", rep);
+        }
+        if (agentroles.loadWindow(io_global, sarena, session_path.?, src_id)) |data| {
+            const saved = agentroles.parseWindow(sarena, data) catch &.{};
+            if (task.resume_id.len > 0) {
+                // Resume: keep the window intact (continue from it).
+                for (saved) |sm| {
+                    msgs.append(sarena, .{ .role = sm.role, .content = sm.content }) catch {};
+                }
+                resumed = msgs.items.len > 0;
+            } else {
+                // Fork: copy context into an independent window (do not share/mutate original).
+                for (saved) |sm| {
+                    msgs.append(sarena, .{ .role = sm.role, .content = sm.content }) catch {};
+                }
+            }
+        } else {
+            return subagent_mod.refused("subagent window not found", rep);
+        }
+    }
+
+    if (!resumed) {
+        msgs.append(sarena, .{ .role = "system", .content = system_prompt }) catch
+            return subagent_mod.refused("no memory for the system prompt", rep);
+    } else {
+        // Ensure resumed window has a system prompt at the front.
+        if (msgs.items.len == 0 or !std.mem.eql(u8, msgs.items[0].role, "system")) {
+            msgs.insert(sarena, 0, .{ .role = "system", .content = system_prompt }) catch {};
+        }
+    }
     msgs.append(sarena, .{ .role = "user", .content = user_msg }) catch
         return subagent_mod.refused("no memory for the prompt", rep);
 
@@ -8256,6 +8509,18 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             // A cancelled subagent returns what it found, if anything. Treating
             // ESC as "refused" would throw away a report the user paid for.
             if (err == error.Cancelled and tstate.text.items.len > 0) {
+                msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items }) catch {};
+                if (session_path) |sp| {
+                    var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
+                    for (msgs.items) |mm| wm.append(sarena, .{ .role = mm.role, .content = mm.content }) catch {};
+                    const wdata = agentroles.serializeWindow(sarena, wm.items) catch "";
+                    if (wdata.len > 0) agentroles.saveWindow(io_global, sp, subagent_id, wdata);
+                }
+                if (subagent_id.len > 0) {
+                    var idnote: [96]u8 = undefined;
+                    const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+                    if (n.len > 0) rep.setNote(n);
+                }
                 const partial = subagent_mod.formatReport(tstate.text.items, rep);
                 return partial;
             }
@@ -8341,6 +8606,18 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
 
         if (tstate.calls.items.len == 0) {
             // Done: the text IS the report.
+            msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items }) catch {};
+            if (session_path) |sp| {
+                var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
+                for (msgs.items) |mm| wm.append(sarena, .{ .role = mm.role, .content = mm.content }) catch {};
+                const wdata = agentroles.serializeWindow(sarena, wm.items) catch "";
+                if (wdata.len > 0) agentroles.saveWindow(io_global, sp, subagent_id, wdata);
+            }
+            if (subagent_id.len > 0) {
+                var idnote: [96]u8 = undefined;
+                const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+                if (n.len > 0 and rep.note().len == 0) rep.setNote(n);
+            }
             const out = subagent_mod.formatReport(tstate.text.items, rep);
             return out;
         }
@@ -8358,15 +8635,75 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             // A tool the subagent is not allowed to use comes back as a tool
             // result, NOT as a crash: the model asked for something out of scope
             // and it should find out by being told, in the same turn.
-            const tool_allowed = if (task.allow_writes)
+            var role_memory_write = false;
+            if (role) |r| {
+                if (std.mem.eql(u8, call.name, "write") or std.mem.eql(u8, call.name, "edit")) {
+                    var lp_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    if (agentroles.lessonsPath(&lp_buf, project_info.cwd(), r)) |lp| {
+                        var pth: ?[]const u8 = null;
+                        if (std.json.parseFromSliceLeaky(std.json.Value, sarena, call.args_json, .{})) |pv| {
+                            if (pv == .object) {
+                                if (pv.object.get("path")) |v| {
+                                    if (v == .string) pth = v.string;
+                                }
+                                if (pth == null) if (pv.object.get("file_path")) |v| {
+                                    if (v == .string) pth = v.string;
+                                };
+                            }
+                        } else |_| {}
+                        if (pth) |pp| {
+                            if (std.mem.eql(u8, pp, lp)) role_memory_write = true;
+                        }
+                    }
+                }
+            }
+
+            const tool_allowed = if (task.is_teammate)
+                agentroles.teammateAllowsTool(call.name, false)
+            else if (task.allow_writes)
                 std.mem.eql(u8, call.name, "write") or std.mem.eql(u8, call.name, "edit") or
                     subagent_mod.allowsTool(call.name)
+            else if (role) |r|
+                agentroles.roleAllowsTool(r, call.name) or role_memory_write
             else
                 subagent_mod.allowsTool(call.name);
+
+            // Phase 26: NO ESCALATION — a role subagent may never use a tool the
+            // caller itself is not allowed to use. Two gates, both from the
+            // caller's own policy:
+            //  1. plan/read-only mode: writes and mutating bash are blocked;
+            //  2. an explicit deny permission rule on the caller.
+            // (An `ask` rule is not a denial: the subagent cannot show a dialog,
+            //  but a rule that only asks does not forbid the tool.)
+            var caller_denied = false;
+            if (tool_allowed and role != null) {
+                if (tool_exec_policy.shouldBlockReadOnly(read_only, call.name, call.args_json, sarena)) {
+                    caller_denied = true;
+                } else {
+                    const subjects = tools_mod.callSubjects(call.name, call.args_json, sarena);
+                    if (permDecision(call.name, subjects)) |d| {
+                        if (d.action == .deny) caller_denied = true;
+                    }
+                }
+            }
+            if (caller_denied) {
+                const reason = if (read_only)
+                    "PLAN MODE is on for the caller; the subagent cannot escalate to this tool."
+                else
+                    "a permission rule denies this tool for the caller; the subagent cannot escalate to it.";
+                msgs.append(sarena, .{ .role = "tool", .content = reason, .tool_call_id = call.id }) catch break;
+                continue;
+            }
             if (!tool_allowed) {
                 const denied = blk: {
                     if (task.allow_writes) {
                         break :blk std.fmt.allocPrint(sarena, "the tester may read, search and write/edit files — `{s}` is not available to it.", .{call.name}) catch "not allowed";
+                    }
+                    if (role) |r| {
+                        if (std.mem.eql(u8, call.name, "write") or std.mem.eql(u8, call.name, "edit")) {
+                            break :blk std.fmt.allocPrint(sarena, "the {s} subagent may only write its own lessons memory file.", .{r.name()}) catch "not allowed";
+                        }
+                        break :blk std.fmt.allocPrint(sarena, "the {s} subagent may not use `{s}`.", .{ r.name(), call.name }) catch "not allowed";
                     }
                     break :blk std.fmt.allocPrint(sarena, "the subagent may not use `{s}`. It can only search and read.", .{call.name}) catch "not allowed";
                 };
@@ -8385,26 +8722,54 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
                     continue;
                 }
             }
-            const res_text = tools_mod.execute(
-                io_global,
-                call.name,
-                call.args_json,
-                // The subagent's throwaway arena, NOT the model allocator: a `grep`
-                // result here is up to 4 KB of memory nobody will ever read again, and
-                // one owner that dies with the subagent is the only way to be sure it
-                // goes back.
-                sarena,
-                // NO background registry: a subagent must not leave processes
-                // behind that nobody is tracking, and `run_in_background` on a
-                // read-only tool is not a thing.
-                null,
-                // NO read cache either, and that is a real decision rather than an
-                // omission: the subagent has its own throwaway window, so nothing
-                // it reads is ever "already in the context" of the main one. A
-                // shared cache would answer "unchanged, it is in your context" to a
-                // window that is thrown away a second later.
-                null,
-            ) catch |err| {
+            if (role_memory_write) {
+                if (role) |r| {
+                    var md_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    if (agentroles.memoryDir(&md_buf, project_info.cwd(), r)) |memdir| {
+                        std.Io.Dir.cwd().createDirPath(io_global, memdir) catch {};
+                    }
+                }
+            }
+            // A teammate uses the SHARED task graph and team store so it can
+            // claim work (`task_update` with claim+owner) and send messages back
+            // to the lead. These calls are serialized on the turn thread (the
+            // harness runs one teammate turn at a time, at the top of an
+            // iteration), so `taskstore.Store` needs no mutex here. A plain
+            // subagent keeps the isolated `execute` path with null stores.
+            const res = if (task.is_teammate)
+                tools_mod.executeTeam(
+                    io_global,
+                    call.name,
+                    call.args_json,
+                    sarena,
+                    null,
+                    null,
+                    &m.tasks,
+                    perm_rules,
+                    &m.team,
+                )
+            else
+                tools_mod.execute(
+                    io_global,
+                    call.name,
+                    call.args_json,
+                    // The subagent's throwaway arena, NOT the model allocator: a `grep`
+                    // result here is up to 4 KB of memory nobody will ever read again, and
+                    // one owner that dies with the subagent is the only way to be sure it
+                    // goes back.
+                    sarena,
+                    // NO background registry: a subagent must not leave processes
+                    // behind that nobody is tracking, and `run_in_background` on a
+                    // read-only tool is not a thing.
+                    null,
+                    // NO read cache either, and that is a real decision rather than an
+                    // omission: the subagent has its own throwaway window, so nothing
+                    // it reads is ever "already in the context" of the main one. A
+                    // shared cache would answer "unchanged, it is in your context" to a
+                    // window that is thrown away a second later.
+                    null,
+                );
+            const res_text: []const u8 = res catch |err| {
                 const emsg = sarena.dupe(u8, @errorName(err)) catch continue;
                 msgs.append(sarena, .{ .role = "tool", .content = emsg, .tool_call_id = call.id }) catch break;
                 continue;
@@ -8427,8 +8792,31 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     // Out of steps. The report it managed to write is usually good enough, and
     // throwing it away because the search did not FINISH is the worst of both.
     if (tstate.text.items.len > 0) {
+        msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items }) catch {};
+        if (session_path) |sp| {
+            var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
+            for (msgs.items) |mm| wm.append(sarena, .{ .role = mm.role, .content = mm.content }) catch {};
+            const wdata = agentroles.serializeWindow(sarena, wm.items) catch "";
+            if (wdata.len > 0) agentroles.saveWindow(io_global, sp, subagent_id, wdata);
+        }
+        if (subagent_id.len > 0) {
+            var idnote: [96]u8 = undefined;
+            const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+            if (n.len > 0 and rep.note().len == 0) rep.setNote(n);
+        }
         const out = subagent_mod.formatReport(tstate.text.items, rep);
         return out;
+    }
+    if (session_path) |sp| {
+        var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
+        for (msgs.items) |mm| wm.append(sarena, .{ .role = mm.role, .content = mm.content }) catch {};
+        const wdata = agentroles.serializeWindow(sarena, wm.items) catch "";
+        if (wdata.len > 0) agentroles.saveWindow(io_global, sp, subagent_id, wdata);
+    }
+    if (subagent_id.len > 0) {
+        var idnote: [96]u8 = undefined;
+        const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+        if (n.len > 0 and rep.note().len == 0) rep.setNote(n);
     }
     return subagent_mod.refused("it ran out of steps without reporting anything", rep);
 }
@@ -8998,6 +9386,18 @@ fn withPendingImages(m: *tui.Model, arena: std.mem.Allocator, msgs: []chat.ChatM
     // `submitInput` / `prepareImageFor`'s eviction), never cached or persisted.
     if (m.pending_images.isEmpty()) return msgs;
 
+    // THE LAST-MOMENT VISION GATE. The earlier gates (staging, `read`) checked
+    // vision when the image was attached, but the ANSWERING MODEL can change
+    // between then and now — the cheap router, `/model`, `/free-auto`. Checking
+    // here means a model with no vision NEVER gets image bytes on the wire, and
+    // the user is told once why they did not arrive.
+    if (!models_mod.isVision(curAnswering())) {
+        const n = m.pending_images.len;
+        m.pending_images.clear(m.allocator);
+        pushInfoFmt(m, "· {d} image(s) NOT sent: {s} cannot see images", .{ n, curAnswering() });
+        return msgs;
+    }
+
     const note = images_mod.wireNote(arena, &m.pending_images) catch return msgs;
     const imgs = arena.alloc(chat.Image, m.pending_images.len) catch return msgs;
     for (m.pending_images.images[0..m.pending_images.len], imgs) |src, *dst| {
@@ -9156,6 +9556,40 @@ fn clipboardBytes(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) 
             gpa.free(res.stdout);
             return null;
         },
+    }
+}
+
+/// Stage image mentions typed in the prompt (`@shot.png`) into `pending_images`.
+///
+/// `@file` mentions normally inline a file's text into the prompt. An image has
+/// no text worth inlining (`mentions.expand` now skips it), so this turns it into
+/// a real attachment instead. Vision is checked HERE too, but `withPendingImages`
+/// re-checks at the last moment — the answering model can change mid-turn.
+pub fn stageImageMentions(m: *tui.Model, text: []const u8) void {
+    const scan_result = mentions.scan(text) catch return;
+    for (scan_result.mentions[0..scan_result.count]) |mention| {
+        const path = mention.pathOf();
+        const mime = images_mod.mimeForPath(path) orelse continue;
+        if (m.pending_images.len >= images_mod.max_images) break;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io_global, path, m.allocator, .limited(images_mod.max_bytes)) catch {
+            m.pushInfoFmt("· image {s} could not be read — NOT attached", .{path});
+            continue;
+        };
+        defer m.allocator.free(bytes);
+        var p = images_mod.prepare(m.allocator, path, bytes, mime, models_mod.isVision(curAnswering())) catch {
+            m.pushInfoFmt("· image {s} could not be prepared — NOT attached", .{path});
+            continue;
+        };
+        defer p.deinit(m.allocator);
+        const b64 = p.image_b64 orelse continue;
+        p.image_b64 = null; // ownership moves to pending_images
+        m.allocator.free(p.text); // the model already has the typed mention as its label
+        const slot = &m.pending_images.images[m.pending_images.len];
+        slot.* = .{ .mime = mime, .data_b64 = b64, .path = m.allocator.dupe(u8, path) catch "" };
+        m.pending_images.len += 1;
+        m.pending_images.total_bytes += bytes.len;
+        m.pending_images.user_attached = true;
+        m.pushInfoFmt("· image {s} attached to this message", .{std.fs.path.basename(path)});
     }
 }
 
@@ -9371,6 +9805,12 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
     _ = killForeground();
     _ = bgproc.requestKillAll(&m.bg);
     bgproc.killAll(&m.bg, io, 120);
+
+    // Phase 20: acknowledge any remaining teammates so no live team state
+    // outlives the app. Teammates run on the turn thread (no detached threads),
+    // so this is bookkeeping closure rather than a process kill — but it is the
+    // same "sweep on exit" invariant as bgproc.killAll.
+    _ = m.team.sweepOnExit();
 
     // 2. Workers: ask, then a SHORT wait. 60 ms is not arbitrary either — it is
     // long enough for a worker that is between operations to notice and leave, and
@@ -10698,7 +11138,9 @@ var catalog_refresh_last_ms: std.atomic.Value(i64) = .init(0);
 
 const catalog_refresh_interval_ms: i64 = 15 * 60 * 1000;
 var models_palette_refresh_last_ms: std.atomic.Value(i64) = .init(0);
-const models_palette_refresh_interval_ms: i64 = 5 * 60 * std.time.ms_per_s;
+// One source of truth: the palette refreshes exactly as often as a cached
+// catalog becomes stale. Changing `modelcache.max_age_seconds` changes both.
+const models_palette_refresh_interval_ms: i64 = modelcache.max_age_ms;
 
 /// Resets the model palette refresh throttle so the next open/refresh fetches
 /// fresh catalogs (cache invalidation on auth/provider changes).
@@ -10954,6 +11396,7 @@ fn modelsWorker(job: *ModelsJob) void {
     // that is already there reads as an app that has not noticed it has the answer.
     var cached: []models_mod.Model = &.{};
     var from_cache = false;
+    var cache_stale = false;
     {
         var astate = std.heap.ArenaAllocator.init(gpa);
         defer astate.deinit();
@@ -10965,13 +11408,19 @@ fn modelsWorker(job: *ModelsJob) void {
             // `--models` uses its list before the arena goes away.
             cached = modelcache.copyOut(gpa, e.models) catch &.{};
             from_cache = cached.len > 0;
+            cache_stale = modelcache.isStale(worker_io, e.fetched_at);
         }
     }
     defer if (cached.len > 0) modelcache.freeOut(gpa, cached);
     if (from_cache) {
         publishModels(m, cached, job.request_id);
         if (is_current(m, job)) {
-            m.setCatalogNotice(job.request_id, "Saved catalog · checking for updates...");
+            // Say WHY the refresh matters. A stale list is still shown (resilience),
+            // but the reader knows it is older than the TTL and is being replaced.
+            m.setCatalogNotice(job.request_id, if (cache_stale)
+                "Saved catalog is older than 5 min · refreshing..."
+            else
+                "Saved catalog · checking for updates...");
         }
     }
 
@@ -18247,4 +18696,79 @@ test "buildModelItems: a free model in the cache does not corrupt the heap [cras
         }
     }
     try std.testing.expect(found);
+}
+
+test "team: parseTask reads name and team for teammate runs" {
+    var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ast.deinit();
+    const a = ast.allocator();
+    const t = try subagent_mod.parseTask(a,
+        "{\"description\":\"watch tests\",\"name\":\"alice\",\"team\":\"builders\"}");
+    try std.testing.expectEqualStrings("alice", t.name);
+    try std.testing.expectEqualStrings("builders", t.team_name);
+    try std.testing.expect(!t.is_teammate); // set by the harness, not the model
+}
+
+test "team: a teammate keeps its window and wakes only on messages" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    // No team yet: wake is a no-op.
+    drainTeamNotifications(&m);
+
+    try m.team.create("builders");
+    try m.team.add("alice", false);
+    try m.team.setWindow("alice", "sa-42");
+    var ast = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ast.deinit();
+    const wake = try m.team.wakeable(ast.allocator());
+    try std.testing.expectEqual(@as(usize, 0), wake.len);
+
+    _ = try m.team.send("lead", "alice", "check the parser");
+    const wake2 = try m.team.wakeable(ast.allocator());
+    try std.testing.expectEqual(@as(usize, 1), wake2.len);
+    try std.testing.expectEqualStrings("alice", wake2[0]);
+    try std.testing.expectEqualStrings("sa-42", m.team.window("alice").?);
+}
+
+test "team: exit sweep acknowledges every teammate" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try m.team.create("builders");
+    try m.team.add("alice", false);
+    try m.team.add("bob", false);
+    try std.testing.expectEqual(@as(usize, 2), m.team.sweepOnExit());
+    try std.testing.expect(m.team.shutdownComplete());
+}
+
+test "withPendingImages: a no-vision model gets NO image bytes on the wire" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Stage two images as if the user had pasted them.
+    m.pending_images.len = 2;
+    m.pending_images.images[0] = .{ .mime = "image/png", .data_b64 = "AAAA", .path = "" };
+    m.pending_images.images[1] = .{ .mime = "image/jpeg", .data_b64 = "BBBB", .path = "" };
+    m.pending_images.total_bytes = 8;
+
+    // Pick a model with NO vision (an embedding/router id), set it as the one
+    // answering, then build the wire. No image message may appear.
+    const saved_model = cur_model;
+    const saved_answering = cur_answering;
+    defer {
+        cur_model = saved_model;
+        cur_answering = saved_answering;
+    }
+    const no_vision = "text-embedding-3-small";
+    try std.testing.expect(!models_mod.isVision(no_vision));
+    setAnswering(no_vision);
+
+    var msgs = [_]chat.ChatMessage{.{ .role = "user", .content = "look at this" }};
+    const out = withPendingImages(&m, a, &msgs);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqual(@as(u8, 0), out[0].images.len);
+    // The images were DROPPED, not left pending for a later request.
+    try std.testing.expectEqual(@as(u8, 0), m.pending_images.len);
 }

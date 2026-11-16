@@ -815,7 +815,12 @@ pub fn percentEncodeQuery(raw: []const u8, w: *std.Io.Writer) !void {
 ///
 /// It is one variable and not a `--allow-local` flag because the thing it is for is a
 /// standing preference ("I fetch my own dev server from here"), not a per-call decision.
+/// Session-level override from the interactive `/config` modal. Null means the
+/// env var decides; a value forces it for the rest of the session.
+pub var allow_local_override: ?bool = null;
+
 fn allowLocal() bool {
+    if (allow_local_override) |v| return v;
     const v = agent.environ_global orelse return false;
     const s = v.get("ZODE_WEB_ALLOW_LOCAL") orelse return false;
     return s.len > 0 and !std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "false");

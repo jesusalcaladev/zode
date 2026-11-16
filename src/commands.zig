@@ -28,6 +28,8 @@ const clipboard = @import("clipboard.zig");
 const bgproc = @import("bgproc.zig");
 const github_lib = @import("lib/github.zig");
 const subagent_mod = @import("lib/subagent.zig");
+const configmenu = @import("lib/configmenu.zig");
+const common = @import("tools/common.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const sandbox_mod = @import("lib/sandbox.zig");
 const taskstore = @import("lib/taskstore.zig");
@@ -305,18 +307,16 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
 }
 
 /// `/agents`: subagent definitions/status (35.11 panel).
-///
-/// Agent definitions on disk (Phase 9) and built-in roles (Phase 26) are not
-/// implemented; this panel is honest and shows current subagent behavior.
 pub fn cmdAgents(m: *tui.Model) void {
     const gpa = m.allocator;
     agent.pushInfoOwned(m, gpa.dupe(u8, "agents  ·  subagent/task configuration") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  current: task subagent (general-purpose), depth 1, effort low, 24k budget, restricted/read-oriented tool set, no conversation history") catch return);
     agent.pushInfoOwned(m, gpa.dupe(u8, "  parallel cap: ZODE_TASK_PARALLEL (default 3; see env/config)") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  definitions on disk (Phase 9): not implemented") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  built-in roles explore/plan/verify (Phase 26): not implemented") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  team mode (Phase 20): not implemented") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  note: interactive agent editing is not implemented") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  definitions on disk (Phase 9): .zode/agents/<name>/AGENT.md and ~/.config/zode/agents/<name>/AGENT.md") catch return);
+    agent.pushInfoOwned(m, gpa.dupe(u8, "  built-in roles (Phase 26): explore / plan / verify via task(role=…)") catch return);
+    const team_summary = m.team.summary(gpa) catch "";
+    defer gpa.free(team_summary);
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  team mode (Phase 20): {s}", .{team_summary}) catch return);
 }
 
 /// `/mcp`: MCP server configuration and status (35.13 panel, partial).
@@ -821,7 +821,19 @@ pub fn cmdStatus(m: *tui.Model) void {
 /// `/config`: configuration that is actually in effect — env vars, compaction
 /// thresholds, model source, limits. The command you run to verify "why is zode
 /// using this number?".
-pub fn cmdConfig(m: *tui.Model) void {
+/// `/config` — the interactive settings modal (Claude-Code-style): one list of
+/// every setting, Enter opens a small value picker, and the change applies to
+/// this session immediately. `report` keeps the old read-only numbers panel.
+pub fn cmdConfig(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(a, "report") or std.ascii.eqlIgnoreCase(a, "show")) {
+        configReport(m);
+        return;
+    }
+    m.settingsOpen();
+}
+
+fn configReport(m: *tui.Model) void {
     const gpa = m.allocator;
     const ctx = agent.curModelContext();
     const limit = compaction.contextLimitFor(m.environ, ctx);
@@ -850,6 +862,180 @@ pub fn cmdConfig(m: *tui.Model) void {
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  hot (sync):    {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct}) catch return);
     agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  recent window: {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)}) catch return);
     agent.pushInfoOwned(m, "");
+}
+
+// ── interactive Settings screen (Claude-Code-style internal config) ────
+
+/// The action a row navigation key asked for.
+pub const SettingsAction = enum { enter, next, prev };
+
+/// Current value of a settings row, as the text painted on screen. Caller frees.
+pub fn settingsValue(m: *tui.Model, s: configmenu.Setting) []const u8 {
+    const gpa = m.allocator;
+    return switch (s) {
+        .model => gpa.dupe(u8, agent.cur_model) catch "",
+        .provider => gpa.dupe(u8, agent.cur_provider_id) catch "",
+        .effort => gpa.dupe(u8, agent.current_effort.label()) catch "",
+        .output_style => gpa.dupe(u8, agent.current_style orelse "default") catch "",
+        .permission_mode => gpa.dupe(u8, agent.permModeName()) catch "",
+        .compaction => gpa.dupe(u8, @tagName(compaction.effectiveMode(m.environ, m.compact_mode))) catch "",
+        .task_parallel => std.fmt.allocPrint(gpa, "{d}", .{agent.taskParallelLimit(m)}) catch "",
+        .max_iter => std.fmt.allocPrint(gpa, "{d}", .{agent.iterationLimit()}) catch "",
+        .context_limit => if (compaction.context_limit_override > 0)
+            std.fmt.allocPrint(gpa, "{d}", .{compaction.context_limit_override}) catch ""
+        else
+            gpa.dupe(u8, "auto") catch "",
+        .auto_check => gpa.dupe(u8, if (agent.autochk_enabled(m)) "on" else "off") catch "",
+        .web_allow_local => gpa.dupe(u8, if (agent.web_allow_local_enabled()) "on" else "off") catch "",
+        .prompt_cache => gpa.dupe(u8, if (agent.prompt_cache_enabled()) "on" else "off") catch "",
+        .read_cache_size => std.fmt.allocPrint(gpa, "{s}", .{formatBytes(common.max_tool_output)}) catch "",
+        .cache_stats => cacheStatsLine(m),
+        .permission_rules => permRulesLine(m),
+        .color_palette => gpa.dupe(u8, if (theme.caps.daltonized) "daltonized" else "default") catch "",
+        .vim_mode => gpa.dupe(u8, if (m.vim_mode) "on" else "off") catch "",
+        .nerd_icons => gpa.dupe(u8, if (m.nerd_icons) "on" else "off") catch "",
+    };
+}
+
+fn formatBytes(n: usize) []const u8 {
+    // Static strings only: the screen paints this and frees nothing.
+    if (n >= 10 * 1024 * 1024) return "10M";
+    if (n >= 4 * 1024 * 1024) return "4M";
+    if (n >= 1024 * 1024) return "1M";
+    if (n >= 256 * 1024) return "256K";
+    return "64K";
+}
+
+fn parseBytes(s: []const u8) usize {
+    const mult: usize = if (std.mem.endsWith(u8, s, "M")) 1024 * 1024 else if (std.mem.endsWith(u8, s, "K")) 1024 else 1;
+    const digits = if (mult == 1) s else s[0 .. s.len - 1];
+    const n = std.fmt.parseInt(usize, digits, 10) catch return 1024 * 1024;
+    return n * mult;
+}
+
+fn cacheStatsLine(m: *tui.Model) []const u8 {
+    const st = &cache_stats.session;
+    return std.fmt.allocPrint(m.allocator, "{d:.0}% hit · {s}", .{ st.hitRatePct(), @tagName(st.verdict()) }) catch "n/a";
+}
+
+fn permRulesLine(m: *tui.Model) []const u8 {
+    const rules = agent.permRuleSet();
+    return std.fmt.allocPrint(m.allocator, "{s} · mode {s}", .{
+        if (rules.rules.len == 0) "no rules" else "rules active",
+        agent.permModeName(),
+    }) catch "n/a";
+}
+
+/// Writes the persisted fields of a Settings row from the CURRENT runtime
+/// state. Called after any change so config.json mirrors what is on screen.
+fn persistSettings(m: *tui.Model) void {
+    if (m.environ == null or !m.io_ready) return;
+    var s = config_mod.Settings{};
+    s.output_style = if (agent.current_style) |v| m.allocator.dupe(u8, v) catch null else "default";
+    s.effort = m.allocator.dupe(u8, agent.current_effort.label()) catch null;
+    s.permission_mode = m.allocator.dupe(u8, agent.permModeName()) catch null;
+    s.compaction = m.allocator.dupe(u8, @tagName(compaction.effectiveMode(m.environ, m.compact_mode))) catch null;
+    if (m.taskParallelLimit() > 0) s.task_parallel = m.taskParallelLimit();
+    s.max_iter = agent.iterationLimit();
+    if (compaction.context_limit_override > 0) s.context_limit = compaction.context_limit_override;
+    s.auto_check = agent.autochk_enabled(m);
+    s.web_allow_local = agent.web_allow_local_enabled();
+    s.prompt_cache = agent.prompt_cache_enabled();
+    s.read_cache_bytes = common.max_tool_output;
+    s.color_palette = if (theme.caps.daltonized) "daltonized" else "default";
+    s.vim_mode = m.vim_mode;
+    s.nerd_icons = if (m.nerd_icons) "on" else "off";
+    config_mod.patchSettings(m.io, m.environ, s) catch {};
+}
+
+/// Apply one concrete value to a settings row.
+pub fn applySettingValue(m: *tui.Model, s: configmenu.Setting, value: []const u8) void {
+    switch (s) {
+        .model, .provider => return, // handled by the palette
+        .cache_stats, .permission_rules => return, // read-only
+        .effort => cmdEffort(m, value),
+        .output_style => cmdStyle(m, value),
+        .permission_mode => {
+            if (agent.parsePermMode(value)) |mode| agent.setPermMode(m, mode);
+        },
+        .compaction => cmdCompact(m, value),
+        .task_parallel => cmdTaskParallel(m, value),
+        .max_iter => {
+            const n = std.fmt.parseInt(usize, value, 10) catch 0;
+            if (n > 0) agent.iter_limit_override = n;
+        },
+        .context_limit => {
+            if (std.mem.eql(u8, value, "auto")) {
+                compaction.context_limit_override = 0;
+            } else {
+                const n = parseBytes(value);
+                compaction.context_limit_override = if (n > 0) @intCast(n) else 0;
+            }
+        },
+        .auto_check => agent.autochk_set_enabled(m, std.mem.eql(u8, value, "on")),
+        .web_allow_local => agent.web_allow_local_set(std.mem.eql(u8, value, "on")),
+        .prompt_cache => agent.prompt_cache_set(std.mem.eql(u8, value, "on")),
+        .read_cache_size => common.max_tool_output = parseBytes(value),
+        .color_palette => cmdColor(m, value),
+        .vim_mode => cmdVim(m),
+        .nerd_icons => m.nerd_icons = std.mem.eql(u8, value, "on"),
+    }
+    if (s.persisted()) persistSettings(m);
+}
+
+/// Navigation callback from `Model.settingsHandleKey`.
+pub fn applySettingsRow(m: *tui.Model, s: configmenu.Setting, action: SettingsAction) void {
+    switch (s.kind()) {
+        .info => return,
+        .palette => {
+            if (action != .enter) return;
+            m.settingsClose();
+            if (s == .model) agent.openModelPaletteAsync(m) else agent.openProviderPicker(m);
+            return;
+        },
+        .picker, .toggle => {},
+    }
+    const current = settingsValue(m, s);
+    defer m.allocator.free(current);
+    const opts = configmenu.optionsFor(s);
+    if (opts.len == 0) return;
+    var idx: usize = 0;
+    for (opts, 0..) |o, i| {
+        if (std.mem.eql(u8, o, current)) {
+            idx = i;
+            break;
+        }
+    }
+    const next = switch (action) {
+        .enter => (idx + 1) % opts.len,
+        .next => (idx + 1) % opts.len,
+        .prev => if (idx == 0) opts.len - 1 else idx - 1,
+    };
+    applySettingValue(m, s, opts[next]);
+}
+
+test "/config opens the Settings screen" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try agent.submit(&m, "/config");
+    try std.testing.expect(m.settings_active);
+    try std.testing.expect(!m.pickerActive());
+}
+
+test "/config report still shows the numbers panel" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try agent.submit(&m, "/config report");
+    try std.testing.expect(!m.settings_active);
+}
+
+test "settings: a toggle row cycles and applies" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    const before = agent.autochk_enabled(&m);
+    defer agent.autochk_set_enabled(&m, before); // per-Model field: never leak into other tests
+    applySettingsRow(&m, .auto_check, .next);
+    try std.testing.expectEqual(!before, agent.autochk_enabled(&m));
 }
 
 /// `/usage`: unified pretty panel (tokens + cache + cost chord).
@@ -2167,7 +2353,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/tasks", .desc = "task panel with blockers and priorities (task graph)", .palette_visible = true },
     .{ .key = "/view", .desc = "workbench view mode (presentation only): normal|focus|flow|review", .key_hint = "normal|focus|flow|review", .palette_visible = true },
     .{ .key = "/doctor", .desc = "diagnosis: model, effort, style, permissions, key, compaction, sessions" },
-    .{ .key = "/config", .desc = "effective configuration: limits, budgets, compact thresholds, recent window" },
+    .{ .key = "/config", .desc = "Settings screen: internal config (style, context, cache, permissions, ...)" },
     .{ .key = "/status", .desc = "session status: model, effort, perms, compaction, context gauge", .key_hint = "context gauge" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
@@ -3679,4 +3865,20 @@ test "/btw without a question shows usage" {
     const text = try pendingText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "usage: /btw") != null);
+}
+
+test "render: the Settings screen shows sections and rows" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    try agent.submit(&m, "/config");
+    try std.testing.expect(m.settings_active);
+    try std.testing.expect(!m.pickerActive());
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const surface = try tui.drawTest(&m, arena_state.allocator(), 100, 30);
+    const text = tui.allText(surface);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Settings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Model & reasoning") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Context & cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Permissions") != null);
 }

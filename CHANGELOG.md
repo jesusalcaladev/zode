@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add the git workflow module with native GitHub first (git) [`1998ccc5`](https://github.com/jesusalcaladev/zode/commit/1998ccc5)
 - add the /github status command and route the model to it (github) [`f25b91ca`](https://github.com/jesusalcaladev/zode/commit/f25b91ca)
 - refine file intelligence navigation and compact change output (tui) [`d06c2137`](https://github.com/jesusalcaladev/zode/commit/d06c2137)
-- complete phase 33 (picker scoring, notifications, context chart, tasks panel) (tui) [`4f12a4a1`](https://github.com/jesusalcaladev/zode/commit/4f12a4a1)
+- complete phase 33 (picker scoring, notifications, context chart, tasks panel) (tui) [`d666861e`](https://github.com/jesusalcaladev/zode/commit/d666861e)
+- interactive Settings screen, team mode, roles, model cache TTL and image input [`5e78c3c1`](https://github.com/jesusalcaladev/zode/commit/5e78c3c1)
 
 ### Bug Fixes
 

@@ -25,7 +25,29 @@ const mcp_servers = @import("mcp/servers.zig");
 ///     }
 ///   ]
 /// }
+/// Internal settings managed by the interactive Settings screen. They live
+/// under a single `settings` object in config.json so a patch can update them
+/// without touching (or losing) the provider/LSP/MCP fields around them.
+pub const Settings = struct {
+    output_style: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
+    permission_mode: ?[]const u8 = null,
+    compaction: ?[]const u8 = null,
+    task_parallel: ?u8 = null,
+    max_iter: ?usize = null,
+    context_limit: ?i64 = null,
+    auto_check: ?bool = null,
+    web_allow_local: ?bool = null,
+    prompt_cache: ?bool = null,
+    read_cache_bytes: ?usize = null,
+    color_palette: ?[]const u8 = null,
+    vim_mode: ?bool = null,
+    nerd_icons: ?[]const u8 = null,
+};
+
 pub const Config = struct {
+    /// Internal settings from the `"settings"` object.
+    settings: Settings = .{},
     /// Default provider (id, must exist in the effective list).
     provider: []const u8 = "",
     /// Global default model (empty = the provider's).
@@ -174,6 +196,57 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
         if (wdv == .object) {
             cfg.web_domains_allow = parseStringList(arena, wdv.object.get("allow"));
             cfg.web_domains_block = parseStringList(arena, wdv.object.get("block"));
+        }
+    }
+
+    // Internal settings from the interactive Settings screen. Unknown keys and
+    // wrong types are ignored: a stale hand-edit must not take the whole config
+    // (and the provider that was working) down.
+    if (root.get("settings")) |sv| {
+        if (sv == .object) {
+            const so = sv.object;
+            if (so.get("output_style")) |v| {
+                if (v == .string) cfg.settings.output_style = try arena.dupe(u8, v.string);
+            }
+            if (so.get("effort")) |v| {
+                if (v == .string) cfg.settings.effort = try arena.dupe(u8, v.string);
+            }
+            if (so.get("permission_mode")) |v| {
+                if (v == .string) cfg.settings.permission_mode = try arena.dupe(u8, v.string);
+            }
+            if (so.get("compaction")) |v| {
+                if (v == .string) cfg.settings.compaction = try arena.dupe(u8, v.string);
+            }
+            if (so.get("task_parallel")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= 8) cfg.settings.task_parallel = @intCast(v.integer);
+            }
+            if (so.get("max_iter")) |v| {
+                if (v == .integer and v.integer > 0) cfg.settings.max_iter = @intCast(v.integer);
+            }
+            if (so.get("context_limit")) |v| {
+                if (v == .integer and v.integer > 0) cfg.settings.context_limit = v.integer;
+            }
+            if (so.get("auto_check")) |v| {
+                if (v == .bool) cfg.settings.auto_check = v.bool;
+            }
+            if (so.get("web_allow_local")) |v| {
+                if (v == .bool) cfg.settings.web_allow_local = v.bool;
+            }
+            if (so.get("prompt_cache")) |v| {
+                if (v == .bool) cfg.settings.prompt_cache = v.bool;
+            }
+            if (so.get("read_cache_bytes")) |v| {
+                if (v == .integer and v.integer > 0) cfg.settings.read_cache_bytes = @intCast(v.integer);
+            }
+            if (so.get("color_palette")) |v| {
+                if (v == .string) cfg.settings.color_palette = try arena.dupe(u8, v.string);
+            }
+            if (so.get("vim_mode")) |v| {
+                if (v == .bool) cfg.settings.vim_mode = v.bool;
+            }
+            if (so.get("nerd_icons")) |v| {
+                if (v == .string) cfg.settings.nerd_icons = try arena.dupe(u8, v.string);
+            }
         }
     }
 
@@ -659,6 +732,71 @@ test "allDefs: the config ones come after the built-in ones" {
     try std.testing.expectEqualStrings("vllm", all[all.len - 1].id);
 }
 
+// ── writing (settings patch into config.json) ────────────────
+
+/// Creates a JSON value for one settings field. Only non-null fields are
+/// written, so "unset" stays unset (env/model decides) rather than freezing a
+/// value the user never chose.
+fn settingValue(v: Settings, key: []const u8, arena: std.mem.Allocator) ?std.json.Value {
+    if (std.mem.eql(u8, key, "output_style")) if (v.output_style) |s| return .{ .string = arena.dupe(u8, s) catch return null };
+    if (std.mem.eql(u8, key, "effort")) if (v.effort) |s| return .{ .string = arena.dupe(u8, s) catch return null };
+    if (std.mem.eql(u8, key, "permission_mode")) if (v.permission_mode) |s| return .{ .string = arena.dupe(u8, s) catch return null };
+    if (std.mem.eql(u8, key, "compaction")) if (v.compaction) |s| return .{ .string = arena.dupe(u8, s) catch return null };
+    if (std.mem.eql(u8, key, "task_parallel")) if (v.task_parallel) |n| return .{ .integer = n };
+    if (std.mem.eql(u8, key, "max_iter")) if (v.max_iter) |n| return .{ .integer = @intCast(n) };
+    if (std.mem.eql(u8, key, "context_limit")) if (v.context_limit) |n| return .{ .integer = n };
+    if (std.mem.eql(u8, key, "auto_check")) if (v.auto_check) |b| return .{ .bool = b };
+    if (std.mem.eql(u8, key, "web_allow_local")) if (v.web_allow_local) |b| return .{ .bool = b };
+    if (std.mem.eql(u8, key, "prompt_cache")) if (v.prompt_cache) |b| return .{ .bool = b };
+    if (std.mem.eql(u8, key, "read_cache_bytes")) if (v.read_cache_bytes) |n| return .{ .integer = @intCast(n) };
+    if (std.mem.eql(u8, key, "color_palette")) if (v.color_palette) |s| return .{ .string = arena.dupe(u8, s) catch return null };
+    if (std.mem.eql(u8, key, "vim_mode")) if (v.vim_mode) |b| return .{ .bool = b };
+    if (std.mem.eql(u8, key, "nerd_icons")) if (v.nerd_icons) |s| return .{ .string = arena.dupe(u8, s) catch return null };
+    return null;
+}
+
+const setting_keys = [_][]const u8{
+    "output_style", "effort", "permission_mode", "compaction", "task_parallel",
+    "max_iter", "context_limit", "auto_check", "web_allow_local", "prompt_cache",
+    "read_cache_bytes", "color_palette", "vim_mode", "nerd_icons",
+};
+
+/// Patches ONLY the `"settings"` object of `~/.config/zode/config.json`.
+///
+/// The rest of the tree (providers, LSP/MCP servers, web_domains, unknown
+/// fields from a newer version) is parsed as `std.json.Value` and written back
+/// untouched — reconstructing the file from `Config` would silently drop every
+/// field this binary does not know about. The write is atomic through
+/// `writeFileSecure`, which also refuses a symlinked config dir/path.
+pub fn patchSettings(
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    settings: Settings,
+) !void {
+    var path_buf: [1024]u8 = undefined;
+    const path = configPath(env, &path_buf) orelse return error.NoHome;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch "{}";
+    var root = std.json.parseFromSliceLeaky(std.json.Value, arena, existing, .{}) catch
+        return error.BadConfig;
+    if (root != .object) root = .{ .object = std.json.ObjectMap.init(arena, &.{}, &.{}) catch return error.OutOfMemory };
+
+    var so = std.json.ObjectMap.init(arena, &.{}, &.{}) catch return error.OutOfMemory;
+    for (setting_keys) |key| {
+        if (settingValue(settings, key, arena)) |val| {
+            try so.put(arena, key, val);
+        }
+    }
+    try root.object.put(arena, "settings", .{ .object = so });
+
+    const data = try std.json.Stringify.valueAlloc(arena, root, .{ .whitespace = .indent_1 });
+    try writeFileSecure(io, env, path, data);
+}
+
 // ── writing (auth.json) ───────────────────────────────────────
 
 /// Path of `~/.config/zode`, or null when there is no HOME.
@@ -928,4 +1066,54 @@ test "tightenPermissions: a 0644 auth.json becomes 0600, a private one is left a
     // Idempotent: calling it again cannot fail or change anything.
     tightenPermissions(io, path);
     try std.testing.expectEqual(@as(u32, 0o600), try modeOf(io, path));
+}
+
+test "settings: parse and patch round-trip, preserving unknown fields" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const home: [:0]const u8 = "HOME=/tmp/zode-settings-test\x00";
+    try env_map.putPosixBlock(.{ .slice = &.{home} });
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = "/tmp/zode-settings-test/.config/zode";
+    std.Io.Dir.cwd().deleteTree(io, "/tmp/zode-settings-test") catch {};
+
+    // A config with fields this binary does not know about: the patch must
+    // carry them through verbatim.
+    const original =
+        \\{
+        \\  "provider": "opencode",
+        \\  "a_field_from_a_newer_zode": {"keep": true},
+        \\  "providers": [{"id": "custom", "base_url": "http://localhost/v1"}]
+        \\}
+    ;
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const path = "/tmp/zode-settings-test/.config/zode/config.json";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = original });
+
+    const s = Settings{
+        .output_style = "concise",
+        .context_limit = 200000,
+        .auto_check = false,
+        .task_parallel = 2,
+    };
+    try patchSettings(io, &env_map, s);
+
+    const got = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "concise") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "200000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "a_field_from_a_newer_zode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "custom") != null);
+
+    var ap = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ap.deinit();
+    const cfg = parse(ap.allocator(), got, path) catch return error.BadConfig;
+    try std.testing.expectEqualStrings("concise", cfg.settings.output_style.?);
+    try std.testing.expectEqual(@as(i64, 200000), cfg.settings.context_limit.?);
+    try std.testing.expectEqual(@as(bool, false), cfg.settings.auto_check.?);
+    try std.testing.expectEqual(@as(u8, 2), cfg.settings.task_parallel.?);
+    try std.testing.expectEqualStrings("opencode", cfg.provider);
 }

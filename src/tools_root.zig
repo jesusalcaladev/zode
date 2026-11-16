@@ -27,6 +27,7 @@ pub const toolsJson = tools.toolsJson;
 pub const needsPermission = tools.needsPermission;
 pub const execute = tools.execute;
 pub const executeWith = tools.executeWith;
+pub const executeTeam = tools.executeTeam;
 pub const callSubjects = tools.callSubjects;
 pub const callTouchedPaths = tools.callTouchedPaths;
 pub const riskyPaths = tools.riskyPaths;
