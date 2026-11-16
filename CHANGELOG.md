@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete phase 33 (picker scoring, notifications, context chart, tasks panel) (tui) [`d666861e`](https://github.com/jesusalcaladev/zode/commit/d666861e)
 - interactive Settings screen, team mode, roles, model cache TTL and image input [`ff57591e`](https://github.com/jesusalcaladev/zode/commit/ff57591e)
 - complete phase 9 with both layouts and Settings integration (agents) [`fc5cc42d`](https://github.com/jesusalcaladev/zode/commit/fc5cc42d)
-- complete phase 32 (three-way count, advisor, spend gate, idle stability) (verify) [`cfe78532`](https://github.com/jesusalcaladev/zode/commit/cfe78532)
+- complete phase 32 (three-way count, advisor, spend gate, idle stability) (verify) [`9f330046`](https://github.com/jesusalcaladev/zode/commit/9f330046)
+- complete phase 23 (whitelisted config tool) (config) [`f1eaec0c`](https://github.com/jesusalcaladev/zode/commit/f1eaec0c)
 
 ### Bug Fixes
 

@@ -27,7 +27,7 @@ Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-refe
 
 **Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills + rich frontmatter) · **Phase 2 (2.1–2.5)** (skill listing budget, once-per-session listing, named args/`$ARGUMENTS`, `context: fork`, `!cmd` substitution behind permissions) · Phase 4 (output styles) · Phase 9 (agent definitions on disk: `.zode/agents/<name>/AGENT.md` + `~/.config/zode/agents/<name>/AGENT.md`, frontmatter parsing/validation, project-over-user shadowing, cached discovery) · Phase 12 (MCP over stdio + deferred tool loading) · Phase 14 (LSP client) · Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19.1 (`sleep`, claimed; Phase 19 section still pending) · Phase 20 (team mode: `team_create`/`team_delete`/`send_message`/`team_status`, Team equals TaskList, message routing by name and broadcast, idle claim from the task graph, orderly shutdown acknowledged once, session overrides) · Phase 25.1 (bash safety classify) · Phase 26 (built-in subagent roles `explore`/`plan`/`verify` with role prompts, per-project per-role agent memory consulted/not inlined, resumable/forkable subagent windows with persisted ids, role-aware tool access and pure tests) · **model catalog invalidation at 5 minutes** (one `modelcache.max_age_seconds` TTL drives `--models` freshness, the palette refresh throttle, and a "catalog older than 5 min · refreshing" notice; a stale list is still shown for resilience but flagged) · **image input improvements** (`@shot.png` typed in the prompt is staged as a real attachment instead of binary text — TUI and headless; last-moment vision gate in `withPendingImages` and headless wire drops all image bytes when the answering model cannot see images, even if it changed after staging) · **interactive Settings screen** (full-surface two-column Claude-Code-style internal config opened with `/config` or `Ctrl+,`: sections for Model & reasoning, Output style with live preview and source badge, Context & cache with stats/verdict + prompt-cache + read-cache size, Agent behavior, Permissions, Appearance; changes persist to `~/.config/zode/config.json` through a patch writer that preserves unknown fields; `/config report` keeps the numbers panel; bundled `concise` output style added) · Phase 27 (diff with gutter + word diff + colour ladder) · Phase 28 (`/copy`) · **Phase 33 (TUI at a mature harness's level)** (effective effort/glyphs, turn counts, scroll pill/context header, transcript screen, bottom-anchored modal/fuzzy picker with scoring and preview, notifications, context visualisation, task panel, per-message actions, transcript search, OSC 8 hyperlinks, external editor/image paste, modal diff viewer, compact-summary line, permission dialog with rule explanation) · Phase 35.1 (`/files`) · Phase 35.2 (`/init`) · Phase 36 (use-after-free crash, worker lifetime/counting audit, and build-step fixes) · Tool upgrades (grep context, bash description, read PDF, glob subdir).
 
-**Completed phase sections removed from the board (all checklist items done):** Phase 2, 3, 5, 6, 7, 9, 10, 11, 20, 24, 25, 26, 29, 30, 31, 32, 33, 34, 35, 36.
+**Completed phase sections removed from the board (all checklist items done):** Phase 2, 3, 5, 6, 7, 9, 10, 11, 20, 23, 24, 25, 26, 29, 30, 31, 32, 33, 34, 35, 36.
 
 **The analysis behind the new phases** lives in `docs/analysis/`:
 `tui-chrome.md` (the TUI port list, 42 features) · `commands.md` (72 reference
@@ -118,15 +118,9 @@ state, the open bug and the quality bar).
 
 ---
 
-## Phase 23 — Settings the model can read and change
+---
 
-`✨ feature · 🟢 · independent`
-
-- [ ] `config` tool with `get`/`set` over a **whitelisted** key set (model, effort, compaction mode, auto-check, task-parallel, output style, web allow-local)
-- [ ] Whitelist, not free-form: only documented keys; never `auth.json`; an unknown key is refused with the list of known ones
-- [ ] Secrets are never returned: `get` on a credential-backed key answers "set"/"not set", never the value
-- [ ] `set` is a write with a dialog unless the key was already allowed (changing model or compaction changes every later request)
-- [ ] Pure tests: whitelist enforced · an unknown key lists the known ones · a secret is masked · `set` round-trips the config serializer and survives a reload
+**Phase 23 (Settings the model can read and change)** is complete: a `config` tool (`operation=get|set`, `key`, `value`) over a WHITELIST of seven keys (model, effort, compaction, auto_check, task_parallel, output_style, web_allow_local) defined in pure `src/lib/configkeys.zig`. An unknown key is refused with the full list and the "auth.json is off-limits" note; credentials are never reachable (no credential key in the whitelist; `secretPresenceText` returns only set/not-set). `get` is free; `set` validates the value, is blocked in plan mode, and asks for permission unless `Config(<key>)` was already allowed (remembered in the allowlist). `set` applies the value to the live session and persists the full config snapshot so a single-key write does not erase other settings. Pure tests cover the whitelist, unknown-key refusal, secret masking, value validation, permit subjects and a `set` round-trip that survives a reload.
 
 ---
 

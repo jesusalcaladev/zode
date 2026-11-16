@@ -56,6 +56,7 @@ pub const subagent = @import("lib/subagent.zig");
 pub const verifycounts = @import("lib/verifycounts.zig");
 pub const spendgate = @import("lib/spendgate.zig");
 pub const idlestability = @import("lib/idlestability.zig");
+pub const configkeys = @import("lib/configkeys.zig");
 pub const textadmit = @import("lib/textadmit.zig");
 pub const textcap = @import("lib/textcap.zig");
 pub const resultcap = @import("lib/resultcap.zig");

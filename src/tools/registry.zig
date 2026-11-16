@@ -63,6 +63,8 @@ const team_status_prompt = @import("prompts/team_status.zig");
 const review_prompt = @import("prompts/review.zig");
 const advisor_prompt = @import("prompts/advisor.zig");
 const goal_prompt = @import("prompts/goal.zig");
+const config_prompt = @import("prompts/config.zig");
+const configkeys_mod = @import("../lib/configkeys.zig");
 const bash_output_prompt = @import("prompts/bash_output.zig");
 const bash_kill_prompt = @import("prompts/bash_kill.zig");
 const sleep_prompt = @import("prompts/sleep.zig");
@@ -502,6 +504,15 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .max_result_chars = resultcap.default_max_result_chars,
     },
     .{
+        .name = "config",
+        .desc = "Read or change a whitelisted setting (never auth.json)",
+        .schema = config_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = false,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
         .name = "bash_output",
         .desc = "New output of a backgrounded command (incremental) plus its exit status",
         .schema = bash_output_prompt.json,
@@ -689,6 +700,12 @@ pub fn toolSummarize(
         if (op) |o| return std.fmt.allocPrint(arena, "memory({s})", .{o}) catch "memory";
         return "memory";
     }
+    if (std.mem.eql(u8, name, "config")) {
+        const op = extractStringArg(arena, args_json, "operation");
+        const k = extractStringArg(arena, args_json, "key");
+        if (op) |o| if (k) |kk| return std.fmt.allocPrint(arena, "config {s} {s}", .{ o, kk }) catch "config";
+        return "config";
+    }
     if (std.mem.eql(u8, name, "check")) return "check";
     if (std.mem.eql(u8, name, "notebook_edit")) {
         if (path) |p| return std.fmt.allocPrint(arena, "notebook_edit({s})", .{p}) catch "notebook_edit";
@@ -784,6 +801,7 @@ pub fn toolActivity(
     if (std.mem.eql(u8, name, "batch")) return "Running batch";
     if (std.mem.eql(u8, name, "skill")) return "Loading skill";
     if (std.mem.eql(u8, name, "memory")) return "Consulting memory";
+    if (std.mem.eql(u8, name, "config")) return "Config";
     if (std.mem.eql(u8, name, "check")) return "Typechecking";
     if (std.mem.eql(u8, name, "notebook_edit")) {
         if (path) |p| return std.fmt.allocPrint(arena, "Editing notebook {s}", .{p}) catch "Editing notebook";
@@ -846,6 +864,19 @@ pub fn callPermissionTools(name: []const u8, args_json: []const u8, arena: std.m
             const q = mcp_tool.qualifiedOf(parseObject(arena, args_json) orelse return &.{}, arena) orelse return &.{};
             const one = arena.alloc([]const u8, 1) catch return &.{};
             one[0] = q;
+            return one;
+        }
+        // `config get` is free; `config set` asks about the qualified key so a
+        // remembered allow covers only that key, not every setting.
+        if (std.mem.eql(u8, name, "config")) {
+            const obj = parseObject(arena, args_json) orelse return &.{};
+            const op = obj.get("operation") orelse return &.{};
+            if (op != .string or !std.ascii.eqlIgnoreCase(op.string, "set")) return &.{};
+            const kv = obj.get("key") orelse return &.{};
+            if (kv != .string) return &.{};
+            const subject = configkeys_mod.permitSubjectBound(kv.string, arena) orelse return &.{};
+            const one = arena.alloc([]const u8, 1) catch return &.{};
+            one[0] = subject;
             return one;
         }
         // GitHub: read operations are free; mutating operations ask per op
@@ -927,6 +958,12 @@ pub fn callWrites(name: []const u8, args_json: []const u8, arena: std.mem.Alloca
         const op = obj.get("operation") orelse return false;
         if (op != .string) return false;
         return std.ascii.eqlIgnoreCase(op.string, "propose") or std.ascii.eqlIgnoreCase(op.string, "approve");
+    }
+    if (std.mem.eql(u8, name, "config")) {
+        const obj = parseObject(arena, args_json) orelse return true;
+        const op = obj.get("operation") orelse return true;
+        if (op != .string) return true;
+        return std.ascii.eqlIgnoreCase(op.string, "set");
     }
     if (std.mem.eql(u8, name, "github")) {
         const obj = parseObject(arena, args_json) orelse return true;

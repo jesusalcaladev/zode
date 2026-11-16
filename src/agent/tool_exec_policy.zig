@@ -26,6 +26,7 @@ pub fn callIsWrite(name: []const u8, args_json: []const u8, arena: std.mem.Alloc
     if (std.mem.eql(u8, name, "mcp")) return tools_mod.callWrites(name, args_json, arena);
     if (std.mem.eql(u8, name, "github")) return tools_mod.callWrites(name, args_json, arena);
     if (std.mem.eql(u8, name, "memory")) return tools_mod.callWrites(name, args_json, arena);
+    if (std.mem.eql(u8, name, "config")) return tools_mod.callWrites(name, args_json, arena);
     return isWriteTool(name);
 }
 

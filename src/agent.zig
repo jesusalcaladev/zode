@@ -81,6 +81,8 @@ const clipboard = @import("clipboard.zig");
 const agentdefs = @import("lib/agentdefs.zig");
 const cachebreak = @import("lib/cachebreak.zig");
 const commands_mod = @import("commands.zig");
+const configmenu = @import("lib/configmenu.zig");
+const configkeys_mod = @import("lib/configkeys.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeat_guard.zig");
 const taskloop = @import("lib/taskloop.zig");
@@ -7036,6 +7038,155 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
 ///
 /// A boolean would be satisfied by one review at the start of the turn and would call
 /// the last three files "reviewed" for the rest of it. `reviewed_writes` is the value of
+/// Phase 23: `config` tool — read/change whitelisted settings.
+///
+/// `get` is free. `set` is a WRITE: it asks for permission unless the key was
+/// already allowed (`Config(<key>)` in the persisted allowlist). Secrets are
+/// never reachable — the whitelist has no credential keys, and an unknown key
+/// is refused with the full list.
+fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    _ = _arena;
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
+        const msg = "config needs operation=get|set and a key. Example: {\"operation\":\"get\",\"key\":\"model\"}.";
+        m.pushToolDone("config", "malformed arguments", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    };
+    if (parsed != .object) {
+        const msg = "config needs a JSON object with operation and key.";
+        m.pushToolDone("config", "malformed arguments", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+    const obj = parsed.object;
+    const op_v = obj.get("operation") orelse {
+        const msg = "config needs operation=get|set.";
+        m.pushToolDone("config", "missing operation", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    };
+    if (op_v != .string) {
+        const msg = "operation must be the string \"get\" or \"set\".";
+        m.pushToolDone("config", "bad operation", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+    const is_set = std.ascii.eqlIgnoreCase(op_v.string, "set");
+    if (!is_set and !std.ascii.eqlIgnoreCase(op_v.string, "get")) {
+        const msg = "operation must be get or set.";
+        m.pushToolDone("config", "bad operation", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+    const key_v = obj.get("key") orelse {
+        const msg = "config needs a key.";
+        m.pushToolDone("config", "missing key", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    };
+    if (key_v != .string) {
+        const msg = "key must be a string.";
+        m.pushToolDone("config", "bad key", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+
+    // Whitelist first: an unknown key is refused WITH the list of known ones.
+    const key = configkeys_mod.fromName(key_v.string) orelse {
+        const msg = configkeys_mod.unknownKeyText(arena, key_v.string) catch "unknown config key";
+        m.pushToolDone("config", "unknown key", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    };
+
+    // Secrets are never returned, even on a get. (No credential key is in the
+    // whitelist today; this keeps the invariant explicit if one is added.)
+    if (key.isSecret()) {
+        const msg = configkeys_mod.secretPresenceText(arena, key.name(), false) catch "value never shown";
+        m.pushToolDone("config", "value masked", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+
+    if (!is_set) {
+        const cs = configmenuToSetting(key);
+        const value = commands_mod.settingsValue(m, cs);
+        defer m.allocator.free(value);
+        const msg = std.fmt.allocPrint(arena, "{s}: {s}", .{ key.name(), value }) catch key.name();
+        m.pushToolDone("config", "get", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+
+    // set: validate the value first (cheap, before any dialog or write).
+    const value_v = obj.get("value") orelse {
+        const msg = "config set needs a `value`.";
+        m.pushToolDone("config", "missing value", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    };
+    if (value_v != .string or !configkeys_mod.validValue(key, value_v.string)) {
+        const msg = std.fmt.allocPrint(arena, "invalid value for {s}. {s}", .{
+            key.name(),
+            if (key.values()) |vs| std.fmt.allocPrint(arena, "Accepted: {s}", .{std.mem.join(arena, ", ", vs) catch ""}) catch "" else "any non-empty value",
+        }) catch "invalid value";
+        m.pushToolDone("config", "invalid value", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+
+    // WRITE GATE: plan mode blocks; otherwise ask unless already allowed.
+    var subj_buf: [64]u8 = undefined;
+    const subject = configkeys_mod.permitSubject(key, &subj_buf) orelse "Config";
+    if (read_only) {
+        const msg = "PLAN MODE is on: config set is a write and did not run. End the plan for approval first.";
+        m.pushToolDone("config", "refused (plan mode)", 0, msg);
+        capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+        return 1;
+    }
+    if (key.needsWriteDialog() and !isAlwaysAllowed(subject)) {
+        const detail = std.fmt.allocPrint(arena, "change {s} to '{s}' for this session and future ones", .{ key.name(), value_v.string }) catch key.name();
+        const answer = m.requestPermission("config", detail);
+        switch (answer) {
+            .allow_always => {
+                setAlwaysAllowed(m, subject);
+            },
+            .allow => {},
+            else => {
+                const msg = "denied: permission required to change this setting.";
+                m.pushToolDone("config", "denied", 0, msg);
+                capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+                return 1;
+            },
+        }
+    }
+
+    // Apply the value to the live session, then persist the full snapshot so a
+    // single-key set does not erase other settings on disk.
+    commands_mod.applySettingValue(m, configmenuToSetting(key), value_v.string);
+    commands_mod.persistSettings(m);
+    const msg = std.fmt.allocPrint(arena, "{s} set to '{s}' (saved to config.json)", .{ key.name(), value_v.string }) catch "setting changed";
+    m.pushToolDone("config", "set", 0, msg);
+    capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
+    return 1;
+}
+
+fn configmenuToSetting(k: configkeys_mod.Key) configmenu.Setting {
+    return switch (k) {
+        .model => .model,
+        .effort => .effort,
+        .compaction => .compaction,
+        .auto_check => .auto_check,
+        .task_parallel => .task_parallel,
+        .output_style => .output_style,
+        .web_allow_local => .web_allow_local,
+    };
+}
+
 /// Phase 32.2: `advisor` — one independent LLM call at a checkpoint.
 ///
 /// No arguments: the whole conversation is forwarded automatically. The
@@ -9402,6 +9553,10 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
             _ = p;
             return advisorCall(m_, s_, call, a, b);
         }
+        fn configW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return configCall(m_, s_, call, a, b);
+        }
         fn memoryW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
             _ = p;
             return memoryCall(m_, s_, call, a, b);
@@ -9459,6 +9614,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
         .skillCall = S.skillW,
         .reviewCall = S.reviewW,
         .advisorCall = S.advisorW,
+        .configCall = S.configW,
         .memoryCall = S.memoryW,
         .taskCall = S.taskW,
         .runTaskBatch = S.runTaskBatchW,

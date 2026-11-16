@@ -951,7 +951,7 @@ fn permRulesLine(m: *tui.Model) []const u8 {
 
 /// Writes the persisted fields of a Settings row from the CURRENT runtime
 /// state. Called after any change so config.json mirrors what is on screen.
-fn persistSettings(m: *tui.Model) void {
+pub fn persistSettings(m: *tui.Model) void {
     if (m.environ == null or !m.io_ready) return;
     var s = config_mod.Settings{};
     s.output_style = if (agent.current_style) |v| m.allocator.dupe(u8, v) catch null else "default";

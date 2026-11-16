@@ -1123,3 +1123,27 @@ test "settings: parse and patch round-trip, preserving unknown fields" {
     try std.testing.expectEqual(@as(u8, 2), cfg.settings.task_parallel.?);
     try std.testing.expectEqualStrings("opencode", cfg.provider);
 }
+
+test "config tool: a set round-trips and survives a reload" {
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const home: [:0]const u8 = "HOME=/tmp/zode-configtool-test\x00";
+    try env_map.putPosixBlock(.{ .slice = &.{home} });
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    std.Io.Dir.cwd().deleteTree(io, "/tmp/zode-configtool-test") catch {};
+    try std.Io.Dir.cwd().createDirPath(io, "/tmp/zode-configtool-test/.config/zode");
+
+    // Simulate `config set compaction full` followed by `config set auto_check off`:
+    // a full-snapshot patch, then a reload must show BOTH values.
+    const s = Settings{ .compaction = "full", .auto_check = false };
+    try patchSettings(io, &env_map, s);
+
+    var ap = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ap.deinit();
+    const reloaded = load(ap.allocator(), io, &env_map);
+    try std.testing.expectEqualStrings("full", reloaded.settings.compaction.?);
+    try std.testing.expectEqual(@as(bool, false), reloaded.settings.auto_check.?);
+}
