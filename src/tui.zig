@@ -18,6 +18,8 @@ const taskstore = @import("lib/taskstore.zig");
 const team_mod = @import("lib/team.zig");
 const verifycounts = @import("lib/verifycounts.zig");
 const configmenu = @import("lib/configmenu.zig");
+const schedule_mod = @import("lib/schedule.zig");
+const tick_mod = @import("lib/tick.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
@@ -1895,6 +1897,10 @@ pub const Model = struct {
     /// The active team (Phase 20). Team equals TaskList: the roster and
     /// mailboxes live here, while the shared work list is `tasks` above.
     team: team_mod.Team = .{ .gpa = std.heap.page_allocator },
+    /// Phase 19: recurring prompts for this project (sidecar next to the
+    /// session) and the periodic-tick state (off by default).
+    schedule_store: schedule_mod.Store = .{},
+    tick_state: tick_mod.State = .{},
     /// Bench counters for `/bench`.
     bench: bench_mod.Stats = .{},
 
@@ -9402,6 +9408,10 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // app that goes dead with no explanation.
             self.tick_armed = false;
             self.motion_tick_count +%= 1;
+            // Phase 19: a parked turn may need a scheduled prompt or a periodic
+            // check-in even when no model iteration is running. The same door
+            // (appendHarnessPrompt) is used; both are suppressed while busy.
+            agent.drainScheduleNotifications(self);
             const a = self.activity();
             const asked = self.redraw_requested.swap(false, .seq_cst);
             // `mascotMoved` and not "there is an animation": at rest the face

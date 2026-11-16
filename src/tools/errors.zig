@@ -131,6 +131,12 @@ pub fn describeError(arena: std.mem.Allocator, err: anyerror, name: []const u8, 
         error.NoActiveWorktree => "there is no active worktree to exit.",
         error.DirtyWorktree => "the worktree is dirty. Pass discard: true explicitly to remove it anyway (the changes are listed in the tool result).",
         error.NotAGitRepo => "not in a git repository — worktree is a no-op here.",
+        // Phase 19: schedule errors. Each says the way forward.
+        error.BadExpression => "invalid cron expression — use 5 fields: minute hour day month weekday (e.g. '0 9 * * 1').",
+        error.ScheduleFull => "the schedule list is full (32). Remove one before adding another.",
+        error.UnknownSchedule => "no schedule with that id. Use schedule operation=list to see the ids.",
+        error.EmptyPrompt => "a schedule needs a non-empty prompt to deliver when it fires.",
+        error.PromptTooLong => "the schedule prompt is too long (8 KB max). Shorten it.",
         error.OutOfMemory => "there was not enough memory to answer that. Ask for less at once.",
         else => "the call failed with an internal error. Do not retry it unchanged: simplify what you asked for.",
     };

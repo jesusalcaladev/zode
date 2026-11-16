@@ -66,6 +66,7 @@ const goal_prompt = @import("prompts/goal.zig");
 const config_prompt = @import("prompts/config.zig");
 const send_user_message_prompt = @import("prompts/send_user_message.zig");
 const worktree_prompt = @import("prompts/worktree.zig");
+const schedule_prompt = @import("prompts/schedule.zig");
 const configkeys_mod = @import("../lib/configkeys.zig");
 const bash_output_prompt = @import("prompts/bash_output.zig");
 const bash_kill_prompt = @import("prompts/bash_kill.zig");
@@ -527,6 +528,15 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .name = "worktree",
         .desc = "Enter/exit an isolated git worktree (only when the user asks)",
         .schema = worktree_prompt.json,
+        .read_only = false,
+        .parallel_safe = false,
+        .destructive = true,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        .name = "schedule",
+        .desc = "Recurring prompts for this project (5-field cron), stored next to the session",
+        .schema = schedule_prompt.json,
         .read_only = false,
         .parallel_safe = false,
         .destructive = true,

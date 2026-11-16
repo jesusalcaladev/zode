@@ -183,6 +183,7 @@ pub const ToolCallsOps = struct {
     configCall: *const fn (*anyopaque, *tui.Model, *session_mod.Session, TurnCtx.Call, std.mem.Allocator, *ResultBudget) usize,
     sendUserMessageCall: *const fn (*anyopaque, *tui.Model, *session_mod.Session, TurnCtx.Call, std.mem.Allocator, *ResultBudget) usize,
     worktreeCall: *const fn (*anyopaque, *tui.Model, *session_mod.Session, TurnCtx.Call, std.mem.Allocator, *ResultBudget) usize,
+    scheduleCall: *const fn (*anyopaque, *tui.Model, *session_mod.Session, TurnCtx.Call, std.mem.Allocator, *ResultBudget) usize,
     memoryCall: *const fn (*anyopaque, *tui.Model, *session_mod.Session, TurnCtx.Call, std.mem.Allocator, *ResultBudget) usize,
     taskCall: *const fn (*anyopaque, *tui.Model, *session_mod.Session, TurnCtx.Call, std.mem.Allocator, *ResultBudget) usize,
     runTaskBatch: *const fn (*anyopaque, *tui.Model, *session_mod.Session, *TurnCtx, usize, usize, std.mem.Allocator, *ResultBudget) ParallelResult,
@@ -245,6 +246,11 @@ pub fn execToolCalls(
         if (std.mem.eql(u8, call.name, "worktree")) {
             i += 1;
             ran += ops.worktreeCall(ops.ctx, m, s, call, arena, &budget);
+            continue;
+        }
+        if (std.mem.eql(u8, call.name, "schedule")) {
+            i += 1;
+            ran += ops.scheduleCall(ops.ctx, m, s, call, arena, &budget);
             continue;
         }
         if (std.mem.eql(u8, call.name, "memory")) {

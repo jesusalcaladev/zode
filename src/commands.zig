@@ -2429,6 +2429,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/sandbox", .desc = "sandbox availability for flagged bash commands (panel)" },
     .{ .key = "/add-dir", .desc = "add/list additional directories for this session: /add-dir [path]", .key_hint = "[path]" },
     .{ .key = "/vim", .desc = "toggle vim keybindings for the input editor" },
+    .{ .key = "/ticks", .desc = "toggle periodic check-ins while a turn is parked (off by default)" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
     .{ .key = "/new-session", .desc = "new session" },
     .{ .key = "/branch", .desc = "fork the current session into a new branch", .key_hint = "[title]" },
@@ -4001,4 +4002,8 @@ test "cache: /cache reports detected prefix breaks" {
     const text = try pendingText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "0 breaks") != null);
+}
+
+test "schedule: the routing prompt mentions recurring prompts and ticks" {
+    try std.testing.expect(std.mem.indexOf(u8, agent.tool_routing_prompt, "schedule") != null);
 }

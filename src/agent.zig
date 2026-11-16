@@ -85,6 +85,8 @@ const configmenu = @import("lib/configmenu.zig");
 const configkeys_mod = @import("lib/configkeys.zig");
 const usermessage_mod = @import("lib/usermessage.zig");
 const worktree_mod = @import("lib/worktree.zig");
+const schedule_mod = @import("lib/schedule.zig");
+const tick_mod = @import("lib/tick.zig");
 const exitgate = @import("lib/exitgate.zig");
 const repeats_mod = @import("lib/repeat_guard.zig");
 const taskloop = @import("lib/taskloop.zig");
@@ -2776,6 +2778,8 @@ pub fn bootstrapSession(m: *tui.Model) void {
                 session = s;
                 m.session = s;
                 m.bg.setSession(m.allocator, io_global, s.path);
+                // Phase 19: restore this project's schedules from the sidecar.
+                schedLoad(m, a);
                 cache_stats.session = s.usage_stats;
                 const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
                     "session resumed";
@@ -3007,6 +3011,10 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdAddDir(m, arg);
     } else if (std.mem.eql(u8, cmd, "vim")) {
         commands_mod.cmdVim(m);
+    } else if (std.mem.eql(u8, cmd, "ticks")) {
+        m.tick_state.enabled = !m.tick_state.enabled;
+        m.tick_state.reset();
+        pushInfoFmt(m, "· periodic check-ins {s}", .{if (m.tick_state.enabled) "on" else "off"});
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "inspect")) {
@@ -4426,6 +4434,9 @@ fn drainBackgroundTaskNotifications(m: *tui.Model) void {
     // Team wake/shutdown is handled here too: it is the same "at the top of an
     // iteration" moment, and reuses the single drain hook in loop_iter/loop_run.
     drainTeamNotifications(m);
+    // Phase 19: due schedules and the periodic parked tick are checked at the
+    // same "top of an iteration" moment, delivered through the same door.
+    drainScheduleNotifications(m);
     var arena_state = std.heap.ArenaAllocator.init(m.allocator);
     defer arena_state.deinit();
     loop_runtime.drainBackgroundTaskNotifications(
@@ -7166,6 +7177,133 @@ fn sendUserMessageCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Cal
     return 1;
 }
 
+/// Phase 19: `schedule` — add/list/remove recurring prompts stored next to the
+/// session. Scheduled prompts arrive as ordinary user messages, so their tool
+/// calls go through the same permission gate as typed ones (no special case).
+fn scheduleCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: std.mem.Allocator, budget: *ResultBudget) usize {
+    var astate = std.heap.ArenaAllocator.init(m.allocator);
+    defer astate.deinit();
+    const arena = astate.allocator();
+    _ = _arena;
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch
+        return schedReply(m, s, call, arena, budget, "schedule needs a JSON object with operation=add|list|remove.", "malformed arguments");
+    if (parsed != .object) return schedReply(m, s, call, arena, budget, "schedule needs a JSON object.", "malformed arguments");
+    const obj = parsed.object;
+    const op_v = obj.get("operation") orelse return schedReply(m, s, call, arena, budget, "schedule needs operation=add|list|remove.", "missing operation");
+    if (op_v != .string) return schedReply(m, s, call, arena, budget, "operation must be a string.", "bad operation");
+
+    if (std.mem.eql(u8, op_v.string, "add")) {
+        const cron_v = obj.get("cron") orelse return schedReply(m, s, call, arena, budget, "add needs a 5-field cron expression.", "missing cron");
+        const prompt_v = obj.get("prompt") orelse return schedReply(m, s, call, arena, budget, "add needs a prompt.", "missing prompt");
+        if (cron_v != .string or prompt_v != .string) return schedReply(m, s, call, arena, budget, "cron and prompt must be strings.", "bad arguments");
+        const once = if (obj.get("once")) |v| (v == .bool and v.bool) else false;
+        var id_buf: [32]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "s{d}", .{m.schedule_store.len + 1}) catch "s1";
+        m.schedule_store.add(id, cron_v.string, prompt_v.string, once) catch |err| {
+            const text = tools_mod.describeError(arena, err, "schedule", call.args_json);
+            return schedReply(m, s, call, arena, budget, text, "add refused");
+        };
+        schedSave(m, arena);
+        const text = std.fmt.allocPrint(arena, "schedule '{s}' added: {s} → {s}{s}.", .{
+            id, cron_v.string, prompt_v.string, if (once) " (once)" else "",
+        }) catch "schedule added";
+        return schedReply(m, s, call, arena, budget, text, "added");
+    }
+
+    if (std.mem.eql(u8, op_v.string, "list")) {
+        if (m.schedule_store.len == 0) return schedReply(m, s, call, arena, budget, "no schedules for this project.", "list");
+        var out: std.ArrayList(u8) = .empty;
+        for (m.schedule_store.items[0..m.schedule_store.len], 0..) |sc, i| {
+            if (i > 0) out.append(arena, '\n') catch {};
+            out.print(arena, "[{s}] {s} → {s}{s}", .{
+                sc.id(), sc.expr(), sc.prompt(), if (sc.once) " (once)" else "",
+            }) catch {};
+        }
+        return schedReply(m, s, call, arena, budget, out.items, "list");
+    }
+
+    if (std.mem.eql(u8, op_v.string, "remove")) {
+        const id_v = obj.get("id") orelse return schedReply(m, s, call, arena, budget, "remove needs an id (see schedule list).", "missing id");
+        if (id_v != .string or !m.schedule_store.remove(id_v.string)) {
+            return schedReply(m, s, call, arena, budget, "no schedule with that id.", "not found");
+        }
+        schedSave(m, arena);
+        const text = std.fmt.allocPrint(arena, "schedule '{s}' removed.", .{id_v.string}) catch "removed";
+        return schedReply(m, s, call, arena, budget, text, "removed");
+    }
+
+    return schedReply(m, s, call, arena, budget, "unknown operation — use add, list or remove.", "bad operation");
+}
+
+fn schedReply(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator, budget: *ResultBudget, text: []const u8, summary: []const u8) usize {
+    m.pushToolDone("schedule", summary, 0, text);
+    capStoreAppendToolResult(m, s, call.id, "schedule", text, arena, budget);
+    return 1;
+}
+
+/// Persist the schedule sidecar next to the session (best-effort: a failed
+/// write costs schedules on resume, not the turn).
+fn schedSave(m: *tui.Model, arena: std.mem.Allocator) void {
+    if (!m.io_ready) return;
+    const sess = ensureSession(m, m.allocator);
+    const sp = sess.path orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = schedule_mod.pathForSession(&buf, sp) catch return;
+    const data = m.schedule_store.toJson(arena) catch return;
+    std.Io.Dir.cwd().writeFile(m.io, .{ .sub_path = path, .data = data }) catch {};
+}
+
+/// Load a schedules sidecar on resume (mirrors taskstore.bind / loadCaps).
+fn schedLoad(m: *tui.Model, arena: std.mem.Allocator) void {
+    if (!m.io_ready) return;
+    const sess = ensureSession(m, m.allocator);
+    const sp = sess.path orelse return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = schedule_mod.pathForSession(&buf, sp) catch return;
+    const data = std.Io.Dir.cwd().readFileAlloc(m.io, path, arena, .limited(1024 * 1024)) catch return;
+    m.schedule_store.fromJson(arena, data);
+}
+
+/// Phase 19: fire due schedules and the periodic tick at the top of an
+/// iteration. Both are delivered through `appendHarnessPrompt` — the one door
+/// that puts harness-authored text on the wire as a `user` message.
+pub fn drainScheduleNotifications(m: *tui.Model) void {
+    if (!m.io_ready) return;
+    const now_s = std.Io.Timestamp.now(m.io, .real).toSeconds();
+    const now_ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(m.io, .real).nanoseconds, std.time.ns_per_ms));
+
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var due_buf: [schedule_mod.max_schedules]usize = undefined;
+    const n = m.schedule_store.due(now_s, &due_buf);
+    // Fire from last to first so removing a `once` entry does not shift the
+    // indices of the ones still to come.
+    var k = n;
+    while (k > 0) {
+        k -= 1;
+        const ix = due_buf[k];
+        if (ix >= m.schedule_store.len) continue;
+        const sc = m.schedule_store.items[ix];
+        const text = sc.prompt();
+        m.schedule_store.markFired(ix, now_s);
+        if (sc.once) _ = m.schedule_store.remove(sc.id());
+        const note = std.fmt.allocPrint(arena, "[scheduled prompt \"{s}\" fired]\n{s}", .{ sc.id(), text }) catch text;
+        appendHarnessPrompt(m, note);
+    }
+    if (n > 0) schedSave(m, arena);
+
+    // Periodic check-in while parked: off by default, and never while a tool
+    // is running or a turn is in flight (`isBusy`).
+    const tool_running = m.tool_run != null or m.task_batch_total > 0;
+    if (m.tick_state.due(now_ms, tool_running, m.isBusy())) {
+        m.tick_state.mark(now_ms);
+        appendHarnessPrompt(m, tick_mod.checkin_text);
+    }
+}
+
 /// Phase 18: run a git command with fixed argv (safe for a model-supplied
 /// worktree name), returning the foreground result. Caller deinits it.
 fn wtGit(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) !bg_tool.Foreground {
@@ -9846,6 +9984,10 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
             _ = p;
             return worktreeCall(m_, s_, call, a, b);
         }
+        fn scheduleW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
+            _ = p;
+            return scheduleCall(m_, s_, call, a, b);
+        }
         fn memoryW(p: *anyopaque, m_: *tui.Model, s_: *session_mod.Session, call: TurnCtx.Call, a: std.mem.Allocator, b: *ResultBudget) usize {
             _ = p;
             return memoryCall(m_, s_, call, a, b);
@@ -9906,6 +10048,7 @@ fn execToolCalls(m: *tui.Model, s: *session_mod.Session, t: *TurnCtx) !void {
         .configCall = S.configW,
         .sendUserMessageCall = S.sendUserMessageW,
         .worktreeCall = S.worktreeW,
+        .scheduleCall = S.scheduleW,
         .memoryCall = S.memoryW,
         .taskCall = S.taskW,
         .runTaskBatch = S.runTaskBatchW,
