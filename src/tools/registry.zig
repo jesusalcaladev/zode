@@ -67,6 +67,7 @@ const config_prompt = @import("prompts/config.zig");
 const send_user_message_prompt = @import("prompts/send_user_message.zig");
 const worktree_prompt = @import("prompts/worktree.zig");
 const schedule_prompt = @import("prompts/schedule.zig");
+const structured_output_prompt = @import("prompts/structured_output.zig");
 const configkeys_mod = @import("../lib/configkeys.zig");
 const bash_output_prompt = @import("prompts/bash_output.zig");
 const bash_kill_prompt = @import("prompts/bash_kill.zig");
@@ -540,6 +541,15 @@ pub const defs: []const ToolDef = &[_]ToolDef{
         .read_only = false,
         .parallel_safe = false,
         .destructive = true,
+        .max_result_chars = resultcap.default_max_result_chars,
+    },
+    .{
+        .name = "structured_output",
+        .desc = "The final validated object for --chat --schema runs (off in the TUI)",
+        .schema = structured_output_prompt.json,
+        .read_only = true,
+        .parallel_safe = false,
+        .destructive = false,
         .max_result_chars = resultcap.default_max_result_chars,
     },
     .{

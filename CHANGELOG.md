@@ -40,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete phase 8 (prompt-cache break detection) (cache) [`c4b9cf00`](https://github.com/jesusalcaladev/zode/commit/c4b9cf00)
 - complete phase 21 (send_user_message) (user) [`0dc247f2`](https://github.com/jesusalcaladev/zode/commit/0dc247f2)
 - complete phase 18 (isolated worktree sessions) (worktree) [`7e429eea`](https://github.com/jesusalcaladev/zode/commit/7e429eea)
-- complete phase 19 (ticks and scheduled prompts) (schedule) [`23935ce2`](https://github.com/jesusalcaladev/zode/commit/23935ce2)
+- complete phase 19 (ticks and scheduled prompts) (schedule) [`3a919193`](https://github.com/jesusalcaladev/zode/commit/3a919193)
+- complete phase 22 (structured output for scripted runs) (schema) [`d72b3ec5`](https://github.com/jesusalcaladev/zode/commit/d72b3ec5)
 
 ### Bug Fixes
 

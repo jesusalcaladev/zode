@@ -24,6 +24,8 @@ const plan_mod = @import("lib/plan.zig");
 const taskstore = @import("lib/taskstore.zig");
 const team_mod = @import("lib/team.zig");
 const usermessage_mod = @import("lib/usermessage.zig");
+const jsonschema_mod = @import("lib/jsonschema.zig");
+const structured_run = @import("lib/structured_run.zig");
 const hooks_mod = @import("lib/hooks.zig");
 const permrules = @import("lib/permrules.zig");
 const pathsafe = @import("lib/pathsafe.zig");
@@ -387,7 +389,10 @@ fn ageIsStale(io: std.Io, fetched_at: i64) bool {
 
 /// Headless mode: zode --chat "text"
 /// Headless agent: like the TUI but without UI (yolo ON, prints to stderr).
-fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, text: []const u8) !u8 {
+fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, text: []const u8, schema_data: ?[]const u8) !u8 {
+    // Phase 22: schema mode is a PROPERTY OF THIS RUN, never of the TUI.
+    const schema_mode = schema_data != null;
+    var structured_outcome = structured_run.Outcome{};
     var http = http_client.Http.init(gpa, io);
     defer http.deinit();
 
@@ -458,7 +463,13 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
     // The `arena`, not the `gpa`: this text lives as long as the conversation
     // does, and the arena dies at the end of the run. With `gpa` it was a leak
     // per process (the DebugAllocator says so on exit, which is how it showed up).
-    try msgs.append(arena, .{ .role = "system", .content = try headlessSystemPrompt(arena, env) });
+    const base_system = try headlessSystemPrompt(arena, env);
+    const schema_directive = structured_run.directive(schema_mode);
+    const system_content = if (schema_mode)
+        try std.fmt.allocPrint(arena, "{s}\n\n{s}", .{ base_system, schema_directive })
+    else
+        base_system;
+    try msgs.append(arena, .{ .role = "system", .content = system_content });
     // `@file` mentions work in headless too: the TUI expands them in
     // `runOneTurn` (`withMentions`), but this runner sent the raw text, so
     // `zode --chat "explain @src/foo.zig"` made the model answer "I don't have
@@ -684,7 +695,13 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
                 wire = with;
             }
         }
-        const body = chat.buildBodyMessagesCapped(body_buf, model_name, wire, effort_pref, tools_mod.toolsJson(), kind, agent.outputCapFor(def, env)) catch return error.BodyTooBig;
+        // Phase 22: in --schema mode the model is offered `structured_output`
+        // in addition to the normal tools; in the TUI it never appears.
+        const tools_json = if (schema_mode)
+            try structured_run.withTool(arena, tools_mod.toolsJson(), structured_run.toolSchema(true))
+        else
+            tools_mod.toolsJson();
+        const body = chat.buildBodyMessagesCapped(body_buf, model_name, wire, effort_pref, tools_json, kind, agent.outputCapFor(def, env)) catch return error.BodyTooBig;
 
         const Cb = struct {
             fn onDelta(_: ?*anyopaque, delta: []const u8) void {
@@ -798,7 +815,12 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
             // prints "done" over a typecheck claims a test run nobody did, and the person
             // reading the CI log is the one who stops looking.
             printProofLine(&auto_check, gpa);
-            return 0; // final answer
+            // Phase 22: in schema mode a prose final answer is NOT a result.
+            if (schema_mode and !structured_outcome.satisfied) {
+                std.debug.print("error: the run ended without a valid structured_output call.\n", .{});
+                return structured_run.exitCode(structured_outcome);
+            }
+            return structured_run.exitCode(structured_outcome); // final answer
         }
 
         // Runs the tools (headless = yolo) and feeds the results back.
@@ -806,6 +828,22 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         try msgs.append(arena, .{ .role = "assistant", .content = "", .tool_calls_json = tc_json });
         for (result.ctx.parts.items) |*p| {
             models.dbg("\n[tool {s}] {s}\n", .{ p.name.items, p.args.items });
+
+            // Phase 22: `structured_output` is the final, validated answer.
+            // It is NEVER dispatched as a normal tool — validate the model's
+            // object against the caller's schema here. A mismatch is a named
+            // error the model sees and can fix; success prints the JSON to
+            // stdout and marks the run satisfied.
+            if (schema_mode and std.mem.eql(u8, p.name.items, "structured_output")) {
+                const so_result = try handleStructuredOutput(arena, io, schema_data.?, p.args.items, &msgs, p.id.items);
+                if (so_result == .satisfied) {
+                    structured_outcome.satisfied = true;
+                    // Do not run other tools after the final call this turn.
+                    break;
+                }
+                continue;
+            }
+
             const res = execHeadless(io, &bg, &tasks, &team, &pending_images, p.name.items, p.args.items, arena) catch |err| {
                 try msgs.append(arena, .{
                     .role = "tool",
@@ -912,7 +950,13 @@ fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         );
     }
     models.dbg("\n[stopped: {s} after {d} iterations]\n", .{ @tagName(reason), iteration });
-    return 0;
+    // Phase 22: reaching the ceiling (or any non-final exit) in schema mode
+    // without a valid structured_output call is a loud failure for CI.
+    if (schema_mode and !structured_outcome.satisfied) {
+        std.debug.print("error: the run ended ({s}) without a valid structured_output call.\n", .{@tagName(reason)});
+        return structured_run.exitCode(structured_outcome);
+    }
+    return structured_run.exitCode(structured_outcome);
 }
 
 /// The end-of-turn proof line, printed for the headless runner.
@@ -1425,11 +1469,31 @@ pub fn main(init: std.process.Init) !u8 {
             return acp_server.run(init.gpa, init.io, init.environ_map);
         }
         if (std.mem.eql(u8, arg0, "--chat")) {
-            const text = it.next() orelse {
-                models.dbg("uso: zode --chat \"texto\"\n", .{});
+            // Phase 22: `--chat --schema <file> "text"` — the caller supplies a
+            // JSON schema; the model must call structured_output with a
+            // matching object. `--chat "text"` keeps the plain mode.
+            var schema_data: ?[]const u8 = null;
+            var text: ?[]const u8 = null;
+            while (it.next()) |tok| {
+                if (std.mem.eql(u8, tok, "--schema")) {
+                    const path = it.next() orelse {
+                        std.debug.print("error: --schema needs a path to a JSON schema file.\n", .{});
+                        return 1;
+                    };
+                    schema_data = std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(1024 * 1024)) catch |err| {
+                        std.debug.print("error: could not read schema file {s}: {t}\n", .{ path, err });
+                        return 1;
+                    };
+                } else {
+                    text = tok;
+                    break;
+                }
+            }
+            const prompt_text = text orelse {
+                std.debug.print("usage: zode --chat [--schema <file>] \"text\"\n", .{});
                 return 1;
             };
-            return runChat(init.gpa, init.io, init.environ_map, text);
+            return runChat(init.gpa, init.io, init.environ_map, prompt_text, schema_data);
         }
         if (std.mem.eql(u8, arg0, "--selftest")) {
             return runSelftest(init);
@@ -1449,6 +1513,7 @@ pub fn main(init: std.process.Init) !u8 {
                     "  acp, --acp   run Agent Client Protocol (ACP) agent over stdio\n" ++
                     "  --models     list the models of the provider\n" ++
                     "  --chat TXT   send a message (streaming)\n" ++
+                    "  --chat --schema FILE TXT   schema mode: the model must call structured_output with a matching object (JSON on stdout, non-zero if missing)\n" ++
                     "  --resume     resume the last session\n" ++
                     "  --version    show version\n" ++
                     "  --selftest   internal: one HTTPS request, for the updater\n" ++
@@ -1466,6 +1531,56 @@ pub fn main(init: std.process.Init) !u8 {
 
 /// Headless counterpart of `agent.stageImageMentions`: turn `@shot.png` in the
 /// typed prompt into a real attachment instead of inlined binary text.
+/// Phase 22: validate a `structured_output` call against the caller's schema.
+/// Returns `.satisfied` when the object passed (and prints it to stdout), or
+/// `.retry` after appending a named validation error for the model to fix.
+const StructuredResult = enum { satisfied, retry };
+
+fn handleStructuredOutput(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    schema_text: []const u8,
+    args_json: []const u8,
+    msgs: *std.ArrayList(chat.ChatMessage),
+    call_id: []const u8,
+) !StructuredResult {
+    const schema = std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{}) catch {
+        std.debug.print("error: the caller's JSON schema is malformed.\n", .{});
+        return error.BadSchema;
+    };
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch {
+        try msgs.append(arena, .{
+            .role = "tool",
+            .content = "structured_output needs a JSON object with an `object` field.",
+            .tool_call_id = try arena.dupe(u8, call_id),
+        });
+        return .retry;
+    };
+    var obj: std.json.Value = parsed;
+    if (parsed == .object) {
+        if (parsed.object.get("object")) |inner| obj = inner;
+    }
+
+    const verdict = try jsonschema_mod.validate(arena, schema, obj);
+    switch (verdict) {
+        .fail => |v| {
+            const text = try jsonschema_mod.violationText(arena, v);
+            try msgs.append(arena, .{ .role = "tool", .content = text, .tool_call_id = try arena.dupe(u8, call_id) });
+            return .retry;
+        },
+        .ok => {},
+    }
+
+    // Validated: the JSON is the run's result. Print ONLY the object to stdout
+    // so a script can parse it directly (diagnostics go to stderr).
+    var out_buf: [64 * 1024]u8 = undefined;
+    var out = std.Io.File.stdout().writer(io, &out_buf);
+    try std.json.Stringify.value(obj, .{}, &out.interface);
+    try out.interface.writeAll("\n");
+    try out.interface.flush();
+    return .satisfied;
+}
+
 fn stageImageMentionsHeadless(
     arena: std.mem.Allocator,
     io: std.Io,

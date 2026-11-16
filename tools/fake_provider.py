@@ -25,6 +25,13 @@ PORT = 11434
 # A `call` is {"name": "...", "args": {...}} and becomes a tool_call.
 
 SCENARIOS = {
+    # Phase 22: a scripted structured-output run. The object matches the
+    # caller's schema; the harness validates it and prints it to stdout.
+    "structured": [
+        {"tools": [{"name": "structured_output", "args": {
+            "object": {"name": "zode", "count": 3, "tags": ["a", "b"]},
+        }}]},
+    ],
     "bg": [
         {"tools": [{"name": "run_in_background", "args": {"command": "echo start; sleep 3; echo done"}}]},
         {"tools": [{"name": "bash_output", "args": {"id": 1}}]},
