@@ -424,6 +424,7 @@ pub fn cmdAddDir(m: *tui.Model, arg: ?[]const u8) void {
 
 /// `/cache`: prompt cache hit-rate of the session.
 pub fn cmdCache(m: *tui.Model) void {
+    const gpa = m.allocator;
     const st = &cache_stats.session;
     agent.pushInfoFmt(
         m,
@@ -459,6 +460,27 @@ pub fn cmdCache(m: *tui.Model) void {
             "THE MODEL IS A ROUTER: the prompt count went DOWN {d} time(s) with nothing removed from the conversation. Measured 2026-10-04, same prefix three times: openrouter/free 3583/3273/3381 (0% cached), a fixed model 3611/3613/3613 (98%). Routers do not share a prompt cache, so no prefix arrangement can make one hit. /model and pick a model, not a router.",
             .{st.prompt_shrinks},
         ),
+    }
+
+    // Phase 8: WHICH block broke the stable prefix. The verdict above says
+    // whether caching works; this says what in OUR prompt stopped being stable
+    // — the one thing the harness can fix (the provider/router it cannot).
+    const breaks = agent.cacheBreakCount();
+    if (breaks == 0) {
+        agent.pushInfo(m, "prefix: 0 breaks detected — the stable blocks are unchanged between requests");
+    } else {
+        var line_buf: [512]u8 = undefined;
+        var line: std.Io.Writer = .fixed(&line_buf);
+        line.print("prefix: {d} break(s) detected — ", .{breaks}) catch {};
+        var i: usize = 0;
+        while (agent.cacheBreakAt(i)) |b| : (i += 1) {
+            if (i > 0) line.writeAll(", ") catch {};
+            line.print("{s} @ byte {d}", .{ b.block, b.pos }) catch {};
+        }
+        agent.pushInfoOwned(m, gpa.dupe(u8, line.buffered()) catch return);
+        if (agent.cacheBreakUnstable()) {
+            agent.pushInfo(m, "prefix writes are frequent (>0.5 per request): a moving block is rebuilt on every turn");
+        }
     }
 }
 
@@ -3963,4 +3985,16 @@ test "settings: a verify report feeds the three-way pill" {
     try std.testing.expectEqual(@as(usize, 1), m.verify_counts.verified);
     try std.testing.expectEqual(@as(usize, 1), m.verify_counts.refuted);
     try std.testing.expectEqual(@as(usize, 3), m.verify_counter.target);
+}
+
+test "cache: /cache reports detected prefix breaks" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    agent.resetCacheBreak();
+    defer agent.resetCacheBreak();
+    // No breaks yet: the report says so.
+    try agent.submit(&m, "/cache");
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "0 breaks") != null);
 }

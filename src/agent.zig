@@ -170,6 +170,16 @@ pub fn cacheBreakUnstable() bool {
     return prompt_system.cacheBreakUnstable();
 }
 
+/// Phase 8: number of stable-prefix breaks detected this session.
+pub fn cacheBreakCount() usize {
+    return prompt_system.breakCount();
+}
+
+pub const CacheBreak = prompt_system.Break;
+pub fn cacheBreakAt(i: usize) ?CacheBreak {
+    return prompt_system.breakAt(i);
+}
+
 /// Discovers and caches agent definitions. Cache/state extracted to
 /// `agent/discovery.zig` (behavior preserved); wrapper keeps the public API.
 pub fn ensureAgentDefs(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) []const agentdefs.Entry {

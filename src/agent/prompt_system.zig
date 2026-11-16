@@ -23,10 +23,19 @@ var cache_break_prev: ?[8]u64 = null;
 var cache_break_last_block: ?[]const u8 = null;
 var cache_break_last_pos: usize = 0;
 
+/// Phase 8: a bounded history of prefix breaks, so `/cache` can answer not
+/// only "what broke" but "how many times". Fixed-size, no allocator — a break
+/// is rare and the last 8 are more than enough to explain a bad hit-rate.
+pub const Break = struct { block: []const u8, pos: usize };
+pub const max_breaks: usize = 8;
+var cache_break_history: [max_breaks]Break = undefined;
+var cache_break_count: usize = 0;
+
 pub fn resetCacheBreak() void {
     cache_break_prev = null;
     cache_break_last_block = null;
     cache_break_last_pos = 0;
+    cache_break_count = 0;
 }
 
 pub fn cacheBreakUnstable() bool {
@@ -36,6 +45,10 @@ pub fn cacheBreakUnstable() bool {
 pub fn cacheBreakLastBlock() ?[]const u8 { return cache_break_last_block; }
 pub fn cacheBreakLastPos() usize { return cache_break_last_pos; }
 pub fn cacheBreakPrev() ?[8]u64 { return cache_break_prev; }
+pub fn breakCount() usize { return cache_break_count; }
+pub fn breakAt(i: usize) ?Break {
+    return if (i < cache_break_count) cache_break_history[i] else null;
+}
 pub fn setCacheBreakPrev(prev: [8]u64) void { cache_break_prev = prev; }
 pub fn clearCacheBreakLast() void {
     cache_break_last_block = null;
@@ -44,6 +57,12 @@ pub fn clearCacheBreakLast() void {
 pub fn noteCacheBreak(block: ?[]const u8, pos: usize) void {
     cache_break_last_block = block;
     cache_break_last_pos = pos;
+    if (block) |b| {
+        if (cache_break_count < max_breaks) {
+            cache_break_history[cache_break_count] = .{ .block = b, .pos = pos };
+            cache_break_count += 1;
+        }
+    }
 }
 
 pub fn forgetAgentsCache(a: std.mem.Allocator) void {
@@ -257,4 +276,33 @@ pub fn syncSystemPrompt(s: *session_mod.Session, ctx: BuildCtx) void {
         break;
     }
     _ = s.replaceSystem(want) catch {};
+}
+
+// ── Phase 8: cache-break history tests ──────────────────────────
+
+test "cachebreak: history records breaks in order and is bounded" {
+    resetCacheBreak();
+    try std.testing.expectEqual(@as(usize, 0), breakCount());
+    noteCacheBreak("skills", 123);
+    noteCacheBreak("style", 456);
+    try std.testing.expectEqual(@as(usize, 2), breakCount());
+    try std.testing.expectEqualStrings("skills", breakAt(0).?.block);
+    try std.testing.expectEqual(@as(usize, 123), breakAt(0).?.pos);
+    try std.testing.expectEqualStrings("style", breakAt(1).?.block);
+    try std.testing.expect(breakAt(2) == null);
+    // Bounded: more breaks than the cap keep the first `max_breaks`.
+    for (0..max_breaks + 4) |i| {
+        noteCacheBreak("base", i);
+    }
+    try std.testing.expectEqual(@as(usize, max_breaks), breakCount());
+    resetCacheBreak();
+    try std.testing.expectEqual(@as(usize, 0), breakCount());
+}
+
+test "cachebreak: a null block is not recorded (no false break)" {
+    resetCacheBreak();
+    noteCacheBreak(null, 0);
+    try std.testing.expectEqual(@as(usize, 0), breakCount());
+    try std.testing.expect(cacheBreakLastBlock() == null);
+    resetCacheBreak();
 }
