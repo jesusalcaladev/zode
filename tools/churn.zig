@@ -18,6 +18,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]const u8
     const r = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(4 * 1024 * 1024) }) catch return null;
     defer gpa.free(r.stderr);
     if (r.term != .exited or r.term.exited != 0) {
+        std.debug.print("RUN FAIL argv[0]={s} term={s} stderr={s}\n", .{ argv[0], @tagName(r.term), r.stderr });
         gpa.free(r.stdout);
         return null;
     }
