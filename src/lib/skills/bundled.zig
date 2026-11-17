@@ -356,7 +356,7 @@ test "substituteArguments: no placeholder returns the body untouched" {
     const body: []const u8 = "nothing to substitute";
     var out: [64]u8 = undefined;
     const r = substituteArguments(body, "whatever", &out);
-    // Sin placeholder no hay copia: se devuelve el mismo slice.
+    // No placeholder means no copy: the same slice is returned.
     try std.testing.expect(r.ptr == body.ptr);
 }
 

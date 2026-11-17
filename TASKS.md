@@ -16,23 +16,25 @@
 | ⚡    | token/time saving           |     |          |           |
 | 🔒    | security                    |     |          |           |
 
-Task IDs mirror the roadmap (`27.3` = Phase 27, item 3) so both files cross-reference.
+Task IDs mirror the phase numbers (`27.3` = Phase 27, item 3). The board is the
+source of truth; the old roadmap/analysis docs it used to point at were never
+committed, so those references were removed.
 
 ---
 
 ## 🚀 Next up — the roadmap's own verdict
 
-- [ ] 🟢 **Tool track complete** — Phase 32 (verify-or-refute) is done; Phases 20, 25, 26, 9 are done. Remaining work is the independent phases below.
-- [ ] 🟢 Everything else per the dependency table at the bottom.
+- [x] 🟢 **Tool track complete** — Phase 32 (verify-or-refute) is done; Phases 20, 25, 26, 9 are done. Verified against code and tests.
+- [x] 🟢 **All other boarded phases complete** — every phase on this board except the optional Phase 13 is implemented and tested. (The old "dependency table at the bottom" never existed; this line replaces it.)
 
-**Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills + rich frontmatter) · **Phase 2 (2.1–2.5)** (skill listing budget, once-per-session listing, named args/`$ARGUMENTS`, `context: fork`, `!cmd` substitution behind permissions) · Phase 4 (output styles) · Phase 9 (agent definitions on disk: `.zode/agents/<name>/AGENT.md` + `~/.config/zode/agents/<name>/AGENT.md`, frontmatter parsing/validation, project-over-user shadowing, cached discovery) · Phase 12 (MCP over stdio + deferred tool loading) · Phase 14 (LSP client) · Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19 (sleep + ticks + schedule, complete) · Phase 20 (team mode: `team_create`/`team_delete`/`send_message`/`team_status`, Team equals TaskList, message routing by name and broadcast, idle claim from the task graph, orderly shutdown acknowledged once, session overrides) · Phase 25.1 (bash safety classify) · Phase 26 (built-in subagent roles `explore`/`plan`/`verify` with role prompts, per-project per-role agent memory consulted/not inlined, resumable/forkable subagent windows with persisted ids, role-aware tool access and pure tests) · **model catalog invalidation at 5 minutes** (one `modelcache.max_age_seconds` TTL drives `--models` freshness, the palette refresh throttle, and a "catalog older than 5 min · refreshing" notice; a stale list is still shown for resilience but flagged) · **image input improvements** (`@shot.png` typed in the prompt is staged as a real attachment instead of binary text — TUI and headless; last-moment vision gate in `withPendingImages` and headless wire drops all image bytes when the answering model cannot see images, even if it changed after staging) · **interactive Settings screen** (full-surface two-column Claude-Code-style internal config opened with `/config` or `Ctrl+,`: sections for Model & reasoning, Output style with live preview and source badge, Context & cache with stats/verdict + prompt-cache + read-cache size, Agent behavior, Permissions, Appearance; changes persist to `~/.config/zode/config.json` through a patch writer that preserves unknown fields; `/config report` keeps the numbers panel; bundled `concise` output style added) · Phase 27 (diff with gutter + word diff + colour ladder) · Phase 28 (`/copy`) · **Phase 33 (TUI at a mature harness's level)** (effective effort/glyphs, turn counts, scroll pill/context header, transcript screen, bottom-anchored modal/fuzzy picker with scoring and preview, notifications, context visualisation, task panel, per-message actions, transcript search, OSC 8 hyperlinks, external editor/image paste, modal diff viewer, compact-summary line, permission dialog with rule explanation) · Phase 35.1 (`/files`) · Phase 35.2 (`/init`) · Phase 36 (use-after-free crash, worker lifetime/counting audit, and build-step fixes) · Tool upgrades (grep context, bash description, read PDF, glob subdir).
+**Done since the board was written**: Phase 0 (tool registry + result cap) · Phase 1 (bundled skills + rich frontmatter) · **Phase 2 (2.1–2.5)** (skill listing budget, once-per-session listing, named args/`$ARGUMENTS`, `context: fork`, `!cmd` substitution behind permissions) · Phase 4 (output styles) · Phase 9 (agent definitions on disk: `.zode/agents/<name>/AGENT.md` + `~/.config/zode/agents/<name>/AGENT.md`, frontmatter parsing/validation, project-over-user shadowing, cached discovery) · Phase 12 (MCP over stdio + deferred tool loading) · Phase 14 (LSP client) · Phase 15 (task graph) · Phase 16 (`batch` tool) · Phase 19 (sleep + ticks + schedule, complete) · Phase 20 (team mode: `team_create`/`team_delete`/`send_message`/`team_status`, Team equals TaskList, message routing by name and broadcast, idle claim from the task graph, orderly shutdown acknowledged once, session overrides) · Phase 25.1 (bash safety classify) · Phase 26 (built-in subagent roles `explore`/`plan`/`verify` with role prompts, per-project per-role agent memory consulted/not inlined, resumable/forkable subagent windows with persisted ids, role-aware tool access and pure tests) · **model catalog invalidation at 5 minutes** (one `modelcache.max_age_seconds` TTL drives `--models` freshness, the palette refresh throttle, and a "catalog older than 5 min · refreshing" notice; a stale list is still shown for resilience but flagged) · **image input improvements** (`@shot.png` typed in the prompt is staged as a real attachment instead of binary text — TUI and headless; last-moment vision gate in `withPendingImages` and headless wire drops all image bytes when the answering model cannot see images, even if it changed after staging) · **interactive Settings screen** (full-surface two-column Claude-Code-style internal config opened with `/config` or `Ctrl+,`: sections for Model & reasoning, Output style with live preview and source badge, Context & cache with stats/verdict + prompt-cache + read-cache size, Agent behavior, Permissions, Appearance; changes persist to `~/.config/zode/config.json` through a patch writer that preserves unknown fields; `/config report` keeps the numbers panel; bundled `concise` output style added) · Phase 27 (diff with gutter + word diff + colour ladder) · Phase 28 (`/copy`) · **Phase 33 (TUI at a mature harness's level)** (effective effort/glyphs, turn counts, scroll pill/context header, transcript screen, bottom-anchored modal/fuzzy picker with scoring and preview, notifications, context visualisation, task panel, per-message actions, transcript search, OSC 8 hyperlinks, external editor/image paste, modal diff viewer, compact-summary line, permission dialog with rule explanation) · Phase 35.1 (`/files`) · Phase 35.2 (`/init`) · Phase 36 (use-after-free crash, worker lifetime/counting audit, and build-step fixes) · Phase 37 (`/diag` + `--diag` + `zig build diag`, pure `src/lib/diag.zig` memory snapshot) · Phase 38 (release/beta flow: real `churn` tool, `ZODE_UPDATE_CHANNEL=beta`, `src/lib/release.zig`, `docs/releasing.md`, `v0.3.0-beta.1` published with four platform assets) · Phase 39 (`zig build memaudit`: pure `src/lib/memaudit.zig` + `tools/memaudit.zig` static auditor for stack-buffer escapes and borrowed `.items`; CI gate; found and fixed the latent `copy_toast_text` dangling slice) · auth-encryption hardening (`src/lib/authstore.zig`, passphrase-protected master key) · Tool upgrades (grep context, bash description, read PDF, glob subdir).
 
-**Completed phase sections removed from the board (all checklist items done):** Phase 2, 3, 5, 6, 7, 8, 9, 10, 11, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29, 30, 31, 32, 33, 34, 35, 36.
+**Completed phase sections removed from the board (all checklist items done):** Phase 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39.
 
-**The analysis behind the new phases** lives in `docs/analysis/`:
-`tui-chrome.md` (the TUI port list, 42 features) · `commands.md` (72 reference
-commands, 26 gaps) · `harness.md` (the machinery gaps) · `audit.md` (our own
-state, the open bug and the quality bar).
+**Analysis docs:** the old `docs/analysis/` set (`tui-chrome.md`, `commands.md`,
+`harness.md`, `audit.md`) and `ROADMAP.md` were referenced here but were never
+committed. The completed-phase paragraphs above are the surviving record; the
+references were removed instead of leaving dangling links.
 
 ---
 
@@ -120,15 +122,42 @@ state, the open bug and the quality bar).
 
 **Phase 33 (TUI at a mature harness's level)** is complete: all 18 ported features (33.1–33.7, 33.9–33.14, 33.16, 33.18, 33.19, 33.21) are implemented and checked; its section was removed from the board per convention.
 
-**What we deliberately do NOT copy** (and why) — the reasoning is in
-`docs/analysis/tui-chrome.md` §5: the alternate screen (it destroys the
+**What we deliberately do NOT copy** (and why): the alternate screen (it destroys the
 terminal's native scrollback), the random-verb spinner (our phase label says
 more), the boxed prompt (our rule costs 1 row instead of 3), the user-defined
 status line (an execution surface we do not need) and the shimmer animation (a
 permanent CPU cost for a decoration).
 
 **Where we are BETTER than the reference implementation** (so nobody ports it
-backwards) — `docs/analysis/harness.md` §4 lists ten: the exit gate, the
+backwards) — ten concrete advantages: the exit gate, the
 `goal` checkpoint, the `verdictCredible` refusal, the `batch` sandbox, the
 "stale green" detection (no equivalent there), the free-model rotation, the
 edit hint, the repetition guard, the `ask` cap and the `proofWord` precision.
+
+---
+
+**Phase 37 (Internal diagnostics)** is complete: `/diag`, `--diag` and `zig build diag` expose a one-shot memory snapshot from `/proc/self/status` without touching the network or the real HOME. The pure `src/lib/diag.zig` parses the status fields; it runs in CI-adjacent tooling only and never renders into the TUI.
+
+---
+
+**Phase 38 (Release/beta flow)** is complete: `tools/churn.zig` is a real four-command tool (`add`, `version`, `changelog`, `release`) that replaces the old stub and the buggy `churn.sh`. `release` refuses a dirty tree, runs `zig build test`, cuts the dated `CHANGELOG.md` section, consumes the changesets, commits and tags — and only pushes with explicit `--push`. The release math lives in pure `src/lib/release.zig` (channel selection, semver bump, `pickLatest` that prefers prereleases on the beta channel and never demotes stable to beta). Self-update reads `ZODE_UPDATE_CHANNEL=beta` and follows the newest prerelease; stable keeps `/releases/latest`. Runbook in `docs/releasing.md`. Verified end-to-end: `v0.3.0-beta.1` published with four platform binaries plus `install.sh`, marked as a GitHub prerelease, and the downloaded binary reports `zode v0.3.0-beta.1`.
+
+---
+
+**Phase 39 (Memory-safety auditor)** is complete: `zig build memaudit` runs `tools/memaudit.zig` over all 287 `.zig` files under `src/`. The pure `src/lib/memaudit.zig` has two narrow detectors for the two crash classes that actually hit zode — a stack buffer stored in a struct field (`field = bufPrint(&local, ...)`) and a borrowed `.items` stored as message `.content`. It is a CI gate (`.github/workflows/zig.yml`) and exits 1 on findings; `// memaudit: allow` suppresses a reviewed line. It immediately found a real latent bug: `m.copy_toast_text` was a slice into a dead stack buffer, now formatted into a Model-owned buffer.
+
+---
+
+**Quality cleanup (bookkeeping, no new feature)** is complete: the stale
+`ROADMAP.md` / `docs/analysis/` references were removed from this board, the two
+"Next up" boxes were resolved (only optional Phase 13 stays open), and Phases
+37-39 plus the auth-encryption hardening are now recorded above. All Spanish
+comments and test names in `src/lib/project.zig` and
+`src/lib/skills/bundled.zig` were translated to English, along with Spanish
+test fixtures in `ask.zig`, `checkpoint.zig`, `dispatch.zig`, `ui_frame.zig`
+and `agent.zig` (Spanish kept only where it is the *subject* of a test, e.g.
+the language-following prompt and filename fixtures). Pure tests were added for
+`src/lib/authstore.zig` (4 tests: envelope round trip, tamper/wrong-key refusal,
+key encoding, passphrase master key) and for the previously uncovered
+`provider.zig`, `shellquote.zig`, `sleep.zig` and `highlight/{config,scanner,styles}.zig`;
+all are registered in `src/test_all.zig`. The suite is 2054 passed / 4 skipped.

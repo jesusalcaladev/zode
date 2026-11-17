@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- bring the board up to date and close the quality gaps (tasks) [`60010258`](https://github.com/jesusalcaladev/zode/commit/60010258)
+
 ## [0.3.0-beta.1] - 2026-11-16
 
 ### Features

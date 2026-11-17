@@ -1155,11 +1155,11 @@ test "read: `paths` reads SEVERAL files in ONE call, and each is cached on its o
 
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = "/tmp/opencode/multi-a.txt",
-        .data = "contenido del primer fichero\n",
+        .data = "content of the first file\n",
     });
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = "/tmp/opencode/multi-b.txt",
-        .data = "contenido del segundo fichero\n",
+        .data = "content of the second file\n",
     });
 
     const multi = try std.fmt.allocPrint(arena,
@@ -1171,8 +1171,8 @@ test "read: `paths` reads SEVERAL files in ONE call, and each is cached on its o
     try std.testing.expect(std.mem.indexOf(u8, out, "read 2 file(s)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "multi-a.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "multi-b.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "contenido del primer fichero") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "contenido del segundo fichero") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "content of the first file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "content of the second file") != null);
 
     // And the cache is per file: a second call over the same two says neither is
     // repeated, which is what makes the batch safe to call again.

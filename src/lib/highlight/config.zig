@@ -188,3 +188,9 @@ pub fn cfgFor(lang: []const u8) Cfg {
     if (std.mem.eql(u8, l, "sql")) return langs.sql;
     return langs.generic;
 }
+
+test "highlight config: eqAny finds a word in a language table" {
+    try std.testing.expect(eqAny("const", langs.zig.keywords));
+    try std.testing.expect(!eqAny("const", langs.zig.control));
+    try std.testing.expect(!eqAny("nope", langs.zig.keywords));
+}

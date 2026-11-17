@@ -87,3 +87,14 @@ pub fn findStrEnd(line: []const u8, from: usize, quote: u8) ?usize {
     }
     return null;
 }
+
+test "highlight scanner: identifier and comment predicates" {
+    try std.testing.expect(isIdentStart('_'));
+    try std.testing.expect(isIdentStart(0x80));
+    try std.testing.expect(!isIdentStart('1'));
+    try std.testing.expect(isIdentChar('1'));
+    try std.testing.expect(isDigit('9'));
+    try std.testing.expect(!isDigit('x'));
+    const at = lineCommentAt("const x = 1; // note", 13, &.{"//"});
+    try std.testing.expectEqual(@as(usize, 2), at.?); // returns the prefix length
+}

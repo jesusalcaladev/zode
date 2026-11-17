@@ -240,7 +240,7 @@ test "a snapshot is copied, not referenced: the turn arena dies" {
     var st = Stack.init(gpa);
     defer st.deinit();
 
-    st.begin("crear el fichero");
+    st.begin("create the file");
     // `src` is stack memory: if `addFile` stored it as-is, undo would write
     // garbage.
     var src = [_]u8{ 'h', 'o', 'l', 'a' };
@@ -279,7 +279,7 @@ test "an oversized file is flagged, it does not swallow the memory" {
     const gpa = std.testing.allocator;
     var st = Stack.init(gpa);
     defer st.deinit();
-    st.begin("reescribir un fichero enorme");
+    st.begin("rewrite a huge file");
 
     const big = repeat.rep("x", (file_max + 1));
     try std.testing.expectEqual(Checkpoint.Added.too_big, st.items[0].addFile(gpa, "enorme.txt", &big, true));
@@ -353,11 +353,11 @@ test "summary: how many files, from which turn, and what cannot be undone" {
         vacio.summary(arena),
     );
 
-    st.begin("crear el fichero");
-    _ = st.items[0].addFile(std.testing.allocator, "a.txt", "hola", true);
+    st.begin("create the file");
+    _ = st.items[0].addFile(std.testing.allocator, "a.txt", "hello", true);
     const s = st.last().?.summary(arena);
     try std.testing.expect(std.mem.indexOf(u8, s, "undo: 1 file to undo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "crear el fichero") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "create the file") != null);
 
     // With a file that does not fit, the summary says so instead of promising an
     // undo that would leave the repo half-done.

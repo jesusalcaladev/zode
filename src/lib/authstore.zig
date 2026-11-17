@@ -256,3 +256,74 @@ pub fn decodeKeyB64(b64: []const u8) ?[Aead.key_length]u8 {
     };
     return key;
 }
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+test "authstore: encrypt/decrypt round trip, wrong key and non-envelope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [128]u8 = undefined;
+    const key_b64 = try generateKeyB64(&buf);
+    const key = decodeKeyB64(key_b64).?;
+    const envelope = try encrypt(a, "secret-api-key", key);
+    try std.testing.expect(isEncrypted(envelope));
+    try std.testing.expect(!isPassphraseProtectedMasterKey(envelope));
+    try std.testing.expectEqualStrings("secret-api-key", try decrypt(a, envelope, key));
+
+    var wrong = key;
+    wrong[0] ^= 1;
+    try std.testing.expectError(error.AuthFailed, decrypt(a, envelope, wrong));
+    try std.testing.expectError(error.NotEncrypted, decrypt(a, "{\"key\":\"x\"}", key));
+
+    // A flipped byte inside the base64 body must not authenticate.
+    var tampered = try a.dupe(u8, envelope);
+    const i = magic.len + 8;
+    tampered[i] = if (tampered[i] == 'A') 'B' else 'A';
+    try std.testing.expectError(error.AuthFailed, decrypt(a, tampered, key));
+}
+
+test "authstore: key encoding helpers reject bad input" {
+    var buf: [128]u8 = undefined;
+    const b64 = try generateKeyB64(&buf);
+    try std.testing.expect(decodeKeyB64(b64) != null);
+    try std.testing.expect(decodeKeyB64("not-base64!") == null);
+    try std.testing.expect(keyFromBytes("too short") == null);
+    var zeroed: [64]u8 = @splat(0xAB);
+    secureZero(&zeroed);
+    for (zeroed) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "authstore: passphrase derivation is deterministic and salt/passphrase sensitive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Cheap params for the pure derivation check (the envelope uses OWASP).
+    const params = Scrypt.Params{ .ln = 4, .r = 1, .p = 1 };
+    const salt: [16]u8 = @splat(1);
+    const k1 = try deriveMasterKeyFromPassphrase(a, "correct horse", salt, params);
+    const k2 = try deriveMasterKeyFromPassphrase(a, "correct horse", salt, params);
+    try std.testing.expectEqual(k1, k2);
+    const other_pass = try deriveMasterKeyFromPassphrase(a, "wrong horse", salt, params);
+    try std.testing.expect(!std.mem.eql(u8, &k1, &other_pass));
+    const other_salt = try deriveMasterKeyFromPassphrase(a, "correct horse", @as([16]u8, @splat(2)), params);
+    try std.testing.expect(!std.mem.eql(u8, &k1, &other_salt));
+}
+
+test "authstore: passphrase-protected master key round trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const master = try generateKeyB64(&buf);
+
+    const envelope = try encryptMasterKeyWithPassphrase(a, master, "my passphrase");
+    try std.testing.expect(isPassphraseProtectedMasterKey(envelope));
+    try std.testing.expectEqualStrings(master, try decryptMasterKeyWithPassphrase(a, envelope, "my passphrase"));
+    // A fresh salt/nonce makes each envelope different, even for the same key.
+    const again = try encryptMasterKeyWithPassphrase(a, master, "my passphrase");
+    try std.testing.expect(!std.mem.eql(u8, envelope, again));
+    try std.testing.expectError(error.NotProtected, decryptMasterKeyWithPassphrase(a, "plain", "my passphrase"));
+    try std.testing.expectError(error.AuthFailed, decryptMasterKeyWithPassphrase(a, envelope, "wrong passphrase"));
+}

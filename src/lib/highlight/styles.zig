@@ -43,3 +43,10 @@ pub fn styleFor(kind: Kinds) Style {
         .deco => T.deco,
     };
 }
+
+test "highlight styles: every token kind maps to a style" {
+    inline for (@typeInfo(Kinds).@"enum".field_names) |name| {
+        const kind: Kinds = std.meta.stringToEnum(Kinds, name).?;
+        _ = styleFor(kind);
+    }
+}

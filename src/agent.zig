@@ -14794,21 +14794,21 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     try std.Io.Dir.cwd().createDirPath(io_global, dotgit);
     var head_buf2: [256]u8 = undefined;
     const head = try std.fmt.bufPrint(&head_buf2, "{s}/HEAD", .{dotgit});
-    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = head, .data = "ref: refs/heads/mi-rama\n" });
+    try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = head, .data = "ref: refs/heads/my-branch\n" });
 
     setProjectInfoForTest(io_global, root);
     // The repo's own `AGENTS.md` is 119 KB: it would not fit in the 16 KB
     // composition buffer, `bufPrint` would fail, and `buildSystemPrompt` would
     // return the base alone — which is the right behaviour, and would make this
     // test fail for a reason that has nothing to do with the cwd line.
-    prompt_system.agents_md_cache = try std.testing.allocator.dupe(u8, "# proyecto de prueba\n");
+    prompt_system.agents_md_cache = try std.testing.allocator.dupe(u8, "# test project\n");
     defer if (prompt_system.agents_md_cache != null and saved_agents == null) std.testing.allocator.free(prompt_system.agents_md_cache.?);
 
     var out: [16 * 1024]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
     try std.testing.expect(std.mem.indexOf(u8, composed, "Working directory:") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, root) != null);
-    try std.testing.expect(std.mem.indexOf(u8, composed, "branch mi-rama") != null);
+    try std.testing.expect(std.mem.indexOf(u8, composed, "branch my-branch") != null);
     // The routing guide is still there: the cwd did not push it out.
     try std.testing.expect(std.mem.indexOf(u8, composed, "NEVER use bash") != null);
     // And git is named by its name, so that "what has changed" is a `git diff`

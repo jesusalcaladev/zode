@@ -36,3 +36,27 @@ pub const Config = struct {
         return std.fmt.bufPrint(buf, "{s}/chat/completions", .{self.base_url}) catch self.base_url;
     }
 };
+
+test "provider: config defaults and environment overrides" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    var c = Config.load(null);
+    try std.testing.expectEqualStrings(default_base_url, c.base_url);
+    try std.testing.expectEqualStrings(default_model, c.model);
+    c = Config.load(&env);
+    try std.testing.expectEqualStrings(default_base_url, c.base_url);
+    try env.put("ZODE_BASE_URL", "http://localhost:1234/v1");
+    c = Config.load(&env);
+    try std.testing.expectEqualStrings("http://localhost:1234/v1", c.base_url);
+}
+
+test "provider: endpoint URLs are built from the configured base" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("ZODE_BASE_URL", "http://localhost:1234/v1");
+    try env.put("ZODE_MODELS_URL", "http://localhost:1234/v1/models");
+    const c = Config.load(&env);
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("http://localhost:1234/v1/models", c.urlModels(&buf));
+    try std.testing.expectEqualStrings("http://localhost:1234/v1/chat/completions", c.urlChat(&buf));
+}

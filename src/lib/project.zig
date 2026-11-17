@@ -346,7 +346,7 @@ fn join(comptime fmt: []const u8, args: anytype, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, fmt, args);
 }
 
-test "branchFromHead: la rama sale, un sha no" {
+test "branchFromHead: returns a branch, rejects a sha" {
     var buf: [max_branch]u8 = undefined;
     try std.testing.expectEqualStrings("main", branchFromHead("ref: refs/heads/main\n", &buf).?);
     try std.testing.expectEqualStrings("feat/algo", branchFromHead("ref: refs/heads/feat/algo", &buf).?);
@@ -358,7 +358,7 @@ test "branchFromHead: la rama sale, un sha no" {
     try std.testing.expect(branchFromHead("", &buf) == null);
 }
 
-test "detect: encuentra la raiz subiendo desde un subdirectorio" {
+test "detect: finds the root walking up from a subdirectory" {
     var rel_buf: [max_path]u8 = undefined;
     var root_buf: [max_path]u8 = undefined;
     const root = try sandbox(&rel_buf, &root_buf);
@@ -388,7 +388,7 @@ test "detect: encuentra la raiz subiendo desde un subdirectorio" {
     try std.testing.expect(std.mem.indexOf(u8, text, "git") != null);
 }
 
-test "detect: en la raiz no dice que es un subdirectorio" {
+test "detect: at the root it does not claim to be a subdirectory" {
     var rel_buf: [max_path]u8 = undefined;
     var root_buf: [max_path]u8 = undefined;
     const root = try sandbox(&rel_buf, &root_buf);
@@ -406,7 +406,7 @@ test "detect: en la raiz no dice que es un subdirectorio" {
     try std.testing.expect(std.mem.indexOf(u8, text, "branch main") != null);
 }
 
-test "detect: sin repositorio no inventa uno" {
+test "detect: with no repository it invents none" {
     // NOT `sandbox()`: a fixture under the cwd is inside the zode repository, and
     // "no repository here" is only testable somewhere with no `.git` in any
     // ancestor. `/tmp` is the honest place for it.
@@ -426,16 +426,16 @@ test "detect: sin repositorio no inventa uno" {
     try std.testing.expect(std.mem.indexOf(u8, text, dir) != null);
 }
 
-test "detect: un worktree con .git como fichero se lee igual" {
+test "detect: a worktree with .git as a file reads the same" {
     var rel_buf: [max_path]u8 = undefined;
     var root_buf: [max_path]u8 = undefined;
     const root = try sandbox(&rel_buf, &root_buf);
     const rel_len = rel_buf_len(&rel_buf);
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, rel_buf[0..rel_len]) catch {};
 
-    // `git worktree add` deja un FICHERE `.git` con `gitdir: ...` dentro, y el
-    // HEAD vive en esa ruta, no en `<root>/.git`. Si esto devuelve null, zode
-    // cree que no esta en un repositorio justo en el directorio de trabajo.
+    // `git worktree add` leaves a `.git` FILE containing `gitdir: ...`, and the
+    // HEAD lives at that path, not at `<root>/.git`. If this returns null, zode
+    // wrongly thinks it is not in a repository right in the working directory.
     var meta_buf: [max_path]u8 = undefined;
     const gitdir = try join("{s}/meta/wt", .{root}, &meta_buf);
     var head_buf: [max_path]u8 = undefined;
@@ -451,7 +451,7 @@ test "detect: un worktree con .git como fichero se lee igual" {
     try std.testing.expectEqualStrings("feat/wt", info.branch().?);
 }
 
-test "detect: un gitdir relativo a la raiz tambien vale" {
+test "detect: a gitdir relative to the root is also accepted" {
     var rel_buf: [max_path]u8 = undefined;
     var root_buf: [max_path]u8 = undefined;
     const root = try sandbox(&rel_buf, &root_buf);
@@ -472,7 +472,7 @@ test "detect: un gitdir relativo a la raiz tambien vale" {
     try std.testing.expectEqualStrings("w", info.branch().?);
 }
 
-test "readGitDir: un .git que no existe devuelve null en vez de una ruta inventada" {
+test "readGitDir: a missing .git returns null instead of an invented path" {
     var rel_buf: [max_path]u8 = undefined;
     var root_buf: [max_path]u8 = undefined;
     const root = try sandbox(&rel_buf, &root_buf);
@@ -482,7 +482,7 @@ test "readGitDir: un .git que no existe devuelve null en vez de una ruta inventa
     try std.testing.expect(readGitDir(std.testing.io, root, &out) == null);
 }
 
-test "findRoot: se detiene en el primer .git y no sube mas alla" {
+test "findRoot: stops at the first .git and does not climb past it" {
     var rel_buf: [max_path]u8 = undefined;
     var root_buf: [max_path]u8 = undefined;
     const root = try sandbox(&rel_buf, &root_buf);
@@ -500,11 +500,11 @@ test "findRoot: se detiene en el primer .git y no sube mas alla" {
     var out: [max_path]u8 = undefined;
     try std.testing.expectEqualStrings(inner, findRoot(std.testing.io, inner, &out).?);
     try std.testing.expectEqualStrings(root, findRoot(std.testing.io, root, &out).?);
-    // Una ruta que no es absoluta no se puede recorrer hacia arriba.
+    // A relative path cannot be walked upward.
     try std.testing.expect(findRoot(std.testing.io, "src/x", &out) == null);
 }
 
-test "promptLines: un cwd con espacios y no ascii no se rompe" {
+test "promptLines: a cwd with spaces and non-ASCII does not break" {
     var info: Info = .{};
     const cwd = "/home/jesusalcala/Projects/zode/src";
     @memcpy(info.cwd_buf[0..cwd.len], cwd);

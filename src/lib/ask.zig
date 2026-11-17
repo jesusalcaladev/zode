@@ -403,7 +403,7 @@ test "formatAnswered: an overlong answer is truncated AND it says so" {
 test "formatAnswered: an answer that fits carries no marker" {
     // The truncation marker is noise if there was no truncation: the model
     // could read "truncated" as one of its own instructions.
-    const a = ask.formatAnswered("vale, vamos con el parser nuevo");
+    const a = ask.formatAnswered("ok, let us use the new parser");
     try std.testing.expect(std.mem.indexOf(u8, a.slice(), "truncated") == null);
 }
 

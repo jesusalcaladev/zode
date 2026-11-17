@@ -29,3 +29,8 @@ pub fn nap(ms: u64) void {
     };
     _ = std.os.linux.nanosleep(&ts, null);
 }
+
+test "sleep: nap with zero and a short interval returns without error" {
+    nap(0);
+    nap(1);
+}

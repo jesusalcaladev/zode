@@ -578,18 +578,18 @@ fn sceneLong(m: *tui.Model) void {
         "src/tools/ holds one file per tool.",
     );
     m.streamStart();
-    m.streamDelta("Los ficheros de `src/tools/` son uno por herramienta.\n\n");
-    m.streamDelta("- `dispatch.zig` es el unico que las conoce todas\n");
-    m.streamDelta("- `common.zig` tiene lo compartido (`getStr`, `getInt`)\n");
-    m.streamDelta("- `bash.zig` es la que tiene la parte que bloquea\n\n");
-    m.streamDelta("### Lo que no se divide\n\n");
-    m.streamDelta("`agent.zig` es un hub de estado compartido: moverlo exige\n");
-    m.streamDelta("reducir el estado primero.\n\n");
-    m.streamDelta("> La regla es: un modulo no importa hacia arriba.\n\n");
-    m.streamDelta("| modulo | lineas | notas |\n");
+    m.streamDelta("The files in `src/tools/` are one per tool.\n\n");
+    m.streamDelta("- `dispatch.zig` is the only one that knows them all\n");
+    m.streamDelta("- `common.zig` holds the shared parts (`getStr`, `getInt`)\n");
+    m.streamDelta("- `bash.zig` has the part that blocks\n\n");
+    m.streamDelta("### What is not split\n\n");
+    m.streamDelta("`agent.zig` is a shared-state hub: moving it requires\n");
+    m.streamDelta("reducing the state first.\n\n");
+    m.streamDelta("> The rule is: a module does not import upward.\n\n");
+    m.streamDelta("| module | lines | notes |\n");
     m.streamDelta("|---|---|---|\n");
-    m.streamDelta("| `tui.zig` | 10407 | estado + dibujo |\n");
-    m.streamDelta("| `agent.zig` | 11868 | el bucle |\n");
+    m.streamDelta("| `tui.zig` | 10407 | state + drawing |\n");
+    m.streamDelta("| `agent.zig` | 11868 | the loop |\n");
     m.streamEnd();
 }
 
