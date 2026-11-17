@@ -97,6 +97,7 @@ zig test src/chat.zig            # SSE parser tests
 - `ZODE_COMPACT=off|elide|full` (default when unset: `elide`, Tier 1 only), `ZODE_COMPACT_PCT=10..95`
 - `ZODE_YES=1` (autoconfirm destructive commands)
 - `ZODE_NERD_ICONS=auto|1|0` (default `auto`, icons on): Nerd Font language icon before code block labels; label always shown. Set `0` if your font lacks Nerd Font glyphs.
+- `ZODE_REMOTE_URL` / `ZODE_REMOTE_TOKEN`: remote session endpoint for `/remote` (Phase 13). The token is only sent as a Bearer header, never printed.
 - `ZODE_RESUME=1` / `ZODE_DBG_ERR=1`
 
 ## Architecture map

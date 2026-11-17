@@ -40,6 +40,7 @@ const lsp_manager = @import("lsp/manager.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const theme = @import("lib/theme.zig");
 const lang_icons = @import("lib/lang_icons.zig");
+const keybinds = @import("lib/keybinds.zig");
 const acp_server = @import("acp/server.zig");
 
 var child_env_static: std.process.Environ.Map = undefined;
@@ -1315,6 +1316,13 @@ fn runTui(init: std.process.Init) !u8 {
     defer agent.shutdownUserConfig();
     defer agent.shutdownBuffers(); // the 1 MiB body buffer (see `bodyBuf`)
     agent.loadUserConfig();
+    // Phase 13.3: the user's keybinding map is loaded once at startup, from
+    // the same config.json the Settings screen persists. A malformed entry is
+    // skipped by the pure parser; the defaults stay in force for that key.
+    if (agent.user_config.keybindings) |kb| {
+        const parsed = keybinds.parseJsonObject(model.allocator, .{ .object = kb }) catch &.{};
+        model.keybindings = parsed;
+    }
     agent.bootMark("loadUserConfig");
     agent.bootstrapSession(&model);
     agent.bootMark("bootstrapSession");

@@ -376,7 +376,7 @@ def main() -> int:
     out10, t10 = drive([b"/files", b"\r", b"\r"], budget=9.0)
     ok &= check(
         "/files answers",
-        "nothing read or written" in t10 or "changed this session" in t10,
+        "nothing read or written" in t10.lower() or "changed this session" in t10.lower(),
         t10,
     )
     ok &= check("/files does not break anything", "panic" not in t10.lower(), t10)

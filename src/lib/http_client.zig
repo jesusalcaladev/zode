@@ -180,6 +180,12 @@ pub const Http = struct {
         return self.request(.POST, url, bearer, body, &.{}, null);
     }
 
+    /// PUT with a raw body. Used by remote session sync to upload a .jsonl
+    /// file to a session endpoint. `body` must be mutable for std's signature.
+    pub fn put(self: *Http, url: []const u8, bearer: ?[]const u8, body: []u8) !JsonResult {
+        return self.request(.PUT, url, bearer, body, &.{}, null);
+    }
+
     /// POST with extra headers (e.g: Anthropic's x-api-key).
     pub fn postJsonWithHeaders(
         self: *Http,

@@ -298,6 +298,11 @@ never touches them: what the wire drops, the file keeps.
 |---|---|
 | `ZODE_SESSIONS_DIR` | Put sessions somewhere else (absolute path) |
 | `ZODE_RESUME=1` | Resume the most recent session at startup (`--resume` does the same) |
+| `ZODE_REMOTE_URL` | Base URL of a remote session endpoint for `/remote` (http(s), no embedded credentials) |
+| `ZODE_REMOTE_TOKEN` | Optional bearer token sent to the remote endpoint; never printed by `/remote` |
+
+The reference server lives in `tools/remote_server.py` and implements the
+minimal `GET /sessions`, `GET /sessions/<id>`, `PUT /sessions/<id>` contract.
 
 ## 11. Automation and diagnostics
 

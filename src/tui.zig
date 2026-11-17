@@ -18,6 +18,7 @@ const taskstore = @import("lib/taskstore.zig");
 const team_mod = @import("lib/team.zig");
 const verifycounts = @import("lib/verifycounts.zig");
 const configmenu = @import("lib/configmenu.zig");
+const keybinds = @import("lib/keybinds.zig");
 const schedule_mod = @import("lib/schedule.zig");
 const tick_mod = @import("lib/tick.zig");
 const diag_mod = @import("lib/diag.zig");
@@ -1390,6 +1391,9 @@ pub const Model = struct {
     /// prompt is edited with `editor.Editor`.
     ed: ed.Editor,
 
+    /// User keybindings (Phase 13.3), owned by the config arena. Resolved
+    /// before the composer sees a key, so a binding can call any slash command.
+    keybindings: []const keybinds.Binding = &.{},
     /// Vim-like modal editing for the input (Phase 13/35.13): `/vim` toggles.
     /// When enabled, starts in insert mode; Esc enters normal mode.
     vim_mode: bool = false,
@@ -2419,6 +2423,10 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        // Custom keybindings are owned by the model's allocator.
+        if (self.keybindings.len > 0) {
+            keybinds.freeBindings(self.allocator, self.keybindings);
+        }
         // The read cache's table is heap memory of the model's allocator.
         self.reads.deinit();
         // The task graph holds its own strings and its file path.
@@ -8052,8 +8060,70 @@ fn openShortcutsPicker(self: *Model) void {
 /// The callback exists because the picker's contract is a callback.
 fn onShortcutPick(_: *Model, _: u32, _: []const u8) void {}
 
+/// Turn a Vaxis key into the canonical string `keybinds` looks up. Returns
+/// null for a key we deliberately do not bind (a Unicode codepoint with no
+/// single-byte name). Named keys use their Vaxis codepoints; modifiers are
+/// spelled in the same order as `keybinds.canonicalize` produces.
+fn keyToBinding(gpa: std.mem.Allocator, key: vaxis.Key) !?[]u8 {
+    var one: [1]u8 = undefined;
+    var fbuf: [4]u8 = undefined;
+    const base: []const u8 = blk: {
+        const cp = key.codepoint;
+        if (cp == vaxis.Key.tab) break :blk "tab";
+        if (cp == vaxis.Key.backspace) break :blk "backspace";
+        if (cp == 27) break :blk "esc";
+        if (cp == 13 or cp == 10) break :blk "enter";
+        if (cp == 32) break :blk "space";
+        if (cp == 57349) break :blk "delete";
+        if (cp == 57350) break :blk "left";
+        if (cp == 57351) break :blk "right";
+        if (cp == 57352) break :blk "up";
+        if (cp == 57353) break :blk "down";
+        if (cp == 57354) break :blk "pageup";
+        if (cp == 57355) break :blk "pagedown";
+        if (cp == 57356) break :blk "home";
+        if (cp == 57357) break :blk "end";
+        if (cp >= vaxis.Key.f1 and cp <= vaxis.Key.f12) {
+            break :blk std.fmt.bufPrint(&fbuf, "f{d}", .{cp - vaxis.Key.f1 + 1}) catch return null;
+        }
+        if (cp < 0x20 or cp > 0x7e) return null;
+        one[0] = @intCast(cp);
+        break :blk one[0..];
+    };
+    // A one-byte base already carries its shifted spelling (e.g. 'P'); adding
+    // `shift` would make the canonical form unmatchable. Named keys need it.
+    const with_shift = key.mods.shift and base.len > 1;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    if (key.mods.ctrl) try out.appendSlice(gpa, "ctrl+");
+    if (key.mods.alt) try out.appendSlice(gpa, "alt+");
+    if (with_shift) try out.appendSlice(gpa, "shift+");
+    try out.appendSlice(gpa, base);
+    return try out.toOwnedSlice(gpa);
+}
+
+/// The command bound to this key, or null. Custom bindings do not fire while
+/// vim is in normal mode — in that mode vim owns every key by design.
+fn boundCommand(self: *const Model, gpa: std.mem.Allocator, key: vaxis.Key) !?[]const u8 {
+    if (self.vim_mode and self.vim_normal) return null;
+    if (self.keybindings.len == 0) return null;
+    const name = (try keyToBinding(gpa, key)) orelse return null;
+    defer gpa.free(name);
+    return (keybinds.Map{ .bindings = self.keybindings }).resolve(name);
+}
+
 fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     const k = key;
+
+    // Custom keybindings run here, AFTER every modal had its chance: the
+    // global key handler calls editorKey last. A binding executes an existing
+    // slash command through the same door the palette uses, so permissions,
+    // session writes and the transcript are identical either way.
+    if (try boundCommand(self, self.allocator, key)) |command| {
+        _ = agent.runPaletteCommand(self, command);
+        ctx.redraw = true;
+        return true;
+    }
 
     // Vim mode (35.13 / Phase 13): modal input editing.
     if (self.vim_mode) {
@@ -19575,4 +19645,41 @@ test "detectLinks finds URLs and file paths" {
     try std.testing.expectEqual(@as(usize, 2), paths.len);
     try std.testing.expectEqualStrings("file:src/tui.zig", paths[0].uri);
     try std.testing.expectEqualStrings("file:///tmp/out.txt", paths[1].uri);
+}
+
+test "keybinds: a Vaxis key maps to the canonical binding string" {
+    const gpa = std.testing.allocator;
+    const f2 = (try keyToBinding(gpa, .{ .codepoint = vaxis.Key.f2 })).?;
+    defer gpa.free(f2);
+    try std.testing.expectEqualStrings("f2", f2);
+    const ck = (try keyToBinding(gpa, .{ .codepoint = 'k', .mods = .{ .ctrl = true } })).?;
+    defer gpa.free(ck);
+    try std.testing.expectEqualStrings("ctrl+k", ck);
+    const ar = (try keyToBinding(gpa, .{ .codepoint = 'r', .mods = .{ .alt = true } })).?;
+    defer gpa.free(ar);
+    try std.testing.expectEqualStrings("alt+r", ar);
+    const esc = (try keyToBinding(gpa, .{ .codepoint = 27 })).?;
+    defer gpa.free(esc);
+    try std.testing.expectEqualStrings("esc", esc);
+    // A Unicode codepoint with no single-byte name is intentionally unbound.
+    try std.testing.expect((try keyToBinding(gpa, .{ .codepoint = 0x1F600 })) == null);
+}
+
+test "keybinds: a bound key resolves to its command, vim normal mode wins" {
+    const gpa = std.testing.allocator;
+    const bindings = try gpa.alloc(keybinds.Binding, 2);
+    bindings[0] = .{ .key = try gpa.dupe(u8, "f2"), .command = try gpa.dupe(u8, "/help") };
+    bindings[1] = .{ .key = try gpa.dupe(u8, "alt+r"), .command = try gpa.dupe(u8, "/review") };
+    var m = Model.init(gpa);
+    defer m.deinit();
+    m.keybindings = bindings;
+    const f2 = vaxis.Key{ .codepoint = vaxis.Key.f2 };
+    try std.testing.expectEqualStrings("/help", (try boundCommand(&m, gpa, f2)).?);
+    try std.testing.expectEqualStrings("/review", (try boundCommand(&m, gpa, .{ .codepoint = 'r', .mods = .{ .alt = true } })).?);
+    try std.testing.expect((try boundCommand(&m, gpa, .{ .codepoint = vaxis.Key.f7 })) == null);
+    m.vim_mode = true;
+    m.vim_normal = true;
+    try std.testing.expect((try boundCommand(&m, gpa, f2)) == null);
+    m.vim_mode = false;
+    m.vim_normal = false;
 }

@@ -6,6 +6,11 @@ const compaction = @import("compaction.zig");
 const goal_mod = @import("lib/goal.zig");
 const providers = @import("lib/providers.zig");
 const config_mod = @import("config.zig");
+const keybinds = @import("lib/keybinds.zig");
+const plugins_mod = @import("lib/plugins.zig");
+const pluginstore = @import("lib/pluginstore.zig");
+const remote_mod = @import("lib/remote.zig");
+const remotesync = @import("lib/remotesync.zig");
 const chat = @import("chat.zig");
 const filesview = @import("lib/filesview.zig");
 const readcache = @import("lib/readcache.zig");
@@ -377,6 +382,276 @@ pub fn cmdSandbox(m: *tui.Model) void {
 }
 
 /// `/vim`: toggle vim keybindings for the input editor (35.13 / Phase 13).
+/// `/remote`: list, pull, push and sync sessions with an HTTP endpoint.
+/// Configured by ZODE_REMOTE_URL and ZODE_REMOTE_TOKEN. The token is only
+/// ever sent as an Authorization header — never printed by this command.
+pub fn cmdRemote(m: *tui.Model, arg: ?[]const u8) void {
+    const a = m.allocator;
+    const cfg = remote_mod.Config.fromEnv(m.environ);
+    if (!cfg.enabled or !cfg.valid()) {
+        agent.pushInfo(m, "remote: set ZODE_REMOTE_URL (http(s), no credentials) to enable. Optional: ZODE_REMOTE_TOKEN.");
+        return;
+    }
+    var it = std.mem.tokenizeScalar(u8, arg orelse "", ' ');
+    const op = it.next() orelse "status";
+    const id = it.next();
+    const dir = session_mod.sessions_dir;
+
+    if (std.mem.eql(u8, op, "status")) {
+        agent.pushInfoFmt(m, "remote: {s} (token {s})", .{ cfg.url, if (cfg.token != null) "set" else "not set" });
+        return;
+    }
+    if (std.mem.eql(u8, op, "list")) {
+        const refs = remotesync.fetchIndex(a, m.io, cfg) catch {
+            agent.pushInfo(m, "remote: could not fetch the session index");
+            return;
+        };
+        defer a.free(refs);
+        if (refs.len == 0) {
+            agent.pushInfo(m, "remote: no sessions");
+            return;
+        }
+        for (refs) |r| {
+            agent.pushInfoFmt(m, "  {s}  {d} bytes  {s}", .{ r.id, r.size, r.updated });
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "pull")) {
+        if (id == null) {
+            agent.pushInfo(m, "usage: /remote pull <session-id>");
+            return;
+        }
+        const data = remotesync.fetchSession(a, m.io, cfg, id.?) catch {
+            agent.pushInfoFmt(m, "remote: pull '{s}' failed", .{id.?});
+            return;
+        };
+        defer a.free(data);
+        remotesync.writeSession(a, m.io, dir, id.?, data) catch {
+            agent.pushInfo(m, "remote: could not write the local session");
+            return;
+        };
+        agent.pushInfoFmt(m, "remote: pulled {s} ({d} bytes)", .{ id.?, data.len });
+        return;
+    }
+    if (std.mem.eql(u8, op, "push")) {
+        if (id == null) {
+            agent.pushInfo(m, "usage: /remote push <session-id>");
+            return;
+        }
+        const data = remotesync.readSession(a, m.io, dir, id.?) catch {
+            agent.pushInfoFmt(m, "remote: local session '{s}' not found", .{id.?});
+            return;
+        };
+        defer a.free(data);
+        const status = remotesync.uploadSession(a, m.io, cfg, id.?, data) catch {
+            agent.pushInfo(m, "remote: upload failed");
+            return;
+        };
+        agent.pushInfoFmt(m, "remote: pushed {s} (HTTP {d})", .{ id.?, status });
+        return;
+    }
+    if (std.mem.eql(u8, op, "sync")) {
+        const refs = remotesync.fetchIndex(a, m.io, cfg) catch {
+            agent.pushInfo(m, "remote: could not fetch the session index");
+            return;
+        };
+        defer a.free(refs);
+        const local = remotesync.localIds(a, m.io, dir) catch &.{};
+        defer if (local.len > 0) remotesync.freeIds(a, local);
+        const policy: remote_mod.ConflictPolicy = if (std.mem.eql(u8, id orelse "", "local"))
+            .prefer_local
+        else if (std.mem.eql(u8, id orelse "", "remote"))
+            .prefer_remote
+        else
+            .skip;
+        const plan = remote_mod.plan(a, local, refs, policy) catch {
+            agent.pushInfo(m, "remote: out of memory");
+            return;
+        };
+        defer a.free(plan);
+        const result = remotesync.applyPlan(a, m.io, cfg, dir, plan) catch {
+            agent.pushInfo(m, "remote: sync failed");
+            return;
+        };
+        agent.pushInfoFmt(m, "remote sync: {d} pulled, {d} pushed, {d} skipped", .{ result.pulled, result.pushed, result.skipped });
+        return;
+    }
+    agent.pushInfo(m, "usage: /remote [status | list | pull <id> | push <id> | sync [local|remote]]");
+}
+
+/// `/plugin`: the declarative plugin marketplace. No code is ever executed —
+/// a plugin is a JSON manifest that contributes instructions to the prompt.
+pub fn cmdPlugin(m: *tui.Model, arg: ?[]const u8) void {
+    const a = m.allocator;
+    const root = agent.project_info.root() orelse agent.project_info.cwd();
+    var it = std.mem.tokenizeScalar(u8, arg orelse "", ' ');
+    const op = it.next() orelse "list";
+    const name = it.next();
+
+    if (std.mem.eql(u8, op, "search")) {
+        const q = name orelse "";
+        const hits = plugins_mod.search(a, q) catch {
+            agent.pushInfo(m, "plugin: out of memory");
+            return;
+        };
+        defer a.free(hits);
+        if (hits.len == 0) {
+            agent.pushInfoFmt(m, "plugin: no catalog entry matches '{s}'", .{q});
+            return;
+        }
+        for (hits) |i| {
+            const e = plugins_mod.catalog[i];
+            agent.pushInfoFmt(m, "  {s} {s} - {s}", .{ e.name, e.version, e.description });
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "list")) {
+        const installed = pluginstore.discover(a, m.io, m.environ, root) catch &.{};
+        defer if (installed.len > 0) pluginstore.freeInstalled(a, installed);
+        agent.pushInfo(m, "plugin catalog (bundled):");
+        for (plugins_mod.catalog) |e| {
+            agent.pushInfoFmt(m, "  {s} {s} - {s}", .{ e.name, e.version, e.description });
+        }
+        agent.pushInfo(m, "installed:");
+        if (installed.len == 0) {
+            agent.pushInfo(m, "  (none) - use /plugin install <name>");
+        }
+        for (installed) |it2| {
+            agent.pushInfoFmt(m, "  {s} {s} [{s}] {s}", .{ it2.name, it2.manifest.version, it2.source, if (it2.manifest.enabled) "enabled" else "disabled" });
+        }
+        return;
+    }
+    const pname = name orelse {
+        agent.pushInfo(m, "usage: /plugin [list | search <q> | install <name> | remove <name> | info <name> | enable <name> | disable <name>]");
+        return;
+    };
+    if (std.mem.eql(u8, op, "install")) {
+        const path = pluginstore.install(a, m.io, root, pname) catch |err| {
+            agent.pushInfoFmt(m, "plugin: install {s} failed ({s})", .{ pname, @errorName(err) });
+            return;
+        };
+        a.free(path);
+        agent.pushInfoFmt(m, "plugin: installed {s} in {s}/.zode/plugins (instructions now on the prompt)", .{ pname, root });
+        return;
+    }
+    if (std.mem.eql(u8, op, "remove")) {
+        pluginstore.remove(a, m.io, root, pname) catch |err| {
+            agent.pushInfoFmt(m, "plugin: remove {s} failed ({s})", .{ pname, @errorName(err) });
+            return;
+        };
+        agent.pushInfoFmt(m, "plugin: removed {s}", .{pname});
+        return;
+    }
+    if (std.mem.eql(u8, op, "info")) {
+        const e = plugins_mod.findInCatalog(pname) orelse {
+            agent.pushInfoFmt(m, "plugin: '{s}' is not in the catalog", .{pname});
+            return;
+        };
+        agent.pushInfoFmt(m, "plugin {s} {s}: {s}", .{ e.name, e.version, e.description });
+        agent.pushInfoFmt(m, "  instructions: {s}", .{e.instructions});
+        return;
+    }
+    if (std.mem.eql(u8, op, "enable") or std.mem.eql(u8, op, "disable")) {
+        const enabled = std.mem.eql(u8, op, "enable");
+        const installed = pluginstore.discover(a, m.io, m.environ, root) catch &.{};
+        defer if (installed.len > 0) pluginstore.freeInstalled(a, installed);
+        for (installed) |it2| {
+            if (std.mem.eql(u8, it2.name, pname)) {
+                pluginstore.setEnabled(a, m.io, it2.path, enabled) catch {
+                    agent.pushInfoFmt(m, "plugin: could not update {s}", .{pname});
+                    return;
+                };
+                agent.pushInfoFmt(m, "plugin: {s} {s}", .{ pname, if (enabled) "enabled" else "disabled" });
+                return;
+            }
+        }
+        agent.pushInfoFmt(m, "plugin: '{s}' is not installed", .{pname});
+        return;
+    }
+    agent.pushInfoFmt(m, "plugin: unknown operation '{s}'", .{op});
+}
+
+/// `/keybinds`: list, set or reset the user's custom key -> command map.
+/// The map is persisted through config.patchKeybindings, which preserves the
+/// rest of config.json. Only keys that canonicalize are accepted; a typo is a
+/// named error, never a silent no-op.
+pub fn cmdKeybinds(m: *tui.Model, arg: ?[]const u8) void {
+    const a = m.allocator;
+    const current = m.keybindings;
+    const raw = arg orelse "";
+    var it = std.mem.tokenizeScalar(u8, raw, ' ');
+    const op = it.next() orelse "";
+
+    if (op.len == 0 or std.mem.eql(u8, op, "list")) {
+        if (current.len == 0) {
+            agent.pushInfo(m, "keybindings: none (defaults only). Use /keybinds set <key> <command>.");
+            return;
+        }
+        for (current) |b| {
+            agent.pushInfoFmt(m, "{s} -> {s}", .{ b.key, b.command });
+        }
+        return;
+    }
+    if (std.mem.eql(u8, op, "reset")) {
+        const obj = std.json.ObjectMap.init(a, &.{}, &.{}) catch return;
+        config_mod.patchKeybindings(m.io, m.environ, obj) catch {
+            agent.pushInfo(m, "keybindings: could not write config.json");
+            return;
+        };
+        if (current.len > 0) keybinds.freeBindings(a, current);
+        m.keybindings = &.{};
+        agent.pushInfo(m, "keybindings: reset to defaults");
+        return;
+    }
+    if (std.mem.eql(u8, op, "set")) {
+        const key_raw = it.next() orelse {
+            agent.pushInfo(m, "usage: /keybinds set <key> <command>   (e.g. /keybinds set alt+r /review)");
+            return;
+        };
+        const command = it.rest();
+        if (command.len == 0 or command[0] != '/') {
+            agent.pushInfo(m, "keybindings: the command must be a slash command, e.g. /review");
+            return;
+        }
+        const key = keybinds.canonicalize(a, key_raw) catch {
+            agent.pushInfo(m, "keybindings: out of memory");
+            return;
+        } orelse {
+            agent.pushInfoFmt(m, "keybindings: unsupported key '{s}'", .{key_raw});
+            return;
+        };
+        defer a.free(key);
+
+        var updated: std.ArrayList(keybinds.Binding) = .empty;
+        defer updated.deinit(a);
+        var replaced = false;
+        for (current) |b| {
+            if (std.mem.eql(u8, b.key, key)) {
+                updated.append(a, .{ .key = a.dupe(u8, key) catch return, .command = a.dupe(u8, command) catch return }) catch return;
+                replaced = true;
+            } else {
+                updated.append(a, .{ .key = a.dupe(u8, b.key) catch return, .command = a.dupe(u8, b.command) catch return }) catch return;
+            }
+        }
+        if (!replaced) {
+            updated.append(a, .{ .key = a.dupe(u8, key) catch return, .command = a.dupe(u8, command) catch return }) catch return;
+        }
+        var obj = std.json.ObjectMap.init(a, &.{}, &.{}) catch return;
+        for (updated.items) |b| {
+            obj.put(a, b.key, .{ .string = b.command }) catch return;
+        }
+        config_mod.patchKeybindings(m.io, m.environ, obj) catch {
+            agent.pushInfo(m, "keybindings: could not write config.json");
+            return;
+        };
+        if (current.len > 0) keybinds.freeBindings(a, current);
+        m.keybindings = updated.toOwnedSlice(a) catch &.{};
+        agent.pushInfoFmt(m, "keybindings: {s} -> {s}", .{ key, command });
+        return;
+    }
+    agent.pushInfo(m, "usage: /keybinds [list | set <key> <command> | reset]");
+}
+
 pub fn cmdVim(m: *tui.Model) void {
     m.vim_mode = !m.vim_mode;
     m.vim_normal = false;
@@ -2484,6 +2759,9 @@ pub const commands = [_]Cmd{
     .{ .key = "/sandbox", .desc = "sandbox availability for flagged bash commands (panel)" },
     .{ .key = "/add-dir", .desc = "add/list additional directories for this session: /add-dir [path]", .key_hint = "[path]" },
     .{ .key = "/vim", .desc = "toggle vim keybindings for the input editor" },
+    .{ .key = "/keybinds", .desc = "custom key bindings: list | set <key> <command> | reset" },
+    .{ .key = "/plugin", .desc = "plugin marketplace: list | search <q> | install|remove|info|enable|disable <name>" },
+    .{ .key = "/remote", .desc = "remote sessions: status | list | pull <id> | push <id> | sync [local|remote]" },
     .{ .key = "/ticks", .desc = "toggle periodic check-ins while a turn is parked (off by default)" },
     .{ .key = "/bg", .desc = "background commands: list | kill <id> | killall", .palette_visible = false },
     .{ .key = "/new-session", .desc = "new session" },

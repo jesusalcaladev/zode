@@ -3009,6 +3009,12 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdSandbox(m);
     } else if (std.mem.eql(u8, cmd, "add-dir") or std.mem.eql(u8, cmd, "add_dir")) {
         commands_mod.cmdAddDir(m, arg);
+    } else if (std.mem.eql(u8, cmd, "keybinds")) {
+        commands_mod.cmdKeybinds(m, arg);
+    } else if (std.mem.eql(u8, cmd, "plugin")) {
+        commands_mod.cmdPlugin(m, arg);
+    } else if (std.mem.eql(u8, cmd, "remote")) {
+        commands_mod.cmdRemote(m, arg);
     } else if (std.mem.eql(u8, cmd, "vim")) {
         commands_mod.cmdVim(m);
     } else if (std.mem.eql(u8, cmd, "ticks")) {

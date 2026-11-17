@@ -10,6 +10,42 @@ Every command listed here is documented with its syntax, what it does, and how t
 
 ---
 
+## Plugins, remote sessions and keybindings
+
+### `/plugin`
+
+Declarative plugin marketplace. A plugin is a JSON manifest under
+`.zode/plugins/<name>/plugin.json` (or the user config dir) that contributes
+instructions to the system prompt — it never executes code.
+
+- `/plugin list` — bundled catalog plus installed plugins (project shadows user).
+- `/plugin search <query>` — search the bundled catalog by name or description.
+- `/plugin install <name>` — copy a catalog entry into this project.
+- `/plugin remove <name>` — remove a project plugin.
+- `/plugin info <name>` — show a catalog entry's instructions.
+- `/plugin enable|disable <name>` — toggle an installed plugin (no reinstall).
+
+### `/remote`
+
+Sync sessions with an HTTP endpoint configured by `ZODE_REMOTE_URL` and
+`ZODE_REMOTE_TOKEN` (see `docs/settings.md`). `tools/remote_server.py` is a
+working reference server.
+
+- `/remote status` — show the configured URL (never the token).
+- `/remote list` — list remote session ids, sizes and update times.
+- `/remote pull <id>` / `/remote push <id>` — transfer one session file.
+- `/remote sync [local|remote]` — plan and apply a sync; conflicts skip by
+  default, `local`/`remote` choose a side.
+
+### `/keybinds`
+
+Custom key -> command map, persisted in `~/.config/zode/config.json`.
+
+- `/keybinds list` — show the current bindings.
+- `/keybinds set <key> <command>` — e.g. `/keybinds set alt+r /review`.
+- `/keybinds reset` — back to defaults (`f2` help, `f3` context, `f4` session,
+  `f5` tasks). Bindings do not fire while vim normal mode is active.
+
 ## Sessions
 
 ### `/new`

@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Features
+
+- complete the ecosystem - plugins, remote sessions, keybindings (phase13) [`a715aebc`](https://github.com/jesusalcaladev/zode/commit/a715aebc)
+
 ### Documentation
 
-- bring the board up to date and close the quality gaps (tasks) [`60010258`](https://github.com/jesusalcaladev/zode/commit/60010258)
+- bring the board up to date and close the quality gaps (tasks) [`2f3254d5`](https://github.com/jesusalcaladev/zode/commit/2f3254d5)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

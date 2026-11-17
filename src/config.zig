@@ -87,6 +87,9 @@ pub const Config = struct {
     /// stays a fixed floor regardless of these lists.
     web_domains_allow: []const []const u8 = &.{},
     web_domains_block: []const []const u8 = &.{},
+    /// Custom keybindings from the top-level `"keybindings"` object: a map of
+    /// canonical key -> slash-command name. Borrows the load arena.
+    keybindings: ?std.json.ObjectMap = null,
     /// Config path that was loaded (for diagnostics), or null.
     path: ?[]const u8 = null,
     pub const empty: Config = .{};
@@ -164,6 +167,12 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
     }
     if (root.get("subagent_model")) |v| {
         if (v == .string) cfg.subagent_model = try arena.dupe(u8, v.string);
+    }
+    // Custom keybindings: a flat { "key": "/command" } object. Keep the raw
+    // object so keybinds.parseJsonObject can validate it without losing any
+    // entry this binary does not understand.
+    if (root.get("keybindings")) |v| {
+        if (v == .object) cfg.keybindings = v.object;
     }
     // The user's language servers. A malformed entry is SKIPPED, not an error:
     // one bad row must not take the whole config (and with it the provider
@@ -799,6 +808,27 @@ pub fn patchSettings(
     }
     try root.object.put(arena, "settings", .{ .object = so });
 
+    const data = try std.json.Stringify.valueAlloc(arena, root, .{ .whitespace = .indent_1 });
+    try writeFileSecure(io, env, path, data);
+}
+
+/// Patches ONLY the top-level `"keybindings"` object, preserving every other
+/// field (including unknown ones) exactly as `patchSettings` does.
+pub fn patchKeybindings(
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    bindings: std.json.ObjectMap,
+) !void {
+    var path_buf: [1024]u8 = undefined;
+    const path = configPath(env, &path_buf) orelse return error.NoHome;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch "{}";
+    var root = std.json.parseFromSliceLeaky(std.json.Value, arena, existing, .{}) catch
+        return error.BadConfig;
+    if (root != .object) root = .{ .object = std.json.ObjectMap.init(arena, &.{}, &.{}) catch return error.OutOfMemory };
+    try root.object.put(arena, "keybindings", .{ .object = bindings });
     const data = try std.json.Stringify.valueAlloc(arena, root, .{ .whitespace = .indent_1 });
     try writeFileSecure(io, env, path, data);
 }

@@ -50,9 +50,9 @@ references were removed instead of leaving dangling links.
 
 ## Phase 13 — Ecosystem
 
-`⏳ optional · 🟢 · only if usage asks for it`
+`✅ complete · 🟢 · was optional, now implemented and verified`
 
-- [ ] Plugins/marketplace · remote sessions · keybindings/vim mode — outside the core (basic vim input mode toggle `/vim` implemented; rest pending)
+- [x] Plugins/marketplace · remote sessions · keybindings/vim mode — all three implemented in Phase 13 below.
 
 ---
 
@@ -161,3 +161,11 @@ the language-following prompt and filename fixtures). Pure tests were added for
 key encoding, passphrase master key) and for the previously uncovered
 `provider.zig`, `shellquote.zig`, `sleep.zig` and `highlight/{config,scanner,styles}.zig`;
 all are registered in `src/test_all.zig`. The suite is 2054 passed / 4 skipped.
+
+---
+
+**Phase 13 (Ecosystem)** is complete — the last open checkbox, now closed:
+
+- **13.1 Plugins/marketplace.** Pure `src/lib/plugins.zig` (manifest parse/validate, bundled catalog, search, prompt section) plus `src/lib/pluginstore.zig` for disk IO (discover with project-over-user shadowing, install from catalog, remove, toggle). A plugin is a DECLARATIVE JSON manifest that contributes instructions to the system prompt — it never executes code, so installing from the catalog is safe. Appended to the existing skills cache block so the eight-block prompt-cache prefix does not move. `/plugin` lists, searches, installs, removes, shows info and toggles plugins.
+- **13.2 Remote sessions.** Pure `src/lib/remote.zig` (config from `ZODE_REMOTE_URL`/`ZODE_REMOTE_TOKEN`, URL validation, index parsing, pull/push/skip planning, session-id validation) plus `src/lib/remotesync.zig` for HTTP GET/PUT and local file IO. `/remote` supports `status`, `list`, `pull`, `push` and `sync [local|remote]`. IDs are validated before they become filenames (no path traversal). `tools/remote_server.py` is a working reference server; the full command flow was verified against it in a real pty.
+- **13.3 Keybindings.** Pure `src/lib/keybinds.zig` (canonicalization, defaults, JSON map parsing, last-wins resolution) plus a Vaxis-to-canonical adapter in `src/tui.zig`. Bindings are resolved in the composer AFTER every modal had its chance and execute an existing slash command through `agent.runPaletteCommand` — the same door the palette uses. Vim normal mode keeps ownership of its keys. `/keybinds` lists, sets and resets the map, persisted through a config patch writer that preserves unknown fields.

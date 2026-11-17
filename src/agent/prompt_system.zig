@@ -8,6 +8,8 @@ const prompt_mod = @import("../lib/prompt.zig");
 const cachebreak = @import("../lib/cachebreak.zig");
 const compaction = @import("../compaction.zig");
 const skills = @import("../lib/skills.zig");
+const plugins_mod = @import("../lib/plugins.zig");
+const pluginstore = @import("../lib/pluginstore.zig");
 const outputstyles = @import("../lib/outputstyles.zig");
 const ask = @import("../lib/ask.zig");
 const discovery = @import("discovery.zig");
@@ -158,7 +160,26 @@ pub fn skillsSectionText(ctx: BuildCtx, list_buf: []u8) []const u8 {
         }
     }
     defer filtered.deinit(ctx.gpa);
-    return skills.systemPromptSection(filtered.items, skillListingBudget(ctx), list_buf);
+    const base = skills.systemPromptSection(filtered.items, skillListingBudget(ctx), list_buf);
+
+    // Phase 13.1: enabled plugins contribute instructions. They are appended
+    // to the SAME skills block so the eight-block cache prefix does not move —
+    // a plugin install must not invalidate every cached request.
+    const installed = pluginstore.discover(ctx.gpa, ctx.io, ctx.env, ctx.project_root orelse ctx.project_cwd) catch &.{};
+    defer if (installed.len > 0) pluginstore.freeInstalled(ctx.gpa, installed);
+    if (installed.len == 0) return base;
+    var manifests: [pluginstore.max_installed]plugins_mod.Manifest = undefined;
+    var n: usize = 0;
+    for (installed) |it| {
+        if (n >= manifests.len) break;
+        manifests[n] = it.manifest;
+        n += 1;
+    }
+    const extra = plugins_mod.renderPromptSection(ctx.gpa, manifests[0..n], 4096) catch return base;
+    defer ctx.gpa.free(extra);
+    if (extra.len == 0 or base.len + extra.len > list_buf.len) return base;
+    @memcpy(list_buf[base.len .. base.len + extra.len], extra);
+    return list_buf[0 .. base.len + extra.len];
 }
 
 pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const u8 {
@@ -305,4 +326,38 @@ test "cachebreak: a null block is not recorded (no false break)" {
     try std.testing.expectEqual(@as(usize, 0), breakCount());
     try std.testing.expect(cacheBreakLastBlock() == null);
     resetCacheBreak();
+}
+
+test "plugins: an installed plugin contributes its instructions to the skills block" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const installed = try pluginstore.install(a, std.testing.io, root, "review-checklist");
+    defer a.free(installed);
+    discovery.resetSkillsCacheForTest();
+
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    var buf: [64 * 1024]u8 = undefined;
+    const ctx = BuildCtx{
+        .gpa = a,
+        .io = std.testing.io,
+        .cache_gpa = a,
+        .env = &env,
+        .env_fallback = null,
+        .project_cwd = root,
+        .project_root = root,
+        .location = "test",
+        .read_only = false,
+        .accept_edits = true,
+        .yolo = false,
+        .current_style = null,
+    };
+    const section = skillsSectionText(ctx, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, section, "SEVERITY: high|medium|low") != null);
+    discovery.resetSkillsCacheForTest();
 }
