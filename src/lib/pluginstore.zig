@@ -78,6 +78,27 @@ pub fn discover(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Env
     return try out.toOwnedSlice(gpa);
 }
 
+/// Discovery is a directory scan + a manifest read per plugin. System-prompt
+/// composition is rare but repeats on every mode/worktree change; cache the
+/// result and invalidate it on any mutation. Single-threaded by construction:
+/// the system prompt is composed on the main thread, never from a tool worker.
+var cached: ?[]Installed = null;
+
+/// Drop the cache WITHOUT freeing it. The producer's allocator is an arena in
+/// production, and a test's arena may already be gone by the time a later
+/// test invalidates — freeing here was a real use-after-free. Callers that
+/// need the strings own them through their own allocator/arena lifetime.
+pub fn invalidate() void {
+    cached = null;
+}
+
+pub fn discoverCached(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, project_root: []const u8) ![]Installed {
+    if (cached) |items| return items;
+    const items = try discover(gpa, io, env, project_root);
+    cached = items;
+    return items;
+}
+
 pub fn freeInstalled(gpa: std.mem.Allocator, items: []const Installed) void {
     for (items) |it| {
         gpa.free(it.name);
@@ -105,6 +126,7 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, nam
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = body });
     errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
+    invalidate();
     return gpa.dupe(u8, path);
 }
 
@@ -113,6 +135,7 @@ pub fn remove(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, name
     const dir_path = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ project_root, project_dir, name });
     defer gpa.free(dir_path);
     try std.Io.Dir.cwd().deleteTree(io, dir_path);
+    invalidate();
 }
 
 /// Toggle `enabled` in a manifest while preserving every other field.
@@ -129,6 +152,7 @@ pub fn setEnabled(gpa: std.mem.Allocator, io: std.Io, path: []const u8, enabled:
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = out });
     errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
+    invalidate();
 }
 
 test "pluginstore: install, discover and remove a bundled plugin" {
@@ -166,4 +190,25 @@ test "pluginstore: install, discover and remove a bundled plugin" {
     const list3 = try discover(a, std.testing.io, null, cwd);
     defer freeInstalled(a, list3);
     try std.testing.expectEqual(@as(usize, 0), list3.len);
+}
+
+test "pluginstore: discovery is cached until invalidated" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+
+    invalidate();
+    defer invalidate();
+    const installed = try install(a, std.testing.io, root, "review-checklist");
+    a.free(installed);
+    const first = try discoverCached(a, std.testing.io, null, root);
+    const second = try discoverCached(a, std.testing.io, null, root);
+    try std.testing.expect(first.ptr == second.ptr);
+    invalidate();
+    const third = try discoverCached(a, std.testing.io, null, root);
+    try std.testing.expect(first.ptr != third.ptr);
 }

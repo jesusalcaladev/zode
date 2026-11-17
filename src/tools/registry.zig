@@ -43,6 +43,7 @@ const git_add_prompt = @import("prompts/git_add.zig");
 const git_commit_prompt = @import("prompts/git_commit.zig");
 const git_stash_prompt = @import("prompts/git_stash.zig");
 const list_files_prompt = @import("prompts/list_files.zig");
+const terse_prompts = @import("prompts/terse.zig");
 const web_fetch_prompt = @import("prompts/web_fetch.zig");
 const web_search_prompt = @import("prompts/web_search.zig");
 const think_prompt = @import("prompts/think.zig");
@@ -1164,14 +1165,52 @@ fn blob(comptime read_only_only: bool) []const u8 {
     return out ++ "]";
 }
 
+/// Replace the function-level `description` value in a schema with a shorter
+/// one. The description never contains a quote (`validate.entry` refuses it),
+/// so the first quote after the value is its end. Compile-time only: the
+/// standard blob must stay byte-for-byte unchanged.
+fn terseSchema(comptime schema: []const u8, comptime short: []const u8) []const u8 {
+    @setEvalBranchQuota(200_000);
+    const key = "\"description\":\"";
+    const at = std.mem.indexOf(u8, schema, key) orelse return schema;
+    const value_start = at + key.len;
+    const value_end = std.mem.indexOfScalarPos(u8, schema, value_start, '"') orelse return schema;
+    return schema[0..value_start] ++ short ++ schema[value_end..];
+}
+
+fn blobTerse(comptime read_only_only: bool) []const u8 {
+    @setEvalBranchQuota(1_000_000);
+    var out: []const u8 = "[";
+    var first = true;
+    inline for (defs) |d| {
+        if (read_only_only and !d.read_only) continue;
+        if (!first) out = out ++ ",";
+        if (terse_prompts.descriptionFor(d.name)) |short| {
+            out = out ++ terseSchema(d.schema, short);
+        } else {
+            out = out ++ d.schema;
+        }
+        first = false;
+    }
+    return out ++ "]";
+}
+
 /// Every registered tool, in `defs` order.
 pub const toolsJsonBlob: []const u8 = blob(false);
+
+/// The opt-in short form used by the `terse` output style. Nothing changes
+/// unless the user selects that style — the default wire is identical.
+pub const toolsJsonTerseBlob: []const u8 = blobTerse(false);
 
 /// Only the tools that ask for no permission: the schema of read-only mode.
 pub const toolsJsonReadOnlyBlob: []const u8 = blob(true);
 
 pub fn toolsJson() []const u8 {
     return toolsJsonBlob;
+}
+
+pub fn toolsJsonTerse() []const u8 {
+    return toolsJsonTerseBlob;
 }
 
 pub fn toolsJsonReadOnly() []const u8 {
@@ -1186,6 +1225,13 @@ pub fn toolsJsonReadOnly() []const u8 {
 /// files the user can edit mid-session; the comptime `blob` above cannot see
 /// them. The returned slice is owned by `gpa`.
 pub fn toolsJsonFiltered(gpa: std.mem.Allocator, denied: []const []const u8) ![]u8 {
+    return toolsJsonFilteredFor(gpa, denied, false);
+}
+
+/// The deny-filtered schema, optionally with the `terse` style's short
+/// descriptions. The filtered path is runtime because deny rules are editable
+/// mid-session, so the terse replacement here is runtime too.
+pub fn toolsJsonFilteredFor(gpa: std.mem.Allocator, denied: []const []const u8, terse: bool) ![]u8 {
     var deny_all = false;
     for (denied) |dn| {
         if (std.mem.eql(u8, dn, "*")) {
@@ -1212,6 +1258,20 @@ pub fn toolsJsonFiltered(gpa: std.mem.Allocator, denied: []const []const u8) ![]
         if (is_denied) continue;
         if (!first) try out.appendSlice(gpa, ",");
         first = false;
+        if (terse) {
+            if (terse_prompts.descriptionFor(d.name)) |short| {
+                const key = "\"description\":\"";
+                if (std.mem.indexOf(u8, d.schema, key)) |at| {
+                    const vs = at + key.len;
+                    if (std.mem.indexOfScalarPos(u8, d.schema, vs, '"')) |ve| {
+                        try out.appendSlice(gpa, d.schema[0..vs]);
+                        try out.appendSlice(gpa, short);
+                        try out.appendSlice(gpa, d.schema[ve..]);
+                        continue;
+                    }
+                }
+            }
+        }
         try out.appendSlice(gpa, d.schema);
     }
     try out.appendSlice(gpa, "]");
@@ -1706,4 +1766,35 @@ test "toolSummarize/toolActivity: github includes operation" {
 
     try std.testing.expectEqualStrings("github(pr_view)", toolSummarize(arena, "github", "{\"operation\":\"pr_view\"}"));
     try std.testing.expectEqualStrings("GitHub: pr_view", toolActivity(arena, "github", "{\"operation\":\"pr_view\"}"));
+}
+
+test "terse schemas: same tools, valid JSON, materially smaller" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const full = toolsJson();
+    const terse = toolsJsonTerse();
+    try std.testing.expect(terse.len < full.len);
+    // A 15% reduction is the floor; the curated descriptions cut much more.
+    try std.testing.expect(terse.len < full.len * 85 / 100);
+
+    const vf = try std.json.parseFromSliceLeaky(std.json.Value, a, full, .{});
+    const vt = try std.json.parseFromSliceLeaky(std.json.Value, a, terse, .{});
+    try std.testing.expectEqual(vf.array.items.len, vt.array.items.len);
+    for (vt.array.items) |item| {
+        try std.testing.expect(item == .object);
+        const f = item.object.get("function") orelse return error.TestExpectedNotNull;
+        try std.testing.expect(f.object.get("name") != null);
+        try std.testing.expect(f.object.get("description") != null);
+    }
+}
+
+test "terse schemas: deny filtering still works with short descriptions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const out = try toolsJsonFilteredFor(a, &.{"bash"}, true);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"bash\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"read\"") != null);
 }

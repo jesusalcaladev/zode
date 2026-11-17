@@ -3328,17 +3328,20 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
             var found: ?[]const u8 = null;
             var found_desc: []const u8 = "";
             var found_keep: bool = true;
+            var found_terse: bool = false;
             for (entries) |e| {
                 if (std.mem.eql(u8, e.name, name)) {
                     found = e.name;
                     found_desc = e.description;
                     found_keep = e.keep_coding_instructions;
+                    found_terse = e.terse_tools;
                     break;
                 }
             }
             if (found) |n| {
                 const keep_note = if (found_keep) "" else " (coding rules replaced by this style)";
-                m.pushInfoFmt("output style: {s}{s} — {s}", .{ n, keep_note, found_desc });
+                const terse_note = if (found_terse) " · terse tool schemas" else "";
+                m.pushInfoFmt("output style: {s}{s}{s} — {s}", .{ n, keep_note, terse_note, found_desc });
             } else {
                 m.pushInfoFmt("output style: {s} (not found — was it removed?)", .{name});
             }
@@ -3351,6 +3354,8 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
     if (std.ascii.eqlIgnoreCase(trimmed, "off") or std.ascii.eqlIgnoreCase(trimmed, "clear")) {
         agent.current_style = null;
         agent.current_style_len = 0;
+        agent.terse_tools = false;
+        persistSettings(m); // /style is a persisted setting, not a per-session whim
         agent.pushInfo(m, "output style cleared. The base prompt (with coding rules) is used.");
         return;
     }
@@ -3358,10 +3363,12 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
     const entries = agent.discoverStyles(m.allocator, m.environ);
     var found: ?[]const u8 = null;
     var found_keep: bool = true;
+    var found_terse: bool = false;
     for (entries) |e| {
         if (std.mem.eql(u8, e.name, trimmed)) {
             found = e.name;
             found_keep = e.keep_coding_instructions;
+            found_terse = e.terse_tools;
             break;
         }
     }
@@ -3377,9 +3384,12 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
     std.mem.copyForwards(u8, agent.current_style_buf[0..n], trimmed[0..n]);
     agent.current_style_len = n;
     agent.current_style = agent.current_style_buf[0..n];
+    agent.terse_tools = found_terse;
+    persistSettings(m); // survives restart; loadUserConfig restores it
 
     const keep_note = if (found_keep) "" else " — this style replaces the coding rules";
-    agent.pushInfoFmt(m, "output style: {s}{s}", .{ trimmed, keep_note });
+    const terse_note = if (found_terse) " — terse tool schemas (rules restated in this style)" else "";
+    agent.pushInfoFmt(m, "output style: {s}{s}{s}", .{ trimmed, keep_note, terse_note });
 }
 
 pub fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {

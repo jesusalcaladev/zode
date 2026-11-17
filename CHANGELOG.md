@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 - complete the ecosystem - plugins, remote sessions, keybindings (phase13) [`acd62990`](https://github.com/jesusalcaladev/zode/commit/acd62990)
+- Phase 41 - terse output style and lossless prompt trims (tokens) [`54014e1e`](https://github.com/jesusalcaladev/zode/commit/54014e1e)
 
 ### Bug Fixes
 
 - close six critical permission and token-leak holes (security) [`a2998bc7`](https://github.com/jesusalcaladev/zode/commit/a2998bc7)
-- complete Phase 40 medium items (12 of 13) (security) [`caf1b895`](https://github.com/jesusalcaladev/zode/commit/caf1b895)
+- complete Phase 40 medium items (12 of 13) (security) [`1285cbea`](https://github.com/jesusalcaladev/zode/commit/1285cbea)
 
 ### Chores
 

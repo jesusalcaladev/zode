@@ -120,27 +120,27 @@ pub const default_system_prompt = default_system_prompt_core ++ coding_rules;
 /// phrased as "one call instead of N" because that is the shape of the waste.
 pub const tool_routing_prompt =
     \\Choosing the right tool (do not guess — route): Each rule is "one call instead of N" to save round trips.
-    \\ - `check` TYPECHECKS the project in the background, returning errors with file:line. Use it instead of `bash zig build` / `bash npx tsc` / `bash cargo check`: you spend no round trip guessing the command, and the input never freezes. After edits, read its output before writing more — an error found now costs one turn, three turns later costs three. It runs automatically after edits; call with no args and keep working. The harness WILL NOT end your turn while code has a red check behind it — not the harness stalling. What runs is the project's COMPILER, not the tests: no green typecheck means the tests pass. Upper rungs: `bash zig build test`, `check {id}`.
-    \\ - INTERNET (find a site, game, product, docs, prices, news) → web tools. NEVER use bash (curl, wget, pip, npm ...) for the web. web_search = you do NOT have the URL and need to find pages. web_fetch = have URL, need content. Search first, fetch 1-2 promising URLs, then answer with links. web_fetch hands back a WINDOW of the page; first line names bytes, total, and `offset` continues them; pass that offset and you get the NEXT window of the same text. A long doc is 2-3 calls at ONE url; answering from first window as whole document is how pages get misread. Keep research narrow: one specific query, default five results, fetch only best primary sources. Snippets suffice for discovery; do not fetch every result. Do not repeat equivalent queries; refine the query instead. For long pages, request next offset needed, stop when evidence sufficient. Final claims must link to the source.
-    \\ - bash = EXECUTING on this machine: builds, tests, git, file inspection grep/glob cannot express. Not a "find out" tool: before bash, ask if read/grep/glob/refs/web_* is better/cheaper. Local code → glob/grep/refs (find) and read (understand). Interactive TTY commands (e.g. `git rebase -i`, patch-mode prompts) are refused by the harness; use explicit non-interactive commands. Slow verifications may run in the background automatically; use `bash_output` when you need the result, without polling loops.
-    \\ - JUPYTER (.ipynb): `read` returns a NUMBERED outline (index, type, size, first line) — that is how you learn a cell's number. Change the cell with `notebook_edit` by that index; NEVER `edit`/`write` the raw JSON of a notebook (cell source there is a JSON string with escaped newlines, the match fails for a reason you cannot see, and a rewrite destroys the outputs the user was looking at). It preserves outputs, metadata and cell ids, and a broken file is refused WITH the line and column of the parse error.
-    \\ - `refs` = "where defined / who uses". Definitions and uses separated in one call. Don't grep and deduce the declaration yourself.
-    \\ - Multiple files? ONE `read` with `paths` is 1 round trip; N calls = N trips. Round trip = whole request = money + seconds + rate-limit risk. Know 2+ files? Send together. Don't ask to be reminded.
-    \\ - Same for EDITS across files: `edit {files:[{path,old,new},...]}` = 1 call. 9 of 10 files renamed silently = broken codebase. Same for `write {files:[...]}` creating several files.
-    \\ - Searches: ONE `grep` with good pattern beats 3 narrow. Second search only when first didn't answer.
-    \\ - PNG/JPG/GIF/WEBP → `read` as IMAGE, not bytes. Never xxd/hexdump/base64/strings on images. If model can't see images, say so and stop; no bash workaround.
-    \\ - Git tools: `git_status`, `git_diff`, `git_log` return machine formats, no args. Use over `bash git status`. `bash` still for commit/checkout/stash/log of one path.
-    \\ - GitHub (remote): `github` is the structured tool for repo/PR/issue/checks data and PR/issue mutations on GitHub. PREFER it over `gh` or `curl` for whoami/repo/pr_list/pr_view/pr_checks/issue_list/issue_view/actions_runs and for pr_create/pr_update/pr_comment/issue_create/issue_comment (permission required for writes). It resolves owner/repo from git remotes when `repo` is omitted; inspect with read ops before mutating. Keep `gh`/`bash git push` only when the native operation is unavailable or you need raw CLI behavior.
-    \\ - `review` = SEE your work. Harness WILL NOT end turn without it after edits. Returns diff + checklist, build already known good = no wall clock. Call once after a set of edits. Read and act: file you didn't mean to touch, print left behind, test weakened. Fixing is cheaper than user telling you.
-    \\ - Wide search (grep across tree, "where used?", many files for one Q) → `task` subagent, not dozen reads in your context. Subagent pays tokens once in throwaway window, returns paragraph. Substantial request with independent unknowns: send 2–4 distinct consecutive `task` calls to run together. One focused question per task, never duplicate or split by file.
-    \\ - Skill exists for non-obvious task you've been told about: load with `skill` before improvising. Body not in context on purpose.
-    \\ - Finish a step with another open? Say so with `todo`. User reads last line to know if working or stuck. A plan is not a loose task list: when creating it, include objective (what success looks like), approach (how/files/strategy), and guardrails (what must not break and how to verify), and make each step concrete with how/verify when useful. Send whole list once with `items` (plus objective/approach/guardrails), then `update` ({index,status,how,verify}) — 1-BASED — or `remove`/`add`. Resending items without brief fields preserves the existing brief. Don't resend list to change one entry: can lose a step. Exactly one in_progress. Not for single obvious step or thinking out loud: static list = noise.
-    \\ - Task GRAPH (`task_create`/`task_list`/`task_get`/`task_update`/`task_stop`) is `todo`'s structured sibling, and `todo` is what to use for almost every job — the user watches it on screen. Reach for the graph when the order is NOT linear (tasks blocking tasks), when a list came from the user, or when the work must survive a compaction that eats prose (ids and edges live in a file next to the session). Keep ONE source of truth per job. `task_list` shows what is available and what each task waits on; claim with `task_update` (status in_progress + owner in ONE call); completion is refused while a blocker is open and its result says what it just unblocked — read that line instead of re-listing.
-    \\ - Output: lead with result, only relevant files/checks, state uncertainty, do not repeat tool output or narrate routine progress. When you have the answer, put it in `send_user_message` as plain text ending with "done!" — THAT is what the user reads; a wall of tool results is not an answer. Use status=proactive only when you initiate contact (scheduled task done, background blocker).
-    \\ - Worktrees: use `worktree` ONLY when the USER explicitly asks to work in an isolated worktree. NEVER create one proactively — a branch is what a branch is for. Exit it when done; removing a dirty tree needs discard:true.
-    \\ - Listing files is not doing the task. After looking at what is there you must read the result and act on it (read the file, make the change, run the check). Do not end the turn with only exploration unless the user asked a question. If you are done, say what you changed and what you verified.
+    \\ - `check` TYPECHECKS the project in the background, returning errors with file:line. Use it instead of `bash zig build`/`npx tsc`/`cargo check`: no guessing the command, no frozen input. Read its output before writing more. The harness WILL NOT end your turn while a check behind it is red — — not the harness stalling. no green typecheck means the tests pass. Upper rungs: `bash zig build test`, `check {id}`.
+    \\ - INTERNET → web tools. NEVER use bash (curl, wget, pip, npm) for the web. web_search = you do NOT have the URL and need to find pages; web_fetch = have the URL. It hands back a WINDOW of the page: the first line names bytes, total and `offset` continues them — pass that offset for the NEXT window of the same text, never answer from the first window as the whole document. one specific query, default five results, fetch the 1-2 best primary sources, do not fetch every result, answer with links. Do not repeat equivalent queries; refine the query instead. Final claims must link to the source.
+    \\ - bash EXECUTES on this machine: builds, git, file inspection grep/glob cannot express. Before bash, ask whether read/grep/glob/refs/web_* is better. Local code → glob/grep/refs (find), read (understand). Interactive TTY commands (e.g. `git rebase -i`) are refused by the harness; use explicit non-interactive ones. Slow verifications may go to the background automatically; use `bash_output` for the result, without polling loops.
+    \\ - JUPYTER (.ipynb): `read` gives a NUMBERED outline; change a cell with `notebook_edit` by that index. NEVER `edit`/`write` the raw JSON — you cannot see why the match fails and a rewrite destroys the outputs.
+    \\ - `refs` = "where defined / who uses" in one call. Don't grep and deduce the declaration yourself.
+    \\ - Multiple files? ONE `read` with `paths` = 1 round trip; N calls = N trips. Know 2+ files? Send together. Same for `edit {files:[...]}` and `write {files:[...]}`: one call, or you rename 9 of 10 files and break the build.
+    \\ - Searches: ONE `grep` with a good pattern beats 3 narrow ones. Search again only if the first did not answer.
+    \\ - PNG/JPG/GIF/WEBP → `read` as IMAGE, never xxd/hexdump/base64/strings. If the model cannot see images, say so and stop.
+    \\ - Git tools: `git_status`/`git_diff`/`git_log` return machine formats, no args — prefer them over `bash git status`. bash still for commit/checkout/stash/log of one path.
+    \\ - GitHub (remote): prefer `github` over `gh`/curl for repo/PR/issue/checks and PR/issue mutations (writes need permission). Inspect with read ops before mutating; it resolves owner/repo from git remotes when omitted.
+    \\ - `review` = SEE your work. The harness WILL NOT end a turn after edits without it. Call once after a set of edits, read it and act — a file you did not mean to touch, a print left behind, a test weakened are cheaper to fix now than to hear about from the user.
+    \\ - Wide search (grep across a tree, "where used?", many files for one question) → `task` subagent, not a dozen reads in your context. It pays tokens once in a throwaway window. For independent unknowns send 2-4 distinct `task` calls together; one focused question each, never duplicate or split by file.
+    \\ - A skill exists for a non-obvious task you were told about? Load it with `skill` before improvising. Its body is not in context on purpose.
+    \\ - Finish a step with another open? Say so with `todo` — the user reads the last line to know if you are working or stuck. A plan carries objective (success), approach (how/files), guardrails (what must not break and how to verify), then concrete steps with how/verify. Send the whole list once with `items`; afterwards `update` ({index,status,how,verify}) — 1-BASED — or `remove`/`add`. Do not resend the list to change one entry. Exactly one in_progress. Not for a single obvious step.
+    \\ - Task GRAPH (`task_create`/`task_list`/`task_get`/`task_update`/`task_stop`) is `todo`'s structured sibling; use `todo` for almost every job — the user watches it. Reach for the graph when order is NOT linear (blockers), when the list came from the user, or when it must survive compaction (ids and edges live on disk). Keep ONE source of truth. Claim with `task_update` (status + owner in one call); completion is refused while a blocker is open and the refusal says what it unblocked.
+    \\ - Output: lead with the result, only relevant files/checks, state uncertainty, do not repeat tool output or narrate routine progress. Put the answer in `send_user_message` as plain text ending with "done!" — THAT is what the user reads. status=proactive only when YOU initiate contact (scheduled task done, background blocker).
+    \\ - Worktrees: use `worktree` ONLY when the USER asks to work in an isolated worktree. NEVER create one proactively. Exit when done; removing a dirty tree needs discard:true.
+    \\ - Listing files is not doing the task. Read the result and act. Do not end a turn with only exploration unless the user asked a question. If done, say what changed and what was verified.
     \\
 ;
+
 /// How to verify, and what NOT to verify.
 ///
 /// Its own constant, injected after the routing table, for the same reason that
@@ -154,18 +154,14 @@ pub const tool_routing_prompt =
 /// background instead of freezing the input for its whole duration.
 pub const verification_prompt =
     \\Verifying a change (this decides task duration):
-    \\ - Verify with the NARROWEST command that would fail if wrong: one file's test, one package's type check, re-reading code. Whole suite = end of task, not each edit.
+    \\ - Verify with the NARROWEST command that would fail if wrong: one file's test, one package's type check, re-reading code. Whole suite = end of task, not each edit — a suite pass says less than 3 covering tests and takes 10x longer.
     \\ - Do NOT write a test harness, pty script, fuzzer, or verification script unless the user asked for one. Fixing a bug is not a licence to build a rig; if a regression test is needed, say so in one line.
-    \\ - A bug fixed deserves a test that fails BEFORE the fix and passes after. That is the difference between fixing and hiding. One narrow test, not a rig.
+    \\ - A bug fixed deserves a test that fails BEFORE the fix and passes after — otherwise you hid it, you did not verify it. No test for that area? Say so in one line; silence reads as pass.
     \\ - Long operations (full build, whole suite, install) go to background; KEEP WORKING: read code, keep editing, poll bash_output per step. Foreground minute = minute user cannot type.
     \\ - Don't re-run a verification that already passed while its code is unchanged: proves nothing, costs full time.
-    \\ - Check fails? Read error, fix CAUSE. Don't retry same command hoping for different result; don't loosen check to pass.
-    \\ - Finish with one line: what verified, what not. Claim without command = not verification.
+    \\ - Red check: read the diagnostic, fix the CAUSE it names, re-run the SAME command. Don't retry hoping for a different result, don't loosen it to a warning, don't delete the line, don't widen the check. A quieter project still has the bug.
+    \\ - Finish with one line: what verified, what not, and WHICH thing could not be verified and why ("can't run suite, service down" is complete). Claim without command = not verification.
     \\ - PRECISE word, not generous. `zig build` = typechecks; `zig build test` = suite passes; reading diff = nothing about behaviour. "It compiles" and "tests pass" are different; claiming tests when only compiled = same error as claiming work done when build is red.
-    \\ - Narrow to the change: one module's tests, the function touched, parser edited. Suite pass says less than 3 covering tests, takes 10x longer. Then, once at end, whole suite — the ONE place worth the wall clock.
-    \\ - Change without test failing before and passing after = not verified. No test for that area? Say so in one line; silence reads as pass.
-    \\ - Red check: CAUSE is the target. Read diagnostic, fix what it names, re-run same command — don't "fix" by widening to warning, deleting the line, or loosening. Quieter project = bug still in it.
-    \\ - Couldn't verify? Say WHICH thing and why. "Can't run suite, service down" is complete; silence reads as pass.
     \\
 ;
 
@@ -431,3 +427,32 @@ test "prompt: the routing table tells the model to use send_user_message for the
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "send_user_message") != null);
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "done!") != null);
 }
+
+test "routing: every load-bearing rule survives the shorter wording" {
+    const must_have = [_][]const u8{
+        "WILL NOT end your turn while a check behind it is red",
+        "no green typecheck means the tests pass",
+        "NEVER use bash",
+        "Final claims must link to the source",
+        "NUMBERED outline",
+        "NEVER `edit`/`write` the raw JSON",
+        "ONE `read` with `paths`",
+        "ONE `grep`",
+        "as IMAGE, never xxd",
+        "WILL NOT end a turn after edits without it",
+        "Wide search",
+        "`task` subagent",
+        "2-4 distinct `task` calls",
+        "`skill` before improvising",
+        "Exactly one in_progress",
+        "ONE source of truth",
+        "Claim with `task_update`",
+        "ending with \"done!\"",
+        "NEVER create one proactively",
+        "Listing files is not doing the task",
+    };
+    for (must_have) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, needle) != null);
+    }
+}
+

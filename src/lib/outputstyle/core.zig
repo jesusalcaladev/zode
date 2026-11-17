@@ -64,6 +64,10 @@ pub const Meta = struct {
     /// Whether the harness's coding rules stay alongside this style. When
     /// false, the style replaces them entirely.
     keep_coding_instructions: bool = true,
+    /// When true, the tool SCHEMAS use short descriptions. The full guidance
+    /// moves into this style's body, so this is opt-in and never a silent
+    /// loss of instructions.
+    terse_tools: bool = false,
 };
 
 /// Splits the frontmatter from the body.
@@ -109,6 +113,8 @@ pub fn splitFrontmatter(text: []const u8) ?struct { meta: Meta, body: []const u8
             meta.description = val;
         } else if (keyIs(key, "keep_coding_instructions")) {
             meta.keep_coding_instructions = std.ascii.eqlIgnoreCase(val, "true");
+        } else if (keyIs(key, "terse_tools")) {
+            meta.terse_tools = std.ascii.eqlIgnoreCase(val, "true");
         }
     }
     return null; // unterminated frontmatter
@@ -167,6 +173,7 @@ pub const Entry = struct {
     body: ?[]const u8 = null,
     source: Source = .project,
     keep_coding_instructions: bool = true,
+    terse_tools: bool = false,
 };
 
 /// Text for a selected style: the body, framed so the model knows what it has.
@@ -374,4 +381,24 @@ pub fn joinNames(entries: []const Entry) []const u8 {
         w.writeAll(e.name) catch {};
     }
     return w.buffered();
+}
+
+test "splitFrontmatter: terse_tools is parsed and defaults to false" {
+    const with_key =
+        \\---
+        \\name: terse
+        \\description: short tool schemas
+        \\terse_tools: true
+        \\---
+        \\body
+    ;
+    try std.testing.expect(splitFrontmatter(with_key).?.meta.terse_tools);
+    const without =
+        \\---
+        \\name: default
+        \\description: normal
+        \\---
+        \\body
+    ;
+    try std.testing.expect(!splitFrontmatter(without).?.meta.terse_tools);
 }

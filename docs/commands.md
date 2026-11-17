@@ -10,6 +10,22 @@ Every command listed here is documented with its syntax, what it does, and how t
 
 ---
 
+## Output styles
+
+### `/style <name>`
+
+Selects an output style (instruction block appended to the system prompt).
+`/style` with no argument reports the current one; `/style off` clears it.
+The choice is persisted in `~/.config/zode/config.json` and restored at startup.
+
+Bundled styles: `default`, `concise`, `explanatory`, `learning` and `terse`.
+
+- `terse` is the token-saving style: it selects short tool schemas (~26% fewer
+  schema bytes per request) and restates every rule those schemas normally
+  carry in a single block, so nothing is lost. The selection is reported as
+  `output style: terse — terse tool schemas…`. Custom styles can opt in with
+  `terse_tools: true` in their frontmatter.
+
 ## Plugins, remote sessions and keybindings
 
 ### `/plugin`

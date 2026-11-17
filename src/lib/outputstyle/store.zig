@@ -156,6 +156,7 @@ pub const Loader = struct {
                     .body = null,
                     .source = if (user_root == root_idx) .user else .project,
                     .keep_coding_instructions = meta.keep_coding_instructions,
+                    .terse_tools = meta.terse_tools,
                 };
                 n += 1;
             }
@@ -188,6 +189,7 @@ pub const Loader = struct {
                 .body = b.body,
                 .source = .bundled,
                 .keep_coding_instructions = b.keep_coding_instructions,
+                .terse_tools = b.terse_tools,
             };
             n += 1;
         }
@@ -366,7 +368,7 @@ test "scan: project shadows repo and user, both layouts and bundled styles are f
 
     // Precedence is fixed even though the order INSIDE a root is not: project
     // first, then repo, then user, then the bundled styles last.
-    try std.testing.expectEqual(@as(usize, 7), found.len); // 3 project/user + 4 bundled (default/concise/explanatory/learning)
+    try std.testing.expectEqual(@as(usize, 8), found.len); // 3 project/user + 5 bundled (default/concise/explanatory/learning/terse)
     try std.testing.expectEqualStrings("mine", found[0].name);
     try std.testing.expectEqualStrings("repoonly", found[1].name);
     try std.testing.expectEqualStrings("default", found[4].name);

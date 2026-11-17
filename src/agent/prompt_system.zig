@@ -165,8 +165,8 @@ pub fn skillsSectionText(ctx: BuildCtx, list_buf: []u8) []const u8 {
     // Phase 13.1: enabled plugins contribute instructions. They are appended
     // to the SAME skills block so the eight-block cache prefix does not move —
     // a plugin install must not invalidate every cached request.
-    const installed = pluginstore.discover(ctx.gpa, ctx.io, ctx.env, ctx.project_root orelse ctx.project_cwd) catch &.{};
-    defer if (installed.len > 0) pluginstore.freeInstalled(ctx.gpa, installed);
+    const installed = pluginstore.discoverCached(ctx.gpa, ctx.io, ctx.env, ctx.project_root orelse ctx.project_cwd) catch &.{};
+    // Cached by pluginstore; invalidate() owns the memory.
     if (installed.len == 0) return base;
     var manifests: [pluginstore.max_installed]plugins_mod.Manifest = undefined;
     var n: usize = 0;

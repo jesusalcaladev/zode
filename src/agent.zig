@@ -1,4 +1,5 @@
 const std = @import("std");
+const pluginstore_mod = @import("lib/pluginstore.zig");
 const posix = std.posix;
 const sleepz = @import("lib/sleep.zig");
 const vaxis = @import("vaxis");
@@ -328,6 +329,7 @@ pub fn switchProjectContext(gpa: std.mem.Allocator, io: std.Io, env: ?*const std
     resetAgentDefs();
     discovery.resetSkillsCacheForTest();
     discovery.resetStylesCacheForTest();
+    pluginstore_mod.invalidate();
 
     // 4. Permission rules and hooks: `.zode/permissions.json` / `.zode/hooks.json`
     //    live in the tree, so reload from the new root. Clearing the old arenas
@@ -467,6 +469,11 @@ pub var current_effort: chat.Effort = .medium;
 pub var current_style: ?[]const u8 = null;
 pub var current_style_buf: [128]u8 = undefined;
 pub var current_style_len: usize = 0;
+
+/// True when the selected output style asks for short tool schemas. Derived
+/// from the style's `terse_tools` frontmatter — never set directly from a
+/// model message (a model could otherwise shrink its own instructions).
+pub var terse_tools: bool = false;
 
 /// Default agent definition (Phase 9) used when `task` names no `definition`.
 /// Loaded from `settings.active_agent` in config.json at startup; empty means
@@ -1606,6 +1613,19 @@ pub fn loadUserConfig() void {
         cfg_arena_state = std.heap.ArenaAllocator.init(gpa_global);
         user_config = config_mod.load(cfg_arena_state.?.allocator(), io_global, environ_global);
 
+        // Restore the output style that `/style` persisted. It used to be
+        // written to config.json but never loaded, so a restart silently
+        // dropped it — and with it terse_tools and keep_coding_instructions.
+        if (user_config.settings.output_style) |style_name| {
+            if (style_name.len > 0 and style_name.len <= current_style_buf.len and
+                !std.ascii.eqlIgnoreCase(style_name, "off") and !std.ascii.eqlIgnoreCase(style_name, "clear"))
+            {
+                @memcpy(current_style_buf[0..style_name.len], style_name);
+                current_style_len = style_name.len;
+                current_style = current_style_buf[0..current_style_len];
+            }
+        }
+
         // Phase 9: the default agent definition from settings.active_agent.
         if (user_config.settings.active_agent) |name| {
             if (agentdefs.validName(name) and name.len <= active_agent_buf.len) {
@@ -2603,7 +2623,7 @@ fn prepareTurnRequest(
     else if (read_only)
         tools_registry.toolsJsonReadOnly()
     else
-        try tools_registry.toolsJsonFiltered(schema_arena, denied);
+        try tools_registry.toolsJsonFilteredFor(schema_arena, denied, terse_tools);
 
     chat.markCachePrefix(msgs_wire, 2);
     const body = try chat.buildBodyMessagesCapped(

@@ -12,6 +12,7 @@ pub const BundledStyle = struct {
     name: []const u8,
     description: []const u8,
     keep_coding_instructions: bool,
+    terse_tools: bool = false,
     body: []const u8,
 };
 
@@ -41,6 +42,13 @@ pub const bundled_styles: []const BundledStyle = &[_]BundledStyle{
         .keep_coding_instructions = true,
         .body = @embedFile("output_styles/learning.md"),
     },
+    .{
+        .name = "terse",
+        .description = "Short tool schemas + the essential tool rules in one block (fewer tokens per request)",
+        .keep_coding_instructions = true,
+        .terse_tools = true,
+        .body = @embedFile("output_styles/terse.md"),
+    },
 };
 
 /// Returns the bundled style with the given name, or null.
@@ -63,7 +71,7 @@ pub fn substituteArguments(body: []const u8, args: []const u8, out: []u8) []cons
 }
 
 test "bundled styles are embedded and accessible" {
-    try std.testing.expect(bundled_styles.len == 4);
+    try std.testing.expect(bundled_styles.len == 5);
     for (bundled_styles) |s| {
         try std.testing.expect(s.name.len > 0);
         try std.testing.expect(s.description.len > 0);
@@ -77,4 +85,13 @@ test "getBundled: finds by name" {
     try std.testing.expect(getBundled("explanatory") != null);
     try std.testing.expect(getBundled("learning") != null);
     try std.testing.expect(getBundled("nonexistent") == null);
+}
+
+test "bundled terse style: the flag is set and the body carries the rules" {
+    const s = getBundled("terse").?;
+    try std.testing.expect(s.terse_tools);
+    try std.testing.expect(std.mem.indexOf(u8, s.body, "SAME message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.body, "offset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s.body, "done!") != null);
+    try std.testing.expect(!getBundled("default").?.terse_tools);
 }

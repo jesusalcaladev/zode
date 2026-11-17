@@ -313,6 +313,12 @@ pub fn check(ctx: Context, force: bool) ?Update {
     const now = Io.Timestamp.now(ctx.io, .real).toSeconds();
     const cached = loadCache(ctx);
 
+    // A `dev` build has no semver to compare against: no network verdict is
+    // possible and a cached "latest" cannot be called newer either. Skip the
+    // check entirely instead of making a TLS round trip on every launch (and
+    // instead of flashing a box the developer cannot act on).
+    if (!isValidVersion(current_version)) return null;
+
     if (!force) {
         if (cached) |c| {
             if (c.latest.len > 0 and now - c.checked_at < ttl_secs) {
@@ -587,4 +593,17 @@ test "Context.fromEnv: ZODE_UPDATE_CHANNEL selects beta, default is stable" {
     try std.testing.expectEqual(release_mod.Channel.beta, Context.fromEnv(io, alloc, &env).channel);
     try env.put("ZODE_UPDATE_CHANNEL", "stable");
     try std.testing.expectEqual(release_mod.Channel.stable, Context.fromEnv(io, alloc, &env).channel);
+}
+
+test "a dev build never needs a network check" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const ctx = Context{ .io = threaded.io(), .alloc = arena_state.allocator(), .env = &env };
+    try std.testing.expect(!isValidVersion(current_version));
+    try std.testing.expect(check(ctx, false) == null);
+    try std.testing.expect(check(ctx, true) == null);
 }

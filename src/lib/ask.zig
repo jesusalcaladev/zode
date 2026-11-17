@@ -247,33 +247,12 @@ pub fn parse(arena: std.mem.Allocator, args_json: []const u8) ParseError!Questio
 /// asks for something it could have read out of a file, is worse than one that
 /// never asks.
 pub const guidance =
-    \\When to use `ask`:
-    \\ - The answer changes what you do next: a choice between approaches, an
-    \\   ambiguous request with two readings, a "which one" with real
-    \\   consequences. One question, at the moment it matters.
-    \\ - The question is not answerable by looking: do NOT ask what you can read
-    \\   with read/grep/glob, do not ask for a path you can find, do not ask for
-    \\   the output of a command you can run. Read it first, then ask if it is
-    \\   still unclear.
-    \\ - At most ONE question per step, and no more than three in a whole turn.
-    \\   A model that asks everything is as useless as one that assumes
-    \\   everything.
-    \\ - Do NOT use it to report progress, to say you are done, or to hand back work
-    \\   you could have finished. It is for a decision only YOU cannot make; anything
-    \\   else is your job, and a user who gets asked to confirm your work learns to
-    \\   press enter without reading.
-    \\
-    \\How to ask:
-    \\ - Put your recommendation FIRST and say why in the question text, so the
-    \\   user can just press enter.
-    \\ - Use `options` when the choices are enumerable (2 to 5). Use no options
-    \\   when the answer is free text (a name, a path, a yes/no with a nuance).
+    \\Asking (the full WHEN is already in the `ask` schema):
+    \\ - Do NOT use it to report progress or to say you are done — anything else is your job; a user asked to confirm your work learns to press enter without reading.
+    \\ - Schema rules repeated for the cap: do NOT ask what you can read with read/grep/glob; at most ONE question per step, no more than three in a whole turn.
+    \\ - Never ask a question whose answer is "whatever you think is right". That is your call; asking it hands back the decision you were given.
     \\ - `header` is a 2-3 word label for the dialog, not the question.
-    \\ - Never ask a question whose answer is "whatever you think is right". That is
-    \\   the model's own call; asking it hands back the decision it was given.
-    \\
-    \\After the answer: keep going. Do not ask a follow-up that restates the same
-    \\decision, and do not ask anything you have already been told.
+    \\ - After the answer: keep going. No follow-up that restates the same decision, and nothing you have already been told.
 ;
 
 /// The line the TUI shows above the options, and the ONLY thing the user reads
@@ -480,4 +459,13 @@ test "the decision: only YOLO skips the question, and only with options is there
     try std.testing.expectEqual(ask.Decision.take_recommendation, ask.decide(true, true));
     // Without options there is nothing to take: the question stays open.
     try std.testing.expectEqual(ask.Decision.leave_open, ask.decide(true, false));
+}
+
+test "ask guidance: only the rules absent from the schema remain" {
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "press enter without reading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "whatever you think is right") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "2-3 word label") != null);
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "After the answer") != null);
+    // The "when to use" essay now lives only in the tool schema.
+    try std.testing.expect(std.mem.indexOf(u8, guidance, "ambiguous request with two readings") == null);
 }
