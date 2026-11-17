@@ -9180,7 +9180,8 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             // A cancelled subagent returns what it found, if anything. Treating
             // ESC as "refused" would throw away a report the user paid for.
             if (err == error.Cancelled and tstate.text.items.len > 0) {
-                msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items }) catch {};
+                const owned = sarena.dupe(u8, tstate.text.items) catch "";
+                msgs.append(sarena, .{ .role = "assistant", .content = owned }) catch {};
                 if (session_path) |sp| {
                     var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
                     for (msgs.items) |mm| wm.append(sarena, .{ .role = mm.role, .content = mm.content }) catch {};
@@ -9277,7 +9278,8 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
 
         if (tstate.calls.items.len == 0) {
             // Done: the text IS the report.
-            msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items }) catch {};
+            const owned = sarena.dupe(u8, tstate.text.items) catch "";
+            msgs.append(sarena, .{ .role = "assistant", .content = owned }) catch {};
             if (session_path) |sp| {
                 var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
                 for (msgs.items) |mm| wm.append(sarena, .{ .role = mm.role, .content = mm.content }) catch {};
@@ -9299,7 +9301,9 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             toolCallsJsonFromCalls(sarena, tstate.calls.items)
         else
             null;
-        msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items, .tool_calls_json = tc_json }) catch
+        const owned_text = sarena.dupe(u8, tstate.text.items) catch
+            return subagent_mod.refused("out of memory during the subagent loop", rep);
+        msgs.append(sarena, .{ .role = "assistant", .content = owned_text, .tool_calls_json = tc_json }) catch
             return subagent_mod.refused("out of memory during the subagent loop", rep);
 
         for (tstate.calls.items) |call| {
@@ -9463,7 +9467,8 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     // Out of steps. The report it managed to write is usually good enough, and
     // throwing it away because the search did not FINISH is the worst of both.
     if (tstate.text.items.len > 0) {
-        msgs.append(sarena, .{ .role = "assistant", .content = tstate.text.items }) catch {};
+        const owned = sarena.dupe(u8, tstate.text.items) catch "";
+        msgs.append(sarena, .{ .role = "assistant", .content = owned }) catch {};
         if (session_path) |sp| {
             var wm: std.ArrayList(agentroles.WindowMsg) = .empty;
             for (msgs.items) |mm| wm.append(sarena, .{ .role = mm.role, .content = mm.content }) catch {};
@@ -19638,4 +19643,33 @@ test "worktree: a dirty tree is refused until discard is explicit" {
     const text = try worktree_mod.dirtyRefusal(a, "feature-a", changes);
     try std.testing.expect(std.mem.indexOf(u8, text, "discard: true") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "src/a.zig") != null);
+}
+
+// ── crash fix: subagent message content must outlive the turn buffer ───────
+
+test "subagent: a copied message survives the source buffer being overwritten" {
+    // This pins the exact bug behind the SIGSEGV in chat.jsonEscape: storing
+    // `tstate.text.items` directly into a message aliases the turn's text
+    // buffer, which is cleared and REFILLED on the next iteration. The old
+    // message then reads the NEW delta — and can point at freed memory.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var turn_text: std.ArrayList(u8) = .empty;
+    defer turn_text.deinit(std.testing.allocator);
+    try turn_text.appendSlice(std.testing.allocator, "first iteration text");
+
+    // The fix: own the content in the message's arena.
+    const owned = try arena.dupe(u8, turn_text.items);
+    try std.testing.expectEqualStrings("first iteration text", owned);
+
+    // Simulate the next iteration: clear + refill the source buffer.
+    turn_text.clearRetainingCapacity();
+    try turn_text.appendSlice(std.testing.allocator, "second iteration completely different text");
+
+    // The message's copy is intact — and so is the pointer the JSON writer
+    // will later walk byte by byte.
+    try std.testing.expectEqualStrings("first iteration text", owned);
+    try std.testing.expect(std.mem.indexOf(u8, turn_text.items, "second iteration") != null);
 }
