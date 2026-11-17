@@ -3592,8 +3592,10 @@ fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
 
     // Toast: show the confirmation in the top-right corner for ~1 second.
     // At 40 ms/tick when busy, 25 ticks = 1000 ms.
-    var tb: [64]u8 = undefined;
-    m.copy_toast_text = std.fmt.bufPrint(&tb, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
+    // The toast is drawn on later frames, so its text MUST outlive this stack
+    // frame. Format into the Model-owned buffer: a stack local here is the exact
+    // `field = bufPrint(&local)` escape that memaudit catches.
+    m.copy_toast_text = std.fmt.bufPrint(&m.copy_toast_buf, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
     m.copy_toast_frames = 12;
 
     var name_buf: [64]u8 = undefined;

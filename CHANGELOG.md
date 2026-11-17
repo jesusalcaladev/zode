@@ -43,7 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete phase 19 (ticks and scheduled prompts) (schedule) [`3a919193`](https://github.com/jesusalcaladev/zode/commit/3a919193)
 - complete phase 22 (structured output for scripted runs) (schema) [`c7a84fef`](https://github.com/jesusalcaladev/zode/commit/c7a84fef)
 - internal memory/leak diagnostics with millimetre control (diag) [`9d4db8a7`](https://github.com/jesusalcaladev/zode/commit/9d4db8a7)
-- churn tool and beta channel for the release flow (release) [`e3bf4ff6`](https://github.com/jesusalcaladev/zode/commit/e3bf4ff6)
+- churn tool and beta channel for the release flow (release) [`45ed1183`](https://github.com/jesusalcaladev/zode/commit/45ed1183)
+- static auditor for the two crash classes (memaudit) [`f4311046`](https://github.com/jesusalcaladev/zode/commit/f4311046)
 
 ### Bug Fixes
 

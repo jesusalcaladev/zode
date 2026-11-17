@@ -390,6 +390,28 @@ pub fn build(b: *std.Build) void {
     run_diag.has_side_effects = true;
     diag_step.dependOn(&run_diag.step);
 
+    // Phase 39: `zig build memaudit` — static source auditor for the two
+    // crash classes (stack buffer escape, borrowed .items stored into a
+    // longer-lived struct). Pure, advisory, exits 1 on findings.
+    const ma_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib/memaudit.zig"),
+        .target = target,
+        .optimize = .safe,
+    });
+    const ma_cli_mod = b.createModule(.{
+        .root_source_file = b.path("tools/memaudit.zig"),
+        .target = target,
+        .optimize = .safe,
+    });
+    ma_cli_mod.addImport("memaudit", ma_mod);
+    const ma = b.addExecutable(.{ .name = "memaudit", .root_module = ma_cli_mod });
+    const ma_step = b.step("memaudit", "Audit src/ for stack-buffer escapes and borrowed .items");
+    ma_step.dependOn(&ma.step);
+    const ma_run = b.addRunArtifact(ma);
+    ma_run.setName("memaudit_run");
+    ma_run.has_side_effects = true;
+    ma_step.dependOn(&ma_run.step);
+
     // churn: Zig-native changeset tool for version bumps and changelogs.
     // Share the release rules with the main tree instead of duplicating them.
     const cm_release_mod = b.createModule(.{

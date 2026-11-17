@@ -2046,7 +2046,11 @@ pub const Model = struct {
     /// Differential render tracking: forces a full redraw of history (first frame or after scroll).
     diff_needs_full_redraw: bool = true,
     /// Toast notification: text shown when user copies to clipboard, and frames remaining.
+    /// `copy_toast_buf` is Model-owned so the text slice stays valid across the
+    /// frames the toast is drawn (a stack local here dangles - the `memaudit`
+    /// stack-field-slice crash class).
     copy_toast_text: []const u8 = "",
+    copy_toast_buf: [64]u8 = undefined,
     copy_toast_frames: u64 = 0,
 
     /// 33.9: transient notifications channel (absolutely positioned, no layout shift).
