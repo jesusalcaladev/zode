@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- close six critical permission and token-leak holes (security) [`91cd2cb3`](https://github.com/jesusalcaladev/zode/commit/91cd2cb3)
+- close six critical permission and token-leak holes (security) [`a2998bc7`](https://github.com/jesusalcaladev/zode/commit/a2998bc7)
+- complete Phase 40 medium items (12 of 13) (security) [`caf1b895`](https://github.com/jesusalcaladev/zode/commit/caf1b895)
 
 ### Chores
 

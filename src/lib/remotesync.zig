@@ -91,7 +91,13 @@ pub fn sessionPath(gpa: std.mem.Allocator, dir_path: []const u8, id: []const u8)
 pub fn writeSession(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, id: []const u8, data: []const u8) !void {
     const path = try sessionPath(gpa, dir_path, id);
     defer gpa.free(path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+    // A session is the whole conversation: an interrupted pull must not leave
+    // a half-written file. Write a private temp file, then rename atomically.
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = data, .flags = .{ .permissions = @fromBackingInt(@intCast(0o600)) } });
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
 }
 
 pub fn readSession(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, id: []const u8) ![]u8 {

@@ -160,10 +160,14 @@ fn restoreTerminalForCrash() void {
 /// time is not a moment to build directories: the path is fixed.
 fn openCrashLog() ?std.posix.fd_t {
     if (builtin.os.tag != .linux) return null;
+    // NOFOLLOW closes the symlink hole: a predictable path in a world-writable
+    // directory must not be a way to append to somebody else's file. Panic
+    // time is raw-syscall territory — no allocator, no Io, no fstat wrapper.
     return std.posix.openat(std.posix.AT.FDCWD, crash_log_path, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
         .APPEND = true,
+        .NOFOLLOW = true,
     }, 0o600) catch null;
 }
 

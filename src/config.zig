@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 const servers = @import("lsp/servers.zig");
@@ -893,12 +894,22 @@ pub fn writeFileSecure(
     _ = std.Io.Dir.cwd().createDirPathStatus(io, dir_path, @fromBackingInt(@intCast(0o700))) catch
         try std.Io.Dir.cwd().createDirPath(io, dir_path);
 
+    // A predictable `{path}.tmp` has a TOCTOU window: an attacker can swap it
+    // for a symlink between the check and the create. A random name opened
+    // EXCLUSIVELY closes that window — a planted symlink makes the open fail
+    // with PathAlreadyExists instead of being followed.
     var tmp_buf: [1200]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
-    if (isPathSymlink(io, tmp)) return error.SymlinkRefused;
+    var nonce: u64 = @truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).nanoseconds)));
+    if (builtin.os.tag == .linux) {
+        var rnd: u64 = 0;
+        const rc = std.os.linux.getrandom(@ptrCast(&rnd), @sizeOf(u64), 0);
+        if (@as(isize, @bitCast(rc)) > 0) nonce = rnd;
+    }
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.{x:0>16}.tmp", .{ path, nonce });
 
     var file = try std.Io.Dir.cwd().createFile(io, tmp, .{
         .truncate = true,
+        .exclusive = true,
         .permissions = @fromBackingInt(@intCast(0o600)),
     });
     defer file.close(io);

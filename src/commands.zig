@@ -398,7 +398,18 @@ pub fn cmdRemote(m: *tui.Model, arg: ?[]const u8) void {
     const dir = session_mod.sessions_dir;
 
     if (std.mem.eql(u8, op, "status")) {
-        agent.pushInfoFmt(m, "remote: {s} (token {s})", .{ cfg.url, if (cfg.token != null) "set" else "not set" });
+        // Show the origin only: a token in a query string or URL userinfo
+        // must not be echoed into the transcript (or the session file).
+        var shown = cfg.url;
+        if (std.mem.indexOfScalar(u8, shown, '?')) |q| shown = shown[0..q];
+        if (std.mem.indexOf(u8, shown, "://")) |scheme| {
+            const authority = scheme + 3;
+            const end = std.mem.indexOfScalarPos(u8, shown, authority, '/') orelse shown.len;
+            if (std.mem.lastIndexOfScalar(u8, shown[authority..end], '@')) |at| {
+                shown = std.fmt.allocPrint(a, "{s}{s}", .{ shown[0..authority], shown[authority + at + 1 ..] }) catch cfg.url;
+            }
+        }
+        agent.pushInfoFmt(m, "remote: {s} (token {s})", .{ shown, if (cfg.token != null) "set" else "not set" });
         return;
     }
     if (std.mem.eql(u8, op, "list")) {

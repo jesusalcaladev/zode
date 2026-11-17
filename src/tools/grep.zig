@@ -229,13 +229,15 @@ pub fn toolGrep(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) !
     const pattern = args.pattern;
     const subdir = args.subdir;
     // Secret refusal: grep has no pathsafe blocklist, so a subdir of
-    // ~/.config/zode or a glob for auth.json would leak keys.
-    const verdict = pathsafe_mod.checkRead(subdir);
+    // ~/.config/zode or a glob for auth.json would leak keys. Resolve first:
+    // a symlinked directory must be judged by its TARGET, not its name.
+    const cwd = std.Io.Dir.cwd();
+    const verdict = pathsafe_mod.checkReadResolved(arena, io, cwd, subdir);
     if (verdict != .ok) {
         return arena.dupe(u8, "refused: this path names a credential file") catch "refused: credential";
     }
     if (args.glob) |g| {
-        if (pathsafe_mod.checkRead(g) != .ok) {
+        if (pathsafe_mod.checkReadResolved(arena, io, cwd, g) != .ok) {
             return arena.dupe(u8, "refused: this glob names a credential file") catch "refused: credential";
         }
     }
@@ -583,6 +585,10 @@ pub fn fallbackGrep(io: std.Io, pattern: []const u8, subdir: []const u8, _args: 
             break;
         }
         if (!list_files_tool.looksLikeText(entry_path)) continue;
+        // A symlink named `notes.txt` pointing at auth.json must not leak its
+        // target into the tool result. The native engines do not follow
+        // symlinks; the fallback walks the tree itself, so it must check.
+        if (pathsafe_mod.checkReadResolved(arena, io, std.Io.Dir.cwd(), entry_path) != .ok) continue;
         const data = std.Io.Dir.cwd().readFileAlloc(io, entry_path, arena, .limited(2 * 1024 * 1024)) catch continue;
         defer arena.free(data);
 
@@ -829,4 +835,19 @@ test "grep: the search does not go inside .git" {
     };
     // `--hidden` makes ripgrep look inside dot-directories, and `.git` is one.
     try std.testing.expect(std.mem.indexOf(u8, out, "zedmarker") == null);
+}
+
+test "grep: the fallback engine skips files that read would refuse" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = "/tmp/opencode/grep-secret-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dir ++ "/auth.json", .data = "uniquezodemarker123\n" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dir ++ "/plain.txt", .data = "nothing\n" });
+
+    const out = try fallbackGrep(std.testing.io, "uniquezodemarker123", dir, .{ .pattern = "uniquezodemarker123", .subdir = dir }, arena);
+    try std.testing.expect(std.mem.startsWith(u8, out, "no matches:"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "auth.json") == null);
 }

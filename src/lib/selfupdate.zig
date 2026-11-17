@@ -404,14 +404,23 @@ pub fn installLatest(ctx: Context) InstallError![]const u8 {
     const data = download(ctx, download_url) orelse return error.DownloadFailed;
 
     const exe = std.process.executablePathAlloc(ctx.io, ctx.alloc) catch return error.NotWritable;
-    const tmp = std.fmt.allocPrint(ctx.alloc, "{s}.new", .{exe}) catch return error.NotWritable;
+    // A predictable `{exe}.new` is a symlink target for anyone who can write
+    // the binary's directory: we would write through it and then rename it
+    // over the executable. Random name + exclusive create closes that door.
+    var nonce: u64 = @truncate(@as(u96, @bitCast(Io.Timestamp.now(ctx.io, .real).nanoseconds)));
+    if (builtin.os.tag == .linux) {
+        var rnd: u64 = 0;
+        const rc = std.os.linux.getrandom(@ptrCast(&rnd), @sizeOf(u64), 0);
+        if (@as(isize, @bitCast(rc)) > 0) nonce = rnd;
+    }
+    const tmp = std.fmt.allocPrint(ctx.alloc, "{s}.{x:0>16}.new", .{ exe, nonce }) catch return error.NotWritable;
 
     // 0755 from the start: a temp file that is not executable cannot be run,
-    // and the run is the check.
+    // and the run is the check. EXCLUSIVE refuses a planted symlink.
     std.Io.Dir.cwd().writeFile(ctx.io, .{
         .sub_path = tmp,
         .data = data,
-        .flags = .{ .permissions = @enumFromInt(0o755) },
+        .flags = .{ .permissions = @enumFromInt(0o755), .exclusive = true },
     }) catch return error.NotWritable;
 
     if (!runs(ctx, tmp)) {

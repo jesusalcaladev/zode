@@ -100,7 +100,11 @@ pub fn install(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, nam
     defer gpa.free(body);
     const dir_path = path[0 .. path.len - filename.len - 1];
     try std.Io.Dir.cwd().createDirPath(io, dir_path);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = body });
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
     return gpa.dupe(u8, path);
 }
 
@@ -120,7 +124,11 @@ pub fn setEnabled(gpa: std.mem.Allocator, io: std.Io, path: []const u8, enabled:
     try root.object.put(gpa, "enabled", .{ .bool = enabled });
     const out = try std.json.Stringify.valueAlloc(gpa, root, .{ .whitespace = .indent_1 });
     defer gpa.free(out);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out });
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
+    defer gpa.free(tmp);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = out });
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    try std.Io.Dir.rename(.cwd(), tmp, .cwd(), path, io);
 }
 
 test "pluginstore: install, discover and remove a bundled plugin" {

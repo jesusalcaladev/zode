@@ -34,7 +34,7 @@ pub fn encryptMasterKeyWithPassphrase(
 ) ![]u8 {
     const params = Scrypt.Params.owasp;
     var salt: [16]u8 = undefined;
-    fillRandom(&salt);
+    try fillRandom(&salt);
     const kek = try deriveMasterKeyFromPassphrase(alloc, passphrase, salt, params);
     defer {
         var k = kek;
@@ -42,7 +42,7 @@ pub fn encryptMasterKeyWithPassphrase(
     }
 
     var nonce: [Aead.nonce_length]u8 = undefined;
-    fillRandom(&nonce);
+    try fillRandom(&nonce);
     const pt = master_key_b64;
     const raw = try alloc.alloc(u8, Aead.nonce_length + pt.len + Aead.tag_length);
     defer {
@@ -124,6 +124,13 @@ pub fn decryptMasterKeyWithPassphrase(
     }
     std.base64.url_safe_no_pad.Decoder.decode(ct_raw, ct_b64) catch return error.BadEncoding;
 
+    // The envelope is on disk, so whoever can write it could set r/p to ~10^9
+    // and turn an ordinary unlock into a multi-GB allocation. Our own writer
+    // uses OWASP params; anything above them is refused, not honoured.
+    const owasp = Scrypt.Params.owasp;
+    if (ln == 0 or ln > owasp.ln or r == 0 or r > owasp.r or p == 0 or p > owasp.p) {
+        return error.BadEncoding;
+    }
     const params = Scrypt.Params{ .ln = ln, .r = r, .p = p };
     const kek = deriveMasterKeyFromPassphrase(alloc, passphrase, salt, params) catch return error.BadPassphrase;
     defer {
@@ -150,10 +157,10 @@ pub fn decryptMasterKeyWithPassphrase(
     return plain; // master key b64
 }
 
-fn fillRandom(buf: []u8) void {
+fn fillRandom(buf: []u8) !void {
     if (buf.len == 0) return;
+    var off: usize = 0;
     if (comptime builtin.os.tag == .linux) {
-        var off: usize = 0;
         while (off < buf.len) {
             const rc = std.os.linux.getrandom(buf[off..].ptr, buf.len - off, 0);
             const signed: isize = @bitCast(rc);
@@ -162,12 +169,15 @@ fn fillRandom(buf: []u8) void {
         }
         if (off == buf.len) return;
     }
-    // Fallback: /dev/urandom (best-effort).
+    // Fallback: /dev/urandom. A short read MUST be an error — silently using a
+    // partially filled buffer would create a weak key with no signal.
     if (comptime @hasDecl(std.fs, "openFileAbsolute")) {
-        const file = std.fs.openFileAbsolute("/dev/urandom", .{}) catch return;
+        const file = std.fs.openFileAbsolute("/dev/urandom", .{}) catch return error.EntropyUnavailable;
         defer file.close();
-        _ = file.readAll(buf) catch {};
+        const n = file.readAll(buf[off..]) catch return error.EntropyUnavailable;
+        if (off + n == buf.len) return;
     }
+    return error.EntropyUnavailable;
 }
 
 pub fn secureZero(buf: []u8) void {
@@ -183,7 +193,7 @@ pub fn isEncrypted(data: []const u8) bool {
 
 pub fn encrypt(alloc: std.mem.Allocator, plaintext: []const u8, key: [Aead.key_length]u8) ![]u8 {
     var nonce: [Aead.nonce_length]u8 = undefined;
-    fillRandom(&nonce);
+    try fillRandom(&nonce);
     const out_raw = try alloc.alloc(u8, Aead.nonce_length + plaintext.len + Aead.tag_length);
     defer {
         secureZero(out_raw);
@@ -240,7 +250,7 @@ pub fn keyFromBytes(bytes: []const u8) ?[Aead.key_length]u8 {
 pub fn generateKeyB64(buf: []u8) ![]const u8 {
     var key: [Aead.key_length]u8 = undefined;
     defer secureZero(&key);
-    fillRandom(&key);
+    try fillRandom(&key);
     const n = std.base64.url_safe_no_pad.Encoder.calcSize(key.len);
     if (buf.len < n) return error.NoSpace;
     return std.base64.url_safe_no_pad.Encoder.encode(buf[0..n], &key);
@@ -326,4 +336,12 @@ test "authstore: passphrase-protected master key round trip" {
     try std.testing.expect(!std.mem.eql(u8, envelope, again));
     try std.testing.expectError(error.NotProtected, decryptMasterKeyWithPassphrase(a, "plain", "my passphrase"));
     try std.testing.expectError(error.AuthFailed, decryptMasterKeyWithPassphrase(a, envelope, "wrong passphrase"));
+}
+
+test "authstore: an envelope with excessive scrypt params is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const hostile = "ZODE_AUTH_MKP1:v=1;ln=17;r=1000000;p=1;salt=AAAAAAAAAAAAAAAAAAAAAA;nonce=AAAAAAAAAAAAAAAAAAAAAAAAAA;ct=AAAAAAAA";
+    try std.testing.expectError(error.BadEncoding, decryptMasterKeyWithPassphrase(a, hostile, "pw"));
 }
