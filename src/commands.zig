@@ -3786,11 +3786,7 @@ fn updateWorker(job: *UpdateJob) void {
     var arena_state = std.heap.ArenaAllocator.init(m.allocator);
     defer arena_state.deinit();
 
-    const ctx: selfupdate.Context = .{
-        .io = threaded.io(),
-        .alloc = arena_state.allocator(),
-        .env = m.environ,
-    };
+    const ctx: selfupdate.Context = selfupdate.Context.fromEnv(threaded.io(), arena_state.allocator(), m.environ);
 
     switch (mode) {
         .check => {

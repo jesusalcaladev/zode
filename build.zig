@@ -391,16 +391,29 @@ pub fn build(b: *std.Build) void {
     diag_step.dependOn(&run_diag.step);
 
     // churn: Zig-native changeset tool for version bumps and changelogs.
+    // Share the release rules with the main tree instead of duplicating them.
+    const cm_release_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib/release.zig"),
+        .target = target,
+        .optimize = .safe,
+    });
     const cm_mod = b.createModule(.{
         .root_source_file = b.path("tools/churn.zig"),
         .target = target,
         .optimize = .safe,
     });
+    cm_mod.addImport("release", cm_release_mod);
     const cm = b.addExecutable(.{ .name = "churn", .root_module = cm_mod });
-    const cm_step = b.step("churn", "Churn: add/release/changelog/version");
+    // Install so `./zig-out/bin/churn version` (etc.) works directly. Release
+    // commands need real args; run them with `-Drun-args`, e.g.
+    //   zig build churn -Drun-args="version --beta"
+    b.installArtifact(cm);
+    const cm_step = b.step("churn", "Churn: add/release/changelog/version (-Drun-args=...)");
     cm_step.dependOn(&cm.step);
+    cm_step.dependOn(b.getInstallStep());
     const cm_run = b.addRunArtifact(cm);
     cm_run.setName("churn_run");
+    cm_run.addArgs(run_args);
     cm_run.has_side_effects = true;
     cm_step.dependOn(&cm_run.step);
 }

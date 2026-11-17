@@ -1,11 +1,239 @@
-const std = @import("std");
+//! Churn - the release/beta flow tool (Phase 38). Replaces the old stub and
+//! the buggy churn.sh. One binary, four commands, no shell scripting:
+//!
+//!   churn add <type> <scope> <description>   record a changeset
+//!   churn version [--beta|--stable]          print the bumped version (dry run)
+//!   churn changelog                          regenerate [Unreleased] from git log
+//!   churn release [--beta] [--push]          cut: version + changelog + tag + push
+//!
+//! Safety: `release` refuses on a dirty tree, runs `zig build test` first, and
+//! NEVER pushes unless `--push` is explicit. Tags follow the v-prefix convention.
 
-pub fn main() !void {
-    std.debug.print("change_manager - Zig changeset tool\n", .{});
-    std.debug.print("Usage: change_manager <add|version|changelog|release> [args...]\n", .{});
-    std.debug.print("  add <type> <scope> <description>\n", .{});
-    std.debug.print("  version\n", .{});
-    std.debug.print("  changelog\n", .{});
-    std.debug.print("  release\n", .{});
-    std.debug.print("Types: feature, fix, perf, refactor, docs, chore, beta, next, breaking\n", .{});
+const std = @import("std");
+const release_mod = @import("release");
+
+const types = [_][]const u8{ "feat", "fix", "perf", "refactor", "docs", "chore", "breaking", "next", "beta" };
+
+fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]const u8 {
+    const r = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(4 * 1024 * 1024) }) catch return null;
+    defer gpa.free(r.stderr);
+    if (r.term != .exited or r.term.exited != 0) {
+        gpa.free(r.stdout);
+        return null;
+    }
+    return r.stdout;
+}
+
+fn trimmed(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t\r\n");
+}
+
+fn currentVersion(gpa: std.mem.Allocator, io: std.Io) []const u8 {
+    const zon = std.Io.Dir.cwd().readFileAlloc(io, "build.zig.zon", gpa, .limited(64 * 1024)) catch return "";
+    defer gpa.free(zon);
+    const needle = ".version = \"";
+    const at = std.mem.indexOf(u8, zon, needle) orelse return "";
+    const rest = zon[at + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return "";
+    return gpa.dupe(u8, rest[0..end]) catch "";
+}
+
+fn countChangesets(gpa: std.mem.Allocator, io: std.Io) usize {
+    _ = gpa;
+    var dir = std.Io.Dir.cwd().openDir(io, ".churn", .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (it.next(io) catch null) |e| {
+        if (e.kind == .file and std.mem.endsWith(u8, e.name, ".json") and !std.mem.eql(u8, e.name, "config.json")) n += 1;
+    }
+    return n;
+}
+
+fn bumpFromChangesets(gpa: std.mem.Allocator, io: std.Io) release_mod.Bump {
+    var dir = std.Io.Dir.cwd().openDir(io, ".churn", .{ .iterate = true }) catch return .patch;
+    defer dir.close(io);
+    var it = dir.iterate();
+    var bump: release_mod.Bump = .patch;
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".json") or std.mem.eql(u8, e.name, "config.json")) continue;
+        const path = std.fmt.allocPrint(gpa, ".churn/{s}", .{e.name}) catch continue;
+        defer gpa.free(path);
+        const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096)) catch continue;
+        defer gpa.free(data);
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, data, .{}) catch continue;
+        if (parsed != .object) continue;
+        const t = parsed.object.get("type") orelse continue;
+        if (t != .string) continue;
+        if (std.mem.eql(u8, t.string, "breaking") or std.mem.eql(u8, t.string, "next")) {
+            return .major;
+        } else if (std.mem.eql(u8, t.string, "feat")) {
+            if (bump != .major) bump = .minor;
+        } else if (std.mem.eql(u8, t.string, "beta")) {
+            if (bump == .patch) bump = .beta;
+        }
+    }
+    return bump;
+}
+
+fn cmdAdd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+    if (args.len < 3) {
+        std.debug.print("usage: churn add <type> <scope> <description>\n", .{});
+        return 1;
+    }
+    const kind = args[0];
+    var valid = false;
+    for (types) |t| {
+        if (std.mem.eql(u8, t, kind)) valid = true;
+    }
+    if (!valid) {
+        std.debug.print("unknown type '{s}'. Use: feat, fix, perf, refactor, docs, chore, breaking, next, beta\n", .{kind});
+        return 1;
+    }
+    const ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
+    var name_buf: [32]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{x}.json", .{@as(u64, @intCast(ms))}) catch "changeset.json";
+    const path = std.fmt.allocPrint(gpa, ".churn/{s}", .{name}) catch return 1;
+    defer gpa.free(path);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    payload.print(gpa, "{{\"type\":\"{s}\",\"scope\":\"{s}\",\"description\":\"{s}\",\"breaking\":{s}}}\n", .{
+        kind, args[1], args[2], if (std.mem.eql(u8, kind, "breaking")) "true" else "false",
+    }) catch return 1;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = payload.items }) catch {
+        std.debug.print("could not write {s} (is .churn/ present?)\n", .{path});
+        return 1;
+    };
+    std.debug.print("added {s}\n", .{path});
+    return 0;
+}
+
+fn flag(args: []const []const u8, name: []const u8) bool {
+    for (args) |a| if (std.mem.eql(u8, a, name)) return true;
+    return false;
+}
+
+fn cmdVersion(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+    const cur = currentVersion(gpa, io);
+    if (cur.len == 0) {
+        std.debug.print("could not read version from build.zig.zon\n", .{});
+        return 1;
+    }
+    const beta = flag(args, "--beta");
+    const promote = flag(args, "--stable") and !beta;
+    const bump = bumpFromChangesets(gpa, io);
+    const next = release_mod.nextVersion(gpa, cur, bump, promote) catch return 1;
+    defer gpa.free(next);
+    std.debug.print("current: {s}\nchangesets: {d}\nbump: {s}\nnext: {s}\n", .{
+        cur, countChangesets(gpa, io), @tagName(bump), next,
+    });
+    return 0;
+}
+
+fn cmdChangelog(gpa: std.mem.Allocator, io: std.Io) u8 {
+    const result = run(gpa, io, &.{ "python3", "tools/generate_changelog.py" }) orelse {
+        std.debug.print("changelog generation failed\n", .{});
+        return 1;
+    };
+    defer gpa.free(result);
+    std.debug.print("changelog regenerated from git history\n", .{});
+    return 0;
+}
+
+fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+    const push = flag(args, "--push");
+    // 1. Refuse a dirty tree.
+    const status = run(gpa, io, &.{ "git", "status", "--porcelain" }) orelse {
+        std.debug.print("release: could not check git status\n", .{});
+        return 1;
+    };
+    defer gpa.free(status);
+    if (trimmed(status).len > 0) {
+        std.debug.print("release: the working tree is dirty. Commit or stash first.\n", .{});
+        return 1;
+    }
+    // 2. Run the gate.
+    std.debug.print("release: running zig build test ...\n", .{});
+    const test_out = run(gpa, io, &.{ "zig", "build", "test" }) orelse {
+        std.debug.print("release: tests failed\n", .{});
+        return 1;
+    };
+    gpa.free(test_out);
+
+    // 3. Compute + write the version into build.zig.zon.
+    const cur = currentVersion(gpa, io);
+    const bump = bumpFromChangesets(gpa, io);
+    const beta = flag(args, "--beta");
+    const next = release_mod.nextVersion(gpa, cur, bump, !beta) catch return 1;
+    defer gpa.free(next);
+
+    const zon = std.Io.Dir.cwd().readFileAlloc(io, "build.zig.zon", gpa, .limited(64 * 1024)) catch return 1;
+    defer gpa.free(zon);
+    const needle = ".version = \"";
+    const at = std.mem.indexOf(u8, zon, needle) orelse return 1;
+    const rest = zon[at + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return 1;
+    var updated: std.ArrayList(u8) = .empty;
+    defer updated.deinit(gpa);
+    updated.appendSlice(gpa, zon[0 .. at + needle.len]) catch return 1;
+    updated.appendSlice(gpa, next) catch return 1;
+    updated.appendSlice(gpa, rest[end..]) catch return 1;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "build.zig.zon", .data = updated.items }) catch return 1;
+
+    // 4. Regenerate the changelog.
+    if (cmdChangelog(gpa, io) != 0) return 1;
+
+    // 5. Commit + tag (push only when explicit).
+    const tag = std.fmt.allocPrint(gpa, "v{s}", .{next}) catch return 1;
+    defer gpa.free(tag);
+    const commit_msg = std.fmt.allocPrint(gpa, "chore(release): {s}", .{tag}) catch return 1;
+    defer gpa.free(commit_msg);
+    _ = run(gpa, io, &.{ "git", "add", "-A" });
+    _ = run(gpa, io, &.{ "git", "commit", "-m", commit_msg });
+    _ = run(gpa, io, &.{ "git", "tag", tag });
+    std.debug.print("release {s} cut. Tag created locally.\n", .{tag});
+    if (push) {
+        _ = run(gpa, io, &.{ "git", "push", "origin", "main" });
+        _ = run(gpa, io, &.{ "git", "push", "origin", tag });
+        std.debug.print("pushed main and {s} - the release workflow will build all platforms.\n", .{tag});
+    } else {
+        std.debug.print("not pushed. Review, then: git push origin main && git push origin {s}\n", .{tag});
+    }
+    return 0;
+}
+
+pub fn main(init: std.process.Init) !void {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.heap.page_allocator;
+
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    var arg_list: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |a| arg_list.append(gpa, a) catch {};
+    const args = arg_list.items;
+    if (args.len < 2) {
+        std.debug.print("churn - zode release/beta flow\n" ++
+            "  churn add <type> <scope> <description>\n" ++
+            "  churn version [--beta|--stable]\n" ++
+            "  churn changelog\n" ++
+            "  churn release [--beta] [--push]\n", .{});
+        return;
+    }
+
+    const cmd = args[1];
+    const rest = args[2..];
+    const code: u8 = if (std.mem.eql(u8, cmd, "add"))
+        cmdAdd(gpa, io, rest)
+    else if (std.mem.eql(u8, cmd, "version"))
+        cmdVersion(gpa, io, rest)
+    else if (std.mem.eql(u8, cmd, "changelog"))
+        cmdChangelog(gpa, io)
+    else if (std.mem.eql(u8, cmd, "release"))
+        cmdRelease(gpa, io, rest)
+    else blk: {
+        std.debug.print("unknown command '{s}'\n", .{cmd});
+        break :blk 1;
+    };
+    if (code != 0) std.process.exit(code);
 }

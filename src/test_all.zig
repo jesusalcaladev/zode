@@ -81,6 +81,7 @@ pub const prompt = @import("lib/prompt.zig");
 pub const init_mod = @import("lib/init.zig");
 pub const commands = @import("commands.zig");
 pub const selfupdate = @import("lib/selfupdate.zig");
+pub const release = @import("lib/release.zig");
 pub const clipboard = @import("clipboard.zig");
 pub const copytext = @import("lib/copytext.zig");
 pub const permrules = @import("lib/permrules.zig");

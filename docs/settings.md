@@ -313,6 +313,7 @@ never touches them: what the wire drops, the file keeps.
 | `ZODE_BRAVE_KEY` | *(unset)* | Real search index for `web_search` instead of the free chain |
 | `ZODE_NO_SELF_UPDATE` | `0` | Disable the update check |
 | `ZODE_AUTO_UPDATE` | `0` | Install updates without asking |
+| `ZODE_UPDATE_CHANNEL` | `stable` | `beta` follows the newest prerelease; `stable` never installs one |
 | `ZODE_DALTONIZED` | `0` | Colour-blind-safe theme |
 | `ZODE_NERD_ICONS` | `auto` (on) | Nerd Font language icon in code block chips. The label is always shown; set `0`/`off` if your font lacks Nerd Font glyphs. |
 | `ZODE_LSP_TIMEOUT_MS` | built-in | LSP request timeout |

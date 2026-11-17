@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const release_mod = @import("release.zig");
 
 /// Injected at build time (see `build.zig`): `v0.2.0` for a release, `dev` for
 /// a local build.
@@ -138,6 +139,18 @@ pub const Context = struct {
     io: Io,
     alloc: std.mem.Allocator,
     env: ?*const std.process.Environ.Map,
+    /// Stable (default) follows GitHub's `/releases/latest`. Beta lists the
+    /// recent releases and picks the newest prerelease, without ever demoting
+    /// a stable build, because `release.allowed(.stable, …)` rejects betas.
+    channel: release_mod.Channel = .stable,
+
+    pub fn fromEnv(io: Io, alloc: std.mem.Allocator, env: ?*const std.process.Environ.Map) Context {
+        var ch: release_mod.Channel = .stable;
+        if (env) |e| {
+            if (e.get("ZODE_UPDATE_CHANNEL")) |v| ch = release_mod.Channel.parse(v);
+        }
+        return .{ .io = io, .alloc = alloc, .env = env, .channel = ch };
+    }
 };
 
 /// Where the check's answer is remembered.
@@ -220,6 +233,58 @@ fn fetchRelease(ctx: Context) ?Release {
     return .{ .tag = tag.string, .asset_url = assetUrlIn(json, ctx.alloc) };
 }
 
+/// Fetch the newest release for the channel. Stable uses the single
+/// `/releases/latest` call (one request, cheap). Beta lists the ten most
+/// recent releases and picks the newest prerelease; a beta never replaces a
+/// stable build unless the user explicitly opted into the channel.
+fn fetchReleaseForChannel(ctx: Context) ?Release {
+    if (ctx.channel == .stable) return fetchRelease(ctx);
+
+    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = ctx.io };
+    defer client.deinit();
+
+    const uri = std.Uri.parse(api ++ "/releases?per_page=10") catch return null;
+    var req = client.request(.GET, uri, .{ .headers = .{
+        .accept_encoding = .omit,
+        .user_agent = .{ .override = "zode/" ++ current_version },
+    } }) catch return null;
+    defer req.deinit();
+    req.sendBodiless() catch return null;
+
+    var redirect_buf: [8192]u8 = undefined;
+    const response = req.receiveHead(&redirect_buf) catch return null;
+    if (response.head.status != .ok) return null;
+
+    var transfer_buf: [16 * 1024]u8 = undefined;
+    var response_mut = response;
+    const reader = response_mut.reader(&transfer_buf);
+    const body = reader.allocRemaining(ctx.alloc, .limited(4 * 1024 * 1024)) catch return null;
+
+    const json = std.json.parseFromSliceLeaky(std.json.Value, ctx.alloc, body, .{}) catch return null;
+    if (json != .array) return null;
+    var tags_buf: [16][]const u8 = undefined;
+    var n: usize = 0;
+    for (json.array.items) |item| {
+        if (item != .object) continue;
+        const tag = item.object.get("tag_name") orelse continue;
+        if (tag != .string or tag.string.len == 0) continue;
+        if (n < tags_buf.len) {
+            tags_buf[n] = tag.string;
+            n += 1;
+        }
+    }
+    const chosen = release_mod.pickLatest(tags_buf[0..n], ctx.channel) orelse return null;
+    // Find the full release object (for the asset URL) for the chosen tag.
+    for (json.array.items) |item| {
+        if (item != .object) continue;
+        const tag = item.object.get("tag_name") orelse continue;
+        if (tag == .string and std.mem.eql(u8, tag.string, chosen)) {
+            return .{ .tag = chosen, .asset_url = assetUrlIn(item, ctx.alloc) };
+        }
+    }
+    return null;
+}
+
 /// The download URL of this platform's asset inside a release object.
 fn assetUrlIn(json: std.json.Value, alloc: std.mem.Allocator) ?[]const u8 {
     const platform = platformName() orelse return null;
@@ -267,7 +332,7 @@ pub fn check(ctx: Context, force: bool) ?Update {
         }
     }
 
-    const release = fetchRelease(ctx) orelse {
+    const release = fetchReleaseForChannel(ctx) orelse {
         // A network blip must not hide an update we already know about.
         if (cached) |c| {
             if (c.latest.len > 0 and newerThan(c.latest, current_version)) {
@@ -501,4 +566,16 @@ test "the cache path follows XDG_CACHE_HOME, then HOME" {
     try std.testing.expectEqualStrings("/var/cache/x/zode/update.json", cachePath(&env, &buf).?);
 
     try std.testing.expect(cachePath(null, &buf) == null);
+}
+
+test "Context.fromEnv: ZODE_UPDATE_CHANNEL selects beta, default is stable" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    const io: Io = undefined;
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(release_mod.Channel.stable, Context.fromEnv(io, alloc, &env).channel);
+    try env.put("ZODE_UPDATE_CHANNEL", "beta");
+    try std.testing.expectEqual(release_mod.Channel.beta, Context.fromEnv(io, alloc, &env).channel);
+    try env.put("ZODE_UPDATE_CHANNEL", "stable");
+    try std.testing.expectEqual(release_mod.Channel.stable, Context.fromEnv(io, alloc, &env).channel);
 }
