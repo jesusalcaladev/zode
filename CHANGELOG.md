@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-beta.1] - 2026-11-16
+
 ### Features
 
 - complete /resume picker, tiers 1-3 search wiring, and UI/cache fixes (phase29) [`4f9a954d`](https://github.com/jesusalcaladev/zode/commit/4f9a954d)
@@ -56,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - static scratch buffers for discovery Loaders (@memcpy alias) (crash) [`febfaf2e`](https://github.com/jesusalcaladev/zode/commit/febfaf2e)
 - copy subagent text into the message arena (use-after-free) (crash) [`82847c9c`](https://github.com/jesusalcaladev/zode/commit/82847c9c)
 - cut dated changelog section and consume changesets on release (churn) [`a88f7c3f`](https://github.com/jesusalcaladev/zode/commit/a88f7c3f)
-- pass environment to child processes (zig needs HOME) (churn) [`fae9e7ea`](https://github.com/jesusalcaladev/zode/commit/fae9e7ea)
+- pass environment to child processes (zig needs HOME) (churn) [`3b7f8d27`](https://github.com/jesusalcaladev/zode/commit/3b7f8d27)
 
 ### Chores
 

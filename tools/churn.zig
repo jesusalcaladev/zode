@@ -163,7 +163,9 @@ fn cutChangelog(gpa: std.mem.Allocator, io: std.Io, version: []const u8) u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     out.appendSlice(gpa, data[0..at]) catch return 1;
-    out.print(gpa, "## [{s}] - {s}\n\n{s}", .{ version, date, marker }) catch return 1;
+    // Fresh Unreleased goes ABOVE the dated section, so the generated entries
+    // that followed the old marker stay under the version we are cutting.
+    out.print(gpa, "{s}\n\n## [{s}] - {s}", .{ marker, version, date }) catch return 1;
     out.appendSlice(gpa, data[at + marker.len ..]) catch return 1;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "CHANGELOG.md", .data = out.items }) catch {
         std.debug.print("release: cannot write CHANGELOG.md\n", .{});
