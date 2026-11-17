@@ -14,11 +14,10 @@ const release_mod = @import("release");
 
 const types = [_][]const u8{ "feat", "fix", "perf", "refactor", "docs", "chore", "breaking", "next", "beta" };
 
-fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]const u8 {
-    const r = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(4 * 1024 * 1024) }) catch return null;
+fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, argv: []const []const u8) ?[]const u8 {
+    const r = std.process.run(gpa, io, .{ .argv = argv, .environ_map = env, .stdout_limit = .limited(4 * 1024 * 1024) }) catch return null;
     defer gpa.free(r.stderr);
     if (r.term != .exited or r.term.exited != 0) {
-        std.debug.print("RUN FAIL argv[0]={s} term={s} stderr={s}\n", .{ argv[0], @tagName(r.term), r.stderr });
         gpa.free(r.stdout);
         return null;
     }
@@ -131,8 +130,8 @@ fn cmdVersion(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     return 0;
 }
 
-fn cmdChangelog(gpa: std.mem.Allocator, io: std.Io) u8 {
-    const result = run(gpa, io, &.{ "python3", "tools/generate_changelog.py" }) orelse {
+fn cmdChangelog(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map) u8 {
+    const result = run(gpa, io, env, &.{ "python3", "tools/generate_changelog.py" }) orelse {
         std.debug.print("changelog generation failed\n", .{});
         return 1;
     };
@@ -193,10 +192,10 @@ fn consumeChangesets(gpa: std.mem.Allocator, io: std.Io) void {
     for (names.items) |n| dir.deleteFile(io, n) catch {};
 }
 
-fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
+fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, args: []const []const u8) u8 {
     const push = flag(args, "--push");
     // 1. Refuse a dirty tree.
-    const status = run(gpa, io, &.{ "git", "status", "--porcelain" }) orelse {
+    const status = run(gpa, io, env, &.{ "git", "status", "--porcelain" }) orelse {
         std.debug.print("release: could not check git status\n", .{});
         return 1;
     };
@@ -207,7 +206,7 @@ fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
     // 2. Run the gate.
     std.debug.print("release: running zig build test ...\n", .{});
-    const test_out = run(gpa, io, &.{ "zig", "build", "test" }) orelse {
+    const test_out = run(gpa, io, env, &.{ "zig", "build", "test" }) orelse {
         std.debug.print("release: tests failed\n", .{});
         return 1;
     };
@@ -234,7 +233,7 @@ fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "build.zig.zon", .data = updated.items }) catch return 1;
 
     // 4. Regenerate the changelog, then cut the dated version section.
-    if (cmdChangelog(gpa, io) != 0) return 1;
+    if (cmdChangelog(gpa, io, env) != 0) return 1;
     if (cutChangelog(gpa, io, next) != 0) return 1;
     // The bump is spent: consume the changesets so the next release is fresh.
     consumeChangesets(gpa, io);
@@ -244,13 +243,13 @@ fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     defer gpa.free(tag);
     const commit_msg = std.fmt.allocPrint(gpa, "chore(release): {s}", .{tag}) catch return 1;
     defer gpa.free(commit_msg);
-    _ = run(gpa, io, &.{ "git", "add", "-A" });
-    _ = run(gpa, io, &.{ "git", "commit", "-m", commit_msg });
-    _ = run(gpa, io, &.{ "git", "tag", tag });
+    _ = run(gpa, io, env, &.{ "git", "add", "-A" });
+    _ = run(gpa, io, env, &.{ "git", "commit", "-m", commit_msg });
+    _ = run(gpa, io, env, &.{ "git", "tag", tag });
     std.debug.print("release {s} cut. Tag created locally.\n", .{tag});
     if (push) {
-        _ = run(gpa, io, &.{ "git", "push", "origin", "main" });
-        _ = run(gpa, io, &.{ "git", "push", "origin", tag });
+        _ = run(gpa, io, env, &.{ "git", "push", "origin", "main" });
+        _ = run(gpa, io, env, &.{ "git", "push", "origin", tag });
         std.debug.print("pushed main and {s} - the release workflow will build all platforms.\n", .{tag});
     } else {
         std.debug.print("not pushed. Review, then: git push origin main && git push origin {s}\n", .{tag});
@@ -284,9 +283,9 @@ pub fn main(init: std.process.Init) !void {
     else if (std.mem.eql(u8, cmd, "version"))
         cmdVersion(gpa, io, rest)
     else if (std.mem.eql(u8, cmd, "changelog"))
-        cmdChangelog(gpa, io)
+        cmdChangelog(gpa, io, init.environ_map)
     else if (std.mem.eql(u8, cmd, "release"))
-        cmdRelease(gpa, io, rest)
+        cmdRelease(gpa, io, init.environ_map, rest)
     else blk: {
         std.debug.print("unknown command '{s}'\n", .{cmd});
         break :blk 1;

@@ -55,7 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - highlight diff stats and improve diff emphasis (tui) [`f0d49e17`](https://github.com/jesusalcaladev/zode/commit/f0d49e17)
 - static scratch buffers for discovery Loaders (@memcpy alias) (crash) [`febfaf2e`](https://github.com/jesusalcaladev/zode/commit/febfaf2e)
 - copy subagent text into the message arena (use-after-free) (crash) [`82847c9c`](https://github.com/jesusalcaladev/zode/commit/82847c9c)
-- cut dated changelog section and consume changesets on release (churn) [`ffcaf1f5`](https://github.com/jesusalcaladev/zode/commit/ffcaf1f5)
+- cut dated changelog section and consume changesets on release (churn) [`a88f7c3f`](https://github.com/jesusalcaladev/zode/commit/a88f7c3f)
+- pass environment to child processes (zig needs HOME) (churn) [`fae9e7ea`](https://github.com/jesusalcaladev/zode/commit/fae9e7ea)
 
 ### Chores
 
@@ -112,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add running summaries and resume counters/checkpoints (30.3, 30.5) [`431272d8`](https://github.com/jesusalcaladev/zode/commit/431272d8)
 - finish phase 30 restore/tests (summaries, counters, checkpoints) [`2b069e13`](https://github.com/jesusalcaladev/zode/commit/2b069e13)
 - harden auth key storage and add passphrase-protected master key [`7027bc08`](https://github.com/jesusalcaladev/zode/commit/7027bc08)
+- instrument churn run helper [`295d4b68`](https://github.com/jesusalcaladev/zode/commit/295d4b68)
 
 ## [0.2.0] - 2026-11-07
 
