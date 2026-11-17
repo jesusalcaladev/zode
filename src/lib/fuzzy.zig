@@ -30,6 +30,7 @@
 //! it is also the right thing: you cannot half-highlight a glyph.
 
 const std = @import("std");
+const textcase = @import("textcase.zig");
 
 /// How much wider than the query the matched span may be.
 pub const fuzzy_window_slack: usize = 8;
@@ -197,13 +198,7 @@ pub fn rank(
 }
 
 pub fn indexOfIgnoreCase(hay: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > hay.len) return null;
-    var i: usize = 0;
-    while (i + needle.len <= hay.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return i;
-    }
-    return null;
+    return textcase.indexOf(hay, needle);
 }
 
 pub fn startsWithIgnoreCase(hay: []const u8, needle: []const u8) bool {

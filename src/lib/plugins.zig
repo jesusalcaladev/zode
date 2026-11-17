@@ -9,6 +9,7 @@
 //! marketplace safe to install and cheap to load. Project shadows user by name.
 
 const std = @import("std");
+const textcase = @import("textcase.zig");
 
 pub const Manifest = struct {
     name: []const u8 = "",
@@ -87,20 +88,7 @@ pub fn search(gpa: std.mem.Allocator, query: []const u8) ![]usize {
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var match = true;
-        for (needle, 0..) |c, j| {
-            if (std.ascii.toLower(haystack[i + j]) != c) {
-                match = false;
-                break;
-            }
-        }
-        if (match) return true;
-    }
-    return false;
+    return textcase.contains(haystack, needle);
 }
 
 pub fn validName(name: []const u8) bool {

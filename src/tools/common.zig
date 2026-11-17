@@ -44,37 +44,35 @@ pub var max_tool_output_hard_cap: usize = 10 * 1024 * 1024;
 /// Read `ZODE_MAX_TOOL_OUTPUT` from the environment and install it as the
 /// per-tool budget. Safe to call once at startup; calling it again overwrites
 /// the previous value (which is what tests do).
-pub fn initMaxToolOutput(env: ?*const std.process.Environ.Map) void {
-    const raw = if (env) |e| e.get("ZODE_MAX_TOOL_OUTPUT") else null;
-    const val = raw orelse return;
-    if (val.len == 0) return;
-
-    // Parse an optional numeric suffix: 5M, 1G, 512K, 1024, etc.
+/// Parse a byte size with an optional K/M/G suffix, clamped to `hard_cap`.
+/// ONE implementation for the three `ZODE_MAX_TOOL_OUTPUT` readers (tool
+/// budget, diff capture, grep capture) — they used to be byte-for-byte copies.
+/// Overflow in `n * mult` is refused rather than wrapping into a small cap.
+pub fn parseSize(raw: []const u8, hard_cap: usize) ?usize {
+    const val = std.mem.trim(u8, raw, " \t");
+    if (val.len == 0) return null;
     var digits: usize = 0;
     while (digits < val.len and std.ascii.isDigit(val[digits])) : (digits += 1) {}
-
-    const num_str = val[0..digits];
-    const suffix = std.mem.trim(u8, val[digits..], " ");
-
-    const n = std.fmt.parseInt(usize, num_str, 10) catch return;
-
+    if (digits == 0) return null;
+    const n = std.fmt.parseInt(usize, val[0..digits], 10) catch return null;
+    const suffix = std.mem.trim(u8, val[digits..], " \t");
     var mult: usize = 1;
     if (suffix.len > 0) {
-        const s = std.ascii.toLower(suffix[0]);
-        if (s == 'k') {
-            mult = 1024;
-        } else if (s == 'm') {
-            mult = 1024 * 1024;
-        } else if (s == 'g') {
-            mult = 1024 * 1024 * 1024;
-        } else {
-            return; // unknown suffix: ignore, keep the default
-        }
+        mult = switch (std.ascii.toLower(suffix[0])) {
+            'k' => 1024,
+            'm' => 1024 * 1024,
+            'g' => 1024 * 1024 * 1024,
+            else => return null,
+        };
     }
+    if (n > hard_cap / mult) return hard_cap;
+    const wanted = n * mult;
+    return @min(wanted, hard_cap);
+}
 
-    var wanted = n * mult;
-    if (wanted > max_tool_output_hard_cap) wanted = max_tool_output_hard_cap;
-    max_tool_output = wanted;
+pub fn initMaxToolOutput(env: ?*const std.process.Environ.Map) void {
+    const val = (if (env) |e| e.get("ZODE_MAX_TOOL_OUTPUT") else null) orelse return;
+    max_tool_output = parseSize(val, max_tool_output_hard_cap) orelse return;
 }
 
 pub const Walker = struct {
@@ -279,4 +277,14 @@ pub fn getStrList(obj: std.json.ObjectMap, key: []const u8) []const []const u8 {
         if (e == .string) out.append(std.heap.page_allocator, e.string) catch break;
     }
     return out.items;
+}
+
+test "parseSize: K/M/G suffixes, clamping and overflow" {
+    try std.testing.expectEqual(@as(usize, 512), parseSize("512", 10000).?);
+    try std.testing.expectEqual(@as(usize, 2048), parseSize("2k", 10000).?);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), parseSize("2M", 100 * 1024 * 1024).?);
+    try std.testing.expectEqual(@as(usize, 10000), parseSize("99G", 10000).?);
+    try std.testing.expect(parseSize("99999999999999999999", 10000) == null);
+    try std.testing.expect(parseSize("junk", 10000) == null);
+    try std.testing.expect(parseSize("", 10000) == null);
 }

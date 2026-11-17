@@ -1,5 +1,6 @@
 //! Minimal GitHub REST API client.
 const std = @import("std");
+const configdir = @import("../configdir.zig");
 const types = @import("types.zig");
 
 pub const default_api_base = "https://api.github.com";
@@ -21,10 +22,8 @@ pub const Auth = struct {
 };
 
 fn authJsonPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
-    const m = env orelse return null;
-    const home = m.get("HOME") orelse return null;
-    if (home.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode/auth.json", .{home}) catch null;
+    const dir = configdir.dir(env, buf) orelse return null;
+    return std.fmt.bufPrint(buf[dir.len..], "{s}/auth.json", .{dir}) catch null;
 }
 
 pub fn resolveToken(arena: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, host: []const u8) Auth {

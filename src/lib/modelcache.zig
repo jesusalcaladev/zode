@@ -32,6 +32,8 @@
 /// in the background — the worker for that already existed, and all it lacked was
 /// something to paint immediately.
 const std = @import("std");
+const configdir = @import("configdir.zig");
+const json_escape = @import("json_escape.zig");
 const models = @import("models.zig");
 
 /// Bumped by hand when a stored field of `Model` changes meaning. A mismatch is a
@@ -72,14 +74,9 @@ pub const Entry = struct {
 /// The file for one provider. Under `~/.config/zode` and not in the project: this is
 /// machine state, like `auth.json`, and it must not end up in somebody's repository.
 pub fn cachePath(env: ?*const std.process.Environ.Map, buf: []u8, provider_id: []const u8) ?[]const u8 {
-    const m = env orelse return null;
-    const home = m.get("HOME") orelse return null;
-    if (home.len == 0) return null;
     var id_buf: [64]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode/models/{s}.json", .{
-        home,
-        sanitize(provider_id, &id_buf),
-    }) catch null;
+    const dir = configdir.dir(env, buf) orelse return null;
+    return std.fmt.bufPrint(buf[dir.len..], "{s}/models/{s}.json", .{ dir, sanitize(provider_id, &id_buf) }) catch null;
 }
 
 /// The provider id goes into a FILENAME, so it cannot be anything that escapes the
@@ -348,28 +345,7 @@ pub fn describe(arena: std.mem.Allocator, d: Diff) []const u8 {
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    // An if-chain and not a switch: `\n`, `\r` and `\t` are IN `0x00...0x1f`, and a
-    // switch rejects overlapping cases however they are ordered, so the range arm can
-    // never coexist with the three named ones.
-    for (s) |c| {
-        if (c == '"') {
-            try w.writeAll("\\\"");
-        } else if (c == '\\') {
-            try w.writeAll("\\\\");
-        } else if (c == '\n') {
-            try w.writeAll("\\n");
-        } else if (c == '\r') {
-            try w.writeAll("\\r");
-        } else if (c == '\t') {
-            try w.writeAll("\\t");
-        } else if (c < 0x20) {
-            try w.print("\\u{x:0>4}", .{c});
-        } else {
-            try w.writeByte(c);
-        }
-    }
-    try w.writeByte('"');
+    try json_escape.writeString(w, s);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────────

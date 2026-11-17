@@ -1,4 +1,5 @@
 const std = @import("std");
+const textcase = @import("../textcase.zig");
 const sessionindex = @import("index.zig");
 const fuzzy = @import("../fuzzy.zig");
 const zjsonl = @import("../zjsonl.zig");
@@ -14,17 +15,7 @@ pub const SessionHit = struct {
 };
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var i: usize = 0;
-    while (i <= haystack.len - needle.len) : (i += 1) {
-        var j: usize = 0;
-        while (j < needle.len) : (j += 1) {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
-            if (j + 1 == needle.len) return i;
-        }
-    }
-    return null;
+    return textcase.indexOf(haystack, needle);
 }
 
 fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {

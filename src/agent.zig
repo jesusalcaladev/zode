@@ -144,7 +144,6 @@ const gate_mod = @import("lib/gate.zig");
 const turn_types = @import("agent/turn_types.zig");
 const tool_exec = @import("agent/tool_exec.zig");
 const runtime_state = @import("agent/runtime_state.zig");
-const cheap_router_state = @import("agent/cheap_router_state.zig");
 
 // The `/help` tables live with the commands they document. Re-exported because
 // the palette builds its items from `commands`, and that is not a commands

@@ -368,33 +368,9 @@ pub var grep_capture: usize = 1 * 1024 * 1024;
 /// Read `ZODE_MAX_TOOL_OUTPUT` and install it as `grep_capture`. Safe to call
 /// once at startup.
 pub fn initGrepCapture(env: ?*const std.process.Environ.Map) void {
-    const raw = if (env) |e| e.get("ZODE_MAX_TOOL_OUTPUT") else null;
-    const val = raw orelse return;
-    if (val.len == 0) return;
-
-    var digits: usize = 0;
-    while (digits < val.len and std.ascii.isDigit(val[digits])) : (digits += 1) {}
-
-    const num_str = val[0..digits];
-    const suffix = std.mem.trim(u8, val[digits..], " ");
-
-    const n = std.fmt.parseInt(usize, num_str, 10) catch return;
-
-    var mult: usize = 1;
-    if (suffix.len > 0) {
-        const s = std.ascii.toLower(suffix[0]);
-        if (s == 'k') mult = 1024
-        else if (s == 'm') mult = 1024 * 1024
-        else if (s == 'g') mult = 1024 * 1024 * 1024
-        else return;
-    }
-
-    var wanted = n * mult;
-    const hard_cap = 10 * 1024 * 1024;
-    if (wanted > hard_cap) wanted = hard_cap;
-    grep_capture = wanted;
+    const val = (if (env) |e| e.get("ZODE_MAX_TOOL_OUTPUT") else null) orelse return;
+    grep_capture = common.parseSize(val, 10 * 1024 * 1024) orelse return;
 }
-
 /// The directories that are never searched, as ripgrep globs.
 
 /// Read `ZODE_MAX_TOOL_OUTPUT` and install it as `grep_capture`. Safe to call

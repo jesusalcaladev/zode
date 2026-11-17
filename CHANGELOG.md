@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 - complete the ecosystem - plugins, remote sessions, keybindings (phase13) [`acd62990`](https://github.com/jesusalcaladev/zode/commit/acd62990)
-- Phase 41 - terse output style and lossless prompt trims (tokens) [`54014e1e`](https://github.com/jesusalcaladev/zode/commit/54014e1e)
+- Phase 41 - terse output style and lossless prompt trims (tokens) [`f1a20944`](https://github.com/jesusalcaladev/zode/commit/f1a20944)
 
 ### Bug Fixes
 
@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - bring the board up to date and close the quality gaps (tasks) [`2f3254d5`](https://github.com/jesusalcaladev/zode/commit/2f3254d5)
 - new improvement backlog from a six-track code audit (tasks) [`a674eb1b`](https://github.com/jesusalcaladev/zode/commit/a674eb1b)
+
+### Refactors
+
+- deduplicate core helpers (-722 net lines) (phase42) [`a5addc0a`](https://github.com/jesusalcaladev/zode/commit/a5addc0a)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

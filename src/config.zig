@@ -1,5 +1,7 @@
 const std = @import("std");
+const json_escape = @import("lib/json_escape.zig");
 const builtin = @import("builtin");
+const configdir = @import("lib/configdir.zig");
 const providers = @import("lib/providers.zig");
 const chat = @import("chat.zig");
 const servers = @import("lsp/servers.zig");
@@ -113,10 +115,8 @@ pub fn authPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
 }
 
 fn configPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
-    const m = env orelse return null;
-    const home = m.get("HOME") orelse return null;
-    if (home.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode/config.json", .{home}) catch null;
+    const dir = configdir.dir(env, buf) orelse return null;
+    return std.fmt.bufPrint(buf[dir.len..], "{s}/config.json", .{dir}) catch null;
 }
 
 /// Loads `~/.config/zode/config.json`. Best-effort: if it is missing or corrupt
@@ -842,10 +842,7 @@ pub fn patchKeybindings(
 /// integration") needs the same directory as reading the config, and
 /// duplicating `configPath`'s logic would just invite them to drift apart.
 pub fn configDir(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
-    const m = env orelse return null;
-    const home = m.get("HOME") orelse return null;
-    if (home.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode", .{home}) catch null;
+    return configdir.dir(env, buf);
 }
 
 /// Writes a file with 0600 permissions.
@@ -997,25 +994,8 @@ pub fn writeStringArray(out: *std.Io.Writer, gpa: std.mem.Allocator, items: []co
 
 /// JSON string with minimal escaping (quote, backslash, control, UTF-8 as-is).
 pub fn writeJsonString(out: *std.Io.Writer, gpa: std.mem.Allocator, s: []const u8) !void {
-    try out.writeAll("\"");
-    var start: usize = 0;
-    for (s, 0..) |c, i| {
-        const esc: ?[]const u8 = switch (c) {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            else => null,
-        };
-        const e = esc orelse continue;
-        if (i > start) try out.writeAll(s[start..i]);
-        try out.writeAll(e);
-        start = i + 1;
-    }
-    if (start < s.len) try out.writeAll(s[start..]);
-    _ = gpa;
-    try out.writeAll("\"");
+    _ = gpa; // kept for API compatibility with older callers
+    try json_escape.writeString(out, s);
 }
 
 test "writeFileSecure: creates the directory and writes with 0600" {

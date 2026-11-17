@@ -15,6 +15,7 @@
 //! lives in `src/agent/discovery.zig`.
 
 const std = @import("std");
+const frontmatter = @import("frontmatter.zig");
 const subagent = @import("subagent.zig");
 
 /// A definition name is a stable routing key (used by `task(definition=…)` and
@@ -73,46 +74,24 @@ pub const user_subdir = "zode/agents";
 /// The parser is hand-written and DELIBERATELY narrow: `key: value` lines, one
 /// `---`-fenced block at the top, `#` comments inside it. It does not do YAML.
 pub fn splitFrontmatter(text: []const u8) ?struct { meta: Meta, body: []const u8 } {
-    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "---")) return null;
-    const after = trimmed[3..];
-    if (after.len > 0 and after[0] != '\n' and after[0] != '\r') return null;
-
-    var rest = after;
-    if (std.mem.startsWith(u8, rest, "\r\n")) rest = rest[2..] else if (rest.len > 0 and rest[0] == '\n') rest = rest[1..];
-
+    const parsed = frontmatter.split(text) orelse return null;
+    if (!parsed.closed) return null;
     var meta = Meta{};
-    var i: usize = 0;
-    while (i < rest.len) {
-        const nl = std.mem.indexOfScalar(u8, rest[i..], '\n') orelse rest.len - i;
-        const line = rest[i .. i + nl];
-        i = @min(i + nl + 1, rest.len);
-        const t = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.eql(u8, t, "---")) {
-            return .{ .meta = meta, .body = std.mem.trimStart(u8, rest[i..], " \t\r\n") };
-        }
-        if (t.len == 0 or t[0] == '#') continue;
-        const colon = std.mem.indexOfScalar(u8, t, ':') orelse continue;
-        const key = std.mem.trim(u8, t[0..colon], " \t");
-        var val = std.mem.trim(u8, t[colon + 1 ..], " \t");
-        if (val.len >= 2 and ((val[0] == '"' and val[val.len - 1] == '"') or
-            (val[0] == '\'' and val[val.len - 1] == '\'')))
-        {
-            val = val[1 .. val.len - 1];
-        }
-        if (std.mem.eql(u8, key, "name")) {
-            meta.name = val;
-        } else if (std.mem.eql(u8, key, "description")) {
-            meta.description = val;
-        } else if (std.mem.eql(u8, key, "tools")) {
-            meta.tools = val;
-        } else if (std.mem.eql(u8, key, "model")) {
-            meta.model = val;
-        } else if (std.mem.eql(u8, key, "effort")) {
-            meta.effort = val;
+    var it = parsed.iterator;
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key, "name")) {
+            meta.name = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "description")) {
+            meta.description = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "tools")) {
+            meta.tools = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "model")) {
+            meta.model = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "effort")) {
+            meta.effort = kv.value;
         }
     }
-    return null; // unterminated frontmatter
+    return .{ .meta = meta, .body = parsed.body };
 }
 
 /// Parses the comma-separated `tools` field into an array of tool names.

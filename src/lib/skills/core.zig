@@ -46,6 +46,7 @@
 //! anyone's default).
 
 const std = @import("std");
+const frontmatter = @import("../frontmatter.zig");
 const textcap = @import("../textcap.zig");
 const repeat = @import("../repeat.zig");
 
@@ -162,70 +163,32 @@ pub const Meta = struct {
 /// A real YAML parser is 600 lines and a whole set of ways to be surprised by a
 /// tab, and the only keys that matter here are the known strings.
 pub fn splitFrontmatter(text: []const u8) ?struct { meta: Meta, body: []const u8 } {
-    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "---")) return null;
-    const after = trimmed[3..];
-    // The fence has to be at the start of a line: a `---` inside prose is a
-    // horizontal rule, not a frontmatter opener.
-    if (after.len > 0 and after[0] != '\n' and after[0] != '\r') return null;
-
-    var rest = after;
-    if (std.mem.startsWith(u8, rest, "\r\n")) rest = rest[2..] else if (rest.len > 0 and rest[0] == '\n') rest = rest[1..];
-
+    const parsed = frontmatter.split(text) orelse return null;
+    if (!parsed.closed) return null;
     var meta = Meta{};
-    var i: usize = 0;
-    while (i < rest.len) {
-        const nl = std.mem.indexOfScalar(u8, rest[i..], '\n') orelse rest.len - i;
-        const line = rest[i .. i + nl];
-        // `+ 1` for the newline, and it has to be CLAMPED: when the closing `---`
-        // is the last line and the file has no trailing newline, `nl` is 0 and
-        // `i` walks one past the end. `rest[i..]` with `i > len` is a panic, not
-        // an empty slice — and a `SKILL.md` that ends right at the fence is
-        // completely normal to write. (Found by the fixture tests, which is what
-        // they are for: the pure tests all had a trailing newline.)
-        i = @min(i + nl + 1, rest.len);
-        const t = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.eql(u8, t, "---")) {
-            return .{ .meta = meta, .body = std.mem.trimStart(u8, rest[i..], " \t\r\n") };
+    var it = parsed.iterator;
+    while (it.next()) |kv| {
+        if (std.mem.eql(u8, kv.key, "name")) {
+            meta.name = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "description")) {
+            meta.description = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "when_to_use")) {
+            meta.when_to_use = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "argument_hint")) {
+            meta.argument_hint = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "allowed_tools")) {
+            meta.allowed_tools = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "model")) {
+            meta.model = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "effort")) {
+            meta.effort = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "paths")) {
+            meta.paths = kv.value;
+        } else if (std.mem.eql(u8, kv.key, "context")) {
+            meta.context = if (std.mem.eql(u8, kv.value, "fork")) .fork else .inline_mode;
         }
-        if (t.len == 0 or t[0] == '#') continue;
-        const colon = std.mem.indexOfScalar(u8, t, ':') orelse continue;
-        const key = std.mem.trim(u8, t[0..colon], " \t");
-        var val = std.mem.trim(u8, t[colon + 1 ..], " \t");
-        // Quotes are optional and stripped when present: people write both and
-        // the value has to come out the same.
-        if (val.len >= 2 and ((val[0] == '"' and val[val.len - 1] == '"') or
-            (val[0] == '\'' and val[val.len - 1] == '\'')))
-        {
-            val = val[1 .. val.len - 1];
-        }
-        // Known frontmatter keys
-        if (std.mem.eql(u8, key, "name")) {
-            meta.name = val;
-        } else if (std.mem.eql(u8, key, "description")) {
-            meta.description = val;
-        } else if (std.mem.eql(u8, key, "when_to_use")) {
-            meta.when_to_use = val;
-        } else if (std.mem.eql(u8, key, "argument_hint")) {
-            meta.argument_hint = val;
-        } else if (std.mem.eql(u8, key, "allowed_tools")) {
-            meta.allowed_tools = val;
-        } else if (std.mem.eql(u8, key, "model")) {
-            meta.model = val;
-        } else if (std.mem.eql(u8, key, "effort")) {
-            meta.effort = val;
-        } else if (std.mem.eql(u8, key, "paths")) {
-            meta.paths = val;
-        } else if (std.mem.eql(u8, key, "context")) {
-            if (std.mem.eql(u8, val, "fork")) {
-                meta.context = .fork;
-            } else {
-                meta.context = .inline_mode;
-            }
-        }
-        // Unknown keys are silently ignored — the parser stays narrow
     }
-    return null; // unterminated frontmatter
+    return .{ .meta = meta, .body = parsed.body };
 }
 
 /// A valid name: lowercase letters, digits, `-`, `_`. It ends up in a tool call

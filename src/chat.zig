@@ -1,4 +1,5 @@
 const redact_mod = @import("lib/redact.zig");
+const json_escape = @import("lib/json_escape.zig");
 const providers = @import("lib/providers.zig");
 const session_mod = @import("session.zig");
 const std = @import("std");
@@ -1884,22 +1885,7 @@ fn writeJsonValue(w: *std.Io.Writer, v: std.json.Value) !void {
 }
 
 fn jsonEscape(w: *std.Io.Writer, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try w.print("\\u{x:0>4}", .{c});
-                } else {
-                    try w.writeByte(c);
-                }
-            },
-        }
-    }
+    try json_escape.escape(w, s);
 }
 
 // ── hermetic tests ───────────────────────────────────────────

@@ -46,6 +46,7 @@
 //! write. A list that quietly came back empty is how a model re-does work it had
 //! already tracked.
 const std = @import("std");
+const json_escape = @import("json_escape.zig");
 
 pub const Status = enum {
     pending,
@@ -636,24 +637,7 @@ pub fn pathForSession(buf: []u8, session_path: []const u8) ![]const u8 {
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeAll("\"");
-    var start: usize = 0;
-    for (s, 0..) |c, i| {
-        const esc: ?[]const u8 = switch (c) {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            else => null,
-        };
-        const e = esc orelse continue;
-        if (i > start) try w.writeAll(s[start..i]);
-        try w.writeAll(e);
-        start = i + 1;
-    }
-    if (start < s.len) try w.writeAll(s[start..]);
-    try w.writeAll("\"");
+    try json_escape.writeString(w, s);
 }
 
 // ── tests ────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@
 //! the store never accepts model-hallucinated durable facts silently).
 
 const std = @import("std");
+const textcase = @import("../textcase.zig");
 const skills = @import("../skills.zig");
 const textcap = @import("../textcap.zig");
 
@@ -112,20 +113,7 @@ pub fn scoreMatch(e: Entry, query: []const u8) usize {
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var ok = true;
-        for (needle, 0..) |nc, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) return true;
-    }
-    return false;
+    return textcase.contains(haystack, needle);
 }
 
 pub const ConsultResult = struct {

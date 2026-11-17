@@ -1,4 +1,5 @@
 const std = @import("std");
+const textcase = @import("lib/textcase.zig");
 const builtin = @import("builtin");
 
 const vaxis = @import("vaxis");
@@ -1280,19 +1281,7 @@ fn buildLinesBase(
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    for (0..haystack.len - needle.len + 1) |i| {
-        var ok = true;
-        for (needle, 0..) |nc, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) return true;
-    }
-    return false;
+    return textcase.contains(haystack, needle);
 }
 
 /// Compact terminal workspace: scrollable history, contextual work indicators,

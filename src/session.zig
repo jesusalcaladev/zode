@@ -29,6 +29,7 @@ pub fn setSessionsDir(dir: []const u8) void {
 }
 
 const std = @import("std");
+const json_escape = @import("lib/json_escape.zig");
 const sessionindex = @import("lib/sessionindex.zig");
 
 /// The first bytes of the goal note, so it can be found again and replaced.
@@ -1083,22 +1084,7 @@ pub fn freeEntries(arena: std.mem.Allocator, entries: []Entry) void {
 }
 
 fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            else => {
-                if (c < 0x20) {
-                    try w.print("\\u{x:0>4}", .{c}); // JSON-safe for compressed binary
-                } else {
-                    try w.writeByte(c);
-                }
-            },
-        }
-    }
+    try json_escape.escape(w, s);
 }
 
 fn sessionPath(allocator: std.mem.Allocator, id: *const [8]u8) ![]const u8 {

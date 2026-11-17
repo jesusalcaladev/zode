@@ -16,6 +16,7 @@
 //! would be the single most likely way to get this wrong, so it is called out.
 
 const std = @import("std");
+const json_escape = @import("../lib/json_escape.zig");
 
 /// The protocol revision zode asks for.
 ///
@@ -92,24 +93,7 @@ pub const Message = struct {
 /// Bytes >= 0x80 pass through: the wire is UTF-8 and re-encoding them as
 /// `\u` escapes would be correct but unreadable in a log.
 pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        0x08 => try w.writeAll("\\b"),
-        0x0c => try w.writeAll("\\f"),
-        else => {
-            if (c < 0x20) {
-                try w.print("\\u{x:0>4}", .{c});
-            } else {
-                try w.writeByte(c);
-            }
-        },
-    };
-    try w.writeByte('"');
+    try json_escape.writeString(w, s);
 }
 
 /// A JSON-RPC request, as one line (the newline included).

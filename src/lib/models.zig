@@ -1,4 +1,5 @@
 const std = @import("std");
+const textcase = @import("textcase.zig");
 const http_client = @import("http_client.zig");
 const providers = @import("providers.zig");
 const redact_mod = @import("redact.zig");
@@ -258,19 +259,7 @@ pub fn isConversational(id: []const u8) bool {
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var ok = true;
-        for (needle, 0..) |nc, j| {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
-                ok = false;
-                break;
-            }
-        }
-        if (ok) return true;
-    }
-    return false;
+    return textcase.contains(haystack, needle);
 }
 
 /// Does the published price say it is free?

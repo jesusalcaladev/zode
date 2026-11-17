@@ -11,6 +11,7 @@
 //! machine in `client.zig`; this file is imported by both and by the formatter.
 
 const std = @import("std");
+const json_escape = @import("../lib/json_escape.zig");
 
 /// The blank line that closes the header block, as the spec mandates it.
 pub const header_end = "\r\n\r\n";
@@ -55,24 +56,7 @@ pub fn frame(arena: std.mem.Allocator, body: []const u8) ![]u8 {
 /// for. Bytes >= 0x80 pass through: the wire is UTF-8 and re-encoding them as
 /// `\u` escapes would be correct but unreadable in a log.
 pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        0x08 => try w.writeAll("\\b"),
-        0x0c => try w.writeAll("\\f"),
-        else => {
-            if (c < 0x20) {
-                try w.print("\\u{x:0>4}", .{c});
-            } else {
-                try w.writeByte(c);
-            }
-        },
-    };
-    try w.writeByte('"');
+    try json_escape.writeString(w, s);
 }
 
 /// A local path as a `file://` URI, percent-encoding everything outside the

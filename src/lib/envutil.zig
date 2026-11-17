@@ -1,20 +1,8 @@
 const std = @import("std");
 
-pub fn get(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
+fn get(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = env orelse return null;
     return m.get(key);
-}
-
-/// Env var as boolean from an explicit map (case-insensitive falsey values).
-pub fn truthyIn(env: ?*const std.process.Environ.Map, key: []const u8, default: bool) bool {
-    const raw = get(env, key) orelse return default;
-    if (raw.len == 0) return default;
-    if (std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no") or std.ascii.eqlIgnoreCase(raw, "off"))
-    {
-        return false;
-    }
-    return true;
 }
 
 pub fn iterationLimitFor(
@@ -35,17 +23,6 @@ pub fn iterationLimitFor(
     return best;
 }
 
-test "truthyIn" {
-    var map = std.process.Environ.Map.init(std.testing.allocator);
-    defer map.deinit();
-    try std.testing.expect(truthyIn(&map, "X", true));
-    try map.put("X", "0");
-    try std.testing.expect(!truthyIn(&map, "X", true));
-    try map.put("X", "OFF");
-    try std.testing.expect(!truthyIn(&map, "X", true));
-    try map.put("X", "1");
-    try std.testing.expect(truthyIn(&map, "X", false));
-}
 
 
 /// Reads `KEY=VALUE` pairs from `.env` into `map`.

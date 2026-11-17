@@ -4,6 +4,7 @@
 //! no embedded newlines in messages. This module is pure/testable where possible.
 
 const std = @import("std");
+const json_escape = @import("../lib/json_escape.zig");
 
 pub const protocol_version: i64 = 1;
 
@@ -103,24 +104,7 @@ pub fn parseLine(arena: std.mem.Allocator, line: []const u8) !Incoming {
 }
 
 pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        0x08 => try w.writeAll("\\b"),
-        0x0c => try w.writeAll("\\f"),
-        else => {
-            if (c < 0x20) {
-                try w.print("\\u{x:0>4}", .{c});
-            } else {
-                try w.writeByte(c);
-            }
-        },
-    };
-    try w.writeByte('"');
+    try json_escape.writeString(w, s);
 }
 
 /// Writes a JSON-RPC response with raw JSON `result_json` (already serialized).
