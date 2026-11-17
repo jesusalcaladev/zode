@@ -20,6 +20,7 @@ const verifycounts = @import("lib/verifycounts.zig");
 const configmenu = @import("lib/configmenu.zig");
 const schedule_mod = @import("lib/schedule.zig");
 const tick_mod = @import("lib/tick.zig");
+const diag_mod = @import("lib/diag.zig");
 const palette = @import("palette.zig");
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
@@ -1903,6 +1904,10 @@ pub const Model = struct {
     tick_state: tick_mod.State = .{},
     /// Bench counters for `/bench`.
     bench: bench_mod.Stats = .{},
+    /// Phase 37: recent /proc memory samples for leak detection. Fixed ring,
+    /// no allocator, so the UI thread can read while a worker pushes.
+    diag_monitor: diag_mod.Monitor = .{},
+    diag_seq: usize = 0,
 
     /// Spinner (counters, no alloc).
     spinner_frame: usize = 0,
@@ -9408,6 +9413,15 @@ fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.E
             // app that goes dead with no explanation.
             self.tick_armed = false;
             self.motion_tick_count +%= 1;
+            // Phase 37: sample RSS about once per second (the tick fires every
+            // ~120 ms). The ring is fixed and allocation-free, so this is safe
+            // from the UI thread and gives /diag a growth history.
+            if (self.motion_tick_count % 8 == 0 and self.io_ready) {
+                self.diag_seq +%= 1;
+                var s = diag_mod.sample(self.io);
+                s.seq = self.diag_seq;
+                self.diag_monitor.push(s);
+            }
             // Phase 19: a parked turn may need a scheduled prompt or a periodic
             // check-in even when no model iteration is running. The same door
             // (appendHarnessPrompt) is used; both are suppressed while busy.

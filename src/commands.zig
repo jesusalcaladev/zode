@@ -31,6 +31,7 @@ const subagent_mod = @import("lib/subagent.zig");
 const configmenu = @import("lib/configmenu.zig");
 const agentdefs = @import("lib/agentdefs.zig");
 const worktree_mod = @import("lib/worktree.zig");
+const diag_mod = @import("lib/diag.zig");
 const common = @import("tools/common.zig");
 const mcp_manager = @import("mcp/manager.zig");
 const sandbox_mod = @import("lib/sandbox.zig");
@@ -1210,6 +1211,60 @@ pub fn cmdDoctor(m: *tui.Model) void {
         agent.session_elided,
     }) catch return);
     agent.pushInfoOwned(m, "");
+}
+
+/// Phase 37: `/diag` — internal, millimetre-level runtime control. Reports
+/// live memory from /proc plus the growth trend from the sample ring, worker
+/// count, and the last crash-log entry. Read-only: it never changes state.
+pub fn cmdDiag(m: *tui.Model) void {
+    const gpa = m.allocator;
+    var cur = diag_mod.sample(m.io);
+    if (m.diag_monitor.last()) |s| {
+        // Prefer the most recent sample taken on the tick; if none yet, take
+        // one now so the first /diag is still useful.
+        cur = s;
+    } else if (m.io_ready) {
+        m.diag_seq +%= 1;
+        cur.seq = m.diag_seq;
+        m.diag_monitor.push(cur);
+    }
+    const growth = m.diag_monitor.growthKb();
+    const line = diag_mod.formatLine(gpa, cur, growth) catch return;
+    defer gpa.free(line);
+
+    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "diag  ·  zode {s}  ·  pid {d}", .{
+        build_options.version,
+        if (m.io_ready) std.os.linux.getpid() else 0,
+    }) catch return);
+    agent.pushInfoFmt(m, "  memory: {s}", .{line});
+    agent.pushInfoFmt(m, "  samples: {d}/{d}  ·  sustained growth (5): {s}", .{
+        m.diag_monitor.len,
+        diag_mod.max_samples,
+        if (m.diag_monitor.growingFor(5)) "YES (possible leak)" else "no",
+    });
+    agent.pushInfoFmt(m, "  workers in flight: {d}  ·  subagents {d}/{d}  ·  bg jobs {d}", .{
+        m.workers.load(.seq_cst),
+        m.task_batch_completed,
+        m.task_batch_total,
+        m.bg.liveCount(),
+    });
+    agent.pushInfoFmt(m, "  uptime: {d:.1}s  ·  turns {d}  ·  tool calls {d}", .{
+        @as(f64, @floatFromInt(m.motion_tick_count)) * 0.12,
+        m.bench.turns,
+        m.bench.tool_calls,
+    });
+    // The crash log is the durable record; show its last line if present.
+    if (std.Io.Dir.cwd().readFileAlloc(m.io, "/tmp/zode-crash.log", gpa, .limited(64 * 1024))) |data| {
+        defer gpa.free(data);
+        var last: []const u8 = "";
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |ln| {
+            if (ln.len > 0) last = ln;
+        }
+        agent.pushInfoFmt(m, "  last crash: {s}", .{if (last.len > 0) last else "(empty log)"});
+    } else |_| {}
+    agent.pushInfo(m, "  tip: ZODE_DBG_BOOT=1 for startup timings · ZODE_EXIT_TRACE=1 for exit state · zig build debug for symbolized crash traces");
+    agent.pushInfo(m, "");
 }
 
 pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
@@ -2439,6 +2494,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/tasks", .desc = "task panel with blockers and priorities (task graph)", .palette_visible = true },
     .{ .key = "/view", .desc = "workbench view mode (presentation only): normal|focus|flow|review", .key_hint = "normal|focus|flow|review", .palette_visible = true },
     .{ .key = "/doctor", .desc = "diagnosis: model, effort, style, permissions, key, compaction, sessions" },
+    .{ .key = "/diag", .desc = "internal: live memory (RSS/size/peak), growth trend, workers, crash log" },
     .{ .key = "/config", .desc = "Settings screen: internal config (style, context, cache, permissions, ...)" },
     .{ .key = "/status", .desc = "session status: model, effort, perms, compaction, context gauge", .key_hint = "context gauge" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },

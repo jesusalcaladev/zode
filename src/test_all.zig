@@ -64,6 +64,7 @@ pub const schedule = @import("lib/schedule.zig");
 pub const tick = @import("lib/tick.zig");
 pub const jsonschema = @import("lib/jsonschema.zig");
 pub const structured_run = @import("lib/structured_run.zig");
+pub const diag = @import("lib/diag.zig");
 pub const textadmit = @import("lib/textadmit.zig");
 pub const textcap = @import("lib/textcap.zig");
 pub const resultcap = @import("lib/resultcap.zig");

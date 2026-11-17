@@ -3073,6 +3073,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdCache(m);
     } else if (std.mem.eql(u8, cmd, "bench")) {
         commands_mod.cmdBench(m);
+    } else if (std.mem.eql(u8, cmd, "diag")) {
+        commands_mod.cmdDiag(m);
     } else if (std.mem.eql(u8, cmd, "iter")) {
         cmdIter(m, rest);
     } else if (std.mem.eql(u8, cmd, "pipeline")) {

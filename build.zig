@@ -381,6 +381,15 @@ pub fn build(b: *std.Build) void {
     run_copy.has_side_effects = true;
     pty_check.dependOn(&run_copy.step);
 
+    // Phase 37: `zig build diag` — one-shot internal diagnostics. Doesn't
+    // touch the network or the real HOME: --diag only reads /proc/self/status.
+    const diag_step = b.step("diag", "Internal diagnostics: one-shot memory snapshot from /proc");
+    diag_step.dependOn(b.getInstallStep());
+    const run_diag = b.addSystemCommand(&.{ "./zig-out/bin/zode", "--diag" });
+    run_diag.setName("zode --diag");
+    run_diag.has_side_effects = true;
+    diag_step.dependOn(&run_diag.step);
+
     // churn: Zig-native changeset tool for version bumps and changelogs.
     const cm_mod = b.createModule(.{
         .root_source_file = b.path("tools/churn.zig"),

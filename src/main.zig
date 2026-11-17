@@ -26,6 +26,7 @@ const team_mod = @import("lib/team.zig");
 const usermessage_mod = @import("lib/usermessage.zig");
 const jsonschema_mod = @import("lib/jsonschema.zig");
 const structured_run = @import("lib/structured_run.zig");
+const diag_mod = @import("lib/diag.zig");
 const hooks_mod = @import("lib/hooks.zig");
 const permrules = @import("lib/permrules.zig");
 const pathsafe = @import("lib/pathsafe.zig");
@@ -1431,6 +1432,25 @@ fn runTui(init: std.process.Init) !u8 {
 /// an unreachable host): the network is not the binary's fault and must not
 /// veto an update. Only a FAULT is a verdict, and the caller reads that from
 /// the process term (a signal), not from here.
+/// Phase 37: `--diag` — one-shot internal snapshot for scripts/CI. Prints
+/// the same /proc memory numbers as the TUI's /diag, to stdout, and returns 0.
+pub fn runDiag(init: std.process.Init) u8 {
+    const s = diag_mod.sample(init.io);
+    var buf: [512]u8 = undefined;
+    var out = std.Io.File.stdout().writer(init.io, &buf);
+    out.interface.print(
+        "zode diag · pid {d} · rss {d:.1} MiB · size {d:.1} MiB · peak {d:.1} MiB\n",
+        .{
+            if (builtin.os.tag == .linux) std.os.linux.getpid() else 0,
+            s.residentMiB(),
+            @as(f64, @floatFromInt(s.vm_size_kb)) / 1024.0,
+            @as(f64, @floatFromInt(s.vm_peak_kb)) / 1024.0,
+        },
+    ) catch return 1;
+    out.interface.flush() catch return 1;
+    return 0;
+}
+
 pub fn runSelftest(init: std.process.Init) u8 {
     var threaded: std.Io.Threaded = .init(init.gpa, .{});
     defer threaded.deinit();
@@ -1494,6 +1514,9 @@ pub fn main(init: std.process.Init) !u8 {
                 return 1;
             };
             return runChat(init.gpa, init.io, init.environ_map, prompt_text, schema_data);
+        }
+        if (std.mem.eql(u8, arg0, "--diag")) {
+            return runDiag(init);
         }
         if (std.mem.eql(u8, arg0, "--selftest")) {
             return runSelftest(init);

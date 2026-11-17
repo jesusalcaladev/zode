@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete phase 18 (isolated worktree sessions) (worktree) [`7e429eea`](https://github.com/jesusalcaladev/zode/commit/7e429eea)
 - complete phase 19 (ticks and scheduled prompts) (schedule) [`3a919193`](https://github.com/jesusalcaladev/zode/commit/3a919193)
 - complete phase 22 (structured output for scripted runs) (schema) [`c7a84fef`](https://github.com/jesusalcaladev/zode/commit/c7a84fef)
+- internal memory/leak diagnostics with millimetre control (diag) [`cd8111f3`](https://github.com/jesusalcaladev/zode/commit/cd8111f3)
 
 ### Bug Fixes
 
@@ -50,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep typed composer input visible and scrollable (tui) [`57e24d60`](https://github.com/jesusalcaladev/zode/commit/57e24d60)
 - detect repeated reads per file instead of per turn (agent) [`d8a4e91e`](https://github.com/jesusalcaladev/zode/commit/d8a4e91e)
 - highlight diff stats and improve diff emphasis (tui) [`f0d49e17`](https://github.com/jesusalcaladev/zode/commit/f0d49e17)
-- static scratch buffers for discovery Loaders (@memcpy alias) (crash) [`99dcb66f`](https://github.com/jesusalcaladev/zode/commit/99dcb66f)
+- static scratch buffers for discovery Loaders (@memcpy alias) (crash) [`febfaf2e`](https://github.com/jesusalcaladev/zode/commit/febfaf2e)
 
 ### Chores
 
