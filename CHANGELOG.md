@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete phase 22 (structured output for scripted runs) (schema) [`c7a84fef`](https://github.com/jesusalcaladev/zode/commit/c7a84fef)
 - internal memory/leak diagnostics with millimetre control (diag) [`9d4db8a7`](https://github.com/jesusalcaladev/zode/commit/9d4db8a7)
 - churn tool and beta channel for the release flow (release) [`45ed1183`](https://github.com/jesusalcaladev/zode/commit/45ed1183)
-- static auditor for the two crash classes (memaudit) [`f4311046`](https://github.com/jesusalcaladev/zode/commit/f4311046)
+- static auditor for the two crash classes (memaudit) [`fc008c2d`](https://github.com/jesusalcaladev/zode/commit/fc008c2d)
 
 ### Bug Fixes
 
@@ -55,10 +55,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - highlight diff stats and improve diff emphasis (tui) [`f0d49e17`](https://github.com/jesusalcaladev/zode/commit/f0d49e17)
 - static scratch buffers for discovery Loaders (@memcpy alias) (crash) [`febfaf2e`](https://github.com/jesusalcaladev/zode/commit/febfaf2e)
 - copy subagent text into the message arena (use-after-free) (crash) [`82847c9c`](https://github.com/jesusalcaladev/zode/commit/82847c9c)
+- cut dated changelog section and consume changesets on release (churn) [`ffcaf1f5`](https://github.com/jesusalcaladev/zode/commit/ffcaf1f5)
 
 ### Chores
 
 - track local plans and pending memory notes (zode) [`e1624043`](https://github.com/jesusalcaladev/zode/commit/e1624043)
+- beta flow and memory audit (changeset) [`4b759345`](https://github.com/jesusalcaladev/zode/commit/4b759345)
 
 ### Documentation
 

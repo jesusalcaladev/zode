@@ -140,6 +140,58 @@ fn cmdChangelog(gpa: std.mem.Allocator, io: std.Io) u8 {
     return 0;
 }
 
+/// Rename `## [Unreleased]` into a dated version section and open a fresh one.
+/// The Python generator only rebuilds the Unreleased block; the cut is ours.
+fn cutChangelog(gpa: std.mem.Allocator, io: std.Io, version: []const u8) u8 {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, "CHANGELOG.md", gpa, .limited(8 * 1024 * 1024)) catch {
+        std.debug.print("release: cannot read CHANGELOG.md\n", .{});
+        return 1;
+    };
+    defer gpa.free(data);
+    const marker = "## [Unreleased]";
+    const at = std.mem.indexOf(u8, data, marker) orelse {
+        std.debug.print("release: CHANGELOG.md has no [Unreleased] section\n", .{});
+        return 1;
+    };
+    const secs: u64 = @intCast(std.Io.Timestamp.now(io, .real).toSeconds());
+    const ep = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = ep.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const date = std.fmt.allocPrint(gpa, "{d}-{d:0>2}-{d:0>2}", .{ yd.year, @intFromEnum(md.month), md.day_index + 1 }) catch return 1;
+    defer gpa.free(date);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, data[0..at]) catch return 1;
+    out.print(gpa, "## [{s}] - {s}\n\n{s}", .{ version, date, marker }) catch return 1;
+    out.appendSlice(gpa, data[at + marker.len ..]) catch return 1;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "CHANGELOG.md", .data = out.items }) catch {
+        std.debug.print("release: cannot write CHANGELOG.md\n", .{});
+        return 1;
+    };
+    return 0;
+}
+
+/// Delete the changesets that were just released (keep config.json), so the
+/// next release starts from zero instead of reusing this one's bump.
+fn consumeChangesets(gpa: std.mem.Allocator, io: std.Io) void {
+    var dir = std.Io.Dir.cwd().openDir(io, ".churn", .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+    var it = dir.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".json")) continue;
+        if (std.mem.eql(u8, e.name, "config.json")) continue;
+        const copy = gpa.dupe(u8, e.name) catch continue;
+        names.append(gpa, copy) catch gpa.free(copy);
+    }
+    for (names.items) |n| dir.deleteFile(io, n) catch {};
+}
+
 fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     const push = flag(args, "--push");
     // 1. Refuse a dirty tree.
@@ -180,8 +232,11 @@ fn cmdRelease(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     updated.appendSlice(gpa, rest[end..]) catch return 1;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "build.zig.zon", .data = updated.items }) catch return 1;
 
-    // 4. Regenerate the changelog.
+    // 4. Regenerate the changelog, then cut the dated version section.
     if (cmdChangelog(gpa, io) != 0) return 1;
+    if (cutChangelog(gpa, io, next) != 0) return 1;
+    // The bump is spent: consume the changesets so the next release is fresh.
+    consumeChangesets(gpa, io);
 
     // 5. Commit + tag (push only when explicit).
     const tag = std.fmt.allocPrint(gpa, "v{s}", .{next}) catch return 1;
