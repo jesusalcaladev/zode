@@ -64,8 +64,24 @@ pub fn apiBaseForHost(arena: std.mem.Allocator, host: []const u8) []const u8 {
     return std.fmt.allocPrint(arena, "https://{s}/api/v3", .{host}) catch default_api_base;
 }
 
+/// Two URLs share an origin when scheme, host and port match. Used before we
+/// attach a Bearer token to a URL from a server-controlled `Link` header.
+fn sameOrigin(a: std.Uri, b: std.Uri) bool {
+    if (!std.ascii.eqlIgnoreCase(a.scheme, b.scheme)) return false;
+    if (a.host == null or b.host == null) return false;
+    if (!std.ascii.eqlIgnoreCase(a.host.?.percent_encoded, b.host.?.percent_encoded)) return false;
+    return a.port == b.port;
+}
+
 pub fn buildUrl(arena: std.mem.Allocator, api_base: []const u8, path: []const u8) ![]const u8 {
-    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return arena.dupe(u8, path);
+    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) {
+        const base_uri = std.Uri.parse(api_base) catch return error.InvalidUrl;
+        const path_uri = std.Uri.parse(path) catch return error.InvalidUrl;
+        // A `Link: <http://attacker/steal>; rel="next"` must never carry our
+        // token. GitHub pagination is the only reason we accept absolute URLs.
+        if (!sameOrigin(base_uri, path_uri)) return error.OffOriginUrl;
+        return arena.dupe(u8, path);
+    }
     const base = std.mem.trimEnd(u8, api_base, "/");
     if (path.len == 0) return arena.dupe(u8, base);
     if (path[0] == '/') return std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
@@ -262,4 +278,21 @@ test "parseLinkNextFromValue: extracts next URL" {
     try std.testing.expect(next != null);
     try std.testing.expectEqualStrings("https://api.github.com/repos/a/b/issues?page=2", next.?);
     try std.testing.expect(parseLinkNextFromValue(a, "<https://x>; rel=\"prev\"") == null);
+}
+
+test "buildUrl: pagination follows same-origin links only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = "https://ghe.example.com/api/v3";
+    try std.testing.expectEqualStrings(
+        "https://ghe.example.com/api/v3/repos/o/r/issues?page=2",
+        try buildUrl(a, base, "https://ghe.example.com/api/v3/repos/o/r/issues?page=2"),
+    );
+    // A different host, scheme or port would receive the Bearer token.
+    try std.testing.expectError(error.OffOriginUrl, buildUrl(a, base, "http://attacker.example/steal"));
+    try std.testing.expectError(error.OffOriginUrl, buildUrl(a, base, "https://evil.example/api/v3/x"));
+    try std.testing.expectError(error.OffOriginUrl, buildUrl(a, base, "https://ghe.example.com:8443/api/v3/x"));
+    // Relative paths are always allowed — they are built from our own base.
+    try std.testing.expectEqualStrings("https://api.github.com/user", try buildUrl(a, default_api_base, "/user"));
 }

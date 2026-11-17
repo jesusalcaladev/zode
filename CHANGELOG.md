@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - complete the ecosystem - plugins, remote sessions, keybindings (phase13) [`acd62990`](https://github.com/jesusalcaladev/zode/commit/acd62990)
 
+### Bug Fixes
+
+- close six critical permission and token-leak holes (security) [`91cd2cb3`](https://github.com/jesusalcaladev/zode/commit/91cd2cb3)
+
 ### Chores
 
 - remove the completed task board (tasks) [`65c9ef69`](https://github.com/jesusalcaladev/zode/commit/65c9ef69)
@@ -18,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - bring the board up to date and close the quality gaps (tasks) [`2f3254d5`](https://github.com/jesusalcaladev/zode/commit/2f3254d5)
-- new improvement backlog from a six-track code audit (tasks) [`1201f384`](https://github.com/jesusalcaladev/zode/commit/1201f384)
+- new improvement backlog from a six-track code audit (tasks) [`a674eb1b`](https://github.com/jesusalcaladev/zode/commit/a674eb1b)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

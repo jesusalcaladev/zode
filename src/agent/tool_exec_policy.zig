@@ -2,6 +2,7 @@ const std = @import("std");
 const tools_mod = @import("../tools/dispatch.zig");
 const cmdsafety = @import("../lib/cmdsafety.zig");
 const agent_perms = @import("perms.zig");
+const pathsafe = @import("../lib/pathsafe.zig");
 
 pub fn isWriteTool(name: []const u8) bool {
     return agent_perms.isEditTool(name) or
@@ -18,6 +19,10 @@ pub fn callReadsOnly(name: []const u8, args_json: []const u8, arena: std.mem.All
     if (parsed != .object) return false;
     const cmd = parsed.object.get("command") orelse return false;
     if (cmd != .string) return false;
+    // A read-only bash command skips the dialog. It must not also be a way to
+    // read auth.json / id_rsa with nothing on screen — the `read` tool refuses
+    // those, and its documented escape hatch has to carry the same rule.
+    if (pathsafe.commandNamesSecret(cmd.string)) return false;
     return cmdsafety.isReadOnly(cmd.string, arena);
 }
 

@@ -96,10 +96,33 @@ const read_only_programs = [_][]const u8{
     "df",       "date",     "uname",    "whoami",    "hostname", "id",     "groups",
     "printenv", "realpath", "basename", "dirname",   "file",     "sort",   "uniq",
     "cut",      "tr",       "nl",       "comm",      "join",     "paste",  "column",
-    "tac",      "seq",      "expr",     "test",      "jq",       "yq",     "diff",
+    "tac",      "seq",      "expr",     "test",                  "diff",
     "cmp",      "md5sum",   "sha1sum",  "sha256sum", "ps",       "uptime", "free",
     "lscpu",    "lsblk",    "nproc",    "who",       "w",        "last",   "column",
-    "getconf",  "locale",   "tty",      "stdbuf",
+    "getconf",  "locale",   "tty",
+};
+
+/// Read-only programs whose FLAGS can make them write, delete or execute.
+/// The name alone is not the verdict — same principle as the `families` table.
+/// `find . -name x` reads; `find . -delete` and `find . -exec sh …` do not.
+const read_program_flags = [_]struct {
+    name: []const u8,
+    flags: []const []const u8,
+    verdict: Verdict,
+    why: []const u8,
+}{
+    .{
+        .name = "find",
+        .flags = &.{ "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fprint0", "-fls" },
+        .verdict = .executes,
+        .why = "find can delete files or run a command with -delete/-exec",
+    },
+    .{
+        .name = "fd",
+        .flags = &.{ "-x", "-X", "--exec", "--exec-batch" },
+        .verdict = .executes,
+        .why = "fd can run a command for every match with --exec",
+    },
 };
 
 /// The programs that change something.
@@ -181,6 +204,9 @@ const execute_programs = [_]struct { name: []const u8, why: []const u8 }{
     .{ .name = "nohup", .why = "this runs a program in the background" },
     .{ .name = "setsid", .why = "this runs a program in a new session" },
     .{ .name = "nice", .why = "this runs a program" },
+    .{ .name = "stdbuf", .why = "this runs the program it is given" },
+    .{ .name = "jq", .why = "jq filters can run system commands" },
+    .{ .name = "yq", .why = "yq filters can run system commands" },
     .{ .name = "watch", .why = "this runs a program over and over" },
     .{ .name = "script", .why = "this records a session" },
     .{ .name = "sudo", .why = "this runs a program as another user" },
@@ -472,6 +498,17 @@ pub fn classifyPart(part: []const u8, arena: std.mem.Allocator) Finding {
         return .{ .verdict = e.verdict, .fragment = part, .why = e.why };
     }
 
+    // Read-only programs with dangerous flags: the flag wins over the name.
+    for (read_program_flags) |e| {
+        if (!std.mem.eql(u8, e.name, program)) continue;
+        for (words[1..]) |w| {
+            for (e.flags) |f| {
+                if (!flagMatches(w, f)) continue;
+                return .{ .verdict = e.verdict, .fragment = part, .why = e.why };
+            }
+        }
+        break;
+    }
     // The programs that read.
     for (read_only_programs) |p| {
         if (std.mem.eql(u8, p, program)) {
@@ -835,4 +872,23 @@ test "cmdsafety: Phase 25 pure cases — quoted semicolon, pipe into sh, git sta
     const sub2 = classify("printf '%s' `id`", a);
     try t.expectEqual(Verdict.executes, sub2.verdict);
     try t.expect(std.mem.indexOf(u8, sub2.fragment, "`") != null);
+}
+
+test "cmdsafety: read-looking programs that execute or delete are not read-only" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Plain find/fd still read.
+    try t.expect(isReadOnly("find . -name '*.zig'", a));
+    try t.expect(isReadOnly("fd -e zig foo", a));
+    // These change things or run other programs, despite a quiet name.
+    try t.expect(!isReadOnly("find . -delete", a));
+    try t.expect(!isReadOnly("find . -exec sh -c 'echo x' {} +", a));
+    try t.expect(!isReadOnly("find . -execdir rm {} +", a));
+    try t.expect(!isReadOnly("fd -x rm", a));
+    try t.expect(!isReadOnly("fd --exec rm {}", a));
+    try t.expect(!isReadOnly("stdbuf -oL rm -rf x", a));
+    try t.expect(!isReadOnly("jq 'system(\"id\")' file.json", a));
+    try t.expect(!isReadOnly("yq '.a = 1' file.yaml", a));
 }

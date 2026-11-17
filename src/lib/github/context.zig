@@ -8,7 +8,7 @@ pub const Remote = struct {
     url: []const u8,
 };
 
-pub fn parseRemoteUrl(url_in: []const u8) ?Remote {
+pub fn parseRemoteUrl(alloc: std.mem.Allocator, url_in: []const u8) ?Remote {
     const url = std.mem.trim(u8, url_in, " \t\r\n");
     if (url.len == 0) return null;
     if (std.mem.indexOf(u8, url, "://")) |scheme_end| {
@@ -20,7 +20,7 @@ pub fn parseRemoteUrl(url_in: []const u8) ?Remote {
         const host = stripPort(host_port);
         if (host.len == 0) return null;
         const path = after_hostinfo[slash + 1 ..];
-        return parseOwnerRepoPath(host, path, url);
+        return parseOwnerRepoPath(host, path, sanitizeUrl(alloc, url));
     }
     if (std.mem.indexOfScalar(u8, url, ':')) |colon| {
         if (std.mem.indexOfScalar(u8, url[0..colon], '/')) |_| return null;
@@ -30,7 +30,7 @@ pub fn parseRemoteUrl(url_in: []const u8) ?Remote {
         const host = if (std.mem.lastIndexOfScalar(u8, left, '@')) |at| left[at + 1 ..] else left;
         const host_trim = stripPort(std.mem.trim(u8, host, " \t"));
         if (host_trim.len == 0 or std.mem.indexOfScalar(u8, host_trim, ' ') != null) return null;
-        return parseOwnerRepoPath(host_trim, path, url);
+        return parseOwnerRepoPath(host_trim, path, sanitizeUrl(alloc, url));
     }
     return null;
 }
@@ -45,6 +45,24 @@ fn stripPort(host_port: []const u8) []const u8 {
     const last = std.mem.lastIndexOfScalar(u8, host_port, ':').?;
     if (first != last) return host_port;
     return host_port[0..first];
+}
+
+/// A remote URL can carry credentials in its userinfo (`https://user:token@host/...`
+/// or `git@host:...`). It is printed into tool results, so strip that part.
+/// Returns `url` itself when there is nothing to strip.
+fn sanitizeUrl(alloc: std.mem.Allocator, url: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, url, "://")) |scheme| {
+        const authority = scheme + 3;
+        const end = std.mem.indexOfScalarPos(u8, url, authority, '/') orelse url.len;
+        if (std.mem.lastIndexOfScalar(u8, url[authority..end], '@')) |at| {
+            return std.fmt.allocPrint(alloc, "{s}{s}", .{ url[0..authority], url[authority + at + 1 ..] }) catch url;
+        }
+    } else if (std.mem.indexOfScalar(u8, url, ':')) |colon| {
+        if (std.mem.lastIndexOfScalar(u8, url[0..colon], '@')) |at| {
+            return std.fmt.allocPrint(alloc, "{s}{s}", .{ url[at + 1 .. colon], url[colon..] }) catch url;
+        }
+    }
+    return url;
 }
 
 fn parseOwnerRepoPath(host: []const u8, path_in: []const u8, original: []const u8) ?Remote {
@@ -106,61 +124,98 @@ pub fn resolve(arena: std.mem.Allocator, io: std.Io) ?Remote {
     const preferred = [_][]const u8{ "origin", "upstream" };
     for (preferred) |name| {
         if (remoteUrl(arena, io, name)) |u| {
-            if (parseRemoteUrl(u)) |r| return r;
+            if (parseRemoteUrl(arena, u)) |r| return r;
         }
     }
     const names = remoteNames(arena, io) orelse return null;
     for (names) |name| {
         if (remoteUrl(arena, io, name)) |u| {
-            if (parseRemoteUrl(u)) |r| return r;
+            if (parseRemoteUrl(arena, u)) |r| return r;
         }
     }
     return null;
 }
 
 test "parseRemoteUrl: https with .git" {
-    const r = parseRemoteUrl("https://github.com/jesusalcaladev/zode.git").?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = parseRemoteUrl(a, "https://github.com/jesusalcaladev/zode.git").?;
     try std.testing.expectEqualStrings("github.com", r.host);
     try std.testing.expectEqualStrings("jesusalcaladev", r.owner);
     try std.testing.expectEqualStrings("zode", r.repo);
 }
 
 test "parseRemoteUrl: https without .git and with trailing slash" {
-    const r = parseRemoteUrl("https://github.com/acme/widgets/").?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = parseRemoteUrl(a, "https://github.com/acme/widgets/").?;
     try std.testing.expectEqualStrings("acme", r.owner);
     try std.testing.expectEqualStrings("widgets", r.repo);
 }
 
 test "parseRemoteUrl: ssh scp-like" {
-    const r = parseRemoteUrl("git@github.com:acme/widgets.git").?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = parseRemoteUrl(a, "git@github.com:acme/widgets.git").?;
     try std.testing.expectEqualStrings("github.com", r.host);
     try std.testing.expectEqualStrings("acme", r.owner);
     try std.testing.expectEqualStrings("widgets", r.repo);
 }
 
 test "parseRemoteUrl: ssh:// with userinfo and port" {
-    const r = parseRemoteUrl("ssh://git@ghe.example.com:2222/team/repo.git").?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = parseRemoteUrl(a, "ssh://git@ghe.example.com:2222/team/repo.git").?;
     try std.testing.expectEqualStrings("ghe.example.com", r.host);
     try std.testing.expectEqualStrings("team", r.owner);
     try std.testing.expectEqualStrings("repo", r.repo);
 }
 
 test "parseRemoteUrl: https enterprise host" {
-    const r = parseRemoteUrl("https://git.corp.internal/org/service").?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = parseRemoteUrl(a, "https://git.corp.internal/org/service").?;
     try std.testing.expectEqualStrings("git.corp.internal", r.host);
     try std.testing.expectEqualStrings("org", r.owner);
     try std.testing.expectEqualStrings("service", r.repo);
 }
 
 test "parseRemoteUrl: rejects invalid" {
-    try std.testing.expect(parseRemoteUrl("") == null);
-    try std.testing.expect(parseRemoteUrl("not-a-remote") == null);
-    try std.testing.expect(parseRemoteUrl("https://github.com/onlyowner") == null);
-    try std.testing.expect(parseRemoteUrl("https://github.com/") == null);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(parseRemoteUrl(a, "") == null);
+    try std.testing.expect(parseRemoteUrl(a, "not-a-remote") == null);
+    try std.testing.expect(parseRemoteUrl(a, "https://github.com/onlyowner") == null);
+    try std.testing.expect(parseRemoteUrl(a, "https://github.com/") == null);
 }
 
 test "stripPort: host and host:port" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     try std.testing.expectEqualStrings("github.com", stripPort("github.com"));
     try std.testing.expectEqualStrings("github.com", stripPort("github.com:443"));
     try std.testing.expectEqualStrings("::1", stripPort("[::1]:22"));
+}
+
+test "parseRemoteUrl: credentials in userinfo never survive into the URL field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const https = parseRemoteUrl(a, "https://user:ghp_secret123@github.com/acme/widgets.git").?;
+    try std.testing.expectEqualStrings("https://github.com/acme/widgets.git", https.url);
+    try std.testing.expectEqualStrings("acme", https.owner);
+    try std.testing.expect(std.mem.indexOf(u8, https.url, "ghp_") == null);
+
+    const scp = parseRemoteUrl(a, "git@github.com:acme/widgets.git").?;
+    try std.testing.expectEqualStrings("github.com:acme/widgets.git", scp.url);
+    try std.testing.expect(std.mem.indexOf(u8, scp.url, "git@") == null);
+
+    const ssh = parseRemoteUrl(a, "ssh://git@ghe.example.com:2222/team/repo.git").?;
+    try std.testing.expectEqualStrings("ssh://ghe.example.com:2222/team/repo.git", ssh.url);
 }

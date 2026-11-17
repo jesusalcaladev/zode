@@ -927,8 +927,14 @@ const Server = struct {
     }
 
     fn checkToolPermission(self: *Server, arena: std.mem.Allocator, ss: *SessionState, tool_name: []const u8, args_json: []const u8, tool_call_id: []const u8, rules: permrules.Set) bool {
-        if (!tools_mod.needsPermission(tool_name)) return true;
-        const subjects = tools_mod.callSubjects(tool_name, args_json, arena);
+        // The static `needsPermission` flag is NOT enough here: several tools
+        // (`github`, `config`, `mcp`, `memory`) are marked read-only because
+        // their permission is PER OPERATION. Asking for `github auth_status`
+        // is free, but `github pr_create` must reach the dialog. The main
+        // agent path already uses this per-call helper; ACP must use the same
+        // door or an ACP client can mutate state with no prompt at all.
+        const subjects = tools_mod.callPermissionTools(tool_name, args_json, arena);
+        if (subjects.len == 0) return true; // a decided read operation
         if (permrules.decide(rules.rules, tool_name, subjects)) |d| {
             if (d.action == .allow) return true;
             if (d.action == .deny) return false;

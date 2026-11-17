@@ -7,6 +7,12 @@ pub fn redact(alloc: std.mem.Allocator, text: []const u8, known_keys: []const []
     // Fast path: nothing to hide and no shape.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
+    // The env-marker search used to re-scan the ENTIRE remaining slice at
+    // every byte: O(n^2) on any ordinary large message, reachable from
+    // Session.append for every tool result. Track the NEXT marker position
+    // instead and only re-scan once the cursor passes it — total O(n).
+    var next_key: ?usize = std.mem.indexOf(u8, text, "_KEY=");
+    var next_token: ?usize = std.mem.indexOf(u8, text, "_TOKEN=");
     var i: usize = 0;
     while (i < text.len) {
         // Known key values win first.
@@ -36,8 +42,10 @@ pub fn redact(alloc: std.mem.Allocator, text: []const u8, known_keys: []const []
             continue;
         }
         // ZODE_*_KEY= , *_TOKEN=
+        if (next_key != null and next_key.? < i) next_key = std.mem.indexOfPos(u8, text, i, "_KEY=");
+        if (next_token != null and next_token.? < i) next_token = std.mem.indexOfPos(u8, text, i, "_TOKEN=");
         const rest = text[i..];
-        if (std.mem.indexOf(u8, rest, "_KEY=") != null or std.mem.indexOf(u8, rest, "_TOKEN=") != null) {
+        if (next_key != null or next_token != null) {
             // Find the first '=' in a short window ahead
             var j: usize = 0;
             var eq: ?usize = null;
@@ -94,4 +102,29 @@ test "redact: does not over-redact" {
     const out = try redact(a, text, &.{});
     defer a.free(out);
     try std.testing.expectEqualStrings(text, out);
+}
+
+test "redact: a large message without env markers is handled in one pass" {
+    const a = std.testing.allocator;
+    // 100 KB of ordinary text used to cost ~10^10 byte comparisons because
+    // every position re-scanned the rest for _KEY=/_TOKEN=.
+    var big = std.ArrayList(u8).empty;
+    defer big.deinit(a);
+    for (0..100) |_| try big.appendSlice(a, "ordinary prose without any secret markers 0123456789\n");
+    const result = try redact(a, big.items, &.{});
+    defer a.free(result);
+    try std.testing.expectEqual(big.items.len, result.len);
+    try std.testing.expectEqualStrings(big.items, result);
+}
+
+test "redact: many env markers are all replaced correctly" {
+    const a = std.testing.allocator;
+    const src = "ZODE_FOO_KEY=secret1 middle ZODE_BAR_TOKEN=secret2 tail ZODE_BAZ_KEY=secret3";
+    const result = try redact(a, src, &.{});
+    defer a.free(result);
+    try std.testing.expectEqualStrings(
+        "ZODE_FOO_KEY=[REDACTED] middle ZODE_BAR_TOKEN=[REDACTED] tail ZODE_BAZ_KEY=[REDACTED]",
+        result,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, result, "secret") == null);
 }

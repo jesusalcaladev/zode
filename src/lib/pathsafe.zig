@@ -180,6 +180,43 @@ pub fn checkRead(path: []const u8) Verdict {
     return .ok;
 }
 
+/// Fragments that mark a path as secret even when `checkRead` does not catch
+/// the basename (e.g. `~/.ssh/id_rsa` has no extension, `~/.aws/credentials`
+/// is not in `secret_files`). Used for read-only bash commands, which would
+/// otherwise skip the permission dialog entirely.
+const secret_path_fragments = [_][]const u8{
+    ".ssh/",        ".aws/",      ".gnupg/",    ".config/zode/",
+    ".kube/",       "id_rsa",     "id_ed25519", "id_dsa",
+    "credentials",  ".git-credentials", ".docker/config.json",
+};
+
+fn containsIgnoreCaseSlice(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (eqIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// Does a shell command name a file that `read` would refuse?
+///
+/// A read-only bash command gets `no_dialog = true` in the main agent path and
+/// in ACP: `cat ~/.ssh/id_rsa` would send a private key to the provider with
+/// nothing on screen. The dedicated `read` tool is protected; this is the
+/// matching guard for its documented escape hatch.
+pub fn commandNamesSecret(command: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, command, " \t\r\n\"'|$;&<>()");
+    while (it.next()) |tok| {
+        if (tok.len == 0 or tok[0] == '-') continue;
+        if (checkRead(tok) != .ok) return true;
+        for (secret_path_fragments) |frag| {
+            if (containsIgnoreCaseSlice(tok, frag)) return true;
+        }
+    }
+    return false;
+}
+
 /// checkRead on the RESOLVED path: a symlink `notes.txt -> auth.json` must be
 /// refused as a read of `auth.json`, not as a read of `notes.txt`.
 pub fn checkReadResolved(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) Verdict {
@@ -767,4 +804,14 @@ test "pathsafe: ask rule falls back to pathsafe (refuses dangerous path)" {
 
     // An "ask" rule is not definitive: the dangerous table still refuses.
     try std.testing.expect(checkWritePermitted(rules, "Write", dir, io, arena, ".git/config") != .ok);
+}
+
+test "pathsafe: read-only bash commands that name secrets are detected" {
+    try std.testing.expect(commandNamesSecret("cat ~/.ssh/id_rsa"));
+    try std.testing.expect(commandNamesSecret("head ~/.config/zode/auth.json"));
+    try std.testing.expect(commandNamesSecret("tail ~/.aws/credentials"));
+    try std.testing.expect(commandNamesSecret("cat /home/user/.gnupg/private.key"));
+    try std.testing.expect(!commandNamesSecret("cat src/main.zig"));
+    try std.testing.expect(!commandNamesSecret("git status"));
+    try std.testing.expect(!commandNamesSecret("rg foo src/"));
 }
