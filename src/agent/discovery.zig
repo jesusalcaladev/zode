@@ -213,6 +213,15 @@ fn loadSkillsNow(
     return copy;
 }
 
+/// Scratch buffers for the Loaders built by `skillsLoader`/`stylesLoader`.
+///
+/// These MUST NOT be stack locals: a Loader returned by value holds slices into
+/// them, and a stack slot is dead (and reused by the caller's next `bufPrint`)
+/// the moment the function returns — the exact overlap that produced
+/// `@memcpy arguments alias`. Static buffers outlive the Loader; both callers
+/// hold their module lock (`skills_lock` / `styles_lock`) while using them.
+var loader_path_bufs: [4][std.fs.max_path_bytes]u8 = undefined;
+
 fn skillsLoader(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -222,9 +231,8 @@ fn skillsLoader(
 ) skillstore.Loader {
     var loader = skillstore.Loader.init(gpa, io, env);
     if (project_cwd.len == 0) return loader;
-    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
-    loader.project_dir = std.fmt.bufPrint(&bufs[0], "{s}/{s}", .{ project_cwd, skills.project_dir }) catch loader.project_dir;
-    loader.agents_dir = std.fmt.bufPrint(&bufs[1], "{s}/{s}", .{ project_cwd, skills.agents_dir }) catch loader.agents_dir;
+    loader.project_dir = std.fmt.bufPrint(&loader_path_bufs[0], "{s}/{s}", .{ project_cwd, skills.project_dir }) catch loader.project_dir;
+    loader.agents_dir = std.fmt.bufPrint(&loader_path_bufs[1], "{s}/{s}", .{ project_cwd, skills.agents_dir }) catch loader.agents_dir;
     if (project_root) |root| {
         if (!std.mem.eql(u8, root, project_cwd)) loader.repo_root = root;
     }
@@ -368,8 +376,7 @@ fn stylesLoader(
 ) outputstyle_store.Loader {
     var loader = outputstyle_store.Loader.init(gpa, io, env);
     if (project_cwd.len == 0) return loader;
-    var bufs: [2][std.fs.max_path_bytes]u8 = undefined;
-    loader.project_dir = std.fmt.bufPrint(&bufs[0], "{s}/{s}", .{ project_cwd, outputstyles.project_dir }) catch loader.project_dir;
+    loader.project_dir = std.fmt.bufPrint(&loader_path_bufs[2], "{s}/{s}", .{ project_cwd, outputstyles.project_dir }) catch loader.project_dir;
     if (project_root) |root| {
         if (!std.mem.eql(u8, root, project_cwd)) loader.repo_root = root;
     }
@@ -436,4 +443,33 @@ pub fn resetStylesCacheForTest() void {
     styles_cache_gpa = std.heap.page_allocator;
     styles_stamp_len = 0;
     styles_rescans = 0;
+}
+
+// ── Phase 36 / crash fix: Loader paths must outlive the returning frame ────
+
+test "discovery: loader paths survive the function that built them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cwd = "/tmp/zode-loader-path-test";
+    const root: ?[]const u8 = null;
+
+    // Build a skills loader and a styles loader, then FORCE the old stack
+    // region to be overwritten by other bufPrint calls. If the paths were
+    // stack locals (the bug: `@memcpy arguments alias`), they now read as
+    // garbage; with static scratch buffers they stay intact.
+    const sk = skillsLoader(a, std.testing.io, null, cwd, root);
+    const st = stylesLoader(a, std.testing.io, null, cwd, root);
+    try std.testing.expect(std.mem.startsWith(u8, sk.project_dir, cwd));
+    try std.testing.expect(std.mem.startsWith(u8, st.project_dir, cwd));
+
+    var churn: [4][std.fs.max_path_bytes]u8 = undefined;
+    for (0..64) |i| {
+        _ = std.fmt.bufPrint(&churn[i % 4], "churn-{d}-{s}", .{ i, cwd }) catch {};
+    }
+    try std.testing.expect(std.mem.startsWith(u8, sk.project_dir, cwd));
+    try std.testing.expect(std.mem.startsWith(u8, st.project_dir, cwd));
+    try std.testing.expect(std.mem.indexOf(u8, sk.project_dir, ".zode/skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st.project_dir, ".zode/output-styles") != null);
 }
